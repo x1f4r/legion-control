@@ -477,6 +477,207 @@ async fn baseline_50mp_is_admitted_under_cap_and_over_cap_progressive_falls_back
 }
 
 #[tokio::test]
+async fn thumb_reply_budget_caps_32_noisy_covers_and_transparent_pngs_under_16mib_line() {
+    use audio_fixtures as af;
+
+    let _guard = MEASURE_LOCK.lock().await;
+    const LINK_LINE_LIMIT: usize = 16 * 1024 * 1024;
+    const REPLY_B64_LIMIT: usize = 12 * 1024 * 1024;
+
+    // Helper: drains a 32-path batch by re-asking any `busy (reply_budget)` paths, asserting every
+    // reply line stays strictly < 16 MiB and total base64 stays <= 12 MiB, returning `(calls,
+    // max_line_bytes, max_b64_bytes, peak_heap_delta_bytes)`.
+    async fn drain_batch(
+        node: &Node,
+        all_paths: &[String],
+        size: u32,
+        fit: &str,
+    ) -> (usize, usize, usize, usize) {
+        let mut remaining: Vec<String> = all_paths.to_vec();
+        let mut completed = std::collections::HashSet::new();
+        let mut calls = 0usize;
+        let mut max_line_bytes = 0usize;
+        let mut max_b64_bytes = 0usize;
+        let mut peak_heap_delta = 0usize;
+
+        while !remaining.is_empty() {
+            calls += 1;
+            assert!(
+                calls <= all_paths.len(),
+                "reply budget must make progress on every call"
+            );
+            let live_before = LIVE_BYTES.load(Ordering::SeqCst);
+            reset_peak();
+            let res = node
+                .call(Call::new(
+                    Door::Cli,
+                    "fs.thumb",
+                    json!({"paths": remaining, "size": size, "fit": fit}),
+                ))
+                .await
+                .unwrap();
+            let serialized_line = serde_json::to_string(&res).unwrap();
+            let call_peak_delta = peak_total_bytes().saturating_sub(live_before);
+            peak_heap_delta = peak_heap_delta.max(call_peak_delta);
+            max_line_bytes = max_line_bytes.max(serialized_line.len());
+            assert!(
+                serialized_line.len() < LINK_LINE_LIMIT,
+                "serialized fs.thumb reply line ({} bytes) exceeded 16 MiB link limit",
+                serialized_line.len()
+            );
+
+            let items = res["results"].as_array().unwrap();
+            assert_eq!(items.len(), remaining.len());
+
+            let mut total_b64 = 0usize;
+            let mut saw_budget_cutoff = false;
+            let mut next_remaining = Vec::new();
+            for (idx, item) in items.iter().enumerate() {
+                assert_eq!(item["path"], json!(remaining[idx]));
+                if let Some(ok) = item.get("ok") {
+                    assert!(
+                        !saw_budget_cutoff,
+                        "no later path may succeed once reply_budget cutoff triggers at {idx}"
+                    );
+                    total_b64 += ok["content"].as_str().unwrap().len();
+                    assert!(completed.insert(remaining[idx].clone()));
+                } else {
+                    let err = &item["error"];
+                    assert_eq!(err["code"], json!("busy"), "unexpected error: {item}");
+                    assert_eq!(
+                        err["details"]["reason"],
+                        json!("reply_budget"),
+                        "expected reply_budget reason: {item}"
+                    );
+                    assert!(
+                        err["message"].as_str().unwrap().contains("again"),
+                        "reply_budget message must tell caller to ask again: {item}"
+                    );
+                    saw_budget_cutoff = true;
+                    next_remaining.push(remaining[idx].clone());
+                }
+            }
+            assert!(
+                total_b64 <= REPLY_B64_LIMIT,
+                "base64 payload ({total_b64} bytes) exceeded 12 MiB cap"
+            );
+            assert!(
+                next_remaining.len() < remaining.len(),
+                "every call must complete at least one thumbnail"
+            );
+            max_b64_bytes = max_b64_bytes.max(total_b64);
+            remaining = next_remaining;
+        }
+
+        assert_eq!(completed.len(), all_paths.len());
+        (calls, max_line_bytes, max_b64_bytes, peak_heap_delta)
+    }
+
+    // 1. 32 transparent noise PNGs at size=512 (previously 40.9 MiB reply line) and size=1024
+    //    (previously 179 MB reply line / 622 MiB node peak).
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let node = Node::new(
+            Paths::under(dir.path()).with_home(&home),
+            legion_tools::registry(),
+        );
+
+        let png512 = af::build_transparent_noise_png(512, 512, 1);
+        let mut paths512 = Vec::with_capacity(32);
+        for i in 0..32usize {
+            let p = home.join(format!("noise512_{i:02}.png"));
+            std::fs::write(&p, &png512).unwrap();
+            paths512.push(p.to_string_lossy().into_owned());
+        }
+        let (calls512, line512, b64_512, peak512) =
+            drain_batch(&node, &paths512, 512, "contain").await;
+        assert!(
+            calls512 >= 3,
+            "32x 512px transparent noise PNGs must split across multiple calls (got {calls512})"
+        );
+        eprintln!(
+            "REPLY_BUDGET 32x 512px transparent noise PNGs: calls={calls512}, max_line={:.2} MiB, max_b64={:.2} MiB, in_proc_peak_heap={:.2} MiB",
+            line512 as f64 / (1024.0 * 1024.0),
+            b64_512 as f64 / (1024.0 * 1024.0),
+            peak512 as f64 / (1024.0 * 1024.0),
+        );
+
+        let png1024 = af::build_transparent_noise_png(1024, 1024, 2);
+        let mut paths1024 = Vec::with_capacity(32);
+        for i in 0..32usize {
+            let p = home.join(format!("noise1024_{i:02}.png"));
+            std::fs::write(&p, &png1024).unwrap();
+            paths1024.push(p.to_string_lossy().into_owned());
+        }
+        // Verify first call + re-ask on 1024px transparent noise PNGs (measuring full 32-path call
+        // peak heap delta including JSON line serialization).
+        let live_before_1024 = LIVE_BYTES.load(Ordering::SeqCst);
+        reset_peak();
+        let res1024 = node
+            .call(Call::new(
+                Door::Cli,
+                "fs.thumb",
+                json!({"paths": paths1024, "size": 1024, "fit": "contain"}),
+            ))
+            .await
+            .unwrap();
+        let line1024 = serde_json::to_string(&res1024).unwrap();
+        let peak1024 = peak_total_bytes().saturating_sub(live_before_1024);
+        assert!(line1024.len() < LINK_LINE_LIMIT);
+        let ok_count = res1024["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|it| it.get("ok").is_some())
+            .count();
+        assert!((1..=2).contains(&ok_count), "ok_count={ok_count}");
+        assert_eq!(res1024["results"][ok_count]["error"]["code"], json!("busy"));
+        assert_eq!(
+            res1024["results"][ok_count]["error"]["details"]["reason"],
+            json!("reply_budget")
+        );
+        eprintln!(
+            "REPLY_BUDGET 32x 1024px transparent noise PNGs (call 1): ok={ok_count}/32, line={:.2} MiB, in_proc_peak_heap={:.2} MiB",
+            line1024.len() as f64 / (1024.0 * 1024.0),
+            peak1024 as f64 / (1024.0 * 1024.0),
+        );
+    }
+
+    // 2. 32 songs with noisy ~10 MiB JPEG covers at size=1024 (previously 31.8 MiB reply line).
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let node = Node::new(
+            Paths::under(dir.path()).with_home(&home),
+            legion_tools::registry(),
+        );
+        let noisy_jpg = af::build_noisy_10mib_jpeg_cover();
+        let base_mp3 = af::build_mp3_with_raw_cover("Noisy cover", "image/jpeg", &noisy_jpg);
+        let mut song_paths = Vec::with_capacity(32);
+        for i in 0..32usize {
+            let p = home.join(format!("noisy_song_{i:02}.mp3"));
+            std::fs::write(&p, &base_mp3).unwrap();
+            song_paths.push(p.to_string_lossy().into_owned());
+        }
+        let (calls_songs, line_songs, b64_songs, peak_songs) =
+            drain_batch(&node, &song_paths, 1024, "cover").await;
+        assert!(
+            calls_songs >= 2,
+            "32x 10 MiB noisy JPEG covers at 1024 must split across multiple calls (got {calls_songs})"
+        );
+        eprintln!(
+            "REPLY_BUDGET 32x 10 MiB noisy JPEG song covers at 1024: calls={calls_songs}, max_line={:.2} MiB, max_b64={:.2} MiB, in_proc_peak_heap={:.2} MiB",
+            line_songs as f64 / (1024.0 * 1024.0),
+            b64_songs as f64 / (1024.0 * 1024.0),
+            peak_songs as f64 / (1024.0 * 1024.0),
+        );
+    }
+}
+
+#[tokio::test]
 async fn format_bytes_per_pixel_stays_within_documented_factors() {
     let _guard = MEASURE_LOCK.lock().await;
     let w = 1000u32;

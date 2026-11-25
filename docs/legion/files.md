@@ -97,7 +97,13 @@ node.
   invalidation key.
 - `fs.thumb` (read): `{paths: [1..32], size: 96..1024 = 256, fit: "contain" | "cover"}` returns
   exactly one entry per input path in input order: `{"results": [{path, ok: {mime, content
-  (base64), width, height}} | {path, error}]}`. Regular files are opened non-blockingly once
+  (base64), width, height}} | {path, error}]}`. Total base64 `content` across a single reply is
+  capped at **12 MiB** (so the full JSON-RPC reply line always stays comfortably below the 16 MiB
+  link line limit while a single worst-case 1024×1024 thumbnail always fits). Results are committed
+  in input order; once adding the next thumbnail would exceed 12 MiB, that path and every later path
+  in the batch receive a retryable per-path `busy` error with `details.reason = "reply_budget"`
+  telling the caller to ask for those remaining paths in a follow-up `fs.thumb` call. Regular files
+  are opened non-blockingly once
   (`O_NONBLOCK | O_NOCTTY` plus `fstat` regular-file verification on Unix; disk file check on
   Windows) across `fs.*` and `legion-xfer` so swapping a regular file for a FIFO or special file
   cannot block a node thread. Pictures are header-peeked (`<= 128 KiB`, cross-checking inner frame

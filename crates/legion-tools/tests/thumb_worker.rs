@@ -72,6 +72,7 @@ fn main() -> ExitCode {
         test_gif_many_extension_blocks_and_32_parallel_workers_stay_within_budget().await;
         test_worker_cli_rejects_absurd_args_without_allocating().await;
         test_audio_tags_and_covers_through_real_worker_and_benchmarks().await;
+        test_reply_budget_real_worker_node_memory_and_completion().await;
     });
 
     ExitCode::SUCCESS
@@ -2306,4 +2307,182 @@ async fn test_audio_tags_and_covers_through_real_worker_and_benchmarks() {
         big_peak_rss > 0 && big_peak_rss < 256 * 1024 * 1024,
         "10 MiB embedded cover worker exceeded 256 MiB RSS: {big_peak_rss} bytes"
     );
+}
+
+async fn test_reply_budget_real_worker_node_memory_and_completion() {
+    use audio_fixtures as af;
+
+    const LINK_LINE_LIMIT: usize = 16 * 1024 * 1024;
+    const REPLY_B64_LIMIT: usize = 12 * 1024 * 1024;
+
+    async fn drain_with_rss(
+        node: &Node,
+        all_paths: &[String],
+        size: u32,
+        fit: &str,
+        label: &str,
+    ) -> usize {
+        let mut remaining: Vec<String> = all_paths.to_vec();
+        let mut done = 0usize;
+        let mut calls = 0usize;
+        let mut max_line = 0usize;
+        let rss_before = legion_os::mem_limit::process_rss_bytes(std::process::id()).unwrap_or(0);
+        let mut max_rss = rss_before;
+
+        while !remaining.is_empty() {
+            calls += 1;
+            assert!(calls <= all_paths.len(), "{label}: must make progress");
+            let res = node
+                .call(Call::new(
+                    Door::Cli,
+                    "fs.thumb",
+                    json!({"paths": remaining, "size": size, "fit": fit}),
+                ))
+                .await
+                .unwrap();
+            let line = serde_json::to_string(&res).unwrap();
+            let rss_now = legion_os::mem_limit::process_rss_bytes(std::process::id()).unwrap_or(0);
+            max_rss = max_rss.max(rss_now);
+            max_line = max_line.max(line.len());
+            assert!(
+                line.len() < LINK_LINE_LIMIT,
+                "{label}: reply line {} bytes >= 16 MiB",
+                line.len()
+            );
+
+            let items = res["results"].as_array().unwrap();
+            assert_eq!(items.len(), remaining.len());
+            let mut b64_total = 0usize;
+            let mut next = Vec::new();
+            let mut saw_cutoff = false;
+            for (idx, item) in items.iter().enumerate() {
+                if let Some(ok) = item.get("ok") {
+                    assert!(!saw_cutoff, "{label}: ok after reply_budget cutoff");
+                    b64_total += ok["content"].as_str().unwrap().len();
+                    done += 1;
+                } else {
+                    assert_eq!(item["error"]["code"], json!("busy"), "{label}: {item}");
+                    assert_eq!(
+                        item["error"]["details"]["reason"],
+                        json!("reply_budget"),
+                        "{label}: {item}"
+                    );
+                    saw_cutoff = true;
+                    next.push(remaining[idx].clone());
+                }
+            }
+            assert!(b64_total <= REPLY_B64_LIMIT);
+            assert!(next.len() < remaining.len());
+            drop(line);
+            drop(res);
+            remaining = next;
+        }
+
+        assert_eq!(done, all_paths.len());
+        let rss_delta = max_rss.saturating_sub(rss_before);
+        eprintln!(
+            "WORKER_REPLY_BUDGET {label}: calls={calls}, max_line={:.2} MiB, parent_rss_peak={:.2} MiB (delta={:.2} MiB)",
+            max_line as f64 / (1024.0 * 1024.0),
+            max_rss as f64 / (1024.0 * 1024.0),
+            rss_delta as f64 / (1024.0 * 1024.0),
+        );
+        assert!(
+            rss_delta < 256 * 1024 * 1024,
+            "{label}: parent RSS grew by {:.1} MiB (expected << 622 MiB)",
+            rss_delta as f64 / (1024.0 * 1024.0)
+        );
+        calls
+    }
+
+    // 1. 32 songs with ~10 MiB noisy JPEG covers at size=1024 (real out-of-process workers).
+    {
+        let dir1 = tempfile::tempdir().unwrap();
+        let home1 = dir1.path().join("home");
+        fs::create_dir_all(&home1).unwrap();
+        let node1 = Node::new(
+            Paths::under(dir1.path()).with_home(&home1),
+            legion_tools::registry(),
+        );
+        let song_paths = {
+            let noisy_jpg = af::build_noisy_10mib_jpeg_cover();
+            let base_mp3 = af::build_mp3_with_raw_cover("Noisy cover", "image/jpeg", &noisy_jpg);
+            let mut paths = Vec::with_capacity(32);
+            for i in 0..32usize {
+                let p = home1.join(format!("song_{i:02}.mp3"));
+                fs::write(&p, &base_mp3).unwrap();
+                paths.push(p.to_string_lossy().into_owned());
+            }
+            paths
+        };
+        let song_calls = drain_with_rss(
+            &node1,
+            &song_paths,
+            1024,
+            "cover",
+            "32x 10 MiB noisy JPEG song covers @1024",
+        )
+        .await;
+        assert!(song_calls >= 2);
+    }
+
+    // 2. 32 transparent noise PNGs at size=512 (real out-of-process workers).
+    {
+        let dir2 = tempfile::tempdir().unwrap();
+        let home2 = dir2.path().join("home");
+        fs::create_dir_all(&home2).unwrap();
+        let node2 = Node::new(
+            Paths::under(dir2.path()).with_home(&home2),
+            legion_tools::registry(),
+        );
+        let png512_paths = {
+            let noise_png512 = af::build_transparent_noise_png(512, 512, 11);
+            let mut paths = Vec::with_capacity(32);
+            for i in 0..32usize {
+                let p = home2.join(format!("alpha512_{i:02}.png"));
+                fs::write(&p, &noise_png512).unwrap();
+                paths.push(p.to_string_lossy().into_owned());
+            }
+            paths
+        };
+        let png512_calls = drain_with_rss(
+            &node2,
+            &png512_paths,
+            512,
+            "contain",
+            "32x transparent noise PNGs @512",
+        )
+        .await;
+        assert!(png512_calls >= 3);
+    }
+
+    // 3. 32 transparent noise PNGs at size=1024 (real out-of-process workers; single worst-case
+    //    reply previously hit 179 MB / 622 MiB node peak).
+    {
+        let dir3 = tempfile::tempdir().unwrap();
+        let home3 = dir3.path().join("home");
+        fs::create_dir_all(&home3).unwrap();
+        let node3 = Node::new(
+            Paths::under(dir3.path()).with_home(&home3),
+            legion_tools::registry(),
+        );
+        let png1024_paths = {
+            let noise_png1024 = af::build_transparent_noise_png(1024, 1024, 22);
+            let mut paths = Vec::with_capacity(32);
+            for i in 0..32usize {
+                let p = home3.join(format!("alpha1024_{i:02}.png"));
+                fs::write(&p, &noise_png1024).unwrap();
+                paths.push(p.to_string_lossy().into_owned());
+            }
+            paths
+        };
+        let png1024_calls = drain_with_rss(
+            &node3,
+            &png1024_paths,
+            1024,
+            "contain",
+            "32x transparent noise PNGs @1024",
+        )
+        .await;
+        assert!(png1024_calls >= 16);
+    }
 }

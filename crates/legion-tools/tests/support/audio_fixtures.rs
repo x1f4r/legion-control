@@ -74,6 +74,56 @@ pub fn build_10mib_png_cover() -> Vec<u8> {
     out
 }
 
+/// Builds a deterministic, high-entropy noisy RGB JPEG of roughly `~10 MiB` (high-frequency noise
+/// so re-encoding at `size = 1024` produces a ~0.8–1.0 MiB JPEG / ~1.1–1.3 MiB base64 output).
+pub fn build_noisy_10mib_jpeg_cover() -> Vec<u8> {
+    let (w, h) = (1900u32, 1900u32);
+    let mut raw = vec![0u8; (w as usize) * (h as usize) * 3];
+    let mut state = 0x1234_5678_9ABC_DEF0u64;
+    for chunk in raw.as_chunks_mut::<8>().0 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        chunk.copy_from_slice(&state.to_le_bytes());
+    }
+    let mut out = Vec::with_capacity(11 * 1024 * 1024);
+    JpegEncoder::new_with_quality(&mut out, 97)
+        .encode(&raw, w, h, ExtendedColorType::Rgb8)
+        .expect("encode 10 MiB noisy jpeg");
+    assert!(
+        out.len() >= 9 * 1024 * 1024 && out.len() <= 12 * 1024 * 1024,
+        "expected ~10 MiB noisy JPEG, got {} bytes",
+        out.len()
+    );
+    out
+}
+
+/// Builds a deterministic transparent noise RGBA8 PNG of `width x height` pixels with varying
+/// non-opaque alpha so `fs.thumb` keeps it as an incompressible PNG.
+pub fn build_transparent_noise_png(width: u32, height: u32, seed: u64) -> Vec<u8> {
+    let mut raw = vec![0u8; (width as usize) * (height as usize) * 4];
+    let mut state = seed ^ 0xA5A5_5A5A_1357_2468u64;
+    for px in raw.as_chunks_mut::<4>().0 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let b = state.to_le_bytes();
+        px[0] = b[4];
+        px[1] = b[5];
+        px[2] = b[6];
+        px[3] = 64 + (b[7] & 0x7F); // strictly < 255 so alpha is preserved
+    }
+    let mut out = Vec::with_capacity((width as usize) * (height as usize) * 4 + 1024);
+    PngEncoder::new_with_quality(
+        &mut out,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::NoFilter,
+    )
+    .write_image(&raw, width, height, ExtendedColorType::Rgba8)
+    .expect("encode transparent noise png");
+    out
+}
+
 pub fn encode_syncsafe(n: u32) -> [u8; 4] {
     [
         ((n >> 21) & 0x7F) as u8,

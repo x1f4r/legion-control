@@ -95,16 +95,19 @@ use image::imageops;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageFormat, ImageReader};
 use legion_core::media::{Category, classify_path};
-use legion_core::proto::{Effect, ErrorBody, ErrorCode};
-use legion_core::{Access, CancellationToken, Ctx, Grant, Registry, ToolError};
+use legion_core::proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use legion_core::{
+    Access, BoxFuture, CancellationToken, Ctx, Grant, Registry, Tool, ToolError, input_schema,
+    parse_args,
+};
 use legion_os::OsError;
 use legion_os::file_id::{self, FileId};
 use legion_os::mem_limit::effective_memory_bytes;
 use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
 use tokio::task::JoinSet;
 
 use super::audio_tags::{
@@ -130,6 +133,10 @@ use super::{
 
 pub(super) const MIN_PATHS: usize = 1;
 pub(super) const MAX_PATHS: usize = 32;
+/// Maximum cumulative base64 thumbnail payload allowed in a single `fs.thumb` reply (12 MiB),
+/// keeping the full JSON-RPC reply line comfortably under the 16 MiB link line limit while always
+/// admitting at least one worst-case 1024×1024 PNG thumbnail (~5.6 MiB base64).
+pub(super) const MAX_REPLY_BASE64_BYTES: usize = 12 * 1024 * 1024;
 const MIN_THUMB_SIZE: u32 = 96;
 const DEFAULT_THUMB_SIZE: u32 = 256;
 const MAX_THUMB_SIZE: u32 = 1024;
@@ -324,17 +331,39 @@ fn video_pool() -> Arc<FairPool> {
     )
 }
 
+/// Direct [`Tool`] implementation for `fs.thumb` so the JSON reply object is assembled once
+/// without building an intermediate Rust struct and cloning every base64 thumbnail into a second
+/// [`serde_json::Value`] tree.
+struct ThumbTool {
+    spec: ToolSpec,
+}
+
+impl Tool for ThumbTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn call<'a>(&'a self, ctx: &'a Ctx, args: Value) -> BoxFuture<'a, Result<Value, ToolError>> {
+        Box::pin(async move {
+            let parsed = parse_args::<ThumbArgs>(&self.spec.name, args)?;
+            thumb(ctx, parsed).await
+        })
+    }
+}
+
 pub(super) fn register(registry: &mut Registry) {
-    registry.add_fn(
-        "fs.thumb",
-        Effect::Read,
-        "Generate thumbnails for 1 to 32 image, audio or video paths on this node (size 96 to 1024; 64 MiB image source cap, 256 MiB estimated decode memory per image with EXIF/MPF preview fallback for larger JPEGs, audio embedded cover or folder cover fallback with 16 MiB tag cap, out-of-process memory-bounded workers, in-flight budget capped at min(512 MiB, effective RAM/8)), returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory.",
-        thumb,
-    );
+    registry.add(ThumbTool {
+        spec: ToolSpec {
+            name: "fs.thumb".to_owned(),
+            description: "Generate thumbnails for 1 to 32 image, audio or video paths on this node (size 96 to 1024; 64 MiB image source cap, 256 MiB estimated decode memory per image with EXIF/MPF preview fallback for larger JPEGs, audio embedded cover or folder cover fallback with 16 MiB tag cap, out-of-process memory-bounded workers, in-flight budget capped at min(512 MiB, effective RAM/8)), returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory. Total base64 content in one reply is capped at 12 MiB; once adding the next path would exceed that budget, that path and every later path return retryable busy (details.reason = \"reply_budget\") so the caller can ask for them again.".to_owned(),
+            effect: Effect::Read,
+            input_schema: input_schema::<ThumbArgs>(),
+        },
+    });
 }
 
 /// How a thumbnail is fitted into the square target dimensions.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ThumbFit {
     /// Preserve aspect ratio so the thumbnail fits inside `size x size` without cropping.
@@ -363,52 +392,57 @@ fn default_thumb_size() -> u32 {
     DEFAULT_THUMB_SIZE
 }
 
-/// Encoded thumbnail returned for a single successful path.
-#[derive(Debug, Serialize)]
-struct ThumbData {
-    mime: String,
-    content: String,
-    width: u32,
-    height: u32,
+/// Unencoded per-path outcome returned by a worker before input-order budget accounting and
+/// single-pass base64 JSON encoding.
+enum ThumbOutcome {
+    Ok(CachedThumb),
+    Error(ErrorBody),
 }
 
-/// Per-path entry in the `fs.thumb` reply.
-#[derive(Debug, Serialize)]
-struct ThumbItem {
-    path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ok: Option<ThumbData>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<ErrorBody>,
+const fn base64_encoded_len(raw_len: usize) -> usize {
+    raw_len.div_ceil(3).saturating_mul(4)
 }
 
-impl ThumbItem {
-    fn from_cached(path: String, thumb: CachedThumb) -> ThumbItem {
-        ThumbItem {
-            path,
-            ok: Some(ThumbData {
-                mime: thumb.mime.to_owned(),
-                content: BASE64.encode(&thumb.bytes),
-                width: thumb.width,
-                height: thumb.height,
-            }),
-            error: None,
-        }
-    }
-
-    fn from_error(path: String, error: ErrorBody) -> ThumbItem {
-        ThumbItem {
-            path,
-            ok: None,
-            error: Some(error),
-        }
-    }
+fn reply_budget_error(path: &str) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Busy,
+        format!(
+            "Reply base64 budget (12 MiB) reached before {path}; ask for this path again in another fs.thumb call."
+        ),
+    )
+    .with_hint("Call fs.thumb again with the remaining paths that returned busy (reply_budget).")
+    .with_details(json!({
+        "reason": "reply_budget",
+        "limit_bytes": MAX_REPLY_BASE64_BYTES,
+    }))
 }
 
-/// Result of `fs.thumb`.
-#[derive(Debug, Serialize)]
-struct ThumbResult {
-    results: Vec<ThumbItem>,
+fn thumb_ok_value(path: String, thumb: CachedThumb) -> (usize, Value) {
+    let content = BASE64.encode(&thumb.bytes);
+    let content_len = content.len();
+    drop(thumb.bytes);
+    let mut ok = Map::with_capacity(4);
+    ok.insert("mime".to_owned(), Value::String(thumb.mime.to_owned()));
+    ok.insert("content".to_owned(), Value::String(content));
+    ok.insert("width".to_owned(), Value::from(thumb.width));
+    ok.insert("height".to_owned(), Value::from(thumb.height));
+    let mut item = Map::with_capacity(2);
+    item.insert("path".to_owned(), Value::String(path));
+    item.insert("ok".to_owned(), Value::Object(ok));
+    (content_len, Value::Object(item))
+}
+
+fn thumb_error_value(path: String, error: ErrorBody) -> Value {
+    let mut item = Map::with_capacity(2);
+    item.insert("path".to_owned(), Value::String(path));
+    let err_val = serde_json::to_value(error).unwrap_or_else(|_| {
+        json!({
+            "code": "internal",
+            "message": "Failed to serialize thumbnail error."
+        })
+    });
+    item.insert("error".to_owned(), err_val);
+    Value::Object(item)
 }
 
 /// Metadata + OS identity snapshot used for cache keys and TOCTOU checks.
@@ -442,7 +476,7 @@ impl FileStamp {
     }
 }
 
-async fn thumb(ctx: &Ctx, args: ThumbArgs) -> Result<ThumbResult, ToolError> {
+async fn thumb(ctx: &Ctx, args: ThumbArgs) -> Result<Value, ToolError> {
     let read_spec = ctx.node().spec("fs.read")?;
     if !ctx.grant().allows(&read_spec) {
         return Err(ErrorBody::new(
@@ -485,83 +519,172 @@ async fn thumb(ctx: &Ctx, args: ThumbArgs) -> Result<ThumbResult, ToolError> {
     let size = args.size;
     let fit = args.fit;
 
-    let results = run_batch(args.paths, cancel, move |raw_path, cancel| {
-        let grant = grant.clone();
-        let principal = principal.clone();
-        let cache = cache.clone();
-        let cache_dir = cache_dir.clone();
-        async move {
-            thumb_one(
-                &grant, &principal, &cache, &cache_dir, raw_path, size, fit, cancel,
-            )
-            .await
-        }
-    })
+    let results = run_batch(
+        args.paths,
+        size,
+        MAX_REPLY_BASE64_BYTES,
+        cancel,
+        move |raw_path, cancel| {
+            let grant = grant.clone();
+            let principal = principal.clone();
+            let cache = cache.clone();
+            let cache_dir = cache_dir.clone();
+            async move {
+                thumb_one(
+                    &grant, &principal, &cache, &cache_dir, raw_path, size, fit, cancel,
+                )
+                .await
+            }
+        },
+    )
     .await?;
 
-    Ok(ThumbResult { results })
+    let mut root = Map::with_capacity(1);
+    root.insert("results".to_owned(), Value::Array(results));
+    Ok(Value::Object(root))
 }
 
-/// Runs per-path workers concurrently and guarantees every input path receives exactly one
-/// [`ThumbItem`] in input order, converting any non-cancellation worker error or task panic into a
-/// per-path error rather than dropping the slot.
+/// Runs per-path workers across a bounded sliding window ahead of the in-order commit cursor,
+/// encodes each winning thumbnail directly into its final JSON [`Value`] once while freeing raw
+/// bytes immediately, and stops committing once adding the next thumbnail would exceed
+/// `reply_b64_budget`. Every path from the overflowing index onward receives a retryable
+/// `busy` (`details.reason = "reply_budget"`) error in input order, and in-flight work past the
+/// cutoff is cancelled immediately.
 async fn run_batch<F, Fut>(
     paths: Vec<String>,
+    size: u32,
+    reply_b64_budget: usize,
     cancel: CancellationToken,
     worker: F,
-) -> Result<Vec<ThumbItem>, ToolError>
+) -> Result<Vec<Value>, ToolError>
 where
     F: Fn(String, CancellationToken) -> Fut,
-    Fut: std::future::Future<Output = Result<ThumbItem, ToolError>> + Send + 'static,
+    Fut: std::future::Future<Output = Result<ThumbOutcome, ToolError>> + Send + 'static,
 {
     let total = paths.len();
-    let original_paths = paths.clone();
-    let mut set = JoinSet::new();
-    let mut task_owners: HashMap<tokio::task::Id, (usize, String)> = HashMap::with_capacity(total);
-
-    for (idx, raw_path) in paths.into_iter().enumerate() {
-        let fut = worker(raw_path.clone(), cancel.clone());
-        let handle = set.spawn(async move {
-            let outcome = fut.await;
-            (idx, raw_path, outcome)
-        });
-        task_owners.insert(handle.id(), (idx, original_paths[idx].clone()));
+    let mut original_paths = paths;
+    // Keep lookahead small for large target sizes so raw thumbnails stay tightly bounded before the
+    // 12 MiB base64 cutoff triggers: at 1024px, worst-case transparent PNGs are ~4.2 MiB raw (~5.6
+    // MiB base64) so at most 2 fit in one reply anyway; at 512px, up to 4 raw buffers is <= 4.2 MiB.
+    let max_window = if size > 512 {
+        2usize
+    } else if size >= 512 {
+        4usize
+    } else {
+        max_in_flight_images()
     }
+    .min(total.max(1));
 
-    let mut slots: Vec<Option<ThumbItem>> = (0..total).map(|_| None).collect();
-    while let Some(joined) = set.join_next_with_id().await {
+    let batch_cancel = cancel.child_token();
+    let mut set = JoinSet::new();
+    let mut task_owners: HashMap<tokio::task::Id, usize> = HashMap::with_capacity(max_window);
+    let mut slots: Vec<Option<ThumbOutcome>> = (0..total).map(|_| None).collect();
+    let mut results: Vec<Value> = Vec::with_capacity(total);
+
+    let mut next_to_spawn = 0usize;
+    let mut next_to_commit = 0usize;
+    let mut committed_b64_bytes = 0usize;
+    let mut budget_exhausted = false;
+
+    while next_to_commit < total {
+        while !budget_exhausted
+            && next_to_spawn < total
+            && next_to_spawn - next_to_commit < max_window
+        {
+            let idx = next_to_spawn;
+            let raw_path = original_paths[idx].clone();
+            let fut = worker(raw_path, batch_cancel.clone());
+            let handle = set.spawn(async move {
+                let outcome = fut.await;
+                (idx, outcome)
+            });
+            task_owners.insert(handle.id(), idx);
+            next_to_spawn += 1;
+        }
+
+        let Some(joined) = set.join_next_with_id().await else {
+            break;
+        };
+
         match joined {
-            Ok((task_id, (idx, _raw_path, Ok(item)))) => {
+            Ok((task_id, (idx, Ok(outcome)))) => {
                 task_owners.remove(&task_id);
                 if let Some(slot) = slots.get_mut(idx) {
-                    *slot = Some(item);
+                    *slot = Some(outcome);
                 }
             }
-            Ok((task_id, (idx, raw_path, Err(err)))) => {
+            Ok((task_id, (idx, Err(err)))) => {
                 task_owners.remove(&task_id);
                 if err.code == ErrorCode::Cancelled {
-                    set.abort_all();
-                    while set.join_next().await.is_some() {}
-                    return Err(err);
-                }
-                if let Some(slot) = slots.get_mut(idx) {
-                    *slot = Some(ThumbItem::from_error(raw_path, err));
+                    if cancel.is_cancelled() {
+                        batch_cancel.cancel();
+                        set.abort_all();
+                        while set.join_next().await.is_some() {}
+                        return Err(err);
+                    }
+                    if let Some(slot) = slots.get_mut(idx) {
+                        *slot = Some(ThumbOutcome::Error(err));
+                    }
+                } else if let Some(slot) = slots.get_mut(idx) {
+                    *slot = Some(ThumbOutcome::Error(err));
                 }
             }
             Err(join_err) => {
                 let task_id = join_err.id();
-                if let Some((idx, raw_path)) = task_owners.remove(&task_id)
+                if let Some(idx) = task_owners.remove(&task_id)
                     && let Some(slot) = slots.get_mut(idx)
                 {
-                    *slot = Some(ThumbItem::from_error(
-                        raw_path,
-                        ErrorBody::new(
-                            ErrorCode::Internal,
-                            format!("Thumbnail worker stopped unexpectedly: {join_err}."),
-                        ),
-                    ));
+                    *slot = Some(ThumbOutcome::Error(ErrorBody::new(
+                        ErrorCode::Internal,
+                        format!("Thumbnail worker stopped unexpectedly: {join_err}."),
+                    )));
                 }
             }
+        }
+
+        while next_to_commit < total {
+            let Some(outcome) = slots[next_to_commit].take() else {
+                break;
+            };
+            match outcome {
+                ThumbOutcome::Ok(thumb) => {
+                    let b64_len = base64_encoded_len(thumb.bytes.len());
+                    if committed_b64_bytes.saturating_add(b64_len) <= reply_b64_budget {
+                        let path = std::mem::take(&mut original_paths[next_to_commit]);
+                        let (written_len, val) = thumb_ok_value(path, thumb);
+                        committed_b64_bytes = committed_b64_bytes.saturating_add(written_len);
+                        results.push(val);
+                        next_to_commit += 1;
+                    } else {
+                        drop(thumb);
+                        budget_exhausted = true;
+                        break;
+                    }
+                }
+                ThumbOutcome::Error(err) => {
+                    let path = std::mem::take(&mut original_paths[next_to_commit]);
+                    results.push(thumb_error_value(path, err));
+                    next_to_commit += 1;
+                }
+            }
+        }
+
+        if budget_exhausted {
+            // Free any already-completed raw thumbnails past the cutoff immediately, then cancel
+            // and reap in-flight workers so they release pool permits and child processes cleanly.
+            for slot in &mut slots[next_to_commit..] {
+                *slot = None;
+            }
+            batch_cancel.cancel();
+            let drained = tokio::time::timeout(Duration::from_secs(2), async {
+                while set.join_next().await.is_some() {}
+            })
+            .await;
+            if drained.is_err() {
+                set.abort_all();
+                while set.join_next().await.is_some() {}
+            }
+            break;
         }
     }
 
@@ -569,21 +692,23 @@ where
         return Err(cancelled_error("fs.thumb"));
     }
 
-    let results = slots
-        .into_iter()
-        .enumerate()
-        .map(|(idx, slot)| {
-            slot.unwrap_or_else(|| {
-                ThumbItem::from_error(
-                    original_paths[idx].clone(),
-                    ErrorBody::new(
-                        ErrorCode::Internal,
-                        "Thumbnail worker exited without returning a result.",
-                    ),
-                )
-            })
-        })
-        .collect();
+    if budget_exhausted {
+        for path in original_paths.into_iter().skip(next_to_commit) {
+            let err = reply_budget_error(&path);
+            results.push(thumb_error_value(path, err));
+        }
+    } else if next_to_commit < total {
+        for path in original_paths.into_iter().skip(next_to_commit) {
+            results.push(thumb_error_value(
+                path,
+                ErrorBody::new(
+                    ErrorCode::Internal,
+                    "Thumbnail worker exited without returning a result.",
+                ),
+            ));
+        }
+    }
+
     Ok(results)
 }
 
@@ -597,7 +722,7 @@ async fn thumb_one(
     size: u32,
     fit: ThumbFit,
     cancel: CancellationToken,
-) -> Result<ThumbItem, ToolError> {
+) -> Result<ThumbOutcome, ToolError> {
     if cancel.is_cancelled() {
         return Err(cancelled_error("fs.thumb"));
     }
@@ -615,7 +740,7 @@ async fn thumb_one(
         )
     })? {
         Ok(path) => path,
-        Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
+        Err(err) => return Ok(ThumbOutcome::Error(err)),
     };
 
     let media = classify_path(&resolved);
@@ -658,20 +783,10 @@ async fn thumb_one(
     }
 
     match category {
-        Category::Image => {
-            thumb_image(principal, cache, raw_path, resolved, size, fit, cancel).await
-        }
-        Category::Audio => {
-            thumb_audio(
-                grant, principal, cache, raw_path, resolved, size, fit, cancel,
-            )
-            .await
-        }
+        Category::Image => thumb_image(principal, cache, resolved, size, fit, cancel).await,
+        Category::Audio => thumb_audio(grant, principal, cache, resolved, size, fit, cancel).await,
         Category::Video => {
-            thumb_video(
-                principal, cache, cache_dir, raw_path, resolved, size, fit, cancel,
-            )
-            .await
+            thumb_video(principal, cache, cache_dir, resolved, size, fit, cancel).await
         }
         _ => {
             let resolved_stat = resolved.clone();
@@ -690,10 +805,9 @@ async fn thumb_one(
                 )
             })?;
             if let Err(err) = stat_res {
-                return Ok(ThumbItem::from_error(raw_path, err));
+                return Ok(ThumbOutcome::Error(err));
             }
-            Ok(ThumbItem::from_error(
-                raw_path,
+            Ok(ThumbOutcome::Error(
                 ErrorBody::new(
                     ErrorCode::Unsupported,
                     format!(
@@ -809,12 +923,11 @@ async fn thumb_audio(
     grant: &Grant,
     principal: &str,
     cache: &ThumbCache,
-    raw_path: String,
     resolved: PathBuf,
     size: u32,
     fit: ThumbFit,
     cancel: CancellationToken,
-) -> Result<ThumbItem, ToolError> {
+) -> Result<ThumbOutcome, ToolError> {
     let cache_prep = cache.clone();
     let resolved_prep = resolved.clone();
     let prep = tokio::task::spawn_blocking(move || {
@@ -829,13 +942,11 @@ async fn thumb_audio(
     })?;
 
     let (key, bad_key, tags_key, open_stamp, mut file, format) = match prep {
-        Ok(AudioCoverPrep::CacheHit(hit)) => return Ok(ThumbItem::from_cached(raw_path, hit)),
-        Ok(AudioCoverPrep::CachedBad(err)) => return Ok(ThumbItem::from_error(raw_path, err)),
+        Ok(AudioCoverPrep::CacheHit(hit)) => return Ok(ThumbOutcome::Ok(hit)),
+        Ok(AudioCoverPrep::CachedBad(err)) => return Ok(ThumbOutcome::Error(err)),
         Ok(AudioCoverPrep::NoEmbeddedCover) => {
-            return thumb_audio_folder_cover(
-                grant, principal, cache, raw_path, resolved, size, fit, cancel,
-            )
-            .await;
+            return thumb_audio_folder_cover(grant, principal, cache, resolved, size, fit, cancel)
+                .await;
         }
         Ok(AudioCoverPrep::Ready {
             key,
@@ -845,12 +956,11 @@ async fn thumb_audio(
             file,
             format,
         }) => (key, bad_key, tags_key, open_stamp, file, format),
-        Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
+        Err(err) => return Ok(ThumbOutcome::Error(err)),
     };
 
     if let Some(remaining) = timeout_backoff().active_remaining(&bad_key) {
-        return Ok(ThumbItem::from_error(
-            raw_path,
+        return Ok(ThumbOutcome::Error(
             ErrorBody::new(
                 ErrorCode::Timeout,
                 format!(
@@ -883,8 +993,7 @@ async fn thumb_audio(
                 Ok(permit) => permit,
                 Err(AcquireError::Cancelled) => return Err(cancelled_error("fs.thumb")),
                 Err(AcquireError::TimedOut) => {
-                    return Ok(ThumbItem::from_error(
-                        raw_path,
+                    return Ok(ThumbOutcome::Error(
                         ErrorBody::new(
                             ErrorCode::Busy,
                             format!(
@@ -905,19 +1014,13 @@ async fn thumb_audio(
                         && let Err(err) = cloned.seek(SeekFrom::Start(0))
                     {
                         drop(permit);
-                        return Ok(ThumbItem::from_error(
-                            raw_path,
-                            map_io_error("read", &resolved, err),
-                        ));
+                        return Ok(ThumbOutcome::Error(map_io_error("read", &resolved, err)));
                     }
                     cloned
                 }
                 Err(err) => {
                     drop(permit);
-                    return Ok(ThumbItem::from_error(
-                        raw_path,
-                        map_io_error("read", &resolved, err),
-                    ));
+                    return Ok(ThumbOutcome::Error(map_io_error("read", &resolved, err)));
                 }
             };
 
@@ -940,7 +1043,7 @@ async fn thumb_audio(
             let worker_outcome = match worker_res {
                 Ok(outcome) => outcome,
                 Err(err) if err.code == ErrorCode::Cancelled => return Err(err),
-                Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
+                Err(err) => return Ok(ThumbOutcome::Error(err)),
             };
 
             match worker_outcome {
@@ -957,13 +1060,21 @@ async fn thumb_audio(
                         )
                     })?;
                     if let Err(err) = stamp_ok {
-                        return Ok(ThumbItem::from_error(raw_path, err));
+                        return Ok(ThumbOutcome::Error(err));
                     }
                     let cache_put = cache.clone();
-                    let thumb_put = thumb.clone();
-                    let _ =
-                        tokio::task::spawn_blocking(move || cache_put.put(&key, &thumb_put)).await;
-                    return Ok(ThumbItem::from_cached(raw_path, thumb));
+                    let thumb = tokio::task::spawn_blocking(move || {
+                        cache_put.put(&key, &thumb);
+                        thumb
+                    })
+                    .await
+                    .map_err(|err| {
+                        ErrorBody::new(
+                            ErrorCode::Internal,
+                            format!("fs.thumb cache write stopped unexpectedly: {err}."),
+                        )
+                    })?;
+                    return Ok(ThumbOutcome::Ok(thumb));
                 }
                 AudioCoverWorkerOutcome::NoEmbeddedCover(parsed_tags) => {
                     let resolved_check = resolved.clone();
@@ -982,10 +1093,10 @@ async fn thumb_audio(
                         )
                     })?;
                     if let Err(err) = stamp_ok {
-                        return Ok(ThumbItem::from_error(raw_path, err));
+                        return Ok(ThumbOutcome::Error(err));
                     }
                     return thumb_audio_folder_cover(
-                        grant, principal, cache, raw_path, resolved, size, fit, cancel,
+                        grant, principal, cache, resolved, size, fit, cancel,
                     )
                     .await;
                 }
@@ -994,8 +1105,7 @@ async fn thumb_audio(
                     continue;
                 }
                 AudioCoverWorkerOutcome::NeedsCap(_) => {
-                    return Ok(ThumbItem::from_error(
-                        raw_path,
+                    return Ok(ThumbOutcome::Error(
                         ErrorBody::new(
                             ErrorCode::Failed,
                             format!(
@@ -1008,13 +1118,13 @@ async fn thumb_audio(
                 }
                 AudioCoverWorkerOutcome::Rejected(err)
                 | AudioCoverWorkerOutcome::TransientFailure(err) => {
-                    return Ok(ThumbItem::from_error(raw_path, err));
+                    return Ok(ThumbOutcome::Error(err));
                 }
                 AudioCoverWorkerOutcome::TimedOut { error, cpu_busy } => {
                     if cpu_busy {
                         timeout_backoff().record_timeout(&bad_key);
                     }
-                    return Ok(ThumbItem::from_error(raw_path, error));
+                    return Ok(ThumbOutcome::Error(error));
                 }
                 AudioCoverWorkerOutcome::MemoryLimitExceeded { error, .. } => {
                     let resolved_check = resolved.clone();
@@ -1026,7 +1136,7 @@ async fn thumb_audio(
                         }
                     })
                     .await;
-                    return Ok(ThumbItem::from_error(raw_path, error));
+                    return Ok(ThumbOutcome::Error(error));
                 }
             }
         }
@@ -1044,8 +1154,7 @@ async fn thumb_audio(
         Ok(permit) => permit,
         Err(AcquireError::Cancelled) => return Err(cancelled_error("fs.thumb")),
         Err(AcquireError::TimedOut) => {
-            return Ok(ThumbItem::from_error(
-                raw_path,
+            return Ok(ThumbOutcome::Error(
                 ErrorBody::new(
                     ErrorCode::Busy,
                     format!(
@@ -1123,22 +1232,28 @@ async fn thumb_audio(
     match outcome {
         Ok(Ok(thumb)) => {
             let cache_put = cache.clone();
-            let thumb_put = thumb.clone();
-            let _ = tokio::task::spawn_blocking(move || cache_put.put(&key, &thumb_put)).await;
-            Ok(ThumbItem::from_cached(raw_path, thumb))
+            let thumb = tokio::task::spawn_blocking(move || {
+                cache_put.put(&key, &thumb);
+                thumb
+            })
+            .await
+            .map_err(|err| {
+                ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!("fs.thumb cache write stopped unexpectedly: {err}."),
+                )
+            })?;
+            Ok(ThumbOutcome::Ok(thumb))
         }
         Ok(Err(parsed_tags)) => {
             let cache_put = cache.clone();
             let _ =
                 tokio::task::spawn_blocking(move || cache_put.put_tags(&tags_key, &parsed_tags))
                     .await;
-            thumb_audio_folder_cover(
-                grant, principal, cache, raw_path, resolved, size, fit, cancel,
-            )
-            .await
+            thumb_audio_folder_cover(grant, principal, cache, resolved, size, fit, cancel).await
         }
         Err(err) if err.code == ErrorCode::Cancelled => Err(err),
-        Err(err) => Ok(ThumbItem::from_error(raw_path, err)),
+        Err(err) => Ok(ThumbOutcome::Error(err)),
     }
 }
 
@@ -1147,12 +1262,11 @@ async fn thumb_audio_folder_cover(
     grant: &Grant,
     principal: &str,
     cache: &ThumbCache,
-    raw_path: String,
     resolved: PathBuf,
     size: u32,
     fit: ThumbFit,
     cancel: CancellationToken,
-) -> Result<ThumbItem, ToolError> {
+) -> Result<ThumbOutcome, ToolError> {
     let grant_cover = grant.clone();
     let resolved_cover = resolved.clone();
     let folder_cover =
@@ -1166,11 +1280,8 @@ async fn thumb_audio_folder_cover(
             })?;
 
     match folder_cover {
-        Some(cover_path) => {
-            thumb_image(principal, cache, raw_path, cover_path, size, fit, cancel).await
-        }
-        None => Ok(ThumbItem::from_error(
-            raw_path,
+        Some(cover_path) => thumb_image(principal, cache, cover_path, size, fit, cancel).await,
+        None => Ok(ThumbOutcome::Error(
             ErrorBody::new(
                 ErrorCode::NotFound,
                 format!("No embedded or folder cover found for {}.", resolved.display()),
@@ -1201,12 +1312,11 @@ enum ImagePrep {
 async fn thumb_image(
     principal: &str,
     cache: &ThumbCache,
-    raw_path: String,
     resolved: std::path::PathBuf,
     size: u32,
     fit: ThumbFit,
     cancel: CancellationToken,
-) -> Result<ThumbItem, ToolError> {
+) -> Result<ThumbOutcome, ToolError> {
     let cache_prep = cache.clone();
     let resolved_prep = resolved.clone();
     let prep = tokio::task::spawn_blocking(move || {
@@ -1230,8 +1340,8 @@ async fn thumb_image(
         rss_limit_bytes,
         baseline_rss_bytes,
     ) = match prep {
-        Ok(ImagePrep::CacheHit(hit)) => return Ok(ThumbItem::from_cached(raw_path, hit)),
-        Ok(ImagePrep::CachedBad(err)) => return Ok(ThumbItem::from_error(raw_path, err)),
+        Ok(ImagePrep::CacheHit(hit)) => return Ok(ThumbOutcome::Ok(hit)),
+        Ok(ImagePrep::CachedBad(err)) => return Ok(ThumbOutcome::Error(err)),
         Ok(ImagePrep::Ready {
             key,
             bad_key,
@@ -1251,12 +1361,11 @@ async fn thumb_image(
             rss_limit_bytes,
             baseline_rss_bytes,
         ),
-        Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
+        Err(err) => return Ok(ThumbOutcome::Error(err)),
     };
 
     if let Some(remaining) = timeout_backoff().active_remaining(&bad_key) {
-        return Ok(ThumbItem::from_error(
-            raw_path,
+        return Ok(ThumbOutcome::Error(
             ErrorBody::new(
                 ErrorCode::Timeout,
                 format!(
@@ -1280,8 +1389,7 @@ async fn thumb_image(
         Ok(permit) => permit,
         Err(AcquireError::Cancelled) => return Err(cancelled_error("fs.thumb")),
         Err(AcquireError::TimedOut) => {
-            return Ok(ThumbItem::from_error(
-                raw_path,
+            return Ok(ThumbOutcome::Error(
                 ErrorBody::new(
                     ErrorCode::Busy,
                     format!(
@@ -1301,10 +1409,7 @@ async fn thumb_image(
             Ok(cloned) => cloned,
             Err(err) => {
                 drop(permit);
-                return Ok(ThumbItem::from_error(
-                    raw_path,
-                    map_io_error("read", &resolved, err),
-                ));
+                return Ok(ThumbOutcome::Error(map_io_error("read", &resolved, err)));
             }
         };
         let worker_res = run_thumb_worker(
@@ -1326,7 +1431,7 @@ async fn thumb_image(
         let worker_outcome = match worker_res {
             Ok(outcome) => outcome,
             Err(err) if err.code == ErrorCode::Cancelled => return Err(err),
-            Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
+            Err(err) => return Ok(ThumbOutcome::Error(err)),
         };
 
         return match worker_outcome {
@@ -1343,16 +1448,25 @@ async fn thumb_image(
                     )
                 })?;
                 if let Err(err) = stamp_ok {
-                    return Ok(ThumbItem::from_error(raw_path, err));
+                    return Ok(ThumbOutcome::Error(err));
                 }
                 let cache_put = cache.clone();
-                let thumb_put = thumb.clone();
-                let _ = tokio::task::spawn_blocking(move || cache_put.put(&key, &thumb_put)).await;
-                Ok(ThumbItem::from_cached(raw_path, thumb))
+                let thumb = tokio::task::spawn_blocking(move || {
+                    cache_put.put(&key, &thumb);
+                    thumb
+                })
+                .await
+                .map_err(|err| {
+                    ErrorBody::new(
+                        ErrorCode::Internal,
+                        format!("fs.thumb cache write stopped unexpectedly: {err}."),
+                    )
+                })?;
+                Ok(ThumbOutcome::Ok(thumb))
             }
             WorkerOutcome::Rejected(err) | WorkerOutcome::TransientFailure(err) => {
                 // External kills, crashes, and normal format rejections are NOT cached as bad.
-                Ok(ThumbItem::from_error(raw_path, err))
+                Ok(ThumbOutcome::Error(err))
             }
             WorkerOutcome::TimedOut { error, cpu_busy } => {
                 // Timeouts are NOT stored permanently on disk; repeated CPU-busy timeouts get a
@@ -1360,7 +1474,7 @@ async fn thumb_image(
                 if cpu_busy {
                     timeout_backoff().record_timeout(&bad_key);
                 }
-                Ok(ThumbItem::from_error(raw_path, error))
+                Ok(ThumbOutcome::Error(error))
             }
             WorkerOutcome::MemoryLimitExceeded { error, .. } => {
                 let resolved_check = resolved.clone();
@@ -1372,7 +1486,7 @@ async fn thumb_image(
                     }
                 })
                 .await;
-                Ok(ThumbItem::from_error(raw_path, error))
+                Ok(ThumbOutcome::Error(error))
             }
         };
     }
@@ -1431,12 +1545,21 @@ async fn thumb_image(
     match outcome {
         Ok(thumb) => {
             let cache_put = cache.clone();
-            let thumb_put = thumb.clone();
-            let _ = tokio::task::spawn_blocking(move || cache_put.put(&key, &thumb_put)).await;
-            Ok(ThumbItem::from_cached(raw_path, thumb))
+            let thumb = tokio::task::spawn_blocking(move || {
+                cache_put.put(&key, &thumb);
+                thumb
+            })
+            .await
+            .map_err(|err| {
+                ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!("fs.thumb cache write stopped unexpectedly: {err}."),
+                )
+            })?;
+            Ok(ThumbOutcome::Ok(thumb))
         }
         Err(err) if err.code == ErrorCode::Cancelled => Err(err),
-        Err(err) => Ok(ThumbItem::from_error(raw_path, err)),
+        Err(err) => Ok(ThumbOutcome::Error(err)),
     }
 }
 
@@ -1445,12 +1568,11 @@ async fn thumb_video(
     principal: &str,
     cache: &ThumbCache,
     cache_dir: &Path,
-    raw_path: String,
     resolved: std::path::PathBuf,
     size: u32,
     fit: ThumbFit,
     cancel: CancellationToken,
-) -> Result<ThumbItem, ToolError> {
+) -> Result<ThumbOutcome, ToolError> {
     let resolved_stat = resolved.clone();
     let cache_get = cache.clone();
     let pre = tokio::task::spawn_blocking(move || {
@@ -1510,17 +1632,16 @@ async fn thumb_video(
 
     let (stamp, key, bad_key, container, initial_tier, hit, bad) = match pre {
         Ok(v) => v,
-        Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
+        Err(err) => return Ok(ThumbOutcome::Error(err)),
     };
     if let Some(hit) = hit {
-        return Ok(ThumbItem::from_cached(raw_path, hit));
+        return Ok(ThumbOutcome::Ok(hit));
     }
     if let Some(bad) = bad {
-        return Ok(ThumbItem::from_error(raw_path, bad));
+        return Ok(ThumbOutcome::Error(bad));
     }
     if let Some(remaining) = timeout_backoff().active_remaining(&bad_key) {
-        return Ok(ThumbItem::from_error(
-            raw_path,
+        return Ok(ThumbOutcome::Error(
             ErrorBody::new(
                 ErrorCode::Timeout,
                 format!(
@@ -1545,8 +1666,7 @@ async fn thumb_video(
             Ok(permit) => permit,
             Err(AcquireError::Cancelled) => return Err(cancelled_error("fs.thumb")),
             Err(AcquireError::TimedOut) => {
-                return Ok(ThumbItem::from_error(
-                    raw_path,
+                return Ok(ThumbOutcome::Error(
                     ErrorBody::new(
                         ErrorCode::Busy,
                         format!(
@@ -1571,8 +1691,7 @@ async fn thumb_video(
             }
             Err(AcquireError::TimedOut) => {
                 drop(video_permit);
-                return Ok(ThumbItem::from_error(
-                    raw_path,
+                return Ok(ThumbOutcome::Error(
                     ErrorBody::new(
                         ErrorCode::Busy,
                         format!(
@@ -1614,9 +1733,18 @@ async fn thumb_video(
     match outcome {
         Ok(thumb) => {
             let cache_put = cache.clone();
-            let thumb_put = thumb.clone();
-            let _ = tokio::task::spawn_blocking(move || cache_put.put(&key, &thumb_put)).await;
-            Ok(ThumbItem::from_cached(raw_path, thumb))
+            let thumb = tokio::task::spawn_blocking(move || {
+                cache_put.put(&key, &thumb);
+                thumb
+            })
+            .await
+            .map_err(|err| {
+                ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!("fs.thumb cache write stopped unexpectedly: {err}."),
+                )
+            })?;
+            Ok(ThumbOutcome::Ok(thumb))
         }
         Err(err) if err.code == ErrorCode::Cancelled => Err(err),
         Err(err) => {
@@ -1636,7 +1764,7 @@ async fn thumb_video(
                 let _ = tokio::task::spawn_blocking(move || cache_bad.put_bad(&bad_key, &err_bad))
                     .await;
             }
-            Ok(ThumbItem::from_error(raw_path, err))
+            Ok(ThumbOutcome::Error(err))
         }
     }
 }
@@ -3299,38 +3427,81 @@ mod tests {
             "/d.jpg".to_owned(),
         ];
 
-        let results = run_batch(paths.clone(), cancel, |path, _cancel| async move {
-            if path.contains("b_err") {
-                return Err(ErrorBody::new(ErrorCode::Failed, "forced worker error."));
-            }
-            if path.contains("c_panic") {
-                #[allow(clippy::panic)]
-                {
-                    panic!("forced worker panic");
+        let results = run_batch(
+            paths.clone(),
+            256,
+            MAX_REPLY_BASE64_BYTES,
+            cancel,
+            |path, _cancel| async move {
+                if path.contains("b_err") {
+                    return Err(ErrorBody::new(ErrorCode::Failed, "forced worker error."));
                 }
-            }
-            Ok(ThumbItem::from_cached(
-                path,
-                CachedThumb {
+                if path.contains("c_panic") {
+                    #[allow(clippy::panic)]
+                    {
+                        panic!("forced worker panic");
+                    }
+                }
+                Ok(ThumbOutcome::Ok(CachedThumb {
                     mime: "image/jpeg",
                     width: 96,
                     height: 96,
                     bytes: vec![0xFF, 0xD8],
-                },
-            ))
-        })
+                }))
+            },
+        )
         .await
         .unwrap();
 
         assert_eq!(results.len(), 4);
-        assert_eq!(results[0].path, "/a.jpg");
-        assert!(results[0].ok.is_some());
-        assert_eq!(results[1].path, "/b_err.jpg");
-        assert_eq!(results[1].error.as_ref().unwrap().code, ErrorCode::Failed);
-        assert_eq!(results[2].path, "/c_panic.jpg");
-        assert_eq!(results[2].error.as_ref().unwrap().code, ErrorCode::Internal);
-        assert_eq!(results[3].path, "/d.jpg");
-        assert!(results[3].ok.is_some());
+        assert_eq!(results[0]["path"], json!("/a.jpg"));
+        assert!(results[0].get("ok").is_some());
+        assert_eq!(results[1]["path"], json!("/b_err.jpg"));
+        assert_eq!(results[1]["error"]["code"], json!("failed"));
+        assert_eq!(results[2]["path"], json!("/c_panic.jpg"));
+        assert_eq!(results[2]["error"]["code"], json!("internal"));
+        assert_eq!(results[3]["path"], json!("/d.jpg"));
+        assert!(results[3].get("ok").is_some());
+    }
+
+    #[tokio::test]
+    async fn run_batch_enforces_reply_budget_in_input_order() {
+        let cancel = CancellationToken::new();
+        let paths: Vec<String> = (0..6).map(|i| format!("/p{i}.png")).collect();
+        // Each 300-byte payload encodes to 400 bytes of base64. With a 900-byte budget, paths 0
+        // and 1 (800 bytes) fit, path 2 is an error (0 bytes) and still reports its own error,
+        // path 3 would bring total to 1200 > 900 so paths 3, 4, and 5 all get `busy/reply_budget`.
+        let results = run_batch(paths, 512, 900, cancel, |path, _cancel| async move {
+            if path == "/p2.png" {
+                return Ok(ThumbOutcome::Error(ErrorBody::new(
+                    ErrorCode::NotFound,
+                    "missing",
+                )));
+            }
+            let len = if path == "/p5.png" { 3 } else { 300 };
+            Ok(ThumbOutcome::Ok(CachedThumb {
+                mime: "image/png",
+                width: 96,
+                height: 96,
+                bytes: vec![0xAA; len],
+            }))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 6);
+        assert!(results[0].get("ok").is_some());
+        assert!(results[1].get("ok").is_some());
+        assert_eq!(results[2]["error"]["code"], json!("not_found"));
+        for (i, item) in results.iter().enumerate().skip(3) {
+            assert_eq!(item["path"], json!(format!("/p{i}.png")));
+            assert_eq!(item["error"]["code"], json!("busy"), "{item}");
+            assert_eq!(
+                item["error"]["details"]["reason"],
+                json!("reply_budget"),
+                "{item}"
+            );
+        }
     }
 
     #[test]
