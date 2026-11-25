@@ -31,11 +31,12 @@ pub struct DesktopTransferPlatform {
     downloads_dir: PathBuf,
     cache_dir: PathBuf,
     hidden_while_draining: Arc<AtomicBool>,
+    exit_requested: Arc<AtomicBool>,
 }
 
 impl DesktopTransferPlatform {
     /// Creates the desktop transfer platform bound to `app` and prunes stale cache files.
-    pub fn new(app: AppHandle, data_dir: &Path) -> Self {
+    pub fn new(app: AppHandle, data_dir: &Path, exit_requested: Arc<AtomicBool>) -> Self {
         let downloads_dir = app
             .path()
             .download_dir()
@@ -58,6 +59,7 @@ impl DesktopTransferPlatform {
             downloads_dir,
             cache_dir,
             hidden_while_draining: Arc::new(AtomicBool::new(false)),
+            exit_requested,
         }
     }
 
@@ -233,7 +235,10 @@ impl TransferPlatform for DesktopTransferPlatform {
     }
 
     fn on_queue_updated(&self, summary: QueueNotificationSummary) {
-        if summary.active_count == 0 && self.hidden_while_draining.swap(false, Ordering::SeqCst) {
+        if summary.active_count == 0
+            && summary.cancelling_count == 0
+            && self.hidden_while_draining.swap(false, Ordering::SeqCst)
+        {
             if summary.paused_count > 0 {
                 notify_background_transfer(
                     "Transfers paused",
@@ -246,8 +251,52 @@ impl TransferPlatform for DesktopTransferPlatform {
                 );
             }
             let app = self.app.clone();
+            let exit_requested = Arc::clone(&self.exit_requested);
             crate::transfers::spawn_bg(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                // If the app is already quitting or the session is ending, never start a close-time
+                // update supervisor that the OS will immediately terminate.
+                if exit_requested.load(Ordering::SeqCst) {
+                    return;
+                }
+                // If the user reopened the window or started a new transfer during the grace
+                // period, stay running instead of exiting or installing an update under them.
+                if app
+                    .try_state::<crate::transfers::SharedTransfers>()
+                    .is_some_and(|t| t.0.has_active_work())
+                {
+                    return;
+                }
+                if app
+                    .get_webview_window("main")
+                    .and_then(|w| w.is_visible().ok())
+                    == Some(true)
+                {
+                    return;
+                }
+                if !exit_requested.load(Ordering::SeqCst)
+                    && let (Some(updater), Some(backend), Some(transfers)) = (
+                        app.try_state::<crate::updater::SharedUpdater>(),
+                        app.try_state::<crate::commands::SharedBackend>(),
+                        app.try_state::<crate::transfers::SharedTransfers>(),
+                    )
+                {
+                    let updater = Arc::clone(&updater.0);
+                    let backend = Arc::clone(&backend.0);
+                    let transfers = Arc::clone(&transfers.0);
+                    let spawned = tokio::task::spawn_blocking(move || {
+                        crate::try_spawn_close_install_after_drain(
+                            &updater,
+                            backend.as_ref(),
+                            &transfers,
+                        )
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if spawned {
+                        tauri_plugin_single_instance::destroy(&app);
+                    }
+                }
                 app.exit(0);
             });
         }
@@ -276,6 +325,28 @@ pub fn confirm_quit_with_active_transfers() -> bool {
         .show();
     matches!(choice, rfd::MessageDialogResult::Ok)
         || matches!(choice, rfd::MessageDialogResult::Custom(ref s) if s == "Quit")
+}
+
+/// Shows the same native confirmation dialog when the user clicks manual "Update now" while native
+/// device transfers, calls, or content streams are active. Returns `true` when confirmed.
+pub fn confirm_update_with_active_work() -> bool {
+    #[cfg(debug_assertions)]
+    if let Ok(mode) = std::env::var("LEGION_APP_TEST_QUIT_CONFIRM") {
+        return mode == "allow";
+    }
+    let choice = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("Update and restart now?")
+        .set_description(
+            "Downloads, uploads, or active work are still running in Legion. Installing the update will restart Legion and interrupt them.",
+        )
+        .set_buttons(rfd::MessageButtons::OkCancelCustom(
+            "Update now".to_owned(),
+            "Keep running".to_owned(),
+        ))
+        .show();
+    matches!(choice, rfd::MessageDialogResult::Ok)
+        || matches!(choice, rfd::MessageDialogResult::Custom(ref s) if s == "Update now")
 }
 
 /// Emits a best-effort desktop system notification using the platform's standard mechanism.

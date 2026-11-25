@@ -29,6 +29,14 @@ import {
 import { readSortPreference, writeSortPreference } from './lib/files-store.js';
 import { createFolderChangesStore } from './lib/folder-changes.js';
 import { formatBytes, formatRelativeTime } from './lib/format.js';
+import {
+  isLocalConnectionName,
+  isPendingLocalName,
+  isRealMachineName,
+  LOCAL_PIPE_CONNECTION,
+  migrateLocalMachineStorage,
+  PENDING_LOCAL_MACHINE_NAME,
+} from './lib/local-machine.js';
 import { createThumbCache } from './lib/thumb-cache.js';
 import {
   classifyHorizontalSwipe,
@@ -51,7 +59,9 @@ import {
   writeSettings,
 } from './lib/settings.js';
 import {
+  ERROR_RETRY_INTERVAL_MS,
   PERIODIC_CHECK_INTERVAL_MS,
+  countActiveTransfers,
   isSafeForAutoInstall,
   shouldCheckOnResume,
 } from './lib/updates.js';
@@ -86,6 +96,14 @@ function createPersistentCache() {
 function safeLocalStorage() {
   try {
     return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function safeSessionStorage() {
+  try {
+    return window.sessionStorage;
   } catch {
     return null;
   }
@@ -361,6 +379,7 @@ function App() {
   const learnInFlightRef = useRef(false);
   const updateCheckInFlightRef = useRef(false);
   const userInteractedRef = useRef(false);
+  const firstScreenShownRef = useRef(false);
   const startupAutoInstallRanRef = useRef(false);
   const updateStateRef = useRef(updateState);
   updateStateRef.current = updateState;
@@ -374,10 +393,10 @@ function App() {
   pairingOpenRef.current = pairingOpen;
   const filesSheetRef = useRef(filesSheet);
   filesSheetRef.current = filesSheet;
+  const wakeSheetOpenRef = useRef(false);
+  wakeSheetOpenRef.current = Boolean(wakeUiState?.sheet);
   const activeTransfersCountRef = useRef(0);
-  activeTransfersCountRef.current = deviceTransfers.filter(
-    (t) => t.state === 'running' || t.state === 'queued',
-  ).length;
+  activeTransfersCountRef.current = countActiveTransfers(deviceTransfers);
 
   const nodeInfo = linkState?.nodes?.[0] || null;
   const nodeInfoRef = useRef(nodeInfo);
@@ -969,11 +988,7 @@ function App() {
 
   const handleInstallUpdate = useCallback(async () => {
     if (typeof link.installUpdate !== 'function') return null;
-    if (
-      commandDraftRef.current.running ||
-      activeCallsRef.current > 0 ||
-      activeTransfersCountRef.current > 0
-    ) {
+    const promptConfirm = () => {
       if (!sheetHistoryRef.current) {
         window.history.pushState({ legionSheet: true }, '');
         sheetHistoryRef.current = true;
@@ -985,15 +1000,30 @@ function App() {
         confirmLabel: 'Update now',
         danger: false,
         async onConfirm() {
-          const next = await link.installUpdate();
+          const next = await link.installUpdate({ confirmInterrupt: true });
           if (next) setUpdateState(next);
         },
       });
+    };
+    if (
+      commandDraftRef.current.running ||
+      activeCallsRef.current > 0 ||
+      activeTransfersCountRef.current > 0
+    ) {
+      promptConfirm();
       return null;
     }
-    const next = await link.installUpdate();
-    if (next) setUpdateState(next);
-    return next;
+    try {
+      const next = await link.installUpdate();
+      if (next) setUpdateState(next);
+      return next;
+    } catch (err) {
+      if (err?.code === 'conflict') {
+        promptConfirm();
+        return null;
+      }
+      throw err;
+    }
   }, [link]);
 
   const handleSetAutoUpdate = useCallback(
@@ -1017,6 +1047,109 @@ function App() {
     }
   }, [link]);
 
+  const applyLocalNodeMigration = useCallback(
+    (realName) => {
+      if (!isRealMachineName(realName)) return;
+      migrateLocalMachineStorage(realName, {
+        localStorage: safeLocalStorage(),
+        sessionStorage: safeSessionStorage(),
+      });
+      capsStore.renameMachine(LOCAL_PIPE_CONNECTION, realName);
+      capsStore.renameMachine(PENDING_LOCAL_MACHINE_NAME, realName);
+      folderChanges.renameMachine(LOCAL_PIPE_CONNECTION, realName);
+      folderChanges.renameMachine(PENDING_LOCAL_MACHINE_NAME, realName);
+      thumbCache.renameMachine(LOCAL_PIPE_CONNECTION, realName);
+      thumbCache.renameMachine(PENDING_LOCAL_MACHINE_NAME, realName);
+
+      const cur = routeRef.current;
+      if (cur) {
+        let changed = false;
+        const nextRoute = { ...cur };
+        if (isLocalConnectionName(cur.machine) || isPendingLocalName(cur.machine)) {
+          nextRoute.machine = realName;
+          changed = true;
+        }
+        if (
+          cur.viewer &&
+          (isLocalConnectionName(cur.viewer.machine) || isPendingLocalName(cur.viewer.machine))
+        ) {
+          nextRoute.viewer = { ...cur.viewer, machine: realName };
+          changed = true;
+        }
+        if (
+          cur.section === 'settings' &&
+          cur.page === 'connections' &&
+          cur.sub === 'node' &&
+          (isLocalConnectionName(cur.item) || isPendingLocalName(cur.item))
+        ) {
+          nextRoute.item = realName;
+          changed = true;
+        }
+        if (changed) {
+          const nextHref = routeHref(nextRoute);
+          if (nextHref && nextHref !== window.location.hash) {
+            window.history.replaceState(window.history.state, '', nextHref);
+            lastHashRef.current = nextHref;
+          }
+          setRoute(nextRoute);
+        }
+      }
+    },
+    [capsStore, folderChanges, thumbCache],
+  );
+
+  const handleLocalNodeResolved = useCallback(
+    (realName) => {
+      if (!isRealMachineName(realName)) return;
+      if (typeof link.setLocalMachineName === 'function') {
+        link.setLocalMachineName(realName);
+      }
+      applyLocalNodeMigration(realName);
+      setLinkState((prev) => {
+        if (!prev || !Array.isArray(prev.nodes)) return prev;
+        const seen = new Set();
+        const nextNodes = [];
+        for (const n of prev.nodes) {
+          if (!n) continue;
+          const isLocalEntry =
+            n.isLocalComputer ||
+            n.nodeNamePending ||
+            isLocalConnectionName(n.node) ||
+            isPendingLocalName(n.node);
+          const nodeName = isLocalEntry ? realName : n.node;
+          if (!nodeName || seen.has(nodeName)) continue;
+          seen.add(nodeName);
+          if (isLocalEntry) {
+            nextNodes.push({
+              ...n,
+              node: realName,
+              isLocalComputer: true,
+              nodeNamePending: false,
+              reachable: true,
+              whoami: n.whoami ? { ...n.whoami, node: realName } : n.whoami,
+            });
+          } else {
+            nextNodes.push(n);
+          }
+        }
+        const nextState = { ...prev, nodes: nextNodes };
+        nodeInfoRef.current = nextNodes[0] || null;
+        return nextState;
+      });
+      capsStore
+        .ensure(realName)
+        .then((entry) => {
+          const toolList = entry?.tools;
+          if (Array.isArray(toolList) && toolList.length > 0 && nodeInfoRef.current?.node === realName) {
+            setTools(toolList);
+            sessionCache.set(`tools:${realName}`, toolList);
+          }
+        })
+        .catch(() => {});
+    },
+    [link, applyLocalNodeMigration, capsStore, sessionCache],
+  );
+
   const refreshFleet = useCallback(
     async (activeNodeInfo, options = {}) => {
       const targetNode = activeNodeInfo || nodeInfoRef.current;
@@ -1038,11 +1171,14 @@ function App() {
         await refreshFleetProgressive({
           link,
           localNode: targetNode.node,
+          isLocalComputer: Boolean(targetNode.isLocalComputer),
+          nodeNamePending: Boolean(targetNode.nodeNamePending),
           initialMachines: baseSnap?.machines || [],
           cachedAt: baseSnap?.cachedAt ?? null,
           forceOffline: Boolean(options.forceOffline),
           checkOffline: settingsRef.current.checkOffline !== false,
           signal: ctrl.signal,
+          onLocalNodeResolved: handleLocalNodeResolved,
           onUpdate(next) {
             if (ctrl.signal.aborted) return;
             setSnapshot(next);
@@ -1051,7 +1187,9 @@ function App() {
             if (ctrl.signal.aborted) return;
             if (link.kind !== 'mock') {
               const activeName = nodeInfoRef.current?.node || targetNode.node;
-              persistentCache.set('fleet', serializeFleetCache(activeName, finalSnap.machines));
+              if (isRealMachineName(activeName)) {
+                persistentCache.set('fleet', serializeFleetCache(activeName, finalSnap.machines));
+              }
             }
           },
         });
@@ -1065,7 +1203,7 @@ function App() {
         }
       }
     },
-    [link, persistentCache],
+    [link, persistentCache, handleLocalNodeResolved],
   );
 
   const handleAcceptIdentityChange = useCallback(
@@ -1101,6 +1239,9 @@ function App() {
         return;
       }
       const primary = nextState.nodes[0];
+      if (isRealMachineName(primary.node)) {
+        applyLocalNodeMigration(primary.node);
+      }
       let cachedSnap = null;
       if (typeof link.initialFleetCache === 'function') {
         cachedSnap = hydrateFleetCache(link.initialFleetCache(), primary.node);
@@ -1139,7 +1280,7 @@ function App() {
         checkUpdatesQuietly();
       }
     },
-    [link, capsStore, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
+    [link, capsStore, sessionCache, persistentCache, applyLocalNodeMigration, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
   );
 
   // Feed fleet version/build/reachability into the per-machine capabilities store so build
@@ -1157,7 +1298,9 @@ function App() {
     }
   }, [capsStore, snapshot]);
 
-  // Subscribe to native updater state and apply ready updates on startup before user interaction.
+  // Track any user interaction (including wheel/scroll) and subscribe to live updater state.
+  // Startup auto-install runs once during boot before the first full screen renders — never on
+  // subsequent live state pushes mid-session.
   useEffect(() => {
     const markInteracted = () => {
       userInteractedRef.current = true;
@@ -1165,87 +1308,31 @@ function App() {
     window.addEventListener('pointerdown', markInteracted, { passive: true, once: true });
     window.addEventListener('keydown', markInteracted, { passive: true, once: true });
     window.addEventListener('touchstart', markInteracted, { passive: true, once: true });
-
-    if (typeof link.watchUpdates !== 'function' && typeof link.updateState !== 'function') {
-      return () => {
-        window.removeEventListener('pointerdown', markInteracted);
-        window.removeEventListener('keydown', markInteracted);
-        window.removeEventListener('touchstart', markInteracted);
-      };
-    }
+    window.addEventListener('wheel', markInteracted, { passive: true, once: true });
+    window.addEventListener('scroll', markInteracted, { passive: true, capture: true, once: true });
 
     let alive = true;
-    const maybeRunStartupInstall = (st) => {
-      if (
-        !alive ||
-        !st ||
-        startupAutoInstallRanRef.current ||
-        typeof link.maybeAutoInstall !== 'function'
-      ) {
-        return;
-      }
-      if (
-        !isSafeForAutoInstall({
-          updateState: st,
-          trigger: 'startup',
-          userInteracted: userInteractedRef.current,
-          hasOpenSheet: Boolean(
-            confirmRequestRef.current || whatIsNewOpenRef.current || filesSheetRef.current,
-          ),
-          hasCommandDraft: Boolean(commandDraftRef.current.cmd?.trim()),
-          isRunningCommand: Boolean(commandDraftRef.current.running),
-          activeCalls: activeCallsRef.current + activeTransfersCountRef.current,
-          isPairingOpen: Boolean(pairingOpenRef.current),
-        })
-      ) {
-        return;
-      }
-      startupAutoInstallRanRef.current = true;
-      const isMock = Boolean(link.mockFlags);
-      if (!isMock) setStartupUpdating(true);
-      link
-        .maybeAutoInstall('startup')
-        .then((res) => {
-          if (alive && (!res || res.phase !== 'installing')) {
-            setStartupUpdating(false);
-            if (res?.phase === 'checking') {
-              startupAutoInstallRanRef.current = false;
-            }
-          }
-        })
-        .catch(() => {
-          if (alive) setStartupUpdating(false);
-        });
-    };
-
     const unwatch =
       typeof link.watchUpdates === 'function'
         ? link.watchUpdates((st) => {
             if (!alive || !st) return;
             setUpdateState(st);
-            maybeRunStartupInstall(st);
           })
         : () => {};
-    if (typeof link.updateState === 'function') {
-      link
-        .updateState()
-        .then((st) => {
-          if (!alive || !st) return;
-          setUpdateState(st);
-          maybeRunStartupInstall(st);
-        })
-        .catch(() => {});
-    }
+
     return () => {
       alive = false;
       unwatch();
       window.removeEventListener('pointerdown', markInteracted);
       window.removeEventListener('keydown', markInteracted);
       window.removeEventListener('touchstart', markInteracted);
+      window.removeEventListener('wheel', markInteracted);
+      window.removeEventListener('scroll', markInteracted, { capture: true });
     };
   }, [link]);
 
-  // Trigger periodic (6h) update checks while the app is open and visible.
+  // Trigger periodic (6h) update checks while the app is open and visible, and retry sooner (5m)
+  // after a transient check or download error.
   useEffect(() => {
     if (!linkState?.ready || typeof link.checkUpdates !== 'function') return;
 
@@ -1261,8 +1348,82 @@ function App() {
   }, [link, linkState?.ready, checkUpdatesQuietly]);
 
   useEffect(() => {
+    if (
+      !linkState?.ready ||
+      typeof link.checkUpdates !== 'function' ||
+      updateState?.phase !== 'error' ||
+      updateState?.failed_update
+    ) {
+      return;
+    }
+    const retryTimer = window.setTimeout(() => {
+      if (document.visibilityState === 'visible') {
+        checkUpdatesQuietly();
+      }
+    }, ERROR_RETRY_INTERVAL_MS);
+    return () => {
+      window.clearTimeout(retryTimer);
+    };
+  }, [link, linkState?.ready, updateState?.phase, updateState?.failed_update, updateState?.last_checked_at, checkUpdatesQuietly]);
+
+  useEffect(() => {
     let alive = true;
     (async () => {
+      // Check for an already-downloaded update BEFORE calling link.state() / painting the first
+      // full screen so startup auto-install runs only at launch with zero native calls in flight.
+      if (
+        typeof link.updateState === 'function' &&
+        !startupAutoInstallRanRef.current &&
+        !firstScreenShownRef.current
+      ) {
+        try {
+          const initialUpdate = await link.updateState();
+          if (!alive) return;
+          if (initialUpdate) {
+            setUpdateState(initialUpdate);
+            if (
+              typeof link.maybeAutoInstall === 'function' &&
+              isSafeForAutoInstall({
+                updateState: initialUpdate,
+                trigger: 'startup',
+                userInteracted: userInteractedRef.current,
+                firstScreenShown: firstScreenShownRef.current,
+                hasOpenSheet: Boolean(
+                  confirmRequestRef.current ||
+                    whatIsNewOpenRef.current ||
+                    filesSheetRef.current ||
+                    wakeSheetOpenRef.current,
+                ),
+                hasCommandDraft: Boolean(commandDraftRef.current.cmd?.trim()),
+                isRunningCommand: Boolean(commandDraftRef.current.running),
+                activeCalls: activeCallsRef.current + activeTransfersCountRef.current,
+                isPairingOpen: Boolean(pairingOpenRef.current),
+              })
+            ) {
+              startupAutoInstallRanRef.current = true;
+              const isMock = Boolean(link.mockFlags);
+              if (!isMock) setStartupUpdating(true);
+              try {
+                const res = await link.maybeAutoInstall('startup');
+                if (!alive) return;
+                if (res) setUpdateState(res);
+                if (!isMock && res?.phase === 'installing') {
+                  return;
+                }
+              } catch {
+                // Fall through to normal startup on auto-install error.
+              }
+              if (alive) setStartupUpdating(false);
+            }
+          }
+        } catch {
+          // Ignore updateState errors during boot.
+        }
+      }
+
+      if (!alive) return;
+      firstScreenShownRef.current = true;
+
       const { token } = extractHashToken(window.location.hash);
       if (token && typeof link.setToken === 'function') {
         window.history.replaceState(null, '', window.location.pathname + window.location.search + '#/machines');
@@ -1307,7 +1468,10 @@ function App() {
             updateState: updateStateRef.current,
             trigger: 'background',
             hasOpenSheet: Boolean(
-              confirmRequestRef.current || whatIsNewOpenRef.current || filesSheetRef.current,
+              confirmRequestRef.current ||
+                whatIsNewOpenRef.current ||
+                filesSheetRef.current ||
+                wakeSheetOpenRef.current,
             ),
             hasCommandDraft: Boolean(commandDraftRef.current.cmd?.trim()),
             isRunningCommand: Boolean(commandDraftRef.current.running),
@@ -1334,7 +1498,7 @@ function App() {
         wasHidden = false;
         refreshFleet(nodeInfo, { background: true });
       }
-      if (shouldCheckOnResume(updateStateRef.current?.last_checked_at)) {
+      if (shouldCheckOnResume(updateStateRef.current?.last_checked_at, Date.now(), { phase: updateStateRef.current?.phase })) {
         checkUpdatesQuietly();
       }
     };
@@ -1771,9 +1935,17 @@ function App() {
     inMachinePhone && route.tab === 'files' && Boolean(selectedMachine?.reachable);
   const isActionsRoot =
     route.section === 'actions' && !route.action && !route.allTools;
+  const isWideSplitHost =
+    wide &&
+    (route.section === 'machines' ||
+      route.section === 'files' ||
+      route.section === 'activity' ||
+      route.section === 'settings' ||
+      (route.section === 'actions' && Boolean(route.allTools)));
+  const isWideSplitScreen = isWideSplitHost && !filesSelecting;
   const hasFilesDock =
     (route.section === 'files' &&
-      (filesSelecting || (!wide && (isFilesRoot || isFilesFolder || isFilesSearch)) || (wide && isFilesSearch))) ||
+      (filesSelecting || (!wide && (isFilesRoot || isFilesFolder || isFilesSearch)))) ||
     isPhoneMachineFiles;
   const hasDock = isActionsRoot || isPhoneCommand || hasFilesDock;
 
@@ -2030,6 +2202,10 @@ function App() {
   }
 
   function renderHeader() {
+    if (isWideSplitScreen) {
+      return null;
+    }
+
     // Files headers: selection mode, folder, search, sync, favourites, recent, and root.
     if (route.section === 'files') {
       if (filesSelecting) {
@@ -2463,6 +2639,7 @@ function App() {
     'app',
     !showBottomNav ? 'standalone' : '',
     hasDock ? 'docked' : '',
+    isWideSplitScreen ? 'split-screen' : '',
   ]
     .filter(Boolean)
     .join(' ');
@@ -2531,9 +2708,9 @@ function App() {
                 <${ScrollContainer}
                   as="main"
                   containerRef=${mainRef}
-                  className=${isPhoneCommand ? 'main command-stream' : 'main'}
-                  onRefresh=${handlePullRefresh}
-                  disabled=${pullDisabled}
+                  className=${isPhoneCommand ? 'main command-stream' : isWideSplitHost ? 'main split-host' : 'main'}
+                  onRefresh=${isWideSplitHost ? null : handlePullRefresh}
+                  disabled=${pullDisabled || isWideSplitHost}
                   onTouchStart=${onMainTouchStart}
                   onTouchEnd=${onMainTouchEnd}
                   onTouchCancel=${onMainTouchCancel}

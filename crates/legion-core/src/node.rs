@@ -2,16 +2,19 @@
 //! through.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::Instant;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use legion_os::lock::{FileLock, LockMode};
 pub use legion_proto::{CANCEL_GRACE, VERSION};
 use legion_proto::{ErrorBody, ErrorCode, HelloParams, HelloResult, PROTOCOL, ToolSpec};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::audit::{self, AuditLog, Entry, Outcome};
-use crate::config::{ConfigStore, NodeFile, NodeName};
+use crate::config::{ConfigStore, NodeFile, NodeName, write_atomically};
 use crate::ctx::{Ctx, Door, EventSink};
 use crate::paths::Paths;
 use crate::policy::Policy;
@@ -95,6 +98,7 @@ struct Inner {
     config: ConfigStore,
     audit: AuditLog,
     host_name: NodeName,
+    node_id: OnceLock<String>,
 }
 
 impl Node {
@@ -109,6 +113,7 @@ impl Node {
                 config: ConfigStore::new(paths.config_dir()),
                 audit: AuditLog::new(&paths),
                 host_name: NodeName::from_host(),
+                node_id: OnceLock::new(),
                 paths,
                 registry,
             }),
@@ -148,6 +153,16 @@ impl Node {
                 .map_or_else(|| self.inner.host_name.to_string(), NodeName::to_string),
             Err(_) => self.inner.host_name.to_string(),
         }
+    }
+
+    /// Whether `node.toml` sets `name` explicitly (`Some(true)`), omits `name` / does not exist
+    /// (`Some(false)`), or could not be parsed (`None`, so callers never overwrite a broken file).
+    pub fn name_explicit(&self) -> Option<bool> {
+        self.inner
+            .config
+            .get::<NodeFile>()
+            .ok()
+            .map(|file| file.name.is_some())
     }
 
     /// Every tool's spec, sorted by name: built-in tools first, then any reloadable sources.
@@ -200,7 +215,19 @@ impl Node {
     }
 
     /// Answers a `hello`, refusing a client that speaks another protocol.
+    ///
+    /// Includes `node_id` only when the session's principal holds a role with the `admin` effect;
+    /// callers without a pinned principal (local / owner SSH `legion rpc`) act as `owner`.
     pub fn hello(&self, params: &HelloParams) -> Result<HelloResult, ErrorBody> {
+        self.hello_for(params, None)
+    }
+
+    /// Answers a `hello` for an optionally pinned principal (`legion gate --as` / `legion rpc --as`).
+    pub fn hello_for(
+        &self,
+        params: &HelloParams,
+        pinned: Option<&str>,
+    ) -> Result<HelloResult, ErrorBody> {
         if params.protocol != PROTOCOL {
             return Err(ErrorBody::new(
                 ErrorCode::Unsupported,
@@ -225,8 +252,17 @@ impl Node {
                 systems.push(target.clone());
             }
         }
+        let node_explicit = file.as_ref().map(|file| file.name.is_some());
+        let allow_node_id = self.inner.config.get::<Policy>().is_ok_and(|policy| {
+            let principal = pinned.unwrap_or(crate::policy::OWNER);
+            policy
+                .grant(principal, &self.inner.paths)
+                .allows_effect(legion_proto::Effect::Admin)
+        });
         Ok(HelloResult {
             node: self.name(),
+            node_explicit,
+            node_id: allow_node_id.then(|| self.node_id()).flatten(),
             version: VERSION.to_owned(),
             build: BUILD.map(str::to_owned),
             protocol: PROTOCOL,
@@ -236,6 +272,18 @@ impl Node {
             system,
             boot_id: self.boot_id(),
         })
+    }
+
+    /// Persistent random identifier for this node's state directory (`<state_dir>/node-id`),
+    /// created race-safely on first use. Returns `None` if the state directory is not writable.
+    pub fn node_id(&self) -> Option<String> {
+        if let Some(id) = self.inner.node_id.get() {
+            return Some(id.clone());
+        }
+        let state_dir = self.inner.paths.state_dir();
+        let id = load_or_create_node_id(state_dir)?;
+        let _ = self.inner.node_id.set(id.clone());
+        Some(id)
     }
 
     /// An identifier of the machine's current boot, which changes on every restart; `None` when
@@ -346,6 +394,48 @@ impl Node {
         .await;
     }
 
+    /// Appends one call to this node's audit log synchronously (for callers already running inside
+    /// `spawn_blocking`), applying the same redaction and stderr fallback as
+    /// [`Node::record_audit_with_device`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_audit_blocking(
+        &self,
+        target: String,
+        principal: Option<String>,
+        door: Door,
+        device: Option<String>,
+        tool: String,
+        args: &Value,
+        started: Instant,
+        result: &Result<Value, ErrorBody>,
+    ) {
+        let entry = Entry {
+            time: audit::now(),
+            principal,
+            door,
+            device,
+            tool,
+            target,
+            outcome: match result {
+                Ok(_) => Outcome::Ok,
+                Err(error) => Outcome::Error(error.code),
+            },
+            duration: (started.elapsed().as_secs_f64() * 1e6).round() / 1e6,
+            args: audit::redact(args),
+            message: result
+                .as_ref()
+                .err()
+                .map(|error| audit::redact_message(&error.message)),
+        };
+        if let Err(error) = self.inner.audit.append(&entry) {
+            let problem = format!(
+                "legion: the call ran, but it could not be written to the audit log {}: {error}\n",
+                self.inner.audit.path().display()
+            );
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), problem.as_bytes());
+        }
+    }
+
     async fn append_audit_entry(&self, entry: Entry) {
         let log = self.inner.audit.clone();
         let written = tokio::task::spawn_blocking(move || log.append(&entry)).await;
@@ -453,6 +543,60 @@ fn cancelled(tool: &str) -> ErrorBody {
     )
 }
 
+/// Persistent node identifier stored in `<state_dir>/node-id` (32 lower-case hex characters).
+const NODE_ID_FILE: &str = "node-id";
+const NODE_ID_LOCK_FILE: &str = "node-id.lock";
+const NODE_ID_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn valid_node_id(text: &str) -> bool {
+    text.len() == 32
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn generate_node_id(state_dir: &std::path::Path) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"legion-node-id-v1:");
+    for salt in 0u64..4 {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u64(salt);
+        hasher.update(&h.finish().to_le_bytes());
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    hasher.update(&nanos.to_le_bytes());
+    hasher.update(&std::process::id().to_le_bytes());
+    hasher.update(state_dir.as_os_str().as_encoded_bytes());
+    let hex = hasher.finalize().to_hex();
+    hex.as_str()[..32].to_owned()
+}
+
+fn load_or_create_node_id(state_dir: &std::path::Path) -> Option<String> {
+    let id_path = state_dir.join(NODE_ID_FILE);
+    if let Ok(raw) = std::fs::read_to_string(&id_path) {
+        let trimmed = raw.trim();
+        if valid_node_id(trimmed) {
+            return Some(trimmed.to_owned());
+        }
+    }
+    std::fs::create_dir_all(state_dir).ok()?;
+    let lock_path = state_dir.join(NODE_ID_LOCK_FILE);
+    let _held =
+        FileLock::acquire_timeout(&lock_path, LockMode::Exclusive, NODE_ID_LOCK_TIMEOUT).ok()?;
+    if let Ok(raw) = std::fs::read_to_string(&id_path) {
+        let trimmed = raw.trim();
+        if valid_node_id(trimmed) {
+            return Some(trimmed.to_owned());
+        }
+    }
+    let generated = generate_node_id(state_dir);
+    let content = format!("{generated}\n");
+    write_atomically(&id_path, content.as_bytes()).ok()?;
+    Some(generated)
+}
+
 #[cfg(test)]
 mod tests {
     use legion_proto::HelloParams;
@@ -472,6 +616,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = Node::new(Paths::under(dir.path()), Registry::new());
         let bare = node.hello(&hello_params()).unwrap();
+        assert_eq!(bare.node_explicit, Some(false));
+        assert!(bare.node_id.as_deref().is_some_and(valid_node_id));
+        let second_node = Node::new(Paths::under(dir.path()), Registry::new());
+        assert_eq!(second_node.node_id(), bare.node_id);
+        let other_dir = tempfile::tempdir().unwrap();
+        let other_node = Node::new(Paths::under(other_dir.path()), Registry::new());
+        assert_ne!(other_node.node_id(), bare.node_id);
         assert_eq!(bare.build.as_deref(), BUILD);
         assert_eq!(bare.system, None);
         assert!(bare.systems.is_empty());
@@ -497,7 +648,74 @@ mod tests {
         )
         .unwrap();
         let named = node.hello(&hello_params()).unwrap();
+        assert_eq!(named.node_explicit, Some(false));
         assert_eq!(named.system.as_deref(), Some("linux"));
         assert_eq!(named.systems, ["linux", "windows"]);
+
+        std::fs::write(
+            dir.path().join("config").join("node.toml"),
+            "name = \"studio\"\n",
+        )
+        .unwrap();
+        let explicit = node.hello(&hello_params()).unwrap();
+        assert_eq!(explicit.node, "studio");
+        assert_eq!(explicit.node_explicit, Some(true));
+
+        std::fs::write(dir.path().join("config").join("node.toml"), "name = 3\n").unwrap();
+        let broken = node.hello(&hello_params()).unwrap();
+        assert_eq!(broken.node_explicit, None);
+
+        // `node_id` is returned only to principals whose role allows `Effect::Admin`.
+        std::fs::write(
+            dir.path().join("config").join("node.toml"),
+            "name = \"studio\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config").join("policy.toml"),
+            "[roles.observer]\n\
+             allow = [\"effect:read\"]\n\
+             [roles.device-operator]\n\
+             allow = [\"effect:read\", \"effect:write\"]\n\
+             [roles.keeper]\n\
+             allow = [\"effect:read\", \"effect:admin\"]\n\
+             [principals.viewer]\n\
+             role = \"observer\"\n\
+             [principals.\"device:phone\"]\n\
+             role = \"device-operator\"\n\
+             [principals.\"device:admin-pad\"]\n\
+             role = \"keeper\"\n",
+        )
+        .unwrap();
+        assert!(
+            node.hello_for(&hello_params(), None)
+                .unwrap()
+                .node_id
+                .is_some()
+        );
+        assert!(
+            node.hello_for(&hello_params(), Some("owner"))
+                .unwrap()
+                .node_id
+                .is_some()
+        );
+        assert!(
+            node.hello_for(&hello_params(), Some("device:admin-pad"))
+                .unwrap()
+                .node_id
+                .is_some()
+        );
+        assert_eq!(
+            node.hello_for(&hello_params(), Some("viewer"))
+                .unwrap()
+                .node_id,
+            None
+        );
+        assert_eq!(
+            node.hello_for(&hello_params(), Some("device:phone"))
+                .unwrap()
+                .node_id,
+            None
+        );
     }
 }

@@ -214,13 +214,23 @@ jobs:
           cp "$src" "$dest"
           test -s "$dest"
           node scripts/check-binary-paths.mjs "$dest"
+          node scripts/make-update-set.mjs check-artifact \
+            --file "$dest" \
+            --kind binary \
+            --sequence "${{ needs.prepare.outputs.sequence }}" \
+            --forbid-preview-key
           ls -lh "$dest"
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             file "$dest"
           fi
           if [[ -n "${{ matrix.deb_arch }}" ]]; then
-            deb_path="$(bash packaging/deb/build-deb.sh "$src" "${{ matrix.deb_arch }}" "${{ needs.prepare.outputs.version }}" dist)"
+            deb_path="$(LEGION_BUILD_SEQUENCE="${{ needs.prepare.outputs.sequence }}" bash packaging/deb/build-deb.sh "$src" "${{ matrix.deb_arch }}" "${{ needs.prepare.outputs.version }}" dist)"
             test -s "$deb_path"
+            node scripts/make-update-set.mjs check-artifact \
+              --file "$deb_path" \
+              --kind deb \
+              --sequence "${{ needs.prepare.outputs.sequence }}" \
+              --forbid-preview-key
             ls -lh "$deb_path"
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -370,6 +370,9 @@ pub struct QueueNotificationSummary {
     pub running_count: usize,
     /// Count of paused transfers (kept visible on Android so Resume/Cancel buttons stay usable).
     pub paused_count: usize,
+    /// Count of transfers in `cancelling` state still waiting for worker exit or file removal.
+    #[serde(default)]
+    pub cancelling_count: usize,
     /// Notification title line.
     pub title: String,
     /// Notification detail line.
@@ -778,7 +781,7 @@ impl TransferManager {
     }
 
     #[cfg(test)]
-    fn with_cleanup_retry_interval(
+    pub(crate) fn with_cleanup_retry_interval(
         data_dir: impl AsRef<Path>,
         backend: Arc<dyn Backend>,
         platform: Arc<dyn TransferPlatform>,
@@ -995,13 +998,17 @@ impl TransferManager {
         self.cleanup_notify.notify_one();
     }
 
-    /// Returns true if any transfer is currently `queued` or `running`.
+    /// Returns true if any transfer is currently `queued`, `running`, or `cancelling` (still
+    /// stopping its worker or removing partial/saved files).
     pub fn has_active_work(&self) -> bool {
         let guard = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.items.iter().any(|r| r.transfer.state.is_active())
+        guard
+            .items
+            .iter()
+            .any(|r| r.transfer.state.is_active() || r.transfer.state == TransferState::Cancelling)
     }
 
     /// Returns true if any transfer is `queued`, `running`, `paused`, or `cancelling` (used on
@@ -4018,6 +4025,7 @@ fn build_notification_summary(items: &[TransferRecord]) -> QueueNotificationSumm
         active_count: active.len(),
         running_count,
         paused_count: paused.len(),
+        cancelling_count: cancelling.len(),
         title,
         detail,
         bytes_done,
@@ -4550,6 +4558,8 @@ mod tests {
                                     req.id,
                                     serde_json::to_value(HelloResult {
                                         node: "tower".to_owned(),
+                                        node_explicit: None,
+                                        node_id: None,
                                         version: VERSION.to_owned(),
                                         build: None,
                                         protocol: PROTOCOL,

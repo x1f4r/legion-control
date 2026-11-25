@@ -343,21 +343,11 @@ fn process_enrol_blocking(
 
     let policy_path = paths.config_file(Policy::FILE);
     let devices_path = paths.config_file(DevicesFile::FILE);
-    let read_optional_bytes = |path: &std::path::Path| -> Result<Option<Vec<u8>>, ErrorBody> {
-        match std::fs::read(path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", path.display()),
-            )),
-        }
-    };
-    let policy_before = match read_optional_bytes(&policy_path) {
+    let policy_before = match legion_core::config::read_regular_file(&policy_path) {
         Ok(bytes) => bytes,
         Err(error) => return (None, None, base_args, Err(error)),
     };
-    let devices_before = match read_optional_bytes(&devices_path) {
+    let devices_before = match legion_core::config::read_regular_file(&devices_path) {
         Ok(bytes) => bytes,
         Err(error) => return (None, None, base_args, Err(error)),
     };
@@ -753,24 +743,16 @@ fn process_enrol_blocking(
         attach_rollback_failures(error, &rollback_failures)
     };
 
-    let live_policy = match std::fs::read(&policy_path) {
-        Ok(bytes) => match parse::<Policy>(&policy_path, &bytes) {
+    let live_policy = match legion_core::config::read_regular_file(&policy_path) {
+        Ok(Some(bytes)) => match parse::<Policy>(&policy_path, &bytes) {
             Ok(policy) => policy,
             Err(error) => {
                 return (Some(principal), None, base_args, Err(rollback_both(error)));
             }
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Policy::default(),
+        Ok(None) => Policy::default(),
         Err(error) => {
-            return (
-                Some(principal),
-                None,
-                base_args,
-                Err(rollback_both(ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!("{} cannot be read: {error}.", policy_path.display()),
-                ))),
-            );
+            return (Some(principal), None, base_args, Err(rollback_both(error)));
         }
     };
 

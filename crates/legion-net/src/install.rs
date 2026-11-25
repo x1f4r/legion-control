@@ -15,12 +15,13 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use legion_core::{
-    BoxFuture, CancellationToken, Ctx, Paths, Registry, Tool, ToolError, input_schema, parse_args,
+    BoxFuture, CancellationToken, Ctx, EventSink, Paths, Registry, Tool, ToolError, input_schema,
+    parse_args,
 };
 use legion_os::OsError;
 use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
-use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use legion_proto::{CallParams, Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::binfmt::verify_binary_matches_target;
 use legion_tools::floor::{SemVer, check_version_transition, commit_floor, machine_floor_path};
 use legion_tools::package::{PackageManager, managed_fleet_install_error};
@@ -37,6 +38,7 @@ use serde_json::Value;
 use crate::config::{FleetFile, RemoteOs, Transport, validate_program, validate_ssh_target};
 use crate::connector::ssh_args;
 use crate::pool::Fleet;
+use crate::session::CallError;
 
 /// Timeout for short remote SSH probes and file-move commands.
 const SSH_CMD_TIMEOUT: Duration = Duration::from_secs(20);
@@ -72,7 +74,7 @@ pub fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add(InstallTool {
         spec: ToolSpec {
             name: "fleet.install".to_owned(),
-            description: "Install or upgrade the legion binary on a machine in fleet.toml using only ssh and scp. Refuses to overwrite a remote binary managed by a system package manager (such as `deb` or `pacman`) and reports the package manager's upgrade command instead. Detects the remote OS and architecture, verifies the offline Ed25519 signature (SHA256SUMS.sig) against the compiled-in release key and checks SHA-256 (for both downloaded and cached releases, with no skip flag; passing `from=<local file>` is the only way to install an unsigned binary, where the admin naming the file vouches for it), copies it atomically into place, and opens a normal session to verify the installed version.".to_owned(),
+            description: "Install or upgrade the legion binary on a machine in fleet.toml using only ssh and scp. Refuses to overwrite a remote binary managed by a system package manager (such as `deb` or `pacman`) and reports the package manager's upgrade command instead. Detects the remote OS and architecture, verifies the offline Ed25519 signature (SHA256SUMS.sig) against the compiled-in release key and checks SHA-256 (for both downloaded and cached releases, with no skip flag; passing `from=<local file>` is the only way to install an unsigned binary, where the admin naming the file vouches for it), copies it atomically into place, opens a normal session to verify the installed version, and ensures the target's `node.toml` has `name = \"<machine>\"` when missing or unset (leaving any different explicit `name` untouched and reporting it in `problems`).".to_owned(),
             effect: Effect::Admin,
             input_schema: input_schema::<InstallArgs>(),
         },
@@ -97,6 +99,7 @@ impl Tool for InstallTool {
                 fleet: self.fleet.clone(),
                 config_dir: ctx.config().dir().to_path_buf(),
                 here: ctx.node_name().to_owned(),
+                principal: ctx.principal().to_owned(),
             };
             let fleet_file = ctx.config().get::<FleetFile>()?;
             let result = run_fleet_install(
@@ -145,7 +148,7 @@ pub struct InstallArgs {
 }
 
 /// Result of `fleet.install`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct InstallResult {
     /// Machine name from `fleet.toml`.
     pub machine: String,
@@ -174,6 +177,10 @@ pub struct InstallResult {
     /// Optional platform note (for example Rosetta 2 native selection or Windows ARM64 emulation).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Non-fatal problems noticed after installing (for example, `node.toml` already sets a
+    /// different explicit `name`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<ErrorBody>,
 }
 
 /// Remote operating system, architecture, and release target detected over SSH.
@@ -285,6 +292,15 @@ pub trait InstallBackend: Send + Sync {
         machine: &'a str,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ParsedVersion, ErrorBody>>;
+
+    /// Ensures the target machine's `node.toml` has `name = "<machine>"` when missing or unset,
+    /// leaving any different explicit `name` untouched and returning a non-fatal problem to report
+    /// in [`InstallResult::problems`].
+    fn ensure_node_name<'a>(
+        &'a self,
+        machine: &'a str,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Option<ErrorBody>>;
 }
 
 struct BackendFetcher<'a>(&'a dyn InstallBackend);
@@ -311,6 +327,7 @@ struct SystemInstallBackend {
     fleet: Fleet,
     config_dir: PathBuf,
     here: String,
+    principal: String,
 }
 
 impl InstallBackend for SystemInstallBackend {
@@ -476,6 +493,117 @@ impl InstallBackend for SystemInstallBackend {
                 version: hello.version.clone(),
                 build: hello.build.clone(),
             })
+        })
+    }
+
+    fn ensure_node_name<'a>(
+        &'a self,
+        machine: &'a str,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Option<ErrorBody>> {
+        Box::pin(async move {
+            let store = legion_core::ConfigStore::new(self.config_dir.clone());
+            let session = match self
+                .fleet
+                .session_for(&store, &self.here, machine, cancel.clone())
+                .await
+            {
+                Ok(session) => session,
+                Err(err) => return Some(err.with_machine(machine)),
+            };
+            let params = CallParams {
+                tool: "config.set_name".to_owned(),
+                args: serde_json::json!({
+                    "name": machine,
+                    "caller": self.here,
+                }),
+                as_principal: Some(self.principal.clone()),
+                on: None,
+                hops: 1,
+            };
+            match session.call(params, cancel, EventSink::discard()).await {
+                Ok(value) => {
+                    let hello = &session.info().hello;
+                    self.fleet.record_reported_node(
+                        machine,
+                        crate::state::ReportedNode {
+                            node: machine.to_owned(),
+                            explicit: Some(true),
+                            node_id: hello.node_id.clone(),
+                        },
+                    );
+                    if value.get("changed").and_then(Value::as_bool) == Some(true) {
+                        self.fleet.evict(machine).await;
+                    }
+                    None
+                }
+                Err(CallError::Remote(err)) if crate::pool::is_name_mismatch_error(&err) => {
+                    let hello = &session.info().hello;
+                    let reported = err
+                        .details
+                        .as_ref()
+                        .and_then(|d| d.get("reported"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(hello.node.as_str());
+                    self.fleet.record_reported_node(
+                        machine,
+                        crate::state::ReportedNode {
+                            node: reported.to_owned(),
+                            explicit: Some(true),
+                            node_id: hello.node_id.clone(),
+                        },
+                    );
+                    Some(
+                        ErrorBody::new(
+                            ErrorCode::Conflict,
+                            format!(
+                                "{machine} is already explicitly named {reported} in node.toml, so its name was left unchanged."
+                            ),
+                        )
+                        .with_hint(format!(
+                            "Set `name = \"{machine}\"` in {machine}'s node.toml, or rename the entry in fleet.toml to `{reported}`."
+                        ))
+                        .with_machine(machine)
+                        .with_details(serde_json::json!({
+                            "kind": "name_mismatch",
+                            "expected": machine,
+                            "reported": reported,
+                            "explicit": true,
+                        })),
+                    )
+                }
+                Err(CallError::Remote(err)) if err.code == ErrorCode::UnknownTool => {
+                    let hello = &session.info().hello;
+                    if hello.node != machine {
+                        Some(
+                            ErrorBody::new(
+                                ErrorCode::Conflict,
+                                format!(
+                                    "{machine} calls itself {}, and the installed binary does not support config.set_name.",
+                                    hello.node
+                                ),
+                            )
+                            .with_hint(format!(
+                                "Set `name = \"{machine}\"` in {machine}'s node.toml, or install a newer legion release."
+                            ))
+                            .with_machine(machine)
+                            .with_details(serde_json::json!({
+                                "kind": "name_mismatch",
+                                "expected": machine,
+                                "reported": hello.node,
+                            })),
+                        )
+                    } else {
+                        // The remote node already answers under the fleet name, so there is no
+                        // mismatch problem to report even when the installed binary predates
+                        // `config.set_name`.
+                        None
+                    }
+                }
+                Err(CallError::Remote(err))
+                | Err(CallError::NotWritten(err))
+                | Err(CallError::LostInFlight(err)) => Some(err.with_machine(machine)),
+            }
         })
     }
 }
@@ -1148,6 +1276,7 @@ async fn run_fleet_install_with_key(
             source: Some(source_desc),
             dry_run: true,
             note: platform.note.map(str::to_owned),
+            problems: Vec::new(),
         });
     }
 
@@ -1360,7 +1489,10 @@ async fn run_fleet_install_with_key(
         return Err(err);
     }
 
-    let verified_session = match backend.verify_session_version(&args.machine, cancel).await {
+    let verified_session = match backend
+        .verify_session_version(&args.machine, cancel.clone())
+        .await
+    {
         Ok(parsed) if versions_match(&parsed.version, &verified_expected_version) => parsed,
         Ok(parsed) => {
             let rollback_note = attempt_remote_rollback(
@@ -1414,6 +1546,11 @@ async fn run_fleet_install_with_key(
         commit_floor(&floor_path, &installed_semver, args.allow_downgrade)?;
     }
 
+    let mut problems = Vec::new();
+    if let Some(problem) = backend.ensure_node_name(&args.machine, cancel).await {
+        problems.push(problem);
+    }
+
     Ok(InstallResult {
         machine: args.machine,
         os: platform.os.to_owned(),
@@ -1426,6 +1563,7 @@ async fn run_fleet_install_with_key(
         source: None,
         dry_run: false,
         note: platform.note.map(str::to_owned),
+        problems,
     })
 }
 
@@ -1964,10 +2102,12 @@ mod tests {
         session_build_after_install: Option<String>,
         fail_finalize: bool,
         fail_session: bool,
+        node_name_problem: Option<ErrorBody>,
         ssh_log: Mutex<Vec<(String, String)>>,
         scp_log: Mutex<Vec<(PathBuf, String, String)>>,
         download_log: Mutex<Vec<String>>,
         session_checks: Mutex<Vec<String>>,
+        name_checks: Mutex<Vec<String>>,
     }
 
     impl FakeInstallBackend {
@@ -1992,10 +2132,12 @@ mod tests {
                 session_build_after_install: None,
                 fail_finalize: false,
                 fail_session: false,
+                node_name_problem: None,
                 ssh_log: Mutex::new(Vec::new()),
                 scp_log: Mutex::new(Vec::new()),
                 download_log: Mutex::new(Vec::new()),
                 session_checks: Mutex::new(Vec::new()),
+                name_checks: Mutex::new(Vec::new()),
             }
         }
 
@@ -2026,10 +2168,12 @@ mod tests {
                 session_build_after_install: None,
                 fail_finalize: false,
                 fail_session: false,
+                node_name_problem: None,
                 ssh_log: Mutex::new(Vec::new()),
                 scp_log: Mutex::new(Vec::new()),
                 download_log: Mutex::new(Vec::new()),
                 session_checks: Mutex::new(Vec::new()),
+                name_checks: Mutex::new(Vec::new()),
             }
         }
 
@@ -2204,6 +2348,17 @@ mod tests {
                     version: self.session_version_after_install.clone(),
                     build: self.session_build_after_install.clone(),
                 })
+            })
+        }
+
+        fn ensure_node_name<'a>(
+            &'a self,
+            machine: &'a str,
+            _cancel: CancellationToken,
+        ) -> BoxFuture<'a, Option<ErrorBody>> {
+            Box::pin(async move {
+                self.name_checks.lock().unwrap().push(machine.to_owned());
+                self.node_name_problem.clone()
             })
         }
     }
@@ -3025,5 +3180,262 @@ program = "/opt/legion/legion"
             assert!(backend.scp_log.lock().unwrap().is_empty());
             assert!(backend.session_checks.lock().unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn fleet_install_sets_node_name_and_reports_explicit_mismatch_without_failing() {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let fleet = sample_fleet();
+        let local_bin = dir.path().join("legion-custom");
+        fs::write(
+            &local_bin,
+            fake_binary("x86_64-unknown-linux-musl", b"local-binary"),
+        )
+        .unwrap();
+
+        // Dry run never calls ensure_node_name.
+        let dry_backend = FakeInstallBackend::linux_x86_64("0.2.0", None, "0.2.0");
+        let dry = run_fleet_install(
+            &paths,
+            &fleet,
+            "laptop",
+            &dry_backend,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: None,
+                from: Some(local_bin.display().to_string()),
+                dry_run: true,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(dry.problems.is_empty());
+        assert!(dry_backend.name_checks.lock().unwrap().is_empty());
+
+        // Normal install calls ensure_node_name and reports no problems when clean.
+        let clean_backend = FakeInstallBackend::linux_x86_64("0.2.0", None, "0.2.0");
+        let clean = run_fleet_install(
+            &paths,
+            &fleet,
+            "laptop",
+            &clean_backend,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: None,
+                from: Some(local_bin.display().to_string()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(clean.problems.is_empty());
+        assert_eq!(
+            clean_backend.name_checks.lock().unwrap().as_slice(),
+            &["tower"]
+        );
+
+        // Explicit mismatch is reported in `problems` with code, sentence, and hint, without
+        // failing the install.
+        let mut mismatch_backend = FakeInstallBackend::linux_x86_64("0.2.0", None, "0.2.0");
+        mismatch_backend.node_name_problem = Some(
+            ErrorBody::new(
+                ErrorCode::Conflict,
+                "tower is already explicitly named studio in node.toml, so its name was left unchanged.",
+            )
+            .with_hint("Set `name = \"tower\"` in tower's node.toml, or rename the entry in fleet.toml to `studio`.")
+            .with_machine("tower")
+            .with_details(serde_json::json!({
+                "kind": "name_mismatch",
+                "expected": "tower",
+                "reported": "studio",
+            })),
+        );
+        let with_problem = run_fleet_install(
+            &paths,
+            &fleet,
+            "laptop",
+            &mismatch_backend,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: None,
+                from: Some(local_bin.display().to_string()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(with_problem.installed_version, "0.2.0");
+        assert_eq!(with_problem.problems.len(), 1);
+        assert_eq!(with_problem.problems[0].code, ErrorCode::Conflict);
+        assert!(crate::pool::is_name_mismatch_error(
+            &with_problem.problems[0]
+        ));
+        assert!(with_problem.problems[0].message.contains("studio"));
+        assert!(with_problem.problems[0].hint.is_some());
+    }
+
+    #[tokio::test]
+    async fn system_install_backend_ensure_node_name_handles_missing_unset_and_explicit() {
+        use legion_core::Node;
+        use legion_proto::{Id, PROTOCOL, Request, Response, method};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        async fn run_case(
+            initial_node_toml: Option<&[u8]>,
+            offer_set_name: bool,
+            legacy_reported_name: Option<&str>,
+        ) -> (Option<ErrorBody>, Option<Vec<u8>>) {
+            let local_dir = tempdir().unwrap();
+            let remote_dir = tempdir().unwrap();
+            let local_paths = Paths::under(local_dir.path());
+            let remote_paths = Paths::under(remote_dir.path());
+            fs::create_dir_all(local_paths.config_dir()).unwrap();
+            fs::create_dir_all(remote_paths.config_dir()).unwrap();
+            fs::write(
+                local_paths.config_file("fleet.toml"),
+                "[machines.studio]\nssh = \"studio.example\"\n",
+            )
+            .unwrap();
+            if let Some(bytes) = initial_node_toml {
+                fs::write(remote_paths.config_file("node.toml"), bytes).unwrap();
+            }
+
+            let fleet = Fleet::new(&local_paths);
+            let mut remote_reg = Registry::new();
+            if offer_set_name {
+                crate::sync::register(&mut remote_reg, Fleet::new(&remote_paths));
+            }
+            let remote_node = Node::new(remote_paths.clone(), remote_reg);
+
+            // Wire an in-memory JSON-RPC session directly into the Fleet pool for `studio`.
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (client_r, client_w) = tokio::io::split(client);
+            let (server_r, mut server_w) = tokio::io::split(server);
+            let legacy_name = legacy_reported_name.map(str::to_owned);
+            let node_task = {
+                let remote_node = remote_node.clone();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        let reply = match req.method.as_str() {
+                            method::HELLO => {
+                                let params = serde_json::from_value(req.params).unwrap();
+                                let mut hello = remote_node.hello(&params).unwrap();
+                                if !offer_set_name {
+                                    if let Some(ref name) = legacy_name {
+                                        hello.node = name.clone();
+                                    }
+                                    hello.node_explicit = None;
+                                    hello.node_id = None;
+                                }
+                                Response::ok(req.id, serde_json::to_value(hello).unwrap())
+                            }
+                            method::CALL => {
+                                let params: CallParams =
+                                    serde_json::from_value(req.params).unwrap();
+                                let mut call = legion_core::Call::new(
+                                    legion_core::Door::Rpc,
+                                    params.tool,
+                                    params.args,
+                                );
+                                call.as_principal = params.as_principal;
+                                call.hops = params.hops;
+                                match remote_node.call(call).await {
+                                    Ok(val) => Response::ok(req.id, val),
+                                    Err(err) => Response::error(
+                                        req.id,
+                                        legion_proto::RpcError::new(legion_proto::TOOL_ERROR, err),
+                                    ),
+                                }
+                            }
+                            _ => Response::ok(req.id, serde_json::json!({})),
+                        };
+                        let mut encoded = serde_json::to_string(&reply).unwrap();
+                        encoded.push('\n');
+                        if server_w.write_all(encoded.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = server_w.flush().await;
+                    }
+                })
+            };
+
+            let fleet_file = legion_core::ConfigStore::new(local_paths.config_dir())
+                .get::<FleetFile>()
+                .unwrap();
+            let entry = fleet_file.machine("studio").unwrap();
+            let session = crate::session::Session::open_io(
+                client_r,
+                client_w,
+                "studio",
+                None,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            fleet.install_test_session("studio", entry, session);
+
+            let backend = SystemInstallBackend {
+                fleet: fleet.clone(),
+                config_dir: local_paths.config_dir().to_path_buf(),
+                here: "tower".to_owned(),
+                principal: "owner".to_owned(),
+            };
+            let problem = backend
+                .ensure_node_name("studio", CancellationToken::new())
+                .await;
+            fleet.close().await;
+            let _ = node_task.await;
+            let _ = (Id::Number(1), PROTOCOL);
+            let after = fs::read(remote_paths.config_file("node.toml")).ok();
+            (problem, after)
+        }
+
+        // 1. Missing node.toml -> written with `name = "studio"\n`, no problem.
+        let (problem, after) = run_case(None, true, None).await;
+        assert_eq!(problem, None);
+        assert_eq!(after.as_deref(), Some(b"name = \"studio\"\n".as_slice()));
+
+        // 2. Existing node.toml without `name` -> keeps rest of file byte for byte.
+        let original = b"# keep this comment\n[svc]\nsudo = true\n";
+        let (problem, after) = run_case(Some(original), true, None).await;
+        assert_eq!(problem, None);
+        let written = after.unwrap();
+        assert!(written.starts_with(b"name = \"studio\"\n"));
+        assert_eq!(&written[b"name = \"studio\"\n".len()..], original);
+
+        // 3. Different explicit name -> left untouched byte for byte and reported as a problem.
+        let explicit_other = b"# pinned\nname = \"tower\"\n";
+        let (problem, after) = run_case(Some(explicit_other), true, None).await;
+        let problem = problem.expect("expected mismatch problem");
+        assert_eq!(problem.code, ErrorCode::Conflict);
+        assert!(crate::pool::is_name_mismatch_error(&problem));
+        assert!(problem.message.contains("tower"), "{}", problem.message);
+        assert!(problem.hint.is_some());
+        assert_eq!(after.as_deref(), Some(explicit_other.as_slice()));
+
+        // 4. Older remote binary lacking `config.set_name` with wrong name -> reports mismatch.
+        let (problem, after) = run_case(None, false, Some("someones-laptop")).await;
+        let problem = problem.expect("expected problem for older binary");
+        assert_eq!(problem.code, ErrorCode::Conflict);
+        assert!(crate::pool::is_name_mismatch_error(&problem));
+        assert!(problem.message.contains("someones-laptop"));
+        assert!(problem.hint.is_some());
+        assert_eq!(after, None);
+
+        // 5. Older remote binary lacking `config.set_name` that already answers under the right
+        //    name -> no spurious problem reported.
+        let (problem, after) = run_case(None, false, Some("studio")).await;
+        assert_eq!(problem, None);
+        assert_eq!(after, None);
     }
 }

@@ -1,8 +1,9 @@
 // Technical All tools view and schema-driven tool runner (reused by Actions and Settings).
 
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
+import { Icon } from '../icons.js';
 import { CodeText, Notice, ResultView } from './common.js';
-import { ScrollContainer } from './scroll-container.js';
+import { SplitView } from './split-view.js';
 import { parentFilePath } from '../lib/files.js';
 import { parseTransferTarget } from '../lib/folder-changes.js';
 import { splitFirstSentence } from '../lib/format.js';
@@ -455,7 +456,9 @@ export function ToolDetail({
                   setResult(null);
                 }}
               >
-                <option value="local">${localNode} (this machine)</option>
+                <option value="local">
+                  ${localNode === 'This computer' ? 'This computer' : `${localNode} (this machine)`}
+                </option>
                 ${remoteMachines.map((m) => {
                   const suffix =
                     m.status === 'asking' || m.asking
@@ -637,95 +640,121 @@ export function ToolsView({
   const selectedName = wide ? route.tool || tools?.[0]?.name || null : route.tool || null;
   const selectedTool = (tools || []).find((t) => t.name === selectedName) || null;
   const selectedAllowed = selectedTool && allowedSet ? allowedSet.has(selectedTool.name) : true;
+  const totalTools = (tools || []).length;
+  const shownTools = groups.reduce((sum, g) => sum + g.tools.length, 0);
 
-  const listPane = html`
-    <section>
-      <input
-        class="input plain"
-        type="search"
-        value=${query}
-        onInput=${(e) => setQuery(e.target.value)}
-        placeholder="Search tools"
-        aria-label="Search tools"
-      />
-
-      ${!tools || tools.length === 0
-        ? html`<div class="empty">No tools available.</div>`
-        : groups.length === 0
-          ? html`<div class="empty">No tools match "${query}".</div>`
-          : groups.map(
-              (group) => html`
-                <div key=${group.family}>
-                  <p class="label">${group.family}</p>
-                  <div class="list">
-                    ${group.tools.map((tool) => {
-                      const selected = wide && tool.name === selectedName;
-                      const cls = [
-                        'row',
-                        !tool.allowed ? 'off' : '',
-                        selected ? 'selected' : '',
-                      ]
-                        .filter(Boolean)
-                        .join(' ');
-                      return html`
-                        <a
-                          key=${tool.name}
-                          class=${cls}
-                          href=${routeHref({ section: 'actions', allTools: true, tool: tool.name })}
-                          aria-current=${selected ? 'true' : undefined}
-                        >
-                          <span class="body">
-                            <span class="title mono">
-                              <span>${tool.name}</span>
-                              <span class=${`chip fx ${tool.effect}`}>${tool.effect}</span>
-                              ${!tool.allowed ? html`<span class="chip">unavailable</span>` : null}
-                            </span>
-                            <span class="sub">
-                              ${tool.allowed
-                                ? html`<${CodeText} text=${tool.summary} />`
-                                : tool.reason}
-                            </span>
-                          </span>
-                        </a>
-                      `;
-                    })}
-                  </div>
-                </div>
-              `,
-            )}
-    </section>
+  const searchInputEl = html`
+    <input
+      class="input plain"
+      type="search"
+      value=${query}
+      onInput=${(e) => setQuery(e.target.value)}
+      placeholder="Search tools"
+      aria-label="Search tools"
+    />
   `;
 
-  if (wide) {
+  function renderToolGroups(hideFirstLabel) {
     return html`
-      <div class="split">
-        <${ScrollContainer} as="section">
-          ${listPane}
-        <//>
-        <${ScrollContainer} as="section">
-          ${selectedTool
-            ? html`
-                <h2 class="pane-title">
-                  <span>${selectedTool.name}</span>
-                  <span class=${`chip fx ${selectedTool.effect}`}>${selectedTool.effect}</span>
-                </h2>
-                <${ToolDetail}
-                  key=${selectedTool.name}
-                  tool=${selectedTool}
-                  allowed=${selectedAllowed}
-                  nodeInfo=${nodeInfo}
-                  machines=${snapshot?.machines || []}
-                  runningJobs=${snapshot?.runningJobs || []}
-                  link=${link}
-                  folderChanges=${folderChanges}
-                  technical=${technical}
-                  onRequestConfirm=${onRequestConfirm}
-                  onEnsureAwake=${onEnsureAwake}
-                />
-              `
-            : html`<div class="empty">Select a tool to run it.</div>`}
-        <//>
-      </div>
+      <section>
+        ${!hideFirstLabel ? searchInputEl : null}
+
+        ${totalTools === 0
+          ? html`<div class="empty">No tools available.</div>`
+          : groups.length === 0
+            ? html`<div class="empty">No tools match "${query}".</div>`
+            : groups.map(
+                (group, idx) => html`
+                  <div key=${group.family}>
+                    ${!(hideFirstLabel && idx === 0) ? html`<p class="label">${group.family}</p>` : null}
+                    <div class="list">
+                      ${group.tools.map((tool) => {
+                        const selected = wide && tool.name === selectedName;
+                        const cls = [
+                          'row',
+                          !tool.allowed ? 'off' : '',
+                          selected ? 'selected' : '',
+                        ]
+                          .filter(Boolean)
+                          .join(' ');
+                        return html`
+                          <a
+                            key=${tool.name}
+                            class=${cls}
+                            href=${routeHref({ section: 'actions', allTools: true, tool: tool.name })}
+                            aria-current=${selected ? 'true' : undefined}
+                          >
+                            <span class="body">
+                              <span class="title mono">
+                                <span>${tool.name}</span>
+                                <span class=${`chip fx ${tool.effect}`}>${tool.effect}</span>
+                                ${!tool.allowed ? html`<span class="chip">unavailable</span>` : null}
+                              </span>
+                              <span class="sub">
+                                ${tool.allowed
+                                  ? html`<${CodeText} text=${tool.summary} />`
+                                  : tool.reason}
+                              </span>
+                            </span>
+                          </a>
+                        `;
+                      })}
+                    </div>
+                  </div>
+                `,
+              )}
+      </section>
+    `;
+  }
+
+  if (wide) {
+    const toolsCountFact =
+      totalTools > 0
+        ? query.trim()
+          ? `${shownTools} of ${totalTools}`
+          : String(totalTools)
+        : null;
+    const selectedFamily = selectedTool ? selectedTool.name.split('.')[0] : null;
+
+    return html`
+      <${SplitView}
+        leftTitle=${html`
+          <a class="btn icon split-back" href="#/actions" aria-label="Back to Actions">
+            <${Icon} name="back" />
+          </a>
+          <span class="pane-title-text">All tools</span>
+        `}
+        leftFact=${toolsCountFact}
+        leftTools=${searchInputEl}
+        leftLabel=${groups[0]?.family || 'Tools'}
+        leftBody=${renderToolGroups(true)}
+        rightTitle=${selectedTool
+          ? html`
+              <span class="pane-title-text">${selectedTool.name}</span>
+              <span class=${`chip fx ${selectedTool.effect}`}>${selectedTool.effect}</span>
+            `
+          : null}
+        rightLabel=${selectedTool ? selectedFamily || 'Tool' : null}
+        rightLabelFact=${selectedTool && nodeInfo?.node ? nodeInfo.node : null}
+        rightEmpty=${!selectedTool ? 'Choose a tool on the left.' : null}
+        rightBody=${selectedTool
+          ? html`
+              <${ToolDetail}
+                key=${selectedTool.name}
+                tool=${selectedTool}
+                allowed=${selectedAllowed}
+                nodeInfo=${nodeInfo}
+                machines=${snapshot?.machines || []}
+                runningJobs=${snapshot?.runningJobs || []}
+                link=${link}
+                folderChanges=${folderChanges}
+                technical=${technical}
+                onRequestConfirm=${onRequestConfirm}
+                onEnsureAwake=${onEnsureAwake}
+              />
+            `
+          : null}
+      />
     `;
   }
 
@@ -747,5 +776,5 @@ export function ToolsView({
     `;
   }
 
-  return listPane;
+  return renderToolGroups(false);
 }

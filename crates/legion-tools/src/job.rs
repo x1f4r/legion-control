@@ -337,9 +337,9 @@ fn load_live_policy_and_devices(
 ) -> Option<(Policy, Option<crate::device::registry::DevicesFile>)> {
     use legion_core::config::Document as _;
     let policy_file = paths.config_file(Policy::FILE);
-    let policy = match std::fs::read(&policy_file) {
-        Ok(bytes) => legion_core::config::parse::<Policy>(&policy_file, &bytes).ok()?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Policy::default(),
+    let policy = match legion_core::config::read_regular_file(&policy_file) {
+        Ok(Some(bytes)) => legion_core::config::parse::<Policy>(&policy_file, &bytes).ok()?,
+        Ok(None) => Policy::default(),
         Err(_) => return None,
     };
     // Fail closed if `devices.toml` exists on disk but cannot be read or parsed.
@@ -373,11 +373,21 @@ fn is_transfer_job_authorized_once(paths: &Paths, id: &str) -> bool {
 /// having removed a right (which can happen transiently during an editor's in-place save), re-reads
 /// twice after [`AUTH_RECHECK_RETRY_DELAY`] and returns `false` only if every read agrees.
 pub fn is_transfer_job_authorized(paths: &Paths, id: &str) -> bool {
+    is_transfer_job_authorized_with_pause(paths, id, std::thread::sleep)
+}
+
+/// Like [`is_transfer_job_authorized`], but invokes `pause` instead of sleeping so tests can
+/// drive transient policy-save retries deterministically without wall-clock sleeps.
+pub fn is_transfer_job_authorized_with_pause(
+    paths: &Paths,
+    id: &str,
+    mut pause: impl FnMut(Duration),
+) -> bool {
     if is_transfer_job_authorized_once(paths, id) {
         return true;
     }
     for _ in 0..AUTH_RECHECK_RETRIES {
-        std::thread::sleep(AUTH_RECHECK_RETRY_DELAY);
+        pause(AUTH_RECHECK_RETRY_DELAY);
         if is_transfer_job_authorized_once(paths, id) {
             return true;
         }

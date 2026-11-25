@@ -486,6 +486,49 @@ export function createCapabilitiesStore(link, options = {}) {
   }
 
   /**
+   * Moves cached capabilities and observed metadata from one machine key (such as `"local"` or
+   * `"This computer"`) to the resolved node name without losing already-fetched tool schemas.
+   */
+  function renameMachine(fromName, toName) {
+    const fromKey = keyOf(fromName);
+    const toKey = keyOf(toName);
+    if (!fromKey || !toKey || fromKey === toKey) return false;
+    let changed = false;
+
+    const prevEntry = entries.get(fromKey);
+    if (prevEntry) {
+      entries.delete(fromKey);
+      const destEntry = entries.get(toKey);
+      if (!destEntry || (destEntry.status !== 'known' && prevEntry.status === 'known')) {
+        entries.set(toKey, {
+          ...prevEntry,
+          machine: toKey,
+          generation: generationOf(toKey),
+        });
+      }
+      changed = true;
+    }
+
+    const prevMeta = observedMeta.get(fromKey);
+    if (prevMeta) {
+      observedMeta.delete(fromKey);
+      if (!observedMeta.has(toKey)) {
+        observedMeta.set(toKey, { ...prevMeta });
+      }
+      changed = true;
+    }
+
+    if (inFlight.has(fromKey)) {
+      inFlight.delete(fromKey);
+      bumpMachineGeneration(fromKey);
+      changed = true;
+    }
+
+    if (changed) notify();
+    return changed;
+  }
+
+  /**
    * Synchronizes machine version/build/reachability metadata observed from fleet refreshes or
    * state updates. Refetches are triggered automatically if a machine's build/version changes
    * or if it reconnects after being offline.
@@ -912,6 +955,7 @@ export function createCapabilitiesStore(link, options = {}) {
     seed,
     syncMachineMeta,
     invalidate,
+    renameMachine,
     markArgUnsupported,
     markToolAbsent,
     ensure,

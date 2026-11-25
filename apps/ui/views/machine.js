@@ -27,7 +27,7 @@ import {
 import { routeHref, WIDE_MACHINE_TABS } from '../lib/route.js';
 import { describePowerConfirm, unavailableReason } from '../lib/schema.js';
 
-const WIDE_TAB_LABELS = {
+export const WIDE_TAB_LABELS = {
   overview: 'Overview',
   files: 'Files',
   power: 'Power',
@@ -275,6 +275,7 @@ function OverviewTab({
   allowedSet,
   technical,
   wide,
+  hideWideChrome = false,
   wakePending,
   onRegisterRefresh = null,
   onEnsureAwake,
@@ -460,7 +461,7 @@ function OverviewTab({
 
   return html`
     <div>
-      ${wide
+      ${wide && !hideWideChrome
         ? html`
             <div class=${stale ? 'machine-state stale-values' : 'machine-state'}>
               <span class=${activeBusy ? 'dot busy' : 'dot'} aria-hidden="true"></span>
@@ -483,7 +484,9 @@ function OverviewTab({
 
       ${meters.length > 0
         ? html`
-            <p class="label">Health</p>
+            ${!(wide && hideWideChrome && missingFeatures.length === 0)
+              ? html`<p class="label">Health</p>`
+              : null}
             <div class=${stale ? 'list stale-values' : 'list'}>
               ${meters.map(
                 (m) => html`
@@ -1733,6 +1736,7 @@ export function MachineDetail({
   tab,
   jobId,
   wide,
+  hideWideChrome = false,
   link,
   capsStore = null,
   folderChanges = null,
@@ -1804,7 +1808,7 @@ export function MachineDetail({
 
   return html`
     <div>
-      ${wide
+      ${wide && !hideWideChrome
         ? html`
             <h2 class="pane-title">
               <span class=${dotClass} aria-hidden="true"></span>
@@ -1837,6 +1841,7 @@ export function MachineDetail({
               allowedSet=${allowedSet}
               technical=${technical}
               wide=${wide}
+              hideWideChrome=${hideWideChrome}
               wakePending=${wakePending}
               capsStore=${capsStore}
               onRegisterRefresh=${onRegisterRefresh}
