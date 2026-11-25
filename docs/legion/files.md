@@ -82,10 +82,15 @@ node.
   exactly one entry per input path in input order: `{"results": [{path, ok: {mime, content
   (base64), width, height}} | {path, error}]}`. Pictures are opened once and decoded on the node
   (JPEG, PNG, GIF first frame, WebP, BMP; EXIF orientation applied) inside hard limits: source at
-  most 64 MiB and 25 megapixels (bounded decoder memory, 50 megapixels / 8 concurrent image
-  decodes across sessions, 10 s decode timeout, fair round-robin scheduling per principal with
-  bounded wait returning retryable `busy`), off the async threads. Output is JPEG, or PNG when
-  the source has transparency. Video posters run in a separate fair pool (2 concurrent) with
+  most 64 MiB and estimated peak decode memory at most 256 MiB per image (computed from header
+  dimensions and format/subtype factors — admitting 48–61 MP baseline JPEGs while capping heavier
+  progressive/16-bit/interlaced encodings). Over-cap JPEGs fall back to a validated embedded MPF
+  preview (preferred) or EXIF IFD1 thumbnail through the same limits with the main image's EXIF
+  orientation, returning a per-path `too_large` error only when none is usable. Image decodes run
+  off the async threads, scheduled round-robin by principal against an in-flight byte budget of
+  `min(512 MiB, machine RAM / 8)` (floored at 256 MiB) and at most 8 concurrent decodes, with a
+  10 s decode timeout and 10 s bounded wait (returning retryable `busy`). Output is JPEG, or PNG
+  when the source has transparency. Video posters run in a separate fair pool (2 concurrent) with
   `ffmpeg` (no shell, `-threads 1`, `-protocol_whitelist file`, strict container
   `-format_whitelist` blocking manifests and playlists, video-only mapping, hard time limit) when
   the node has it on `PATH` and report `unsupported` otherwise. Results are cached lock-free on

@@ -54,10 +54,14 @@ keep their existing `kind` and omit `category` and `mime`.
   96 to 512, default 256; `fit` `"contain"` or `"cover"`), returning exactly one result per input
   path in input order: `{"results": [{"path": …, "ok": {"mime", "content", "width", "height"}} |
   {"path": …, "error": …}]}`. JPEG, PNG, GIF (first frame), WebP, and BMP images are opened once
-  and decoded with EXIF orientation applied under hard limits (64 MiB source, 25 megapixels per
-  image, 50 megapixels / 8 concurrent decodes across sessions, 10 s decode timeout, and fair
-  per-principal round-robin scheduling with bounded wait returning retryable `busy`), outputting
-  JPEG or PNG when transparent. Video posters run in a separate 2-slot fair pool with `ffmpeg`
+  and decoded with EXIF orientation applied under hard limits: 64 MiB source file cap, 256 MiB
+  estimated peak decode memory per image (computed per format and encoding subtype from header
+  metadata, admitting 48–61 MP baseline photos while capping heavier progressive/16-bit/interlaced
+  images), embedded MPF preview / EXIF IFD1 thumbnail fallback for over-cap JPEGs (returning
+  `too_large` only when no valid preview is embedded), in-flight scheduling bounded to
+  `min(512 MiB, machine RAM / 8)` (floored at 256 MiB) and 8 concurrent decodes round-robin per
+  principal, 10 s decode timeout, and 10 s wait timeout returning retryable `busy`. Output is JPEG,
+  or PNG when transparent. Video posters run in a separate 2-slot fair pool with `ffmpeg`
   locked to local container formats (`-protocol_whitelist file`, strict `-format_whitelist`,
   `-threads 1`, video-only mapping) when it is on the node's `PATH` and report `unsupported`
   otherwise. Results are cached lock-free on hits in a 256 MiB disk-reconciled LRU store under the

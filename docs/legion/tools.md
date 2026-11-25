@@ -385,7 +385,7 @@ Compare, push, or pull shared configuration documents (devices.toml, fleet.toml,
 | `fs.read` | `read` | Read up to 1 MiB of a file from an offset as UTF-8 or base64, returning the whole-file BLAKE3 hash when the entire file fit in this reply. |
 | `fs.remove` | `destroy` | Remove a file, symbolic link or directory (with optional recursive and dry_run modes), refusing roots, the home directory and Legion's own directories. |
 | `fs.stat` | `read` | Return metadata for a path (kind, size, modification time, Unix mode, readonly flag, symbolic link target, and file category and MIME type) without following a symbolic link. |
-| `fs.thumb` | `read` | Generate thumbnails for 1 to 32 image or video paths on this node, returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory. |
+| `fs.thumb` | `read` | Generate thumbnails for 1 to 32 image or video paths on this node (64 MiB source cap, 256 MiB estimated decode memory per image with EXIF/MPF preview fallback for larger JPEGs, in-flight budget capped at min(512 MiB, RAM/8)), returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory. |
 | `fs.transfer` | `write` | Copy a file or a directory tree between machines, or within one. |
 | `fs.write` | `write` | Write UTF-8 text or base64 bytes to a file atomically, supporting overwrite, create-only and append modes, optional expect_hash conflict checks, parent creation and Unix mode. |
 
@@ -561,7 +561,7 @@ Return metadata for a path (kind, size, modification time, Unix mode, readonly f
 
 Effect: `read`
 
-Generate thumbnails for 1 to 32 image or video paths on this node, returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory.
+Generate thumbnails for 1 to 32 image or video paths on this node (64 MiB source cap, 256 MiB estimated decode memory per image with EXIF/MPF preview fallback for larger JPEGs, in-flight budget capped at min(512 MiB, RAM/8)), returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
