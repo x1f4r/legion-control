@@ -21,6 +21,7 @@ pub mod procid;
 pub mod run;
 pub mod shell;
 pub mod user;
+pub mod webview2;
 #[cfg(windows)]
 mod win_proc;
 

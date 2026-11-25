@@ -68,7 +68,7 @@ webkit2gtk = "2.0.2"
 zbus = "5.19.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-legion-os = { path = "../../../crates/legion-os" }
+legion-os = { path = "../../../crates/legion-os", features = ["webview2"] }
 
 [dev-dependencies]
 ed25519-dalek = "3.0.0"

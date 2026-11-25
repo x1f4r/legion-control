@@ -399,6 +399,19 @@ fn build_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<tauri::Web
         });
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        let term_app = app.clone();
+        let term_label = window.label().to_owned();
+        let _ = window.with_webview(move |webview| {
+            let controller = webview.controller();
+            let _ = legion_os::webview2::register_process_failed_handler(&controller, move || {
+                let win = term_app.get_webview_window(&term_label);
+                reset_desktop_player_state(&term_app, win.as_ref());
+            });
+        });
+    }
+
     Ok(window)
 }
 
