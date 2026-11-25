@@ -316,7 +316,12 @@ mount it:
   machine, separate from transfer and RPC pipes (which never share permits with content), with
   per-holder fair sharing and a short acquire timeout (`503 Service Unavailable` with `Retry-After`).
 - **The app**: the native side mounts `legion-content` behind `content_url({machine, path,
-  download})`, reading through `Link::open_content`. Linux, macOS, Windows, iOS and iPadOS mount it
+  download})`, reading through `Link::open_content`. Both `Link::open_content` and `Link::open_put`
+  follow the same direct-first routing with relay fallback as RPC calls: they stream directly when
+  the device has a direct route to `machine`, and relay through a paired node advertising
+  `stream.relay` (`op: "relay"`) otherwise — never silently failing over after bytes were sent — so
+  viewing pictures, playing media, downloading, uploading, and opening externally all work on any
+  machine in the fleet. Linux, macOS, Windows, iOS and iPadOS mount it
   lazily on a listener bound to `127.0.0.1` on a system-chosen port (capped at 32 simultaneous
   connections with a 5-second header-read timeout, exponential backoff on accept errors, iOS
   resume recovery, and stopping 60 seconds after no live tickets or active streams remain),

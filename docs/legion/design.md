@@ -109,24 +109,28 @@ JSON carries control, never bulk bytes. File content beyond what `fs.read` allow
 (1 MiB) moves over a second pipe, `legion stream`. Its first line on stdin is one JSON object
 carrying `protocol` (starting at 1), `op`, optional `as`, and the operation's fields; raw bytes
 follow in the direction the operation needs. The node's first line on stdout, before any reply or
-refusal, is `{"protocol": 1}` so both ends agree on the protocol version before bulk bytes move
-(waiting up to 60 seconds for the handshake and first reply, and 120 seconds between messages or
-chunks). While an operation works on something long it writes `{"busy": true}` every 10 seconds
-where a reply line is awaited:
+refusal, is `{"protocol": 1, "capabilities": ["stream.relay"]}` (older nodes emit `{"protocol": 1}`
+without `capabilities`) so both ends agree on the protocol version and optional stream capabilities
+before bulk bytes move (waiting up to 60 seconds for the handshake and first reply, and 120 seconds
+between messages or chunks). While an operation works on something long it writes `{"busy": true}`
+every 10 seconds where a reply line is awaited:
 
 | `op` | Header | Then |
 | --- | --- | --- |
 | `manifest` | `{protocol, op, root, checksum?, exclude?}` | one JSON line per entry on stdout, then `{done, entries, skipped}` |
 | `stat` | `{protocol, op, path, checksum?, if_size?}` | one JSON line `{kind, size, mode?, hash?, mtime?, partial?, case_insensitive?}` on stdout |
-| `get` | `{protocol, op, path, offset?, length?}` | one JSON line `{size, offset, length, mtime}` on stdout, then `length` bytes from `offset` (to the end when `length` is absent) |
-| `put` | `{protocol, op, path, size, hash, mode?, mtime?}` | `{offset}` on stdout (what is on disk decides where it starts); bytes on stdin; `{ok, size, hash}` when verified and renamed |
+| `get` | `{protocol, op, path, offset?, length?, keep_open?}` | one JSON line `{size, offset, length, mtime, keep_open?}` on stdout, then `length` bytes from `offset` (to the end when `length` is absent; followed by `{"done": true}` when `keep_open` is true) |
+| `put` | `{protocol, op, path, size, hash, mode?, mtime?, no_replace?}` | `{offset}` on stdout (what is on disk decides where it starts); bytes on stdin; `{ok, size, hash}` when verified and renamed |
 | `pack` | `{protocol, op, root, names: […]}` | `{ready, skipped}` on stdout, then a tar stream of those names |
 | `unpack` | `{protocol, op, root, entries: [{path, kind, size?, hash?, target?}]}` | `{ready}` on stdout; a tar stream on stdin (only the planned `entries` are accepted, verified before replacing the destination); `{ok, files, …}` when done |
 | `delete` | `{protocol, op, root, names: […]}` | `{removed, skipped}` on stdout |
+| `relay` | `{protocol, op, on, request, as?, hops?}` | forwards the inner direct stream `request` to fleet machine `on` (serving locally when `on` names this node); the relay checks the caller's principal against its own policy without checking paths, then passes that principal on so the target enforces its own policy and path confinement; bounded buffers, hop cap, heartbeat pass-through, and audit logs on both nodes |
 
 They are the same permission-checked operations as the `fs.*` tools (`fs.read` for `manifest`,
 `stat`, `get` and `pack`; `fs.write` for `put` and `unpack`; `fs.remove` for `delete`), audited
-with door `stream`. Hashes are BLAKE3, written `blake3:<hex>`.
+with door `stream`. Using a distinct `relay` operation ensures older nodes that do not advertise
+`stream.relay` reject it with `unsupported` rather than misreading a relayed header as local.
+Hashes are BLAKE3, written `blake3:<hex>`.
 
 The remote command line is therefore always one of two fixed strings, `legion rpc` or
 `legion stream`, with every path and value inside JSON. Nothing a caller supplies is ever quoted

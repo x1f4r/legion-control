@@ -334,15 +334,17 @@ and loopback `sshd` (`127.0.0.1` on an ephemeral high port):
 ```
 
 The script builds a release `legion` binary from `--node-ref` (default `HEAD`) in a
-cache checkout under `${XDG_CACHE_HOME:-$HOME/.cache}/legion-app/`, creates a throwaway
-`LEGION_HOME` node named `tower` with principal `phone` in role `operator`, starts a loopback
-`sshd` using a throwaway host key and `authorized_keys` file, builds a WebView-debuggable `x86_64`
-debug APK (used only by this test), installs it on `legion-test`, and drives the real UI over
-`adb forward` + Chrome DevTools Protocol (`playwright-core` from `apps/ui/test`). It verifies
-first-start pairing, live machine metrics, streamed command execution, file listing, `meta.whoami`,
-power confirmation with dry run only, force-stop/relaunch persistence, transparent reconnect after
-killing the node-side session, revocation recovery and re-pairing, plus a wide paired screenshot on
-`legion-tablet`. It never touches `~/.ssh`, the system `sshd`, `~/.config/legion`, or `/tmp`.
+cache checkout under `${XDG_CACHE_HOME:-$HOME/.cache}/legion-app/`, creates two throwaway
+`LEGION_HOME` nodes (`tower` and `pi`) connected in a mutual loopback SSH fleet, builds a
+WebView-debuggable `x86_64` debug APK (with `test-upload-paths`, used only by this test), installs
+it on `legion-test`, and drives the real UI over `adb forward` + Chrome DevTools Protocol
+(`playwright-core` from `apps/ui/test`). It verifies first-start pairing, a second machine (`pi`)
+reached only through the fleet relay (opening a picture, ranged media read, download, and upload
+through `tower`, plus plain `"Through tower"` vs Technical details rejection display), learning a
+direct route to `pi` and switching streams and commands to direct, independent failover when either
+node stops, inviting a second device with a chosen role, force-stop/relaunch persistence, and
+revocation recovery, plus a wide paired screenshot on `legion-tablet`. It never touches `~/.ssh`,
+the system `sshd`, `~/.config/legion`, or `/tmp`.
 
 ## End-to-end Android self-update test (`e2e-android-updates.sh`)
 
