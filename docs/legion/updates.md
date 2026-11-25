@@ -260,3 +260,117 @@ The Android `versionCode` (derived from the UTC `YYYYMMDDHHMM` sequence as Unix 
 positive test sequences `1..=20_000_000`) and the desktop bundle versions (`<version>+seq<sequence>`
 on Linux and Windows, `CFBundleVersion=<sequence>` on macOS) are derived from the sequence, so each
 platform's own downgrade protection agrees with Legion's.
+
+## Preview builds for desktops
+
+Ordinary pushes, pull requests, and `.github/workflows/legion-release.yml` always compile without a
+preview key (`LEGION_UPDATE_PREVIEW_KEY=none`) and enforce `--forbid-preview-key`. To get desktop
+bundles and matching platform `legion` binaries that trust a preview key without installing build
+tools on every machine, use the manual `workflow_dispatch` preview path in
+`.github/workflows/legion-app.yml`.
+
+### Starting a preview run
+
+1. **One-time setup:** generate a preview Ed25519 keypair outside the repository on your signing
+   machine (`node scripts/make-update-set.mjs keygen`). Keep the private key
+   (`/home/me/.legion-control/preview-update.key`, mode `0600`) offline and copy the **public** key
+   PEM (`/home/me/.legion-control/preview-update.pub.pem`, starting with
+   `-----BEGIN PUBLIC KEY-----`) into the GitHub repository variable
+   `LEGION_PREVIEW_UPDATE_PUBKEY` (Settings > Secrets and variables > Actions > Variables; public by
+   nature, never a secret).
+2. **Choose a 12-digit UTC sequence:** run `node scripts/make-update-set.mjs sequence` (for example
+   `202611251200`). Use the same value if you also run `apps/legion-app/build-android.sh --sequence`.
+3. **Run the workflow:** in Actions > **Legion App** > **Run workflow** (or with `gh`), set
+   `preview=true`, pass the 12-digit `sequence`, and pick `job=all` or one desktop job
+   (`macos-desktop`, `windows-desktop`, or `linux-desktop`):
+
+```bash
+gh workflow run legion-app.yml \
+  -f job=all \
+  -f preview=true \
+  -f sequence=202611251200
+```
+
+If `LEGION_PREVIEW_UPDATE_PUBKEY` is missing or invalid, or `sequence` is not a valid 12-digit UTC
+`YYYYMMDDHHMM` timestamp, the desktop jobs fail right after checkout with an error naming the
+variable or field to fix.
+
+### Artifacts produced
+
+Each desktop job runs `scripts/build-desktop-preview.mjs` and uploads a separate preview artifact
+alongside the normal release-keyed CI bundles:
+
+- `legion-macos-preview`: `Legion-macos-aarch64.app.tar.gz` (ad-hoc signed Apple Silicon `.app`
+  tarball for self-updates), `Legion_<ver>_aarch64.dmg` (for manual first install),
+  `legion-macos-aarch64` (macOS arm64 node binary), and `PREVIEW-INFO.txt`.
+- `legion-windows-preview`: `Legion_<ver>+seq<seq>_x64-setup.exe` (per-user NSIS installer),
+  `legion-windows-x86_64.exe` (Windows x64 node binary), and `PREVIEW-INFO.txt`.
+- `legion-linux-preview`: `legion-app_<ver>+<seq>_amd64.AppImage`,
+  `legion-app_<ver>+<seq>_amd64.deb`, `legion-linux-x86_64` (Linux x64 node binary), and
+  `PREVIEW-INFO.txt`.
+
+Every `PREVIEW-INFO.txt` records the commit SHA, 12-digit sequence, compiled preview key fingerprint
+(`SHA256:...`), file SHA-256 digests, and (for macOS) verified `arm64` architecture status.
+
+### Building an update set from the artifacts
+
+The desktop updaters and `scripts/make-update-set.mjs create` accept these exact `program`, `os`,
+`arch`, and `kind` values:
+
+| Artifact file | `program` | `os` | `arch` | `kind` | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `Legion-macos-aarch64.app.tar.gz` | `app` | `macos` | `aarch64` | `app-tar` | Required for macOS self-updates. `.dmg` is **not** accepted in update sets; use `.dmg` only for manual first install. |
+| `Legion_<ver>+seq<seq>_x64-setup.exe` | `app` | `windows` | `x86_64` | `nsis` | Silent per-user NSIS upgrade. |
+| `legion-app_<ver>+<seq>_amd64.AppImage` | `app` | `linux` | `x86_64` | `appimage` | Atomic self-replacing AppImage. |
+| `legion-app_<ver>+<seq>_amd64.deb` | `app` | `linux` | `x86_64` | `deb` | Verified download; Legion shows the `sudo apt-get install` command. |
+| `legion-macos-aarch64` | `node` | `macos` | `aarch64` | `binary` | macOS arm64 node binary. |
+| `legion-windows-x86_64.exe` | `node` | `windows` | `x86_64` | `binary` | Windows x64 node binary. |
+| `legion-linux-x86_64` | `node` | `linux` | `x86_64` | `binary` | Linux x64 node binary (`kind=deb` is also accepted for `program=node, os=linux`). |
+
+After downloading the preview artifacts into `/home/me/preview-artifacts`, assemble and sign the set
+on the machine holding the preview private key, then publish it to any preview-enabled node:
+
+```bash
+node scripts/make-update-set.mjs create \
+  --out /home/me/preview-set-202611251200 \
+  --channel preview \
+  --version 0.1.0 \
+  --build abc123def456 \
+  --sequence 202611251200 \
+  --notes "Desktop and node preview build." \
+  --key /home/me/.legion-control/preview-update.key \
+  --public-key /home/me/.legion-control/preview-update.pub.pem \
+  --artifact /home/me/preview-artifacts/Legion-macos-aarch64.app.tar.gz:program=app,os=macos,arch=aarch64,kind=app-tar \
+  --artifact /home/me/preview-artifacts/Legion_0.1.0+seq202611251200_x64-setup.exe:program=app,os=windows,arch=x86_64,kind=nsis \
+  --artifact /home/me/preview-artifacts/legion-app_0.1.0+202611251200_amd64.AppImage:program=app,os=linux,arch=x86_64,kind=appimage \
+  --artifact /home/me/preview-artifacts/legion-app_0.1.0+202611251200_amd64.deb:program=app,os=linux,arch=x86_64,kind=deb \
+  --artifact /home/me/preview-artifacts/legion-macos-aarch64:program=node,os=macos,arch=aarch64,kind=binary \
+  --artifact /home/me/preview-artifacts/legion-windows-x86_64.exe:program=node,os=windows,arch=x86_64,kind=binary \
+  --artifact /home/me/preview-artifacts/legion-linux-x86_64:program=node,os=linux,arch=x86_64,kind=binary
+
+legion update.publish from=/home/me/preview-set-202611251200
+```
+
+### First manual install on each desktop
+
+A desktop must install one preview-keyed copy by hand before it can verify and apply future preview
+sets automatically; installing the preview `legion` binary on each machine also lets that machine's
+node accept and serve preview sets:
+
+- **macOS (Apple Silicon):** open `Legion_<ver>_aarch64.dmg` from `legion-macos-preview` and drag
+  `Legion.app` to `/Applications`. Because CI bundles are ad-hoc signed rather than notarized, clear
+  quarantine once if macOS blocks the first launch:
+  `xattr -dr com.apple.quarantine /Applications/Legion.app`. Install the node binary with
+  `install -m 755 legion-macos-aarch64 /Users/me/.local/bin/legion` and restart the `legion`
+  launchd service if running.
+- **Windows (x64):** run `Legion_<ver>+seq<seq>_x64-setup.exe` from `legion-windows-preview` to
+  install per-user into `%LOCALAPPDATA%\Legion`. Replace the node binary with
+  `legion-windows-x86_64.exe` (for example at `C:\Users\me\.local\bin\legion.exe`) and restart the
+  node task or service if running.
+- **Linux (x64):** for automatic self-updates, place `legion-app_<ver>+<seq>_amd64.AppImage` at a
+  user-writable path (for example `/home/me/.local/bin/Legion.AppImage`) and mark it executable
+  (`chmod +x`). For a Debian/Ubuntu package install instead, run
+  `sudo apt-get install ./legion-app_<ver>+<seq>_amd64.deb` (later updates download and verify the
+  new `.deb` and show the install command). Install the node binary with
+  `install -m 755 legion-linux-x86_64 /home/me/.local/bin/legion` and restart the `legion` user
+  service if running.
