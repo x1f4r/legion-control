@@ -36,6 +36,7 @@ import {
 } from '../lib/files-store.js';
 import { plainErrorMessage } from '../lib/errors.js';
 import { formatBytes, formatElapsed, formatRelativeTime, primaryDisk } from '../lib/format.js';
+import { extractThumbMap } from '../lib/player.js';
 import { routeHref } from '../lib/route.js';
 import { thumbCacheKey } from '../lib/thumb-cache.js';
 import { Notice, OlderMachineNote, ProgressBar, SwipeRow } from './common.js';
@@ -201,7 +202,7 @@ function joinMemberNames(members) {
 const THUMB_MAX_RETRIES = 3;
 const THUMB_RETRY_BASE_MS = 350;
 
-function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, thumbCache }) {
+function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, includeAudio = false, thumbCache }) {
   const [, setTick] = useState(0);
   const queueRef = useRef(new Set());
   const inFlightRef = useRef(new Set());
@@ -266,7 +267,7 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, t
       : link.call('fs.thumb', { paths: batch, size: 128, fit: 'cover' }, { on: machine });
     thumbPromise
       .then((res) => {
-        const map = res?.thumbnails || {};
+        const map = extractThumbMap(res);
         for (const p of batch) {
           inFlightRef.current.delete(p);
           const entry = entryMapRef.current.get(p);
@@ -303,7 +304,7 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, t
 
   const requestPath = useCallback(
     (entry) => {
-      if (!enabled || !machine || !entry || !isThumbEligible(entry)) return;
+      if (!enabled || !machine || !entry || !isThumbEligible(entry, { includeAudio })) return;
       const key = thumbCacheKey(machine, entry.path, entry.mtime || '', 128);
       if (thumbCache.get(key) || inFlightRef.current.has(entry.path)) return;
       queueRef.current.add(entry.path);
@@ -311,7 +312,7 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, t
         timerRef.current = window.setTimeout(flush, 24);
       }
     },
-    [enabled, machine, thumbCache, flush],
+    [enabled, includeAudio, machine, thumbCache, flush],
   );
 
   // Immediately enqueue the first visible batch so initial paint fills thumbnails promptly.
@@ -320,7 +321,7 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, t
     let count = 0;
     for (const e of entries) {
       if (count >= 24) break;
-      if (isThumbEligible(e)) {
+      if (isThumbEligible(e, { includeAudio })) {
         requestPath(e);
         count += 1;
       }
@@ -331,7 +332,7 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, t
         timerRef.current = null;
       }
     };
-  }, [enabled, machine, entries, requestPath]);
+  }, [enabled, includeAudio, machine, entries, requestPath]);
 
   useEffect(() => {
     if (!enabled || typeof IntersectionObserver === 'undefined') return undefined;
@@ -449,7 +450,7 @@ export function FilesHome({
       fetchThumbs()
         .then((res) => {
           if (!alive || !res) return;
-          const map = res?.thumbnails || {};
+          const map = extractThumbMap(res);
           const patch = {};
           for (const item of items) {
             const t = map[item.path];
@@ -978,6 +979,7 @@ export function FolderBrowser({
     link,
     capsStore,
     enabled: Boolean(caps?.known && caps?.hasThumb && reachable),
+    includeAudio: Boolean(caps?.hasAudioCovers),
     thumbCache,
   });
 
@@ -1463,8 +1465,11 @@ export function FilesSearchView({
     for (const [mName, items] of Object.entries(resultsByMachine)) {
       if (!Array.isArray(items) || items.length === 0) continue;
       if (capsStore && !capsStore.hasTool(mName, 'fs.thumb')) continue;
+      const includeAudio = capsStore
+        ? Boolean(capsStore.fileCapabilities(mName).hasAudioCovers)
+        : Boolean(caps?.hasAudioCovers);
       for (const entry of items) {
-        if (!isThumbEligible(entry)) continue;
+        if (!isThumbEligible(entry, { includeAudio })) continue;
         const key = thumbCacheKey(mName, entry.path, entry.mtime || '', 128);
         if (thumbCache.get(key)) continue;
         if (!byMachine.has(mName)) byMachine.set(mName, []);
@@ -1481,7 +1486,7 @@ export function FilesSearchView({
       req
         .then((res) => {
           if (!alive) return;
-          const map = res?.thumbnails || {};
+          const map = extractThumbMap(res);
           let didChange = false;
           for (const entry of batch) {
             const t = map[entry.path];
@@ -2788,6 +2793,7 @@ export function FilesView({
               link=${link}
               caps=${viewerCaps}
               capsStore=${capsStore}
+              thumbCache=${thumbCache}
               deviceNoun=${deviceNoun}
               technical=${technical}
               isStarred=${Boolean(viewerFav)}

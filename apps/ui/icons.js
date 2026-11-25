@@ -107,6 +107,40 @@ export function IconSprite() {
       <symbol id="i-play" viewBox="0 0 24 24">
         <path d="m8 5.5 11 6.5-11 6.5z" />
       </symbol>
+      <symbol id="i-prev" viewBox="0 0 24 24">
+        <path d="M6.5 6v12" />
+        <path d="m17.5 6.5-8 5.5 8 5.5z" />
+      </symbol>
+      <symbol id="i-next" viewBox="0 0 24 24">
+        <path d="M17.5 6v12" />
+        <path d="m6.5 6.5 8 5.5-8 5.5z" />
+      </symbol>
+      <symbol id="i-skip-back-10" viewBox="0 0 24 24">
+        <path d="M11.5 5.5a6.5 6.5 0 1 1-5.8 3.6" />
+        <path d="M8 5.5H4.5V9" />
+        <path d="M10.2 10.6v4.8" />
+        <rect x="12.6" y="10.6" width="3.2" height="4.8" rx="1.4" />
+      </symbol>
+      <symbol id="i-skip-fwd-10" viewBox="0 0 24 24">
+        <path d="M12.5 5.5a6.5 6.5 0 1 0 5.8 3.6" />
+        <path d="M16 5.5h3.5V9" />
+        <path d="M9.4 10.6v4.8" />
+        <rect x="11.8" y="10.6" width="3.2" height="4.8" rx="1.4" />
+      </symbol>
+      <symbol id="i-fullscreen" viewBox="0 0 24 24">
+        <path d="M4.5 9V5.5A1 1 0 0 1 5.5 4.5H9M15 4.5h3.5a1 1 0 0 1 1 1V9M19.5 15v3.5a1 1 0 0 1-1 1H15M9 19.5H5.5a1 1 0 0 1-1-1V15" />
+      </symbol>
+      <symbol id="i-exit-fullscreen" viewBox="0 0 24 24">
+        <path d="M9 4.5V8a1 1 0 0 1-1 1H4.5M19.5 9H16a1 1 0 0 1-1-1V4.5M15 19.5V16a1 1 0 0 1 1-1h3.5M4.5 15H8a1 1 0 0 1 1 1v3.5" />
+      </symbol>
+      <symbol id="i-volume" viewBox="0 0 24 24">
+        <path d="M4.5 9.5H8l4.5-3.8v12.6L8 14.5H4.5z" />
+        <path d="M15.8 9.2a4 4 0 0 1 0 5.6M18.3 6.8a7.4 7.4 0 0 1 0 10.4" />
+      </symbol>
+      <symbol id="i-volume-mute" viewBox="0 0 24 24">
+        <path d="M4.5 9.5H8l4.5-3.8v12.6L8 14.5H4.5z" />
+        <path d="m15.5 9.5 4.5 5M20 9.5l-4.5 5" />
+      </symbol>
     </svg>
   `;
 }

@@ -51,7 +51,9 @@
   --text-sub: 13px;
   --text-small: 12px;
   --safe-top: max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
+  --safe-right: max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px));
   --safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px));
+  --safe-left: max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px));
 }
 
 :root[data-accent="blue"] {
@@ -1788,7 +1790,7 @@ button.row:active {
 /* ── Sheet ──────────────────────────────────────────────────────────────────────────────────── */
 
 .scrim {
-  position: absolute;
+  position: fixed;
   inset: 0;
   z-index: 50;
   display: grid;
@@ -2175,7 +2177,7 @@ button.row:active {
 
 /* The viewer covers everything, on black, with its actions at the bottom. */
 .viewer {
-  position: absolute;
+  position: fixed;
   inset: 0;
   z-index: 40;
   display: grid;
@@ -2184,6 +2186,16 @@ button.row:active {
   overflow: hidden;
   background: #000;
   color: #fff;
+}
+
+.viewer.player-viewer {
+  display: block;
+}
+
+.viewer:fullscreen {
+  width: 100%;
+  height: 100%;
+  background: #000;
 }
 
 /* Keep dark-surface accent contrast inside the always-black viewer even when light theme is active. */
@@ -2277,8 +2289,593 @@ button.row:active {
 
 .viewer-video {
   width: 100%;
-  max-height: 100%;
-  background: #111;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  background: #000;
+}
+
+/* ── Video & Music Player ──────────────────────────────────────────────────────────────────── */
+
+.player-video-wrap {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.player-video-wrap.cursor-hidden,
+.player-video-wrap.cursor-hidden * {
+  cursor: none;
+}
+
+.player-stage-hit {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  touch-action: manipulation;
+}
+
+.player-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity 0.18s ease;
+}
+
+.player-overlay.hidden {
+  opacity: 0;
+}
+
+.player-top {
+  pointer-events: auto;
+  padding: calc(var(--safe-top) + 10px) calc(var(--safe-right) + 8px) 16px calc(var(--safe-left) + 8px);
+  background: linear-gradient(rgb(0 0 0 / 0.78), rgb(0 0 0 / 0.32) 65%, transparent);
+}
+
+.player-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+  pointer-events: none;
+}
+
+.player-center-btn {
+  pointer-events: auto;
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  background: rgb(0 0 0 / 0.52);
+  color: #fff;
+  border-color: rgb(255 255 255 / 0.14);
+}
+
+.player-center-btn svg {
+  width: 26px;
+  height: 26px;
+}
+
+.player-center-btn.main {
+  width: 66px;
+  height: 66px;
+  background: rgb(0 0 0 / 0.68);
+  border-color: rgb(255 255 255 / 0.22);
+}
+
+.player-center-btn.main svg {
+  width: 30px;
+  height: 30px;
+}
+
+.player-bottom {
+  pointer-events: auto;
+  display: grid;
+  gap: 2px;
+  padding: 20px calc(var(--safe-right) + 14px) calc(var(--safe-bottom) + 10px) calc(var(--safe-left) + 14px);
+  background: linear-gradient(transparent, rgb(0 0 0 / 0.45) 30%, rgb(0 0 0 / 0.84));
+}
+
+.player-times {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font: 500 var(--text-small) var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: rgb(255 255 255 / 0.82);
+  margin-top: -6px;
+}
+
+.player-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.player-controls-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.player-btn {
+  color: #fff;
+}
+
+.player-speed-wrap {
+  position: relative;
+}
+
+.player-speed-btn {
+  color: #fff;
+  border-color: rgb(255 255 255 / 0.22);
+  background: rgb(0 0 0 / 0.35);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  min-width: 52px;
+}
+
+.player-speed-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 6;
+  display: grid;
+  gap: 2px;
+  min-width: 84px;
+  padding: 6px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--line-strong);
+  background: #15171a;
+  box-shadow: 0 10px 28px rgb(0 0 0 / 0.6);
+}
+
+.player-speed-menu button {
+  min-height: 36px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #eceef0;
+  font: 500 var(--text-sub) var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  cursor: pointer;
+}
+
+.player-speed-menu button.active {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+}
+
+/* Position slider (accessible role="slider", 44px touch target, buffered bar, drag preview) */
+.player-scrub {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 44px;
+  padding: 16px 0;
+  cursor: pointer;
+  touch-action: none;
+  outline-offset: 2px;
+}
+
+.player-scrub-track {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.24);
+  overflow: visible;
+}
+
+.player-scrub.dragging .player-scrub-track {
+  height: 6px;
+}
+
+.player-scrub-buf {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.42);
+}
+
+.player-scrub-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.player-scrub-thumb {
+  position: absolute;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  transform: translate(-50%, -50%);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.55);
+}
+
+.player-scrub.dragging .player-scrub-thumb {
+  width: 18px;
+  height: 18px;
+}
+
+.player-scrub-tip {
+  position: absolute;
+  bottom: calc(100% - 4px);
+  transform: translateX(-50%);
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: #15171a;
+  border: 1px solid var(--line-strong);
+  color: #fff;
+  font: 600 var(--text-small) var(--mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* Desktop/browser volume slider */
+.player-vol {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.player-vol-slider {
+  display: flex;
+  align-items: center;
+  width: 84px;
+  min-height: 44px;
+  padding: 16px 6px;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.player-vol-track {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.25);
+}
+
+.player-vol-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 999px;
+  background: #fff;
+}
+
+.player-vol-thumb {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  transform: translate(-50%, -50%);
+}
+
+/* Stall spinner (> 400 ms) */
+.player-spinner {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 4;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.player-spinner span,
+.music-spinner {
+  display: block;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 3px solid rgb(255 255 255 / 0.24);
+  border-top-color: var(--accent);
+  animation: legion-spin 0.8s linear infinite;
+}
+
+.music-spinner {
+  width: 24px;
+  height: 24px;
+  border-color: color-mix(in srgb, var(--accent-ink) 28%, transparent);
+  border-top-color: var(--accent-ink);
+}
+
+@keyframes legion-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Double-tap +/-10s feedback */
+.player-seek-flash {
+  position: absolute;
+  top: 50%;
+  z-index: 4;
+  transform: translateY(-50%);
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: rgb(0 0 0 / 0.68);
+  color: #fff;
+  font: 600 var(--text-sub) var(--mono);
+  pointer-events: none;
+}
+
+.player-seek-flash.left {
+  left: 14%;
+}
+
+.player-seek-flash.right {
+  right: 14%;
+}
+
+/* Resume chip ("Resumed at 12:40 · Start over") */
+.player-resume-chip {
+  position: absolute;
+  left: 50%;
+  top: calc(var(--safe-top) + 64px);
+  z-index: 5;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 32px);
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid rgb(255 255 255 / 0.18);
+  background: rgb(21 23 26 / 0.9);
+  color: #eceef0;
+  font-size: var(--text-sub);
+  white-space: nowrap;
+}
+
+.player-resume-chip.inline {
+  position: static;
+  transform: none;
+  justify-self: center;
+}
+
+.player-resume-btn {
+  border: 0;
+  padding: 4px 2px;
+  background: none;
+  color: var(--accent);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* ── Music Listening Screen ────────────────────────────────────────────────────────────────── */
+
+.music-screen {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  background: #0d0e10;
+  color: #eceef0;
+}
+
+.music-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.music-backdrop img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  filter: blur(44px) brightness(0.36) saturate(1.1);
+  transform: scale(1.18);
+}
+
+.music-backdrop::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(rgb(13 14 16 / 0.35), rgb(13 14 16 / 0.75));
+}
+
+.music-top {
+  position: relative;
+  z-index: 2;
+  background: none;
+  padding: calc(var(--safe-top) + 10px) calc(var(--safe-right) + 8px) 6px calc(var(--safe-left) + 8px);
+}
+
+.music-top .name {
+  text-align: center;
+  font-weight: 500;
+  font-size: var(--text-sub);
+  color: rgb(255 255 255 / 0.72);
+}
+
+.music-body {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: center;
+  justify-items: center;
+  gap: 24px;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px calc(var(--safe-right) + 24px) calc(var(--safe-bottom) + 24px) calc(var(--safe-left) + 24px);
+}
+
+.music-cover-wrap {
+  width: min(320px, 76vw, 42dvh);
+}
+
+.music-cover-box {
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: #1a1c20;
+  box-shadow: 0 18px 48px rgb(0 0 0 / 0.48);
+}
+
+.music-cover {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.music-cover-tile {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  color: var(--accent);
+}
+
+.music-cover-tile svg {
+  width: 34%;
+  height: 34%;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.music-meta-panel {
+  width: min(440px, 100%);
+  display: grid;
+  gap: 14px;
+}
+
+.music-headings {
+  text-align: center;
+  min-width: 0;
+}
+
+.music-title {
+  margin: 0;
+  font: 650 22px/1.2 var(--sans);
+  letter-spacing: -0.015em;
+  color: #fff;
+  overflow-wrap: anywhere;
+}
+
+.music-subtitle {
+  margin: 6px 0 0;
+  font-size: var(--text-base);
+  color: rgb(255 255 255 / 0.72);
+  overflow-wrap: anywhere;
+}
+
+.music-scrub-block {
+  display: grid;
+  gap: 2px;
+}
+
+.music-transport {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  margin-top: 2px;
+}
+
+.music-ctl-btn {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  color: #fff;
+}
+
+.music-ctl-btn svg {
+  width: 26px;
+  height: 26px;
+}
+
+.music-play-btn {
+  width: 68px;
+  height: 68px;
+  border-radius: 50%;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.music-play-btn svg {
+  width: 28px;
+  height: 28px;
+}
+
+.music-vol-row {
+  display: flex;
+  justify-content: center;
+}
+
+.music-speed-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 12px;
+}
+
+@media (min-width: 720px), (orientation: landscape) and (min-width: 540px) {
+  .music-body {
+    grid-template-columns: minmax(180px, 320px) minmax(260px, 440px);
+    align-items: center;
+    justify-content: center;
+    gap: 36px;
+  }
+
+  .music-cover-wrap {
+    width: min(320px, 38vw, 66dvh);
+  }
+
+  .music-headings {
+    text-align: left;
+  }
+
+  .music-resume-inline,
+  .player-resume-chip.inline {
+    justify-self: start;
+  }
+
+  .music-transport {
+    justify-content: flex-start;
+  }
+
+  .music-vol-row {
+    justify-content: flex-start;
+  }
 }
 
 .viewer-audio {

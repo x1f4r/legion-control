@@ -13,7 +13,9 @@ import {
 } from '../lib/files.js';
 import { readTextWrapPreference, writeTextWrapPreference } from '../lib/files-store.js';
 import { formatBytes, formatRelativeTime } from '../lib/format.js';
+import { extractThumbMap, formatSpeed, PLAYBACK_SPEEDS } from '../lib/player.js';
 import { CopyButton, Notice, Sheet } from './common.js';
+import { MusicPlayer, VideoPlayer } from './player.js';
 
 const TEXT_CHUNK_BYTES = 131072; // 128 KiB
 
@@ -43,6 +45,7 @@ export function FilesViewer({
   link,
   capsStore = null,
   caps,
+  thumbCache = null,
   deviceNoun = 'phone',
   technical = false,
   isStarred = false,
@@ -65,6 +68,8 @@ export function FilesViewer({
 
   const [chromeHidden, setChromeHidden] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [musicPlaybackRate, setMusicPlaybackRate] = useState(1);
+  const [videoFullscreen, setVideoFullscreen] = useState(false);
   const [wrapLines, setWrapLines] = useState(() => readTextWrapPreference(safeStorage()));
   const [mediaUrl, setMediaUrl] = useState(null);
   const [mediaLoading, setMediaLoading] = useState(false);
@@ -72,6 +77,8 @@ export function FilesViewer({
   const [textState, setTextState] = useState({ content: '', size: 0, loaded: 0, eof: true, binary: false, loading: false, error: null });
   const [hashInfo, setHashInfo] = useState(null);
 
+  const viewerRef = useRef(null);
+  const pictureImmersiveRef = useRef(false);
   const imgRef = useRef(null);
   const videoRef = useRef(null);
   const audioRef = useRef(null);
@@ -138,8 +145,44 @@ export function FilesViewer({
       abortRef.current = null;
     }
     stopMediaElements();
+    if (pictureImmersiveRef.current) {
+      pictureImmersiveRef.current = false;
+      link?.immersive?.(false, { element: viewerRef.current });
+    }
+    link?.keepScreenOn?.(false);
     if (onClose) onClose();
   }
+
+  // Picture viewer: hidden viewer bars and hidden system bars are one state.
+  useEffect(() => {
+    if (category === 'image' && chromeHidden) {
+      pictureImmersiveRef.current = true;
+      link?.immersive?.(true, { orientation: 'none', element: viewerRef.current });
+    } else if (pictureImmersiveRef.current) {
+      pictureImmersiveRef.current = false;
+      link?.immersive?.(false, { element: viewerRef.current });
+    }
+  }, [category, chromeHidden, link]);
+
+  useEffect(() => {
+    if (category !== 'image' || typeof link?.onImmersiveChange !== 'function') return undefined;
+    return link.onImmersiveChange((active) => {
+      if (!active && pictureImmersiveRef.current) {
+        pictureImmersiveRef.current = false;
+        setChromeHidden(false);
+      }
+    });
+  }, [category, link]);
+
+  useEffect(() => {
+    return () => {
+      if (pictureImmersiveRef.current) {
+        pictureImmersiveRef.current = false;
+        link?.immersive?.(false, { element: viewerRef.current });
+      }
+      link?.keepScreenOn?.(false);
+    };
+  }, [link]);
 
   // Load media URL or text content whenever machine/path changes; abort immediately on close/switch.
   useEffect(() => {
@@ -216,7 +259,7 @@ export function FilesViewer({
         runCall('fs.thumb', { paths: [path], size: 512, fit: 'contain' }, { signal: ctrl.signal })
           .then((res) => {
             if (ctrl.signal.aborted) return;
-            const t = res?.thumbnails?.[path];
+            const t = extractThumbMap(res)[path];
             if (t?.content && t?.mime) {
               setMediaUrl(`data:${t.mime};base64,${t.content}`);
             } else {
@@ -264,8 +307,13 @@ export function FilesViewer({
     };
   }, [machine, path, category, caps?.known, caps?.hasContentUrl, caps?.hasThumb, caps?.hasRead]);
 
+  const useVideoPlayer = category === 'video' && !mediaError && Boolean(mediaUrl);
+  const useMusicPlayer = category === 'audio' && !mediaError && Boolean(mediaUrl);
+  const usingCustomPlayer = useVideoPlayer || useMusicPlayer;
+
   // Keyboard navigation inside viewer: Escape closes, Left/Right steps through pictures.
   useEffect(() => {
+    if (usingCustomPlayer) return undefined;
     function onKeyDown(e) {
       if (moreOpen || document.querySelector('.scrim')) return;
       if (e.key === 'Escape') {
@@ -281,7 +329,7 @@ export function FilesViewer({
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [moreOpen, category, siblingIndex, pictureSiblings.length]);
+  }, [usingCustomPlayer, moreOpen, category, siblingIndex, pictureSiblings.length]);
 
   // Load BLAKE3 hash when details sheet opens in technical mode.
   useEffect(() => {
@@ -549,19 +597,7 @@ export function FilesViewer({
       if (!mediaUrl) {
         return html`<div class="said"><span>${mediaLoading ? 'Starting video…' : 'Preparing video…'}</span></div>`;
       }
-      return html`
-        <video
-          ref=${videoRef}
-          class="viewer-video"
-          src=${mediaUrl}
-          controls
-          playsinline
-          preload="metadata"
-          aria-label=${name}
-          onError=${() =>
-            setMediaError({ code: 'decode', message: `This ${deviceNoun} can't play this kind of video.` })}
-        />
-      `;
+      return null;
     }
 
     if (category === 'audio') {
@@ -579,23 +615,7 @@ export function FilesViewer({
       if (!mediaUrl) {
         return html`<div class="said"><span>${mediaLoading ? 'Starting audio…' : 'Preparing audio…'}</span></div>`;
       }
-      return html`
-        <div class="viewer-audio">
-          <div class="viewer-audio-art" aria-hidden="true">
-            <${Icon} name="music" />
-          </div>
-          <strong>${name}</strong>
-          <audio
-            ref=${audioRef}
-            src=${mediaUrl}
-            controls
-            preload="metadata"
-            aria-label=${name}
-            onError=${() =>
-              setMediaError({ code: 'decode', message: `This ${deviceNoun} can't play this audio file.` })}
-          />
-        </div>
-      `;
+      return null;
     }
 
     if (category === 'text') {
@@ -670,80 +690,158 @@ export function FilesViewer({
     return renderFallbackCard(name, otherMeta || `File on ${machine}`);
   }
 
-  const viewerCls = ['viewer', chromeHidden ? 'chrome-hidden' : ''].filter(Boolean).join(' ');
+  const viewerCls = [
+    'viewer',
+    usingCustomPlayer ? 'player-viewer' : '',
+    chromeHidden && !usingCustomPlayer ? 'chrome-hidden' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
   const stageCls = category === 'text' ? 'viewer-stage scrollable' : 'viewer-stage';
 
+  function runOutsideFullscreen(fn) {
+    setMoreOpen(false);
+    if (videoFullscreen) {
+      link?.immersive?.(false, { element: viewerRef.current });
+    }
+    if (fn) fn();
+  }
+
   return html`
-    <div class=${viewerCls} role="dialog" aria-modal="true" aria-label=${name}>
-      <div class="viewer-top">
-        <button type="button" class="btn icon" aria-label="Close" onClick=${handleClose}>
-          <${Icon} name="down" />
-        </button>
-        <span class="name">
-          ${name}
-          ${topSub ? html`<small>${topSub}</small>` : null}
-        </span>
-        <button
-          type="button"
-          class="btn icon"
-          aria-label="More options"
-          onClick=${() => setMoreOpen(true)}
-        >
-          <${Icon} name="more" />
-        </button>
-      </div>
-
-      <div
-        class=${stageCls}
-        onPointerDown=${onStagePointerDown}
-        onPointerMove=${onStagePointerMove}
-        onPointerUp=${onStagePointerUp}
-        onPointerCancel=${onStagePointerCancel}
-      >
-        ${renderStage()}
-      </div>
-
-      <div class="viewer-bar">
-        <div class="bar4">
-          ${caps?.hasDownload
-            ? html`
-                <button type="button" onClick=${() => onDownload && onDownload(effectiveEntry)}>
-                  <${Icon} name="download" />Download
+    <div ref=${viewerRef} class=${viewerCls} role="dialog" aria-modal="true" aria-label=${name}>
+      ${useVideoPlayer
+        ? html`
+            <${VideoPlayer}
+              machine=${machine}
+              path=${path}
+              entry=${effectiveEntry}
+              name=${name}
+              mediaUrl=${mediaUrl}
+              siblings=${siblings}
+              link=${link}
+              viewerRef=${viewerRef}
+              moreOpen=${moreOpen}
+              onOpenMore=${() => setMoreOpen(true)}
+              onClose=${handleClose}
+              onNavigateSibling=${onNavigateSibling}
+              onMediaError=${() =>
+                setMediaError({ code: 'decode', message: `This ${deviceNoun} can't play this kind of video.` })}
+              onFullscreenStateChange=${(active) => setVideoFullscreen(Boolean(active))}
+            />
+          `
+        : useMusicPlayer
+          ? html`
+              <${MusicPlayer}
+                machine=${machine}
+                path=${path}
+                entry=${effectiveEntry}
+                name=${name}
+                mediaUrl=${mediaUrl}
+                siblings=${siblings}
+                link=${link}
+                capsStore=${capsStore}
+                caps=${caps}
+                thumbCache=${thumbCache}
+                moreOpen=${moreOpen}
+                playbackRate=${musicPlaybackRate}
+                onOpenMore=${() => setMoreOpen(true)}
+                onClose=${handleClose}
+                onNavigateSibling=${onNavigateSibling}
+                onMediaError=${() =>
+                  setMediaError({ code: 'decode', message: `This ${deviceNoun} can't play this audio file.` })}
+              />
+            `
+          : html`
+              <div class="viewer-top">
+                <button type="button" class="btn icon" aria-label="Close" onClick=${handleClose}>
+                  <${Icon} name="down" />
                 </button>
-              `
-            : null}
-          ${caps?.hasTransfer || caps?.hasDownload
-            ? html`
-                <button type="button" onClick=${() => onSendTo && onSendTo([effectiveEntry])}>
-                  <${Icon} name="send" />Send to
-                </button>
-              `
-            : null}
-          ${caps?.hasFavWrite
-            ? html`
+                <span class="name">
+                  ${name}
+                  ${topSub ? html`<small>${topSub}</small>` : null}
+                </span>
                 <button
                   type="button"
-                  class=${isStarred ? 'active' : ''}
-                  aria-pressed=${isStarred ? 'true' : 'false'}
-                  onClick=${() => onToggleStar && onToggleStar(effectiveEntry)}
+                  class="btn icon"
+                  aria-label="More options"
+                  onClick=${() => setMoreOpen(true)}
                 >
-                  <${Icon} name="star" />${isStarred ? 'Starred' : 'Star'}
+                  <${Icon} name="more" />
                 </button>
-              `
-            : null}
-          ${caps?.hasOpenExternally
-            ? html`
-                <button type="button" onClick=${() => onOpenExternally && onOpenExternally(effectiveEntry)}>
-                  <${Icon} name="more" />Open in…
-                </button>
-              `
-            : null}
-        </div>
-      </div>
+              </div>
+
+              <div
+                class=${stageCls}
+                onPointerDown=${onStagePointerDown}
+                onPointerMove=${onStagePointerMove}
+                onPointerUp=${onStagePointerUp}
+                onPointerCancel=${onStagePointerCancel}
+              >
+                ${renderStage()}
+              </div>
+
+              <div class="viewer-bar">
+                <div class="bar4">
+                  ${caps?.hasDownload
+                    ? html`
+                        <button type="button" onClick=${() => onDownload && onDownload(effectiveEntry)}>
+                          <${Icon} name="download" />Download
+                        </button>
+                      `
+                    : null}
+                  ${caps?.hasTransfer || caps?.hasDownload
+                    ? html`
+                        <button type="button" onClick=${() => onSendTo && onSendTo([effectiveEntry])}>
+                          <${Icon} name="send" />Send to
+                        </button>
+                      `
+                    : null}
+                  ${caps?.hasFavWrite
+                    ? html`
+                        <button
+                          type="button"
+                          class=${isStarred ? 'active' : ''}
+                          aria-pressed=${isStarred ? 'true' : 'false'}
+                          onClick=${() => onToggleStar && onToggleStar(effectiveEntry)}
+                        >
+                          <${Icon} name="star" />${isStarred ? 'Starred' : 'Star'}
+                        </button>
+                      `
+                    : null}
+                  ${caps?.hasOpenExternally
+                    ? html`
+                        <button type="button" onClick=${() => onOpenExternally && onOpenExternally(effectiveEntry)}>
+                          <${Icon} name="more" />Open in…
+                        </button>
+                      `
+                    : null}
+                </div>
+              </div>
+            `}
 
       ${moreOpen
         ? html`
             <${Sheet} title=${name} onClose=${() => setMoreOpen(false)}>
+              ${useMusicPlayer
+                ? html`
+                    <p class="label">Playback speed</p>
+                    <div class="music-speed-chips" role="group" aria-label="Playback speed">
+                      ${PLAYBACK_SPEEDS.map(
+                        (rate) => html`
+                          <button
+                            key=${rate}
+                            type="button"
+                            class="chip-btn"
+                            aria-pressed=${rate === musicPlaybackRate ? 'true' : 'false'}
+                            onClick=${() => setMusicPlaybackRate(rate)}
+                          >
+                            ${formatSpeed(rate)}
+                          </button>
+                        `,
+                      )}
+                    </div>
+                  `
+                : null}
               <div class="list">
                 <dl class=${technical ? 'kv' : 'kv plain'}>
                   <dt>${technical ? 'category' : 'Kind'}</dt>
@@ -782,6 +880,59 @@ export function FilesViewer({
               </div>
 
               <div class="list spaced">
+                ${usingCustomPlayer && caps?.hasDownload
+                  ? html`
+                      <button
+                        type="button"
+                        class="row"
+                        onClick=${() => {
+                          setMoreOpen(false);
+                          if (onDownload) onDownload(effectiveEntry);
+                        }}
+                      >
+                        <span class="body"><span class="title">Download to this ${deviceNoun}</span></span>
+                      </button>
+                    `
+                  : null}
+                ${usingCustomPlayer && (caps?.hasTransfer || caps?.hasDownload)
+                  ? html`
+                      <button
+                        type="button"
+                        class="row"
+                        onClick=${() => runOutsideFullscreen(() => onSendTo && onSendTo([effectiveEntry]))}
+                      >
+                        <span class="body"><span class="title">Send to</span></span>
+                      </button>
+                    `
+                  : null}
+                ${usingCustomPlayer && caps?.hasFavWrite
+                  ? html`
+                      <button
+                        type="button"
+                        class="row"
+                        onClick=${() => {
+                          setMoreOpen(false);
+                          if (onToggleStar) onToggleStar(effectiveEntry);
+                        }}
+                      >
+                        <span class="body"><span class="title">${isStarred ? 'Remove from Favourites' : 'Star'}</span></span>
+                      </button>
+                    `
+                  : null}
+                ${usingCustomPlayer && caps?.hasOpenExternally
+                  ? html`
+                      <button
+                        type="button"
+                        class="row"
+                        onClick=${() => {
+                          setMoreOpen(false);
+                          if (onOpenExternally) onOpenExternally(effectiveEntry);
+                        }}
+                      >
+                        <span class="body"><span class="title">Open in another app</span></span>
+                      </button>
+                    `
+                  : null}
                 ${caps?.hasFavWrite
                   ? html`
                       <button
@@ -806,10 +957,7 @@ export function FilesViewer({
                       <button
                         type="button"
                         class="row"
-                        onClick=${() => {
-                          setMoreOpen(false);
-                          onRename(effectiveEntry);
-                        }}
+                        onClick=${() => runOutsideFullscreen(() => onRename(effectiveEntry))}
                       >
                         <span class="body"><span class="title">Rename</span></span>
                       </button>
@@ -827,10 +975,7 @@ export function FilesViewer({
                       <button
                         type="button"
                         class="row"
-                        onClick=${() => {
-                          setMoreOpen(false);
-                          onDelete([effectiveEntry]);
-                        }}
+                        onClick=${() => runOutsideFullscreen(() => onDelete([effectiveEntry]))}
                       >
                         <span class="body">
                           <span class="title err">Delete</span>

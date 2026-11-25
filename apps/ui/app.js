@@ -104,6 +104,8 @@ const PASSIVE_REFRESH_TOOLS = new Set([
   'fs.stat',
   'fs.read',
   'fs.search',
+  'fs.tags',
+  'fs.thumb',
   'fav.list',
   'sync.list',
 ]);
