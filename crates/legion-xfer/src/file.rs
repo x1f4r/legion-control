@@ -1169,25 +1169,44 @@ fn read_partial_meta(meta_path: &Path) -> Option<PartialMeta> {
     Some(PartialMeta { size, hash })
 }
 
+#[cfg(windows)]
+fn is_windows_transient_unlink_race(err: &io::Error) -> bool {
+    // On Windows NTFS, opening or creating a lock file while another thread or process has just
+    // called `DeleteFile` (`STATUS_DELETE_PENDING`) or briefly holds a handle fails transiently
+    // with `ERROR_ACCESS_DENIED` (5) or `ERROR_SHARING_VIOLATION` (32) until that handle closes.
+    matches!(err.raw_os_error(), Some(5 | 32))
+}
+
+#[cfg(not(windows))]
+fn is_windows_transient_unlink_race(_err: &io::Error) -> bool {
+    false
+}
+
 /// Non-blocking exclusive lock acquisition on a state-directory lock file.
 ///
 /// Retries cleanly if another process or opportunistic sweep unlinks the lock file between
-/// `create_new` and `symlink_metadata`/`open`, or if the locked file descriptor no longer matches
-/// the live directory entry. Returns `Ok(Some(file))` when acquired, `Ok(None)` when another live
-/// holder owns the lock (`WouldBlock`), or `Err` on unexpected I/O errors.
+/// `create_new` and `symlink_metadata`/`open` (including Windows `STATUS_DELETE_PENDING`), or if
+/// the locked file descriptor no longer matches the live directory entry. Returns `Ok(Some(file))`
+/// when acquired, `Ok(None)` when another live holder owns the lock (`WouldBlock`), or `Err` on
+/// unexpected I/O errors.
 pub fn try_lock_state_file(lock_path: &Path) -> Result<Option<File>> {
     if let Some(parent) = lock_path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent).map_err(|e| classify_io(parent, e))?;
     }
-    for _ in 0..LOCK_RETRY_LIMIT {
+    for attempt in 0..LOCK_RETRY_LIMIT {
+        let can_retry = attempt + 1 < LOCK_RETRY_LIMIT;
         let lock_file = match platform::create_new_private(lock_path) {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 let meta = match fs::symlink_metadata(lock_path) {
                     Ok(meta) => meta,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) if can_retry && is_windows_transient_unlink_race(&e) => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
                     Err(e) => return Err(classify_io(lock_path, e)),
                 };
                 if !meta.file_type().is_file() {
@@ -1196,8 +1215,16 @@ pub fn try_lock_state_file(lock_path: &Path) -> Result<Option<File>> {
                 match OpenOptions::new().write(true).open(lock_path) {
                     Ok(file) => file,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) if can_retry && is_windows_transient_unlink_race(&e) => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
                     Err(e) => return Err(classify_io(lock_path, e)),
                 }
+            }
+            Err(err) if can_retry && is_windows_transient_unlink_race(&err) => {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
             }
             Err(err) => return Err(classify_io(lock_path, err)),
         };
