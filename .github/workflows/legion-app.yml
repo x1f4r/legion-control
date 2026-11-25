@@ -253,7 +253,24 @@ jobs:
         working-directory: apps/legion-app
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
-        run: cargo tauri build --bundles deb,appimage
+        # The cached target directory can hold bundles from an earlier run under another name.
+        run: |
+          set -euo pipefail
+          rm -rf src-tauri/target/release/bundle
+          cargo tauri build --bundles deb,appimage
+      - name: Verify deb package metadata does not collide with node package
+        run: |
+          set -euo pipefail
+          DEB="$(find apps/legion-app/src-tauri/target/release/bundle/deb -maxdepth 1 -name '*.deb' | head -n 1)"
+          test -f "$DEB"
+          PKG="$(dpkg-deb -f "$DEB" Package)"
+          echo "Desktop app .deb package name: $PKG"
+          test "$PKG" = "legion-app"
+          ! dpkg-deb -f "$DEB" Description | grep -qx ' (none)'
+          UNPACKED="$RUNNER_TEMP/legion-app-deb"
+          rm -rf "$UNPACKED"
+          dpkg-deb -x "$DEB" "$UNPACKED"
+          grep -qx 'Name=Legion' "$UNPACKED/usr/share/applications/legion-app.desktop"
       - name: Launch Linux app under Xvfb and verify ready marker
         run: |
           set -euo pipefail
