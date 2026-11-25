@@ -1348,7 +1348,27 @@ requiring `effect:admin`, built on `config.list`, `config.read`, and `config.wri
   `direction=push` sends local entries to peers and imports **only tombstones** back (never live
   peer entries), whereas `direction=pull from=<peer>` imports live devices from that named peer
   without writing back. `meta.doctor` warns if any reachable peer has a different `devices.toml`.
-- **Machine-local (never synced)**: `node.toml` and `tokens.toml`.
+- **Machine-local (never synced as whole files)**: `node.toml` and `tokens.toml`. However,
+  `fleet.sync` probes every target machine before deciding any renames: if more than one fleet
+  entry reports the same `node_id`, none of them renames it and each reports `status: "ambiguous"`
+  with the other entry names and instructions to remove the out-of-date entry or delete `node-id`
+  on a cloned machine. For an unambiguous machine that reports a `node_id` and a different
+  host-derived name (no explicit `name` in `node.toml`), `direction=push` writes
+  `name = "<fleet name>"` one machine at a time via `config.set_name` (keeping all other bytes in
+  `node.toml` verbatim, preserving any UTF-8 BOM and CRLF line endings, backing up all changed files
+  before writing, migrating matching `[projects.<name>.on]` entries in `projects.toml` and matching
+  entries in `favorites.toml` before writing `node.toml` without overwriting existing entries or
+  moving entries whose old name is listed as another machine in the node's own `fleet.toml`, and
+  recording audit entries for each write) and records the update in `node_names`. If `node.toml` —
+  or `projects.toml` / `favorites.toml` when it has entries to move — is a symbolic link,
+  `config.set_name` refuses without writing through links (`conflict`, `details.kind = "linked_config"`)
+  and `fleet.sync` reports `status: "manual"` with a hint to edit by hand. When a machine has a
+  different explicit `name` in `node.toml` — or reports no `node_id` (an older node or an unwritable
+  state directory) — `fleet.sync` leaves `node.toml` untouched and reports `name_mismatch` in
+  `node_names`.
+  `fleet.list`, `fleet.ping`, and `meta.doctor` also flag name mismatches (including when a node's
+  own name is absent from a non-empty `fleet.toml`), and forwarded `device.endpoint` and
+  `device.invite` calls refuse mismatched nodes with `conflict` (`details.kind = "name_mismatch"`).
 
 Inspect differences with `direction=status` (reporting per-document status `same`, `only_here`,
 `only_there`, `changed_here`, `changed_there`, or `both`):
@@ -1468,9 +1488,11 @@ the staged file, and save a one-generation `<exe>.prev` backup beside the destin
   uses an unsigned self-built binary you vouch for with `from=<local file>`, checks the downgrade
   floor and binary header locally, copies to a random temporary file over `scp`, runs `--version`
   preflight on the remote host before saving `<dest>.prev` and moving it into place, and opens a
-  fresh `legion rpc` session to confirm the installed version (reporting its `build` when present).
-  If the new session fails or reports a different version, `fleet.install` restores `<dest>.prev`
-  automatically.
+  fresh `legion rpc` session to confirm the installed version (reporting its `build` when present),
+  and writes `name = "<machine>"` to the target's `node.toml` when missing or unset (keeping every
+  other byte verbatim; a different explicit `name` is left untouched and reported in `problems`
+  without failing the install). If the new session fails or reports a different version,
+  `fleet.install` restores `<dest>.prev` automatically.
 
 ### Publishing a release (owner procedure)
 

@@ -142,6 +142,13 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
         checks.push(check);
     }
 
+    let fleet_machines = read_fleet_machine_names(&ctx.paths().config_file("fleet.toml"));
+    if let Some(check) =
+        check_self_in_fleet(ctx.node_name(), ctx.node_name_explicit(), &fleet_machines)
+    {
+        checks.push(check);
+    }
+
     if !quick
         && let Some(ping_tool) = ctx.node().registry().get("fleet.ping")
         && ctx.grant().allows(ping_tool.spec())
@@ -1021,10 +1028,64 @@ fn is_unreachable_warning(error: Option<&ErrorBody>) -> bool {
     }
 }
 
+fn read_fleet_machine_names(fleet_path: &Path) -> Vec<String> {
+    let Ok(Some(bytes)) = legion_core::config::read_regular_file(fleet_path) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Vec::new();
+    };
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let Some(machines) = doc.get("machines").and_then(toml_edit::Item::as_table) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = machines.iter().map(|(k, _)| k.to_owned()).collect();
+    names.sort();
+    names
+}
+
+/// Builds a `meta.doctor` warning when `fleet.toml` lists machines but does not include this
+/// node's own name — which happens when a machine's host-derived or explicit name differs from
+/// its fleet name, causing it to treat its own fleet entry as a remote peer.
+pub fn check_self_in_fleet(
+    here: &str,
+    name_explicit: Option<bool>,
+    fleet_machines: &[String],
+) -> Option<Check> {
+    if fleet_machines.is_empty() || fleet_machines.iter().any(|name| name == here) {
+        return None;
+    }
+    let origin = match name_explicit {
+        Some(true) => "set explicitly in node.toml",
+        Some(false) => "derived from the host name; no explicit name in node.toml",
+        None => "fallback host name",
+    };
+    let hint = match name_explicit {
+        Some(false) => format!(
+            "If one of those entries is this machine, run `legion fleet.sync direction=push` from another machine or set `name = \"<fleet name>\"` in node.toml; otherwise add `[machines.{here}]` to fleet.toml."
+        ),
+        _ => format!(
+            "If one of those entries is this machine, set `name = \"<fleet name>\"` in node.toml (or rename the entry in fleet.toml); otherwise add `[machines.{here}]` to fleet.toml."
+        ),
+    };
+    Some(Check {
+        name: "node name in fleet".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "This node calls itself {here} ({origin}), which is not listed in fleet.toml (fleet.toml lists: {}).",
+            fleet_machines.join(", ")
+        ),
+        hint: Some(hint),
+    })
+}
+
 /// Converts `fleet.ping` outcomes into one `meta.doctor` check per machine.
 ///
-/// A machine that simply does not answer (unreachable or timed out) becomes a warning (`ok: true`,
-/// `warning: true`) because switched-off machines are normal; protocol mismatches, unparseable
+/// A machine that simply does not answer (unreachable or timed out) or answers under a different
+/// node name becomes a warning (`ok: true`, `warning: true`); protocol mismatches, unparseable
 /// replies, and local configuration errors remain failures (`ok: false`).
 pub fn fleet_ping_checks(results: &[FleetPingEntry]) -> Vec<Check> {
     results
@@ -1034,6 +1095,25 @@ pub fn fleet_ping_checks(results: &[FleetPingEntry]) -> Vec<Check> {
             if entry.reachable {
                 let node = entry.node.as_deref().unwrap_or(&entry.machine);
                 let version = entry.version.as_deref().unwrap_or("unknown");
+                if node != entry.machine {
+                    let detail = match entry.latency_ms {
+                        Some(ms) => format!(
+                            "{} calls itself {node} (v{version}, {ms} ms).",
+                            entry.machine
+                        ),
+                        None => format!("{} calls itself {node} (v{version}).", entry.machine),
+                    };
+                    return Check {
+                        name,
+                        ok: true,
+                        warning: true,
+                        detail,
+                        hint: Some(format!(
+                            "Run `legion fleet.sync direction=push machines='[\"{}\"]'` to set its name, or set `name = \"{}\"` in its node.toml.",
+                            entry.machine, entry.machine
+                        )),
+                    };
+                }
                 let detail = match entry.latency_ms {
                     Some(ms) => format!("Answered as {node} (v{version}, {ms} ms)."),
                     None => format!("Answered as {node} (v{version})."),
@@ -1515,6 +1595,73 @@ deny = [\"effect:power\", \"effect:admin\"]
         assert!(
             check_fleet_device_drift(&denied_only).is_none(),
             "Denied config.read must not be reported as drift"
+        );
+    }
+
+    #[test]
+    fn self_in_fleet_warns_only_when_fleet_lists_other_machines_without_this_node() {
+        assert!(check_self_in_fleet("studio", Some(true), &[]).is_none());
+        assert!(
+            check_self_in_fleet(
+                "studio",
+                Some(true),
+                &["studio".to_owned(), "tower".to_owned()]
+            )
+            .is_none()
+        );
+
+        let host_derived = check_self_in_fleet(
+            "someones-laptop",
+            Some(false),
+            &["studio".to_owned(), "tower".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(host_derived.name, "node name in fleet");
+        assert!(host_derived.ok && host_derived.warning);
+        assert!(host_derived.detail.contains("someones-laptop"));
+        assert!(host_derived.detail.contains("studio, tower"));
+        assert!(host_derived.detail.contains("host name"));
+        assert!(
+            host_derived
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("fleet.sync"))
+        );
+
+        let explicit = check_self_in_fleet("other", Some(true), &["studio".to_owned()]).unwrap();
+        assert!(explicit.ok && explicit.warning);
+        assert!(explicit.detail.contains("explicitly in node.toml"));
+        assert!(
+            explicit
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("node.toml"))
+        );
+    }
+
+    #[test]
+    fn fleet_ping_checks_warns_when_reachable_machine_reports_different_node_name() {
+        let checks = fleet_ping_checks(&[FleetPingEntry {
+            machine: "studio".to_owned(),
+            reachable: true,
+            node: Some("someones-laptop".to_owned()),
+            version: Some("0.1.0".to_owned()),
+            latency_ms: Some(4),
+            error: None,
+        }]);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "fleet: studio");
+        assert!(checks[0].ok && checks[0].warning);
+        assert!(
+            checks[0]
+                .detail
+                .contains("studio calls itself someones-laptop")
+        );
+        assert!(
+            checks[0]
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("fleet.sync"))
         );
     }
 }

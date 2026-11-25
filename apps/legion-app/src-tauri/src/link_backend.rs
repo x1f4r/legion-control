@@ -2213,6 +2213,8 @@ mod tests {
                                 req.id,
                                 serde_json::to_value(HelloResult {
                                     node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
                                     version: "0.1.0".to_owned(),
                                     build: None,
                                     protocol: PROTOCOL,
@@ -2328,6 +2330,8 @@ mod tests {
                                 req.id,
                                 serde_json::to_value(HelloResult {
                                     node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
                                     version: "0.1.0".to_owned(),
                                     build: None,
                                     protocol: PROTOCOL,
@@ -2418,6 +2422,8 @@ mod tests {
                                 req.id,
                                 serde_json::to_value(HelloResult {
                                     node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
                                     version: "0.1.0".to_owned(),
                                     build: None,
                                     protocol: PROTOCOL,
@@ -2521,6 +2527,8 @@ mod tests {
                                 req.id,
                                 serde_json::to_value(HelloResult {
                                     node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
                                     version: "0.1.0".to_owned(),
                                     build: None,
                                     protocol: PROTOCOL,
@@ -2780,6 +2788,8 @@ mod tests {
                                 req.id,
                                 serde_json::to_value(HelloResult {
                                     node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
                                     version: "0.1.0".to_owned(),
                                     build: None,
                                     protocol: PROTOCOL,
@@ -2932,6 +2942,8 @@ mod tests {
                                 req.id,
                                 serde_json::to_value(HelloResult {
                                     node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
                                     version: "0.1.0".to_owned(),
                                     build: None,
                                     protocol: PROTOCOL,
@@ -3386,6 +3398,8 @@ mod tests {
                                 req.id,
                                 serde_json::to_value(HelloResult {
                                     node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
                                     version: "0.1.0".to_owned(),
                                     build: None,
                                     protocol: PROTOCOL,
