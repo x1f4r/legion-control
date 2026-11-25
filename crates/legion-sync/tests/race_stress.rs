@@ -93,17 +93,17 @@ fn s1_saves_racing_remote_replacements() {
             // Invisible change: index says one hash, disk holds another, and a normal scan agrees.
             let _ = pi.scan(ts(10 * it as i64 + 7));
             let rec = pi.store().get_record("big.bin").unwrap();
-            if let (Some(rec), Ok(bytes)) = (rec, fs::read(&path)) {
-                if rec.hash != Some(legion_xfer::hash::hash_bytes(&bytes)) {
-                    hidden += 1;
-                    let _ = pi.scan_with_options(
-                        ts(10 * it as i64 + 8),
-                        ScanOptions {
-                            verify_checksums: true,
-                            ..ScanOptions::default()
-                        },
-                    );
-                }
+            if let (Some(rec), Ok(bytes)) = (rec, fs::read(&path))
+                && rec.hash != Some(legion_xfer::hash::hash_bytes(&bytes))
+            {
+                hidden += 1;
+                let _ = pi.scan_with_options(
+                    ts(10 * it as i64 + 8),
+                    ScanOptions {
+                        verify_checksums: true,
+                        ..ScanOptions::default()
+                    },
+                );
             }
         }
     }

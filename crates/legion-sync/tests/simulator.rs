@@ -264,6 +264,8 @@ impl SyncWrite for SyncSimWriter {
 /// normalization, Windows naming/length/symlink rules, unreadable subtrees, OS litter & ignored
 /// files, non-replacing renames & optional atomic swaps, crash/non-crash fault injection, and
 /// mid-apply human edit hooks.
+type TmpMetaMap = BTreeMap<String, (Timestamp, Option<u32>, u64)>;
+
 struct HonestSimFs {
     caps: FsCapabilities,
     supports_exchange: bool,
@@ -271,7 +273,7 @@ struct HonestSimFs {
     deletion_log: RefCell<Vec<u8>>,
     live: RefCell<BTreeMap<String, SimNode>>,
     tmp: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
-    tmp_meta: RefCell<BTreeMap<String, (Timestamp, Option<u32>, u64)>>,
+    tmp_meta: RefCell<TmpMetaMap>,
     bin: RefCell<BTreeMap<String, SimBinData>>,
     unreadable: RefCell<BTreeSet<String>>,
     any_unreadable: Cell<bool>,

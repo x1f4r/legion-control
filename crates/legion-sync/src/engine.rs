@@ -951,10 +951,9 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         let existing_problems = self.store.list_problems()?;
         let mut remove_problems = Vec::new();
         for (key, prob) in existing_problems {
-            if key.starts_with(SCAN_PROBLEM_PREFIX) {
-                remove_problems.push(key);
-            } else if key.starts_with(DIR_KEPT_PROBLEM_PREFIX)
-                && self.fs.stat_live(&prob.path).ok().flatten().is_none()
+            if key.starts_with(SCAN_PROBLEM_PREFIX)
+                || (key.starts_with(DIR_KEPT_PROBLEM_PREFIX)
+                    && self.fs.stat_live(&prob.path).ok().flatten().is_none())
             {
                 remove_problems.push(key);
             }

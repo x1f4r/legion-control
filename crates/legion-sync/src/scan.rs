@@ -603,14 +603,13 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         // them, preserving each path's first `detected_at`.
         for old in unmatched_file_deletes {
             let path = old.path.clone();
-            if !meta.pending_deletions.contains_key(&path) {
-                meta.pending_deletions.insert(
-                    path,
-                    PendingLocalDeletion {
-                        old_record: old,
-                        detected_at: now,
-                    },
-                );
+            if let std::collections::btree_map::Entry::Vacant(e) =
+                meta.pending_deletions.entry(path)
+            {
+                e.insert(PendingLocalDeletion {
+                    old_record: old,
+                    detected_at: now,
+                });
                 brake_meta_dirty = true;
             }
         }
@@ -622,14 +621,13 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
                     .any(|k| is_descendant_of(k, &old.path));
                 if has_pending_child {
                     let path = old.path.clone();
-                    if !meta.pending_deletions.contains_key(&path) {
-                        meta.pending_deletions.insert(
-                            path,
-                            PendingLocalDeletion {
-                                old_record: old,
-                                detected_at: now,
-                            },
-                        );
+                    if let std::collections::btree_map::Entry::Vacant(e) =
+                        meta.pending_deletions.entry(path)
+                    {
+                        e.insert(PendingLocalDeletion {
+                            old_record: old,
+                            detected_at: now,
+                        });
                         brake_meta_dirty = true;
                     }
                 } else {

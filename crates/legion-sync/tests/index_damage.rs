@@ -46,7 +46,8 @@ fn i1_truncated_or_torn_index() {
     }
     let orig = fs::read(t.join("tower.redb")).unwrap();
     let orig_marker = fs::read(t.join("tower/.legion-sync/marker.json")).unwrap();
-    let cases: Vec<(&str, Box<dyn Fn(&std::path::Path)>)> = vec![
+    type DamageCase = (&'static str, Box<dyn Fn(&std::path::Path)>);
+    let cases: Vec<DamageCase> = vec![
         (
             "truncate to 0",
             Box::new(|p| {
