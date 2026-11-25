@@ -787,7 +787,8 @@ mod tests {
     }
 
     /// Verifies that every downstream mirror table across the workspace matches [`MEDIA_TABLE`]
-    /// without drift. Run `node scripts/sync-media-table.mjs` after editing `MEDIA_TABLE`.
+    /// without drift, regardless of LF or CRLF line endings. Run `node scripts/sync-media-table.mjs`
+    /// after editing `MEDIA_TABLE`.
     #[test]
     fn downstream_media_mirrors_match_canonical_table() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -795,241 +796,267 @@ mod tests {
             .and_then(Path::parent)
             .expect("legion-core lives under <repo>/crates/legion-core");
 
-        let extract = |src: &str, begin: &str, end: &str, label: &str| -> String {
-            let start = src
-                .find(begin)
-                .unwrap_or_else(|| panic!("missing {begin} marker in {label}"));
-            let rest = &src[start + begin.len()..];
-            let stop = rest
-                .find(end)
-                .unwrap_or_else(|| panic!("missing {end} marker in {label}"));
-            rest[..stop].to_owned()
+        let normalize_newlines = |src: &str| -> String { src.replace("\r\n", "\n") };
+        let to_crlf = |src: &str| -> String { src.replace("\r\n", "\n").replace('\n', "\r\n") };
+
+        let assert_mirrors_match = |content_raw: &str,
+                                    policy_raw: &str,
+                                    kt_raw: &str,
+                                    js_raw: &str| {
+            let content_src = normalize_newlines(content_raw);
+            let policy_src = normalize_newlines(policy_raw);
+            let kt_src = normalize_newlines(kt_raw);
+            let js_src = normalize_newlines(js_raw);
+
+            let extract = |src: &str, begin: &str, end: &str, label: &str| -> String {
+                let start = src
+                    .find(begin)
+                    .unwrap_or_else(|| panic!("missing {begin} marker in {label}"));
+                let rest = &src[start + begin.len()..];
+                let stop = rest
+                    .find(end)
+                    .unwrap_or_else(|| panic!("missing {end} marker in {label}"));
+                rest[..stop].to_owned()
+            };
+
+            // 1. Check `crates/legion-content/src/media.rs`
+            let content_block = extract(
+                &content_src,
+                "// BEGIN_CONTENT_MEDIA_TABLE",
+                "// END_CONTENT_MEDIA_TABLE",
+                "crates/legion-content/src/media.rs",
+            );
+            let mut content_map: BTreeMap<String, String> = BTreeMap::new();
+            for line in content_block.lines() {
+                let t = line.trim();
+                if let Some(rest) = t.strip_prefix("(\"")
+                    && let Some((ext, tail)) = rest.split_once("\", \"")
+                    && let Some((ctype, _)) = tail.split_once("\")")
+                {
+                    assert!(
+                        content_map
+                            .insert(ext.to_owned(), ctype.to_owned())
+                            .is_none(),
+                        "duplicate ext {ext:?} in legion-content/src/media.rs"
+                    );
+                }
+            }
+            let mut expected_content: BTreeMap<String, String> = BTreeMap::new();
+            for item in MEDIA_TABLE {
+                match item.content_serve {
+                    ContentServe::InlineMedia(ct) => {
+                        expected_content.insert(item.ext.to_owned(), ct.to_owned());
+                    }
+                    ContentServe::InlineText => {
+                        expected_content
+                            .insert(item.ext.to_owned(), "text/plain; charset=utf-8".to_owned());
+                    }
+                    ContentServe::InlineVtt => {
+                        expected_content
+                            .insert(item.ext.to_owned(), "text/vtt; charset=utf-8".to_owned());
+                    }
+                    ContentServe::Attachment => {}
+                }
+            }
+            assert_eq!(
+                content_map, expected_content,
+                "crates/legion-content/src/media.rs drifted from crates/legion-core/src/media.rs (run `node scripts/sync-media-table.mjs`)"
+            );
+
+            // 2. Check `apps/legion-app/src-tauri/src/transfers/file_policy.rs`
+            let parse_rust_pairs = |block: &str, label: &str| -> BTreeMap<String, String> {
+                let mut map = BTreeMap::new();
+                let mut joined = String::new();
+                for line in block.lines() {
+                    let t = line.trim();
+                    if t.starts_with("//") {
+                        continue;
+                    }
+                    joined.push_str(t);
+                    joined.push(' ');
+                }
+                let mut rest = joined.as_str();
+                while let Some(idx) = rest.find('(') {
+                    rest = rest[idx + 1..].trim_start();
+                    let Some(after_open) = rest.strip_prefix('"') else {
+                        continue;
+                    };
+                    let Some((ext, after_ext)) = after_open.split_once('"') else {
+                        break;
+                    };
+                    let Some((_, after_comma)) = after_ext.split_once('"') else {
+                        break;
+                    };
+                    let Some((mime, after_mime)) = after_comma.split_once('"') else {
+                        break;
+                    };
+                    assert!(
+                        map.insert(ext.to_owned(), mime.to_owned()).is_none(),
+                        "duplicate ext {ext:?} in {label}"
+                    );
+                    rest = after_mime;
+                }
+                map
+            };
+            let policy_allowed = parse_rust_pairs(
+                &extract(
+                    &policy_src,
+                    "// BEGIN_ALLOWED_OPEN_MIME_BY_EXT",
+                    "// END_ALLOWED_OPEN_MIME_BY_EXT",
+                    "file_policy.rs",
+                ),
+                "file_policy.rs::ALLOWED_OPEN_MIME_BY_EXT",
+            );
+            let policy_non_open = parse_rust_pairs(
+                &extract(
+                    &policy_src,
+                    "// BEGIN_NON_OPEN_DOWNLOAD_MIME_BY_EXT",
+                    "// END_NON_OPEN_DOWNLOAD_MIME_BY_EXT",
+                    "file_policy.rs",
+                ),
+                "file_policy.rs::NON_OPEN_DOWNLOAD_MIME_BY_EXT",
+            );
+            let expected_allowed: BTreeMap<String, String> = MEDIA_TABLE
+                .iter()
+                .filter_map(|i| {
+                    i.open_externally_mime
+                        .map(|m| (i.ext.to_owned(), m.to_owned()))
+                })
+                .collect();
+            let expected_non_open: BTreeMap<String, String> = MEDIA_TABLE
+                .iter()
+                .filter_map(|i| i.download_mime.map(|m| (i.ext.to_owned(), m.to_owned())))
+                .collect();
+            assert_eq!(
+                policy_allowed, expected_allowed,
+                "file_policy.rs::ALLOWED_OPEN_MIME_BY_EXT drifted from crates/legion-core/src/media.rs (run `node scripts/sync-media-table.mjs`)"
+            );
+            assert_eq!(
+                policy_non_open, expected_non_open,
+                "file_policy.rs::NON_OPEN_DOWNLOAD_MIME_BY_EXT drifted from crates/legion-core/src/media.rs (run `node scripts/sync-media-table.mjs`)"
+            );
+
+            // 3. Check `TransferPathPolicy.kt`
+            let parse_kt_map = |block: &str| -> BTreeMap<String, String> {
+                let mut map = BTreeMap::new();
+                for line in block.lines() {
+                    let t = line.trim();
+                    if t.is_empty() || t.starts_with("//") {
+                        continue;
+                    }
+                    if let Some((lhs, rhs)) = t.split_once(" to ") {
+                        let k = lhs.trim().trim_matches('"');
+                        let v = rhs.trim().trim_end_matches(',').trim().trim_matches('"');
+                        if !k.is_empty() && !v.is_empty() {
+                            assert!(
+                                map.insert(k.to_owned(), v.to_owned()).is_none(),
+                                "duplicate Kotlin key {k:?}"
+                            );
+                        }
+                    }
+                }
+                map
+            };
+            let kt_allowed = parse_kt_map(&extract(
+                &kt_src,
+                "// BEGIN_ALLOWED_OPEN_MIME_BY_EXT",
+                "// END_ALLOWED_OPEN_MIME_BY_EXT",
+                "TransferPathPolicy.kt",
+            ));
+            let kt_non_open = parse_kt_map(&extract(
+                &kt_src,
+                "// BEGIN_NON_OPEN_DOWNLOAD_MIME_BY_EXT",
+                "// END_NON_OPEN_DOWNLOAD_MIME_BY_EXT",
+                "TransferPathPolicy.kt",
+            ));
+            assert_eq!(
+                kt_allowed, expected_allowed,
+                "TransferPathPolicy.kt::ALLOWED_OPEN_MIME_BY_EXT drifted from crates/legion-core/src/media.rs"
+            );
+            assert_eq!(
+                kt_non_open, expected_non_open,
+                "TransferPathPolicy.kt::NON_OPEN_DOWNLOAD_MIME_BY_EXT drifted from crates/legion-core/src/media.rs"
+            );
+
+            // 4. Check `apps/ui/lib/files.js`
+            let js_block = extract(
+                &js_src,
+                "// BEGIN_MEDIA_TABLE",
+                "// END_MEDIA_TABLE",
+                "apps/ui/lib/files.js",
+            );
+            // Each generated row in files.js has the form:
+            //   ext: ['category', 'mime', 'viewer_mode', openBool],
+            let mut js_rows: BTreeMap<String, (String, String, String, bool)> = BTreeMap::new();
+            for line in js_block.lines() {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with("//") || !t.contains(": [") {
+                    continue;
+                }
+                let Some((raw_key, rest)) = t.split_once(": [") else {
+                    continue;
+                };
+                let ext = raw_key.trim().trim_matches('\'');
+                let inner = rest.trim_end_matches("],").trim_end_matches(']');
+                let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+                assert_eq!(parts.len(), 4, "malformed files.js media row: {t}");
+                let cat = parts[0].trim_matches('\'').to_owned();
+                let mime = parts[1].trim_matches('\'').to_owned();
+                let mode = parts[2].trim_matches('\'').to_owned();
+                let open = match parts[3] {
+                    "true" => true,
+                    "false" => false,
+                    other => panic!("unexpected open flag {other:?} in files.js row: {t}"),
+                };
+                assert!(
+                    js_rows
+                        .insert(ext.to_owned(), (cat, mime, mode, open))
+                        .is_none(),
+                    "duplicate ext {ext:?} in apps/ui/lib/files.js"
+                );
+            }
+            let expected_js: BTreeMap<String, (String, String, String, bool)> = MEDIA_TABLE
+                .iter()
+                .map(|i| {
+                    (
+                        i.ext.to_owned(),
+                        (
+                            i.category.as_str().to_owned(),
+                            i.mime.to_owned(),
+                            i.viewer_mode.as_str().to_owned(),
+                            i.open_externally_mime.is_some(),
+                        ),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                js_rows, expected_js,
+                "apps/ui/lib/files.js drifted from crates/legion-core/src/media.rs (run `node scripts/sync-media-table.mjs`)"
+            );
         };
 
-        // 1. Check `crates/legion-content/src/media.rs`
         let content_src =
             std::fs::read_to_string(repo_root.join("crates/legion-content/src/media.rs"))
                 .expect("legion-content media.rs must exist");
-        let content_block = extract(
-            &content_src,
-            "// BEGIN_CONTENT_MEDIA_TABLE",
-            "// END_CONTENT_MEDIA_TABLE",
-            "crates/legion-content/src/media.rs",
-        );
-        let mut content_map: BTreeMap<String, String> = BTreeMap::new();
-        for line in content_block.lines() {
-            let t = line.trim();
-            if let Some(rest) = t.strip_prefix("(\"")
-                && let Some((ext, tail)) = rest.split_once("\", \"")
-                && let Some((ctype, _)) = tail.split_once("\")")
-            {
-                assert!(
-                    content_map
-                        .insert(ext.to_owned(), ctype.to_owned())
-                        .is_none(),
-                    "duplicate ext {ext:?} in legion-content/src/media.rs"
-                );
-            }
-        }
-        let mut expected_content: BTreeMap<String, String> = BTreeMap::new();
-        for item in MEDIA_TABLE {
-            match item.content_serve {
-                ContentServe::InlineMedia(ct) => {
-                    expected_content.insert(item.ext.to_owned(), ct.to_owned());
-                }
-                ContentServe::InlineText => {
-                    expected_content
-                        .insert(item.ext.to_owned(), "text/plain; charset=utf-8".to_owned());
-                }
-                ContentServe::InlineVtt => {
-                    expected_content
-                        .insert(item.ext.to_owned(), "text/vtt; charset=utf-8".to_owned());
-                }
-                ContentServe::Attachment => {}
-            }
-        }
-        assert_eq!(
-            content_map, expected_content,
-            "crates/legion-content/src/media.rs drifted from crates/legion-core/src/media.rs (run `node scripts/sync-media-table.mjs`)"
-        );
-
-        // 2. Check `apps/legion-app/src-tauri/src/transfers/file_policy.rs`
-        let policy_path = repo_root.join("apps/legion-app/src-tauri/src/transfers/file_policy.rs");
-        let policy_src = std::fs::read_to_string(&policy_path).expect("file_policy.rs must exist");
-        let parse_rust_pairs = |block: &str, label: &str| -> BTreeMap<String, String> {
-            let mut map = BTreeMap::new();
-            let mut joined = String::new();
-            for line in block.lines() {
-                let t = line.trim();
-                if t.starts_with("//") {
-                    continue;
-                }
-                joined.push_str(t);
-                joined.push(' ');
-            }
-            let mut rest = joined.as_str();
-            while let Some(idx) = rest.find('(') {
-                rest = rest[idx + 1..].trim_start();
-                let Some(after_open) = rest.strip_prefix('"') else {
-                    continue;
-                };
-                let Some((ext, after_ext)) = after_open.split_once('"') else {
-                    break;
-                };
-                let Some((_, after_comma)) = after_ext.split_once('"') else {
-                    break;
-                };
-                let Some((mime, after_mime)) = after_comma.split_once('"') else {
-                    break;
-                };
-                assert!(
-                    map.insert(ext.to_owned(), mime.to_owned()).is_none(),
-                    "duplicate ext {ext:?} in {label}"
-                );
-                rest = after_mime;
-            }
-            map
-        };
-        let policy_allowed = parse_rust_pairs(
-            &extract(
-                &policy_src,
-                "// BEGIN_ALLOWED_OPEN_MIME_BY_EXT",
-                "// END_ALLOWED_OPEN_MIME_BY_EXT",
-                "file_policy.rs",
-            ),
-            "file_policy.rs::ALLOWED_OPEN_MIME_BY_EXT",
-        );
-        let policy_non_open = parse_rust_pairs(
-            &extract(
-                &policy_src,
-                "// BEGIN_NON_OPEN_DOWNLOAD_MIME_BY_EXT",
-                "// END_NON_OPEN_DOWNLOAD_MIME_BY_EXT",
-                "file_policy.rs",
-            ),
-            "file_policy.rs::NON_OPEN_DOWNLOAD_MIME_BY_EXT",
-        );
-        let expected_allowed: BTreeMap<String, String> = MEDIA_TABLE
-            .iter()
-            .filter_map(|i| {
-                i.open_externally_mime
-                    .map(|m| (i.ext.to_owned(), m.to_owned()))
-            })
-            .collect();
-        let expected_non_open: BTreeMap<String, String> = MEDIA_TABLE
-            .iter()
-            .filter_map(|i| i.download_mime.map(|m| (i.ext.to_owned(), m.to_owned())))
-            .collect();
-        assert_eq!(
-            policy_allowed, expected_allowed,
-            "file_policy.rs::ALLOWED_OPEN_MIME_BY_EXT drifted from crates/legion-core/src/media.rs (run `node scripts/sync-media-table.mjs`)"
-        );
-        assert_eq!(
-            policy_non_open, expected_non_open,
-            "file_policy.rs::NON_OPEN_DOWNLOAD_MIME_BY_EXT drifted from crates/legion-core/src/media.rs (run `node scripts/sync-media-table.mjs`)"
-        );
-
-        // 3. Check `TransferPathPolicy.kt`
+        let policy_src = std::fs::read_to_string(
+            repo_root.join("apps/legion-app/src-tauri/src/transfers/file_policy.rs"),
+        )
+        .expect("file_policy.rs must exist");
         let kt_src = std::fs::read_to_string(repo_root.join(
             "apps/legion-app/src-tauri/gen/android/app/src/main/java/com/x1f4r/legion/TransferPathPolicy.kt",
         ))
         .expect("TransferPathPolicy.kt must exist");
-        let parse_kt_map = |block: &str| -> BTreeMap<String, String> {
-            let mut map = BTreeMap::new();
-            for line in block.lines() {
-                let t = line.trim();
-                if t.is_empty() || t.starts_with("//") {
-                    continue;
-                }
-                if let Some((lhs, rhs)) = t.split_once(" to ") {
-                    let k = lhs.trim().trim_matches('"');
-                    let v = rhs.trim().trim_end_matches(',').trim().trim_matches('"');
-                    if !k.is_empty() && !v.is_empty() {
-                        assert!(
-                            map.insert(k.to_owned(), v.to_owned()).is_none(),
-                            "duplicate Kotlin key {k:?}"
-                        );
-                    }
-                }
-            }
-            map
-        };
-        let kt_allowed = parse_kt_map(&extract(
-            &kt_src,
-            "// BEGIN_ALLOWED_OPEN_MIME_BY_EXT",
-            "// END_ALLOWED_OPEN_MIME_BY_EXT",
-            "TransferPathPolicy.kt",
-        ));
-        let kt_non_open = parse_kt_map(&extract(
-            &kt_src,
-            "// BEGIN_NON_OPEN_DOWNLOAD_MIME_BY_EXT",
-            "// END_NON_OPEN_DOWNLOAD_MIME_BY_EXT",
-            "TransferPathPolicy.kt",
-        ));
-        assert_eq!(
-            kt_allowed, expected_allowed,
-            "TransferPathPolicy.kt::ALLOWED_OPEN_MIME_BY_EXT drifted from crates/legion-core/src/media.rs"
-        );
-        assert_eq!(
-            kt_non_open, expected_non_open,
-            "TransferPathPolicy.kt::NON_OPEN_DOWNLOAD_MIME_BY_EXT drifted from crates/legion-core/src/media.rs"
-        );
-
-        // 4. Check `apps/ui/lib/files.js`
         let js_src = std::fs::read_to_string(repo_root.join("apps/ui/lib/files.js"))
             .expect("apps/ui/lib/files.js must exist");
-        let js_block = extract(
-            &js_src,
-            "// BEGIN_MEDIA_TABLE",
-            "// END_MEDIA_TABLE",
-            "apps/ui/lib/files.js",
-        );
-        // Each generated row in files.js has the form:
-        //   ext: ['category', 'mime', 'viewer_mode', openBool],
-        let mut js_rows: BTreeMap<String, (String, String, String, bool)> = BTreeMap::new();
-        for line in js_block.lines() {
-            let t = line.trim();
-            if t.is_empty() || t.starts_with("//") || !t.contains(": [") {
-                continue;
-            }
-            let Some((raw_key, rest)) = t.split_once(": [") else {
-                continue;
-            };
-            let ext = raw_key.trim().trim_matches('\'');
-            let inner = rest.trim_end_matches("],").trim_end_matches(']');
-            let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
-            assert_eq!(parts.len(), 4, "malformed files.js media row: {t}");
-            let cat = parts[0].trim_matches('\'').to_owned();
-            let mime = parts[1].trim_matches('\'').to_owned();
-            let mode = parts[2].trim_matches('\'').to_owned();
-            let open = match parts[3] {
-                "true" => true,
-                "false" => false,
-                other => panic!("unexpected open flag {other:?} in files.js row: {t}"),
-            };
-            assert!(
-                js_rows
-                    .insert(ext.to_owned(), (cat, mime, mode, open))
-                    .is_none(),
-                "duplicate ext {ext:?} in apps/ui/lib/files.js"
-            );
-        }
-        let expected_js: BTreeMap<String, (String, String, String, bool)> = MEDIA_TABLE
-            .iter()
-            .map(|i| {
-                (
-                    i.ext.to_owned(),
-                    (
-                        i.category.as_str().to_owned(),
-                        i.mime.to_owned(),
-                        i.viewer_mode.as_str().to_owned(),
-                        i.open_externally_mime.is_some(),
-                    ),
-                )
-            })
-            .collect();
-        assert_eq!(
-            js_rows, expected_js,
-            "apps/ui/lib/files.js drifted from crates/legion-core/src/media.rs (run `node scripts/sync-media-table.mjs`)"
+
+        // Verify the checked-out files directly, and verify CRLF-converted copies explicitly so
+        // Windows autocrlf checkouts are always covered on every host OS.
+        assert_mirrors_match(&content_src, &policy_src, &kt_src, &js_src);
+        assert_mirrors_match(
+            &to_crlf(&content_src),
+            &to_crlf(&policy_src),
+            &to_crlf(&kt_src),
+            &to_crlf(&js_src),
         );
     }
 }
