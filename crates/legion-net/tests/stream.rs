@@ -131,7 +131,12 @@ impl Ran {
 fn after_protocol(output: &[u8]) -> &[u8] {
     let end = output.iter().position(|b| *b == b'\n').expect("a line");
     let opening: Value = serde_json::from_slice(&output[..end]).unwrap();
-    assert_eq!(opening, json!({"protocol": STREAM_PROTOCOL}));
+    assert_eq!(opening["protocol"], json!(STREAM_PROTOCOL), "{opening}");
+    assert_eq!(
+        opening["capabilities"],
+        json!(["if_exists", "move", "probe", "rename"]),
+        "{opening}"
+    );
     &output[end + 1..]
 }
 
@@ -338,10 +343,10 @@ fn put_says_where_to_start_verifies_and_renames() {
     let ran = node.run(None, &header(0), &data[7..]);
     let lines = ran.ok().lines();
     assert_eq!(lines[0], json!({"offset": 7}));
-    assert_eq!(
-        lines[1],
-        json!({"ok": true, "size": data.len(), "hash": hash(&data)})
-    );
+    assert_eq!(lines[1]["ok"], json!(true), "{}", lines[1]);
+    assert_eq!(lines[1]["size"], json!(data.len()), "{}", lines[1]);
+    assert_eq!(lines[1]["hash"], json!(hash(&data)), "{}", lines[1]);
+    assert!(lines[1].get("file_id").is_some(), "{}", lines[1]);
     assert_eq!(fs::read(&target).unwrap(), data);
     let audit = node.last_audit();
     assert_eq!(
@@ -696,9 +701,14 @@ fn a_partial_file_beside_a_target_is_checked_like_the_target() {
     assert_eq!(fs::read(&outside).unwrap(), b"not yours");
     assert!(!node.home().join("sandbox").exists());
 
-    // Inside the root, a partial file is used as before.
+    // Inside the root, a partial file with a matching identity sidecar is resumed.
     fs::create_dir_all(node.home().join("sandbox")).unwrap();
     fs::write(node.home().join("sandbox/f.bin.legion-part"), b"ab").unwrap();
+    fs::write(
+        node.home().join("sandbox/f.bin.legion-part.meta"),
+        format!("3 {}\n", hash(b"abc")),
+    )
+    .unwrap();
     let ran = node.run(
         Some("boxed"),
         &json!({"op": "stat", "path": "~/sandbox/f.bin"}),
