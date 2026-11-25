@@ -3470,3 +3470,368 @@ async fn find_checks_budget_even_when_directories_are_unreadable() {
         assert_eq!(val["reason"], json!("time"));
     }
 }
+
+#[tokio::test]
+async fn thumb_blocks_ffmpeg_manifest_playlist_symlink_and_http_attacks() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let has_ffmpeg = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !has_ffmpeg {
+        return;
+    }
+
+    let f = Fixture::new();
+    f.write_config(
+        "policy.toml",
+        r#"
+[principals.jailed]
+role = "jailed"
+
+[roles.jailed]
+allow = ["fs.*"]
+paths = ["~/projects/**"]
+"#,
+    );
+
+    // Create a real secret video outside `~/projects` and a real legitimate video inside.
+    let outside_dir = f.home.join("outside");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    let secret_mp4 = outside_dir.join("secret.mp4");
+    let legit_mp4 = f.work.join("legit.mp4");
+    for (path, color) in [(&secret_mp4, "red"), (&legit_mp4, "blue")] {
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color=c={color}:s=160x90:d=1:r=10"),
+                "-pix_fmt",
+                "yuv420p",
+                path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "ffmpeg fixture failed for {path:?}");
+    }
+
+    // Forward-slash representation works inside manifests/playlists on both Unix and Windows.
+    let secret_fwd = secret_mp4.to_string_lossy().replace('\\', "/");
+    let secret_file_url = if secret_fwd.starts_with('/') {
+        format!("file://{secret_fwd}")
+    } else {
+        format!("file:///{secret_fwd}")
+    };
+
+    // 1. DASH `.mpd` manifest renamed to `.mp4` pointing at the outside secret video.
+    let evil_dash = f.work.join("evil_dash.mp4");
+    std::fs::write(
+        &evil_dash,
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT1S" minBufferTime="PT1S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4">
+      <Representation id="1" bandwidth="100000" width="160" height="90">
+        <BaseURL>{secret_file_url}</BaseURL>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>
+"#
+        ),
+    )
+    .unwrap();
+
+    // 2. `ffconcat` playlist renamed to `.mp4` pointing through a relative symlink (or relative
+    // path on platforms without unprivileged symlinks) to the outside video.
+    let evil_concat_sym = f.work.join("evil_concat_sym.mp4");
+    let concat_rel_target = {
+        #[cfg(unix)]
+        {
+            let link_dir = f.work.join("link_inside");
+            std::os::unix::fs::symlink(&outside_dir, &link_dir).unwrap();
+            "link_inside/secret.mp4".to_owned()
+        }
+        #[cfg(not(unix))]
+        {
+            "../outside/secret.mp4".to_owned()
+        }
+    };
+    std::fs::write(
+        &evil_concat_sym,
+        format!("ffconcat version 1.0\nfile '{concat_rel_target}'\n"),
+    )
+    .unwrap();
+
+    // 3. HLS `.m3u8` playlist renamed to `.mp4` referencing the outside video.
+    let evil_hls = f.work.join("evil_hls.mp4");
+    std::fs::write(
+        &evil_hls,
+        format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXTINF:1.0,\n{secret_fwd}\n#EXT-X-ENDLIST\n"
+        ),
+    )
+    .unwrap();
+
+    // 4. `ffconcat` playlist renamed to `.mp4` naming the absolute path to the outside video.
+    let evil_abs = f.work.join("evil_abs.mp4");
+    std::fs::write(
+        &evil_abs,
+        format!("ffconcat version 1.0\nfile '{secret_fwd}'\n"),
+    )
+    .unwrap();
+
+    // 5. Playlist renamed to `.mp4` referencing an `http://127.0.0.1:<port>/secret.mp4` endpoint.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let http_hit = Arc::new(AtomicBool::new(false));
+    let http_stop = Arc::new(AtomicBool::new(false));
+    let http_hit_srv = Arc::clone(&http_hit);
+    let http_stop_srv = Arc::clone(&http_stop);
+    let server = std::thread::spawn(move || {
+        while !http_stop_srv.load(Ordering::Relaxed) {
+            if listener.accept().is_ok() {
+                http_hit_srv.store(true, Ordering::SeqCst);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let evil_http = f.work.join("evil_http.mp4");
+    std::fs::write(
+        &evil_http,
+        format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXTINF:1.0,\nhttp://{addr}/secret.mp4\n#EXT-X-ENDLIST\n"
+        ),
+    )
+    .unwrap();
+
+    // Sanity check: without our `-format_whitelist` / `-protocol_whitelist`, raw `ffmpeg` WOULD
+    // follow `evil_concat_sym.mp4` on Unix (confirming the attack fixture is genuine and fails
+    // loudly if the restrictions in `fs.thumb` are removed).
+    #[cfg(unix)]
+    {
+        let probe_out = f.dir.path().join("probe_without_whitelist.jpg");
+        let probe_status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                &format!("file:{}", evil_concat_sym.to_string_lossy()),
+                "-frames:v",
+                "1",
+                "-y",
+                probe_out.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            probe_status.success() && probe_out.exists(),
+            "expected unrestricted ffmpeg to follow ffconcat symlink fixture"
+        );
+    }
+
+    // Call `fs.thumb` as the jailed role on all 5 attack files plus the legitimate video.
+    let res = f
+        .call_as(
+            "jailed",
+            "fs.thumb",
+            json!({
+                "paths": [
+                    f.p(&evil_dash),
+                    f.p(&evil_concat_sym),
+                    f.p(&evil_hls),
+                    f.p(&evil_abs),
+                    f.p(&evil_http),
+                    f.p(&legit_mp4),
+                ],
+                "size": 128,
+            }),
+        )
+        .await
+        .unwrap();
+    http_stop.store(true, Ordering::SeqCst);
+    let _ = server.join();
+
+    let items = res["results"].as_array().unwrap();
+    assert_eq!(items.len(), 6);
+    for (idx, label) in [
+        (0, "DASH .mpd renamed to .mp4"),
+        (1, "ffconcat via symlink"),
+        (2, "HLS .m3u8 renamed to .mp4"),
+        (3, "ffconcat with absolute path"),
+        (4, "HLS playlist with http:// URL"),
+    ] {
+        assert!(
+            items[idx].get("ok").is_none(),
+            "{label} must be rejected, got: {}",
+            items[idx]
+        );
+        assert!(
+            items[idx].get("error").is_some(),
+            "{label} must return a per-path error, got: {}",
+            items[idx]
+        );
+    }
+    assert!(
+        !http_hit.load(Ordering::SeqCst),
+        "ffmpeg must never connect to an http:// URL referenced in a playlist"
+    );
+    // Legitimate video inside `~/projects` still succeeds under the strict whitelists.
+    assert!(
+        items[5].get("ok").is_some(),
+        "legitimate mp4 should still thumbnail: {}",
+        items[5]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn jailed_role_refuses_symlink_in_middle_path_component() {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    f.write_config(
+        "policy.toml",
+        r#"
+[principals.jailed]
+role = "jailed"
+
+[roles.jailed]
+allow = ["fs.*"]
+paths = ["~/projects/**"]
+"#,
+    );
+
+    let outside = f.home.join("outside_secret");
+    std::fs::create_dir_all(&outside).unwrap();
+    let secret_pic = outside.join("photo.png");
+    make_rgb_image(128, 128, [220, 40, 40])
+        .save_with_format(&secret_pic, image::ImageFormat::Png)
+        .unwrap();
+
+    // Middle-component symlink inside `~/projects` pointing outside the jail.
+    let mid_link = f.work.join("mid_link");
+    symlink(&outside, &mid_link).unwrap();
+    let escaped_photo = mid_link.join("photo.png");
+
+    let thumb_res = f
+        .call_as(
+            "jailed",
+            "fs.thumb",
+            json!({"paths": [f.p(&escaped_photo)], "size": 128}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        thumb_res["results"][0]["error"]["code"],
+        json!("denied"),
+        "fs.thumb must refuse middle-component symlink: {thumb_res}"
+    );
+
+    let list_err = f
+        .call_as("jailed", "fs.list", json!({"path": f.p(&mid_link)}))
+        .await
+        .unwrap_err();
+    assert_eq!(list_err.code, ErrorCode::Denied);
+
+    let find_err = f
+        .call_as("jailed", "fs.find", json!({"path": f.p(&mid_link)}))
+        .await
+        .unwrap_err();
+    assert_eq!(find_err.code, ErrorCode::Denied);
+}
+
+#[tokio::test]
+async fn thumb_cache_invalidates_on_same_size_same_mtime_rename_swap() {
+    use std::time::{Duration, SystemTime};
+
+    let f = Fixture::new();
+    let target = f.work.join("swapped.bmp");
+    let replacement = f.work.join("replacement.bmp");
+
+    // Two solid-color BMPs of identical dimensions always have the exact same byte length.
+    make_rgb_image(128, 128, [240, 10, 10])
+        .save_with_format(&target, image::ImageFormat::Bmp)
+        .unwrap();
+    make_rgb_image(128, 128, [10, 10, 240])
+        .save_with_format(&replacement, image::ImageFormat::Bmp)
+        .unwrap();
+
+    // Pin both files to the exact same modification timestamp.
+    let fixed_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&target)
+        .unwrap()
+        .set_modified(fixed_mtime)
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(fixed_mtime)
+        .unwrap();
+
+    let meta_before = std::fs::metadata(&target).unwrap();
+
+    // First call caches the red thumbnail.
+    let first = f
+        .call("fs.thumb", json!({"paths": [f.p(&target)], "size": 96}))
+        .await
+        .unwrap();
+    let first_b64 = first["results"][0]["ok"]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let first_img = image::load_from_memory(&BASE64.decode(&first_b64).unwrap())
+        .unwrap()
+        .to_rgb8();
+    let first_px = first_img.get_pixel(48, 48).0;
+    assert!(
+        first_px[0] > 180 && first_px[2] < 60,
+        "expected red: {first_px:?}"
+    );
+
+    // Atomically rename `replacement` (blue) over `target` (red) keeping identical size and mtime.
+    std::fs::rename(&replacement, &target).unwrap();
+    let meta_after = std::fs::metadata(&target).unwrap();
+    assert_eq!(meta_before.len(), meta_after.len());
+    assert_eq!(
+        meta_before.modified().unwrap(),
+        meta_after.modified().unwrap()
+    );
+
+    // Second call MUST miss the cache (different FileId / ctime) and return the blue thumbnail.
+    let second = f
+        .call("fs.thumb", json!({"paths": [f.p(&target)], "size": 96}))
+        .await
+        .unwrap();
+    let second_b64 = second["results"][0]["ok"]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(
+        first_b64, second_b64,
+        "cache returned stale thumbnail after same-size, same-mtime rename swap"
+    );
+    let second_img = image::load_from_memory(&BASE64.decode(&second_b64).unwrap())
+        .unwrap()
+        .to_rgb8();
+    let second_px = second_img.get_pixel(48, 48).0;
+    assert!(
+        second_px[2] > 180 && second_px[0] < 60,
+        "expected blue: {second_px:?}"
+    );
+}

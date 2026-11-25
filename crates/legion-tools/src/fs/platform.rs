@@ -75,10 +75,6 @@ mod imp {
         a == b
     }
 
-    pub(super) fn file_identity(meta: &Metadata) -> Option<(u64, u64)> {
-        Some((meta.dev(), meta.ino()))
-    }
-
     pub(super) fn ffmpeg_input_arg(path: &Path) -> String {
         format!("file:{}", path.to_string_lossy())
     }
@@ -177,10 +173,6 @@ mod imp {
         a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
     }
 
-    pub(super) fn file_identity(_meta: &Metadata) -> Option<(u64, u64)> {
-        None
-    }
-
     pub(super) fn ffmpeg_input_arg(path: &Path) -> String {
         path.to_string_lossy().into_owned()
     }
@@ -253,10 +245,6 @@ mod imp {
         a == b
     }
 
-    pub(super) fn file_identity(_meta: &Metadata) -> Option<(u64, u64)> {
-        None
-    }
-
     pub(super) fn ffmpeg_input_arg(path: &Path) -> String {
         path.to_string_lossy().into_owned()
     }
@@ -327,11 +315,6 @@ pub(crate) fn same_device(
 ) -> bool {
     let inner = root.as_ref().map(|d| d.0.clone());
     imp::same_device(&inner, child_path, child_meta)
-}
-
-/// Stable `(device, inode)` identity on Unix, or `None` on platforms without cheap inode metadata.
-pub(crate) fn file_identity(meta: &Metadata) -> Option<(u64, u64)> {
-    imp::file_identity(meta)
 }
 
 /// Formats an absolute local file path as an `ffmpeg -i` input argument without letting Unix
