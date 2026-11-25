@@ -451,7 +451,7 @@ pub(crate) fn map_os_error(action: &str, path: &Path, error: OsError) -> ErrorBo
 /// Refuses whole-tree mutation (remove, move or directory replacement) on any protected place
 /// reported by [`Grant::protected`]: a file-system root, the home directory, Legion's own
 /// configuration or state directories, or any ancestor holding one of them.
-pub(crate) fn check_not_protected_tree(grant: &Grant, path: &Path) -> Result<(), ToolError> {
+pub fn check_not_protected_tree(grant: &Grant, path: &Path) -> Result<(), ToolError> {
     let Some(place) = grant.protected(path)? else {
         return Ok(());
     };
@@ -551,6 +551,20 @@ pub(crate) fn is_same_or_descendant(candidate: &Path, base: &Path) -> bool {
 /// Whether `ancestor` is a strict ancestor of `descendant` (not equal to it).
 pub(crate) fn is_strict_ancestor(ancestor: &Path, descendant: &Path) -> bool {
     is_same_or_descendant(descendant, ancestor) && !paths_equal(ancestor, descendant)
+}
+
+/// Validates `from` and `to` for a move or rename with the exact same platform-path, `paths`
+/// confinement, and protected-tree checks enforced by `fs.move`.
+pub fn check_move_paths(
+    grant: &Grant,
+    from: &str,
+    to: &str,
+) -> Result<(PathBuf, PathBuf), ToolError> {
+    let from = check_fs_path(grant, from, Access::Write)?;
+    let to = check_fs_path(grant, to, Access::Write)?;
+    check_not_protected_tree(grant, &from)?;
+    check_not_protected_tree(grant, &to)?;
+    Ok((from, to))
 }
 
 /// Validates platform path rules (on Windows: reserved device names and alternate data streams)

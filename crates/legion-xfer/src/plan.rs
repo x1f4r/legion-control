@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::file::IfExists;
 use crate::manifest::{CaseCollision, Entry, EntryKind, Manifest, detect_case_collisions};
 use crate::path::validate_relative_path;
 
@@ -15,6 +16,9 @@ pub struct PlanOptions {
     /// Plan removal of destination entries absent from the source manifest and allow replacing a
     /// destination directory with a source file or symlink.
     pub delete: bool,
+    /// How to handle destination entries that already exist.
+    #[serde(default)]
+    pub if_exists: IfExists,
 }
 
 /// Summary counts for a [`Plan`].
@@ -26,6 +30,9 @@ pub struct PlanTotals {
     pub bytes_to_send: u64,
     /// Regular files already up to date on the destination.
     pub files_unchanged: u64,
+    /// Regular files skipped because they already exist under [`IfExists::Skip`].
+    #[serde(default)]
+    pub files_skipped: u64,
     /// Directories that must be created on the destination.
     pub dirs_to_send: u64,
     /// Symlinks that must be created or updated on the destination.
@@ -60,12 +67,19 @@ pub struct Plan {
     /// Paths across source and destination that differ only in letter case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub case_collisions: Vec<CaseCollision>,
+    /// Relative paths that already exist at the destination when [`IfExists::Fail`] is active.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub existing: Vec<String>,
 }
 
 impl Plan {
-    /// Returns `true` when there is nothing to send, nothing to delete, and no conflicts.
+    /// Returns `true` when there is nothing to send, nothing to delete, and no conflicts or
+    /// existing collisions.
     pub fn is_empty(&self) -> bool {
-        self.send.is_empty() && self.delete.is_empty() && self.conflicts.is_empty()
+        self.send.is_empty()
+            && self.delete.is_empty()
+            && self.conflicts.is_empty()
+            && self.existing.is_empty()
     }
 }
 
@@ -97,6 +111,7 @@ pub fn plan(source: &Manifest, dest: &Manifest, options: &PlanOptions) -> Plan {
     let mut source_paths: BTreeSet<&str> = BTreeSet::new();
     let mut send = Vec::new();
     let mut delete_set: BTreeSet<String> = BTreeSet::new();
+    let mut existing = Vec::new();
     let mut totals = PlanTotals::default();
 
     for src in &source.entries {
@@ -110,29 +125,67 @@ pub fn plan(source: &Manifest, dest: &Manifest, options: &PlanOptions) -> Plan {
         source_paths.insert(src.path.as_str());
 
         if let Some(dst) = dest_by_path.get(src.path.as_str()) {
-            if dst.kind != src.kind {
-                if dst.kind == EntryKind::Dir {
-                    if !options.delete {
+            match options.if_exists {
+                IfExists::Replace => {
+                    if dst.kind != src.kind {
+                        if dst.kind == EntryKind::Dir {
+                            if !options.delete {
+                                conflicts.push(PlanConflict {
+                                    path: src.path.clone(),
+                                    reason: format!(
+                                        "destination is a directory while source is a {}; enable delete to replace it",
+                                        kind_label(src.kind)
+                                    ),
+                                });
+                                continue;
+                            }
+                            delete_set.insert(dst.path.clone());
+                        } else {
+                            // Replacing a single destination file or symlink with a different kind
+                            // is safe without `delete`, and must happen before unpack writes the
+                            // new entry.
+                            delete_set.insert(dst.path.clone());
+                        }
+                    } else if is_unchanged(src, dst, options.checksum) {
+                        if src.kind == EntryKind::File {
+                            totals.files_unchanged += 1;
+                        }
+                        continue;
+                    }
+                }
+                IfExists::Skip => {
+                    if src.kind == EntryKind::Dir && dst.kind == EntryKind::Dir {
+                        continue;
+                    }
+                    if src.kind == EntryKind::File {
+                        totals.files_skipped += 1;
+                    }
+                    continue;
+                }
+                IfExists::Fail => {
+                    if src.kind == EntryKind::Dir && dst.kind == EntryKind::Dir {
+                        continue;
+                    }
+                    existing.push(src.path.clone());
+                    continue;
+                }
+                IfExists::Rename => {
+                    if src.kind == EntryKind::Dir {
+                        if dst.kind == EntryKind::Dir {
+                            continue;
+                        }
                         conflicts.push(PlanConflict {
                             path: src.path.clone(),
                             reason: format!(
-                                "destination is a directory while source is a {}; enable delete to replace it",
-                                kind_label(src.kind)
+                                "destination is a {} while source is a directory; cannot merge a directory onto a non-directory",
+                                kind_label(dst.kind)
                             ),
                         });
                         continue;
                     }
-                    delete_set.insert(dst.path.clone());
-                } else {
-                    // Replacing a single destination file or symlink with a different kind is
-                    // safe without `delete`, and must happen before unpack writes the new entry.
-                    delete_set.insert(dst.path.clone());
+                    // Files and symlinks that already exist at the destination are still sent and
+                    // atomically renamed to `name (2).ext` at unpack time; never delete `dst`.
                 }
-            } else if is_unchanged(src, dst, options.checksum) {
-                if src.kind == EntryKind::File {
-                    totals.files_unchanged += 1;
-                }
-                continue;
             }
         }
 
@@ -152,6 +205,7 @@ pub fn plan(source: &Manifest, dest: &Manifest, options: &PlanOptions) -> Plan {
     }
 
     send.sort();
+    existing.sort();
 
     if options.delete {
         for dst in dest_by_path.values() {
@@ -188,6 +242,7 @@ pub fn plan(source: &Manifest, dest: &Manifest, options: &PlanOptions) -> Plan {
         totals,
         conflicts,
         case_collisions,
+        existing,
     }
 }
 
@@ -334,6 +389,7 @@ mod tests {
             &PlanOptions {
                 checksum: true,
                 delete: false,
+                ..Default::default()
             },
         );
         assert_eq!(p.send, vec!["diff_hash.txt", "no_hash.txt"]);
@@ -350,6 +406,7 @@ mod tests {
             let opts = PlanOptions {
                 checksum: false,
                 delete: delete_flag,
+                ..Default::default()
             };
 
             // file -> symlink
@@ -423,6 +480,7 @@ mod tests {
                 &PlanOptions {
                     checksum: false,
                     delete: false,
+                    ..Default::default()
                 },
             );
             assert!(without_delete.send.is_empty());
@@ -439,6 +497,7 @@ mod tests {
                 &PlanOptions {
                     checksum: false,
                     delete: true,
+                    ..Default::default()
                 },
             );
             assert!(with_delete.conflicts.is_empty());
@@ -482,6 +541,7 @@ mod tests {
             &PlanOptions {
                 checksum: false,
                 delete: true,
+                ..Default::default()
             },
         );
         assert!(p.send.is_empty());
@@ -512,6 +572,7 @@ mod tests {
             &PlanOptions {
                 checksum: false,
                 delete: true,
+                ..Default::default()
             },
         );
         assert!(with_delete.send.is_empty());
@@ -544,6 +605,7 @@ mod tests {
             &PlanOptions {
                 checksum: false,
                 delete: true,
+                ..Default::default()
             },
         );
         // Distinct casing is never merged: App.txt is sent and app.txt is marked for delete.
@@ -580,6 +642,7 @@ mod tests {
             &PlanOptions {
                 checksum: false,
                 delete: true,
+                ..Default::default()
             },
         );
         assert!(p1.is_empty());
@@ -591,9 +654,62 @@ mod tests {
             &PlanOptions {
                 checksum: true,
                 delete: true,
+                ..Default::default()
             },
         );
         assert!(p2.is_empty());
         assert_eq!(p2.totals.files_unchanged, 1);
+    }
+
+    #[test]
+    fn if_exists_modes_control_existing_entries() {
+        let src = manifest(vec![
+            dir("sub", 10),
+            file("a.txt", 10, 100, 0, Some(b"new-a")),
+            file("sub/b.txt", 10, 100, 0, Some(b"only-src")),
+            file("same.txt", 5, 100, 0, Some(b"same!")),
+        ]);
+        let dst = manifest(vec![
+            dir("sub", 10),
+            file("a.txt", 5, 50, 0, Some(b"old-a")),
+            file("same.txt", 5, 100, 0, Some(b"same!")),
+        ]);
+
+        let skip = plan(
+            &src,
+            &dst,
+            &PlanOptions {
+                if_exists: IfExists::Skip,
+                ..Default::default()
+            },
+        );
+        assert_eq!(skip.send, vec!["sub/b.txt"]);
+        assert_eq!(skip.totals.files_to_send, 1);
+        assert_eq!(skip.totals.files_skipped, 2);
+        assert!(skip.existing.is_empty());
+
+        let fail = plan(
+            &src,
+            &dst,
+            &PlanOptions {
+                if_exists: IfExists::Fail,
+                ..Default::default()
+            },
+        );
+        assert_eq!(fail.existing, vec!["a.txt", "same.txt"]);
+        assert_eq!(fail.send, vec!["sub/b.txt"]);
+
+        let rename = plan(
+            &src,
+            &dst,
+            &PlanOptions {
+                if_exists: IfExists::Rename,
+                ..Default::default()
+            },
+        );
+        // Existing files (even identical ones) are sent so unpack creates numbered siblings.
+        assert_eq!(rename.send, vec!["a.txt", "same.txt", "sub/b.txt"]);
+        assert!(rename.delete.is_empty());
+        assert!(rename.existing.is_empty());
     }
 }

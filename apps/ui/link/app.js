@@ -237,11 +237,24 @@ export function createAppLink() {
           'position:fixed;left:-9999px;top:-9999px;width:64px;height:64px;opacity:0;pointer-events:none;';
         document.body.appendChild(video);
         let seekStarted = false;
+        let settled = false;
+        let timer = null;
+        let pollTimer = null;
         const cleanup = () => {
-          window.clearTimeout(timer);
+          if (timer !== null) {
+            window.clearTimeout(timer);
+            timer = null;
+          }
+          if (pollTimer !== null) {
+            window.clearInterval(pollTimer);
+            pollTimer = null;
+          }
           video.removeEventListener('loadedmetadata', onMeta);
           video.removeEventListener('loadeddata', onLoaded);
           video.removeEventListener('canplay', onLoaded);
+          video.removeEventListener('resize', onLoaded);
+          video.removeEventListener('playing', onLoaded);
+          video.removeEventListener('timeupdate', onLoaded);
           video.removeEventListener('seeked', onSeeked);
           video.removeEventListener('error', onError);
           try {
@@ -253,12 +266,9 @@ export function createAppLink() {
           }
           video.remove();
         };
-        const timer = window.setTimeout(() => {
-          const st = `readyState=${video.readyState} net=${video.networkState} t=${video.currentTime}`;
-          cleanup();
-          reject(new Error(`Video load timed out (${st})`));
-        }, 30000);
         const onSeeked = () => {
+          if (settled) return;
+          settled = true;
           const width = video.videoWidth || 0;
           const height = video.videoHeight || 0;
           const duration = Number.isFinite(video.duration) ? video.duration : 0;
@@ -273,6 +283,7 @@ export function createAppLink() {
           }
         };
         const onLoaded = () => {
+          if (settled) return;
           const width = video.videoWidth || 0;
           const height = video.videoHeight || 0;
           const duration = Number.isFinite(video.duration) ? video.duration : 0;
@@ -284,18 +295,32 @@ export function createAppLink() {
             }
             return;
           }
+          settled = true;
           cleanup();
           resolve({ width, height, duration, seekedTime: null });
         };
         const onError = () => {
+          if (settled) return;
+          settled = true;
           const code = video.error ? video.error.code : 'unknown';
           const msg = video.error?.message || '';
           cleanup();
           reject(new Error(`Video error code=${code} ${msg}`.trim()));
         };
+        timer = window.setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          const st = `readyState=${video.readyState} net=${video.networkState} t=${video.currentTime} w=${video.videoWidth || 0} h=${video.videoHeight || 0}`;
+          cleanup();
+          reject(new Error(`Video load timed out (${st})`));
+        }, 30000);
+        pollTimer = window.setInterval(onLoaded, 250);
         video.addEventListener('loadedmetadata', onMeta);
         video.addEventListener('loadeddata', onLoaded);
         video.addEventListener('canplay', onLoaded);
+        video.addEventListener('resize', onLoaded);
+        video.addEventListener('playing', onLoaded);
+        video.addEventListener('timeupdate', onLoaded);
         video.addEventListener('seeked', onSeeked);
         video.addEventListener('error', onError);
         video.src = url;

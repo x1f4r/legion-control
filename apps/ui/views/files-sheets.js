@@ -38,6 +38,7 @@ export function SendToSheet({
   favourites = [],
   caps,
   capsStore = null,
+  folderChanges = null,
   allowedSet,
   wakePendingSet = null,
   deviceNoun = 'phone',
@@ -94,12 +95,6 @@ export function SendToSheet({
   const canMove = isSameMachine
     ? Boolean(sourceCaps?.hasMove || sourceCaps?.hasTransferMove)
     : Boolean(sourceCaps?.hasTransferMove);
-  const moveNeedsNewerLegion =
-    !isSameMachine &&
-    Boolean(sourceCaps?.known) &&
-    Boolean(sourceCaps?.hasTransfer) &&
-    Boolean(sourceCaps?.hasRemove) &&
-    !sourceCaps?.hasTransferMove;
 
   useEffect(() => {
     if (!canMove && mode === 'move') setMode('copy');
@@ -198,7 +193,7 @@ export function SendToSheet({
   ].filter(Boolean);
 
   const isDeviceDest = dest === '__device__';
-  const effectiveMode = isDeviceDest ? 'copy' : mode;
+  const effectiveMode = !isDeviceDest && canMove ? mode : 'copy';
   const confirmLabel = isDeviceDest
     ? `Download to this ${deviceNoun}`
     : dest === sourceMachine
@@ -252,13 +247,45 @@ export function SendToSheet({
       const toolName = isMove ? 'fs.move' : 'fs.copy';
       const folderName = folderDisplayName(targetDir, { technical });
       const runLocal = async () => {
-        for (const item of items) {
+        const touchedSources = new Set();
+        let anySucceeded = false;
+        for (let idx = 0; idx < items.length; idx += 1) {
+          const item = items[idx];
           const destPath = buildTransferDestination(targetDir, item.path);
           if (destPath === item.path) continue;
           const callPromise = capsStore
             ? capsStore.call(toolName, { from: item.path, to: destPath }, { on: sourceMachine })
             : link.call(toolName, { from: item.path, to: destPath }, { on: sourceMachine });
-          await callPromise.catch(() => {});
+          const ok = await callPromise.then(() => true, () => false);
+          if (ok) {
+            anySucceeded = true;
+            const srcParent = parentFilePath(item.path) || '~';
+            if (isMove) touchedSources.add(srcParent);
+            if (idx < items.length - 1 && folderChanges) {
+              folderChanges.changed(sourceMachine, targetDir, {
+                throttle: true,
+                reason: isMove ? 'move' : 'copy',
+              });
+              if (isMove) {
+                folderChanges.changed(sourceMachine, srcParent, {
+                  throttle: true,
+                  reason: 'move',
+                });
+              }
+            }
+          }
+        }
+        if (anySucceeded && folderChanges) {
+          folderChanges.changed(sourceMachine, targetDir, {
+            throttle: false,
+            reason: isMove ? 'move' : 'copy',
+          });
+          for (const srcParent of touchedSources) {
+            folderChanges.changed(sourceMachine, srcParent, {
+              throttle: false,
+              reason: 'move',
+            });
+          }
         }
         if (onLocalDone) onLocalDone();
       };
@@ -277,6 +304,7 @@ export function SendToSheet({
       const startedJobs = [];
       for (const item of items) {
         const destPath = buildTransferDestination(targetDir, item.path);
+        const srcDir = parentFilePath(item.path) || '~';
         const baseArgs = {
           from: item.path,
           to: `${destMachine}:${destPath}`,
@@ -320,7 +348,22 @@ export function SendToSheet({
             label: item.name || baseFileName(item.path),
             move: isMove,
             destMachine,
+            destDir: targetDir,
+            srcMachine: sourceMachine,
+            srcDir,
           });
+        } else if (res && folderChanges) {
+          // Synchronous transfer (older machine without background jobs).
+          folderChanges.changed(destMachine, targetDir, {
+            throttle: false,
+            reason: 'transfer',
+          });
+          if (isMove) {
+            folderChanges.changed(sourceMachine, srcDir, {
+              throttle: false,
+              reason: 'transfer',
+            });
+          }
         }
       }
       return startedJobs;
@@ -341,28 +384,24 @@ export function SendToSheet({
     <${Sheet} title=${title} onClose=${onClose}>
       <p class="sheet-sub">${subParts.join(' · ')}</p>
 
-      ${!isDeviceDest
+      ${!isDeviceDest && canMove
         ? html`
             <div class="seg" role="group" aria-label="Copy or move">
               <button
                 type="button"
-                aria-pressed=${mode === 'copy' ? 'true' : 'false'}
+                aria-pressed=${effectiveMode === 'copy' ? 'true' : 'false'}
                 onClick=${() => setMode('copy')}
               >
                 Copy
               </button>
               <button
                 type="button"
-                aria-pressed=${mode === 'move' ? 'true' : 'false'}
-                disabled=${!canMove}
+                aria-pressed=${effectiveMode === 'move' ? 'true' : 'false'}
                 onClick=${() => setMode('move')}
               >
                 Move
               </button>
             </div>
-            ${moveNeedsNewerLegion
-              ? html`<p class="sheet-note">${sourceMachine} needs a newer Legion to move files between machines. You can still copy them.</p>`
-              : null}
           `
         : null}
 
@@ -529,7 +568,7 @@ export function SendToSheet({
                   </button>
                 `;
               })}
-              ${caps?.hasDownload && mode !== 'move'
+              ${caps?.hasDownload && effectiveMode !== 'move'
                 ? html`
                     <button
                       type="button"
@@ -800,7 +839,7 @@ export function FolderMoreSheet({
 
 // ── New folder & Rename sheets ───────────────────────────────────────────────────────────────
 
-export function NewFolderSheet({ machine, parentPath, link, capsStore = null, onCreated, onClose }) {
+export function NewFolderSheet({ machine, parentPath, link, capsStore = null, folderChanges = null, onCreated, onClose }) {
   const [name, setName] = useState('');
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -820,6 +859,9 @@ export function NewFolderSheet({ machine, parentPath, link, capsStore = null, on
         await capsStore.call('fs.mkdir', { path: target, parents: false }, { on: machine, optional: ['parents'] });
       } else {
         await link.call('fs.mkdir', { path: target, parents: false }, { on: machine });
+      }
+      if (folderChanges) {
+        folderChanges.changed(machine, parentPath, { reason: 'mkdir' });
       }
       onClose();
       if (onCreated) onCreated(target);
@@ -855,7 +897,7 @@ export function NewFolderSheet({ machine, parentPath, link, capsStore = null, on
   `;
 }
 
-export function RenameSheet({ machine, entry, link, capsStore = null, onRenamed, onClose }) {
+export function RenameSheet({ machine, entry, link, capsStore = null, folderChanges = null, onRenamed, onClose }) {
   const [name, setName] = useState(entry?.name || baseFileName(entry?.path || ''));
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -884,6 +926,9 @@ export function RenameSheet({ machine, entry, link, capsStore = null, onRenamed,
         );
       } else {
         await link.call('fs.move', { from: entry.path, to: nextPath, overwrite: false }, { on: machine });
+      }
+      if (folderChanges) {
+        folderChanges.changed(machine, parent || '~', { reason: 'rename' });
       }
       onClose();
       if (onRenamed) onRenamed(nextPath, trimmed);
@@ -1002,7 +1047,7 @@ export function SearchFiltersSheet({ size, changed, onApply, onClose }) {
 
 // ── Sync folder action sheets ────────────────────────────────────────────────────────────────
 
-export function SyncConflictsSheet({ syncFolder, link, onChanged, onClose }) {
+export function SyncConflictsSheet({ syncFolder, link, folderChanges = null, onChanged, onClose }) {
   const [conflicts, setConflicts] = useState(syncFolder?.conflicts || []);
   const [busyPath, setBusyPath] = useState('');
   const [error, setError] = useState(null);
@@ -1025,6 +1070,13 @@ export function SyncConflictsSheet({ syncFolder, link, onChanged, onClose }) {
     setError(null);
     try {
       await link.call('sync.resolve', { id: syncFolder.id, path: c.path, keep });
+      if (folderChanges) {
+        for (const mem of syncFolder?.members || []) {
+          if (!mem?.machine || !mem?.path) continue;
+          const full = joinFilePath(mem.path, c.path);
+          folderChanges.changed(mem.machine, parentFilePath(full) || mem.path, { reason: 'sync-resolve' });
+        }
+      }
       setConflicts((prev) => prev.filter((item) => item.path !== c.path));
       if (onChanged) onChanged();
     } catch (err) {
@@ -1075,7 +1127,7 @@ export function SyncConflictsSheet({ syncFolder, link, onChanged, onClose }) {
   `;
 }
 
-export function SyncBinSheet({ syncFolder, link, onChanged, onClose }) {
+export function SyncBinSheet({ syncFolder, link, folderChanges = null, onChanged, onClose }) {
   const [entries, setEntries] = useState(syncFolder?.bin || []);
   const [busyPath, setBusyPath] = useState('');
   const [error, setError] = useState(null);
@@ -1098,6 +1150,13 @@ export function SyncBinSheet({ syncFolder, link, onChanged, onClose }) {
     setError(null);
     try {
       await link.call('sync.restore', { id: syncFolder.id, path: item.path });
+      if (folderChanges) {
+        for (const mem of syncFolder?.members || []) {
+          if (!mem?.machine || !mem?.path) continue;
+          const full = joinFilePath(mem.path, item.path);
+          folderChanges.changed(mem.machine, parentFilePath(full) || mem.path, { reason: 'sync-restore' });
+        }
+      }
       setEntries((prev) => prev.filter((e) => e.path !== item.path));
       if (onChanged) onChanged();
     } catch (err) {
