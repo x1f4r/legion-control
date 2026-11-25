@@ -16,6 +16,7 @@ function ActionDetail({
   allowedSet,
   technical,
   onRequestConfirm,
+  onEnsureAwake,
   onWakeSent,
   onRefreshFleet,
 }) {
@@ -24,6 +25,7 @@ function ActionDetail({
   const [error, setError] = useState(null);
   const machines = snapshot?.machines || [];
   const localNode = nodeInfo?.node || 'this node';
+  const canWake = allowedSet ? allowedSet.has('power.wake') : false;
 
   if (!action) {
     return html`<div class="empty">That action is not available here.</div>`;
@@ -39,48 +41,104 @@ function ActionDetail({
     `;
   }
 
-  // Machine-tab actions (Browse, Command, Projects, Services): pick which answering machine, then open its tab.
+  // Machine-tab actions (Browse, Command, Projects, Services): pick which answering (or off wakeable) machine, then open its tab.
   if (action.mode === 'machine-tab') {
     const candidates = machines.filter((m) => m.reachable);
+    const wakeableOff = canWake ? machines.filter((m) => !m.reachable && m.canWake) : [];
+    const wakeKind =
+      action.machineTab === 'files'
+        ? 'files'
+        : action.machineTab === 'command'
+          ? 'command'
+          : 'action';
     return html`
       <div>
         <p class="lede">Choose a machine for ${action.title.toLowerCase()}.</p>
-        ${candidates.length === 0
+        ${candidates.length === 0 && wakeableOff.length === 0
           ? html`<div class="empty">No machines are on right now.</div>`
           : html`
-              <p class="label">Which machine?</p>
-              <div class="list">
-                ${candidates.map(
-                  (m) => html`
-                    <a
-                      key=${m.name}
-                      class="row"
-                      href=${routeHref({
-                        section: 'machines',
-                        machine: m.name,
-                        tab: action.machineTab,
+              ${candidates.length > 0
+                ? html`
+                    <p class="label">Which machine?</p>
+                    <div class="list">
+                      ${candidates.map(
+                        (m) => html`
+                          <a
+                            key=${m.name}
+                            class="row"
+                            href=${routeHref({
+                              section: 'machines',
+                              machine: m.name,
+                              tab: action.machineTab,
+                            })}
+                          >
+                            <span class=${m.busy ? 'dot busy' : 'dot'} aria-hidden="true"></span>
+                            <span class="body">
+                              <span class="title mono">${m.name}</span>
+                              <span class="sub">${formatMachineStatusPhrase(m)}</span>
+                            </span>
+                            <span class="chev" aria-hidden="true">›</span>
+                          </a>
+                        `,
+                      )}
+                    </div>
+                  `
+                : null}
+              ${wakeableOff.length > 0
+                ? html`
+                    <p class="label">Off</p>
+                    <div class="list">
+                      ${wakeableOff.map((m) => {
+                        const destHref = routeHref({
+                          section: 'machines',
+                          machine: m.name,
+                          tab: action.machineTab,
+                        });
+                        return html`
+                          <button
+                            type="button"
+                            key=${m.name}
+                            class="row off"
+                            onClick=${() => {
+                              if (onEnsureAwake) {
+                                const continueLabel =
+                                  action.machineTab === 'files'
+                                    ? 'open its files'
+                                    : action.machineTab === 'command'
+                                      ? `open Command on ${m.name}`
+                                      : `open ${action.title.toLowerCase()} on ${m.name}`;
+                                onEnsureAwake(m, {
+                                  kind: wakeKind,
+                                  label: continueLabel,
+                                  onContinue: () => {
+                                    window.location.hash = destHref;
+                                  },
+                                });
+                              } else {
+                                window.location.hash = destHref;
+                              }
+                            }}
+                          >
+                            <span class="dot off" aria-hidden="true"></span>
+                            <span class="body">
+                              <span class="title mono">${m.name}</span>
+                              <span class="sub">${formatMachineStatusPhrase(m)}</span>
+                            </span>
+                            <span class="chev" aria-hidden="true">›</span>
+                          </button>
+                        `;
                       })}
-                    >
-                      <span class=${m.busy ? 'dot busy' : 'dot'} aria-hidden="true"></span>
-                      <span class="body">
-                        <span class="title mono">${m.name}</span>
-                        <span class="sub">${formatMachineStatusPhrase(m)}</span>
-                      </span>
-                      <span class="chev" aria-hidden="true">›</span>
-                    </a>
-                  `,
-                )}
-              </div>
+                    </div>
+                  `
+                : null}
             `}
       </div>
     `;
   }
 
-  // Wake: pick an off wakeable machine and confirm.
+  // Wake: pick an off wakeable machine and confirm through the shared wake sheet.
   if (action.id === 'wake') {
     const wakeable = machines.filter((m) => !m.reachable && m.canWake);
-    const wakeRunner =
-      machines.find((m) => m.reachable)?.name || (localNode !== 'this node' ? localNode : undefined);
     return html`
       <div>
         ${error ? html`<${Notice} error=${error} />` : null}
@@ -97,35 +155,17 @@ function ActionDetail({
                       key=${m.name}
                       class="row"
                       onClick=${() => {
-                        const copy = describePowerConfirm('power.wake', m.name, { machine: m.name });
-                        onRequestConfirm({
-                          title: copy.title,
-                          summary: copy.summary,
-                          tool: 'power.wake',
-                          targetName: m.name,
-                          args: { machine: m.name },
-                          effect: 'power',
-                          confirmLabel: copy.confirmLabel,
-                          canDryRun: true,
-                          async onDryRun() {
-                            return link.call(
-                              'power.wake',
-                              { machine: m.name, dry_run: true },
-                              { on: wakeRunner },
-                            );
-                          },
-                          async onConfirm() {
-                            setError(null);
-                            try {
-                              await link.call('power.wake', { machine: m.name }, { on: wakeRunner });
-                              if (onWakeSent) onWakeSent(m.name);
-                              setResultMsg(`Wake sent to ${m.name} — waiting for it to answer.`);
+                        if (onEnsureAwake) {
+                          onEnsureAwake(m, {
+                            kind: 'wake',
+                            immediate: true,
+                            forgettable: true,
+                            onContinue: () => {
+                              setResultMsg(`${m.name} is on.`);
                               if (onRefreshFleet) onRefreshFleet();
-                            } catch (err) {
-                              setError(err);
-                            }
-                          },
-                        });
+                            },
+                          });
+                        }
                       }}
                     >
                       <span class="dot off" aria-hidden="true"></span>
@@ -147,78 +187,117 @@ function ActionDetail({
   if (action.targetFilter === 'on' && !pickedMachine) {
     const candidates = machines.filter((m) => m.reachable);
     const isPower = action.tool.startsWith('power.');
+    const wakeableOff = !isPower && canWake ? machines.filter((m) => !m.reachable && m.canWake) : [];
     return html`
       <div>
         ${error ? html`<${Notice} error=${error} />` : null}
         ${resultMsg ? html`<div class="notice"><strong>${resultMsg}</strong></div>` : null}
         <p class="lede">${action.summary}.</p>
-        ${candidates.length === 0
+        ${candidates.length === 0 && wakeableOff.length === 0
           ? html`<div class="empty">No machines are on right now.</div>`
           : html`
-              <p class="label">Which machine?</p>
-              <div class="list">
-                ${candidates.map(
-                  (m) => html`
-                    <button
-                      type="button"
-                      key=${m.name}
-                      class="row"
-                      onClick=${() => {
-                        if (isPower && action.tool !== 'power.restart') {
-                          const on = m.name;
-                          const liveJobs = Array.isArray(m.jobs) ? m.jobs : [];
-                          const copy = describePowerConfirm(
-                            action.tool,
-                            m.name,
-                            {},
-                            liveJobs,
-                            m.busyReasons || [],
-                          );
-                          onRequestConfirm({
-                            title: copy.title,
-                            summary: copy.summary,
-                            jobs: liveJobs,
-                            tool: action.tool,
-                            targetName: m.name,
-                            args: {},
-                            effect: 'power',
-                            confirmLabel: copy.confirmLabel,
-                            canDryRun: true,
-                            async onDryRun() {
-                              return link.call(action.tool, { dry_run: true }, { on });
-                            },
-                            async onConfirm() {
-                              setError(null);
-                              try {
-                                await link.call(action.tool, { dry_run: false }, { on });
-                                setResultMsg(`${action.title} scheduled on ${m.name}.`);
-                                if (onRefreshFleet) onRefreshFleet();
-                              } catch (err) {
-                                setError(err);
+              ${candidates.length > 0
+                ? html`
+                    <p class="label">Which machine?</p>
+                    <div class="list">
+                      ${candidates.map(
+                        (m) => html`
+                          <button
+                            type="button"
+                            key=${m.name}
+                            class="row"
+                            onClick=${() => {
+                              if (isPower && action.tool !== 'power.restart') {
+                                const on = m.name;
+                                const liveJobs = Array.isArray(m.jobs) ? m.jobs : [];
+                                const copy = describePowerConfirm(
+                                  action.tool,
+                                  m.name,
+                                  {},
+                                  liveJobs,
+                                  m.busyReasons || [],
+                                );
+                                onRequestConfirm({
+                                  title: copy.title,
+                                  summary: copy.summary,
+                                  jobs: liveJobs,
+                                  tool: action.tool,
+                                  targetName: m.name,
+                                  args: {},
+                                  effect: 'power',
+                                  confirmLabel: copy.confirmLabel,
+                                  canDryRun: true,
+                                  async onDryRun() {
+                                    return link.call(action.tool, { dry_run: true }, { on });
+                                  },
+                                  async onConfirm() {
+                                    setError(null);
+                                    try {
+                                      await link.call(action.tool, { dry_run: false }, { on });
+                                      setResultMsg(`${action.title} scheduled on ${m.name}.`);
+                                      if (onRefreshFleet) onRefreshFleet();
+                                    } catch (err) {
+                                      setError(err);
+                                    }
+                                  },
+                                });
+                              } else if (action.tool === 'power.restart') {
+                                window.location.hash = routeHref({
+                                  section: 'machines',
+                                  machine: m.name,
+                                  tab: 'power',
+                                });
+                              } else {
+                                setPickedMachine(m.name);
                               }
-                            },
-                          });
-                        } else if (action.tool === 'power.restart') {
-                          window.location.hash = routeHref({
-                            section: 'machines',
-                            machine: m.name,
-                            tab: 'power',
-                          });
-                        } else {
-                          setPickedMachine(m.name);
-                        }
-                      }}
-                    >
-                      <span class=${m.busy ? 'dot busy' : 'dot'} aria-hidden="true"></span>
-                      <span class="body">
-                        <span class="title mono">${m.name}</span>
-                        <span class="sub">${formatMachineStatusPhrase(m)}</span>
-                      </span>
-                      <span class="chev" aria-hidden="true">›</span>
-                    </button>
-                  `,
-                )}
-              </div>
+                            }}
+                          >
+                            <span class=${m.busy ? 'dot busy' : 'dot'} aria-hidden="true"></span>
+                            <span class="body">
+                              <span class="title mono">${m.name}</span>
+                              <span class="sub">${formatMachineStatusPhrase(m)}</span>
+                            </span>
+                            <span class="chev" aria-hidden="true">›</span>
+                          </button>
+                        `,
+                      )}
+                    </div>
+                  `
+                : null}
+              ${wakeableOff.length > 0
+                ? html`
+                    <p class="label">Off</p>
+                    <div class="list">
+                      ${wakeableOff.map(
+                        (m) => html`
+                          <button
+                            type="button"
+                            key=${m.name}
+                            class="row off"
+                            onClick=${() => {
+                              if (onEnsureAwake) {
+                                onEnsureAwake(m, {
+                                  kind: 'action',
+                                  label: `run ${action.title}`,
+                                  onContinue: () => setPickedMachine(m.name),
+                                });
+                              } else {
+                                setPickedMachine(m.name);
+                              }
+                            }}
+                          >
+                            <span class="dot off" aria-hidden="true"></span>
+                            <span class="body">
+                              <span class="title mono">${m.name}</span>
+                              <span class="sub">${formatMachineStatusPhrase(m)}</span>
+                            </span>
+                            <span class="chev" aria-hidden="true">›</span>
+                          </button>
+                        `,
+                      )}
+                    </div>
+                  `
+                : null}
             `}
       </div>
     `;
@@ -256,6 +335,7 @@ function ActionDetail({
         link=${link}
         technical=${technical}
         onRequestConfirm=${onRequestConfirm}
+        onEnsureAwake=${onEnsureAwake}
       />
     </div>
   `;
@@ -272,6 +352,7 @@ export function ActionsView({
   wide,
   query,
   onRequestConfirm,
+  onEnsureAwake,
   onWakeSent,
   onRefreshFleet,
 }) {
@@ -289,6 +370,7 @@ export function ActionsView({
         wide=${wide}
         technical=${technical}
         onRequestConfirm=${onRequestConfirm}
+        onEnsureAwake=${onEnsureAwake}
       />
     `;
   }
@@ -317,6 +399,7 @@ export function ActionsView({
         allowedSet=${allowedSet}
         technical=${technical}
         onRequestConfirm=${onRequestConfirm}
+        onEnsureAwake=${onEnsureAwake}
         onWakeSent=${onWakeSent}
         onRefreshFleet=${onRefreshFleet}
       />
