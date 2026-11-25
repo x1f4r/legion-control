@@ -135,6 +135,15 @@ function normalizeFindEntries(rawList) {
     .map((item) => (item.name ? item : { ...item, name: baseFileName(item.path) }));
 }
 
+function isMachineFilesRoot(filePath) {
+  const p = String(filePath || '').trim().replace(/[/\\]+$/, '');
+  if (!p || p === '~') return true;
+  if (/^\/(?:home|Users)\/[^/]+$/.test(p)) return true;
+  if (/^[A-Za-z]:\\Users\\[^\\]+$/i.test(p)) return true;
+  if (p === '/' || /^[A-Za-z]:$/.test(p)) return true;
+  return false;
+}
+
 function safeStorage() {
   try {
     return window.localStorage;
@@ -1200,6 +1209,7 @@ export function FolderBrowser({
   }
 
   const inlineTools = wide && !selecting;
+  const atMachineFilesRoot = !path || path === '~' || isMachineFilesRoot(resolvedPath);
 
   return html`
     <div data-no-swipe="true">
@@ -1279,7 +1289,7 @@ export function FolderBrowser({
         })}
       </nav>
 
-      ${missingFeatures?.length > 0
+      ${atMachineFilesRoot && missingFeatures?.length > 0
         ? html`
             <${OlderMachineNote}
               machine=${machine}

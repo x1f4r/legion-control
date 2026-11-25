@@ -647,13 +647,47 @@ test('Files tab degrades cleanly against an old node with none of the new tools 
 });
 
 async function assertToastDoesNotCoverFirstRow(page, label) {
-  const toastBox = await page.locator('.toast-banner').boundingBox();
-  const rowBox = await page.locator('main .list .row').first().boundingBox();
-  assert.ok(toastBox, `${label}: expected visible .toast-banner bounding box`);
-  assert.ok(rowBox, `${label}: expected visible first list row bounding box`);
+  const boxes = await page.evaluate(
+    () =>
+      new Promise((resolve) => {
+        const read = () => {
+          const t = document.querySelector('.toast-banner')?.getBoundingClientRect();
+          const r = document.querySelector('main .list .row')?.getBoundingClientRect();
+          if (!t || !r) return null;
+          return {
+            toast: { x: t.x, y: t.y, width: t.width, height: t.height },
+            row: { x: r.x, y: r.y, width: r.width, height: r.height },
+          };
+        };
+        const same = (a, b) =>
+          Boolean(a && b) &&
+          Math.abs(a.x - b.x) < 0.5 &&
+          Math.abs(a.y - b.y) < 0.5 &&
+          Math.abs(a.width - b.width) < 0.5 &&
+          Math.abs(a.height - b.height) < 0.5;
+        const deadline = performance.now() + 1500;
+        let prev = null;
+        const step = () => {
+          const cur = read();
+          if (cur && prev && same(cur.toast, prev.toast) && same(cur.row, prev.row)) {
+            resolve(cur);
+            return;
+          }
+          if (performance.now() >= deadline) {
+            resolve(cur || prev);
+            return;
+          }
+          prev = cur;
+          requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+      }),
+  );
+  assert.ok(boxes?.toast, `${label}: expected visible .toast-banner bounding box`);
+  assert.ok(boxes?.row, `${label}: expected visible first list row bounding box`);
   assert.ok(
-    toastBox.y + toastBox.height <= rowBox.y + 0.5,
-    `${label}: toast (${toastBox.y}..${toastBox.y + toastBox.height}) must not overlap first row (${rowBox.y}..${rowBox.y + rowBox.height})`,
+    boxes.toast.y + boxes.toast.height <= boxes.row.y + 0.5,
+    `${label}: toast (${boxes.toast.y}..${boxes.toast.y + boxes.toast.height}) must not overlap first row (${boxes.row.y}..${boxes.row.y + boxes.row.height})`,
   );
 }
 
@@ -918,11 +952,11 @@ test('Old machine (05ba1ef fixture) at 412x915: quiet note, bottom dock in machi
     await assertNoPlainLeaks(page, 'machine > files');
     await maybeOldShot(page, '02-old-machine-files-dock');
 
-    // 3. Open studio > Documents from Files tab: kind icons only (no fs.thumb), no stars, quiet note once.
+    // 3. Open studio > Documents: kind icons only (no fs.thumb), no stars, and NO repeated older-note in subfolders.
     await page.locator('.list a.row', { hasText: 'Documents' }).click();
     await page.locator('header.top h1', { hasText: 'Documents' }).waitFor();
     await page.locator('.list a.row', { hasText: 'design-notes.md' }).waitFor();
-    assert.equal(await page.locator('.older-note').count(), 1);
+    assert.equal(await page.locator('.older-note').count(), 0, 'Older-note must not repeat inside subfolders');
     assert.equal(await page.locator('.list img').count(), 0, 'Old machine must not render fetched thumbnails');
     assert.equal(await page.locator('.list .star').count(), 0, 'Old machine must not show stars');
     await assertNoPlainLeaks(page, 'old studio Documents');
@@ -962,8 +996,11 @@ test('Old machine (05ba1ef fixture) at 412x915: quiet note, bottom dock in machi
 
     // 5. BigFolder (sibling of Documents under Home) hits old 500-item limit -> quiet truncation line at foot.
     await page.locator('nav.where a', { hasText: 'Home' }).click();
+    await page.locator('.older-note').waitFor();
+    assert.equal(await page.locator('.older-note').count(), 1, 'Older-note shows once at studio Home root');
     await page.locator('.list a.row', { hasText: 'BigFolder' }).click();
     await page.locator('header.top h1', { hasText: 'BigFolder' }).waitFor();
+    assert.equal(await page.locator('.older-note').count(), 0, 'Older-note must not repeat inside BigFolder');
     const limitNote = page.locator('.folder-limit-note');
     await limitNote.waitFor();
     assert.equal(
@@ -1077,11 +1114,14 @@ test('Mixed-version fleet side by side (?mock=multi,mixed): current tower + old 
     assert.equal(await page.locator('.older-note').count(), 0, 'Current machine tower must not show older-note');
 
     // 2. Old machine (studio) in the exact same session degrades cleanly with zero invalid_args.
-    await page.goto(`${server.url}/?mock=multi,mixed#/files/studio//home/me/Documents`, {
+    await page.goto(`${server.url}/?mock=multi,mixed#/files/studio/~`, {
       waitUntil: 'domcontentloaded',
     });
+    await page.locator('.list a.row', { hasText: 'Documents' }).waitFor();
+    assert.equal(await page.locator('.older-note').count(), 1, 'Older-note shows once at studio Home root');
+    await page.locator('.list a.row', { hasText: 'Documents' }).click();
     await page.locator('.list a.row', { hasText: 'design-notes.md' }).waitFor();
-    assert.equal(await page.locator('.older-note').count(), 1);
+    assert.equal(await page.locator('.older-note').count(), 0, 'Older-note stays hidden inside subfolders');
     assert.equal(await page.locator('.list img').count(), 0);
     assert.equal(await page.locator('.list .star').count(), 0);
 
