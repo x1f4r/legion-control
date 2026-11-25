@@ -4,7 +4,7 @@
 //! rpc`) on desktops when a `legion` binary is installed. State is persisted atomically in
 //! [`AppStore`] without ever logging keys or invites.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -20,9 +20,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::backend::{
     AppError, AppState, Backend, BoxFuture, CallId, CallRequest, CancelResult,
-    ConflictingIdentityInfo, DisagreementEntryView, DisagreementView, ErrorCode,
+    ConflictingIdentityInfo, ContentTarget, DisagreementEntryView, DisagreementView, ErrorCode,
     IdentityChangedInfo, LearnResult, MachineRouteView, Needs, NodeLink, PairPendingPeer,
-    PairSummary, RepairInfo, RepairResult, UnpairResult,
+    PairSummary, RepairInfo, RepairResult, TransferCapabilities, UnpairResult,
 };
 use crate::commands::default_device_name;
 use crate::store::{AppStore, AppStoreData, StoredNodeMeta};
@@ -119,13 +119,71 @@ struct BackendState {
     data: AppStoreData,
     store_error: Option<AppError>,
     local_program: Option<String>,
+    /// Observed real node name (`hello.node` / `meta.whoami.node`) of the implicit desktop `local`
+    /// pipe so content and transfer requests naming that machine resolve cleanly to `local`.
+    local_node_name: Option<String>,
     active_node: Option<String>,
     /// Expiring route preference for door-level discovery reads when the user's preferred node is
     /// offline. Never changes `active_node` and never acts as a target for machine calls.
     preferred_relay: Option<(String, Instant)>,
     last_paired: Option<PairSummary>,
     disagreements: Vec<DisagreementView>,
+    /// Monotonic pairing epoch per configured link node (`"local"` or node name). Bumped on pair
+    /// / identity-change acceptance and removed on unpair / repair so content tickets issued under
+    /// a removed or replaced pairing die immediately.
+    pairing_epochs: HashMap<String, u64>,
+    next_pairing_epoch: u64,
     link: Link,
+}
+
+impl BackendState {
+    fn alloc_epoch(&mut self) -> u64 {
+        let next = self.next_pairing_epoch;
+        self.next_pairing_epoch = self.next_pairing_epoch.saturating_add(1);
+        next
+    }
+
+    fn set_fresh_epoch(&mut self, node: &str) -> u64 {
+        let epoch = self.alloc_epoch();
+        self.pairing_epochs.insert(node.to_owned(), epoch);
+        epoch
+    }
+
+    fn sync_pairing_epochs(&mut self) {
+        let mut live: Vec<String> = self
+            .data
+            .link
+            .nodes
+            .iter()
+            .map(|n| n.node.clone())
+            .collect();
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if self.local_program.is_some() && !live.iter().any(|n| n == LOCAL_NODE_ID) {
+            live.push(LOCAL_NODE_ID.to_owned());
+        }
+        self.pairing_epochs
+            .retain(|node, _| live.iter().any(|l| l == node));
+        for node in live {
+            if !self.pairing_epochs.contains_key(&node) {
+                let epoch = self.alloc_epoch();
+                self.pairing_epochs.insert(node, epoch);
+            }
+        }
+    }
+}
+
+fn format_pairing_holder(link_node: &str, epoch: u64) -> String {
+    format!("pairing:{link_node}:{epoch}")
+}
+
+fn parse_pairing_holder(holder: &str) -> Option<(&str, u64)> {
+    let rest = holder.strip_prefix("pairing:")?;
+    let (node, epoch_str) = rest.rsplit_once(':')?;
+    if node.is_empty() {
+        return None;
+    }
+    let epoch = epoch_str.parse::<u64>().ok()?;
+    Some((node, epoch))
 }
 
 impl LinkBackend {
@@ -182,18 +240,26 @@ impl LinkBackend {
             None => Link::with_options(link_cfg, link_options),
         };
 
+        let mut state = BackendState {
+            data,
+            store_error,
+            local_program,
+            local_node_name: None,
+            active_node,
+            preferred_relay: None,
+            last_paired: None,
+            disagreements: Vec::new(),
+            pairing_epochs: HashMap::new(),
+            next_pairing_epoch: 1,
+            link,
+        };
+        if state.store_error.is_none() {
+            state.sync_pairing_epochs();
+        }
+
         Self {
             store,
-            state: Mutex::new(BackendState {
-                data,
-                store_error,
-                local_program,
-                active_node,
-                preferred_relay: None,
-                last_paired: None,
-                disagreements: Vec::new(),
-                link,
-            }),
+            state: Mutex::new(state),
             mutate_lock: AsyncMutex::new(()),
             next_call_seq: AtomicU64::new(1),
         }
@@ -287,6 +353,23 @@ impl LinkBackend {
             ),
         }
     }
+
+    fn resolve_link_node_for_call(&self, machine: &str) -> String {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.data.link.node(machine).is_none()
+                && guard.local_program.is_some()
+                && guard.local_node_name.as_deref() == Some(machine)
+            {
+                return LOCAL_NODE_ID.to_owned();
+            }
+        }
+        machine.to_owned()
+    }
 }
 
 impl Backend for LinkBackend {
@@ -344,10 +427,33 @@ impl Backend for LinkBackend {
 
             match parsed_target {
                 Some(Target::One(machine)) => {
+                    let resolved = self.resolve_link_node_for_call(&machine);
                     let routed = link
-                        .call_machine_with_id(&call_id, &machine, &request.tool, request.args, emit)
+                        .call_machine_with_id(
+                            &call_id,
+                            &resolved,
+                            &request.tool,
+                            request.args,
+                            emit,
+                        )
                         .await
                         .map_err(AppError::from)?;
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    if resolved == LOCAL_NODE_ID
+                        && request.tool == "meta.whoami"
+                        && let Some(actual_name) = routed
+                            .value
+                            .get("node")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    {
+                        let mut guard = self
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        guard.local_node_name = Some(actual_name.to_owned());
+                    }
                     Ok(routed.value)
                 }
                 Some(Target::All | Target::Many(_)) => {
@@ -489,6 +595,7 @@ impl Backend for LinkBackend {
                 guard.preferred_relay = None;
                 guard.last_paired = Some(pair_summary);
                 guard.disagreements.retain(|d| d.machine != node_name);
+                guard.set_fresh_epoch(&node_name);
                 build_app_state(&guard, self.store.path())
             };
 
@@ -566,6 +673,7 @@ impl Backend for LinkBackend {
                 guard.data = next;
                 guard.active_node = resolve_active_node(&guard.data, local_program.as_deref());
                 guard.preferred_relay = None;
+                guard.sync_pairing_epochs();
                 guard.disagreements.retain_mut(|d| {
                     if d.machine == trimmed {
                         return false;
@@ -676,6 +784,8 @@ impl Backend for LinkBackend {
                 guard.preferred_relay = None;
                 guard.last_paired = None;
                 guard.disagreements.clear();
+                guard.pairing_epochs.clear();
+                guard.sync_pairing_epochs();
                 (old, build_app_state(&guard, self.store.path()))
             };
 
@@ -742,6 +852,7 @@ impl Backend for LinkBackend {
                 if updated != guard.data {
                     self.store.save(&updated)?;
                     guard.data = updated;
+                    guard.sync_pairing_epochs();
                 }
                 guard.disagreements = report
                     .disagreement_details
@@ -809,6 +920,7 @@ impl Backend for LinkBackend {
                     .accept_identity_change(trimmed, &fingerprints)
                     .map_err(AppError::from)?;
                 guard.data = updated;
+                guard.set_fresh_epoch(trimmed);
                 build_app_state(&guard, self.store.path())
             };
             Ok(state)
@@ -870,6 +982,83 @@ impl Backend for LinkBackend {
             }
         }
         Ok(Some((guard.link.clone(), nodes)))
+    }
+
+    fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+        let trimmed = machine.trim();
+        if trimmed.is_empty() {
+            return Err(
+                AppError::new(ErrorCode::InvalidArgs, "Machine name cannot be empty.")
+                    .with_hint("Pass the name of a paired machine."),
+            );
+        }
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(err) = &guard.store_error {
+            return Err(err.clone());
+        }
+        let link = guard.link.clone();
+        if let Some(entry) = guard.data.link.node(trimmed).cloned() {
+            let epoch = match guard.pairing_epochs.get(&entry.node).copied() {
+                Some(ep) => ep,
+                None => guard.set_fresh_epoch(&entry.node),
+            };
+            let principal = entry.principal.unwrap_or_else(|| {
+                if entry.local_program.is_some() {
+                    "local".to_owned()
+                } else {
+                    "device".to_owned()
+                }
+            });
+            return Ok(ContentTarget {
+                link,
+                link_node: entry.node.clone(),
+                machine: entry.node.clone(),
+                principal,
+                holder: format_pairing_holder(&entry.node, epoch),
+            });
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if guard.local_program.is_some()
+            && (trimmed == LOCAL_NODE_ID || guard.local_node_name.as_deref() == Some(trimmed))
+        {
+            let epoch = match guard.pairing_epochs.get(LOCAL_NODE_ID).copied() {
+                Some(ep) => ep,
+                None => guard.set_fresh_epoch(LOCAL_NODE_ID),
+            };
+            return Ok(ContentTarget {
+                link,
+                link_node: LOCAL_NODE_ID.to_owned(),
+                machine: trimmed.to_owned(),
+                principal: "local".to_owned(),
+                holder: format_pairing_holder(LOCAL_NODE_ID, epoch),
+            });
+        }
+        let any_configured = !guard.data.link.nodes.is_empty() || guard.local_program.is_some();
+        if !any_configured {
+            return Err(AppError::not_paired());
+        }
+        Err(AppError::new(
+            ErrorCode::NotFound,
+            format!("Machine `{trimmed}` is not paired on this device."),
+        )
+        .with_hint("Pair with that machine or refresh learned fleet routes first."))
+    }
+
+    fn is_pairing_holder_live(&self, holder: &str) -> bool {
+        let Some((node, epoch)) = parse_pairing_holder(holder) else {
+            return false;
+        };
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.store_error.is_some() {
+            return false;
+        }
+        guard.pairing_epochs.get(node).copied() == Some(epoch)
     }
 }
 
@@ -978,6 +1167,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
             routes: BTreeMap::new(),
             disagreements: Vec::new(),
             last_paired: None,
+            transfer_capabilities: TransferCapabilities::current_platform(),
         };
     }
 
@@ -1147,6 +1337,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
         routes,
         disagreements: state.disagreements.clone(),
         last_paired: state.last_paired.clone(),
+        transfer_capabilities: TransferCapabilities::current_platform(),
     }
 }
 

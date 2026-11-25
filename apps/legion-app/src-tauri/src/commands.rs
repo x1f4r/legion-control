@@ -17,6 +17,7 @@ use crate::backend::{
     AppError, AppState, Backend, CallId, CallRequest, CancelResult, ErrorCode, LearnResult,
     RepairResult, UnpairResult,
 };
+use crate::content::{ContentUrlResult, SharedContentServer};
 #[cfg(target_os = "android")]
 use crate::updater::android::AndroidUpdaterHandle;
 use crate::updater::{SharedUpdater, UpdateState};
@@ -152,14 +153,17 @@ pub async fn pair(
     backend.0.pair(invite, resolved_name).await
 }
 
-/// Removes a paired node from this device.
+/// Removes a paired node from this device and revokes any content tickets issued under it.
 #[tauri::command]
 pub async fn unpair(
     backend: State<'_, SharedBackend>,
+    content: State<'_, SharedContentServer>,
     node: String,
 ) -> Result<UnpairResult, AppError> {
     validate_label_size("Node name", &node)?;
-    backend.0.unpair(node).await
+    let result = backend.0.unpair(node).await?;
+    content.0.revoke_stale_pairings();
+    Ok(result)
 }
 
 /// Switches which configured node calls are sent through by default.
@@ -175,8 +179,13 @@ pub async fn select_node(
 /// Moves a damaged or unsupported state file aside (`legion-app.json.damaged-<timestamp>`) and
 /// resets the backend to a clean state.
 #[tauri::command]
-pub async fn repair_store(backend: State<'_, SharedBackend>) -> Result<RepairResult, AppError> {
-    backend.0.repair_store().await
+pub async fn repair_store(
+    backend: State<'_, SharedBackend>,
+    content: State<'_, SharedContentServer>,
+) -> Result<RepairResult, AppError> {
+    let result = backend.0.repair_store().await?;
+    content.0.revoke_all();
+    Ok(result)
 }
 
 /// Closes cached sessions on mobile platforms after resuming from background or sleep so the next
@@ -207,6 +216,7 @@ pub async fn learn(backend: State<'_, SharedBackend>) -> Result<LearnResult, App
 #[tauri::command]
 pub async fn accept_identity_change(
     backend: State<'_, SharedBackend>,
+    content: State<'_, SharedContentServer>,
     node: String,
     fingerprints: Vec<String>,
 ) -> Result<AppState, AppError> {
@@ -220,7 +230,25 @@ pub async fn accept_identity_change(
     for fp in &fingerprints {
         validate_label_size("Fingerprint", fp)?;
     }
-    backend.0.accept_identity_change(node, fingerprints).await
+    let state = backend.0.accept_identity_change(node, fingerprints).await?;
+    content.0.revoke_stale_pairings();
+    Ok(state)
+}
+
+/// Mints a short-lived ticketed content address (`{ url, expires_in }`) for viewing or streaming
+/// `path` on `machine` through `legion-content`.
+#[tauri::command]
+pub async fn content_url(
+    content: State<'_, SharedContentServer>,
+    machine: String,
+    path: String,
+    download: Option<bool>,
+) -> Result<ContentUrlResult, AppError> {
+    validate_label_size("Machine name", &machine)?;
+    content
+        .0
+        .mint_url(&machine, &path, download.unwrap_or(false))
+        .await
 }
 
 /// Dismisses a pending identity-change warning for `node` without altering its pinned target.

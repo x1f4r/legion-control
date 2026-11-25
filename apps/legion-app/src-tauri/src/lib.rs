@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod commands;
+pub mod content;
 pub mod link_backend;
 pub mod store;
 pub mod updater;
@@ -9,9 +10,11 @@ pub mod updater;
 use std::sync::Arc;
 
 use tauri::webview::NewWindowResponse;
-use tauri::{Manager, Url, WebviewWindowBuilder};
+use tauri::{Manager, RunEvent, Url, WebviewWindowBuilder};
 
+use crate::backend::Backend;
 use crate::commands::SharedBackend;
+use crate::content::{AppContentServer, SharedContentServer};
 use crate::link_backend::LinkBackend;
 use crate::store::AppStore;
 use crate::updater::{SharedUpdater, UpdateManager};
@@ -76,6 +79,18 @@ pub fn run() {
 
     let builder = tauri::Builder::default();
 
+    #[cfg(target_os = "android")]
+    let builder = builder.register_asynchronous_uri_scheme_protocol(
+        content::CUSTOM_SCHEME_NAME,
+        |ctx, request, responder| {
+            let content_server = Arc::clone(&ctx.app_handle().state::<SharedContentServer>().0);
+            tauri::async_runtime::spawn(async move {
+                let response = content_server.handle_custom_scheme(request).await;
+                responder.respond(response);
+            });
+        },
+    );
+
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
         if let Some(window) = app.get_webview_window("main") {
@@ -89,11 +104,13 @@ pub fn run() {
         let data_dir = app.path().app_data_dir()?;
         let store = AppStore::in_dir(&data_dir);
         store.prepare_dir()?;
-        let backend = LinkBackend::from_store(store.clone());
+        let backend: Arc<dyn Backend> = Arc::new(LinkBackend::from_store(store.clone()));
+        let content_server = Arc::new(AppContentServer::new(Arc::clone(&backend)));
         let updater =
             UpdateManager::for_app(&data_dir, Some(app.package_info().version.to_string()));
         app.manage(store);
-        app.manage(SharedBackend(Arc::new(backend)));
+        app.manage(SharedBackend(backend));
+        app.manage(SharedContentServer(content_server));
         app.manage(SharedUpdater(Arc::new(updater)));
 
         let window_config = app
@@ -130,6 +147,7 @@ pub fn run() {
             commands::dismiss_identity_change,
             commands::device_name,
             commands::ready,
+            commands::content_url,
             commands::scan_invite,
             commands::update_state,
             commands::update_watch,
@@ -158,6 +176,7 @@ pub fn run() {
             commands::dismiss_identity_change,
             commands::device_name,
             commands::ready,
+            commands::content_url,
             commands::scan_invite,
             commands::update_state,
             commands::update_watch,
@@ -184,6 +203,7 @@ pub fn run() {
         commands::dismiss_identity_change,
         commands::device_name,
         commands::ready,
+        commands::content_url,
         commands::update_state,
         commands::update_watch,
         commands::update_check,
@@ -195,9 +215,15 @@ pub fn run() {
 
     #[allow(clippy::expect_used)]
     // Fatal startup failure before any UI can render; Tauri applications terminate here.
-    builder
-        .run(tauri::generate_context!())
-        .expect("error while running Legion application");
+    let app = builder
+        .build(tauri::generate_context!())
+        .expect("error while building Legion application");
+
+    app.run(|app_handle, event| {
+        if let RunEvent::Exit = event {
+            app_handle.state::<SharedContentServer>().0.shutdown();
+        }
+    });
 }
 
 #[cfg(test)]
