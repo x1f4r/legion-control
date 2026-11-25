@@ -1570,6 +1570,15 @@ fn r9_rebuild_after_damage_carries_unsynced_work() {
                 pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(30 + 3 * settle + k))
                     .unwrap();
             }
+            // When `settle == 0`, `tower`'s own deletion (`d2/f9.txt`, detected at `ts(7)`) was
+            // still inside its 30-second settle window at `ts(32)` and must not be bypassed early;
+            // let `tower`'s 30-second settle window elapse and complete one final sync round.
+            tower.flush_settled_deletions(ts(40 + 3 * settle)).unwrap();
+            pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(41 + 3 * settle))
+                .unwrap();
+            tower
+                .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(41 + 3 * settle))
+                .unwrap();
             let mut issues = Vec::new();
             for (n, root) in [("tower", t.join("tower")), ("pi", t.join("pi"))] {
                 for i in 0..5 {
