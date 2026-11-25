@@ -4110,20 +4110,33 @@ mod tests {
                 "300 parked streams (cap 256) retained too much buffer: {total_retained} bytes"
             );
 
-            // The oldest 44 streams (0..44) were evicted LRU: 0 bytes retained, clean
-            // PermissionDenied error on next read.
-            let mut evicted_count = 0usize;
-            for s in &mut streams[..44] {
-                assert_eq!(s.retained_buffer_bytes(), 0);
-                let mut probe = [0u8; 64];
-                let err = s.read(&mut probe).await.unwrap_err();
-                assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
-                evicted_count += 1;
+            // Exactly 44 oldest streams were evicted LRU: 0 bytes retained and clean
+            // PermissionDenied error on next read. Streams in strictly earlier batches (0..40)
+            // must all be evicted, and the remaining 4 evicted streams come from the boundary
+            // batch (40..48) whose 8 watchdogs parked concurrently.
+            let mut evicted_indices = Vec::new();
+            for (idx, s) in streams.iter_mut().enumerate() {
+                if s.retained_buffer_bytes() == 0 {
+                    evicted_indices.push(idx);
+                    let mut probe = [0u8; 64];
+                    let err = s.read(&mut probe).await.unwrap_err();
+                    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+                }
             }
-            assert_eq!(evicted_count, 44);
+            assert_eq!(evicted_indices.len(), 44);
+            for idx in 0..40 {
+                assert!(
+                    evicted_indices.contains(&idx),
+                    "stream {idx} from an earlier batch must have been evicted LRU"
+                );
+            }
+            assert!(
+                evicted_indices.iter().all(|&idx| idx < 48),
+                "only streams from oldest batches (0..48) may be evicted LRU, got {evicted_indices:?}"
+            );
 
             // Surviving streams resume byte-exact.
-            for idx in [44usize, 170, 299] {
+            for idx in [48usize, 170, 299] {
                 read_exact_pattern(&mut streams[idx], 300 * 1024, (1024 - 300) * 1024).await;
                 let mut eof = [0u8; 8];
                 assert_eq!(streams[idx].read(&mut eof).await.unwrap(), 0);
