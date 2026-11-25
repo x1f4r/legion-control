@@ -19,7 +19,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use legion_proto::{ErrorBody, ErrorCode};
@@ -221,8 +221,10 @@ struct ParkActivity {
     started: Instant,
     last_poll_ms: AtomicU64,
     waiting_for_remote: AtomicBool,
+    probe_pending: AtomicBool,
     parked: AtomicBool,
     watchdog_cancel: CancellationToken,
+    waker: Mutex<Option<Waker>>,
     guard: Mutex<Option<Box<dyn Send + Sync>>>,
 }
 
@@ -236,8 +238,10 @@ impl ParkActivity {
             started: Instant::now(),
             last_poll_ms: AtomicU64::new(0),
             waiting_for_remote: AtomicBool::new(false),
+            probe_pending: AtomicBool::new(false),
             parked: AtomicBool::new(false),
             watchdog_cancel: CancellationToken::new(),
+            waker: Mutex::new(None),
             guard: Mutex::new(guard),
         });
         if let Some(park_token) = park_cancel
@@ -246,6 +250,10 @@ impl ParkActivity {
             let weak = Arc::downgrade(&activity);
             let cancel = activity.watchdog_cancel.clone();
             let threshold_ms = u64::try_from(idle_park_timeout.as_millis()).unwrap_or(u64::MAX);
+            // Probe half-way through the idle window when a read previously returned Poll::Pending:
+            // an active reader re-polls immediately and advances `last_poll_ms`, whereas a read
+            // future dropped by `timeout(read)` or `select!` never re-polls and parks on schedule.
+            let probe_ms = (threshold_ms / 2).max(1);
             let tick = (idle_park_timeout / 4)
                 .clamp(Duration::from_millis(15), Duration::from_millis(250));
             tokio::spawn(async move {
@@ -257,22 +265,46 @@ impl ParkActivity {
                             let Some(act) = weak.upgrade() else {
                                 break;
                             };
-                            if act.waiting_for_remote.load(Ordering::Acquire) {
-                                continue;
-                            }
                             let now_ms = u64::try_from(act.started.elapsed().as_millis())
                                 .unwrap_or(u64::MAX);
                             let last_ms = act.last_poll_ms.load(Ordering::Acquire);
-                            if now_ms.saturating_sub(last_ms) >= threshold_ms {
-                                act.parked.store(true, Ordering::Release);
-                                park_token.cancel();
-                                let _ = act
-                                    .guard
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .take();
-                                break;
+                            let idle_ms = now_ms.saturating_sub(last_ms);
+                            if act.waiting_for_remote.load(Ordering::Acquire) {
+                                if !act.probe_pending.load(Ordering::Acquire) {
+                                    if idle_ms >= probe_ms {
+                                        act.probe_pending.store(true, Ordering::Release);
+                                        let waker = act
+                                            .waker
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .clone();
+                                        if let Some(waker) = waker {
+                                            waker.wake();
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if idle_ms < threshold_ms {
+                                    continue;
+                                }
+                                act.waiting_for_remote.store(false, Ordering::Release);
+                                act.probe_pending.store(false, Ordering::Release);
+                            } else if idle_ms < threshold_ms {
+                                continue;
                             }
+                            act.parked.store(true, Ordering::Release);
+                            let _ = act
+                                .waker
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .take();
+                            park_token.cancel();
+                            let _ = act
+                                .guard
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .take();
+                            break;
                         }
                     }
                 }
@@ -284,10 +316,21 @@ impl ParkActivity {
     fn touch_ms(&self) {
         let now_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_poll_ms.store(now_ms, Ordering::Release);
+        self.probe_pending.store(false, Ordering::Release);
+        if self.waiting_for_remote.swap(false, Ordering::AcqRel) {
+            let _ = self.waker.lock().unwrap_or_else(|p| p.into_inner()).take();
+        }
     }
 
-    fn set_waiting(&self, waiting: bool) {
-        self.waiting_for_remote.store(waiting, Ordering::Release);
+    fn mark_waiting(&self, waker: &Waker) {
+        let mut slot = self.waker.lock().unwrap_or_else(|p| p.into_inner());
+        match slot.as_mut() {
+            Some(existing) => existing.clone_from(waker),
+            None => *slot = Some(waker.clone()),
+        }
+        drop(slot);
+        self.probe_pending.store(false, Ordering::Release);
+        self.waiting_for_remote.store(true, Ordering::Release);
     }
 
     fn is_parked(&self) -> bool {
@@ -296,6 +339,9 @@ impl ParkActivity {
 
     fn stop_and_release(&self) {
         self.watchdog_cancel.cancel();
+        self.waiting_for_remote.store(false, Ordering::Release);
+        self.probe_pending.store(false, Ordering::Release);
+        let _ = self.waker.lock().unwrap_or_else(|p| p.into_inner()).take();
         let _ = self.guard.lock().unwrap_or_else(|p| p.into_inner()).take();
     }
 }
@@ -657,7 +703,6 @@ fn poll_keep_open(
     buf: &mut ReadBuf<'_>,
 ) -> Poll<io::Result<()>> {
     state.activity.touch_ms();
-    state.activity.set_waiting(false);
 
     loop {
         if let KeepOpenPhase::Reopening(fut) = &mut state.phase {
@@ -745,7 +790,7 @@ fn poll_keep_open(
                             state.fail_stream(total_remaining);
                             return Poll::Ready(Err(err));
                         }
-                        state.activity.set_waiting(true);
+                        state.activity.mark_waiting(cx.waker());
                         return Poll::Pending;
                     }
                     Poll::Ready(Err(err)) => {
@@ -826,7 +871,7 @@ fn poll_keep_open(
                             state.fail_stream(total_remaining);
                             return Poll::Ready(Err(err));
                         }
-                        state.activity.set_waiting(true);
+                        state.activity.mark_waiting(cx.waker());
                         return Poll::Pending;
                     }
                     Poll::Ready(Err(err)) => {
@@ -968,7 +1013,7 @@ fn poll_keep_open(
                             state.fail_stream(total_remaining);
                             return Poll::Ready(Err(err));
                         }
-                        state.activity.set_waiting(true);
+                        state.activity.mark_waiting(cx.waker());
                         return Poll::Pending;
                     }
                     Poll::Ready(Err(err)) => {
@@ -1110,7 +1155,7 @@ fn poll_keep_open(
                         state.fail_stream(total_remaining);
                         return Poll::Ready(Err(err));
                     }
-                    state.activity.set_waiting(true);
+                    state.activity.mark_waiting(cx.waker());
                     return Poll::Pending;
                 }
                 Poll::Ready(Err(err)) => {
@@ -3138,6 +3183,222 @@ mod tests {
             assert!(
                 err.to_string().contains("too many consecutive busy"),
                 "{err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_pending_read_does_not_block_parking() {
+        struct SlotGuard(Arc<AtomicUsize>);
+        impl Drop for SlotGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        struct DelayedBodyOpener {
+            payload: Arc<Vec<u8>>,
+            first_body_delay: Duration,
+            active_slots: Arc<AtomicUsize>,
+            opened: Arc<AtomicUsize>,
+        }
+
+        impl StreamOpener for DelayedBodyOpener {
+            fn window_policy(&self) -> Option<WindowPolicy> {
+                Some(WindowPolicy {
+                    initial_bytes: 16 * 1024,
+                    max_bytes: 16 * 1024,
+                })
+            }
+
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let payload = Arc::clone(&self.payload);
+                let delay = self.first_body_delay;
+                let active_slots = Arc::clone(&self.active_slots);
+                let opened = Arc::clone(&self.opened);
+                Box::pin(async move {
+                    let seq = opened.fetch_add(1, Ordering::SeqCst);
+                    active_slots.fetch_add(1, Ordering::SeqCst);
+                    let guard = Box::new(SlotGuard(Arc::clone(&active_slots)));
+
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let channel_cancel = CancellationToken::new();
+                    let park_cancel = CancellationToken::new();
+                    let rx_cancel = channel_cancel.clone();
+                    let rx_park = park_cancel.clone();
+
+                    tokio::spawn(async move {
+                        let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            let n = tokio::select! {
+                                biased;
+                                () = rx_cancel.cancelled() => break,
+                                () = rx_park.cancelled() => break,
+                                res = reader.read_line(&mut line) => res.unwrap_or(0),
+                            };
+                            if n == 0 {
+                                break;
+                            }
+                            let req: Value = serde_json::from_str(&line).unwrap();
+                            let offset = req["offset"].as_u64().unwrap() as usize;
+                            let len = req["length"].as_u64().unwrap() as usize;
+                            let actual = len.min(payload.len() - offset);
+                            let ready = json!({
+                                "size": payload.len(),
+                                "offset": offset,
+                                "length": actual,
+                                "mtime": { "secs": 1_700_000_555i64, "nanos": 0u32 },
+                                "file_id": 88u64,
+                                "keep_open": true,
+                            });
+                            if server_out
+                                .write_all(format!("{ready}\n").as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            let _ = server_out.flush().await;
+                            // Delay body bytes on the first channel so the caller's read returns
+                            // Poll::Pending and sets `waiting_for_remote`.
+                            if seq == 0 {
+                                tokio::select! {
+                                    biased;
+                                    () = rx_cancel.cancelled() => break,
+                                    () = rx_park.cancelled() => break,
+                                    () = tokio::time::sleep(delay) => {}
+                                }
+                            }
+                            if server_out
+                                .write_all(&payload[offset..offset + actual])
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if server_out.write_all(b"{\"done\":true}\n").await.is_err() {
+                                break;
+                            }
+                            let _ = server_out.flush().await;
+                        }
+                        let _ = server_out.shutdown().await;
+                    });
+
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: channel_cancel,
+                        park: Some(park_cancel),
+                        guard: Some(guard),
+                    })
+                })
+            }
+        }
+
+        let payload: Vec<u8> = (0..32 * 1024usize).map(|i| (i % 241) as u8).collect();
+        let idle_park = Duration::from_millis(80);
+        let opts = ContentStreamOptions {
+            idle_park_timeout: idle_park,
+            progress_timeout: Duration::from_secs(5),
+            max_busy_lines: 4,
+        };
+
+        // 1. A read abandoned via `timeout(read)` while pending must NOT block parking.
+        {
+            let active_slots = Arc::new(AtomicUsize::new(0));
+            let opened = Arc::new(AtomicUsize::new(0));
+            let opener: Arc<dyn StreamOpener> = Arc::new(DelayedBodyOpener {
+                payload: Arc::new(payload.clone()),
+                first_body_delay: Duration::from_secs(30),
+                active_slots: Arc::clone(&active_slots),
+                opened: Arc::clone(&opened),
+            });
+            let raw = opener.open_stream(CancellationToken::new()).await.unwrap();
+            let mut stream = handshake_get_with_options(
+                raw,
+                Some(Arc::clone(&opener)),
+                "tower",
+                "/slow.bin",
+                0,
+                None,
+                None,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+                opts,
+            )
+            .await
+            .unwrap();
+            assert_eq!(active_slots.load(Ordering::SeqCst), 1);
+
+            let mut buf = [0u8; 4096];
+            let timed_out =
+                tokio::time::timeout(Duration::from_millis(25), stream.read(&mut buf)).await;
+            assert!(
+                timed_out.is_err(),
+                "first read should time out while pending"
+            );
+
+            // Stream must park within the normal idle park window (~80 ms + modest scheduler slack).
+            let deadline = Instant::now() + Duration::from_millis(400);
+            while active_slots.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            assert_eq!(
+                active_slots.load(Ordering::SeqCst),
+                0,
+                "abandoned pending read must not block parking"
+            );
+
+            // Resuming after park reopens transparently and yields exact payload.
+            let mut out = Vec::new();
+            stream.read_to_end(&mut out).await.unwrap();
+            assert_eq!(out, payload);
+            assert!(opened.load(Ordering::SeqCst) >= 2);
+        }
+
+        // 2. An actively waiting reader (future NOT dropped) must NOT be prematurely parked while
+        //    waiting for a slow remote (220 ms > idle_park_timeout 80 ms).
+        {
+            let active_slots = Arc::new(AtomicUsize::new(0));
+            let opened = Arc::new(AtomicUsize::new(0));
+            let opener: Arc<dyn StreamOpener> = Arc::new(DelayedBodyOpener {
+                payload: Arc::new(payload.clone()),
+                first_body_delay: Duration::from_millis(220),
+                active_slots: Arc::clone(&active_slots),
+                opened: Arc::clone(&opened),
+            });
+            let raw = opener.open_stream(CancellationToken::new()).await.unwrap();
+            let mut stream = handshake_get_with_options(
+                raw,
+                Some(Arc::clone(&opener)),
+                "tower",
+                "/slow-active.bin",
+                0,
+                None,
+                None,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+                opts,
+            )
+            .await
+            .unwrap();
+
+            let mut out = Vec::new();
+            stream.read_to_end(&mut out).await.unwrap();
+            assert_eq!(out, payload);
+            assert_eq!(
+                opened.load(Ordering::SeqCst),
+                1,
+                "active reader waiting on slow remote must not be prematurely parked"
             );
         }
     }
