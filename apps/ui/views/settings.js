@@ -1987,6 +1987,9 @@ function AboutPage({
               <div class="row">
                 <span class="body">
                   <span class="title mono">${summary.manualCommand}</span>
+                  ${summary.manualSha256
+                    ? html`<span class="sub mono wrap">SHA-256: ${summary.manualSha256}</span>`
+                    : null}
                 </span>
                 <${CopyButton} text=${summary.manualCommand} />
               </div>
@@ -1999,7 +2002,7 @@ function AboutPage({
                 <span class="body">
                   <span class="title">Update automatically</span>
                   <span class="sub wrap">
-                    Download when a newer version is seen and install on next start or when idle
+                    Download when a newer version is seen and install on start or when you leave the app
                   </span>
                 </span>
                 <input

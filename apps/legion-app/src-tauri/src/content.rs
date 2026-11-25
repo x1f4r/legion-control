@@ -242,6 +242,19 @@ fn map_link_open_error(err: ProtoErrorBody) -> OpenRangeError {
     {
         return OpenRangeError::OutOfRange { size: actual };
     }
+    if err.code == ProtoErrorCode::Busy {
+        let retry_after_secs = err
+            .details
+            .as_ref()
+            .and_then(|d| d.get("retry_after_secs"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(2)
+            .max(1);
+        return OpenRangeError::Busy {
+            retry_after_secs,
+            error: err,
+        };
+    }
     OpenRangeError::Error(err)
 }
 
@@ -1325,6 +1338,7 @@ mod tests {
                     writer: Box::new(client_out),
                     stderr: None,
                     cancel,
+                    park: None,
                     guard: None,
                 })
             })

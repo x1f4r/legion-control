@@ -20,6 +20,9 @@ pub const MAX_NOTES_BYTES: usize = 16 * 1024;
 /// Maximum number of artifacts listed in one update set.
 pub const MAX_ARTIFACTS: usize = 64;
 
+/// Maximum accepted size of a single update artifact (512 MiB).
+pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Update channel for a signed set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -256,12 +259,23 @@ pub struct Artifact {
     pub arch: Arch,
     /// Installation mechanism for this artifact.
     pub kind: InstallKind,
+    /// Exact artifact file size in bytes (covered by `SHA256SUMS` signature via `update.json`).
+    pub size: u64,
 }
 
 impl Artifact {
-    /// Validates the artifact's filename and `(program, os, kind)` compatibility.
+    /// Validates the artifact's filename, size bounds, and `(program, os, kind)` compatibility.
     pub fn validate(&self) -> Result<(), ErrorBody> {
         validate_entry_name(&self.name)?;
+        if self.size == 0 || self.size > MAX_ARTIFACT_BYTES {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "Artifact {:?} declares invalid size {} bytes (must be 1..={MAX_ARTIFACT_BYTES}).",
+                    self.name, self.size
+                ),
+            ));
+        }
         if matches!(
             self.name.as_str(),
             MANIFEST_FILENAME | CHECKSUMS_FILENAME | SIGNATURE_FILENAME
@@ -432,37 +446,41 @@ impl UpdateManifest {
 
     /// Selects the single artifact matching `target`, preferring an exact architecture match over
     /// a universal bundle (and allowing x86_64 emulation on Windows ARM64 when no native arm64
-    /// artifact is present).
+    /// artifact is present). Refuses ambiguous sets where more than one artifact matches.
     pub fn select_artifact(&self, target: TargetPlatform) -> Result<&Artifact, ErrorBody> {
         let same_shape = |a: &&Artifact| {
             a.program == target.program && a.os == target.os && a.kind == target.kind
         };
 
-        if let Some(exact) = self
+        let exact: Vec<&Artifact> = self
             .artifacts
             .iter()
-            .find(|a| same_shape(a) && a.arch == target.arch)
-        {
-            return Ok(exact);
+            .filter(|a| same_shape(a) && a.arch == target.arch)
+            .collect();
+        if let Some(chosen) = pick_unique_artifact(&exact, self, target, "exact")? {
+            return Ok(chosen);
         }
 
-        if matches!(target.os, Os::Android | Os::Macos)
-            && let Some(universal) = self
+        if matches!(target.os, Os::Android | Os::Macos) {
+            let universal: Vec<&Artifact> = self
                 .artifacts
                 .iter()
-                .find(|a| same_shape(a) && a.arch == Arch::Universal)
-        {
-            return Ok(universal);
+                .filter(|a| same_shape(a) && a.arch == Arch::Universal)
+                .collect();
+            if let Some(chosen) = pick_unique_artifact(&universal, self, target, "universal")? {
+                return Ok(chosen);
+            }
         }
 
-        if target.os == Os::Windows
-            && target.arch == Arch::Aarch64
-            && let Some(emulated) = self
+        if target.os == Os::Windows && target.arch == Arch::Aarch64 {
+            let emulated: Vec<&Artifact> = self
                 .artifacts
                 .iter()
-                .find(|a| same_shape(a) && a.arch == Arch::X86_64)
-        {
-            return Ok(emulated);
+                .filter(|a| same_shape(a) && a.arch == Arch::X86_64)
+                .collect();
+            if let Some(chosen) = pick_unique_artifact(&emulated, self, target, "x86_64")? {
+                return Ok(chosen);
+            }
         }
 
         Err(ErrorBody::new(
@@ -475,5 +493,32 @@ impl UpdateManifest {
         .with_hint(
             "Build and include an artifact for this platform and install kind in the update set.",
         ))
+    }
+}
+
+fn pick_unique_artifact<'a>(
+    matches: &[&'a Artifact],
+    manifest: &UpdateManifest,
+    target: TargetPlatform,
+    tier: &str,
+) -> Result<Option<&'a Artifact>, ErrorBody> {
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches[0])),
+        n => Err(ErrorBody::new(
+            ErrorCode::Conflict,
+            format!(
+                "Update set {} (sequence {}) has {n} ambiguous {tier} artifacts for {} on {}/{} ({}).",
+                manifest.version,
+                manifest.sequence,
+                target.program,
+                target.os,
+                target.arch,
+                target.kind
+            ),
+        )
+        .with_hint(
+            "Include at most one artifact per platform, architecture, and install kind.",
+        )),
     }
 }

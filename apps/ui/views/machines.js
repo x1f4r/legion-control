@@ -97,6 +97,8 @@ export function MachinesView({
   tools,
   allowedSet,
   settings,
+  deviceNoun,
+  thumbCache,
   wakePendingSet,
   onWakeMachine,
   onWakeSent,
@@ -138,25 +140,24 @@ export function MachinesView({
         : null}
       ${justUpdated
         ? html`
-            <div class="list spaced" role="status">
-              <div class="row">
-                <span class="body">
-                  <span class="title">
-                    Updated to ${justUpdated.version}
-                    ${justUpdated.notes
-                      ? html` · <button type="button" class="btn small" onClick=${onOpenWhatIsNew}>What is new</button>`
-                      : null}
-                  </span>
-                </span>
-                <button
-                  type="button"
-                  class="btn small"
-                  aria-label="Dismiss update notice"
-                  onClick=${onDismissUpdateNotice}
-                >
-                  Dismiss
-                </button>
-              </div>
+            <div class="update-note" role="status">
+              ${justUpdated.notes
+                ? html`
+                    <button type="button" class="update-note-link" onClick=${onOpenWhatIsNew}>
+                      <span>Updated to ${justUpdated.version}</span>
+                      <span aria-hidden="true">·</span>
+                      <span class="update-note-action">What is new</span>
+                    </button>
+                  `
+                : html`<span class="update-note-text">Updated to ${justUpdated.version}</span>`}
+              <button
+                type="button"
+                class="update-note-dismiss"
+                aria-label="Dismiss update notice"
+                onClick=${onDismissUpdateNotice}
+              >
+                ×
+              </button>
             </div>
           `
         : null}
@@ -252,6 +253,8 @@ export function MachinesView({
                   tools=${tools}
                   allowedSet=${allowedSet}
                   settings=${settings}
+                  deviceNoun=${deviceNoun}
+                  thumbCache=${thumbCache}
                   wakePending=${Boolean(wakePendingSet?.has(selectedMachine.name))}
                   onWakeMachine=${onWakeMachine}
                   onWakeSent=${onWakeSent}
@@ -279,6 +282,8 @@ export function MachinesView({
         tools=${tools}
         allowedSet=${allowedSet}
         settings=${settings}
+        deviceNoun=${deviceNoun}
+        thumbCache=${thumbCache}
         wakePending=${Boolean(wakePendingSet?.has(selectedMachine.name))}
         onWakeMachine=${onWakeMachine}
         onWakeSent=${onWakeSent}

@@ -94,6 +94,51 @@ export function createAppLink() {
   let nextCallId = 1;
   let readySent = false;
   const iosPlatform = isIosPlatform();
+  const unsupportedContentMachines = new Set();
+  const contentSupportListeners = new Set();
+
+  function machineKey(machine) {
+    return typeof machine === 'string' ? machine.trim() : '';
+  }
+
+  function notifyContentSupport() {
+    for (const listener of contentSupportListeners) {
+      try {
+        listener();
+      } catch {
+        // Keep notifying remaining listeners.
+      }
+    }
+  }
+
+  function markContentUnsupported(machine) {
+    const key = machineKey(machine);
+    if (!key) return;
+    if (!unsupportedContentMachines.has(key)) {
+      unsupportedContentMachines.add(key);
+      notifyContentSupport();
+    }
+  }
+
+  function clearUnsupportedContentMachines() {
+    if (unsupportedContentMachines.size > 0) {
+      unsupportedContentMachines.clear();
+      notifyContentSupport();
+    }
+  }
+
+  function supportsContentFor(machine) {
+    const key = machineKey(machine);
+    return !key || !unsupportedContentMachines.has(key);
+  }
+
+  function onContentSupportChange(listener) {
+    if (typeof listener !== 'function') return () => {};
+    contentSupportListeners.add(listener);
+    return () => {
+      contentSupportListeners.delete(listener);
+    };
+  }
 
   async function runConfiguredMediaCheck() {
     if (typeof document === 'undefined' || !document.body) return;
@@ -668,6 +713,7 @@ export function createAppLink() {
     }
     try {
       const paired = await invoke('pair', { invite: inviteText, name: name || null });
+      clearUnsupportedContentMachines();
       const next = await state();
       return {
         ...next,
@@ -692,6 +738,7 @@ export function createAppLink() {
         node,
         fingerprints: Array.isArray(fingerprints) ? fingerprints : [],
       });
+      clearUnsupportedContentMachines();
       return await state();
     } catch (err) {
       throw normalizeError(err);
@@ -709,7 +756,9 @@ export function createAppLink() {
 
   async function unpair(node) {
     try {
-      return await invoke('unpair', { node });
+      const res = await invoke('unpair', { node });
+      clearUnsupportedContentMachines();
+      return res;
     } catch (err) {
       throw normalizeError(err);
     }
@@ -727,6 +776,7 @@ export function createAppLink() {
   async function repairStore() {
     try {
       const result = await invoke('repair_store');
+      clearUnsupportedContentMachines();
       const nextState = await state();
       return {
         archived_to: result?.archived_to || '',
@@ -741,6 +791,7 @@ export function createAppLink() {
   async function invalidateSessions() {
     try {
       await invoke('invalidate_sessions');
+      clearUnsupportedContentMachines();
     } catch {
       // Best-effort teardown on resume; subsequent calls still reconnect on error.
     }
@@ -825,9 +876,9 @@ export function createAppLink() {
     }
   }
 
-  async function maybeAutoInstall() {
+  async function maybeAutoInstall(trigger = 'startup') {
     try {
-      return await invoke('update_maybe_auto_install');
+      return await invoke('update_maybe_auto_install', { trigger });
     } catch (err) {
       throw normalizeError(err);
     }
@@ -861,7 +912,18 @@ export function createAppLink() {
       }
       return result;
     } catch (err) {
-      throw normalizeError(err);
+      const normalized = normalizeError(err);
+      if (
+        normalized.code === 'unsupported' &&
+        normalized.details?.reason !== 'too_large_for_inline'
+      ) {
+        const target = machineKey(machine) || machineKey(normalized.machine);
+        markContentUnsupported(target);
+        if (normalized.machine && machineKey(normalized.machine) !== target) {
+          markContentUnsupported(normalized.machine);
+        }
+      }
+      throw normalized;
     }
   }
 
@@ -1017,6 +1079,9 @@ export function createAppLink() {
 
   const link = {
     kind: 'app',
+    supportsContent: true,
+    supportsContentFor,
+    onContentSupportChange,
     state,
     tools,
     call,

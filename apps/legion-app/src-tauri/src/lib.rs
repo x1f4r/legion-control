@@ -102,10 +102,7 @@ fn android_files_transfer_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
 
 /// Builds the main Legion WebView window from `tauri.conf.json` with our strict bundled-origin
 /// navigation guard and new-window denial.
-///
-/// Called once during startup and again on Android if `MainActivity` was swiped away while
-/// `TransferForegroundService` kept the process alive and the user later reopens Legion.
-pub fn create_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+fn build_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<tauri::WebviewWindow> {
     let window_config = app
         .config()
         .app
@@ -116,7 +113,16 @@ pub fn create_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<()> {
     WebviewWindowBuilder::from_config(app, &window_config)?
         .on_navigation(is_allowed_navigation_url)
         .on_new_window(|_, _| NewWindowResponse::Deny)
-        .build()?;
+        .build()
+}
+
+/// Builds the main Legion WebView window from `tauri.conf.json` with our strict bundled-origin
+/// navigation guard and new-window denial.
+///
+/// Called on Android if `MainActivity` was swiped away while `TransferForegroundService` kept the
+/// process alive and the user later reopens Legion.
+pub fn create_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let _ = build_main_webview_window(app)?;
     Ok(())
 }
 
@@ -169,12 +175,33 @@ pub fn run() {
 
     let builder = builder.setup(|app| {
         let data_dir = app.path().app_data_dir()?;
+        #[cfg(target_os = "windows")]
+        let updates_base_dir = app
+            .path()
+            .app_local_data_dir()
+            .unwrap_or_else(|_| data_dir.clone());
+        #[cfg(not(target_os = "windows"))]
+        let updates_base_dir = data_dir.clone();
+
+        let updater = Arc::new(UpdateManager::for_app(
+            &updates_base_dir,
+            Some(app.package_info().version.to_string()),
+        ));
+
+        // When spawned by the desktop swapper during a window-close update, confirm startup
+        // cleanly (writing `started-<seq>.ok`, `current-build.json`, advancing `floor.json`, and
+        // recording the post-update notice) and exit without popping a window open.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if std::env::var_os("LEGION_UPDATE_VERIFY_ONLY").is_some_and(|v| v == "1") {
+            updater.on_app_ready();
+            app.handle().exit(0);
+            return Ok(());
+        }
+
         let store = AppStore::in_dir(&data_dir);
         store.prepare_dir()?;
         let backend: Arc<dyn Backend> = Arc::new(LinkBackend::from_store(store.clone()));
         let content_server = Arc::new(AppContentServer::new(Arc::clone(&backend)));
-        let updater =
-            UpdateManager::for_app(&data_dir, Some(app.package_info().version.to_string()));
 
         #[cfg(target_os = "android")]
         let platform: Arc<dyn TransferPlatform> = {
@@ -213,10 +240,25 @@ pub fn run() {
         app.manage(store);
         app.manage(SharedBackend(backend));
         app.manage(SharedContentServer(content_server));
-        app.manage(SharedTransfers(transfers));
-        app.manage(SharedUpdater(Arc::new(updater)));
+        app.manage(SharedTransfers(Arc::clone(&transfers)));
+        app.manage(SharedUpdater(Arc::clone(&updater)));
 
-        create_main_webview_window(app.handle())?;
+        let window = build_main_webview_window(app.handle())?;
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let close_updater = Arc::clone(&updater);
+            let close_transfers = Arc::clone(&transfers);
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { .. } = event
+                    && !close_transfers.has_active_work()
+                {
+                    let _ = close_updater.try_spawn_desktop_close_install();
+                }
+            });
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let _ = (window, transfers);
 
         Ok(())
     });

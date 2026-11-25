@@ -75,6 +75,15 @@ pub struct GetStream {
     file_id: Option<u64>,
 }
 
+/// Failure returned by [`GetStream::stream_to_checked`].
+#[derive(Debug)]
+pub enum StreamCheckedError<E> {
+    /// Underlying file or transfer I/O error.
+    Xfer(Error),
+    /// Caller's periodic check aborted the stream before completion.
+    Aborted(E),
+}
+
 impl GetStream {
     /// Opens `path`, verifies it is a regular file with `offset <= size`, and seeks to `offset`,
     /// streaming through the end of the file.
@@ -165,10 +174,31 @@ impl GetStream {
     ///
     /// If the file grows after opening, reads stop at `length` so framed protocols stay aligned. If
     /// the file shrinks before `length` bytes are read, returns [`Error::Conflict`].
-    pub fn stream_to<W: Write>(self, mut writer: W) -> Result<u64> {
+    pub fn stream_to<W: Write>(self, writer: W) -> Result<u64> {
+        match self.stream_to_checked(writer, |_| Ok::<(), std::convert::Infallible>(())) {
+            Ok(written) => Ok(written),
+            Err(StreamCheckedError::Xfer(err)) => Err(err),
+            Err(StreamCheckedError::Aborted(never)) => match never {},
+        }
+    }
+
+    /// Streams [`Self::length`] bytes into `writer`, invoking `check(bytes_written)` before each
+    /// chunk after the first so callers can re-verify authorization or cancellation during long
+    /// reads and stop streaming immediately on failure.
+    pub fn stream_to_checked<W, E, F>(
+        self,
+        mut writer: W,
+        mut check: F,
+    ) -> std::result::Result<u64, StreamCheckedError<E>>
+    where
+        W: Write,
+        F: FnMut(u64) -> std::result::Result<(), E>,
+    {
         let remaining = self.length;
         if remaining == 0 {
-            writer.flush()?;
+            writer
+                .flush()
+                .map_err(|e| StreamCheckedError::Xfer(e.into()))?;
             return Ok(0);
         }
         let mut limited = self.file.take(remaining);
@@ -176,25 +206,32 @@ impl GetStream {
         let mut written = 0u64;
 
         loop {
+            if written > 0 {
+                check(written).map_err(StreamCheckedError::Aborted)?;
+            }
             let n = limited
                 .read(&mut buf)
-                .map_err(|e| classify_io(&self.path, e))?;
+                .map_err(|e| StreamCheckedError::Xfer(classify_io(&self.path, e)))?;
             if n == 0 {
                 break;
             }
-            writer.write_all(&buf[..n])?;
+            writer
+                .write_all(&buf[..n])
+                .map_err(|e| StreamCheckedError::Xfer(e.into()))?;
             written += n as u64;
         }
-        writer.flush()?;
+        writer
+            .flush()
+            .map_err(|e| StreamCheckedError::Xfer(e.into()))?;
 
         if written < remaining {
-            return Err(Error::Conflict {
+            return Err(StreamCheckedError::Xfer(Error::Conflict {
                 path: self.path,
                 reason: format!(
                     "file shrank while streaming: expected {remaining} bytes from offset {}, read {written}",
                     self.offset
                 ),
-            });
+            }));
         }
 
         Ok(written)

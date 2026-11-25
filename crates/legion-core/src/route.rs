@@ -89,6 +89,10 @@ pub struct ContentRequest {
     pub length: Option<u64>,
     /// Principal pinned by the door (for example the HTTP bearer token's principal).
     pub principal: String,
+    /// Opaque credential holder identifier (for example the HTTP bearer token's name and hash)
+    /// used for per-holder fair sharing of remote content pipes. Falls back to `principal` when
+    /// `None`.
+    pub holder: Option<String>,
     /// Door through which the request arrived, recorded in the audit log.
     pub door: Door,
     /// Whether `open_content` should write an immediate `content.read` audit line.
@@ -127,6 +131,14 @@ pub enum ContentError {
     OutOfRange {
         /// Current file size in bytes.
         size: u64,
+    },
+    /// Content transport capacity for the target machine is temporarily saturated (`503` +
+    /// `Retry-After`).
+    Busy {
+        /// Suggested retry delay in seconds.
+        retry_after_secs: u64,
+        /// Structured error describing the busy condition.
+        error: ErrorBody,
     },
     /// Structured Legion error (denied, not_found, conflict, unreachable, ...).
     Error(ErrorBody),
@@ -225,7 +237,9 @@ pub async fn open_local_content(
                     req.path, req.offset
                 ),
             )),
-            Err(ContentError::Error(err)) => Err(err.clone()),
+            Err(ContentError::Busy { error, .. } | ContentError::Error(error)) => {
+                Err(error.clone())
+            }
         };
         node.record_audit(
             here,

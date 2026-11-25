@@ -961,7 +961,7 @@ curl -sS http://127.0.0.1:7117/v1/health
 ```
 
 ```json
-{"ok":true,"node":"tower","version":"0.1.0"}
+{"ok":true,"node":"tower","version":"0.1.0","content":true}
 ```
 
 List allowed tools for the token's principal:
@@ -1018,15 +1018,37 @@ curl -sSI 'http://127.0.0.1:7117/v1/content/<ticket>/clip.mp4?download=1'
 
 Security and lifecycle guarantees:
 
-- **Tickets and revocation**: 256 random bits bound to one bearer token, one principal, one
-  machine, and one bounded file path (at most 4 KiB; `POST /v1/content` bodies are capped at 16
-  KiB). Permissions are checked as `fs.read` when the ticket is minted, on every `GET` or `HEAD`,
-  and periodically while streaming (every 2 MiB or 2 seconds), so revoking the token, tightening
-  `policy.toml`, or crossing the 6-hour hard limit cuts off active downloads. Tickets expire using
-  a suspend-safe clock (15 minutes after last use, 6 hours absolute maximum), are capped at 128 per
-  token (evicting the oldest), and are never logged; minting writes one `content.ticket` audit
-  entry and successful reads coalesce to at most one `content.read` (and `stream.get` on remote
-  nodes) per ticket per minute with request count and bytes served.
+- **Tickets, revocation bounds, and audit durability**: 256 random bits bound to one bearer token,
+  one principal, one machine, and one bounded file path (at most 4 KiB; `POST /v1/content` bodies
+  are capped at 16 KiB). Permissions are checked as `fs.read` when the ticket is minted, on every
+  `GET` or `HEAD`, on an independent 1-second liveness timer per active stream (not tied to body
+  polling or client read speed), and immediately before yielding another 64 KiB frame after socket
+  backpressure. Revoking a token or removing a principal revokes every ticket of that holder; a
+  narrowed path, expiry, or crossing the 6-hour hard limit ends only that ticket and leaves the
+  holder's other still-allowed tickets serving. Active content sockets request `SO_SNDBUF = 128 KiB`
+  before sending the response (effective kernel buffer varies by OS: 256 KiB on Linux due to kernel
+  doubling, ~128–147 KiB on macOS, 128 KiB on Windows), and for what the door itself decides (its
+  bearer tokens, local principals and paths in `policy.toml`, and ticket lifetime) detecting a
+  revocation cancels the connection first (before flushing audit records), stops handing bytes to
+  the socket, discards server buffers, releases any remote pipe, and sends TCP RST
+  (`SO_LINGER(0)`). That guarantees server-side cutoff within 2 seconds even for slow (20 KB/s) or
+  completely stalled readers, zero bytes handed to the socket after cutoff with the connection
+  closed, and at most the physical ceiling (`effective SO_SNDBUF + client effective SO_RCVBUF +
+  bytes the client reads before cutoff + 64 KiB`, collapsing to `effective SO_SNDBUF + client
+  effective SO_RCVBUF + 64 KiB` for a stalled reader) handed to the socket between revocation and
+  cutoff. For a file on a remote machine, the door does not watch that machine's `policy.toml`: a
+  policy change on the remote machine takes effect at that machine's next check of the stream, which
+  a slow reader delays, and the slow-reader timeout is the backstop. The send-buffer bound (256 KiB
+  effective on Linux) applies to the loopback hop only; behind Tailscale Serve (or another reverse
+  proxy), its own buffers sit beyond it. Bytes already received into the client OS's own TCP receive
+  buffer before revocation cannot be taken back and stay drainable by the client (varying by OS and
+  receive-buffer autotuning, e.g. ~128–256 KiB on Linux loopback and ~384–650 KiB on macOS
+  loopback). Tickets expire using a suspend-safe clock (15 minutes after last use, 6 hours absolute
+  maximum), are capped at 128 per token (evicting the oldest), and are never logged.
+  Minting writes one durable `content.ticket` entry; the first `GET` or `HEAD` on a ticket writes
+  one durable `content.open` entry immediately so every access survives `SIGKILL` or power loss;
+  ongoing reads coalesce to at most one `content.read` summary per ticket per minute (and
+  `stream.get` on remote nodes) with request count and bytes served.
 - **Headers and isolation**: every reply carries `X-Content-Type-Options: nosniff`,
   `Cross-Origin-Resource-Policy: same-origin`, `Referrer-Policy: no-referrer`, `Cache-Control:
   private, no-store`, and unconditionally
@@ -1048,15 +1070,19 @@ Security and lifecycle guarantees:
   default-src 'none'` block cross-origin reads, no-cors embeds, framing, and script execution.
 - **History and exposure**: a content address remains usable for up to 6 hours while in active use
   and appears in browser history if opened directly in a tab; damage is limited because it grants
-  read-only access to one file, expires after 15 minutes idle or 6 hours total, stops immediately
-  when the token or `fs.read` policy is revoked, and never caches or executes in the interface's
-  origin.
+  read-only access to one file, expires after 15 minutes idle or 6 hours total, cuts off active
+  readers within ~2 seconds when the token or `fs.read` policy is revoked, and never caches or
+  executes in the interface's origin.
 - **Concurrency and slow-reader protection**: active content streams are capped per ticket (8), per
   holder (16), and globally (64), answering `429 Too Many Requests` with `Retry-After` and
   `Connection: close`, and stalled or overly slow readers are disconnected after a write-idle
   timeout (15 s) or minimum transfer rate window (40 KiB / 10 s) so API and UI routes stay
-  responsive. Remote reads reuse pooled `keep_open` `legion stream` pipes and multiplexed SSH
-  connections (`ControlMaster` on Unix), capped at 8 concurrent streams per target machine.
+  responsive. Remote reads reuse warm `keep_open` `legion stream` pipes from a dedicated per-target
+  content pool (separate from transfers and RPC, which never share permits with content), reading in
+  bounded windows with per-holder fair sharing and returning `503 Service Unavailable` with
+  `Retry-After` if acquiring a pipe times out. The web UI reads `"content": true` from `/v1/health`
+  once and remembers per-machine `unsupported` replies for the session so older remote nodes fall
+  back cleanly without breaking supported machines.
 
 ### Event stream (SSE)
 
@@ -1339,7 +1365,8 @@ never signs releases; the offline Ed25519 signature is created locally before pu
 
    The script downloads `SHA256SUMS` and every release asset, re-hashes them locally, checks that
    the signing key matches `contract/release-public-key.pem`, writes and verifies `SHA256SUMS.sig`,
-   uploads it to the draft release, and prints the publish command.
+   uploads it to the draft release, and prints the publish command. Node GitHub releases intentionally
+   omit `update.json` so a raw node release `SHA256SUMS` cannot be replayed as a fleet update set.
 5. Review the listed artifacts and digests, then publish the draft release:
 
    ```sh
@@ -1381,7 +1408,9 @@ that never enters the repository:
    Official release builds leave `LEGION_PREVIEW_UPDATE_KEY` unset and never trust preview sets.
 
 3. Assemble and sign the update set directory (`update.json`, artifacts, `SHA256SUMS`,
-   `SHA256SUMS.sig`):
+   `SHA256SUMS.sig`). The script inspects each artifact's embedded sequence metadata without
+   executing it, records exact artifact byte sizes in `update.json`, and refuses sequences more than
+   24 hours ahead of UTC now:
 
    ```sh
    REV="$(git rev-parse --short=12 HEAD)"

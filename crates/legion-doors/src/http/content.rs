@@ -29,8 +29,9 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::{CACHE_CONTROL, HeaderValue};
+use axum::http::header::{CACHE_CONTROL, HeaderValue, RETRY_AFTER};
 use axum::http::{Response, StatusCode};
+use http_body::Body as _;
 use legion_content::{
     ContentSource, ContentTime, CorpPolicy, MAX_PATH_BYTES, OpenRangeError, OpenedRange,
     ServeOptions, StreamHooks, Ticket, TicketRequest, encode_path_segment, extract_file_name,
@@ -43,14 +44,15 @@ use legion_core::{ContentError, ContentRequest, Door, Node};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{ConnectionStreamFlag, Shared, read_body_limited, reply};
+use super::{ConnectionControl, Shared, read_body_limited, reply};
 use crate::Authenticated;
+use tokio_util::sync::CancellationToken;
 
 /// Maximum JSON request body accepted by `POST /v1/content` (16 KiB).
 pub(crate) const MAX_CREATE_BODY: usize = 16 * 1024;
 
 /// Coalescing window for successful `content.read` audit lines per ticket.
-const AUDIT_COALESCE_WINDOW: Duration = Duration::from_secs(60);
+pub(crate) const DEFAULT_AUDIT_COALESCE_WINDOW: Duration = Duration::from_secs(60);
 
 /// The JSON body of `POST /v1/content`.
 #[derive(Debug, Deserialize)]
@@ -82,18 +84,31 @@ struct AuditSnapshot {
 }
 
 /// Coalesces successful `content.read` audit records per ticket to at most one entry per ticket
-/// per minute, while flushing remaining deltas when tickets expire, are revoked, or the door
-/// shuts down.
-#[derive(Default)]
+/// per coalescing window, flushing remaining deltas when tickets expire, are evicted, are revoked,
+/// or when the door shuts down.
 pub(crate) struct ContentAuditCoalescer {
+    window: Duration,
     buckets: Mutex<HashMap<[u8; 32], TicketAuditBucket>>,
 }
 
+impl Default for ContentAuditCoalescer {
+    fn default() -> Self {
+        Self::with_window(DEFAULT_AUDIT_COALESCE_WINDOW)
+    }
+}
+
 impl ContentAuditCoalescer {
-    /// Registers one successful range open for `ticket` and returns the shared byte counter for
-    /// the streaming body.
-    fn record_open(&self, ticket: &Ticket) -> Arc<AtomicU64> {
+    pub(crate) fn with_window(window: Duration) -> Self {
+        Self {
+            window,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Registers one successful range open for `ticket` and returns `(bytes_counter, is_first_use)`.
+    fn record_open(&self, ticket: &Ticket) -> (Arc<AtomicU64>, bool) {
         let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
+        let is_first_use = !buckets.contains_key(&ticket.key_hash);
         let bucket = buckets
             .entry(ticket.key_hash)
             .or_insert_with(|| TicketAuditBucket {
@@ -107,7 +122,7 @@ impl ContentAuditCoalescer {
                 last_flushed: Instant::now(),
             });
         bucket.requests = bucket.requests.saturating_add(1);
-        Arc::clone(&bucket.bytes_served)
+        (Arc::clone(&bucket.bytes_served), is_first_use)
     }
 
     /// Flushes any bucket whose coalescing window has elapsed.
@@ -117,7 +132,7 @@ impl ContentAuditCoalescer {
             let now = Instant::now();
             let mut out = Vec::new();
             for bucket in buckets.values_mut() {
-                if now.saturating_duration_since(bucket.last_flushed) < AUDIT_COALESCE_WINDOW {
+                if now.saturating_duration_since(bucket.last_flushed) < self.window {
                     continue;
                 }
                 if let Some(snap) = take_delta(bucket, now) {
@@ -140,6 +155,30 @@ impl ContentAuditCoalescer {
             let mut out = Vec::new();
             for hash in hashes {
                 if let Some(mut bucket) = buckets.remove(hash)
+                    && let Some(snap) = take_delta(&mut bucket, now)
+                {
+                    out.push(snap);
+                }
+            }
+            out
+        };
+        write_snapshots(node, snapshots).await;
+    }
+
+    /// Removes and flushes any bucket whose ticket is no longer present in the ticket table (for
+    /// example tickets evicted by the per-holder LRU cap or revoked during an in-flight stream).
+    pub(crate) async fn flush_missing(&self, node: &Node, is_present: impl Fn(&[u8; 32]) -> bool) {
+        let snapshots = {
+            let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
+            let now = Instant::now();
+            let missing: Vec<[u8; 32]> = buckets
+                .keys()
+                .copied()
+                .filter(|hash| !is_present(hash))
+                .collect();
+            let mut out = Vec::new();
+            for hash in missing {
+                if let Some(mut bucket) = buckets.remove(&hash)
                     && let Some(snap) = take_delta(&mut bucket, now)
                 {
                     out.push(snap);
@@ -294,6 +333,8 @@ pub(crate) async fn create(State(shared): State<Arc<Shared>>, request: Request) 
 
     let audit_args = json!({ "path": body.path });
 
+    let holder = token_holder(&who);
+
     // Check `fs.read` permission, path confinement (roots, config/state, secrets, symlinks),
     // regular-file type, and remote reachability right now by probing zero bytes.
     let probe_req = ContentRequest {
@@ -302,19 +343,27 @@ pub(crate) async fn create(State(shared): State<Arc<Shared>>, request: Request) 
         offset: 0,
         length: Some(0),
         principal: who.principal.clone(),
+        holder: Some(holder.clone()),
         door: Door::Http,
         audit: false,
         cancel: shared.link.shutdown.child_token(),
     };
     let probe_result = match shared.router.open_content(&shared.node, probe_req).await {
         Ok(_opened) => Ok(()),
-        Err(ContentError::OutOfRange { .. }) => Err(ErrorBody::new(
-            ErrorCode::Internal,
-            "Unexpected out-of-range error while probing file.",
+        Err(ContentError::OutOfRange { .. }) => Err((
+            None,
+            ErrorBody::new(
+                ErrorCode::Internal,
+                "Unexpected out-of-range error while probing file.",
+            ),
         )),
-        Err(ContentError::Error(error)) => Err(error),
+        Err(ContentError::Busy {
+            retry_after_secs,
+            error,
+        }) => Err((Some(retry_after_secs), error)),
+        Err(ContentError::Error(error)) => Err((None, error)),
     };
-    if let Err(error) = probe_result {
+    if let Err((retry_after, error)) = probe_result {
         shared
             .node
             .record_audit(
@@ -327,11 +376,18 @@ pub(crate) async fn create(State(shared): State<Arc<Shared>>, request: Request) 
                 &Err(error.clone()),
             )
             .await;
+        if let Some(secs) = retry_after {
+            let mut response = reply::json(StatusCode::SERVICE_UNAVAILABLE, &error);
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(secs.max(1)));
+            return response;
+        }
         return reply::error(&error);
     }
 
     let issued = match shared.content_tickets.issue(TicketRequest {
-        holder: token_holder(&who),
+        holder,
         principal: who.principal.clone(),
         machine: target_machine.clone(),
         path: body.path,
@@ -358,6 +414,13 @@ pub(crate) async fn create(State(shared): State<Arc<Shared>>, request: Request) 
             return reply::json(status, &error);
         }
     };
+    // Flush any coalesced read bucket whose ticket was evicted by the per-holder LRU cap.
+    shared
+        .content_audit
+        .flush_missing(&shared.node, |hash| {
+            shared.content_tickets.contains_hash(hash)
+        })
+        .await;
 
     shared
         .node
@@ -390,23 +453,29 @@ pub(crate) async fn create(State(shared): State<Arc<Shared>>, request: Request) 
     response
 }
 
-/// RAII guard that activates per-connection write-stall and minimum-rate monitoring while a
-/// content response body is actively streaming.
+/// RAII guard that activates per-connection write-stall, minimum-rate, and send-buffer limits
+/// while a content response body is streaming, and stops the independent revocation watcher when
+/// the response ends.
 struct ActiveContentStreamGuard {
     conn_active: Option<Arc<AtomicUsize>>,
+    stop_watcher: CancellationToken,
 }
 
 impl ActiveContentStreamGuard {
-    fn new(flag: Option<Arc<AtomicUsize>>) -> Self {
+    fn new(flag: Option<Arc<AtomicUsize>>, stop_watcher: CancellationToken) -> Self {
         if let Some(ref counter) = flag {
             counter.fetch_add(1, Ordering::Release);
         }
-        Self { conn_active: flag }
+        Self {
+            conn_active: flag,
+            stop_watcher,
+        }
     }
 }
 
 impl Drop for ActiveContentStreamGuard {
     fn drop(&mut self) {
+        self.stop_watcher.cancel();
         if let Some(ref counter) = self.conn_active {
             counter.fetch_sub(1, Ordering::Release);
         }
@@ -430,24 +499,22 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
         );
     };
 
-    let bytes_slot: Arc<Mutex<Option<Arc<AtomicU64>>>> = Arc::new(Mutex::new(None));
+    let open_slot: OpenAuditSlot = Arc::new(Mutex::new(None));
     let source = Arc::new(DoorContentSource {
         shared: Arc::clone(&shared),
-        bytes_slot: Arc::clone(&bytes_slot),
+        open_slot: Arc::clone(&open_slot),
     });
 
-    let conn_flag = request
-        .extensions()
-        .get::<ConnectionStreamFlag>()
-        .map(|f| Arc::clone(&f.0));
+    let conn_ctrl = request.extensions().get::<ConnectionControl>().cloned();
+    let stop_watcher = CancellationToken::new();
 
-    // Reserve a shared atomic counter attached to the ticket's coalesced audit bucket if the
-    // ticket is known (no secret is logged; lookup inside `handle_request` validates everything).
-    let bytes_served = Arc::new(AtomicU64::new(0));
     let hooks = StreamHooks {
         limiter: Some(shared.content_limiter.clone()),
-        bytes_served: Some(Arc::clone(&bytes_served)),
-        active_guard: Some(Box::new(ActiveContentStreamGuard::new(conn_flag))),
+        bytes_served: None,
+        active_guard: Some(Box::new(ActiveContentStreamGuard::new(
+            conn_ctrl.as_ref().map(|c| Arc::clone(&c.active)),
+            stop_watcher.clone(),
+        ))),
     };
 
     let response = handle_request(
@@ -460,37 +527,171 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
         request.headers(),
         ServeOptions {
             corp: CorpPolicy::SameOrigin,
+            liveness_check_interval: shared.content_liveness_interval,
             ..ServeOptions::default()
         },
         hooks,
     )
     .await;
 
-    // Attach a drop hook via an outer body wrapper? Simpler: forward `bytes_served` directly into
-    // the ticket's coalesced bucket by handing the bucket's own counter to `StreamHooks` if we
-    // can, OR even simpler: `DoorContentSource::open_range` records the open and attaches the
-    // bucket counter via a tiny `CountingBody`! Wait — let's check: `bytes_slot` receives the
-    // bucket's `Arc<AtomicU64>` when `open_range` succeeds, and a lightweight `CountingBody`
-    // wrapper increments it as frames flow out.
-    let bucket_counter = bytes_slot
+    // Wrap the streaming body with the ticket's coalesced byte counter and start an independent
+    // revocation watcher that aborts the TCP connection (TCP RST) even when a slow or stalled
+    // reader prevents body polling.
+    let opened = open_slot
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .take();
-    if let Some(counter) = bucket_counter {
+    if let Some((ticket, counter)) = opened {
+        let body_guard = if let Some(ctrl) = conn_ctrl
+            && response.status().is_success()
+            && !response.body().is_end_stream()
+        {
+            let watch_shared = Arc::clone(&shared);
+            let watch_source = Arc::clone(&source);
+            let watch_ticket = ticket.clone();
+            let watch_ctrl = ctrl.clone();
+            let watch_interval = shared
+                .content_liveness_interval
+                .max(Duration::from_millis(50));
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = watch_ctrl.abort.cancelled() => {
+                            revoke_and_flush_after_abort(
+                                &watch_shared,
+                                &watch_source,
+                                &watch_ticket,
+                            )
+                            .await;
+                            break;
+                        }
+                        () = stop_watcher.cancelled() => break,
+                        () = watch_shared.link.shutdown.cancelled() => break,
+                        () = tokio::time::sleep(watch_interval) => {
+                            match check_stream_liveness(
+                                &watch_shared,
+                                &watch_source,
+                                &watch_ticket,
+                            ) {
+                                LivenessOutcome::Live => {}
+                                LivenessOutcome::HolderRevoked => {
+                                    // Abort the TCP connection first so zero further bytes can be
+                                    // handed to the socket while the revoked holder's audit
+                                    // summaries flush to disk.
+                                    watch_ctrl.abort.cancel();
+                                    let removed = watch_shared
+                                        .content_tickets
+                                        .revoke_holder_hashes(&watch_ticket.holder);
+                                    watch_shared
+                                        .content_audit
+                                        .flush_removed(&watch_shared.node, &removed)
+                                        .await;
+                                    break;
+                                }
+                                LivenessOutcome::TicketEnded => {
+                                    // Only this ticket expired, reached its hard cap, or lost path
+                                    // permission: end only this ticket and leave the holder's
+                                    // other tickets intact.
+                                    watch_ctrl.abort.cancel();
+                                    watch_shared
+                                        .content_tickets
+                                        .revoke_hash(&watch_ticket.key_hash);
+                                    watch_shared
+                                        .content_audit
+                                        .flush_removed(
+                                            &watch_shared.node,
+                                            &[watch_ticket.key_hash],
+                                        )
+                                        .await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            Some(BackpressureLiveness {
+                shared: Arc::clone(&shared),
+                source: Arc::clone(&source),
+                ticket,
+                ctrl,
+            })
+        } else {
+            None
+        };
         response.map(|body| {
             Body::new(AuditCountingBody {
                 inner: body,
                 counter,
+                backpressure_check: body_guard,
             })
         })
     } else {
+        stop_watcher.cancel();
         response.map(Body::new)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LivenessOutcome {
+    Live,
+    HolderRevoked,
+    TicketEnded,
+}
+
+fn check_stream_liveness(
+    shared: &Shared,
+    source: &DoorContentSource,
+    ticket: &Ticket,
+) -> LivenessOutcome {
+    match source.check_live(ticket) {
+        Err(OpenRangeError::TicketRevoked) => LivenessOutcome::HolderRevoked,
+        Err(_) => LivenessOutcome::TicketEnded,
+        Ok(()) => {
+            if shared.content_tickets.is_live(&ticket.key_hash) {
+                LivenessOutcome::Live
+            } else {
+                LivenessOutcome::TicketEnded
+            }
+        }
+    }
+}
+
+async fn revoke_and_flush_after_abort(
+    shared: &Shared,
+    source: &DoorContentSource,
+    ticket: &Ticket,
+) {
+    match check_stream_liveness(shared, source, ticket) {
+        LivenessOutcome::HolderRevoked => {
+            let removed = shared.content_tickets.revoke_holder_hashes(&ticket.holder);
+            shared
+                .content_audit
+                .flush_removed(&shared.node, &removed)
+                .await;
+        }
+        LivenessOutcome::TicketEnded | LivenessOutcome::Live => {
+            shared.content_tickets.revoke_hash(&ticket.key_hash);
+            shared
+                .content_audit
+                .flush_removed(&shared.node, &[ticket.key_hash])
+                .await;
+        }
+    }
+}
+
+struct BackpressureLiveness {
+    shared: Arc<Shared>,
+    source: Arc<DoorContentSource>,
+    ticket: Ticket,
+    ctrl: ConnectionControl,
 }
 
 struct AuditCountingBody {
     inner: legion_content::ContentBody,
     counter: Arc<AtomicU64>,
+    backpressure_check: Option<BackpressureLiveness>,
 }
 
 impl http_body::Body for AuditCountingBody {
@@ -501,6 +702,24 @@ impl http_body::Body for AuditCountingBody {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(ref check) = self.backpressure_check {
+            if check.ctrl.abort.is_cancelled() {
+                return std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "content stream was revoked",
+                ))));
+            }
+            if check.ctrl.backpressured.swap(false, Ordering::AcqRel)
+                && check_stream_liveness(&check.shared, &check.source, &check.ticket)
+                    != LivenessOutcome::Live
+            {
+                check.ctrl.abort.cancel();
+                return std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "content ticket revoked",
+                ))));
+            }
+        }
         let poll = Pin::new(&mut self.inner).poll_frame(cx);
         if let std::task::Poll::Ready(Some(Ok(ref frame))) = poll
             && let Some(data) = frame.data_ref()
@@ -519,9 +738,11 @@ impl http_body::Body for AuditCountingBody {
     }
 }
 
+type OpenAuditSlot = Arc<Mutex<Option<(Ticket, Arc<AtomicU64>)>>>;
+
 struct DoorContentSource {
     shared: Arc<Shared>,
-    bytes_slot: Arc<Mutex<Option<Arc<AtomicU64>>>>,
+    open_slot: OpenAuditSlot,
 }
 
 impl ContentSource for DoorContentSource {
@@ -541,6 +762,16 @@ impl ContentSource for DoorContentSource {
                 tokens.as_deref(),
                 now,
             ) {
+                // Revoke all tickets for this holder and flush their coalesced read summaries
+                // immediately so revoked activity is never stranded in memory.
+                let removed = self
+                    .shared
+                    .content_tickets
+                    .revoke_holder_hashes(&ticket.holder);
+                self.shared
+                    .content_audit
+                    .flush_removed(&self.shared.node, &removed)
+                    .await;
                 return Err(OpenRangeError::TicketRevoked);
             }
             let req = ContentRequest {
@@ -549,6 +780,7 @@ impl ContentSource for DoorContentSource {
                 offset,
                 length,
                 principal: ticket.principal.clone(),
+                holder: Some(ticket.holder.clone()),
                 door: Door::Http,
                 audit: false,
                 cancel: self.shared.link.shutdown.child_token(),
@@ -560,11 +792,29 @@ impl ContentSource for DoorContentSource {
                 .await
             {
                 Ok(opened) => {
-                    let counter = self.shared.content_audit.record_open(ticket);
+                    let (counter, first_use) = self.shared.content_audit.record_open(ticket);
+                    if first_use {
+                        // Write one durable audit line immediately when a ticket is first used so
+                        // an access is always on record even if the door is killed before the
+                        // coalesced summary flushes.
+                        let args = json!({ "path": ticket.path });
+                        self.shared
+                            .node
+                            .record_audit(
+                                ticket.machine.clone(),
+                                Some(ticket.principal.clone()),
+                                Door::Http,
+                                "content.open".to_owned(),
+                                &args,
+                                started,
+                                &Ok(Value::Null),
+                            )
+                            .await;
+                    }
                     *self
-                        .bytes_slot
+                        .open_slot
                         .lock()
-                        .unwrap_or_else(PoisonError::into_inner) = Some(counter);
+                        .unwrap_or_else(PoisonError::into_inner) = Some((ticket.clone(), counter));
                     Ok(OpenedRange {
                         size: opened.size,
                         offset: opened.offset,
@@ -575,6 +825,32 @@ impl ContentSource for DoorContentSource {
                     })
                 }
                 Err(ContentError::OutOfRange { size }) => Err(OpenRangeError::OutOfRange { size }),
+                Err(ContentError::Busy {
+                    retry_after_secs,
+                    error,
+                }) => {
+                    let args = json!({
+                        "path": ticket.path,
+                        "offset": offset,
+                        "length": length,
+                    });
+                    self.shared
+                        .node
+                        .record_audit(
+                            ticket.machine.clone(),
+                            Some(ticket.principal.clone()),
+                            Door::Http,
+                            "content.read".to_owned(),
+                            &args,
+                            started,
+                            &Err(error.clone()),
+                        )
+                        .await;
+                    Err(OpenRangeError::Busy {
+                        retry_after_secs,
+                        error: sanitize_holder_error(&error),
+                    })
+                }
                 Err(ContentError::Error(body)) => {
                     // Record denied/failed content reads immediately in the server audit log.
                     let args = json!({
@@ -625,10 +901,18 @@ impl ContentSource for DoorContentSource {
                 self.shared.node.paths(),
             )
             .map_err(|_| {
-                OpenRangeError::Error(ErrorBody::new(
-                    ErrorCode::Denied,
-                    "Access to this file was denied.",
-                ))
+                if !policy
+                    .principals
+                    .keys()
+                    .any(|p| p.as_str() == ticket.principal)
+                {
+                    OpenRangeError::TicketRevoked
+                } else {
+                    OpenRangeError::Error(ErrorBody::new(
+                        ErrorCode::Denied,
+                        "Access to this file was denied.",
+                    ))
+                }
             })?;
         if ticket.machine == self.shared.node.name()
             && grant.check_path(&ticket.path, Access::Read).is_err()

@@ -341,7 +341,12 @@ impl TicketTable {
 
     /// Removes one ticket by id, returning `true` if it existed.
     pub fn revoke(&self, id: &str) -> bool {
-        self.lock().entries.remove(&ticket_key(id)).is_some()
+        self.revoke_hash(&ticket_key(id))
+    }
+
+    /// Removes one ticket by its key hash, returning `true` if it existed.
+    pub fn revoke_hash(&self, key_hash: &[u8; 32]) -> bool {
+        self.lock().entries.remove(key_hash).is_some()
     }
 
     /// Removes every ticket owned by `holder`, returning how many were removed.
@@ -402,6 +407,12 @@ impl TicketTable {
     /// Total number of tickets currently stored (including any not yet swept).
     pub fn len(&self) -> usize {
         self.lock().entries.len()
+    }
+
+    /// Whether a ticket with `key_hash` is currently present in the table (without modifying its
+    /// last-used timestamp).
+    pub fn contains_hash(&self, key_hash: &[u8; 32]) -> bool {
+        self.lock().entries.contains_key(key_hash)
     }
 
     /// Whether no tickets are stored.

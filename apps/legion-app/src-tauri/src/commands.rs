@@ -732,17 +732,24 @@ pub async fn update_check(
     updater: State<'_, SharedUpdater>,
 ) -> Result<UpdateState, AppError> {
     #[cfg(target_os = "android")]
-    {
+    let is_metered = {
         let android_updater = app.state::<AndroidUpdaterHandle>();
         if let Ok(caps) = crate::updater::android::capabilities(&android_updater).await {
+            let metered = caps.is_metered;
             updater.0.set_android_capabilities(caps);
+            metered
+        } else {
+            false
         }
-    }
+    };
     #[cfg(not(target_os = "android"))]
-    let _ = app;
+    let is_metered = {
+        let _ = app;
+        false
+    };
     updater
         .0
-        .check_with_backend(backend.0.as_ref(), false)
+        .check_with_backend(backend.0.as_ref(), false, is_metered)
         .await
 }
 
@@ -758,7 +765,7 @@ pub async fn update_install(
         let android_updater = app.state::<AndroidUpdaterHandle>();
         updater
             .0
-            .install_android(backend.0.as_ref(), &android_updater, false)
+            .install_android(backend.0.as_ref(), &android_updater, false, false)
             .await
     }
     #[cfg(target_os = "ios")]
@@ -783,7 +790,7 @@ pub async fn update_install(
     }
 }
 
-/// Enables or disables automatic updates (download when seen, install on next start or when idle).
+/// Enables or disables automatic updates (download when seen, install on start or leaving the app).
 #[tauri::command]
 pub fn update_set_auto(
     updater: State<'_, SharedUpdater>,
@@ -798,24 +805,34 @@ pub fn update_dismiss_notice(updater: State<'_, SharedUpdater>) -> Result<Update
     updater.0.dismiss_notice()
 }
 
-/// Installs an already-downloaded verified update when automatic updates are enabled and the app
-/// is at a safe idle or startup point. Never interrupts the user with an unexpected prompt.
+/// Installs an already-downloaded verified update at one of the two non-interrupting moments
+/// (`trigger`: `"startup"` before user interaction, or `"background"` when leaving the app).
+/// Never interrupts the user with an unexpected prompt or brings a backgrounded app forward.
 #[tauri::command]
 pub async fn update_maybe_auto_install(
     app: tauri::AppHandle,
     backend: State<'_, SharedBackend>,
     updater: State<'_, SharedUpdater>,
+    trigger: Option<String>,
 ) -> Result<UpdateState, AppError> {
     let current = updater.0.snapshot();
-    if !current.auto_update || current.phase != "ready" || !current.can_self_install {
+    let ready_or_checking_downloaded = current.phase == "ready"
+        || (current.phase == "checking"
+            && current.available.as_ref().is_some_and(|a| a.downloaded));
+    if !current.auto_update || !ready_or_checking_downloaded || !current.can_self_install {
+        return Ok(current);
+    }
+    let trigger_kind = trigger.as_deref().unwrap_or("startup");
+    if !matches!(trigger_kind, "startup" | "background") {
         return Ok(current);
     }
     #[cfg(target_os = "android")]
     {
+        let background = trigger_kind == "background";
         let android_updater = app.state::<AndroidUpdaterHandle>();
         updater
             .0
-            .install_android(backend.0.as_ref(), &android_updater, true)
+            .install_android(backend.0.as_ref(), &android_updater, true, background)
             .await
     }
     #[cfg(target_os = "ios")]
@@ -825,6 +842,11 @@ pub async fn update_maybe_auto_install(
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
+        // On desktop, window-close installs run via `WindowEvent::CloseRequested`; the frontend
+        // auto-install trigger applies only at startup before user interaction.
+        if trigger_kind != "startup" {
+            return Ok(current);
+        }
         let (st, should_exit) = updater.0.install_desktop(backend.0.as_ref(), true).await?;
         if should_exit {
             let handle = app.clone();

@@ -288,14 +288,19 @@ signature with `apksigner`, and prints the path, size and certificate SHA-256. S
 - **macOS desktop:** runs `cargo test --locked` (including the Apple backup-exclusion attribute
   test), builds the ad-hoc signed Apple Silicon `.app` and `.dmg`, launches the app against a local
   node, waits for `legion-app: interface ready` and content-address PNG + WebM decoding, confirms
-  the app window exists, captures a screenshot when permitted, and uploads the `.dmg`.
+  the app window exists, captures a screenshot when permitted, uploads the `.dmg`, and verifies
+  end-to-end `.app` self-update from a local node with a throwaway preview key (uploading full
+  diagnostics on failure).
 - **Windows desktop:** builds the NSIS installer (`.exe`), runs a silent install into a temporary
   directory, launches the installed executable under WebView2 against a local node, waits for
   `legion-app: interface ready` and content-address PNG + WebM decoding, captures a screenshot when
-  permitted, and uploads the installer.
+  permitted, uploads the installer, and verifies end-to-end silent NSIS self-update from a local
+  node with a throwaway preview key (uploading full diagnostics on failure).
 - **Linux desktop:** builds `.deb` and `.AppImage` bundles, launches the built binary under
   `dbus-run-session` and `xvfb-run` against a local node, waits for `legion-app: interface ready`
-  and content-address PNG + WebM decoding, and uploads the bundles.
+  and content-address PNG + WebM decoding, uploads the bundles, and verifies end-to-end AppImage
+  self-update from a local node with a throwaway preview key (uploading full diagnostics on
+  failure).
 
 ## Headless Android emulator harness
 
@@ -338,3 +343,24 @@ first-start pairing, live machine metrics, streamed command execution, file list
 power confirmation with dry run only, force-stop/relaunch persistence, transparent reconnect after
 killing the node-side session, revocation recovery and re-pairing, plus a wide paired screenshot on
 `legion-tablet`. It never touches `~/.ssh`, the system `sshd`, `~/.config/legion`, or `/tmp`.
+
+## End-to-end Android self-update test (`e2e-android-updates.sh`)
+
+`apps/legion-app/e2e-android-updates.sh` verifies real release-signed Android self-updates in one
+command on a local emulator (`legion-test`):
+
+```sh
+./apps/legion-app/e2e-android-updates.sh
+./apps/legion-app/e2e-android-updates.sh --avd legion-test --shots-dir /home/me/shots/updates
+```
+
+It generates a throwaway preview signing keypair and throwaway release keystore under
+`${XDG_CACHE_HOME:-$HOME/.cache}/legion-app/`, builds a preview-keyed `legion` binary and three
+signed release APKs (`seq1 < seq2 < seq3`) via `build-android.sh --emulator`, packages `seq2` and
+`seq3` through `scripts/make-update-set.mjs create` (checking embedded APK binary AXML
+`versionCode`), pairs over loopback SSH (`10.0.2.2`), verifies `seq1 -> seq2` through Android's
+unknown-sources grant and the quiet post-update notice row, and then verifies `seq2 -> seq3`
+applies silently when Legion moves to the background (`KEYCODE_HOME`) without bringing Legion or an
+installer prompt back to the foreground. It runs as a local script rather than inside GitHub's
+existing `android` CI job because it requires building three signed release APKs and driving Android
+17 silent-update timing (`SilentUpdatePolicy`) end-to-end.

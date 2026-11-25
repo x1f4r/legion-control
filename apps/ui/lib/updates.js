@@ -1,8 +1,7 @@
-// Pure formatting, cadence, and safe-idle helpers for Legion's Updates section.
+// Pure formatting, cadence, and auto-install safety helpers for Legion's Updates section.
 
 export const RESUME_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 export const PERIODIC_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
-export const IDLE_INSTALL_DELAY_MS = 60 * 1000;
 
 /** Returns true when enough time (>= 1 hour) has passed to re-check on foreground resume. */
 export function shouldCheckOnResume(lastCheckedAt, nowMs = Date.now()) {
@@ -15,29 +14,41 @@ export function shouldCheckOnResume(lastCheckedAt, nowMs = Date.now()) {
 /**
  * Returns true only when it is safe to trigger an automatic update install without interrupting
  * anything the person started.
+ *
+ * Automatic installs only ever run at two moments:
+ * - `trigger === 'startup'`: on launch before the person has interacted with the app.
+ * - `trigger === 'background'`: on Android when the app moves into the background (strictly silent;
+ *   desktop window-close updates are triggered natively on `WindowEvent::CloseRequested`).
  */
 export function isSafeForAutoInstall({
   updateState,
+  trigger = 'startup',
   hasOpenSheet = false,
   hasCommandDraft = false,
   isRunningCommand = false,
+  activeCalls = 0,
   isPairingOpen = false,
-  lastInteractionMs = 0,
-  nowMs = Date.now(),
-  startup = false,
+  userInteracted = false,
 } = {}) {
   if (!updateState || !updateState.auto_update) return false;
   if (updateState.phase !== 'ready' || !updateState.can_self_install) return false;
-  if (hasOpenSheet || hasCommandDraft || isRunningCommand || isPairingOpen) return false;
-  // On Android, never trigger background auto-install if Android would pop an unexpected prompt.
-  if (
-    updateState.current?.os === 'android' &&
-    !updateState.android?.supportsSilentSelfUpdate
-  ) {
+  if ((updateState.current?.sequence || 0) === 0) return false;
+  if (updateState.failed_update) return false;
+  if (hasOpenSheet || hasCommandDraft || isRunningCommand || activeCalls > 0 || isPairingOpen) {
     return false;
   }
-  if (startup) return true;
-  return nowMs - lastInteractionMs >= IDLE_INSTALL_DELAY_MS;
+  const isAndroid = updateState.current?.os === 'android';
+  // On Android, never trigger automatic install if Android would pop an unexpected prompt.
+  if (isAndroid && !updateState.android?.supportsSilentSelfUpdate) {
+    return false;
+  }
+  if (trigger === 'startup') {
+    return !userInteracted;
+  }
+  if (trigger === 'background') {
+    return isAndroid;
+  }
+  return false;
 }
 
 /** Format byte progress cleanly as a percentage when total is known. */
@@ -53,7 +64,7 @@ export function formatDownloadPercent(progress) {
 /**
  * Plain-language summary for Settings > About > Updates.
  *
- * Returns `{ line, detail, actionLabel, canAction, showCheck, showAutoSwitch, manualCommand, notes }`.
+ * Returns `{ line, detail, actionLabel, canAction, showCheck, showAutoSwitch, manualCommand, manualSha256, notes }`.
  */
 export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName = '' } = {}) {
   if (doorKind !== 'app' && !updateState) {
@@ -66,6 +77,7 @@ export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName 
       showCheck: false,
       showAutoSwitch: false,
       manualCommand: null,
+      manualSha256: null,
       notes: '',
     };
   }
@@ -79,6 +91,7 @@ export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName 
       showCheck: true,
       showAutoSwitch: false,
       manualCommand: null,
+      manualSha256: null,
       notes: '',
     };
   }
@@ -90,13 +103,11 @@ export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName 
 
   let androidNote = '';
   if (isAndroid && avail && (phase === 'ready' || phase === 'available' || phase === 'needs_permission')) {
-    if (updateState.android?.supportsSilentSelfUpdate) {
-      androidNote = 'Android can apply this update without asking again.';
-    } else if (updateState.android && !updateState.android.canRequestPackageInstalls) {
+    if (updateState.android && !updateState.android.canRequestPackageInstalls) {
       androidNote =
-        'Android will ask you once to allow Legion to install updates, and may ask you to confirm.';
+        'Android asks once to allow Legion to install updates, and may occasionally ask you to confirm.';
     } else {
-      androidNote = 'Android may ask you to confirm this update.';
+      androidNote = 'Android may occasionally ask you to confirm an update.';
     }
   }
 
@@ -109,6 +120,7 @@ export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName 
       showCheck: false,
       showAutoSwitch: true,
       manualCommand: null,
+      manualSha256: null,
       notes,
     };
   }
@@ -123,6 +135,7 @@ export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName 
       showCheck: false,
       showAutoSwitch: true,
       manualCommand: null,
+      manualSha256: null,
       notes,
     };
   }
@@ -136,19 +149,24 @@ export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName 
       showCheck: false,
       showAutoSwitch: true,
       manualCommand: null,
+      manualSha256: null,
       notes,
     };
   }
 
   if (phase === 'manual') {
+    const hasVerifiedCopy = Boolean(updateState.manual_sha256);
     return {
       line: avail ? `Version ${avail.version} is available` : 'A newer version is available',
-      detail: 'This copy is managed by your system package manager. Run this command to update:',
+      detail: hasVerifiedCopy
+        ? 'Legion saved and verified this package in its private folder. Run this command to install it:'
+        : 'This copy is managed by your system package manager. Run this command to update:',
       actionLabel: null,
       canAction: false,
       showCheck: true,
       showAutoSwitch: false,
       manualCommand: updateState.manual_command || null,
+      manualSha256: updateState.manual_sha256 || null,
       notes,
     };
   }
@@ -164,6 +182,7 @@ export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName 
       showCheck: false,
       showAutoSwitch: true,
       manualCommand: null,
+      manualSha256: null,
       notes,
     };
   }
@@ -178,68 +197,87 @@ export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName 
           : 'Update is ready',
       detail: desktopAutoReady
         ? avail
-          ? `Version ${avail.version} is downloaded and verified.`
-          : 'The update is downloaded and verified.'
+          ? `Version ${avail.version} is downloaded and verified. It will install next time you open or close Legion.`
+          : 'The update is downloaded and verified. It will install next time you open or close Legion.'
         : androidNote,
       actionLabel: 'Update now',
       canAction: Boolean(updateState.can_self_install),
       showCheck: false,
       showAutoSwitch: true,
       manualCommand: null,
+      manualSha256: null,
       notes,
     };
   }
 
   if (phase === 'available') {
+    const detail = updateState.metered_paused
+      ? 'Paused on a metered connection because this update is over 5 MB. Tap Update now to download it anyway.'
+      : updateState.can_self_install
+        ? androidNote
+        : updateState.unsupported_reason || 'This copy cannot replace itself in place.';
     return {
       line: avail ? `Version ${avail.version} is available` : 'An update is available',
-      detail: updateState.can_self_install
-        ? androidNote
-        : updateState.unsupported_reason || 'This copy cannot replace itself in place.',
+      detail,
       actionLabel: updateState.can_self_install ? 'Update now' : null,
       canAction: Boolean(updateState.can_self_install),
       showCheck: true,
       showAutoSwitch: Boolean(updateState.can_self_install),
       manualCommand: null,
+      manualSha256: null,
       notes,
     };
   }
 
   if (phase === 'unsupported') {
+    const isSeqZero = (updateState.current?.sequence || 0) === 0;
     return {
-      line: 'Managed outside Legion',
-      detail: updateState.unsupported_reason || 'This platform installs updates through its store.',
+      line: isSeqZero ? 'Updates disabled in this build' : 'Managed outside Legion',
+      detail:
+        updateState.unsupported_reason ||
+        (isSeqZero
+          ? 'This build has sequence 0, so self-updates are disabled.'
+          : 'This platform installs updates through its store.'),
       actionLabel: null,
       canAction: false,
       showCheck: false,
       showAutoSwitch: false,
       manualCommand: null,
+      manualSha256: null,
       notes: '',
     };
   }
 
   if (phase === 'error') {
+    const actionLabel =
+      avail && updateState.can_self_install
+        ? updateState.failed_update
+          ? 'Try again'
+          : 'Update now'
+        : null;
     return {
       line: updateState.last_error || 'Could not finish the update.',
       detail: avail ? `Version ${avail.version}` : '',
-      actionLabel: avail && updateState.can_self_install ? 'Update now' : null,
-      canAction: Boolean(avail && updateState.can_self_install),
+      actionLabel,
+      canAction: Boolean(actionLabel),
       showCheck: true,
       showAutoSwitch: Boolean(updateState.can_self_install),
       manualCommand: null,
+      manualSha256: null,
       notes,
     };
   }
 
-  // up_to_date (note: unreachable fleet machines stay quiet per design)
+  // up_to_date (unreachable fleet machines stay quiet; rebuilt corrupt floor surfaces calmly)
   return {
     line: 'Up to date',
-    detail: '',
+    detail: updateState.last_error || '',
     actionLabel: null,
     canAction: false,
     showCheck: true,
     showAutoSwitch: Boolean(updateState.can_self_install),
     manualCommand: null,
+    manualSha256: null,
     notes: '',
   };
 }
@@ -258,12 +296,15 @@ export function formatUpdateTechnicalRows(updateState) {
   if (cur.build) {
     rows.push({ key: 'build', value: cur.build });
   }
+  const seq = cur.sequence || 0;
   rows.push({
     key: 'sequence',
     value:
-      updateState.sequence_floor && updateState.sequence_floor > (cur.sequence || 0)
-        ? `${cur.sequence || 0} (floor ${updateState.sequence_floor})`
-        : String(cur.sequence || 0),
+      seq === 0
+        ? '0 (updates disabled)'
+        : updateState.sequence_floor && updateState.sequence_floor > seq
+          ? `${seq} (floor ${updateState.sequence_floor})`
+          : String(seq),
   });
   if (cur.install_kind) {
     rows.push({
@@ -292,8 +333,17 @@ export function formatUpdateTechnicalRows(updateState) {
       rows.push({ key: 'preview key', value: cur.preview_key_fingerprint });
     }
   }
+  if (updateState.failed_update) {
+    rows.push({
+      key: 'failed',
+      value: `${updateState.failed_update.version} · seq ${updateState.failed_update.sequence}`,
+    });
+  }
   if (Array.isArray(updateState.checked_nodes) && updateState.checked_nodes.length > 0) {
     rows.push({ key: 'checked', value: updateState.checked_nodes.join(', ') });
+  }
+  if (updateState.last_error_detail) {
+    rows.push({ key: 'last error', value: updateState.last_error_detail });
   }
   return rows;
 }

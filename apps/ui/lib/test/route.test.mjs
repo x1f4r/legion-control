@@ -1,6 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { extractHashToken, parseRoute, routeHref } from '../route.js';
+import {
+  decodeFilePath,
+  encodeFilePath,
+  extractHashToken,
+  parseRoute,
+  ROOT_SECTIONS,
+  routeHref,
+} from '../route.js';
+
+test('ROOT_SECTIONS includes the four top-level tabs in order', () => {
+  assert.deepEqual(ROOT_SECTIONS, ['machines', 'files', 'activity', 'actions']);
+});
 
 test('extractHashToken reads #token= once and clears it', () => {
   assert.deepEqual(extractHashToken('#token=lgn_abc123'), {
@@ -85,6 +96,95 @@ test('parseRoute and routeHref round-trip all v2 views', () => {
     assert.deepEqual(parsed, expected, hash);
     assert.equal(routeHref(parsed), href, hash);
   }
+});
+
+test('Files routes encode and decode every path shape safely', () => {
+  const paths = [
+    '/',
+    '~',
+    '~/Videos/Holiday',
+    '/home/me',
+    '/home/me/Videos/Holiday',
+    '/home/me/My Photos/Summer 2026',
+    '/home/me/weird #hash?q=1&b=2 100%+done/file [1] (copy).jpg',
+    '/home/me/back\\slash/café-日本語',
+    'C:\\',
+    'C:\\Users\\me\\Photos\\Holiday #1?v=2',
+    '\\\\nas\\media\\Films',
+  ];
+
+  for (const p of paths) {
+    const enc = encodeFilePath(p);
+    assert.equal(decodeFilePath(enc), p, `encode/decode round-trip failed for ${p}`);
+    const href = routeHref({ section: 'files', view: 'folder', machine: 'tower', path: p });
+    const parsed = parseRoute(href);
+    assert.equal(parsed.section, 'files');
+    assert.equal(parsed.view, 'folder');
+    assert.equal(parsed.machine, 'tower');
+    assert.equal(parsed.path, p, `routeHref/parseRoute failed for ${p} (${href})`);
+  }
+
+  // Root `/` has an explicit, unambiguous URL.
+  const rootHref = routeHref({ section: 'files', view: 'folder', machine: 'tower', path: '/' });
+  assert.equal(rootHref, '#/files/tower//');
+  assert.equal(parseRoute(rootHref).path, '/');
+
+  // Viewer query parameters round-trip cleanly on folder, home, and search routes.
+  const folderViewerHref = routeHref({
+    section: 'files',
+    view: 'folder',
+    machine: 'tower',
+    path: '/home/me/Videos/Holiday',
+    viewer: { machine: 'tower', path: '/home/me/Videos/Holiday/IMG #1?.jpg' },
+  });
+  const parsedFolderViewer = parseRoute(folderViewerHref);
+  assert.equal(parsedFolderViewer.path, '/home/me/Videos/Holiday');
+  assert.deepEqual(parsedFolderViewer.viewer, {
+    machine: 'tower',
+    path: '/home/me/Videos/Holiday/IMG #1?.jpg',
+  });
+
+  const homeViewerHref = routeHref({
+    section: 'files',
+    view: 'home',
+    viewer: { machine: 'pi', path: '/home/me/Documents/Passport.pdf' },
+  });
+  assert.deepEqual(parseRoute(homeViewerHref).viewer, {
+    machine: 'pi',
+    path: '/home/me/Documents/Passport.pdf',
+  });
+
+  // Files special views: home, favourites, recent, sync, search.
+  assert.equal(parseRoute('#/files').view, 'home');
+  assert.equal(routeHref({ section: 'files', view: 'home' }), '#/files');
+
+  assert.equal(parseRoute('#/files/@favourites').view, 'favourites');
+  assert.equal(routeHref({ section: 'files', view: 'favourites' }), '#/files/@favourites');
+
+  assert.equal(parseRoute('#/files/@recent').view, 'recent');
+  assert.equal(routeHref({ section: 'files', view: 'recent' }), '#/files/@recent');
+
+  const syncHref = routeHref({ section: 'files', view: 'sync', syncId: 'camera-sync' });
+  assert.equal(syncHref, '#/files/@sync/camera-sync');
+  assert.equal(parseRoute(syncHref).syncId, 'camera-sync');
+
+  const searchHref = routeHref({
+    section: 'files',
+    view: 'search',
+    machine: 'tower',
+    path: '/home/me/Videos/Holiday',
+    query: { q: 'arrival', kinds: ['video', 'image'], size: 'large', changed: 'week' },
+  });
+  const parsedSearch = parseRoute(searchHref);
+  assert.equal(parsedSearch.view, 'search');
+  assert.equal(parsedSearch.machine, 'tower');
+  assert.equal(parsedSearch.path, '/home/me/Videos/Holiday');
+  assert.deepEqual(parsedSearch.query, {
+    q: 'arrival',
+    kinds: ['video', 'image'],
+    size: 'large',
+    changed: 'week',
+  });
 });
 
 test('parseRoute accepts legacy aliases and falls back safely', () => {

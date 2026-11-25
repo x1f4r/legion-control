@@ -3828,6 +3828,7 @@ mod tests {
                     writer: Box::new(client_out),
                     stderr: None,
                     cancel: stream_cancel,
+                    park: None,
                     guard: None,
                 })
             })

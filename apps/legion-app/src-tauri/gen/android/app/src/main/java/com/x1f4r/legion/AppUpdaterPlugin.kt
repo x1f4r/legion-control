@@ -2,8 +2,10 @@ package com.x1f4r.legion
 
 import android.app.Activity
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
+import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -25,6 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 @InvokeArg
 class InstallApkArgs {
   var path: String? = null
+  var background: Boolean = false
 }
 
 /**
@@ -32,8 +35,9 @@ class InstallApkArgs {
  *
  * Only installs verified APK files located inside this app's private data directory. Declares
  * `USER_ACTION_NOT_REQUIRED` on Android 12+ so that when Android permits a prompt-free self-update
- * (same installer package + `UPDATE_PACKAGES_WITHOUT_USER_ACTION`) the install applies without
- * interrupting the user, and falls back to Android's standard confirmation dialog otherwise.
+ * the install applies without interrupting the user. When invoked with `background = true`,
+ * `UpdateInstallReceiver` abandons any session that asks for user confirmation instead of bringing
+ * Legion or an installer dialog to the foreground.
  */
 @TauriPlugin
 class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
@@ -76,6 +80,20 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
+  private fun isActiveNetworkMetered(): Boolean {
+    return try {
+      val cm = activity.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+      cm?.isActiveNetworkMetered ?: false
+    } catch (e: Exception) {
+      if (BuildConfig.DEBUG) {
+        Log.w(TAG, "Could not inspect active network metered state: ${e.message}")
+      } else {
+        Log.w(TAG, "Could not inspect active network metered state")
+      }
+      false
+    }
+  }
+
   private fun capabilitiesPayload(): JSObject {
     val canInstall = appContext.packageManager.canRequestPackageInstalls()
     val installer = currentInstallerPackage()
@@ -90,12 +108,14 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
       selfInstaller || installer == null
     }
     val supportsSilent = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && canInstall && ownerAllowsSilent
+    val isMetered = isActiveNetworkMetered()
     return JSObject().apply {
       put("canRequestPackageInstalls", canInstall)
       put("isSelfInstaller", selfInstaller)
       put("installerPackage", installer ?: "")
       put("apiLevel", Build.VERSION.SDK_INT)
       put("supportsSilentSelfUpdate", supportsSilent)
+      put("isMetered", isMetered)
     }
   }
 
@@ -136,6 +156,7 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
   fun installApk(invoke: Invoke) {
     val args = invoke.parseArgs(InstallApkArgs::class.java)
     val rawPath = args.path?.trim().orEmpty()
+    val background = args.background
     if (rawPath.isEmpty()) {
       invoke.reject("APK path is required.")
       return
@@ -162,12 +183,12 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     if (BuildConfig.DEBUG) {
       Log.i(
         TAG,
-        "Starting PackageInstaller session: apk=${apkFile.name} bytes=${apkFile.length()} api=${Build.VERSION.SDK_INT} installer=$installerPkg",
+        "Starting PackageInstaller session: apk=${apkFile.name} bytes=${apkFile.length()} api=${Build.VERSION.SDK_INT} installer=$installerPkg background=$background",
       )
     } else {
       Log.i(
         TAG,
-        "Starting PackageInstaller session: bytes=${apkFile.length()} api=${Build.VERSION.SDK_INT}",
+        "Starting PackageInstaller session: bytes=${apkFile.length()} api=${Build.VERSION.SDK_INT} background=$background",
       )
     }
 
@@ -184,7 +205,7 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         sessionId = installer.createSession(params)
-        pendingInstalls[sessionId] = PendingInstall(invoke)
+        pendingInstalls[sessionId] = PendingInstall(invoke, background)
         session = installer.openSession(sessionId)
 
         FileInputStream(apkFile).use { input ->
@@ -199,7 +220,9 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
           }
         }
 
-        val callbackIntent = Intent(appContext, UpdateInstallReceiver::class.java)
+        val callbackIntent = Intent(activity, UpdateInstallReceiver::class.java).apply {
+          putExtra(EXTRA_BACKGROUND, background)
+        }
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
           PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
         } else {
@@ -212,7 +235,7 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
           flags,
         )
 
-        Log.i(TAG, "Committing PackageInstaller session $sessionId")
+        Log.i(TAG, "Committing PackageInstaller session $sessionId (background=$background)")
         session.commit(pendingIntent.intentSender)
       } catch (e: Exception) {
         if (BuildConfig.DEBUG) {
@@ -231,13 +254,18 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
-  private class PendingInstall(val invoke: Invoke) {
+  private class PendingInstall(val invoke: Invoke, val background: Boolean) {
     val prompted = AtomicBoolean(false)
   }
 
   companion object {
     private const val TAG = "legion-updater"
+    const val EXTRA_BACKGROUND = "com.x1f4r.legion.EXTRA_BACKGROUND"
     private val pendingInstalls = ConcurrentHashMap<Int, PendingInstall>()
+
+    fun isBackgroundSession(sessionId: Int): Boolean {
+      return pendingInstalls[sessionId]?.background ?: false
+    }
 
     fun onPendingUserAction(sessionId: Int) {
       val entry = pendingInstalls[sessionId]

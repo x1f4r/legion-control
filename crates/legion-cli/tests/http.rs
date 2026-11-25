@@ -136,6 +136,18 @@ fn main() -> ExitCode {
             "content_special_names_limits_slow_readers_and_in_flight_revocation",
             content_special_names_limits_slow_readers_and_in_flight_revocation,
         ),
+        (
+            "content_remote_starvation_isolation_and_mid_stream_revocation",
+            content_remote_starvation_isolation_and_mid_stream_revocation,
+        ),
+        (
+            "content_revocation_aborts_slow_and_stalled_readers_within_bound",
+            content_revocation_aborts_slow_and_stalled_readers_within_bound,
+        ),
+        (
+            "content_first_use_audit_survives_sigkill",
+            content_first_use_audit_survives_sigkill,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -608,7 +620,7 @@ fn health_needs_no_token() {
     assert_eq!(health.status, 200);
     assert_eq!(
         health.json(),
-        json!({"ok": true, "node": "laptop", "version": env!("CARGO_PKG_VERSION")})
+        json!({"ok": true, "node": "laptop", "version": env!("CARGO_PKG_VERSION"), "content": true})
     );
 }
 
@@ -3132,11 +3144,22 @@ paths = [\"~/projects/**\"]
     );
 
     // Remote node `pi` also coalesced its keep_open `stream.get` audit entries into one line.
-    let pi_gets: Vec<Value> = pi_home
-        .audit()
-        .into_iter()
-        .filter(|e| e["tool"] == "stream.get" && e["principal"] == "phone" && e["outcome"] == "ok")
-        .collect();
+    // On Windows `server.stop()` terminates `legion serve` directly, so the child `legion stream`
+    // helper on `pi` finishes flushing on stdin EOF asynchronously; wait briefly for it to land.
+    let pi_deadline = Instant::now() + PATIENCE;
+    let pi_gets: Vec<Value> = loop {
+        let gets: Vec<Value> = pi_home
+            .audit()
+            .into_iter()
+            .filter(|e| {
+                e["tool"] == "stream.get" && e["principal"] == "phone" && e["outcome"] == "ok"
+            })
+            .collect();
+        if !gets.is_empty() || Instant::now() >= pi_deadline {
+            break gets;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     assert_eq!(
         pi_gets.len(),
         1,
@@ -3166,16 +3189,17 @@ paths = [\"~/projects/**\"]
     let projects = home.home().join("projects").join("special");
     std::fs::create_dir_all(&projects).unwrap();
 
-    // 1. Filenames with %, %41, #, spaces, non-ASCII, trailing dot (and ? on Unix).
+    // 1. Filenames with %, %41, #, spaces, and non-ASCII are valid on every OS; trailing dots
+    //    and `?` are valid only on Unix and refused on Windows.
     let mut special_names = vec![
         "100%.txt",
         "a%41.txt",
         "hash#1.txt",
         "hello world.txt",
         "café 日本.txt",
-        "trailing.",
     ];
     if cfg!(unix) {
+        special_names.push("trailing.");
         special_names.push("what?.txt");
     }
     for name in &special_names {
@@ -3202,6 +3226,30 @@ paths = [\"~/projects/**\"]
         let got = http(server.port, "GET", &url, &[], b"");
         assert_eq!(got.status, 200, "{name} -> {url}: {}", got.text());
         assert_eq!(got.body, format!("body-of-{name}").as_bytes(), "{name}");
+    }
+
+    // On Windows, names ending in a dot/space, reserved device names, and NTFS ADS are refused
+    // with 400 invalid_args by policy path checks, and forbidden characters such as `?` cannot be
+    // opened as files.
+    #[cfg(windows)]
+    {
+        for forbidden in ["trailing.", "trailing ", "CON.txt", "file.txt:stream"] {
+            let rel_path = format!("~/projects/special/{forbidden}");
+            let refused = server.post("/v1/content", Some(&phone), &json!({"path": rel_path}));
+            assert_eq!(refused.status, 400, "{forbidden}: {}", refused.text());
+            assert_eq!(refused.json()["code"], json!("invalid_args"), "{forbidden}");
+        }
+        let question = server.post(
+            "/v1/content",
+            Some(&phone),
+            &json!({"path": "~/projects/special/what?.txt"}),
+        );
+        assert!(
+            question.status >= 400,
+            "expected Windows to refuse what?.txt, got {}: {}",
+            question.status,
+            question.text()
+        );
     }
 
     // 2. Overflowing Range bounds clamp or fall back to 200 OK instead of 416.
@@ -3407,4 +3455,506 @@ paths = [\"~/projects/**\"]
     );
 
     server.stop();
+}
+
+fn content_remote_starvation_isolation_and_mid_stream_revocation() {
+    let home = Home::new();
+    let pi_home = Home::new();
+
+    let policy = "\
+[principals.holder_a]
+role = \"observer\"
+
+[principals.holder_b]
+role = \"observer\"
+
+[principals.admin]
+role = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+paths = [\"~/projects/**\"]
+";
+    home.write_config("node.toml", "name = \"laptop\"\n");
+    home.write_config("policy.toml", policy);
+    pi_home.write_config("node.toml", "name = \"pi\"\n");
+    pi_home.write_config("policy.toml", policy);
+
+    let test_exe = std::env::current_exe().unwrap();
+    let pi_legion_home = pi_home.state().parent().unwrap().to_path_buf();
+    let pi_cmd = json!([
+        test_exe.to_string_lossy(),
+        HELPER_FLAG,
+        pi_legion_home.to_string_lossy(),
+        pi_home.home().to_string_lossy(),
+        "rpc"
+    ]);
+    home.write_config(
+        "fleet.toml",
+        &format!("[machines.pi]\ncommand = {pi_cmd}\n"),
+    );
+
+    let token_a = make_token(&home, &["tok-a", "holder_a"]);
+    let token_b = make_token(&home, &["tok-b", "holder_b"]);
+    let admin = make_token(&home, &["admin", "admin", "allow_owner=true"]);
+
+    // Large file on `pi` (12 MiB) plus a small transfer fixture.
+    let pi_dir = pi_home.home().join("projects").join("media");
+    std::fs::create_dir_all(&pi_dir).unwrap();
+    let big_len = 12 * 1024 * 1024usize;
+    let big_bytes: Vec<u8> = (0..big_len).map(|i| ((i * 29 + 7) % 251) as u8).collect();
+    let pi_big = pi_dir.join("movie.mp4");
+    std::fs::write(&pi_big, &big_bytes).unwrap();
+    let pi_small = pi_dir.join("note.txt");
+    std::fs::write(&pi_small, b"hello from pi transfer").unwrap();
+
+    let mut server = Server::start(&home);
+
+    // 1. Starvation scenario: holder_a opens 8 stalled GETs of the 12 MiB remote file on `pi`.
+    //    Because remote content reads return their warm pipe to the pool between bounded windows,
+    //    holder_b's POST /v1/content, ranged GET, remote RPC, and fs.transfer all complete fast.
+    let a_url = server
+        .post(
+            "/v1/content",
+            Some(&token_a),
+            &json!({"on": "pi", "path": pi_big.to_string_lossy()}),
+        )
+        .json()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut stalled = Vec::new();
+    for _ in 0..8 {
+        let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        s.set_read_timeout(Some(PATIENCE)).unwrap();
+        write!(
+            s,
+            "GET {a_url} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            server.port
+        )
+        .unwrap();
+        s.flush().unwrap();
+        stalled.push(s);
+    }
+    // Give the 8 stalled readers time to pull initial windows and fill socket buffers.
+    std::thread::sleep(Duration::from_millis(250));
+
+    let t_post = Instant::now();
+    let b_created = server.post(
+        "/v1/content",
+        Some(&token_b),
+        &json!({"on": "pi", "path": pi_big.to_string_lossy()}),
+    );
+    let post_elapsed = t_post.elapsed();
+    assert_eq!(b_created.status, 200, "{}", b_created.text());
+    assert!(
+        post_elapsed < Duration::from_secs(3),
+        "holder_b POST /v1/content starved behind holder_a's 8 stalled reads: {post_elapsed:?}"
+    );
+    let b_url = b_created.json()["url"].as_str().unwrap().to_owned();
+
+    let t_get = Instant::now();
+    let b_range = http(
+        server.port,
+        "GET",
+        &b_url,
+        &[("Range", "bytes=65536-131071".to_owned())],
+        b"",
+    );
+    let get_elapsed = t_get.elapsed();
+    assert_eq!(b_range.status, 206, "{}", b_range.text());
+    assert_eq!(b_range.body, &big_bytes[65_536..131_072]);
+    assert!(
+        get_elapsed < Duration::from_secs(3),
+        "holder_b ranged GET starved behind holder_a's 8 stalled reads: {get_elapsed:?}"
+    );
+
+    // Remote RPC and fs.transfer on `pi` do not share the content pipe pool and succeed promptly.
+    let rpc = server.call(
+        &admin,
+        json!({"tool": "meta.version", "args": {}, "on": "pi"}),
+    );
+    assert_eq!(rpc.status, 200, "{}", rpc.text());
+    let local_copy = home.home().join("projects").join("transferred.txt");
+    let xfer = server.call(
+        &admin,
+        json!({
+            "tool": "fs.transfer",
+            "args": {
+                "from": format!("pi:{}", pi_small.to_string_lossy()),
+                "to": local_copy.to_string_lossy(),
+            }
+        }),
+    );
+    assert_eq!(xfer.status, 200, "{}", xfer.text());
+    assert_eq!(
+        std::fs::read(&local_copy).unwrap(),
+        b"hello from pi transfer"
+    );
+    drop(stalled);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // 2. Mid-stream revocation on the remote machine (`pi`): revoking holder_b's policy on `pi`
+    //    (while `laptop`'s token and policy stay untouched) aborts an in-flight 12 MiB remote
+    //    range download early and denies subsequent reads with 403.
+    let mut rev_stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    rev_stream.set_read_timeout(Some(PATIENCE)).unwrap();
+    write!(
+        rev_stream,
+        "GET {b_url} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        server.port
+    )
+    .unwrap();
+    rev_stream.flush().unwrap();
+    let mut reader = BufReader::new(rev_stream);
+    let (status, _) = read_head(&mut reader);
+    assert_eq!(status, 200);
+    let mut first_chunk = vec![0u8; 512 * 1024];
+    reader.read_exact(&mut first_chunk).unwrap();
+    assert_eq!(first_chunk, &big_bytes[..first_chunk.len()]);
+
+    // Revoke holder_b on `pi` only; `laptop` still allows holder_b.
+    pi_home.write_config(
+        "policy.toml",
+        "\
+[principals.holder_a]
+role = \"observer\"
+
+[principals.holder_b]
+role = \"revoked\"
+
+[principals.admin]
+role = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+paths = [\"~/projects/**\"]
+
+[roles.revoked]
+allow = []
+",
+    );
+
+    let mut rest = Vec::new();
+    let _ = reader.read_to_end(&mut rest);
+    let received = first_chunk.len() + rest.len();
+    assert!(
+        received < big_len,
+        "expected remote policy revocation on pi to abort 12 MiB stream early, received {received}/{big_len}"
+    );
+    assert_eq!(
+        http(
+            server.port,
+            "GET",
+            &b_url,
+            &[("Range", "bytes=0-15".to_owned())],
+            b""
+        )
+        .status,
+        403
+    );
+
+    server.stop();
+}
+
+fn content_revocation_aborts_slow_and_stalled_readers_within_bound() {
+    let home = Home::new();
+    home.write_config("node.toml", "name = \"laptop\"\n");
+    home.write_config(
+        "policy.toml",
+        "\
+[principals.slow]
+role = \"observer\"
+
+[principals.stalled]
+role = \"observer\"
+
+[principals.admin]
+role = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+paths = [\"~/projects/**\"]
+",
+    );
+    let slow_token = make_token(&home, &["slow-tok", "slow"]);
+    let stalled_token = make_token(&home, &["stalled-tok", "stalled"]);
+    let admin_token = make_token(&home, &["admin-tok", "admin", "allow_owner=true"]);
+
+    let projects = home.home().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let big_path = projects.join("movie.bin");
+    let big_len = 16 * 1024 * 1024usize;
+    let big_bytes: Vec<u8> = (0..big_len).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&big_path, &big_bytes).unwrap();
+
+    let mut server = Server::start(&home);
+
+    // 1. Slow 20 KB/s reader: token removal must reset the connection within ~2 seconds and bound
+    //    total bytes received after revocation (well under 512 KiB, never megabytes / 120 seconds).
+    let mint_slow = http(
+        server.port,
+        "POST",
+        "/v1/content",
+        &[
+            ("Authorization", format!("Bearer {slow_token}")),
+            ("Content-Type", "application/json".to_owned()),
+        ],
+        br#"{"path":"~/projects/movie.bin"}"#,
+    );
+    assert_eq!(mint_slow.status, 200, "{}", mint_slow.text());
+    let slow_url = mint_slow.json()["url"].as_str().unwrap().to_owned();
+
+    let mut slow_conn = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    slow_conn
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        slow_conn,
+        "GET {slow_url} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        server.port
+    )
+    .unwrap();
+    slow_conn.flush().unwrap();
+    let mut slow_reader = BufReader::new(slow_conn);
+    let (status, _) = read_head(&mut slow_reader);
+    assert_eq!(status, 200);
+
+    // Read a few small chunks at ~20 KB/s before revoking the token.
+    let mut chunk = [0u8; 4096];
+    slow_reader.read_exact(&mut chunk).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let rm_slow = server.call(
+        &admin_token,
+        json!({"tool": "token.remove", "args": {"name": "slow-tok"}}),
+    );
+    assert_eq!(rm_slow.status, 200, "{}", rm_slow.text());
+    let revoked_at = Instant::now();
+
+    // Keep pacing at 20 KB/s until the server's independent liveness watcher flushes the revoked
+    // ticket's `content.read` audit record and resets the TCP connection (must happen within ~2s).
+    let mut server_cut_at: Option<Duration> = None;
+    let mut bytes_after_revoke = 0usize;
+    let mut eof_or_reset = false;
+    while revoked_at.elapsed() < Duration::from_secs(4) {
+        if server_cut_at.is_none()
+            && home.audit().iter().any(|e| {
+                e["tool"] == "content.read"
+                    && e["principal"] == "slow"
+                    && e["args"]["path"] == "~/projects/movie.bin"
+            })
+        {
+            server_cut_at = Some(revoked_at.elapsed());
+        }
+        match slow_reader.read(&mut chunk) {
+            Ok(0) | Err(_) => {
+                eof_or_reset = true;
+                break;
+            }
+            Ok(n) => {
+                bytes_after_revoke += n;
+                if server_cut_at.is_some() {
+                    // Server has already reset the socket; drain any bytes that had already
+                    // landed in the client's own receive buffer before the RST arrived.
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+    if !eof_or_reset {
+        let mut tail = Vec::new();
+        let _ = slow_reader.read_to_end(&mut tail);
+        bytes_after_revoke += tail.len();
+    }
+    let server_cut_elapsed = server_cut_at.expect(
+        "expected server liveness watcher to revoke, flush audit, and reset 20 KB/s reader within 4s",
+    );
+    assert!(
+        server_cut_elapsed <= Duration::from_secs(3),
+        "expected server to abort 20 KB/s reader within ~2s of revocation, took {server_cut_elapsed:?}"
+    );
+    let slow_served = home
+        .audit()
+        .into_iter()
+        .find(|e| {
+            e["tool"] == "content.read"
+                && e["principal"] == "slow"
+                && e["args"]["path"] == "~/projects/movie.bin"
+        })
+        .and_then(|e| e["args"]["bytes_served"].as_u64())
+        .expect("expected flushed content.read bytes_served for slow reader");
+    assert!(
+        slow_served < 4 * 1024 * 1024,
+        "expected server to abort slow reader well before sending the 16 MiB file, audited {slow_served} bytes"
+    );
+    // Client-side post-revocation reads include whatever bytes the client OS already accepted into
+    // its own TCP receive buffer before revocation (e.g. ~650 KiB on macOS loopback autotuning).
+    // The server-side cutoff time, post-cutoff zero-byte window, and physical socket-write ceiling
+    // (effective SO_SNDBUF + client SO_RCVBUF + client post-revoke reads + 64 KiB) are asserted
+    // directly in `legion_doors::http::tests`; keep a loose OS-independent sanity bound here.
+    assert!(
+        bytes_after_revoke < 4 * 1024 * 1024,
+        "expected slow reader to stop well short of the 16 MiB file after revocation, drained {bytes_after_revoke} bytes (server cut at {server_cut_elapsed:?})"
+    );
+
+    // 2. Completely stalled reader (stops calling read altogether): token removal must reset the
+    //    connection independently of body polling within ~2 seconds.
+    let mint_stalled = http(
+        server.port,
+        "POST",
+        "/v1/content",
+        &[
+            ("Authorization", format!("Bearer {stalled_token}")),
+            ("Content-Type", "application/json".to_owned()),
+        ],
+        br#"{"path":"~/projects/movie.bin"}"#,
+    );
+    assert_eq!(mint_stalled.status, 200, "{}", mint_stalled.text());
+    let stalled_url = mint_stalled.json()["url"].as_str().unwrap().to_owned();
+
+    let mut stalled_conn = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stalled_conn
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
+    write!(
+        stalled_conn,
+        "GET {stalled_url} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        server.port
+    )
+    .unwrap();
+    stalled_conn.flush().unwrap();
+    let mut stalled_reader = BufReader::new(stalled_conn);
+    let (status, _) = read_head(&mut stalled_reader);
+    assert_eq!(status, 200);
+    let mut initial = [0u8; 16 * 1024];
+    stalled_reader.read_exact(&mut initial).unwrap();
+
+    // Stop reading completely and revoke the token.
+    let rm_stalled = server.call(
+        &admin_token,
+        json!({"tool": "token.remove", "args": {"name": "stalled-tok"}}),
+    );
+    assert_eq!(rm_stalled.status, 200, "{}", rm_stalled.text());
+    let stalled_revoked_at = Instant::now();
+
+    // Wait for the server's independent liveness watcher to revoke and reset the stalled socket
+    // while the client never reads a single byte.
+    let mut stalled_cut_at: Option<Duration> = None;
+    while stalled_revoked_at.elapsed() < Duration::from_secs(4) {
+        if home.audit().iter().any(|e| {
+            e["tool"] == "content.read"
+                && e["principal"] == "stalled"
+                && e["args"]["path"] == "~/projects/movie.bin"
+        }) {
+            stalled_cut_at = Some(stalled_revoked_at.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let stalled_cut_elapsed =
+        stalled_cut_at.expect("expected server liveness watcher to abort stalled reader within 4s");
+    assert!(
+        stalled_cut_elapsed <= Duration::from_secs(3),
+        "stalled reader was not aborted promptly after revocation: {stalled_cut_elapsed:?}"
+    );
+
+    let stalled_served = home
+        .audit()
+        .into_iter()
+        .find(|e| {
+            e["tool"] == "content.read"
+                && e["principal"] == "stalled"
+                && e["args"]["path"] == "~/projects/movie.bin"
+        })
+        .and_then(|e| e["args"]["bytes_served"].as_u64())
+        .expect("expected flushed content.read bytes_served for stalled reader");
+    assert!(
+        stalled_served < 4 * 1024 * 1024,
+        "expected server to abort stalled reader well before sending the 16 MiB file, audited {stalled_served} bytes"
+    );
+
+    let mut tail = Vec::new();
+    let read_res = stalled_reader.read_to_end(&mut tail);
+    assert!(
+        read_res.is_err() || initial.len() + tail.len() < big_len,
+        "stalled reader must be aborted early after revocation (got {} / {big_len} bytes)",
+        initial.len() + tail.len()
+    );
+    assert!(
+        tail.len() < 4 * 1024 * 1024,
+        "stalled reader received unreasonably large tail after revocation: {} bytes",
+        tail.len()
+    );
+
+    server.stop();
+}
+
+fn content_first_use_audit_survives_sigkill() {
+    let home = Home::new();
+    home.write_config("node.toml", "name = \"laptop\"\n");
+    home.write_config(
+        "policy.toml",
+        "\
+[principals.phone]
+role = \"observer\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+paths = [\"~/docs/**\"]
+",
+    );
+    let token = make_token(&home, &["phone-tok", "phone"]);
+    let docs = home.home().join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(docs.join("secret.txt"), b"durable audit payload").unwrap();
+
+    let mut server = Server::start(&home);
+    let mint = http(
+        server.port,
+        "POST",
+        "/v1/content",
+        &[
+            ("Authorization", format!("Bearer {token}")),
+            ("Content-Type", "application/json".to_owned()),
+        ],
+        br#"{"path":"~/docs/secret.txt"}"#,
+    );
+    assert_eq!(mint.status, 200, "{}", mint.text());
+    let url = mint.json()["url"].as_str().unwrap().to_owned();
+
+    // First use of the ticket (one range GET).
+    let first = http(
+        server.port,
+        "GET",
+        &url,
+        &[("Range", "bytes=0-6".to_owned())],
+        b"",
+    );
+    assert_eq!(first.status, 206);
+    assert_eq!(first.body, b"durable");
+
+    // Kill the door abruptly (SIGKILL on Unix / TerminateProcess on Windows) before any
+    // coalescing window or graceful shutdown flush can run.
+    let _ = server.child.kill();
+    let _ = server.child.wait();
+
+    let audit = home.audit();
+    let opens: Vec<&Value> = audit
+        .iter()
+        .filter(|e| {
+            e["tool"] == "content.open"
+                && e["principal"] == "phone"
+                && e["target"] == "laptop"
+                && e["outcome"] == "ok"
+                && e["args"]["path"] == "~/docs/secret.txt"
+        })
+        .collect();
+    assert_eq!(
+        opens.len(),
+        1,
+        "expected immediate durable content.open audit entry surviving hard kill: {audit:?}"
+    );
 }

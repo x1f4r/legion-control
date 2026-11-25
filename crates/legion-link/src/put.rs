@@ -344,6 +344,7 @@ pub(crate) async fn handshake_put(
         mut writer,
         stderr,
         cancel: channel_cancel,
+        park: _,
         guard,
     } = stream;
 
@@ -911,6 +912,7 @@ mod tests {
                     writer: Box::new(client_out),
                     stderr: None,
                     cancel: stream_cancel,
+                    park: None,
                     guard: None,
                 })
             })

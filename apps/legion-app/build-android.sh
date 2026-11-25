@@ -206,6 +206,16 @@ printf '%s\n' "$VERIFY_OUTPUT"
 say ""
 say "APK: $SIGNED"
 say "Sequence: $LEGION_BUILD_SEQUENCE (versionCode $APK_VERSION_CODE)"
+if [ -n "${LEGION_PREVIEW_UPDATE_KEY:-}" ]; then
+	if [[ "$LEGION_PREVIEW_UPDATE_KEY" == *"BEGIN PUBLIC KEY"* ]]; then
+		PREVIEW_FP="$(printf '%s\n' "$LEGION_PREVIEW_UPDATE_KEY" | openssl pkey -pubin -outform DER 2>/dev/null | tail -c 32 | openssl dgst -sha256 -binary | openssl base64 -A | tr -d '=')"
+	else
+		PREVIEW_FP="$(openssl pkey -pubin -in "$LEGION_PREVIEW_UPDATE_KEY" -outform DER 2>/dev/null | tail -c 32 | openssl dgst -sha256 -binary | openssl base64 -A | tr -d '=')"
+	fi
+	say "Update keys: release + preview (SHA256:${PREVIEW_FP})"
+else
+	say "Update keys: release only (no preview key)"
+fi
 say "Size: $SIZE_HUMAN ($SIZE_BYTES bytes)"
 say "SHA-256: $CERT_SHA256"
 

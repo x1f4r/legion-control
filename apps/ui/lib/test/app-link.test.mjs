@@ -306,7 +306,8 @@ test('createAppLink wraps native update commands and live update watch channel',
     assert.equal((await link.setAutoUpdate(false)).auto_update, false);
     await link.installUpdate();
     await link.dismissUpdateNotice();
-    await link.maybeAutoInstall();
+    await link.maybeAutoInstall('startup');
+    await link.maybeAutoInstall('background');
     for (const cmd of [
       'update_watch',
       'update_state',
@@ -318,6 +319,14 @@ test('createAppLink wraps native update commands and live update watch channel',
     ]) {
       assert.ok(seen.some((c) => c.command === cmd), `expected ${cmd}`);
     }
+    assert.ok(
+      seen.some((c) => c.command === 'update_maybe_auto_install' && c.payload?.trigger === 'startup'),
+      'expected startup trigger payload',
+    );
+    assert.ok(
+      seen.some((c) => c.command === 'update_maybe_auto_install' && c.payload?.trigger === 'background'),
+      'expected background trigger payload',
+    );
   } finally {
     if (prevWindow === undefined) {
       delete globalThis.window;
@@ -486,6 +495,74 @@ test('createAppLink hides unsupported upload and openExternally methods on iOS',
       Object.defineProperty(globalThis, 'navigator', prevNavigator);
     } else {
       delete globalThis.navigator;
+    }
+  }
+});
+
+test('createAppLink advertises content support and remembers unsupported remote machines per session', async () => {
+  const prevWindow = globalThis.window;
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          if (command === 'content_url') {
+            if (payload.machine === 'legacy') {
+              return Promise.reject({
+                code: 'unsupported',
+                message: 'legacy answered stream get without modification time.',
+                machine: 'legacy',
+              });
+            }
+            if (payload.path === '/huge.png') {
+              return Promise.reject({
+                code: 'unsupported',
+                message: 'This file is too large to show here.',
+                machine: payload.machine,
+                details: { reason: 'too_large_for_inline' },
+              });
+            }
+            return Promise.resolve({ url: 'http://127.0.0.1:42000/v1/content/tok/pic.png', expires_in: 900 });
+          }
+          if (command === 'invalidate_sessions') return Promise.resolve();
+          return Promise.resolve({});
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    let notifications = 0;
+    const unsub = link.onContentSupportChange(() => {
+      notifications += 1;
+    });
+    assert.equal(link.supportsContent, true);
+    assert.equal(link.supportsContentFor('tower'), true);
+    assert.equal(link.supportsContentFor('legacy'), true);
+
+    await assert.rejects(() => link.contentUrl({ machine: 'tower', path: '/huge.png' }), {
+      code: 'unsupported',
+    });
+    assert.equal(link.supportsContentFor('tower'), true);
+    assert.equal(notifications, 0);
+
+    await assert.rejects(() => link.contentUrl({ machine: 'legacy', path: '/a.png' }), {
+      code: 'unsupported',
+      machine: 'legacy',
+    });
+    assert.equal(link.supportsContentFor('legacy'), false);
+    assert.equal(link.supportsContentFor('tower'), true);
+    assert.equal(notifications, 1);
+
+    await link.invalidateSessions();
+    assert.equal(link.supportsContentFor('legacy'), true);
+    assert.equal(notifications, 2);
+    unsub();
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
     }
   }
 });

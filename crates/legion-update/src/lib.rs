@@ -25,10 +25,11 @@ pub use checksums::{
 };
 pub use floor::{
     SequenceFloorState, check_sequence_upgrade, commit_sequence_floor, read_sequence_floor,
+    recover_sequence_floor,
 };
 pub use manifest::{
-    Arch, Artifact, Channel, InstallKind, MAX_ARTIFACTS, MAX_MANIFEST_BYTES, MAX_NOTES_BYTES, Os,
-    Program, TargetPlatform, UpdateManifest,
+    Arch, Artifact, Channel, InstallKind, MAX_ARTIFACT_BYTES, MAX_ARTIFACTS, MAX_MANIFEST_BYTES,
+    MAX_NOTES_BYTES, Os, Program, TargetPlatform, UpdateManifest,
 };
 pub use trust::{
     CHECKSUMS_FILENAME, MANIFEST_FILENAME, PREVIEW_PUBLIC_KEY, RELEASE_PUBLIC_KEY,
@@ -40,7 +41,9 @@ pub use verify::{
     verify_set_directory, verify_set_metadata,
 };
 pub use version::{
-    android_version_code, compiled_sequence, desktop_bundle_version, macos_bundle_version,
+    MAX_FUTURE_HORIZON_DAYS, android_version_code, check_sequence_plausibility, compiled_sequence,
+    compiled_sequence_marker, desktop_bundle_version, macos_bundle_version,
+    sequence_to_unix_minutes,
 };
 
 #[cfg(test)]
@@ -85,6 +88,7 @@ mod tests {
                 "os": os,
                 "arch": arch,
                 "kind": kind,
+                "size": bytes.len(),
             }));
         }
 
@@ -504,6 +508,7 @@ mod tests {
                 "os": "android",
                 "arch": "aarch64",
                 "kind": "apk",
+                "size": 12,
             }],
         });
         let manifest_bytes = serde_json::to_vec_pretty(&manifest_val).unwrap();
@@ -512,6 +517,230 @@ mod tests {
         let missing_sum_err =
             verify_set_metadata(sums.as_bytes(), &sig, &manifest_bytes, &anchors).unwrap_err();
         assert_eq!(missing_sum_err.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn refuses_sequence_zero_running_build() {
+        let floor_dir = tempdir().unwrap();
+        let floor_path = floor_dir.path().join("floor.json");
+
+        let err = check_sequence_upgrade(202611250130, 0, &floor_path).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert!(err.message.contains("sequence 0"));
+
+        let rec_err = recover_sequence_floor(&floor_path, 0).unwrap_err();
+        assert_eq!(rec_err.code, ErrorCode::Unsupported);
+    }
+
+    #[test]
+    fn refuses_far_future_and_malformed_sequences() {
+        let floor_dir = tempdir().unwrap();
+        let floor_path = floor_dir.path().join("floor.json");
+
+        // 10 years ahead is allowed; 10 years + 1 day is refused.
+        check_sequence_upgrade(203611200000, 202611250130, &floor_path).unwrap();
+
+        let far = check_sequence_upgrade(299912312359, 202611250130, &floor_path).unwrap_err();
+        assert_eq!(far.code, ErrorCode::Denied);
+        assert!(far.message.contains("days ahead"));
+
+        let eleven_years =
+            check_sequence_upgrade(203711250130, 202611250130, &floor_path).unwrap_err();
+        assert_eq!(eleven_years.code, ErrorCode::Denied);
+
+        // Against a small synthetic sequence, a far-future calendar sequence past 2099 is refused.
+        let small_to_far = check_sequence_upgrade(299912312359, 10, &floor_path).unwrap_err();
+        assert_eq!(small_to_far.code, ErrorCode::Denied);
+
+        // Completely out-of-range integer sequence (e.g. u64::MAX) is refused as invalid.
+        let huge = check_sequence_upgrade(u64::MAX, 202611250130, &floor_path).unwrap_err();
+        assert_eq!(huge.code, ErrorCode::InvalidArgs);
+    }
+
+    #[test]
+    fn recover_sequence_floor_rebuilds_corrupt_file_without_lowering_valid_floor() {
+        let floor_dir = tempdir().unwrap();
+        let floor_path = floor_dir.path().join("floor.json");
+
+        // Missing floor is created at running_sequence without corruption warning.
+        let (floor, detail) = recover_sequence_floor(&floor_path, 202611250100).unwrap();
+        assert_eq!(floor, 202611250100);
+        assert!(detail.is_none());
+
+        // Valid higher floor is never lowered.
+        commit_sequence_floor(&floor_path, 202611250200).unwrap();
+        let (floor, detail) = recover_sequence_floor(&floor_path, 202611250100).unwrap();
+        assert_eq!(floor, 202611250200);
+        assert!(detail.is_none());
+
+        // Corrupt floor is rebuilt at running_sequence and returns the corruption reason.
+        fs::write(&floor_path, "{corrupt json").unwrap();
+        assert!(matches!(
+            read_sequence_floor(&floor_path),
+            SequenceFloorState::Invalid(_)
+        ));
+        let (floor, detail) = recover_sequence_floor(&floor_path, 202611250150).unwrap();
+        assert_eq!(floor, 202611250150);
+        assert!(detail.is_some());
+        assert_eq!(
+            read_sequence_floor(&floor_path),
+            SequenceFloorState::Recorded(202611250150)
+        );
+        // Newer sequences can now be verified against the rebuilt floor.
+        check_sequence_upgrade(202611250151, 202611250150, &floor_path).unwrap();
+    }
+
+    #[test]
+    fn select_artifact_refuses_ambiguous_matches() {
+        let (rel_sign, rel_pub) = keypair(0x71);
+        let anchors = TrustAnchors::with_keys(rel_pub, None);
+        let dir = tempdir().unwrap();
+        build_signed_set(
+            dir.path(),
+            "stable",
+            "0.2.0",
+            202611250130,
+            &[
+                (
+                    "Legion-0.2.0-a-x86_64.AppImage",
+                    "app",
+                    "linux",
+                    "x86_64",
+                    "appimage",
+                    b"first",
+                ),
+                (
+                    "Legion-0.2.0-b-x86_64.AppImage",
+                    "app",
+                    "linux",
+                    "x86_64",
+                    "appimage",
+                    b"second",
+                ),
+            ],
+            &rel_sign,
+        );
+        let meta = verify_set_directory(dir.path(), &anchors).unwrap();
+        let err = meta
+            .manifest
+            .select_artifact(TargetPlatform {
+                program: Program::App,
+                os: Os::Linux,
+                arch: Arch::X86_64,
+                kind: InstallKind::AppImage,
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.message.contains("ambiguous"), "{}", err.message);
+    }
+
+    #[test]
+    fn refuses_artifact_size_mismatch_and_invalid_sizes() {
+        let (rel_sign, rel_pub) = keypair(0x72);
+        let anchors = TrustAnchors::with_keys(rel_pub, None);
+        let dir = tempdir().unwrap();
+
+        // Artifact declared with wrong byte size in update.json (even if SHA256SUMS matches bytes).
+        let payload = b"actual-payload";
+        fs::write(dir.path().join("app.apk"), payload).unwrap();
+        let manifest_val = json!({
+            "channel": "stable",
+            "version": "0.2.0",
+            "build": "a1b2c3d4e5f6",
+            "sequence": 202611250130u64,
+            "published_at": "2026-11-25T01:00:00Z",
+            "notes": "Wrong size.",
+            "artifacts": [{
+                "name": "app.apk",
+                "program": "app",
+                "os": "android",
+                "arch": "aarch64",
+                "kind": "apk",
+                "size": payload.len() + 10,
+            }],
+        });
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest_val).unwrap();
+        fs::write(dir.path().join(MANIFEST_FILENAME), &manifest_bytes).unwrap();
+        let sums = format!(
+            "{}  app.apk\n{}  {}\n",
+            sha256_bytes(payload),
+            sha256_bytes(&manifest_bytes),
+            MANIFEST_FILENAME
+        );
+        fs::write(dir.path().join(CHECKSUMS_FILENAME), sums.as_bytes()).unwrap();
+        let sig = encode_signature_bytes(&rel_sign.sign(sums.as_bytes()).to_bytes());
+        fs::write(dir.path().join(SIGNATURE_FILENAME), &sig).unwrap();
+
+        let err = verify_set_directory(dir.path(), &anchors).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Failed);
+        assert!(err.message.contains("Size mismatch"));
+
+        // Zero size and > MAX_ARTIFACT_BYTES are refused during manifest parsing.
+        for bad_size in [0u64, MAX_ARTIFACT_BYTES + 1] {
+            let bad_manifest = serde_json::to_vec(&json!({
+                "channel": "stable",
+                "version": "0.2.0",
+                "build": "a1b2c3d4e5f6",
+                "sequence": 202611250130u64,
+                "published_at": "2026-11-25T01:00:00Z",
+                "notes": "Bad size.",
+                "artifacts": [{
+                    "name": "app.apk",
+                    "program": "app",
+                    "os": "android",
+                    "arch": "aarch64",
+                    "kind": "apk",
+                    "size": bad_size,
+                }],
+            }))
+            .unwrap();
+            let parse_err = UpdateManifest::parse(&bad_manifest).unwrap_err();
+            assert_eq!(parse_err.code, ErrorCode::InvalidArgs);
+        }
+    }
+
+    #[test]
+    fn node_release_sha256sums_without_update_json_is_refused() {
+        // Load-bearing property: a plain GitHub node release signs SHA256SUMS over release
+        // tarballs WITHOUT an update.json entry, so the same Ed25519 release key cannot have a
+        // node release replayed as an app update set (and vice versa).
+        let (rel_sign, rel_pub) = keypair(0x73);
+        let anchors = TrustAnchors::with_keys(rel_pub, None);
+        let tarball = b"legion-node-release-tarball";
+        let sums = format!(
+            "{}  legion-v0.2.0-x86_64-unknown-linux-musl.tar.gz\n",
+            sha256_bytes(tarball)
+        );
+        let sig = encode_signature_bytes(&rel_sign.sign(sums.as_bytes()).to_bytes());
+        let forged_manifest = serde_json::to_vec(&json!({
+            "channel": "stable",
+            "version": "0.2.0",
+            "build": "a1b2c3d4e5f6",
+            "sequence": 202611250130u64,
+            "published_at": "2026-11-25T01:00:00Z",
+            "notes": "Forged around node release signature.",
+            "artifacts": [{
+                "name": "legion-v0.2.0-x86_64-unknown-linux-musl.tar.gz",
+                "program": "node",
+                "os": "linux",
+                "arch": "x86_64",
+                "kind": "binary",
+                "size": tarball.len(),
+            }],
+        }))
+        .unwrap();
+
+        let err =
+            verify_set_metadata(sums.as_bytes(), &sig, &forged_manifest, &anchors).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(err.message.contains("update.json"));
+    }
+
+    #[test]
+    fn compiled_sequence_marker_has_expected_format() {
+        let marker = compiled_sequence_marker();
+        let expected = format!("LEGION_UPDATE_SEQUENCE={}\0", compiled_sequence());
+        assert_eq!(marker, expected.as_bytes());
     }
 
     #[test]

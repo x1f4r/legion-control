@@ -138,6 +138,14 @@ pub enum OpenRangeError {
     /// The ticket's backing credential (token or pairing) is no longer valid; the ticket table
     /// revokes the holder and answers `404 Not Found`.
     TicketRevoked,
+    /// Remote content transport capacity is temporarily saturated; answers `503 Service
+    /// Unavailable` with `Retry-After`.
+    Busy {
+        /// Suggested retry delay in seconds.
+        retry_after_secs: u64,
+        /// Structured error body returned to the caller.
+        error: ErrorBody,
+    },
     /// Any other structured Legion error (for example `denied`, `not_found`, `unreachable`).
     Error(ErrorBody),
 }
@@ -790,6 +798,16 @@ fn map_open_error(
             ticket_not_found(options)
         }
         OpenRangeError::OutOfRange { size } => unsatisfiable_without_etag(size, options),
+        OpenRangeError::Busy {
+            retry_after_secs,
+            error,
+        } => {
+            let mut response = json_error(StatusCode::SERVICE_UNAVAILABLE, &error, options);
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(retry_after_secs.max(1)));
+            response
+        }
         OpenRangeError::Error(body) => json_error(status_for_error(body.code), &body, options),
     }
 }
@@ -1133,7 +1151,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(collect_body(resp.into_body()).await.unwrap(), data[10..20]);
 
-        // If-Range mismatch serves full 200 OK (even when Range would be out-of-range!)
+        // If-Range mismatch serves full 200 OK even when Range would be out of range.
         h.insert(RANGE, HeaderValue::from_static("bytes=500-600"));
         h.insert(IF_RANGE, HeaderValue::from_static("\"stale-etag\""));
         let resp = handle_request(
@@ -1997,5 +2015,56 @@ mod tests {
         assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(ranged.headers().get(CONTENT_LENGTH).unwrap(), "2048");
         assert_eq!(source.non_zero_opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn open_range_busy_returns_503_with_retry_after() {
+        struct BusySource;
+
+        impl ContentSource for BusySource {
+            fn open_range<'a>(
+                &'a self,
+                _ticket: &'a Ticket,
+                _offset: u64,
+                _length: Option<u64>,
+            ) -> Pin<Box<dyn Future<Output = Result<OpenedRange, OpenRangeError>> + Send + 'a>>
+            {
+                Box::pin(async {
+                    Err(OpenRangeError::Busy {
+                        retry_after_secs: 3,
+                        error: ErrorBody::new(ErrorCode::Busy, "All remote pipes are busy."),
+                    })
+                })
+            }
+        }
+
+        let tickets = Arc::new(TicketTable::new());
+        let issued = tickets
+            .issue(TicketRequest {
+                holder: "h".to_owned(),
+                principal: "p".to_owned(),
+                machine: "pi".to_owned(),
+                path: "/data.bin".to_owned(),
+            })
+            .unwrap();
+        let resp = handle_request(
+            &tickets,
+            &Arc::new(BusySource),
+            &Method::GET,
+            &issued.id,
+            &issued.file_name,
+            None,
+            &HeaderMap::new(),
+            ServeOptions::default(),
+            StreamHooks::default(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("3")
+        );
     }
 }

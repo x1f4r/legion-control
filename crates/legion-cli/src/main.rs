@@ -133,6 +133,7 @@ async fn run(command: Command) -> ExitCode {
     };
     let (node, router) = match paths_result {
         Ok(paths) => {
+            legion_net::updates::cleanup_stale_staging(&paths);
             let fleet = Fleet::new(&paths);
             let mut registry = legion_tools::registry();
             legion_net::register(&mut registry, fleet.clone());
@@ -292,13 +293,18 @@ async fn serve_stream(
     shutdown: CancellationToken,
 ) -> ExitCode {
     let host = Host::new(node.paths().clone(), node.name());
+    let stream_options = legion_net::stream::StreamServeOptions {
+        shutdown: Some(shutdown.clone()),
+        ..legion_net::stream::StreamServeOptions::default()
+    };
     let mut served = tokio::task::spawn_blocking(move || {
-        legion_net::stream::serve_with_door(
+        legion_net::stream::serve_with_options(
             &host,
             pinned.as_deref(),
             door,
             device.as_deref(),
-            io::stdin().lock(),
+            stream_options,
+            io::stdin(),
             io::stdout().lock(),
         )
     });
