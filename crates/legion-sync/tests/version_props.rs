@@ -4,9 +4,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 
-use legion_sync::{IndexRecord, VersionOrder, VersionVector, compare_live_winner};
+use legion_sync::{IndexRecord, VersionKey, VersionOrder, VersionVector, compare_live_winner};
 use legion_xfer::hash::hash_bytes;
 use legion_xfer::{EntryKind, Timestamp};
 use proptest::prelude::*;
@@ -22,8 +21,12 @@ fn member_name() -> impl Strategy<Value = String> {
     ])
 }
 
+fn version_key() -> impl Strategy<Value = VersionKey> {
+    (member_name(), 1u64..=3).prop_map(|(m, inc)| VersionKey::new(m, inc))
+}
+
 fn version_vector() -> impl Strategy<Value = VersionVector> {
-    prop::collection::btree_map(member_name(), 0u64..8, 0..=6).prop_map(VersionVector::from_map)
+    prop::collection::btree_map(version_key(), 0u64..8, 0..=6).prop_map(VersionVector::from_map)
 }
 
 fn live_record() -> impl Strategy<Value = IndexRecord> {
@@ -44,11 +47,13 @@ fn live_record() -> impl Strategy<Value = IndexRecord> {
             hash: Some(hash_bytes(&bytes)),
             link_target: None,
             deleted: false,
-            version: VersionVector::singleton(member.clone(), 1),
+            version: VersionVector::singleton(VersionKey::new(member.clone(), 1), 1),
             modified_by: member,
             seq: 1,
-            tombstone_deps: BTreeMap::new(),
+            recent_hashes: Vec::new(),
+            from_join: false,
             conflict_of: None,
+            conflict_dismissed: false,
         })
 }
 
@@ -95,27 +100,21 @@ proptest! {
         b in version_vector(),
         c in version_vector(),
     ) {
-        // Idempotence
         prop_assert_eq!(a.merge(&a), a.clone());
 
-        // Commutativity
         let ab = a.merge(&b);
         let ba = b.merge(&a);
         prop_assert_eq!(&ab, &ba);
 
-        // Associativity
         prop_assert_eq!(ab.merge(&c), a.merge(&b.merge(&c)));
 
-        // Upper bound
         prop_assert!(ab.dominates_or_equal(&a));
         prop_assert!(ab.dominates_or_equal(&b));
 
-        // Least upper bound: if c dominates both a and b, c dominates merge(a, b)
         if c.dominates_or_equal(&a) && c.dominates_or_equal(&b) {
             prop_assert!(c.dominates_or_equal(&ab));
         }
 
-        // Compatibility with partial order: a >= b <=> merge(a, b) == a
         prop_assert_eq!(a.dominates_or_equal(&b), ab == a);
     }
 
@@ -136,13 +135,13 @@ proptest! {
     #[test]
     fn bump_above_strictly_dominates(
         mut a in version_vector(),
-        member in member_name(),
+        key in version_key(),
         floor in 0u64..100,
     ) {
         let before = a.clone();
-        let next = a.bump_above(member.clone(), floor);
+        let next = a.bump_above(key.clone(), floor);
         prop_assert!(next > floor);
-        prop_assert!(next > before.get(&member));
+        prop_assert!(next > before.get(&key));
         prop_assert_eq!(a.compare(&before), VersionOrder::Newer);
     }
 

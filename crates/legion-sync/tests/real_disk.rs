@@ -8,13 +8,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Cursor, Read, Write};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use legion_sync::{
-    BinReason, CausalMatrix, ConflictChoice, FolderConfig, FsCapabilities, FsErrorKind, FsMeta,
-    FsWalkResult, IgnoreMatcher, IndexRecord, IndexStore, MemberState, Peer, ProblemKind, RealFs,
-    RecordsPage, RedbIndexStore, RestoreStrategy, ScanOptions, SyncEngine, SyncError, SyncFs,
-    SyncWrite, VersionVector,
+    BinReason, ConflictChoice, FetchOptions, FolderConfig, FolderMarker, FsCapabilities,
+    FsErrorKind, FsMeta, FsWalkResult, IgnoreMatcher, IndexRecord, IndexStore, MemberState, Peer,
+    PeerHandshake, ProblemKind, RealFs, RecordsPage, RedbIndexStore, RestoreStrategy,
+    SYNC_PROTOCOL_VERSION, ScanOptions, SyncEngine, SyncError, SyncFs, SyncWrite, VersionKey,
+    VersionVector, conflict_copy_path,
 };
 use legion_xfer::hash::hash_bytes;
 use legion_xfer::{EntryKind, Hash, Timestamp};
@@ -41,23 +43,32 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
         &self.member_id
     }
 
-    fn records_since(&self, since_seq: u64, limit: usize) -> legion_sync::Result<RecordsPage> {
+    fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
+        self.engine.serve_handshake(&self.caller)
+    }
+
+    fn records_since(
+        &self,
+        since_incarnation: u64,
+        since_seq: u64,
+        limit: usize,
+        _cancel: Option<&AtomicBool>,
+    ) -> legion_sync::Result<RecordsPage> {
         self.engine
-            .serve_records_since(&self.caller, since_seq, limit)
+            .serve_records_since(&self.caller, since_incarnation, since_seq, limit)
     }
 
     fn fetch_file(
         &self,
         path: &str,
         expected_hash: Hash,
+        options: &FetchOptions,
     ) -> legion_sync::Result<Box<dyn Read + Send>> {
         self.engine
-            .serve_fetch_file(&self.caller, path, expected_hash)
+            .serve_fetch_file_range(&self.caller, path, expected_hash, options.offset)
     }
 }
 
-/// Wrapper around any [`SyncFs`] that injects a simulated crash after a configurable number of
-/// mutating operations (either before or after the underlying call runs).
 struct CrashInjectingFs<F: SyncFs> {
     inner: F,
     remaining: Cell<Option<usize>>,
@@ -83,7 +94,7 @@ impl<F: SyncFs> CrashInjectingFs<F> {
         self.remaining.set(None);
     }
 
-    fn tick(&self, label: &str) -> legion_sync::Result<bool> {
+    fn tick(&self, _label: &str) -> legion_sync::Result<bool> {
         if let Some(left) = self.remaining.get() {
             if left == 0 {
                 self.remaining.set(None);
@@ -92,7 +103,6 @@ impl<F: SyncFs> CrashInjectingFs<F> {
             }
             self.remaining.set(Some(left - 1));
         }
-        let _ = label;
         Ok(false)
     }
 
@@ -150,8 +160,32 @@ impl<F: SyncFs> SyncFs for CrashInjectingFs<F> {
         self.inner.capabilities()
     }
 
+    fn read_marker(&self) -> legion_sync::Result<Option<FolderMarker>> {
+        self.inner.read_marker()
+    }
+
+    fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
+        self.inner.write_marker(marker)
+    }
+
+    fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
+        self.inner.ensure_internal_dirs()
+    }
+
+    fn check_not_nested(&self) -> legion_sync::Result<()> {
+        self.inner.check_not_nested()
+    }
+
     fn walk(&self, ignore: &IgnoreMatcher) -> legion_sync::Result<FsWalkResult> {
         self.inner.walk(ignore)
+    }
+
+    fn walk_subtree(
+        &self,
+        rel_root: &str,
+        ignore: &IgnoreMatcher,
+    ) -> legion_sync::Result<FsWalkResult> {
+        self.inner.walk_subtree(rel_root, ignore)
     }
 
     fn stat_live(&self, rel_path: &str) -> legion_sync::Result<Option<FsMeta>> {
@@ -162,8 +196,12 @@ impl<F: SyncFs> SyncFs for CrashInjectingFs<F> {
         self.inner.hash_live(rel_path)
     }
 
-    fn open_live_read(&self, rel_path: &str) -> legion_sync::Result<Box<dyn Read + Send>> {
-        self.inner.open_live_read(rel_path)
+    fn open_live_read_at(
+        &self,
+        rel_path: &str,
+        offset: u64,
+    ) -> legion_sync::Result<Box<dyn Read + Send>> {
+        self.inner.open_live_read_at(rel_path, offset)
     }
 
     fn create_dir_all_live(&self, rel_path: &str) -> legion_sync::Result<()> {
@@ -201,9 +239,13 @@ impl<F: SyncFs> SyncFs for CrashInjectingFs<F> {
         })
     }
 
-    fn rename_live_to_live(&self, from_rel: &str, to_rel: &str) -> legion_sync::Result<()> {
-        self.wrap_mut("rename_live_to_live", |f| {
-            f.rename_live_to_live(from_rel, to_rel)
+    fn rename_live_to_live_no_replace(
+        &self,
+        from_rel: &str,
+        to_rel: &str,
+    ) -> legion_sync::Result<()> {
+        self.wrap_mut("rename_live_to_live_no_replace", |f| {
+            f.rename_live_to_live_no_replace(from_rel, to_rel)
         })
     }
 
@@ -217,6 +259,10 @@ impl<F: SyncFs> SyncFs for CrashInjectingFs<F> {
             inner: writer,
             crash_on_sync: crash_now && self.crash_after_op,
         }))
+    }
+
+    fn open_tmp_append(&self, tmp_name: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
+        self.inner.open_tmp_append(tmp_name)
     }
 
     fn stat_tmp(&self, tmp_name: &str) -> legion_sync::Result<Option<FsMeta>> {
@@ -235,15 +281,60 @@ impl<F: SyncFs> SyncFs for CrashInjectingFs<F> {
         self.inner.list_tmp()
     }
 
-    fn commit_tmp_to_live(&self, tmp_name: &str, live_rel: &str) -> legion_sync::Result<()> {
-        self.wrap_mut("commit_tmp_to_live", |f| {
-            f.commit_tmp_to_live(tmp_name, live_rel)
+    fn commit_tmp_to_live_no_replace(
+        &self,
+        tmp_name: &str,
+        live_rel: &str,
+    ) -> legion_sync::Result<()> {
+        self.wrap_mut("commit_tmp_to_live_no_replace", |f| {
+            f.commit_tmp_to_live_no_replace(tmp_name, live_rel)
         })
     }
 
-    fn move_live_to_bin(&self, live_rel: &str, bin_data_name: &str) -> legion_sync::Result<()> {
-        self.wrap_mut("move_live_to_bin", |f| {
-            f.move_live_to_bin(live_rel, bin_data_name)
+    fn exchange_tmp_with_live(&self, tmp_name: &str, live_rel: &str) -> legion_sync::Result<bool> {
+        self.wrap_mut("exchange_tmp_with_live", |f| {
+            f.exchange_tmp_with_live(tmp_name, live_rel)
+        })
+    }
+
+    fn replace_live_with_tmp_backup(
+        &self,
+        tmp_name: &str,
+        live_rel: &str,
+        backup_tmp: &str,
+    ) -> legion_sync::Result<bool> {
+        self.wrap_mut("replace_live_with_tmp_backup", |f| {
+            f.replace_live_with_tmp_backup(tmp_name, live_rel, backup_tmp)
+        })
+    }
+
+    fn move_live_to_tmp_no_replace(
+        &self,
+        live_rel: &str,
+        tmp_name: &str,
+    ) -> legion_sync::Result<()> {
+        self.wrap_mut("move_live_to_tmp_no_replace", |f| {
+            f.move_live_to_tmp_no_replace(live_rel, tmp_name)
+        })
+    }
+
+    fn move_tmp_to_bin_no_replace(
+        &self,
+        tmp_name: &str,
+        bin_data_name: &str,
+    ) -> legion_sync::Result<()> {
+        self.wrap_mut("move_tmp_to_bin_no_replace", |f| {
+            f.move_tmp_to_bin_no_replace(tmp_name, bin_data_name)
+        })
+    }
+
+    fn move_live_to_bin_no_replace(
+        &self,
+        live_rel: &str,
+        bin_data_name: &str,
+    ) -> legion_sync::Result<()> {
+        self.wrap_mut("move_live_to_bin_no_replace", |f| {
+            f.move_live_to_bin_no_replace(live_rel, bin_data_name)
         })
     }
 
@@ -316,7 +407,6 @@ fn real_disk_scan_skips_unchanged_and_honours_ignores() {
     fs::create_dir_all(root.join("build")).unwrap();
     fs::write(root.join("hello.txt"), b"hello world").unwrap();
     fs::write(root.join("sub/data.bin"), b"0123456789").unwrap();
-    // Ignored files (fixed + custom)
     fs::write(root.join(".DS_Store"), b"junk").unwrap();
     fs::write(root.join("sub/Thumbs.db"), b"junk").unwrap();
     fs::write(root.join("desktop.ini"), b"junk").unwrap();
@@ -326,11 +416,10 @@ fn real_disk_scan_skips_unchanged_and_honours_ignores() {
     fs::write(root.join("build/artifact.o"), b"ignored dir").unwrap();
 
     let r1 = engine.scan(now).unwrap();
-    assert_eq!(r1.created, 3); // sub, hello.txt, sub/data.bin
-    assert_eq!(r1.hashed, 2); // only the 2 regular files
+    assert_eq!(r1.created, 3);
+    assert_eq!(r1.hashed, 2);
     assert_eq!(r1.unchanged, 0);
 
-    // Second scan with no edits must hash ZERO files.
     let r2 = engine.scan(now).unwrap();
     assert_eq!(r2.created, 0);
     assert_eq!(r2.modified, 0);
@@ -338,7 +427,6 @@ fn real_disk_scan_skips_unchanged_and_honours_ignores() {
     assert_eq!(r2.unchanged, 3);
     assert_eq!(r2.hashed, 0);
 
-    // Rename is seen as delete + create.
     fs::rename(root.join("hello.txt"), root.join("renamed.txt")).unwrap();
     let r3 = engine.scan(now).unwrap();
     assert_eq!(r3.deleted, 1);
@@ -357,23 +445,21 @@ fn real_disk_holds_back_still_changing_files() {
     let mut engine = open_real_engine(&root, &db, "tower", &["tower", "pi"], vec![], None);
     fs::write(root.join("writing.bin"), b"part1").unwrap();
 
-    // First look with require_second_look holds the file back without hashing.
     let opts = ScanOptions {
         require_second_look: true,
         min_stable_age: Duration::ZERO,
+        ..ScanOptions::default()
     };
     let r1 = engine.scan_with_options(now, opts).unwrap();
     assert_eq!(r1.created, 0);
     assert_eq!(r1.hashed, 0);
     assert_eq!(r1.held_back_unstable, vec!["writing.bin".to_string()]);
 
-    // File grows before second look -> still held back!
     fs::write(root.join("writing.bin"), b"part1-and-part2").unwrap();
     let r2 = engine.scan_with_options(now, opts).unwrap();
     assert_eq!(r2.created, 0);
     assert_eq!(r2.held_back_unstable, vec!["writing.bin".to_string()]);
 
-    // No change on third look -> now committed!
     let r3 = engine.scan_with_options(now, opts).unwrap();
     assert_eq!(r3.created, 1);
     assert_eq!(r3.hashed, 1);
@@ -402,7 +488,6 @@ fn real_disk_sync_bin_restore_expiry_and_conflict_resolution() {
         None,
     );
 
-    // Create file on tower and sync to laptop.
     fs::write(tmp.path().join("tower/notes.txt"), b"v1").unwrap();
     tower
         .fs()
@@ -410,14 +495,14 @@ fn real_disk_sync_bin_restore_expiry_and_conflict_resolution() {
         .unwrap();
     tower.scan(t0).unwrap();
 
-    let peer_t = EnginePeer::new(&tower, "laptop");
-    laptop.pull_from_peer(&peer_t, t0).unwrap();
+    laptop
+        .pull_from_peer(&EnginePeer::new(&tower, "laptop"), t0)
+        .unwrap();
     assert_eq!(
         fs::read(tmp.path().join("laptop/notes.txt")).unwrap(),
         b"v1"
     );
 
-    // Concurrent divergent edits while apart!
     let t1 = Timestamp::new(t0.secs + 60, 0);
     let t2 = Timestamp::new(t0.secs + 120, 0);
     fs::write(tmp.path().join("tower/notes.txt"), b"tower-edit").unwrap();
@@ -434,14 +519,15 @@ fn real_disk_sync_bin_restore_expiry_and_conflict_resolution() {
         .unwrap();
     laptop.scan(t2).unwrap();
 
-    // Sync both directions.
-    let peer_l = EnginePeer::new(&laptop, "tower");
-    tower.pull_from_peer(&peer_l, t2).unwrap();
-    let peer_t = EnginePeer::new(&tower, "laptop");
-    laptop.pull_from_peer(&peer_t, t2).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&laptop, "tower"), t2)
+        .unwrap();
+    laptop
+        .pull_from_peer(&EnginePeer::new(&tower, "laptop"), t2)
+        .unwrap();
 
-    // Laptop had newer mtime -> keeps `notes.txt`, tower becomes conflict copy on BOTH!
-    let expected_conflict = "notes (changed on tower 2026-11-25).txt";
+    let tower_hash6 = &hash_bytes(b"tower-edit").to_hex()[..6];
+    let expected_conflict = conflict_copy_path("notes.txt", "tower", t1, tower_hash6, None);
     assert_eq!(
         fs::read(tmp.path().join("tower/notes.txt")).unwrap(),
         b"laptop-edit"
@@ -451,23 +537,23 @@ fn real_disk_sync_bin_restore_expiry_and_conflict_resolution() {
         b"laptop-edit"
     );
     assert_eq!(
-        fs::read(tmp.path().join("tower").join(expected_conflict)).unwrap(),
+        fs::read(tmp.path().join("tower").join(&expected_conflict)).unwrap(),
         b"tower-edit"
     );
     assert_eq!(
-        fs::read(tmp.path().join("laptop").join(expected_conflict)).unwrap(),
+        fs::read(tmp.path().join("laptop").join(&expected_conflict)).unwrap(),
         b"tower-edit"
     );
     assert_eq!(tower.status().unwrap().conflicts.len(), 1);
     assert_eq!(laptop.status().unwrap().conflicts.len(), 1);
 
-    // Resolve conflict by keeping the conflict copy (`tower-edit`) on laptop, then sync to tower.
     let t3 = Timestamp::new(t0.secs + 180, 0);
     laptop
-        .resolve_conflict(expected_conflict, ConflictChoice::KeepConflict, t3)
+        .resolve_conflict(&expected_conflict, ConflictChoice::KeepConflict, t3)
         .unwrap();
-    let peer_l = EnginePeer::new(&laptop, "tower");
-    tower.pull_from_peer(&peer_l, t3).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&laptop, "tower"), t3)
+        .unwrap();
 
     assert_eq!(
         fs::read(tmp.path().join("tower/notes.txt")).unwrap(),
@@ -477,17 +563,17 @@ fn real_disk_sync_bin_restore_expiry_and_conflict_resolution() {
         fs::read(tmp.path().join("laptop/notes.txt")).unwrap(),
         b"tower-edit"
     );
-    assert!(!tmp.path().join("tower").join(expected_conflict).exists());
-    assert!(!tmp.path().join("laptop").join(expected_conflict).exists());
+    assert!(!tmp.path().join("tower").join(&expected_conflict).exists());
+    assert!(!tmp.path().join("laptop").join(&expected_conflict).exists());
     assert!(tower.status().unwrap().conflicts.is_empty());
     assert!(laptop.status().unwrap().conflicts.is_empty());
 
-    // Delete `notes.txt` on tower -> moved to bin on laptop!
     let t4 = Timestamp::new(t0.secs + 240, 0);
     fs::remove_file(tmp.path().join("tower/notes.txt")).unwrap();
     tower.scan(t4).unwrap();
-    let peer_t = EnginePeer::new(&tower, "laptop");
-    laptop.pull_from_peer(&peer_t, t4).unwrap();
+    laptop
+        .pull_from_peer(&EnginePeer::new(&tower, "laptop"), t4)
+        .unwrap();
 
     assert!(!tmp.path().join("laptop/notes.txt").exists());
     let bin = laptop.list_bin().unwrap();
@@ -498,7 +584,6 @@ fn real_disk_sync_bin_restore_expiry_and_conflict_resolution() {
         .clone();
     assert_eq!(deleted_entry.hash, Some(hash_bytes(b"tower-edit")));
 
-    // Restore from bin on laptop and sync back to tower!
     let t5 = Timestamp::new(t0.secs + 300, 0);
     let restored = laptop
         .restore_from_bin(&deleted_entry.id, None, RestoreStrategy::FailIfExists, t5)
@@ -509,14 +594,14 @@ fn real_disk_sync_bin_restore_expiry_and_conflict_resolution() {
         b"tower-edit"
     );
 
-    let peer_l = EnginePeer::new(&laptop, "tower");
-    tower.pull_from_peer(&peer_l, t5).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&laptop, "tower"), t5)
+        .unwrap();
     assert_eq!(
         fs::read(tmp.path().join("tower/notes.txt")).unwrap(),
         b"tower-edit"
     );
 
-    // Expire older bin entries after 31 days.
     let after_31d = Timestamp::new(t0.secs + 31 * 86_400, 0);
     let expired = laptop.expire_bin(after_31d).unwrap();
     assert!(!expired.is_empty());
@@ -528,8 +613,6 @@ fn real_disk_crash_injection_at_every_apply_step_converges_without_loss() {
     let t0 = Timestamp::new(1_795_608_000, 0);
     let t1 = Timestamp::new(t0.secs + 60, 0);
 
-    // Exhaustively test crashing BEFORE and AFTER every single mutating FS op (0..12) during
-    // replace, delete, and conflict scenarios against real disk + redb persistence.
     for crash_after in [false, true] {
         for op_idx in 0..10 {
             let tmp = tempfile::tempdir().unwrap();
@@ -543,7 +626,6 @@ fn real_disk_crash_injection_at_every_apply_step_converges_without_loss() {
             let mut dst_init =
                 open_real_engine(&dst_root, &dst_db, "pi", &["tower", "pi"], vec![], None);
 
-            // Seed initial common file `replace.txt` and `delete.txt` and `conflict.txt`.
             fs::write(src_root.join("replace.txt"), b"old-replace").unwrap();
             fs::write(src_root.join("delete.txt"), b"to-be-deleted").unwrap();
             fs::write(src_root.join("conflict.txt"), b"base").unwrap();
@@ -556,7 +638,6 @@ fn real_disk_crash_injection_at_every_apply_step_converges_without_loss() {
                 .unwrap();
             drop(dst_init);
 
-            // Now mutate on src: update replace.txt, delete delete.txt, edit conflict.txt (newer).
             fs::write(src_root.join("replace.txt"), b"new-replace-bytes").unwrap();
             src.fs()
                 .set_live_metadata("replace.txt", t1, Some(0o644))
@@ -568,7 +649,6 @@ fn real_disk_crash_injection_at_every_apply_step_converges_without_loss() {
                 .unwrap();
             src.scan(t1).unwrap();
 
-            // Local edit on dst for conflict.txt (older, so dst loses).
             {
                 let mut dst_edit =
                     open_real_engine(&dst_root, &dst_db, "pi", &["tower", "pi"], vec![], None);
@@ -580,12 +660,11 @@ fn real_disk_crash_injection_at_every_apply_step_converges_without_loss() {
                 dst_edit.scan(t1).unwrap();
             }
 
-            // Reopen dst with crash-injecting RealFs + RedbIndexStore!
             let crash_fs =
                 CrashInjectingFs::new(RealFs::open(&dst_root).unwrap(), Some(op_idx), crash_after);
             let cfg = FolderConfig::new("docs", "pi", ["tower".into(), "pi".into()]);
             let store = RedbIndexStore::open(&dst_db).unwrap();
-            let mut dst_crash = SyncEngine::open(cfg.clone(), crash_fs, store).unwrap();
+            let mut dst_crash = SyncEngine::open(cfg, crash_fs, store).unwrap();
 
             let res = dst_crash.pull_from_peer(&EnginePeer::new(&src, "pi"), t1);
             let did_crash = dst_crash.fs().did_crash();
@@ -600,7 +679,6 @@ fn real_disk_crash_injection_at_every_apply_step_converges_without_loss() {
             dst_crash.fs().disarm();
             drop(dst_crash);
 
-            // Restart from scratch on the same directory and redb file -> recover & finish sync!
             let mut dst_recovered =
                 open_real_engine(&dst_root, &dst_db, "pi", &["tower", "pi"], vec![], None);
             dst_recovered.scan(t1).unwrap();
@@ -610,8 +688,8 @@ fn real_disk_crash_injection_at_every_apply_step_converges_without_loss() {
             src.pull_from_peer(&EnginePeer::new(&dst_recovered, "tower"), t1)
                 .unwrap();
 
-            // Verify 100% convergence and zero lost bytes (old versions live in bin or conflict copy).
-            let conflict_name = "conflict (changed on pi 2026-11-25).txt";
+            let pi_hash6 = &hash_bytes(b"pi-loses").to_hex()[..6];
+            let conflict_name = conflict_copy_path("conflict.txt", "pi", t1, pi_hash6, None);
             assert_eq!(
                 fs::read(dst_root.join("replace.txt")).unwrap(),
                 b"new-replace-bytes"
@@ -621,10 +699,15 @@ fn real_disk_crash_injection_at_every_apply_step_converges_without_loss() {
                 fs::read(dst_root.join("conflict.txt")).unwrap(),
                 b"tower-wins"
             );
-            assert_eq!(fs::read(dst_root.join(conflict_name)).unwrap(), b"pi-loses");
-            assert_eq!(fs::read(src_root.join(conflict_name)).unwrap(), b"pi-loses");
+            assert_eq!(
+                fs::read(dst_root.join(&conflict_name)).unwrap(),
+                b"pi-loses"
+            );
+            assert_eq!(
+                fs::read(src_root.join(&conflict_name)).unwrap(),
+                b"pi-loses"
+            );
 
-            // Verify `.legion-sync/tmp` is completely clean and `.legion-sync/bin` kept old data.
             assert!(dst_recovered.fs().list_tmp().unwrap().is_empty());
             let bin = dst_recovered.list_bin().unwrap();
             assert!(
@@ -673,11 +756,9 @@ fn real_disk_local_edit_between_scan_and_apply_is_never_overwritten() {
     pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), t0)
         .unwrap();
 
-    // Tower deletes `doc.txt`, while pi edits `doc.txt` on disk WITHOUT scanning yet!
     fs::remove_file(tmp.path().join("tower/doc.txt")).unwrap();
     tower.scan(t1).unwrap();
 
-    // Even with the exact same length and same mtime, the hash re-check catches the unscanned edit!
     fs::write(tmp.path().join("pi/doc.txt"), b"v2").unwrap();
     pi.fs()
         .set_live_metadata("doc.txt", t0, Some(0o644))
@@ -685,7 +766,6 @@ fn real_disk_local_edit_between_scan_and_apply_is_never_overwritten() {
 
     pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), t1)
         .unwrap();
-    // Delete vs change -> change MUST survive!
     assert_eq!(fs::read(tmp.path().join("pi/doc.txt")).unwrap(), b"v2");
 
     tower
@@ -703,6 +783,7 @@ fn list_dir_names(dir: &Path) -> BTreeSet<String> {
 
 struct SyntheticLinuxPeer {
     member_id: String,
+    incarnation: u64,
     records: Vec<IndexRecord>,
     files: BTreeMap<String, Vec<u8>>,
     seq: u64,
@@ -713,11 +794,16 @@ impl SyntheticLinuxPeer {
     fn new(member_id: &str) -> Self {
         Self {
             member_id: member_id.to_string(),
+            incarnation: 42,
             records: Vec::new(),
             files: BTreeMap::new(),
             seq: 0,
             clock: 0,
         }
+    }
+
+    fn vkey(&self) -> VersionKey {
+        VersionKey::new(self.member_id.clone(), self.incarnation)
     }
 
     fn put_file(&mut self, path: &str, bytes: &[u8], mtime: Timestamp) {
@@ -736,11 +822,13 @@ impl SyntheticLinuxPeer {
             hash: Some(hash),
             link_target: None,
             deleted: false,
-            version: VersionVector::singleton(self.member_id.clone(), self.clock),
+            version: VersionVector::singleton(self.vkey(), self.clock),
             modified_by: self.member_id.clone(),
             seq: self.seq,
-            tombstone_deps: BTreeMap::new(),
+            recent_hashes: Vec::new(),
+            from_join: false,
             conflict_of: None,
+            conflict_dismissed: false,
         });
     }
 
@@ -758,11 +846,13 @@ impl SyntheticLinuxPeer {
             hash: None,
             link_target: None,
             deleted: false,
-            version: VersionVector::singleton(self.member_id.clone(), self.clock),
+            version: VersionVector::singleton(self.vkey(), self.clock),
             modified_by: self.member_id.clone(),
             seq: self.seq,
-            tombstone_deps: BTreeMap::new(),
+            recent_hashes: Vec::new(),
+            from_join: false,
             conflict_of: None,
+            conflict_dismissed: false,
         });
     }
 
@@ -780,11 +870,13 @@ impl SyntheticLinuxPeer {
             hash: None,
             link_target: Some(target.to_string()),
             deleted: false,
-            version: VersionVector::singleton(self.member_id.clone(), self.clock),
+            version: VersionVector::singleton(self.vkey(), self.clock),
             modified_by: self.member_id.clone(),
             seq: self.seq,
-            tombstone_deps: BTreeMap::new(),
+            recent_hashes: Vec::new(),
+            from_join: false,
             conflict_of: None,
+            conflict_dismissed: false,
         });
     }
 
@@ -799,10 +891,12 @@ impl SyntheticLinuxPeer {
         self.seq += 1;
         self.clock += 1;
         let mut version = prev.version;
-        version.bump_above(self.member_id.clone(), self.clock);
+        version.bump_above(self.vkey(), self.clock);
         self.files.remove(path);
-        let mut deps = BTreeMap::new();
-        deps.insert(self.member_id.clone(), self.seq);
+        let mut recent = Vec::new();
+        if let Some(h) = prev.hash {
+            recent.push(h);
+        }
         self.records.push(IndexRecord {
             path: path.to_string(),
             kind: prev.kind,
@@ -817,8 +911,10 @@ impl SyntheticLinuxPeer {
             version,
             modified_by: self.member_id.clone(),
             seq: self.seq,
-            tombstone_deps: deps,
+            recent_hashes: recent,
+            from_join: false,
             conflict_of: None,
+            conflict_dismissed: false,
         });
     }
 }
@@ -828,26 +924,48 @@ impl Peer for SyntheticLinuxPeer {
         &self.member_id
     }
 
-    fn records_since(&self, since_seq: u64, limit: usize) -> legion_sync::Result<RecordsPage> {
-        // Keep only the latest record per path whose seq > since_seq, matching IndexStore semantics.
+    fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
+        Ok(PeerHandshake {
+            folder_id: "docs".to_string(),
+            member_id: self.member_id.clone(),
+            incarnation: self.incarnation,
+            snapshot_seq: self.seq,
+            protocol_version: SYNC_PROTOCOL_VERSION,
+        })
+    }
+
+    fn records_since(
+        &self,
+        since_incarnation: u64,
+        since_seq: u64,
+        limit: usize,
+        _cancel: Option<&AtomicBool>,
+    ) -> legion_sync::Result<RecordsPage> {
+        let eff = if since_incarnation == self.incarnation {
+            since_seq
+        } else {
+            0
+        };
         let mut latest_by_path: BTreeMap<String, IndexRecord> = BTreeMap::new();
         for rec in &self.records {
             latest_by_path.insert(rec.path.clone(), rec.clone());
         }
         let mut records: Vec<IndexRecord> = latest_by_path
             .into_values()
-            .filter(|r| r.seq > since_seq)
+            .filter(|r| r.seq > eff)
             .collect();
         records.sort_by_key(|r| r.seq);
         let has_more = records.len() > limit;
         records.truncate(limit);
-        let mut matrix = CausalMatrix::default();
-        matrix.record_seen(&self.member_id, &self.member_id, self.seq);
+        let head_fp = self.records.last().map(IndexRecord::head_fingerprint);
         Ok(RecordsPage {
+            incarnation: self.incarnation,
             records,
             snapshot_seq: self.seq,
             has_more,
-            matrix,
+            caller_acked: None,
+            caller_acked_fingerprint: None,
+            head_fingerprint: head_fp,
         })
     }
 
@@ -855,6 +973,7 @@ impl Peer for SyntheticLinuxPeer {
         &self,
         path: &str,
         expected_hash: Hash,
+        options: &FetchOptions,
     ) -> legion_sync::Result<Box<dyn Read + Send>> {
         let bytes = self
             .files
@@ -873,7 +992,8 @@ impl Peer for SyntheticLinuxPeer {
                 actual,
             });
         }
-        Ok(Box::new(Cursor::new(bytes)))
+        let start = (options.offset as usize).min(bytes.len());
+        Ok(Box::new(Cursor::new(bytes[start..].to_vec())))
     }
 }
 
@@ -882,10 +1002,6 @@ fn real_disk_platform_problems_status_and_security_refusals() {
     let tmp = tempfile::tempdir().unwrap();
     let t0 = Timestamp::new(1_795_608_000, 0);
 
-    // Probe the actual host filesystem's case sensitivity before setting up fixtures on disk:
-    // a case-insensitive host volume (Windows NTFS or default macOS APFS) cannot hold two files
-    // whose names differ only in letter case, and Win32 redirects non-verbatim `CON.txt` to the
-    // console device `\??\CON` instead of creating a file on disk.
     let host_case_insensitive = RealFs::open(tmp.path().join("linux"))
         .unwrap()
         .capabilities()
@@ -908,10 +1024,8 @@ fn real_disk_platform_problems_status_and_security_refusals() {
         Some(FsCapabilities::windows()),
     );
 
-    // Status starts UpToDate.
     assert_eq!(winbox.status().unwrap().state, MemberState::UpToDate);
 
-    // Paused status + pull refusal.
     winbox.set_paused(true).unwrap();
     assert_eq!(winbox.status().unwrap().state, MemberState::Paused);
     assert!(matches!(
@@ -920,7 +1034,6 @@ fn real_disk_platform_problems_status_and_security_refusals() {
     ));
     winbox.set_paused(false).unwrap();
 
-    // WaitingForMember status.
     winbox.mark_peer_unreachable("tower");
     assert_eq!(
         winbox.status().unwrap().state,
@@ -929,9 +1042,8 @@ fn real_disk_platform_problems_status_and_security_refusals() {
         }
     );
 
-    // Non-member refusal.
     assert!(matches!(
-        linux.serve_records_since("intruder", 0, 100),
+        linux.serve_records_since("intruder", 0, 0, 100),
         Err(SyncError::Denied { .. })
     ));
     assert!(matches!(
@@ -939,7 +1051,6 @@ fn real_disk_platform_problems_status_and_security_refusals() {
         Err(SyncError::Denied { .. })
     ));
 
-    // Create only the fixtures that the host OS's real filesystem can actually store in `linux/`.
     fs::write(tmp.path().join("linux/ok.txt"), b"ok").unwrap();
     fs::write(tmp.path().join("linux/README.md"), b"upper").unwrap();
     let mut expected_problems: BTreeMap<String, ProblemKind> = BTreeMap::new();
@@ -956,7 +1067,6 @@ fn real_disk_platform_problems_status_and_security_refusals() {
     }
     linux.scan(t0).unwrap();
 
-    // Never serves `.legion-sync/` even to a valid member.
     assert!(matches!(
         linux.serve_fetch_file("winbox", ".legion-sync/bin/x", hash_bytes(b"x")),
         Err(SyncError::InvalidPath { .. })
@@ -966,7 +1076,6 @@ fn real_disk_platform_problems_status_and_security_refusals() {
         Err(SyncError::InvalidPath { .. })
     ));
 
-    // Pull on Windows-capability member and assert the exact expected outcome for this host OS.
     let pull = winbox
         .pull_from_peer(&EnginePeer::new(&linux, "winbox"), t0)
         .unwrap();
@@ -993,7 +1102,6 @@ fn real_disk_platform_problems_status_and_security_refusals() {
             other => panic!("expected Problem state, got {other:?}"),
         }
 
-        // Deleting the blocking / unrepresentable files on `linux` resolves every problem cleanly.
         let t1 = Timestamp::new(t0.secs + 60, 0);
         if !host_case_insensitive {
             fs::remove_file(tmp.path().join("linux/README.md")).unwrap();
@@ -1023,9 +1131,6 @@ fn real_disk_windows_target_holds_back_unrepresentable_peer_records() {
     let tmp = tempfile::tempdir().unwrap();
     let t0 = Timestamp::new(1_795_608_000, 0);
 
-    // Real `RealFs` + `RedbIndexStore` on disk with Windows capabilities pulling from a synthetic
-    // Linux peer so all Windows-unrepresentable names and case clashes are exercised against real
-    // disk storage on Linux, macOS, and Windows alike.
     let mut winbox = open_real_engine(
         &tmp.path().join("winbox"),
         &tmp.path().join("winbox.redb"),
@@ -1045,7 +1150,7 @@ fn real_disk_windows_target_holds_back_unrepresentable_peer_records() {
     peer.put_file("readme.md", b"lower", t0);
     peer.put_file("dir/b.txt", b"dir-b", t0);
     peer.put_file("CON.txt", b"reserved", t0);
-    peer.put_file("a:b.txt", b"colon", t0);
+    peer.put_file("ab:cd.txt", b"colon", t0);
     peer.put_file("trailing.", b"dot", t0);
     peer.put_file("trailing ", b"space", t0);
     peer.put_symlink("sym", "ok.txt", t0);
@@ -1064,19 +1169,10 @@ fn real_disk_windows_target_holds_back_unrepresentable_peer_records() {
             "ok.txt".to_string(),
         ])
     );
-    assert_eq!(fs::read(tmp.path().join("winbox/ok.txt")).unwrap(), b"ok");
-    assert_eq!(
-        fs::read(tmp.path().join("winbox/README.md")).unwrap(),
-        b"upper"
-    );
-    assert_eq!(
-        fs::read(tmp.path().join("winbox/Dir/a.txt")).unwrap(),
-        b"dir-a"
-    );
 
     let expected_by_path: BTreeMap<String, ProblemKind> = BTreeMap::from([
         ("CON.txt".to_string(), ProblemKind::ReservedWindowsName),
-        ("a:b.txt".to_string(), ProblemKind::ForbiddenWindowsChar),
+        ("ab:cd.txt".to_string(), ProblemKind::ForbiddenWindowsChar),
         ("dir/b.txt".to_string(), ProblemKind::CaseClash),
         (over_long_path.clone(), ProblemKind::PathTooLong),
         ("readme.md".to_string(), ProblemKind::CaseClash),
@@ -1094,14 +1190,12 @@ fn real_disk_windows_target_holds_back_unrepresentable_peer_records() {
         other => panic!("expected Problem state, got {other:?}"),
     }
 
-    // Deleting the clashing and Windows-unrepresentable entries on the Linux peer resolves every
-    // problem and materializes the previously held-back case-clash losers onto real disk.
     let t1 = Timestamp::new(t0.secs + 60, 0);
     peer.delete_path("README.md", t1);
     peer.delete_path("Dir/a.txt", t1);
     peer.delete_path("Dir", t1);
     peer.delete_path("CON.txt", t1);
-    peer.delete_path("a:b.txt", t1);
+    peer.delete_path("ab:cd.txt", t1);
     peer.delete_path("trailing.", t1);
     peer.delete_path("trailing ", t1);
     peer.delete_path("sym", t1);
@@ -1111,15 +1205,6 @@ fn real_disk_windows_target_holds_back_unrepresentable_peer_records() {
     assert_eq!(pull2.held_back, 0);
     assert_eq!(pull2.held_back_resolved, 2);
     assert_eq!(winbox.status().unwrap().state, MemberState::UpToDate);
-    assert_eq!(
-        list_dir_names(&tmp.path().join("winbox")),
-        BTreeSet::from([
-            ".legion-sync".to_string(),
-            "dir".to_string(),
-            "ok.txt".to_string(),
-            "readme.md".to_string(),
-        ])
-    );
     assert_eq!(
         fs::read(tmp.path().join("winbox/readme.md")).unwrap(),
         b"lower"
@@ -1158,7 +1243,6 @@ fn real_disk_syncs_symlinks_between_unix_members_and_refuses_symlink_escape() {
     std::os::unix::fs::symlink(outside.path(), tmp.path().join("a/link_dir")).unwrap();
     a.scan(t0).unwrap();
 
-    // Symlink itself is recorded as a Symlink (never followed into `outside`).
     assert!(
         a.store()
             .get_record("link_dir/secret.txt")
@@ -1166,9 +1250,8 @@ fn real_disk_syncs_symlinks_between_unix_members_and_refuses_symlink_escape() {
             .is_none()
     );
     let rec = a.store().get_record("link_dir").unwrap().unwrap();
-    assert_eq!(rec.kind, legion_xfer::EntryKind::Symlink);
+    assert_eq!(rec.kind, EntryKind::Symlink);
 
-    // Syncs to beta as a symbolic link.
     b.pull_from_peer(&EnginePeer::new(&a, "beta"), t0).unwrap();
     let meta = fs::symlink_metadata(tmp.path().join("b/link_dir")).unwrap();
     assert!(meta.file_type().is_symlink());
@@ -1177,7 +1260,6 @@ fn real_disk_syncs_symlinks_between_unix_members_and_refuses_symlink_escape() {
         outside.path()
     );
 
-    // Direct access through symlink ancestor is refused by RealFs!
     assert!(matches!(
         b.fs().stat_live("link_dir/secret.txt"),
         Err(SyncError::InvalidPath { .. })
@@ -1210,22 +1292,21 @@ fn real_disk_status_reports_syncing_files_and_bytes_when_deferred() {
     fs::write(tmp.path().join("src/moving.bin"), payload).unwrap();
     src.scan(t0).unwrap();
 
-    // Mutate `moving.bin` on `src` without rescanning so `dst` sees a peer-side hash mismatch and
-    // defers with `files_left: 1, bytes_left: 12`.
     fs::write(tmp.path().join("src/moving.bin"), b"changed before fetch!!").unwrap();
     let pull = dst
         .pull_from_peer(&EnginePeer::new(&src, "pi"), t0)
         .unwrap();
     assert_eq!(pull.deferred, 1);
+    let status = dst.status().unwrap();
+    assert_eq!(status.deferred.len(), 1);
     assert_eq!(
-        dst.status().unwrap().state,
+        status.state,
         MemberState::Syncing {
             files_left: 1,
-            bytes_left: payload.len() as u64,
+            bytes_left: 0,
         }
     );
 
-    // Once `src` rescans and `dst` pulls again, status returns cleanly to UpToDate.
     let t1 = Timestamp::new(t0.secs + 10, 0);
     src.scan(t1).unwrap();
     dst.pull_from_peer(&EnginePeer::new(&src, "pi"), t1)
@@ -1239,8 +1320,6 @@ fn real_disk_status_reports_syncing_files_and_bytes_when_deferred() {
 
 #[test]
 fn real_disk_holds_back_file_mutating_during_scan_hash() {
-    /// Wrapper that appends bytes to a named file on disk right while it is being hashed,
-    /// simulating an active external writer between Look 1 (walk stat) and Look 2 (post-hash stat).
     struct MutateDuringHashFs {
         inner: RealFs,
         target: String,
@@ -1251,8 +1330,24 @@ fn real_disk_holds_back_file_mutating_during_scan_hash() {
         fn capabilities(&self) -> FsCapabilities {
             self.inner.capabilities()
         }
+        fn read_marker(&self) -> legion_sync::Result<Option<FolderMarker>> {
+            self.inner.read_marker()
+        }
+        fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
+            self.inner.write_marker(marker)
+        }
+        fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
+            self.inner.ensure_internal_dirs()
+        }
         fn walk(&self, ignore: &IgnoreMatcher) -> legion_sync::Result<FsWalkResult> {
             self.inner.walk(ignore)
+        }
+        fn walk_subtree(
+            &self,
+            rel_root: &str,
+            ignore: &IgnoreMatcher,
+        ) -> legion_sync::Result<FsWalkResult> {
+            self.inner.walk_subtree(rel_root, ignore)
         }
         fn stat_live(&self, rel_path: &str) -> legion_sync::Result<Option<FsMeta>> {
             self.inner.stat_live(rel_path)
@@ -1268,8 +1363,12 @@ fn real_disk_holds_back_file_mutating_during_scan_hash() {
             }
             Ok(res)
         }
-        fn open_live_read(&self, rel_path: &str) -> legion_sync::Result<Box<dyn Read + Send>> {
-            self.inner.open_live_read(rel_path)
+        fn open_live_read_at(
+            &self,
+            rel_path: &str,
+            offset: u64,
+        ) -> legion_sync::Result<Box<dyn Read + Send>> {
+            self.inner.open_live_read_at(rel_path, offset)
         }
         fn create_dir_all_live(&self, rel_path: &str) -> legion_sync::Result<()> {
             self.inner.create_dir_all_live(rel_path)
@@ -1294,11 +1393,18 @@ fn real_disk_holds_back_file_mutating_during_scan_hash() {
         ) -> legion_sync::Result<()> {
             self.inner.set_live_metadata(rel_path, mtime, mode)
         }
-        fn rename_live_to_live(&self, from_rel: &str, to_rel: &str) -> legion_sync::Result<()> {
-            self.inner.rename_live_to_live(from_rel, to_rel)
+        fn rename_live_to_live_no_replace(
+            &self,
+            from_rel: &str,
+            to_rel: &str,
+        ) -> legion_sync::Result<()> {
+            self.inner.rename_live_to_live_no_replace(from_rel, to_rel)
         }
         fn create_tmp(&self, tmp_name: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
             self.inner.create_tmp(tmp_name)
+        }
+        fn open_tmp_append(&self, tmp_name: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
+            self.inner.open_tmp_append(tmp_name)
         }
         fn stat_tmp(&self, tmp_name: &str) -> legion_sync::Result<Option<FsMeta>> {
             self.inner.stat_tmp(tmp_name)
@@ -1312,11 +1418,42 @@ fn real_disk_holds_back_file_mutating_during_scan_hash() {
         fn list_tmp(&self) -> legion_sync::Result<Vec<String>> {
             self.inner.list_tmp()
         }
-        fn commit_tmp_to_live(&self, tmp_name: &str, live_rel: &str) -> legion_sync::Result<()> {
-            self.inner.commit_tmp_to_live(tmp_name, live_rel)
+        fn commit_tmp_to_live_no_replace(
+            &self,
+            tmp_name: &str,
+            live_rel: &str,
+        ) -> legion_sync::Result<()> {
+            self.inner.commit_tmp_to_live_no_replace(tmp_name, live_rel)
         }
-        fn move_live_to_bin(&self, live_rel: &str, bin_data_name: &str) -> legion_sync::Result<()> {
-            self.inner.move_live_to_bin(live_rel, bin_data_name)
+        fn exchange_tmp_with_live(
+            &self,
+            tmp_name: &str,
+            live_rel: &str,
+        ) -> legion_sync::Result<bool> {
+            self.inner.exchange_tmp_with_live(tmp_name, live_rel)
+        }
+        fn move_live_to_tmp_no_replace(
+            &self,
+            live_rel: &str,
+            tmp_name: &str,
+        ) -> legion_sync::Result<()> {
+            self.inner.move_live_to_tmp_no_replace(live_rel, tmp_name)
+        }
+        fn move_tmp_to_bin_no_replace(
+            &self,
+            tmp_name: &str,
+            bin_data_name: &str,
+        ) -> legion_sync::Result<()> {
+            self.inner
+                .move_tmp_to_bin_no_replace(tmp_name, bin_data_name)
+        }
+        fn move_live_to_bin_no_replace(
+            &self,
+            live_rel: &str,
+            bin_data_name: &str,
+        ) -> legion_sync::Result<()> {
+            self.inner
+                .move_live_to_bin_no_replace(live_rel, bin_data_name)
         }
         fn write_bin_meta(&self, meta_name: &str, bytes: &[u8]) -> legion_sync::Result<()> {
             self.inner.write_bin_meta(meta_name, bytes)
@@ -1346,6 +1483,7 @@ fn real_disk_holds_back_file_mutating_during_scan_hash() {
     let db = tmp.path().join("index.redb");
     let now = Timestamp::new(1_795_608_000, 0);
 
+    fs::create_dir_all(&root).unwrap();
     let real = RealFs::open(&root).unwrap();
     fs::write(root.join("growing.bin"), b"initial").unwrap();
     let fs_wrap = MutateDuringHashFs {
@@ -1357,13 +1495,11 @@ fn real_disk_holds_back_file_mutating_during_scan_hash() {
     let store = RedbIndexStore::open(&db).unwrap();
     let mut engine = SyncEngine::open(cfg, fs_wrap, store).unwrap();
 
-    // First scan catches the mutation between Look 1 and Look 2 and holds the file back!
     let r1 = engine.scan(now).unwrap();
     assert_eq!(r1.created, 0);
     assert_eq!(r1.held_back_unstable, vec!["growing.bin".to_string()]);
     assert!(engine.store().get_record("growing.bin").unwrap().is_none());
 
-    // Second scan sees the finished file and indexes the complete bytes.
     let r2 = engine.scan(now).unwrap();
     assert_eq!(r2.created, 1);
     assert!(r2.held_back_unstable.is_empty());

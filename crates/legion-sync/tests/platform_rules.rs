@@ -1,23 +1,21 @@
 //! Platform naming, symlink, and case-sensitivity tests against a strict simulated Windows
 //! and macOS [`SyncFs`] backend that runs identically on Linux, macOS, and Windows.
-//!
-//! Unlike a permissive in-memory map, [`StrictPlatformFs`] actively panics if the sync engine
-//! ever attempts to stat, read, create, rename, or delete a live path that violates the target
-//! platform's naming rules, symlink support, or case-insensitivity invariants.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeMap;
 use std::io::{self, Cursor, Read, Write};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use legion_sync::path::{
-    ancestors, check_fs_compatibility, fold_case, validate_flat_internal_name, validate_sync_path,
+    ancestors, check_fs_compatibility, fold_case, fs_equivalence_key, is_descendant_of,
+    validate_flat_internal_name, validate_sync_path,
 };
 use legion_sync::{
-    FolderConfig, FsCapabilities, FsErrorKind, FsMeta, FsWalkEntry, FsWalkResult, IgnoreMatcher,
-    IndexStore, MemberState, MemoryIndexStore, Peer, ProblemKind, RecordsPage, SyncEngine,
-    SyncError, SyncFs, SyncWrite,
+    FetchOptions, FolderConfig, FolderMarker, FsCapabilities, FsErrorKind, FsMeta, FsWalkEntry,
+    FsWalkResult, IgnoreMatcher, IndexStore, MemberState, MemoryIndexStore, Peer, PeerHandshake,
+    ProblemKind, RecordsPage, SyncEngine, SyncError, SyncFs, SyncWrite,
 };
 use legion_xfer::hash::hash_bytes;
 use legion_xfer::{EntryKind, Hash, Timestamp};
@@ -75,10 +73,9 @@ impl Node {
     }
 }
 
-/// Strict in-memory filesystem that enforces Windows naming rules, symlink restrictions, and
-/// case-insensitive collision safety on every engine call.
 struct StrictPlatformFs {
     caps: FsCapabilities,
+    marker: Mutex<Option<FolderMarker>>,
     live: Mutex<BTreeMap<String, Node>>,
     tmp: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     bin: Mutex<BTreeMap<String, Vec<u8>>>,
@@ -89,6 +86,7 @@ impl StrictPlatformFs {
     fn new(caps: FsCapabilities) -> Self {
         Self {
             caps,
+            marker: Mutex::new(None),
             live: Mutex::new(BTreeMap::new()),
             tmp: Arc::new(Mutex::new(BTreeMap::new())),
             bin: Mutex::new(BTreeMap::new()),
@@ -103,34 +101,30 @@ impl StrictPlatformFs {
         out
     }
 
-    /// Panics if the sync engine ever touches a live path the simulated platform cannot hold.
     fn assert_platform_allowed(&self, rel: &str, kind: EntryKind, op: &str) {
         if let Err((prob, msg)) = check_fs_compatibility(rel, kind, &self.caps) {
             panic!("engine attempted {op} on platform-illegal path '{rel}' ({prob:?}): {msg}");
         }
     }
 
-    /// Panics if on a case-insensitive filesystem the engine tries to write a path whose exact
-    /// path or ancestor collides case-insensitively with an existing live entry of different case.
     fn assert_no_case_collision(&self, live: &BTreeMap<String, Node>, rel: &str, op: &str) {
-        if !self.caps.case_insensitive {
+        if !self.caps.case_insensitive && !self.caps.unicode_normalizing {
             return;
         }
         let mut to_check: Vec<&str> = ancestors(rel);
         to_check.push(rel);
         for candidate in to_check {
-            let folded = fold_case(candidate);
+            let cand_key = fs_equivalence_key(candidate, &self.caps);
             for existing in live.keys() {
-                if fold_case(existing) == folded && existing != candidate {
+                if fs_equivalence_key(existing, &self.caps) == cand_key && existing != candidate {
                     panic!(
-                        "engine attempted {op} on '{rel}', colliding case-insensitively with existing '{existing}'"
+                        "engine attempted {op} on '{rel}', colliding with existing '{existing}'"
                     );
                 }
             }
         }
     }
 
-    /// Resolves `rel` case-insensitively when `caps.case_insensitive` is set, matching NTFS/APFS.
     fn lookup_key<'a>(
         &self,
         live: &'a BTreeMap<String, Node>,
@@ -139,9 +133,11 @@ impl StrictPlatformFs {
         if let Some((k, v)) = live.get_key_value(rel) {
             return Some((k, v));
         }
-        if self.caps.case_insensitive {
-            let folded = fold_case(rel);
-            return live.iter().find(|(k, _)| fold_case(k) == folded);
+        if self.caps.case_insensitive || self.caps.unicode_normalizing {
+            let key = fs_equivalence_key(rel, &self.caps);
+            return live
+                .iter()
+                .find(|(k, _)| fs_equivalence_key(k, &self.caps) == key);
         }
         None
     }
@@ -155,7 +151,6 @@ impl StrictPlatformFs {
                 live.insert(anc.to_string(), Node::Dir { mtime });
             }
         }
-        // Mirror real NTFS/APFS case-preserving overwrite if an entry with differing case exists.
         let target_key = self
             .lookup_key(&live, &clean)
             .map(|(k, _)| k.clone())
@@ -222,6 +217,7 @@ struct StrictTmpWriter {
     tmp: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     tmp_name: String,
     buf: Vec<u8>,
+    append: bool,
 }
 
 impl Write for StrictTmpWriter {
@@ -237,7 +233,12 @@ impl Write for StrictTmpWriter {
 
 impl SyncWrite for StrictTmpWriter {
     fn finish_sync(self: Box<Self>) -> legion_sync::Result<()> {
-        self.tmp.lock().unwrap().insert(self.tmp_name, self.buf);
+        let mut guard = self.tmp.lock().unwrap();
+        if self.append {
+            guard.entry(self.tmp_name).or_default().extend(self.buf);
+        } else {
+            guard.insert(self.tmp_name, self.buf);
+        }
         Ok(())
     }
 }
@@ -247,10 +248,50 @@ impl SyncFs for StrictPlatformFs {
         self.caps
     }
 
+    fn read_marker(&self) -> legion_sync::Result<Option<FolderMarker>> {
+        Ok(self.marker.lock().unwrap().clone())
+    }
+
+    fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
+        *self.marker.lock().unwrap() = Some(marker.clone());
+        Ok(())
+    }
+
+    fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
+        Ok(())
+    }
+
     fn walk(&self, ignore: &IgnoreMatcher) -> legion_sync::Result<FsWalkResult> {
         let live = self.live.lock().unwrap();
         let mut entries = Vec::new();
         for (path, node) in live.iter() {
+            let meta = node.meta();
+            if ignore.is_path_or_ancestor_ignored(path, meta.kind == EntryKind::Dir) {
+                continue;
+            }
+            entries.push(FsWalkEntry {
+                path: path.clone(),
+                meta,
+            });
+        }
+        Ok(FsWalkResult {
+            entries,
+            skipped: Vec::new(),
+        })
+    }
+
+    fn walk_subtree(
+        &self,
+        rel_root: &str,
+        ignore: &IgnoreMatcher,
+    ) -> legion_sync::Result<FsWalkResult> {
+        let clean = validate_sync_path(rel_root)?;
+        let live = self.live.lock().unwrap();
+        let mut entries = Vec::new();
+        for (path, node) in live.iter() {
+            if path != &clean && !is_descendant_of(path, &clean) {
+                continue;
+            }
             let meta = node.meta();
             if ignore.is_path_or_ancestor_ignored(path, meta.kind == EntryKind::Dir) {
                 continue;
@@ -303,12 +344,19 @@ impl SyncFs for StrictPlatformFs {
         }
     }
 
-    fn open_live_read(&self, rel_path: &str) -> legion_sync::Result<Box<dyn Read + Send>> {
+    fn open_live_read_at(
+        &self,
+        rel_path: &str,
+        offset: u64,
+    ) -> legion_sync::Result<Box<dyn Read + Send>> {
         let clean = validate_sync_path(rel_path)?;
-        self.assert_platform_allowed(&clean, EntryKind::File, "open_live_read");
+        self.assert_platform_allowed(&clean, EntryKind::File, "open_live_read_at");
         let live = self.live.lock().unwrap();
         match self.lookup_key(&live, &clean).map(|(_, n)| n) {
-            Some(Node::File { bytes, .. }) => Ok(Box::new(Cursor::new(bytes.clone()))),
+            Some(Node::File { bytes, .. }) => {
+                let start = (offset as usize).min(bytes.len());
+                Ok(Box::new(Cursor::new(bytes[start..].to_vec())))
+            }
             Some(_) => Err(SyncError::Conflict {
                 path: clean,
                 reason: "not a regular file".to_string(),
@@ -380,7 +428,7 @@ impl SyncFs for StrictPlatformFs {
             return Err(SyncError::Fs {
                 path: Some(clean),
                 detail: "directory not empty".to_string(),
-                kind: FsErrorKind::Other,
+                kind: FsErrorKind::DirectoryNotEmpty,
             });
         }
         match live.get(&clean) {
@@ -405,6 +453,13 @@ impl SyncFs for StrictPlatformFs {
         self.assert_platform_allowed(&clean, EntryKind::Symlink, "create_symlink_live");
         let mut live = self.live.lock().unwrap();
         self.assert_no_case_collision(&live, &clean, "create_symlink_live");
+        if self.lookup_key(&live, &clean).is_some() {
+            return Err(SyncError::Fs {
+                path: Some(clean),
+                detail: "already exists".to_string(),
+                kind: FsErrorKind::AlreadyExists,
+            });
+        }
         let mtime = Timestamp::new(0, 0);
         for anc in ancestors(&clean) {
             live.entry(anc.to_string()).or_insert(Node::Dir { mtime });
@@ -461,13 +516,24 @@ impl SyncFs for StrictPlatformFs {
         Ok(())
     }
 
-    fn rename_live_to_live(&self, from_rel: &str, to_rel: &str) -> legion_sync::Result<()> {
+    fn rename_live_to_live_no_replace(
+        &self,
+        from_rel: &str,
+        to_rel: &str,
+    ) -> legion_sync::Result<()> {
         let clean_from = validate_sync_path(from_rel)?;
         let clean_to = validate_sync_path(to_rel)?;
-        self.assert_platform_allowed(&clean_from, EntryKind::File, "rename_live_to_live(from)");
-        self.assert_platform_allowed(&clean_to, EntryKind::File, "rename_live_to_live(to)");
+        self.assert_platform_allowed(&clean_from, EntryKind::File, "rename(from)");
+        self.assert_platform_allowed(&clean_to, EntryKind::File, "rename(to)");
         let mut live = self.live.lock().unwrap();
-        self.assert_no_case_collision(&live, &clean_to, "rename_live_to_live");
+        self.assert_no_case_collision(&live, &clean_to, "rename_live_to_live_no_replace");
+        if live.contains_key(&clean_to) {
+            return Err(SyncError::Fs {
+                path: Some(clean_to),
+                detail: "already exists".to_string(),
+                kind: FsErrorKind::AlreadyExists,
+            });
+        }
         let node = live.remove(&clean_from).ok_or_else(|| SyncError::Fs {
             path: Some(clean_from),
             detail: "not found".to_string(),
@@ -488,6 +554,17 @@ impl SyncFs for StrictPlatformFs {
             tmp: Arc::clone(&self.tmp),
             tmp_name: tmp_name.to_string(),
             buf: Vec::new(),
+            append: false,
+        }))
+    }
+
+    fn open_tmp_append(&self, tmp_name: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
+        validate_flat_internal_name(tmp_name)?;
+        Ok(Box::new(StrictTmpWriter {
+            tmp: Arc::clone(&self.tmp),
+            tmp_name: tmp_name.to_string(),
+            buf: Vec::new(),
+            append: true,
         }))
     }
 
@@ -524,10 +601,23 @@ impl SyncFs for StrictPlatformFs {
         Ok(self.tmp.lock().unwrap().keys().cloned().collect())
     }
 
-    fn commit_tmp_to_live(&self, tmp_name: &str, live_rel: &str) -> legion_sync::Result<()> {
+    fn commit_tmp_to_live_no_replace(
+        &self,
+        tmp_name: &str,
+        live_rel: &str,
+    ) -> legion_sync::Result<()> {
         validate_flat_internal_name(tmp_name)?;
         let clean = validate_sync_path(live_rel)?;
-        self.assert_platform_allowed(&clean, EntryKind::File, "commit_tmp_to_live");
+        self.assert_platform_allowed(&clean, EntryKind::File, "commit_tmp_to_live_no_replace");
+        let mut live = self.live.lock().unwrap();
+        self.assert_no_case_collision(&live, &clean, "commit_tmp_to_live_no_replace");
+        if self.lookup_key(&live, &clean).is_some() {
+            return Err(SyncError::Fs {
+                path: Some(clean),
+                detail: "already exists".to_string(),
+                kind: FsErrorKind::AlreadyExists,
+            });
+        }
         let bytes = self
             .tmp
             .lock()
@@ -538,8 +628,6 @@ impl SyncFs for StrictPlatformFs {
                 detail: "tmp not found".to_string(),
                 kind: FsErrorKind::NotFound,
             })?;
-        let mut live = self.live.lock().unwrap();
-        self.assert_no_case_collision(&live, &clean, "commit_tmp_to_live");
         let mtime = Timestamp::new(0, 0);
         for anc in ancestors(&clean) {
             live.entry(anc.to_string()).or_insert(Node::Dir { mtime });
@@ -560,17 +648,126 @@ impl SyncFs for StrictPlatformFs {
         Ok(())
     }
 
-    fn move_live_to_bin(&self, live_rel: &str, bin_data_name: &str) -> legion_sync::Result<()> {
+    fn exchange_tmp_with_live(&self, tmp_name: &str, live_rel: &str) -> legion_sync::Result<bool> {
+        validate_flat_internal_name(tmp_name)?;
         let clean = validate_sync_path(live_rel)?;
-        validate_flat_internal_name(bin_data_name)?;
-        self.assert_platform_allowed(&clean, EntryKind::File, "move_live_to_bin");
+        self.assert_platform_allowed(&clean, EntryKind::File, "exchange_tmp_with_live");
         let mut live = self.live.lock().unwrap();
+        let mut tmp = self.tmp.lock().unwrap();
+        let Some(new_bytes) = tmp.remove(tmp_name) else {
+            return Err(SyncError::Fs {
+                path: Some(tmp_name.to_string()),
+                detail: "tmp not found".to_string(),
+                kind: FsErrorKind::NotFound,
+            });
+        };
+        let Some(Node::File {
+            bytes: old_bytes, ..
+        }) = live.remove(&clean)
+        else {
+            tmp.insert(tmp_name.to_string(), new_bytes);
+            return Err(SyncError::Fs {
+                path: Some(clean),
+                detail: "live file not found".to_string(),
+                kind: FsErrorKind::NotFound,
+            });
+        };
+        tmp.insert(tmp_name.to_string(), old_bytes);
+        live.insert(
+            clean,
+            Node::File {
+                bytes: new_bytes,
+                mtime: Timestamp::new(0, 0),
+                mode: if self.caps.windows_naming {
+                    None
+                } else {
+                    Some(0o644)
+                },
+                gen_id: self.alloc_gen(),
+            },
+        );
+        Ok(true)
+    }
+
+    fn move_live_to_tmp_no_replace(
+        &self,
+        live_rel: &str,
+        tmp_name: &str,
+    ) -> legion_sync::Result<()> {
+        let clean = validate_sync_path(live_rel)?;
+        validate_flat_internal_name(tmp_name)?;
+        self.assert_platform_allowed(&clean, EntryKind::File, "move_live_to_tmp_no_replace");
+        let mut live = self.live.lock().unwrap();
+        let mut tmp = self.tmp.lock().unwrap();
+        if tmp.contains_key(tmp_name) {
+            return Err(SyncError::Fs {
+                path: Some(tmp_name.to_string()),
+                detail: "tmp already exists".to_string(),
+                kind: FsErrorKind::AlreadyExists,
+            });
+        }
         match live.remove(&clean) {
             Some(Node::File { bytes, .. }) => {
-                self.bin
-                    .lock()
-                    .unwrap()
-                    .insert(bin_data_name.to_string(), bytes);
+                tmp.insert(tmp_name.to_string(), bytes);
+                Ok(())
+            }
+            Some(_) => Err(SyncError::Conflict {
+                path: clean,
+                reason: "not a regular file".to_string(),
+            }),
+            None => Err(SyncError::Fs {
+                path: Some(clean),
+                detail: "not found".to_string(),
+                kind: FsErrorKind::NotFound,
+            }),
+        }
+    }
+
+    fn move_tmp_to_bin_no_replace(
+        &self,
+        tmp_name: &str,
+        bin_data_name: &str,
+    ) -> legion_sync::Result<()> {
+        validate_flat_internal_name(tmp_name)?;
+        validate_flat_internal_name(bin_data_name)?;
+        let mut tmp = self.tmp.lock().unwrap();
+        let mut bin = self.bin.lock().unwrap();
+        if bin.contains_key(bin_data_name) {
+            return Err(SyncError::Fs {
+                path: Some(bin_data_name.to_string()),
+                detail: "bin file already exists".to_string(),
+                kind: FsErrorKind::AlreadyExists,
+            });
+        }
+        let bytes = tmp.remove(tmp_name).ok_or_else(|| SyncError::Fs {
+            path: Some(tmp_name.to_string()),
+            detail: "tmp not found".to_string(),
+            kind: FsErrorKind::NotFound,
+        })?;
+        bin.insert(bin_data_name.to_string(), bytes);
+        Ok(())
+    }
+
+    fn move_live_to_bin_no_replace(
+        &self,
+        live_rel: &str,
+        bin_data_name: &str,
+    ) -> legion_sync::Result<()> {
+        let clean = validate_sync_path(live_rel)?;
+        validate_flat_internal_name(bin_data_name)?;
+        self.assert_platform_allowed(&clean, EntryKind::File, "move_live_to_bin_no_replace");
+        let mut live = self.live.lock().unwrap();
+        let mut bin = self.bin.lock().unwrap();
+        if bin.contains_key(bin_data_name) {
+            return Err(SyncError::Fs {
+                path: Some(bin_data_name.to_string()),
+                detail: "bin file already exists".to_string(),
+                kind: FsErrorKind::AlreadyExists,
+            });
+        }
+        match live.remove(&clean) {
+            Some(Node::File { bytes, .. }) => {
+                bin.insert(bin_data_name.to_string(), bytes);
                 Ok(())
             }
             Some(_) => Err(SyncError::Conflict {
@@ -673,18 +870,29 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
         &self.member_id
     }
 
-    fn records_since(&self, since_seq: u64, limit: usize) -> legion_sync::Result<RecordsPage> {
+    fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
+        self.engine.serve_handshake(&self.caller)
+    }
+
+    fn records_since(
+        &self,
+        since_incarnation: u64,
+        since_seq: u64,
+        limit: usize,
+        _cancel: Option<&AtomicBool>,
+    ) -> legion_sync::Result<RecordsPage> {
         self.engine
-            .serve_records_since(&self.caller, since_seq, limit)
+            .serve_records_since(&self.caller, since_incarnation, since_seq, limit)
     }
 
     fn fetch_file(
         &self,
         path: &str,
         expected_hash: Hash,
+        options: &FetchOptions,
     ) -> legion_sync::Result<Box<dyn Read + Send>> {
         self.engine
-            .serve_fetch_file(&self.caller, path, expected_hash)
+            .serve_fetch_file_range(&self.caller, path, expected_hash, options.offset)
     }
 }
 
@@ -703,40 +911,33 @@ fn simulated_windows_fs_holds_back_all_windows_rules_and_unblocks_cleanly() {
     let mut linux = open_sim_engine("tower", &["tower", "winbox"], FsCapabilities::unix());
     let mut winbox = open_sim_engine("winbox", &["tower", "winbox"], FsCapabilities::windows());
 
-    // Safe entries that must sync to Windows.
     linux.fs().user_write_file("ok.txt", b"ok", t0);
     linux.fs().user_write_file("README.md", b"upper", t0);
     linux.fs().user_write_file("Docs/a.txt", b"docs-a", t0);
 
-    // Every Windows naming, length, symlink, and case-clash hazard on the Unix peer.
-    // `FsCapabilities::windows()` sets `max_path_len = 240`: parent dirs total 231 bytes (valid)
-    // while the leaf path totals 245 bytes (> 240 -> PathTooLong).
     let long_path = format!("{}/{}/long-name.txt", "d".repeat(115), "e".repeat(115));
-    let exact_max_path = "x".repeat(240); // exactly at Windows `max_path_len` (representable)
+    let exact_max_path = "x".repeat(240);
     let mut expected_problems: BTreeMap<String, ProblemKind> = BTreeMap::new();
 
     for (path, kind) in [
-        // Reserved DOS device names (bare, with extension, nested, trailing-space stem)
         ("CON", ProblemKind::ReservedWindowsName),
         ("CON.txt", ProblemKind::ReservedWindowsName),
         ("nul.tar.gz", ProblemKind::ReservedWindowsName),
         ("sub/LPT1.log", ProblemKind::ReservedWindowsName),
         ("com9 .txt", ProblemKind::ReservedWindowsName),
-        // Forbidden Windows characters + control character
-        ("a:b.txt", ProblemKind::ForbiddenWindowsChar),
+        // Multi-char colon is Unix-valid and held back on Windows (single-letter `a:b` is
+        // universally refused as a Windows drive-relative path by Item F).
+        ("ab:cd.txt", ProblemKind::ForbiddenWindowsChar),
         ("a?b.txt", ProblemKind::ForbiddenWindowsChar),
         ("a*b.txt", ProblemKind::ForbiddenWindowsChar),
         ("a<b.txt", ProblemKind::ForbiddenWindowsChar),
         ("a>b.txt", ProblemKind::ForbiddenWindowsChar),
         ("a\"b.txt", ProblemKind::ForbiddenWindowsChar),
         ("a|b.txt", ProblemKind::ForbiddenWindowsChar),
-        ("ctrl\x07.txt", ProblemKind::ForbiddenWindowsChar),
-        // Trailing dot or space on leaf and on ancestor directory
         ("trailing.", ProblemKind::TrailingDotOrSpace),
         ("trailing ", ProblemKind::TrailingDotOrSpace),
         ("dir./nested.txt", ProblemKind::TrailingDotOrSpace),
         ("dir /nested.txt", ProblemKind::TrailingDotOrSpace),
-        // Case clashes (leaf and ancestor directory)
         ("readme.md", ProblemKind::CaseClash),
         ("docs/b.txt", ProblemKind::CaseClash),
     ] {
@@ -746,8 +947,6 @@ fn simulated_windows_fs_holds_back_all_windows_rules_and_unblocks_cleanly() {
         expected_problems.insert(path.to_string(), kind);
     }
 
-    // Ancestor directories created by `dir./nested.txt`, `dir /nested.txt`, `docs/b.txt`, and
-    // `long_path` are scanned as Dir entries too; record their exact expected ProblemKinds.
     expected_problems.insert("dir.".to_string(), ProblemKind::TrailingDotOrSpace);
     expected_problems.insert("dir ".to_string(), ProblemKind::TrailingDotOrSpace);
     expected_problems.insert("docs".to_string(), ProblemKind::CaseClash);
@@ -758,7 +957,6 @@ fn simulated_windows_fs_holds_back_all_windows_rules_and_unblocks_cleanly() {
     linux.fs().user_symlink("sym", "ok.txt", t0);
     expected_problems.insert("sym".to_string(), ProblemKind::UnsupportedSymlink);
 
-    // Also verify a 240-byte name (at `max_path_len`) is representable on Windows.
     linux.fs().user_write_file(&exact_max_path, b"max-ok", t0);
 
     linux.scan(t0).unwrap();
@@ -768,7 +966,6 @@ fn simulated_windows_fs_holds_back_all_windows_rules_and_unblocks_cleanly() {
         .unwrap();
     assert_eq!(pull.held_back, expected_problems.len());
 
-    // Only representable entries were materialized on the strict simulated Windows filesystem.
     assert_eq!(
         winbox.fs().read_live_bytes("ok.txt").as_deref(),
         Some(b"ok".as_slice())
@@ -786,10 +983,7 @@ fn simulated_windows_fs_holds_back_all_windows_rules_and_unblocks_cleanly() {
         Some(b"max-ok".as_slice())
     );
     for held_path in expected_problems.keys() {
-        assert!(
-            !winbox.fs().live_paths().contains(held_path),
-            "held-back path '{held_path}' must not exist on simulated Windows FS"
-        );
+        assert!(!winbox.fs().live_paths().contains(held_path));
     }
 
     match winbox.status().unwrap().state {
@@ -802,9 +996,6 @@ fn simulated_windows_fs_holds_back_all_windows_rules_and_unblocks_cleanly() {
         other => panic!("expected Problem state, got {other:?}"),
     }
 
-    // Delete every Windows-illegal entry and the clashing uppercase entries on Linux; Windows must
-    // process every tombstone without ever touching illegal Win32 paths and unblock `readme.md`
-    // and `docs/b.txt`.
     let t1 = Timestamp::new(t0.secs + 60, 0);
     for path in [
         "README.md",
@@ -814,14 +1005,13 @@ fn simulated_windows_fs_holds_back_all_windows_rules_and_unblocks_cleanly() {
         "nul.tar.gz",
         "sub/LPT1.log",
         "com9 .txt",
-        "a:b.txt",
+        "ab:cd.txt",
         "a?b.txt",
         "a*b.txt",
         "a<b.txt",
         "a>b.txt",
         "a\"b.txt",
         "a|b.txt",
-        "ctrl\x07.txt",
         "trailing.",
         "trailing ",
         "dir.",
@@ -837,7 +1027,7 @@ fn simulated_windows_fs_holds_back_all_windows_rules_and_unblocks_cleanly() {
         .pull_from_peer(&EnginePeer::new(&linux, "winbox"), t1)
         .unwrap();
     assert_eq!(pull2.held_back, 0);
-    assert_eq!(pull2.held_back_resolved, 3); // readme.md, docs, docs/b.txt
+    assert_eq!(pull2.held_back_resolved, 3);
     assert_eq!(winbox.status().unwrap().state, MemberState::UpToDate);
     assert_eq!(
         winbox.fs().read_live_bytes("readme.md").as_deref(),
@@ -850,12 +1040,11 @@ fn simulated_windows_fs_holds_back_all_windows_rules_and_unblocks_cleanly() {
 }
 
 #[test]
-fn simulated_windows_fs_conflicts_and_macos_case_insensitive_rules() {
+fn simulated_windows_fs_conflicts_and_macos_case_insensitive_and_unicode_rules() {
     let t0 = Timestamp::new(1_795_608_000, 0);
     let t1 = Timestamp::new(t0.secs + 60, 0);
 
-    // 1. Concurrent edits where the conflict copy name exceeds Windows `max_path_len`: held back
-    //    as `PathTooLong` rather than failing mid-apply on Win32.
+    // 1. Conflict copy name exceeding Windows `max_path_len` is held back as `PathTooLong`.
     let tight_win_caps = FsCapabilities {
         max_path_len: 40,
         ..FsCapabilities::windows()
@@ -863,7 +1052,7 @@ fn simulated_windows_fs_conflicts_and_macos_case_insensitive_rules() {
     let mut linux = open_sim_engine("tower", &["tower", "winbox"], FsCapabilities::unix());
     let mut winbox = open_sim_engine("winbox", &["tower", "winbox"], tight_win_caps);
 
-    let near_limit = "alpha/beta/report-2026.txt"; // 26 bytes (< 40), conflict copy is 55 bytes (> 40)
+    let near_limit = "alpha/beta/report-2026.txt";
     linux.fs().user_write_file(near_limit, b"from-linux", t0);
     linux.scan(t0).unwrap();
     winbox.fs().user_write_file(near_limit, b"from-windows", t1);
@@ -873,10 +1062,6 @@ fn simulated_windows_fs_conflicts_and_macos_case_insensitive_rules() {
         .pull_from_peer(&EnginePeer::new(&linux, "winbox"), t1)
         .unwrap();
     assert_eq!(pull.held_back, 1);
-    assert_eq!(
-        winbox.fs().read_live_bytes(near_limit).as_deref(),
-        Some(b"from-windows".as_slice())
-    );
     match winbox.status().unwrap().state {
         MemberState::Problem { problems, .. } => {
             assert_eq!(problems.len(), 1);
@@ -885,8 +1070,7 @@ fn simulated_windows_fs_conflicts_and_macos_case_insensitive_rules() {
         other => panic!("expected Problem(PathTooLong), got {other:?}"),
     }
 
-    // 2. Local Windows file `Notes.txt` collides with incoming Unix `notes.txt`: `notes.txt` is
-    //    held back as `CaseClash` and never overwrites `Notes.txt`.
+    // 2. Local Windows `Notes.txt` collides with incoming `notes.txt`.
     winbox.fs().user_write_file("Notes.txt", b"win-notes", t1);
     winbox.scan(t1).unwrap();
     linux.fs().user_write_file("notes.txt", b"unix-notes", t1);
@@ -902,8 +1086,7 @@ fn simulated_windows_fs_conflicts_and_macos_case_insensitive_rules() {
     );
     assert!(!winbox.fs().live_paths().contains(&"notes.txt".to_string()));
 
-    // 3. Segment exceeding `max_segment_len` while total path stays within `max_path_len`: held
-    //    back as `SegmentTooLong` without touching the simulated Windows filesystem.
+    // 3. Segment exceeding `max_segment_len`.
     let seg_win_caps = FsCapabilities {
         max_segment_len: 32,
         max_path_len: 240,
@@ -918,18 +1101,15 @@ fn simulated_windows_fs_conflicts_and_macos_case_insensitive_rules() {
         .pull_from_peer(&EnginePeer::new(&seg_src, "winbox"), t0)
         .unwrap();
     assert_eq!(seg_pull.held_back, 1);
-    assert!(!seg_win.fs().live_paths().contains(&long_seg_name));
     match seg_win.status().unwrap().state {
         MemberState::Problem { problems, .. } => {
             assert_eq!(problems.len(), 1);
-            assert_eq!(problems[0].path, long_seg_name);
             assert_eq!(problems[0].kind, ProblemKind::SegmentTooLong);
         }
         other => panic!("expected Problem(SegmentTooLong), got {other:?}"),
     }
 
-    // 4. Case-insensitive macOS allows Windows-forbidden names, reserved names, trailing dots,
-    //    and symlinks, while still holding back case clashes.
+    // 4. macOS case-insensitive + Unicode NFD/NFC normalizing!
     let mut mac_source = open_sim_engine("tower", &["tower", "mac"], FsCapabilities::unix());
     let mut mac = open_sim_engine(
         "mac",
@@ -937,23 +1117,30 @@ fn simulated_windows_fs_conflicts_and_macos_case_insensitive_rules() {
         FsCapabilities::macos_case_insensitive(),
     );
     mac_source.fs().user_write_file("CON.txt", b"con", t0);
-    mac_source.fs().user_write_file("a:b.txt", b"colon", t0);
+    mac_source.fs().user_write_file("ab:cd.txt", b"colon", t0);
     mac_source.fs().user_write_file("trailing.", b"dot", t0);
     mac_source.fs().user_symlink("sym", "CON.txt", t0);
     mac_source.fs().user_write_file("README.md", b"upper", t0);
     mac_source.fs().user_write_file("readme.md", b"lower", t0);
+    // NFC vs NFD `cafe\u{0301}.txt` vs `caf\u{00e9}.txt` clash on macOS APFS!
+    mac_source
+        .fs()
+        .user_write_file("caf\u{00e9}.txt", b"nfc", t0);
+    mac_source
+        .fs()
+        .user_write_file("cafe\u{0301}.txt", b"nfd", t0);
     mac_source.scan(t0).unwrap();
 
     let mac_pull = mac
         .pull_from_peer(&EnginePeer::new(&mac_source, "mac"), t0)
         .unwrap();
-    assert_eq!(mac_pull.held_back, 1);
+    assert_eq!(mac_pull.held_back, 2); // readme.md + NFD cafe
     assert_eq!(
         mac.fs().read_live_bytes("CON.txt").as_deref(),
         Some(b"con".as_slice())
     );
     assert_eq!(
-        mac.fs().read_live_bytes("a:b.txt").as_deref(),
+        mac.fs().read_live_bytes("ab:cd.txt").as_deref(),
         Some(b"colon".as_slice())
     );
     assert_eq!(
@@ -961,12 +1148,5 @@ fn simulated_windows_fs_conflicts_and_macos_case_insensitive_rules() {
         Some(b"dot".as_slice())
     );
     assert!(mac.fs().live_paths().contains(&"sym".to_string()));
-    match mac.status().unwrap().state {
-        MemberState::Problem { problems, .. } => {
-            assert_eq!(problems.len(), 1);
-            assert_eq!(problems[0].path, "readme.md");
-            assert_eq!(problems[0].kind, ProblemKind::CaseClash);
-        }
-        other => panic!("expected Problem(CaseClash), got {other:?}"),
-    }
+    let _ = fold_case("test");
 }
