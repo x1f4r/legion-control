@@ -1274,11 +1274,29 @@ impl StreamOpener for SshStreamOpener {
             };
 
             let open_fut = async {
-                let channel = self
-                    .session
-                    .channel_open_session()
-                    .await
-                    .map_err(classify_channel_open_error)?;
+                // OpenSSH can briefly return `ChannelOpenFailure` while a just-closed channel is
+                // still being reaped in `server_loop2` even though our local permit count stays
+                // strictly below default `MaxSessions = 10`. Retry briefly before surfacing Busy.
+                const RETRY_DELAYS_MS: [u64; 4] = [5, 15, 40, 100];
+                let mut attempt = 0usize;
+                let channel = loop {
+                    match self
+                        .session
+                        .channel_open_session()
+                        .await
+                        .map_err(classify_channel_open_error)
+                    {
+                        Ok(channel) => break channel,
+                        Err(StreamOpenError::ChannelRefused(body)) => {
+                            let Some(&delay_ms) = RETRY_DELAYS_MS.get(attempt) else {
+                                return Err(StreamOpenError::ChannelRefused(body));
+                            };
+                            attempt += 1;
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                        Err(other) => return Err(other),
+                    }
+                };
                 channel.exec(true, command).await.map_err(|err| {
                     let _ = err;
                     StreamOpenError::DeadSession(
@@ -1454,12 +1472,16 @@ fn bridge_stream_channel(channel: Channel<client::Msg>, permit: OwnedSemaphorePe
     let channel_cancel = CancellationToken::new();
     let park_cancel = CancellationToken::new();
     let rx_finished = CancellationToken::new();
+    let remote_closed_tok = CancellationToken::new();
+    let force_close_tok = CancellationToken::new();
 
     let rx_state = Arc::clone(&buf_state);
     let rx_stderr = Arc::clone(&stderr);
     let rx_cancel = channel_cancel.clone();
     let rx_park = park_cancel.clone();
     let rx_done = rx_finished.clone();
+    let rx_remote_closed = remote_closed_tok.clone();
+    let rx_force_close = force_close_tok.clone();
     tokio::spawn(async move {
         // Hold the concurrency permit until `sshd` has sent `ChannelMsg::Close` (or the channel
         // terminates / drain timeout elapses) so we never open a replacement channel while OpenSSH
@@ -1545,22 +1567,31 @@ fn bridge_stream_channel(channel: Channel<client::Msg>, permit: OwnedSemaphorePe
         mark_eof(&mut eof_marked);
         rx_done.cancel();
         if !remote_closed {
-            // Wait briefly for the server's SSH_MSG_CHANNEL_CLOSE so OpenSSH has released its
-            // MaxSessions slot before `_permit` drops and unblocks the next stream waiter.
-            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            // Wait for `sshd` to send `SSH_MSG_CHANNEL_CLOSE` after `tx_task` sends `EOF`:
+            // `russh` automatically replies with `CHANNEL_CLOSE` via `close_from_peer` and
+            // delivers `ChannelMsg::Close` here as soon as OpenSSH has freed its `MaxSessions`
+            // slot. Only force a local `close()` if a misbehaving remote ignores stdin EOF.
+            let closed_cleanly = tokio::time::timeout(Duration::from_secs(2), async {
                 while let Some(msg) = read_half.wait().await {
                     if matches!(msg, ChannelMsg::Close) {
-                        break;
+                        return true;
                     }
                 }
+                true
             })
-            .await;
+            .await
+            .unwrap_or(false);
+            if !closed_cleanly {
+                rx_force_close.cancel();
+            }
         }
+        rx_remote_closed.cancel();
     });
 
     let tx_cancel = channel_cancel.clone();
     let tx_park = park_cancel.clone();
-    let tx_rx_done = rx_finished.clone();
+    let tx_remote_closed = remote_closed_tok;
+    let tx_force_close = force_close_tok;
     tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         let mut stdin_open = true;
@@ -1568,15 +1599,8 @@ fn bridge_stream_channel(channel: Channel<client::Msg>, permit: OwnedSemaphorePe
             if !stdin_open {
                 tokio::select! {
                     biased;
-                    () = tx_cancel.cancelled() => {
-                        let _ = write_half.close().await;
-                        break;
-                    }
-                    () = tx_park.cancelled() => {
-                        let _ = write_half.close().await;
-                        break;
-                    }
-                    () = tx_rx_done.cancelled() => {
+                    () = tx_remote_closed.cancelled() => break,
+                    () = tx_force_close.cancelled() => {
                         let _ = write_half.close().await;
                         break;
                     }
@@ -1584,19 +1608,18 @@ fn bridge_stream_channel(channel: Channel<client::Msg>, permit: OwnedSemaphorePe
             }
             tokio::select! {
                 biased;
-                () = tx_cancel.cancelled() => {
-                    let _ = write_half.eof().await;
+                () = tx_remote_closed.cancelled() => break,
+                () = tx_force_close.cancelled() => {
                     let _ = write_half.close().await;
                     break;
+                }
+                () = tx_cancel.cancelled() => {
+                    let _ = write_half.eof().await;
+                    stdin_open = false;
                 }
                 () = tx_park.cancelled() => {
                     let _ = write_half.eof().await;
-                    let _ = write_half.close().await;
-                    break;
-                }
-                () = tx_rx_done.cancelled() => {
-                    let _ = write_half.close().await;
-                    break;
+                    stdin_open = false;
                 }
                 read = stdin_read.read(&mut buf) => match read {
                     Ok(0) => {
@@ -1609,8 +1632,8 @@ fn bridge_stream_channel(channel: Channel<client::Msg>, permit: OwnedSemaphorePe
                         }
                     }
                     Err(_) => {
-                        let _ = write_half.close().await;
-                        break;
+                        let _ = write_half.eof().await;
+                        stdin_open = false;
                     }
                 }
             }
