@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Legion interface: Files reference screens</title>
+<link rel="stylesheet" href="../styles.css">
+<style>
+  /* Laying the reference screens out side by side. Nothing in this block ships. */
+  body { padding: 28px; display: flex; flex-wrap: wrap; gap: 28px; align-items: flex-start; background: #000; height: auto; }
+  .frame { position: relative; width: 390px; height: 820px; border-radius: 30px; overflow: hidden; outline: 1px solid #333; }
+  .frame .shell { height: 100%; }
+  figcaption { font: 12px ui-monospace, monospace; color: #888; margin: 0 0 8px 6px; max-width: 380px; }
+  figure { margin: 0; }
+  .ph { display: block; background-image: linear-gradient(135deg, var(--a, #3b5d7a), var(--b, #1c2a3a)); }
+</style>
+<style>
+  /* ── New for Files. Everything in this block moves into styles.css as it is built. ─────────── */
+
+  /* A row that starts with a picture of what it is. */
+  .row .thumb {
+    flex: none;
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    border-radius: 9px;
+    background: var(--raised);
+    color: var(--dim);
+    overflow: hidden;
+  }
+  .row .thumb svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .row .thumb.folder { color: var(--accent); }
+  .row .thumb img, .row .thumb .ph { width: 100%; height: 100%; object-fit: cover; }
+  .row .star { color: var(--accent); font-size: 13px; }
+  .row.picked { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .row .check { flex: none; width: 22px; height: 22px; border-radius: 50%; border: 1.5px solid var(--line-strong); }
+  .row.picked .check { border-color: var(--accent); background: var(--accent); box-shadow: inset 0 0 0 4px var(--surface); }
+
+  /* The path, first thing in the scrolling area and stuck to its top; the last part is where you are. */
+  .where { position: sticky; top: -4px; z-index: 1; display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; margin: -4px calc(var(--pad) * -1) 6px; padding: 4px var(--pad) 8px; background: var(--bg); font-size: var(--text-sub); color: var(--dim); white-space: nowrap; }
+  .where a { color: inherit; text-decoration: none; }
+  .where a:last-child { color: var(--text); }
+  .where i { font-style: normal; color: var(--faint); }
+
+  /* Pictures and video as a grid. Three across on a phone, more as the shell widens. */
+  .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 3px; margin: 0 calc(var(--pad) * -1 + 3px); }
+  .grid .cell { position: relative; aspect-ratio: 1; overflow: hidden; border-radius: 4px; background: var(--raised); }
+  .grid .cell > * { display: block; width: 100%; height: 100%; object-fit: cover; }
+  .grid .cell .len { position: absolute; right: 5px; bottom: 5px; width: auto; height: auto; padding: 2px 6px; border-radius: 5px; background: rgb(0 0 0 / 0.6); color: #fff; font: 500 11px/1.3 var(--sans); }
+  .grid .cell.folder { display: grid; place-items: center; align-content: center; gap: 6px; color: var(--dim); font-size: var(--text-small); text-align: center; padding: 6px; }
+  .grid .cell.folder svg { width: 30px; height: 30px; stroke: var(--accent); fill: none; stroke-width: 1.6; }
+
+  /* The dock when it holds a search box and tools, and when it holds actions for a selection. */
+  .dock.tools { display: flex; gap: 6px; align-items: center; }
+  .dock.tools .input { flex: 1; min-width: 0; }
+  .bar4 { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 4px; }
+  .bar4 button { display: grid; justify-items: center; gap: 4px; min-height: 54px; padding: 8px 2px 6px; border: 0; border-radius: 10px; background: none; color: var(--text); font-size: 11px; cursor: pointer; }
+  .bar4 button svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .bar4 button.danger { color: var(--bad); }
+  .bar4 button[disabled] { color: var(--faint); }
+
+  /* Kind filters above the search box: they scroll sideways and never wrap. */
+  .filters { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; padding: 0 0 8px; }
+  .filters button { flex: none; height: 32px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 16px; background: none; color: var(--dim); font-size: var(--text-sub); }
+  .filters button[aria-pressed="true"] { border-color: var(--accent); color: var(--text); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+
+  /* The viewer covers everything, on black, with its actions at the bottom. */
+  .viewer { position: absolute; inset: 0; z-index: 40; display: grid; grid-template-rows: auto 1fr auto; background: #000; color: #fff; }
+  .viewer-top { display: flex; align-items: center; gap: 4px; padding: calc(var(--safe-top) + 10px) 8px 8px; }
+  .viewer-top .name { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .viewer-top .name small { display: block; font-weight: 400; font-size: var(--text-small); color: #aaa; }
+  .viewer-top .btn { color: #fff; }
+  .viewer-stage { min-height: 0; display: grid; place-items: center; overflow: hidden; }
+  .viewer-stage .said { max-width: 280px; text-align: center; color: #ccc; }
+  .viewer-stage .said strong { display: block; color: #fff; font-size: 17px; margin-bottom: 6px; }
+  .viewer-bar { padding: 6px 10px calc(var(--safe-bottom) + 8px); background: linear-gradient(transparent, rgb(0 0 0 / 0.7)); }
+  .viewer-bar .bar4 button { color: #fff; }
+  .player { width: 100%; background: #111; aspect-ratio: 16 / 9; position: relative; }
+  .player .ctl { position: absolute; left: 12px; right: 12px; bottom: 10px; display: grid; gap: 6px; font: 500 12px/1 var(--sans); color: #ddd; }
+  .player .ctl .track { height: 3px; border-radius: 2px; background: #555; }
+  .player .ctl .track i { display: block; width: 38%; height: 100%; border-radius: 2px; background: #fff; }
+
+  /* How far along something is, under a row's title. */
+  .row .progress { display: block; height: 3px; margin-top: 7px; border-radius: 2px; background: var(--raised); overflow: hidden; }
+  .row .progress i { display: block; height: 100%; width: calc(var(--v) * 1%); background: var(--accent); }
+
+  .tile .thumb { width: 36px; height: 36px; border-radius: 8px; display: grid; place-items: center; background: var(--raised); color: var(--accent); overflow: hidden; }
+  .tile .thumb svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 1.7; }
+  .tile strong { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tile span { font-size: var(--text-sub); color: var(--dim); }
+</style>
+
+<svg hidden>
+  <symbol id="i-machines" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="6.5" rx="2"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="2"/><path d="M7 7.25h.01M7 16.75h.01"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><path d="M3.5 12h4l2.5-6 4 12 2.5-6h4"/></symbol>
+  <symbol id="i-actions" viewBox="0 0 24 24"><path d="M13 3.5 5.5 13.5H11l-1 7 7.5-10H12z"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3.5v2.2M12 18.3v2.2M3.5 12h2.2M18.3 12h2.2M6 6l1.6 1.6M16.4 16.4 18 18M18 6l-1.6 1.6M7.6 16.4 6 18"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M14.5 5.5 8 12l6.5 6.5"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M5.5 9 12 15.5 18.5 9"/></symbol>
+  <symbol id="i-files" viewBox="0 0 24 24"><path d="M4 7.5a2 2 0 0 1 2-2h3.5l2 2H18a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><path d="M6 12h.01M12 12h.01M18 12h.01"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><rect x="3.5" y="5.5" width="17" height="13" rx="2.5"/><path d="m10.5 9.5 4 2.5-4 2.5z"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2.5"/><circle cx="9" cy="10" r="1.5"/><path d="m5 17 4.5-4 3 2.5 3-3L20 16"/></symbol>
+  <symbol id="i-music" viewBox="0 0 24 24"><path d="M9.5 17V6.5l9-2V15"/><circle cx="7" cy="17" r="2.5"/><circle cx="16" cy="15" r="2.5"/></symbol>
+  <symbol id="i-doc" viewBox="0 0 24 24"><path d="M7 3.5h7l4 4V20.500H7z"/><path d="M14 3.500V8h4M9.500 12.500h6M9.500 16h6"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="6.500" height="6.500" rx="1.500"/><rect x="13.500" y="4" width="6.500" height="6.500" rx="1.500"/><rect x="4" y="13.500" width="6.500" height="6.500" rx="1.500"/><rect x="13.500" y="13.500" width="6.500" height="6.500" rx="1.500"/></symbol>
+  <symbol id="i-sort" viewBox="0 0 24 24"><path d="M5 7h14M7.500 12h9M10 17h4"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7.500 11l4.500 4.500 4.500-4.500M5 19.500h14"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M4 12h13M12.500 6.500 18 12l-5.500 5.500"/><path d="M20.500 5v14"/></symbol>
+  <symbol id="i-star" viewBox="0 0 24 24"><path d="m12 4 2.400 5 5.400.700-4 3.800 1 5.500-4.800-2.700L7.200 19l1-5.500-4-3.800 5.400-.700z"/></symbol>
+  <symbol id="i-bin" viewBox="0 0 24 24"><path d="M5 7h14M9.500 7V4.500h5V7M7 7l1 12.500h8L17 7"/></symbol>
+  <symbol id="i-sync" viewBox="0 0 24 24"><path d="M5 12a7 7 0 0 1 12-4.900L19 9M19 12a7 7 0 0 1-12 4.900L5 15"/><path d="M19 4.500V9h-4.500M5 19.500V15h4.500"/></symbol>
+</svg>
+
+<!-- ─────────────────────────────── Files, first screen ─────────────────────────────── -->
+<figure>
+<figcaption>Files. A fourth tab. Pinned first, then synced folders, machines, favourites, recent. Search is at the thumb.</figcaption>
+<div class="frame"><div class="shell"><div class="app docked">
+  <header class="top">
+    <h1>Files<small>3 machines are on</small></h1>
+    <button class="btn icon" aria-label="Settings"><svg><use href="#i-gear"/></svg></button>
+  </header>
+  <main class="main">
+    <p class="label">Pinned</p>
+    <div class="tiles">
+      <a class="tile" href="#"><span class="thumb"><svg><use href="#i-files"/></svg></span><strong>Photos</strong><span>tower</span></a>
+      <a class="tile" href="#"><span class="thumb"><svg><use href="#i-files"/></svg></span><strong>Films</strong><span>nas</span></a>
+      <a class="tile" href="#"><span class="thumb ph" style="--a:#7a5b3b;--b:#2a1c14"></span><strong>Passport.pdf</strong><span>pi</span></a>
+      <a class="tile" href="#"><span class="thumb"><svg><use href="#i-files"/></svg></span><strong>Projects</strong><span>studio</span></a>
+    </div>
+
+    <p class="label">Kept in sync</p>
+    <div class="list">
+      <a class="row" href="#"><span class="thumb folder"><svg><use href="#i-sync"/></svg></span><span class="body"><span class="title">Documents</span><span class="sub">tower, pi and studio · Up to date</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="thumb folder"><svg><use href="#i-sync"/></svg></span><span class="body"><span class="title">Camera</span><span class="sub">14 files waiting for laptop, which is off</span></span><span class="chev">›</span></a>
+    </div>
+
+    <p class="label">Machines</p>
+    <div class="list">
+      <a class="row" href="#"><span class="dot"></span><span class="body"><span class="title">tower</span><span class="sub">2.4 TB free</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="dot"></span><span class="body"><span class="title">pi</span><span class="sub">61 GB free</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="dot"></span><span class="body"><span class="title">studio</span><span class="sub">312 GB free</span></span><span class="chev">›</span></a>
+      <a class="row off" href="#"><span class="dot off"></span><span class="body"><span class="title">laptop</span><span class="sub">Off · last on 2 weeks ago</span></span><span class="chev">›</span></a>
+    </div>
+
+    <p class="label">More</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Favourites</span><span class="sub">9 files and folders</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Recent</span><span class="sub">Opened on this phone</span></span><span class="chev">›</span></a>
+    </div>
+  </main>
+  <div class="dock"><input class="input plain" placeholder="Search all machines" aria-label="Search all machines"></div>
+  <nav class="nav">
+    <a href="#"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#" aria-current="page"><svg><use href="#i-files"/></svg>Files</a>
+    <a href="#"><svg><use href="#i-activity"/></svg>Activity</a>
+    <a href="#"><svg><use href="#i-actions"/></svg>Actions</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── A folder, as a list ─────────────────────────────── -->
+<figure>
+<figcaption>A folder. Back (arrow, gesture, button) goes to the folder this was opened from. Tools sit in the dock. Swipe a row: Star, Send to.</figcaption>
+<div class="frame"><div class="shell"><div class="app docked">
+  <header class="top">
+    <button class="btn icon" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <h1>Holiday</h1>
+  </header>
+  <main class="main">
+    <nav class="where" aria-label="Where this folder is"><a href="#">tower</a><i>›</i><a href="#">Home</a><i>›</i><a href="#">Videos</a><i>›</i><a href="#">Holiday</a></nav>
+    <div class="list">
+      <a class="row" href="#"><span class="thumb folder"><svg><use href="#i-files"/></svg></span><span class="body"><span class="title">Raw</span><span class="sub">Folder · 3 days ago</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="thumb"><span class="ph" style="--a:#3b6f7a;--b:#12262b"></span></span><span class="body"><span class="title">Arrival.mp4</span><span class="sub">Video · 1.2 GB · 3 days ago</span></span><span class="star" aria-label="Favourite">★</span></a>
+      <a class="row" href="#"><span class="thumb"><span class="ph" style="--a:#7a6a3b;--b:#2b2412"></span></span><span class="body"><span class="title">Beach.mp4</span><span class="sub">Video · 840 MB · 3 days ago</span></span></a>
+      <a class="row" href="#"><span class="thumb"><span class="ph" style="--a:#5d7a3b;--b:#1b2b12"></span></span><span class="body"><span class="title">IMG_2041.jpg</span><span class="sub">Picture · 4.1 MB · 3 days ago</span></span></a>
+      <a class="row" href="#"><span class="thumb"><span class="ph" style="--a:#3b4f7a;--b:#12182b"></span></span><span class="body"><span class="title">IMG_2042.jpg</span><span class="sub">Picture · 3.8 MB · 3 days ago</span></span></a>
+      <a class="row" href="#"><span class="thumb"><svg><use href="#i-music"/></svg></span><span class="body"><span class="title">Voice note.m4a</span><span class="sub">Music · 2.1 MB · 4 days ago</span></span></a>
+      <a class="row" href="#"><span class="thumb"><svg><use href="#i-doc"/></svg></span><span class="body"><span class="title">Tickets.pdf</span><span class="sub">Document · 310 KB · last week</span></span></a>
+      <a class="row" href="#"><span class="thumb"><svg><use href="#i-doc"/></svg></span><span class="body"><span class="title">notes.txt</span><span class="sub">Text · 2 KB · last week</span></span></a>
+    </div>
+  </main>
+  <div class="dock tools">
+    <input class="input plain" placeholder="Search in Holiday" aria-label="Search in Holiday">
+    <button class="btn icon" aria-label="Sort: by name"><svg><use href="#i-sort"/></svg></button>
+    <button class="btn icon" aria-label="Show as grid"><svg><use href="#i-grid"/></svg></button>
+    <button class="btn icon" aria-label="More: select, new folder, add from this phone, star this folder, show hidden"><svg><use href="#i-more"/></svg></button>
+  </div>
+  <nav class="nav">
+    <a href="#"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#" aria-current="page"><svg><use href="#i-files"/></svg>Files</a>
+    <a href="#"><svg><use href="#i-activity"/></svg>Activity</a>
+    <a href="#"><svg><use href="#i-actions"/></svg>Actions</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── A folder, as a grid ─────────────────────────────── -->
+<figure>
+<figcaption>The same folder as a grid. Offered for any folder, chosen by default when most of it is pictures and video. The choice is remembered per folder.</figcaption>
+<div class="frame"><div class="shell"><div class="app docked">
+  <header class="top">
+    <button class="btn icon" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <h1>Holiday</h1>
+  </header>
+  <main class="main">
+    <nav class="where"><a href="#">tower</a><i>›</i><a href="#">Home</a><i>›</i><a href="#">Videos</a><i>›</i><a href="#">Holiday</a></nav>
+    <div class="grid">
+      <a class="cell folder" href="#"><svg viewBox="0 0 24 24"><use href="#i-files"/></svg>Raw</a>
+      <a class="cell" href="#"><span class="ph" style="--a:#3b6f7a;--b:#12262b"></span><span class="len">12:04</span></a>
+      <a class="cell" href="#"><span class="ph" style="--a:#7a6a3b;--b:#2b2412"></span><span class="len">8:31</span></a>
+      <a class="cell" href="#"><span class="ph" style="--a:#5d7a3b;--b:#1b2b12"></span></a>
+      <a class="cell" href="#"><span class="ph" style="--a:#3b4f7a;--b:#12182b"></span></a>
+      <a class="cell" href="#"><span class="ph" style="--a:#7a3b5d;--b:#2b1220"></span></a>
+      <a class="cell" href="#"><span class="ph" style="--a:#3b7a6a;--b:#122b25"></span></a>
+      <a class="cell" href="#"><span class="ph" style="--a:#7a4a3b;--b:#2b1812"></span></a>
+      <a class="cell" href="#"><span class="ph" style="--a:#4a3b7a;--b:#18122b"></span></a>
+      <a class="cell" href="#"><span class="ph" style="--a:#6a7a3b;--b:#252b12"></span></a>
+      <a class="cell" href="#"><span class="ph" style="--a:#3b5d7a;--b:#12202b"></span></a>
+      <a class="cell" href="#"><span class="ph" style="--a:#7a3b3b;--b:#2b1212"></span></a>
+    </div>
+    <p class="label">Other files</p>
+    <div class="list">
+      <a class="row" href="#"><span class="thumb"><svg><use href="#i-doc"/></svg></span><span class="body"><span class="title">Tickets.pdf</span><span class="sub">Document · 310 KB · last week</span></span></a>
+    </div>
+  </main>
+  <div class="dock tools">
+    <input class="input plain" placeholder="Search in Holiday" aria-label="Search in Holiday">
+    <button class="btn icon" aria-label="Sort: newest first"><svg><use href="#i-sort"/></svg></button>
+    <button class="btn icon" aria-label="Show as list" aria-pressed="true"><svg><use href="#i-grid"/></svg></button>
+    <button class="btn icon" aria-label="More"><svg><use href="#i-more"/></svg></button>
+  </div>
+  <nav class="nav">
+    <a href="#"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#" aria-current="page"><svg><use href="#i-files"/></svg>Files</a>
+    <a href="#"><svg><use href="#i-activity"/></svg>Activity</a>
+    <a href="#"><svg><use href="#i-actions"/></svg>Actions</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Viewer: a picture ─────────────────────────────── -->
+<figure>
+<figcaption>A picture. Pinch or double tap to zoom, swipe sideways for the next one, swipe down or back to close. A tap hides the bars. Actions at the bottom.</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <div class="viewer">
+    <div class="viewer-top">
+      <button class="btn icon" aria-label="Close"><svg><use href="#i-down"/></svg></button>
+      <span class="name">IMG_2041.jpg<small>4 of 9 · 4.1 MB · 3 days ago</small></span>
+      <button class="btn icon" aria-label="More: details, rename, copy path, delete"><svg><use href="#i-more"/></svg></button>
+    </div>
+    <div class="viewer-stage"><div class="ph" style="--a:#5d7a3b;--b:#1b2b12;width:100%;aspect-ratio:4/3"></div></div>
+    <div class="viewer-bar"><div class="bar4">
+      <button><svg><use href="#i-download"/></svg>Download</button>
+      <button><svg><use href="#i-send"/></svg>Send to</button>
+      <button><svg><use href="#i-star"/></svg>Star</button>
+      <button><svg><use href="#i-more"/></svg>Open in…</button>
+    </div></div>
+  </div>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Viewer: a video ─────────────────────────────── -->
+<figure>
+<figcaption>A video plays from the machine with the platform's own player; nothing is downloaded first and seeking asks only for the part needed. Turning the phone fills the screen.</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <div class="viewer">
+    <div class="viewer-top">
+      <button class="btn icon" aria-label="Close"><svg><use href="#i-down"/></svg></button>
+      <span class="name">Arrival.mp4<small>1.2 GB · playing from tower</small></span>
+      <button class="btn icon" aria-label="More"><svg><use href="#i-more"/></svg></button>
+    </div>
+    <div class="viewer-stage"><div class="player ph" style="--a:#3b6f7a;--b:#12262b"><div class="ctl"><div class="track"><i></i></div><span>4:36 / 12:04</span></div></div></div>
+    <div class="viewer-bar"><div class="bar4">
+      <button><svg><use href="#i-download"/></svg>Download</button>
+      <button><svg><use href="#i-send"/></svg>Send to</button>
+      <button><svg><use href="#i-star"/></svg>Star</button>
+      <button><svg><use href="#i-more"/></svg>Open in…</button>
+    </div></div>
+  </div>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Viewer: cannot show it here ─────────────────────────────── -->
+<figure>
+<figcaption>Anything the device cannot show itself (a video format it cannot decode, a spreadsheet, an archive): say so in a sentence, offer the two things that work.</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <div class="viewer">
+    <div class="viewer-top">
+      <button class="btn icon" aria-label="Close"><svg><use href="#i-down"/></svg></button>
+      <span class="name">Concert.mkv<small>Video · 6.3 GB · last month</small></span>
+      <button class="btn icon" aria-label="More"><svg><use href="#i-more"/></svg></button>
+    </div>
+    <div class="viewer-stage"><div class="said">
+      <strong>This phone can't play this kind of video</strong>
+      Open it in another app that can, or download it first.
+      <p style="display:grid;gap:8px;margin-top:18px"><button class="btn primary">Open in another app</button><button class="btn" style="color:#fff">Download to this phone</button></p>
+    </div></div>
+    <div class="viewer-bar"><div class="bar4">
+      <button><svg><use href="#i-download"/></svg>Download</button>
+      <button><svg><use href="#i-send"/></svg>Send to</button>
+      <button><svg><use href="#i-star"/></svg>Star</button>
+      <button><svg><use href="#i-more"/></svg>Open in…</button>
+    </div></div>
+  </div>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Send to ─────────────────────────────── -->
+<figure>
+<figcaption>Send to: copy or move, which machine, which folder there, then one button that says what will happen. It runs on the machines and shows in Activity.</figcaption>
+<div class="frame"><div class="shell"><div class="app standalone">
+  <header class="top"><button class="btn icon"><svg><use href="#i-back"/></svg></button><h1>Holiday</h1></header>
+  <main class="main"></main>
+  <div class="scrim"><div class="sheet">
+    <h2 style="margin:8px 0 2px;font-size:19px">Send Arrival.mp4</h2>
+    <p class="dim" style="margin:0 0 12px">1.2 GB · from tower</p>
+    <div class="seg"><button aria-pressed="true">Copy</button><button aria-pressed="false">Move</button></div>
+    <p class="label">To</p>
+    <div class="list">
+      <label class="row picked"><span class="dot"></span><span class="body"><span class="title">pi</span><span class="sub">61 GB free</span></span><span class="check"></span></label>
+      <label class="row"><span class="dot"></span><span class="body"><span class="title">studio</span><span class="sub">312 GB free</span></span><span class="check"></span></label>
+      <label class="row off"><span class="dot off"></span><span class="body"><span class="title">laptop</span><span class="sub">Off · turn it on to send here</span></span><button class="btn small">Wake</button></label>
+      <label class="row"><span class="body"><span class="title">This phone</span><span class="sub">Downloads</span></span><span class="check"></span></label>
+    </div>
+    <p class="label">Folder on pi</p>
+    <div class="list">
+      <a class="row" href="#"><span class="thumb folder"><svg><use href="#i-files"/></svg></span><span class="body"><span class="title">Films</span><span class="sub">Pinned · Home › Films</span></span><span class="chev">Change</span></a>
+    </div>
+    <p style="display:grid;margin:18px 0 0"><button class="btn primary">Copy to pi</button></p>
+  </div></div>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Selecting ─────────────────────────────── -->
+<figure>
+<figcaption>A long press starts selecting. The title counts, the dock becomes the actions, back ends selecting.</figcaption>
+<div class="frame"><div class="shell"><div class="app standalone docked">
+  <header class="top">
+    <button class="btn icon" aria-label="Stop selecting"><svg><use href="#i-back"/></svg></button>
+    <h1>3 selected<small>2.0 GB</small></h1>
+    <button class="btn small quiet">Select all</button>
+  </header>
+  <main class="main">
+    <div class="list">
+      <label class="row"><span class="thumb folder"><svg><use href="#i-files"/></svg></span><span class="body"><span class="title">Raw</span><span class="sub">Folder · 3 days ago</span></span><span class="check"></span></label>
+      <label class="row picked"><span class="thumb"><span class="ph" style="--a:#3b6f7a;--b:#12262b"></span></span><span class="body"><span class="title">Arrival.mp4</span><span class="sub">Video · 1.2 GB</span></span><span class="check"></span></label>
+      <label class="row picked"><span class="thumb"><span class="ph" style="--a:#7a6a3b;--b:#2b2412"></span></span><span class="body"><span class="title">Beach.mp4</span><span class="sub">Video · 840 MB</span></span><span class="check"></span></label>
+      <label class="row picked"><span class="thumb"><span class="ph" style="--a:#5d7a3b;--b:#1b2b12"></span></span><span class="body"><span class="title">IMG_2041.jpg</span><span class="sub">Picture · 4.1 MB</span></span><span class="check"></span></label>
+      <label class="row"><span class="thumb"><span class="ph" style="--a:#3b4f7a;--b:#12182b"></span></span><span class="body"><span class="title">IMG_2042.jpg</span><span class="sub">Picture · 3.8 MB</span></span><span class="check"></span></label>
+    </div>
+  </main>
+  <div class="dock"><div class="bar4">
+    <button><svg><use href="#i-send"/></svg>Send to</button>
+    <button><svg><use href="#i-download"/></svg>Download</button>
+    <button><svg><use href="#i-star"/></svg>Star</button>
+    <button class="danger"><svg><use href="#i-bin"/></svg>Delete</button>
+  </div></div>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Search ─────────────────────────────── -->
+<figure>
+<figcaption>Search across machines. Kinds as chips above the box. Results arrive machine by machine; a machine that is off is named as not searched.</figcaption>
+<div class="frame"><div class="shell"><div class="app docked">
+  <header class="top">
+    <button class="btn icon" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <h1>Search<small>7 found on 3 machines</small></h1>
+  </header>
+  <main class="main">
+    <p class="label">tower</p>
+    <div class="list">
+      <a class="row" href="#"><span class="thumb"><span class="ph" style="--a:#3b6f7a;--b:#12262b"></span></span><span class="body"><span class="title">Arrival.mp4</span><span class="sub">Home › Videos › Holiday · 1.2 GB</span></span><span class="star">★</span></a>
+      <a class="row" href="#"><span class="thumb"><span class="ph" style="--a:#7a3b5d;--b:#2b1220"></span></span><span class="body"><span class="title">Arrival at the lake.mov</span><span class="sub">Home › Videos › 2025 · 2.6 GB</span></span></a>
+    </div>
+    <p class="label">nas</p>
+    <div class="list">
+      <a class="row" href="#"><span class="thumb"><svg><use href="#i-video"/></svg></span><span class="body"><span class="title">Arrival (2016).mkv</span><span class="sub">Films · 9.8 GB</span></span></a>
+    </div>
+    <p class="label">pi</p>
+    <div class="empty">Nothing found.</div>
+    <p class="dim" style="margin:16px 2px 0;font-size:var(--text-sub)">laptop is off and was not searched.</p>
+  </main>
+  <div class="dock">
+    <div class="filters" role="group" aria-label="Kind">
+      <button aria-pressed="false">Pictures</button><button aria-pressed="true">Videos</button><button aria-pressed="false">Music</button><button aria-pressed="false">Documents</button><button aria-pressed="false">Folders</button><button aria-pressed="false">More filters</button>
+    </div>
+    <input class="input plain" value="arrival" aria-label="Search all machines">
+  </div>
+  <nav class="nav">
+    <a href="#"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#" aria-current="page"><svg><use href="#i-files"/></svg>Files</a>
+    <a href="#"><svg><use href="#i-activity"/></svg>Activity</a>
+    <a href="#"><svg><use href="#i-actions"/></svg>Actions</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── A folder kept in sync ─────────────────────────────── -->
+<figure>
+<figcaption>A folder kept in sync. State in a sentence per machine. Two versions and the bin are things to look at, not alarms.</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top">
+    <button class="btn icon" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <h1>Camera<small>Kept in sync on 4 machines</small></h1>
+  </header>
+  <main class="main">
+    <div class="list">
+      <a class="row" href="#"><span class="thumb folder"><svg><use href="#i-files"/></svg></span><span class="body"><span class="title">Open the folder</span><span class="sub">1,204 files · 38 GB</span></span><span class="chev">›</span></a>
+    </div>
+    <p class="label">Copies</p>
+    <div class="list">
+      <a class="row" href="#"><span class="dot"></span><span class="body"><span class="title">tower</span><span class="sub">Up to date · Home › Pictures › Camera</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="dot"></span><span class="body"><span class="title">pi</span><span class="sub">Up to date</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="dot busy"></span><span class="body"><span class="title">studio</span><span class="sub">Getting 3 files · 410 MB left<span class="progress" style="--v:62"><i></i></span></span></span><span class="chev">›</span></a>
+      <a class="row off" href="#"><span class="dot off"></span><span class="body"><span class="title">laptop</span><span class="sub">Off · 14 files waiting for it</span></span><span class="chev">›</span></a>
+    </div>
+    <p style="display:grid;margin:12px 0 0"><button class="btn">Add a machine</button></p>
+    <p class="label">To look at</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">1 file has two versions</span><span class="sub wrap">Changed on tower and on studio while apart. Both are kept.</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Bin</span><span class="sub">6 deleted files · kept for 30 days</span></span><span class="chev">›</span></a>
+    </div>
+    <p class="label">This folder</p>
+    <div class="list">
+      <label class="row"><span class="body"><span class="title">Pause syncing</span></span><span class="switch row-switch"><input type="checkbox"></span></label>
+      <a class="row" href="#"><span class="body"><span class="title">Stop keeping it in sync</span><span class="sub wrap">The files stay on every machine</span></span><span class="chev">›</span></a>
+    </div>
+  </main>
+  <nav class="nav">
+    <a href="#"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#" aria-current="page"><svg><use href="#i-files"/></svg>Files</a>
+    <a href="#"><svg><use href="#i-activity"/></svg>Activity</a>
+    <a href="#"><svg><use href="#i-actions"/></svg>Actions</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Activity with transfers ─────────────────────────────── -->
+<figure>
+<figcaption>Activity gains transfers and downloads: what, where to, how far. A finished download opens with a tap.</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top"><h1>Activity<small>2 things running</small></h1><button class="btn icon" aria-label="Settings"><svg><use href="#i-gear"/></svg></button></header>
+  <main class="main">
+    <p class="label">Now</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Copying Arrival.mp4 to pi</span><span class="sub">tower · 498 MB of 1.2 GB · about 1 minute left<span class="progress" style="--v:41"><i></i></span></span></span><span class="state running">41%</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Downloading Beach.mp4</span><span class="sub">To this phone · 210 MB of 840 MB<span class="progress" style="--v:25"><i></i></span></span></span><span class="state running">25%</span></a>
+    </div>
+    <p class="label">Earlier today</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Downloaded Tickets.pdf</span><span class="sub">To this phone · tap to open</span></span><span class="state done">Finished</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Moved 12 items to nas</span><span class="sub">From tower · 2 hours ago · took 4 minutes</span></span><span class="state done">Finished</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Copying Films to laptop</span><span class="sub wrap">Stopped when laptop went off. It continues from where it was when you start it again.</span></span><span class="state failed">Stopped</span></a>
+    </div>
+  </main>
+  <nav class="nav">
+    <a href="#"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#"><svg><use href="#i-files"/></svg>Files</a>
+    <a href="#" aria-current="page"><svg><use href="#i-activity"/></svg>Activity</a>
+    <a href="#"><svg><use href="#i-actions"/></svg>Actions</a>
+  </nav>
+</div></div></div>
+</figure>
