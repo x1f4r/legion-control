@@ -254,6 +254,16 @@ jobs:
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
         run: cargo tauri build --bundles deb,appimage
+      - name: Verify deb package metadata does not collide with node package
+        run: |
+          set -euo pipefail
+          DEB="$(find apps/legion-app/src-tauri/target/release/bundle/deb -maxdepth 1 -name '*.deb' | head -n 1)"
+          test -f "$DEB"
+          PKG="$(dpkg-deb -f "$DEB" Package)"
+          echo "Desktop app .deb package name: $PKG"
+          test "$PKG" = "legion-app"
+          ! dpkg-deb -f "$DEB" Description | grep -qx ' (none)'
+          dpkg-deb --fsys-tarfile "$DEB" | tar -xOf - ./usr/share/applications/legion-app.desktop | grep -qx 'Name=Legion'
       - name: Launch Linux app under Xvfb and verify ready marker
         run: |
           set -euo pipefail
