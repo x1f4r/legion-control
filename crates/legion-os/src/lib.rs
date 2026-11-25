@@ -7,11 +7,13 @@
 #![warn(missing_docs)]
 
 pub mod atomic;
+pub mod capped_alloc;
 pub mod detach;
 mod error;
 pub mod file_id;
 pub mod lock;
 pub mod mem_limit;
+pub mod open_regular;
 pub mod procid;
 pub mod run;
 pub mod shell;

@@ -1,6 +1,8 @@
 //! Effective memory limit detection (cgroup v2/v1, systemd `MemoryMax`, Windows Job Object, and
 //! host RAM) plus fast per-process resident memory (RSS) sampling for watchdogs.
 
+use std::time::Duration;
+
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 /// Sentinel threshold above which cgroup v1 `memory.limit_in_bytes` means "unlimited"
@@ -26,6 +28,12 @@ pub fn effective_memory_bytes() -> u64 {
 /// has exited or cannot be queried.
 pub fn process_rss_bytes(pid: u32) -> Option<u64> {
     imp::process_rss_bytes(pid)
+}
+
+/// Samples the cumulative CPU time (user + kernel) consumed by process `pid`, returning `None` if
+/// the process has exited or cannot be queried.
+pub fn process_cpu_time(pid: u32) -> Option<Duration> {
+    imp::process_cpu_time(pid)
 }
 
 fn host_total_memory_bytes() -> u64 {
@@ -117,6 +125,32 @@ mod imp {
         Some(resident_pages.saturating_mul(page_size()))
     }
 
+    fn clock_ticks_per_sec() -> u64 {
+        static TICKS: OnceLock<u64> = OnceLock::new();
+        *TICKS.get_or_init(|| {
+            // SAFETY: `sysconf(_SC_CLK_TCK)` is thread-safe and has no preconditions.
+            #[allow(unsafe_code)]
+            let raw = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+            u64::try_from(raw).ok().filter(|&v| v > 0).unwrap_or(100)
+        })
+    }
+
+    /// Reads total user + kernel CPU time directly from `/proc/<pid>/stat`.
+    pub(super) fn process_cpu_time(pid: u32) -> Option<std::time::Duration> {
+        let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_comm = text.rsplit_once(')')?.1;
+        let mut fields = after_comm.split_whitespace();
+        // Fields after `)` start at index 0 = state (field 3); utime is field 14 (idx 11), stime is field 15 (idx 12).
+        let utime: u64 = fields.nth(11)?.parse().ok()?;
+        let stime: u64 = fields.next()?.parse().ok()?;
+        let total_ticks = utime.saturating_add(stime);
+        let tps = clock_ticks_per_sec();
+        let nanos = u128::from(total_ticks).saturating_mul(1_000_000_000) / u128::from(tps);
+        Some(std::time::Duration::from_nanos(
+            u64::try_from(nanos).unwrap_or(u64::MAX),
+        ))
+    }
+
     pub(super) fn container_or_job_memory_limit() -> Option<u64> {
         let proc_cg = fs::read_to_string("/proc/self/cgroup").ok()?;
         let mut best: Option<u64> = None;
@@ -192,6 +226,18 @@ mod imp {
         sys.process(spid).map(|p| p.memory())
     }
 
+    pub(super) fn process_cpu_time(pid: u32) -> Option<std::time::Duration> {
+        let mut sys = System::new().ok()?;
+        let spid = Pid::from_u32(pid);
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[spid]),
+            true,
+            ProcessRefreshKind::nothing().with_cpu(),
+        );
+        sys.process(spid)
+            .map(|p| std::time::Duration::from_millis(p.accumulated_cpu_time()))
+    }
+
     pub(super) fn container_or_job_memory_limit() -> Option<u64> {
         None
     }
@@ -200,12 +246,17 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use std::mem::size_of;
+    use std::time::Duration;
 
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
     use windows::Win32::System::JobObjects::{
         JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
         QueryInformationJobObject,
+    };
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     pub(super) fn process_rss_bytes(pid: u32) -> Option<u64> {
@@ -217,6 +268,33 @@ mod imp {
             ProcessRefreshKind::nothing().with_memory(),
         );
         sys.process(spid).map(|p| p.memory())
+    }
+
+    pub(super) fn process_cpu_time(pid: u32) -> Option<Duration> {
+        // SAFETY: opens the PID with read-only limited query access and closes the handle before returning.
+        #[allow(unsafe_code)]
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: `handle` is valid and all four `FILETIME` pointers refer to initialized locals.
+        #[allow(unsafe_code)]
+        let ok = unsafe {
+            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user).is_ok()
+        };
+        // SAFETY: `handle` is owned by this function.
+        #[allow(unsafe_code)]
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        if !ok {
+            return None;
+        }
+        let k = (u64::from(kernel.dwHighDateTime) << 32) | u64::from(kernel.dwLowDateTime);
+        let u = (u64::from(user.dwHighDateTime) << 32) | u64::from(user.dwLowDateTime);
+        let ticks_100ns = k.saturating_add(u);
+        Some(Duration::from_nanos(ticks_100ns.saturating_mul(100)))
     }
 
     pub(super) fn container_or_job_memory_limit() -> Option<u64> {
@@ -256,6 +334,10 @@ mod imp {
 #[cfg(not(any(unix, windows)))]
 mod imp {
     pub(super) fn process_rss_bytes(_pid: u32) -> Option<u64> {
+        None
+    }
+
+    pub(super) fn process_cpu_time(_pid: u32) -> Option<std::time::Duration> {
         None
     }
 

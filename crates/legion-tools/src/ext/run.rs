@@ -374,7 +374,9 @@ mod tests {
             timed_out: false,
             cancelled: false,
             killed_for_memory: false,
+            memory_watchdog_killed: false,
             peak_rss_bytes: 0,
+            cpu_time: None,
             stdout_bytes: Vec::new(),
             duration: Duration::from_millis(5),
         }

@@ -1,9 +1,10 @@
 //! Windows Job Object containment and hard process/job memory limits for [`super::run`].
 //!
 //! Each child is assigned to a dedicated Windows Job Object with `KILL_ON_JOB_CLOSE`. When a
-//! `memory_limit` is requested, a nested Job Object with `JOB_OBJECT_LIMIT_PROCESS_MEMORY` and
-//! `JOB_OBJECT_LIMIT_JOB_MEMORY` is attached to enforce the hard ceiling in the kernel alongside
-//! the parent RSS watchdog.
+//! `memory_limit` is requested, the child is created suspended (`CREATE_SUSPENDED`), assigned to a
+//! nested Job Object with `JOB_OBJECT_LIMIT_PROCESS_MEMORY` and `JOB_OBJECT_LIMIT_JOB_MEMORY`
+//! sized with the same headroom rule (`memory_limit + rlimit_as_headroom`) before any child code
+//! executes, and only then resumed.
 
 use std::mem::size_of;
 use std::process::ExitStatus;
@@ -11,6 +12,9 @@ use std::time::Duration;
 
 use process_wrap::tokio::{ChildWrapper, CommandWrap, CreationFlags, JobObject, KillOnDrop};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
@@ -18,7 +22,8 @@ use windows::Win32::System::JobObjects::{
     SetInformationJobObject,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenProcess, OpenThread, PROCESS_SET_QUOTA,
+    PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 
 const POST_KILL_WAIT: Duration = Duration::from_secs(2);
@@ -46,10 +51,18 @@ impl Drop for TreeDropGuard {
 }
 
 impl TreeDropGuard {
-    pub(super) fn new(child_pid: Option<u32>, memory_limit: Option<u64>) -> Self {
-        let mem_job = child_pid
-            .zip(memory_limit)
-            .and_then(|(pid, limit)| attach_memory_job(pid, limit));
+    pub(super) fn new(
+        child_pid: Option<u32>,
+        memory_limit: Option<u64>,
+        memory_headroom: u64,
+    ) -> Self {
+        let mem_job = child_pid.zip(memory_limit).and_then(|(pid, limit)| {
+            let job = attach_memory_job(pid, limit.saturating_add(memory_headroom));
+            // Always resume the suspended child after attempting Job Object attachment so it
+            // begins executing with the limit already active (or falls back to the RSS watchdog).
+            resume_process_threads(pid);
+            job
+        });
         Self { mem_job }
     }
 
@@ -58,8 +71,8 @@ impl TreeDropGuard {
     }
 }
 
-fn attach_memory_job(pid: u32, memory_limit: u64) -> Option<HANDLE> {
-    let limit = usize::try_from(memory_limit).unwrap_or(usize::MAX);
+fn attach_memory_job(pid: u32, commit_limit: u64) -> Option<HANDLE> {
+    let limit = usize::try_from(commit_limit).unwrap_or(usize::MAX);
     // SAFETY: creates an anonymous Job Object with no name or custom security descriptor.
     #[allow(unsafe_code)]
     let job = unsafe { CreateJobObjectW(None, None) }.ok()?;
@@ -126,17 +139,71 @@ fn attach_memory_job(pid: u32, memory_limit: u64) -> Option<HANDLE> {
     Some(job)
 }
 
+/// Resumes the primary thread(s) of a child created with `CREATE_SUSPENDED` after its memory-limit
+/// Job Object has been attached.
+fn resume_process_threads(pid: u32) {
+    // SAFETY: `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)` takes plain integer arguments and
+    // returns an owned snapshot handle closed before returning.
+    #[allow(unsafe_code)]
+    let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }) else {
+        return;
+    };
+    if snap.is_invalid() {
+        return;
+    }
+
+    let mut entry = THREADENTRY32 {
+        dwSize: u32::try_from(size_of::<THREADENTRY32>()).unwrap_or(0),
+        ..Default::default()
+    };
+
+    // SAFETY: `snap` is a valid ToolHelp32 snapshot handle and `entry.dwSize` is initialized.
+    #[allow(unsafe_code)]
+    let mut has_next = unsafe { Thread32First(snap, &mut entry) }.is_ok();
+    while has_next {
+        if entry.th32OwnerProcessID == pid {
+            // SAFETY: opens the suspended thread owned by our child PID to resume it and closes the handle.
+            #[allow(unsafe_code)]
+            if let Ok(thread) =
+                unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) }
+            {
+                #[allow(unsafe_code)]
+                unsafe {
+                    let _ = ResumeThread(thread);
+                    let _ = CloseHandle(thread);
+                }
+            }
+        }
+        // SAFETY: `snap` is valid and `entry.dwSize` remains set.
+        #[allow(unsafe_code)]
+        {
+            has_next = unsafe { Thread32Next(snap, &mut entry) }.is_ok();
+        }
+    }
+
+    // SAFETY: `snap` is an owned ToolHelp32 handle.
+    #[allow(unsafe_code)]
+    unsafe {
+        let _ = CloseHandle(snap);
+    }
+}
+
 pub(super) fn configure_pre_exec_memory_limit(
     _cmd: &mut tokio::process::Command,
     _memory_limit: Option<u64>,
     _rlimit_as_headroom: u64,
 ) {
-    // Windows enforces memory limits via the Job Object attached in `TreeDropGuard::new`.
+    // Windows enforces memory limits via the suspended-create + Job Object path in `TreeDropGuard::new`.
 }
 
-pub(super) fn configure_containment(wrapped: &mut CommandWrap) {
+pub(super) fn configure_containment(wrapped: &mut CommandWrap, suspend_for_memory_job: bool) {
+    let flags = if suspend_for_memory_job {
+        CREATE_NO_WINDOW | CREATE_SUSPENDED
+    } else {
+        CREATE_NO_WINDOW
+    };
     wrapped
-        .wrap(CreationFlags(CREATE_NO_WINDOW))
+        .wrap(CreationFlags(flags))
         .wrap(JobObject)
         .wrap(KillOnDrop);
 }

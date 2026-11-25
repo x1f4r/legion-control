@@ -22,7 +22,11 @@ pub(super) struct TreeDropGuard {
 }
 
 impl TreeDropGuard {
-    pub(super) fn new(child_pid: Option<u32>, _memory_limit: Option<u64>) -> Self {
+    pub(super) fn new(
+        child_pid: Option<u32>,
+        _memory_limit: Option<u64>,
+        _memory_headroom: u64,
+    ) -> Self {
         let pgid = child_pid
             .and_then(|pid| i32::try_from(pid).ok())
             .map(Pid::from_raw);
@@ -110,7 +114,7 @@ impl Drop for TreeDropGuard {
     }
 }
 
-pub(super) fn configure_containment(wrapped: &mut CommandWrap) {
+pub(super) fn configure_containment(wrapped: &mut CommandWrap, _suspend_for_memory_job: bool) {
     wrapped.wrap(ProcessGroup::leader()).wrap(KillOnDrop);
 }
 

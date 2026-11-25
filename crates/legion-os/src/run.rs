@@ -83,7 +83,9 @@ pub struct RunOptions {
     pub command: CommandSpec,
     /// Optional working directory; inherits the caller's current directory when `None`.
     pub cwd: Option<PathBuf>,
-    /// Extra environment variables applied on top of the inherited environment.
+    /// When `true`, clears the inherited environment before applying [`Self::env`].
+    pub env_clear: bool,
+    /// Extra environment variables applied on top of the inherited (or cleared) environment.
     pub env: BTreeMap<OsString, OsString>,
     /// Inherited environment variable names to drop before applying explicit [`Self::env`] entries.
     pub env_remove: Vec<OsString>,
@@ -142,6 +144,7 @@ impl RunOptions {
         Self {
             command,
             cwd: None,
+            env_clear: false,
             env: BTreeMap::new(),
             env_remove: Vec::new(),
             stdin: None,
@@ -167,6 +170,12 @@ impl RunOptions {
     /// Set a single environment variable for the child process.
     pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.env.insert(key.into(), value.into());
+        self
+    }
+
+    /// Clear the inherited environment before applying explicit [`Self::env`] entries.
+    pub fn env_clear(mut self, clear: bool) -> Self {
+        self.env_clear = clear;
         self
     }
 
@@ -296,10 +305,18 @@ pub struct RunOutput {
     pub timed_out: bool,
     /// `true` if the cancellation token fired and its process tree was terminated.
     pub cancelled: bool,
-    /// `true` if the process was terminated for exceeding [`RunOptions::memory_limit`].
+    /// `true` if the process was terminated for exceeding [`RunOptions::memory_limit`] (either
+    /// directly by our RSS watchdog, by our worker capped allocator exit code, or by an explicit
+    /// allocator OOM message/status under our limit — never an unrelated external `SIGKILL`).
     pub killed_for_memory: bool,
+    /// `true` specifically when our RSS watchdog sampled the child above [`RunOptions::memory_limit`]
+    /// and terminated it.
+    pub memory_watchdog_killed: bool,
     /// Peak resident memory (RSS) in bytes observed for the child while it ran (when sampled).
     pub peak_rss_bytes: u64,
+    /// Cumulative user + kernel CPU time observed for the child right before termination or exit,
+    /// when available from the OS.
+    pub cpu_time: Option<Duration>,
     /// Elapsed wall-clock duration of the call.
     pub duration: Duration,
 }
@@ -351,7 +368,9 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
             timed_out: false,
             cancelled: true,
             killed_for_memory: false,
+            memory_watchdog_killed: false,
             peak_rss_bytes: 0,
+            cpu_time: None,
             duration: started.elapsed(),
         });
     }
@@ -361,13 +380,18 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
     let has_stdin_bytes = stdin_file.is_none() && options.stdin.is_some();
     let memory_limit = options.memory_limit;
     let rlimit_as_headroom = options.rlimit_as_headroom;
+    let env_clear = options.env_clear;
     let mut wrapped = CommandWrap::with_new(&resolved.program, |cmd| {
         cmd.args(&resolved.args);
-        for key in &resolved.env_remove {
-            cmd.env_remove(key);
-        }
-        for key in &options.env_remove {
-            cmd.env_remove(key);
+        if env_clear {
+            cmd.env_clear();
+        } else {
+            for key in &resolved.env_remove {
+                cmd.env_remove(key);
+            }
+            for key in &options.env_remove {
+                cmd.env_remove(key);
+            }
         }
         for (key, value) in &options.env {
             cmd.env(key, value);
@@ -386,13 +410,13 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
         cmd.stderr(Stdio::piped());
         configure_pre_exec_memory_limit(cmd, memory_limit, rlimit_as_headroom);
     });
-    configure_containment(&mut wrapped)?;
+    configure_containment(&mut wrapped, memory_limit.is_some())?;
 
     let mut child = wrapped
         .spawn()
         .map_err(|err| OsError::from_spawn_io(program_display, err))?;
     let child_pid = child.id();
-    let mut tree_guard = create_drop_guard(child_pid, memory_limit);
+    let mut tree_guard = create_drop_guard(child_pid, memory_limit, rlimit_as_headroom);
 
     let stdin_task = if has_stdin_bytes {
         match (child.stdin().take(), options.stdin) {
@@ -435,7 +459,8 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
     let mut exit_status: Option<ExitStatus> = None;
     let mut timed_out = false;
     let mut cancelled = false;
-    let mut killed_for_memory = false;
+    let mut memory_watchdog_killed = false;
+    let mut cpu_time: Option<Duration> = None;
 
     // Phase 1: wait for the DIRECT child to exit (never blocking on grandchildren in a Job Object
     // or process group), or for timeout / cancellation / RSS watchdog breach.
@@ -445,12 +470,14 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
         }
         () = wait_deadline(deadline) => {
             timed_out = true;
+            cpu_time = child_pid.and_then(crate::mem_limit::process_cpu_time);
         }
         () = options.cancel.cancelled() => {
             cancelled = true;
         }
         () = watch_memory_limit(child_pid, memory_limit, options.rss_poll_interval, Arc::clone(&peak_rss)) => {
-            killed_for_memory = true;
+            memory_watchdog_killed = true;
+            cpu_time = child_pid.and_then(crate::mem_limit::process_cpu_time);
         }
     }
 
@@ -459,7 +486,7 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
 
     // Phase 2: stop any surviving processes in the group/job under one consistent rule on every
     // platform—whether the direct child exited normally or we hit timeout/cancellation/OOM.
-    if killed_for_memory {
+    if memory_watchdog_killed {
         // Immediate kill with zero grace so a runaway allocator stops at once.
         let kill_status = terminate_tree(&mut child, child_pid, Duration::ZERO).await;
         if exit_status.is_none() {
@@ -506,8 +533,14 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
     let (stdout, stdout_bytes) = stdout_captured.unwrap_or_default();
     let (stderr, _) = stderr_captured.unwrap_or_default();
 
-    // Detect OS-enforced OOM kills (e.g. Linux RLIMIT_AS causing Rust's `memory allocation of ...
-    // failed` + SIGABRT, or kernel SIGKILL / Windows ERROR_NOT_ENOUGH_MEMORY) as memory-limit kills.
+    // Only classify a death as `killed_for_memory` when THIS node's own memory limit decided it:
+    // - our RSS watchdog observed `rss > limit`,
+    // - our worker's `CappedAlloc` exited with `CAP_EXCEEDED_EXIT_CODE`, or
+    // - under an active `memory_limit`, stderr explicitly reports an allocation failure (e.g.
+    //   Rust's `memory allocation of ... failed` under `RLIMIT_AS`) or Windows `STATUS_NO_MEMORY`.
+    // Never classify an unrelated external `SIGKILL` or arbitrary signal as a memory kill.
+    let mut killed_for_memory =
+        memory_watchdog_killed || exit_code == Some(crate::capped_alloc::CAP_EXCEEDED_EXIT_CODE);
     if memory_limit.is_some()
         && !killed_for_memory
         && !timed_out
@@ -515,10 +548,11 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
         && exit_code != Some(0)
     {
         let err_lower = stderr.text.to_ascii_lowercase();
+        const WINDOWS_STATUS_NO_MEMORY: i32 = 0xC000_0017u32 as i32;
         if err_lower.contains("memory allocation of")
             || err_lower.contains("out of memory")
             || err_lower.contains("cannot allocate memory")
-            || signal == Some(9)
+            || exit_code == Some(WINDOWS_STATUS_NO_MEMORY)
         {
             killed_for_memory = true;
         }
@@ -533,7 +567,9 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
         timed_out,
         cancelled,
         killed_for_memory,
+        memory_watchdog_killed,
         peak_rss_bytes: peak_rss.load(Ordering::Relaxed),
+        cpu_time,
         duration: started.elapsed(),
     })
 }
@@ -765,8 +801,12 @@ impl BoundedCapture {
 }
 
 #[cfg(any(unix, windows))]
-fn create_drop_guard(child_pid: Option<u32>, memory_limit: Option<u64>) -> platform::TreeDropGuard {
-    platform::TreeDropGuard::new(child_pid, memory_limit)
+fn create_drop_guard(
+    child_pid: Option<u32>,
+    memory_limit: Option<u64>,
+    memory_headroom: u64,
+) -> platform::TreeDropGuard {
+    platform::TreeDropGuard::new(child_pid, memory_limit, memory_headroom)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -778,7 +818,11 @@ impl FallbackDropGuard {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn create_drop_guard(_child_pid: Option<u32>, _memory_limit: Option<u64>) -> FallbackDropGuard {
+fn create_drop_guard(
+    _child_pid: Option<u32>,
+    _memory_limit: Option<u64>,
+    _memory_headroom: u64,
+) -> FallbackDropGuard {
     FallbackDropGuard
 }
 
@@ -800,13 +844,13 @@ fn configure_pre_exec_memory_limit(
 }
 
 #[cfg(any(unix, windows))]
-fn configure_containment(wrapped: &mut CommandWrap) -> Result<()> {
-    platform::configure_containment(wrapped);
+fn configure_containment(wrapped: &mut CommandWrap, suspend_for_memory_job: bool) -> Result<()> {
+    platform::configure_containment(wrapped, suspend_for_memory_job);
     Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
-fn configure_containment(_wrapped: &mut CommandWrap) -> Result<()> {
+fn configure_containment(_wrapped: &mut CommandWrap, _suspend_for_memory_job: bool) -> Result<()> {
     Err(OsError::Unsupported {
         detail: "process-tree containment is not supported on this platform".into(),
     })
