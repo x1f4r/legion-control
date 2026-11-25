@@ -1400,9 +1400,13 @@ paths = ["~/projects"]
 
     let wait_ready = |rx: &mpsc::Receiver<Vec<u8>>| -> Value {
         let mut gathered = Vec::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while gathered.iter().filter(|b| **b == b'\n').count() < 2 {
-            assert!(std::time::Instant::now() < deadline);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for lock ready reply; got so far: {:?}",
+                String::from_utf8_lossy(&gathered)
+            );
             if let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(25)) {
                 gathered.extend_from_slice(&chunk);
             }

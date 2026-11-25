@@ -3672,13 +3672,55 @@ fn move_lock_meta_path(lock_path: &Path) -> PathBuf {
     lock_path.with_extension("meta")
 }
 
+/// Writes ephemeral move-lock metadata (`<key>.meta`) atomically without fsyncing: move locks are
+/// scoped to the holding process and vanish on exit or reboot, so calling `sync_all()` per path
+/// adds seconds of NTFS flush latency on Windows (especially for 256-path batches) with no
+/// durability benefit. Uses a sibling temp file + rename so concurrent readers never observe a
+/// half-written JSON object.
 fn write_lock_meta(lock_path: &Path, meta: &MoveLockMeta) {
-    if let Ok(bytes) = serde_json::to_vec(meta) {
-        let _ = write_atomic(
-            move_lock_meta_path(lock_path),
-            &bytes,
-            WriteOptions::with_mode(0o600),
-        );
+    static META_SEQ: AtomicU64 = AtomicU64::new(0);
+    let Ok(bytes) = serde_json::to_vec(meta) else {
+        return;
+    };
+    let meta_path = move_lock_meta_path(lock_path);
+    let seq = META_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(
+        ".{}.tmp.{}.{seq}",
+        meta_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("lock"),
+        std::process::id()
+    );
+    let tmp_path = meta_path.with_file_name(tmp_name);
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if opts
+        .open(&tmp_path)
+        .and_then(|mut f| f.write_all(&bytes))
+        .is_err()
+    {
+        let _ = fs::remove_file(&tmp_path);
+        return;
+    }
+    let mut renamed = false;
+    for attempt in 0..5 {
+        match fs::rename(&tmp_path, &meta_path) {
+            Ok(()) => {
+                renamed = true;
+                break;
+            }
+            Err(_) if attempt < 4 => std::thread::sleep(Duration::from_millis(5)),
+            Err(_) => break,
+        }
+    }
+    if !renamed {
+        let _ = fs::remove_file(&tmp_path);
     }
 }
 
@@ -3711,15 +3753,18 @@ impl HeldLockFiles {
         job_id: Option<&str>,
         expires_at_ms: u64,
     ) {
+        let Some((id_lock_path, _)) = self.files.first() else {
+            return;
+        };
         let meta = MoveLockMeta {
             lock_id: lock_id.to_owned(),
             principal: principal.to_owned(),
             job_id: job_id.map(str::to_owned),
             expires_at_ms,
         };
-        for (path, _) in &self.files {
-            write_lock_meta(path, &meta);
-        }
+        // Only `id-<lock_id>.meta` carries the authoritative lease deadline checked by `delete`;
+        // per-path `.meta` files record immutable holder/lock_id ownership.
+        write_lock_meta(id_lock_path, &meta);
     }
 }
 
