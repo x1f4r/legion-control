@@ -55,16 +55,38 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
+  private fun currentUpdateOwnerPackage(): String? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+      return null
+    }
+    return try {
+      activity.packageManager.getInstallSourceInfo(activity.packageName).updateOwnerPackageName
+    } catch (e: Exception) {
+      Log.w(TAG, "Could not inspect update owner info: ${e.message}")
+      null
+    }
+  }
+
   private fun capabilitiesPayload(): JSObject {
     val canInstall = activity.packageManager.canRequestPackageInstalls()
     val installer = currentInstallerPackage()
+    val updateOwner = currentUpdateOwnerPackage()
     val selfInstaller = installer == activity.packageName
+    // Android 12+ (API 31+) allows prompt-free self-updates when UPDATE_PACKAGES_WITHOUT_USER_ACTION
+    // is declared, Install unknown apps is granted, and no competing update owner holds the package
+    // (on API 34+, Android checks updateOwnerPackageName; on API 31-33, installerPackageName).
+    val ownerAllowsSilent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+      updateOwner == null || updateOwner == activity.packageName
+    } else {
+      selfInstaller || installer == null
+    }
+    val supportsSilent = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && canInstall && ownerAllowsSilent
     return JSObject().apply {
       put("canRequestPackageInstalls", canInstall)
       put("isSelfInstaller", selfInstaller)
       put("installerPackage", installer ?: "")
       put("apiLevel", Build.VERSION.SDK_INT)
-      put("supportsSilentSelfUpdate", Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && canInstall && selfInstaller)
+      put("supportsSilentSelfUpdate", supportsSilent)
     }
   }
 

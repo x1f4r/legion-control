@@ -529,16 +529,20 @@ pub struct UpdateManager {
 }
 
 impl UpdateManager {
-    /// Creates the production update manager for this app using compiled-in trusted keys and
-    /// detected platform/install kind.
-    pub fn for_app(data_dir: impl AsRef<Path>) -> Self {
+    /// Creates the production update manager for this app using compiled-in trusted keys, the
+    /// bundle's configured version string, and the detected platform/install kind.
+    pub fn for_app(data_dir: impl AsRef<Path>, bundle_version: Option<String>) -> Self {
+        let version = bundle_version
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| APP_VERSION.to_owned());
         Self::with_config(
             data_dir.as_ref().join("updates"),
             TrustAnchors::compiled_in(),
             current_os(),
             current_arch(),
             PlatformEnv::detect(),
-            APP_VERSION.to_owned(),
+            version,
             APP_BUILD_ID.to_owned(),
             current_app_sequence(),
         )

@@ -94,7 +94,7 @@ export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName 
       androidNote = 'Android can apply this update without asking again.';
     } else if (updateState.android && !updateState.android.canRequestPackageInstalls) {
       androidNote =
-        'Android will ask you to allow Legion to install updates once, and to confirm this update.';
+        'Android will ask you once to allow Legion to install updates, and may ask you to confirm.';
     } else {
       androidNote = 'Android may ask you to confirm this update.';
     }

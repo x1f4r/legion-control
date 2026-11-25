@@ -90,7 +90,8 @@ pub fn run() {
         let store = AppStore::in_dir(&data_dir);
         store.prepare_dir()?;
         let backend = LinkBackend::from_store(store.clone());
-        let updater = UpdateManager::for_app(&data_dir);
+        let updater =
+            UpdateManager::for_app(&data_dir, Some(app.package_info().version.to_string()));
         app.manage(store);
         app.manage(SharedBackend(Arc::new(backend)));
         app.manage(SharedUpdater(Arc::new(updater)));

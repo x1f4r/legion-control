@@ -141,6 +141,27 @@ test('describeUpdateSummary renders plain words for browser door, app states, an
   assert.equal(desktopReady.line, 'Restart to finish');
   assert.equal(desktopReady.actionLabel, 'Update now');
   assert.equal(desktopReady.canAction, true);
+
+  const androidFirst = describeUpdateSummary({
+    phase: 'ready',
+    auto_update: true,
+    can_self_install: true,
+    current: { os: 'android', install_kind: 'apk' },
+    android: { canRequestPackageInstalls: false, supportsSilentSelfUpdate: false },
+    available: { version: '0.2.0', notes: 'Android update.' },
+  });
+  assert.equal(androidFirst.line, 'Version 0.2.0 is ready');
+  assert.match(androidFirst.detail, /allow Legion to install updates/);
+
+  const androidSilent = describeUpdateSummary({
+    phase: 'ready',
+    auto_update: true,
+    can_self_install: true,
+    current: { os: 'android', install_kind: 'apk' },
+    android: { canRequestPackageInstalls: true, supportsSilentSelfUpdate: true },
+    available: { version: '0.2.0', notes: 'Android update.' },
+  });
+  assert.match(androidSilent.detail, /without asking again/);
 });
 
 test('formatUpdateTechnicalRows includes channel, build, sequence, key, and source node', () => {
