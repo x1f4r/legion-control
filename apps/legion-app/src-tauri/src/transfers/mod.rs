@@ -39,8 +39,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::{AppError, Backend, BoxFuture, ContentTarget, ErrorCode};
 pub use crate::transfers::file_policy::{
-    REFUSED_OPEN_HINT, REFUSED_OPEN_MESSAGE, is_refused_open_file_name, mime_for_file_name,
-    place_file_without_overwrite, sanitize_file_name, validate_child_in_dir,
+    REFUSED_OPEN_HINT, REFUSED_OPEN_MESSAGE, can_open_file_name, is_refused_open_file_name,
+    mime_for_file_name, place_file_without_overwrite, sanitize_file_name, validate_child_in_dir,
 };
 
 /// Default maximum concurrent transfers running at once.
@@ -725,10 +725,10 @@ impl TransferManager {
                     changed = true;
                 }
                 if rec.transfer.state == TransferState::Done {
-                    let refused = is_refused_open_file_name(&rec.transfer.name);
-                    let want_open = platform.supports_open_downloads() && !refused;
+                    let allowed_open = can_open_file_name(&rec.transfer.name);
+                    let want_open = platform.supports_open_downloads() && allowed_open;
                     let want_show = platform.supports_show_in_folder();
-                    let want_reason = refused.then(|| REFUSED_OPEN_MESSAGE.to_owned());
+                    let want_reason = (!allowed_open).then(|| REFUSED_OPEN_MESSAGE.to_owned());
                     if rec.transfer.can_open != want_open
                         || rec.transfer.can_show_in_folder != want_show
                         || rec.transfer.open_blocked_reason != want_reason
@@ -1150,7 +1150,7 @@ impl TransferManager {
                 )
                 .with_hint("Download the file to save it instead."));
             }
-            if is_refused_open_file_name(&display_name) {
+            if !can_open_file_name(&display_name) {
                 return Err(AppError::new(ErrorCode::Denied, REFUSED_OPEN_MESSAGE)
                     .with_hint(REFUSED_OPEN_HINT));
             }
@@ -1596,7 +1596,7 @@ impl TransferManager {
                     "Only downloaded files can be opened from device transfers.",
                 ));
             }
-            if is_refused_open_file_name(&rec.transfer.name) {
+            if !can_open_file_name(&rec.transfer.name) {
                 return Err(AppError::new(ErrorCode::Denied, REFUSED_OPEN_MESSAGE)
                     .with_hint(REFUSED_OPEN_HINT));
             }
@@ -1977,14 +1977,14 @@ impl TransferManager {
                             }
                             if rec.transfer.direction == TransferDirection::Download {
                                 let device_mime = mime_for_file_name(&rec.transfer.name);
-                                let refused = is_refused_open_file_name(&rec.transfer.name);
+                                let allowed_open = can_open_file_name(&rec.transfer.name);
                                 rec.transfer.mime = Some(device_mime.to_owned());
                                 rec.transfer.can_open =
-                                    self.platform.supports_open_downloads() && !refused;
+                                    self.platform.supports_open_downloads() && allowed_open;
                                 rec.transfer.can_show_in_folder =
                                     self.platform.supports_show_in_folder();
                                 rec.transfer.open_blocked_reason =
-                                    refused.then(|| REFUSED_OPEN_MESSAGE.to_owned());
+                                    (!allowed_open).then(|| REFUSED_OPEN_MESSAGE.to_owned());
                             } else {
                                 rec.transfer.can_open = false;
                                 rec.transfer.can_show_in_folder = false;
@@ -4780,6 +4780,20 @@ mod tests {
                 .insert("/home/me/evil.apk".into(), b"apk-bytes".to_vec());
             st.files
                 .insert("/home/me/setup.exe".into(), b"exe-bytes".to_vec());
+            st.files
+                .insert("/home/me/page.html".into(), b"<html></html>".to_vec());
+            st.files
+                .insert("/home/me/vector.svg".into(), b"<svg/>".to_vec());
+            st.files
+                .insert("/home/me/bundle.zip".into(), b"zip-bytes".to_vec());
+            st.files
+                .insert("/home/me/remote.rdp".into(), b"rdp-bytes".to_vec());
+            st.files
+                .insert("/home/me/macro.xlsb".into(), b"xlsb-bytes".to_vec());
+            st.files
+                .insert("/home/me/blob.unknown".into(), b"blob-bytes".to_vec());
+            st.files
+                .insert("/home/me/x.ap\u{212A}".into(), b"kelvin-bytes".to_vec());
         }
         let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
         let platform = Arc::new(MockPlatform::new(dir.path()));
@@ -4814,23 +4828,46 @@ mod tests {
             Some("image/jpeg")
         );
 
-        // Refused open_after_done on executable / installer extensions immediately returns Denied.
-        let open_ext_err = mgr
-            .enqueue_download(
-                "tower".into(),
-                "/home/me/evil.apk".into(),
-                None,
-                None,
-                Some("image/jpeg".into()),
-                true,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(open_ext_err.code, ErrorCode::Denied);
+        // Refused open_after_done on non-allow-listed extensions immediately returns Denied.
+        for blocked_ext_path in [
+            "/home/me/evil.apk",
+            "/home/me/page.html",
+            "/home/me/vector.svg",
+            "/home/me/bundle.zip",
+            "/home/me/remote.rdp",
+            "/home/me/x.ap\u{212A}",
+        ] {
+            let open_ext_err = mgr
+                .enqueue_download(
+                    "tower".into(),
+                    blocked_ext_path.into(),
+                    None,
+                    None,
+                    Some("image/jpeg".into()),
+                    true,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                open_ext_err.code,
+                ErrorCode::Denied,
+                "expected open_after_done Denied for {blocked_ext_path}"
+            );
+        }
 
-        // Regular download of evil.apk and setup.exe succeeds, but canOpen=false, canShowInFolder=true,
-        // open_transfer refuses with Denied, and show_transfer_in_folder works.
-        for path in ["/home/me/evil.apk", "/home/me/setup.exe"] {
+        // Regular download of non-allow-listed types succeeds, but canOpen=false, canShowInFolder=true,
+        // openBlockedReason is set, open_transfer refuses with Denied, and show_transfer_in_folder works.
+        for path in [
+            "/home/me/evil.apk",
+            "/home/me/setup.exe",
+            "/home/me/page.html",
+            "/home/me/vector.svg",
+            "/home/me/bundle.zip",
+            "/home/me/remote.rdp",
+            "/home/me/macro.xlsb",
+            "/home/me/blob.unknown",
+            "/home/me/x.ap\u{212A}",
+        ] {
             let id = mgr
                 .enqueue_download(
                     "tower".into(),
@@ -4845,7 +4882,10 @@ mod tests {
             let done = wait_for_state(&mgr, &id, |s| s == TransferState::Done).await;
             assert!(!done.can_open, "{path} must not be openable directly");
             assert!(done.can_show_in_folder);
-            assert!(done.open_blocked_reason.is_some());
+            assert_eq!(
+                done.open_blocked_reason.as_deref(),
+                Some(REFUSED_OPEN_MESSAGE)
+            );
             let open_err = mgr.open_transfer(&id).await.unwrap_err();
             assert_eq!(open_err.code, ErrorCode::Denied);
             mgr.show_transfer_in_folder(&id).await.unwrap();

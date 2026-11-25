@@ -109,7 +109,8 @@ class TransferSecurityTest {
 
   @Test
   fun refusedExtensionsAndNotificationTapDecisionsIgnoreRemoteMime() {
-    // Executables, installers, scripts, shortcuts, disk images are always refused.
+    // Executables, installers, scripts, shortcuts, disk images, archives, web pages, and unknown
+    // extensions are NEVER directly openable; tapping the completion notification opens Downloads.
     for (blocked in listOf(
       "evil.apk",
       "bundle.APKS",
@@ -122,20 +123,78 @@ class TransferSecurityTest {
       "shortcut.lnk",
       "macro.docm",
       "tool.jar",
+      "page.html",
+      "page.htm",
+      "vector.svg",
+      "feed.xml",
+      "archive.zip",
+      "backup.tar",
+      "backup.gz",
+      "legacy.doc",
+      "legacy.xls",
+      "legacy.ppt",
+      "legacy.rtf",
+      "blob.unknown",
+      "README",
+      "x.ap\u212A",
+      "run.pyz",
+      "run.pyzw",
+      "script.ws",
+      "script.wsc",
+      "script.sct",
+      "clickonce.application",
+      "remote.rdp",
+      "diag.diagcab",
+      "lib.library-ms",
+      "query.search-ms",
+      "query.searchConnector-ms",
+      "look.theme",
+      "look.themepack",
+      "pin.website",
+      "app.xbap",
+      "addin.vsto",
+      "console.psc1",
+      "types.ps1xml",
+      "shell.msh",
+      "cert.cer",
+      "sheet.xlsb",
+      "slides.ppsm",
+      "tmpl.potm",
+      "tmpl.xltm",
+      "addin.ppam",
+      "addin.xla",
+      "db.mde",
+      "db.accde",
+      "db.mdb",
+      "web.iqy",
+      "sheet.slk",
+      "mac.fileloc",
+      "mac.shortcut",
+      "kde.kdelnk",
+      "suse.ymp",
+      "repo.flatpakrepo",
     )) {
-      assertTrue("expected $blocked to be refused", TransferPathPolicy.isRefusedOpenFileName(blocked))
+      assertFalse("expected $blocked to not be directly openable", TransferPathPolicy.canOpenFileName(blocked))
       val decision = TransferPathPolicy.decideCompletedNotificationTap(
         direction = "download",
         fileName = blocked,
         localUri = "content://media/external/downloads/42",
       )
       assertEquals(
-        "refused type $blocked must open Downloads instead of viewer/installer",
+        "non-allowed type $blocked must open Downloads instead of viewer/installer",
         TransferPathPolicy.NotificationTapTarget.OPEN_DOWNLOADS,
         decision.target,
       )
       assertNull(decision.mime)
     }
+
+    // Explicit Kelvin sign check (`x.ap\u212A`): non-ASCII extension is treated as unknown type
+    // matching Rust exactly (never lowercased to `apk` and never openable).
+    val kelvin = "x.ap\u212A"
+    assertEquals("", TransferPathPolicy.extensionOf(kelvin))
+    assertFalse(TransferPathPolicy.canOpenFileName(kelvin))
+    assertFalse(TransferPathPolicy.isRefusedOpenFileName(kelvin))
+    assertEquals("application/octet-stream", TransferPathPolicy.mimeForFileName(kelvin))
 
     // Safe media / document files derive MIME on device and always open via chooser.
     val photoDecision = TransferPathPolicy.decideCompletedNotificationTap(
@@ -198,5 +257,114 @@ class TransferSecurityTest {
     assertFalse(files[2].exists())
     assertTrue(files[3].exists())
     assertTrue(files[4].exists())
+  }
+
+  @Test
+  fun openAllowListPropertyTestOver10000GeneratedNames() {
+    val allowedKeys = TransferPathPolicy.ALLOWED_OPEN_MIME_BY_EXT.keys.toList()
+    val refusedList = TransferPathPolicy.REFUSED_OPEN_EXTENSIONS.toList()
+    val prefixes = listOf("", "dir/", "C:\\Users\\me\\", "../../", "C:", "\u202E", "  .")
+    val stems = listOf(
+      "file",
+      "holiday (2)",
+      "CON",
+      "archive.tar",
+      "photo.jpg",
+      "doc\u202Egpj",
+      "report_2026",
+      "日本語",
+      "x",
+    )
+    val exoticChars = charArrayOf(
+      'a', 'z', 'A', 'Z', '0', '9', '-', '_', '.', ' ', '\u212A', '\u0130', '\u0131',
+      '\u0430', '\u202E', 'é',
+    )
+    val extraExts = listOf(
+      "html", "svg", "xml", "zip", "tar", "gz", "doc", "xls", "ppt", "rtf",
+      "apk", "exe", "rdp", "xlsb", "search-ms", "ap\u212A", "jp\u0430", "pd\u017F", "unknown", "",
+    )
+
+    var seed = -7046029254386353131L // deterministic xorshift64
+    fun nextLong(): Long {
+      seed = seed xor (seed shl 13)
+      seed = seed xor (seed ushr 7)
+      seed = seed xor (seed shl 17)
+      return seed
+    }
+    fun nextIdx(bound: Int): Int = ((nextLong() ushr 1) % bound.toLong()).toInt()
+
+    var openableCount = 0
+    var blockedCount = 0
+    val total = 10_500
+
+    for (i in 0 until total) {
+      val prefix = prefixes[nextIdx(prefixes.size)]
+      val stem = stems[nextIdx(stems.size)]
+      val candidate = when (i % 5) {
+        0 -> {
+          val ext = allowedKeys[nextIdx(allowedKeys.size)]
+          val cased = if ((nextLong() and 1L) == 0L) ext.uppercase() else ext
+          val trail = if ((nextLong() and 3L) == 0L) ". " else ""
+          "$prefix$stem.$cased$trail"
+        }
+        1 -> {
+          val ext = refusedList[nextIdx(refusedList.size)]
+          val ads = if ((nextLong() and 3L) == 0L) ":\$DATA" else ""
+          "$prefix$stem.$ext$ads"
+        }
+        2 -> {
+          val ext = extraExts[nextIdx(extraExts.size)]
+          if (ext.isEmpty()) "$prefix$stem" else "$prefix$stem.$ext"
+        }
+        3 -> {
+          val len = 1 + nextIdx(8)
+          val sb = StringBuilder(len)
+          repeat(len) {
+            val idx = nextIdx(62)
+            val ch = when {
+              idx < 26 -> ('a'.code + idx).toChar()
+              idx < 52 -> ('A'.code + (idx - 26)).toChar()
+              else -> ('0'.code + (idx - 52)).toChar()
+            }
+            sb.append(ch)
+          }
+          "$prefix$stem.$sb"
+        }
+        else -> {
+          val len = 1 + nextIdx(10)
+          val sb = StringBuilder(len)
+          repeat(len) {
+            sb.append(exoticChars[nextIdx(exoticChars.size)])
+          }
+          "$prefix$stem.$sb"
+        }
+      }
+
+      if (TransferPathPolicy.canOpenFileName(candidate)) {
+        openableCount++
+        val ext = TransferPathPolicy.extensionOf(candidate)
+        assertTrue("openable $candidate must have non-empty ext", ext.isNotEmpty())
+        assertTrue(
+          "openable $candidate ext '$ext' must be lowercase ASCII alphanumeric",
+          ext.all { it in 'a'..'z' || it in '0'..'9' },
+        )
+        assertTrue(
+          "openable $candidate ext '$ext' must be on allow-list",
+          TransferPathPolicy.ALLOWED_OPEN_MIME_BY_EXT.containsKey(ext),
+        )
+        assertFalse(
+          "openable $candidate must not match refused list",
+          TransferPathPolicy.REFUSED_OPEN_EXTENSIONS.contains(ext) ||
+            TransferPathPolicy.isRefusedOpenFileName(candidate),
+        )
+      } else {
+        blockedCount++
+      }
+    }
+
+    assertTrue(
+      "property test must cover both openable ($openableCount) and blocked ($blockedCount) cases",
+      openableCount >= 1000 && blockedCount >= 5000,
+    )
   }
 }

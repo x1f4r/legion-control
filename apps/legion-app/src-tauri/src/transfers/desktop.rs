@@ -20,9 +20,8 @@ use tauri::{AppHandle, Manager};
 use crate::backend::{AppError, BoxFuture, ErrorCode};
 use crate::transfers::file_policy::{
     MAX_OPEN_EXTERNALLY_CACHE_AGE, MAX_OPEN_EXTERNALLY_CACHE_BYTES,
-    MAX_OPEN_EXTERNALLY_CACHE_FILES, REFUSED_OPEN_HINT, REFUSED_OPEN_MESSAGE,
-    is_refused_open_file_name, mime_for_file_name, place_file_without_overwrite, prune_cache_dir,
-    sanitize_file_name,
+    MAX_OPEN_EXTERNALLY_CACHE_FILES, REFUSED_OPEN_HINT, REFUSED_OPEN_MESSAGE, can_open_file_name,
+    mime_for_file_name, place_file_without_overwrite, prune_cache_dir, sanitize_file_name,
 };
 use crate::transfers::{PickedUploadFile, QueueNotificationSummary, TransferPlatform};
 
@@ -158,7 +157,7 @@ impl TransferPlatform for DesktopTransferPlatform {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default();
-            if is_refused_open_file_name(file_name) {
+            if !can_open_file_name(file_name) {
                 return Err(AppError::new(ErrorCode::Denied, REFUSED_OPEN_MESSAGE)
                     .with_hint(REFUSED_OPEN_HINT));
             }

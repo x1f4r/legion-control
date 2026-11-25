@@ -322,8 +322,8 @@ object TransferBridge {
     val transferId = TransferPathPolicy.sanitizeFileName(params.optString("transferId", "item"))
     val tempPath = params.optString("tempPath", "")
     val fileName = TransferPathPolicy.sanitizeFileName(params.optString("fileName", "file"))
-    if (TransferPathPolicy.isRefusedOpenFileName(fileName)) {
-      throw SecurityException("Refusing to stage executable or installer file for direct opening.")
+    if (!TransferPathPolicy.canOpenFileName(fileName)) {
+      throw SecurityException("Refusing to stage disallowed file type for direct opening.")
     }
     val partFile = verifyPartFile(context, tempPath)
 
@@ -400,8 +400,8 @@ object TransferBridge {
       uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
     }
 
-    if (TransferPathPolicy.isRefusedOpenFileName(displayName)) {
-      throw SecurityException("Legion refuses to open executable or installer files directly.")
+    if (!TransferPathPolicy.canOpenFileName(displayName)) {
+      throw SecurityException("Legion refuses to open this file type directly.")
     }
     // Always derive MIME on this device from the saved file's real extension.
     val mime = TransferPathPolicy.mimeForFileName(displayName)

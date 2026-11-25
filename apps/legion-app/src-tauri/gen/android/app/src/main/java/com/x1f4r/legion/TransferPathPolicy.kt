@@ -18,31 +18,118 @@ import java.util.Locale
  */
 object TransferPathPolicy {
   const val MAX_FILE_NAME_UTF8_BYTES = 200
+  const val MAX_EXTENSION_BYTES = 32
   const val MAX_OPEN_EXTERNALLY_CACHE_FILES = 24
   const val MAX_OPEN_EXTERNALLY_CACHE_AGE_MS = 24L * 60L * 60L * 1000L
   const val MAX_OPEN_EXTERNALLY_CACHE_BYTES = 256L * 1000L * 1000L
 
-  private val REFUSED_OPEN_EXTENSIONS: Set<String> = setOf(
+  // Explicit direct-open allow-list (mirrored 1-to-1 with `file_policy.rs::ALLOWED_OPEN_MIME_BY_EXT`).
+  // BEGIN_ALLOWED_OPEN_MIME_BY_EXT
+  internal val ALLOWED_OPEN_MIME_BY_EXT: Map<String, String> = mapOf(
+    // Pictures (NOT SVG)
+    "jpg" to "image/jpeg",
+    "jpeg" to "image/jpeg",
+    "png" to "image/png",
+    "gif" to "image/gif",
+    "webp" to "image/webp",
+    "avif" to "image/avif",
+    "bmp" to "image/bmp",
+    "heic" to "image/heic",
+    "heif" to "image/heif",
+    "tif" to "image/tiff",
+    "tiff" to "image/tiff",
+    "ico" to "image/x-icon",
+    // Audio
+    "mp3" to "audio/mpeg",
+    "m4a" to "audio/mp4",
+    "aac" to "audio/mp4",
+    "flac" to "audio/flac",
+    "ogg" to "audio/ogg",
+    "opus" to "audio/ogg",
+    "wav" to "audio/wav",
+    // Video
+    "mp4" to "video/mp4",
+    "m4v" to "video/mp4",
+    "webm" to "video/webm",
+    "mov" to "video/quicktime",
+    "mkv" to "video/x-matroska",
+    "avi" to "video/x-msvideo",
+    // PDF
+    "pdf" to "application/pdf",
+    // Plain text and plain-text family (NOT HTML, XML, SVG)
+    "txt" to "text/plain",
+    "md" to "text/plain",
+    "log" to "text/plain",
+    "toml" to "text/plain",
+    "yaml" to "text/plain",
+    "yml" to "text/plain",
+    "ini" to "text/plain",
+    "conf" to "text/plain",
+    "vtt" to "text/plain",
+    "json" to "application/json",
+    // Common macro-free document formats
+    "csv" to "text/plain",
+    "docx" to "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx" to "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pptx" to "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "odt" to "application/vnd.oasis.opendocument.text",
+    "ods" to "application/vnd.oasis.opendocument.spreadsheet",
+    "odp" to "application/vnd.oasis.opendocument.presentation",
+    "epub" to "application/epub+zip",
+  )
+  // END_ALLOWED_OPEN_MIME_BY_EXT
+
+  // Non-openable download MIME mappings (mirrored 1-to-1 with `file_policy.rs::NON_OPEN_DOWNLOAD_MIME_BY_EXT`).
+  // BEGIN_NON_OPEN_DOWNLOAD_MIME_BY_EXT
+  internal val NON_OPEN_DOWNLOAD_MIME_BY_EXT: Map<String, String> = mapOf(
+    "svg" to "image/svg+xml",
+    "xml" to "application/xml",
+    "html" to "text/html",
+    "htm" to "text/html",
+    "css" to "text/css",
+    "rtf" to "application/rtf",
+    "zip" to "application/zip",
+    "tar" to "application/x-tar",
+    "gz" to "application/gzip",
+    "bz2" to "application/x-bzip2",
+    "xz" to "application/x-xz",
+    "zst" to "application/zstd",
+    "7z" to "application/x-7z-compressed",
+    "rar" to "application/vnd.rar",
+    "doc" to "application/msword",
+    "xls" to "application/vnd.ms-excel",
+    "ppt" to "application/vnd.ms-powerpoint",
+  )
+  // END_NON_OPEN_DOWNLOAD_MIME_BY_EXT
+
+  // Defense-in-depth refused extension list (mirrored 1-to-1 with `file_policy.rs::REFUSED_OPEN_EXTENSIONS`).
+  // BEGIN_REFUSED_OPEN_EXTENSIONS
+  internal val REFUSED_OPEN_EXTENSIONS: Set<String> = setOf(
     // Android packages and native binaries
     "apk", "apks", "apkm", "xapk", "aab", "dex", "odex", "so",
-    // Windows executables, installers, scripts, shortcuts, Office macros
-    "exe", "dll", "sys", "msi", "msp", "msu", "mst", "com", "scr", "pif",
-    "bat", "cmd", "ps1", "psm1", "psd1",
-    "vbs", "vbe", "js", "jse", "mjs", "cjs", "wsf", "wsh", "hta",
-    "cpl", "msc", "reg", "inf", "lnk", "url", "scf", "gadget",
-    "settingcontent-ms", "appref-ms", "msix", "msixbundle", "appx", "appxbundle", "chm",
-    "xll", "xlam", "docm", "xlsm", "pptm", "dotm",
-    // Unix / macOS scripts, bundles, installers, packages, binaries, launchers
-    "sh", "bash", "zsh", "ksh", "csh", "fish", "command", "tool",
-    "app", "pkg", "mpkg", "action", "workflow", "applescript", "osascript", "scpt", "scptd",
-    "mobileconfig", "terminal", "inetloc", "webloc", "macho", "dylib",
-    "appimage", "deb", "rpm", "flatpak", "flatpakref", "snap",
-    "run", "bin", "elf", "desktop",
-    // Disk images that auto-mount or execute
-    "dmg", "iso", "img", "vhd", "vhdx", "vmdk",
-    // Cross-platform runnable bytecode / scripts
-    "jar", "jnlp", "py", "pyc", "pyw", "rb", "pl", "php",
+    // Windows executables, installers, scripts, shortcuts, profiles, and Office macro carriers
+    "exe", "dll", "sys", "scr", "com", "msi", "msp", "msu", "mst",
+    "bat", "cmd", "ps1", "psm1", "psd1", "psc1", "ps1xml", "msh",
+    "vbs", "vbe", "js", "jse", "mjs", "cjs", "ws", "wsc", "wsf", "wsh", "sct", "hta",
+    "cpl", "msc", "inf", "reg", "lnk", "url", "pif", "scf", "gadget",
+    "application", "rdp", "diagcab",
+    "settingcontent-ms", "appref-ms", "library-ms", "search-ms", "searchconnector-ms",
+    "theme", "themepack", "website", "xbap", "vsto", "cer",
+    "msix", "msixbundle", "appx", "appxbundle", "jar", "jnlp", "chm",
+    "xll", "xla", "xlam", "docm", "xlsm", "xlsb", "pptm", "ppsm", "potm", "xltm", "ppam", "dotm",
+    "mde", "accde", "mdb", "iqy", "slk",
+    // macOS executables, bundles, installers, scripts, shortcuts, and disk images
+    "app", "pkg", "mpkg", "dmg", "command", "tool", "workflow", "action",
+    "applescript", "osascript", "scpt", "scptd",
+    "mobileconfig", "terminal", "inetloc", "webloc", "fileloc", "shortcut", "macho", "dylib",
+    // Linux / cross-platform scripts, executables, packages, launchers, and disk images
+    "sh", "bash", "zsh", "fish", "csh", "ksh",
+    "run", "bin", "elf", "appimage", "deb", "rpm",
+    "flatpak", "flatpakref", "flatpakrepo", "snap", "desktop", "kdelnk", "ymp",
+    "iso", "img", "vhd", "vhdx", "vmdk",
+    "py", "pyc", "pyw", "pyz", "pyzw", "rb", "pl", "php",
   )
+  // END_REFUSED_OPEN_EXTENSIONS
 
   private val RESERVED_WINDOWS_STEMS: Set<String> = setOf(
     "CON", "PRN", "AUX", "NUL",
@@ -165,75 +252,71 @@ object TransferPathPolicy {
   }
 
   /**
-   * Returns the lowercase extension (without leading dot) of the sanitized filename, or empty.
+   * Returns the lowercase pure ASCII-alphanumeric extension (without leading dot) of the sanitized
+   * filename, or empty if absent or if any character lies outside ASCII letters and digits
+   * (`A-Z`, `a-z`, `0-9`).
+   *
+   * Any non-ASCII extension (such as Kelvin sign `x.ap\u212A`) returns empty (unknown type),
+   * keeping Kotlin and Rust 100% consistent.
    */
   fun extensionOf(fileName: String): String {
     val safe = sanitizeFileName(fileName)
     val dot = safe.lastIndexOf('.')
     if (dot <= 0 || dot >= safe.length - 1) return ""
-    return safe.substring(dot + 1).lowercase(Locale.ROOT)
+    val ext = safe.substring(dot + 1)
+    if (ext.length > MAX_EXTENSION_BYTES) return ""
+    for (i in 0 until ext.length) {
+      val c = ext[i]
+      val asciiAlnum = (c in 'A'..'Z') || (c in 'a'..'z') || (c in '0'..'9')
+      if (!asciiAlnum) return ""
+    }
+    return ext.lowercase(Locale.ROOT)
+  }
+
+  private fun refusalExtensionOf(fileName: String): String {
+    val safe = sanitizeFileName(fileName)
+    val dot = safe.lastIndexOf('.')
+    if (dot <= 0 || dot >= safe.length - 1) return ""
+    val ext = safe.substring(dot + 1)
+    if (ext.length > MAX_EXTENSION_BYTES) return ""
+    for (i in 0 until ext.length) {
+      val c = ext[i]
+      val allowed = (c in 'A'..'Z') || (c in 'a'..'z') || (c in '0'..'9') || c == '-'
+      if (!allowed) return ""
+    }
+    return ext.lowercase(Locale.ROOT)
   }
 
   /**
-   * Returns `true` if Legion refuses to open this file directly (executables, installers, scripts,
-   * shortcuts, disk images, and macro-enabled office documents).
+   * Returns `true` if `fileName` has an extension on the defense-in-depth refused list.
    */
   fun isRefusedOpenFileName(fileName: String): Boolean {
-    val ext = extensionOf(fileName)
+    val ext = refusalExtensionOf(fileName)
     return ext.isNotEmpty() && REFUSED_OPEN_EXTENSIONS.contains(ext)
   }
 
   /**
-   * Derives a safe MIME type strictly on this device from the filename's real extension.
+   * Returns `true` ONLY when `fileName` has a pure ASCII-alphanumeric extension on the explicit
+   * direct-open allow-list and is NOT on the defense-in-depth refused list.
+   */
+  fun canOpenFileName(fileName: String): Boolean {
+    if (isRefusedOpenFileName(fileName)) return false
+    val ext = extensionOf(fileName)
+    if (ext.isEmpty() || REFUSED_OPEN_EXTENSIONS.contains(ext)) return false
+    return ALLOWED_OPEN_MIME_BY_EXT.containsKey(ext)
+  }
+
+  /**
+   * Derives a safe MIME type strictly on this device from the filename's real ASCII extension.
    * Never trusts MIME strings sent by a remote machine.
    */
   fun mimeForFileName(fileName: String): String {
-    return when (extensionOf(fileName)) {
-      "jpg", "jpeg" -> "image/jpeg"
-      "png" -> "image/png"
-      "gif" -> "image/gif"
-      "webp" -> "image/webp"
-      "avif" -> "image/avif"
-      "bmp" -> "image/bmp"
-      "heic" -> "image/heic"
-      "heif" -> "image/heif"
-      "tif", "tiff" -> "image/tiff"
-      "svg" -> "image/svg+xml"
-      "mp4", "m4v" -> "video/mp4"
-      "webm" -> "video/webm"
-      "mov" -> "video/quicktime"
-      "mkv" -> "video/x-matroska"
-      "avi" -> "video/x-msvideo"
-      "mp3" -> "audio/mpeg"
-      "m4a", "aac" -> "audio/mp4"
-      "flac" -> "audio/flac"
-      "ogg", "opus" -> "audio/ogg"
-      "wav" -> "audio/wav"
-      "pdf" -> "application/pdf"
-      "epub" -> "application/epub+zip"
-      "txt", "md", "log", "csv", "toml", "yaml", "yml", "vtt" -> "text/plain"
-      "json" -> "application/json"
-      "xml" -> "application/xml"
-      "html", "htm" -> "text/html"
-      "css" -> "text/css"
-      "zip" -> "application/zip"
-      "tar" -> "application/x-tar"
-      "gz" -> "application/gzip"
-      "xz" -> "application/x-xz"
-      "zst" -> "application/zstd"
-      "7z" -> "application/x-7z-compressed"
-      "rar" -> "application/vnd.rar"
-      "doc" -> "application/msword"
-      "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-      "xls" -> "application/vnd.ms-excel"
-      "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-      "ppt" -> "application/vnd.ms-powerpoint"
-      "pptx" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-      "odt" -> "application/vnd.oasis.opendocument.text"
-      "ods" -> "application/vnd.oasis.opendocument.spreadsheet"
-      "odp" -> "application/vnd.oasis.opendocument.presentation"
-      else -> "application/octet-stream"
-    }
+    if (isRefusedOpenFileName(fileName)) return "application/octet-stream"
+    val ext = extensionOf(fileName)
+    if (ext.isEmpty() || REFUSED_OPEN_EXTENSIONS.contains(ext)) return "application/octet-stream"
+    return ALLOWED_OPEN_MIME_BY_EXT[ext]
+      ?: NON_OPEN_DOWNLOAD_MIME_BY_EXT[ext]
+      ?: "application/octet-stream"
   }
 
   /**
@@ -334,7 +417,7 @@ object TransferPathPolicy {
         body = "Finished uploading",
       )
     }
-    if (isRefusedOpenFileName(safeName)) {
+    if (!canOpenFileName(safeName)) {
       return NotificationTapDecision(
         target = NotificationTapTarget.OPEN_DOWNLOADS,
         mime = null,

@@ -247,191 +247,344 @@ pub fn validate_child_in_dir(dir: &Path, candidate_name: &str) -> Result<PathBuf
     Ok(dst)
 }
 
-/// Returns the lowercase real final extension of `file_name` after sanitization, if any.
+/// Returns the lowercase ASCII alphanumeric real final extension of `file_name` after
+/// sanitization, or `None` if there is no extension or if any character lies outside ASCII letters
+/// and digits (`A-Z`, `a-z`, `0-9`).
+///
+/// Treating any non-ASCII-alphanumeric extension as unknown guarantees that Unicode lookalikes
+/// such as `x.ap\u{212A}` (Kelvin sign) are handled identically across Rust and Kotlin and are
+/// never treated as openable.
 pub fn real_extension(file_name: &str) -> Option<String> {
     let safe = sanitize_file_name(file_name);
-    let (_, ext) = split_stem_and_ext(&safe);
-    ext.map(str::to_ascii_lowercase)
+    let (stem, ext) = safe.rsplit_once('.')?;
+    if stem.is_empty()
+        || ext.is_empty()
+        || ext.len() > MAX_EXTENSION_BYTES
+        || !ext.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
 }
 
-/// Fixed list of executable, installer, script, shortcut, and disk-image extensions that Legion
-/// refuses to open directly on any platform.
+/// Returns the lowercase ASCII extension (allowing `-` for Windows compound extensions such as
+/// `.search-ms` and `.settingcontent-ms`) used by the defense-in-depth refusal check.
+fn refusal_extension(file_name: &str) -> Option<String> {
+    let safe = sanitize_file_name(file_name);
+    let (stem, ext) = safe.rsplit_once('.')?;
+    if stem.is_empty()
+        || ext.is_empty()
+        || ext.len() > MAX_EXTENSION_BYTES
+        || !ext.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
+}
+
+/// Explicit cross-platform allow-list of data types (and their device-derived MIME types) that
+/// Legion may offer to open directly via the OS viewer/chooser.
+///
+/// Only non-executable data formats belong here: raster pictures (explicitly NOT SVG), audio,
+/// video, PDF, plain text and the plain-text family (NOT HTML, XML, or SVG), and common
+/// macro-free document formats. Every other extension — including archives, HTML/SVG/XML, legacy
+/// macro-capable Office formats, scripts, shortcuts, installers, and unknown extensions — is
+/// saved to Downloads with `canOpen = false` and "Show in folder".
+///
+/// Mirrored 1-to-1 in `TransferPathPolicy.kt`; a unit test in this module fails on any drift.
+pub const ALLOWED_OPEN_MIME_BY_EXT: &[(&str, &str)] = &[
+    // Pictures (NOT SVG)
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("png", "image/png"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+    ("avif", "image/avif"),
+    ("bmp", "image/bmp"),
+    ("heic", "image/heic"),
+    ("heif", "image/heif"),
+    ("tif", "image/tiff"),
+    ("tiff", "image/tiff"),
+    ("ico", "image/x-icon"),
+    // Audio
+    ("mp3", "audio/mpeg"),
+    ("m4a", "audio/mp4"),
+    ("aac", "audio/mp4"),
+    ("flac", "audio/flac"),
+    ("ogg", "audio/ogg"),
+    ("opus", "audio/ogg"),
+    ("wav", "audio/wav"),
+    // Video
+    ("mp4", "video/mp4"),
+    ("m4v", "video/mp4"),
+    ("webm", "video/webm"),
+    ("mov", "video/quicktime"),
+    ("mkv", "video/x-matroska"),
+    ("avi", "video/x-msvideo"),
+    // PDF
+    ("pdf", "application/pdf"),
+    // Plain text and plain-text family (NOT HTML, XML, SVG)
+    ("txt", "text/plain"),
+    ("md", "text/plain"),
+    ("log", "text/plain"),
+    ("toml", "text/plain"),
+    ("yaml", "text/plain"),
+    ("yml", "text/plain"),
+    ("ini", "text/plain"),
+    ("conf", "text/plain"),
+    ("vtt", "text/plain"),
+    ("json", "application/json"),
+    // Common macro-free document formats
+    ("csv", "text/plain"),
+    (
+        "docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ),
+    (
+        "xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
+    (
+        "pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ),
+    ("odt", "application/vnd.oasis.opendocument.text"),
+    ("ods", "application/vnd.oasis.opendocument.spreadsheet"),
+    ("odp", "application/vnd.oasis.opendocument.presentation"),
+    ("epub", "application/epub+zip"),
+];
+
+/// Device-derived MIME mappings for known non-executable download types (archives, web documents,
+/// legacy Office formats) that are NOT allowed to open directly (`canOpen = false`).
+///
+/// Mirrored 1-to-1 in `TransferPathPolicy.kt`; a unit test in this module fails on any drift.
+pub const NON_OPEN_DOWNLOAD_MIME_BY_EXT: &[(&str, &str)] = &[
+    ("svg", "image/svg+xml"),
+    ("xml", "application/xml"),
+    ("html", "text/html"),
+    ("htm", "text/html"),
+    ("css", "text/css"),
+    ("rtf", "application/rtf"),
+    ("zip", "application/zip"),
+    ("tar", "application/x-tar"),
+    ("gz", "application/gzip"),
+    ("bz2", "application/x-bzip2"),
+    ("xz", "application/x-xz"),
+    ("zst", "application/zstd"),
+    ("7z", "application/x-7z-compressed"),
+    ("rar", "application/vnd.rar"),
+    ("doc", "application/msword"),
+    ("xls", "application/vnd.ms-excel"),
+    ("ppt", "application/vnd.ms-powerpoint"),
+];
+
+/// Defense-in-depth list of executable, installer, script, shortcut, macro-carrier, and disk-image
+/// extensions refused behind the allow-list on every platform. If an extension appears on both
+/// lists, it is refused and its MIME type is forced to `"application/octet-stream"`.
+///
+/// Mirrored 1-to-1 in `TransferPathPolicy.kt`; a unit test in this module fails on any drift.
+pub const REFUSED_OPEN_EXTENSIONS: &[&str] = &[
+    // Android packages and native binaries
+    "apk",
+    "apks",
+    "apkm",
+    "xapk",
+    "aab",
+    "dex",
+    "odex",
+    "so",
+    // Windows executables, installers, scripts, shortcuts, profiles, and Office macro carriers
+    "exe",
+    "dll",
+    "sys",
+    "scr",
+    "com",
+    "msi",
+    "msp",
+    "msu",
+    "mst",
+    "bat",
+    "cmd",
+    "ps1",
+    "psm1",
+    "psd1",
+    "psc1",
+    "ps1xml",
+    "msh",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "mjs",
+    "cjs",
+    "ws",
+    "wsc",
+    "wsf",
+    "wsh",
+    "sct",
+    "hta",
+    "cpl",
+    "msc",
+    "inf",
+    "reg",
+    "lnk",
+    "url",
+    "pif",
+    "scf",
+    "gadget",
+    "application",
+    "rdp",
+    "diagcab",
+    "settingcontent-ms",
+    "appref-ms",
+    "library-ms",
+    "search-ms",
+    "searchconnector-ms",
+    "theme",
+    "themepack",
+    "website",
+    "xbap",
+    "vsto",
+    "cer",
+    "msix",
+    "msixbundle",
+    "appx",
+    "appxbundle",
+    "jar",
+    "jnlp",
+    "chm",
+    "xll",
+    "xla",
+    "xlam",
+    "docm",
+    "xlsm",
+    "xlsb",
+    "pptm",
+    "ppsm",
+    "potm",
+    "xltm",
+    "ppam",
+    "dotm",
+    "mde",
+    "accde",
+    "mdb",
+    "iqy",
+    "slk",
+    // macOS executables, bundles, installers, scripts, shortcuts, and disk images
+    "app",
+    "pkg",
+    "mpkg",
+    "dmg",
+    "command",
+    "tool",
+    "workflow",
+    "action",
+    "applescript",
+    "osascript",
+    "scpt",
+    "scptd",
+    "mobileconfig",
+    "terminal",
+    "inetloc",
+    "webloc",
+    "fileloc",
+    "shortcut",
+    "macho",
+    "dylib",
+    // Linux / cross-platform scripts, executables, packages, launchers, and disk images
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "csh",
+    "ksh",
+    "run",
+    "bin",
+    "elf",
+    "appimage",
+    "deb",
+    "rpm",
+    "flatpak",
+    "flatpakref",
+    "flatpakrepo",
+    "snap",
+    "desktop",
+    "kdelnk",
+    "ymp",
+    "iso",
+    "img",
+    "vhd",
+    "vhdx",
+    "vmdk",
+    "py",
+    "pyc",
+    "pyw",
+    "pyz",
+    "pyzw",
+    "rb",
+    "pl",
+    "php",
+];
+
+/// Returns `true` when `ext_lower` is on the defense-in-depth refused extension list.
 pub fn is_refused_open_extension(ext_lower: &str) -> bool {
-    matches!(
-        ext_lower,
-        // Android packages and native binaries
-        "apk"
-            | "apks"
-            | "apkm"
-            | "xapk"
-            | "aab"
-            | "dex"
-            | "odex"
-            | "so"
-            // Windows executables, installers, scripts, and shortcuts
-            | "exe"
-            | "dll"
-            | "sys"
-            | "scr"
-            | "com"
-            | "msi"
-            | "msp"
-            | "msu"
-            | "mst"
-            | "bat"
-            | "cmd"
-            | "ps1"
-            | "psm1"
-            | "psd1"
-            | "vbs"
-            | "vbe"
-            | "js"
-            | "jse"
-            | "mjs"
-            | "cjs"
-            | "wsf"
-            | "wsh"
-            | "hta"
-            | "cpl"
-            | "msc"
-            | "inf"
-            | "reg"
-            | "lnk"
-            | "url"
-            | "pif"
-            | "scf"
-            | "gadget"
-            | "settingcontent-ms"
-            | "appref-ms"
-            | "msix"
-            | "msixbundle"
-            | "appx"
-            | "appxbundle"
-            | "jar"
-            | "jnlp"
-            | "chm"
-            | "xll"
-            | "xlam"
-            | "docm"
-            | "xlsm"
-            | "pptm"
-            | "dotm"
-            // macOS executables, bundles, installers, scripts, and disk images
-            | "app"
-            | "pkg"
-            | "mpkg"
-            | "dmg"
-            | "command"
-            | "tool"
-            | "workflow"
-            | "action"
-            | "applescript"
-            | "osascript"
-            | "scpt"
-            | "scptd"
-            | "mobileconfig"
-            | "terminal"
-            | "inetloc"
-            | "webloc"
-            | "macho"
-            | "dylib"
-            // Linux / cross-platform scripts, executables, packages, and disk images
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "fish"
-            | "csh"
-            | "ksh"
-            | "run"
-            | "bin"
-            | "elf"
-            | "appimage"
-            | "deb"
-            | "rpm"
-            | "flatpak"
-            | "flatpakref"
-            | "snap"
-            | "desktop"
-            | "iso"
-            | "img"
-            | "vhd"
-            | "vhdx"
-            | "vmdk"
-            | "py"
-            | "pyc"
-            | "pyw"
-            | "rb"
-            | "pl"
-            | "php"
-    )
+    REFUSED_OPEN_EXTENSIONS.contains(&ext_lower)
 }
 
-/// Returns `true` when `file_name` has an extension on the refused executable/installer list.
+/// Returns `true` when `file_name` has an extension on the defense-in-depth refused list.
 pub fn is_refused_open_file_name(file_name: &str) -> bool {
-    real_extension(file_name)
+    refusal_extension(file_name)
         .as_deref()
         .is_some_and(is_refused_open_extension)
 }
 
-/// Single authoritative device-side MIME table derived strictly from the file's real extension
-/// (never from untrusted remote listings).
+/// Returns `true` when `ext_lower` is on the explicit direct-open allow-list and NOT refused.
+pub fn is_allowed_open_extension(ext_lower: &str) -> bool {
+    if is_refused_open_extension(ext_lower) {
+        return false;
+    }
+    ALLOWED_OPEN_MIME_BY_EXT
+        .iter()
+        .any(|&(ext, _)| ext == ext_lower)
+}
+
+/// Returns `true` ONLY when `file_name` has a pure ASCII-alphanumeric extension on the explicit
+/// direct-open allow-list and is NOT on the defense-in-depth refused list.
+pub fn can_open_file_name(file_name: &str) -> bool {
+    if is_refused_open_file_name(file_name) {
+        return false;
+    }
+    real_extension(file_name)
+        .as_deref()
+        .is_some_and(is_allowed_open_extension)
+}
+
+/// Single authoritative device-side MIME table derived strictly from the file's real ASCII
+/// extension (never from untrusted remote listings).
 ///
-/// Refused executable/installer types always map to `"application/octet-stream"`.
+/// Unknown, non-ASCII, and refused executable/installer extensions always map to
+/// `"application/octet-stream"`.
 pub fn mime_for_file_name(file_name: &str) -> &'static str {
+    if is_refused_open_file_name(file_name) {
+        return "application/octet-stream";
+    }
     let Some(ext) = real_extension(file_name) else {
         return "application/octet-stream";
     };
     if is_refused_open_extension(&ext) {
         return "application/octet-stream";
     }
-    match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "avif" => "image/avif",
-        "bmp" => "image/bmp",
-        "heic" => "image/heic",
-        "heif" => "image/heif",
-        "tif" | "tiff" => "image/tiff",
-        "ico" => "image/x-icon",
-        "svg" => "image/svg+xml",
-        "mp4" | "m4v" => "video/mp4",
-        "webm" => "video/webm",
-        "mov" => "video/quicktime",
-        "mkv" => "video/x-matroska",
-        "avi" => "video/x-msvideo",
-        "mp3" => "audio/mpeg",
-        "m4a" | "aac" => "audio/mp4",
-        "flac" => "audio/flac",
-        "ogg" | "opus" => "audio/ogg",
-        "wav" => "audio/wav",
-        "pdf" => "application/pdf",
-        "txt" | "md" | "log" | "csv" | "toml" | "yaml" | "yml" | "ini" | "conf" => "text/plain",
-        "json" => "application/json",
-        "xml" => "application/xml",
-        "html" | "htm" => "text/html",
-        "css" => "text/css",
-        "rtf" => "application/rtf",
-        "zip" => "application/zip",
-        "tar" => "application/x-tar",
-        "gz" => "application/gzip",
-        "bz2" => "application/x-bzip2",
-        "xz" => "application/x-xz",
-        "zst" => "application/zstd",
-        "7z" => "application/x-7z-compressed",
-        "doc" => "application/msword",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "xls" => "application/vnd.ms-excel",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "ppt" => "application/vnd.ms-powerpoint",
-        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "odt" => "application/vnd.oasis.opendocument.text",
-        "ods" => "application/vnd.oasis.opendocument.spreadsheet",
-        "odp" => "application/vnd.oasis.opendocument.presentation",
-        "epub" => "application/epub+zip",
-        _ => "application/octet-stream",
+    for &(allowed_ext, mime) in ALLOWED_OPEN_MIME_BY_EXT {
+        if allowed_ext == ext {
+            return mime;
+        }
     }
+    for &(other_ext, mime) in NON_OPEN_DOWNLOAD_MIME_BY_EXT {
+        if other_ext == ext {
+            return mime;
+        }
+    }
+    "application/octet-stream"
 }
 
 /// Formats the Windows Mark-of-the-Web (`Zone.Identifier`) NTFS alternate data stream contents
@@ -699,7 +852,7 @@ pub fn prune_cache_dir(dir: &Path, max_files: usize, max_age: Duration, max_tota
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -998,5 +1151,436 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         prune_cache_dir(dir.path(), 10, Duration::ZERO, 10_000);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn open_allow_list_blocks_dangerous_web_archives_unknown_and_kelvin_sign() {
+        // Every allow-listed data extension is openable (case-insensitive and with `(2)` suffix).
+        for &(ext, expected_mime) in ALLOWED_OPEN_MIME_BY_EXT {
+            let lower = format!("sample.{ext}");
+            let upper = format!("SAMPLE.{}", ext.to_ascii_uppercase());
+            let numbered = format!("sample (2).{ext}");
+            assert!(
+                can_open_file_name(&lower),
+                "expected {lower} to be allowed for direct open"
+            );
+            assert!(
+                can_open_file_name(&upper),
+                "expected {upper} to be allowed for direct open"
+            );
+            assert!(
+                can_open_file_name(&numbered),
+                "expected {numbered} to be allowed for direct open"
+            );
+            assert_eq!(mime_for_file_name(&lower), expected_mime);
+        }
+
+        // All dangerous desktop/mobile extensions named in the security check must be blocked AND
+        // on the defense-in-depth refused list with application/octet-stream MIME.
+        for dangerous_ext in [
+            "pyz",
+            "pyzw",
+            "ws",
+            "wsc",
+            "sct",
+            "application",
+            "rdp",
+            "diagcab",
+            "library-ms",
+            "search-ms",
+            "searchConnector-ms",
+            "theme",
+            "themepack",
+            "website",
+            "xbap",
+            "vsto",
+            "psc1",
+            "ps1xml",
+            "msh",
+            "cer",
+            "xlsb",
+            "ppsm",
+            "potm",
+            "xltm",
+            "ppam",
+            "xla",
+            "mde",
+            "accde",
+            "mdb",
+            "iqy",
+            "slk",
+            "fileloc",
+            "shortcut",
+            "kdelnk",
+            "ymp",
+            "flatpakrepo",
+        ] {
+            let name = format!("payload.{dangerous_ext}");
+            assert!(
+                !can_open_file_name(&name),
+                "expected {name} to be blocked from direct open"
+            );
+            assert!(
+                is_refused_open_file_name(&name),
+                "expected {name} to be on the defense-in-depth refused list"
+            );
+            assert_eq!(
+                mime_for_file_name(&name),
+                "application/octet-stream",
+                "expected refused type {name} to map to application/octet-stream"
+            );
+        }
+
+        // Archives, HTML/SVG/XML, CSS, legacy Office, unknown extensions, and extensionless files
+        // are NEVER openable directly.
+        for blocked in [
+            "page.html",
+            "page.HTM",
+            "diagram.svg",
+            "feed.xml",
+            "style.css",
+            "archive.zip",
+            "backup.tar",
+            "backup.tar.gz",
+            "data.gz",
+            "data.bz2",
+            "data.xz",
+            "data.zst",
+            "data.7z",
+            "data.rar",
+            "legacy.doc",
+            "legacy.xls",
+            "legacy.ppt",
+            "legacy.rtf",
+            "blob.unknown",
+            "blob.xyz123",
+            "README",
+        ] {
+            assert!(
+                !can_open_file_name(blocked),
+                "expected {blocked} to be blocked by the strict open allow-list"
+            );
+        }
+
+        // Non-ASCII Kelvin sign (`x.ap\u{212A}`) is an unknown extension on BOTH Rust and Kotlin.
+        let kelvin = "x.ap\u{212A}";
+        assert_eq!(real_extension(kelvin), None);
+        assert!(!can_open_file_name(kelvin));
+        assert!(!is_refused_open_file_name(kelvin));
+        assert_eq!(mime_for_file_name(kelvin), "application/octet-stream");
+    }
+
+    #[test]
+    fn open_policy_tables_match_kotlin_without_drift() {
+        use std::collections::BTreeMap;
+
+        // First verify internal invariants on Rust tables.
+        let rust_allowed: BTreeMap<String, String> = ALLOWED_OPEN_MIME_BY_EXT
+            .iter()
+            .map(|&(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let rust_non_open: BTreeMap<String, String> = NON_OPEN_DOWNLOAD_MIME_BY_EXT
+            .iter()
+            .map(|&(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let rust_refused: HashSet<String> = REFUSED_OPEN_EXTENSIONS
+            .iter()
+            .map(|&s| s.to_owned())
+            .collect();
+
+        assert_eq!(
+            rust_allowed.len(),
+            ALLOWED_OPEN_MIME_BY_EXT.len(),
+            "duplicate key in Rust ALLOWED_OPEN_MIME_BY_EXT"
+        );
+        assert_eq!(
+            rust_non_open.len(),
+            NON_OPEN_DOWNLOAD_MIME_BY_EXT.len(),
+            "duplicate key in Rust NON_OPEN_DOWNLOAD_MIME_BY_EXT"
+        );
+        assert_eq!(
+            rust_refused.len(),
+            REFUSED_OPEN_EXTENSIONS.len(),
+            "duplicate entry in Rust REFUSED_OPEN_EXTENSIONS"
+        );
+
+        for ext in rust_allowed.keys() {
+            assert!(
+                !ext.is_empty()
+                    && ext
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+                "allowed extension {ext:?} must be lowercase ASCII alphanumeric"
+            );
+            assert!(
+                !rust_refused.contains(ext),
+                "extension {ext:?} appears in both ALLOWED and REFUSED lists"
+            );
+            assert!(
+                !rust_non_open.contains_key(ext),
+                "extension {ext:?} appears in both ALLOWED and NON_OPEN lists"
+            );
+        }
+
+        // Parse Kotlin TransferPathPolicy.kt tables directly so any drift fails cargo test.
+        let kt_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("gen/android/app/src/main/java/com/x1f4r/legion/TransferPathPolicy.kt");
+        let kt_src = fs::read_to_string(&kt_path)
+            .expect("TransferPathPolicy.kt must exist beside Rust crate");
+
+        let extract_block = |begin: &str, end: &str| -> String {
+            let start_idx = kt_src
+                .find(begin)
+                .unwrap_or_else(|| panic!("missing marker {begin} in TransferPathPolicy.kt"));
+            let rest = &kt_src[start_idx + begin.len()..];
+            let end_idx = rest
+                .find(end)
+                .unwrap_or_else(|| panic!("missing marker {end} in TransferPathPolicy.kt"));
+            rest[..end_idx].to_owned()
+        };
+
+        let parse_kotlin_map = |block: &str| -> BTreeMap<String, String> {
+            let mut map = BTreeMap::new();
+            for line in block.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("//") {
+                    continue;
+                }
+                if let Some((lhs, rhs)) = trimmed.split_once(" to ") {
+                    let key = lhs.trim().trim_matches('"');
+                    let val = rhs.trim().trim_end_matches(',').trim().trim_matches('"');
+                    if !key.is_empty() && !val.is_empty() {
+                        let prev = map.insert(key.to_owned(), val.to_owned());
+                        assert!(prev.is_none(), "duplicate Kotlin map key {key:?}");
+                    }
+                }
+            }
+            map
+        };
+
+        let parse_kotlin_set = |block: &str| -> HashSet<String> {
+            let mut set = HashSet::new();
+            for line in block.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty()
+                    || trimmed.starts_with("//")
+                    || trimmed.contains("setOf(")
+                    || trimmed == ")"
+                {
+                    continue;
+                }
+                let mut in_str = false;
+                let mut cur = String::new();
+                for ch in trimmed.chars() {
+                    if ch == '"' {
+                        if in_str {
+                            assert!(
+                                set.insert(cur.clone()),
+                                "duplicate Kotlin refused extension {cur:?}"
+                            );
+                            cur.clear();
+                            in_str = false;
+                        } else {
+                            in_str = true;
+                        }
+                    } else if in_str {
+                        cur.push(ch);
+                    }
+                }
+            }
+            set
+        };
+
+        let kt_allowed = parse_kotlin_map(&extract_block(
+            "BEGIN_ALLOWED_OPEN_MIME_BY_EXT",
+            "END_ALLOWED_OPEN_MIME_BY_EXT",
+        ));
+        let kt_non_open = parse_kotlin_map(&extract_block(
+            "BEGIN_NON_OPEN_DOWNLOAD_MIME_BY_EXT",
+            "END_NON_OPEN_DOWNLOAD_MIME_BY_EXT",
+        ));
+        let kt_refused = parse_kotlin_set(&extract_block(
+            "BEGIN_REFUSED_OPEN_EXTENSIONS",
+            "END_REFUSED_OPEN_EXTENSIONS",
+        ));
+
+        assert_eq!(
+            rust_allowed, kt_allowed,
+            "Rust ALLOWED_OPEN_MIME_BY_EXT drifted from Kotlin TransferPathPolicy.kt"
+        );
+        assert_eq!(
+            rust_non_open, kt_non_open,
+            "Rust NON_OPEN_DOWNLOAD_MIME_BY_EXT drifted from Kotlin TransferPathPolicy.kt"
+        );
+        assert_eq!(
+            rust_refused, kt_refused,
+            "Rust REFUSED_OPEN_EXTENSIONS drifted from Kotlin TransferPathPolicy.kt"
+        );
+    }
+
+    #[test]
+    fn open_allow_list_property_test_10000_generated_names() {
+        let allowed_set: HashSet<&str> = ALLOWED_OPEN_MIME_BY_EXT
+            .iter()
+            .map(|&(ext, _)| ext)
+            .collect();
+        let refused_set: HashSet<&str> = REFUSED_OPEN_EXTENSIONS.iter().copied().collect();
+
+        // Deterministic xorshift64 PRNG so test failures are 100% reproducible.
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_u64 = || -> u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        let prefixes = [
+            "",
+            "dir/",
+            "C:\\Users\\me\\",
+            "../../",
+            "C:",
+            "\u{202E}",
+            "  .",
+        ];
+        let stems = [
+            "file",
+            "holiday (2)",
+            "CON",
+            "archive.tar",
+            "photo.jpg",
+            "doc\u{202E}gpj",
+            "report_2026",
+            "日本語",
+            "x",
+        ];
+        let exotic_chars: &[char] = &[
+            'a', 'z', 'A', 'Z', '0', '9', '-', '_', '.', ' ', '\u{212A}', '\u{0130}', '\u{0131}',
+            '\u{0430}', '\u{202E}', 'é',
+        ];
+        let extra_exts = [
+            "html",
+            "svg",
+            "xml",
+            "zip",
+            "tar",
+            "gz",
+            "doc",
+            "xls",
+            "ppt",
+            "rtf",
+            "apk",
+            "exe",
+            "rdp",
+            "xlsb",
+            "search-ms",
+            "ap\u{212A}",
+            "jp\u{0430}",
+            "pd\u{017F}",
+            "unknown",
+            "",
+        ];
+
+        let mut openable_count = 0usize;
+        let mut blocked_count = 0usize;
+        const TOTAL: usize = 10_500;
+
+        for i in 0..TOTAL {
+            let prefix = prefixes[(next_u64() as usize) % prefixes.len()];
+            let stem = stems[(next_u64() as usize) % stems.len()];
+            let candidate = match i % 5 {
+                // Mix of allow-listed extensions (various casings and trailing spaces/dots).
+                0 => {
+                    let &(ext, _) = ALLOWED_OPEN_MIME_BY_EXT
+                        .get((next_u64() as usize) % ALLOWED_OPEN_MIME_BY_EXT.len())
+                        .unwrap();
+                    let ext_cased = if next_u64().is_multiple_of(2) {
+                        ext.to_ascii_uppercase()
+                    } else {
+                        ext.to_owned()
+                    };
+                    let trail = if next_u64().is_multiple_of(4) {
+                        ". "
+                    } else {
+                        ""
+                    };
+                    format!("{prefix}{stem}.{ext_cased}{trail}")
+                }
+                // Refused extensions (with optional BiDi or ADS suffix).
+                1 => {
+                    let ext = REFUSED_OPEN_EXTENSIONS
+                        [(next_u64() as usize) % REFUSED_OPEN_EXTENSIONS.len()];
+                    let ads = if next_u64().is_multiple_of(3) {
+                        ":$DATA"
+                    } else {
+                        ""
+                    };
+                    format!("{prefix}{stem}.{ext}{ads}")
+                }
+                // Explicitly blocked non-allowed & Unicode-lookalike extensions.
+                2 => {
+                    let ext = extra_exts[(next_u64() as usize) % extra_exts.len()];
+                    if ext.is_empty() {
+                        format!("{prefix}{stem}")
+                    } else {
+                        format!("{prefix}{stem}.{ext}")
+                    }
+                }
+                // Random pure ASCII-alphanumeric extension of length 1..=8.
+                3 => {
+                    let len = 1 + ((next_u64() as usize) % 8);
+                    let mut ext = String::with_capacity(len);
+                    for _ in 0..len {
+                        let idx = (next_u64() as usize) % 62;
+                        let ch = match idx {
+                            0..=25 => (b'a' + idx as u8) as char,
+                            26..=51 => (b'A' + (idx - 26) as u8) as char,
+                            _ => (b'0' + (idx - 52) as u8) as char,
+                        };
+                        ext.push(ch);
+                    }
+                    format!("{prefix}{stem}.{ext}")
+                }
+                // Random exotic/Unicode/punctuation extension of length 1..=10.
+                _ => {
+                    let len = 1 + ((next_u64() as usize) % 10);
+                    let mut ext = String::with_capacity(len);
+                    for _ in 0..len {
+                        ext.push(exotic_chars[(next_u64() as usize) % exotic_chars.len()]);
+                    }
+                    format!("{prefix}{stem}.{ext}")
+                }
+            };
+
+            if can_open_file_name(&candidate) {
+                openable_count += 1;
+                let ext = real_extension(&candidate).unwrap_or_else(|| {
+                    panic!(
+                        "can_open_file_name returned true without real_extension for {candidate:?}"
+                    )
+                });
+                assert!(
+                    ext.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+                    "openable name {candidate:?} had non-ASCII-alphanumeric ext {ext:?}"
+                );
+                assert!(
+                    allowed_set.contains(ext.as_str()),
+                    "openable name {candidate:?} had ext {ext:?} NOT on allow-list"
+                );
+                assert!(
+                    !refused_set.contains(ext.as_str()) && !is_refused_open_file_name(&candidate),
+                    "openable name {candidate:?} matched refused list"
+                );
+            } else {
+                blocked_count += 1;
+            }
+        }
+
+        assert!(
+            openable_count >= 1000 && blocked_count >= 5000,
+            "property test must exercise both openable ({openable_count}) and blocked ({blocked_count}) cases"
+        );
     }
 }
