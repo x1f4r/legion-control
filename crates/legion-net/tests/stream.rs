@@ -292,24 +292,88 @@ fn the_line_that_ends_a_listing_stays_short_however_much_could_not_be_read() {
 fn get_sends_the_size_then_the_bytes_from_the_offset() {
     let node = Node::new();
     let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-    fs::write(node.home().join("projects/big.bin"), &data).unwrap();
+    let file = node.home().join("projects/big.bin");
+    fs::write(&file, &data).unwrap();
+    let expected_mtime =
+        legion_xfer::Timestamp::from_system_time(fs::metadata(&file).unwrap().modified().unwrap());
 
+    // Legacy caller omitting `length` still receives offset..EOF and gets full metadata.
     let ran = node.run(
         None,
         &json!({"op": "get", "path": "~/projects/big.bin", "offset": 1000}),
         b"",
     );
     let (line, rest) = ran.ok().first();
-    assert_eq!(line, json!({"size": 200_000}));
+    assert_eq!(
+        line,
+        json!({
+            "size": 200_000,
+            "offset": 1000,
+            "length": 199_000,
+            "mtime": {"secs": expected_mtime.secs, "nanos": expected_mtime.nanos}
+        })
+    );
     assert_eq!(rest, &data[1000..]);
     assert_eq!(node.last_audit()["tool"], "stream.get");
 
+    // Bounded slice with explicit `length`.
+    let ran = node.run(
+        None,
+        &json!({"op": "get", "path": "~/projects/big.bin", "offset": 4096, "length": 1234}),
+        b"",
+    );
+    let (line, rest) = ran.ok().first();
+    assert_eq!(line["size"], json!(200_000));
+    assert_eq!(line["offset"], json!(4096));
+    assert_eq!(line["length"], json!(1234));
+    assert_eq!(
+        line["mtime"],
+        json!({"secs": expected_mtime.secs, "nanos": expected_mtime.nanos})
+    );
+    assert_eq!(rest, &data[4096..4096 + 1234]);
+
+    // `length` extending past EOF clamps to the remaining bytes.
+    let ran = node.run(
+        None,
+        &json!({"op": "get", "path": "~/projects/big.bin", "offset": 199_900, "length": 500}),
+        b"",
+    );
+    let (line, rest) = ran.ok().first();
+    assert_eq!(line["length"], json!(100));
+    assert_eq!(rest, &data[199_900..]);
+
+    // `length: 0` returns metadata and zero bytes (useful for HEAD / range probes).
+    let ran = node.run(
+        None,
+        &json!({"op": "get", "path": "~/projects/big.bin", "offset": 0, "length": 0}),
+        b"",
+    );
+    let (line, rest) = ran.ok().first();
+    assert_eq!(line["size"], json!(200_000));
+    assert_eq!(line["offset"], json!(0));
+    assert_eq!(line["length"], json!(0));
+    assert!(rest.is_empty());
+
+    // `offset == size` succeeds with `length: 0`.
+    let ran = node.run(
+        None,
+        &json!({"op": "get", "path": "~/projects/big.bin", "offset": 200_000, "length": 10}),
+        b"",
+    );
+    let (line, rest) = ran.ok().first();
+    assert_eq!(line["length"], json!(0));
+    assert!(rest.is_empty());
+
+    // `offset > size` fails with Conflict and carries `requested` / `actual`.
     let ran = node.run(
         None,
         &json!({"op": "get", "path": "~/projects/big.bin", "offset": 300_000}),
         b"",
     );
-    ran.refused(ErrorCode::Conflict);
+    let err = ran.refused(ErrorCode::Conflict);
+    assert_eq!(err["details"]["requested"], json!(300_000));
+    assert_eq!(err["details"]["actual"], json!(200_000));
+
     let ran = node.run(None, &json!({"op": "get", "path": "~/projects/none"}), b"");
     ran.refused(ErrorCode::NotFound);
     assert_eq!(node.last_audit()["outcome"], "not_found");

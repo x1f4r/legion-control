@@ -23,7 +23,7 @@
 //! | --- | --- | --- |
 //! | `manifest` | `{root, checksum?, exclude?}` | one line per entry, then `{done, entries, skipped}` |
 //! | `stat` | `{path, checksum?, if_size?}` | `{kind, size, mode?, hash?, mtime?, partial?, …}` |
-//! | `get` | `{path, offset?}` | `{size}`, then the bytes from `offset` to the end |
+//! | `get` | `{path, offset?, length?}` | `{size, offset, length, mtime}`, then `length` bytes starting at `offset` |
 //! | `put` | `{path, size, hash, offset?, mode?, mtime?}` | `{offset}`; reads the rest; `{ok, size, hash}` |
 //! | `pack` | `{root, names}` | `{ready, skipped}`, then a tar stream of those names |
 //! | `unpack` | `{root, entries}` | `{ready}`; reads a tar stream to its end; `{ok, files, …}` |
@@ -141,6 +141,8 @@ pub(crate) enum Op {
         path: String,
         #[serde(default)]
         offset: u64,
+        #[serde(default)]
+        length: Option<u64>,
     },
     /// A sender's `offset` is not read: what is on disk decides where it starts. `mtime`, the
     /// source's modification time, is given to the file once it is in place, so a tree that holds
@@ -256,6 +258,12 @@ pub(crate) struct ManifestDone {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct GetReady {
     pub size: u64,
+    #[serde(default)]
+    pub offset: u64,
+    #[serde(default)]
+    pub length: u64,
+    #[serde(default)]
+    pub mtime: Option<Timestamp>,
 }
 
 /// The line that answers a `put` before its bytes: where the sender is to start.
@@ -578,7 +586,11 @@ fn run<R: BufRead, W: Write>(
             checksum,
             if_size,
         } => stat(grant, &path, checksum, if_size, output),
-        Op::Get { path, offset } => get(grant, &path, offset, output),
+        Op::Get {
+            path,
+            offset,
+            length,
+        } => get(grant, &path, offset, length, output),
         Op::Put {
             path,
             size,
@@ -787,13 +799,22 @@ fn case_insensitive(path: &Path) -> Option<bool> {
     None
 }
 
-fn get<W: Write>(grant: &Grant, path: &str, offset: u64, output: &mut W) -> Result<(), Failure> {
+fn get<W: Write>(
+    grant: &Grant,
+    path: &str,
+    offset: u64,
+    length: Option<u64>,
+    output: &mut W,
+) -> Result<(), Failure> {
     let path = grant.check_path(path, Access::Read)?;
-    let source = legion_xfer::open_get(&path, offset).map_err(xfer_error)?;
+    let source = legion_xfer::open_get_range(&path, offset, length).map_err(xfer_error)?;
     reply(
         output,
         &GetReady {
             size: source.size(),
+            offset: source.offset(),
+            length: source.length(),
+            mtime: Some(source.mtime()),
         },
     )?;
     source
