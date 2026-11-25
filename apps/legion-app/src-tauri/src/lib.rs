@@ -812,11 +812,12 @@ pub fn run() {
             // (`sceneDidBecomeActive`) without entering background, `WindowEvent::Resumed` does
             // not fire; still recover the listener and resume background-paused transfers.
             if mobile_suspended.swap(false, Ordering::AcqRel) {
-                app_handle.state::<SharedContentServer>().0.on_app_resumed();
-                app_handle
-                    .state::<SharedTransfers>()
-                    .0
-                    .resume_paused_for(PauseReason::Background);
+                if let Some(content) = app_handle.try_state::<SharedContentServer>() {
+                    content.0.on_app_resumed();
+                }
+                if let Some(transfers) = app_handle.try_state::<SharedTransfers>() {
+                    transfers.0.resume_paused_for(PauseReason::Background);
+                }
             }
         }
         RunEvent::ExitRequested { code, api, .. } => {

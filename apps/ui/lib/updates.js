@@ -45,6 +45,7 @@ export function isSafeForAutoInstall({
   isRunningCommand = false,
   activeCalls = 0,
   isPairingOpen = false,
+  isResuming = false,
   userInteracted = false,
   firstScreenShown = false,
 } = {}) {
@@ -52,7 +53,14 @@ export function isSafeForAutoInstall({
   if (updateState.phase !== 'ready' || !updateState.can_self_install) return false;
   if ((updateState.current?.sequence || 0) === 0) return false;
   if (updateState.failed_update) return false;
-  if (hasOpenSheet || hasCommandDraft || isRunningCommand || activeCalls > 0 || isPairingOpen) {
+  if (
+    hasOpenSheet ||
+    hasCommandDraft ||
+    isRunningCommand ||
+    activeCalls > 0 ||
+    isPairingOpen ||
+    isResuming
+  ) {
     return false;
   }
   const isAndroid = updateState.current?.os === 'android';
