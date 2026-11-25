@@ -37,6 +37,12 @@ import {
 import { plainErrorMessage } from '../lib/errors.js';
 import { createCoalescedRefetch, STALE_AFTER_MS } from '../lib/folder-changes.js';
 import { formatBytes, formatElapsed, formatRelativeTime, primaryDisk } from '../lib/format.js';
+import {
+  isRealMachineName,
+  migrateLocalFavouritesOnNode,
+  normalizeFavouritesMachine,
+  PENDING_LOCAL_MACHINE_NAME,
+} from '../lib/local-machine.js';
 import { routeHref } from '../lib/route.js';
 import { thumbCacheKey } from '../lib/thumb-cache.js';
 import { Notice, OlderMachineNote, ProgressBar, SwipeRow } from './common.js';
@@ -156,10 +162,11 @@ function safeStorage() {
 
 function freeSpaceSub(machine) {
   const disk = primaryDisk(machine?.sys?.disks);
-  if (disk?.disk?.available != null) {
-    return `${formatBytes(disk.disk.available)} free`;
+  const free = disk?.disk?.available != null ? `${formatBytes(disk.disk.available)} free` : '';
+  if (machine?.isLocalComputer && machine?.name !== PENDING_LOCAL_MACHINE_NAME) {
+    return free ? `This computer · ${free}` : 'This computer';
   }
-  return 'On';
+  return free || 'On';
 }
 
 function offlineMachineSub(machine) {
@@ -2556,6 +2563,11 @@ export function FilesView({
   const [resolvedFolderPath, setResolvedFolderPath] = useState(route.path || '~');
   const [reloadToken, setReloadToken] = useState(0);
   const [viewerEntryCache, setViewerEntryCache] = useState(null);
+  const migratedFavNodeRef = useRef(null);
+
+  useEffect(() => {
+    setRecentFiles(readRecentFiles(safeStorage()));
+  }, [localNode]);
 
   const loadFavourites = useCallback(() => {
     if (!localCaps.hasFav || !localNode) {
@@ -2566,9 +2578,40 @@ export function FilesView({
       ? capsStore.call('fav.list', {}, { on: localNode }).then((r) => r.value)
       : link.call('fav.list', {}, { on: localNode });
     return req
-      .then((res) => setFavourites(Array.isArray(res?.entries) ? res.entries : []))
+      .then(async (res) => {
+        const rawEntries = Array.isArray(res?.entries) ? res.entries : [];
+        const normalized = isRealMachineName(localNode)
+          ? normalizeFavouritesMachine(rawEntries, localNode)
+          : rawEntries;
+        setFavourites(normalized);
+
+        if (
+          isRealMachineName(localNode) &&
+          localCaps.hasFavWrite &&
+          migratedFavNodeRef.current !== localNode &&
+          rawEntries.some((e) => e?.machine === 'local' || e?.machine === PENDING_LOCAL_MACHINE_NAME)
+        ) {
+          migratedFavNodeRef.current = localNode;
+          const outcome = await migrateLocalFavouritesOnNode({
+            entries: rawEntries,
+            realNodeName: localNode,
+            link,
+            localNode,
+            canWrite: true,
+          });
+          if (outcome.migrated) {
+            const refreshed = await (capsStore
+              ? capsStore.call('fav.list', {}, { on: localNode }).then((r) => r.value)
+              : link.call('fav.list', {}, { on: localNode })
+            ).catch(() => null);
+            if (Array.isArray(refreshed?.entries)) {
+              setFavourites(normalizeFavouritesMachine(refreshed.entries, localNode));
+            }
+          }
+        }
+      })
       .catch(() => setFavourites([]));
-  }, [localCaps.hasFav, capsStore, link, localNode]);
+  }, [localCaps.hasFav, localCaps.hasFavWrite, capsStore, link, localNode]);
 
   const loadSyncFolders = useCallback(() => {
     if (!localCaps.hasSync || !localNode) {

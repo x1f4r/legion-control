@@ -455,7 +455,9 @@ export function ToolDetail({
                   setResult(null);
                 }}
               >
-                <option value="local">${localNode} (this machine)</option>
+                <option value="local">
+                  ${localNode === 'This computer' ? 'This computer' : `${localNode} (this machine)`}
+                </option>
                 ${remoteMachines.map((m) => {
                   const suffix =
                     m.status === 'asking' || m.asking
