@@ -128,6 +128,10 @@ fn main() -> ExitCode {
             "ui_assets_are_served_with_security_headers_and_guarded_api",
             ui_assets_are_served_with_security_headers_and_guarded_api,
         ),
+        (
+            "content_tickets_ranges_headers_policy_revocation_and_remote",
+            content_tickets_ranges_headers_policy_revocation_and_remote,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -173,13 +177,22 @@ fn helper(args: &[String]) -> ExitCode {
         std::thread::sleep(Duration::from_secs(60));
         return ExitCode::SUCCESS;
     }
-    let [mode, legion_home, user_home] = args else {
-        eprintln!("the helper takes rpc, a LEGION_HOME and a home, or wait and a marker");
-        return ExitCode::from(2);
+    let (mode, legion_home, user_home) = match args {
+        [mode, legion_home, user_home] if mode == "rpc" || mode == "stream" => {
+            (mode.as_str(), legion_home, user_home)
+        }
+        [legion_home, user_home, mode] if mode == "rpc" || mode == "stream" => {
+            (mode.as_str(), legion_home, user_home)
+        }
+        _ => {
+            eprintln!(
+                "the helper takes rpc/stream, a LEGION_HOME and a home, or wait and a marker"
+            );
+            return ExitCode::from(2);
+        }
     };
-    assert_eq!(mode, "rpc");
     let status = Command::new(LEGION_BIN)
-        .arg("rpc")
+        .arg(mode)
         .env("LEGION_HOME", legion_home)
         .env("HOME", user_home)
         .env("USERPROFILE", user_home)
@@ -2385,7 +2398,7 @@ fn expiring_token_cannot_forward_credential_minting_tools() {
 }
 
 fn ui_assets_are_served_with_security_headers_and_guarded_api() {
-    const EXPECTED_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    const EXPECTED_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
     let fixture = Fixture::new();
     let server = Server::start(&fixture.home);
@@ -2500,4 +2513,555 @@ fn ui_assets_are_served_with_security_headers_and_guarded_api() {
     assert_eq!(server.get("/", None).status, 401);
     assert_eq!(server.get("/v1/health", None).status, 200);
     assert_eq!(server.get("/v1/tools", Some(&fixture.phone)).status, 200);
+}
+
+fn content_tickets_ranges_headers_policy_revocation_and_remote() {
+    let home = Home::new();
+    let pi_home = Home::new();
+
+    // Confined observer role restricted to ~/projects/** so path escapes and config/state dirs
+    // are exercised end to end through the real HTTP server.
+    let confined_policy = "\
+[principals.phone]
+role = \"observer\"
+
+[principals.admin]
+role = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+paths = [\"~/projects/**\"]
+";
+    home.write_config(
+        "node.toml",
+        "name = \"laptop\"\n\n[serve]\norigins = [\"https://app.example.net\"]\n",
+    );
+    home.write_config("policy.toml", confined_policy);
+    pi_home.write_config("node.toml", "name = \"pi\"\n");
+    pi_home.write_config("policy.toml", confined_policy);
+
+    let test_exe = std::env::current_exe().unwrap();
+    let pi_legion_home = pi_home.state().parent().unwrap().to_path_buf();
+    let pi_cmd = json!([
+        test_exe.to_string_lossy(),
+        HELPER_FLAG,
+        pi_legion_home.to_string_lossy(),
+        pi_home.home().to_string_lossy(),
+        "rpc"
+    ]);
+    home.write_config(
+        "fleet.toml",
+        &format!("[machines.pi]\ncommand = {pi_cmd}\n"),
+    );
+
+    let phone = make_token(&home, &["phone", "phone"]);
+    let admin = make_token(&home, &["admin", "admin", "allow_owner=true"]);
+
+    // Local sample files under ~/projects/app and an out-of-root secret file.
+    let projects = home.home().join("projects").join("app");
+    let media_bytes: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+    std::fs::write(projects.join("clip.mp4"), &media_bytes).unwrap();
+    std::fs::write(projects.join("doc.pdf"), b"%PDF-1.4\nhello pdf\n").unwrap();
+    std::fs::write(
+        projects.join("page.html"),
+        b"<html><script>alert(1)</script></html>",
+    )
+    .unwrap();
+    std::fs::write(
+        projects.join("icon.svg"),
+        b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+    )
+    .unwrap();
+    std::fs::write(projects.join("archive.bin"), b"\x00\x01\x02\x03").unwrap();
+    let outside_dir = home.home().join("private");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    let outside_file = outside_dir.join("secret.txt");
+    std::fs::write(&outside_file, b"outside secret").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside_file, projects.join("escape.txt")).unwrap();
+
+    // Remote sample file on `pi` under pi's ~/projects/app.
+    let pi_file = pi_home
+        .home()
+        .join("projects")
+        .join("app")
+        .join("remote.mp4");
+    let pi_bytes: Vec<u8> = (0..8192usize).map(|i| ((i * 17 + 3) % 256) as u8).collect();
+    std::fs::write(&pi_file, &pi_bytes).unwrap();
+
+    let mut server = Server::start(&home);
+
+    // 1. POST /v1/content requires bearer token.
+    assert_eq!(
+        server
+            .post(
+                "/v1/content",
+                None,
+                &json!({"path": "~/projects/app/clip.mp4"})
+            )
+            .status,
+        401
+    );
+
+    // 2. Mint ticket for local clip.mp4 and verify range conformance, HEAD, If-Range, ?download=1.
+    let created = server.post(
+        "/v1/content",
+        Some(&phone),
+        &json!({"path": "~/projects/app/clip.mp4"}),
+    );
+    assert_eq!(created.status, 200, "{}", created.text());
+    let created_json = created.json();
+    let url = created_json["url"].as_str().unwrap().to_owned();
+    assert!(url.starts_with("/v1/content/"), "{url}");
+    assert!(url.ends_with("/clip.mp4"), "{url}");
+    assert_eq!(created_json["expires_in"], json!(900));
+    let ticket_segment = url
+        .strip_prefix("/v1/content/")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    // GET without Authorization and without Origin succeeds (as <video> / <img> sends).
+    let full = http(server.port, "GET", &url, &[], b"");
+    assert_eq!(full.status, 200, "{}", full.text());
+    assert_eq!(full.body, media_bytes);
+    assert_eq!(full.header("content-type"), Some("video/mp4"));
+    assert_eq!(full.header("accept-ranges"), Some("bytes"));
+    assert_eq!(full.header("x-content-type-options"), Some("nosniff"));
+    assert_eq!(
+        full.header("cross-origin-resource-policy"),
+        Some("same-origin")
+    );
+    assert_eq!(full.header("referrer-policy"), Some("no-referrer"));
+    assert_eq!(full.header("cache-control"), Some("private, no-store"));
+    assert_eq!(
+        full.header("content-security-policy"),
+        Some("sandbox; default-src 'none'")
+    );
+    let etag = full.header("etag").expect("missing ETag").to_owned();
+
+    // Range: first byte, last byte, suffix, open-ended, unsatisfiable, If-Range match & mismatch.
+    let r_first = http(
+        server.port,
+        "GET",
+        &url,
+        &[("Range", "bytes=0-0".to_owned())],
+        b"",
+    );
+    assert_eq!(r_first.status, 206);
+    assert_eq!(r_first.header("content-range"), Some("bytes 0-0/4096"));
+    assert_eq!(r_first.body, &media_bytes[0..1]);
+
+    let r_last = http(
+        server.port,
+        "GET",
+        &url,
+        &[("Range", "bytes=4095-4095".to_owned())],
+        b"",
+    );
+    assert_eq!(r_last.status, 206);
+    assert_eq!(r_last.body, &media_bytes[4095..4096]);
+
+    let r_suffix = http(
+        server.port,
+        "GET",
+        &url,
+        &[("Range", "bytes=-32".to_owned())],
+        b"",
+    );
+    assert_eq!(r_suffix.status, 206);
+    assert_eq!(
+        r_suffix.header("content-range"),
+        Some("bytes 4064-4095/4096")
+    );
+    assert_eq!(r_suffix.body, &media_bytes[4064..]);
+
+    let r_open = http(
+        server.port,
+        "GET",
+        &url,
+        &[("Range", "bytes=4000-".to_owned())],
+        b"",
+    );
+    assert_eq!(r_open.status, 206);
+    assert_eq!(r_open.body, &media_bytes[4000..]);
+
+    let r_bad = http(
+        server.port,
+        "GET",
+        &url,
+        &[("Range", "bytes=5000-6000".to_owned())],
+        b"",
+    );
+    assert_eq!(r_bad.status, 416);
+    assert_eq!(r_bad.header("content-range"), Some("bytes */4096"));
+
+    let r_if_match = http(
+        server.port,
+        "GET",
+        &url,
+        &[("Range", "bytes=10-19".to_owned()), ("If-Range", etag)],
+        b"",
+    );
+    assert_eq!(r_if_match.status, 206);
+    assert_eq!(r_if_match.body, &media_bytes[10..20]);
+
+    let r_if_miss = http(
+        server.port,
+        "GET",
+        &url,
+        &[
+            ("Range", "bytes=10-19".to_owned()),
+            ("If-Range", "\"stale\"".to_owned()),
+        ],
+        b"",
+    );
+    assert_eq!(r_if_miss.status, 200);
+    assert_eq!(r_if_miss.body, media_bytes);
+
+    // HEAD and ?download=1.
+    let head = http(server.port, "HEAD", &format!("{url}?download=1"), &[], b"");
+    assert_eq!(head.status, 200);
+    assert_eq!(head.header("content-length"), Some("4096"));
+    assert_eq!(
+        head.header("content-disposition"),
+        Some("attachment; filename=\"clip.mp4\"")
+    );
+    assert!(head.body.is_empty());
+
+    // 3. Host and Origin guards on /v1/content/<ticket>/<name>.
+    let bad_host = http(
+        server.port,
+        "GET",
+        &url,
+        &[("Host", "evil.example:7117".to_owned())],
+        b"",
+    );
+    assert_eq!(bad_host.status, 421);
+    let bad_origin = http(
+        server.port,
+        "GET",
+        &url,
+        &[("Origin", "https://evil.example".to_owned())],
+        b"",
+    );
+    assert_eq!(bad_origin.status, 403);
+    let null_origin = http(
+        server.port,
+        "GET",
+        &url,
+        &[("Origin", "null".to_owned())],
+        b"",
+    );
+    assert_eq!(null_origin.status, 403);
+    let listed_origin = http(
+        server.port,
+        "GET",
+        &url,
+        &[("Origin", "https://app.example.net".to_owned())],
+        b"",
+    );
+    assert_eq!(listed_origin.status, 200);
+    assert_eq!(
+        listed_origin.header("access-control-allow-origin"),
+        Some("https://app.example.net")
+    );
+
+    // 4. Content-Type allow-list + CSP for html, svg, pdf, unknown bin.
+    let html_url = server
+        .post(
+            "/v1/content",
+            Some(&phone),
+            &json!({"path": "~/projects/app/page.html"}),
+        )
+        .json()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let html_resp = http(server.port, "GET", &html_url, &[], b"");
+    assert_eq!(html_resp.status, 200);
+    assert_eq!(
+        html_resp.header("content-type"),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(
+        html_resp.header("content-security-policy"),
+        Some("sandbox; default-src 'none'")
+    );
+
+    let svg_url = server
+        .post(
+            "/v1/content",
+            Some(&phone),
+            &json!({"path": "~/projects/app/icon.svg"}),
+        )
+        .json()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let svg_resp = http(server.port, "GET", &svg_url, &[], b"");
+    assert_eq!(svg_resp.status, 200);
+    assert_eq!(svg_resp.header("content-type"), Some("image/svg+xml"));
+    assert_eq!(
+        svg_resp.header("content-security-policy"),
+        Some("sandbox; default-src 'none'")
+    );
+
+    let pdf_url = server
+        .post(
+            "/v1/content",
+            Some(&phone),
+            &json!({"path": "~/projects/app/doc.pdf"}),
+        )
+        .json()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let pdf_resp = http(server.port, "GET", &pdf_url, &[], b"");
+    assert_eq!(pdf_resp.status, 200);
+    assert_eq!(pdf_resp.header("content-type"), Some("application/pdf"));
+    assert_eq!(
+        pdf_resp.header("content-security-policy"),
+        None,
+        "inline PDF must not carry sandbox CSP"
+    );
+
+    let bin_url = server
+        .post(
+            "/v1/content",
+            Some(&phone),
+            &json!({"path": "~/projects/app/archive.bin"}),
+        )
+        .json()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bin_resp = http(server.port, "GET", &bin_url, &[], b"");
+    assert_eq!(bin_resp.status, 200);
+    assert_eq!(
+        bin_resp.header("content-type"),
+        Some("application/octet-stream")
+    );
+    assert_eq!(
+        bin_resp.header("content-disposition"),
+        Some("attachment; filename=\"archive.bin\"")
+    );
+
+    // 5. Wrong ticket & filename mismatch return 404.
+    assert_eq!(
+        http(
+            server.port,
+            "GET",
+            "/v1/content/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/clip.mp4",
+            &[],
+            b"",
+        )
+        .status,
+        404
+    );
+    assert_eq!(
+        http(
+            server.port,
+            "GET",
+            &format!("/v1/content/{ticket_segment}/doc.pdf"),
+            &[],
+            b"",
+        )
+        .status,
+        404
+    );
+
+    // 6. Path outside role's `paths`, config dir, state dir, and escaping symlink are all 403.
+    let config_policy = home
+        .state()
+        .parent()
+        .unwrap()
+        .join("config")
+        .join("policy.toml");
+    let state_audit = home.state().join("audit.jsonl");
+    for blocked in [
+        outside_file.to_string_lossy().into_owned(),
+        config_policy.to_string_lossy().into_owned(),
+        state_audit.to_string_lossy().into_owned(),
+    ] {
+        let resp = server.post("/v1/content", Some(&phone), &json!({"path": blocked}));
+        assert_eq!(
+            resp.status,
+            403,
+            "expected 403 for {blocked}: {}",
+            resp.text()
+        );
+    }
+    #[cfg(unix)]
+    {
+        let resp = server.post(
+            "/v1/content",
+            Some(&phone),
+            &json!({"path": "~/projects/app/escape.txt"}),
+        );
+        assert_eq!(
+            resp.status,
+            403,
+            "escaping symlink must be 403: {}",
+            resp.text()
+        );
+    }
+
+    // 7. Remote machine (`on: "pi"`) read by read-only `observer` role with range support.
+    let pi_created = server.post(
+        "/v1/content",
+        Some(&phone),
+        &json!({"on": "pi", "path": pi_file.to_string_lossy()}),
+    );
+    assert_eq!(pi_created.status, 200, "{}", pi_created.text());
+    let pi_url = pi_created.json()["url"].as_str().unwrap().to_owned();
+    let pi_range = http(
+        server.port,
+        "GET",
+        &pi_url,
+        &[("Range", "bytes=1000-2023".to_owned())],
+        b"",
+    );
+    assert_eq!(pi_range.status, 206, "{}", pi_range.text());
+    assert_eq!(
+        pi_range.header("content-range"),
+        Some("bytes 1000-2023/8192")
+    );
+    assert_eq!(pi_range.body, &pi_bytes[1000..2024]);
+    assert!(
+        pi_home
+            .audit()
+            .iter()
+            .any(|e| e["tool"] == "stream.get" && e["principal"] == "phone"),
+        "remote node must audit stream.get for phone"
+    );
+
+    // Non-single `on` is rejected with 400; unknown machine with 404.
+    assert_eq!(
+        server
+            .post(
+                "/v1/content",
+                Some(&phone),
+                &json!({"on": "all", "path": "~/projects/app/clip.mp4"}),
+            )
+            .status,
+        400
+    );
+    assert_eq!(
+        server
+            .post(
+                "/v1/content",
+                Some(&phone),
+                &json!({"on": "ghost", "path": "~/projects/app/clip.mp4"}),
+            )
+            .status,
+        404
+    );
+
+    // 8. Per-holder ticket bound (128): issuing 129 tickets evicts the oldest one.
+    let first_bound_url = server
+        .post(
+            "/v1/content",
+            Some(&admin),
+            &json!({"path": "~/projects/app/clip.mp4"}),
+        )
+        .json()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut last_bound_url = String::new();
+    for _ in 0..128 {
+        let r = server.post(
+            "/v1/content",
+            Some(&admin),
+            &json!({"path": "~/projects/app/clip.mp4"}),
+        );
+        assert_eq!(r.status, 200, "{}", r.text());
+        last_bound_url = r.json()["url"].as_str().unwrap().to_owned();
+    }
+    assert_eq!(
+        http(server.port, "GET", &first_bound_url, &[], b"").status,
+        404,
+        "oldest ticket past the per-holder bound must be evicted"
+    );
+    assert_eq!(
+        http(server.port, "GET", &last_bound_url, &[], b"").status,
+        200
+    );
+
+    // 9. Existing ticket is denied immediately if the role loses `fs.read` on that path.
+    home.write_config(
+        "policy.toml",
+        "\
+[principals.phone]
+role = \"observer\"
+
+[principals.admin]
+role = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+deny = [\"fs.read\"]
+paths = [\"~/projects/**\"]
+",
+    );
+    assert_eq!(http(server.port, "GET", &url, &[], b"").status, 403);
+    home.write_config("policy.toml", confined_policy);
+    assert_eq!(http(server.port, "GET", &url, &[], b"").status, 200);
+
+    // 10. Removing or replacing the bearer token kills its tickets immediately.
+    let removed = home.run(&["token", "remove", "phone", "--json"]);
+    assert_eq!(removed.code, 0, "{}", removed.stderr);
+    assert_eq!(http(server.port, "GET", &url, &[], b"").status, 404);
+
+    // Replacing a token under the same name also keeps old tickets dead.
+    let phone_v2 = make_token(&home, &["phone", "phone"]);
+    assert_eq!(http(server.port, "GET", &url, &[], b"").status, 404);
+    let url_v2 = server
+        .post(
+            "/v1/content",
+            Some(&phone_v2),
+            &json!({"path": "~/projects/app/clip.mp4"}),
+        )
+        .json()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(http(server.port, "GET", &url_v2, &[], b"").status, 200);
+    let replaced = home.run(&["token", "remove", "phone", "--json"]);
+    assert_eq!(replaced.code, 0, "{}", replaced.stderr);
+    let _phone_v3 = make_token(&home, &["phone", "phone"]);
+    assert_eq!(http(server.port, "GET", &url_v2, &[], b"").status, 404);
+
+    // 11. Reads are audited and tickets never reach audit logs or server stderr.
+    server.stop();
+    let stderr = server.stderr();
+    assert!(
+        !stderr.contains(&ticket_segment),
+        "content ticket leaked to stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("/v1/content/<redacted>/clip.mp4"),
+        "expected redacted content path in stderr:\n{stderr}"
+    );
+    let audit_raw = std::fs::read_to_string(home.state().join("audit.jsonl")).unwrap();
+    assert!(
+        !audit_raw.contains(&ticket_segment),
+        "content ticket leaked to audit.jsonl"
+    );
+    let audit = home.audit();
+    assert!(
+        audit.iter().any(|e| e["tool"] == "content.read"
+            && e["principal"] == "phone"
+            && e["target"] == "laptop"),
+        "missing local content.read audit entry"
+    );
+    assert!(
+        audit.iter().any(|e| e["tool"] == "content.read"
+            && e["principal"] == "phone"
+            && e["target"] == "pi"),
+        "missing remote content.read audit entry"
+    );
 }

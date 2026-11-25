@@ -2,12 +2,19 @@
 //! [`Local`] with a router that reaches other machines for all of them at once.
 
 use std::collections::BTreeMap;
+use std::io::{self, Seek, SeekFrom};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use legion_proto::{Effect, ErrorBody, ErrorCode, FanOut, MachineOutcome, Target};
-use serde_json::Value;
+use serde_json::{Value, json};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
+use crate::ctx::Door;
 use crate::node::{Call, Node};
+use crate::policy::{Access, Policy};
 use crate::tool::BoxFuture;
 
 /// The result of a routed call, preserving whether it targeted one machine or fanned out to
@@ -69,6 +76,53 @@ impl RouteOutcome {
 /// cannot be established.
 pub type MachineEffects = Vec<(String, Option<Effect>)>;
 
+/// One request to open a byte range of a file through a [`Router`].
+#[derive(Clone, Debug)]
+pub struct ContentRequest {
+    /// Target machine name, or `None` for this node.
+    pub machine: Option<String>,
+    /// File path on the target machine (absolute or starting with `~`).
+    pub path: String,
+    /// Starting byte offset.
+    pub offset: u64,
+    /// Maximum number of bytes to read, or `None` to read through the end of the file.
+    pub length: Option<u64>,
+    /// Principal pinned by the door (for example the HTTP bearer token's principal).
+    pub principal: String,
+    /// Door through which the request arrived, recorded in the audit log.
+    pub door: Door,
+    /// Cancelled when the caller disconnects or the server shuts down.
+    pub cancel: CancellationToken,
+}
+
+/// An opened file byte range with metadata and a streaming async reader.
+pub struct OpenedContent {
+    /// Total file size in bytes when opened.
+    pub size: u64,
+    /// Starting byte offset of `reader`.
+    pub offset: u64,
+    /// Exact number of bytes `reader` will yield.
+    pub length: u64,
+    /// File modification time: whole seconds since the Unix epoch.
+    pub mtime_secs: i64,
+    /// File modification time: sub-second nanoseconds (`0..1_000_000_000`).
+    pub mtime_nanos: u32,
+    /// Async byte reader yielding `length` bytes with backpressure.
+    pub reader: Box<dyn AsyncRead + Send + Unpin>,
+}
+
+/// Failure opening a file byte range.
+#[derive(Debug)]
+pub enum ContentError {
+    /// Requested `offset` exceeds the file's current `size`.
+    OutOfRange {
+        /// Current file size in bytes.
+        size: u64,
+    },
+    /// Structured Legion error (denied, not_found, conflict, unreachable, ...).
+    Error(ErrorBody),
+}
+
 /// Runs a call on the machine or machines its `on` names.
 pub trait Router: Send + Sync + 'static {
     /// Runs `call` where `on` says: this node when `on` is absent.
@@ -78,6 +132,31 @@ pub trait Router: Send + Sync + 'static {
         call: Call,
         on: Option<Target>,
     ) -> BoxFuture<'a, RouteOutcome>;
+
+    /// Opens a byte range of a file on this node or another machine, checking `fs.read`
+    /// permission and recording an audit entry.
+    fn open_content<'a>(
+        &'a self,
+        node: &'a Node,
+        req: ContentRequest,
+    ) -> BoxFuture<'a, Result<OpenedContent, ContentError>> {
+        Box::pin(async move {
+            let here = node.name();
+            match req.machine.as_deref() {
+                None => open_local_content(node, &req).await,
+                Some(machine) if machine == here => open_local_content(node, &req).await,
+                Some(machine) => Err(ContentError::Error(
+                    ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!(
+                            "{machine} cannot be reached from {here}: this router serves only local files."
+                        ),
+                    )
+                    .with_machine(here),
+                )),
+            }
+        })
+    }
 
     /// The effect `tool` has on each machine a call sent where `on` says would run on, learned
     /// the way this router learns it to authorise the call: from this node's spec when the call
@@ -110,6 +189,216 @@ pub trait Router: Send + Sync + 'static {
     /// exits.
     fn shutdown(&self) -> BoxFuture<'_, ()> {
         Box::pin(async {})
+    }
+}
+
+/// Authorises `fs.read` for `req.principal`, confines `req.path` via [`Grant::check_path`], opens
+/// the requested byte range on this node, and records an audit entry.
+pub async fn open_local_content(
+    node: &Node,
+    req: &ContentRequest,
+) -> Result<OpenedContent, ContentError> {
+    let started = Instant::now();
+    let here = node.name();
+    let args = json!({
+        "path": req.path,
+        "offset": req.offset,
+        "length": req.length,
+    });
+    let outcome = open_local_content_inner(node, &here, req).await;
+    let audit_result = match &outcome {
+        Ok(_) => Ok(Value::Null),
+        Err(ContentError::OutOfRange { size }) => Err(ErrorBody::new(
+            ErrorCode::Conflict,
+            format!(
+                "{} cannot be read at byte {}: there are {size} bytes.",
+                req.path, req.offset
+            ),
+        )),
+        Err(ContentError::Error(err)) => Err(err.clone()),
+    };
+    node.record_audit(
+        here,
+        Some(req.principal.clone()),
+        req.door,
+        "content.read".to_owned(),
+        &args,
+        started,
+        &audit_result,
+    )
+    .await;
+    outcome
+}
+
+async fn open_local_content_inner(
+    node: &Node,
+    here: &str,
+    req: &ContentRequest,
+) -> Result<OpenedContent, ContentError> {
+    if req.cancel.is_cancelled() {
+        return Err(ContentError::Error(
+            ErrorBody::new(ErrorCode::Cancelled, "The content read was cancelled.")
+                .with_machine(here),
+        ));
+    }
+    let policy = node
+        .config()
+        .get::<Policy>()
+        .map_err(|err| ContentError::Error(err.with_machine(here)))?;
+    let grant = policy
+        .authorize_name(&req.principal, "fs.read", Some(Effect::Read), node.paths())
+        .map_err(|err| ContentError::Error(err.with_machine(here)))?;
+    let resolved = grant
+        .check_path(&req.path, Access::Read)
+        .map_err(|err| ContentError::Error(err.with_machine(here)))?;
+
+    let offset = req.offset;
+    let length = req.length;
+    let here_owned = here.to_owned();
+    let opened = tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(&resolved).map_err(|err| {
+            let code = match err.kind() {
+                io::ErrorKind::NotFound => ErrorCode::NotFound,
+                io::ErrorKind::PermissionDenied => ErrorCode::Denied,
+                _ => ErrorCode::Failed,
+            };
+            ContentError::Error(
+                ErrorBody::new(
+                    code,
+                    format!("Could not open {}: {err}.", resolved.display()),
+                )
+                .with_machine(&here_owned),
+            )
+        })?;
+        let meta = file.metadata().map_err(|err| {
+            ContentError::Error(
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("Could not inspect {}: {err}.", resolved.display()),
+                )
+                .with_machine(&here_owned),
+            )
+        })?;
+        if !meta.is_file() {
+            return Err(ContentError::Error(
+                ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!("{} is not a regular file.", resolved.display()),
+                )
+                .with_hint("Name a regular file rather than a directory or special file.")
+                .with_machine(&here_owned),
+            ));
+        }
+        let size = meta.len();
+        if offset > size {
+            return Err(ContentError::OutOfRange { size });
+        }
+        let available = size - offset;
+        let actual_length = length.map_or(available, |n| n.min(available));
+        if offset > 0 && actual_length > 0 {
+            file.seek(SeekFrom::Start(offset)).map_err(|err| {
+                ContentError::Error(
+                    ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!("Could not seek {}: {err}.", resolved.display()),
+                    )
+                    .with_machine(&here_owned),
+                )
+            })?;
+        }
+        let (mtime_secs, mtime_nanos) = meta
+            .modified()
+            .ok()
+            .map_or((0, 0), system_time_to_unix_pair);
+        Ok((file, size, actual_length, mtime_secs, mtime_nanos))
+    })
+    .await
+    .map_err(|err| {
+        ContentError::Error(
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Opening file stopped unexpectedly: {err}."),
+            )
+            .with_machine(here),
+        )
+    })??;
+
+    let (file, size, actual_length, mtime_secs, mtime_nanos) = opened;
+    let reader: Box<dyn AsyncRead + Send + Unpin> = Box::new(LocalFileReader {
+        file: tokio::fs::File::from_std(file),
+        remaining: actual_length,
+        cancel: req.cancel.clone(),
+    });
+    Ok(OpenedContent {
+        size,
+        offset,
+        length: actual_length,
+        mtime_secs,
+        mtime_nanos,
+        reader,
+    })
+}
+
+fn system_time_to_unix_pair(time: SystemTime) -> (i64, u32) {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(d) => (d.as_secs().min(i64::MAX as u64) as i64, d.subsec_nanos()),
+        Err(err) => {
+            let d = err.duration();
+            let whole = d.as_secs().min(i64::MAX as u64) as i64;
+            let nanos = d.subsec_nanos();
+            if nanos == 0 {
+                (-whole, 0)
+            } else {
+                (-whole - 1, 1_000_000_000 - nanos)
+            }
+        }
+    }
+}
+
+struct LocalFileReader {
+    file: tokio::fs::File,
+    remaining: u64,
+    cancel: CancellationToken,
+}
+
+impl AsyncRead for LocalFileReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.cancel.is_cancelled() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "content read was cancelled",
+            )));
+        }
+        if self.remaining == 0 || buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let max_read = usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buf.remaining());
+        let slice = buf.initialize_unfilled_to(max_read);
+        let mut sub = ReadBuf::new(slice);
+        match Pin::new(&mut self.file).poll_read(cx, &mut sub) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Ready(Ok(())) => {
+                let n = sub.filled().len();
+                buf.advance(n);
+                if n == 0 {
+                    let missing = self.remaining;
+                    self.remaining = 0;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("file shrank while reading ({missing} bytes remaining)"),
+                    )));
+                }
+                self.remaining -= n as u64;
+                Poll::Ready(Ok(()))
+            }
+        }
     }
 }
 

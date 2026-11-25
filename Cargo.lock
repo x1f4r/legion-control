@@ -1163,6 +1163,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jiff",
+ "legion-content",
  "legion-core",
  "legion-tools",
  "rmcp",

@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, Response, StatusCode};
 include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
 
 /// Strict content security policy applied to every HTTP door response.
-pub(crate) const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+pub(crate) const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /// Serves one embedded asset by exact path, answering `304 Not Modified` when `If-None-Match`
 /// matches the build's [`ETAG`]. Returns `None` for any path outside the embedded set.

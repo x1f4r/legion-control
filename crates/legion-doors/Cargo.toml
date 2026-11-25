@@ -13,6 +13,7 @@ http-body.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 jiff.workspace = true
+legion-content.workspace = true
 legion-core.workspace = true
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 serde.workspace = true

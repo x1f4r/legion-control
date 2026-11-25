@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use legion_core::config::ConfigStore;
 use legion_core::policy::Policy;
 use legion_core::{
-    BoxFuture, Call, CancellationToken, Ctx, EventSink, MachineEffects, Node, Paths, RouteOutcome,
-    Router, VERSION,
+    BoxFuture, Call, CancellationToken, ContentError, ContentRequest, Ctx, EventSink,
+    MachineEffects, Node, OpenedContent, Paths, RouteOutcome, Router, VERSION, open_local_content,
 };
 pub use legion_proto::MAX_HOPS;
 use legion_proto::{CallParams, Effect, ErrorBody, ErrorCode, Target};
@@ -1730,6 +1730,385 @@ impl Router for Fleet {
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {
         Box::pin(self.close())
+    }
+
+    fn open_content<'a>(
+        &'a self,
+        node: &'a Node,
+        req: ContentRequest,
+    ) -> BoxFuture<'a, Result<OpenedContent, ContentError>> {
+        Box::pin(async move {
+            let here = node.name();
+            match req.machine.as_deref() {
+                None => open_local_content(node, &req).await,
+                Some(machine) if machine == here => open_local_content(node, &req).await,
+                Some(machine) => {
+                    let started = Instant::now();
+                    let args = json!({
+                        "path": req.path,
+                        "offset": req.offset,
+                        "length": req.length,
+                    });
+                    let outcome = self.open_remote_content(node, &here, machine, &req).await;
+                    let audit_result = match &outcome {
+                        Ok(_) => Ok(Value::Null),
+                        Err(ContentError::OutOfRange { size }) => Err(ErrorBody::new(
+                            ErrorCode::Conflict,
+                            format!(
+                                "{} on {machine} cannot be read at byte {}: there are {size} bytes.",
+                                req.path, req.offset
+                            ),
+                        )),
+                        Err(ContentError::Error(err)) => Err(err.clone()),
+                    };
+                    node.record_audit(
+                        machine.to_owned(),
+                        Some(req.principal.clone()),
+                        req.door,
+                        "content.read".to_owned(),
+                        &args,
+                        started,
+                        &audit_result,
+                    )
+                    .await;
+                    outcome
+                }
+            }
+        })
+    }
+}
+
+impl Fleet {
+    async fn open_remote_content(
+        &self,
+        node: &Node,
+        here: &str,
+        machine: &str,
+        req: &ContentRequest,
+    ) -> Result<OpenedContent, ContentError> {
+        use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
+
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+        const MAX_REPLY_LINE: usize = 1024 * 1024;
+        const MAX_NOISE_LINES: usize = 64;
+        const MAX_NOISE_BYTES: usize = 64 * 1024;
+        const STREAM_BUF: usize = 64 * 1024;
+
+        struct RemoteContentReader {
+            reader: BufReader<tokio::process::ChildStdout>,
+            _stdin: tokio::process::ChildStdin,
+            _handle: crate::connector::PipeHandle,
+            remaining: u64,
+            cancel: CancellationToken,
+        }
+
+        impl AsyncRead for RemoteContentReader {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.cancel.is_cancelled() {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "content stream was cancelled",
+                    )));
+                }
+                if self.remaining == 0 || buf.remaining() == 0 {
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                let max_read = usize::try_from(self.remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(buf.remaining());
+                let slice = buf.initialize_unfilled_to(max_read);
+                let mut sub = ReadBuf::new(slice);
+                match std::pin::Pin::new(&mut self.reader).poll_read(cx, &mut sub) {
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                    std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
+                    std::task::Poll::Ready(Ok(())) => {
+                        let n = sub.filled().len();
+                        buf.advance(n);
+                        if n == 0 {
+                            let missing = self.remaining;
+                            self.remaining = 0;
+                            return std::task::Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                format!(
+                                    "remote content stream ended with {missing} bytes remaining"
+                                ),
+                            )));
+                        }
+                        self.remaining -= n as u64;
+                        std::task::Poll::Ready(Ok(()))
+                    }
+                }
+            }
+        }
+
+        // Authorise on this node first (every node a forwarded read crosses must allow fs.read).
+        let policy = node
+            .config()
+            .get::<Policy>()
+            .map_err(|err| ContentError::Error(ensure_machine(err, here)))?;
+        policy
+            .authorize_name(&req.principal, "fs.read", Some(Effect::Read), node.paths())
+            .map_err(|err| ContentError::Error(err.with_machine(here)))?;
+
+        let pipe = self
+            .open_pipe_for(
+                node.config(),
+                here,
+                machine,
+                Subcommand::Stream,
+                req.cancel.clone(),
+            )
+            .await
+            .map_err(ContentError::Error)?;
+        let stderr = pipe.stderr_tail().clone();
+        let (mut stdin, stdout, handle) = pipe.into_parts();
+
+        let mut header = json!({
+            "protocol": crate::stream::STREAM_PROTOCOL,
+            "op": "get",
+            "path": req.path,
+            "offset": req.offset,
+            "as": req.principal,
+        });
+        if let Some(len) = req.length {
+            header["length"] = json!(len);
+        }
+        let mut line = header.to_string().into_bytes();
+        line.push(b'\n');
+
+        let mut reader = BufReader::with_capacity(STREAM_BUF, stdout);
+        let handshake = async {
+            stdin.write_all(&line).await.map_err(|err| {
+                ContentError::Error(
+                    ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!("Could not send stream get header to {machine}: {err}."),
+                    )
+                    .with_machine(machine),
+                )
+            })?;
+            stdin.flush().await.map_err(|err| {
+                ContentError::Error(
+                    ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!("Could not flush stream get header to {machine}: {err}."),
+                    )
+                    .with_machine(machine),
+                )
+            })?;
+
+            let mut greeted = false;
+            let mut noise_lines = 0usize;
+            let mut noise_bytes = 0usize;
+            let mut reply_buf = Vec::new();
+            loop {
+                reply_buf.clear();
+                let mut total = 0usize;
+                loop {
+                    let available = reader.fill_buf().await.map_err(|err| {
+                        ContentError::Error(
+                            ErrorBody::new(
+                                ErrorCode::Unreachable,
+                                format!("Reading stream reply from {machine} failed: {err}."),
+                            )
+                            .with_machine(machine),
+                        )
+                    })?;
+                    if available.is_empty() {
+                        break;
+                    }
+                    if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                        let take = pos + 1;
+                        if total + take > MAX_REPLY_LINE {
+                            return Err(ContentError::Error(
+                                ErrorBody::new(
+                                    ErrorCode::Failed,
+                                    format!("{machine} sent an oversized stream reply line."),
+                                )
+                                .with_machine(machine),
+                            ));
+                        }
+                        reply_buf.extend_from_slice(&available[..take]);
+                        reader.consume(take);
+                        total += take;
+                        break;
+                    }
+                    let n = available.len();
+                    if total + n > MAX_REPLY_LINE {
+                        return Err(ContentError::Error(
+                            ErrorBody::new(
+                                ErrorCode::Failed,
+                                format!("{machine} sent an oversized stream reply line."),
+                            )
+                            .with_machine(machine),
+                        ));
+                    }
+                    reply_buf.extend_from_slice(available);
+                    reader.consume(n);
+                    total += n;
+                }
+                if total == 0 {
+                    let mut err = ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!("The stream to {machine} closed before answering."),
+                    )
+                    .with_machine(machine);
+                    let text = stderr.text();
+                    if !text.is_empty() {
+                        err = err.with_hint(format!("Remote stderr: {text}"));
+                    }
+                    return Err(ContentError::Error(err));
+                }
+
+                if let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(&reply_buf) {
+                    if !greeted {
+                        if let Some(spoken) = fields.get("protocol") {
+                            if spoken.as_u64() != Some(u64::from(crate::stream::STREAM_PROTOCOL)) {
+                                return Err(ContentError::Error(
+                                    ErrorBody::new(
+                                        ErrorCode::Unsupported,
+                                        format!(
+                                            "{machine} speaks stream protocol {spoken}, and this node speaks stream protocol {}.",
+                                            crate::stream::STREAM_PROTOCOL
+                                        ),
+                                    )
+                                    .with_hint("Update legion on whichever machine is older.")
+                                    .with_machine(machine),
+                                ));
+                            }
+                            greeted = true;
+                            continue;
+                        }
+                    } else if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
+                        continue;
+                    } else {
+                        if let Some(err_val) = fields.get("error")
+                            && let Ok(body) = serde_json::from_value::<ErrorBody>(err_val.clone())
+                        {
+                            if body.code == ErrorCode::Conflict
+                                && let Some(actual) = body
+                                    .details
+                                    .as_ref()
+                                    .and_then(|d| d.get("actual"))
+                                    .and_then(Value::as_u64)
+                                && body
+                                    .details
+                                    .as_ref()
+                                    .and_then(|d| d.get("requested"))
+                                    .is_some()
+                            {
+                                return Err(ContentError::OutOfRange { size: actual });
+                            }
+                            return Err(ContentError::Error(body.with_machine(machine)));
+                        }
+                        if let Ok(ready) =
+                            serde_json::from_value::<crate::stream::GetReady>(Value::Object(fields))
+                        {
+                            return Ok(ready);
+                        }
+                        return Err(ContentError::Error(
+                            ErrorBody::new(
+                                ErrorCode::Failed,
+                                format!("{machine} answered stream get with an unexpected line."),
+                            )
+                            .with_machine(machine),
+                        ));
+                    }
+                }
+                if greeted {
+                    return Err(ContentError::Error(
+                        ErrorBody::new(
+                            ErrorCode::Failed,
+                            format!("{machine} answered stream get with non-JSON output."),
+                        )
+                        .with_machine(machine),
+                    ));
+                }
+                noise_lines += 1;
+                noise_bytes += reply_buf.len();
+                if noise_lines > MAX_NOISE_LINES || noise_bytes > MAX_NOISE_BYTES {
+                    return Err(ContentError::Error(
+                        ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            format!(
+                                "{machine} sent too much non-protocol output before starting legion stream."
+                            ),
+                        )
+                        .with_machine(machine),
+                    ));
+                }
+            }
+        };
+
+        let ready = tokio::select! {
+            biased;
+            () = req.cancel.cancelled() => {
+                drop(stdin);
+                drop(reader);
+                handle.close(Duration::from_secs(1)).await;
+                return Err(ContentError::Error(
+                    ErrorBody::new(
+                        ErrorCode::Cancelled,
+                        format!("Opening content on {machine} was cancelled."),
+                    )
+                    .with_machine(machine),
+                ));
+            }
+            res = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake) => match res {
+                Ok(Ok(ready)) => ready,
+                Ok(Err(err)) => {
+                    drop(stdin);
+                    drop(reader);
+                    handle.close(Duration::from_secs(1)).await;
+                    return Err(err);
+                }
+                Err(_) => {
+                    drop(stdin);
+                    drop(reader);
+                    handle.close(Duration::from_secs(1)).await;
+                    return Err(ContentError::Error(
+                        ErrorBody::new(
+                            ErrorCode::Timeout,
+                            format!("Timed out waiting for {machine} to answer stream get."),
+                        )
+                        .with_machine(machine),
+                    ));
+                }
+            }
+        };
+
+        let Some(mtime) = ready.mtime else {
+            drop(stdin);
+            drop(reader);
+            handle.close(Duration::from_secs(1)).await;
+            return Err(ContentError::Error(
+                ErrorBody::new(
+                    ErrorCode::Unsupported,
+                    format!("{machine} answered stream get without modification time (older legion version)."),
+                )
+                .with_hint("Update legion on that machine so it supports random-access content reads.")
+                .with_machine(machine),
+            ));
+        };
+
+        Ok(OpenedContent {
+            size: ready.size,
+            offset: ready.offset,
+            length: ready.length,
+            mtime_secs: mtime.secs,
+            mtime_nanos: mtime.nanos,
+            reader: Box::new(RemoteContentReader {
+                reader,
+                _stdin: stdin,
+                _handle: handle,
+                remaining: ready.length,
+                cancel: req.cancel.clone(),
+            }),
+        })
     }
 }
 

@@ -18,10 +18,14 @@
 //! - `POST /v1/call`: `{tool, args, on?}` runs a call. The tool's result comes back with 200, a
 //!   failure as the error object with a status that fits its code. With
 //!   `Accept: text/event-stream` the call's events stream as they happen, then its end.
+//! - `POST /v1/content`: `{path, on?}` issues a short-lived ticket URL
+//!   (`/v1/content/<ticket>/<file name>`) for random-access file reads (`GET`/`HEAD` with
+//!   single-range support, safe headers, and no bearer token required on the ticket URL).
 //! - `/mcp`: MCP over streamable HTTP, the same door `legion mcp` serves over stdio.
 //!   `?compact=1` (or `Legion-Compact: 1`) serves the three compact tools.
 
 mod api;
+mod content;
 mod gate;
 mod reply;
 mod sessions;
@@ -45,6 +49,7 @@ use axum::middleware::{self, Next};
 use axum::routing::{any, get, post};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
+use legion_content::TicketTable;
 use legion_core::config::NodeFile;
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::tokens::Tokens;
@@ -220,6 +225,7 @@ impl HttpDoor {
             mcp_compact,
             managers: [managers_full, managers_compact],
             sessions: Sessions::default(),
+            content_tickets: TicketTable::new(),
             node: self.node.clone(),
             router: Arc::clone(&self.router),
             port: local.port(),
@@ -230,6 +236,8 @@ impl HttpDoor {
             .route("/v1/health", get(api::health))
             .route("/v1/tools", get(api::tools))
             .route("/v1/call", post(api::call))
+            .route("/v1/content", post(content::create))
+            .route("/v1/content/{ticket}/{name}", any(content::serve))
             .route("/mcp", any(serve_mcp))
             .fallback(not_found)
             .layer(middleware::from_fn_with_state(Arc::clone(&shared), gate))
@@ -315,6 +323,8 @@ pub(crate) struct Shared {
     managers: [Arc<LocalSessionManager>; 2],
     /// Which token opened each session.
     sessions: Sessions,
+    /// Active content tickets bound to bearer tokens.
+    content_tickets: TicketTable,
 }
 
 impl Shared {
@@ -329,9 +339,13 @@ impl Shared {
         }
     }
 
-    /// Ends the sessions of tokens that were removed, replaced or have expired, and idle ones.
+    /// Ends the sessions and content tickets of tokens that were removed, replaced or have
+    /// expired, and sweeps idle ones.
     async fn end_stale_sessions(&self) {
         let tokens = self.node.config().get::<Tokens>().ok();
+        let now = jiff::Timestamp::now();
+        self.content_tickets
+            .retain_holders(|holder| content::holder_is_live(holder, None, tokens.as_deref(), now));
         let ended = self.sessions.stale(tokens.as_deref());
         self.close(ended).await;
     }
@@ -346,7 +360,11 @@ async fn gate(
 ) -> Response<Body> {
     let started = Instant::now();
     let method = request.method().clone();
-    let path: String = request.uri().path().chars().take(200).collect();
+    let raw_path = request.uri().path().to_owned();
+    let logged_path: String = content::redact_log_path(&raw_path)
+        .chars()
+        .take(200)
+        .collect();
     // A node.toml that does not parse adds no hosts and no origins: loopback still works.
     let config = shared
         .node
@@ -355,6 +373,7 @@ async fn gate(
         .map(|file| file.serve.clone())
         .unwrap_or_default();
     let mut principal = None;
+    let mut served_content = false;
     // The origin of a page allowed to call, which every response past the origin check names, so
     // the browser shows the page its errors as well as its results.
     let mut accepted_origin = None;
@@ -377,7 +396,17 @@ async fn gate(
         if method == Method::OPTIONS && accepted_origin.is_some() {
             // A browser's preflight carries no token; a listed origin is told what it may send.
             preflight()
-        } else if method == Method::GET && path == "/v1/health" {
+        } else if method == Method::GET && raw_path == "/v1/health" {
+            next.run(request).await
+        } else if (method == Method::GET || method == Method::HEAD)
+            && content::is_content_read_path(&raw_path)
+        {
+            // Media elements (`<img>`, `<video>`, `<audio>`) cannot send `Authorization` and send
+            // no `Origin`. Host and Origin guards above have already run; `legion-content`
+            // authenticates the 256-bit ticket, re-verifies the token and `fs.read` policy, and
+            // sets its own fixed headers (`nosniff`, `CORP`, `no-referrer`, `no-store`, and
+            // `sandbox` CSP for everything except inline PDF).
+            served_content = true;
             next.run(request).await
         } else if config.ui
             && (method == Method::GET || method == Method::HEAD)
@@ -414,22 +443,26 @@ async fn gate(
         }
     };
     let headers = response.headers_mut();
-    headers.insert(
-        CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(ui::CONTENT_SECURITY_POLICY),
-    );
-    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    if !served_content {
+        headers.insert(
+            CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(ui::CONTENT_SECURITY_POLICY),
+        );
+        headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+        headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    }
     if let Some(origin) = accepted_origin {
         headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
         headers.insert(
             ACCESS_CONTROL_EXPOSE_HEADERS,
-            HeaderValue::from_static("Mcp-Session-Id, WWW-Authenticate"),
+            HeaderValue::from_static(
+                "Mcp-Session-Id, WWW-Authenticate, Content-Range, Accept-Ranges, ETag, Content-Disposition",
+            ),
         );
         headers.append(VARY, HeaderValue::from_static("Origin"));
     }
     log(&format!(
-        "{method} {path} {} {} {}ms",
+        "{method} {logged_path} {} {} {}ms",
         response.status().as_u16(),
         principal.as_deref().unwrap_or("-"),
         started.elapsed().as_millis()
@@ -446,12 +479,12 @@ fn preflight() -> Response<Body> {
     let headers = response.headers_mut();
     headers.insert(
         ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, DELETE"),
+        HeaderValue::from_static("GET, HEAD, POST, DELETE"),
     );
     headers.insert(
         ACCESS_CONTROL_ALLOW_HEADERS,
         HeaderValue::from_static(
-            "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Last-Event-ID, Legion-Compact",
+            "Authorization, Content-Type, Accept, Range, If-Range, Mcp-Session-Id, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Last-Event-ID, Legion-Compact",
         ),
     );
     headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
@@ -675,7 +708,7 @@ async fn not_found() -> Response<Body> {
     reply::json(
         StatusCode::NOT_FOUND,
         &ErrorBody::new(ErrorCode::NotFound, "There is nothing at this path.")
-            .with_hint("The paths are GET /v1/health, GET /v1/tools, POST /v1/call and /mcp."),
+            .with_hint("The paths are GET /v1/health, GET /v1/tools, POST /v1/call, POST /v1/content and /mcp."),
     )
 }
 
