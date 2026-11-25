@@ -10,8 +10,14 @@ pub mod transfers;
 pub mod updater;
 
 use std::sync::Arc;
-#[cfg(any(target_os = "android", target_os = "ios"))]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+/// Maximum time an update install waits for an in-flight passive background refresh (such as
+/// Machine Overview's 5-second `sys.info` / `sys.procs` poll) to finish cleanly before proceeding
+/// between poll ticks. Automatic installs defer cleanly if a refresh is still mid-call past this
+/// bound rather than cutting it off.
+pub(crate) const BACKGROUND_REFRESH_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tauri::Emitter;
@@ -29,6 +35,22 @@ use crate::transfers::PauseReason;
 use crate::transfers::{SharedTransfers, TransferManager, TransferPlatform};
 use crate::updater::{SharedUpdater, UpdateManager};
 
+/// Returns `true` when this desktop process was spawned by the update supervisor purely to verify
+/// startup (`LEGION_UPDATE_VERIFY_ONLY=1`) and exit without opening a window.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn is_verify_only_launch() -> bool {
+    std::env::var_os("LEGION_UPDATE_VERIFY_ONLY").is_some_and(|v| v == "1")
+}
+
+/// Returns `true` when desktop single-instance hand-over should be registered.
+///
+/// Verify-only update probes skip single-instance hand-over so reopening the app while the
+/// window-close supervisor runs can never make the probe hand off and exit before writing
+/// `started-<seq>.ok` (which would cause a spurious rollback of a healthy build).
+pub const fn should_register_single_instance(verify_only: bool) -> bool {
+    !verify_only
+}
+
 #[cfg(target_os = "android")]
 struct SharedAndroidTransferPlatform(Arc<transfers::android::AndroidTransferPlatform>);
 
@@ -37,6 +59,12 @@ struct SharedAndroidTransferPlugin(Arc<transfers::android::AndroidTransferPlugin
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 struct SharedDesktopTransferPlatform(Arc<transfers::desktop::DesktopTransferPlatform>);
+
+/// Tracks whether the application has begun quitting or the OS session is ending so window-close
+/// and drain-exit hooks never start a close-time update supervisor while the OS is tearing down
+/// processes.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct SharedExitRequested(Arc<AtomicBool>);
 
 /// Returns `true` only for the bundled app origin on the current platform.
 ///
@@ -86,6 +114,190 @@ fn android_app_updater_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
         .build()
 }
 
+/// Testable core of [`should_defer_to_active_update`] operating on an explicit `updates_dir`.
+///
+/// Returns `true` when this desktop launch must exit early before registering single-instance,
+/// creating the content server, loading `transfers/queue.json`, or opening a window because
+/// another process holds an active update lock.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn should_defer_to_active_update_in(
+    updates_dir: &std::path::Path,
+    verify_only: bool,
+    supervised_launch: bool,
+) -> bool {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    should_defer_to_active_update_in_at(updates_dir, verify_only, supervised_launch, now_unix)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn should_defer_to_active_update_in_at(
+    updates_dir: &std::path::Path,
+    verify_only: bool,
+    supervised_launch: bool,
+    now_unix: u64,
+) -> bool {
+    if verify_only || supervised_launch {
+        return false;
+    }
+    match updater::desktop::inspect_update_lock_at(updates_dir, now_unix) {
+        updater::desktop::UpdateLockInspection::Active(active_lock) => {
+            if active_lock.verify_only {
+                updater::desktop::request_reopen_after_update(updates_dir);
+            }
+            true
+        }
+        updater::desktop::UpdateLockInspection::StaleCleared { reason } => {
+            updater::desktop::record_stale_lock_notice(updates_dir, &reason);
+            false
+        }
+        updater::desktop::UpdateLockInspection::None => false,
+    }
+}
+
+/// Returns `true` when this desktop launch should defer to an in-progress update instead of
+/// grabbing the single-instance lock, starting the content server or transfer queue, opening a
+/// window, or holding install files open.
+///
+/// Runs before `tauri_plugin_single_instance::init` and before `AppContentServer` /
+/// `TransferManager` setup so a user double-clicking the app icon during an update never steals
+/// the single-instance name, binds a loopback socket, touches `transfers/queue.json`, or blocks
+/// the swap/NSIS installer. When the active update is a headless window-close update
+/// (`verify_only == true`), leaves a `reopen-requested` flag so the supervisor opens the newly
+/// installed app interactively once the swap finishes.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn should_defer_to_active_update(verify_only: bool) -> bool {
+    let supervised_launch = updater::desktop::is_supervised_launch();
+    if verify_only || supervised_launch {
+        return false;
+    }
+    let Some(updates_dir) = updater::desktop::early_desktop_updates_dir() else {
+        return false;
+    };
+    should_defer_to_active_update_in(&updates_dir, verify_only, supervised_launch)
+}
+
+/// Outcome of handling a desktop window-close request when combining the device transfer queue
+/// with automatic close-time updates.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DesktopCloseOutcome {
+    /// Device transfers are active: keep the app alive hidden until the queue drains, and never
+    /// spawn an update supervisor while transfers run.
+    HideForDrain,
+    /// No active transfers remain and the detached close-time update supervisor was spawned.
+    CloseWithUpdate,
+    /// No active transfers remain and no update supervisor was spawned.
+    CloseNormally,
+}
+
+/// Returns the combined native active-operation count evaluated by desktop close-time updates.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn desktop_close_active_ops(
+    backend: &dyn Backend,
+    transfers: &TransferManager,
+) -> usize {
+    backend
+        .active_operations()
+        .saturating_add(usize::from(transfers.has_active_work()))
+}
+
+/// Coordinates desktop window close between active transfers and close-time auto-updates:
+/// hides to drain if any transfer is active (`queued`, `running`, or `cancelling`, never spawning
+/// a supervisor), waits briefly for any mid-call passive background refresh to finish cleanly so
+/// installs run between poll ticks without cutting off an RPC, and only spawns the close-time
+/// update supervisor when both `!transfers.has_active_work()` and the native updater gate allow it.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn handle_desktop_close_request(
+    updater: &UpdateManager,
+    backend: &dyn Backend,
+    transfers: &TransferManager,
+) -> DesktopCloseOutcome {
+    handle_desktop_close_request_with_timeout(
+        updater,
+        backend,
+        transfers,
+        BACKGROUND_REFRESH_DRAIN_TIMEOUT,
+    )
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn handle_desktop_close_request_with_timeout(
+    updater: &UpdateManager,
+    backend: &dyn Backend,
+    transfers: &TransferManager,
+    refresh_drain_timeout: Duration,
+) -> DesktopCloseOutcome {
+    if transfers.has_active_work() {
+        return DesktopCloseOutcome::HideForDrain;
+    }
+    let active_ops = desktop_close_active_ops(backend, transfers);
+    if updater
+        .evaluate_auto_install_gate("close", active_ops, false)
+        .is_err()
+    {
+        return DesktopCloseOutcome::CloseNormally;
+    }
+    if !backend.wait_for_background_refreshes_sync(refresh_drain_timeout) {
+        return DesktopCloseOutcome::CloseNormally;
+    }
+    if transfers.has_active_work() {
+        return DesktopCloseOutcome::HideForDrain;
+    }
+    let active_ops_after = desktop_close_active_ops(backend, transfers);
+    if updater.try_spawn_desktop_close_install(active_ops_after) {
+        DesktopCloseOutcome::CloseWithUpdate
+    } else {
+        DesktopCloseOutcome::CloseNormally
+    }
+}
+
+/// Runs right before a hidden-for-drain desktop app exits once its transfer queue has drained,
+/// waiting briefly for any mid-call passive background refresh to finish cleanly and spawning a
+/// ready close-time update if no active transfers or user-started native operations remain.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn try_spawn_close_install_after_drain(
+    updater: &UpdateManager,
+    backend: &dyn Backend,
+    transfers: &TransferManager,
+) -> bool {
+    try_spawn_close_install_after_drain_with_timeout(
+        updater,
+        backend,
+        transfers,
+        BACKGROUND_REFRESH_DRAIN_TIMEOUT,
+    )
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn try_spawn_close_install_after_drain_with_timeout(
+    updater: &UpdateManager,
+    backend: &dyn Backend,
+    transfers: &TransferManager,
+    refresh_drain_timeout: Duration,
+) -> bool {
+    if transfers.has_active_work() {
+        return false;
+    }
+    let active_ops = desktop_close_active_ops(backend, transfers);
+    if updater
+        .evaluate_auto_install_gate("close", active_ops, false)
+        .is_err()
+    {
+        return false;
+    }
+    if !backend.wait_for_background_refreshes_sync(refresh_drain_timeout) {
+        return false;
+    }
+    if transfers.has_active_work() {
+        return false;
+    }
+    let active_ops_after = desktop_close_active_ops(backend, transfers);
+    updater.try_spawn_desktop_close_install(active_ops_after)
+}
+
 /// Registers the in-app `FilesTransferPlugin` Kotlin plugin on Android for the system file picker,
 /// lazy notification permission dialog, and `LocalSocket` bridge connection to
 /// `TransferForegroundService`.
@@ -105,13 +317,29 @@ fn android_files_transfer_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn reset_desktop_player_state(app: &tauri::AppHandle, window: Option<&tauri::WebviewWindow>) {
+pub(crate) fn reset_desktop_player_state(
+    app: &tauri::AppHandle,
+    window: Option<&tauri::WebviewWindow>,
+) {
     if let Some(keep) = app.try_state::<commands::DesktopKeepScreenOn>() {
         keep.release();
     }
     if let Some(immersive) = app.try_state::<commands::DesktopImmersiveState>() {
         commands::reset_desktop_immersive(window, &immersive);
     }
+}
+
+/// Notifies the page that the desktop window is hiding/closing (for drain, normal close, or an
+/// update restart) so playback pauses in place, then releases native screen hold and full screen.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn notify_hidden_and_reset_desktop_player(
+    app: &tauri::AppHandle,
+    window: Option<&tauri::WebviewWindow>,
+) {
+    if let Some(win) = window {
+        let _ = win.emit(commands::EVENT_WINDOW_HIDDEN, ());
+    }
+    reset_desktop_player_state(app, window);
 }
 
 /// Builds the main Legion WebView window from `tauri.conf.json` with our strict bundled-origin
@@ -205,6 +433,14 @@ pub fn run() {
             ),
     );
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let verify_only = is_verify_only_launch();
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if should_defer_to_active_update(verify_only) {
+        return;
+    }
+
     let builder = tauri::Builder::default();
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -224,18 +460,22 @@ pub fn run() {
     });
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-        if let Some(desktop) = app.try_state::<SharedDesktopTransferPlatform>() {
-            desktop.0.clear_hidden_for_drain();
-        }
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.unminimize();
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
-    }));
+    let builder = if should_register_single_instance(verify_only) {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(desktop) = app.try_state::<SharedDesktopTransferPlatform>() {
+                desktop.0.clear_hidden_for_drain();
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
+    } else {
+        builder
+    };
 
-    let builder = builder.setup(|app| {
+    let builder = builder.setup(move |app| {
         let data_dir = app.path().app_data_dir()?;
         #[cfg(target_os = "windows")]
         let updates_base_dir = app
@@ -254,11 +494,16 @@ pub fn run() {
         // cleanly (writing `started-<seq>.ok`, `current-build.json`, advancing `floor.json`, and
         // recording the post-update notice) and exit without popping a window open.
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if std::env::var_os("LEGION_UPDATE_VERIFY_ONLY").is_some_and(|v| v == "1") {
+        if verify_only {
             updater.on_app_ready();
             app.handle().exit(0);
             return Ok(());
         }
+
+        // Clear any leftover `reopen-requested` flag on every normal interactive start (never
+        // inside a `verify_only` probe, which must leave the flag for its supervisor to honor).
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        updater::desktop::clear_reopen_marker(&updates_base_dir.join("updates"));
 
         let store = AppStore::in_dir(&data_dir);
         store.prepare_dir()?;
@@ -284,10 +529,13 @@ pub fn run() {
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let platform: Arc<dyn TransferPlatform> = {
+            let exit_requested = Arc::new(AtomicBool::new(false));
             let desktop_platform = Arc::new(transfers::desktop::DesktopTransferPlatform::new(
                 app.handle().clone(),
                 &data_dir,
+                Arc::clone(&exit_requested),
             ));
+            app.manage(SharedExitRequested(exit_requested));
             app.manage(SharedDesktopTransferPlatform(Arc::clone(&desktop_platform)));
             desktop_platform
         };
@@ -302,42 +550,35 @@ pub fn run() {
         app.manage(store);
         app.manage(SharedBackend(backend));
         app.manage(SharedContentServer(content_server));
-        app.manage(SharedTransfers(Arc::clone(&transfers)));
-        app.manage(SharedUpdater(Arc::clone(&updater)));
+        app.manage(SharedTransfers(transfers));
+        app.manage(SharedUpdater(updater));
         app.manage(commands::DesktopImmersiveState::default());
         app.manage(commands::DesktopKeepScreenOn::default());
 
         let window = build_main_webview_window(app.handle())?;
 
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(all(
+            not(target_os = "linux"),
+            not(any(target_os = "android", target_os = "ios"))
+        ))]
         {
-            let close_updater = Arc::clone(&updater);
-            let close_transfers = Arc::clone(&transfers);
-            #[cfg(not(target_os = "linux"))]
             let resize_app = app.handle().clone();
-            #[cfg(not(target_os = "linux"))]
             let resize_label = window.label().to_owned();
-            window.on_window_event(move |event| match event {
-                tauri::WindowEvent::CloseRequested { .. } if !close_transfers.has_active_work() => {
-                    let _ = close_updater.try_spawn_desktop_close_install();
-                }
-                #[cfg(not(target_os = "linux"))]
-                tauri::WindowEvent::Resized(_) => {
-                    if let Some(immersive) =
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::Resized(_) = event
+                    && let Some(immersive) =
                         resize_app.try_state::<commands::DesktopImmersiveState>()
-                        && immersive.is_active()
-                        && let Some(win) = resize_app.get_webview_window(&resize_label)
-                        && !commands::read_desktop_fullscreen(&win, &immersive).unwrap_or(true)
-                        && immersive.sync_external_fullscreen(false)
-                    {
-                        let _ = win.emit(commands::EVENT_IMMERSIVE_CHANGED, false);
-                    }
+                    && immersive.is_active()
+                    && let Some(win) = resize_app.get_webview_window(&resize_label)
+                    && !commands::read_desktop_fullscreen(&win, &immersive).unwrap_or(true)
+                    && immersive.sync_external_fullscreen(false)
+                {
+                    let _ = win.emit(commands::EVENT_IMMERSIVE_CHANGED, false);
                 }
-                _ => {}
             });
         }
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        let _ = (window, transfers);
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "ios"))]
+        let _ = window;
 
         Ok(())
     });
@@ -472,18 +713,35 @@ pub fn run() {
             ..
         } => {
             let window = app_handle.get_webview_window(&label);
-            if let Some(win) = window.as_ref() {
-                let _ = win.emit(commands::EVENT_WINDOW_HIDDEN, ());
+            notify_hidden_and_reset_desktop_player(app_handle, window.as_ref());
+            // Never spawn a close-time update once an app quit or OS session shutdown has begun.
+            if app_handle
+                .try_state::<SharedExitRequested>()
+                .is_some_and(|flag| flag.0.load(Ordering::SeqCst))
+            {
+                return;
             }
-            reset_desktop_player_state(app_handle, window.as_ref());
-            let transfers = app_handle.state::<SharedTransfers>();
-            if transfers.0.has_active_work() {
-                api.prevent_close();
-                if let Some(window) = window {
-                    let _ = window.hide();
-                }
-                if let Some(desktop) = app_handle.try_state::<SharedDesktopTransferPlatform>() {
-                    desktop.0.mark_hidden_for_drain();
+            if let (Some(updater), Some(backend), Some(transfers)) = (
+                app_handle.try_state::<SharedUpdater>(),
+                app_handle.try_state::<SharedBackend>(),
+                app_handle.try_state::<SharedTransfers>(),
+            ) {
+                match handle_desktop_close_request(&updater.0, backend.0.as_ref(), &transfers.0) {
+                    DesktopCloseOutcome::HideForDrain => {
+                        api.prevent_close();
+                        if let Some(window) = window {
+                            let _ = window.hide();
+                        }
+                        if let Some(desktop) =
+                            app_handle.try_state::<SharedDesktopTransferPlatform>()
+                        {
+                            desktop.0.mark_hidden_for_drain();
+                        }
+                    }
+                    DesktopCloseOutcome::CloseWithUpdate => {
+                        tauri_plugin_single_instance::destroy(app_handle);
+                    }
+                    DesktopCloseOutcome::CloseNormally => {}
                 }
             }
         }
@@ -494,10 +752,7 @@ pub fn run() {
             ..
         } => {
             let window = app_handle.get_webview_window(&label);
-            if let Some(win) = window.as_ref() {
-                let _ = win.emit(commands::EVENT_WINDOW_HIDDEN, ());
-            }
-            reset_desktop_player_state(app_handle, window.as_ref());
+            notify_hidden_and_reset_desktop_player(app_handle, window.as_ref());
         }
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => {
@@ -517,10 +772,9 @@ pub fn run() {
         } => {
             mobile_suspended.store(true, Ordering::Release);
             #[cfg(target_os = "ios")]
-            app_handle
-                .state::<SharedTransfers>()
-                .0
-                .pause_all_active(PauseReason::Background);
+            if let Some(transfers) = app_handle.try_state::<SharedTransfers>() {
+                transfers.0.pause_all_active(PauseReason::Background);
+            }
         }
         #[cfg(any(target_os = "android", target_os = "ios"))]
         RunEvent::WindowEvent {
@@ -528,12 +782,13 @@ pub fn run() {
             ..
         } => {
             mobile_suspended.store(false, Ordering::Release);
-            app_handle.state::<SharedContentServer>().0.on_app_resumed();
+            if let Some(content) = app_handle.try_state::<SharedContentServer>() {
+                content.0.on_app_resumed();
+            }
             #[cfg(target_os = "ios")]
-            app_handle
-                .state::<SharedTransfers>()
-                .0
-                .resume_paused_for(PauseReason::Background);
+            if let Some(transfers) = app_handle.try_state::<SharedTransfers>() {
+                transfers.0.resume_paused_for(PauseReason::Background);
+            }
         }
         #[cfg(target_os = "ios")]
         RunEvent::WindowEvent {
@@ -552,7 +807,9 @@ pub fn run() {
             }
         }
         RunEvent::ExitRequested { code, api, .. } => {
-            let transfers = app_handle.state::<SharedTransfers>();
+            let Some(transfers) = app_handle.try_state::<SharedTransfers>() else {
+                return;
+            };
             #[cfg(target_os = "android")]
             {
                 if code.is_none() && transfers.0.has_unfinished_or_paused() {
@@ -564,9 +821,14 @@ pub fn run() {
                 if code.is_none() && transfers.0.has_active_work() {
                     if !transfers::desktop::confirm_quit_with_active_transfers() {
                         api.prevent_exit();
-                    } else {
-                        transfers.0.shutdown();
+                        return;
                     }
+                    transfers.0.shutdown();
+                }
+                // Close-time updates start ONLY from the user closing the window, never from
+                // quitting the app or the OS ending the session (`ExitRequested`).
+                if let Some(flag) = app_handle.try_state::<SharedExitRequested>() {
+                    flag.0.store(true, Ordering::SeqCst);
                 }
             }
             #[cfg(target_os = "ios")]
@@ -575,11 +837,20 @@ pub fn run() {
             }
         }
         RunEvent::Exit => {
-            app_handle
-                .state::<commands::DesktopKeepScreenOn>()
-                .release();
-            app_handle.state::<SharedTransfers>().0.shutdown();
-            app_handle.state::<SharedContentServer>().0.shutdown();
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                let window = app_handle.get_webview_window("main");
+                notify_hidden_and_reset_desktop_player(app_handle, window.as_ref());
+                if let Some(flag) = app_handle.try_state::<SharedExitRequested>() {
+                    flag.0.store(true, Ordering::SeqCst);
+                }
+            }
+            if let Some(transfers) = app_handle.try_state::<SharedTransfers>() {
+                transfers.0.shutdown();
+            }
+            if let Some(content) = app_handle.try_state::<SharedContentServer>() {
+                content.0.shutdown();
+            }
         }
         _ => {}
     });
@@ -701,6 +972,99 @@ mod tests {
         assert!(perms.contains(&"core:event:allow-unlisten"));
         assert!(!perms.contains(&"core:event:allow-emit"));
         assert!(!perms.contains(&"core:event:allow-emit-to"));
+        Ok(())
+    }
+
+    #[test]
+    fn verify_only_launch_disables_single_instance_handover() {
+        assert!(!should_register_single_instance(true));
+        assert!(should_register_single_instance(false));
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn early_second_instance_defers_before_content_server_or_transfer_queue_setup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path();
+        let updates_dir = data_dir.join("updates");
+        let transfers_dir = data_dir.join("transfers");
+
+        // No active update lock -> normal launch proceeds.
+        assert!(!should_defer_to_active_update_in(
+            &updates_dir,
+            false,
+            false
+        ));
+
+        // Hold an active verify-only close-update lock (as Instance 1 does during swap).
+        let lock = updater::desktop::try_acquire_update_lock(&updates_dir, 202611250225, true)?
+            .ok_or("expected active update lock")?;
+
+        // Normal second launch MUST defer immediately, request interactive reopen after the
+        // headless swap completes, and never touch the transfers directory or queue.json.
+        assert!(should_defer_to_active_update_in(&updates_dir, false, false));
+        assert!(
+            updates_dir
+                .join(updater::desktop::REOPEN_REQUESTED_FILENAME)
+                .is_file(),
+            "second interactive launch during verify_only update must leave reopen-requested"
+        );
+        assert!(
+            !transfers_dir.exists(),
+            "deferred second instance must exit before TransferManager creates transfers/queue.json"
+        );
+
+        // Verify-only probes and supervised launches MUST NOT defer to their own update lock.
+        assert!(!should_defer_to_active_update_in(&updates_dir, true, false));
+        assert!(!should_defer_to_active_update_in(&updates_dir, false, true));
+
+        drop(lock);
+        assert!(!should_defer_to_active_update_in(
+            &updates_dir,
+            false,
+            false
+        ));
+
+        // Normal start clears any leftover `reopen-requested` flag.
+        updater::desktop::clear_reopen_marker(&updates_dir);
+        assert!(
+            !updates_dir
+                .join(updater::desktop::REOPEN_REQUESTED_FILENAME)
+                .exists()
+        );
+
+        // Stale (> 3 minutes) or future-dated update.lock MUST NOT block startup, MUST clear the
+        // lock file, and MUST record `stale-lock.json` so Updates reports an unfinished update.
+        let now: u64 = 1_800_000_000;
+        let future_lock = updater::desktop::UpdateLockState {
+            owner_pid: std::process::id(),
+            supervisor_pid: Some(std::process::id()),
+            target_sequence: 202611250226,
+            stage: "supervising".to_owned(),
+            verify_only: false,
+            started_unix: now + 300,
+        };
+        std::fs::write(
+            updates_dir.join(updater::desktop::UPDATE_LOCK_FILENAME),
+            serde_json::to_vec(&future_lock)?,
+        )?;
+        assert!(
+            !should_defer_to_active_update_in_at(&updates_dir, false, false, now),
+            "future-dated update.lock must never block startup"
+        );
+        assert!(
+            !updates_dir
+                .join(updater::desktop::UPDATE_LOCK_FILENAME)
+                .exists(),
+            "future-dated update.lock must be cleared"
+        );
+        assert!(
+            updates_dir
+                .join(updater::desktop::STALE_LOCK_MARKER_FILENAME)
+                .is_file(),
+            "clearing a stale or future lock must leave stale-lock.json for Updates"
+        );
         Ok(())
     }
 }

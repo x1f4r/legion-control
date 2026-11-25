@@ -11,14 +11,14 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use legion_update::InstallKind;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
@@ -35,6 +35,744 @@ const MAX_SYMLINK_CHAIN_DEPTH: usize = 40;
 
 /// Default seconds the detached desktop watchdog waits for the new build to confirm startup.
 pub const DEFAULT_STARTUP_WAIT_SECS: u64 = 30;
+
+/// Grace seconds the detached desktop watchdog keeps polling for the ready marker if the launched
+/// PID exits non-zero before the marker appears (for example if a wrapper exited after handing off
+/// to the real app process). Clean exit code 0 keeps polling up to the full `wait_secs`.
+pub const DEFAULT_EXIT_GRACE_SECS: u64 = 8;
+
+/// Maximum bytes retained in the captured first-start log (`new-start.log`) beside update state.
+pub const MAX_CAPTURED_START_LOG_BYTES: usize = 32 * 1024;
+
+/// Maximum characters surfaced in Technical details from captured first-start output.
+const MAX_STARTUP_DETAIL_CHARS: usize = 1024;
+
+/// Filename beside update state holding the capped first-start stdout/stderr of a new build.
+pub const NEW_START_LOG_FILENAME: &str = "new-start.log";
+
+/// Filename beside update state holding the process list captured at the moment of a rollback.
+pub const ROLLBACK_PS_FILENAME: &str = "rollback-ps.txt";
+
+/// JSON lock metadata file persisted in the updates directory across staging, supervisor swap, and
+/// first start of the new copy.
+pub const UPDATE_LOCK_FILENAME: &str = "update.lock";
+
+/// Kernel-locked file (`File::try_lock`) held by the staging process while creating/updating
+/// `update.lock` and staging the replacement so two processes can never stage simultaneously.
+pub const UPDATE_STAGE_LOCK_FILENAME: &str = "update-stage.lock";
+
+/// Kernel-locked file held by the Windows PowerShell supervisor (`FileShare.None`) for its entire
+/// lifetime so any second instance can reliably detect a live supervisor without PID guessing.
+pub const UPDATE_SUPERVISOR_LOCK_FILENAME: &str = "update-supervisor.lock";
+
+/// Flag file written by a user-initiated second launch during a headless (`verify_only`) update so
+/// the supervisor opens the updated app window as soon as the swap finishes.
+pub const REOPEN_REQUESTED_FILENAME: &str = "reopen-requested";
+
+/// Marker file written when startup clears an expired or future-dated update lock so Updates can
+/// show that a previous update did not finish.
+pub const STALE_LOCK_MARKER_FILENAME: &str = "stale-lock.json";
+
+/// Prefix for per-sequence stage files (`pending-stage-<seq>.txt`) updated by the supervisor as it
+/// transitions from `"staged"` -> `"swapping"` -> `"swapped"` -> `"started"`.
+pub const PENDING_STAGE_PREFIX: &str = "pending-stage-";
+
+/// Plain-language notice surfaced under Updates when startup had to clear a stale update lock.
+pub const STALE_UPDATE_NOTICE: &str =
+    "A previous update did not finish, so Legion cleared its lock and started normally.";
+
+/// Environment variable set exclusively by the detached supervisor on the newly launched copy so
+/// that first start is allowed to proceed while `update.lock` is still held.
+pub const SUPERVISED_LAUNCH_ENV: &str = "LEGION_UPDATE_SUPERVISED_LAUNCH";
+
+/// Maximum age in seconds before an `update.lock` (or held stage/supervisor lock) is treated as
+/// stale and ignored so the app is always startable (3 minutes).
+pub const UPDATE_LOCK_MAX_AGE_SECS: u64 = 180;
+
+/// Default hard timeout in seconds for the Windows NSIS installer process (5 minutes).
+pub const DEFAULT_WINDOWS_INSTALLER_WAIT_SECS: u64 = 300;
+
+/// Hand-over grace in seconds on Windows while PowerShell cold-starts before opening
+/// `update-supervisor.lock`.
+#[cfg(windows)]
+const WINDOWS_SUPERVISOR_HANDOVER_SECS: u64 = 15;
+
+/// Default seconds the Unix supervisor waits before swap for all processes running from the
+/// install being replaced to exit before deferring cleanly without changing anything.
+pub const DEFAULT_PRE_SWAP_WAIT_SECS: u64 = 15;
+
+/// Default rollback file-in-use retry attempts (20 × 250ms = 5s).
+pub const DEFAULT_ROLLBACK_RETRIES: u64 = 20;
+
+/// D-Bus well-known name registered by `tauri-plugin-single-instance` on Linux.
+#[cfg(target_os = "linux")]
+const LINUX_SINGLE_INSTANCE_DBUS_NAME: &str = "com.x1f4r.legion.SingleInstance";
+
+/// Unix socket path created by `tauri-plugin-single-instance` on macOS.
+#[cfg(target_os = "macos")]
+const MACOS_SINGLE_INSTANCE_SOCKET: &str = "/tmp/com_x1f4r_legion_si.sock";
+
+/// Metadata stored inside `<updates_dir>/update.lock` for the lifetime of an in-progress update
+/// (stage -> supervisor hand-over -> swap -> first-start verification / rollback).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateLockState {
+    /// PID of the app process that acquired the lock and staged the update.
+    pub owner_pid: u32,
+    /// PID of the detached supervisor once spawned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_pid: Option<u32>,
+    /// Target update sequence being installed.
+    pub target_sequence: u64,
+    /// Lifecycle stage: `"staging"` or `"supervising"`.
+    pub stage: String,
+    /// True when the update was triggered headlessly on window close (`LEGION_UPDATE_VERIFY_ONLY=1`).
+    #[serde(default)]
+    pub verify_only: bool,
+    /// Unix epoch seconds when this lock was acquired or handed over.
+    pub started_unix: u64,
+}
+
+/// Exclusive update-staging guard held while verifying, staging, and spawning the detached
+/// supervisor. Dropping the guard without calling [`Self::hand_over_to_supervisor`] automatically
+/// removes `update.lock` and releases the OS stage lock.
+pub struct UpdateLockGuard {
+    lock_path: PathBuf,
+    state: UpdateLockState,
+    _stage_file: File,
+    handed_over: bool,
+}
+
+impl UpdateLockGuard {
+    /// Hands ownership of `update.lock` over to the newly spawned supervisor `supervisor_pid` so
+    /// dropping this guard keeps `update.lock` alive until the supervisor finishes.
+    pub fn hand_over_to_supervisor(mut self, supervisor_pid: u32) -> Result<(), AppError> {
+        self.state.supervisor_pid = Some(supervisor_pid);
+        self.state.stage = "supervising".to_owned();
+        self.state.started_unix = now_unix_u64();
+        write_update_lock_file(&self.lock_path, &self.state)?;
+        self.handed_over = true;
+        Ok(())
+    }
+}
+
+impl Drop for UpdateLockGuard {
+    fn drop(&mut self) {
+        if !self.handed_over {
+            let _ = fs::remove_file(&self.lock_path);
+            let _ = self._stage_file.unlock();
+        }
+    }
+}
+
+fn now_unix_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Returns `true` when this process was launched directly by the detached update supervisor for
+/// first-start verification (allowing it to start while `update.lock` is held).
+pub fn is_supervised_launch() -> bool {
+    std::env::var_os(SUPERVISED_LAUNCH_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// Computes the desktop `<updates_dir>` early at startup (matching Tauri's `app_data_dir()` on
+/// Linux/macOS and `app_local_data_dir()` on Windows for identifier `com.x1f4r.legion`) so
+/// `lib::run` can check `update.lock` BEFORE registering `tauri-plugin-single-instance`.
+pub fn early_desktop_updates_dir() -> Option<PathBuf> {
+    const IDENTIFIER: &str = "com.x1f4r.legion";
+    #[cfg(target_os = "linux")]
+    {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(|h| PathBuf::from(h).join(".local").join("share"))
+            })?;
+        Some(base.join(IDENTIFIER).join("updates"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+        Some(
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join(IDENTIFIER)
+                .join("updates"),
+        )
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)?;
+        Some(base.join(IDENTIFIER).join("updates"))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// Writes `<updates_dir>/reopen-requested` so a headless (`verify_only`) update supervisor opens
+/// the updated app window as soon as the swap completes.
+pub fn request_reopen_after_update(updates_dir: &Path) {
+    let _ = ensure_private_dir(updates_dir);
+    let _ = fs::write(updates_dir.join(REOPEN_REQUESTED_FILENAME), b"1\n");
+}
+
+/// Removes any leftover `<updates_dir>/reopen-requested` flag (called on every normal app start).
+pub fn clear_reopen_marker(updates_dir: &Path) {
+    let _ = fs::remove_file(updates_dir.join(REOPEN_REQUESTED_FILENAME));
+}
+
+/// Returns the path to `<updates_dir>/pending-stage-<sequence>.txt`.
+pub fn pending_stage_path(updates_dir: &Path, sequence: u64) -> PathBuf {
+    updates_dir.join(format!("{PENDING_STAGE_PREFIX}{sequence}.txt"))
+}
+
+/// Atomically writes and fsyncs `<updates_dir>/pending-stage-<sequence>.txt`.
+pub fn write_pending_stage(updates_dir: &Path, sequence: u64, stage: &str) -> Result<(), AppError> {
+    ensure_private_dir(updates_dir)?;
+    let path = pending_stage_path(updates_dir, sequence);
+    let mut tmp = NamedTempFile::new_in(updates_dir).map_err(|err| {
+        AppError::new(
+            ErrorCode::Failed,
+            format!("Could not create temp stage file: {err}"),
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tmp
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600));
+    }
+    tmp.write_all(format!("{stage}\n").as_bytes())
+        .and_then(|()| tmp.as_file().sync_all())
+        .map_err(|err| {
+            AppError::new(
+                ErrorCode::Failed,
+                format!("Could not write pending stage file: {err}"),
+            )
+        })?;
+    tmp.persist(&path).map_err(|err| {
+        AppError::new(
+            ErrorCode::Failed,
+            format!("Could not save pending stage file: {}", err.error),
+        )
+    })?;
+    Ok(())
+}
+
+/// Reads the trimmed stage token from `<updates_dir>/pending-stage-<sequence>.txt`, if present.
+pub fn read_pending_stage(updates_dir: &Path, sequence: u64) -> Option<String> {
+    let raw = fs::read_to_string(pending_stage_path(updates_dir, sequence)).ok()?;
+    let trimmed = raw.trim().trim_start_matches('\u{feff}').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+/// Removes `<updates_dir>/pending-stage-<sequence>.txt` if present.
+pub fn clear_pending_stage(updates_dir: &Path, sequence: u64) {
+    let _ = fs::remove_file(pending_stage_path(updates_dir, sequence));
+}
+
+/// Persisted marker written when startup clears a stale update lock so Updates surfaces a calm
+/// notice that a previous update did not finish.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleLockNoticeRecord {
+    /// Human-readable diagnostic reason recorded when the stale lock was cleared.
+    pub reason: String,
+    /// Unix epoch seconds when the stale lock was cleared.
+    pub cleared_unix: u64,
+}
+
+/// Writes `<updates_dir>/stale-lock.json` so [`crate::updater::UpdateManager`] surfaces a notice
+/// under Updates on startup.
+pub fn record_stale_lock_notice(updates_dir: &Path, reason: &str) {
+    if ensure_private_dir(updates_dir).is_err() {
+        return;
+    }
+    let rec = StaleLockNoticeRecord {
+        reason: reason.to_owned(),
+        cleared_unix: now_unix_u64(),
+    };
+    if let Ok(bytes) = serde_json::to_vec_pretty(&rec) {
+        let _ = fs::write(updates_dir.join(STALE_LOCK_MARKER_FILENAME), bytes);
+    }
+}
+
+/// Reads and deletes `<updates_dir>/stale-lock.json`, returning its record when present.
+pub fn take_stale_lock_notice(updates_dir: &Path) -> Option<StaleLockNoticeRecord> {
+    let path = updates_dir.join(STALE_LOCK_MARKER_FILENAME);
+    let bytes = fs::read(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    serde_json::from_slice::<StaleLockNoticeRecord>(&bytes).ok()
+}
+
+/// Returns `true` only when `started_unix` is non-zero, not in the future relative to `now_unix`,
+/// and strictly younger than [`UPDATE_LOCK_MAX_AGE_SECS`] (3 minutes).
+pub const fn is_lock_timestamp_fresh(started_unix: u64, now_unix: u64) -> bool {
+    started_unix > 0
+        && started_unix <= now_unix
+        && now_unix - started_unix < UPDATE_LOCK_MAX_AGE_SECS
+}
+
+fn file_mtime_unix(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Outcome of inspecting the update locks in `<updates_dir>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpdateLockInspection {
+    /// No update lock is active and nothing stale needed clearing.
+    None,
+    /// A fresh, live update lock is active (younger than 3 minutes and not future-dated).
+    Active(UpdateLockState),
+    /// A lock file was expired (>= 3 minutes old) or future-dated, so it was cleared (or ignored)
+    /// so the app can start normally.
+    StaleCleared {
+        /// Plain diagnostic reason for Technical details.
+        reason: String,
+    },
+}
+
+fn describe_stale_timestamp(started_unix: u64, now_unix: u64) -> String {
+    if started_unix == 0 {
+        "Update lock had a missing timestamp and was cleared.".to_owned()
+    } else if started_unix > now_unix {
+        format!(
+            "Update lock timestamp ({started_unix}) was in the future relative to current time ({now_unix}) and was cleared."
+        )
+    } else {
+        format!(
+            "Update lock exceeded the {UPDATE_LOCK_MAX_AGE_SECS}s limit ({}s old) and was cleared.",
+            now_unix - started_unix
+        )
+    }
+}
+
+fn clear_stale_lock_files(updates_dir: &Path) {
+    let _ = fs::remove_file(updates_dir.join(UPDATE_LOCK_FILENAME));
+    let _ = fs::remove_file(updates_dir.join(UPDATE_SUPERVISOR_LOCK_FILENAME));
+    let _ = fs::remove_file(updates_dir.join(UPDATE_STAGE_LOCK_FILENAME));
+}
+
+#[cfg(unix)]
+fn is_unix_pid_alive(pid: u32) -> bool {
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    let Some(rpid) = rustix::process::Pid::from_raw(raw) else {
+        return false;
+    };
+    match rustix::process::test_kill_process(rpid) {
+        Ok(()) => true,
+        Err(err) => err == rustix::io::Errno::PERM,
+    }
+}
+
+#[cfg(windows)]
+fn is_windows_file_locked(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock)),
+        Err(err) => err.raw_os_error() == Some(32) || err.kind() == io::ErrorKind::PermissionDenied,
+    }
+}
+
+fn write_update_lock_file(lock_path: &Path, state: &UpdateLockState) -> Result<(), AppError> {
+    let parent = lock_path.parent().ok_or_else(|| {
+        AppError::new(
+            ErrorCode::Internal,
+            format!("Lock path {} has no parent folder.", lock_path.display()),
+        )
+    })?;
+    ensure_private_dir(parent)?;
+    let bytes = serde_json::to_vec_pretty(state).map_err(|err| {
+        AppError::new(
+            ErrorCode::Internal,
+            format!("Could not serialize update lock: {err}"),
+        )
+    })?;
+    let mut tmp = NamedTempFile::new_in(parent).map_err(|err| {
+        AppError::new(
+            ErrorCode::Failed,
+            format!("Could not create temp lock file: {err}"),
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tmp
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600));
+    }
+    tmp.write_all(&bytes)
+        .and_then(|()| tmp.as_file().sync_all())
+        .map_err(|err| {
+            AppError::new(
+                ErrorCode::Failed,
+                format!("Could not write update lock: {err}"),
+            )
+        })?;
+    let mut pending = tmp;
+    for attempt in 0..5u8 {
+        match pending.persist(lock_path) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                if attempt < 4 {
+                    pending = err.file;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                return Err(AppError::new(
+                    ErrorCode::Failed,
+                    format!("Could not persist update lock: {}", err.error),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Inspects `<updates_dir>/update.lock` (plus OS stage/supervisor locks) at `now_unix` without
+/// acquiring staging ownership.
+///
+/// Early quiet exit of a second instance is ONLY honored while the active lock is strictly younger
+/// than [`UPDATE_LOCK_MAX_AGE_SECS`] (3 minutes) and not dated in the future on EVERY system,
+/// including when a Windows kernel lock (`update-supervisor.lock` or `update-stage.lock`) is held.
+/// Past that bound (or on a future timestamp), clears stale lock files and returns
+/// [`UpdateLockInspection::StaleCleared`] so the app is always startable.
+pub fn inspect_update_lock_at(updates_dir: &Path, now_unix: u64) -> UpdateLockInspection {
+    let lock_path = updates_dir.join(UPDATE_LOCK_FILENAME);
+    let stage_path = updates_dir.join(UPDATE_STAGE_LOCK_FILENAME);
+
+    // 1. Check whether another process holds the kernel stage lock right now — still bounded by
+    //    `UPDATE_LOCK_MAX_AGE_SECS` and refusing future timestamps.
+    if stage_path.is_file()
+        && let Ok(file) = OpenOptions::new().read(true).write(true).open(&stage_path)
+    {
+        match file.try_lock() {
+            Err(fs::TryLockError::WouldBlock) => {
+                if let Ok(bytes) = fs::read(&lock_path)
+                    && let Ok(state) = serde_json::from_slice::<UpdateLockState>(&bytes)
+                {
+                    if is_lock_timestamp_fresh(state.started_unix, now_unix) {
+                        return UpdateLockInspection::Active(state);
+                    }
+                    let reason = describe_stale_timestamp(state.started_unix, now_unix);
+                    clear_stale_lock_files(updates_dir);
+                    return UpdateLockInspection::StaleCleared { reason };
+                }
+                let fallback_ts = file_mtime_unix(&stage_path).unwrap_or(0);
+                if is_lock_timestamp_fresh(fallback_ts, now_unix) {
+                    return UpdateLockInspection::Active(UpdateLockState {
+                        owner_pid: 0,
+                        supervisor_pid: None,
+                        target_sequence: 0,
+                        stage: "staging".to_owned(),
+                        verify_only: false,
+                        started_unix: fallback_ts,
+                    });
+                }
+                let reason = describe_stale_timestamp(fallback_ts, now_unix);
+                clear_stale_lock_files(updates_dir);
+                return UpdateLockInspection::StaleCleared { reason };
+            }
+            Ok(()) => {
+                drop(file);
+            }
+            Err(_) => {}
+        }
+    }
+
+    inspect_supervisor_lock_without_stage_probe_at(updates_dir, now_unix)
+}
+
+/// Inspects `<updates_dir>/update.lock` (plus OS stage/supervisor locks) without acquiring staging
+/// ownership. Returns `Some(state)` when an update is actively staging or being supervised and
+/// within the 3-minute freshness bound, or `None` (cleaning up any stale lock file) otherwise.
+pub fn inspect_active_update_lock(updates_dir: &Path) -> Option<UpdateLockState> {
+    match inspect_update_lock_at(updates_dir, now_unix_u64()) {
+        UpdateLockInspection::Active(state) => Some(state),
+        UpdateLockInspection::None | UpdateLockInspection::StaleCleared { .. } => None,
+    }
+}
+
+fn inspect_supervisor_lock_without_stage_probe_at(
+    updates_dir: &Path,
+    now_unix: u64,
+) -> UpdateLockInspection {
+    let lock_path = updates_dir.join(UPDATE_LOCK_FILENAME);
+
+    #[cfg(windows)]
+    {
+        let sup_lock_path = updates_dir.join(UPDATE_SUPERVISOR_LOCK_FILENAME);
+        if is_windows_file_locked(&sup_lock_path) {
+            if let Ok(bytes) = fs::read(&lock_path)
+                && let Ok(state) = serde_json::from_slice::<UpdateLockState>(&bytes)
+            {
+                if is_lock_timestamp_fresh(state.started_unix, now_unix) {
+                    return UpdateLockInspection::Active(state);
+                }
+                let reason = describe_stale_timestamp(state.started_unix, now_unix);
+                clear_stale_lock_files(updates_dir);
+                return UpdateLockInspection::StaleCleared { reason };
+            }
+            let fallback_ts = file_mtime_unix(&sup_lock_path).unwrap_or(0);
+            if is_lock_timestamp_fresh(fallback_ts, now_unix) {
+                return UpdateLockInspection::Active(UpdateLockState {
+                    owner_pid: 0,
+                    supervisor_pid: None,
+                    target_sequence: 0,
+                    stage: "supervising".to_owned(),
+                    verify_only: false,
+                    started_unix: fallback_ts,
+                });
+            }
+            let reason = describe_stale_timestamp(fallback_ts, now_unix);
+            clear_stale_lock_files(updates_dir);
+            return UpdateLockInspection::StaleCleared { reason };
+        }
+    }
+
+    let bytes = match fs::read(&lock_path) {
+        Ok(b) => b,
+        Err(_) => return UpdateLockInspection::None,
+    };
+    let state = match serde_json::from_slice::<UpdateLockState>(&bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            // Treat a freshly created unreadable file (< 5s, not future-dated) as active;
+            // otherwise clean stale junk.
+            let mtime = file_mtime_unix(&lock_path).unwrap_or(0);
+            if mtime > 0 && mtime <= now_unix && now_unix - mtime < 5 {
+                return UpdateLockInspection::Active(UpdateLockState {
+                    owner_pid: 0,
+                    supervisor_pid: None,
+                    target_sequence: 0,
+                    stage: "staging".to_owned(),
+                    verify_only: false,
+                    started_unix: mtime,
+                });
+            }
+            clear_stale_lock_files(updates_dir);
+            return UpdateLockInspection::StaleCleared {
+                reason: "Corrupt or stale update lock was cleared.".to_owned(),
+            };
+        }
+    };
+
+    if !is_lock_timestamp_fresh(state.started_unix, now_unix) {
+        let reason = describe_stale_timestamp(state.started_unix, now_unix);
+        clear_stale_lock_files(updates_dir);
+        return UpdateLockInspection::StaleCleared { reason };
+    }
+    let age = now_unix - state.started_unix;
+
+    #[cfg(unix)]
+    {
+        let _ = age;
+        let alive = match state.stage.as_str() {
+            "supervising" => state.supervisor_pid.is_some_and(is_unix_pid_alive),
+            _ => is_unix_pid_alive(state.owner_pid),
+        };
+        if alive {
+            UpdateLockInspection::Active(state)
+        } else {
+            let _ = fs::remove_file(&lock_path);
+            UpdateLockInspection::None
+        }
+    }
+    #[cfg(windows)]
+    {
+        // On Windows, `update-stage.lock` (checked by caller) and `update-supervisor.lock` (checked
+        // above) are kernel-enforced. Keep a short hand-over window while PowerShell cold-starts
+        // before it opens `update-supervisor.lock`.
+        if state.stage == "supervising" && age < WINDOWS_SUPERVISOR_HANDOVER_SECS {
+            UpdateLockInspection::Active(state)
+        } else {
+            let _ = fs::remove_file(&lock_path);
+            UpdateLockInspection::None
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (state, age);
+        UpdateLockInspection::None
+    }
+}
+
+/// Removes orphaned temporary files left behind by an interrupted staging or supervisor run
+/// (`<parent>/.<name>.new-<pid>`, `<parent>/.<name>.extract-<pid>`, orphaned staged installers in
+/// `updates_dir/verified/`, stray `supervisor-*.ps1`, `.stdout`/`.stderr` captures, and FIFO
+/// entries). Does nothing if an active update lock is currently held.
+pub fn cleanup_interrupted_staging_files(updates_dir: &Path, install: &DesktopInstall) {
+    if inspect_active_update_lock(updates_dir).is_some() {
+        return;
+    }
+
+    match install {
+        DesktopInstall::LinuxAppImage { appimage_path } => {
+            if let (Some(parent), Some(file_name)) = (
+                appimage_path.parent(),
+                appimage_path.file_name().and_then(|n| n.to_str()),
+            ) {
+                let prefix = format!(".{file_name}.new-");
+                if let Ok(entries) = fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let Some(text) = name.to_str() else { continue };
+                        if text.starts_with(&prefix) {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                let _ = fs::remove_dir_all(&path);
+                            } else {
+                                let _ = fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        DesktopInstall::MacosAppBundle { bundle_dir, .. } => {
+            if let (Some(parent), Some(bundle_name)) = (
+                bundle_dir.parent(),
+                bundle_dir.file_name().and_then(|n| n.to_str()),
+            ) {
+                let new_prefix = format!(".{bundle_name}.new-");
+                let extract_prefix = format!(".{bundle_name}.extract-");
+                if let Ok(entries) = fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let Some(text) = name.to_str() else { continue };
+                        if text.starts_with(&new_prefix) || text.starts_with(&extract_prefix) {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                let _ = fs::remove_dir_all(&path);
+                            } else {
+                                let _ = fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        DesktopInstall::WindowsNsis { .. }
+        | DesktopInstall::LinuxDeb { .. }
+        | DesktopInstall::LinuxPacman { .. }
+        | DesktopInstall::Standalone { .. } => {}
+    }
+
+    // Clean orphaned staged installers inside `<updates_dir>/verified/` without touching verified
+    // manual `.deb` packages.
+    let verified_dir = updates_dir.join("verified");
+    if let Ok(entries) = fs::read_dir(&verified_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(text) = name.to_str() else { continue };
+            if (text.starts_with("verified-") && text.ends_with(".app.tar.gz"))
+                || (text.starts_with("verified-") && text.ends_with("-setup.exe"))
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    // Clean stray supervisor scripts, Windows `.stdout`/`.stderr` captures, and FIFO entries.
+    if let Ok(entries) = fs::read_dir(updates_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(text) = name.to_str() else { continue };
+            let is_orphan_script = (text.starts_with("supervisor-") && text.ends_with(".ps1"))
+                || (text.starts_with(".supervisor-") && text.ends_with(".ps1.tmp"));
+            let is_orphan_capture = text == format!("{NEW_START_LOG_FILENAME}.stdout")
+                || text == format!("{NEW_START_LOG_FILENAME}.stderr")
+                || text.starts_with(&format!("{NEW_START_LOG_FILENAME}.fifo."));
+            if is_orphan_script || is_orphan_capture {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// Atomically acquires the exclusive update lock in `updates_dir` so only one process may stage,
+/// hand off to a supervisor, swap, and verify first start. Returns `Ok(None)` immediately when
+/// another instance or supervisor already holds an active update lock.
+pub fn try_acquire_update_lock(
+    updates_dir: &Path,
+    target_sequence: u64,
+    verify_only: bool,
+) -> Result<Option<UpdateLockGuard>, AppError> {
+    ensure_private_dir(updates_dir)?;
+    let stage_path = updates_dir.join(UPDATE_STAGE_LOCK_FILENAME);
+    let mut opts = OpenOptions::new();
+    opts.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let stage_file = opts.open(&stage_path).map_err(|err| {
+        AppError::new(
+            ErrorCode::Failed,
+            format!("Could not open update stage lock: {err}"),
+        )
+    })?;
+    match stage_file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(err) => {
+            return Err(AppError::new(
+                ErrorCode::Failed,
+                format!("Could not acquire update stage lock: {err}"),
+            ));
+        }
+    }
+
+    // While holding `stage_file`, verify no live supervisor already owns `update.lock`.
+    if matches!(
+        inspect_supervisor_lock_without_stage_probe_at(updates_dir, now_unix_u64()),
+        UpdateLockInspection::Active(_)
+    ) {
+        return Ok(None);
+    }
+
+    let lock_path = updates_dir.join(UPDATE_LOCK_FILENAME);
+    let state = UpdateLockState {
+        owner_pid: std::process::id(),
+        supervisor_pid: None,
+        target_sequence,
+        stage: "staging".to_owned(),
+        verify_only,
+        started_unix: now_unix_u64(),
+    };
+    write_update_lock_file(&lock_path, &state)?;
+    Ok(Some(UpdateLockGuard {
+        lock_path,
+        state,
+        _stage_file: stage_file,
+        handed_over: false,
+    }))
+}
 
 /// Fixed minimal system `PATH` passed to the Unix swap supervisor shell itself.
 #[cfg(unix)]
@@ -866,9 +1604,10 @@ fn validate_tar_rel_path(path: &Path) -> Result<PathBuf, AppError> {
     Ok(clean)
 }
 
-/// Validates every symlink in `symlinks` against the archive root by resolving multi-hop symlink
-/// chains (forward or backward in archive order) up to [`MAX_SYMLINK_CHAIN_DEPTH`]. Refuses any
-/// symlink chain that escapes the archive root, uses an absolute target, or loops.
+/// Validates every symlink in `symlinks` against the `.app` bundle root by resolving multi-hop
+/// symlink chains (forward or backward in archive order) up to [`MAX_SYMLINK_CHAIN_DEPTH`].
+/// Refuses any top-level symlink, absolute target, symlink loop, or symlink chain that escapes
+/// the top-level `.app` bundle directory (even one level up to the archive root or to a sibling).
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn validate_all_symlink_chains(symlinks: &BTreeMap<PathBuf, PathBuf>) -> Result<(), AppError> {
     for (link_rel, raw_target) in symlinks {
@@ -883,6 +1622,20 @@ fn validate_all_symlink_chains(symlinks: &BTreeMap<PathBuf, PathBuf>) -> Result<
                     .collect()
             })
             .unwrap_or_default();
+
+        // Every symlink in a macOS app-tar must live inside `<Bundle>.app/...`; refuse any
+        // top-level symlink at the archive root.
+        if stack.is_empty() {
+            return Err(AppError::new(
+                ErrorCode::Denied,
+                format!(
+                    "Refusing top-level symlink {} -> {} outside the .app bundle root.",
+                    link_rel.display(),
+                    raw_target.display()
+                ),
+            ));
+        }
+        let bundle_root = stack[0].clone();
 
         let mut remaining: Vec<Component<'_>> = raw_target.components().collect();
         let mut pending_targets: Vec<PathBuf> = Vec::new();
@@ -914,19 +1667,32 @@ fn validate_all_symlink_chains(symlinks: &BTreeMap<PathBuf, PathBuf>) -> Result<
 
         while let Some(seg) = work_queue.pop() {
             if seg == OsStr::new("..") {
-                if stack.pop().is_none() {
+                // `stack[0]` is `<Bundle>.app`; popping it would escape one level above the `.app`
+                // bundle root (for example into `/Applications` once swapped into place).
+                if stack.len() <= 1 {
                     return Err(AppError::new(
                         ErrorCode::Denied,
                         format!(
-                            "Refusing escaping symlink chain starting at {} -> {} inside update archive.",
+                            "Refusing escaping symlink chain starting at {} -> {} leaving bundle root.",
                             link_rel.display(),
                             raw_target.display()
                         ),
                     ));
                 }
+                stack.pop();
                 continue;
             }
             stack.push(seg);
+            if stack.first() != Some(&bundle_root) {
+                return Err(AppError::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Refusing symlink chain starting at {} -> {} leaving bundle root.",
+                        link_rel.display(),
+                        raw_target.display()
+                    ),
+                ));
+            }
             let current_rel: PathBuf = stack.iter().collect();
             if let Some(next_target) = symlinks.get(&current_rel) {
                 hops += 1;
@@ -975,6 +1741,9 @@ fn validate_all_symlink_chains(symlinks: &BTreeMap<PathBuf, PathBuf>) -> Result<
 pub struct UnixSwapPlan {
     /// PID of the currently running app to wait for before swapping.
     pub old_pid: u32,
+    /// Optional parent PID when running under an AppImage extract-and-run wrapper runtime so the
+    /// supervisor waits for the wrapper process to exit and clean up too.
+    pub old_ppid: Option<u32>,
     /// Target path to replace (`.AppImage` file on Linux, `.app` directory on macOS).
     pub target_path: PathBuf,
     /// Staged replacement path on the same filesystem as `target_path`.
@@ -988,16 +1757,137 @@ pub struct UnixSwapPlan {
     pub ready_marker_path: PathBuf,
     /// Path where the watchdog writes rollback metadata if the new build fails to start.
     pub rollback_marker_path: PathBuf,
-    /// JSON payload written to `rollback_marker_path` on rollback.
+    /// JSON payload written to `rollback_marker_path` when the previous copy is restored cleanly.
     pub rollback_json: String,
+    /// JSON payload written to `rollback_marker_path` when rollback cannot safely replace in-use
+    /// files and keeps the new copy intact.
+    pub rollback_kept_new_json: String,
+    /// Path where the supervisor writes deferred metadata when it gives up cleanly before swapping
+    /// because another instance is still running from the install (never counted as a failure).
+    pub deferred_marker_path: Option<PathBuf>,
+    /// JSON payload written to `deferred_marker_path` on clean pre-swap deferral.
+    pub deferred_json: Option<String>,
+    /// Target sequence string passed via `LEGION_UPDATE_SUPERVISED_LAUNCH` to the newly launched copy.
+    pub target_sequence: u64,
+    /// Path to `<updates_dir>/update.lock` removed by the supervisor when it exits.
+    pub update_lock_path: Option<PathBuf>,
+    /// Path to `<updates_dir>/pending-stage-<seq>.txt` updated as the supervisor moves from
+    /// `"staged"` -> `"swapping"` -> `"swapped"` -> `"started"`.
+    pub stage_file_path: Option<PathBuf>,
+    /// Path to `<updates_dir>/reopen-requested` checked after a `verify_only` update finishes or
+    /// defers.
+    pub reopen_marker_path: Option<PathBuf>,
     /// Optional diagnostic log file for supervisor stdout/stderr (`<updates_dir>/supervisor.log`).
     pub log_path: Option<PathBuf>,
+    /// Optional size-capped log capturing the new copy's first-start stdout/stderr
+    /// (`<updates_dir>/new-start.log`).
+    pub new_start_log_path: Option<PathBuf>,
+    /// Optional process-list snapshot captured at the exact moment of a rollback decision
+    /// (`<updates_dir>/rollback-ps.txt`).
+    pub rollback_ps_path: Option<PathBuf>,
+    /// Optional Linux D-Bus single-instance name to wait to clear before launching the new copy.
+    pub single_instance_dbus_name: Option<String>,
+    /// Optional macOS Unix socket path to wait to clear before launching the new copy.
+    pub single_instance_socket_path: Option<PathBuf>,
+    /// Seconds to wait before swapping for all processes using the install to exit.
+    pub pre_swap_wait_secs: u64,
     /// Seconds to wait for `ready_marker_path` before restoring `backup_path`.
     pub wait_secs: u64,
+    /// Grace seconds to keep polling for `ready_marker_path` if the launched PID exits non-zero
+    /// early (clamped to `wait_secs`).
+    pub exit_grace_secs: u64,
+    /// Bounded rollback retry count (250ms per retry) if another process holds target files open.
+    pub rollback_retries: u64,
     /// When `true` (window-close install), launches the new build with `LEGION_UPDATE_VERIFY_ONLY=1`
     /// so it confirms startup and exits cleanly without opening a window, and does not relaunch a
-    /// window on rollback.
+    /// window on rollback (unless `reopen_marker_path` was created while updating).
     pub verify_only: bool,
+}
+
+/// Reads the captured first-start output (`new-start.log`, capped to 32 KiB) and any exit reason
+/// recorded in `supervisor.log` so Technical details can explain why a desktop update rolled back.
+pub fn read_captured_startup_detail(updates_dir: &Path) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Ok(sup_raw) = fs::read(updates_dir.join("supervisor.log")) {
+        let sup_text = String::from_utf8_lossy(&sup_raw);
+        let interesting = sup_text
+            .lines()
+            .rev()
+            .find(|line| {
+                line.contains("exited with")
+                    || line.contains("NSIS installer exited")
+                    || line.contains("supervisor exception")
+            })
+            .or_else(|| {
+                sup_text.lines().rev().find(|line| {
+                    line.contains("ready marker missing")
+                        || line.contains("ready marker not observed")
+                })
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(line) = interesting {
+            parts.push(line.to_owned());
+        }
+    }
+
+    if let Ok(file) = fs::File::open(updates_dir.join(NEW_START_LOG_FILENAME)) {
+        let mut buf = Vec::new();
+        let _ = file
+            .take((MAX_CAPTURED_START_LOG_BYTES + 1) as u64)
+            .read_to_end(&mut buf);
+        if buf.len() > MAX_CAPTURED_START_LOG_BYTES {
+            let start = buf.len() - MAX_CAPTURED_START_LOG_BYTES;
+            buf.drain(0..start);
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !lines.is_empty() {
+            let tail_start = lines.len().saturating_sub(6);
+            let excerpt = lines[tail_start..].join(" | ");
+            if !excerpt.is_empty() {
+                parts.push(excerpt);
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+    let combined = parts.join(" — ");
+    if combined.chars().count() <= MAX_STARTUP_DETAIL_CHARS {
+        Some(combined)
+    } else {
+        let truncated: String = combined
+            .chars()
+            .take(MAX_STARTUP_DETAIL_CHARS.saturating_sub(1))
+            .collect();
+        Some(format!("{truncated}…"))
+    }
+}
+
+/// Returns the parent PID on Linux ONLY when the parent process is the AppImage runtime binary
+/// (`APPIMAGE_EXTRACT_AND_RUN=1` forks the child instead of `exec`ing in place). In FUSE mode the
+/// runtime `exec`s `legion-app` in place, so our parent is the user's shell or desktop launcher and
+/// must NOT be waited on.
+#[cfg(target_os = "linux")]
+fn detect_appimage_wrapper_ppid(appimage_path: &Path) -> Option<u32> {
+    let ppid = rustix::process::getppid()?.as_raw_nonzero().get() as u32;
+    if ppid <= 1 {
+        return None;
+    }
+    let proc_exe = fs::canonicalize(format!("/proc/{ppid}/exe")).ok()?;
+    let target_canon = fs::canonicalize(appimage_path).ok()?;
+    if proc_exe == target_canon {
+        Some(ppid)
+    } else {
+        None
+    }
 }
 
 /// Sanitized environment prepared for the detached Unix swap supervisor and relaunched desktop app.
@@ -1100,6 +1990,25 @@ where
         "GDMSESSION",
         "QT_QPA_PLATFORM",
         "MOZ_ENABLE_WAYLAND",
+        "GTK_IM_MODULE",
+        "QT_IM_MODULE",
+        "QT4_IM_MODULE",
+        "CLUTTER_IM_MODULE",
+        "SDL_IM_MODULE",
+        "GLFW_IM_MODULE",
+        "XMODIFIERS",
+        "INPUT_METHOD",
+        "IMSETTINGS_MODULE",
+        "QT_IM_MODULES",
+        "IBUS_ADDRESS",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "all_proxy",
         "LEGION_HOME",
         #[cfg(debug_assertions)]
         "LEGION_APP_READY_FILE",
@@ -1169,107 +2078,554 @@ MV="$(find_sys_bin mv)" || exit 1
 RM="$(find_sys_bin rm)" || exit 1
 PS="$(find_sys_bin ps)" || exit 1
 SLEEP="$(find_sys_bin sleep)" || exit 1
+CAT="$(find_sys_bin cat 2>/dev/null || true)"
+MKFIFO="$(find_sys_bin mkfifo 2>/dev/null || true)"
+TAIL="$(find_sys_bin tail 2>/dev/null || true)"
+DBUS_SEND="$(find_sys_bin dbus-send 2>/dev/null || true)"
+READLINK="$(find_sys_bin readlink 2>/dev/null || true)"
 
-printf 'supervisor: start old_pid=%s verify_only=%s target=%s\n' "$LEGION_OLD_PID" "${LEGION_VERIFY_ONLY:-0}" "$LEGION_TARGET"
+swapped=0
+verified_ok=0
+rollback_done=0
+NEW_PID=""
+LOG_READER_PID=""
+ACTIVE_CAP_FIFO=""
 
-# 1. Wait up to 15s for the previous process to exit cleanly.
+write_stage() {
+  if [ -n "${LEGION_STAGE_FILE:-}" ]; then
+    (umask 077 && printf '%s\n' "$1" > "$LEGION_STAGE_FILE") 2>/dev/null || true
+  fi
+}
+
+release_update_lock() {
+  if [ -n "${ACTIVE_CAP_FIFO:-}" ]; then
+    "$RM" -f -- "$ACTIVE_CAP_FIFO" 2>/dev/null || true
+    ACTIVE_CAP_FIFO=""
+  fi
+  if [ -n "${LEGION_UPDATE_LOCK:-}" ]; then
+    "$RM" -f -- "$LEGION_UPDATE_LOCK" 2>/dev/null || true
+  fi
+}
+trap release_update_lock EXIT
+
+collect_children() {
+  parent="$1"
+  ps_snap="$("$PS" -eo pid=,ppid= 2>/dev/null || true)"
+  out=""
+  if [ -n "$ps_snap" ]; then
+    set -- $ps_snap
+    while [ "$#" -ge 2 ]; do
+      cpid="$1"
+      cppid="$2"
+      shift 2
+      case "$cpid" in ''|*[!0-9]*) continue ;; esac
+      if [ "$cppid" = "$parent" ] && [ "$cpid" != "$$" ]; then
+        out="$out $cpid"
+      fi
+    done
+  fi
+  printf '%s\n' "$out"
+}
+
+# Returns 0 if any live process (other than this supervisor $$) is running from $LEGION_TARGET.
+# Checks /proc/<pid>/exe in a single pass on Linux and ps arg0/script prefix on macOS/POSIX
+# without word-splitting paths that contain spaces or glob characters.
+install_target_in_use() {
+  target_real="$LEGION_TARGET"
+  if [ -n "$READLINK" ]; then
+    resolved="$("$READLINK" -f -- "$LEGION_TARGET" 2>/dev/null || true)"
+    if [ -n "$resolved" ]; then
+      target_real="$resolved"
+    fi
+  fi
+  if [ -d /proc ] && [ -n "$READLINK" ]; then
+    proc_exes="$("$READLINK" -f /proc/[0-9]*/exe 2>/dev/null || true)"
+    if [ -n "$proc_exes" ]; then
+      while IFS= read -r pexe; do
+        case "$pexe" in
+          "$target_real"|"$target_real"/*|"$LEGION_TARGET"|"$LEGION_TARGET"/*)
+            return 0
+            ;;
+        esac
+      done <<EOF
+$proc_exes
+EOF
+    fi
+  fi
+  ps_args="$("$PS" -eo pid=,args= 2>/dev/null || true)"
+  if [ -n "$ps_args" ]; then
+    while IFS= read -r pline; do
+      trimmed="${pline#"${pline%%[! 	]*}"}"
+      [ -n "$trimmed" ] || continue
+      pp="${trimmed%%[ 	]*}"
+      case "$pp" in ''|*[!0-9]*) continue ;; esac
+      if [ "$pp" = "$$" ]; then
+        continue
+      fi
+      rest="${trimmed#"$pp"}"
+      rest="${rest#"${rest%%[! 	]*}"}"
+      [ -n "$rest" ] || continue
+      case "$rest" in
+        "$LEGION_TARGET"|"$LEGION_TARGET"/*|"$LEGION_TARGET "*|"$target_real"|"$target_real"/*|"$target_real "*)
+          return 0
+          ;;
+        "sh $LEGION_TARGET"|"sh $LEGION_TARGET "*|"/bin/sh $LEGION_TARGET"|"/bin/sh $LEGION_TARGET "*|"/usr/bin/sh $LEGION_TARGET"|"/usr/bin/sh $LEGION_TARGET "*|"dash $LEGION_TARGET"|"dash $LEGION_TARGET "*|"/bin/dash $LEGION_TARGET"|"/bin/dash $LEGION_TARGET "*|"/usr/bin/dash $LEGION_TARGET"|"/usr/bin/dash $LEGION_TARGET "*|"bash $LEGION_TARGET"|"bash $LEGION_TARGET "*|"/bin/bash $LEGION_TARGET"|"/bin/bash $LEGION_TARGET "*|"/usr/bin/bash $LEGION_TARGET"|"/usr/bin/bash $LEGION_TARGET "*|"sh $target_real"|"sh $target_real "*|"/bin/sh $target_real"|"/bin/sh $target_real "*|"/usr/bin/sh $target_real"|"/usr/bin/sh $target_real "*|"dash $target_real"|"dash $target_real "*|"/bin/dash $target_real"|"/bin/dash $target_real "*|"/usr/bin/dash $target_real"|"/usr/bin/dash $target_real "*|"bash $target_real"|"bash $target_real "*|"/bin/bash $target_real"|"/bin/bash $target_real "*|"/usr/bin/bash $target_real"|"/usr/bin/bash $target_real "*)
+          return 0
+          ;;
+      esac
+    done <<EOF
+$ps_args
+EOF
+  fi
+  return 1
+}
+
+dbus_name_owned() {
+  if [ -z "${LEGION_SINGLE_INSTANCE_DBUS:-}" ] || [ -z "$DBUS_SEND" ] || [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    return 1
+  fi
+  reply="$("$DBUS_SEND" --session --reply-timeout=1000 --dest=org.freedesktop.DBus --type=method_call --print-reply \
+    /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner "string:$LEGION_SINGLE_INSTANCE_DBUS" 2>/dev/null || true)"
+  case "$reply" in
+    *"boolean true"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+cap_log_file() {
+  log_file="$1"
+  if [ -z "$log_file" ] || [ ! -f "$log_file" ]; then
+    return 0
+  fi
+  if [ -n "$TAIL" ]; then
+    tmp_cap="${log_file}.cap"
+    if (umask 077 && "$TAIL" -c 32768 "$log_file" > "$tmp_cap" 2>/dev/null); then
+      "$MV" -f -- "$tmp_cap" "$log_file" 2>/dev/null || "$RM" -f -- "$tmp_cap"
+    else
+      "$RM" -f -- "$tmp_cap"
+    fi
+  fi
+}
+
+capture_rollback_ps() {
+  ps_file="${LEGION_ROLLBACK_PS_FILE:-}"
+  if [ -z "$ps_file" ]; then
+    return 0
+  fi
+  (umask 077 && { "$PS" -ef 2>/dev/null || "$PS" aux 2>/dev/null || true; } > "$ps_file") 2>/dev/null || true
+}
+
+launch_target() {
+  verify_flag="$1"
+  capture_log="$2"
+  supervised_flag="$3"
+  exec_bin="$LEGION_EXEC"
+  LOG_READER_PID=""
+  if [ -n "$capture_log" ]; then
+    "$RM" -f -- "$capture_log"
+    (umask 077 && : > "$capture_log") 2>/dev/null || true
+    use_fifo=0
+    if [ -n "$MKFIFO" ] && [ -n "$CAT" ]; then
+      cap_fifo="${capture_log}.fifo.$$"
+      "$RM" -f -- "$cap_fifo" 2>/dev/null || true
+      if (umask 077 && "$MKFIFO" "$cap_fifo" 2>/dev/null); then
+        use_fifo=1
+        ACTIVE_CAP_FIFO="$cap_fifo"
+      fi
+    fi
+    if [ "$use_fifo" -eq 1 ]; then
+      # Read child output through a private FIFO and switch immediately to `/dev/null` as soon as
+      # `$LEGION_READY_MARKER` exists, never holding `$capture_log` open between lines so the
+      # running app stops writing to `new-start.log` once startup is confirmed.
+      (
+        bytes=0
+        while IFS= read -r line || [ -n "$line" ]; do
+          if [ -f "$LEGION_READY_MARKER" ]; then
+            exec "$CAT" >/dev/null 2>&1
+          fi
+          if [ ! -f "$LEGION_READY_MARKER" ]; then
+            (umask 077 && printf '%s\n' "$line" >> "$capture_log") 2>/dev/null || true
+            bytes=$((bytes + ${#line} + 1))
+            if [ "$bytes" -ge 131072 ]; then
+              cap_log_file "$capture_log"
+              bytes=32768
+            fi
+          fi
+        done
+      ) < "$cap_fifo" &
+      LOG_READER_PID=$!
+      (
+        PATH="${LEGION_RELAUNCH_PATH:-/usr/local/bin:/usr/bin:/bin}"
+        export PATH
+        if [ "$verify_flag" = "1" ]; then
+          LEGION_UPDATE_VERIFY_ONLY=1
+          export LEGION_UPDATE_VERIFY_ONLY
+        else
+          unset LEGION_UPDATE_VERIFY_ONLY
+        fi
+        if [ -n "$supervised_flag" ]; then
+          LEGION_UPDATE_SUPERVISED_LAUNCH="$supervised_flag"
+          export LEGION_UPDATE_SUPERVISED_LAUNCH
+        else
+          unset LEGION_UPDATE_SUPERVISED_LAUNCH
+        fi
+        unset LEGION_OLD_PID LEGION_OLD_PPID LEGION_TARGET LEGION_NEW LEGION_BACKUP LEGION_EXEC \
+          LEGION_READY_MARKER LEGION_ROLLBACK_FILE LEGION_ROLLBACK_JSON LEGION_ROLLBACK_KEPT_NEW_JSON \
+          LEGION_DEFERRED_FILE LEGION_DEFERRED_JSON LEGION_TARGET_SEQUENCE LEGION_UPDATE_LOCK \
+          LEGION_STAGE_FILE LEGION_REOPEN_FILE LEGION_PRE_SWAP_WAIT_SECS LEGION_ROLLBACK_RETRIES \
+          LEGION_WAIT_SECS LEGION_EXIT_GRACE_SECS LEGION_RELAUNCH_PATH LEGION_VERIFY_ONLY \
+          LEGION_NEW_LOG LEGION_ROLLBACK_PS_FILE LEGION_SINGLE_INSTANCE_DBUS LEGION_SINGLE_INSTANCE_SOCK \
+          APPIMAGE APPDIR ARGV0 OWD LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT \
+          GTK_DATA_PREFIX GTK_EXE_PREFIX GTK_PATH GTK_IM_MODULE_FILE \
+          GDK_PIXBUF_MODULE_FILE GSETTINGS_SCHEMA_DIR GI_TYPELIB_PATH GIO_MODULE_DIR \
+          GST_PLUGIN_SYSTEM_PATH_1_0 GST_PLUGIN_PATH_1_0 GST_PLUGIN_SCANNER_1_0 GST_PTP_HELPER_1_0
+        exec "$exec_bin"
+      ) >"$cap_fifo" 2>&1 &
+    else
+      (
+        PATH="${LEGION_RELAUNCH_PATH:-/usr/local/bin:/usr/bin:/bin}"
+        export PATH
+        if [ "$verify_flag" = "1" ]; then
+          LEGION_UPDATE_VERIFY_ONLY=1
+          export LEGION_UPDATE_VERIFY_ONLY
+        else
+          unset LEGION_UPDATE_VERIFY_ONLY
+        fi
+        if [ -n "$supervised_flag" ]; then
+          LEGION_UPDATE_SUPERVISED_LAUNCH="$supervised_flag"
+          export LEGION_UPDATE_SUPERVISED_LAUNCH
+        else
+          unset LEGION_UPDATE_SUPERVISED_LAUNCH
+        fi
+        unset LEGION_OLD_PID LEGION_OLD_PPID LEGION_TARGET LEGION_NEW LEGION_BACKUP LEGION_EXEC \
+          LEGION_READY_MARKER LEGION_ROLLBACK_FILE LEGION_ROLLBACK_JSON LEGION_ROLLBACK_KEPT_NEW_JSON \
+          LEGION_DEFERRED_FILE LEGION_DEFERRED_JSON LEGION_TARGET_SEQUENCE LEGION_UPDATE_LOCK \
+          LEGION_STAGE_FILE LEGION_REOPEN_FILE LEGION_PRE_SWAP_WAIT_SECS LEGION_ROLLBACK_RETRIES \
+          LEGION_WAIT_SECS LEGION_EXIT_GRACE_SECS LEGION_RELAUNCH_PATH LEGION_VERIFY_ONLY \
+          LEGION_NEW_LOG LEGION_ROLLBACK_PS_FILE LEGION_SINGLE_INSTANCE_DBUS LEGION_SINGLE_INSTANCE_SOCK \
+          APPIMAGE APPDIR ARGV0 OWD LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT \
+          GTK_DATA_PREFIX GTK_EXE_PREFIX GTK_PATH GTK_IM_MODULE_FILE \
+          GDK_PIXBUF_MODULE_FILE GSETTINGS_SCHEMA_DIR GI_TYPELIB_PATH GIO_MODULE_DIR \
+          GST_PLUGIN_SYSTEM_PATH_1_0 GST_PLUGIN_PATH_1_0 GST_PLUGIN_SCANNER_1_0 GST_PTP_HELPER_1_0
+        exec "$exec_bin"
+      ) >"$capture_log" 2>&1 &
+    fi
+  else
+    (
+      PATH="${LEGION_RELAUNCH_PATH:-/usr/local/bin:/usr/bin:/bin}"
+      export PATH
+      if [ "$verify_flag" = "1" ]; then
+        LEGION_UPDATE_VERIFY_ONLY=1
+        export LEGION_UPDATE_VERIFY_ONLY
+      else
+        unset LEGION_UPDATE_VERIFY_ONLY
+      fi
+      if [ -n "$supervised_flag" ]; then
+        LEGION_UPDATE_SUPERVISED_LAUNCH="$supervised_flag"
+        export LEGION_UPDATE_SUPERVISED_LAUNCH
+      else
+        unset LEGION_UPDATE_SUPERVISED_LAUNCH
+      fi
+      unset LEGION_OLD_PID LEGION_OLD_PPID LEGION_TARGET LEGION_NEW LEGION_BACKUP LEGION_EXEC \
+        LEGION_READY_MARKER LEGION_ROLLBACK_FILE LEGION_ROLLBACK_JSON LEGION_ROLLBACK_KEPT_NEW_JSON \
+        LEGION_DEFERRED_FILE LEGION_DEFERRED_JSON LEGION_TARGET_SEQUENCE LEGION_UPDATE_LOCK \
+        LEGION_STAGE_FILE LEGION_REOPEN_FILE LEGION_PRE_SWAP_WAIT_SECS LEGION_ROLLBACK_RETRIES \
+        LEGION_WAIT_SECS LEGION_EXIT_GRACE_SECS LEGION_RELAUNCH_PATH LEGION_VERIFY_ONLY \
+        LEGION_NEW_LOG LEGION_ROLLBACK_PS_FILE LEGION_SINGLE_INSTANCE_DBUS LEGION_SINGLE_INSTANCE_SOCK \
+        APPIMAGE APPDIR ARGV0 OWD LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT \
+        GTK_DATA_PREFIX GTK_EXE_PREFIX GTK_PATH GTK_IM_MODULE_FILE \
+        GDK_PIXBUF_MODULE_FILE GSETTINGS_SCHEMA_DIR GI_TYPELIB_PATH GIO_MODULE_DIR \
+        GST_PLUGIN_SYSTEM_PATH_1_0 GST_PLUGIN_PATH_1_0 GST_PLUGIN_SCANNER_1_0 GST_PTP_HELPER_1_0
+      exec "$exec_bin"
+    ) >/dev/null 2>&1 &
+  fi
+  NEW_PID=$!
+}
+
+defer_and_exit() {
+  "$RM" -rf -- "$LEGION_NEW"
+  if [ -n "${LEGION_DEFERRED_FILE:-}" ] && [ -n "${LEGION_DEFERRED_JSON:-}" ]; then
+    printf '%s\n' "$LEGION_DEFERRED_JSON" > "$LEGION_DEFERRED_FILE" || true
+  fi
+  reopen_needed=0
+  if [ "${LEGION_VERIFY_ONLY:-0}" = "1" ] && [ -n "${LEGION_REOPEN_FILE:-}" ] && [ -f "$LEGION_REOPEN_FILE" ]; then
+    "$RM" -f -- "$LEGION_REOPEN_FILE"
+    reopen_needed=1
+  fi
+  release_update_lock
+  if [ "$reopen_needed" -eq 1 ] && [ -x "$LEGION_EXEC" ]; then
+    printf 'supervisor: user reopened app during deferred close update; launching existing copy interactively\n'
+    launch_target 0 "" "" || true
+  fi
+  exit 0
+}
+
+do_rollback() {
+  allow_relaunch="$1"
+  rb_why="$2"
+  if [ "$rollback_done" -eq 1 ]; then
+    return 0
+  fi
+  rollback_done=1
+  printf 'supervisor: rolling back (%s)\n' "$rb_why"
+  capture_rollback_ps
+  if [ -n "$NEW_PID" ]; then
+    new_children="$(collect_children "$NEW_PID")"
+    kill "$NEW_PID" 2>/dev/null || true
+    for cpid in $new_children; do
+      kill "$cpid" 2>/dev/null || true
+    done
+    "$SLEEP" 1
+    kill -9 "$NEW_PID" 2>/dev/null || true
+    for cpid in $new_children; do
+      kill -9 "$cpid" 2>/dev/null || true
+    done
+  fi
+  if [ -n "$LOG_READER_PID" ]; then
+    lr=0
+    while [ "$lr" -lt 4 ]; do
+      if ! kill -0 "$LOG_READER_PID" 2>/dev/null; then
+        break
+      fi
+      "$SLEEP" 0.25 2>/dev/null || "$SLEEP" 1
+      lr=$((lr + 1))
+    done
+    kill "$LOG_READER_PID" 2>/dev/null || true
+  fi
+  if [ -n "${ACTIVE_CAP_FIFO:-}" ]; then
+    "$RM" -f -- "$ACTIVE_CAP_FIFO" 2>/dev/null || true
+    ACTIVE_CAP_FIFO=""
+  fi
+  cap_log_file "${LEGION_NEW_LOG:-}"
+
+  rb_retries="${LEGION_ROLLBACK_RETRIES:-20}"
+  r=0
+  target_busy=0
+  while [ "$r" -lt "$rb_retries" ]; do
+    if ! install_target_in_use; then
+      target_busy=0
+      break
+    fi
+    target_busy=1
+    "$SLEEP" 0.25 2>/dev/null || "$SLEEP" 1
+    r=$((r + 1))
+  done
+
+  restored=0
+  if [ "$target_busy" -eq 1 ]; then
+    printf 'supervisor: rollback target still in use after %s retries; keeping new copy intact\n' "$rb_retries"
+    printf '%s\n' "${LEGION_ROLLBACK_KEPT_NEW_JSON:-$LEGION_ROLLBACK_JSON}" > "$LEGION_ROLLBACK_FILE" || true
+  else
+    failed_aside="${LEGION_TARGET}.failed.$$"
+    "$RM" -rf -- "$failed_aside" 2>/dev/null || true
+    if "$MV" -f -- "$LEGION_TARGET" "$failed_aside" 2>/dev/null; then
+      if "$MV" -f -- "$LEGION_BACKUP" "$LEGION_TARGET" 2>/dev/null; then
+        "$RM" -rf -- "$failed_aside" 2>/dev/null || true
+        restored=1
+        printf '%s\n' "$LEGION_ROLLBACK_JSON" > "$LEGION_ROLLBACK_FILE" || true
+      else
+        printf 'supervisor: failed to move backup back into target; restoring new copy intact\n'
+        "$MV" -f -- "$failed_aside" "$LEGION_TARGET" 2>/dev/null || true
+        printf '%s\n' "${LEGION_ROLLBACK_KEPT_NEW_JSON:-$LEGION_ROLLBACK_JSON}" > "$LEGION_ROLLBACK_FILE" || true
+      fi
+    else
+      printf 'supervisor: could not move new target aside during rollback; keeping new copy intact\n'
+      printf '%s\n' "${LEGION_ROLLBACK_KEPT_NEW_JSON:-$LEGION_ROLLBACK_JSON}" > "$LEGION_ROLLBACK_FILE" || true
+    fi
+  fi
+
+  reopen_needed=0
+  if [ "${LEGION_VERIFY_ONLY:-0}" = "1" ] && [ -n "${LEGION_REOPEN_FILE:-}" ] && [ -f "$LEGION_REOPEN_FILE" ]; then
+    "$RM" -f -- "$LEGION_REOPEN_FILE"
+    reopen_needed=1
+  fi
+  release_update_lock
+
+  if [ "$allow_relaunch" = "1" ] && [ "$restored" -eq 1 ]; then
+    k=0
+    while [ "$k" -lt 8 ]; do
+      if ! dbus_name_owned && { [ -z "${LEGION_SINGLE_INSTANCE_SOCK:-}" ] || [ ! -S "$LEGION_SINGLE_INSTANCE_SOCK" ]; }; then
+        break
+      fi
+      "$SLEEP" 0.25 2>/dev/null || "$SLEEP" 1
+      k=$((k + 1))
+    done
+    if { [ "${LEGION_VERIFY_ONLY:-0}" != "1" ] || [ "$reopen_needed" -eq 1 ]; } && [ -x "$LEGION_EXEC" ]; then
+      launch_target 0 "" "" || true
+    fi
+  fi
+}
+
+on_signal() {
+  sig="$1"
+  trap '' TERM HUP INT
+  printf 'supervisor: received %s (swapped=%s verified_ok=%s)\n' "$sig" "$swapped" "$verified_ok"
+  if [ "$swapped" -eq 1 ] && [ "$verified_ok" -eq 0 ] && [ "$rollback_done" -eq 0 ]; then
+    do_rollback "0" "signal $sig"
+  elif [ "$swapped" -eq 0 ]; then
+    "$RM" -rf -- "$LEGION_NEW" 2>/dev/null || true
+    if [ -n "${LEGION_DEFERRED_FILE:-}" ] && [ -n "${LEGION_DEFERRED_JSON:-}" ]; then
+      printf '%s\n' "$LEGION_DEFERRED_JSON" > "$LEGION_DEFERRED_FILE" 2>/dev/null || true
+    fi
+    release_update_lock
+  else
+    release_update_lock
+  fi
+  exit 1
+}
+
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP' HUP
+trap 'on_signal INT' INT
+
+old_children="$(collect_children "$LEGION_OLD_PID")"
+printf 'supervisor: start old_pid=%s old_ppid=%s old_children=[%s] verify_only=%s target=%s\n' \
+  "$LEGION_OLD_PID" "${LEGION_OLD_PPID:-}" "$old_children" "${LEGION_VERIFY_ONLY:-0}" "$LEGION_TARGET"
+
+# 1. Wait up to LEGION_PRE_SWAP_WAIT_SECS for the previous process, its AppImage wrapper parent
+# (if any), its helper children, its single-instance lock, AND any other process running from
+# $LEGION_TARGET to exit completely. If another instance is still running when the bound expires,
+# defer cleanly without changing the install and without counting as a failure.
+pre_wait="${LEGION_PRE_SWAP_WAIT_SECS:-15}"
+pre_ticks=$((pre_wait * 4))
 i=0
-while [ "$i" -lt 60 ]; do
-  if ! kill -0 "$LEGION_OLD_PID" 2>/dev/null; then
+still_up=0
+while [ "$i" -lt "$pre_ticks" ]; do
+  still_up=0
+  if kill -0 "$LEGION_OLD_PID" 2>/dev/null; then
+    still_up=1
+  fi
+  if [ -n "${LEGION_OLD_PPID:-}" ] && kill -0 "$LEGION_OLD_PPID" 2>/dev/null; then
+    still_up=1
+  fi
+  for cpid in $old_children; do
+    if kill -0 "$cpid" 2>/dev/null; then
+      still_up=1
+      break
+    fi
+  done
+  if [ "$still_up" -eq 0 ]; then
+    if install_target_in_use; then
+      still_up=1
+    elif dbus_name_owned; then
+      still_up=1
+    elif [ -n "${LEGION_SINGLE_INSTANCE_SOCK:-}" ] && [ -S "$LEGION_SINGLE_INSTANCE_SOCK" ]; then
+      still_up=1
+    fi
+  fi
+  if [ "$still_up" -eq 0 ]; then
     break
   fi
   "$SLEEP" 0.25 2>/dev/null || "$SLEEP" 1
   i=$((i + 1))
 done
-printf 'supervisor: old_pid=%s exited after %s ticks\n' "$LEGION_OLD_PID" "$i"
+printf 'supervisor: pre-swap wait finished after %s ticks (still_up=%s)\n' "$i" "$still_up"
+
+if [ "$still_up" -ne 0 ]; then
+  printf 'supervisor: install still in use after %ss; deferring update cleanly without changing install\n' "$pre_wait"
+  defer_and_exit
+fi
 
 "$RM" -f -- "$LEGION_READY_MARKER"
 "$RM" -rf -- "$LEGION_BACKUP"
 
 # 2. Move current install aside and put the verified new copy into place.
+write_stage swapping
 if ! "$MV" -f -- "$LEGION_TARGET" "$LEGION_BACKUP"; then
   printf 'supervisor: failed to move target to backup\n'
-  "$RM" -rf -- "$LEGION_NEW"
-  exit 1
+  defer_and_exit
 fi
 
 if ! "$MV" -f -- "$LEGION_NEW" "$LEGION_TARGET"; then
   printf 'supervisor: failed to move staged new copy into target; restoring backup\n'
   "$MV" -f -- "$LEGION_BACKUP" "$LEGION_TARGET" || true
-  exit 1
+  defer_and_exit
 fi
+swapped=1
+write_stage swapped
 printf 'supervisor: swapped new copy into target\n'
 
-launch_target() {
-  verify_flag="$1"
-  exec_bin="$LEGION_EXEC"
-  (
-    PATH="${LEGION_RELAUNCH_PATH:-/usr/local/bin:/usr/bin:/bin}"
-    export PATH
-    if [ "$verify_flag" = "1" ]; then
-      LEGION_UPDATE_VERIFY_ONLY=1
-      export LEGION_UPDATE_VERIFY_ONLY
-    else
-      unset LEGION_UPDATE_VERIFY_ONLY
-    fi
-    unset LEGION_OLD_PID LEGION_TARGET LEGION_NEW LEGION_BACKUP LEGION_EXEC \
-      LEGION_READY_MARKER LEGION_ROLLBACK_FILE LEGION_ROLLBACK_JSON \
-      LEGION_WAIT_SECS LEGION_RELAUNCH_PATH LEGION_VERIFY_ONLY \
-      APPIMAGE APPDIR ARGV0 OWD LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT \
-      GTK_DATA_PREFIX GTK_EXE_PREFIX GTK_PATH GTK_IM_MODULE_FILE \
-      GDK_PIXBUF_MODULE_FILE GSETTINGS_SCHEMA_DIR GI_TYPELIB_PATH GIO_MODULE_DIR \
-      GST_PLUGIN_SYSTEM_PATH_1_0 GST_PLUGIN_PATH_1_0 GST_PLUGIN_SCANNER_1_0 GST_PTP_HELPER_1_0
-    exec "$exec_bin"
-  ) >/dev/null 2>&1 &
-  NEW_PID=$!
-}
-
-# 3. Start the new build and wait for its ready marker.
+# 3. Start the new build (marked as supervised launch so update.lock permits it) and decide
+# startup strictly by whether the ready marker appears within the wait window.
 verify_mode="${LEGION_VERIFY_ONLY:-0}"
-launch_target "$verify_mode"
-printf 'supervisor: launched new_pid=%s exec=%s\n' "$NEW_PID" "$LEGION_EXEC"
+new_log="${LEGION_NEW_LOG:-}"
+target_seq="${LEGION_TARGET_SEQUENCE:-1}"
+if [ -n "${LEGION_ROLLBACK_PS_FILE:-}" ]; then
+  "$RM" -f -- "$LEGION_ROLLBACK_PS_FILE"
+fi
+launch_target "$verify_mode" "$new_log" "$target_seq"
+printf 'supervisor: launched new_pid=%s exec=%s log=%s\n' "$NEW_PID" "$LEGION_EXEC" "$new_log"
 wait_limit="${LEGION_WAIT_SECS:-30}"
-ticks=$((wait_limit * 4))
+grace_limit="${LEGION_EXIT_GRACE_SECS:-8}"
+max_ticks=$((wait_limit * 4))
+grace_ticks=$((grace_limit * 4))
 j=0
 started=0
-while [ "$j" -lt "$ticks" ]; do
+proc_done=0
+while [ "$j" -lt "$max_ticks" ]; do
   if [ -f "$LEGION_READY_MARKER" ]; then
     started=1
     break
   fi
-  if ! kill -0 "$NEW_PID" 2>/dev/null; then
-    break
+  if [ "$proc_done" -eq 0 ]; then
+    exited_now=0
+    if ! kill -0 "$NEW_PID" 2>/dev/null; then
+      exited_now=1
+    else
+      new_stat="$("$PS" -o stat= -p "$NEW_PID" 2>/dev/null || true)"
+      case "$new_stat" in
+        *Z*) exited_now=1 ;;
+      esac
+    fi
+    if [ "$exited_now" -eq 1 ]; then
+      proc_done=1
+      wait "$NEW_PID" 2>/dev/null
+      new_rc=$?
+      printf 'supervisor: new_pid=%s exited with rc=%s after %s ticks\n' "$NEW_PID" "$new_rc" "$j"
+      # Never roll back immediately on a single PID exit: on exit 0 keep polling for the full
+      # wait_limit (single-instance handover or wrapper fork); on non-zero exit keep polling for
+      # grace_limit seconds in case a wrapper exited while another process finishes starting.
+      if [ "$new_rc" -ne 0 ]; then
+        grace_end=$((j + grace_ticks))
+        if [ "$grace_end" -lt "$max_ticks" ]; then
+          max_ticks="$grace_end"
+        fi
+      fi
+    fi
   fi
-  new_stat="$("$PS" -o stat= -p "$NEW_PID" 2>/dev/null || true)"
-  case "$new_stat" in
-    ""|*Z*) break ;;
-  esac
   "$SLEEP" 0.25 2>/dev/null || "$SLEEP" 1
   j=$((j + 1))
 done
 
-# One final check after process exit (in verify_only mode the new binary writes the marker and exits 0).
+# One final check after loop exit.
 if [ -f "$LEGION_READY_MARKER" ]; then
   started=1
 fi
 
 if [ "$started" -eq 1 ]; then
+  verified_ok=1
+  write_stage started
   printf 'supervisor: ready marker observed at %s; removing backup\n' "$LEGION_READY_MARKER"
   "$RM" -rf -- "$LEGION_BACKUP"
+  if [ -n "$new_log" ]; then
+    "$SLEEP" 0.25 2>/dev/null || true
+    "$RM" -f -- "$new_log"
+  fi
+  if [ -n "${LEGION_ROLLBACK_PS_FILE:-}" ]; then
+    "$RM" -f -- "$LEGION_ROLLBACK_PS_FILE"
+  fi
+  release_update_lock
+  if [ "$verify_mode" = "1" ] && [ -n "${LEGION_REOPEN_FILE:-}" ] && [ -f "$LEGION_REOPEN_FILE" ]; then
+    "$RM" -f -- "$LEGION_REOPEN_FILE"
+    printf 'supervisor: user reopened app during close update; launching updated copy interactively\n'
+    launch_target 0 "" "" || true
+  fi
   exit 0
 fi
 
-# 4. New build failed to start: stop it, record rollback, restore previous copy, and relaunch if interactive.
-printf 'supervisor: ready marker missing after %s ticks; rolling back\n' "$j"
-kill "$NEW_PID" 2>/dev/null || true
-"$SLEEP" 1
-kill -9 "$NEW_PID" 2>/dev/null || true
-printf '%s\n' "$LEGION_ROLLBACK_JSON" > "$LEGION_ROLLBACK_FILE"
-"$RM" -rf -- "$LEGION_TARGET"
-"$MV" -f -- "$LEGION_BACKUP" "$LEGION_TARGET"
-if [ "$verify_mode" != "1" ]; then
-  launch_target 0
-fi
+# 4. New build failed to confirm startup: stop the new process, cap startup output, restore backup,
+# record exact rollback state, release lock, and relaunch.
+do_rollback "1" "ready marker missing after $j ticks"
 exit 1
 "#;
 
@@ -1286,9 +2642,13 @@ pub fn stage_and_spawn_linux_appimage(
     ready_marker_path: &Path,
     rollback_marker_path: &Path,
     rollback_json: String,
+    rollback_kept_new_json: String,
+    deferred_marker_path: &Path,
+    deferred_json: String,
+    target_sequence: u64,
     wait_secs: u64,
     verify_only: bool,
-) -> Result<(), AppError> {
+) -> Result<u32, AppError> {
     let parent = appimage_path.parent().ok_or_else(|| {
         AppError::new(
             ErrorCode::Failed,
@@ -1324,8 +2684,19 @@ pub fn stage_and_spawn_linux_appimage(
         0o755,
     )?;
 
+    #[cfg(target_os = "linux")]
+    let old_ppid = detect_appimage_wrapper_ppid(appimage_path);
+    #[cfg(not(target_os = "linux"))]
+    let old_ppid = None;
+    #[cfg(target_os = "linux")]
+    let single_instance_dbus_name = Some(LINUX_SINGLE_INSTANCE_DBUS_NAME.to_owned());
+    #[cfg(not(target_os = "linux"))]
+    let single_instance_dbus_name = None;
+
+    let updates_dir = ready_marker_path.parent();
     spawn_unix_swap_supervisor(&UnixSwapPlan {
         old_pid: pid,
+        old_ppid,
         target_path: appimage_path.to_path_buf(),
         staged_new_path: staged_new,
         backup_path,
@@ -1333,8 +2704,22 @@ pub fn stage_and_spawn_linux_appimage(
         ready_marker_path: ready_marker_path.to_path_buf(),
         rollback_marker_path: rollback_marker_path.to_path_buf(),
         rollback_json,
-        log_path: ready_marker_path.parent().map(|d| d.join("supervisor.log")),
+        rollback_kept_new_json,
+        deferred_marker_path: Some(deferred_marker_path.to_path_buf()),
+        deferred_json: Some(deferred_json),
+        target_sequence,
+        update_lock_path: updates_dir.map(|d| d.join(UPDATE_LOCK_FILENAME)),
+        stage_file_path: updates_dir.map(|d| pending_stage_path(d, target_sequence)),
+        reopen_marker_path: updates_dir.map(|d| d.join(REOPEN_REQUESTED_FILENAME)),
+        log_path: updates_dir.map(|d| d.join("supervisor.log")),
+        new_start_log_path: updates_dir.map(|d| d.join(NEW_START_LOG_FILENAME)),
+        rollback_ps_path: updates_dir.map(|d| d.join(ROLLBACK_PS_FILENAME)),
+        single_instance_dbus_name,
+        single_instance_socket_path: None,
+        pre_swap_wait_secs: DEFAULT_PRE_SWAP_WAIT_SECS,
         wait_secs,
+        exit_grace_secs: DEFAULT_EXIT_GRACE_SECS,
+        rollback_retries: DEFAULT_ROLLBACK_RETRIES,
         verify_only,
     })
 }
@@ -1353,9 +2738,13 @@ pub fn stage_and_spawn_macos_bundle(
     ready_marker_path: &Path,
     rollback_marker_path: &Path,
     rollback_json: String,
+    rollback_kept_new_json: String,
+    deferred_marker_path: &Path,
+    deferred_json: String,
+    target_sequence: u64,
     wait_secs: u64,
     verify_only: bool,
-) -> Result<(), AppError> {
+) -> Result<u32, AppError> {
     let parent = bundle_dir.parent().ok_or_else(|| {
         AppError::new(
             ErrorCode::Failed,
@@ -1410,8 +2799,14 @@ pub fn stage_and_spawn_macos_bundle(
     let _ = fs::remove_dir_all(&extract_root);
 
     let exec_path = bundle_dir.join(executable_rel);
+    #[cfg(target_os = "macos")]
+    let single_instance_socket_path = Some(PathBuf::from(MACOS_SINGLE_INSTANCE_SOCKET));
+    #[cfg(not(target_os = "macos"))]
+    let single_instance_socket_path = None;
+    let updates_dir = ready_marker_path.parent();
     spawn_unix_swap_supervisor(&UnixSwapPlan {
         old_pid: pid,
+        old_ppid: None,
         target_path: bundle_dir.to_path_buf(),
         staged_new_path: staged_bundle,
         backup_path,
@@ -1419,27 +2814,42 @@ pub fn stage_and_spawn_macos_bundle(
         ready_marker_path: ready_marker_path.to_path_buf(),
         rollback_marker_path: rollback_marker_path.to_path_buf(),
         rollback_json,
-        log_path: ready_marker_path.parent().map(|d| d.join("supervisor.log")),
+        rollback_kept_new_json,
+        deferred_marker_path: Some(deferred_marker_path.to_path_buf()),
+        deferred_json: Some(deferred_json),
+        target_sequence,
+        update_lock_path: updates_dir.map(|d| d.join(UPDATE_LOCK_FILENAME)),
+        stage_file_path: updates_dir.map(|d| pending_stage_path(d, target_sequence)),
+        reopen_marker_path: updates_dir.map(|d| d.join(REOPEN_REQUESTED_FILENAME)),
+        log_path: updates_dir.map(|d| d.join("supervisor.log")),
+        new_start_log_path: updates_dir.map(|d| d.join(NEW_START_LOG_FILENAME)),
+        rollback_ps_path: updates_dir.map(|d| d.join(ROLLBACK_PS_FILENAME)),
+        single_instance_dbus_name: None,
+        single_instance_socket_path,
+        pre_swap_wait_secs: DEFAULT_PRE_SWAP_WAIT_SECS,
         wait_secs,
+        exit_grace_secs: DEFAULT_EXIT_GRACE_SECS,
+        rollback_retries: DEFAULT_ROLLBACK_RETRIES,
         verify_only,
     })
 }
 
 /// Spawns the detached POSIX `/bin/sh` swap supervisor for [`UnixSwapPlan`] using the current
-/// process environment (sanitized).
+/// process environment (sanitized) and returns its PID.
 #[cfg(unix)]
-pub fn spawn_unix_swap_supervisor(plan: &UnixSwapPlan) -> Result<(), AppError> {
+pub fn spawn_unix_swap_supervisor(plan: &UnixSwapPlan) -> Result<u32, AppError> {
     let sanitized = build_sanitized_unix_env(std::env::vars_os(), None);
     spawn_unix_swap_supervisor_with_env(plan, &sanitized)
 }
 
 /// Spawns the detached POSIX `/bin/sh` swap supervisor with an explicitly pre-sanitized
-/// environment (used directly by security tests with planted `$APPDIR` fixtures).
+/// environment (used directly by security tests with planted `$APPDIR` fixtures) and returns its
+/// PID.
 #[cfg(unix)]
 pub fn spawn_unix_swap_supervisor_with_env(
     plan: &UnixSwapPlan,
     sanitized: &SanitizedUnixEnv,
-) -> Result<(), AppError> {
+) -> Result<u32, AppError> {
     if let Some(script_diag) = plan
         .log_path
         .as_deref()
@@ -1465,19 +2875,60 @@ pub fn spawn_unix_swap_supervisor_with_env(
         .env("LEGION_READY_MARKER", &plan.ready_marker_path)
         .env("LEGION_ROLLBACK_FILE", &plan.rollback_marker_path)
         .env("LEGION_ROLLBACK_JSON", &plan.rollback_json)
+        .env(
+            "LEGION_ROLLBACK_KEPT_NEW_JSON",
+            &plan.rollback_kept_new_json,
+        )
+        .env("LEGION_TARGET_SEQUENCE", plan.target_sequence.to_string())
+        .env(
+            "LEGION_PRE_SWAP_WAIT_SECS",
+            plan.pre_swap_wait_secs.to_string(),
+        )
         .env("LEGION_WAIT_SECS", plan.wait_secs.to_string())
+        .env("LEGION_EXIT_GRACE_SECS", plan.exit_grace_secs.to_string())
+        .env("LEGION_ROLLBACK_RETRIES", plan.rollback_retries.to_string())
         .env(
             "LEGION_VERIFY_ONLY",
             if plan.verify_only { "1" } else { "0" },
         );
+    if let Some(ppid) = plan.old_ppid {
+        cmd.env("LEGION_OLD_PPID", ppid.to_string());
+    }
+    if let Some(deferred_path) = &plan.deferred_marker_path {
+        cmd.env("LEGION_DEFERRED_FILE", deferred_path);
+    }
+    if let Some(deferred_json) = &plan.deferred_json {
+        cmd.env("LEGION_DEFERRED_JSON", deferred_json);
+    }
+    if let Some(lock_path) = &plan.update_lock_path {
+        cmd.env("LEGION_UPDATE_LOCK", lock_path);
+    }
+    if let Some(stage_path) = &plan.stage_file_path {
+        cmd.env("LEGION_STAGE_FILE", stage_path);
+    }
+    if let Some(reopen_path) = &plan.reopen_marker_path {
+        cmd.env("LEGION_REOPEN_FILE", reopen_path);
+    }
+    if let Some(new_log) = &plan.new_start_log_path {
+        cmd.env("LEGION_NEW_LOG", new_log);
+    }
+    if let Some(ps_path) = &plan.rollback_ps_path {
+        cmd.env("LEGION_ROLLBACK_PS_FILE", ps_path);
+    }
+    if let Some(dbus_name) = &plan.single_instance_dbus_name {
+        cmd.env("LEGION_SINGLE_INSTANCE_DBUS", dbus_name);
+    }
+    if let Some(sock_path) = &plan.single_instance_socket_path {
+        cmd.env("LEGION_SINGLE_INSTANCE_SOCK", sock_path);
+    }
 
-    cmd.spawn().map_err(|err| {
+    let child = cmd.spawn().map_err(|err| {
         AppError::new(
             ErrorCode::Failed,
             format!("Could not start update helper process: {err}"),
         )
     })?;
-    Ok(())
+    Ok(child.id())
 }
 
 fn open_supervisor_log_stdio(log_path: Option<&Path>) -> (Stdio, Stdio) {
@@ -1503,16 +2954,6 @@ fn open_supervisor_log_stdio(log_path: Option<&Path>) -> (Stdio, Stdio) {
     }
 }
 
-/// Encodes a PowerShell script as UTF-16LE Base64 for `powershell.exe -EncodedCommand` so
-/// embedded newlines and quotes are never mangled by Windows command-line parsing.
-pub fn encode_powershell_command(script: &str) -> String {
-    let mut utf16le = Vec::with_capacity(script.len() * 2);
-    for unit in script.encode_utf16() {
-        utf16le.extend_from_slice(&unit.to_le_bytes());
-    }
-    BASE64.encode(utf16le)
-}
-
 /// Resolves Windows PowerShell via the full System32 path (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`).
 pub fn windows_system_powershell_path() -> PathBuf {
     let root = std::env::var_os("SystemRoot")
@@ -1526,21 +2967,297 @@ pub fn windows_system_powershell_path() -> PathBuf {
         .join("powershell.exe")
 }
 
+/// Resolves a System32 executable on Windows (`%SystemRoot%\System32\<name>`).
+#[cfg(windows)]
+fn windows_system32_exe(name: &str) -> PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    root.join("System32").join(name)
+}
+
+/// Restricts a Windows file's DACL to owner-only (`*<current-user-SID>:F` plus
+/// `NT AUTHORITY\SYSTEM` `*S-1-5-18:F`) with inheritance disabled via System32 `icacls.exe`.
+#[cfg(windows)]
+fn restrict_windows_file_to_owner(path: &Path) -> Result<(), AppError> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let whoami = windows_system32_exe("whoami.exe");
+    let owner_grant = Command::new(&whoami)
+        .args(["/user", "/fo", "csv", "/nh"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| {
+            let line = String::from_utf8_lossy(&out.stdout);
+            let sid = line
+                .trim()
+                .rsplit(',')
+                .next()?
+                .trim()
+                .trim_matches('"')
+                .trim();
+            if sid.starts_with("S-1-")
+                && sid
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || matches!(b, b'S' | b'-'))
+            {
+                Some(format!("*{sid}:F"))
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            let user = std::env::var("USERNAME").ok()?;
+            let user = user.trim();
+            if user.is_empty() {
+                return None;
+            }
+            if let Ok(domain) = std::env::var("USERDOMAIN")
+                && !domain.trim().is_empty()
+            {
+                Some(format!("{}\\{}:F", domain.trim(), user))
+            } else {
+                Some(format!("{user}:F"))
+            }
+        })
+        .ok_or_else(|| {
+            AppError::new(
+                ErrorCode::Failed,
+                "Could not determine current Windows user for supervisor script permissions.",
+            )
+        })?;
+
+    let icacls = windows_system32_exe("icacls.exe");
+    let out = Command::new(&icacls)
+        .arg(path)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            &owner_grant,
+            "/grant:r",
+            "*S-1-5-18:F",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| {
+            AppError::new(
+                ErrorCode::Failed,
+                format!("Could not run icacls on {}: {err}", path.display()),
+            )
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return Err(AppError::new(
+            ErrorCode::Failed,
+            format!(
+                "Could not restrict permissions on {}: {} {}",
+                path.display(),
+                stdout.trim(),
+                stderr.trim()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Writes [`WINDOWS_NSIS_SUPERVISOR_SCRIPT`] (with a UTF-8 BOM so Windows PowerShell 5.1 always
+/// parses it as UTF-8) to a private owner-only `.ps1` file inside `updates_dir` so `powershell.exe`
+/// runs it with `-File` and a short command line well below Windows's 32,767-character limit.
+pub fn write_windows_supervisor_script(updates_dir: &Path, pid: u32) -> Result<PathBuf, AppError> {
+    ensure_private_dir(updates_dir)?;
+    let final_path = updates_dir.join(format!("supervisor-{pid}.ps1"));
+    let tmp_path = updates_dir.join(format!(".supervisor-{pid}-{}.ps1.tmp", now_unix_u64()));
+    let _ = fs::remove_file(&tmp_path);
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp_path).map_err(|err| {
+        AppError::new(
+            ErrorCode::Failed,
+            format!(
+                "Could not create supervisor script {}: {err}",
+                tmp_path.display()
+            ),
+        )
+    })?;
+    let write_res = file
+        .write_all(&[0xEF, 0xBB, 0xBF])
+        .and_then(|()| file.write_all(WINDOWS_NSIS_SUPERVISOR_SCRIPT.as_bytes()))
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(AppError::new(
+            ErrorCode::Failed,
+            format!(
+                "Could not write supervisor script {}: {err}",
+                tmp_path.display()
+            ),
+        ));
+    }
+
+    #[cfg(windows)]
+    if let Err(err) = restrict_windows_file_to_owner(&tmp_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    for attempt in 0..5u8 {
+        match fs::rename(&tmp_path, &final_path) {
+            Ok(()) => return Ok(final_path),
+            Err(err) if attempt < 4 => {
+                let _ = err;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(AppError::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Could not finalize supervisor script {}: {err}",
+                        final_path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(final_path)
+}
+
 /// Fixed PowerShell supervisor script for Windows NSIS silent upgrade with automatic rollback.
 ///
-/// Passed to `powershell.exe -EncodedCommand` (UTF-16LE Base64) so embedded newlines and quotes
-/// are never mangled by `CreateProcessW` / PowerShell `-Command` parsing. Receives all paths
-/// strictly through environment variables, uses `-LiteralPath` on every filesystem cmdlet, invokes
-/// the NSIS installer directly via `ProcessStartInfo` (`UseShellExecute = $false`) with
-/// `/S /UPDATE /D=<install_dir>` (`/D=` last and unquoted), writes progress lines to stdout
-/// (redirected by the parent to `supervisor.log`), and restores the previous copy on any installer
-/// or startup failure.
+/// Written to an owner-only `.ps1` file in the updates directory and invoked via System32
+/// `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <path>` so the command
+/// line stays short (well under Windows's 32,767-character `CreateProcessW` limit). Receives all
+/// paths strictly through environment variables, performs all filesystem and path work via .NET
+/// (`[System.IO.File]`, `[System.IO.Directory]`, `[System.IO.Path]`) to avoid Windows PowerShell
+/// 5.1 parameter-set and wildcard-path quirks, invokes the NSIS installer directly via
+/// `ProcessStartInfo` (`UseShellExecute = $false`) with `/S /UPDATE /D=<install_dir>` (`/D=` last
+/// and unquoted), writes progress lines to stdout (redirected by the parent to `supervisor.log`),
+/// and restores the previous copy transactionally on any installer or startup failure.
 pub const WINDOWS_NSIS_SUPERVISOR_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
+$script:supLockStream = $null
+
 function Write-Log([string]$msg) {
-  $line = "$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffZ') $msg"
-  [Console]::Out.WriteLine($line)
-  [Console]::Out.Flush()
+  try {
+    $ts = [System.DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    [Console]::Out.WriteLine("$ts $msg")
+    [Console]::Out.Flush()
+  } catch {}
+}
+
+function Format-ErrorRecord($err) {
+  $msg = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
+  $inv = if ($err) { $err.InvocationInfo } else { $null }
+  if ($inv) {
+    $lineNum = $inv.ScriptLineNumber
+    $lineText = if ($inv.Line) { $inv.Line.Trim() } else { '' }
+    $posMsg = if ($inv.PositionMessage) { ($inv.PositionMessage -replace '\r?\n', ' | ').Trim() } else { '' }
+    return "$msg [line $($lineNum): $lineText] ($posMsg)"
+  }
+  return $msg
+}
+
+function Remove-FileQuiet([string]$filePath) {
+  if (-not $filePath) { return }
+  try {
+    if ([System.IO.File]::Exists($filePath)) {
+      try { [System.IO.File]::SetAttributes($filePath, [System.IO.FileAttributes]::Normal) } catch {}
+      [System.IO.File]::Delete($filePath)
+    }
+  } catch {}
+}
+
+function Remove-DirQuiet([string]$dirPath) {
+  if (-not $dirPath) { return }
+  try {
+    if ([System.IO.Directory]::Exists($dirPath)) {
+      foreach ($f in [System.IO.Directory]::GetFiles($dirPath, '*', [System.IO.SearchOption]::AllDirectories)) {
+        try { [System.IO.File]::SetAttributes($f, [System.IO.FileAttributes]::Normal) } catch {}
+      }
+      [System.IO.Directory]::Delete($dirPath, $true)
+    }
+  } catch {}
+}
+
+function Move-FileSafe([string]$src, [string]$dst) {
+  $parent = [System.IO.Path]::GetDirectoryName($dst)
+  if ($parent -and -not [System.IO.Directory]::Exists($parent)) {
+    [System.IO.Directory]::CreateDirectory($parent) | Out-Null
+  }
+  if ([System.IO.File]::Exists($dst)) {
+    try { [System.IO.File]::SetAttributes($dst, [System.IO.FileAttributes]::Normal) } catch {}
+    [System.IO.File]::Delete($dst)
+  }
+  $srcRoot = [System.IO.Path]::GetPathRoot($src)
+  $dstRoot = [System.IO.Path]::GetPathRoot($dst)
+  if ($srcRoot -and $dstRoot -and $srcRoot.Equals($dstRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    [System.IO.File]::Move($src, $dst)
+  } else {
+    [System.IO.File]::Copy($src, $dst, $true)
+    try { [System.IO.File]::SetAttributes($src, [System.IO.FileAttributes]::Normal) } catch {}
+    [System.IO.File]::Delete($src)
+  }
+}
+
+function Copy-FileSafe([string]$src, [string]$dst) {
+  $parent = [System.IO.Path]::GetDirectoryName($dst)
+  if ($parent -and -not [System.IO.Directory]::Exists($parent)) {
+    [System.IO.Directory]::CreateDirectory($parent) | Out-Null
+  }
+  if ([System.IO.File]::Exists($dst)) {
+    try { [System.IO.File]::SetAttributes($dst, [System.IO.FileAttributes]::Normal) } catch {}
+  }
+  [System.IO.File]::Copy($src, $dst, $true)
+}
+
+function Write-Utf8NoBom([string]$filePath, [string]$text) {
+  $parent = [System.IO.Path]::GetDirectoryName($filePath)
+  if ($parent -and -not [System.IO.Directory]::Exists($parent)) {
+    [System.IO.Directory]::CreateDirectory($parent) | Out-Null
+  }
+  [System.IO.File]::WriteAllText($filePath, $text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Clear-EnvVar([string]$name) {
+  [System.Environment]::SetEnvironmentVariable($name, $null)
+}
+
+function Release-UpdateLocks {
+  if ($script:supLockStream) {
+    try { $script:supLockStream.Dispose() } catch {}
+    $script:supLockStream = $null
+  }
+  Remove-FileQuiet $env:LEGION_SUPERVISOR_LOCK
+  Remove-FileQuiet $env:LEGION_UPDATE_LOCK
+}
+
+if ($env:LEGION_SUPERVISOR_LOCK) {
+  try {
+    $script:supLockStream = [System.IO.File]::Open(
+      $env:LEGION_SUPERVISOR_LOCK,
+      [System.IO.FileMode]::OpenOrCreate,
+      [System.IO.FileAccess]::ReadWrite,
+      [System.IO.FileShare]::None
+    )
+  } catch {
+    Write-Log "failed to hold supervisor lock $($env:LEGION_SUPERVISOR_LOCK): $(Format-ErrorRecord $_)"
+  }
 }
 
 function Start-Direct([string]$filePath, [string]$arguments, [bool]$noWindow) {
@@ -1552,108 +3269,675 @@ function Start-Direct([string]$filePath, [string]$arguments, [bool]$noWindow) {
   return [System.Diagnostics.Process]::Start($psi)
 }
 
+function Start-Captured([string]$filePath) {
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $filePath
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  return [System.Diagnostics.Process]::Start($psi)
+}
+
+function Write-PendingStage([string]$stage) {
+  if (-not $env:LEGION_STAGE_FILE) { return }
+  try {
+    Write-Utf8NoBom $env:LEGION_STAGE_FILE "$stage`n"
+  } catch {}
+}
+
+function Test-PidAlive([int]$targetPid) {
+  if ($targetPid -le 0) { return $false }
+  $p = $null
+  try {
+    $p = [System.Diagnostics.Process]::GetProcessById($targetPid)
+    return (-not $p.HasExited)
+  } catch {
+    return $false
+  } finally {
+    if ($p) { try { $p.Dispose() } catch {} }
+  }
+}
+
+function Get-InstallDirProcesses([string]$installDir) {
+  if (-not $installDir) { return @() }
+  $prefix = [System.IO.Path]::GetFullPath($installDir).TrimEnd('\') + '\'
+  $found = New-Object System.Collections.Generic.List[object]
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  $procs = @()
+  try {
+    $procs = [System.Diagnostics.Process]::GetProcesses()
+    foreach ($p in $procs) {
+      if ($sw.ElapsedMilliseconds -ge 2000) { break }
+      if ($p.Id -eq $PID) { continue }
+      $pPath = ''
+      try {
+        if ($p.MainModule) { $pPath = $p.MainModule.FileName }
+      } catch {}
+      if ($pPath -and $pPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $found.Add(@{ Id = $p.Id; ProcessName = $p.ProcessName })
+      }
+    }
+  } catch {} finally {
+    foreach ($p in $procs) {
+      try { $p.Dispose() } catch {}
+    }
+  }
+  return $found.ToArray()
+}
+
+function Capture-RollbackPs {
+  if (-not $env:LEGION_ROLLBACK_PS_FILE) { return }
+  $procs = @()
+  try {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $lines = New-Object System.Collections.Generic.List[string]
+    $procs = [System.Diagnostics.Process]::GetProcesses()
+    foreach ($p in $procs) {
+      if ($sw.ElapsedMilliseconds -ge 3000) {
+        $lines.Add("... truncated after 3000ms")
+        break
+      }
+      $pPath = ''
+      try {
+        if ($p.MainModule) { $pPath = $p.MainModule.FileName }
+      } catch {}
+      $lines.Add("pid=$($p.Id) name=$($p.ProcessName) path=$pPath")
+    }
+    Write-Utf8NoBom $env:LEGION_ROLLBACK_PS_FILE ($lines -join "`n")
+  } catch {
+    Write-Log "failed to write rollback process list: $(Format-ErrorRecord $_)"
+  } finally {
+    foreach ($p in $procs) {
+      try { $p.Dispose() } catch {}
+    }
+  }
+}
+
+function Drain-StreamTask($stream, [byte[]]$buf, [ref]$taskRef, [System.Collections.Generic.List[byte]]$acc, [int]$maxBytes) {
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  while ($taskRef.Value -and $taskRef.Value.IsCompleted -and $sw.ElapsedMilliseconds -lt 150) {
+    $n = 0
+    try {
+      if (-not $taskRef.Value.IsFaulted -and -not $taskRef.Value.IsCanceled) {
+        $n = [int]$taskRef.Value.Result
+      }
+    } catch { $n = 0 }
+    if ($n -le 0) {
+      $taskRef.Value = $null
+      break
+    }
+    $chunk = New-Object byte[] $n
+    [System.Buffer]::BlockCopy($buf, 0, $chunk, 0, $n)
+    $acc.AddRange($chunk)
+    if ($acc.Count -gt ($maxBytes * 2)) {
+      $acc.RemoveRange(0, $acc.Count - $maxBytes)
+    }
+    try {
+      $taskRef.Value = $stream.ReadAsync($buf, 0, $buf.Length)
+    } catch {
+      $taskRef.Value = $null
+      break
+    }
+  }
+}
+
+function Save-CappedNewStartLog([System.Collections.Generic.List[byte]]$outAcc, [System.Collections.Generic.List[byte]]$errAcc) {
+  if (-not $env:LEGION_NEW_LOG) { return }
+  try {
+    $combined = New-Object System.Collections.Generic.List[byte]
+    if ($outAcc -and $outAcc.Count -gt 0) {
+      $combined.AddRange($outAcc)
+    }
+    if ($errAcc -and $errAcc.Count -gt 0) {
+      if ($combined.Count -gt 0) { $combined.Add([byte]10) }
+      $combined.AddRange($errAcc)
+    }
+    if ($combined.Count -gt 32768) {
+      $combined.RemoveRange(0, $combined.Count - 32768)
+    }
+    $text = [System.Text.Encoding]::UTF8.GetString($combined.ToArray())
+    Write-Utf8NoBom $env:LEGION_NEW_LOG $text
+  } catch {
+    Write-Log "failed to save capped startup log: $(Format-ErrorRecord $_)"
+  }
+  Remove-FileQuiet "$($env:LEGION_NEW_LOG).stdout"
+  Remove-FileQuiet "$($env:LEGION_NEW_LOG).stderr"
+}
+
+function Test-FileUnlocked([string]$filePath) {
+  if (-not $filePath -or -not [System.IO.File]::Exists($filePath)) { return $true }
+  $stream = $null
+  try {
+    $stream = [System.IO.File]::Open(
+      $filePath,
+      [System.IO.FileMode]::Open,
+      [System.IO.FileAccess]::ReadWrite,
+      [System.IO.FileShare]::None
+    )
+    return $true
+  } catch {
+    return $false
+  } finally {
+    if ($stream) {
+      try { $stream.Dispose() } catch {}
+    }
+  }
+}
+
+function Write-RollbackNotice([string]$installState, [string]$extraDetail) {
+  $payload = if ($installState -eq 'new_kept_files_in_use' -and $env:LEGION_ROLLBACK_KEPT_NEW_JSON) {
+    $env:LEGION_ROLLBACK_KEPT_NEW_JSON
+  } else {
+    $env:LEGION_ROLLBACK_JSON
+  }
+  try {
+    $obj = $payload | ConvertFrom-Json
+    $obj | Add-Member -NotePropertyName 'install_state' -NotePropertyValue $installState -Force
+    if ($extraDetail) {
+      $obj | Add-Member -NotePropertyName 'detail' -NotePropertyValue $extraDetail -Force
+    }
+    $payload = $obj | ConvertTo-Json -Compress
+  } catch {}
+  try {
+    Write-Utf8NoBom $env:LEGION_ROLLBACK_FILE $payload
+  } catch {
+    Write-Log "failed to write rollback notice: $(Format-ErrorRecord $_)"
+  }
+}
+
 $oldPid = [int]$env:LEGION_OLD_PID
 $verifyOnly = ($env:LEGION_VERIFY_ONLY -eq '1')
-Write-Log "supervisor start oldPid=$oldPid verifyOnly=$verifyOnly installer=$($env:LEGION_INSTALLER) installDir=$($env:LEGION_INSTALL_DIR) exe=$($env:LEGION_EXE)"
+$preWaitSecs = [int]$env:LEGION_PRE_SWAP_WAIT_SECS
+if ($preWaitSecs -le 0) { $preWaitSecs = 20 }
+$installerTimeoutSecs = [int]$env:LEGION_INSTALLER_WAIT_SECS
+if ($installerTimeoutSecs -le 0) { $installerTimeoutSecs = 300 }
+$rollbackRetries = [int]$env:LEGION_ROLLBACK_RETRIES
+if ($rollbackRetries -le 0) { $rollbackRetries = 20 }
 
-for ($i = 0; $i -lt 80; $i++) {
-  if (-not (Get-Process -Id $oldPid -ErrorAction SilentlyContinue)) { break }
-  Start-Sleep -Milliseconds 250
-}
-if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) {
-  Write-Log "oldPid $oldPid still alive after 20s; forcing stop"
-  Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
-  Start-Sleep -Milliseconds 500
-} else {
-  Write-Log "oldPid $oldPid exited cleanly"
-  Start-Sleep -Milliseconds 250
-}
+$script:installerStarted = $false
+$script:restoreAttempted = $false
 
-if (Test-Path -LiteralPath $env:LEGION_READY_MARKER) {
-  Remove-Item -LiteralPath $env:LEGION_READY_MARKER -Force -ErrorAction SilentlyContinue
+function Complete-Deferral([string]$why) {
+  Write-Log "deferring update cleanly without changing install: $why"
+  Remove-FileQuiet $env:LEGION_INSTALLER
+  Remove-DirQuiet $env:LEGION_BACKUP_DIR
+  if ($env:LEGION_DEFERRED_FILE -and $env:LEGION_DEFERRED_JSON) {
+    try { Write-Utf8NoBom $env:LEGION_DEFERRED_FILE $env:LEGION_DEFERRED_JSON } catch {}
+  }
+  $reopenNeeded = $false
+  if ($verifyOnly -and $env:LEGION_REOPEN_FILE -and [System.IO.File]::Exists($env:LEGION_REOPEN_FILE)) {
+    Remove-FileQuiet $env:LEGION_REOPEN_FILE
+    $reopenNeeded = $true
+  }
+  Release-UpdateLocks
+  if ($reopenNeeded -and $env:LEGION_EXE -and [System.IO.File]::Exists($env:LEGION_EXE)) {
+    try {
+      Clear-EnvVar 'LEGION_UPDATE_VERIFY_ONLY'
+      Clear-EnvVar 'LEGION_UPDATE_SUPERVISED_LAUNCH'
+      if ($env:LEGION_RELAUNCH_PATH) { $env:PATH = $env:LEGION_RELAUNCH_PATH }
+      Write-Log "user reopened app during deferred close update; launching existing copy interactively"
+      $rp = Start-Direct $env:LEGION_EXE '' $false
+      if ($rp) { try { $rp.Dispose() } catch {} }
+    } catch {
+      Write-Log "failed to reopen existing copy after deferral: $(Format-ErrorRecord $_)"
+    }
+  }
 }
 
 function Restore-Previous([string]$why) {
+  if ($script:restoreAttempted) { return }
+  $script:restoreAttempted = $true
   Write-Log "restoring previous install: $why"
-  Set-Content -LiteralPath $env:LEGION_ROLLBACK_FILE -Value $env:LEGION_ROLLBACK_JSON -Encoding UTF8
-  if (Test-Path -LiteralPath $env:LEGION_BACKUP_DIR) {
-    Get-ChildItem -LiteralPath $env:LEGION_BACKUP_DIR -Force | ForEach-Object {
-      Copy-Item -LiteralPath $_.FullName -Destination $env:LEGION_INSTALL_DIR -Recurse -Force
+
+  $stageNew = $null
+  $moved = New-Object System.Collections.Generic.List[object]
+  $copied = New-Object System.Collections.Generic.List[string]
+  $restoredDone = $false
+  $noticeWritten = $false
+
+  try {
+    $hasBackup = $false
+    try {
+      $hasBackup = [bool]($env:LEGION_BACKUP_DIR -and [System.IO.Directory]::Exists($env:LEGION_BACKUP_DIR))
+    } catch {
+      Write-Log "failed to inspect backup dir: $(Format-ErrorRecord $_)"
     }
-  }
-  if ((-not $verifyOnly) -and (Test-Path -LiteralPath $env:LEGION_EXE)) {
-    Remove-Item Env:LEGION_UPDATE_VERIFY_ONLY -ErrorAction SilentlyContinue
-    if ($env:LEGION_RELAUNCH_PATH) { $env:PATH = $env:LEGION_RELAUNCH_PATH }
-    Start-Direct $env:LEGION_EXE '' $false | Out-Null
+
+    if (-not $hasBackup) {
+      Write-Log "backup dir missing: $($env:LEGION_BACKUP_DIR); keeping new install intact"
+      Write-RollbackNotice 'new_kept_backup_missing' "Backup folder missing; kept new install in place."
+      $noticeWritten = $true
+      return
+    }
+
+    $backupRoot = [System.IO.Path]::GetFullPath($env:LEGION_BACKUP_DIR).TrimEnd('\')
+    $installRoot = [System.IO.Path]::GetFullPath($env:LEGION_INSTALL_DIR).TrimEnd('\')
+    $backupFiles = @()
+    try {
+      $backupFiles = @([System.IO.Directory]::GetFiles($backupRoot, '*', [System.IO.SearchOption]::AllDirectories))
+    } catch {
+      $listErr = Format-ErrorRecord $_
+      Write-Log "failed to list backup dir: $listErr"
+      Write-RollbackNotice 'new_kept_files_in_use' "Could not enumerate backup folder: $listErr"
+      $noticeWritten = $true
+      return
+    }
+
+    # Phase 1: Bounded retry waiting until no install-dir process is running and EVERY file that
+    # would be overwritten can be opened exclusively. Never touch a single file while another process
+    # holds any target file open so the install directory can never end up half-copied.
+    $canRestore = $false
+    $busyReason = ''
+    $rbWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $rbLimitMs = ($rollbackRetries * 250) + 5000
+    for ($r = 0; $r -lt $rollbackRetries; $r++) {
+      if ($rbWatch.ElapsedMilliseconds -ge $rbLimitMs) { break }
+      $busyReason = ''
+      $dirProcs = @(Get-InstallDirProcesses $installRoot)
+      if ($dirProcs.Count -gt 0) {
+        $busyReason = "install-dir process pid=$($dirProcs[0].Id) ($($dirProcs[0].ProcessName)) still running"
+      } else {
+        foreach ($bf in $backupFiles) {
+          $rel = $bf.Substring($backupRoot.Length).TrimStart('\')
+          $dst = [System.IO.Path]::Combine($installRoot, $rel)
+          if (-not (Test-FileUnlocked $dst)) {
+            $busyReason = "file '$rel' is in use by another process"
+            break
+          }
+        }
+      }
+      if (-not $busyReason) {
+        $canRestore = $true
+        break
+      }
+      Start-Sleep -Milliseconds 250
+    }
+
+    if (-not $canRestore) {
+      Write-Log "rollback could not acquire exclusive access after $rollbackRetries attempts ($busyReason); keeping new install intact"
+      Write-RollbackNotice 'new_kept_files_in_use' "Could not restore previous install because $busyReason; kept new install intact."
+      $noticeWritten = $true
+      return
+    }
+
+    Remove-FileQuiet $env:LEGION_INSTALLER
+
+    # Phase 2: Transactional swap with undo — move all existing target files into a staging snapshot
+    # first, then copy backup files in. If any step fails mid-way, remove newly created files and
+    # restore all staged new files back so the install directory is never left half-copied.
+    $stageNew = "$backupRoot.new-snap"
+    Remove-DirQuiet $stageNew
+    $swapFailed = $false
+    $swapError = ''
+
+    foreach ($bf in $backupFiles) {
+      $rel = $bf.Substring($backupRoot.Length).TrimStart('\')
+      $dst = [System.IO.Path]::Combine($installRoot, $rel)
+      if ([System.IO.File]::Exists($dst)) {
+        $stagedDst = [System.IO.Path]::Combine($stageNew, $rel)
+        try {
+          Move-FileSafe $dst $stagedDst
+          $moved.Add(@{ Src = $dst; Staged = $stagedDst })
+        } catch {
+          $swapFailed = $true
+          $swapError = "could not move '$rel' aside: $(Format-ErrorRecord $_)"
+          break
+        }
+      }
+    }
+
+    if (-not $swapFailed) {
+      foreach ($bf in $backupFiles) {
+        $rel = $bf.Substring($backupRoot.Length).TrimStart('\')
+        $dst = [System.IO.Path]::Combine($installRoot, $rel)
+        try {
+          Copy-FileSafe $bf $dst
+          $copied.Add($dst)
+        } catch {
+          $swapFailed = $true
+          $swapError = "could not restore '$rel': $(Format-ErrorRecord $_)"
+          break
+        }
+      }
+    }
+
+    if ($swapFailed) {
+      Write-Log "transactional rollback aborted ($swapError); undoing partial changes so new install stays intact"
+      $undoFailed = $false
+      foreach ($c in $copied) {
+        Remove-FileQuiet $c
+      }
+      foreach ($m in $moved) {
+        try {
+          if ([System.IO.File]::Exists($m.Staged)) {
+            Move-FileSafe $m.Staged $m.Src
+          }
+        } catch {
+          $undoFailed = $true
+          Write-Log "failed to undo staged file $($m.Src): $(Format-ErrorRecord $_)"
+        }
+      }
+      Remove-DirQuiet $stageNew
+      $abortState = if ($undoFailed) { 'restore_incomplete' } else { 'new_kept_files_in_use' }
+      Write-RollbackNotice $abortState "Rollback could not replace install files ($swapError); kept new install intact."
+      $noticeWritten = $true
+      return
+    }
+
+    Remove-DirQuiet $stageNew
+    $restoredDone = $true
+    Write-Log "restored previous install cleanly ($($backupFiles.Count) files)"
+    Write-RollbackNotice 'restored_previous' ''
+    $noticeWritten = $true
+
+    $reopenNeeded = $false
+    if ($verifyOnly -and $env:LEGION_REOPEN_FILE -and [System.IO.File]::Exists($env:LEGION_REOPEN_FILE)) {
+      Remove-FileQuiet $env:LEGION_REOPEN_FILE
+      $reopenNeeded = $true
+    }
+    Release-UpdateLocks
+
+    if (-not $verifyOnly -or $reopenNeeded) {
+      try {
+        if ($env:LEGION_EXE -and [System.IO.File]::Exists($env:LEGION_EXE)) {
+          Clear-EnvVar 'LEGION_UPDATE_VERIFY_ONLY'
+          Clear-EnvVar 'LEGION_UPDATE_SUPERVISED_LAUNCH'
+          if ($env:LEGION_RELAUNCH_PATH) { $env:PATH = $env:LEGION_RELAUNCH_PATH }
+          Write-Log "relaunching restored executable after rollback: $($env:LEGION_EXE)"
+          $rp = Start-Direct $env:LEGION_EXE '' $false
+          if ($rp) { try { $rp.Dispose() } catch {} }
+        } else {
+          Write-Log "cannot relaunch after rollback: executable missing at $($env:LEGION_EXE)"
+        }
+      } catch {
+        Write-Log "failed to relaunch executable after rollback: $(Format-ErrorRecord $_)"
+      }
+    }
+  } catch {
+    $errInfo = Format-ErrorRecord $_
+    Write-Log "restore exception: $errInfo"
+    if (-not $restoredDone) {
+      $undoFailed = $false
+      foreach ($c in $copied) {
+        Remove-FileQuiet $c
+      }
+      foreach ($m in $moved) {
+        try {
+          if ([System.IO.File]::Exists($m.Staged)) {
+            Move-FileSafe $m.Staged $m.Src
+          }
+        } catch {
+          $undoFailed = $true
+          Write-Log "failed to undo staged file $($m.Src): $(Format-ErrorRecord $_)"
+        }
+      }
+      if ($stageNew) { Remove-DirQuiet $stageNew }
+      if (-not $noticeWritten) {
+        $fallbackState = if ($undoFailed) { 'restore_incomplete' } else { 'new_kept_files_in_use' }
+        Write-RollbackNotice $fallbackState "Restore failed: $errInfo"
+        $noticeWritten = $true
+      }
+    } elseif (-not $noticeWritten) {
+      Write-RollbackNotice 'restored_previous' ''
+      $noticeWritten = $true
+    }
   }
 }
 
 try {
+  Write-Log "supervisor start oldPid=$oldPid verifyOnly=$verifyOnly installer=$($env:LEGION_INSTALLER) installDir=$($env:LEGION_INSTALL_DIR) exe=$($env:LEGION_EXE)"
+
+  # 1. Wait up to $preWaitSecs for the old process and any other process running from $installDir
+  # to exit (bounded by both tick count and wall-clock Stopwatch, with zero WMI queries). If still
+  # in use when the bound expires, defer cleanly without touching the install or counting as a failure.
+  $preTicks = $preWaitSecs * 4
+  $preWatch = [System.Diagnostics.Stopwatch]::StartNew()
+  $stillUp = $false
+  for ($i = 0; $i -lt $preTicks; $i++) {
+    $oldAlive = Test-PidAlive $oldPid
+    $dirProcs = @(Get-InstallDirProcesses $env:LEGION_INSTALL_DIR)
+    if (-not $oldAlive -and $dirProcs.Count -eq 0) {
+      $stillUp = $false
+      break
+    }
+    $stillUp = $true
+    if ($preWatch.ElapsedMilliseconds -ge ($preWaitSecs * 1000)) { break }
+    Start-Sleep -Milliseconds 250
+  }
+  if ($stillUp) {
+    $oldAlive = Test-PidAlive $oldPid
+    $dirProcs = @(Get-InstallDirProcesses $env:LEGION_INSTALL_DIR)
+    Complete-Deferral "install still in use after ${preWaitSecs}s (oldAlive=$oldAlive, dirProcs=$($dirProcs.Count))"
+    exit 0
+  }
+  Write-Log "old instance exited cleanly"
+  Start-Sleep -Milliseconds 250
+
+  Remove-FileQuiet $env:LEGION_READY_MARKER
+  Remove-FileQuiet $env:LEGION_ROLLBACK_PS_FILE
+
   $nsisArgs = "/S /UPDATE /D=" + $env:LEGION_INSTALL_DIR
-  Write-Log "running NSIS installer with args: $nsisArgs"
+  Write-Log "running NSIS installer with args: $nsisArgs (timeout=${installerTimeoutSecs}s)"
+  Write-PendingStage 'swapping'
+  $script:installerStarted = $true
   $inst = Start-Direct $env:LEGION_INSTALLER $nsisArgs $true
-  $inst.WaitForExit()
-  $instCode = $inst.ExitCode
+  $instCode = -1
+  try {
+    $instExited = $inst.WaitForExit($installerTimeoutSecs * 1000)
+    if (-not $instExited) {
+      Write-Log "NSIS installer timed out after ${installerTimeoutSecs}s; stopping pid=$($inst.Id)"
+      try { $inst.Kill() } catch {}
+      try { $inst.WaitForExit(5000) | Out-Null } catch {}
+      Restore-Previous "NSIS installer timed out after ${installerTimeoutSecs}s"
+      exit 1
+    }
+    $instCode = $inst.ExitCode
+  } finally {
+    try { $inst.Dispose() } catch {}
+  }
   Write-Log "NSIS installer exited with code $instCode"
   if ($instCode -ne 0) {
     Restore-Previous "NSIS exited with $instCode"
     exit 1
   }
+  Write-PendingStage 'swapped'
+
   if ($env:LEGION_RELAUNCH_PATH) {
     $env:PATH = $env:LEGION_RELAUNCH_PATH
   }
   if ($verifyOnly) {
     $env:LEGION_UPDATE_VERIFY_ONLY = '1'
   } else {
-    Remove-Item Env:LEGION_UPDATE_VERIFY_ONLY -ErrorAction SilentlyContinue
+    Clear-EnvVar 'LEGION_UPDATE_VERIFY_ONLY'
+  }
+  $env:LEGION_UPDATE_SUPERVISED_LAUNCH = if ($env:LEGION_TARGET_SEQUENCE) { $env:LEGION_TARGET_SEQUENCE } else { '1' }
+
+  if ($env:LEGION_NEW_LOG) {
+    foreach ($f in @($env:LEGION_NEW_LOG, "$($env:LEGION_NEW_LOG).stdout", "$($env:LEGION_NEW_LOG).stderr")) {
+      Remove-FileQuiet $f
+    }
   }
   Write-Log "launching updated app: $($env:LEGION_EXE)"
-  $proc = Start-Direct $env:LEGION_EXE '' $false
+  $outAcc = New-Object System.Collections.Generic.List[byte]
+  $errAcc = New-Object System.Collections.Generic.List[byte]
+  $outBuf = New-Object byte[] 4096
+  $errBuf = New-Object byte[] 4096
+  $outTask = $null
+  $errTask = $null
+  $capturePipes = [bool]$env:LEGION_NEW_LOG
+  if ($capturePipes) {
+    $proc = Start-Captured $env:LEGION_EXE
+    try { $outTask = $proc.StandardOutput.BaseStream.ReadAsync($outBuf, 0, $outBuf.Length) } catch {}
+    try { $errTask = $proc.StandardError.BaseStream.ReadAsync($errBuf, 0, $errBuf.Length) } catch {}
+  } else {
+    $proc = Start-Direct $env:LEGION_EXE '' $false
+  }
   Write-Log "launched updated app pid=$($proc.Id)"
   $waitSecs = [int]$env:LEGION_WAIT_SECS
   if ($waitSecs -le 0) { $waitSecs = 30 }
+  $graceSecs = [int]$env:LEGION_EXIT_GRACE_SECS
+  if ($graceSecs -le 0) { $graceSecs = 8 }
+  $maxTicks = $waitSecs * 4
+  $graceTicks = $graceSecs * 4
+  $startWatch = [System.Diagnostics.Stopwatch]::StartNew()
   $started = $false
-  for ($j = 0; $j -lt ($waitSecs * 4); $j++) {
-    if (Test-Path -LiteralPath $env:LEGION_READY_MARKER) {
+  $exitedLogged = $false
+  for ($j = 0; $j -lt $maxTicks; $j++) {
+    if ($capturePipes) {
+      Drain-StreamTask $proc.StandardOutput.BaseStream $outBuf ([ref]$outTask) $outAcc 32768
+      Drain-StreamTask $proc.StandardError.BaseStream $errBuf ([ref]$errTask) $errAcc 32768
+    }
+    if ($env:LEGION_READY_MARKER -and [System.IO.File]::Exists($env:LEGION_READY_MARKER)) {
       $started = $true
       break
     }
     if ($proc.HasExited) {
-      Write-Log "updated app exited early with code $($proc.ExitCode)"
-      break
+      if (-not $exitedLogged) {
+        $exitedLogged = $true
+        Write-Log "updated app pid=$($proc.Id) exited with code $($proc.ExitCode) after $j ticks"
+        if ($proc.ExitCode -ne 0) {
+          $graceEnd = $j + $graceTicks
+          if ($graceEnd -lt $maxTicks) {
+            $maxTicks = $graceEnd
+          }
+        }
+      }
     }
+    if ($startWatch.ElapsedMilliseconds -ge (($waitSecs + 5) * 1000)) { break }
     Start-Sleep -Milliseconds 250
   }
-  if (Test-Path -LiteralPath $env:LEGION_READY_MARKER) {
+  if ($env:LEGION_READY_MARKER -and [System.IO.File]::Exists($env:LEGION_READY_MARKER)) {
     $started = $true
   }
   if ($started) {
+    Write-PendingStage 'started'
     Write-Log "ready marker observed at $($env:LEGION_READY_MARKER); cleaning up backup"
-    if (Test-Path -LiteralPath $env:LEGION_BACKUP_DIR) {
-      Remove-Item -LiteralPath $env:LEGION_BACKUP_DIR -Recurse -Force -ErrorAction SilentlyContinue
+    if ($verifyOnly) {
+      try { $proc.WaitForExit(2000) | Out-Null } catch {}
     }
-    if (Test-Path -LiteralPath $env:LEGION_INSTALLER) {
-      Remove-Item -LiteralPath $env:LEGION_INSTALLER -Force -ErrorAction SilentlyContinue
+    try { $proc.Dispose() } catch {}
+    Remove-DirQuiet $env:LEGION_BACKUP_DIR
+    Remove-FileQuiet $env:LEGION_INSTALLER
+    Remove-FileQuiet $env:LEGION_ROLLBACK_PS_FILE
+    if ($env:LEGION_NEW_LOG) {
+      Remove-FileQuiet $env:LEGION_NEW_LOG
+      Remove-FileQuiet "$($env:LEGION_NEW_LOG).stdout"
+      Remove-FileQuiet "$($env:LEGION_NEW_LOG).stderr"
+    }
+    $reopenNeeded = $false
+    if ($verifyOnly -and $env:LEGION_REOPEN_FILE -and [System.IO.File]::Exists($env:LEGION_REOPEN_FILE)) {
+      Remove-FileQuiet $env:LEGION_REOPEN_FILE
+      $reopenNeeded = $true
+    }
+    Release-UpdateLocks
+    if ($reopenNeeded -and $env:LEGION_EXE -and [System.IO.File]::Exists($env:LEGION_EXE)) {
+      Clear-EnvVar 'LEGION_UPDATE_VERIFY_ONLY'
+      Clear-EnvVar 'LEGION_UPDATE_SUPERVISED_LAUNCH'
+      Write-Log "user reopened app during close update; launching updated copy interactively"
+      $rp = Start-Direct $env:LEGION_EXE '' $false
+      if ($rp) { try { $rp.Dispose() } catch {} }
     }
     exit 0
   }
+  Capture-RollbackPs
   if (-not $proc.HasExited) {
-    Write-Log "ready marker not observed after ${waitSecs}s; stopping pid=$($proc.Id)"
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    Write-Log "ready marker not observed after $j ticks; stopping pid=$($proc.Id)"
+    try { $proc.Kill() } catch {}
+    try { $proc.WaitForExit(3000) | Out-Null } catch {}
   }
+  if ($capturePipes) {
+    Start-Sleep -Milliseconds 100
+    Drain-StreamTask $proc.StandardOutput.BaseStream $outBuf ([ref]$outTask) $outAcc 32768
+    Drain-StreamTask $proc.StandardError.BaseStream $errBuf ([ref]$errTask) $errAcc 32768
+    Save-CappedNewStartLog $outAcc $errAcc
+  }
+  try { $proc.Dispose() } catch {}
   Restore-Previous "ready marker not observed"
   exit 1
 } catch {
-  Write-Log "supervisor exception: $($_.Exception.Message)"
-  Restore-Previous $_.Exception.Message
+  $errInfo = Format-ErrorRecord $_
+  Write-Log "supervisor exception: $errInfo"
+  if (-not $script:installerStarted) {
+    Complete-Deferral "pre-installer exception: $errInfo"
+    exit 0
+  }
+  Restore-Previous $errInfo
   exit 1
+} finally {
+  Release-UpdateLocks
+  Remove-FileQuiet $env:LEGION_SUPERVISOR_SCRIPT
 }
 "#;
 
+/// Fixed allow-list of harmless Windows session, OS, and proxy variables preserved when spawning
+/// the detached PowerShell supervisor and relaunching Legion.
+pub const WIN_ALLOWED_VARS: &[&str] = &[
+    "SystemRoot",
+    "WINDIR",
+    "SystemDrive",
+    "COMSPEC",
+    "PATHEXT",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "USERNAME",
+    "USERDOMAIN",
+    "COMPUTERNAME",
+    "PUBLIC",
+    "ALLUSERSPROFILE",
+    "TEMP",
+    "TMP",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "ProgramData",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    "OS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "LEGION_HOME",
+    #[cfg(debug_assertions)]
+    "LEGION_APP_READY_FILE",
+    #[cfg(debug_assertions)]
+    "LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS",
+];
+
+/// Filters `raw_env` to the fixed allow-list of harmless Windows variables (plus `WEBVIEW2_*`) so
+/// the relaunched app keeps standard Windows and proxy variables while stripping hostile variables.
+pub fn build_sanitized_windows_env<I>(raw_env: I) -> BTreeMap<OsString, OsString>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let mut kept = BTreeMap::new();
+    for (k, v) in raw_env {
+        if let Some(key) = k.to_str()
+            && (WIN_ALLOWED_VARS
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(key))
+                || key.to_ascii_uppercase().starts_with("WEBVIEW2_"))
+        {
+            kept.insert(k, v);
+        }
+    }
+    kept
+}
+
 /// Copies-while-hashing the verified NSIS installer into `verified_dir`, backs up the current
-/// Windows installation directory, and spawns the detached System32 PowerShell supervisor via
-/// `-EncodedCommand` with job breakaway (`CREATE_BREAKAWAY_FROM_JOB`, falling back if forbidden)
-/// and a cleaned environment.
+/// Windows installation directory, writes the supervisor script to an owner-only `.ps1` file in
+/// the updates directory, and spawns detached System32 PowerShell via `-File` with job breakaway
+/// (`CREATE_BREAKAWAY_FROM_JOB`, falling back if forbidden) and a cleaned environment.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 pub fn stage_and_spawn_windows_nsis(
@@ -1667,9 +3951,13 @@ pub fn stage_and_spawn_windows_nsis(
     ready_marker_path: &Path,
     rollback_marker_path: &Path,
     rollback_json: String,
+    rollback_kept_new_json: String,
+    deferred_marker_path: &Path,
+    deferred_json: String,
+    target_sequence: u64,
     wait_secs: u64,
     verify_only: bool,
-) -> Result<(), AppError> {
+) -> Result<u32, AppError> {
     use std::os::windows::process::CommandExt;
 
     let dir_str = install_dir.to_string_lossy();
@@ -1737,37 +4025,17 @@ pub fn stage_and_spawn_windows_nsis(
         })
         .unwrap_or_else(|| clean_path.clone());
 
-    const WIN_ALLOWED_VARS: &[&str] = &[
-        "SystemRoot",
-        "WINDIR",
-        "SystemDrive",
-        "COMSPEC",
-        "LOCALAPPDATA",
-        "APPDATA",
-        "USERPROFILE",
-        "HOMEDRIVE",
-        "HOMEPATH",
-        "USERNAME",
-        "USERDOMAIN",
-        "COMPUTERNAME",
-        "TEMP",
-        "TMP",
-        "ProgramFiles",
-        "ProgramFiles(x86)",
-        "ProgramData",
-        "CommonProgramFiles",
-        "NUMBER_OF_PROCESSORS",
-        "PROCESSOR_ARCHITECTURE",
-        "OS",
-        "LEGION_HOME",
-        #[cfg(debug_assertions)]
-        "LEGION_APP_READY_FILE",
-        #[cfg(debug_assertions)]
-        "LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS",
-    ];
-
-    let encoded_script = encode_powershell_command(WINDOWS_NSIS_SUPERVISOR_SCRIPT);
-    let log_path = ready_marker_path.parent().map(|d| d.join("supervisor.log"));
+    let sanitized_win_env = build_sanitized_windows_env(std::env::vars_os());
+    let updates_dir = ready_marker_path.parent();
+    let script_dir = updates_dir.unwrap_or(verified_dir);
+    let script_path = write_windows_supervisor_script(script_dir, pid)?;
+    let log_path = updates_dir.map(|d| d.join("supervisor.log"));
+    let new_start_log_path = updates_dir.map(|d| d.join(NEW_START_LOG_FILENAME));
+    let rollback_ps_path = updates_dir.map(|d| d.join(ROLLBACK_PS_FILENAME));
+    let update_lock_path = updates_dir.map(|d| d.join(UPDATE_LOCK_FILENAME));
+    let stage_file_path = updates_dir.map(|d| pending_stage_path(d, target_sequence));
+    let sup_lock_path = updates_dir.map(|d| d.join(UPDATE_SUPERVISOR_LOCK_FILENAME));
+    let reopen_path = updates_dir.map(|d| d.join(REOPEN_REQUESTED_FILENAME));
     if let Some(lp) = &log_path {
         let _ = fs::remove_file(lp);
         if let Some(dir) = lp.parent() {
@@ -1782,16 +4050,7 @@ pub fn stage_and_spawn_windows_nsis(
         let (stdout_cfg, stderr_cfg) = open_supervisor_log_stdio(log_path.as_deref());
         let mut cmd = Command::new(&ps_path);
         cmd.env_clear();
-        for (k, v) in std::env::vars_os() {
-            if let Some(key) = k.to_str()
-                && (WIN_ALLOWED_VARS
-                    .iter()
-                    .any(|allowed| allowed.eq_ignore_ascii_case(key))
-                    || key.to_ascii_uppercase().starts_with("WEBVIEW2_"))
-            {
-                cmd.env(&k, &v);
-            }
-        }
+        cmd.envs(&sanitized_win_env);
         cmd.env("PATH", &clean_path)
             .env("LEGION_RELAUNCH_PATH", &relaunch_path)
             .args([
@@ -1799,13 +4058,14 @@ pub fn stage_and_spawn_windows_nsis(
                 "-NonInteractive",
                 "-ExecutionPolicy",
                 "Bypass",
-                "-EncodedCommand",
-                &encoded_script,
+                "-File",
             ])
+            .arg(&script_path)
             .creation_flags(flags)
             .stdin(Stdio::null())
             .stdout(stdout_cfg)
             .stderr(stderr_cfg)
+            .env("LEGION_SUPERVISOR_SCRIPT", &script_path)
             .env("LEGION_OLD_PID", pid.to_string())
             .env("LEGION_INSTALLER", &staged_installer)
             .env("LEGION_INSTALL_DIR", install_dir)
@@ -1814,10 +4074,45 @@ pub fn stage_and_spawn_windows_nsis(
             .env("LEGION_READY_MARKER", ready_marker_path)
             .env("LEGION_ROLLBACK_FILE", rollback_marker_path)
             .env("LEGION_ROLLBACK_JSON", &rollback_json)
+            .env("LEGION_ROLLBACK_KEPT_NEW_JSON", &rollback_kept_new_json)
+            .env("LEGION_DEFERRED_FILE", deferred_marker_path)
+            .env("LEGION_DEFERRED_JSON", &deferred_json)
+            .env("LEGION_TARGET_SEQUENCE", target_sequence.to_string())
+            .env("LEGION_PRE_SWAP_WAIT_SECS", "20")
+            .env(
+                "LEGION_INSTALLER_WAIT_SECS",
+                DEFAULT_WINDOWS_INSTALLER_WAIT_SECS.to_string(),
+            )
             .env("LEGION_WAIT_SECS", wait_secs.to_string())
+            .env(
+                "LEGION_EXIT_GRACE_SECS",
+                DEFAULT_EXIT_GRACE_SECS.to_string(),
+            )
+            .env(
+                "LEGION_ROLLBACK_RETRIES",
+                DEFAULT_ROLLBACK_RETRIES.to_string(),
+            )
             .env("LEGION_VERIFY_ONLY", if verify_only { "1" } else { "0" });
         if let Some(lp) = &log_path {
             cmd.env("LEGION_SUPERVISOR_LOG", lp);
+        }
+        if let Some(nl) = &new_start_log_path {
+            cmd.env("LEGION_NEW_LOG", nl);
+        }
+        if let Some(ps) = &rollback_ps_path {
+            cmd.env("LEGION_ROLLBACK_PS_FILE", ps);
+        }
+        if let Some(ul) = &update_lock_path {
+            cmd.env("LEGION_UPDATE_LOCK", ul);
+        }
+        if let Some(sf) = &stage_file_path {
+            cmd.env("LEGION_STAGE_FILE", sf);
+        }
+        if let Some(sl) = &sup_lock_path {
+            cmd.env("LEGION_SUPERVISOR_LOCK", sl);
+        }
+        if let Some(rp) = &reopen_path {
+            cmd.env("LEGION_REOPEN_FILE", rp);
         }
         cmd
     };
@@ -1828,22 +4123,28 @@ pub fn stage_and_spawn_windows_nsis(
     // or NSIS installer; fall back without breakaway if the job forbids it (`ERROR_ACCESS_DENIED`).
     let base_flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
     match build_cmd(base_flags | CREATE_BREAKAWAY_FROM_JOB).spawn() {
-        Ok(_) => Ok(()),
+        Ok(child) => Ok(child.id()),
         Err(err)
             if err.kind() == io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(5) =>
         {
-            build_cmd(base_flags).spawn().map_err(|err2| {
-                AppError::new(
-                    ErrorCode::Failed,
-                    format!("Could not start Windows update helper: {err2}"),
-                )
-            })?;
-            Ok(())
+            match build_cmd(base_flags).spawn() {
+                Ok(child) => Ok(child.id()),
+                Err(err2) => {
+                    let _ = fs::remove_file(&script_path);
+                    Err(AppError::new(
+                        ErrorCode::Failed,
+                        format!("Could not start Windows update helper: {err2}"),
+                    ))
+                }
+            }
         }
-        Err(err) => Err(AppError::new(
-            ErrorCode::Failed,
-            format!("Could not start Windows update helper: {err}"),
-        )),
+        Err(err) => {
+            let _ = fs::remove_file(&script_path);
+            Err(AppError::new(
+                ErrorCode::Failed,
+                format!("Could not start Windows update helper: {err}"),
+            ))
+        }
     }
 }
 
@@ -2003,19 +4304,30 @@ mod tests {
         assert!(ps_str.contains("system32"));
         assert!(ps_str.ends_with("powershell.exe"));
 
-        // EncodedCommand round-trips cleanly as UTF-16LE Base64.
-        let encoded = encode_powershell_command(WINDOWS_NSIS_SUPERVISOR_SCRIPT);
-        let decoded_bytes = BASE64.decode(&encoded).unwrap();
-        assert_eq!(decoded_bytes.len() % 2, 0);
-        let units: Vec<u16> = decoded_bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_le_bytes(*c))
-            .collect();
+        // Supervisor script must be written to an owner-only .ps1 file (with UTF-8 BOM for
+        // Windows PowerShell 5.1) so launching via `-File` stays well under Windows's 32,767-char
+        // CreateProcessW command-line limit regardless of script length.
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = write_windows_supervisor_script(dir.path(), 4242).unwrap();
+        assert!(script_path.is_file());
+        let raw_bytes = fs::read(&script_path).unwrap();
+        assert!(
+            raw_bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+            "Windows .ps1 script must carry UTF-8 BOM for PowerShell 5.1"
+        );
         assert_eq!(
-            String::from_utf16(&units).unwrap(),
+            std::str::from_utf8(&raw_bytes[3..]).unwrap(),
             WINDOWS_NSIS_SUPERVISOR_SCRIPT
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&script_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert!(
+            WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("$env:LEGION_SUPERVISOR_SCRIPT"),
+            "Windows supervisor must clean up its own script file in finally"
         );
 
         // NSIS silent update must pass /S /UPDATE /D= with /D= last and unquoted.
@@ -2024,25 +4336,210 @@ mod tests {
             "Windows NSIS supervisor must pass /S /UPDATE /D= unquoted and last"
         );
 
-        // Every Test-Path, Remove-Item, Set-Content, Get-ChildItem, and Copy-Item in the script
-        // must use -LiteralPath (never wildcard-expanding -Path or bare positional path).
+        // All filesystem and path operations in the Windows supervisor must use .NET
+        // ([System.IO.File], [System.IO.Directory], [System.IO.Path]) rather than PowerShell
+        // filesystem cmdlets so Windows PowerShell 5.1 parameter-set differences (such as
+        // `Split-Path -LiteralPath ... -Parent`) and wildcard interpretation can never occur.
+        let forbidden_cmdlets = [
+            "Test-Path",
+            "Remove-Item",
+            "Set-Content",
+            "Get-Content",
+            "Get-Item",
+            "Get-ChildItem",
+            "Copy-Item",
+            "Move-Item",
+            "Split-Path",
+            "Join-Path",
+            "ManagementObjectSearcher",
+            "Win32_Process",
+            "Get-CimInstance",
+            "Get-WmiObject",
+            ".WaitForExit()",
+        ];
         for line in WINDOWS_NSIS_SUPERVISOR_SCRIPT.lines() {
             let trimmed = line.trim();
-            if trimmed.contains("Test-Path ") {
-                assert!(trimmed.contains("Test-Path -LiteralPath "), "{trimmed}");
+            if trimmed.starts_with('#') {
+                continue;
             }
-            if trimmed.contains("Remove-Item ") && !trimmed.contains("Env:") {
-                assert!(trimmed.contains("Remove-Item -LiteralPath "), "{trimmed}");
+            for cmdlet in forbidden_cmdlets {
+                assert!(
+                    !trimmed.contains(cmdlet),
+                    "Windows supervisor must not use {cmdlet} (PS 5.1 / bounded wait / no-WMI safety): {trimmed}"
+                );
             }
-            if trimmed.contains("Set-Content ") {
-                assert!(trimmed.contains("Set-Content -LiteralPath "), "{trimmed}");
-            }
-            if trimmed.contains("Get-ChildItem ") {
-                assert!(trimmed.contains("Get-ChildItem -LiteralPath "), "{trimmed}");
-            }
-            if trimmed.contains("Copy-Item ") {
-                assert!(trimmed.contains("Copy-Item -LiteralPath "), "{trimmed}");
-            }
+        }
+        for required_dotnet in [
+            "[System.IO.Path]::GetDirectoryName",
+            "[System.IO.Path]::Combine",
+            "[System.IO.Path]::GetFullPath",
+            "[System.IO.Directory]::GetFiles",
+            "[System.IO.File]::Copy",
+            "[System.IO.File]::Move",
+            "[System.IO.File]::Delete",
+            "[System.Diagnostics.Process]::GetProcesses()",
+            "WaitForExit($installerTimeoutSecs * 1000)",
+            "Start-Captured",
+            "ReadAsync",
+            "Write-PendingStage",
+            "Complete-Deferral",
+            "$script:installerStarted",
+            "ScriptLineNumber",
+            "PositionMessage",
+        ] {
+            assert!(
+                WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains(required_dotnet),
+                "Windows supervisor missing expected .NET / bounded-wait / diagnostic call: {required_dotnet}"
+            );
+        }
+
+        // Restore-Previous must wrap its body in try/catch, log failing line/position on error,
+        // probe file locks before touching any file, undo any mid-way move/copy failure so the
+        // install directory can never end up half-copied, and prevent double-execution from the
+        // outer catch block.
+        let restore_start = WINDOWS_NSIS_SUPERVISOR_SCRIPT
+            .find("function Restore-Previous")
+            .unwrap();
+        let restore_end = WINDOWS_NSIS_SUPERVISOR_SCRIPT[restore_start..]
+            .find("\ntry {")
+            .unwrap()
+            + restore_start;
+        let restore_body = &WINDOWS_NSIS_SUPERVISOR_SCRIPT[restore_start..restore_end];
+        assert!(
+            restore_body.contains("$script:restoreAttempted"),
+            "Restore-Previous must guard against double invocation"
+        );
+        assert!(
+            restore_body.contains("Test-FileUnlocked")
+                && restore_body.contains("new_kept_files_in_use")
+                && restore_body.contains("new_kept_backup_missing")
+                && restore_body.contains("restored_previous")
+                && restore_body.contains("restore_incomplete")
+                && restore_body.contains("restore exception:"),
+            "Restore-Previous must retry file locks, catch unexpected errors with diagnostics, and record exact install_state:\n{restore_body}"
+        );
+        assert!(
+            restore_body.matches("try {").count() >= 5,
+            "Restore-Previous must isolate outer restore, list, transactional swap, undo, and relaunch in try/catch guards:\n{restore_body}"
+        );
+        assert!(
+            restore_body.matches("} catch {").count() >= 5,
+            "Restore-Previous must catch failures per step:\n{restore_body}"
+        );
+        assert!(
+            WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("if ($proc.ExitCode -ne 0)"),
+            "Windows supervisor must keep polling for ready marker after clean exit code 0 (close-then-reopen race)"
+        );
+        assert!(
+            WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("$graceEnd = $j + $graceTicks"),
+            "Windows supervisor must wait a grace period on non-zero exit instead of rolling back immediately"
+        );
+        assert!(
+            WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("Get-InstallDirProcesses")
+                && !WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("Get-LegionWebViewProcesses"),
+            "Windows supervisor must wait for install-dir processes using .NET without WMI"
+        );
+        assert!(
+            WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("Release-UpdateLocks")
+                && WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("$env:LEGION_DEFERRED_FILE")
+                && WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("$env:LEGION_STAGE_FILE")
+                && WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("LEGION_UPDATE_SUPERVISED_LAUNCH")
+                && WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("$env:LEGION_REOPEN_FILE"),
+            "Windows supervisor must hold/release update locks, update pending stage, defer cleanly when busy, mark supervised launches, and honor reopen-requested"
+        );
+        assert!(
+            WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("Capture-RollbackPs")
+                && WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("$env:LEGION_ROLLBACK_PS_FILE"),
+            "Windows supervisor must snapshot processes at rollback decision"
+        );
+        assert!(
+            WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("Save-CappedNewStartLog")
+                && WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("$env:LEGION_NEW_LOG"),
+            "Windows supervisor must capture size-capped first-start output"
+        );
+    }
+
+    #[test]
+    fn windows_sanitized_env_preserves_pathext_programw6432_and_proxies_while_stripping_hostile_vars()
+     {
+        let raw = vec![
+            (OsString::from("SystemRoot"), OsString::from(r"C:\Windows")),
+            (
+                OsString::from("PATHEXT"),
+                OsString::from(".COM;.EXE;.BAT;.CMD"),
+            ),
+            (
+                OsString::from("ProgramW6432"),
+                OsString::from(r"C:\Program Files"),
+            ),
+            (
+                OsString::from("CommonProgramW6432"),
+                OsString::from(r"C:\Program Files\Common Files"),
+            ),
+            (
+                OsString::from("CommonProgramFiles(x86)"),
+                OsString::from(r"C:\Program Files (x86)\Common Files"),
+            ),
+            (
+                OsString::from("HTTPS_PROXY"),
+                OsString::from("http://proxy.example:8080"),
+            ),
+            (
+                OsString::from("no_proxy"),
+                OsString::from("localhost,127.0.0.1"),
+            ),
+            (
+                OsString::from("WEBVIEW2_USER_DATA_FOLDER"),
+                OsString::from(r"C:\Users\me\AppData\Local\Legion"),
+            ),
+            (
+                OsString::from("PSModulePath"),
+                OsString::from(r"C:\evil\modules"),
+            ),
+            (OsString::from("EVIL_VAR"), OsString::from("injected")),
+        ];
+        let kept = build_sanitized_windows_env(raw);
+        assert_eq!(
+            kept.get(OsStr::new("PATHEXT")),
+            Some(&OsString::from(".COM;.EXE;.BAT;.CMD"))
+        );
+        assert_eq!(
+            kept.get(OsStr::new("ProgramW6432")),
+            Some(&OsString::from(r"C:\Program Files"))
+        );
+        assert_eq!(
+            kept.get(OsStr::new("CommonProgramW6432")),
+            Some(&OsString::from(r"C:\Program Files\Common Files"))
+        );
+        assert_eq!(
+            kept.get(OsStr::new("CommonProgramFiles(x86)")),
+            Some(&OsString::from(r"C:\Program Files (x86)\Common Files"))
+        );
+        assert_eq!(
+            kept.get(OsStr::new("HTTPS_PROXY")),
+            Some(&OsString::from("http://proxy.example:8080"))
+        );
+        assert_eq!(
+            kept.get(OsStr::new("no_proxy")),
+            Some(&OsString::from("localhost,127.0.0.1"))
+        );
+        assert!(kept.contains_key(OsStr::new("WEBVIEW2_USER_DATA_FOLDER")));
+        assert!(!kept.contains_key(OsStr::new("PSModulePath")));
+        assert!(!kept.contains_key(OsStr::new("EVIL_VAR")));
+
+        // Release builds must never allow debug-only test switches through the env allow-list.
+        #[cfg(not(debug_assertions))]
+        {
+            assert!(
+                !WIN_ALLOWED_VARS
+                    .iter()
+                    .any(|v| v.eq_ignore_ascii_case("LEGION_APP_READY_FILE"))
+            );
+            assert!(
+                !WIN_ALLOWED_VARS
+                    .iter()
+                    .any(|v| v.eq_ignore_ascii_case("LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS"))
+            );
         }
     }
 
@@ -2207,6 +4704,42 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(small_limit_err.code, ErrorCode::Denied);
+
+        // 7. Symlinks that escape one level above the `.app` bundle root (pointing to the archive
+        //    root or a sibling entry, which would escape into `/Applications` once swapped) must
+        //    be refused, while symlinks staying inside the `.app` bundle remain valid.
+        for (label, link_name, link_target) in [
+            (
+                "escape-one-above-contents",
+                "Legion.app/Contents/escape",
+                "../..",
+            ),
+            ("escape-one-above-bundle", "Legion.app/escape", ".."),
+            (
+                "escape-to-sibling",
+                "Legion.app/Contents/sibling",
+                "../../Other",
+            ),
+            ("top-level-symlink", "escape", "Legion.app"),
+        ] {
+            let tar_path = dir.path().join(format!("{label}.app.tar.gz"));
+            {
+                let file = fs::File::create(&tar_path).unwrap();
+                let enc = GzEncoder::new(file, Compression::default());
+                let mut builder = Builder::new(enc);
+                let mut lh = Header::new_gnu();
+                lh.set_entry_type(tar::EntryType::Symlink);
+                lh.set_size(0);
+                lh.set_cksum();
+                builder
+                    .append_link(&mut lh, link_name, link_target)
+                    .unwrap();
+                builder.into_inner().unwrap().finish().unwrap();
+            }
+            let err = extract_macos_app_tar(&tar_path, &dir.path().join(format!("out-{label}")))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{label}: {err:?}");
+        }
     }
 
     #[cfg(unix)]
@@ -2281,6 +4814,26 @@ mod tests {
             ),
             (OsString::from("HOME"), OsString::from("/home/me")),
             (OsString::from("DISPLAY"), OsString::from(":0")),
+            (OsString::from("GTK_IM_MODULE"), OsString::from("fcitx")),
+            (OsString::from("QT_IM_MODULE"), OsString::from("fcitx")),
+            (OsString::from("XMODIFIERS"), OsString::from("@im=fcitx")),
+            (
+                OsString::from("GTK_IM_MODULE_FILE"),
+                fake_appdir
+                    .join("usr/lib/gtk-3.0/immodules.cache")
+                    .as_os_str()
+                    .to_os_string(),
+            ),
+            (
+                OsString::from("HTTPS_PROXY"),
+                OsString::from("http://proxy.example:3128"),
+            ),
+            (
+                OsString::from("http_proxy"),
+                OsString::from("http://proxy.example:3128"),
+            ),
+            (OsString::from("NO_PROXY"), OsString::from("localhost")),
+            (OsString::from("BASH_ENV"), OsString::from("/tmp/evil.sh")),
         ];
 
         let sanitized = build_sanitized_unix_env(poisoned_env, Some(&fake_appdir));
@@ -2302,6 +4855,37 @@ mod tests {
                 .contains_key(OsStr::new("LD_PRELOAD"))
         );
         assert!(!sanitized.session_vars.contains_key(OsStr::new("GTK_PATH")));
+        assert!(
+            !sanitized
+                .session_vars
+                .contains_key(OsStr::new("GTK_IM_MODULE_FILE"))
+        );
+        assert!(!sanitized.session_vars.contains_key(OsStr::new("BASH_ENV")));
+        // Harmless input-method and proxy variables must survive sanitization and relaunch.
+        assert_eq!(
+            sanitized.session_vars.get(OsStr::new("GTK_IM_MODULE")),
+            Some(&OsString::from("fcitx"))
+        );
+        assert_eq!(
+            sanitized.session_vars.get(OsStr::new("QT_IM_MODULE")),
+            Some(&OsString::from("fcitx"))
+        );
+        assert_eq!(
+            sanitized.session_vars.get(OsStr::new("XMODIFIERS")),
+            Some(&OsString::from("@im=fcitx"))
+        );
+        assert_eq!(
+            sanitized.session_vars.get(OsStr::new("HTTPS_PROXY")),
+            Some(&OsString::from("http://proxy.example:3128"))
+        );
+        assert_eq!(
+            sanitized.session_vars.get(OsStr::new("http_proxy")),
+            Some(&OsString::from("http://proxy.example:3128"))
+        );
+        assert_eq!(
+            sanitized.session_vars.get(OsStr::new("NO_PROXY")),
+            Some(&OsString::from("localhost"))
+        );
         let xdg = sanitized
             .session_vars
             .get(OsStr::new("XDG_DATA_DIRS"))
@@ -2309,6 +4893,51 @@ mod tests {
             .to_string_lossy();
         assert!(!xdg.contains(&*fake_appdir.to_string_lossy()));
         assert_eq!(xdg, "/usr/local/share:/usr/share");
+
+        // Also confirm an APPDIR located outside `/tmp` (e.g. under `$HOME/.local`) is stripped
+        // from PATH and session variables just like `/tmp/.mount_*`.
+        let non_tmp_appdir = PathBuf::from("/home/me/.local/fake_appdir");
+        let non_tmp_env = vec![
+            (
+                OsString::from("APPDIR"),
+                non_tmp_appdir.as_os_str().to_os_string(),
+            ),
+            (
+                OsString::from("PATH"),
+                OsString::from("/home/me/.local/fake_appdir/usr/bin:/usr/bin:/bin"),
+            ),
+            (
+                OsString::from("XDG_DATA_DIRS"),
+                OsString::from("/home/me/.local/fake_appdir/usr/share:/usr/share"),
+            ),
+            (OsString::from("GTK_IM_MODULE"), OsString::from("ibus")),
+        ];
+        let non_tmp_sanitized = build_sanitized_unix_env(non_tmp_env, None);
+        assert!(
+            !non_tmp_sanitized
+                .relaunch_path
+                .to_string_lossy()
+                .contains("/home/me/.local/fake_appdir"),
+            "non-/tmp APPDIR leaked into relaunch PATH: {:?}",
+            non_tmp_sanitized.relaunch_path
+        );
+        assert!(
+            !non_tmp_sanitized
+                .session_vars
+                .contains_key(OsStr::new("APPDIR"))
+        );
+        assert_eq!(
+            non_tmp_sanitized
+                .session_vars
+                .get(OsStr::new("XDG_DATA_DIRS")),
+            Some(&OsString::from("/usr/share"))
+        );
+        assert_eq!(
+            non_tmp_sanitized
+                .session_vars
+                .get(OsStr::new("GTK_IM_MODULE")),
+            Some(&OsString::from("ibus"))
+        );
 
         // Now run the real swap supervisor with the sanitized env and capture the relaunched
         // process's complete environment to prove zero planted tools ran and zero APPDIR/LD vars
@@ -2343,6 +4972,7 @@ mod tests {
         spawn_unix_swap_supervisor_with_env(
             &UnixSwapPlan {
                 old_pid: exited_pid,
+                old_ppid: None,
                 target_path: target.clone(),
                 staged_new_path: staged,
                 backup_path: backup.clone(),
@@ -2350,8 +4980,22 @@ mod tests {
                 ready_marker_path: ready.clone(),
                 rollback_marker_path: rollback,
                 rollback_json: "{}".to_owned(),
+                rollback_kept_new_json: "{}".to_owned(),
+                deferred_marker_path: None,
+                deferred_json: None,
+                target_sequence: 2,
+                update_lock_path: None,
+                stage_file_path: None,
+                reopen_marker_path: None,
                 log_path: None,
+                new_start_log_path: None,
+                rollback_ps_path: None,
+                single_instance_dbus_name: None,
+                single_instance_socket_path: None,
+                pre_swap_wait_secs: 5,
                 wait_secs: 5,
+                exit_grace_secs: 2,
+                rollback_retries: 4,
                 verify_only: false,
             },
             &sanitized,
@@ -2385,6 +5029,8 @@ mod tests {
             "APPIMAGE=",
             "LD_LIBRARY_PATH=",
             "LD_PRELOAD=",
+            "GTK_IM_MODULE_FILE=",
+            "BASH_ENV=",
             "LEGION_RELAUNCH_PATH=",
             "LEGION_TARGET=",
         ] {
@@ -2393,6 +5039,104 @@ mod tests {
                 "relaunched env leaked {forbidden}:\n{dumped}"
             );
         }
+        for preserved in [
+            "GTK_IM_MODULE=fcitx",
+            "QT_IM_MODULE=fcitx",
+            "XMODIFIERS=@im=fcitx",
+            "HTTPS_PROXY=http://proxy.example:3128",
+            "http_proxy=http://proxy.example:3128",
+            "NO_PROXY=localhost",
+        ] {
+            assert!(
+                dumped.contains(preserved),
+                "relaunched env lost {preserved}:\n{dumped}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_swap_supervisor_close_then_reopen_race_does_not_roll_back() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Legion.AppImage");
+        let staged = dir.path().join(".Legion.AppImage.new-2");
+        let backup = dir.path().join(".Legion.AppImage.prev");
+        let ready = dir.path().join("started-2.ok");
+        let rollback = dir.path().join("rollback-2.json");
+
+        fs::write(&target, "#!/bin/sh\necho v1\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Simulate a close-then-reopen race where the verify-only launch exits 0 immediately
+        // (for instance after handing off to a concurrently reopened instance of the new build)
+        // while the reopened instance finishes painting and writes `started-2.ok` 600ms later.
+        let v2_handover = format!(
+            "#!/bin/sh\n(sleep 0.6; printf 'ok\\n' > '{}') &\nexit 0\n",
+            ready.display()
+        );
+        fs::write(&staged, v2_handover).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut exited_child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let exited_pid = exited_child.id();
+        let _ = exited_child.wait();
+
+        spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid: exited_pid,
+            old_ppid: None,
+            target_path: target.clone(),
+            staged_new_path: staged,
+            backup_path: backup.clone(),
+            exec_path: target.clone(),
+            ready_marker_path: ready.clone(),
+            rollback_marker_path: rollback.clone(),
+            rollback_json: "{\"sequence\":2}".to_owned(),
+            rollback_kept_new_json: "{\"sequence\":2}".to_owned(),
+            deferred_marker_path: None,
+            deferred_json: None,
+            target_sequence: 2,
+            update_lock_path: None,
+            stage_file_path: None,
+            reopen_marker_path: None,
+            log_path: None,
+            new_start_log_path: None,
+            rollback_ps_path: None,
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            pre_swap_wait_secs: 5,
+            wait_secs: 5,
+            exit_grace_secs: 2,
+            rollback_retries: 4,
+            verify_only: true,
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            if ready.exists() && !backup.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ready.exists(), "expected ready marker to be written");
+        assert!(
+            !rollback.exists(),
+            "close-then-reopen race must NOT write a rollback file"
+        );
+        assert!(
+            !backup.exists(),
+            "supervisor should clean up .prev backup once ready marker arrives"
+        );
+        assert!(
+            fs::read_to_string(&target).unwrap().contains("sleep 0.6"),
+            "new v2 binary should stay installed rather than rolling back to v1"
+        );
     }
 
     #[cfg(unix)]
@@ -2432,6 +5176,7 @@ mod tests {
 
         spawn_unix_swap_supervisor(&UnixSwapPlan {
             old_pid: exited_pid,
+            old_ppid: None,
             target_path: target.clone(),
             staged_new_path: staged_ok,
             backup_path: backup.clone(),
@@ -2439,8 +5184,22 @@ mod tests {
             ready_marker_path: ready_ok.clone(),
             rollback_marker_path: rollback_ok.clone(),
             rollback_json: "{\"sequence\":2}".to_owned(),
+            rollback_kept_new_json: "{\"sequence\":2}".to_owned(),
+            deferred_marker_path: None,
+            deferred_json: None,
+            target_sequence: 2,
+            update_lock_path: None,
+            stage_file_path: None,
+            reopen_marker_path: None,
             log_path: None,
+            new_start_log_path: None,
+            rollback_ps_path: None,
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            pre_swap_wait_secs: 5,
             wait_secs: 5,
+            exit_grace_secs: 2,
+            rollback_retries: 4,
             verify_only: true,
         })
         .unwrap();
@@ -2467,6 +5226,7 @@ mod tests {
 
         spawn_unix_swap_supervisor(&UnixSwapPlan {
             old_pid: exited_pid,
+            old_ppid: None,
             target_path: target.clone(),
             staged_new_path: staged_bad,
             backup_path: backup.clone(),
@@ -2475,8 +5235,24 @@ mod tests {
             rollback_marker_path: rollback_bad.clone(),
             rollback_json: "{\"version\":\"0.3.0\",\"sequence\":3,\"reason\":\"crashed\"}"
                 .to_owned(),
+            rollback_kept_new_json:
+                "{\"version\":\"0.3.0\",\"sequence\":3,\"reason\":\"crashed\",\"install_state\":\"new_kept_files_in_use\"}"
+                    .to_owned(),
+            deferred_marker_path: None,
+            deferred_json: None,
+            target_sequence: 3,
+            update_lock_path: None,
+            stage_file_path: None,
+            reopen_marker_path: None,
             log_path: None,
+            new_start_log_path: None,
+            rollback_ps_path: None,
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            pre_swap_wait_secs: 5,
             wait_secs: 3,
+            exit_grace_secs: 1,
+            rollback_retries: 4,
             verify_only: false,
         })
         .unwrap();
@@ -2492,5 +5268,1289 @@ mod tests {
         assert!(ready_ok.exists());
         assert!(fs::read_to_string(&target).unwrap().contains("v2:"));
         assert!(!backup.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_swap_supervisor_waits_grace_period_on_nonzero_exit_and_captures_capped_log_and_ps() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Legion.AppImage");
+        let staged_handover = dir.path().join(".Legion.AppImage.new-handover");
+        let backup = dir.path().join(".Legion.AppImage.prev");
+        let ready = dir.path().join("started-10.ok");
+        let rollback = dir.path().join("rollback-10.json");
+        let sup_log = dir.path().join("supervisor.log");
+        let new_log = dir.path().join(NEW_START_LOG_FILENAME);
+        let rollback_ps = dir.path().join(ROLLBACK_PS_FILENAME);
+
+        fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // 1. Even if the launched PID exits non-zero (rc=42) immediately, the supervisor waits the
+        //    grace period; a handover child writing the ready marker 0.8s later succeeds cleanly
+        //    without rolling back and cleans up new-start.log.
+        fs::write(
+            &staged_handover,
+            format!(
+                "#!/bin/sh\necho 'handover starting' >&2\n(sleep 0.8; printf 'ok\\n' > '{}') &\nexit 42\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&staged_handover, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut exited_child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let exited_pid = exited_child.id();
+        let _ = exited_child.wait();
+
+        spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid: exited_pid,
+            old_ppid: None,
+            target_path: target.clone(),
+            staged_new_path: staged_handover,
+            backup_path: backup.clone(),
+            exec_path: target.clone(),
+            ready_marker_path: ready.clone(),
+            rollback_marker_path: rollback.clone(),
+            rollback_json: "{\"sequence\":10}".to_owned(),
+            rollback_kept_new_json: "{\"sequence\":10}".to_owned(),
+            deferred_marker_path: None,
+            deferred_json: None,
+            target_sequence: 10,
+            update_lock_path: None,
+            stage_file_path: None,
+            reopen_marker_path: None,
+            log_path: Some(sup_log.clone()),
+            new_start_log_path: Some(new_log.clone()),
+            rollback_ps_path: Some(rollback_ps.clone()),
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            pre_swap_wait_secs: 5,
+            wait_secs: 6,
+            exit_grace_secs: 3,
+            rollback_retries: 4,
+            verify_only: true,
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if ready.exists() && !backup.exists() && !new_log.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            ready.exists(),
+            "handover during non-zero exit grace period must succeed"
+        );
+        assert!(
+            !rollback.exists(),
+            "must not roll back when marker appears during grace period"
+        );
+        assert!(
+            !new_log.exists(),
+            "new-start.log should be cleaned up on success"
+        );
+        assert!(
+            !rollback_ps.exists(),
+            "rollback-ps.txt should not exist on success"
+        );
+
+        // 2. When a build truly crashes and prints > 64 KiB before exiting without writing the
+        //    ready marker, the supervisor waits the grace period, captures rollback-ps.txt, caps
+        //    new-start.log to <= 32 KiB, and read_captured_startup_detail surfaces the failure.
+        let staged_crash = dir.path().join(".Legion.AppImage.new-crash");
+        let ready_crash = dir.path().join("started-11.ok");
+        let rollback_crash = dir.path().join("rollback-11.json");
+        fs::write(
+            &staged_crash,
+            "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 800 ]; do\n  printf 'noisy startup line %04d 0123456789abcdefghijklmnopqrstuvwxyz0123456789\\n' \"$i\"\n  i=$((i + 1))\ndone\nprintf 'fatal: missing shared library libbroken.so.1\\n' >&2\nexit 127\n",
+        )
+        .unwrap();
+        fs::set_permissions(&staged_crash, fs::Permissions::from_mode(0o755)).unwrap();
+
+        spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid: exited_pid,
+            old_ppid: None,
+            target_path: target.clone(),
+            staged_new_path: staged_crash,
+            backup_path: backup.clone(),
+            exec_path: target.clone(),
+            ready_marker_path: ready_crash,
+            rollback_marker_path: rollback_crash.clone(),
+            rollback_json: "{\"version\":\"0.4.0\",\"sequence\":11,\"reason\":\"crashed\"}"
+                .to_owned(),
+            rollback_kept_new_json:
+                "{\"version\":\"0.4.0\",\"sequence\":11,\"reason\":\"crashed\",\"install_state\":\"new_kept_files_in_use\"}"
+                    .to_owned(),
+            deferred_marker_path: None,
+            deferred_json: None,
+            target_sequence: 11,
+            update_lock_path: None,
+            stage_file_path: None,
+            reopen_marker_path: None,
+            log_path: Some(sup_log.clone()),
+            new_start_log_path: Some(new_log.clone()),
+            rollback_ps_path: Some(rollback_ps.clone()),
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            pre_swap_wait_secs: 5,
+            wait_secs: 6,
+            exit_grace_secs: 1,
+            rollback_retries: 4,
+            verify_only: true,
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if rollback_crash.exists() && rollback_ps.exists() && !backup.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            rollback_crash.exists(),
+            "expected rollback marker after crash"
+        );
+        assert!(
+            rollback_ps.exists(),
+            "expected rollback-ps.txt captured at rollback"
+        );
+        assert!(
+            !fs::read_to_string(&rollback_ps).unwrap().trim().is_empty(),
+            "rollback-ps.txt must contain process snapshot"
+        );
+        let new_log_meta = fs::metadata(&new_log).unwrap();
+        assert!(
+            new_log_meta.len() > 0 && new_log_meta.len() <= MAX_CAPTURED_START_LOG_BYTES as u64,
+            "new-start.log must be non-empty and capped to <= 32 KiB, got {} bytes",
+            new_log_meta.len()
+        );
+        let detail = read_captured_startup_detail(dir.path()).unwrap();
+        assert!(
+            detail.contains("rc=127") && detail.contains("libbroken.so.1"),
+            "captured startup detail should surface exit status and stderr tail: {detail}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_swap_supervisor_waits_for_old_children_and_wrapper_parent_before_swap() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Legion.AppImage");
+        let staged = dir.path().join(".Legion.AppImage.new-wait");
+        let backup = dir.path().join(".Legion.AppImage.prev");
+        let ready = dir.path().join("started-12.ok");
+        let rollback = dir.path().join("rollback-12.json");
+        let child_gone_marker = dir.path().join("old-child-gone.txt");
+        let new_started_check = dir.path().join("new-saw-child-gone.txt");
+
+        fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // New binary asserts that the old child already finished before the new copy launched!
+        fs::write(
+            &staged,
+            format!(
+                "#!/bin/sh\nif [ -f '{}' ]; then printf 'clean\\n' > '{}'; fi\nprintf 'ok\\n' > '{}'\n",
+                child_gone_marker.display(),
+                new_started_check.display(),
+                ready.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Simulate old process + lingering helper child (e.g., WebKitNetworkProcess) that exits
+        // 0.8s after old_pid exits, plus a lingering AppImage wrapper parent (`old_ppid`).
+        let mut old_proc = Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!(
+                    "(sleep 0.9; printf 'done\\n' > '{}') &\nsleep 0.25\nexit 0\n",
+                    child_gone_marker.display()
+                ),
+            ])
+            .spawn()
+            .unwrap();
+        let old_pid = old_proc.id();
+        // Give the shell a moment to spawn its background child before spawning the supervisor so
+        // `collect_children "$LEGION_OLD_PID"` sees it while old_pid is still running.
+        std::thread::sleep(Duration::from_millis(80));
+
+        spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid,
+            old_ppid: None,
+            target_path: target.clone(),
+            staged_new_path: staged,
+            backup_path: backup.clone(),
+            exec_path: target.clone(),
+            ready_marker_path: ready.clone(),
+            rollback_marker_path: rollback.clone(),
+            rollback_json: "{\"sequence\":12}".to_owned(),
+            rollback_kept_new_json: "{\"sequence\":12}".to_owned(),
+            deferred_marker_path: None,
+            deferred_json: None,
+            target_sequence: 12,
+            update_lock_path: None,
+            stage_file_path: None,
+            reopen_marker_path: None,
+            log_path: Some(dir.path().join("supervisor.log")),
+            new_start_log_path: Some(dir.path().join(NEW_START_LOG_FILENAME)),
+            rollback_ps_path: Some(dir.path().join(ROLLBACK_PS_FILENAME)),
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            pre_swap_wait_secs: 6,
+            wait_secs: 6,
+            exit_grace_secs: 2,
+            rollback_retries: 4,
+            verify_only: true,
+        })
+        .unwrap();
+
+        let _ = old_proc.wait();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if ready.exists() && !backup.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ready.exists(), "expected new build ready marker");
+        assert!(!rollback.exists(), "expected no rollback");
+        assert!(
+            new_started_check.exists(),
+            "supervisor must wait until old helper children exit before launching new build"
+        );
+    }
+
+    #[test]
+    fn update_lock_prevents_concurrent_staging_and_recovers_stale_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+
+        // 1. Acquiring the lock excludes a second acquirer and exposes active metadata.
+        let guard = try_acquire_update_lock(&updates_dir, 202611250210, true)
+            .unwrap()
+            .expect("first lock acquisition must succeed");
+        assert!(
+            try_acquire_update_lock(&updates_dir, 202611250210, false)
+                .unwrap()
+                .is_none(),
+            "second instance must not acquire the update lock while staging is active"
+        );
+        let active = inspect_active_update_lock(&updates_dir).expect("active lock must be visible");
+        assert_eq!(active.target_sequence, 202611250210);
+        assert!(active.verify_only);
+        assert_eq!(active.stage, "staging");
+
+        // 2. Dropping without hand-over releases both locks cleanly.
+        drop(guard);
+        assert!(
+            inspect_active_update_lock(&updates_dir).is_none(),
+            "dropping lock guard without hand-over must remove update.lock"
+        );
+
+        // 3. Hand-over to a live supervisor PID keeps update.lock active until removed or stale.
+        let guard2 = try_acquire_update_lock(&updates_dir, 202611250211, false)
+            .unwrap()
+            .expect("re-acquiring after clean drop must succeed");
+        guard2.hand_over_to_supervisor(std::process::id()).unwrap();
+        let handed =
+            inspect_active_update_lock(&updates_dir).expect("handed-over lock must stay active");
+        assert_eq!(handed.stage, "supervising");
+        assert_eq!(handed.target_sequence, 202611250211);
+        assert!(
+            try_acquire_update_lock(&updates_dir, 202611250211, false)
+                .unwrap()
+                .is_none(),
+            "second instance must not stage while supervisor holds update.lock"
+        );
+
+        // 4. A stale lock past UPDATE_LOCK_MAX_AGE_SECS is cleaned automatically so a crashed
+        //    supervisor can never wedge future updates.
+        let stale = UpdateLockState {
+            owner_pid: 999_999,
+            supervisor_pid: Some(999_998),
+            target_sequence: 202611250211,
+            stage: "supervising".to_owned(),
+            verify_only: false,
+            started_unix: now_unix_u64().saturating_sub(UPDATE_LOCK_MAX_AGE_SECS + 10),
+        };
+        write_update_lock_file(&updates_dir.join(UPDATE_LOCK_FILENAME), &stale).unwrap();
+        assert!(
+            inspect_active_update_lock(&updates_dir).is_none(),
+            "expired stale lock must be cleaned automatically"
+        );
+        let recovered = try_acquire_update_lock(&updates_dir, 202611250212, false)
+            .unwrap()
+            .expect("must acquire lock after stale lock cleanup");
+        drop(recovered);
+    }
+
+    #[cfg(unix)]
+    fn spawn_retry_etxtbsy(cmd: &mut Command) -> std::process::Child {
+        for attempt in 0..10u8 {
+            match cmd.spawn() {
+                Ok(child) => return child,
+                Err(err) if err.raw_os_error() == Some(26) && attempt < 9 => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(err) => panic!("failed to spawn test script: {err}"),
+            }
+        }
+        unreachable!()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_swap_supervisor_defers_cleanly_when_another_instance_holds_install() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Legion.AppImage");
+        let staged = dir.path().join(".Legion.AppImage.new-defer");
+        let backup = dir.path().join(".Legion.AppImage.prev");
+        let ready = dir.path().join("started-13.ok");
+        let rollback = dir.path().join("rollback-13.json");
+        let deferred = dir.path().join("deferred-13.json");
+        let lock_file = dir.path().join(UPDATE_LOCK_FILENAME);
+
+        fs::write(&target, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&staged, "#!/bin/sh\necho new-v2\n").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&lock_file, "{}").unwrap();
+
+        // Spawn a second running process executing $LEGION_TARGET so the install is actively in use.
+        let mut busy_child = spawn_retry_etxtbsy(&mut Command::new(&target));
+        std::thread::sleep(Duration::from_millis(120));
+
+        let mut exited_child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let exited_pid = exited_child.id();
+        let _ = exited_child.wait();
+
+        spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid: exited_pid,
+            old_ppid: None,
+            target_path: target.clone(),
+            staged_new_path: staged.clone(),
+            backup_path: backup.clone(),
+            exec_path: target.clone(),
+            ready_marker_path: ready.clone(),
+            rollback_marker_path: rollback.clone(),
+            rollback_json: "{\"sequence\":13}".to_owned(),
+            rollback_kept_new_json: "{\"sequence\":13}".to_owned(),
+            deferred_marker_path: Some(deferred.clone()),
+            deferred_json: Some("{\"sequence\":13,\"reason\":\"busy\"}".to_owned()),
+            target_sequence: 13,
+            update_lock_path: Some(lock_file.clone()),
+            stage_file_path: None,
+            reopen_marker_path: None,
+            log_path: Some(dir.path().join("supervisor.log")),
+            new_start_log_path: None,
+            rollback_ps_path: None,
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            pre_swap_wait_secs: 1,
+            wait_secs: 4,
+            exit_grace_secs: 1,
+            rollback_retries: 4,
+            verify_only: false,
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            if deferred.exists() && !lock_file.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let _ = busy_child.kill();
+        let _ = busy_child.wait();
+
+        assert!(
+            deferred.exists(),
+            "supervisor must write deferred marker when another instance holds the install"
+        );
+        assert!(
+            !rollback.exists(),
+            "deferring pre-swap must NOT write a rollback failure marker"
+        );
+        assert!(!ready.exists(), "deferred update must not launch new copy");
+        assert!(
+            !staged.exists(),
+            "staged new file must be cleaned up on defer"
+        );
+        assert!(
+            !backup.exists(),
+            "target must never be moved aside on defer"
+        );
+        assert!(!lock_file.exists(), "update.lock must be released on defer");
+        assert!(
+            fs::read_to_string(&target).unwrap().contains("sleep 30"),
+            "original install must remain untouched when deferred"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_swap_supervisor_rollback_keeps_new_intact_when_other_process_holds_target_open() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Legion.AppImage");
+        let staged = dir.path().join(".Legion.AppImage.new-busy-rb");
+        let backup = dir.path().join(".Legion.AppImage.prev");
+        let ready = dir.path().join("started-14.ok");
+        let rollback = dir.path().join("rollback-14.json");
+        let lock_file = dir.path().join(UPDATE_LOCK_FILENAME);
+        let launched_flag = dir.path().join("new-launched.txt");
+
+        fs::write(&target, "#!/bin/sh\necho old-v1\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // New v2 script marks that it started, then exits 1 without writing ready marker.
+        // While it fails, this test spawns an independent process holding $LEGION_TARGET open so
+        // rollback retries hit busy and MUST leave the new copy intact (never half-replaced) with
+        // install_state == "new_kept_files_in_use".
+        let v2_body = format!(
+            "#!/bin/sh\nif [ \"${{HOLD_OPEN:-0}}\" = \"1\" ]; then\n  sleep 30\n  exit 0\nfi\nprintf 'started\\n' > '{}'\nexit 1\n",
+            launched_flag.display()
+        );
+        fs::write(&staged, &v2_body).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&lock_file, "{}").unwrap();
+
+        let mut exited_child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let exited_pid = exited_child.id();
+        let _ = exited_child.wait();
+
+        spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid: exited_pid,
+            old_ppid: None,
+            target_path: target.clone(),
+            staged_new_path: staged,
+            backup_path: backup.clone(),
+            exec_path: target.clone(),
+            ready_marker_path: ready,
+            rollback_marker_path: rollback.clone(),
+            rollback_json:
+                "{\"version\":\"0.4.0\",\"sequence\":14,\"reason\":\"failed\",\"install_state\":\"restored_previous\"}"
+                    .to_owned(),
+            rollback_kept_new_json:
+                "{\"version\":\"0.4.0\",\"sequence\":14,\"reason\":\"failed\",\"install_state\":\"new_kept_files_in_use\"}"
+                    .to_owned(),
+            deferred_marker_path: None,
+            deferred_json: None,
+            target_sequence: 14,
+            update_lock_path: Some(lock_file.clone()),
+            stage_file_path: None,
+            reopen_marker_path: None,
+            log_path: Some(dir.path().join("supervisor.log")),
+            new_start_log_path: Some(dir.path().join(NEW_START_LOG_FILENAME)),
+            rollback_ps_path: Some(dir.path().join(ROLLBACK_PS_FILENAME)),
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            pre_swap_wait_secs: 4,
+            wait_secs: 4,
+            exit_grace_secs: 1,
+            rollback_retries: 4,
+            verify_only: true,
+        })
+        .unwrap();
+
+        // As soon as the swap completes and v2 launches, open a second process executing $target.
+        let swap_deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < swap_deadline && !launched_flag.exists() {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(launched_flag.exists(), "expected v2 to launch after swap");
+        let mut holder = spawn_retry_etxtbsy(Command::new(&target).env("HOLD_OPEN", "1"));
+
+        let rb_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < rb_deadline {
+            if rollback.exists() && !lock_file.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let _ = holder.kill();
+        let _ = holder.wait();
+
+        assert!(rollback.exists(), "expected rollback notice to be written");
+        assert!(!lock_file.exists(), "update.lock must be released");
+        let rb_text = fs::read_to_string(&rollback).unwrap();
+        assert!(
+            rb_text.contains("new_kept_files_in_use"),
+            "rollback notice must record new_kept_files_in_use: {rb_text}"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            v2_body,
+            "new copy must stay completely intact when target is held open during rollback"
+        );
+        assert!(
+            backup.exists(),
+            "previous backup must stay intact when rollback kept the new copy"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_swap_supervisor_reopen_requested_launches_window_after_verify_only() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Legion.AppImage");
+        let staged = dir.path().join(".Legion.AppImage.new-reopen");
+        let backup = dir.path().join(".Legion.AppImage.prev");
+        let ready = dir.path().join("started-15.ok");
+        let rollback = dir.path().join("rollback-15.json");
+        let lock_file = dir.path().join(UPDATE_LOCK_FILENAME);
+        let reopen_file = dir.path().join(REOPEN_REQUESTED_FILENAME);
+        let modes_log = dir.path().join("launch-modes.txt");
+
+        fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            &staged,
+            format!(
+                "#!/bin/sh\nprintf 'verify=%s supervised=%s\\n' \"${{LEGION_UPDATE_VERIFY_ONLY:-0}}\" \"${{LEGION_UPDATE_SUPERVISED_LAUNCH:-none}}\" >> '{}'\nprintf 'ok\\n' > '{}'\nexit 0\n",
+                modes_log.display(),
+                ready.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&lock_file, "{}").unwrap();
+        // Simulate a user reopening Legion while the headless close-update supervisor is running.
+        request_reopen_after_update(dir.path());
+        assert!(reopen_file.exists());
+
+        let mut exited_child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let exited_pid = exited_child.id();
+        let _ = exited_child.wait();
+
+        spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid: exited_pid,
+            old_ppid: None,
+            target_path: target.clone(),
+            staged_new_path: staged,
+            backup_path: backup.clone(),
+            exec_path: target,
+            ready_marker_path: ready.clone(),
+            rollback_marker_path: rollback,
+            rollback_json: "{\"sequence\":15}".to_owned(),
+            rollback_kept_new_json: "{\"sequence\":15}".to_owned(),
+            deferred_marker_path: None,
+            deferred_json: None,
+            target_sequence: 15,
+            update_lock_path: Some(lock_file.clone()),
+            stage_file_path: None,
+            reopen_marker_path: Some(reopen_file.clone()),
+            log_path: Some(dir.path().join("supervisor.log")),
+            new_start_log_path: None,
+            rollback_ps_path: None,
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            pre_swap_wait_secs: 4,
+            wait_secs: 5,
+            exit_grace_secs: 1,
+            rollback_retries: 4,
+            verify_only: true,
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            if let Ok(text) = fs::read_to_string(&modes_log)
+                && text.lines().count() >= 2
+                && !lock_file.exists()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let text = fs::read_to_string(&modes_log).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["verify=1 supervised=15", "verify=0 supervised=none"],
+            "supervisor must run verify_only first with supervised env, then open interactive window when reopen-requested was touched"
+        );
+        assert!(!reopen_file.exists(), "reopen-requested must be consumed");
+        assert!(!lock_file.exists(), "update.lock must be released");
+    }
+
+    #[test]
+    fn stale_and_future_update_locks_never_block_startup_and_clear_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let now: u64 = 1_800_000_000;
+
+        assert!(!is_lock_timestamp_fresh(0, now));
+        assert!(is_lock_timestamp_fresh(now, now));
+        assert!(is_lock_timestamp_fresh(
+            now - (UPDATE_LOCK_MAX_AGE_SECS - 1),
+            now
+        ));
+        assert!(!is_lock_timestamp_fresh(
+            now - UPDATE_LOCK_MAX_AGE_SECS,
+            now
+        ));
+        assert!(!is_lock_timestamp_fresh(now + 1, now));
+        assert!(!is_lock_timestamp_fresh(now + 3600, now));
+
+        // 1. Future-dated `update.lock` (even with a live PID!) MUST be treated as stale and cleared.
+        let future_lock = UpdateLockState {
+            owner_pid: std::process::id(),
+            supervisor_pid: Some(std::process::id()),
+            target_sequence: 202611250300,
+            stage: "supervising".to_owned(),
+            verify_only: false,
+            started_unix: now + 60,
+        };
+        write_update_lock_file(&updates_dir.join(UPDATE_LOCK_FILENAME), &future_lock).unwrap();
+        assert!(matches!(
+            inspect_update_lock_at(&updates_dir, now),
+            UpdateLockInspection::StaleCleared { .. }
+        ));
+        assert!(
+            !updates_dir.join(UPDATE_LOCK_FILENAME).exists(),
+            "future-dated update.lock must be removed"
+        );
+
+        // 2. Expired `update.lock` (>= 180s old, even while stage lock is kernel-held!) MUST NOT
+        //    block startup and MUST clear cleanly.
+        let stage_path = updates_dir.join(UPDATE_STAGE_LOCK_FILENAME);
+        let stage_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&stage_path)
+            .unwrap();
+        stage_file.try_lock().unwrap();
+        let expired_lock = UpdateLockState {
+            owner_pid: std::process::id(),
+            supervisor_pid: None,
+            target_sequence: 202611250301,
+            stage: "staging".to_owned(),
+            verify_only: false,
+            started_unix: now - UPDATE_LOCK_MAX_AGE_SECS - 5,
+        };
+        write_update_lock_file(&updates_dir.join(UPDATE_LOCK_FILENAME), &expired_lock).unwrap();
+        assert!(matches!(
+            inspect_update_lock_at(&updates_dir, now),
+            UpdateLockInspection::StaleCleared { .. }
+        ));
+        drop(stage_file);
+    }
+
+    #[test]
+    fn cleanup_interrupted_staging_files_removes_orphans_only_when_unlocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let verified_dir = updates_dir.join("verified");
+        fs::create_dir_all(&verified_dir).unwrap();
+        let appimage = dir.path().join("Legion.AppImage");
+        fs::write(&appimage, b"v1").unwrap();
+
+        let orphan_new = dir.path().join(".Legion.AppImage.new-99999");
+        let orphan_tar = verified_dir.join("verified-99999.app.tar.gz");
+        let orphan_exe = verified_dir.join("verified-99999-setup.exe");
+        let keep_deb = verified_dir.join("legion-app_0.2.0_amd64.deb");
+        let orphan_ps1 = updates_dir.join("supervisor-99999.ps1");
+        let orphan_out = updates_dir.join("new-start.log.stdout");
+        let orphan_err = updates_dir.join("new-start.log.stderr");
+        for p in [
+            &orphan_new,
+            &orphan_tar,
+            &orphan_exe,
+            &keep_deb,
+            &orphan_ps1,
+            &orphan_out,
+            &orphan_err,
+        ] {
+            fs::write(p, b"data").unwrap();
+        }
+
+        let install = DesktopInstall::LinuxAppImage {
+            appimage_path: appimage,
+        };
+
+        // While an active update lock is held, cleanup MUST NOT touch staging files.
+        let lock = try_acquire_update_lock(&updates_dir, 202611250305, false)
+            .unwrap()
+            .unwrap();
+        cleanup_interrupted_staging_files(&updates_dir, &install);
+        assert!(
+            orphan_new.exists(),
+            "must not delete staging files while lock held"
+        );
+        drop(lock);
+
+        // Once unlocked, all interrupted staging leftovers are removed while verified `.deb` stays.
+        cleanup_interrupted_staging_files(&updates_dir, &install);
+        assert!(!orphan_new.exists());
+        assert!(!orphan_tar.exists());
+        assert!(!orphan_exe.exists());
+        assert!(!orphan_ps1.exists());
+        assert!(!orphan_out.exists());
+        assert!(!orphan_err.exists());
+        assert!(
+            keep_deb.exists(),
+            "verified .deb manual install copy must be preserved"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_swap_supervisor_restores_previous_copy_on_sigterm_after_swap() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Legion.AppImage");
+        let staged = dir.path().join(".Legion.AppImage.new-sigterm");
+        let backup = dir.path().join(".Legion.AppImage.prev");
+        let ready = dir.path().join("started-16.ok");
+        let rollback = dir.path().join("rollback-16.json");
+        let stage_file = pending_stage_path(dir.path(), 16);
+        let lock_file = dir.path().join(UPDATE_LOCK_FILENAME);
+        let v1_ran = dir.path().join("v1-ran.txt");
+
+        let v1_body = format!("#!/bin/sh\nprintf 'v1\\n' >> '{}'\n", v1_ran.display());
+        fs::write(&target, &v1_body).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        // New v2 hangs forever without writing the ready marker.
+        fs::write(&staged, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&lock_file, "{}").unwrap();
+
+        let mut exited_child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let exited_pid = exited_child.id();
+        let _ = exited_child.wait();
+
+        let sup_pid = spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid: exited_pid,
+            old_ppid: None,
+            target_path: target.clone(),
+            staged_new_path: staged,
+            backup_path: backup.clone(),
+            exec_path: target.clone(),
+            ready_marker_path: ready,
+            rollback_marker_path: rollback.clone(),
+            rollback_json:
+                "{\"version\":\"0.5.0\",\"sequence\":16,\"reason\":\"signal\",\"install_state\":\"restored_previous\"}"
+                    .to_owned(),
+            rollback_kept_new_json:
+                "{\"version\":\"0.5.0\",\"sequence\":16,\"reason\":\"signal\",\"install_state\":\"new_kept_files_in_use\"}"
+                    .to_owned(),
+            deferred_marker_path: None,
+            deferred_json: None,
+            target_sequence: 16,
+            update_lock_path: Some(lock_file.clone()),
+            stage_file_path: Some(stage_file.clone()),
+            reopen_marker_path: None,
+            log_path: Some(dir.path().join("supervisor.log")),
+            new_start_log_path: Some(dir.path().join(NEW_START_LOG_FILENAME)),
+            rollback_ps_path: None,
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            pre_swap_wait_secs: 4,
+            wait_secs: 25,
+            exit_grace_secs: 1,
+            rollback_retries: 8,
+            verify_only: false,
+        })
+        .unwrap();
+
+        // Wait until the swap has completed (`pending-stage-16.txt` == "swapped").
+        let swap_deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < swap_deadline {
+            if read_pending_stage(dir.path(), 16).as_deref() == Some("swapped") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            read_pending_stage(dir.path(), 16).as_deref(),
+            Some("swapped"),
+            "supervisor must record swapped stage before launching v2"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Send SIGTERM to the supervisor while v2 is unverified.
+        let rpid = rustix::process::Pid::from_raw(sup_pid as i32).unwrap();
+        rustix::process::kill_process(rpid, rustix::process::Signal::TERM).unwrap();
+
+        let rb_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < rb_deadline {
+            if rollback.exists() && !lock_file.exists() && !backup.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            rollback.exists(),
+            "SIGTERM after swap must write rollback record"
+        );
+        assert!(
+            !lock_file.exists(),
+            "SIGTERM after swap must release update.lock"
+        );
+        assert!(!backup.exists(), "backup must be moved back into target");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            v1_body,
+            "SIGTERM after swap must restore previous v1 copy"
+        );
+        assert!(
+            !v1_ran.exists(),
+            "SIGTERM rollback (e.g. session logout) must not relaunch interactively"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_swap_supervisor_reopens_existing_app_when_deferred_with_reopen_requested() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Legion.AppImage");
+        let staged = dir.path().join(".Legion.AppImage.new-defer-reopen");
+        let backup = dir.path().join(".Legion.AppImage.prev");
+        let ready = dir.path().join("started-17.ok");
+        let rollback = dir.path().join("rollback-17.json");
+        let deferred = dir.path().join("deferred-17.json");
+        let lock_file = dir.path().join(UPDATE_LOCK_FILENAME);
+        let reopen_file = dir.path().join(REOPEN_REQUESTED_FILENAME);
+        let reopened_log = dir.path().join("reopened.txt");
+
+        fs::write(
+            &target,
+            format!(
+                "#!/bin/sh\nif [ \"${{HOLD_BUSY:-0}}\" = \"1\" ]; then\n  sleep 30\n  exit 0\nfi\nprintf 'reopened verify=%s\\n' \"${{LEGION_UPDATE_VERIFY_ONLY:-0}}\" >> '{}'\n",
+                reopened_log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&staged, "#!/bin/sh\necho v2\n").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&lock_file, "{}").unwrap();
+        request_reopen_after_update(dir.path());
+
+        let mut busy = spawn_retry_etxtbsy(Command::new(&target).env("HOLD_BUSY", "1"));
+        std::thread::sleep(Duration::from_millis(120));
+
+        let mut exited_child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let exited_pid = exited_child.id();
+        let _ = exited_child.wait();
+
+        spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid: exited_pid,
+            old_ppid: None,
+            target_path: target.clone(),
+            staged_new_path: staged,
+            backup_path: backup,
+            exec_path: target,
+            ready_marker_path: ready,
+            rollback_marker_path: rollback.clone(),
+            rollback_json: "{\"sequence\":17}".to_owned(),
+            rollback_kept_new_json: "{\"sequence\":17}".to_owned(),
+            deferred_marker_path: Some(deferred.clone()),
+            deferred_json: Some("{\"sequence\":17,\"reason\":\"busy\"}".to_owned()),
+            target_sequence: 17,
+            update_lock_path: Some(lock_file.clone()),
+            stage_file_path: None,
+            reopen_marker_path: Some(reopen_file.clone()),
+            log_path: Some(dir.path().join("supervisor.log")),
+            new_start_log_path: None,
+            rollback_ps_path: None,
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            pre_swap_wait_secs: 1,
+            wait_secs: 4,
+            exit_grace_secs: 1,
+            rollback_retries: 4,
+            verify_only: true,
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            if deferred.exists() && reopened_log.exists() && !lock_file.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = busy.kill();
+        let _ = busy.wait();
+
+        assert!(deferred.exists(), "expected deferred marker");
+        assert!(
+            !rollback.exists(),
+            "deferral must not write rollback marker"
+        );
+        assert!(
+            !reopen_file.exists(),
+            "reopen-requested must be deleted when honored"
+        );
+        assert!(!lock_file.exists(), "update.lock must be released");
+        assert_eq!(
+            fs::read_to_string(&reopened_log).unwrap().trim(),
+            "reopened verify=0",
+            "deferred close-time update must honor reopen-requested by launching existing copy interactively"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_swap_supervisor_stops_writing_new_start_log_after_ready_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Legion.AppImage");
+        let staged = dir.path().join(".Legion.AppImage.new-logstop");
+        let backup = dir.path().join(".Legion.AppImage.prev");
+        let ready = dir.path().join("started-18.ok");
+        let rollback = dir.path().join("rollback-18.json");
+        let new_log = dir.path().join(NEW_START_LOG_FILENAME);
+        let done_flag = dir.path().join("child-done.txt");
+
+        fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        // Writes before ready, confirms ready, sleeps while supervisor removes new-start.log, then
+        // writes multiple lines after ready — none of which may recreate or write to new-start.log.
+        fs::write(
+            &staged,
+            format!(
+                "#!/bin/sh\necho 'before-ready'\nprintf 'ok\\n' > '{}'\nsleep 0.6\necho 'after-ready-1'\necho 'after-ready-2'\necho 'after-ready-3' >&2\nprintf 'done\\n' > '{}'\n",
+                ready.display(),
+                done_flag.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut exited_child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let exited_pid = exited_child.id();
+        let _ = exited_child.wait();
+
+        spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid: exited_pid,
+            old_ppid: None,
+            target_path: target.clone(),
+            staged_new_path: staged,
+            backup_path: backup.clone(),
+            exec_path: target,
+            ready_marker_path: ready.clone(),
+            rollback_marker_path: rollback,
+            rollback_json: "{\"sequence\":18}".to_owned(),
+            rollback_kept_new_json: "{\"sequence\":18}".to_owned(),
+            deferred_marker_path: None,
+            deferred_json: None,
+            target_sequence: 18,
+            update_lock_path: None,
+            stage_file_path: None,
+            reopen_marker_path: None,
+            log_path: Some(dir.path().join("supervisor.log")),
+            new_start_log_path: Some(new_log.clone()),
+            rollback_ps_path: None,
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            pre_swap_wait_secs: 4,
+            wait_secs: 6,
+            exit_grace_secs: 1,
+            rollback_retries: 4,
+            verify_only: false,
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if ready.exists() && done_flag.exists() && !backup.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ready.exists(), "expected ready marker");
+        assert!(
+            done_flag.exists(),
+            "expected post-ready child lines to complete without SIGPIPE"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !new_log.exists(),
+            "new-start.log must not be written or recreated after ready marker is confirmed"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_supervisor_rollback_retries_and_never_half_copies_when_exe_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let install_dir = dir.path().join("install");
+        let backup_dir = dir.path().join("backup-1");
+        let updates_dir = dir.path().join("updates");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::create_dir_all(&updates_dir).unwrap();
+
+        let exe_path = install_dir.join("legion-app.exe");
+        let dll_path = install_dir.join("helper.dll");
+        fs::write(&exe_path, b"new-v2-exe").unwrap();
+        fs::write(&dll_path, b"new-v2-dll").unwrap();
+        fs::write(backup_dir.join("legion-app.exe"), b"old-v1-exe").unwrap();
+        fs::write(backup_dir.join("helper.dll"), b"old-v1-dll").unwrap();
+
+        // Use System32 where.exe as a failing stand-in for NSIS (`/S /UPDATE /D=...` exits non-zero
+        // cleanly without reading stdin), triggering Restore-Previous directly.
+        let sys_root = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("WINDIR"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let fake_installer = updates_dir.join("failing-installer.exe");
+        fs::copy(sys_root.join("System32").join("where.exe"), &fake_installer).unwrap();
+
+        let mut exited = Command::new(sys_root.join("System32").join("cmd.exe"))
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = exited.id();
+        let _ = exited.wait();
+
+        let ready_marker = updates_dir.join("started-2.ok");
+        let rollback_marker = updates_dir.join("rollback-2.json");
+        let deferred_marker = updates_dir.join("deferred-2.json");
+        let update_lock = updates_dir.join(UPDATE_LOCK_FILENAME);
+        let sup_lock = updates_dir.join(UPDATE_SUPERVISOR_LOCK_FILENAME);
+        let ps_path = windows_system_powershell_path();
+
+        // Part 1: Hold `install\legion-app.exe` open with exclusive share_mode(0). The supervisor
+        // MUST retry boundedly, NOT throw an unhandled exception, leave BOTH `legion-app.exe` and
+        // `helper.dll` completely intact as v2 (ZERO half-copy), write `new_kept_files_in_use`,
+        // and release its locks and script file.
+        let script1 = write_windows_supervisor_script(&updates_dir, 1001).unwrap();
+        fs::write(&update_lock, "{}").unwrap();
+        let held_exe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&exe_path)
+            .unwrap();
+
+        let out1 = Command::new(&ps_path)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script1)
+            .env("LEGION_SUPERVISOR_SCRIPT", &script1)
+            .env("LEGION_OLD_PID", dead_pid.to_string())
+            .env("LEGION_INSTALLER", &fake_installer)
+            .env("LEGION_INSTALL_DIR", &install_dir)
+            .env("LEGION_EXE", &exe_path)
+            .env("LEGION_BACKUP_DIR", &backup_dir)
+            .env("LEGION_READY_MARKER", &ready_marker)
+            .env("LEGION_ROLLBACK_FILE", &rollback_marker)
+            .env(
+                "LEGION_ROLLBACK_JSON",
+                r#"{"version":"0.2.0","sequence":2,"reason":"failed","install_state":"restored_previous"}"#,
+            )
+            .env(
+                "LEGION_ROLLBACK_KEPT_NEW_JSON",
+                r#"{"version":"0.2.0","sequence":2,"reason":"failed","install_state":"new_kept_files_in_use"}"#,
+            )
+            .env("LEGION_DEFERRED_FILE", &deferred_marker)
+            .env("LEGION_DEFERRED_JSON", r#"{"sequence":2}"#)
+            .env("LEGION_TARGET_SEQUENCE", "2")
+            .env("LEGION_PRE_SWAP_WAIT_SECS", "2")
+            .env("LEGION_WAIT_SECS", "4")
+            .env("LEGION_EXIT_GRACE_SECS", "1")
+            .env("LEGION_ROLLBACK_RETRIES", "4")
+            .env("LEGION_VERIFY_ONLY", "1")
+            .env("LEGION_UPDATE_LOCK", &update_lock)
+            .env("LEGION_SUPERVISOR_LOCK", &sup_lock)
+            .output()
+            .unwrap();
+
+        drop(held_exe);
+
+        let log1 = String::from_utf8_lossy(&out1.stdout);
+        let err1 = String::from_utf8_lossy(&out1.stderr);
+        assert!(
+            !log1.contains("supervisor exception:") && !log1.contains("restore exception:"),
+            "rollback must not throw an unhandled exception when exe is locked:\n{log1}\nstderr:\n{err1}"
+        );
+        assert_eq!(
+            fs::read(&exe_path).unwrap(),
+            b"new-v2-exe",
+            "locked exe must stay intact at v2:\n{log1}\nstderr:\n{err1}"
+        );
+        assert_eq!(
+            fs::read(&dll_path).unwrap(),
+            b"new-v2-dll",
+            "sibling helper.dll must NOT be overwritten when exe is locked (zero half-copy!):\n{log1}\nstderr:\n{err1}"
+        );
+        let rb1_text = fs::read_to_string(&rollback_marker).unwrap_or_else(|e| {
+            panic!("missing rollback marker after locked restore ({e}):\n{log1}\nstderr:\n{err1}")
+        });
+        assert!(
+            rb1_text.contains("new_kept_files_in_use"),
+            "rollback notice must record new_kept_files_in_use: {rb1_text}\nlog:\n{log1}\nstderr:\n{err1}"
+        );
+        assert!(
+            !update_lock.exists(),
+            "update.lock must be released:\n{log1}"
+        );
+        assert!(
+            !sup_lock.exists(),
+            "update-supervisor.lock must be released:\n{log1}"
+        );
+        assert!(
+            !script1.exists(),
+            "supervisor .ps1 script must be cleaned up:\n{log1}"
+        );
+
+        // Part 2: With the file lock released, rollback cleanly restores ALL files (including
+        // nested subdirectories and paths containing wildcard characters like `[1]`) to v1 and
+        // records `restored_previous`.
+        let nested_sub = install_dir.join("res[1]");
+        let backup_nested = backup_dir.join("res[1]");
+        fs::create_dir_all(&nested_sub).unwrap();
+        fs::create_dir_all(&backup_nested).unwrap();
+        fs::write(nested_sub.join("asset.dat"), b"new-v2-asset").unwrap();
+        fs::write(backup_nested.join("asset.dat"), b"old-v1-asset").unwrap();
+
+        fs::copy(sys_root.join("System32").join("where.exe"), &fake_installer).unwrap();
+        let _ = fs::remove_file(&rollback_marker);
+        let script2 = write_windows_supervisor_script(&updates_dir, 1002).unwrap();
+        fs::write(&update_lock, "{}").unwrap();
+
+        let out2 = Command::new(&ps_path)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script2)
+            .env("LEGION_SUPERVISOR_SCRIPT", &script2)
+            .env("LEGION_OLD_PID", dead_pid.to_string())
+            .env("LEGION_INSTALLER", &fake_installer)
+            .env("LEGION_INSTALL_DIR", &install_dir)
+            .env("LEGION_EXE", &exe_path)
+            .env("LEGION_BACKUP_DIR", &backup_dir)
+            .env("LEGION_READY_MARKER", &ready_marker)
+            .env("LEGION_ROLLBACK_FILE", &rollback_marker)
+            .env(
+                "LEGION_ROLLBACK_JSON",
+                r#"{"version":"0.2.0","sequence":2,"reason":"failed","install_state":"restored_previous"}"#,
+            )
+            .env(
+                "LEGION_ROLLBACK_KEPT_NEW_JSON",
+                r#"{"version":"0.2.0","sequence":2,"reason":"failed","install_state":"new_kept_files_in_use"}"#,
+            )
+            .env("LEGION_DEFERRED_FILE", &deferred_marker)
+            .env("LEGION_DEFERRED_JSON", r#"{"sequence":2}"#)
+            .env("LEGION_TARGET_SEQUENCE", "2")
+            .env("LEGION_PRE_SWAP_WAIT_SECS", "2")
+            .env("LEGION_WAIT_SECS", "4")
+            .env("LEGION_EXIT_GRACE_SECS", "1")
+            .env("LEGION_ROLLBACK_RETRIES", "4")
+            .env("LEGION_VERIFY_ONLY", "1")
+            .env("LEGION_UPDATE_LOCK", &update_lock)
+            .env("LEGION_SUPERVISOR_LOCK", &sup_lock)
+            .output()
+            .unwrap();
+
+        let log2 = String::from_utf8_lossy(&out2.stdout);
+        let err2 = String::from_utf8_lossy(&out2.stderr);
+        assert!(
+            !log2.contains("supervisor exception:") && !log2.contains("restore exception:"),
+            "clean rollback must not throw:\n{log2}\nstderr:\n{err2}"
+        );
+        assert_eq!(
+            fs::read(&exe_path).unwrap(),
+            b"old-v1-exe",
+            "unlocked exe must be restored to v1:\n{log2}\nstderr:\n{err2}"
+        );
+        assert_eq!(
+            fs::read(&dll_path).unwrap(),
+            b"old-v1-dll",
+            "sibling helper.dll must be restored to v1:\n{log2}\nstderr:\n{err2}"
+        );
+        assert_eq!(
+            fs::read(nested_sub.join("asset.dat")).unwrap(),
+            b"old-v1-asset",
+            "nested wildcard-named subdir file must be restored to v1:\n{log2}\nstderr:\n{err2}"
+        );
+        let rb2_text = fs::read_to_string(&rollback_marker).unwrap_or_else(|e| {
+            panic!("missing rollback marker after clean restore ({e}):\n{log2}\nstderr:\n{err2}")
+        });
+        assert!(
+            rb2_text.contains("restored_previous"),
+            "rollback notice must record restored_previous: {rb2_text}\nlog:\n{log2}\nstderr:\n{err2}"
+        );
+        assert!(
+            !update_lock.exists(),
+            "update.lock must be released:\n{log2}"
+        );
+        assert!(
+            !sup_lock.exists(),
+            "update-supervisor.lock must be released:\n{log2}"
+        );
+        assert!(
+            !script2.exists(),
+            "supervisor .ps1 script must be cleaned up:\n{log2}"
+        );
     }
 }

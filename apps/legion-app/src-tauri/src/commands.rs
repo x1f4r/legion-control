@@ -7,10 +7,11 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-#[cfg(target_os = "android")]
+#[cfg(not(target_os = "ios"))]
 use tauri::Manager;
 use tauri::State;
 use tauri::ipc::Channel;
@@ -1070,7 +1071,7 @@ pub fn media_check_report(app: tauri::AppHandle, report: MediaCheckReport) -> Re
 #[tauri::command]
 pub fn ready(updater: State<'_, SharedUpdater>) -> Result<(), AppError> {
     if !READY_LOGGED.swap(true, Ordering::SeqCst) {
-        println!("{INTERFACE_READY_MARKER}");
+        let _ = writeln!(std::io::stdout(), "{INTERFACE_READY_MARKER}");
         let _ = std::io::stdout().flush();
         #[cfg(target_os = "android")]
         log::info!(target: "legion-app", "{INTERFACE_READY_MARKER}");
@@ -1142,15 +1143,92 @@ pub async fn update_check(
         .await
 }
 
+/// Returns `true` when any user-started native call, device transfer (`queued`, `running`, or
+/// `cancelling`), content stream, or tracked external operation (such as camera scanning) is
+/// currently active. Passive background refreshes (`sys.info`, `sys.procs`, etc.) are excluded so
+/// they do not block updates; installs instead drain them briefly between ticks.
+pub(crate) fn has_active_native_work(
+    backend: &dyn Backend,
+    transfers: &crate::transfers::TransferManager,
+    content: &crate::content::AppContentServer,
+    updater: &crate::updater::UpdateManager,
+) -> bool {
+    backend.active_operations() > 0
+        || transfers.has_active_work()
+        || content.active_streams() > 0
+        || updater.external_operations_count() > 0
+}
+
+/// Evaluates the native automatic-install gate and waits briefly for any in-flight passive
+/// background refreshes to complete so an automatic install runs cleanly between poll ticks
+/// without cutting off a refresh mid-call.
+///
+/// Returns `true` only when the gate permits installation, all in-flight background refreshes
+/// finished within `refresh_timeout`, and no user-started work (or first-screen paint for
+/// `"startup"`) started while waiting.
+pub(crate) async fn evaluate_and_quiesce_auto_install(
+    updater: &crate::updater::UpdateManager,
+    backend: &dyn Backend,
+    transfers: &crate::transfers::TransferManager,
+    content: &crate::content::AppContentServer,
+    trigger_kind: &str,
+    refresh_timeout: Duration,
+) -> bool {
+    let active_ops = backend
+        .active_operations()
+        .saturating_add(usize::from(transfers.has_active_work()))
+        .saturating_add(content.active_streams());
+    if updater
+        .evaluate_auto_install_gate(trigger_kind, active_ops, true)
+        .is_err()
+    {
+        return false;
+    }
+    if !backend.wait_for_background_refreshes(refresh_timeout).await {
+        return false;
+    }
+    if has_active_native_work(backend, transfers, content, updater) {
+        return false;
+    }
+    if trigger_kind == "startup" && updater.is_first_screen_shown() {
+        return false;
+    }
+    true
+}
+
 /// Downloads (if needed), re-verifies, and installs the available app update.
+///
+/// Checks native activity (user-started calls, device transfers including `cancelling`, content
+/// streams, and external operations) before replacing the app: on desktop, shows the same native
+/// confirmation prompt as quitting with active transfers unless `confirm_interrupt == Some(true)`;
+/// on Android, returns [`ErrorCode::Conflict`] so the interface can confirm before retrying with
+/// `confirm_interrupt = true`. Waits briefly for any in-flight passive background refresh to finish
+/// cleanly before restarting.
 #[tauri::command]
 pub async fn update_install(
     app: tauri::AppHandle,
     backend: State<'_, SharedBackend>,
+    content: State<'_, SharedContentServer>,
+    transfers: State<'_, SharedTransfers>,
     updater: State<'_, SharedUpdater>,
+    confirm_interrupt: Option<bool>,
 ) -> Result<UpdateState, AppError> {
+    let confirmed = confirm_interrupt.unwrap_or(false);
+    let busy = has_active_native_work(backend.0.as_ref(), &transfers.0, &content.0, &updater.0);
+
     #[cfg(target_os = "android")]
     {
+        if busy && !confirmed {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "Legion is still transferring files or running a command.",
+            )
+            .with_hint("Confirm to interrupt active work and install the update."));
+        }
+        let _ = backend
+            .0
+            .wait_for_background_refreshes(crate::BACKGROUND_REFRESH_DRAIN_TIMEOUT)
+            .await;
         let android_updater = app.state::<AndroidUpdaterHandle>();
         updater
             .0
@@ -1159,7 +1237,7 @@ pub async fn update_install(
     }
     #[cfg(target_os = "ios")]
     {
-        let _ = (app, backend, updater);
+        let _ = (app, backend, updater, busy, confirmed);
         Err(AppError::new(
             ErrorCode::Unsupported,
             "Updates on iOS are delivered through TestFlight or the App Store.",
@@ -1167,11 +1245,28 @@ pub async fn update_install(
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
+        if busy && !confirmed {
+            let allow = tokio::task::spawn_blocking(
+                crate::transfers::desktop::confirm_update_with_active_work,
+            )
+            .await
+            .unwrap_or(false);
+            if !allow {
+                return Ok(updater.0.snapshot());
+            }
+        }
+        let _ = backend
+            .0
+            .wait_for_background_refreshes(crate::BACKGROUND_REFRESH_DRAIN_TIMEOUT)
+            .await;
         let (st, should_exit) = updater.0.install_desktop(backend.0.as_ref(), false).await?;
         if should_exit {
+            let win = app.get_webview_window("main");
+            crate::notify_hidden_and_reset_desktop_player(&app, win.as_ref());
             let handle = app.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                tauri_plugin_single_instance::destroy(&handle);
                 handle.exit(0);
             });
         }
@@ -1201,19 +1296,23 @@ pub fn update_dismiss_notice(updater: State<'_, SharedUpdater>) -> Result<Update
 pub async fn update_maybe_auto_install(
     app: tauri::AppHandle,
     backend: State<'_, SharedBackend>,
+    content: State<'_, SharedContentServer>,
+    transfers: State<'_, SharedTransfers>,
     updater: State<'_, SharedUpdater>,
     trigger: Option<String>,
 ) -> Result<UpdateState, AppError> {
-    let current = updater.0.snapshot();
-    let ready_or_checking_downloaded = current.phase == "ready"
-        || (current.phase == "checking"
-            && current.available.as_ref().is_some_and(|a| a.downloaded));
-    if !current.auto_update || !ready_or_checking_downloaded || !current.can_self_install {
-        return Ok(current);
-    }
     let trigger_kind = trigger.as_deref().unwrap_or("startup");
-    if !matches!(trigger_kind, "startup" | "background") {
-        return Ok(current);
+    if !evaluate_and_quiesce_auto_install(
+        &updater.0,
+        backend.0.as_ref(),
+        &transfers.0,
+        &content.0,
+        trigger_kind,
+        crate::BACKGROUND_REFRESH_DRAIN_TIMEOUT,
+    )
+    .await
+    {
+        return Ok(updater.0.snapshot());
     }
     #[cfg(target_os = "android")]
     {
@@ -1227,20 +1326,23 @@ pub async fn update_maybe_auto_install(
     #[cfg(target_os = "ios")]
     {
         let _ = (app, backend);
-        Ok(current)
+        Ok(updater.0.snapshot())
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         // On desktop, window-close installs run via `WindowEvent::CloseRequested`; the frontend
-        // auto-install trigger applies only at startup before user interaction.
+        // auto-install trigger applies only at startup before the first full screen renders.
         if trigger_kind != "startup" {
-            return Ok(current);
+            return Ok(updater.0.snapshot());
         }
         let (st, should_exit) = updater.0.install_desktop(backend.0.as_ref(), true).await?;
         if should_exit {
+            let win = app.get_webview_window("main");
+            crate::notify_hidden_and_reset_desktop_player(&app, win.as_ref());
             let handle = app.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                tauri_plugin_single_instance::destroy(&handle);
                 handle.exit(0);
             });
         }
@@ -1309,8 +1411,13 @@ pub fn default_device_name() -> String {
 /// Camera permission is checked and requested only when this command is called.
 #[cfg(target_os = "android")]
 #[tauri::command]
-pub async fn scan_invite(scanner: State<'_, ScannerHandle>) -> Result<ScanInviteResult, AppError> {
+pub async fn scan_invite(
+    scanner: State<'_, ScannerHandle>,
+    updater: State<'_, SharedUpdater>,
+) -> Result<ScanInviteResult, AppError> {
     use serde_json::json;
+
+    let _scan_guard = updater.0.track_external_operation();
 
     #[derive(Deserialize)]
     struct PermissionResponse {
@@ -1441,6 +1548,82 @@ mod tests {
         assert_eq!(plugin_json["formats"], serde_json::json!(["QR_CODE"]));
         assert_eq!(plugin_json["camera_direction"], "back");
         assert_eq!(plugin_json["windowed"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn manual_update_detects_active_native_work() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::AppStore::in_dir(dir.path());
+        let backend: Arc<dyn Backend> =
+            Arc::new(crate::link_backend::LinkBackend::from_store(store));
+        let content = crate::content::AppContentServer::new(Arc::clone(&backend));
+
+        struct NoopPlatform;
+        impl crate::transfers::TransferPlatform for NoopPlatform {
+            fn pick_upload_files(
+                &self,
+            ) -> crate::backend::BoxFuture<
+                '_,
+                Result<Vec<crate::transfers::PickedUploadFile>, AppError>,
+            > {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn finalize_download<'a>(
+                &'a self,
+                _id: &'a str,
+                _part_path: &'a Path,
+                file_name: &'a str,
+                _mime: Option<&'a str>,
+                _open_after_done: bool,
+            ) -> crate::backend::BoxFuture<'a, Result<String, AppError>> {
+                let name = file_name.to_owned();
+                Box::pin(async move { Ok(name) })
+            }
+            fn open_local_file<'a>(
+                &'a self,
+                _local_path: &'a str,
+                _mime: Option<&'a str>,
+            ) -> crate::backend::BoxFuture<'a, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn show_in_folder<'a>(
+                &'a self,
+                _local_path: &'a str,
+            ) -> crate::backend::BoxFuture<'a, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let transfers = crate::transfers::TransferManager::load_or_new(
+            dir.path(),
+            Arc::clone(&backend),
+            Arc::new(NoopPlatform),
+        );
+        let updater = crate::updater::UpdateManager::with_config(
+            dir.path().join("updates"),
+            legion_update::TrustAnchors::compiled_in(),
+            crate::updater::current_os(),
+            crate::updater::current_arch(),
+            crate::updater::PlatformEnv::detect(),
+            "0.1.0".to_owned(),
+            "test".to_owned(),
+            202611250200,
+        );
+
+        assert!(!has_active_native_work(
+            backend.as_ref(),
+            &transfers,
+            &content,
+            &updater
+        ));
+        let _guard = updater.track_external_operation();
+        assert!(has_active_native_work(
+            backend.as_ref(),
+            &transfers,
+            &content,
+            &updater
+        ));
         Ok(())
     }
 

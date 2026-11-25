@@ -34,6 +34,15 @@ pub const RELEASE_PUBLIC_KEY: [u8; 32] = [
 
 include!(concat!(env!("OUT_DIR"), "/preview_key.rs"));
 
+static PREVIEW_KEY_MARKER_BYTES: &[u8] = PREVIEW_KEY_MARKER_STR.as_bytes();
+
+/// NUL-terminated static marker compiled into binaries indicating whether a preview update signing
+/// key was compiled in (`LEGION_UPDATE_PREVIEW_KEY=none\0` for official release/CI builds, or
+/// `LEGION_UPDATE_PREVIEW_KEY=SHA256:<fingerprint>\0` when `LEGION_PREVIEW_UPDATE_KEY` was set).
+pub fn compiled_preview_key_marker() -> &'static [u8] {
+    PREVIEW_KEY_MARKER_BYTES
+}
+
 /// Which compiled-in key signed an update set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
