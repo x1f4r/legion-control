@@ -143,6 +143,16 @@ test('legion-app.yml covers every platform with timeouts, credential-free checko
   // artifact uploads must reference exact paths from build outputs rather than installer globs.
   assert.match(appJobs.get('android').join('\n'), /rm -rf src-tauri\/gen\/android\/app\/build\/outputs\/apk/);
   assert.match(appJobs.get('linux-desktop').join('\n'), /rm -rf src-tauri\/target\/release\/bundle/);
+  assert.match(
+    appJobs.get('linux-desktop').join('\n'),
+    /scripts\/build-linux-app-bundles\.sh/,
+    'legion-app.yml:linux-desktop must build Linux bundles against the ubuntu:22.04 glibc baseline',
+  );
+  assert.match(
+    appJobs.get('linux-desktop').join('\n'),
+    /scripts\/legion-app-distro-test\.sh/,
+    'legion-app.yml:linux-desktop must install-verify the built .deb and AppImage across Debian and Ubuntu containers',
+  );
   assert.match(appJobs.get('ios').join('\n'), /rm -rf src-tauri\/gen\/apple\/build/);
   assert.match(appJobs.get('macos-desktop').join('\n'), /rm -rf src-tauri\/target\/release\/bundle/);
   assert.match(
