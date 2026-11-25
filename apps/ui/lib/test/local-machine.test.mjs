@@ -10,6 +10,7 @@ import {
   migrateLocalMachineStorage,
   normalizeFavouritesMachine,
 } from '../local-machine.js';
+import { createResumeStore, RESUME_STORAGE_KEY } from '../player.js';
 import { createThumbCache, thumbCacheKey } from '../thumb-cache.js';
 
 function memoryStorage(initial = {}) {
@@ -271,4 +272,56 @@ test('createThumbQueue finds migrated local and pending thumbnails under the res
     'data:image/png;base64,TUVN',
   );
   q2.dispose();
+});
+
+test('migrateLocalMachineStorage migrates player resume store positions from local and This computer to the node name', () => {
+  // Minimal storage shim (getItem/setItem/removeItem only) verifies explicit RESUME_STORAGE_KEY migration.
+  const map = new Map();
+  const storage = {
+    getItem(k) {
+      return map.has(k) ? map.get(k) : null;
+    },
+    setItem(k, v) {
+      map.set(k, String(v));
+    },
+    removeItem(k) {
+      map.delete(k);
+    },
+  };
+
+  const store = createResumeStore(storage);
+  const localFilm = { machine: 'local', path: '/home/me/Videos/Film.mp4', size: 120_000, mtime: '2026-11-20T10:00:00Z' };
+  const pendingAlbum = {
+    machine: 'This computer',
+    path: '/home/me/Music/LiveSet.flac',
+    size: 80_000,
+    mtime: '2026-11-21T12:00:00Z',
+  };
+  const bothLocal = { machine: 'local', path: '/home/me/Videos/Both.mp4', size: 50_000, mtime: '2026-11-22T08:00:00Z' };
+  const bothNative = { ...bothLocal, machine: 'studio' };
+  const remoteFilm = { machine: 'tower', path: '/home/me/Videos/Film.mp4', size: 120_000, mtime: '2026-11-20T10:00:00Z' };
+
+  assert.equal(store.save(localFilm, 412, 1800, 100), true);
+  assert.equal(store.save(pendingAlbum, 725, 2400, 200), true);
+  assert.equal(store.save(bothLocal, 95, 1800, 300), true);
+  assert.equal(store.save(bothNative, 840, 1800, 400), true);
+  assert.equal(store.save(remoteFilm, 310, 1800, 500), true);
+
+  const first = migrateLocalMachineStorage('studio', { localStorage: storage });
+  assert.equal(first.migrated, true);
+  assert.ok(first.keys.includes(RESUME_STORAGE_KEY));
+
+  // Fresh store instance finds every migrated position under 'studio' and leaves 'local' / 'This computer' gone.
+  const after = createResumeStore(storage);
+  assert.equal(after.load(localFilm, 1800), null);
+  assert.equal(after.load({ ...localFilm, machine: 'studio' }, 1800), 412);
+  assert.equal(after.load(pendingAlbum, 2400), null);
+  assert.equal(after.load({ ...pendingAlbum, machine: 'studio' }, 2400), 725);
+  assert.equal(after.load(bothNative, 1800), 840);
+  assert.equal(after.load(bothLocal, 1800), null);
+  assert.equal(after.load(remoteFilm, 1800), 310);
+
+  // Idempotent on second run.
+  const second = migrateLocalMachineStorage('studio', { localStorage: storage });
+  assert.equal(second.migrated, false);
 });

@@ -9,6 +9,7 @@
 pub mod atomic;
 pub mod capped_alloc;
 pub mod detach;
+pub mod display_awake;
 mod error;
 pub mod file_id;
 pub mod fs_kind;
@@ -21,6 +22,7 @@ pub mod procid;
 pub mod run;
 pub mod shell;
 pub mod user;
+pub mod webview2;
 #[cfg(windows)]
 mod win_proc;
 

@@ -3,7 +3,7 @@
 // on content addresses, text (128 KiB + load more), extensionless text probing, and in-place
 // "Open in another app" staging with progress, cancel, and honest errors.
 
-import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
+import { html, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
 import { plainErrorMessage } from '../lib/errors.js';
 import {
@@ -20,7 +20,9 @@ import {
 } from '../lib/files.js';
 import { readTextWrapPreference, writeTextWrapPreference } from '../lib/files-store.js';
 import { formatBytePair, formatBytes, formatRelativeTime } from '../lib/format.js';
+import { createFullscreenController, formatSpeed, PLAYBACK_SPEEDS, queueNeighbors } from '../lib/player.js';
 import { CopyButton, Notice, Sheet } from './common.js';
+import { MusicPlayer, VideoPlayer } from './player.js';
 
 const TEXT_CHUNK_BYTES = 131072; // 128 KiB
 const MEDIA_RECOVERY_WINDOW_MS = 10_000;
@@ -135,6 +137,8 @@ export function FilesViewer({
   link,
   capsStore = null,
   caps,
+  thumbCache = null,
+  onRegisterPopState = null,
   deviceNoun = 'phone',
   technical = false,
   isStarred = false,
@@ -162,6 +166,13 @@ export function FilesViewer({
 
   const [chromeHidden, setChromeHidden] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [musicPlaybackRate, setMusicPlaybackRate] = useState(1);
+  const [fullscreenState, setFullscreenState] = useState({
+    active: false,
+    source: null,
+    pushedHistory: false,
+    inFlight: false,
+  });
   const [wrapLines, setWrapLines] = useState(() => readTextWrapPreference(safeStorage()));
   const [retryNonce, setRetryNonce] = useState(0);
   const [binaryTsVideo, setBinaryTsVideo] = useState(() => ({ key: fileKey, active: false }));
@@ -230,9 +241,24 @@ export function FilesViewer({
   const activeHash = hashInfo.key === fileKey ? hashInfo.value : null;
   const activeOpen = openState.key === fileKey ? openState : makeIdleOpenState(fileKey);
 
+  const viewerRef = useRef(null);
   const imgRef = useRef(null);
   const videoRef = useRef(null);
   const audioRef = useRef(null);
+  const musicAutoPlayRef = useRef(null);
+  const fullscreenController = useMemo(
+    () =>
+      createFullscreenController({
+        link,
+        getElement: () => viewerRef.current,
+        getVideo: () => videoRef.current,
+        onChange: (next) => setFullscreenState(next),
+      }),
+    [link],
+  );
+  if (typeof window !== 'undefined' && window.location.hash) {
+    fullscreenController.noteViewerHash(window.location.hash);
+  }
   const abortRef = useRef(null);
   const noticeTimerRef = useRef(null);
   const activeFileKeyRef = useRef(fileKey);
@@ -247,6 +273,7 @@ export function FilesViewer({
   const playbackRef = useRef({ key: fileKey, time: 0, wantPlay: false });
   const pendingResumeRef = useRef(null);
   const recoveryRef = useRef({ key: fileKey, lastAttemptAt: 0, inFlight: false });
+  const windowHiddenPauseRef = useRef(null);
   const prevHasContentRef = useRef(hasContentUrl);
 
   // Gesture state for picture zoom/pan/swipe.
@@ -349,15 +376,188 @@ export function FilesViewer({
     }
   }
 
-  function handleClose() {
+  async function handleClose() {
     if (abortRef.current) {
       abortRef.current.abort();
       abortRef.current = null;
     }
     stopMediaElements();
     revokeActiveMintedUrl();
+    if (fullscreenController.getState().active) {
+      await fullscreenController.leave();
+    }
+    link?.keepScreenOn?.(false);
     if (onClose) onClose();
   }
+
+  const effectiveChromeHidden =
+    category === 'image' &&
+    chromeHidden &&
+    activeOpen.status === 'idle' &&
+    !(viewerNotice && viewerNotice.key === fileKey);
+
+  // Register the single viewer-level fullscreen controller for history Back handling.
+  useEffect(() => {
+    if (typeof onRegisterPopState === 'function') {
+      return onRegisterPopState(() => fullscreenController.handlePopState());
+    }
+    const onPopState = () => {
+      fullscreenController.handlePopState();
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [fullscreenController, onRegisterPopState]);
+
+  // Picture viewer: hidden viewer bars and hidden system bars are one state owned by the controller.
+  useEffect(() => {
+    if (category === 'image' && effectiveChromeHidden) {
+      fullscreenController.enter('picture', { orientation: 'none' });
+    } else if (fullscreenController.getState().source === 'picture') {
+      fullscreenController.leave();
+    }
+  }, [category, effectiveChromeHidden, fullscreenController]);
+
+  // If the platform leaves immersive while a picture is hiding its bars, restore the viewer bars.
+  useEffect(() => {
+    let prevSource = null;
+    if (fullscreenState.source === 'picture' && fullscreenState.active) {
+      prevSource = 'picture';
+    }
+    return () => {
+      if (prevSource === 'picture' && !fullscreenController.getState().active) {
+        setChromeHidden(false);
+      }
+    };
+  }, [fullscreenState.active, fullscreenState.source, fullscreenController]);
+
+  useEffect(() => {
+    return () => {
+      fullscreenController.dispose();
+      link?.keepScreenOn?.(false);
+    };
+  }, [fullscreenController, link]);
+
+  // When a desktop window hides (e.g. closing while background transfers drain) or closes,
+  // pause active media right where it is and leave full screen so reopening shows it paused.
+  // If the loopback content listener tears down the stream while hidden, stay paused and
+  // resumable and mint one fresh URL when the person presses play again.
+  useEffect(() => {
+    if (typeof link?.onWindowHidden !== 'function') return undefined;
+    return link.onWindowHidden(() => {
+      playbackRef.current.wantPlay = false;
+      if (pendingResumeRef.current) {
+        pendingResumeRef.current = { ...pendingResumeRef.current, play: false };
+      }
+      musicAutoPlayRef.current = null;
+      let savedTime =
+        playbackRef.current.key === activeFileKeyRef.current ? playbackRef.current.time : 0;
+      for (const ref of [videoRef, audioRef]) {
+        const el = ref.current;
+        if (el) {
+          if (typeof el.currentTime === 'number' && Number.isFinite(el.currentTime) && el.currentTime > 0) {
+            savedTime = el.currentTime;
+          }
+          if (!el.paused) {
+            try {
+              el.pause();
+            } catch {
+              // Ignore pause errors on unready elements.
+            }
+          }
+        }
+      }
+      if (activeMediaUrlRef.current && !isLocalMediaUrl(activeMediaUrlRef.current)) {
+        windowHiddenPauseRef.current = {
+          key: activeFileKeyRef.current,
+          url: activeMediaUrlRef.current,
+          time: savedTime,
+          teardownDetected: false,
+          refreshInFlight: false,
+        };
+      }
+      if (fullscreenController.getState().active) {
+        fullscreenController.leave();
+      }
+      fullscreenController.clearPlatformExitGuard?.();
+      setChromeHidden(false);
+      link?.keepScreenOn?.(false);
+    });
+  }, [link, fullscreenController]);
+
+  // Modal focus isolation: mark background shell siblings outside `.viewer` inert while open,
+  // keep Tab focus cycling strictly inside `.viewer` when no sheet scrim is on top, and return
+  // focus to the element that opened the viewer once closed.
+  useLayoutEffect(() => {
+    const viewerEl = viewerRef.current;
+    if (!viewerEl) return undefined;
+    const openerEl =
+      document.activeElement &&
+      document.activeElement !== document.body &&
+      document.activeElement !== document.documentElement &&
+      typeof document.activeElement.focus === 'function' &&
+      !viewerEl.contains(document.activeElement)
+        ? document.activeElement
+        : null;
+    const saved = [];
+    let node = viewerEl;
+    while (node && node.parentElement) {
+      const parent = node.parentElement;
+      for (const sibling of Array.from(parent.children)) {
+        if (sibling === node) continue;
+        if (sibling.classList?.contains('scrim') || sibling.querySelector?.('.scrim')) continue;
+        saved.push([sibling, Boolean(sibling.inert)]);
+        sibling.inert = true;
+      }
+      if (parent.classList?.contains('app')) break;
+      node = parent;
+    }
+    if (document.activeElement && !viewerEl.contains(document.activeElement)) {
+      try {
+        viewerEl.focus({ preventScroll: true });
+      } catch {
+        // Ignore focus failures.
+      }
+    }
+
+    function onModalTab(e) {
+      if (e.key !== 'Tab' || e.defaultPrevented) return;
+      if (document.querySelector('.scrim')) return;
+      const focusables = Array.from(
+        viewerEl.querySelectorAll('button:not([disabled]), a[href], [role="slider"], [tabindex="0"]'),
+      ).filter((el) => !el.closest('[inert]') && el.offsetParent !== null);
+      if (focusables.length === 0) return;
+      const active = document.activeElement;
+      if (!viewerEl.contains(active) || active === viewerEl) {
+        e.preventDefault();
+        (e.shiftKey ? focusables[focusables.length - 1] : focusables[0]).focus();
+      } else if (!e.shiftKey && active === focusables[focusables.length - 1]) {
+        e.preventDefault();
+        focusables[0].focus();
+      } else if (e.shiftKey && active === focusables[0]) {
+        e.preventDefault();
+        focusables[focusables.length - 1].focus();
+      }
+    }
+
+    window.addEventListener('keydown', onModalTab);
+    return () => {
+      window.removeEventListener('keydown', onModalTab);
+      for (const [el, prev] of saved) {
+        try {
+          el.inert = prev;
+        } catch {
+          // Ignore detached nodes.
+        }
+      }
+      if (openerEl && openerEl.isConnected && !openerEl.closest?.('[inert]')) {
+        try {
+          openerEl.focus({ preventScroll: true });
+        } catch {
+          // Ignore focus restoration errors.
+        }
+      }
+    };
+  }, []);
 
   function syncOpenStateFromTransfers(list) {
     if (!Array.isArray(list)) return;
@@ -678,6 +878,7 @@ export function FilesViewer({
     playbackRef.current = { key: targetKey, time: 0, wantPlay: false };
     pendingResumeRef.current = null;
     recoveryRef.current = { key: targetKey, lastAttemptAt: 0, inFlight: false };
+    windowHiddenPauseRef.current = null;
     setMediaState({
       key: targetKey,
       url: null,
@@ -975,13 +1176,53 @@ export function FilesViewer({
     capsStore,
   ]);
 
-  // Keyboard navigation inside viewer: Escape closes, Left/Right steps through pictures.
-  useEffect(() => {
+  const useVideoPlayer = category === 'video' && !skipMediaPlayer && !mediaError;
+  const useMusicPlayer = category === 'audio' && !skipMediaPlayer && !mediaError;
+  const usingCustomPlayer = useVideoPlayer || useMusicPlayer;
+  const isViewerFullscreen = Boolean(
+    fullscreenState.active && (fullscreenState.source === 'button' || fullscreenState.source === 'rotation'),
+  );
+  const mediaQueue = useMemo(
+    () => (category === 'video' || category === 'audio' ? queueNeighbors(siblings, path, category) : null),
+    [siblings, path, category],
+  );
+
+  // Keyboard navigation inside viewer when the custom video/music player isn't mounted (pictures,
+  // text, and unplayable/error screens): Escape exits full screen first then closes, F leaves
+  // full screen, N/P step through video/audio queues so an unplayable file never strands the queue,
+  // and Left/Right step through pictures.
+  useLayoutEffect(() => {
+    if (usingCustomPlayer) return undefined;
     function onKeyDown(e) {
       if (moreOpen || document.querySelector('.scrim')) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const target = e.target;
+      if (
+        target &&
+        typeof target === 'object' &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
       if (e.key === 'Escape') {
         e.preventDefault();
-        handleClose();
+        if (isViewerFullscreen) {
+          fullscreenController.leave();
+        } else if (!fullscreenController.recentlyExitedFromPlatform?.()) {
+          handleClose();
+        }
+      } else if ((e.key === 'f' || e.key === 'F') && isViewerFullscreen) {
+        e.preventDefault();
+        fullscreenController.leave();
+      } else if ((e.key === 'n' || e.key === 'N') && mediaQueue?.next && onNavigateSibling) {
+        e.preventDefault();
+        onNavigateSibling(mediaQueue.next);
+      } else if ((e.key === 'p' || e.key === 'P') && mediaQueue?.prev && onNavigateSibling) {
+        e.preventDefault();
+        onNavigateSibling(mediaQueue.prev);
       } else if (category === 'image' && e.key === 'ArrowRight' && siblingIndex >= 0 && siblingIndex + 1 < pictureSiblings.length) {
         e.preventDefault();
         if (onNavigateSibling) onNavigateSibling(pictureSiblings[siblingIndex + 1]);
@@ -992,7 +1233,17 @@ export function FilesViewer({
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [moreOpen, category, siblingIndex, pictureSiblings.length]);
+  }, [
+    usingCustomPlayer,
+    moreOpen,
+    isViewerFullscreen,
+    fullscreenController,
+    mediaQueue,
+    onNavigateSibling,
+    category,
+    siblingIndex,
+    pictureSiblings.length,
+  ]);
 
   // Load BLAKE3 hash when details sheet opens in technical mode.
   useEffect(() => {
@@ -1085,7 +1336,7 @@ export function FilesViewer({
 
   function applyPendingResume(expectedKey, expectedUrl, el) {
     const resume = pendingResumeRef.current;
-    if (!resume || resume.key !== expectedKey || resume.url !== expectedUrl || !el) return;
+    if (!resume || resume.key !== expectedKey || resume.url !== expectedUrl || !el) return false;
     pendingResumeRef.current = null;
     const duration = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : null;
     const targetTime =
@@ -1106,6 +1357,7 @@ export function FilesViewer({
       const p = el.play();
       if (p && typeof p.catch === 'function') p.catch(() => {});
     }
+    return true;
   }
 
   async function inspectFailedMediaUrl(kind, expectedUrl, el, signal) {
@@ -1215,10 +1467,127 @@ export function FilesViewer({
     }
   }
 
-  async function handleMediaElementError(kind, expectedKey, expectedUrl, el) {
-    if (activeFileKeyRef.current !== expectedKey || activeMediaUrlRef.current !== expectedUrl) {
-      return;
+  function handleBeforeResumePlay(kind, expectedKey, expectedUrl, el) {
+    const hidden = windowHiddenPauseRef.current;
+    if (!hidden || hidden.key !== expectedKey || hidden.url !== expectedUrl) {
+      return false;
     }
+    if (hidden.refreshInFlight) return true;
+
+    const brokenAfterHide =
+      hidden.teardownDetected || Boolean(el?.error) || el?.networkState === 3;
+    const canRefresh = Boolean(
+      !isLocalMediaUrl(expectedUrl) &&
+        caps?.hasContentUrl &&
+        typeof link?.contentUrl === 'function',
+    );
+    const savedTime =
+      el && typeof el.currentTime === 'number' && Number.isFinite(el.currentTime) && el.currentTime > 0
+        ? el.currentTime
+        : hidden.time > 0
+          ? hidden.time
+          : playbackRef.current.key === expectedKey
+            ? playbackRef.current.time
+            : 0;
+    if (!brokenAfterHide || !canRefresh) {
+      windowHiddenPauseRef.current = null;
+      playbackRef.current = { key: expectedKey, time: savedTime, wantPlay: true };
+      return false;
+    }
+
+    hidden.refreshInFlight = true;
+
+    const signal = abortRef.current?.signal;
+    recoveryRef.current = { key: expectedKey, lastAttemptAt: Date.now(), inFlight: true };
+    link
+      .contentUrl({ machine, path, signal })
+      .then((res) => {
+        if (windowHiddenPauseRef.current === hidden) {
+          windowHiddenPauseRef.current = null;
+        }
+        if (signal?.aborted || activeFileKeyRef.current !== expectedKey) {
+          if (res?.url) revokeContentUrlNow(res.url);
+          return;
+        }
+        recoveryRef.current.inFlight = false;
+        if (!res?.url) {
+          revokeContentUrlNow(expectedUrl);
+          setMediaState({
+            key: expectedKey,
+            url: null,
+            loading: false,
+            error: { code: 'unreachable', message: '' },
+            isFreshAddress: false,
+            isMachinePreview: false,
+          });
+          return;
+        }
+        if (expectedUrl && expectedUrl !== res.url) {
+          revokeContentUrlNow(expectedUrl);
+        }
+        mintedUrlRef.current = res.url;
+        pendingResumeRef.current = {
+          key: expectedKey,
+          url: res.url,
+          time: savedTime,
+          play: true,
+        };
+        setMediaState({
+          key: expectedKey,
+          url: res.url,
+          loading: false,
+          error: null,
+          isFreshAddress: true,
+          isMachinePreview: false,
+        });
+      })
+      .catch((err) => {
+        if (windowHiddenPauseRef.current === hidden) {
+          windowHiddenPauseRef.current = null;
+        }
+        if (err?.code === 'cancelled' || signal?.aborted || activeFileKeyRef.current !== expectedKey) {
+          return;
+        }
+        recoveryRef.current.inFlight = false;
+        revokeContentUrlNow(expectedUrl);
+        setMediaState({
+          key: expectedKey,
+          url: null,
+          loading: false,
+          error: classifyMintError(err),
+          isFreshAddress: false,
+          isMachinePreview: false,
+        });
+      });
+    return true;
+  }
+
+  function handleMediaElementError(kind, expectedKey, expectedUrl, el) {
+    if (activeFileKeyRef.current !== expectedKey || activeMediaUrlRef.current !== expectedUrl) {
+      return false;
+    }
+
+    const hidden = windowHiddenPauseRef.current;
+    if (
+      kind !== 'image' &&
+      hidden &&
+      hidden.key === expectedKey &&
+      hidden.url === expectedUrl
+    ) {
+      // Loopback stream aborted while paused for a hidden desktop window: keep the element
+      // paused and resumable without retrying the dead URL until the person presses play again.
+      hidden.teardownDetected = true;
+      if (el && typeof el.currentTime === 'number' && Number.isFinite(el.currentTime) && el.currentTime > 0) {
+        hidden.time = el.currentTime;
+      }
+      return true;
+    }
+
+    void handleMediaElementErrorAsync(kind, expectedKey, expectedUrl, el);
+    return false;
+  }
+
+  async function handleMediaElementErrorAsync(kind, expectedKey, expectedUrl, el) {
 
     const now = Date.now();
     const rec = recoveryRef.current;
@@ -1839,28 +2208,7 @@ export function FilesViewer({
       if (!mediaUrl) {
         return html`<div class="said"><span>${mediaLoading ? 'Starting video…' : 'Preparing video…'}</span></div>`;
       }
-      const expectedKey = fileKey;
-      const expectedUrl = mediaUrl;
-      return html`
-        <video
-          key=${expectedKey}
-          ref=${videoRef}
-          class="viewer-video"
-          src=${expectedUrl}
-          controls
-          playsinline
-          preload="metadata"
-          aria-label=${name}
-          onLoadedMetadata=${(e) => applyPendingResume(expectedKey, expectedUrl, e.currentTarget)}
-          onTimeUpdate=${(e) => noteMediaTime(expectedKey, e.currentTarget)}
-          onSeeked=${(e) => noteMediaTime(expectedKey, e.currentTarget)}
-          onPlay=${(e) => noteMediaPlay(expectedKey, e.currentTarget)}
-          onPlaying=${(e) => noteMediaPlay(expectedKey, e.currentTarget)}
-          onPause=${(e) => noteMediaPause(expectedKey, e.currentTarget)}
-          onEnded=${(e) => noteMediaPause(expectedKey, e.currentTarget)}
-          onError=${(e) => handleMediaElementError('video', expectedKey, expectedUrl, e.currentTarget)}
-        />
-      `;
+      return null;
     }
 
     if (category === 'audio') {
@@ -1897,32 +2245,7 @@ export function FilesViewer({
       if (!mediaUrl) {
         return html`<div class="said"><span>${mediaLoading ? 'Starting audio…' : 'Preparing audio…'}</span></div>`;
       }
-      const expectedKey = fileKey;
-      const expectedUrl = mediaUrl;
-      return html`
-        <div class="viewer-audio">
-          <div class="viewer-audio-art" aria-hidden="true">
-            <${Icon} name="music" />
-          </div>
-          <strong>${name}</strong>
-          <audio
-            key=${expectedKey}
-            ref=${audioRef}
-            src=${expectedUrl}
-            controls
-            preload="metadata"
-            aria-label=${name}
-            onLoadedMetadata=${(e) => applyPendingResume(expectedKey, expectedUrl, e.currentTarget)}
-            onTimeUpdate=${(e) => noteMediaTime(expectedKey, e.currentTarget)}
-            onSeeked=${(e) => noteMediaTime(expectedKey, e.currentTarget)}
-            onPlay=${(e) => noteMediaPlay(expectedKey, e.currentTarget)}
-            onPlaying=${(e) => noteMediaPlay(expectedKey, e.currentTarget)}
-            onPause=${(e) => noteMediaPause(expectedKey, e.currentTarget)}
-            onEnded=${(e) => noteMediaPause(expectedKey, e.currentTarget)}
-            onError=${(e) => handleMediaElementError('audio', expectedKey, expectedUrl, e.currentTarget)}
-          />
-        </div>
-      `;
+      return null;
     }
 
     if (category === 'text' || isExtensionlessProbe) {
@@ -2115,84 +2438,209 @@ export function FilesViewer({
     return null;
   }
 
-  const effectiveChromeHidden =
-    chromeHidden && activeOpen.status === 'idle' && !(viewerNotice && viewerNotice.key === fileKey);
-  const viewerCls = ['viewer', effectiveChromeHidden ? 'chrome-hidden' : ''].filter(Boolean).join(' ');
+  const viewerCls = [
+    'viewer',
+    usingCustomPlayer ? 'player-viewer' : '',
+    effectiveChromeHidden && !usingCustomPlayer ? 'chrome-hidden' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
   const stageCls = isShowingText ? 'viewer-stage scrollable' : 'viewer-stage';
   const openBusy = activeOpen.status === 'starting' || activeOpen.status === 'downloading';
+  const expectedKey = fileKey;
+  const expectedUrl = mediaUrl;
+  const openBanner = renderOpenBanner();
+
+  async function runOutsideFullscreen(fn) {
+    setMoreOpen(false);
+    if (fullscreenController.getState().active) {
+      await fullscreenController.leave();
+    }
+    if (fn) fn();
+  }
 
   return html`
-    <div class=${viewerCls} role="dialog" aria-modal="true" aria-label=${name}>
-      <div class="viewer-top">
-        <button type="button" class="btn icon" aria-label="Close" onClick=${handleClose}>
-          <${Icon} name="down" />
-        </button>
-        <span class="name">
-          ${name}
-          ${topSub ? html`<small>${topSub}</small>` : null}
-        </span>
-        <button
-          type="button"
-          class="btn icon"
-          aria-label="More options"
-          onClick=${() => setMoreOpen(true)}
-        >
-          <${Icon} name="more" />
-        </button>
-      </div>
-
-      <div
-        class=${stageCls}
-        onPointerDown=${onStagePointerDown}
-        onPointerMove=${onStagePointerMove}
-        onPointerUp=${onStagePointerUp}
-        onPointerCancel=${onStagePointerCancel}
-      >
-        ${renderStage()}
-      </div>
-
-      <div class="viewer-bar">
-        ${renderOpenBanner()}
-        <div class="bar4">
-          ${caps?.hasDownload
-            ? html`
-                <button type="button" onClick=${handleDownloadClick}>
-                  <${Icon} name="download" />Download
-                </button>
-              `
-            : null}
-          ${caps?.hasTransfer || caps?.hasDownload
-            ? html`
-                <button type="button" onClick=${() => onSendTo && onSendTo([effectiveEntry])}>
-                  <${Icon} name="send" />Send to
-                </button>
-              `
-            : null}
-          ${caps?.hasFavWrite
-            ? html`
+    <div ref=${viewerRef} class=${viewerCls} role="dialog" aria-modal="true" aria-label=${name} tabIndex="-1">
+      ${useVideoPlayer
+        ? html`
+            <${VideoPlayer}
+              machine=${machine}
+              path=${path}
+              entry=${effectiveEntry}
+              name=${name}
+              mediaUrl=${expectedUrl}
+              mediaLoading=${mediaLoading || !expectedUrl}
+              mediaRef=${videoRef}
+              siblings=${siblings}
+              link=${link}
+              viewerRef=${viewerRef}
+              fullscreenController=${fullscreenController}
+              fullscreenState=${fullscreenState}
+              moreOpen=${moreOpen}
+              onOpenMore=${() => setMoreOpen(true)}
+              onClose=${handleClose}
+              onNavigateSibling=${onNavigateSibling}
+              onMediaLoadedMetadata=${(el) => applyPendingResume(expectedKey, expectedUrl, el)}
+              onMediaTime=${(el) => noteMediaTime(expectedKey, el)}
+              onMediaPlay=${(el) => noteMediaPlay(expectedKey, el)}
+              onMediaPause=${(el) => noteMediaPause(expectedKey, el)}
+              onBeforePlay=${(el) =>
+                expectedUrl ? handleBeforeResumePlay('video', expectedKey, expectedUrl, el) : false}
+              onMediaError=${(el) =>
+                expectedUrl ? handleMediaElementError('video', expectedKey, expectedUrl, el) : false}
+            />
+            ${openBanner ? html`<div class="player-open-banner-wrap">${openBanner}</div>` : null}
+          `
+        : useMusicPlayer
+          ? html`
+              <${MusicPlayer}
+                machine=${machine}
+                path=${path}
+                entry=${effectiveEntry}
+                name=${name}
+                mediaUrl=${expectedUrl}
+                mediaLoading=${mediaLoading || !expectedUrl}
+                mediaRef=${audioRef}
+                autoPlayNextRef=${musicAutoPlayRef}
+                siblings=${siblings}
+                link=${link}
+                capsStore=${capsStore}
+                caps=${caps}
+                thumbCache=${thumbCache}
+                moreOpen=${moreOpen}
+                playbackRate=${musicPlaybackRate}
+                onOpenMore=${() => setMoreOpen(true)}
+                onClose=${handleClose}
+                onNavigateSibling=${onNavigateSibling}
+                onMediaLoadedMetadata=${(el) => applyPendingResume(expectedKey, expectedUrl, el)}
+                onMediaTime=${(el) => noteMediaTime(expectedKey, el)}
+                onMediaPlay=${(el) => noteMediaPlay(expectedKey, el)}
+                onMediaPause=${(el) => noteMediaPause(expectedKey, el)}
+                onBeforePlay=${(el) =>
+                  expectedUrl ? handleBeforeResumePlay('audio', expectedKey, expectedUrl, el) : false}
+                onMediaError=${(el) =>
+                  expectedUrl ? handleMediaElementError('audio', expectedKey, expectedUrl, el) : false}
+              />
+              ${openBanner ? html`<div class="player-open-banner-wrap">${openBanner}</div>` : null}
+            `
+          : html`
+              <div class="viewer-top">
                 <button
                   type="button"
-                  class=${isStarred ? 'active' : ''}
-                  aria-pressed=${isStarred ? 'true' : 'false'}
-                  onClick=${() => onToggleStar && onToggleStar(effectiveEntry)}
+                  class="btn icon"
+                  aria-label=${fullscreenState.active && fullscreenState.source === 'button' ? 'Back' : 'Close'}
+                  onClick=${() => {
+                    if (fullscreenState.active && fullscreenState.source === 'button') {
+                      fullscreenController.leave();
+                    } else {
+                      handleClose();
+                    }
+                  }}
                 >
-                  <${Icon} name="star" />${isStarred ? 'Starred' : 'Star'}
+                  <${Icon} name=${fullscreenState.active && fullscreenState.source === 'button' ? 'back' : 'down'} />
                 </button>
-              `
-            : null}
-          ${allowExternalOpen
-            ? html`
-                <button type="button" disabled=${openBusy} onClick=${handleOpenExternally}>
-                  <${Icon} name="more" />Open in…
+                <span class="name">
+                  ${name}
+                  ${topSub ? html`<small>${topSub}</small>` : null}
+                </span>
+                ${isViewerFullscreen
+                  ? html`
+                      <button
+                        type="button"
+                        class="btn icon"
+                        aria-label="Exit full screen"
+                        onClick=${() => fullscreenController.leave()}
+                      >
+                        <${Icon} name="fullscreen-exit" />
+                      </button>
+                    `
+                  : null}
+                <button
+                  type="button"
+                  class="btn icon"
+                  aria-label="More options"
+                  onClick=${() => setMoreOpen(true)}
+                >
+                  <${Icon} name="more" />
                 </button>
-              `
-            : null}
-        </div>
-      </div>
+              </div>
+
+              <div
+                class=${stageCls}
+                onPointerDown=${onStagePointerDown}
+                onPointerMove=${onStagePointerMove}
+                onPointerUp=${onStagePointerUp}
+                onPointerCancel=${onStagePointerCancel}
+              >
+                ${renderStage()}
+              </div>
+
+              <div class="viewer-bar">
+                ${openBanner}
+                <div class="bar4">
+                  ${caps?.hasDownload
+                    ? html`
+                        <button type="button" onClick=${handleDownloadClick}>
+                          <${Icon} name="download" />Download
+                        </button>
+                      `
+                    : null}
+                  ${caps?.hasTransfer || caps?.hasDownload
+                    ? html`
+                        <button
+                          type="button"
+                          onClick=${() => runOutsideFullscreen(() => onSendTo && onSendTo([effectiveEntry]))}
+                        >
+                          <${Icon} name="send" />Send to
+                        </button>
+                      `
+                    : null}
+                  ${caps?.hasFavWrite
+                    ? html`
+                        <button
+                          type="button"
+                          class=${isStarred ? 'active' : ''}
+                          aria-pressed=${isStarred ? 'true' : 'false'}
+                          onClick=${() => onToggleStar && onToggleStar(effectiveEntry)}
+                        >
+                          <${Icon} name="star" />${isStarred ? 'Starred' : 'Star'}
+                        </button>
+                      `
+                    : null}
+                  ${allowExternalOpen
+                    ? html`
+                        <button type="button" disabled=${openBusy} onClick=${handleOpenExternally}>
+                          <${Icon} name="more" />Open in…
+                        </button>
+                      `
+                    : null}
+                </div>
+              </div>
+            `}
 
       ${moreOpen
         ? html`
             <${Sheet} title=${name} onClose=${() => setMoreOpen(false)}>
+              ${useMusicPlayer
+                ? html`
+                    <p class="label">Playback speed</p>
+                    <div class="music-speed-chips" role="group" aria-label="Playback speed">
+                      ${PLAYBACK_SPEEDS.map(
+                        (rate) => html`
+                          <button
+                            key=${rate}
+                            type="button"
+                            class="chip-btn"
+                            aria-pressed=${rate === musicPlaybackRate ? 'true' : 'false'}
+                            onClick=${() => setMusicPlaybackRate(rate)}
+                          >
+                            ${formatSpeed(rate)}
+                          </button>
+                        `,
+                      )}
+                    </div>
+                  `
+                : null}
               <div class="list">
                 <dl class=${technical ? 'kv' : 'kv plain'}>
                   <dt>${technical ? 'category' : 'Kind'}</dt>
@@ -2231,6 +2679,56 @@ export function FilesViewer({
               </div>
 
               <div class="list spaced">
+                ${usingCustomPlayer && caps?.hasDownload
+                  ? html`
+                      <button
+                        type="button"
+                        class="row"
+                        onClick=${() => {
+                          setMoreOpen(false);
+                          handleDownloadClick();
+                        }}
+                      >
+                        <span class="body"><span class="title">Download to this ${deviceNoun}</span></span>
+                      </button>
+                    `
+                  : null}
+                ${usingCustomPlayer && (caps?.hasTransfer || caps?.hasDownload)
+                  ? html`
+                      <button
+                        type="button"
+                        class="row"
+                        onClick=${() => runOutsideFullscreen(() => onSendTo && onSendTo([effectiveEntry]))}
+                      >
+                        <span class="body"><span class="title">Send to</span></span>
+                      </button>
+                    `
+                  : null}
+                ${usingCustomPlayer && caps?.hasFavWrite
+                  ? html`
+                      <button
+                        type="button"
+                        class="row"
+                        onClick=${() => {
+                          setMoreOpen(false);
+                          if (onToggleStar) onToggleStar(effectiveEntry);
+                        }}
+                      >
+                        <span class="body"><span class="title">${isStarred ? 'Remove from Favourites' : 'Star'}</span></span>
+                      </button>
+                    `
+                  : null}
+                ${usingCustomPlayer && allowExternalOpen && !openBusy
+                  ? html`
+                      <button
+                        type="button"
+                        class="row"
+                        onClick=${() => runOutsideFullscreen(() => handleOpenExternally())}
+                      >
+                        <span class="body"><span class="title">Open in another app</span></span>
+                      </button>
+                    `
+                  : null}
                 ${caps?.hasFavWrite
                   ? html`
                       <button
@@ -2255,10 +2753,7 @@ export function FilesViewer({
                       <button
                         type="button"
                         class="row"
-                        onClick=${() => {
-                          setMoreOpen(false);
-                          onRename(effectiveEntry);
-                        }}
+                        onClick=${() => runOutsideFullscreen(() => onRename(effectiveEntry))}
                       >
                         <span class="body"><span class="title">Rename</span></span>
                       </button>
@@ -2269,10 +2764,7 @@ export function FilesViewer({
                       <button
                         type="button"
                         class="row"
-                        onClick=${() => {
-                          setMoreOpen(false);
-                          onDelete([effectiveEntry]);
-                        }}
+                        onClick=${() => runOutsideFullscreen(() => onDelete([effectiveEntry]))}
                       >
                         <span class="body"><span class="title" style="color:var(--bad)">Delete</span></span>
                       </button>

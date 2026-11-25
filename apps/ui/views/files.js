@@ -286,9 +286,14 @@ function useBatchedThumbs({
           const p = item.target?.dataset?.thumbPath;
           if (!p) continue;
           const entry = entryMapRef.current.get(p);
-          if (entry) requestPath(entry);
-          obs.unobserve(item.target);
-          observedElsRef.current.delete(item.target);
+          if (entry && isThumbEligible(entry, { allowAudio })) {
+            requestPath(entry);
+            obs.unobserve(item.target);
+            observedElsRef.current.delete(item.target);
+          } else if (!entry || entryCategory(entry) !== 'audio') {
+            obs.unobserve(item.target);
+            observedElsRef.current.delete(item.target);
+          }
         }
       },
       { rootMargin: '200px 0px' },
@@ -2505,6 +2510,7 @@ export function FilesView({
   capsStore = null,
   folderChanges = null,
   onRegisterRefresh = null,
+  onRegisterPopState = null,
   nodeInfo,
   tools,
   allowedSet,
@@ -3458,6 +3464,8 @@ export function FilesView({
               link=${link}
               caps=${viewerCaps}
               capsStore=${capsStore}
+              thumbCache=${thumbCache}
+              onRegisterPopState=${onRegisterPopState}
               deviceNoun=${deviceNoun}
               technical=${technical}
               isStarred=${Boolean(viewerFav)}

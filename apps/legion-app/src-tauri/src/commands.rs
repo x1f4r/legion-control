@@ -5,13 +5,13 @@ use std::fs;
 use std::io::Write;
 #[cfg(debug_assertions)]
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-#[cfg(target_os = "android")]
+#[cfg(not(target_os = "ios"))]
 use tauri::Manager;
 use tauri::State;
 use tauri::ipc::Channel;
@@ -111,6 +111,364 @@ pub enum ScanInviteResult {
 
 /// Shared backend state registered with Tauri.
 pub struct SharedBackend(pub Arc<dyn Backend>);
+
+/// Native desktop event emitted to the web view when the window manager exits full screen
+/// outside Legion's own `window_set_immersive(false)` call.
+pub const EVENT_IMMERSIVE_CHANGED: &str = "legion://immersive-changed";
+
+/// Native desktop event emitted to the web view when the main window is hidden (for example while
+/// background transfers drain) or closed, so active playback pauses where it is and leaves full
+/// screen.
+pub const EVENT_WINDOW_HIDDEN: &str = "legion://window-hidden";
+
+/// Tracks whether Legion entered desktop full screen so leaving only undoes what Legion did.
+///
+/// If the window was already full screen when immersive started, entering changes nothing and
+/// leaving changes nothing. If the window leaves full screen by any other hand, immersive follows
+/// and never forces full screen back on.
+///
+/// On Linux, `tao`'s `window.is_fullscreen()` only caches Legion's own `set_fullscreen` calls and
+/// misses window-manager toggles (Hyprland, GNOME, etc.). `observed_window_fullscreen` tracks the
+/// real GTK `window-state-event` (`GDK_WINDOW_STATE_FULLSCREEN`) bit as the source of truth.
+#[derive(Default)]
+pub struct DesktopImmersiveState {
+    inner: Mutex<DesktopImmersiveInner>,
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+struct DesktopImmersiveInner {
+    active: bool,
+    entered_by_legion: bool,
+    observed_window_fullscreen: Option<bool>,
+}
+
+impl DesktopImmersiveState {
+    /// Transitions into immersive mode. Returns `true` only when the window was not already full
+    /// screen and Legion should request full screen on the window.
+    pub fn enter(&self, currently_fullscreen: bool) -> bool {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !guard.active {
+            guard.active = true;
+            guard.entered_by_legion = !currently_fullscreen;
+        }
+        !currently_fullscreen
+    }
+
+    /// Leaves immersive mode. Returns `true` only when Legion was the one that entered full
+    /// screen and should now call `set_fullscreen(false)`. Never requests `set_fullscreen(true)`.
+    pub fn leave(&self) -> bool {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let should_exit = guard.active && guard.entered_by_legion;
+        guard.active = false;
+        guard.entered_by_legion = false;
+        should_exit
+    }
+
+    /// Reconciles with the window's observed full-screen state after an external window-manager
+    /// transition. Returns `true` if immersive mode was active and just ended externally.
+    pub fn sync_external_fullscreen(&self, window_fullscreen: bool) -> bool {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.observed_window_fullscreen = Some(window_fullscreen);
+        if guard.active && !window_fullscreen {
+            guard.active = false;
+            guard.entered_by_legion = false;
+            return true;
+        }
+        false
+    }
+
+    /// Seeds the observed native window full-screen state if no state event has been recorded yet.
+    pub fn set_initial_observed_fullscreen(&self, is_fullscreen: bool) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.observed_window_fullscreen.is_none() {
+            guard.observed_window_fullscreen = Some(is_fullscreen);
+        }
+    }
+
+    /// Records a GTK `window-state-event` update (`is_fullscreen` from `new_window_state`,
+    /// `fullscreen_changed` from `changed_mask`). Returns `true` if immersive mode was active and
+    /// the window manager just took the window out of full screen.
+    pub fn record_window_state_fullscreen(
+        &self,
+        is_fullscreen: bool,
+        fullscreen_changed: bool,
+    ) -> bool {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if fullscreen_changed {
+            guard.observed_window_fullscreen = Some(is_fullscreen);
+            if guard.active && !is_fullscreen {
+                guard.active = false;
+                guard.entered_by_legion = false;
+                return true;
+            }
+        } else if guard.observed_window_fullscreen.is_none() || !guard.active {
+            guard.observed_window_fullscreen = Some(is_fullscreen);
+        }
+        false
+    }
+
+    /// Returns the last observed native window full-screen bit, if known.
+    pub fn observed_fullscreen(&self) -> Option<bool> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.observed_window_fullscreen
+    }
+
+    /// Returns whether immersive mode is currently active.
+    pub fn is_active(&self) -> bool {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.active
+    }
+}
+
+/// Reads the real OS/window-manager full-screen state of the main desktop window.
+///
+/// On Linux this reads the GTK `window-state-event` state tracked in [`DesktopImmersiveState`]
+/// rather than `tao`'s cached `window.is_fullscreen()`, which ignores window-manager toggles.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn read_desktop_fullscreen(
+    window: &tauri::WebviewWindow,
+    state: &DesktopImmersiveState,
+) -> Result<bool, AppError> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = window;
+        Ok(state.observed_fullscreen().unwrap_or(false))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = state;
+        window.is_fullscreen().map_err(|err| {
+            AppError::new(
+                ErrorCode::Failed,
+                format!("Could not read window full-screen state: {err}"),
+            )
+        })
+    }
+}
+
+/// Result returned by [`window_set_immersive`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImmersiveResult {
+    /// Whether immersive mode is active after this call.
+    pub active: bool,
+    /// Whether the window is full screen after this call.
+    pub fullscreen: bool,
+}
+
+/// Result returned on mobile targets where desktop window full-screen is a no-op; a no-op must
+/// never claim `active: true`.
+pub fn mobile_noop_immersive_result() -> ImmersiveResult {
+    ImmersiveResult {
+        active: false,
+        fullscreen: false,
+    }
+}
+
+pub use crate::keep_screen_on::DesktopKeepScreenOn;
+
+/// Resets desktop immersive state when the page reloads, crashes, or the window closes/hides.
+/// Only exits full screen if Legion itself entered it.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn reset_desktop_immersive(
+    window: Option<&tauri::WebviewWindow>,
+    state: &DesktopImmersiveState,
+) {
+    if state.leave()
+        && let Some(win) = window
+    {
+        let _ = win.set_fullscreen(false);
+    }
+}
+
+/// Enters or leaves immersive mode on the main desktop window. Legion only undoes what Legion
+/// did: if the window was already full screen, entering and leaving change nothing.
+#[tauri::command]
+pub fn window_set_immersive(
+    window: tauri::WebviewWindow,
+    state: State<'_, DesktopImmersiveState>,
+    on: bool,
+) -> Result<ImmersiveResult, AppError> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        if on {
+            let currently_fullscreen = read_desktop_fullscreen(&window, &state)?;
+            let should_request = state.enter(currently_fullscreen);
+            if should_request {
+                window.set_fullscreen(true).map_err(|err| {
+                    AppError::new(
+                        ErrorCode::Failed,
+                        format!("Could not enter full screen: {err}"),
+                    )
+                })?;
+            }
+            let fullscreen = if should_request {
+                #[cfg(target_os = "linux")]
+                {
+                    true
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    window.is_fullscreen().unwrap_or(true)
+                }
+            } else {
+                currently_fullscreen
+            };
+            Ok(ImmersiveResult {
+                active: true,
+                fullscreen,
+            })
+        } else {
+            let should_exit = state.leave();
+            if should_exit {
+                window.set_fullscreen(false).map_err(|err| {
+                    AppError::new(
+                        ErrorCode::Failed,
+                        format!("Could not leave full screen: {err}"),
+                    )
+                })?;
+            }
+            let fullscreen = if should_exit {
+                #[cfg(target_os = "linux")]
+                {
+                    false
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    window.is_fullscreen().unwrap_or(false)
+                }
+            } else {
+                read_desktop_fullscreen(&window, &state).unwrap_or(false)
+            };
+            Ok(ImmersiveResult {
+                active: false,
+                fullscreen,
+            })
+        }
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = (window, state, on);
+        Ok(mobile_noop_immersive_result())
+    }
+}
+
+/// Reports whether the main desktop window is currently full screen.
+#[tauri::command]
+pub fn window_is_fullscreen(
+    window: tauri::WebviewWindow,
+    state: State<'_, DesktopImmersiveState>,
+) -> Result<bool, AppError> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        read_desktop_fullscreen(&window, &state)
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = (window, state);
+        Ok(false)
+    }
+}
+
+/// Enables or releases the desktop keep-screen-on hold during video playback, returning whether a
+/// real OS screen-awake hold is active afterward.
+#[tauri::command]
+pub fn set_keep_screen_on(
+    keep: State<'_, DesktopKeepScreenOn>,
+    on: bool,
+) -> Result<bool, AppError> {
+    Ok(keep.set(on))
+}
+
+/// Debug/test-only helper to flip the main desktop window's real OS/WM full-screen state directly
+/// (on Linux via the underlying GTK window rather than `tao::Window::set_fullscreen`, so `tao`'s
+/// internal cache stays untouched just like a window-manager key press). Compiled ONLY in debug
+/// builds.
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub fn debug_set_window_fullscreen(
+    window: tauri::WebviewWindow,
+    state: State<'_, DesktopImmersiveState>,
+    fullscreen: bool,
+) -> Result<bool, AppError> {
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::GtkWindowExt;
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let win_for_main = window.clone();
+        window
+            .run_on_main_thread(move || {
+                let res = win_for_main.gtk_window().map(|gtk_win| {
+                    if fullscreen {
+                        gtk_win.fullscreen();
+                    } else {
+                        gtk_win.unfullscreen();
+                    }
+                });
+                let _ = tx.send(res);
+            })
+            .map_err(|err| {
+                AppError::new(
+                    ErrorCode::Failed,
+                    format!("Could not schedule GTK full-screen change: {err}"),
+                )
+            })?;
+        rx.recv()
+            .map_err(|_| {
+                AppError::new(
+                    ErrorCode::Failed,
+                    "GTK main thread closed before applying full-screen change.",
+                )
+            })?
+            .map_err(|err| {
+                AppError::new(
+                    ErrorCode::Failed,
+                    format!("Could not set GTK window full screen: {err}"),
+                )
+            })?;
+        Ok(read_desktop_fullscreen(&window, &state).unwrap_or(fullscreen))
+    }
+    #[cfg(all(
+        not(target_os = "linux"),
+        not(any(target_os = "android", target_os = "ios"))
+    ))]
+    {
+        let _ = state;
+        window.set_fullscreen(fullscreen).map_err(|err| {
+            AppError::new(
+                ErrorCode::Failed,
+                format!("Could not set window full screen: {err}"),
+            )
+        })?;
+        Ok(window.is_fullscreen().unwrap_or(fullscreen))
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = (window, state);
+        Ok(fullscreen)
+    }
+}
 
 /// Managed handle to the mobile barcode scanner plugin on Android.
 #[cfg(target_os = "android")]
@@ -508,6 +866,9 @@ pub struct MediaCheckSpec {
     /// Optional flag asking the page to also re-verify media decode after an iOS resume event.
     #[serde(default)]
     pub verify_resume: bool,
+    /// Optional flag asking the page to verify desktop window immersive full-screen transitions.
+    #[serde(default)]
+    pub verify_immersive: bool,
     /// Optional host path where [`media_check_report`] writes the JSON result. Never read from JS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out_file: Option<String>,
@@ -538,6 +899,9 @@ pub struct PublicMediaCheckSpec {
     /// Whether to also wait for an app resume and re-verify media loading.
     #[serde(default)]
     pub verify_resume: bool,
+    /// Whether to verify desktop window immersive full-screen transitions.
+    #[serde(default)]
+    pub verify_immersive: bool,
 }
 
 /// Decoded media verification report submitted by the web view after loading content URLs.
@@ -572,6 +936,9 @@ pub struct MediaCheckReport {
     /// Result of post-resume loopback media reload check when requested (iOS).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_ok: Option<bool>,
+    /// Result of desktop window immersive full-screen transition check when requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub immersive_check: Option<Value>,
     /// Lifecycle trigger that fired the post-resume media check (e.g. `tauri://resumed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_trigger: Option<String>,
@@ -639,6 +1006,7 @@ pub fn media_check_spec(app: tauri::AppHandle) -> Result<Option<PublicMediaCheck
         html_path: spec.html_path,
         svg_path: spec.svg_path,
         verify_resume: spec.verify_resume,
+        verify_immersive: spec.verify_immersive,
     }))
 }
 
@@ -927,6 +1295,8 @@ pub async fn update_install(
             .await;
         let (st, should_exit) = updater.0.install_desktop(backend.0.as_ref(), false).await?;
         if should_exit {
+            let win = app.get_webview_window("main");
+            crate::notify_hidden_and_reset_desktop_player(&app, win.as_ref());
             let handle = app.clone();
             let transfers = Arc::clone(&transfers.0);
             let content = Arc::clone(&content.0);
@@ -1015,6 +1385,8 @@ pub async fn update_maybe_auto_install(
         }
         let (st, should_exit) = updater.0.install_desktop(backend.0.as_ref(), true).await?;
         if should_exit {
+            let win = app.get_webview_window("main");
+            crate::notify_hidden_and_reset_desktop_player(&app, win.as_ref());
             let handle = app.clone();
             let transfers = Arc::clone(&transfers.0);
             let content = Arc::clone(&content.0);
@@ -1331,5 +1703,95 @@ mod tests {
             .ok_or("expected label cap error")?;
         assert_eq!(err.code, ErrorCode::InvalidArgs);
         Ok(())
+    }
+
+    #[test]
+    fn desktop_immersive_only_undoes_what_legion_did_and_never_forces_fullscreen_back() {
+        let state = DesktopImmersiveState::default();
+        assert!(!state.is_active());
+        assert!(!state.leave());
+
+        // Normal window -> enter requests fullscreen -> leave exits fullscreen.
+        assert!(state.enter(false));
+        assert!(state.is_active());
+        // Repeated enter while already active does not overwrite entered_by_legion.
+        assert!(!state.enter(true));
+        assert!(state.leave());
+        assert!(!state.is_active());
+        assert!(!state.leave());
+
+        // Window already full screen -> entering changes nothing, leaving changes nothing.
+        assert!(!state.enter(true));
+        assert!(state.is_active());
+        assert!(!state.leave());
+        assert!(!state.is_active());
+
+        // Window already full screen -> user leaves full screen through WM -> controller follows
+        // and never forces full screen back on.
+        assert!(!state.enter(true));
+        assert!(state.is_active());
+        assert!(state.sync_external_fullscreen(false));
+        assert!(!state.is_active());
+        assert!(!state.leave());
+
+        // Windowed -> Legion entered full screen -> user leaves full screen through WM ->
+        // controller follows and leaving afterward changes nothing.
+        assert!(state.enter(false));
+        assert!(state.is_active());
+        assert!(state.sync_external_fullscreen(false));
+        assert!(!state.is_active());
+        assert!(!state.leave());
+    }
+
+    #[test]
+    fn mobile_noop_immersive_always_reports_inactive() {
+        let res = mobile_noop_immersive_result();
+        assert!(!res.active);
+        assert!(!res.fullscreen);
+    }
+
+    #[test]
+    fn linux_window_state_events_track_wm_fullscreen_and_external_exit() {
+        let state = DesktopImmersiveState::default();
+        assert_eq!(state.observed_fullscreen(), None);
+        state.set_initial_observed_fullscreen(false);
+        assert_eq!(state.observed_fullscreen(), Some(false));
+
+        // Sequence A: WM makes the window full screen (without Legion calling set_fullscreen),
+        // then player enters and exits full screen -> Legion neither enters nor leaves WM full screen.
+        assert!(!state.record_window_state_fullscreen(true, true));
+        assert_eq!(state.observed_fullscreen(), Some(true));
+        assert!(!state.enter(state.observed_fullscreen().unwrap_or(false)));
+        assert!(state.is_active());
+        assert!(!state.leave());
+        assert!(!state.is_active());
+        assert_eq!(state.observed_fullscreen(), Some(true));
+
+        // WM leaves full screen while player is inactive -> observed state clears, no external exit signal.
+        assert!(!state.record_window_state_fullscreen(false, true));
+        assert_eq!(state.observed_fullscreen(), Some(false));
+
+        // Sequence B: Player enters full screen -> an unrelated GTK state event (changed_fs=false)
+        // before WM acknowledges fullscreen does NOT cancel immersive -> WM applies fullscreen ->
+        // WM exits fullscreen (changed_fs=true, is_fs=false) -> clears active and signals exit!
+        assert!(state.enter(state.observed_fullscreen().unwrap_or(false)));
+        assert!(state.is_active());
+        assert!(!state.record_window_state_fullscreen(false, false));
+        assert!(state.is_active());
+        assert!(!state.record_window_state_fullscreen(true, true));
+        assert_eq!(state.observed_fullscreen(), Some(true));
+        assert!(state.is_active());
+        assert!(state.record_window_state_fullscreen(false, true));
+        assert!(!state.is_active());
+        assert_eq!(state.observed_fullscreen(), Some(false));
+        assert!(!state.leave());
+
+        // WM entered full screen -> player enters -> WM exits while player active -> signals exit.
+        assert!(!state.record_window_state_fullscreen(true, true));
+        assert!(!state.enter(state.observed_fullscreen().unwrap_or(false)));
+        assert!(state.is_active());
+        assert!(state.record_window_state_fullscreen(false, true));
+        assert!(!state.is_active());
+        assert_eq!(state.observed_fullscreen(), Some(false));
     }
 }
