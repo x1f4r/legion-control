@@ -2534,3 +2534,210 @@ test('real legion serve renders real fs.thumb thumbnails in grid, list, pinned s
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('delayed capability replies still render thumbnails in pinned strip, folder listing, and viewer', async () => {
+  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+  const root = makeWorkRoot();
+  const towerHome = path.join(root, 'tower-legion');
+  const towerUser = path.join(root, 'tower-user');
+  const piHome = path.join(root, 'pi-legion');
+  const piUser = path.join(root, 'pi-user');
+  const legacyHome = path.join(root, 'legacy-legion');
+  const legacyUser = path.join(root, 'legacy-user');
+
+  const samplePng = fs.readFileSync(path.join(REPO_ROOT, 'apps', 'ui', 'icons', 'icon-512.png'));
+
+  for (const [home, user] of [
+    [towerHome, towerUser],
+    [piHome, piUser],
+    [legacyHome, legacyUser],
+  ]) {
+    fs.mkdirSync(path.join(home, 'config'), { recursive: true });
+    fs.mkdirSync(path.join(home, 'state'), { recursive: true });
+    fs.mkdirSync(user, { recursive: true });
+  }
+
+  const piGallery = path.join(piUser, 'gallery');
+  fs.mkdirSync(piGallery, { recursive: true });
+  const piAmberPath = path.join(piGallery, 'pi-amber.png');
+  const piVioletPath = path.join(piGallery, 'pi-violet.png');
+  fs.writeFileSync(piAmberPath, makeSolidPng(160, 120, 225, 165, 35));
+  fs.writeFileSync(piVioletPath, makeSolidPng(160, 120, 125, 70, 200));
+
+  const legacyMedia = path.join(legacyUser, 'media');
+  fs.mkdirSync(legacyMedia, { recursive: true });
+  const legacyIconPath = path.join(legacyMedia, 'icon.png');
+  fs.writeFileSync(legacyIconPath, samplePng);
+
+  const policy = [
+    'default = "owner"',
+    '',
+    '[principals.ui]',
+    'role = "operator"',
+    '',
+    '[roles.operator]',
+    'allow = ["effect:read", "effect:write"]',
+    '',
+  ].join('\n');
+
+  for (const [name, home] of [
+    ['tower', towerHome],
+    ['pi', piHome],
+    ['legacy', legacyHome],
+  ]) {
+    fs.writeFileSync(path.join(home, 'config', 'node.toml'), `name = "${name}"\nsystem = "linux"\nbusy = "none"\n`);
+    fs.writeFileSync(path.join(home, 'config', 'policy.toml'), policy);
+  }
+
+  const piCmd = [process.execPath, path.join(TEST_DIR, 'rpc-helper.mjs'), LEGION_BIN, piHome, piUser, 'rpc'];
+  const legacyCmd = [process.execPath, path.join(TEST_DIR, 'legacy-node-helper.mjs'), LEGION_BIN, legacyHome, legacyUser, 'rpc'];
+  fs.writeFileSync(
+    path.join(towerHome, 'config', 'fleet.toml'),
+    [
+      '[machines.tower]',
+      'ssh = "tower.example"',
+      '',
+      '[machines.pi]',
+      `command = ${JSON.stringify(piCmd)}`,
+      '',
+      '[machines.legacy]',
+      `command = ${JSON.stringify(legacyCmd)}`,
+      '',
+    ].join('\n'),
+  );
+
+  // Pin a picture that lives on `pi` so Files home renders the tile via tower's fav.list while
+  // pi's own capabilities are still held back.
+  runLegion(['fav.add', 'machine=pi', `path=${piAmberPath}`, 'pinned=true', '--json'], towerHome, towerUser);
+  const tokenOut = JSON.parse(runLegion(['token.add', 'name=ui', 'principal=ui', '--json'], towerHome, towerUser));
+
+  const server = await startServer(towerHome, towerUser);
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
+    const page = await ctx.newPage();
+    const cdp = await ctx.newCDPSession(page);
+    await cdp.send('Emulation.setCPUThrottlingRate', { rate: 4 });
+
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    function makeGate() {
+      let release;
+      let arrivedResolve;
+      const promise = new Promise((r) => {
+        release = r;
+      });
+      const arrived = new Promise((r) => {
+        arrivedResolve = r;
+      });
+      let held = true;
+      return {
+        isHeld: () => held,
+        waitArrived: () => arrived,
+        markArrived: () => arrivedResolve(),
+        waitRelease: () => promise,
+        release() {
+          held = false;
+          release();
+        },
+      };
+    }
+
+    let piCapsGate = makeGate();
+    let legacyCapsGate = makeGate();
+
+    await page.route('**/v1/call', async (route) => {
+      let body = null;
+      try {
+        body = JSON.parse(route.request().postData() || '{}');
+      } catch {
+        body = null;
+      }
+      const isCapProbe = body && (body.tool === 'meta.whoami' || body.tool === 'meta.version');
+      if (isCapProbe && body.on === 'pi' && piCapsGate.isHeld()) {
+        piCapsGate.markArrived();
+        await piCapsGate.waitRelease();
+      } else if (isCapProbe && body.on === 'legacy' && legacyCapsGate.isHeld()) {
+        legacyCapsGate.markArrived();
+        await legacyCapsGate.waitRelease();
+      }
+      await route.continue();
+    });
+
+    // 1. Pinned strip renders while pi's capability reply is still held back.
+    await page.goto(`${server.url}/#token=${encodeURIComponent(tokenOut.token)}`, { waitUntil: 'domcontentloaded' });
+    await page.getByText('3 are on').waitFor({ timeout: 15_000 });
+    await page.locator('nav.nav a', { hasText: 'Files' }).click();
+    await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
+
+    const pinnedTile = page.locator('.tiles a.tile', { hasText: 'pi-amber.png' });
+    await pinnedTile.waitFor({ timeout: 10_000 });
+    await piCapsGate.waitArrived();
+    assert.equal(await pinnedTile.locator('img').count(), 0, 'Pinned tile should show icon while pi caps are held');
+    piCapsGate.release();
+    await waitForLoadedThumb(pinnedTile, 'delayed-caps pinned pi-amber.png');
+
+    // 2. Folder listing mounts while pi's capability reply is held back on a fresh reload.
+    piCapsGate = makeGate();
+    await page.goto(`${server.url}/#/files/pi/${encodeURIComponent(piGallery).replace(/%2F/g, '/')}`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.locator('header.top h1', { hasText: 'gallery' }).waitFor({ timeout: 10_000 });
+    await piCapsGate.waitArrived();
+    assert.equal(await page.locator('.grid a.cell img').count(), 0, 'Listing should wait until pi caps arrive');
+    piCapsGate.release();
+    for (const name of ['pi-amber.png', 'pi-violet.png']) {
+      const cell = page.locator(`.grid a.cell[aria-label="${name}"]`);
+      await cell.waitFor({ timeout: 10_000 });
+      await waitForLoadedThumb(cell, `delayed-caps listing ${name}`);
+    }
+
+    // 3. Viewer renders while legacy's capability reply is held back; releasing loads the fs.thumb preview.
+    legacyCapsGate = makeGate();
+    await page.goto(
+      `${server.url}/#/files/legacy/${encodeURIComponent(legacyMedia).replace(/%2F/g, '/')}?view=${encodeURIComponent(legacyIconPath)}`,
+      { waitUntil: 'domcontentloaded' },
+    );
+    await page.locator('.viewer').waitFor({ timeout: 10_000 });
+    await legacyCapsGate.waitArrived();
+    assert.equal(await page.locator('.viewer img.viewer-img').count(), 0, 'Viewer should wait until legacy caps arrive');
+    legacyCapsGate.release();
+    const viewerImg = page.locator('.viewer img.viewer-img');
+    await viewerImg.waitFor({ timeout: 10_000 });
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector('.viewer img.viewer-img');
+        return Boolean(el && el.complete && el.naturalWidth === 512 && el.naturalHeight === 512);
+      },
+      null,
+      { timeout: 10_000 },
+    );
+    const viewerSrc = await viewerImg.getAttribute('src');
+    assert.ok(
+      viewerSrc && viewerSrc.startsWith('data:image/'),
+      `Expected data:image/ fs.thumb preview after delayed caps, got ${String(viewerSrc).slice(0, 40)}`,
+    );
+
+    const unexpectedConsole = consoleErrors.filter((msg) => !msg.includes('status of 501'));
+    assert.deepEqual(unexpectedConsole, [], `Unexpected console/CSP errors: ${unexpectedConsole.join('\n')}`);
+    assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
+
+    await ctx.close();
+  } finally {
+    await browser.close();
+    await server.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

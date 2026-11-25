@@ -203,6 +203,7 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, i
   const [, setTick] = useState(0);
   const queueRef = useRef(null);
   const observerRef = useRef(null);
+  const observedElsRef = useRef(new Set());
   const entryMapRef = useRef(new Map());
 
   useEffect(() => {
@@ -212,6 +213,10 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, i
     }
     entryMapRef.current = map;
   }, [entries]);
+
+  useEffect(() => () => {
+    observedElsRef.current.clear();
+  }, []);
 
   useEffect(() => {
     if (!enabled || !machine) {
@@ -264,11 +269,16 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, i
           const entry = entryMapRef.current.get(p);
           if (entry) requestPath(entry);
           obs.unobserve(item.target);
+          observedElsRef.current.delete(item.target);
         }
       },
       { rootMargin: '200px 0px' },
     );
     observerRef.current = obs;
+    for (const el of observedElsRef.current) {
+      if (el.isConnected) obs.observe(el);
+      else observedElsRef.current.delete(el);
+    }
     return () => {
       obs.disconnect();
       observerRef.current = null;
@@ -276,7 +286,9 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, i
   }, [enabled, requestPath]);
 
   const observeEl = useCallback((el) => {
-    if (el && observerRef.current) {
+    if (!el) return;
+    observedElsRef.current.add(el);
+    if (observerRef.current) {
       observerRef.current.observe(el);
     }
   }, []);
@@ -295,7 +307,13 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, i
 
 function useMultiMachineThumbs({ itemsByMachine, enabled, link, capsStore = null, thumbCache }) {
   const [, setTick] = useState(0);
+  const [capsRev, setCapsRev] = useState(0);
   const queuesRef = useRef(new Map());
+
+  useEffect(() => {
+    if (!capsStore) return undefined;
+    return capsStore.subscribe(() => setCapsRev((n) => n + 1));
+  }, [capsStore]);
 
   useEffect(() => {
     const queues = queuesRef.current;
@@ -336,7 +354,7 @@ function useMultiMachineThumbs({ itemsByMachine, enabled, link, capsStore = null
         q.enqueue(item);
       }
     }
-  }, [itemsByMachine, enabled, link, capsStore, thumbCache]);
+  }, [itemsByMachine, enabled, link, capsStore, thumbCache, capsRev]);
 
   return useCallback(
     (machine, path, mtime = '') => {

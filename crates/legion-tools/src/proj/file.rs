@@ -270,16 +270,7 @@ pub(super) fn update<T>(
         })?;
     // A missing file is the empty default; one that exists must parse, empty or not, since an
     // editor caught half way through rewriting it can leave it empty for a moment.
-    let text = match std::fs::read(file) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(failed(
-                &format!("{} cannot be read", file.display()),
-                &error,
-            ));
-        }
-    };
+    let text = legion_core::config::read_regular_file(file)?;
     let current = match &text {
         Some(bytes) => legion_core::config::parse::<ProjectsFile>(file, bytes)?,
         None => ProjectsFile::default(),

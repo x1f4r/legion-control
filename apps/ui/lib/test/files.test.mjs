@@ -692,4 +692,60 @@ test('createThumbQueue batches at most 32 paths and retries busy errors with exp
   assert.ok(recordedDelays.includes(THUMB_RETRY_BASE_MS * 4));
   assert.equal(timers.size, 0);
   q2.dispose();
+
+  // 3. Transient capability ensure failure leaves cache unpoisoned so re-enqueuing once
+  //    capabilities arrive fetches the thumbnail cleanly.
+  const cache3 = createThumbCache({ maxEntries: 20 });
+  let capsKnown = false;
+  let ensureAttempts = 0;
+  let thumbCalls = 0;
+  let updates3 = 0;
+  const fakeCapsStore = {
+    isKnown: () => capsKnown,
+    hasTool: (_m, tool) => capsKnown && tool === 'fs.thumb',
+    async ensure() {
+      ensureAttempts += 1;
+      if (ensureAttempts === 1) throw { code: 'unreachable', message: 'Timed out.' };
+      capsKnown = true;
+      return { status: 'known' };
+    },
+    async call(tool, args) {
+      assert.equal(tool, 'fs.thumb');
+      thumbCalls += 1;
+      return {
+        value: {
+          results: args.paths.map((p) => ({
+            path: p,
+            ok: { mime: 'image/png', content: 'T0s=', width: 128, height: 128 },
+          })),
+        },
+      };
+    },
+  };
+  const q3 = createThumbQueue({
+    machine: 'pi',
+    link: null,
+    capsStore: fakeCapsStore,
+    thumbCache: cache3,
+    onUpdate: () => {
+      updates3 += 1;
+    },
+    schedule,
+    cancel,
+  });
+
+  q3.enqueue({ path: '/home/me/late.png', mtime: '' });
+  await runAllTimers();
+  assert.equal(ensureAttempts, 1);
+  assert.equal(thumbCalls, 0);
+  assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late.png', '', 128)), null);
+
+  // Capabilities arrive later; re-enqueueing fetches the thumbnail.
+  capsKnown = true;
+  q3.enqueue({ path: '/home/me/late.png', mtime: '' });
+  await runAllTimers();
+  assert.equal(thumbCalls, 1);
+  assert.equal(updates3, 1);
+  assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late.png', '', 128))?.url, 'data:image/png;base64,T0s=');
+  q3.dispose();
 });

@@ -9,11 +9,12 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use legion_os::open_regular::{OpenRegularError, open_regular_read};
 use legion_proto::{ErrorBody, ErrorCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -85,17 +86,7 @@ impl ConfigStore {
     /// nothing.
     pub fn get<D: Document>(&self) -> Result<Arc<D>, ErrorBody> {
         let path = self.path_of::<D>();
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!("{} cannot be read: {error}.", path.display()),
-                )
-                .with_hint("Make the file readable by the account legion runs as."));
-            }
-        };
+        let bytes = read_regular_file(&path)?;
 
         // A poisoned lock means another call panicked while holding it; the cache is still a
         // plain map, so carry on with it rather than spreading the panic.
@@ -145,6 +136,52 @@ impl ConfigStore {
                 )
             })
     }
+}
+
+/// Reads a configuration file non-blockingly after verifying it is a regular file, so a FIFO,
+/// socket, device node, or directory returns a clear error instead of hanging.
+///
+/// Returns `Ok(None)` when `path` does not exist.
+pub fn read_regular_file(path: &Path) -> Result<Option<Vec<u8>>, ErrorBody> {
+    let (mut file, _meta) = match open_regular_read(path) {
+        Ok(opened) => opened,
+        Err(OpenRegularError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(OpenRegularError::IsDirectory) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} is a directory, not a regular file.", path.display()),
+            )
+            .with_hint("Replace it with a regular TOML file."));
+        }
+        Err(OpenRegularError::NotRegularFile) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "{} is not a regular file (for example a FIFO, socket, or device).",
+                    path.display()
+                ),
+            )
+            .with_hint("Replace it with a regular TOML file."));
+        }
+        Err(OpenRegularError::Io(error)) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be read: {error}.", path.display()),
+            )
+            .with_hint("Make the file readable by the account legion runs as."));
+        }
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} cannot be read: {error}.", path.display()),
+        )
+        .with_hint("Make the file readable by the account legion runs as.")
+    })?;
+    Ok(Some(bytes))
 }
 
 /// How long replacing a file keeps trying while something holds it open. On Windows an indexer or
@@ -484,6 +521,74 @@ impl NodeFile {
     pub fn name_or_host(&self) -> NodeName {
         self.name.clone().unwrap_or_else(NodeName::from_host)
     }
+}
+
+/// Outcome of planning a `name = "<fleet name>"` insertion into `node.toml`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InsertNodeName {
+    /// The file did not exist or had no `name`; write these exact bytes (keeping any prior content
+    /// byte for byte after the inserted `name` line).
+    Write(Vec<u8>),
+    /// The file already explicitly sets `name` to the requested name; nothing to write.
+    AlreadyMatches,
+    /// The file already explicitly sets a different `name`; leave it untouched.
+    ExplicitMismatch(NodeName),
+}
+
+/// Plans inserting `name = "<target>"` into `node.toml` while keeping every existing byte verbatim.
+///
+/// Refuses to modify a file that does not parse as a valid [`NodeFile`] or that already declares a
+/// different explicit `name`.
+pub fn insert_node_name(
+    existing: Option<&[u8]>,
+    path: &Path,
+    target: &NodeName,
+) -> Result<InsertNodeName, ErrorBody> {
+    let Some(bytes) = existing else {
+        let content = format!("name = \"{}\"\n", target.as_str()).into_bytes();
+        parse::<NodeFile>(path, &content)?;
+        return Ok(InsertNodeName::Write(content));
+    };
+
+    let parsed = parse::<NodeFile>(path, bytes)?;
+    if let Some(current) = parsed.name {
+        if current == *target {
+            return Ok(InsertNodeName::AlreadyMatches);
+        }
+        return Ok(InsertNodeName::ExplicitMismatch(current));
+    }
+
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        let line = line_and_column(bytes, error.valid_up_to()).0;
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} is not UTF-8 text (line {line}).", path.display()),
+        )
+    })?;
+    const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+    let (bom, body) = match bytes.strip_prefix(UTF8_BOM) {
+        Some(rest) => (UTF8_BOM, rest),
+        None => (&[][..], bytes),
+    };
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let prefix = format!("name = \"{}\"{eol}", target.as_str());
+    let mut updated = Vec::with_capacity(bom.len() + prefix.len() + body.len());
+    updated.extend_from_slice(bom);
+    updated.extend_from_slice(prefix.as_bytes());
+    updated.extend_from_slice(body);
+
+    let reparsed = parse::<NodeFile>(path, &updated)?;
+    if reparsed.name.as_ref() != Some(target) {
+        return Err(ErrorBody::new(
+            ErrorCode::Internal,
+            format!(
+                "Inserting name = {:?} into {} did not parse back with that name.",
+                target.as_str(),
+                path.display()
+            ),
+        ));
+    }
+    Ok(InsertNodeName::Write(updated))
 }
 
 /// The longest a node's name may be: what a DNS label may be, so a name can also be a host's.
@@ -949,5 +1054,101 @@ verify = ["check-next-entry", "Other"]
         ] {
             assert!(node(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn insert_node_name_preserves_existing_bytes_and_refuses_explicit_mismatch() {
+        let studio = NodeName::try_from("studio".to_owned()).unwrap();
+        let path = Path::new("node.toml");
+
+        // Missing file creates minimal valid node.toml.
+        let created = insert_node_name(None, path, &studio).unwrap();
+        assert_eq!(
+            created,
+            InsertNodeName::Write(b"name = \"studio\"\n".to_vec())
+        );
+
+        // Existing file without name keeps every byte verbatim after the inserted line.
+        let original =
+            b"# Header comment\n# name = \"commented\"\nsystem = \"linux\"\n\n[svc]\nsudo = true # keep me";
+        let updated = insert_node_name(Some(original), path, &studio).unwrap();
+        let InsertNodeName::Write(written) = updated else {
+            panic!("expected Write, got {updated:?}");
+        };
+        let expected_prefix = b"name = \"studio\"\n";
+        assert!(written.starts_with(expected_prefix));
+        assert_eq!(&written[expected_prefix.len()..], original);
+        let parsed = parse::<NodeFile>(path, &written).unwrap();
+        assert_eq!(parsed.name.as_ref(), Some(&studio));
+        assert!(parsed.svc.sudo);
+
+        // CRLF file uses CRLF for the inserted line and keeps CRLF body byte for byte.
+        let crlf_original = b"[svc]\r\nsudo = true\r\n";
+        let InsertNodeName::Write(crlf_written) =
+            insert_node_name(Some(crlf_original), path, &studio).unwrap()
+        else {
+            panic!("expected Write for CRLF");
+        };
+        assert_eq!(
+            crlf_written,
+            b"name = \"studio\"\r\n[svc]\r\nsudo = true\r\n"
+        );
+
+        // UTF-8 BOM stays at byte 0 and the name line goes immediately after it.
+        let bom_crlf = b"\xEF\xBB\xBF[svc]\r\nsudo = true\r\n";
+        let InsertNodeName::Write(bom_written) =
+            insert_node_name(Some(bom_crlf), path, &studio).unwrap()
+        else {
+            panic!("expected Write for BOM");
+        };
+        assert_eq!(
+            bom_written,
+            b"\xEF\xBB\xBFname = \"studio\"\r\n[svc]\r\nsudo = true\r\n"
+        );
+        let bom_parsed = parse::<NodeFile>(path, &bom_written).unwrap();
+        assert_eq!(bom_parsed.name.as_ref(), Some(&studio));
+        assert!(bom_parsed.svc.sudo);
+
+        // Matching explicit name is a no-op.
+        assert_eq!(
+            insert_node_name(Some(b"name = \"studio\"\n"), path, &studio).unwrap(),
+            InsertNodeName::AlreadyMatches
+        );
+
+        // Different explicit name is refused without modification.
+        let mismatch = insert_node_name(Some(b"name = \"tower\"\n"), path, &studio).unwrap();
+        assert_eq!(
+            mismatch,
+            InsertNodeName::ExplicitMismatch(NodeName::try_from("tower".to_owned()).unwrap())
+        );
+
+        // Unparseable node.toml returns an error rather than overwriting it.
+        assert!(insert_node_name(Some(b"name = 3\n"), path, &studio).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_store_refuses_fifo_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("node.toml");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo failed");
+
+        let store = ConfigStore::new(dir.path());
+        let started = Instant::now();
+        let err = store.get::<NodeFile>().unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "reading a FIFO config file must fail promptly"
+        );
+        assert_eq!(err.code, ErrorCode::Failed);
+        assert!(
+            err.message.contains("not a regular file"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 }
