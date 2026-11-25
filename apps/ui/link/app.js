@@ -352,7 +352,29 @@ export function createAppLink() {
 
     const display = localDisplayName();
     const pending = !localPipeNode;
-    const seen = new Set();
+    const isSelfName = (name) =>
+      name === LOCAL_PIPE_CONNECTION ||
+      name === PENDING_LOCAL_MACHINE_NAME ||
+      Boolean(localPipeNode && name === localPipeNode);
+    const mapHopName = (name) => (name === LOCAL_PIPE_CONNECTION ? display : name);
+
+    const normalizeIdentityChanged = (idChanged) => {
+      if (!idChanged || typeof idChanged !== 'object') return idChanged;
+      const reportedBy = mapHopName(idChanged.reported_by);
+      const conflicts = Array.isArray(idChanged.conflicts)
+        ? idChanged.conflicts.map((c) =>
+            c && typeof c === 'object' && c.reported_by === LOCAL_PIPE_CONNECTION
+              ? { ...c, reported_by: display }
+              : c,
+          )
+        : idChanged.conflicts;
+      if (reportedBy === idChanged.reported_by && conflicts === idChanged.conflicts) {
+        return idChanged;
+      }
+      return { ...idChanged, reported_by: reportedBy, conflicts };
+    };
+
+    const indexByName = new Map();
     const normalizedNodes = [];
 
     for (const entry of raw.nodes) {
@@ -360,27 +382,85 @@ export function createAppLink() {
       const isLocalEntry =
         entry.via === LOCAL_PIPE_CONNECTION || entry.node === LOCAL_PIPE_CONNECTION;
       const nodeName = isLocalEntry ? display : entry.node;
-      if (!nodeName || seen.has(nodeName)) continue;
-      seen.add(nodeName);
-      if (isLocalEntry) {
-        normalizedNodes.push({
-          ...entry,
-          node: nodeName,
-          isLocalComputer: true,
-          nodeNamePending: pending,
-        });
-      } else {
-        normalizedNodes.push(entry);
+      if (!nodeName) continue;
+      const normalizedEntry = isLocalEntry
+        ? {
+            ...entry,
+            node: nodeName,
+            via: LOCAL_PIPE_CONNECTION,
+            route: 'direct',
+            route_via: null,
+            learned_from: null,
+            identity_changed: null,
+            isLocalComputer: true,
+            nodeNamePending: pending,
+          }
+        : {
+            ...entry,
+            route_via: mapHopName(entry.route_via),
+            learned_from: mapHopName(entry.learned_from),
+            identity_changed: normalizeIdentityChanged(entry.identity_changed),
+          };
+      if (indexByName.has(nodeName)) {
+        // The local pipe always wins over a duplicate fleet/learned entry for this computer,
+        // regardless of array order.
+        if (isLocalEntry) {
+          normalizedNodes[indexByName.get(nodeName)] = normalizedEntry;
+        }
+        continue;
       }
+      indexByName.set(nodeName, normalizedNodes.length);
+      normalizedNodes.push(normalizedEntry);
     }
 
     let nextRoutes = raw.routes;
-    if (raw.routes && typeof raw.routes === 'object' && LOCAL_PIPE_CONNECTION in raw.routes) {
-      nextRoutes = { ...raw.routes };
-      if (!(display in nextRoutes)) {
-        nextRoutes[display] = nextRoutes[LOCAL_PIPE_CONNECTION];
+    if (raw.routes && typeof raw.routes === 'object') {
+      const hasLocalKey =
+        LOCAL_PIPE_CONNECTION in raw.routes ||
+        display in raw.routes ||
+        PENDING_LOCAL_MACHINE_NAME in raw.routes;
+      const rebuilt = {};
+      for (const [name, info] of Object.entries(raw.routes)) {
+        if (!name || isSelfName(name)) continue;
+        if (info && typeof info === 'object') {
+          rebuilt[name] = {
+            ...info,
+            via: mapHopName(info.via),
+            introducer: mapHopName(info.introducer),
+          };
+        } else {
+          rebuilt[name] = info;
+        }
       }
-      delete nextRoutes[LOCAL_PIPE_CONNECTION];
+      if (hasLocalKey) {
+        rebuilt[display] = { kind: 'direct', via: null, introducer: null };
+      }
+      nextRoutes = rebuilt;
+    }
+
+    let nextLearnRejections = raw.learn_rejections;
+    if (Array.isArray(raw.learn_rejections)) {
+      nextLearnRejections = raw.learn_rejections
+        .filter((r) => r && typeof r === 'object' && !isSelfName(r.machine))
+        .map((r) =>
+          r.reported_by === LOCAL_PIPE_CONNECTION ? { ...r, reported_by: display } : r,
+        );
+    }
+
+    let nextDisagreements = raw.disagreements;
+    if (Array.isArray(raw.disagreements)) {
+      nextDisagreements = raw.disagreements
+        .filter((d) => d && typeof d === 'object' && !isSelfName(d.machine))
+        .map((d) => ({
+          ...d,
+          reports: Array.isArray(d.reports)
+            ? d.reports.map((r) =>
+                r && typeof r === 'object' && r.reported_by === LOCAL_PIPE_CONNECTION
+                  ? { ...r, reported_by: display }
+                  : r,
+              )
+            : d.reports,
+        }));
     }
 
     let nextHealth = raw.health;
@@ -392,6 +472,8 @@ export function createAppLink() {
       ...raw,
       health: nextHealth,
       routes: nextRoutes,
+      learn_rejections: nextLearnRejections,
+      disagreements: nextDisagreements,
       nodes: normalizedNodes,
     };
   }
@@ -1099,6 +1181,7 @@ export function createAppLink() {
           noteLocalNodeName(whoami.node);
         }
         const resolvedNodeName = primaryIsLocalPipe ? localDisplayName() : rawTargetNode;
+        selectedNode = machineKey(resolvedNodeName);
         const nodeNamePending = primaryIsLocalPipe && !localPipeNode;
         const checkedAt = new Date().toISOString();
         const latestRaw = await rawState().catch(() => base);
@@ -1262,9 +1345,48 @@ export function createAppLink() {
         clearUnsupportedContentMachines();
       }
       if (!hasLocalPipe || !res || typeof res !== 'object') return res;
+      const display = localDisplayName();
+      const mapHop = (name) => (name === LOCAL_PIPE_CONNECTION ? display : name);
+      const isSelf = (name) =>
+        name === LOCAL_PIPE_CONNECTION ||
+        name === PENDING_LOCAL_MACHINE_NAME ||
+        Boolean(localPipeNode && name === localPipeNode);
       const report =
-        res.report && typeof res.report === 'object' && res.report.introducer === LOCAL_PIPE_CONNECTION
-          ? { ...res.report, introducer: localDisplayName() }
+        res.report && typeof res.report === 'object'
+          ? {
+              ...res.report,
+              introducer: mapHop(res.report.introducer),
+              ...(Array.isArray(res.report.introducers)
+                ? { introducers: res.report.introducers.map(mapHop) }
+                : {}),
+              ...(Array.isArray(res.report.rejected_details)
+                ? {
+                    rejected_details: res.report.rejected_details
+                      .filter((r) => r && !isSelf(r.machine))
+                      .map((r) =>
+                        r.reported_by === LOCAL_PIPE_CONNECTION
+                          ? { ...r, reported_by: display }
+                          : r,
+                      ),
+                  }
+                : {}),
+              ...(Array.isArray(res.report.disagreement_details)
+                ? {
+                    disagreement_details: res.report.disagreement_details
+                      .filter((d) => d && !isSelf(d.machine))
+                      .map((d) => ({
+                        ...d,
+                        reports: Array.isArray(d.reports)
+                          ? d.reports.map((r) =>
+                              r && r.reported_by === LOCAL_PIPE_CONNECTION
+                                ? { ...r, reported_by: display }
+                                : r,
+                            )
+                          : d.reports,
+                      })),
+                  }
+                : {}),
+            }
           : res.report;
       const nextState = res.state ? normalizeBackendState(res.state) : res.state;
       return { ...res, report, state: nextState };
