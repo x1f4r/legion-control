@@ -320,6 +320,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
   const isNoSync = flags.has('nosync') || isOld;
   const isLarge = flags.has('large');
   const isTransfersDemo = flags.has('transfers');
+  const isEmpty = flags.has('empty');
 
   const day = 86400;
   const longLogText = makeLongLogText();
@@ -1723,6 +1724,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
         },
 
         async transfers() {
+          if (isEmpty) return [];
           if (isTransfersDemo) ensureTransferPump();
           return snapshotTransfers();
         },

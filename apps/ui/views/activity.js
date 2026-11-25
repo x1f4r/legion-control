@@ -1,17 +1,24 @@
-// Activity screen and job detail: plain by default, grouped by Running now / Today / Yesterday / Earlier.
+// Activity screen and job detail: plain by default, including machine transfer jobs and device
+// download/upload queue rows with progress, pause/resume/cancel, and tap-to-open finished downloads.
 
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
-import { Notice, SwipeRow } from './common.js';
+import { Notice, ProgressBar, SwipeRow } from './common.js';
 import {
   formatActivityDuration,
   formatActivitySubtitle,
+  formatDeviceTransferSubtitle,
+  formatDeviceTransferTitle,
   formatFriendlyRelativeTime,
+  formatTransferJobSubtitle,
+  friendlyDeviceTransferState,
   friendlyJobName,
   friendlyJobState,
   groupActivity,
   jobDurationSeconds,
+  transferProgressPct,
 } from '../lib/activity.js';
 import { callWithTimeout, DETAIL_TIMEOUT_MS } from '../lib/fleet.js';
+import { formatBytes } from '../lib/format.js';
 import { routeHref } from '../lib/route.js';
 
 function targetFor(machineName, nodeName) {
@@ -59,7 +66,7 @@ export function ActivityDetail({
           offsetRef.current = logs.next_offset;
         }
         if (st.state === 'starting' || st.state === 'running') {
-          timer = window.setTimeout(poll, 900);
+          timer = window.setTimeout(poll, 700);
         }
       } catch (err) {
         if (alive) setError(err);
@@ -95,6 +102,7 @@ export function ActivityDetail({
   const title = normalizedJob ? friendlyJobName(normalizedJob) : 'Activity';
   const stateInfo = normalizedJob ? friendlyJobState(normalizedJob, technical) : null;
   const dur = normalizedJob ? jobDurationSeconds(normalizedJob) : null;
+  const pct = status?.kind === 'transfer' ? transferProgressPct(status.progress) : null;
 
   return html`
     <div>
@@ -110,8 +118,20 @@ export function ActivityDetail({
                 <dd>${machineName}</dd>
                 <dt>${technical ? 'state' : 'Status'}</dt>
                 <dd>
-                  <span class=${`state ${stateInfo.cls}`}>${stateInfo.label}</span>
+                  <span class=${`state ${stateInfo.cls}`}>
+                    ${active && pct != null ? `${pct}%` : stateInfo.label}
+                  </span>
                 </dd>
+                ${status.progress?.bytes_total
+                  ? html`
+                      <dt>${technical ? 'bytes' : 'Progress'}</dt>
+                      <dd>
+                        ${technical
+                          ? `${status.progress.bytes_done || 0} / ${status.progress.bytes_total} bytes`
+                          : `${formatBytes(status.progress.bytes_done || 0)} of ${formatBytes(status.progress.bytes_total)}`}
+                      </dd>
+                    `
+                  : null}
                 ${status.created
                   ? html`
                       <dt>${technical ? 'started' : 'Started'}</dt>
@@ -122,6 +142,30 @@ export function ActivityDetail({
                   ? html`
                       <dt>${technical ? 'duration' : 'How long'}</dt>
                       <dd>${formatActivityDuration(dur, technical)}</dd>
+                    `
+                  : null}
+                ${technical && status.from
+                  ? html`
+                      <dt>from</dt>
+                      <dd>${status.from}</dd>
+                    `
+                  : null}
+                ${technical && status.to
+                  ? html`
+                      <dt>to</dt>
+                      <dd>${status.to}</dd>
+                    `
+                  : null}
+                ${technical && status.hash
+                  ? html`
+                      <dt>hash</dt>
+                      <dd>${status.hash}</dd>
+                    `
+                  : null}
+                ${technical && status.kind === 'transfer'
+                  ? html`
+                      <dt>tool</dt>
+                      <dd>fs.transfer</dd>
                     `
                   : null}
                 ${technical && normalizedJob.command
@@ -177,16 +221,35 @@ export function ActivityRow({
   onStop,
 }) {
   const active = job.state === 'running' || job.state === 'starting';
-  const stateInfo = friendlyJobState(job, technical);
+  const isTransfer = job.kind === 'transfer';
+  const pct = isTransfer ? transferProgressPct(job.progress) : null;
+  const baseState = friendlyJobState(job, technical);
+  const stateInfo =
+    isTransfer && active && pct != null
+      ? { label: `${pct}%`, cls: 'running' }
+      : isTransfer && job.state === 'failed' && !technical
+        ? { label: 'Stopped', cls: 'failed' }
+        : baseState;
+
   const title = technical ? job.command || job.name || job.id : friendlyJobName(job);
-  const subtitle = formatActivitySubtitle(job, { includeMachine, technical });
+  const subtitle = isTransfer
+    ? formatTransferJobSubtitle(job, { includeMachine, technical })
+    : formatActivitySubtitle(job, { includeMachine, technical });
+  const wrapSub = isTransfer && job.state === 'failed' && !technical;
   const rowCls = ['row', selected ? 'selected' : ''].filter(Boolean).join(' ');
 
   const rowEl = html`
     <a class=${rowCls} href=${href} aria-current=${selected ? 'true' : undefined}>
       <span class="body">
         <span class=${technical ? 'title mono' : 'title'}>${title}</span>
-        ${subtitle ? html`<span class="sub">${subtitle}</span>` : null}
+        ${subtitle || (active && pct != null)
+          ? html`
+              <span class=${wrapSub ? 'sub wrap' : 'sub'}>
+                ${subtitle}
+                ${active && pct != null ? html`<${ProgressBar} value=${pct} />` : null}
+              </span>
+            `
+          : null}
       </span>
       <span class=${`state ${stateInfo.cls}`}>${stateInfo.label}</span>
     </a>
@@ -202,19 +265,127 @@ export function ActivityRow({
   return rowEl;
 }
 
+export function DeviceTransferRow({
+  transfer,
+  deviceNoun = 'phone',
+  technical = false,
+  canControl = false,
+  onControl,
+  onOpen,
+}) {
+  const st = transfer.state;
+  const isActive = st === 'running' || st === 'queued';
+  const isPaused = st === 'paused';
+  const isFailed = st === 'failed';
+  const isDone = st === 'done';
+  const pct = transferProgressPct(transfer);
+  const stateInfo = friendlyDeviceTransferState(transfer, technical);
+  const title = formatDeviceTransferTitle(transfer, technical);
+  const sub = formatDeviceTransferSubtitle(transfer, { deviceNoun, technical });
+
+  if (isDone && transfer.canOpen && onOpen) {
+    return html`
+      <button type="button" class="row" onClick=${() => onOpen(transfer)}>
+        <span class="body">
+          <span class=${technical ? 'title mono' : 'title'}>${title}</span>
+          <span class="sub">${sub}</span>
+        </span>
+        <span class=${`state ${stateInfo.cls}`}>${stateInfo.label}</span>
+      </button>
+    `;
+  }
+
+  return html`
+    <div class="row">
+      <div class="body">
+        <span class=${technical ? 'title mono' : 'title'}>${title}</span>
+        <span class=${isFailed ? 'sub wrap' : 'sub'}>
+          ${sub}
+          ${(isActive || isPaused) && pct != null ? html`<${ProgressBar} value=${pct} />` : null}
+        </span>
+        ${canControl && (isActive || isPaused || isFailed)
+          ? html`
+              <div class="transfer-ctl">
+                ${isActive
+                  ? html`
+                      <button
+                        type="button"
+                        class="btn small"
+                        onClick=${() => onControl(transfer.id, 'pause')}
+                      >
+                        Pause
+                      </button>
+                    `
+                  : null}
+                ${isPaused || isFailed
+                  ? html`
+                      <button
+                        type="button"
+                        class="btn small primary"
+                        onClick=${() => onControl(transfer.id, 'resume')}
+                      >
+                        Resume
+                      </button>
+                    `
+                  : null}
+                <button
+                  type="button"
+                  class="btn small quiet"
+                  onClick=${() => onControl(transfer.id, 'cancel')}
+                >
+                  Cancel
+                </button>
+              </div>
+            `
+          : null}
+      </div>
+      <span class=${`state ${stateInfo.cls}`}>${stateInfo.label}</span>
+    </div>
+  `;
+}
+
 export function ActivityGroups({
   jobs,
+  deviceTransfers = [],
   includeMachine = true,
   technical = false,
+  deviceNoun = 'phone',
   canCancel = false,
+  canControlTransfers = false,
   selectedKey = '',
   hrefForJob,
   onStopJob,
+  onControlTransfer,
+  onOpenTransfer,
   emptyText = 'Nothing has run yet. Things you start here or on a machine appear in this list.',
 }) {
-  const groups = useMemo(() => groupActivity(jobs || []), [jobs]);
+  const combined = useMemo(() => {
+    if (jobs === null) return null;
+    const out = (jobs || []).map((j) => ({ _kind: 'job', ...j }));
+    for (const t of deviceTransfers || []) {
+      const mappedState =
+        t.state === 'running' || t.state === 'queued' || t.state === 'paused'
+          ? 'running'
+          : t.state === 'done'
+            ? 'succeeded'
+            : t.state === 'failed'
+              ? 'failed'
+              : 'cancelled';
+      out.push({
+        _kind: 'transfer',
+        _transfer: t,
+        id: t.id,
+        state: mappedState,
+        created: t.created,
+        finished: t.finished,
+      });
+    }
+    return out;
+  }, [jobs, deviceTransfers]);
 
-  if (jobs === null) {
+  const groups = useMemo(() => groupActivity(combined || []), [combined]);
+
+  if (combined === null) {
     return html`<div class="empty">Loading…</div>`;
   }
   if (groups.length === 0) {
@@ -228,13 +399,26 @@ export function ActivityGroups({
           <div key=${group.key}>
             <p class="label">${group.label}</p>
             <div class="list">
-              ${group.items.map((job) => {
-                const key = `${job.machine || ''}:${job.id}`;
+              ${group.items.map((item) => {
+                if (item._kind === 'transfer') {
+                  return html`
+                    <${DeviceTransferRow}
+                      key=${`dt:${item.id}`}
+                      transfer=${item._transfer}
+                      deviceNoun=${deviceNoun}
+                      technical=${technical}
+                      canControl=${canControlTransfers}
+                      onControl=${onControlTransfer}
+                      onOpen=${onOpenTransfer}
+                    />
+                  `;
+                }
+                const key = `${item.machine || ''}:${item.id}`;
                 return html`
                   <${ActivityRow}
                     key=${key}
-                    job=${job}
-                    href=${hrefForJob(job)}
+                    job=${item}
+                    href=${hrefForJob(item)}
                     selected=${selectedKey === key}
                     includeMachine=${includeMachine}
                     technical=${technical}
@@ -259,6 +443,9 @@ export function ActivityView({
   allowedSet,
   settings,
   wide,
+  deviceNoun = 'phone',
+  deviceTransfers = [],
+  onOpenTransfer,
   onRefreshFleet,
 }) {
   const [jobsByMachine, setJobsByMachine] = useState(null);
@@ -267,6 +454,7 @@ export function ActivityView({
   const localNode = nodeInfo?.node || 'this node';
   const technical = Boolean(settings?.technical);
   const canCancel = allowedSet ? allowedSet.has('job.cancel') : true;
+  const canControlTransfers = typeof link?.transferControl === 'function';
 
   const targetNames = useMemo(() => {
     const set = new Set();
@@ -343,6 +531,20 @@ export function ActivityView({
     return flat;
   }, [jobsByMachine]);
 
+  // Poll live transfer jobs while visible so progress bars stay up to date.
+  const hasRunningTransferJob = useMemo(
+    () => Boolean(jobs?.some((j) => j.kind === 'transfer' && (j.state === 'running' || j.state === 'starting'))),
+    [jobs],
+  );
+
+  useEffect(() => {
+    if (!hasRunningTransferJob) return undefined;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') load(targetNames);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [hasRunningTransferJob, targetKey]);
+
   async function handleStopJob(job) {
     setError(null);
     try {
@@ -350,6 +552,16 @@ export function ActivityView({
       await link.call('job.cancel', { id: job.id }, { on });
       await load();
       if (onRefreshFleet) onRefreshFleet();
+    } catch (err) {
+      setError(err);
+    }
+  }
+
+  async function handleControlTransfer(id, action) {
+    if (typeof link?.transferControl !== 'function') return;
+    setError(null);
+    try {
+      await link.transferControl(id, action);
     } catch (err) {
       setError(err);
     }
@@ -363,17 +575,24 @@ export function ActivityView({
       ${error ? html`<${Notice} error=${error} />` : null}
       <${ActivityGroups}
         jobs=${jobs}
+        deviceTransfers=${deviceTransfers}
         includeMachine=${true}
         technical=${technical}
+        deviceNoun=${deviceNoun}
         canCancel=${canCancel}
+        canControlTransfers=${canControlTransfers}
         selectedKey=${wide ? selectedKey : ''}
         hrefForJob=${(job) => routeHref({ section: 'activity', machine: job.machine, jobId: job.id })}
         onStopJob=${handleStopJob}
+        onControlTransfer=${handleControlTransfer}
+        onOpenTransfer=${onOpenTransfer}
       />
     </section>
   `;
 
-  if (wide && (hasSelected || !jobs || jobs.length > 0)) {
+  const hasAnyItems = (jobs && jobs.length > 0) || (deviceTransfers && deviceTransfers.length > 0);
+
+  if (wide && (hasSelected || !jobs || hasAnyItems)) {
     return html`
       <div class="split">
         ${listPane}

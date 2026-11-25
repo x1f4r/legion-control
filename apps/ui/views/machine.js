@@ -1,8 +1,9 @@
 // One machine screen: Overview, Files, Power, More, Command, Services, Projects, and Activity.
 
 import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
-import { CopyButton, Meter, Notice } from './common.js';
+import { Meter, Notice } from './common.js';
 import { ActivityDetail, ActivityGroups, ActivityRow } from './activity.js';
+import { MachineFilesBrowser } from './files.js';
 import { plainDenyReason } from '../lib/actions.js';
 import {
   formatCommandMeta,
@@ -35,37 +36,6 @@ const WIDE_TAB_LABELS = {
 
 function targetFor(machineName, nodeName) {
   return machineName || nodeName || undefined;
-}
-
-function defaultRoot(whoami) {
-  const roots = whoami?.paths;
-  if (Array.isArray(roots) && roots.length > 0) {
-    return roots[0].replace(/\/\*\*$/, '').replace(/\/\*$/, '') || '/';
-  }
-  return '~';
-}
-
-function splitCrumbs(fullPath) {
-  if (!fullPath) return [];
-  if (fullPath === '/' || fullPath === '~') return [{ label: fullPath, path: fullPath }];
-  if (/^[A-Za-z]:\\?/.test(fullPath)) {
-    const parts = fullPath.split(/\\+/).filter(Boolean);
-    const out = [];
-    let acc = '';
-    for (let i = 0; i < parts.length; i += 1) {
-      acc = i === 0 ? `${parts[i]}\\` : `${acc}${acc.endsWith('\\') ? '' : '\\'}${parts[i]}`;
-      out.push({ label: parts[i], path: acc });
-    }
-    return out;
-  }
-  const parts = fullPath.split('/').filter(Boolean);
-  const out = [{ label: '/', path: '/' }];
-  let acc = '';
-  for (const part of parts) {
-    acc += `/${part}`;
-    out.push({ label: part, path: acc });
-  }
-  return out;
 }
 
 // ── Overview tab ─────────────────────────────────────────────────────────────────────────────
@@ -551,180 +521,6 @@ function MoreTab({ machine }) {
           </a>
         `,
       )}
-    </div>
-  `;
-}
-
-// ── Files tab ────────────────────────────────────────────────────────────────────────────────
-
-const PREVIEW_CAP = 131072;
-
-function FilesTab({ machine, nodeInfo, link, technical }) {
-  const initialPath = defaultRoot(nodeInfo?.whoami);
-  const [dirPath, setDirPath] = useState(initialPath);
-  const [listing, setListing] = useState(null);
-  const [preview, setPreview] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-  const crumbsRef = useRef(null);
-  const on = targetFor(machine.name, nodeInfo?.node);
-
-  async function loadDir(path) {
-    setLoading(true);
-    setError(null);
-    setPreview(null);
-    try {
-      const res = await link.call('fs.list', { path, depth: 1 }, { on });
-      setListing(res);
-      setDirPath(res.path || path);
-    } catch (err) {
-      setError(err);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function openFile(entry) {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await link.call(
-        'fs.read',
-        { path: entry.path, offset: 0, length: PREVIEW_CAP },
-        { on },
-      );
-      setPreview({ entry, data: res });
-    } catch (err) {
-      setError(err);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    if (!machine.reachable) return;
-    loadDir(defaultRoot(nodeInfo?.whoami));
-  }, [machine.name, machine.reachable]);
-
-  const currentPath = listing?.path || dirPath;
-  const crumbs = splitCrumbs(currentPath);
-
-  useEffect(() => {
-    if (crumbsRef.current) {
-      crumbsRef.current.scrollLeft = crumbsRef.current.scrollWidth;
-    }
-  }, [currentPath]);
-
-  if (!machine.reachable) {
-    return html`<div class="empty">${machine.name} is off.</div>`;
-  }
-
-  const filesHref = routeHref({ section: 'machines', machine: machine.name, tab: 'files' });
-
-  return html`
-    <div>
-      <div class="crumbs-bar" data-no-swipe="true">
-        <nav ref=${crumbsRef} class="crumbs" aria-label="Directory path">
-          ${crumbs.map(
-            (c, i) => html`
-              <span key=${c.path} class="crumb-item">
-                ${i > 0 && crumbs[i - 1].label !== '/'
-                  ? html`<span class="dim" aria-hidden="true">/</span>`
-                  : null}
-                <a
-                  href=${filesHref}
-                  onClick=${(e) => {
-                    e.preventDefault();
-                    loadDir(c.path);
-                  }}
-                >
-                  ${c.label}
-                </a>
-              </span>
-            `,
-          )}
-        </nav>
-        <${CopyButton}
-          text=${preview ? preview.data.path : currentPath}
-          label="Copy path"
-          iconOnly=${true}
-        />
-      </div>
-
-      ${error ? html`<${Notice} error=${error} />` : null}
-
-      ${preview
-        ? html`
-            <div>
-              <div class="result-head">
-                <p class="label">${preview.entry.name} · ${formatBytes(preview.data.size)}</p>
-                <button type="button" class="btn small quiet" onClick=${() => setPreview(null)}>
-                  Back to folder
-                </button>
-              </div>
-              ${preview.data.encoding === 'base64'
-                ? html`
-                    <${Notice}
-                      kind="warn"
-                      title="Binary file preview is not shown."
-                      hint=${`${formatBytes(preview.data.size)} at ${preview.data.path}.`}
-                    />
-                  `
-                : html`
-                    ${!preview.data.eof
-                      ? html`
-                          <${Notice}
-                            kind="warn"
-                            title="Showing the start of this file."
-                            hint=${`Cut at ${formatBytes(preview.data.length)} of ${formatBytes(preview.data.size)}.`}
-                          />
-                        `
-                      : null}
-                    <pre class="out">${preview.data.content}</pre>
-                  `}
-            </div>
-          `
-        : listing
-          ? html`
-              ${listing.entries.length === 0
-                ? html`<div class="empty">This folder is empty.</div>`
-                : html`
-                    <div class="list">
-                      ${listing.entries.map((entry) => {
-                        const kindLabel = technical
-                          ? `${entry.kind}${entry.mode ? ` · ${entry.mode}` : ''}`
-                          : entry.kind === 'dir'
-                            ? 'Folder'
-                            : 'File';
-                        return html`
-                          <button
-                            type="button"
-                            key=${entry.path}
-                            class="row"
-                            onClick=${() =>
-                              entry.kind === 'dir' ? loadDir(entry.path) : openFile(entry)}
-                          >
-                            <span class="body">
-                              <span class="title mono">
-                                ${entry.kind === 'dir' ? `${entry.name}/` : entry.name}
-                              </span>
-                              <span class="sub">
-                                ${kindLabel}
-                                ${entry.mtime ? ` · ${formatRelativeTime(entry.mtime)}` : ''}
-                              </span>
-                            </span>
-                            <span class="end">
-                              ${entry.kind === 'file' ? formatBytes(entry.size) : ''}
-                            </span>
-                          </button>
-                        `;
-                      })}
-                    </div>
-                  `}
-            `
-          : loading
-            ? html`<div class="empty">Loading files…</div>`
-            : null}
     </div>
   `;
 }
@@ -1462,8 +1258,11 @@ export function MachineDetail({
   wide,
   link,
   nodeInfo,
+  tools,
   allowedSet,
   settings,
+  deviceNoun,
+  thumbCache,
   wakePending,
   onWakeMachine,
   onWakeSent,
@@ -1592,11 +1391,16 @@ export function MachineDetail({
               `
             : effectiveTab === 'files'
               ? html`
-                  <${FilesTab}
+                  <${MachineFilesBrowser}
                     machine=${machine}
                     nodeInfo=${nodeInfo}
+                    tools=${tools}
+                    allowedSet=${allowedSet}
                     link=${link}
-                    technical=${technical}
+                    settings=${settings}
+                    deviceNoun=${deviceNoun}
+                    thumbCache=${thumbCache}
+                    onWakeMachine=${onWakeMachine}
                   />
                 `
               : effectiveTab === 'activity'

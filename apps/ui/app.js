@@ -16,7 +16,17 @@ import {
   refreshFleetProgressive,
   serializeFleetCache,
 } from './lib/fleet.js';
-import { formatRelativeTime } from './lib/format.js';
+import {
+  filesFallbackBackRoute,
+  folderDisplayName,
+  parentFilePath,
+  selectAllEntries,
+  selectionSummary,
+  toggleSelection,
+} from './lib/files.js';
+import { readSortPreference, writeSortPreference } from './lib/files-store.js';
+import { formatBytes, formatRelativeTime } from './lib/format.js';
+import { createThumbCache } from './lib/thumb-cache.js';
 import {
   classifyHorizontalSwipe,
   classifyPullRefresh,
@@ -43,6 +53,7 @@ import { createLink } from './link/index.js';
 import { ActionsView } from './views/actions.js';
 import { ActivityView } from './views/activity.js';
 import { Notice, Sheet } from './views/common.js';
+import { FilesDock, FilesView } from './views/files.js';
 import { CommandComposer } from './views/machine.js';
 import { MachinesView } from './views/machines.js';
 import { SettingsView } from './views/settings.js';
@@ -223,11 +234,18 @@ function App() {
   const link = useMemo(() => createLink(), []);
   const sessionCache = useMemo(() => createSessionCache(), []);
   const persistentCache = useMemo(() => createPersistentCache(), []);
+  const thumbCache = useMemo(() => createThumbCache({ maxEntries: 180, storage: null }), []);
   const shellRef = useRef(null);
   const mainRef = useRef(null);
   const refreshAbortRef = useRef(null);
   const refreshInFlightRef = useRef(false);
   const swipeRef = useRef(null);
+  const scrollByFolderRef = useRef(new Map());
+  const filesHistoryDepthRef = useRef(0);
+  const filesSheetHistoryRef = useRef(false);
+  const filesSelectHistoryRef = useRef(false);
+  const filesBulkHandlersRef = useRef({});
+  const toastTimerRef = useRef(null);
 
   const [settings, setSettings] = useState(() => {
     const loaded = readSettings(safeLocalStorage());
@@ -259,6 +277,17 @@ function App() {
   const [pairingOpen, setPairingOpen] = useState(false);
   const [pairNotice, setPairNotice] = useState(null);
   const [wakeSentAt, setWakeSentAt] = useState({});
+  const [toast, setToast] = useState(null);
+  const [deviceTransfers, setDeviceTransfers] = useState([]);
+  const [filesSortPref, setFilesSortPref] = useState(() => readSortPreference(safeLocalStorage()));
+  const [filesShowHidden, setFilesShowHidden] = useState(false);
+  const [filesSelecting, setFilesSelecting] = useState(false);
+  const [filesSelectedPaths, setFilesSelectedPaths] = useState(() => new Set());
+  const [filesSheet, setFilesSheet] = useState(null);
+  const [filesViewModeOverride, setFilesViewModeOverride] = useState(null);
+  const [filesResolvedViewMode, setFilesResolvedViewMode] = useState('list');
+  const [filesMeta, setFilesMeta] = useState({ caps: null, resolvedPath: '~', entries: [], syncFolders: [] });
+  const [filesSearchSummary, setFilesSearchSummary] = useState({ count: 0, machineCount: 0, searching: false });
   const sheetHistoryRef = useRef(false);
   const learnInFlightRef = useRef(false);
 
@@ -297,15 +326,66 @@ function App() {
     }
   }, [settings, deviceNoun]);
 
+  const routeRef = useRef(route);
+  routeRef.current = route;
+
+  const showToast = useCallback((message, opts = {}) => {
+    if (!message) return;
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast({ message, actionLabel: opts.actionLabel || null, actionHref: opts.actionHref || null });
+    toastTimerRef.current = window.setTimeout(() => {
+      toastTimerRef.current = null;
+      setToast(null);
+    }, 4500);
+  }, []);
+
+  // Keep device transfer queue in sync when the link supports it.
   useEffect(() => {
-    if (mainRef.current) mainRef.current.scrollTop = 0;
+    if (!linkState?.ready || typeof link.transfers !== 'function') {
+      setDeviceTransfers([]);
+      return undefined;
+    }
+    let alive = true;
+    link
+      .transfers()
+      .then((list) => {
+        if (alive && Array.isArray(list)) setDeviceTransfers(list);
+      })
+      .catch(() => {});
+    const unsub =
+      typeof link.onTransferEvent === 'function'
+        ? link.onTransferEvent((list) => {
+            if (alive && Array.isArray(list)) setDeviceTransfers(list);
+          })
+        : null;
+    return () => {
+      alive = false;
+      if (typeof unsub === 'function') unsub();
+    };
+  }, [link, linkState?.ready]);
+
+  useEffect(() => {
+    if (mainRef.current && route.section !== 'files') mainRef.current.scrollTop = 0;
   }, [route.section]);
 
   useEffect(() => {
-    if (!wide && mainRef.current && route.tab !== 'command') {
+    if (!wide && mainRef.current && route.tab !== 'command' && route.section !== 'files') {
       mainRef.current.scrollTop = 0;
     }
-  }, [wide, route.machine, route.tab, route.tool, route.action, route.jobId, route.page, route.sub]);
+  }, [wide, route.section, route.machine, route.tab, route.tool, route.action, route.jobId, route.page, route.sub]);
+
+  // Restore saved folder scroll position when arriving at a Files folder (e.g. via Back).
+  useEffect(() => {
+    if (route.section !== 'files' || route.view !== 'folder' || route.viewer) return;
+    const key = `${route.machine || ''}\0${route.path || '~'}`;
+    const saved = scrollByFolderRef.current.get(key);
+    if (mainRef.current) {
+      const target = typeof saved === 'number' ? saved : 0;
+      window.requestAnimationFrame(() => {
+        if (mainRef.current) mainRef.current.scrollTop = target;
+      });
+    }
+  }, [route.section, route.view, route.machine, route.path, route.viewer, filesMeta.entries.length]);
 
   useEffect(() => {
     const el = shellRef.current;
@@ -321,9 +401,16 @@ function App() {
 
   useEffect(() => {
     function syncRoute() {
+      const prevRoute = routeRef.current;
+      if (prevRoute?.section === 'files' && prevRoute.view === 'folder' && !prevRoute.viewer && mainRef.current) {
+        scrollByFolderRef.current.set(`${prevRoute.machine || ''}\0${prevRoute.path || '~'}`, mainRef.current.scrollTop);
+      }
       const next = parseRoute(window.location.hash);
+      if (prevRoute?.section === 'files' && (next.section !== 'files' || next.machine !== prevRoute.machine || next.path !== prevRoute.path)) {
+        setFilesViewModeOverride(null);
+      }
       setRoute((prev) => {
-        if (mainRef.current && (prev.section !== next.section || !wideRef.current)) {
+        if (mainRef.current && next.section !== 'files' && (prev.section !== next.section || !wideRef.current)) {
           mainRef.current.scrollTop = 0;
         }
         return next;
@@ -333,6 +420,20 @@ function App() {
       if (sheetHistoryRef.current) {
         sheetHistoryRef.current = false;
         setConfirmRequest(null);
+      }
+      if (filesSheetHistoryRef.current) {
+        filesSheetHistoryRef.current = false;
+        setFilesSheet(null);
+        return;
+      }
+      if (filesSelectHistoryRef.current) {
+        filesSelectHistoryRef.current = false;
+        setFilesSelecting(false);
+        setFilesSelectedPaths(new Set());
+        return;
+      }
+      if (filesHistoryDepthRef.current > 0) {
+        filesHistoryDepthRef.current -= 1;
       }
       syncRoute();
     }
@@ -713,13 +814,155 @@ function App() {
     [link, openConfirm, markWakeSent, refreshFleet, nodeInfo],
   );
 
+  const filesActions = useMemo(
+    () => ({
+      pushHref(href) {
+        const cur = routeRef.current;
+        if (cur?.section === 'files' && cur.view === 'folder' && !cur.viewer && mainRef.current) {
+          scrollByFolderRef.current.set(`${cur.machine || ''}\0${cur.path || '~'}`, mainRef.current.scrollTop);
+        }
+        if (href && href !== window.location.hash) {
+          filesHistoryDepthRef.current += 1;
+          window.location.hash = href;
+        }
+      },
+      closeViewer() {
+        if (filesHistoryDepthRef.current > 0) {
+          window.history.back();
+        } else {
+          const cur = routeRef.current;
+          window.location.hash = routeHref({ ...cur, viewer: null });
+        }
+      },
+      openSheet(nextSheet) {
+        if (!filesSheetHistoryRef.current) {
+          window.history.pushState({ legionFilesSheet: true }, '');
+          filesSheetHistoryRef.current = true;
+        }
+        setFilesSheet(nextSheet);
+      },
+      closeSheet() {
+        setFilesSheet(null);
+        if (filesSheetHistoryRef.current) {
+          filesSheetHistoryRef.current = false;
+          window.history.back();
+        }
+      },
+      startSelect(initialPath) {
+        if (!filesSelectHistoryRef.current) {
+          window.history.pushState({ legionFilesSelect: true }, '');
+          filesSelectHistoryRef.current = true;
+        }
+        setFilesSelecting(true);
+        setFilesSelectedPaths(initialPath ? new Set([initialPath]) : new Set());
+      },
+      endSelect() {
+        setFilesSelecting(false);
+        setFilesSelectedPaths(new Set());
+        if (filesSelectHistoryRef.current) {
+          filesSelectHistoryRef.current = false;
+          window.history.back();
+        }
+      },
+      toggleSelect(path) {
+        setFilesSelectedPaths((prev) => toggleSelection(prev, path));
+      },
+      toggleSelectAll(entries) {
+        setFilesSelectedPaths((prev) => {
+          if (prev.size >= (entries || []).length && prev.size > 0) return new Set();
+          return selectAllEntries(entries);
+        });
+      },
+      setSortPref(pref) {
+        writeSortPreference(safeLocalStorage(), pref);
+        setFilesSortPref(pref);
+      },
+      setShowHidden(val) {
+        setFilesShowHidden(Boolean(val));
+      },
+      setViewModeOverride(mode) {
+        setFilesViewModeOverride(mode);
+      },
+      setResolvedViewMode(mode) {
+        setFilesResolvedViewMode(mode);
+      },
+      setMeta(meta) {
+        setFilesMeta((prev) => ({ ...prev, ...meta }));
+      },
+      setSearchSummary(summary) {
+        setFilesSearchSummary(summary);
+      },
+      registerHandlers(handlers) {
+        filesBulkHandlersRef.current = handlers || {};
+      },
+      bulkSend(machine, items) {
+        filesBulkHandlersRef.current.onBulkSend?.(machine, items);
+      },
+      bulkDownload(machine, items) {
+        filesBulkHandlersRef.current.onBulkDownload?.(machine, items);
+      },
+      bulkStar(machine, items) {
+        filesBulkHandlersRef.current.onBulkStar?.(machine, items);
+      },
+      bulkDelete(machine, items) {
+        filesBulkHandlersRef.current.onBulkDelete?.(machine, items);
+      },
+    }),
+    [],
+  );
+
+  const handleOpenDeviceTransfer = useCallback(
+    async (transfer) => {
+      if (!transfer) return;
+      if (typeof link.openTransfer === 'function') {
+        try {
+          const res = await link.openTransfer(transfer.id);
+          if (res?.viewer?.machine && res?.viewer?.path) {
+            const dir = parentFilePath(res.viewer.path) || '~';
+            filesActions.pushHref(
+              routeHref({
+                section: 'files',
+                view: 'folder',
+                machine: res.viewer.machine,
+                path: dir,
+                viewer: { machine: res.viewer.machine, path: res.viewer.path },
+              }),
+            );
+          }
+          return;
+        } catch (err) {
+          showToast(err?.message || 'Could not open this download.');
+          return;
+        }
+      }
+      if (transfer.machine && transfer.path) {
+        const dir = parentFilePath(transfer.path) || '~';
+        filesActions.pushHref(
+          routeHref({
+            section: 'files',
+            view: 'folder',
+            machine: transfer.machine,
+            path: dir,
+            viewer: { machine: transfer.machine, path: transfer.path },
+          }),
+        );
+      }
+    },
+    [link, filesActions, showToast],
+  );
+
   const machines = snapshot?.machines || [];
   const selectedMachine = route.machine
     ? machines.find((m) => m.name === route.machine) || null
     : null;
 
+  const isFilesRoot = route.section === 'files' && route.view === 'home' && !route.viewer;
+  const isFilesFolder = route.section === 'files' && route.view === 'folder';
+  const isFilesSearch = route.section === 'files' && route.view === 'search';
+
   const isRootPlace =
     (route.section === 'machines' && !route.machine) ||
+    isFilesRoot ||
     (route.section === 'activity' && !route.jobId) ||
     (route.section === 'actions' && !route.action && !route.allTools);
 
@@ -728,12 +971,44 @@ function App() {
     inMachinePhone && route.tab === 'command' && Boolean(selectedMachine?.reachable);
   const isActionsRoot =
     route.section === 'actions' && !route.action && !route.allTools;
-  const hasDock = isActionsRoot || isPhoneCommand;
+  const hasFilesDock =
+    route.section === 'files' &&
+    (filesSelecting || (!wide && (isFilesRoot || isFilesFolder || isFilesSearch)) || (wide && isFilesSearch));
+  const hasDock = isActionsRoot || isPhoneCommand || hasFilesDock;
 
-  // Hide bottom bar on phone for Settings and single-item detail pages so Settings feels like a real page.
-  const showBottomNav = wide || isRootPlace || inMachinePhone;
+  // Hide bottom bar on phone for Settings, single-item detail pages, and Files selection mode.
+  const showBottomNav =
+    wide ||
+    isRootPlace ||
+    inMachinePhone ||
+    (route.section === 'files' && !filesSelecting);
 
   function goBack() {
+    if (route.section === 'files') {
+      if (filesSheet) {
+        filesActions.closeSheet();
+        return;
+      }
+      if (filesSelecting) {
+        filesActions.endSelect();
+        return;
+      }
+      if (filesHistoryDepthRef.current > 0) {
+        window.history.back();
+        return;
+      }
+      const step = filesFallbackBackRoute(route, { hasSheet: Boolean(filesSheet), selecting: filesSelecting });
+      if (step?.action === 'navigate' && step.href) {
+        window.location.hash = step.href;
+        return;
+      }
+      if (window.history.length > 1) {
+        window.history.back();
+      } else {
+        window.location.hash = '#/machines';
+      }
+      return;
+    }
     if (route.section === 'machines' && route.machine) {
       if (route.jobId) {
         window.location.hash = routeHref({ section: 'machines', machine: route.machine, tab: 'activity' });
@@ -888,6 +1163,125 @@ function App() {
   }
 
   function renderHeader() {
+    // Files headers: selection mode, folder, search, sync, favourites, recent, and root.
+    if (route.section === 'files') {
+      if (filesSelecting) {
+        const sum = selectionSummary(filesMeta.entries, filesSelectedPaths);
+        const allPicked = filesMeta.entries.length > 0 && sum.count >= filesMeta.entries.length;
+        return html`
+          <header class="top sub">
+            <button
+              type="button"
+              class="btn icon back"
+              aria-label="Stop selecting"
+              onClick=${() => filesActions.endSelect()}
+            >
+              <${Icon} name="back" />
+            </button>
+            <h1>
+              ${`${sum.count} selected`}
+              ${sum.totalBytes > 0 ? html`<small>${formatBytes(sum.totalBytes)}</small>` : null}
+            </h1>
+            <button
+              type="button"
+              class="btn small quiet"
+              onClick=${() => filesActions.toggleSelectAll(filesMeta.entries)}
+            >
+              ${allPicked ? 'Deselect all' : 'Select all'}
+            </button>
+          </header>
+        `;
+      }
+      if (!wide && route.view === 'folder') {
+        const title = folderDisplayName(filesMeta.resolvedPath || route.path, {
+          technical: Boolean(settings.technical),
+        });
+        return html`
+          <header class="top sub">
+            <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
+              <${Icon} name="back" />
+            </button>
+            <h1>${title}</h1>
+          </header>
+        `;
+      }
+      if (!wide && route.view === 'search') {
+        const sub = filesSearchSummary.searching
+          ? 'Searching…'
+          : route.machine
+            ? `${filesSearchSummary.count} found in ${folderDisplayName(route.path)}`
+            : filesSearchSummary.machineCount > 0
+              ? `${filesSearchSummary.count} found on ${filesSearchSummary.machineCount} ${filesSearchSummary.machineCount === 1 ? 'machine' : 'machines'}`
+              : 'Search across your machines';
+        return html`
+          <header class="top sub">
+            <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
+              <${Icon} name="back" />
+            </button>
+            <h1>Search<small>${sub}</small></h1>
+          </header>
+        `;
+      }
+      if (!wide && route.view === 'sync') {
+        const sf = (filesMeta.syncFolders || []).find((f) => f.id === route.syncId);
+        const memberCount = sf?.members?.length || 0;
+        return html`
+          <header class="top sub">
+            <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
+              <${Icon} name="back" />
+            </button>
+            <h1>
+              ${sf?.name || 'Synced folder'}
+              ${memberCount > 0 ? html`<small>Kept in sync on ${memberCount} machines</small>` : null}
+            </h1>
+          </header>
+        `;
+      }
+      if (!wide && route.view === 'favourites') {
+        return html`
+          <header class="top sub">
+            <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
+              <${Icon} name="back" />
+            </button>
+            <h1>Favourites</h1>
+          </header>
+        `;
+      }
+      if (!wide && route.view === 'recent') {
+        return html`
+          <header class="top sub">
+            <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
+              <${Icon} name="back" />
+            </button>
+            <h1>Recent<small>Opened on this ${deviceNoun}</small></h1>
+          </header>
+        `;
+      }
+
+      const onlineCount = machines.filter((m) => m.reachable).length;
+      const filesSub =
+        onlineCount === 0
+          ? 'No machines are on'
+          : onlineCount === 1
+            ? '1 machine is on'
+            : `${onlineCount} machines are on`;
+      return html`
+        <header class="top">
+          <h1>
+            Files
+            ${machines.length > 0 ? html`<small>${filesSub}</small>` : null}
+          </h1>
+          ${!wide
+            ? html`
+                <a class="btn icon" href="#/settings" aria-label="Settings">
+                  <${Icon} name="gear" />
+                </a>
+              `
+            : null}
+        </header>
+      `;
+    }
+
     // Phone inside a machine.
     if (inMachinePhone && route.machine) {
       const m = selectedMachine;
@@ -1005,12 +1399,17 @@ function App() {
       : null;
 
     if (route.section === 'activity') {
-      const runningCount = (snapshot?.runningJobs || []).length;
+      const activeDeviceCount = deviceTransfers.filter(
+        (t) => t.state === 'running' || t.state === 'queued',
+      ).length;
+      const runningCount = (snapshot?.runningJobs || []).length + activeDeviceCount;
       return html`
         <header class="top">
           <h1>
             Activity
-            ${runningCount > 0 ? html`<small>${runningCount} running now</small>` : null}
+            ${runningCount > 0
+              ? html`<small>${runningCount} ${runningCount === 1 ? 'thing' : 'things'} running</small>`
+              : null}
           </h1>
           ${gearBtn}
         </header>
@@ -1041,6 +1440,24 @@ function App() {
   }
 
   function renderDock() {
+    if (hasFilesDock) {
+      return html`
+        <${FilesDock}
+          route=${route}
+          filesState=${{
+            caps: filesMeta.caps,
+            selecting: filesSelecting,
+            selectedPaths: filesSelectedPaths,
+            entries: filesMeta.entries,
+            resolvedPath: filesMeta.resolvedPath,
+            sortPref: filesSortPref,
+            resolvedViewMode: filesResolvedViewMode,
+          }}
+          filesActions=${filesActions}
+          onNavigateHref=${filesActions.pushHref}
+        />
+      `;
+    }
     if (isActionsRoot) {
       return html`
         <div class="dock">
@@ -1118,7 +1535,7 @@ function App() {
       `;
     }
 
-    // Root 3 places (plus Settings at the foot of the wide rail).
+    // Root 4 places (plus Settings at the foot of the wide rail).
     return html`
       <nav class="nav" aria-label="Main">
         <a
@@ -1126,6 +1543,12 @@ function App() {
           aria-current=${route.section === 'machines' ? 'page' : undefined}
         >
           <${Icon} name="machines" />Machines
+        </a>
+        <a
+          href="#/files"
+          aria-current=${route.section === 'files' ? 'page' : undefined}
+        >
+          <${Icon} name="files" />Files
         </a>
         <a
           href="#/activity"
@@ -1225,6 +1648,8 @@ function App() {
                           tools=${tools}
                           allowedSet=${allowedSet}
                           settings=${settings}
+                          deviceNoun=${deviceNoun}
+                          thumbCache=${thumbCache}
                           wakePendingSet=${wakePendingSet}
                           onWakeMachine=${onWakeMachine}
                           onWakeSent=${markWakeSent}
@@ -1237,19 +1662,50 @@ function App() {
                           onCommandRunsChange=${commandRunsApi}
                         />
                       `
-                    : route.section === 'activity'
+                    : route.section === 'files'
                       ? html`
-                          <${ActivityView}
+                          <${FilesView}
                             route=${route}
+                            wide=${wide}
                             snapshot=${snapshot}
                             link=${link}
                             nodeInfo=${nodeInfo}
+                            tools=${tools}
                             allowedSet=${allowedSet}
                             settings=${settings}
-                            wide=${wide}
-                            onRefreshFleet=${() => refreshFleet(nodeInfo)}
+                            deviceNoun=${deviceNoun}
+                            thumbCache=${thumbCache}
+                            filesState=${{
+                              sortPref: filesSortPref,
+                              showHidden: filesShowHidden,
+                              selecting: filesSelecting,
+                              selectedPaths: filesSelectedPaths,
+                              sheet: filesSheet,
+                              viewModeOverride: filesViewModeOverride,
+                              resolvedViewMode: filesResolvedViewMode,
+                            }}
+                            filesActions=${filesActions}
+                            onWakeMachine=${onWakeMachine}
+                            onRequestConfirm=${openConfirm}
+                            onToast=${showToast}
                           />
                         `
+                      : route.section === 'activity'
+                        ? html`
+                            <${ActivityView}
+                              route=${route}
+                              snapshot=${snapshot}
+                              link=${link}
+                              nodeInfo=${nodeInfo}
+                              allowedSet=${allowedSet}
+                              settings=${settings}
+                              wide=${wide}
+                              deviceNoun=${deviceNoun}
+                              deviceTransfers=${deviceTransfers}
+                              onOpenTransfer=${handleOpenDeviceTransfer}
+                              onRefreshFleet=${() => refreshFleet(nodeInfo)}
+                            />
+                          `
                       : route.section === 'actions'
                         ? html`
                             <${ActionsView}
@@ -1329,6 +1785,32 @@ function App() {
                 </main>
                 ${renderDock()}
                 ${renderNav()}
+                ${toast
+                  ? html`
+                      <div class="toast-banner" role="status">
+                        <span>${toast.message}</span>
+                        ${toast.actionLabel && toast.actionHref
+                          ? html`
+                              <a
+                                class="btn small primary"
+                                href=${toast.actionHref}
+                                onClick=${() => setToast(null)}
+                              >
+                                ${toast.actionLabel}
+                              </a>
+                            `
+                          : null}
+                        <button
+                          type="button"
+                          class="btn small quiet"
+                          aria-label="Dismiss"
+                          onClick=${() => setToast(null)}
+                        >
+                          OK
+                        </button>
+                      </div>
+                    `
+                  : null}
               </div>
             `}
       ${confirmRequest

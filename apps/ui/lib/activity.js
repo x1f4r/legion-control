@@ -1,6 +1,15 @@
 // Plain-language formatting for activity rows, machine status phrases, and role summaries.
 
-import { busyReasonLabel, formatDuration, formatDurationMs, formatRelativeTime, splitFirstSentence } from './format.js';
+import {
+  busyReasonLabel,
+  clampPct,
+  formatBytePair,
+  formatBytes,
+  formatDuration,
+  formatDurationMs,
+  formatRelativeTime,
+  splitFirstSentence,
+} from './format.js';
 
 const SHELL_NAMES = new Set([
   'sh',
@@ -71,6 +80,10 @@ function capitalize(word) {
  */
 export function friendlyJobName(job) {
   if (!job || typeof job !== 'object') return 'Command';
+
+  if (job.kind === 'transfer' && typeof job.title === 'string' && job.title.trim()) {
+    return job.title.trim();
+  }
 
   if (job.project && job.task) {
     return `${capitalize(job.task)} for ${job.project}`;
@@ -488,4 +501,166 @@ export function formatInviteValidity(minutes) {
   if (m % 1440 === 0) return `${m / 1440} days`;
   if (m % 60 === 0) return `${m / 60} hours`;
   return m === 1 ? '1 minute' : `${m} minutes`;
+}
+
+/**
+ * Progress percentage (0..100) for a machine transfer job or device transfer.
+ */
+export function transferProgressPct(progressOrTransfer) {
+  if (!progressOrTransfer || typeof progressOrTransfer !== 'object') return null;
+  const done = Number(progressOrTransfer.bytes_done);
+  const total = Number(progressOrTransfer.bytes_total);
+  if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) return null;
+  return clampPct((done / total) * 100);
+}
+
+/**
+ * Plain-English remaining time estimate for an active transfer ("about 1 minute left").
+ */
+export function formatTransferEta(bytesDone, bytesTotal, rate) {
+  if (!Number.isFinite(bytesDone) || !Number.isFinite(bytesTotal) || !Number.isFinite(rate) || rate <= 0) {
+    return '';
+  }
+  const remaining = Math.max(0, bytesTotal - bytesDone);
+  if (remaining <= 0) return '';
+  const sec = Math.ceil(remaining / rate);
+  if (sec < 45) return `about ${Math.max(1, sec)} seconds left`;
+  const mins = Math.round(sec / 60);
+  if (mins < 60) return `about ${mins} ${mins === 1 ? 'minute' : 'minutes'} left`;
+  const hours = Math.round(sec / 3600);
+  return `about ${hours} ${hours === 1 ? 'hour' : 'hours'} left`;
+}
+
+/**
+ * Formats the subtitle for a machine-side transfer job (`kind === 'transfer'`).
+ */
+export function formatTransferJobSubtitle(job, { includeMachine = true, technical = false, nowMs = Date.now() } = {}) {
+  if (!job) return '';
+  const active = job.state === 'running' || job.state === 'starting';
+  const p = job.progress;
+
+  if (active && p && Number.isFinite(p.bytes_total) && p.bytes_total > 0) {
+    const parts = [];
+    if (includeMachine && job.machine) parts.push(job.machine);
+    parts.push(
+      technical
+        ? `${formatBytes(p.bytes_done || 0)} / ${formatBytes(p.bytes_total)} (${p.bytes_done || 0} / ${p.bytes_total} B)`
+        : formatBytePair(p.bytes_done || 0, p.bytes_total),
+    );
+    const eta = formatTransferEta(p.bytes_done || 0, p.bytes_total, p.rate);
+    if (eta) parts.push(eta);
+    return parts.join(' · ');
+  }
+
+  if (job.state === 'failed' && job.error_summary && !technical) {
+    return job.error_summary;
+  }
+
+  const parts = [];
+  if (includeMachine && job.machine) {
+    parts.push(technical ? job.machine : `From ${job.machine}`);
+  }
+  const when = job.finished || job.created;
+  if (when) {
+    const ago = formatFriendlyRelativeTime(when, nowMs);
+    if (ago) parts.push(ago);
+  }
+  const dur = jobDurationSeconds(job);
+  if (dur != null && job.state !== 'cancelled' && job.state !== 'failed') {
+    const durText = formatActivityDuration(dur, technical);
+    if (durText) parts.push(durText);
+  }
+  if (technical && job.from && job.to) {
+    parts.push(`${job.from} -> ${job.to}`);
+  }
+  return parts.join(' · ');
+}
+
+/**
+ * Plain title for a device-side transfer ("Downloading Beach.mp4", "Downloaded Tickets.pdf", "Uploading Photo.jpg").
+ */
+export function formatDeviceTransferTitle(transfer, technical = false) {
+  if (!transfer) return 'Transfer';
+  const name = transfer.name || 'file';
+  const isUp = transfer.direction === 'upload';
+  if (technical) {
+    return isUp ? `upload ${name} -> ${transfer.machine}:${transfer.path}` : `download ${transfer.machine}:${transfer.path}`;
+  }
+  if (transfer.state === 'done') {
+    return isUp ? `Uploaded ${name}` : `Downloaded ${name}`;
+  }
+  if (transfer.state === 'queued') {
+    return isUp ? `Waiting to upload ${name}` : `Waiting to download ${name}`;
+  }
+  return isUp ? `Uploading ${name} to ${transfer.machine}` : `Downloading ${name}`;
+}
+
+/**
+ * Plain or technical subtitle for a device-side transfer row.
+ */
+export function formatDeviceTransferSubtitle(transfer, { deviceNoun = 'phone', technical = false, nowMs = Date.now() } = {}) {
+  if (!transfer) return '';
+  const isUp = transfer.direction === 'upload';
+  const destLabel = isUp ? `From this ${deviceNoun} to ${transfer.machine}` : `To this ${deviceNoun}`;
+
+  if (transfer.state === 'running' || transfer.state === 'paused' || transfer.state === 'queued') {
+    const parts = [transfer.state === 'paused' ? 'Paused' : destLabel];
+    if (Number.isFinite(transfer.bytes_total) && transfer.bytes_total > 0) {
+      parts.push(
+        technical
+          ? `${transfer.bytes_done || 0} / ${transfer.bytes_total} B`
+          : formatBytePair(transfer.bytes_done || 0, transfer.bytes_total),
+      );
+    }
+    if (transfer.state === 'running') {
+      const eta = formatTransferEta(transfer.bytes_done || 0, transfer.bytes_total, transfer.rate);
+      if (eta) parts.push(eta);
+    }
+    return parts.join(' · ');
+  }
+
+  if (transfer.state === 'failed') {
+    const msg =
+      typeof transfer.error === 'string'
+        ? transfer.error
+        : transfer.error?.message || 'Stopped before finishing. Tap Resume to continue from where it stopped.';
+    return msg;
+  }
+
+  if (transfer.state === 'done') {
+    if (technical) {
+      return [
+        transfer.localPath || destLabel,
+        transfer.bytes_total ? `${transfer.bytes_total} B` : null,
+        transfer.hash ? transfer.hash.slice(0, 22) : null,
+      ]
+        .filter(Boolean)
+        .join(' · ');
+    }
+    if (!isUp && transfer.canOpen) {
+      return `${destLabel} · tap to open`;
+    }
+    const when = transfer.finished ? formatFriendlyRelativeTime(transfer.finished, nowMs) : '';
+    return [destLabel, when].filter(Boolean).join(' · ');
+  }
+
+  const when = transfer.finished || transfer.created;
+  return [destLabel, when ? formatFriendlyRelativeTime(when, nowMs) : null].filter(Boolean).join(' · ');
+}
+
+/**
+ * State badge for a device-side transfer row.
+ */
+export function friendlyDeviceTransferState(transfer, technical = false) {
+  const st = transfer?.state || '';
+  if (st === 'running') {
+    const pct = transferProgressPct(transfer);
+    return { label: pct != null ? `${pct}%` : 'Running', cls: 'running' };
+  }
+  if (st === 'queued') return { label: 'Queued', cls: 'running' };
+  if (st === 'paused') return { label: 'Paused', cls: '' };
+  if (st === 'done') return { label: technical ? 'done' : 'Finished', cls: 'done' };
+  if (st === 'failed') return { label: technical ? 'failed' : 'Stopped', cls: 'failed' };
+  if (st === 'cancelled') return { label: technical ? 'cancelled' : 'Stopped', cls: '' };
+  return { label: st || 'Finished', cls: 'done' };
 }
