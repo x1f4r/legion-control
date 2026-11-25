@@ -1011,7 +1011,7 @@ test('Files viewer: honest media errors, in-place Open in another app progress/c
     // and closing the viewer immediately revokes the minted content URL.
     await page.locator('.list a.row', { hasText: 'studio-master.flac' }).click();
     await page.locator('.viewer .music-screen').waitFor();
-    const flacAudio = page.locator('.viewer audio');
+    const flacAudio = page.locator('.viewer audio[src]');
     await flacAudio.waitFor({ state: 'attached' });
     const flacUrl = await flacAudio.getAttribute('src');
     assert.ok(flacUrl, 'expected minted audio content URL');
