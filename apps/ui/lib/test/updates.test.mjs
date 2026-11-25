@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  ERROR_RETRY_INTERVAL_MS,
   RESUME_CHECK_INTERVAL_MS,
   describeUpdateSummary,
   formatDownloadPercent,
@@ -10,13 +11,16 @@ import {
   shouldCheckOnResume,
 } from '../updates.js';
 
-test('shouldCheckOnResume enforces a 1-hour interval', () => {
+test('shouldCheckOnResume enforces a 1-hour interval normally and 5 minutes after an error', () => {
   const now = Date.UTC(2026, 10, 25, 10, 0, 0);
   assert.equal(shouldCheckOnResume(null, now), true);
   assert.equal(shouldCheckOnResume(now - RESUME_CHECK_INTERVAL_MS + 1000, now), false);
   assert.equal(shouldCheckOnResume(now - RESUME_CHECK_INTERVAL_MS, now), true);
   assert.equal(shouldCheckOnResume('2026-11-25T08:30:00Z', now), true);
   assert.equal(shouldCheckOnResume('2026-11-25T09:30:00Z', now), false);
+  // Transient error retries much sooner (5 minutes) instead of waiting 1 hour.
+  assert.equal(shouldCheckOnResume(now - ERROR_RETRY_INTERVAL_MS + 1000, now, { phase: 'error' }), false);
+  assert.equal(shouldCheckOnResume(now - ERROR_RETRY_INTERVAL_MS, now, { phase: 'error' }), true);
 });
 
 test('isSafeForAutoInstall only allows startup before interaction or silent Android backgrounding', () => {
@@ -40,6 +44,16 @@ test('isSafeForAutoInstall only allows startup before interaction or silent Andr
       updateState: readyDesktop,
       trigger: 'startup',
       userInteracted: true,
+    }),
+    false,
+  );
+  // Once the first full screen has shown, startup auto-install must never interrupt the session.
+  assert.equal(
+    isSafeForAutoInstall({
+      updateState: readyDesktop,
+      trigger: 'startup',
+      userInteracted: false,
+      firstScreenShown: true,
     }),
     false,
   );

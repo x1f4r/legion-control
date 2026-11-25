@@ -475,6 +475,13 @@ pub trait Backend: Send + Sync {
     fn update_sources(&self) -> Result<Option<(legion_link::Link, Vec<String>)>, AppError> {
         Ok(None)
     }
+
+    /// Returns the count of native operations currently in flight (tool calls, pairing, unpairing,
+    /// learning, transfers, or content streams). Used by the updater to refuse automatic restarts
+    /// while native work is active.
+    fn active_operations(&self) -> usize {
+        0
+    }
 }
 
 /// Fallback backend returning honest unpaired responses.

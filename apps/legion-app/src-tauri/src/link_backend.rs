@@ -5,8 +5,8 @@
 //! [`AppStore`] without ever logging keys or invites.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use legion_link::proto::Target;
@@ -105,6 +105,16 @@ fn allow_loopback_endpoints_for_store(store: &AppStore) -> bool {
     }
 }
 
+/// RAII guard tracking one in-flight native backend operation (tool call, pairing, unpairing,
+/// learning, file transfer, or content stream) so automatic updates never restart mid-operation.
+pub struct OperationGuard(Arc<AtomicUsize>);
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Production backend implementation over [`legion_link::Link`].
 pub struct LinkBackend {
     store: AppStore,
@@ -113,6 +123,8 @@ pub struct LinkBackend {
     /// and store writes never race.
     mutate_lock: AsyncMutex<()>,
     next_call_seq: AtomicU64,
+    /// Count of currently active native operations (calls, pairing, transfers, streams).
+    in_flight_ops: Arc<AtomicUsize>,
 }
 
 struct BackendState {
@@ -196,7 +208,15 @@ impl LinkBackend {
             }),
             mutate_lock: AsyncMutex::new(()),
             next_call_seq: AtomicU64::new(1),
+            in_flight_ops: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Marks one native operation (call, pairing, file transfer, or content stream) as in flight
+    /// until the returned [`OperationGuard`] is dropped.
+    pub fn track_operation(&self) -> OperationGuard {
+        self.in_flight_ops.fetch_add(1, Ordering::SeqCst);
+        OperationGuard(Arc::clone(&self.in_flight_ops))
     }
 
     fn require_healthy_store(&self) -> Result<(), AppError> {
@@ -327,6 +347,7 @@ impl Backend for LinkBackend {
         on_event: Option<Channel<Value>>,
     ) -> BoxFuture<'_, Result<Value, AppError>> {
         Box::pin(async move {
+            let _op = self.track_operation();
             let (link, route_hint) = self.active_link_and_route_hint()?;
             let Some(hint_name) = route_hint else {
                 return Err(AppError::not_paired());
@@ -411,6 +432,7 @@ impl Backend for LinkBackend {
 
     fn pair(&self, invite: String, name: String) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async move {
+            let _op = self.track_operation();
             self.require_healthy_store()?;
             let trimmed_invite = invite.trim();
             if trimmed_invite.is_empty() {
@@ -498,6 +520,7 @@ impl Backend for LinkBackend {
 
     fn unpair(&self, node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
         Box::pin(async move {
+            let _op = self.track_operation();
             self.require_healthy_store()?;
             let trimmed = node.trim();
             if trimmed.is_empty() {
@@ -637,6 +660,7 @@ impl Backend for LinkBackend {
 
     fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
         Box::pin(async move {
+            let _op = self.track_operation();
             let _mutation = self.mutate_lock.lock().await;
             {
                 let guard = self
@@ -709,6 +733,7 @@ impl Backend for LinkBackend {
 
     fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
         Box::pin(async move {
+            let _op = self.track_operation();
             self.require_healthy_store()?;
             // Hold `mutate_lock` across the whole learn call so an `unpair` during `learn` can
             // never be undone when learned routes are persisted.
@@ -779,6 +804,7 @@ impl Backend for LinkBackend {
         fingerprints: Vec<String>,
     ) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async move {
+            let _op = self.track_operation();
             self.require_healthy_store()?;
             let trimmed = node.trim();
             if trimmed.is_empty() {
@@ -817,6 +843,7 @@ impl Backend for LinkBackend {
 
     fn dismiss_identity_change(&self, node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async move {
+            let _op = self.track_operation();
             self.require_healthy_store()?;
             let trimmed = node.trim();
             if trimmed.is_empty() {
@@ -870,6 +897,10 @@ impl Backend for LinkBackend {
             }
         }
         Ok(Some((guard.link.clone(), nodes)))
+    }
+
+    fn active_operations(&self) -> usize {
+        self.in_flight_ops.load(Ordering::SeqCst)
     }
 }
 
@@ -2679,5 +2710,41 @@ mod tests {
             summary.not_synced[0].reason.as_deref(),
             Some("live device changes refused")
         );
+    }
+
+    #[tokio::test]
+    async fn active_operations_tracks_in_flight_calls_and_guards_and_releases_on_drop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let backend = LinkBackend::with_local_program(store, None);
+        assert_eq!(backend.active_operations(), 0);
+
+        {
+            let _g1 = backend.track_operation();
+            assert_eq!(backend.active_operations(), 1);
+            {
+                let _g2 = backend.track_operation();
+                assert_eq!(backend.active_operations(), 2);
+            }
+            assert_eq!(backend.active_operations(), 1);
+        }
+        assert_eq!(backend.active_operations(), 0);
+
+        // Even a failing `call` / `pair` releases its counter cleanly when it returns.
+        let _ = backend
+            .call(
+                CallRequest {
+                    id: None,
+                    tool: "sys.info".to_owned(),
+                    args: serde_json::json!({}),
+                    on: Some(serde_json::json!("tower")),
+                },
+                None,
+            )
+            .await;
+        let _ = backend.pair(String::new(), "phone".to_owned()).await;
+        assert_eq!(backend.active_operations(), 0);
+        Ok(())
     }
 }

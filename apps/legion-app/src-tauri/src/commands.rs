@@ -380,16 +380,13 @@ pub async fn update_maybe_auto_install(
     updater: State<'_, SharedUpdater>,
     trigger: Option<String>,
 ) -> Result<UpdateState, AppError> {
-    let current = updater.0.snapshot();
-    let ready_or_checking_downloaded = current.phase == "ready"
-        || (current.phase == "checking"
-            && current.available.as_ref().is_some_and(|a| a.downloaded));
-    if !current.auto_update || !ready_or_checking_downloaded || !current.can_self_install {
-        return Ok(current);
-    }
     let trigger_kind = trigger.as_deref().unwrap_or("startup");
-    if !matches!(trigger_kind, "startup" | "background") {
-        return Ok(current);
+    if updater
+        .0
+        .evaluate_auto_install_gate(trigger_kind, backend.0.active_operations(), true)
+        .is_err()
+    {
+        return Ok(updater.0.snapshot());
     }
     #[cfg(target_os = "android")]
     {
@@ -403,14 +400,14 @@ pub async fn update_maybe_auto_install(
     #[cfg(target_os = "ios")]
     {
         let _ = (app, backend);
-        Ok(current)
+        Ok(updater.0.snapshot())
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         // On desktop, window-close installs run via `WindowEvent::CloseRequested`; the frontend
-        // auto-install trigger applies only at startup before user interaction.
+        // auto-install trigger applies only at startup before the first full screen renders.
         if trigger_kind != "startup" {
-            return Ok(current);
+            return Ok(updater.0.snapshot());
         }
         let (st, should_exit) = updater.0.install_desktop(backend.0.as_ref(), true).await?;
         if should_exit {
@@ -484,8 +481,13 @@ pub fn default_device_name() -> String {
 /// Camera permission is checked and requested only when this command is called.
 #[cfg(target_os = "android")]
 #[tauri::command]
-pub async fn scan_invite(scanner: State<'_, ScannerHandle>) -> Result<ScanInviteResult, AppError> {
+pub async fn scan_invite(
+    scanner: State<'_, ScannerHandle>,
+    updater: State<'_, SharedUpdater>,
+) -> Result<ScanInviteResult, AppError> {
     use serde_json::json;
+
+    let _scan_guard = updater.0.track_external_operation();
 
     #[derive(Deserialize)]
     struct PermissionResponse {

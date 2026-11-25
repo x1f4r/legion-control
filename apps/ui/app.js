@@ -50,6 +50,7 @@ import {
   writeSettings,
 } from './lib/settings.js';
 import {
+  ERROR_RETRY_INTERVAL_MS,
   PERIODIC_CHECK_INTERVAL_MS,
   isSafeForAutoInstall,
   shouldCheckOnResume,
@@ -332,6 +333,7 @@ function App() {
   const learnInFlightRef = useRef(false);
   const updateCheckInFlightRef = useRef(false);
   const userInteractedRef = useRef(false);
+  const firstScreenShownRef = useRef(false);
   const startupAutoInstallRanRef = useRef(false);
   const updateStateRef = useRef(updateState);
   updateStateRef.current = updateState;
@@ -753,7 +755,9 @@ function App() {
     [link, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
   );
 
-  // Subscribe to native updater state and apply ready updates on startup before user interaction.
+  // Track any user interaction (including wheel/scroll) and subscribe to live updater state.
+  // Startup auto-install runs once during boot before the first full screen renders — never on
+  // subsequent live state pushes mid-session.
   useEffect(() => {
     const markInteracted = () => {
       userInteractedRef.current = true;
@@ -761,87 +765,31 @@ function App() {
     window.addEventListener('pointerdown', markInteracted, { passive: true, once: true });
     window.addEventListener('keydown', markInteracted, { passive: true, once: true });
     window.addEventListener('touchstart', markInteracted, { passive: true, once: true });
-
-    if (typeof link.watchUpdates !== 'function' && typeof link.updateState !== 'function') {
-      return () => {
-        window.removeEventListener('pointerdown', markInteracted);
-        window.removeEventListener('keydown', markInteracted);
-        window.removeEventListener('touchstart', markInteracted);
-      };
-    }
+    window.addEventListener('wheel', markInteracted, { passive: true, once: true });
+    window.addEventListener('scroll', markInteracted, { passive: true, capture: true, once: true });
 
     let alive = true;
-    const maybeRunStartupInstall = (st) => {
-      if (
-        !alive ||
-        !st ||
-        startupAutoInstallRanRef.current ||
-        typeof link.maybeAutoInstall !== 'function'
-      ) {
-        return;
-      }
-      if (
-        !isSafeForAutoInstall({
-          updateState: st,
-          trigger: 'startup',
-          userInteracted: userInteractedRef.current,
-          hasOpenSheet: Boolean(
-            confirmRequestRef.current || whatIsNewOpenRef.current || filesSheetRef.current,
-          ),
-          hasCommandDraft: Boolean(commandDraftRef.current.cmd?.trim()),
-          isRunningCommand: Boolean(commandDraftRef.current.running),
-          activeCalls: activeCallsRef.current + activeTransfersCountRef.current,
-          isPairingOpen: Boolean(pairingOpenRef.current),
-        })
-      ) {
-        return;
-      }
-      startupAutoInstallRanRef.current = true;
-      const isMock = Boolean(link.mockFlags);
-      if (!isMock) setStartupUpdating(true);
-      link
-        .maybeAutoInstall('startup')
-        .then((res) => {
-          if (alive && (!res || res.phase !== 'installing')) {
-            setStartupUpdating(false);
-            if (res?.phase === 'checking') {
-              startupAutoInstallRanRef.current = false;
-            }
-          }
-        })
-        .catch(() => {
-          if (alive) setStartupUpdating(false);
-        });
-    };
-
     const unwatch =
       typeof link.watchUpdates === 'function'
         ? link.watchUpdates((st) => {
             if (!alive || !st) return;
             setUpdateState(st);
-            maybeRunStartupInstall(st);
           })
         : () => {};
-    if (typeof link.updateState === 'function') {
-      link
-        .updateState()
-        .then((st) => {
-          if (!alive || !st) return;
-          setUpdateState(st);
-          maybeRunStartupInstall(st);
-        })
-        .catch(() => {});
-    }
+
     return () => {
       alive = false;
       unwatch();
       window.removeEventListener('pointerdown', markInteracted);
       window.removeEventListener('keydown', markInteracted);
       window.removeEventListener('touchstart', markInteracted);
+      window.removeEventListener('wheel', markInteracted);
+      window.removeEventListener('scroll', markInteracted, { capture: true });
     };
   }, [link]);
 
-  // Trigger periodic (6h) update checks while the app is open and visible.
+  // Trigger periodic (6h) update checks while the app is open and visible, and retry sooner (5m)
+  // after a transient check or download error.
   useEffect(() => {
     if (!linkState?.ready || typeof link.checkUpdates !== 'function') return;
 
@@ -857,8 +805,79 @@ function App() {
   }, [link, linkState?.ready, checkUpdatesQuietly]);
 
   useEffect(() => {
+    if (
+      !linkState?.ready ||
+      typeof link.checkUpdates !== 'function' ||
+      updateState?.phase !== 'error' ||
+      updateState?.failed_update
+    ) {
+      return;
+    }
+    const retryTimer = window.setTimeout(() => {
+      if (document.visibilityState === 'visible') {
+        checkUpdatesQuietly();
+      }
+    }, ERROR_RETRY_INTERVAL_MS);
+    return () => {
+      window.clearTimeout(retryTimer);
+    };
+  }, [link, linkState?.ready, updateState?.phase, updateState?.failed_update, updateState?.last_checked_at, checkUpdatesQuietly]);
+
+  useEffect(() => {
     let alive = true;
     (async () => {
+      // Check for an already-downloaded update BEFORE calling link.state() / painting the first
+      // full screen so startup auto-install runs only at launch with zero native calls in flight.
+      if (
+        typeof link.updateState === 'function' &&
+        !startupAutoInstallRanRef.current &&
+        !firstScreenShownRef.current
+      ) {
+        try {
+          const initialUpdate = await link.updateState();
+          if (!alive) return;
+          if (initialUpdate) {
+            setUpdateState(initialUpdate);
+            if (
+              typeof link.maybeAutoInstall === 'function' &&
+              isSafeForAutoInstall({
+                updateState: initialUpdate,
+                trigger: 'startup',
+                userInteracted: userInteractedRef.current,
+                firstScreenShown: firstScreenShownRef.current,
+                hasOpenSheet: Boolean(
+                  confirmRequestRef.current || whatIsNewOpenRef.current || filesSheetRef.current,
+                ),
+                hasCommandDraft: Boolean(commandDraftRef.current.cmd?.trim()),
+                isRunningCommand: Boolean(commandDraftRef.current.running),
+                activeCalls: activeCallsRef.current + activeTransfersCountRef.current,
+                isPairingOpen: Boolean(pairingOpenRef.current),
+              })
+            ) {
+              startupAutoInstallRanRef.current = true;
+              const isMock = Boolean(link.mockFlags);
+              if (!isMock) setStartupUpdating(true);
+              try {
+                const res = await link.maybeAutoInstall('startup');
+                if (!alive) return;
+                if (res) setUpdateState(res);
+                if (!isMock && res?.phase === 'installing') {
+                  return;
+                }
+              } catch {
+                // Fall through to normal startup on auto-install error.
+              }
+              if (alive) setStartupUpdating(false);
+            }
+          }
+        } catch {
+          // Ignore updateState errors during boot.
+        }
+      }
+
+      if (!alive) return;
+      firstScreenShownRef.current = true;
+
       const { token } = extractHashToken(window.location.hash);
       if (token && typeof link.setToken === 'function') {
         window.history.replaceState(null, '', window.location.pathname + window.location.search + '#/machines');
@@ -929,7 +948,7 @@ function App() {
         wasHidden = false;
         refreshFleet(nodeInfo, { background: true });
       }
-      if (shouldCheckOnResume(updateStateRef.current?.last_checked_at)) {
+      if (shouldCheckOnResume(updateStateRef.current?.last_checked_at, Date.now(), { phase: updateStateRef.current?.phase })) {
         checkUpdatesQuietly();
       }
     };

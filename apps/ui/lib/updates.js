@@ -2,13 +2,18 @@
 
 export const RESUME_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 export const PERIODIC_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+export const ERROR_RETRY_INTERVAL_MS = 5 * 60 * 1000;
 
-/** Returns true when enough time (>= 1 hour) has passed to re-check on foreground resume. */
-export function shouldCheckOnResume(lastCheckedAt, nowMs = Date.now()) {
+/**
+ * Returns true when enough time has passed to re-check on foreground resume (>= 1 hour normally,
+ * or >= 5 minutes when the previous check ended in an error).
+ */
+export function shouldCheckOnResume(lastCheckedAt, nowMs = Date.now(), { phase } = {}) {
   if (!lastCheckedAt) return true;
   const ts = typeof lastCheckedAt === 'number' ? lastCheckedAt : Date.parse(lastCheckedAt);
   if (!Number.isFinite(ts)) return true;
-  return nowMs - ts >= RESUME_CHECK_INTERVAL_MS;
+  const interval = phase === 'error' ? ERROR_RETRY_INTERVAL_MS : RESUME_CHECK_INTERVAL_MS;
+  return nowMs - ts >= interval;
 }
 
 /**
@@ -16,7 +21,8 @@ export function shouldCheckOnResume(lastCheckedAt, nowMs = Date.now()) {
  * anything the person started.
  *
  * Automatic installs only ever run at two moments:
- * - `trigger === 'startup'`: on launch before the person has interacted with the app.
+ * - `trigger === 'startup'`: on launch within the native startup window, before the first full
+ *   screen is shown and before the person has interacted with the app.
  * - `trigger === 'background'`: on Android when the app moves into the background (strictly silent;
  *   desktop window-close updates are triggered natively on `WindowEvent::CloseRequested`).
  */
@@ -29,6 +35,7 @@ export function isSafeForAutoInstall({
   activeCalls = 0,
   isPairingOpen = false,
   userInteracted = false,
+  firstScreenShown = false,
 } = {}) {
   if (!updateState || !updateState.auto_update) return false;
   if (updateState.phase !== 'ready' || !updateState.can_self_install) return false;
@@ -43,7 +50,7 @@ export function isSafeForAutoInstall({
     return false;
   }
   if (trigger === 'startup') {
-    return !userInteracted;
+    return !userInteracted && !firstScreenShown;
   }
   if (trigger === 'background') {
     return isAndroid;

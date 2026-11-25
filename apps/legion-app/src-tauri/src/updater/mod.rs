@@ -20,13 +20,15 @@ pub mod android;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod desktop;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::task::Poll;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -35,14 +37,15 @@ use legion_update::{
     Arch, Artifact, CHECKSUMS_FILENAME, Channel, InstallKind, MANIFEST_FILENAME,
     MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, MAX_SIG_BYTES, MAX_SUMS_BYTES, Os, Program,
     SIGNATURE_FILENAME, SequenceFloorState, SignerKind, TargetPlatform, TrustAnchors,
-    VerifiedSetMeta, compiled_sequence_marker, read_sequence_floor, recover_sequence_floor,
-    select_verified_artifact, verify_artifact_file, verify_set_metadata,
+    VerifiedSetMeta, compiled_preview_key_marker, compiled_sequence_marker, read_sequence_floor,
+    recover_sequence_floor, select_verified_artifact, verify_artifact_file, verify_set_metadata,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::ipc::Channel as IpcChannel;
 use tempfile::NamedTempFile;
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 use crate::backend::{AppError, Backend, BoxFuture, ErrorCode};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -79,19 +82,68 @@ const MAX_SMALL_FILE_CHUNKS: usize = 32;
 const MIN_EXPECTED_CHUNK_BYTES: u64 = 4096;
 
 /// Minimum sustained download progress rate (16 KiB/s) enforced after [`PROGRESS_GRACE_WINDOW`].
-const MIN_PROGRESS_BYTES_PER_SEC: u64 = 16 * 1024;
+pub const MIN_PROGRESS_BYTES_PER_SEC: u64 = 16 * 1024;
 
 /// Grace window before enforcing [`MIN_PROGRESS_BYTES_PER_SEC`].
 const PROGRESS_GRACE_WINDOW: Duration = Duration::from_secs(5);
 
-/// Overall wall-clock deadline for one check + download pass.
-const OVERALL_CHECK_DEADLINE: Duration = Duration::from_secs(180);
+/// Minimum sustained metadata progress rate (4 KiB/s) enforced after [`METADATA_PROGRESS_GRACE`].
+const MIN_METADATA_BYTES_PER_SEC: u64 = 4 * 1024;
 
-/// Per-node timeout for `update.list` and metadata `update.read` calls.
-const CHECK_CALL_TIMEOUT: Duration = Duration::from_secs(12);
+/// Grace window before enforcing [`MIN_METADATA_BYTES_PER_SEC`] during metadata reads.
+const METADATA_PROGRESS_GRACE: Duration = Duration::from_secs(2);
+
+/// Per-node timeout for concurrent `update.list` calls.
+const LIST_NODE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Shorter `update.list` timeout for nodes already deprioritized from an earlier timeout or bad set.
+const BAD_NODE_LIST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Per-RPC timeout for metadata `update.read` calls (`SHA256SUMS`, `SHA256SUMS.sig`, `update.json`).
+const METADATA_CALL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Per-(candidate, node) wall-clock budget for reading and verifying a candidate's metadata files.
+const METADATA_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Total metadata wall-clock budget spent probing any single node within one update check.
+const METADATA_NODE_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Maximum metadata verification/timeout failures tolerated from one node within a single check
+/// before skipping that node's remaining candidates in that check.
+const MAX_METADATA_FAILURES_PER_NODE_PER_CHECK: usize = 4;
+
+/// How long a node or `(channel, sequence, node)` source stays deprioritized before decay forgets it.
+pub const BAD_NODE_TTL: Duration = Duration::from_secs(20 * 60);
+
+/// Minimum wall-clock deadline for an artifact download attempt.
+const MIN_DOWNLOAD_DEADLINE: Duration = Duration::from_secs(180);
+
+/// Extra slack added on top of `remaining_bytes / MIN_PROGRESS_BYTES_PER_SEC` for an artifact download.
+const DOWNLOAD_DEADLINE_SLACK: Duration = Duration::from_secs(60);
+
+/// Upper cap on a single artifact download deadline (10 hours; > 512 MiB at 16 KiB/s).
+const MAX_DOWNLOAD_DEADLINE: Duration = Duration::from_secs(10 * 3600);
+
+/// Maximum time after launch during which a `"startup"` automatic install may run (and only
+/// before the interface has shown its first full screen).
+pub const STARTUP_AUTO_INSTALL_WINDOW: Duration = Duration::from_secs(15);
+
+/// Minimum interval enforced natively between page-initiated `update_maybe_auto_install` requests.
+pub const AUTO_INSTALL_RATE_LIMIT: Duration = Duration::from_secs(5);
 
 /// Per-chunk timeout for artifact `update.read` calls.
 const CHUNK_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Computes the download deadline scaled to `remaining_bytes` and [`MIN_PROGRESS_BYTES_PER_SEC`],
+/// guaranteeing an honest node sustaining at least the rate floor can always finish.
+pub fn download_deadline_for_bytes(remaining_bytes: u64) -> Duration {
+    let at_floor_secs = remaining_bytes.div_ceil(MIN_PROGRESS_BYTES_PER_SEC);
+    let total_secs = at_floor_secs.saturating_add(DOWNLOAD_DEADLINE_SLACK.as_secs());
+    Duration::from_secs(total_secs.clamp(
+        MIN_DOWNLOAD_DEADLINE.as_secs(),
+        MAX_DOWNLOAD_DEADLINE.as_secs(),
+    ))
+}
 
 /// Build-time app semantic version from `Cargo.toml`.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -103,6 +155,7 @@ pub const APP_BUILD_ID: &str = env!("LEGION_APP_BUILD_ID");
 /// static `LEGION_UPDATE_SEQUENCE=<seq>\0` marker in compiled binaries for packaging inspection.
 pub fn current_app_sequence() -> u64 {
     let _ = std::hint::black_box(compiled_sequence_marker());
+    let _ = std::hint::black_box(compiled_preview_key_marker());
     env!("LEGION_APP_SEQUENCE").parse::<u64>().unwrap_or(0)
 }
 
@@ -360,7 +413,7 @@ impl UpdateSourceClient for LinkUpdateClient {
         let node = node.to_owned();
         Box::pin(async move {
             let routed = tokio::time::timeout(
-                CHECK_CALL_TIMEOUT,
+                LIST_NODE_TIMEOUT,
                 link.call_machine(&node, "update.list", json!({}), |_| {}),
             )
             .await
@@ -649,8 +702,64 @@ struct VerifiedCandidate {
     all_nodes: Vec<String>,
 }
 
+/// One contiguous byte range `[start, end)` written into a `.part` file by `node`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PartRange {
+    start: u64,
+    end: u64,
+    node: String,
+}
+
+/// Sidecar provenance persisted beside `<artifact>.part` (`<artifact>.part.meta.json`) recording
+/// which paired node contributed each byte range.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PartMetadata {
+    sha256: String,
+    expected_size: u64,
+    #[serde(default)]
+    ranges: Vec<PartRange>,
+}
+
+enum CandidateFetchError {
+    /// Set metadata verified cleanly, but the signed manifest carries no artifact for this OS/arch/kind.
+    NotForThisPlatform {
+        bytes_read: usize,
+        elapsed: Duration,
+    },
+    /// Check was cancelled by a newer generation.
+    Cancelled,
+    /// Metadata read timed out, stalled, or failed cryptographic/manifest verification.
+    Failed {
+        err: AppError,
+        bytes_read: usize,
+        elapsed: Duration,
+    },
+}
+
+enum DownloadFailure {
+    /// Download was cancelled by a newer generation (`.part` preserved).
+    Cancelled(AppError),
+    /// Network disconnect, timeout, rate floor, or protocol error (`.part` preserved).
+    Interrupted(AppError),
+    /// Complete `.part` reached signed size but failed final SHA-256 verification (`.part` discarded).
+    HashMismatch {
+        err: AppError,
+        contributors: Vec<String>,
+    },
+}
+
 /// Shared managed state holding the app's [`UpdateManager`].
 pub struct SharedUpdater(pub Arc<UpdateManager>);
+
+/// RAII guard for native UI/command activity outside [`Backend`] (such as Android QR scanner
+/// activity) so automatic updates never fire while it is active.
+pub struct ExternalOpGuard(Arc<AtomicUsize>);
+
+impl Drop for ExternalOpGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Native app update coordinator persisted under `<updates_base>/updates/`.
 pub struct UpdateManager {
@@ -665,12 +774,25 @@ pub struct UpdateManager {
     state: Mutex<UpdateState>,
     prefs: Mutex<PersistedPrefs>,
     watchers: Mutex<Vec<IpcChannel<UpdateState>>>,
-    /// Tracks `(channel, sequence, node)` sources that returned corrupt bytes, stalled, or errored
-    /// so future checks and multi-node fallbacks try healthy nodes first.
-    bad_sources: Mutex<BTreeSet<(Channel, u64, String)>>,
+    /// Tracks `(channel, sequence, node)` sources that failed or stalled on a specific update set,
+    /// with timestamps so entries decay after [`BAD_NODE_TTL`].
+    bad_sources: Mutex<BTreeMap<(Channel, u64, String), Instant>>,
+    /// Tracks nodes that timed out or served unverifiable sets across checks so they are tried last
+    /// on subsequent checks and automatically forgotten after [`BAD_NODE_TTL`].
+    bad_nodes: Mutex<BTreeMap<String, Instant>>,
     /// Generation counter used to immediately cancel a stalled background check whenever a manual
     /// check or install starts (no mutex is ever held across network waits).
     cancel_tx: watch::Sender<u64>,
+    /// Monotonic launch timestamp used to enforce [`STARTUP_AUTO_INSTALL_WINDOW`] natively.
+    launched_at: Instant,
+    /// Set once `commands::ready` reports that the interface painted its first full screen,
+    /// permanently closing the `"startup"` auto-install window for this session.
+    first_screen_shown: AtomicBool,
+    /// Last page-initiated `update_maybe_auto_install` request timestamp for native rate limiting.
+    last_auto_install_request: Mutex<Option<Instant>>,
+    /// Count of in-flight native operations tracked directly on the updater (for example Android
+    /// QR camera scanning during pairing or future content streams).
+    external_operations: Arc<AtomicUsize>,
 }
 
 impl UpdateManager {
@@ -823,8 +945,13 @@ impl UpdateManager {
             state: Mutex::new(initial_state),
             prefs: Mutex::new(prefs),
             watchers: Mutex::new(Vec::new()),
-            bad_sources: Mutex::new(BTreeSet::new()),
+            bad_sources: Mutex::new(BTreeMap::new()),
+            bad_nodes: Mutex::new(BTreeMap::new()),
             cancel_tx,
+            launched_at: Instant::now(),
+            first_screen_shown: AtomicBool::new(false),
+            last_auto_install_request: Mutex::new(None),
+            external_operations: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -896,6 +1023,7 @@ impl UpdateManager {
     ///   when a `pending_install` did not take effect (`current_sequence != pending.sequence`) or
     ///   when the desktop watchdog left a rollback marker.
     pub fn on_app_ready(&self) {
+        self.first_screen_shown.store(true, Ordering::SeqCst);
         if ensure_updates_root(&self.updates_dir).is_err() {
             return;
         }
@@ -1135,7 +1263,6 @@ impl UpdateManager {
         };
 
         let (my_gen, mut cancel_rx) = self.bump_generation();
-        let deadline = Instant::now() + OVERALL_CHECK_DEADLINE;
         let floor_path = self.updates_dir.join("floor.json");
         let _ = ensure_updates_root(&self.updates_dir);
 
@@ -1162,27 +1289,60 @@ impl UpdateManager {
         });
 
         let checked_at = now_rfc3339_utc();
-        let mut by_key: BTreeMap<(Channel, u64), CandidateSource> = BTreeMap::new();
         let mut answered_nodes = Vec::new();
         let mut last_query_detail: Option<String> = None;
+        let mut had_timeout = false;
 
-        for node in nodes {
-            let list_res = run_cancellable(&mut cancel_rx, deadline, client.list_sets(node)).await;
-            match list_res {
+        // Ask all paired nodes concurrently during listing, each with its own short time budget
+        // completely separate from the download deadline. Order clean nodes ahead of previously
+        // deprioritized nodes so fair candidate merging favors healthy machines first.
+        let ordered_list_nodes = self.order_nodes_general(nodes);
+        let list_futs: Vec<ListNodeFuture<'_>> = ordered_list_nodes
+            .iter()
+            .map(|node| {
+                let node_name = node.clone();
+                let timeout = if self.is_node_deprioritized(node) {
+                    BAD_NODE_LIST_TIMEOUT
+                } else {
+                    LIST_NODE_TIMEOUT
+                };
+                Box::pin(async move {
+                    let res = tokio::time::timeout(timeout, client.list_sets(&node_name))
+                        .await
+                        .map_err(|_| ());
+                    (node_name, res)
+                }) as ListNodeFuture<'_>
+            })
+            .collect();
+
+        let list_results = tokio::select! {
+            biased;
+            _ = cancel_rx.changed() => {
+                return Ok(self.snapshot());
+            }
+            res = join_all_futures(list_futs) => res,
+        };
+
+        if *cancel_rx.borrow() != my_gen {
+            return Ok(self.snapshot());
+        }
+
+        // Cap eligible candidates per node BEFORE merging round-robin across nodes so two flooding
+        // nodes can never fill `MAX_CANDIDATES_TOTAL` and crowd out an honest node listed later.
+        let mut per_node_candidates: Vec<(String, Vec<(Channel, u64)>)> = Vec::new();
+        for (node, res) in list_results {
+            match res {
                 Ok(Ok(listed)) => {
                     answered_nodes.push(node.clone());
-                    let mut accepted_from_node = 0usize;
-                    // Sort newest first BEFORE truncating per-node candidate cap so a flood of old
-                    // or fake sequences cannot push valid new sets out (and a flood of fake high
-                    // sequences is capped at MAX_CANDIDATES_PER_NODE).
                     let mut sets = listed.sets;
                     sets.sort_by(|a, b| {
                         b.sequence
                             .cmp(&a.sequence)
                             .then_with(|| a.channel.cmp(&b.channel))
                     });
+                    let mut node_cands: Vec<(Channel, u64)> = Vec::new();
                     for set in sets {
-                        if accepted_from_node >= MAX_CANDIDATES_PER_NODE {
+                        if node_cands.len() >= MAX_CANDIDATES_PER_NODE {
                             break;
                         }
                         if set.sequence <= self.current_sequence || set.sequence <= floor {
@@ -1199,45 +1359,55 @@ impl UpdateManager {
                         {
                             continue;
                         }
-                        if !by_key.contains_key(&(set.channel, set.sequence))
-                            && by_key.len() >= MAX_CANDIDATES_TOTAL
-                        {
-                            continue;
-                        }
-                        accepted_from_node += 1;
-                        let entry =
-                            by_key
-                                .entry((set.channel, set.sequence))
-                                .or_insert_with(|| CandidateSource {
-                                    channel: set.channel,
-                                    sequence: set.sequence,
-                                    nodes: Vec::new(),
-                                });
-                        if !entry.nodes.contains(node) {
-                            entry.nodes.push(node.clone());
+                        let key = (set.channel, set.sequence);
+                        if !node_cands.contains(&key) {
+                            node_cands.push(key);
                         }
                     }
+                    per_node_candidates.push((node, node_cands));
                 }
                 Ok(Err(err)) => {
+                    if err.code == ErrorCode::Timeout {
+                        had_timeout = true;
+                        self.mark_bad_node(&node);
+                    }
                     if err.code != ErrorCode::UnknownTool {
                         last_query_detail = Some(format!("{node}: {}", err.message));
                     }
                 }
-                Err(cancelled_or_timeout) => {
-                    if *cancel_rx.borrow() != my_gen {
-                        return Ok(self.snapshot());
-                    }
-                    last_query_detail = Some(cancelled_or_timeout.message);
-                    break;
+                Err(()) => {
+                    had_timeout = true;
+                    self.mark_bad_node(&node);
+                    last_query_detail =
+                        Some(format!("{node}: Timed out asking {node} for updates."));
                 }
             }
         }
 
-        if *cancel_rx.borrow() != my_gen {
-            return Ok(self.snapshot());
+        let mut by_key: BTreeMap<(Channel, u64), CandidateSource> = BTreeMap::new();
+        for rank in 0..MAX_CANDIDATES_PER_NODE {
+            for (node, node_cands) in &per_node_candidates {
+                let Some(&(channel, sequence)) = node_cands.get(rank) else {
+                    continue;
+                };
+                if let Some(entry) = by_key.get_mut(&(channel, sequence)) {
+                    if !entry.nodes.contains(node) {
+                        entry.nodes.push(node.clone());
+                    }
+                } else if by_key.len() < MAX_CANDIDATES_TOTAL {
+                    by_key.insert(
+                        (channel, sequence),
+                        CandidateSource {
+                            channel,
+                            sequence,
+                            nodes: vec![node.clone()],
+                        },
+                    );
+                }
+            }
         }
 
-        // Order candidates newest sequence first (preferring stable on an exact tie).
+        // Order merged candidates newest sequence first (preferring stable on an exact tie).
         let mut candidates: Vec<CandidateSource> = by_key.into_values().collect();
         candidates.sort_by(|a, b| {
             b.sequence
@@ -1247,32 +1417,112 @@ impl UpdateManager {
 
         let prefs_snapshot = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let mut metadata_budget_by_node: BTreeMap<String, usize> = BTreeMap::new();
+        let mut metadata_time_by_node: BTreeMap<String, Duration> = BTreeMap::new();
+        let mut metadata_failures_by_node: BTreeMap<String, usize> = BTreeMap::new();
         let mut chosen: Option<VerifiedCandidate> = None;
         let mut newest_failed_verified: Option<(VerifiedCandidate, FailedUpdateRecord)> = None;
         let mut refusal_detail: Option<String> = None;
+        let mut had_unverifiable_candidate = false;
 
         'outer: for cand in candidates {
             let ordered_nodes = self.order_nodes_for(cand.channel, cand.sequence, &cand.nodes);
-            for node in &ordered_nodes {
-                let used = metadata_budget_by_node.get(node).copied().unwrap_or(0);
-                if used >= MAX_METADATA_BYTES_PER_NODE {
+            let eligible_nodes: Vec<String> = ordered_nodes
+                .iter()
+                .filter(|node| {
+                    let used_bytes = metadata_budget_by_node.get(*node).copied().unwrap_or(0);
+                    let used_time = metadata_time_by_node
+                        .get(*node)
+                        .copied()
+                        .unwrap_or(Duration::ZERO);
+                    let failures = metadata_failures_by_node.get(*node).copied().unwrap_or(0);
+                    used_bytes < MAX_METADATA_BYTES_PER_NODE
+                        && used_time < METADATA_NODE_TOTAL_TIMEOUT
+                        && failures < MAX_METADATA_FAILURES_PER_NODE_PER_CHECK
+                })
+                .cloned()
+                .collect();
+            if eligible_nodes.is_empty() {
+                continue;
+            }
+
+            // Probe clean nodes concurrently first (so a slow sibling node holding the same
+            // candidate costs nothing), then fall back to previously deprioritized nodes.
+            let (clean_wave, bad_wave): (Vec<String>, Vec<String>) = eligible_nodes
+                .into_iter()
+                .partition(|n| !self.is_source_or_node_bad(cand.channel, cand.sequence, n));
+
+            for wave in [clean_wave, bad_wave] {
+                if wave.is_empty() {
                     continue;
                 }
-                let budget_left = MAX_METADATA_BYTES_PER_NODE - used;
-                let verify_fut = self.fetch_and_verify_candidate(
-                    client,
-                    node,
-                    &cand,
-                    &ordered_nodes,
-                    target,
-                    &floor_path,
-                    budget_left,
-                    deadline,
-                    &mut cancel_rx,
-                );
-                match verify_fut.await {
-                    Ok((verified, bytes_read)) => {
+                let outcome = self
+                    .probe_candidate_nodes_concurrent(
+                        client,
+                        &cand,
+                        &ordered_nodes,
+                        &wave,
+                        target,
+                        &floor_path,
+                        &metadata_budget_by_node,
+                        &metadata_time_by_node,
+                        my_gen,
+                        &mut cancel_rx,
+                    )
+                    .await;
+
+                match outcome {
+                    WaveOutcome::Cancelled => {
+                        return Ok(self.snapshot());
+                    }
+                    WaveOutcome::NotForThisPlatform {
+                        node,
+                        bytes_read,
+                        elapsed,
+                        errors,
+                    } => {
                         *metadata_budget_by_node.entry(node.clone()).or_insert(0) += bytes_read;
+                        *metadata_time_by_node.entry(node).or_insert(Duration::ZERO) += elapsed;
+                        for (bad_node, err, b_read, b_elapsed) in errors {
+                            *metadata_budget_by_node.entry(bad_node.clone()).or_insert(0) += b_read;
+                            *metadata_time_by_node
+                                .entry(bad_node.clone())
+                                .or_insert(Duration::ZERO) += b_elapsed;
+                            *metadata_failures_by_node
+                                .entry(bad_node.clone())
+                                .or_insert(0) += 1;
+                            if err.code == ErrorCode::Timeout {
+                                had_timeout = true;
+                            }
+                            self.mark_bad_source(cand.channel, cand.sequence, &bad_node);
+                        }
+                        continue 'outer;
+                    }
+                    WaveOutcome::Verified {
+                        verified,
+                        bytes_read,
+                        elapsed,
+                        errors,
+                    } => {
+                        *metadata_budget_by_node
+                            .entry(verified.source_node.clone())
+                            .or_insert(0) += bytes_read;
+                        *metadata_time_by_node
+                            .entry(verified.source_node.clone())
+                            .or_insert(Duration::ZERO) += elapsed;
+                        for (bad_node, err, b_read, b_elapsed) in errors {
+                            *metadata_budget_by_node.entry(bad_node.clone()).or_insert(0) += b_read;
+                            *metadata_time_by_node
+                                .entry(bad_node.clone())
+                                .or_insert(Duration::ZERO) += b_elapsed;
+                            *metadata_failures_by_node
+                                .entry(bad_node.clone())
+                                .or_insert(0) += 1;
+                            if err.code == ErrorCode::Timeout {
+                                had_timeout = true;
+                            }
+                            self.mark_bad_source(cand.channel, cand.sequence, &bad_node);
+                        }
+                        self.clear_bad_node(cand.channel, cand.sequence, &verified.source_node);
                         let seq = verified.meta.manifest.sequence;
                         if !force_download && let Some(fail_rec) = prefs_snapshot.failed_record(seq)
                         {
@@ -1280,20 +1530,30 @@ impl UpdateManager {
                             // can still be chosen, while remembering the newest failed one so the
                             // user can tap "Try again".
                             if newest_failed_verified.is_none() {
-                                newest_failed_verified = Some((verified, fail_rec));
+                                newest_failed_verified = Some((*verified, fail_rec));
                             }
                             continue 'outer;
                         }
-                        chosen = Some(verified);
+                        chosen = Some(*verified);
                         break 'outer;
                     }
-                    Err((err, bytes_read)) => {
-                        *metadata_budget_by_node.entry(node.clone()).or_insert(0) += bytes_read;
-                        if *cancel_rx.borrow() != my_gen {
-                            return Ok(self.snapshot());
+                    WaveOutcome::AllFailed(errors) => {
+                        for (bad_node, err, b_read, b_elapsed) in errors {
+                            *metadata_budget_by_node.entry(bad_node.clone()).or_insert(0) += b_read;
+                            *metadata_time_by_node
+                                .entry(bad_node.clone())
+                                .or_insert(Duration::ZERO) += b_elapsed;
+                            *metadata_failures_by_node
+                                .entry(bad_node.clone())
+                                .or_insert(0) += 1;
+                            if err.code == ErrorCode::Timeout {
+                                had_timeout = true;
+                            } else {
+                                had_unverifiable_candidate = true;
+                            }
+                            self.mark_bad_source(cand.channel, cand.sequence, &bad_node);
+                            refusal_detail = Some(format!("{bad_node}: {}", err.message));
                         }
-                        self.mark_bad_source(cand.channel, cand.sequence, node);
-                        refusal_detail = Some(format!("{node}: {}", err.message));
                     }
                 }
             }
@@ -1362,8 +1622,9 @@ impl UpdateManager {
 
         let Some(chosen) = chosen else {
             self.record_last_checked(&checked_at, None);
-            if answered_nodes.is_empty()
-                && !nodes.is_empty()
+            let had_no_answers = answered_nodes.is_empty() && !nodes.is_empty();
+            let check_incomplete = had_timeout || had_unverifiable_candidate;
+            if (had_no_answers || check_incomplete)
                 && let Some(existing) = prev_state.available.as_ref()
                 && existing.downloaded
                 && existing.sequence > floor
@@ -1376,10 +1637,28 @@ impl UpdateManager {
                         "Legion rebuilt a damaged update floor file at the running version."
                             .to_owned()
                     });
-                    st.last_error_detail = floor_recovery_detail.or(last_query_detail);
+                    st.last_error_detail = floor_recovery_detail
+                        .or(refusal_detail)
+                        .or(last_query_detail);
                 }));
             }
-            let had_no_answers = answered_nodes.is_empty() && !nodes.is_empty();
+            if check_incomplete {
+                return Ok(self.update_state(|st| {
+                    st.phase = "error".to_owned();
+                    st.available = None;
+                    st.manual_command = None;
+                    st.manual_sha256 = None;
+                    st.progress = None;
+                    st.metered_paused = false;
+                    st.failed_update = None;
+                    st.last_checked_at = Some(checked_at);
+                    st.checked_nodes = answered_nodes;
+                    st.last_error = Some("Could not check for updates right now.".to_owned());
+                    st.last_error_detail = floor_recovery_detail
+                        .or(refusal_detail)
+                        .or(last_query_detail);
+                }));
+            }
             return Ok(self.update_state(|st| {
                 st.phase = "up_to_date".to_owned();
                 st.available = None;
@@ -1545,13 +1824,7 @@ impl UpdateManager {
         });
 
         match self
-            .download_verified_candidate_with_fallback(
-                client,
-                &chosen,
-                my_gen,
-                &mut cancel_rx,
-                deadline,
-            )
+            .download_verified_candidate_with_fallback(client, &chosen, my_gen, &mut cancel_rx)
             .await
         {
             Ok((final_size, winning_node)) => {
@@ -1638,12 +1911,49 @@ impl UpdateManager {
         Ok((self.platform.manual_command_for(Some(art_path)), None))
     }
 
-    fn order_nodes_for(&self, channel: Channel, sequence: u64, nodes: &[String]) -> Vec<String> {
-        let bad = self.bad_sources.lock().unwrap_or_else(|p| p.into_inner());
+    fn prune_expired_reputation(&self, now: Instant) {
+        {
+            let mut bad = self.bad_sources.lock().unwrap_or_else(|p| p.into_inner());
+            bad.retain(|_, ts| now.saturating_duration_since(*ts) < BAD_NODE_TTL);
+        }
+        {
+            let mut bad = self.bad_nodes.lock().unwrap_or_else(|p| p.into_inner());
+            bad.retain(|_, ts| now.saturating_duration_since(*ts) < BAD_NODE_TTL);
+        }
+    }
+
+    fn is_node_deprioritized(&self, node: &str) -> bool {
+        let now = Instant::now();
+        let mut bad = self.bad_nodes.lock().unwrap_or_else(|p| p.into_inner());
+        bad.retain(|_, ts| now.saturating_duration_since(*ts) < BAD_NODE_TTL);
+        bad.contains_key(node)
+    }
+
+    fn is_source_or_node_bad(&self, channel: Channel, sequence: u64, node: &str) -> bool {
+        let now = Instant::now();
+        self.prune_expired_reputation(now);
+        let src_bad = self
+            .bad_sources
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&(channel, sequence, node.to_owned()));
+        if src_bad {
+            return true;
+        }
+        self.bad_nodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(node)
+    }
+
+    fn order_nodes_general(&self, nodes: &[String]) -> Vec<String> {
+        let now = Instant::now();
+        self.prune_expired_reputation(now);
+        let bad = self.bad_nodes.lock().unwrap_or_else(|p| p.into_inner());
         let mut good_list = Vec::new();
         let mut bad_list = Vec::new();
         for n in nodes {
-            if bad.contains(&(channel, sequence, n.clone())) {
+            if bad.contains_key(n) {
                 bad_list.push(n.clone());
             } else {
                 good_list.push(n.clone());
@@ -1653,12 +1963,174 @@ impl UpdateManager {
         good_list
     }
 
-    fn mark_bad_source(&self, channel: Channel, sequence: u64, node: &str) {
-        let mut bad = self.bad_sources.lock().unwrap_or_else(|p| p.into_inner());
+    fn order_nodes_for(&self, channel: Channel, sequence: u64, nodes: &[String]) -> Vec<String> {
+        let now = Instant::now();
+        self.prune_expired_reputation(now);
+        let bad_src = self.bad_sources.lock().unwrap_or_else(|p| p.into_inner());
+        let bad_nodes = self.bad_nodes.lock().unwrap_or_else(|p| p.into_inner());
+        let mut clean_list = Vec::new();
+        let mut node_bad_list = Vec::new();
+        let mut src_bad_list = Vec::new();
+        for n in nodes {
+            if bad_src.contains_key(&(channel, sequence, n.clone())) {
+                src_bad_list.push(n.clone());
+            } else if bad_nodes.contains_key(n) {
+                node_bad_list.push(n.clone());
+            } else {
+                clean_list.push(n.clone());
+            }
+        }
+        clean_list.extend(node_bad_list);
+        clean_list.extend(src_bad_list);
+        clean_list
+    }
+
+    fn mark_bad_node(&self, node: &str) {
+        let now = Instant::now();
+        let mut bad = self.bad_nodes.lock().unwrap_or_else(|p| p.into_inner());
+        bad.retain(|_, ts| now.saturating_duration_since(*ts) < BAD_NODE_TTL);
         if bad.len() >= 128 {
             bad.clear();
         }
-        bad.insert((channel, sequence, node.to_owned()));
+        bad.insert(node.to_owned(), now);
+    }
+
+    fn mark_bad_source(&self, channel: Channel, sequence: u64, node: &str) {
+        let now = Instant::now();
+        {
+            let mut bad = self.bad_sources.lock().unwrap_or_else(|p| p.into_inner());
+            bad.retain(|_, ts| now.saturating_duration_since(*ts) < BAD_NODE_TTL);
+            if bad.len() >= 128 {
+                bad.clear();
+            }
+            bad.insert((channel, sequence, node.to_owned()), now);
+        }
+        self.mark_bad_node(node);
+    }
+
+    fn clear_bad_node(&self, channel: Channel, sequence: u64, node: &str) {
+        self.bad_sources
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(channel, sequence, node.to_owned()));
+        self.bad_nodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(node);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn probe_candidate_nodes_concurrent(
+        &self,
+        client: &dyn UpdateSourceClient,
+        cand: &CandidateSource,
+        ordered_nodes: &[String],
+        wave_nodes: &[String],
+        target: TargetPlatform,
+        floor_path: &Path,
+        metadata_budget_by_node: &BTreeMap<String, usize>,
+        metadata_time_by_node: &BTreeMap<String, Duration>,
+        my_gen: u64,
+        cancel_rx: &mut watch::Receiver<u64>,
+    ) -> WaveOutcome {
+        let mut futs: Vec<(String, Option<CandidateProbeFuture<'_>>)> = wave_nodes
+            .iter()
+            .map(|node| {
+                let used_bytes = metadata_budget_by_node.get(node).copied().unwrap_or(0);
+                let budget_left = MAX_METADATA_BYTES_PER_NODE.saturating_sub(used_bytes);
+                let used_time = metadata_time_by_node
+                    .get(node)
+                    .copied()
+                    .unwrap_or(Duration::ZERO);
+                let time_left = METADATA_NODE_TOTAL_TIMEOUT.saturating_sub(used_time);
+                let deprioritized = self.is_source_or_node_bad(cand.channel, cand.sequence, node);
+                let cand_budget = if deprioritized {
+                    Duration::from_secs(5).min(time_left)
+                } else {
+                    METADATA_CANDIDATE_TIMEOUT.min(time_left)
+                };
+                let call_budget = if deprioritized {
+                    Duration::from_secs(3)
+                } else {
+                    METADATA_CALL_TIMEOUT
+                };
+                let node_deadline = Instant::now() + cand_budget;
+                let node_cancel = cancel_rx.clone();
+                let fut: CandidateProbeFuture<'_> = Box::pin(self.fetch_and_verify_candidate(
+                    client,
+                    node,
+                    cand,
+                    ordered_nodes,
+                    target,
+                    floor_path,
+                    budget_left,
+                    node_deadline,
+                    call_budget,
+                    my_gen,
+                    node_cancel,
+                ));
+                (node.clone(), Some(fut))
+            })
+            .collect();
+
+        let race_fut = async {
+            let mut errors: Vec<(String, AppError, usize, Duration)> = Vec::new();
+            let mut pending = futs.len();
+            std::future::poll_fn(|cx| {
+                for (node, slot) in &mut futs {
+                    let Some(fut) = slot.as_mut() else {
+                        continue;
+                    };
+                    if let Poll::Ready(res) = fut.as_mut().poll(cx) {
+                        *slot = None;
+                        pending -= 1;
+                        match res {
+                            Ok((verified, bytes_read, elapsed)) => {
+                                return Poll::Ready(WaveOutcome::Verified {
+                                    verified: Box::new(verified),
+                                    bytes_read,
+                                    elapsed,
+                                    errors: std::mem::take(&mut errors),
+                                });
+                            }
+                            Err(CandidateFetchError::NotForThisPlatform {
+                                bytes_read,
+                                elapsed,
+                            }) => {
+                                return Poll::Ready(WaveOutcome::NotForThisPlatform {
+                                    node: node.clone(),
+                                    bytes_read,
+                                    elapsed,
+                                    errors: std::mem::take(&mut errors),
+                                });
+                            }
+                            Err(CandidateFetchError::Cancelled) => {
+                                return Poll::Ready(WaveOutcome::Cancelled);
+                            }
+                            Err(CandidateFetchError::Failed {
+                                err,
+                                bytes_read,
+                                elapsed,
+                            }) => {
+                                errors.push((node.clone(), err, bytes_read, elapsed));
+                            }
+                        }
+                    }
+                }
+                if pending == 0 {
+                    Poll::Ready(WaveOutcome::AllFailed(std::mem::take(&mut errors)))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await
+        };
+
+        tokio::select! {
+            biased;
+            _ = cancel_rx.changed() => WaveOutcome::Cancelled,
+            outcome = race_fut => outcome,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1672,9 +2144,24 @@ impl UpdateManager {
         floor_path: &Path,
         budget_left: usize,
         deadline: Instant,
-        cancel_rx: &mut watch::Receiver<u64>,
-    ) -> Result<(VerifiedCandidate, usize), (AppError, usize)> {
+        call_timeout: Duration,
+        my_gen: u64,
+        mut cancel_rx: watch::Receiver<u64>,
+    ) -> Result<(VerifiedCandidate, usize, Duration), CandidateFetchError> {
+        let started = Instant::now();
         let mut read_total = 0usize;
+
+        let map_read_err = |err: AppError, read_total: usize, rx: &watch::Receiver<u64>| {
+            if *rx.borrow() != my_gen || err.code == ErrorCode::Cancelled {
+                CandidateFetchError::Cancelled
+            } else {
+                CandidateFetchError::Failed {
+                    err,
+                    bytes_read: read_total,
+                    elapsed: started.elapsed(),
+                }
+            }
+        };
 
         let sums_bytes = read_small_file(
             client,
@@ -1684,10 +2171,11 @@ impl UpdateManager {
             CHECKSUMS_FILENAME,
             MAX_SUMS_BYTES.min(budget_left),
             deadline,
-            cancel_rx,
+            call_timeout,
+            &mut cancel_rx,
         )
         .await
-        .map_err(|e| (e, read_total))?;
+        .map_err(|e| map_read_err(e, read_total, &cancel_rx))?;
         read_total += sums_bytes.len();
 
         let sig_budget = MAX_SIG_BYTES.min(budget_left.saturating_sub(read_total));
@@ -1699,25 +2187,29 @@ impl UpdateManager {
             SIGNATURE_FILENAME,
             sig_budget,
             deadline,
-            cancel_rx,
+            call_timeout,
+            &mut cancel_rx,
         )
         .await
-        .map_err(|e| (e, read_total))?;
+        .map_err(|e| map_read_err(e, read_total, &cancel_rx))?;
         read_total += sig_bytes.len();
 
-        let sig_text = String::from_utf8(sig_bytes).map_err(|err| {
-            (
-                AppError::new(
-                    ErrorCode::Denied,
-                    format!("{SIGNATURE_FILENAME} from {node} is not valid UTF-8: {err}"),
-                ),
-                read_total,
-            )
+        let sig_text = String::from_utf8(sig_bytes).map_err(|err| CandidateFetchError::Failed {
+            err: AppError::new(
+                ErrorCode::Denied,
+                format!("{SIGNATURE_FILENAME} from {node} is not valid UTF-8: {err}"),
+            ),
+            bytes_read: read_total,
+            elapsed: started.elapsed(),
         })?;
         // Verify signature before reading update.json so untrusted sets are refused immediately.
         self.anchors
             .verify_for_channel(cand.channel, &sums_bytes, &sig_text)
-            .map_err(|e| (AppError::new(ErrorCode::Denied, e.message), read_total))?;
+            .map_err(|e| CandidateFetchError::Failed {
+                err: AppError::new(ErrorCode::Denied, e.message),
+                bytes_read: read_total,
+                elapsed: started.elapsed(),
+            })?;
 
         let manifest_budget = MAX_MANIFEST_BYTES.min(budget_left.saturating_sub(read_total));
         let manifest_bytes = read_small_file(
@@ -1728,45 +2220,66 @@ impl UpdateManager {
             MANIFEST_FILENAME,
             manifest_budget,
             deadline,
-            cancel_rx,
+            call_timeout,
+            &mut cancel_rx,
         )
         .await
-        .map_err(|e| (e, read_total))?;
+        .map_err(|e| map_read_err(e, read_total, &cancel_rx))?;
         read_total += manifest_bytes.len();
 
         let meta = verify_set_metadata(&sums_bytes, &sig_text, &manifest_bytes, &self.anchors)
-            .map_err(|e| (AppError::new(e.code.into(), e.message), read_total))?;
-        let artifact = select_verified_artifact(&meta, self.current_sequence, floor_path, target)
-            .map_err(|e| (AppError::new(e.code.into(), e.message), read_total))?
-            .clone();
+            .map_err(|e| CandidateFetchError::Failed {
+                err: AppError::new(e.code.into(), e.message),
+                bytes_read: read_total,
+                elapsed: started.elapsed(),
+            })?;
+        let artifact =
+            match select_verified_artifact(&meta, self.current_sequence, floor_path, target) {
+                Ok(art) => art.clone(),
+                Err(e) if e.code == legion_link::proto::ErrorCode::NotFound => {
+                    // Valid signed set that simply carries no artifact for this OS/arch/kind (for
+                    // example a node-only update set). Do not blame the node or flag an error.
+                    return Err(CandidateFetchError::NotForThisPlatform {
+                        bytes_read: read_total,
+                        elapsed: started.elapsed(),
+                    });
+                }
+                Err(e) => {
+                    return Err(CandidateFetchError::Failed {
+                        err: AppError::new(e.code.into(), e.message),
+                        bytes_read: read_total,
+                        elapsed: started.elapsed(),
+                    });
+                }
+            };
 
         if meta.manifest.channel != cand.channel || meta.manifest.sequence != cand.sequence {
-            return Err((
-                AppError::new(
+            return Err(CandidateFetchError::Failed {
+                err: AppError::new(
                     ErrorCode::Denied,
                     format!(
                         "Update set from {node} claims {}/{} instead of {}/{}.",
                         meta.manifest.channel, meta.manifest.sequence, cand.channel, cand.sequence
                     ),
                 ),
-                read_total,
-            ));
+                bytes_read: read_total,
+                elapsed: started.elapsed(),
+            });
         }
 
         let expected_sha256 = meta
             .sums
             .get(&artifact.name)
-            .ok_or_else(|| {
-                (
-                    AppError::new(
-                        ErrorCode::Denied,
-                        format!(
-                            "Artifact {} is missing from {CHECKSUMS_FILENAME}.",
-                            artifact.name
-                        ),
+            .ok_or_else(|| CandidateFetchError::Failed {
+                err: AppError::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Artifact {} is missing from {CHECKSUMS_FILENAME}.",
+                        artifact.name
                     ),
-                    read_total,
-                )
+                ),
+                bytes_read: read_total,
+                elapsed: started.elapsed(),
             })?
             .to_owned();
 
@@ -1790,6 +2303,7 @@ impl UpdateManager {
                 all_nodes,
             },
             read_total,
+            started.elapsed(),
         ))
     }
 
@@ -1799,7 +2313,6 @@ impl UpdateManager {
         cand: &VerifiedCandidate,
         my_gen: u64,
         cancel_rx: &mut watch::Receiver<u64>,
-        deadline: Instant,
     ) -> Result<(u64, String), AppError> {
         let ordered = self.order_nodes_for(
             cand.meta.manifest.channel,
@@ -1810,7 +2323,10 @@ impl UpdateManager {
             ErrorCode::Failed,
             "No paired machine could serve the update artifact.",
         );
-        let mut poisoned_part_from_earlier_node = false;
+        // Overall download budget is separate from listing/metadata and scales with signed size
+        // and the rate floor, with headroom for multi-node fallback.
+        let overall_deadline =
+            Instant::now() + download_deadline_for_bytes(cand.artifact.size).saturating_mul(2);
 
         for node in ordered {
             if *cancel_rx.borrow() != my_gen {
@@ -1819,15 +2335,20 @@ impl UpdateManager {
                     "Update check was superseded by a newer request.",
                 ));
             }
-            // If an earlier node failed partway through, start fresh on the next node so bytes
-            // from a hostile first node can never poison the hash of a healthy second node.
-            let reset_part = poisoned_part_from_earlier_node;
             match self
-                .download_from_single_node(client, &node, cand, reset_part, deadline, cancel_rx)
+                .download_from_single_node(client, &node, cand, false, overall_deadline, cancel_rx)
                 .await
             {
-                Ok(final_size) => return Ok((final_size, node)),
-                Err(err) => {
+                Ok(final_size) => {
+                    self.clear_bad_node(
+                        cand.meta.manifest.channel,
+                        cand.meta.manifest.sequence,
+                        &node,
+                    );
+                    return Ok((final_size, node));
+                }
+                Err(DownloadFailure::Cancelled(err)) => return Err(err),
+                Err(DownloadFailure::Interrupted(err)) => {
                     if *cancel_rx.borrow() != my_gen {
                         return Err(err);
                     }
@@ -1837,7 +2358,73 @@ impl UpdateManager {
                         &node,
                     );
                     last_err = AppError::new(err.code, format!("{node}: {}", err.message));
-                    poisoned_part_from_earlier_node = true;
+                }
+                Err(DownloadFailure::HashMismatch { err, contributors }) => {
+                    if *cancel_rx.borrow() != my_gen {
+                        return Err(err);
+                    }
+                    // Final SHA-256 verification failed: `.part` was already discarded. Mark every
+                    // contributing node bad so we remember who wrote bytes into the failed file.
+                    let had_other_contributor = contributors.iter().any(|c| c != &node);
+                    for contributor in &contributors {
+                        self.mark_bad_source(
+                            cand.meta.manifest.channel,
+                            cand.meta.manifest.sequence,
+                            contributor,
+                        );
+                    }
+                    if !contributors.contains(&node) {
+                        self.mark_bad_source(
+                            cand.meta.manifest.channel,
+                            cand.meta.manifest.sequence,
+                            &node,
+                        );
+                    }
+                    last_err = AppError::new(err.code, format!("{node}: {}", err.message));
+
+                    // If this node only resumed partial bytes written by another node, retry THIS
+                    // node once from offset 0 before blaming it so a poisoned prefix from an
+                    // earlier node never permanently condemns a healthy node.
+                    if had_other_contributor {
+                        match self
+                            .download_from_single_node(
+                                client,
+                                &node,
+                                cand,
+                                true,
+                                overall_deadline,
+                                cancel_rx,
+                            )
+                            .await
+                        {
+                            Ok(final_size) => {
+                                self.clear_bad_node(
+                                    cand.meta.manifest.channel,
+                                    cand.meta.manifest.sequence,
+                                    &node,
+                                );
+                                return Ok((final_size, node));
+                            }
+                            Err(DownloadFailure::Cancelled(retry_err)) => return Err(retry_err),
+                            Err(
+                                DownloadFailure::Interrupted(retry_err)
+                                | DownloadFailure::HashMismatch { err: retry_err, .. },
+                            ) => {
+                                if *cancel_rx.borrow() != my_gen {
+                                    return Err(retry_err);
+                                }
+                                self.mark_bad_source(
+                                    cand.meta.manifest.channel,
+                                    cand.meta.manifest.sequence,
+                                    &node,
+                                );
+                                last_err = AppError::new(
+                                    retry_err.code,
+                                    format!("{node}: {}", retry_err.message),
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1850,18 +2437,18 @@ impl UpdateManager {
         node: &str,
         cand: &VerifiedCandidate,
         reset_part: bool,
-        deadline: Instant,
+        overall_deadline: Instant,
         cancel_rx: &mut watch::Receiver<u64>,
-    ) -> Result<u64, AppError> {
+    ) -> Result<u64, DownloadFailure> {
         let expected_size = cand.artifact.size;
         if expected_size == 0 || expected_size > MAX_DOWNLOAD_BYTES {
-            return Err(AppError::new(
+            return Err(DownloadFailure::Interrupted(AppError::new(
                 ErrorCode::Denied,
                 format!(
                     "Artifact {} declares invalid signed size {expected_size}.",
                     cand.artifact.name
                 ),
-            ));
+            )));
         }
 
         let set_dir = download_dir_for(
@@ -1869,58 +2456,54 @@ impl UpdateManager {
             cand.meta.manifest.channel,
             cand.meta.manifest.sequence,
         );
-        ensure_updates_root(&self.updates_dir)?;
-        ensure_updates_root(&self.updates_dir.join("downloads"))?;
-        ensure_updates_root(&set_dir)?;
+        ensure_updates_root(&self.updates_dir).map_err(DownloadFailure::Interrupted)?;
+        ensure_updates_root(&self.updates_dir.join("downloads"))
+            .map_err(DownloadFailure::Interrupted)?;
+        ensure_updates_root(&set_dir).map_err(DownloadFailure::Interrupted)?;
 
-        write_atomic(&set_dir.join(CHECKSUMS_FILENAME), &cand.sums_bytes)?;
-        write_atomic(&set_dir.join(SIGNATURE_FILENAME), cand.sig_text.as_bytes())?;
-        write_atomic(&set_dir.join(MANIFEST_FILENAME), &cand.manifest_bytes)?;
+        write_atomic(&set_dir.join(CHECKSUMS_FILENAME), &cand.sums_bytes)
+            .map_err(DownloadFailure::Interrupted)?;
+        write_atomic(&set_dir.join(SIGNATURE_FILENAME), cand.sig_text.as_bytes())
+            .map_err(DownloadFailure::Interrupted)?;
+        write_atomic(&set_dir.join(MANIFEST_FILENAME), &cand.manifest_bytes)
+            .map_err(DownloadFailure::Interrupted)?;
 
         let final_path = set_dir.join(&cand.artifact.name);
         let part_path = set_dir.join(format!("{}.part", cand.artifact.name));
-        let part_hash_marker = set_dir.join(format!("{}.part.sha256", cand.artifact.name));
+        let part_meta_path = set_dir.join(format!("{}.part.meta.json", cand.artifact.name));
+        let legacy_hash_marker = set_dir.join(format!("{}.part.sha256", cand.artifact.name));
+        let _ = fs::remove_file(&legacy_hash_marker);
 
         if reset_part {
             let _ = fs::remove_file(&part_path);
+            let _ = fs::remove_file(&part_meta_path);
         }
 
-        // Resume any leftover `.part` file only if it matches the exact expected SHA-256 and fits
-        // within the signed `expected_size`.
-        let mut offset = 0u64;
-        if part_path.is_file() {
-            let prev_hash = fs::read_to_string(&part_hash_marker).unwrap_or_default();
-            if prev_hash.trim() == cand.expected_sha256 {
-                offset = fs::symlink_metadata(&part_path)
-                    .ok()
-                    .filter(|m| m.file_type().is_file())
-                    .map_or(0, |m| m.len());
-                if offset > expected_size {
-                    offset = 0;
-                    let _ = fs::remove_file(&part_path);
-                }
-            } else {
-                let _ = fs::remove_file(&part_path);
-            }
-        }
-        write_atomic(&part_hash_marker, cand.expected_sha256.as_bytes())?;
+        let (mut offset, mut part_meta) = load_or_init_part_state(
+            &part_path,
+            &part_meta_path,
+            &cand.expected_sha256,
+            expected_size,
+        )
+        .map_err(DownloadFailure::Interrupted)?;
+        save_part_metadata(&part_meta_path, &part_meta).map_err(DownloadFailure::Interrupted)?;
 
         let mut file = if offset > 0 {
             OpenOptions::new()
                 .append(true)
                 .open(&part_path)
                 .map_err(|err| {
-                    AppError::new(
+                    DownloadFailure::Interrupted(AppError::new(
                         ErrorCode::Failed,
                         format!("Could not resume download {}: {err}", part_path.display()),
-                    )
+                    ))
                 })?
         } else {
             fs::File::create(&part_path).map_err(|err| {
-                AppError::new(
+                DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!("Could not create download {}: {err}", part_path.display()),
-                )
+                ))
             })?
         };
 
@@ -1933,19 +2516,32 @@ impl UpdateManager {
             });
         }
 
-        let max_chunks = (expected_size / MIN_EXPECTED_CHUNK_BYTES)
+        // Scale the attempt deadline with the remaining bytes and rate floor so an honest slow
+        // link (at or above MIN_PROGRESS_BYTES_PER_SEC) can always finish.
+        let remaining_at_start = expected_size.saturating_sub(offset);
+        let attempt_deadline = (Instant::now() + download_deadline_for_bytes(remaining_at_start))
+            .min(overall_deadline);
+
+        let max_chunks = (remaining_at_start / MIN_EXPECTED_CHUNK_BYTES)
             .saturating_add(64)
             .min(usize::MAX as u64) as usize;
         let started_at = Instant::now();
         let initial_offset = offset;
         let mut chunks_seen = 0usize;
+        let mut bytes_since_meta_save = 0u64;
+
+        let persist_progress = |file: &mut fs::File, meta: &PartMetadata| {
+            let _ = file.flush();
+            let _ = save_part_metadata(&part_meta_path, meta);
+        };
 
         while offset < expected_size {
             let remaining = expected_size - offset;
             let req_len = DOWNLOAD_CHUNK_BYTES.min(remaining);
-            let reply = run_cancellable(
+            let call_deadline = (Instant::now() + CHUNK_CALL_TIMEOUT).min(attempt_deadline);
+            let reply = match run_cancellable(
                 cancel_rx,
-                deadline,
+                call_deadline,
                 client.read_chunk(
                     node,
                     cand.meta.manifest.channel,
@@ -1955,71 +2551,97 @@ impl UpdateManager {
                     req_len,
                 ),
             )
-            .await??;
+            .await
+            {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(err)) => {
+                    persist_progress(&mut file, &part_meta);
+                    return Err(DownloadFailure::Interrupted(err));
+                }
+                Err(err) if err.code == ErrorCode::Cancelled => {
+                    persist_progress(&mut file, &part_meta);
+                    return Err(DownloadFailure::Cancelled(err));
+                }
+                Err(err) => {
+                    persist_progress(&mut file, &part_meta);
+                    return Err(DownloadFailure::Interrupted(err));
+                }
+            };
 
             if reply.offset != offset {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!(
                         "Unexpected chunk offset {} (expected {offset}) for {}.",
                         reply.offset, cand.artifact.name
                     ),
-                ));
+                )));
             }
             if reply.size != expected_size {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!(
                         "Reported size {} for {} does not match signed size {expected_size}.",
                         reply.size, cand.artifact.name
                     ),
-                ));
+                )));
             }
-            let chunk = BASE64.decode(reply.content.as_bytes()).map_err(|err| {
-                let _ = fs::remove_file(&part_path);
-                AppError::new(
-                    ErrorCode::Failed,
-                    format!("Invalid base64 chunk for {}: {err}", cand.artifact.name),
-                )
-            })?;
+            let chunk = match BASE64.decode(reply.content.as_bytes()) {
+                Ok(c) => c,
+                Err(err) => {
+                    persist_progress(&mut file, &part_meta);
+                    return Err(DownloadFailure::Interrupted(AppError::new(
+                        ErrorCode::Failed,
+                        format!("Invalid base64 chunk for {}: {err}", cand.artifact.name),
+                    )));
+                }
+            };
             if chunk.len() as u64 != reply.length {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!("Inconsistent chunk length for {}.", cand.artifact.name),
-                ));
+                )));
             }
             if chunk.len() as u64 > req_len {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!(
                         "Chunk length {} exceeded requested {req_len} bytes for {}.",
                         chunk.len(),
                         cand.artifact.name
                     ),
-                ));
+                )));
             }
             if offset.saturating_add(chunk.len() as u64) > expected_size {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!(
                         "Download exceeded signed size ({expected_size} bytes) for {}.",
                         cand.artifact.name
                     ),
-                ));
+                )));
             }
             if !chunk.is_empty() {
-                file.write_all(&chunk).map_err(|err| {
-                    AppError::new(
+                let write_start = offset;
+                if let Err(err) = file.write_all(&chunk) {
+                    persist_progress(&mut file, &part_meta);
+                    return Err(DownloadFailure::Interrupted(AppError::new(
                         ErrorCode::Failed,
                         format!("Could not write downloaded update: {err}"),
-                    )
-                })?;
+                    )));
+                }
                 offset = offset.saturating_add(chunk.len() as u64);
+                record_part_range(&mut part_meta, write_start, offset, node);
+                bytes_since_meta_save = bytes_since_meta_save.saturating_add(chunk.len() as u64);
+                if bytes_since_meta_save >= DOWNLOAD_CHUNK_BYTES {
+                    let _ = save_part_metadata(&part_meta_path, &part_meta);
+                    bytes_since_meta_save = 0;
+                }
                 self.update_state(|st| {
                     st.progress = Some(DownloadProgress {
                         downloaded_bytes: offset,
@@ -2033,54 +2655,58 @@ impl UpdateManager {
                 break;
             }
             if reply.eof {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!("Download ended early at {offset} bytes (expected {expected_size})."),
-                ));
+                )));
             }
             if chunk.is_empty() {
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     "Download stopped making progress.",
-                ));
+                )));
             }
             if chunks_seen >= max_chunks {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!(
                         "Download used too many tiny chunks ({chunks_seen}) for {}.",
                         cand.artifact.name
                     ),
-                ));
+                )));
             }
             let elapsed = started_at.elapsed();
             if elapsed >= PROGRESS_GRACE_WINDOW {
                 let received = offset.saturating_sub(initial_offset);
                 let min_bytes = (elapsed.as_secs_f64() * MIN_PROGRESS_BYTES_PER_SEC as f64) as u64;
                 if received < min_bytes {
-                    return Err(AppError::new(
+                    persist_progress(&mut file, &part_meta);
+                    return Err(DownloadFailure::Interrupted(AppError::new(
                         ErrorCode::Timeout,
                         format!(
                             "Download rate fell below {} KiB/s.",
                             MIN_PROGRESS_BYTES_PER_SEC / 1024
                         ),
-                    ));
+                    )));
                 }
             }
         }
 
-        file.sync_all().map_err(|err| {
-            AppError::new(
+        if let Err(err) = file.sync_all() {
+            persist_progress(&mut file, &part_meta);
+            return Err(DownloadFailure::Interrupted(AppError::new(
                 ErrorCode::Failed,
                 format!("Could not flush downloaded update: {err}"),
-            )
-        })?;
+            )));
+        }
         drop(file);
+        let _ = save_part_metadata(&part_meta_path, &part_meta);
 
         // Stream-verify the complete `.part` file against signed size + SHA-256 on a blocking
-        // thread before renaming into place.
+        // thread before renaming into place. Only discard `.part` when this final verification fails.
         let meta_clone = cand.meta.clone();
         let art_name = cand.artifact.name.clone();
         let part_check = part_path.clone();
@@ -2089,25 +2715,34 @@ impl UpdateManager {
         })
         .await
         .map_err(|err| {
-            AppError::new(
+            DownloadFailure::Interrupted(AppError::new(
                 ErrorCode::Internal,
                 format!("Artifact verification stopped unexpectedly: {err}"),
-            )
+            ))
         })?;
 
         if let Err(err) = verify_res {
+            let mut contributors = Vec::new();
+            for range in &part_meta.ranges {
+                if !contributors.contains(&range.node) {
+                    contributors.push(range.node.clone());
+                }
+            }
             let _ = fs::remove_file(&part_path);
-            let _ = fs::remove_file(&part_hash_marker);
-            return Err(AppError::new(ErrorCode::Denied, err.message));
+            let _ = fs::remove_file(&part_meta_path);
+            return Err(DownloadFailure::HashMismatch {
+                err: AppError::new(ErrorCode::Denied, err.message),
+                contributors,
+            });
         }
 
         fs::rename(&part_path, &final_path).map_err(|err| {
-            AppError::new(
+            DownloadFailure::Interrupted(AppError::new(
                 ErrorCode::Failed,
                 format!("Could not finalize downloaded update: {err}"),
-            )
+            ))
         })?;
-        let _ = fs::remove_file(&part_hash_marker);
+        let _ = fs::remove_file(&part_meta_path);
         Ok(offset)
     }
 
@@ -2244,19 +2879,100 @@ impl UpdateManager {
         Ok((avail, expected_size, expected_sha256, verified_art))
     }
 
-    /// Synchronous hook called when the last desktop window closes: if automatic updates are on
-    /// and a verified update is ready (and has not failed before), stages it via copy-while-hashing
-    /// and spawns the detached swapper in `verify_only` mode so the new build verifies startup and
-    /// exits cleanly without popping a window open.
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    pub fn try_spawn_desktop_close_install(&self) -> bool {
+    /// Tracks an in-flight native operation outside [`Backend`] (such as Android QR camera
+    /// scanning during pairing) for the lifetime of the returned guard so automatic updates do not
+    /// fire while it is active.
+    pub fn track_external_operation(&self) -> ExternalOpGuard {
+        self.external_operations.fetch_add(1, Ordering::AcqRel);
+        ExternalOpGuard(Arc::clone(&self.external_operations))
+    }
+
+    /// Evaluates natively whether an automatic update install is allowed right now.
+    ///
+    /// The native side—never the web page—enforces all safety rules:
+    /// - Page-initiated requests are rate-limited to at most once every [`AUTO_INSTALL_RATE_LIMIT`].
+    /// - Any in-flight native call, pairing, transfer, or content stream (`active_ops > 0`) refuses
+    ///   automatic installation across every trigger (`"startup"`, `"background"`, and `"close"`).
+    /// - `"startup"` is allowed only within [`STARTUP_AUTO_INSTALL_WINDOW`] of launch and strictly
+    ///   before `on_app_ready` has recorded the first full screen.
+    /// - `"background"` is allowed only on Android.
+    /// - `"close"` is accepted only from the native desktop window-close handler (`from_page == false`).
+    pub fn evaluate_auto_install_gate(
+        &self,
+        trigger: &str,
+        active_ops: usize,
+        from_page: bool,
+    ) -> Result<(), &'static str> {
+        let now = Instant::now();
+        if from_page {
+            let mut last = self
+                .last_auto_install_request
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(prev) = *last
+                && now.saturating_duration_since(prev) < AUTO_INSTALL_RATE_LIMIT
+            {
+                return Err("rate_limited");
+            }
+            *last = Some(now);
+        }
+
+        let total_active_ops =
+            active_ops.saturating_add(self.external_operations.load(Ordering::Acquire));
+        if total_active_ops > 0 {
+            return Err("native_activity_in_flight");
+        }
+
+        match trigger {
+            "startup" => {
+                if self.first_screen_shown.load(Ordering::SeqCst) {
+                    return Err("first_screen_already_shown");
+                }
+                if now.saturating_duration_since(self.launched_at) > STARTUP_AUTO_INSTALL_WINDOW {
+                    return Err("startup_window_elapsed");
+                }
+            }
+            "background" => {
+                if self.os != Os::Android {
+                    return Err("background_android_only");
+                }
+            }
+            "close" => {
+                if from_page {
+                    return Err("close_native_only");
+                }
+            }
+            _ => return Err("unsupported_trigger"),
+        }
+
+        if self.current_sequence == 0 {
+            return Err("sequence_zero");
+        }
         let st = self.snapshot();
         let ready_or_checking_downloaded = st.phase == "ready"
             || (st.phase == "checking" && st.available.as_ref().is_some_and(|a| a.downloaded));
-        if !st.auto_update
-            || !ready_or_checking_downloaded
-            || !st.can_self_install
-            || self.current_sequence == 0
+        if !st.auto_update || !st.can_self_install || !ready_or_checking_downloaded {
+            return Err("not_ready");
+        }
+        if st
+            .available
+            .as_ref()
+            .is_some_and(|a| self.sequence_failed_before(a.sequence))
+        {
+            return Err("sequence_failed_before");
+        }
+        Ok(())
+    }
+
+    /// Synchronous hook called when the last desktop window closes: if automatic updates are on,
+    /// no native operations are in flight, and a verified update is ready (and has not failed
+    /// before), stages it via copy-while-hashing and spawns the detached swapper in `verify_only`
+    /// mode so the new build verifies startup and exits cleanly without popping a window open.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn try_spawn_desktop_close_install(&self, active_ops: usize) -> bool {
+        if self
+            .evaluate_auto_install_gate("close", active_ops, false)
+            .is_err()
         {
             return false;
         }
@@ -2736,6 +3452,171 @@ impl UpdateManager {
     }
 }
 
+type ListNodeOutcome = (String, Result<Result<NodeUpdateList, AppError>, ()>);
+type ListNodeFuture<'a> = BoxFuture<'a, ListNodeOutcome>;
+type CandidateProbeFuture<'a> =
+    BoxFuture<'a, Result<(VerifiedCandidate, usize, Duration), CandidateFetchError>>;
+
+enum WaveOutcome {
+    Verified {
+        verified: Box<VerifiedCandidate>,
+        bytes_read: usize,
+        elapsed: Duration,
+        errors: Vec<(String, AppError, usize, Duration)>,
+    },
+    NotForThisPlatform {
+        node: String,
+        bytes_read: usize,
+        elapsed: Duration,
+        errors: Vec<(String, AppError, usize, Duration)>,
+    },
+    AllFailed(Vec<(String, AppError, usize, Duration)>),
+    Cancelled,
+}
+
+async fn join_all_futures<T>(mut futs: Vec<BoxFuture<'_, T>>) -> Vec<T> {
+    let mut results: Vec<Option<T>> = (0..futs.len()).map(|_| None).collect();
+    let mut remaining = futs.len();
+    std::future::poll_fn(|cx| {
+        for (i, fut) in futs.iter_mut().enumerate() {
+            if results[i].is_none()
+                && let Poll::Ready(val) = fut.as_mut().poll(cx)
+            {
+                results[i] = Some(val);
+                remaining -= 1;
+            }
+        }
+        if remaining == 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    results.into_iter().flatten().collect()
+}
+
+fn load_or_init_part_state(
+    part_path: &Path,
+    meta_path: &Path,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> Result<(u64, PartMetadata), AppError> {
+    let fresh = || PartMetadata {
+        sha256: expected_sha256.to_owned(),
+        expected_size,
+        ranges: Vec::new(),
+    };
+    if !part_path.is_file() {
+        let _ = fs::remove_file(meta_path);
+        return Ok((0, fresh()));
+    }
+    let Ok(raw_meta) = fs::read(meta_path) else {
+        let _ = fs::remove_file(part_path);
+        let _ = fs::remove_file(meta_path);
+        return Ok((0, fresh()));
+    };
+    let Ok(mut meta) = serde_json::from_slice::<PartMetadata>(&raw_meta) else {
+        let _ = fs::remove_file(part_path);
+        let _ = fs::remove_file(meta_path);
+        return Ok((0, fresh()));
+    };
+    if meta.sha256 != expected_sha256 || meta.expected_size != expected_size {
+        let _ = fs::remove_file(part_path);
+        let _ = fs::remove_file(meta_path);
+        return Ok((0, fresh()));
+    }
+    let file_len = fs::symlink_metadata(part_path)
+        .ok()
+        .filter(|m| m.file_type().is_file())
+        .map_or(0, |m| m.len());
+    if file_len > expected_size {
+        let _ = fs::remove_file(part_path);
+        let _ = fs::remove_file(meta_path);
+        return Ok((0, fresh()));
+    }
+    // Validate contiguous provenance ranges starting at 0.
+    let mut meta_end = 0u64;
+    for r in &meta.ranges {
+        if r.start != meta_end || r.end < r.start || r.end > expected_size {
+            let _ = fs::remove_file(part_path);
+            let _ = fs::remove_file(meta_path);
+            return Ok((0, fresh()));
+        }
+        meta_end = r.end;
+    }
+    if file_len > meta_end {
+        // Truncate unattributed tail bytes after an abrupt crash so every byte has provenance.
+        let f = OpenOptions::new()
+            .write(true)
+            .open(part_path)
+            .map_err(|err| {
+                AppError::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Could not align partial download {}: {err}",
+                        part_path.display()
+                    ),
+                )
+            })?;
+        f.set_len(meta_end).map_err(|err| {
+            AppError::new(
+                ErrorCode::Failed,
+                format!(
+                    "Could not align partial download {}: {err}",
+                    part_path.display()
+                ),
+            )
+        })?;
+        return Ok((meta_end, meta));
+    }
+    if file_len < meta_end {
+        // Clamp provenance ranges to actual on-disk length.
+        let mut clamped = Vec::new();
+        for mut r in meta.ranges {
+            if r.start >= file_len {
+                break;
+            }
+            if r.end > file_len {
+                r.end = file_len;
+            }
+            if r.end > r.start {
+                clamped.push(r);
+            }
+        }
+        meta.ranges = clamped;
+    }
+    Ok((file_len, meta))
+}
+
+fn record_part_range(meta: &mut PartMetadata, start: u64, end: u64, node: &str) {
+    if end <= start {
+        return;
+    }
+    if let Some(last) = meta.ranges.last_mut()
+        && last.node == node
+        && last.end == start
+    {
+        last.end = end;
+        return;
+    }
+    meta.ranges.push(PartRange {
+        start,
+        end,
+        node: node.to_owned(),
+    });
+}
+
+fn save_part_metadata(path: &Path, meta: &PartMetadata) -> Result<(), AppError> {
+    let bytes = serde_json::to_vec(meta).map_err(|err| {
+        AppError::new(
+            ErrorCode::Internal,
+            format!("Could not serialize partial download metadata: {err}"),
+        )
+    })?;
+    write_atomic(path, &bytes)
+}
+
 async fn run_cancellable<T, F>(
     cancel_rx: &mut watch::Receiver<u64>,
     deadline: Instant,
@@ -2748,7 +3629,7 @@ where
     if now >= deadline {
         return Err(AppError::new(
             ErrorCode::Timeout,
-            "Update check exceeded its overall time budget.",
+            "Update request exceeded its time budget.",
         ));
     }
     let remaining = deadline.saturating_duration_since(now);
@@ -2761,7 +3642,7 @@ where
         res = tokio::time::timeout(remaining, fut) => res.map_err(|_| {
             AppError::new(
                 ErrorCode::Timeout,
-                "Update check exceeded its overall time budget.",
+                "Update request exceeded its time budget.",
             )
         }),
     }
@@ -2776,6 +3657,7 @@ async fn read_small_file(
     name: &str,
     max_bytes: usize,
     deadline: Instant,
+    call_timeout: Duration,
     cancel_rx: &mut watch::Receiver<u64>,
 ) -> Result<Vec<u8>, AppError> {
     if max_bytes == 0 {
@@ -2784,14 +3666,16 @@ async fn read_small_file(
             format!("Metadata budget exceeded while reading {name} from {node}."),
         ));
     }
+    let started_at = Instant::now();
     let mut out = Vec::new();
     let mut offset = 0u64;
     let mut chunks = 0usize;
     loop {
         let req_len = DOWNLOAD_CHUNK_BYTES.min((max_bytes as u64).saturating_sub(offset));
+        let call_deadline = (Instant::now() + call_timeout).min(deadline);
         let reply = run_cancellable(
             cancel_rx,
-            deadline,
+            call_deadline,
             client.read_chunk(node, channel, sequence, name, offset, req_len),
         )
         .await??;
@@ -2860,6 +3744,19 @@ async fn read_small_file(
                 ErrorCode::Denied,
                 format!("Reading {name} from {node} exceeded the small-file chunk cap."),
             ));
+        }
+        let elapsed = started_at.elapsed();
+        if elapsed >= METADATA_PROGRESS_GRACE {
+            let min_bytes = (elapsed.as_secs_f64() * MIN_METADATA_BYTES_PER_SEC as f64) as u64;
+            if offset < min_bytes {
+                return Err(AppError::new(
+                    ErrorCode::Timeout,
+                    format!(
+                        "Metadata download rate for {name} from {node} fell below {} KiB/s.",
+                        MIN_METADATA_BYTES_PER_SEC / 1024
+                    ),
+                ));
+            }
         }
     }
     Ok(out)
@@ -4173,8 +5070,15 @@ mod tests {
             .check_with_client(&f2, &nodes, false, false)
             .await
             .unwrap();
-        assert_eq!(st2.phase, "up_to_date");
+        assert_eq!(
+            st2.phase, "error",
+            "unverifiable candidate must not report up_to_date: {st2:?}"
+        );
         assert!(st2.available.is_none());
+        assert_eq!(
+            st2.last_error.as_deref(),
+            Some("Could not check for updates right now.")
+        );
 
         let mut f3 = FakeFleet::new();
         let mut set3 = build_fake_set(
@@ -4197,8 +5101,15 @@ mod tests {
             .check_with_client(&f3, &nodes, false, false)
             .await
             .unwrap();
-        assert_eq!(st3.phase, "up_to_date");
+        assert_eq!(
+            st3.phase, "error",
+            "tampered manifest must not report up_to_date: {st3:?}"
+        );
         assert!(st3.available.is_none());
+        assert_eq!(
+            st3.last_error.as_deref(),
+            Some("Could not check for updates right now.")
+        );
 
         let mut f4 = FakeFleet::new();
         let mut set4 = build_fake_set(
@@ -4225,6 +5136,897 @@ mod tests {
             !download_dir_for(&dir.path().join("m4"), Channel::Stable, 202611250210)
                 .join("Legion.apk")
                 .exists()
+        );
+    }
+
+    struct DelayedFleet {
+        sets: HashMap<String, Vec<FakeSet>>,
+        list_delay: HashMap<String, Duration>,
+        /// `(chunk_size, delay_per_chunk)` for metadata files per node.
+        meta_throttle: HashMap<String, (usize, Duration)>,
+        /// `(chunk_size, delay_per_chunk)` for artifact files per node.
+        art_throttle: HashMap<String, (usize, Duration)>,
+        /// Optional byte limit after which `node` disconnects on artifact reads.
+        disconnect_after_offset: HashMap<String, u64>,
+        disconnect_used: Mutex<HashMap<String, bool>>,
+        meta_reads_by_node: Mutex<HashMap<String, usize>>,
+    }
+
+    impl DelayedFleet {
+        fn new() -> Self {
+            Self {
+                sets: HashMap::new(),
+                list_delay: HashMap::new(),
+                meta_throttle: HashMap::new(),
+                art_throttle: HashMap::new(),
+                disconnect_after_offset: HashMap::new(),
+                disconnect_used: Mutex::new(HashMap::new()),
+                meta_reads_by_node: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn add_set(&mut self, node: &str, set: FakeSet) {
+            self.sets.entry(node.to_owned()).or_default().push(set);
+        }
+
+        fn meta_reads(&self, node: &str) -> usize {
+            self.meta_reads_by_node
+                .lock()
+                .unwrap()
+                .get(node)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl UpdateSourceClient for DelayedFleet {
+        fn list_sets(&self, node: &str) -> BoxFuture<'_, Result<NodeUpdateList, AppError>> {
+            let delay = self.list_delay.get(node).copied();
+            let listed = self.sets.get(node).map(|sets| NodeUpdateList {
+                node: node.to_owned(),
+                sets: sets
+                    .iter()
+                    .map(|s| NodeListedSet {
+                        channel: s.channel,
+                        sequence: s.sequence,
+                        artifacts: s.artifacts.clone(),
+                    })
+                    .collect(),
+            });
+            let node_owned = node.to_owned();
+            Box::pin(async move {
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+                listed.ok_or_else(|| {
+                    AppError::new(ErrorCode::Unreachable, format!("{node_owned} offline"))
+                })
+            })
+        }
+
+        fn read_chunk(
+            &self,
+            node: &str,
+            channel: Channel,
+            sequence: u64,
+            name: &str,
+            offset: u64,
+            length: u64,
+        ) -> BoxFuture<'_, Result<UpdateReadChunk, AppError>> {
+            let is_meta = matches!(
+                name,
+                CHECKSUMS_FILENAME | SIGNATURE_FILENAME | MANIFEST_FILENAME
+            );
+            if is_meta {
+                *self
+                    .meta_reads_by_node
+                    .lock()
+                    .unwrap()
+                    .entry(node.to_owned())
+                    .or_insert(0) += 1;
+            } else if let Some(&limit) = self.disconnect_after_offset.get(node)
+                && offset >= limit
+            {
+                let mut used = self.disconnect_used.lock().unwrap();
+                if !used.get(node).copied().unwrap_or(false) {
+                    used.insert(node.to_owned(), true);
+                    return Box::pin(async {
+                        Err(AppError::new(
+                            ErrorCode::Unreachable,
+                            "Simulated mid-stream disconnect",
+                        ))
+                    });
+                }
+            }
+            let throttle = if is_meta {
+                self.meta_throttle.get(node).copied()
+            } else {
+                self.art_throttle.get(node).copied()
+            };
+            let bytes = self
+                .sets
+                .get(node)
+                .and_then(|sets| {
+                    sets.iter()
+                        .find(|s| s.channel == channel && s.sequence == sequence)
+                })
+                .and_then(|s| s.files.get(name))
+                .cloned();
+            let name_owned = name.to_owned();
+            Box::pin(async move {
+                let (cap, delay) = throttle.unwrap_or((512 * 1024, Duration::ZERO));
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let bytes = bytes.ok_or_else(|| {
+                    AppError::new(ErrorCode::NotFound, format!("missing {name_owned}"))
+                })?;
+                let start = (offset as usize).min(bytes.len());
+                let take = (length as usize)
+                    .min(cap)
+                    .min(bytes.len().saturating_sub(start));
+                let slice = &bytes[start..start + take];
+                Ok(UpdateReadChunk {
+                    size: bytes.len() as u64,
+                    offset,
+                    length: slice.len() as u64,
+                    content: BASE64.encode(slice),
+                    eof: start + take >= bytes.len(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_metadata_from_one_node_does_not_freeze_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x91);
+        let (evil_sk, _) = keypair(0x92);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let mut fleet = DelayedFleet::new();
+        // Hostile node advertises higher bogus sequence and stalls 25s per 1-byte metadata chunk.
+        fleet.add_set(
+            "evil",
+            build_fake_set(
+                Channel::Stable,
+                "9.9.9",
+                202611250300,
+                "Legion.apk",
+                Os::Android,
+                Arch::Universal,
+                InstallKind::Apk,
+                b"evil",
+                &evil_sk,
+            ),
+        );
+        fleet
+            .meta_throttle
+            .insert("evil".to_owned(), (1, Duration::from_secs(25)));
+        // Honest node holds genuine update at lower sequence.
+        fleet.add_set(
+            "honest",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion.apk",
+                Os::Android,
+                Arch::Universal,
+                InstallKind::Apk,
+                b"real-apk-payload",
+                &rel_sk,
+            ),
+        );
+
+        let mgr = UpdateManager::with_config(
+            dir.path().join("updates"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+
+        let t0 = Instant::now();
+        let st = mgr
+            .check_with_client(
+                &fleet,
+                &["evil".to_owned(), "honest".to_owned()],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(st.phase, "ready", "{st:?}");
+        assert_eq!(st.available.as_ref().unwrap().sequence, 202611250210);
+        assert_eq!(st.available.as_ref().unwrap().source_node, "honest");
+        assert!(
+            elapsed <= METADATA_CANDIDATE_TIMEOUT,
+            "slow metadata node must be cut off within candidate budget, took {elapsed:?}"
+        );
+        assert!(mgr.is_node_deprioritized("evil"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_metadata_on_genuine_set_raced_concurrently_wins_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x93);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let genuine = build_fake_set(
+            Channel::Stable,
+            "0.2.0",
+            202611250210,
+            "Legion.apk",
+            Os::Android,
+            Arch::Universal,
+            InstallKind::Apk,
+            b"genuine-apk-payload",
+            &rel_sk,
+        );
+        let mut fleet = DelayedFleet::new();
+        fleet.add_set("evil", genuine.clone());
+        fleet.add_set("honest", genuine);
+        fleet
+            .meta_throttle
+            .insert("evil".to_owned(), (1, Duration::from_secs(25)));
+
+        let mgr = UpdateManager::with_config(
+            dir.path().join("updates"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+
+        let t0 = Instant::now();
+        let st = mgr
+            .check_with_client(
+                &fleet,
+                &["evil".to_owned(), "honest".to_owned()],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(st.phase, "ready", "{st:?}");
+        assert_eq!(st.available.as_ref().unwrap().source_node, "honest");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "concurrent metadata probe should finish immediately via honest node, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_metadata_rate_floor_aborts_trickle_and_never_reports_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x94);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let mut fleet = DelayedFleet::new();
+        fleet.add_set(
+            "trickler",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion.apk",
+                Os::Android,
+                Arch::Universal,
+                InstallKind::Apk,
+                b"payload",
+                &rel_sk,
+            ),
+        );
+        // 1 byte per second is faster than METADATA_CALL_TIMEOUT (8s) so only the metadata rate
+        // floor catches it promptly.
+        fleet
+            .meta_throttle
+            .insert("trickler".to_owned(), (1, Duration::from_secs(1)));
+
+        let mgr = UpdateManager::with_config(
+            dir.path().join("updates"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+
+        let t0 = Instant::now();
+        let st = mgr
+            .check_with_client(&fleet, &["trickler".to_owned()], false, false)
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(
+            st.phase, "error",
+            "timed-out check must never report up_to_date: {st:?}"
+        );
+        assert_eq!(
+            st.last_error.as_deref(),
+            Some("Could not check for updates right now.")
+        );
+        assert!(
+            elapsed <= Duration::from_secs(5),
+            "metadata rate floor should abort 1 B/s trickle quickly, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bad_node_is_deprioritized_across_checks_and_forgotten_after_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x95);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let set1 = build_fake_set(
+            Channel::Stable,
+            "0.2.0",
+            202611250210,
+            "Legion.apk",
+            Os::Android,
+            Arch::Universal,
+            InstallKind::Apk,
+            b"payload-1",
+            &rel_sk,
+        );
+        let mut fleet = DelayedFleet::new();
+        fleet.add_set("slow", set1.clone());
+        fleet.add_set("fast", set1);
+        fleet
+            .list_delay
+            .insert("slow".to_owned(), Duration::from_secs(60));
+
+        let mgr = UpdateManager::with_config(
+            dir.path().join("updates"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+
+        // Check 1: slow node times out on list_sets (concurrently with fast node), fast succeeds.
+        let t0 = Instant::now();
+        let st1 = mgr
+            .check_with_client(
+                &fleet,
+                &["slow".to_owned(), "fast".to_owned()],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(st1.phase, "ready", "{st1:?}");
+        assert!(t0.elapsed() <= LIST_NODE_TIMEOUT + Duration::from_secs(1));
+        assert!(mgr.is_node_deprioritized("slow"));
+
+        let ordered = mgr.order_nodes_for(
+            Channel::Stable,
+            202611250211,
+            &["slow".to_owned(), "fast".to_owned()],
+        );
+        assert_eq!(ordered, vec!["fast".to_owned(), "slow".to_owned()]);
+
+        // Check 2 (within TTL): slow recovers on listing, but clean wave tries fast FIRST without
+        // touching slow's metadata!
+        fleet.list_delay.remove("slow");
+        let set2 = build_fake_set(
+            Channel::Stable,
+            "0.2.1",
+            202611250211,
+            "Legion.apk",
+            Os::Android,
+            Arch::Universal,
+            InstallKind::Apk,
+            b"payload-2",
+            &rel_sk,
+        );
+        fleet.add_set("slow", set2.clone());
+        fleet.add_set("fast", set2);
+        let slow_reads_before = fleet.meta_reads("slow");
+        let st2 = mgr
+            .check_with_client(
+                &fleet,
+                &["slow".to_owned(), "fast".to_owned()],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(st2.phase, "ready", "{st2:?}");
+        assert_eq!(st2.available.as_ref().unwrap().source_node, "fast");
+        assert_eq!(
+            fleet.meta_reads("slow"),
+            slow_reads_before,
+            "deprioritized node must not be queried ahead of a clean node"
+        );
+
+        // Advance past BAD_NODE_TTL: slow node is forgotten and treated normally again.
+        tokio::time::advance(BAD_NODE_TTL + Duration::from_secs(1)).await;
+        assert!(!mgr.is_node_deprioritized("slow"));
+        let ordered_after_ttl = mgr.order_nodes_for(
+            Channel::Stable,
+            202611250212,
+            &["slow".to_owned(), "fast".to_owned()],
+        );
+        assert_eq!(
+            ordered_after_ttl,
+            vec!["slow".to_owned(), "fast".to_owned()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_link_6mib_at_24kib_s_completes_with_one_and_two_nodes_and_resumes_across_checks()
+    {
+        let (rel_sk, rel_pk) = keypair(0x96);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        // Exact reviewer scenario: 6 MiB payload at 24 KiB/s (~256s > old 180s fixed deadline).
+        let payload_6m: Vec<u8> = (0..(6 * 1024 * 1024))
+            .map(|i| ((i * 31) & 0xFF) as u8)
+            .collect();
+        let set_6m = build_fake_set(
+            Channel::Stable,
+            "0.2.0",
+            202611250210,
+            "Legion.apk",
+            Os::Android,
+            Arch::Universal,
+            InstallKind::Apk,
+            &payload_6m,
+            &rel_sk,
+        );
+
+        // Case 1: single slow node at 24 KiB/s (24 KiB per 1s) completes in one pass.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut fleet = DelayedFleet::new();
+            fleet.add_set("a", set_6m.clone());
+            fleet
+                .art_throttle
+                .insert("a".to_owned(), (24 * 1024, Duration::from_secs(1)));
+
+            let mgr = UpdateManager::with_config(
+                dir.path().join("updates"),
+                anchors,
+                Os::Android,
+                Arch::Aarch64,
+                PlatformEnv::Android,
+                "0.1.0".to_owned(),
+                "old".to_owned(),
+                202611250200,
+            );
+            let st = mgr
+                .check_with_client(&fleet, &["a".to_owned()], false, false)
+                .await
+                .unwrap();
+            assert_eq!(st.phase, "ready", "1-node 6 MiB @ 24 KiB/s failed: {st:?}");
+            assert!(st.available.unwrap().downloaded);
+        }
+
+        // Case 2: two slow nodes at 24 KiB/s where `a` disconnects at 4 MiB; `b` resumes from
+        // 4 MiB (preserving `.part` progress!) and finishes the remaining 2 MiB cleanly.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut fleet = DelayedFleet::new();
+            fleet.add_set("a", set_6m.clone());
+            fleet.add_set("b", set_6m);
+            fleet
+                .art_throttle
+                .insert("a".to_owned(), (24 * 1024, Duration::from_secs(1)));
+            fleet
+                .art_throttle
+                .insert("b".to_owned(), (24 * 1024, Duration::from_secs(1)));
+            fleet
+                .disconnect_after_offset
+                .insert("a".to_owned(), 4 * 1024 * 1024);
+
+            let mgr = UpdateManager::with_config(
+                dir.path().join("updates"),
+                anchors,
+                Os::Android,
+                Arch::Aarch64,
+                PlatformEnv::Android,
+                "0.1.0".to_owned(),
+                "old".to_owned(),
+                202611250200,
+            );
+            let t0 = Instant::now();
+            let st = mgr
+                .check_with_client(&fleet, &["a".to_owned(), "b".to_owned()], false, false)
+                .await
+                .unwrap();
+            let elapsed = t0.elapsed();
+            assert_eq!(st.phase, "ready", "2-node 6 MiB @ 24 KiB/s failed: {st:?}");
+            assert!(st.available.unwrap().downloaded);
+            // Total transfer time stays ~256s (proving `b` resumed from 4 MiB instead of restarting!).
+            assert!(
+                elapsed < Duration::from_secs(300),
+                "expected b to resume from 4 MiB without re-downloading, took {elapsed:?}"
+            );
+        }
+
+        // Case 3: 11 MiB APK at 24 KiB/s interrupted mid-way completes across checks without losing `.part`.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let updates_dir = dir.path().join("updates");
+            let payload_11m = vec![0x3Cu8; 11 * 1024 * 1024];
+            let set_11m = build_fake_set(
+                Channel::Stable,
+                "0.2.1",
+                202611250211,
+                "Legion.apk",
+                Os::Android,
+                Arch::Universal,
+                InstallKind::Apk,
+                &payload_11m,
+                &rel_sk,
+            );
+            let mut fleet = DelayedFleet::new();
+            fleet.add_set("a", set_11m);
+            fleet
+                .art_throttle
+                .insert("a".to_owned(), (24 * 1024, Duration::from_secs(1)));
+            fleet
+                .disconnect_after_offset
+                .insert("a".to_owned(), 5 * 1024 * 1024);
+
+            let mgr = UpdateManager::with_config(
+                updates_dir.clone(),
+                anchors,
+                Os::Android,
+                Arch::Aarch64,
+                PlatformEnv::Android,
+                "0.1.0".to_owned(),
+                "old".to_owned(),
+                202611250200,
+            );
+
+            // Check 1 disconnects after 5 MiB -> `.part` and `.part.meta.json` stay intact!
+            let st1 = mgr
+                .check_with_client(&fleet, &["a".to_owned()], false, false)
+                .await
+                .unwrap();
+            assert_eq!(st1.phase, "error", "{st1:?}");
+            let set_dir = download_dir_for(&updates_dir, Channel::Stable, 202611250211);
+            let part_len = fs::metadata(set_dir.join("Legion.apk.part")).unwrap().len();
+            assert!(
+                part_len >= 5 * 1024 * 1024,
+                "expected >= 5 MiB preserved, got {part_len}"
+            );
+            let meta: PartMetadata = serde_json::from_slice(
+                &fs::read(set_dir.join("Legion.apk.part.meta.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(meta.ranges.len(), 1);
+            assert_eq!(meta.ranges[0].node, "a");
+            assert_eq!(meta.ranges[0].end, part_len);
+
+            // Check 2 resumes from >= 5 MiB and finishes the remaining <= 6 MiB cleanly!
+            let t_resume = Instant::now();
+            let st2 = mgr
+                .check_with_client(&fleet, &["a".to_owned()], false, false)
+                .await
+                .unwrap();
+            assert_eq!(st2.phase, "ready", "{st2:?}");
+            assert!(st2.available.unwrap().downloaded);
+            assert!(
+                t_resume.elapsed() < Duration::from_secs(290),
+                "check 2 should only transfer remaining ~6 MiB, took {:?}",
+                t_resume.elapsed()
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poisoned_partial_from_first_node_retries_second_node_clean_and_blames_only_poisoner() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x97);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let payload = vec![0x5Au8; 64 * 1024];
+        let good_set = build_fake_set(
+            Channel::Stable,
+            "0.2.0",
+            202611250210,
+            "Legion.apk",
+            Os::Android,
+            Arch::Universal,
+            InstallKind::Apk,
+            &payload,
+            &rel_sk,
+        );
+        let mut poisoned_set = good_set.clone();
+        let mut poisoned_bytes = payload.clone();
+        poisoned_bytes[0] ^= 0xFF;
+        poisoned_set
+            .files
+            .insert("Legion.apk".to_owned(), poisoned_bytes);
+
+        let mut fleet = DelayedFleet::new();
+        fleet.add_set("poisoner", poisoned_set);
+        fleet.add_set("honest", good_set);
+        fleet
+            .art_throttle
+            .insert("poisoner".to_owned(), (16 * 1024, Duration::ZERO));
+        fleet
+            .art_throttle
+            .insert("honest".to_owned(), (16 * 1024, Duration::ZERO));
+        // Poisoner writes 32 KiB of corrupted bytes and then disconnects!
+        fleet
+            .disconnect_after_offset
+            .insert("poisoner".to_owned(), 32 * 1024);
+
+        let mgr = UpdateManager::with_config(
+            dir.path().join("updates"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+
+        let nodes = vec!["poisoner".to_owned(), "honest".to_owned()];
+        let st = mgr
+            .check_with_client(&fleet, &nodes, false, false)
+            .await
+            .unwrap();
+        assert_eq!(st.phase, "ready", "{st:?}");
+        assert_eq!(st.available.as_ref().unwrap().source_node, "honest");
+        assert!(st.available.as_ref().unwrap().downloaded);
+        // Honest node was exonerated after clean retry; poisoner remains deprioritized!
+        assert!(mgr.is_node_deprioritized("poisoner"));
+        assert!(!mgr.is_node_deprioritized("honest"));
+        assert_eq!(
+            mgr.order_nodes_for(Channel::Stable, 202611250210, &nodes),
+            vec!["honest".to_owned(), "poisoner".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn fair_candidate_merging_prevents_two_flooding_nodes_crowding_out_honest_third_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x98);
+        let (bad_sk, _) = keypair(0x99);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let mut fleet = FakeFleet::new();
+        // Two flooding nodes each advertise 16 distinct bogus higher sequences (32 total == cap).
+        for (idx, flooder) in ["flood1", "flood2"].iter().enumerate() {
+            for i in 0..20u64 {
+                let seq = 202611260000 + (idx as u64) * 100 + i;
+                fleet.add_set(
+                    flooder,
+                    build_fake_set(
+                        Channel::Stable,
+                        "9.9.9",
+                        seq,
+                        "Legion.apk",
+                        Os::Android,
+                        Arch::Universal,
+                        InstallKind::Apk,
+                        b"evil",
+                        &bad_sk,
+                    ),
+                );
+            }
+        }
+        // Third node is honest and listed LAST with the real signed update at a lower sequence.
+        fleet.add_set(
+            "honest",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion.apk",
+                Os::Android,
+                Arch::Universal,
+                InstallKind::Apk,
+                b"real-apk-bytes",
+                &rel_sk,
+            ),
+        );
+
+        let mgr = UpdateManager::with_config(
+            dir.path().join("updates"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+        let st = mgr
+            .check_with_client(
+                &fleet,
+                &[
+                    "flood1".to_owned(),
+                    "flood2".to_owned(),
+                    "honest".to_owned(),
+                ],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(st.phase, "ready", "{st:?}");
+        assert_eq!(st.available.as_ref().unwrap().sequence, 202611250210);
+        assert_eq!(st.available.as_ref().unwrap().source_node, "honest");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_install_gate_enforces_startup_window_first_screen_in_flight_ops_and_rate_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x9A);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"ready-appimage",
+                &rel_sk,
+            ),
+        );
+
+        // Desktop manager with ready update right at launch.
+        let mgr = UpdateManager::with_config(
+            dir.path().join("desktop"),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+                appimage_path: dir.path().join("Legion.AppImage"),
+            }),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+        let st = mgr
+            .check_with_client(&fleet, &["tower".to_owned()], false, false)
+            .await
+            .unwrap();
+        assert_eq!(st.phase, "ready");
+
+        // 1. Within startup window, before first screen, zero in-flight ops -> startup allowed.
+        assert_eq!(mgr.evaluate_auto_install_gate("startup", 0, true), Ok(()));
+
+        // 2. Immediate repeat request from page is rate-limited natively.
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("startup", 0, true),
+            Err("rate_limited")
+        );
+
+        // 3. After rate-limit window, in-flight native work still blocks startup and close.
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("startup", 1, true),
+            Err("native_activity_in_flight")
+        );
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("close", 1, false),
+            Err("native_activity_in_flight")
+        );
+        assert_eq!(mgr.evaluate_auto_install_gate("close", 0, false), Ok(()));
+        // Page can never spoof desktop close or background or unknown triggers.
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("close", 0, true),
+            Err("close_native_only")
+        );
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("background", 0, true),
+            Err("background_android_only")
+        );
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("idle", 0, true),
+            Err("unsupported_trigger")
+        );
+
+        // 4. Once startup window elapses, startup is refused even if page never called `ready()`.
+        tokio::time::advance(STARTUP_AUTO_INSTALL_WINDOW + Duration::from_secs(1)).await;
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("startup", 0, true),
+            Err("startup_window_elapsed")
+        );
+
+        // 5. Fresh manager: as soon as first full screen paints (`on_app_ready`), startup is closed
+        //    permanently even 1ms after launch!
+        let mgr2 = UpdateManager::with_config(
+            dir.path().join("desktop"),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+                appimage_path: dir.path().join("Legion.AppImage"),
+            }),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+        assert_eq!(mgr2.snapshot().phase, "ready");
+        mgr2.on_app_ready();
+        assert_eq!(
+            mgr2.evaluate_auto_install_gate("startup", 0, true),
+            Err("first_screen_already_shown")
+        );
+
+        // 6. Android manager allows `"background"` when idle, refuses when native work is in flight.
+        let mut android_fleet = FakeFleet::new();
+        android_fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion.apk",
+                Os::Android,
+                Arch::Universal,
+                InstallKind::Apk,
+                b"ready-apk",
+                &rel_sk,
+            ),
+        );
+        let android_mgr = UpdateManager::with_config(
+            dir.path().join("android"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+        android_mgr
+            .check_with_client(&android_fleet, &["tower".to_owned()], false, false)
+            .await
+            .unwrap();
+        android_mgr.on_app_ready();
+        assert_eq!(
+            android_mgr.evaluate_auto_install_gate("startup", 0, true),
+            Err("first_screen_already_shown")
+        );
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        assert_eq!(
+            android_mgr.evaluate_auto_install_gate("background", 1, true),
+            Err("native_activity_in_flight")
+        );
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        let scan_guard = android_mgr.track_external_operation();
+        assert_eq!(
+            android_mgr.evaluate_auto_install_gate("background", 0, true),
+            Err("native_activity_in_flight")
+        );
+        drop(scan_guard);
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        assert_eq!(
+            android_mgr.evaluate_auto_install_gate("background", 0, true),
+            Ok(())
         );
     }
 }
