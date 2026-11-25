@@ -510,13 +510,14 @@ impl NodePairingGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !active.insert(node.to_owned()) {
-            return Err(AppError::new(
+            let mut err = AppError::new(
                 ErrorCode::Busy,
                 format!("Pairing with {node} is already in progress."),
             )
-            .with_machine(node)
             .with_hint("Wait for the current pairing attempt to finish, then try again.")
-            .with_details(serde_json::json!({ "sent": false })));
+            .with_details(serde_json::json!({ "sent": false }));
+            err.machine = Some(node.to_owned());
+            return Err(err);
         }
         Ok(Self {
             pairing_nodes: Arc::clone(pairing_nodes),
