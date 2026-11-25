@@ -3557,6 +3557,28 @@ impl Drop for MoveLockPinGuard {
     }
 }
 
+/// Removes dead unlocked `.pin` files left behind in `move-lock-pins/` if a `delete` worker was
+/// killed with `SIGKILL` before its [`MoveLockPinGuard`] could drop. Never touches live pins whose
+/// OS lock is still held.
+fn sweep_dead_move_lock_pins(state_dir: &Path) {
+    let dir = move_lock_pins_dir(state_dir);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(OsStr::to_str) != Some("pin") {
+            continue;
+        }
+        let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&path) else {
+            continue;
+        };
+        if file.try_lock().is_ok() {
+            legion_xfer::unlink_held_lock(&path, file);
+        }
+    }
+}
+
 /// Returns `true` while any live `delete` operation on this node holds a pin for `lock_id`,
 /// sweeping any dead unlocked `.pin` leftovers it encounters.
 fn has_active_move_lock_pin(state_dir: &Path, lock_id: &str) -> bool {
@@ -3947,6 +3969,7 @@ fn sweep_and_count_principal_locks(state_dir: &Path, principal: &str) -> usize {
             let _ = fs::remove_file(&meta_path);
         }
     }
+    sweep_dead_move_lock_pins(state_dir);
     held_by_principal
 }
 
