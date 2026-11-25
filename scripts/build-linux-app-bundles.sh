@@ -110,7 +110,7 @@ fi
 CONTAINER_SCRIPT="$(cat <<'CONTAINER_EOF'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-mkdir -p /home/builder
+mkdir -p /home/me
 cleanup_ownership() {
   chown -R "${HOST_UID}:${HOST_GID}" \
     /workspace/legion-control/apps/legion-app/src-tauri/target \
@@ -141,7 +141,7 @@ apt-get install -y -qq --no-install-recommends \
   squashfs-tools \
   xdg-utils >/dev/null
 
-export HOME=/home/builder
+export HOME=/home/me
 export CARGO_HOME=/u22-cache/cargo-home
 mkdir -p "${CARGO_HOME}"
 # Reuse the host's registry cache without exposing host ~/.cargo/bin binaries
