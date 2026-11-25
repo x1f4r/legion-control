@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use legion_core::{BoxFuture, Ctx, Registry, Tool, ToolError, input_schema, parse_args};
 use legion_proto::{Effect, ErrorBody, ErrorCode, EventKind, ToolSpec};
 use legion_xfer::{
-    CaseCollision, Entry, EntryKind, Manifest, Plan, PlanConflict, PlanOptions, SkippedEntry,
+    CaseCollision, Entry, EntryKind, Hash, IfExists, Manifest, Plan, PlanConflict, PlanOptions,
+    RenamedEntry, SkippedEntry,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -56,6 +57,9 @@ const MOST_NOISE_BYTES: usize = 64 * 1024;
 /// below what a stream reads and a huge tree goes in several rounds.
 const BATCH_NAMES: usize = 20_000;
 const BATCH_BYTES: usize = 4 * 1024 * 1024;
+/// Per-round caps for tree moves so verified source files are removed incrementally batch by batch.
+const MOVE_BATCH_FILES: usize = 256;
+const MOVE_BATCH_CONTENT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The shortest time between two `progress` events.
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
@@ -108,7 +112,7 @@ pub fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add(TransferTool {
         spec: ToolSpec {
             name: "fs.transfer".to_owned(),
-            description: "Copy a file or a directory tree between machines, or within one. Each of from and to is machine:/path or a path on this node; to names the destination itself, except that a file sent to an existing directory (or to a path ending in /) lands inside it under its own name. A file resumes where an interrupted transfer stopped and is renamed into place only once its BLAKE3 hash matches. A tree sends only what differs (size and modification time, or hash with checksum), so a second run sends nothing; delete removes what the source no longer has, exclude leaves paths out at both ends, and dry_run reports what would be sent and deleted without changing anything.".to_owned(),
+            description: "Copy or move a file or a directory tree between machines, or within one. Each of from and to is machine:/path or a path on this node; to names the destination itself, except that a file sent to an existing directory (or to a path ending in /) lands inside it under its own name. A file resumes where an interrupted transfer stopped and is renamed into place only once its BLAKE3 hash matches. A tree sends only what differs (size and modification time, or hash with checksum), so a second run sends nothing; if_exists chooses fail, skip, replace (default) or rename (name (2).ext); move removes each source file only after its destination copy is verified by hash (refused up front unless the caller may fs.remove the source); delete removes what the source no longer has, exclude leaves paths out at both ends, and dry_run reports what would be sent, deleted and removed without changing anything.".to_owned(),
             effect: Effect::Write,
             input_schema: input_schema::<TransferArgs>(),
         },
@@ -142,42 +146,88 @@ impl Tool for TransferTool {
     }
 }
 
+/// How `fs.transfer` behaves when a destination entry already exists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IfExistsArg {
+    /// Overwrite the destination entry atomically (default).
+    #[default]
+    Replace,
+    /// Refuse with `exists` before overwriting anything.
+    Fail,
+    /// Keep the existing destination entry untouched and skip sending.
+    Skip,
+    /// Write beside the existing entry as `name (2).ext`, counting up atomically at the destination.
+    Rename,
+}
+
+impl From<IfExistsArg> for IfExists {
+    fn from(value: IfExistsArg) -> Self {
+        match value {
+            IfExistsArg::Replace => IfExists::Replace,
+            IfExistsArg::Fail => IfExists::Fail,
+            IfExistsArg::Skip => IfExists::Skip,
+            IfExistsArg::Rename => IfExists::Rename,
+        }
+    }
+}
+
 /// Arguments of `fs.transfer`.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct TransferArgs {
+pub(crate) struct TransferArgs {
     /// What to send: `machine:/path`, or a path on this node (absolute or starting with `~`).
-    from: String,
+    pub(crate) from: String,
     /// Where it goes, in the same form. It names the destination itself; a file sent to an
     /// existing directory lands inside it.
-    to: String,
+    pub(crate) to: String,
     /// Remove from the destination tree what the source no longer has.
     #[serde(default)]
-    delete: bool,
+    pub(crate) delete: bool,
     /// Compare files by BLAKE3 hash instead of size and modification time, which reads them all.
     #[serde(default)]
-    checksum: bool,
+    pub(crate) checksum: bool,
     /// Globs of paths to leave out at both ends, relative to the tree; a trailing `/` matches
     /// directories only. What is left out at the destination is never deleted.
     #[serde(default)]
-    exclude: Vec<String>,
-    /// List and plan, and report what would be sent and deleted, without changing anything.
+    pub(crate) exclude: Vec<String>,
+    /// List and plan, and report what would be sent, deleted and removed, without changing anything.
     #[serde(default)]
-    dry_run: bool,
+    pub(crate) dry_run: bool,
+    /// What to do when a destination entry already exists: `replace` (default), `fail`, `skip`, or
+    /// `rename` (`name (2).ext`, decided atomically at the destination).
+    #[serde(default)]
+    pub(crate) if_exists: IfExistsArg,
+    /// Remove each source file after its destination copy is verified by BLAKE3 hash (requires
+    /// `fs.remove` permission on the source; refused up front otherwise).
+    #[serde(default, rename = "move")]
+    pub(crate) move_source: bool,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// What `fs.transfer` returns.
 #[derive(Debug, Default, Serialize)]
-struct TransferReport {
+pub(crate) struct TransferReport {
     from: String,
     to: String,
     kind: &'static str,
     files_sent: u64,
     bytes_sent: u64,
     files_unchanged: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    files_skipped: u64,
     deleted: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    moved: bool,
+    #[serde(skip_serializing_if = "is_zero")]
+    source_removed: u64,
     conflicts: Vec<PlanConflict>,
     skipped: Vec<SkippedEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    renamed: Vec<RenamedEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resumed_from: Option<u64>,
     duration_ms: u64,
@@ -186,6 +236,8 @@ struct TransferReport {
     would_send: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     would_delete: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    would_remove: Option<Vec<String>>,
     /// Whether a list above was cut at its first entries; the counts are whole.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     truncated: bool,
@@ -491,7 +543,7 @@ impl Transfer<'_> {
             .await?;
         match source.kind.as_str() {
             "file" => self.file(from, to, &source, args).await,
-            "dir" => self.tree(from, to, args).await,
+            "dir" => self.tree(from, to, &source, args).await,
             "missing" => Err(ErrorBody::new(
                 ErrorCode::NotFound,
                 format!("{} does not exist on {}.", from.path, from.machine),
@@ -514,6 +566,24 @@ impl Transfer<'_> {
         }
     }
 
+    /// Verifies that the caller is allowed `fs.remove` on `from` (including protected-tree checks)
+    /// before any byte moves.
+    async fn check_move_permission(&self, from: &End) -> Result<(), ErrorBody> {
+        let _: DeleteDone = self
+            .request(
+                from,
+                json!({
+                    "op": "delete",
+                    "root": from.path,
+                    "names": [],
+                    "dry_run": true,
+                    "remove_root": true,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn file(
         &self,
         from: &End,
@@ -529,6 +599,7 @@ impl Transfer<'_> {
             .with_machine(from.machine.clone())
         })?;
         let size = source.size;
+        let if_exists = IfExists::from(args.if_exists);
         let mut target = to.clone();
         let mut there: StatReply = self
             .request(
@@ -545,34 +616,67 @@ impl Transfer<'_> {
                 )
                 .await?;
         }
+        if args.move_source {
+            check_not_same_or_subtree(from, &target, source, &there, false)?;
+            self.check_move_permission(from).await?;
+        }
         let mut report = TransferReport {
             from: from.named(),
             to: target.named(),
             kind: "file",
+            moved: args.move_source,
             ..TransferReport::default()
         };
-        match there.kind.as_str() {
-            "file" if there.size == size && there.hash == Some(hash) => {
-                report.files_unchanged = 1;
-                return Ok(report);
-            }
-            "file" | "missing" | "symlink" => {}
-            other => {
-                let what = if other == "dir" {
-                    "a directory"
-                } else {
-                    "a special file"
-                };
+        match if_exists {
+            IfExists::Fail if there.kind != "missing" => {
                 return Err(ErrorBody::new(
-                    ErrorCode::Conflict,
-                    format!(
-                        "{} on {} is {what}, and a file cannot replace it.",
-                        target.path, target.machine
-                    ),
+                    ErrorCode::Exists,
+                    format!("{} already exists on {}.", target.path, target.machine),
                 )
-                .with_hint("Name a different path.")
+                .with_hint(
+                    "Pass if_exists=\"replace\", \"skip\", or \"rename\", or choose another destination.",
+                )
                 .with_machine(target.machine.clone()));
             }
+            IfExists::Skip if there.kind != "missing" => {
+                report.files_skipped = 1;
+                return Ok(report);
+            }
+            IfExists::Replace => match there.kind.as_str() {
+                "file" if there.size == size && there.hash == Some(hash) => {
+                    report.files_unchanged = 1;
+                    if args.move_source {
+                        if args.dry_run {
+                            report.source_removed = 1;
+                            report.would_remove = Some(vec![from.path.clone()]);
+                        } else {
+                            let removed = self
+                                .remove_source_root(from, Some(hash), &mut report.skipped)
+                                .await?;
+                            report.source_removed = removed;
+                        }
+                    }
+                    return Ok(report);
+                }
+                "file" | "missing" | "symlink" => {}
+                other => {
+                    let what = if other == "dir" {
+                        "a directory"
+                    } else {
+                        "a special file"
+                    };
+                    return Err(ErrorBody::new(
+                        ErrorCode::Conflict,
+                        format!(
+                            "{} on {} is {what}, and a file cannot replace it.",
+                            target.path, target.machine
+                        ),
+                    )
+                    .with_hint("Name a different path.")
+                    .with_machine(target.machine.clone()));
+                }
+            },
+            IfExists::Fail | IfExists::Skip | IfExists::Rename => {}
         }
         let partial = there.partial.filter(|len| *len <= size);
         if args.dry_run {
@@ -580,30 +684,57 @@ impl Transfer<'_> {
             report.bytes_sent = size - partial.unwrap_or(0);
             report.resumed_from = partial;
             report.would_send = Some(vec![target.path.clone()]);
+            if args.move_source {
+                report.source_removed = 1;
+                report.would_remove = Some(vec![from.path.clone()]);
+            }
             return Ok(report);
         }
-        let (resumed, sent) = match self.send_file(from, &target, source, partial).await {
+        let (resumed, sent, done) = match self
+            .send_file(from, &target, source, partial, if_exists)
+            .await
+        {
             Err(error) if partial.is_some() && error.code == ErrorCode::Conflict => {
                 // What an earlier attempt left was not a prefix of this file (it changed since):
                 // the destination dropped it when the hash did not match, so start over once.
-                self.send_file(from, &target, source, None).await?
+                self.send_file(from, &target, source, None, if_exists)
+                    .await?
             }
             other => other?,
         };
+        if done.skipped {
+            report.files_skipped = 1;
+            return Ok(report);
+        }
+        if let Some(ref actual_path) = done.path
+            && if_exists == IfExists::Rename
+        {
+            report.to = format!("{}:{actual_path}", target.machine);
+        }
         report.files_sent = 1;
         report.bytes_sent = sent;
         report.resumed_from = (resumed > 0).then_some(resumed);
+        if args.move_source {
+            let mut skipped = Vec::new();
+            let removed = self
+                .remove_source_root(from, Some(hash), &mut skipped)
+                .await?;
+            report.source_removed = removed;
+            report.skipped = report.list(skipped);
+        }
         Ok(report)
     }
 
-    /// Sends one file, returning the offset it continued from and the bytes it sent.
+    /// Sends one file, returning the offset it continued from, the bytes it sent, and the
+    /// destination's `PutDone`.
     async fn send_file(
         &self,
         from: &End,
         to: &End,
         source_file: &StatReply,
         hint: Option<u64>,
-    ) -> Result<(u64, u64), ErrorBody> {
+        if_exists: IfExists,
+    ) -> Result<(u64, u64, PutDone), ErrorBody> {
         let size = source_file.size;
         let Some(hash) = source_file.hash else {
             return Err(changed(from));
@@ -622,6 +753,9 @@ impl Transfer<'_> {
         }
         if let Some(mtime) = source_file.mtime {
             header["mtime"] = json!(mtime);
+        }
+        if if_exists != IfExists::Replace {
+            header["if_exists"] = json!(if_exists);
         }
         let mut dest = self.open(to, header).await?;
         let started: PutReady = match dest.first().await {
@@ -650,7 +784,15 @@ impl Transfer<'_> {
             }
             source = again;
         }
-        let mut meter = Meter::new(self.ctx, self.sent, size - offset, 1, false);
+        let mut meter = Meter::new(
+            self.ctx,
+            self.sent,
+            size,
+            offset,
+            1,
+            Some(file_name(&from.path).to_owned()),
+            false,
+        );
         let relayed = relay(
             &mut source,
             &mut dest,
@@ -665,12 +807,14 @@ impl Transfer<'_> {
         source.close().await;
         dest.close().await;
         let done = done?;
-        if done.hash != hash {
+        if !done.skipped && done.hash != hash {
             return Err(changed(from));
         }
-        self.sent.files.fetch_add(1, Ordering::Relaxed);
+        if !done.skipped {
+            self.sent.files.fetch_add(1, Ordering::Relaxed);
+        }
         meter.emit(true);
-        Ok((offset, size - offset))
+        Ok((offset, size - offset, done))
     }
 
     async fn get(&self, from: &End, offset: u64) -> Result<(Conn, GetReady), ErrorBody> {
@@ -693,11 +837,17 @@ impl Transfer<'_> {
         &self,
         from: &End,
         to: &End,
+        source_stat: &StatReply,
         args: &TransferArgs,
     ) -> Result<TransferReport, ErrorBody> {
+        let if_exists = IfExists::from(args.if_exists);
         let there: StatReply = self
             .request(to, json!({"op": "stat", "path": to.path}))
             .await?;
+        if args.move_source {
+            check_not_same_or_subtree(from, to, source_stat, &there, true)?;
+            self.check_move_permission(from).await?;
+        }
         let missing = match there.kind.as_str() {
             "missing" => true,
             "dir" => false,
@@ -713,22 +863,53 @@ impl Transfer<'_> {
                 .with_machine(to.machine.clone()));
             }
         };
-        let source = self.manifest(from, args).await?;
+        // A move always verifies every file by BLAKE3 hash so no source file is removed without a
+        // hash-verified copy at the destination.
+        let effective_checksum = args.checksum || args.move_source;
+        let source = self
+            .manifest(from, effective_checksum, &args.exclude)
+            .await?;
         let dest = if missing {
             Manifest::default()
         } else {
-            self.manifest(to, args).await?
+            self.manifest(to, effective_checksum, &args.exclude).await?
         };
         let mut plan = legion_xfer::plan::plan(
             &source,
             &dest,
             &PlanOptions {
-                checksum: args.checksum,
+                checksum: effective_checksum,
                 delete: args.delete,
-                ..PlanOptions::default()
+                if_exists,
             },
         );
+        if if_exists == IfExists::Fail && !plan.existing.is_empty() {
+            let first = &plan.existing[0];
+            let count = plan.existing.len();
+            let more = if count > 1 {
+                format!(" (and {} more)", count - 1)
+            } else {
+                String::new()
+            };
+            return Err(ErrorBody::new(
+                ErrorCode::Exists,
+                format!(
+                    "{first} already exists under {} on {}{more}.",
+                    to.path, to.machine
+                ),
+            )
+            .with_hint(
+                "Pass if_exists=\"replace\", \"skip\", or \"rename\", or choose an empty destination.",
+            )
+            .with_details(json!({"existing": plan.existing.iter().take(MOST_LISTED).collect::<Vec<_>>(), "count": count}))
+            .with_machine(to.machine.clone()));
+        }
         let listed: HashMap<&str, &Entry> = source
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect();
+        let dest_listed: HashMap<&str, &Entry> = dest
             .entries
             .iter()
             .map(|entry| (entry.path.as_str(), entry))
@@ -746,17 +927,59 @@ impl Transfer<'_> {
             to: to.named(),
             kind: "tree",
             files_unchanged: plan.totals.files_unchanged,
+            files_skipped: plan.totals.files_skipped,
+            moved: args.move_source,
             ..TransferReport::default()
         };
         let mut skipped: Vec<SkippedEntry> = Vec::new();
         skipped.extend(on(&from.machine, source.skipped));
         skipped.extend(on(&to.machine, dest.skipped));
+
+        // Entries already verified identical at the destination (from an earlier interrupted move
+        // or prior copy under `replace`) can safely be removed from the source once the rest lands.
+        let already_verified: Vec<String> = if args.move_source && if_exists == IfExists::Replace {
+            source
+                .entries
+                .iter()
+                .filter(|src| {
+                    dest_listed.get(src.path.as_str()).is_some_and(|dst| {
+                        match (src.kind, dst.kind) {
+                            (EntryKind::File, EntryKind::File) => {
+                                src.hash.is_some() && src.hash == dst.hash
+                            }
+                            (EntryKind::Symlink, EntryKind::Symlink) => {
+                                src.link_target == dst.link_target
+                            }
+                            _ => false,
+                        }
+                    })
+                })
+                .map(|src| src.path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         if args.dry_run {
             report.files_sent = plan.totals.files_to_send;
             report.bytes_sent = plan.totals.bytes_to_send;
             report.deleted = plan.totals.entries_to_delete;
             report.would_send = Some(report.list(plan.send.clone()));
             report.would_delete = Some(report.list(plan.delete.clone()));
+            if args.move_source {
+                let mut remove_list = planned_source_removals(
+                    &source.entries,
+                    &plan.send,
+                    &already_verified,
+                    &listed,
+                    &conflicts,
+                    &skipped,
+                    args.exclude.is_empty() && report.files_skipped == 0,
+                    &from.path,
+                );
+                report.source_removed = remove_list.len() as u64;
+                report.would_remove = Some(report.list(std::mem::take(&mut remove_list)));
+            }
             report.conflicts = report.list(conflicts);
             report.skipped = report.list(skipped);
             return Ok(report);
@@ -775,15 +998,22 @@ impl Transfer<'_> {
             self.ctx,
             self.sent,
             plan.totals.bytes_to_send,
+            0,
             plan.totals.files_to_send,
+            None,
             true,
         );
         // A destination that does not exist yet is made even when there is nothing to put in it,
         // so an empty tree arrives as an empty directory.
-        let mut rounds = batches(&plan.send);
+        let mut rounds = if args.move_source {
+            move_batches(&plan.send, &listed)
+        } else {
+            batches(&plan.send)
+        };
         if rounds.is_empty() && missing {
             rounds.push(&[]);
         }
+        let mut renamed: Vec<RenamedEntry> = Vec::new();
         for names in rounds {
             let budget = archive_budget(names, &listed);
             let done = self
@@ -794,7 +1024,8 @@ impl Transfer<'_> {
                         names,
                         budget,
                         listed: &listed,
-                        checksum: args.checksum,
+                        checksum: effective_checksum,
+                        if_exists,
                     },
                     &mut meter,
                     &mut skipped,
@@ -803,17 +1034,65 @@ impl Transfer<'_> {
                 .map_err(|error| left_in_place(error, extras.len(), &to.machine))?;
             report.files_sent += done.files;
             report.bytes_sent += done.bytes;
+            report.files_skipped += done.files_skipped;
+            renamed.extend(done.renamed);
             skipped.extend(on(&to.machine, done.skipped));
             if caseless {
                 conflicts.extend(case_conflicts(&done.case_collisions, &to.machine));
+            }
+            // Only remove source files/symlinks that this round just verified by hash and placed at
+            // the destination; never remove anything skipped or omitted.
+            if args.move_source {
+                let mut verified =
+                    Vec::with_capacity(done.verified_files.len() + done.verified_symlinks.len());
+                verified.extend(done.verified_files);
+                verified.extend(done.verified_symlinks);
+                if !verified.is_empty() {
+                    let hashes = expected_hashes_for(&verified, &listed);
+                    report.source_removed += self
+                        .delete_verified(from, &verified, &hashes, false, &mut skipped)
+                        .await?;
+                }
             }
         }
         meter.emit(true);
         conflicts.sort();
         conflicts.dedup();
         report.deleted += self.delete(to, &extras, &mut skipped).await?;
+        if args.move_source {
+            if !already_verified.is_empty() {
+                let hashes = expected_hashes_for(&already_verified, &listed);
+                report.source_removed += self
+                    .delete_verified(from, &already_verified, &hashes, false, &mut skipped)
+                    .await?;
+            }
+            // Remove source directories deepest-first only once every verified file has been
+            // removed; any directory still holding excluded, skipped, or conflicted files stays.
+            let dirs: Vec<String> = source
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::Dir)
+                .map(|entry| entry.path.clone())
+                .collect();
+            let remove_root = args.exclude.is_empty()
+                && conflicts.is_empty()
+                && report.files_skipped == 0
+                && skipped.is_empty();
+            if !dirs.is_empty() || remove_root {
+                let mut dir_skipped = Vec::new();
+                report.source_removed += self
+                    .delete_verified(from, &dirs, &HashMap::new(), remove_root, &mut dir_skipped)
+                    .await?;
+                // Leaving a directory that still holds excluded/skipped entries is expected; only
+                // surface unexpected directory errors when nothing was intentionally left behind.
+                if remove_root {
+                    skipped.extend(dir_skipped);
+                }
+            }
+        }
         report.conflicts = report.list(conflicts);
         report.skipped = report.list(skipped);
+        report.renamed = report.list(renamed);
         Ok(report)
     }
 
@@ -836,6 +1115,79 @@ impl Transfer<'_> {
         Ok(removed)
     }
 
+    /// Removes a single source root file (verifying its BLAKE3 hash first) after a move succeeds.
+    async fn remove_source_root(
+        &self,
+        from: &End,
+        expect_hash: Option<Hash>,
+        skipped: &mut Vec<SkippedEntry>,
+    ) -> Result<u64, ErrorBody> {
+        let mut header = json!({
+            "op": "delete",
+            "root": from.path,
+            "names": [],
+            "remove_root": true,
+        });
+        if let Some(hash) = expect_hash {
+            header["expect_root_hash"] = json!(hash);
+        }
+        let done: DeleteDone = self.request(from, header).await?;
+        skipped.extend(on(&from.machine, done.skipped));
+        Ok(done.removed)
+    }
+
+    /// Removes verified source entries under `from`, verifying each regular file's hash still
+    /// matches before unlinking, and optionally removes the source root directory once empty.
+    async fn delete_verified(
+        &self,
+        from: &End,
+        names: &[String],
+        hashes: &HashMap<String, Hash>,
+        remove_root: bool,
+        skipped: &mut Vec<SkippedEntry>,
+    ) -> Result<u64, ErrorBody> {
+        let mut removed = 0;
+        let chunks = batches(names);
+        if chunks.is_empty() {
+            if remove_root {
+                let done: DeleteDone = self
+                    .request(
+                        from,
+                        json!({
+                            "op": "delete",
+                            "root": from.path,
+                            "names": [],
+                            "remove_root": true,
+                        }),
+                    )
+                    .await?;
+                removed += done.removed;
+                skipped.extend(on(&from.machine, done.skipped));
+            }
+            return Ok(removed);
+        }
+        let last_idx = chunks.len() - 1;
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            let chunk_hashes: HashMap<&str, Hash> = chunk
+                .iter()
+                .filter_map(|name| hashes.get(name).map(|h| (name.as_str(), *h)))
+                .collect();
+            let mut header = json!({
+                "op": "delete",
+                "root": from.path,
+                "names": chunk,
+                "remove_root": remove_root && idx == last_idx,
+            });
+            if !chunk_hashes.is_empty() {
+                header["expect_hashes"] = json!(chunk_hashes);
+            }
+            let done: DeleteDone = self.request(from, header).await?;
+            removed += done.removed;
+            skipped.extend(on(&from.machine, done.skipped));
+        }
+        Ok(removed)
+    }
+
     async fn pack_unpack(
         &self,
         from: &End,
@@ -849,6 +1201,7 @@ impl Transfer<'_> {
             budget,
             listed,
             checksum,
+            if_exists,
         } = round;
         let mut source = self
             .open(
@@ -879,13 +1232,11 @@ impl Transfer<'_> {
             })
             .collect();
         skipped.extend(on(&from.machine, ready.skipped));
-        let mut dest = match self
-            .open(
-                to,
-                json!({"op": "unpack", "root": to.path, "entries": entries}),
-            )
-            .await
-        {
+        let mut unpack_header = json!({"op": "unpack", "root": to.path, "entries": entries});
+        if if_exists != IfExists::Replace {
+            unpack_header["if_exists"] = json!(if_exists);
+        }
+        let mut dest = match self.open(to, unpack_header).await {
             Ok(dest) => dest,
             Err(error) => {
                 source.abort().await;
@@ -911,11 +1262,16 @@ impl Transfer<'_> {
         done.map_err(|error| blame(error, from))
     }
 
-    async fn manifest(&self, end: &End, args: &TransferArgs) -> Result<Manifest, ErrorBody> {
+    async fn manifest(
+        &self,
+        end: &End,
+        checksum: bool,
+        exclude: &[String],
+    ) -> Result<Manifest, ErrorBody> {
         let mut conn = self
             .open(
                 end,
-                json!({"op": "manifest", "root": end.path, "checksum": args.checksum, "exclude": args.exclude}),
+                json!({"op": "manifest", "root": end.path, "checksum": checksum, "exclude": exclude}),
             )
             .await?;
         let listed = conn.manifest().await;
@@ -1044,12 +1400,177 @@ fn left_in_place(error: ErrorBody, extras: usize, machine: &str) -> ErrorBody {
 }
 
 /// One archive's worth of a tree: its names, the most bytes the archive may take, what the source
-/// listed for each, and whether their hashes are checked.
+/// listed for each, whether their hashes are checked, and the `if_exists` policy.
 struct Round<'a> {
     names: &'a [String],
     budget: u64,
     listed: &'a HashMap<&'a str, &'a Entry>,
     checksum: bool,
+    if_exists: IfExists,
+}
+
+/// Refuses moving a path onto itself or moving a directory into its own subtree on the same machine.
+fn check_not_same_or_subtree(
+    from: &End,
+    to: &End,
+    from_stat: &StatReply,
+    to_stat: &StatReply,
+    check_subtree: bool,
+) -> Result<(), ErrorBody> {
+    if from.machine != to.machine {
+        return Ok(());
+    }
+    let from_path = from_stat.resolved_path.as_deref().unwrap_or(&from.path);
+    let to_path = to_stat.resolved_path.as_deref().unwrap_or(&to.path);
+    let caseless = to_stat
+        .case_insensitive
+        .or(from_stat.case_insensitive)
+        .unwrap_or(false)
+        || is_windows_drive_path(from_path)
+        || is_windows_drive_path(to_path);
+    let from_norm = normalize_compare_path(from_path, caseless);
+    let to_norm = normalize_compare_path(to_path, caseless);
+    if from_norm == to_norm {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Cannot move {} on {} onto itself.", from.path, from.machine),
+        )
+        .with_hint("Choose a different destination path.")
+        .with_machine(from.machine.clone()));
+    }
+    if check_subtree {
+        let is_subtree = if from_norm == "/" {
+            to_norm.starts_with('/') && to_norm.len() > 1
+        } else {
+            to_norm
+                .strip_prefix(&from_norm)
+                .is_some_and(|rest| rest.starts_with('/'))
+        };
+        if is_subtree {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "Cannot move {} on {} into its own subdirectory {}.",
+                    from.path, from.machine, to.path
+                ),
+            )
+            .with_hint("Choose a destination outside the source directory.")
+            .with_machine(from.machine.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn is_windows_drive_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+fn normalize_compare_path(path: &str, caseless: bool) -> String {
+    let mut s = path.replace('\\', "/");
+    while s.len() > 1 && s.ends_with('/') {
+        // Keep `C:/` as `C:/` rather than `C:`.
+        if s.len() == 3 && s.as_bytes()[1] == b':' {
+            break;
+        }
+        s.pop();
+    }
+    if caseless {
+        s.make_ascii_lowercase();
+    }
+    s
+}
+
+/// Maps each regular file in `names` to its planned BLAKE3 hash from `listed`.
+fn expected_hashes_for(names: &[String], listed: &HashMap<&str, &Entry>) -> HashMap<String, Hash> {
+    names
+        .iter()
+        .filter_map(|name| {
+            let entry = listed.get(name.as_str())?;
+            (entry.kind == EntryKind::File)
+                .then_some(entry.hash)
+                .flatten()
+                .map(|h| (name.clone(), h))
+        })
+        .collect()
+}
+
+/// Computes the source paths that `dry_run` with `move: true` would remove from the source tree.
+#[allow(clippy::too_many_arguments)]
+fn planned_source_removals(
+    source_entries: &[Entry],
+    sending: &[String],
+    already_verified: &[String],
+    listed: &HashMap<&str, &Entry>,
+    conflicts: &[PlanConflict],
+    skipped: &[SkippedEntry],
+    whole_tree_eligible: bool,
+    source_root: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in sending {
+        if listed
+            .get(name.as_str())
+            .is_some_and(|e| e.kind != EntryKind::Dir)
+        {
+            out.push(name.clone());
+        }
+    }
+    out.extend(already_verified.iter().cloned());
+    if whole_tree_eligible && conflicts.is_empty() && skipped.is_empty() {
+        let mut dirs: Vec<String> = source_entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::Dir)
+            .map(|e| e.path.clone())
+            .collect();
+        dirs.sort_by(|a, b| {
+            b.matches('/')
+                .count()
+                .cmp(&a.matches('/').count())
+                .then_with(|| b.cmp(a))
+        });
+        out.extend(dirs);
+        out.push(source_root.to_owned());
+    }
+    out
+}
+
+/// Splits `names` into smaller move batches so verified source files are removed incrementally.
+fn move_batches<'a>(names: &'a [String], listed: &HashMap<&str, &Entry>) -> Vec<&'a [String]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut name_bytes = 0usize;
+    let mut content_bytes = 0u64;
+    let mut file_count = 0usize;
+    for (at, name) in names.iter().enumerate() {
+        let entry_size = listed.get(name.as_str()).map_or(0, |e| e.size);
+        let is_file = listed
+            .get(name.as_str())
+            .is_some_and(|e| e.kind == EntryKind::File);
+        let would_exceed = at > start
+            && (at - start >= BATCH_NAMES
+                || name_bytes + name.len() > BATCH_BYTES
+                || (is_file && file_count >= MOVE_BATCH_FILES)
+                || (is_file
+                    && content_bytes > 0
+                    && content_bytes + entry_size > MOVE_BATCH_CONTENT_BYTES));
+        if would_exceed {
+            out.push(&names[start..at]);
+            start = at;
+            name_bytes = 0;
+            content_bytes = 0;
+            file_count = 0;
+        }
+        name_bytes += name.len() + 4;
+        if is_file {
+            content_bytes = content_bytes.saturating_add(entry_size);
+            file_count += 1;
+        }
+    }
+    if start < names.len() {
+        out.push(&names[start..]);
+    }
+    out
 }
 
 /// A destination that refused an archive for not being what was planned says which entry and
@@ -1908,9 +2429,15 @@ struct Meter<'a> {
     ctx: Option<&'a Ctx>,
     sent: &'a Sent,
     bytes_total: u64,
+    /// Bytes already on disk before this run started (for resumed single files).
+    bytes_base: u64,
     files_total: u64,
+    current: Option<String>,
     tar: Option<TarCounter>,
+    started: Instant,
     last: Instant,
+    last_bytes_done: u64,
+    last_files_done: u64,
 }
 
 impl<'a> Meter<'a> {
@@ -1918,22 +2445,36 @@ impl<'a> Meter<'a> {
         ctx: &'a Ctx,
         sent: &'a Sent,
         bytes_total: u64,
+        bytes_base: u64,
         files_total: u64,
+        current: Option<String>,
         tar: bool,
     ) -> Meter<'a> {
+        let now = Instant::now();
         Meter {
             ctx: Some(ctx),
             sent,
             bytes_total,
+            bytes_base,
             files_total,
+            current,
             tar: tar.then(TarCounter::default),
-            last: Instant::now(),
+            started: now,
+            last: now,
+            last_bytes_done: bytes_base.min(bytes_total),
+            last_files_done: 0,
         }
     }
 
     fn add(&mut self, chunk: &[u8]) {
         let (bytes, files) = match &mut self.tar {
-            Some(tar) => tar.feed(chunk),
+            Some(tar) => {
+                let res = tar.feed(chunk);
+                if let Some(name) = tar.current_name() {
+                    self.current = Some(name.to_owned());
+                }
+                res
+            }
             None => (chunk.len() as u64, 0),
         };
         self.sent.bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -1949,30 +2490,65 @@ impl<'a> Meter<'a> {
         let Some(ctx) = self.ctx else {
             return;
         };
-        ctx.emit(
-            EventKind::Progress,
-            json!({
-                "bytes": self.sent.bytes.load(Ordering::Relaxed),
-                "bytes_total": self.bytes_total,
-                "files": self.sent.files.load(Ordering::Relaxed),
-                "files_total": self.files_total,
-            }),
-        );
+        let transferred = self.sent.bytes.load(Ordering::Relaxed);
+        let raw_bytes = self.bytes_base.saturating_add(transferred);
+        let clamped_bytes = if self.bytes_total > 0 {
+            raw_bytes.min(self.bytes_total)
+        } else {
+            raw_bytes
+        };
+        let bytes_done = clamped_bytes.max(self.last_bytes_done);
+        self.last_bytes_done = bytes_done;
+
+        let raw_files = self.sent.files.load(Ordering::Relaxed);
+        let clamped_files = if self.files_total > 0 {
+            raw_files.min(self.files_total)
+        } else {
+            raw_files
+        };
+        let files_done = clamped_files.max(self.last_files_done);
+        self.last_files_done = files_done;
+
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.001 && transferred > 0 {
+            (transferred as f64 / elapsed).round() as u64
+        } else {
+            0
+        };
+        let mut payload = json!({
+            "bytes_done": bytes_done,
+            "bytes_total": self.bytes_total,
+            "files_done": files_done,
+            "files_total": self.files_total,
+            "rate": rate,
+        });
+        if let Some(ref current) = self.current {
+            payload["current"] = json!(current);
+        }
+        ctx.emit(EventKind::Progress, payload);
     }
 }
 
-/// Follows a tar stream's headers as it passes, so progress counts the files' own bytes and each
-/// file once all of it has gone, whatever the archive adds around them.
+/// Follows a tar stream's headers as it passes, so progress counts the files' own bytes, each
+/// file once all of it has gone, and the current entry name, whatever the archive adds around them.
 #[derive(Default)]
 struct TarCounter {
     header: Vec<u8>,
     data_left: u64,
     pad_left: u64,
     regular: bool,
+    pending_long_name: Option<Vec<u8>>,
+    reading_long_name: bool,
+    long_name_buf: Vec<u8>,
+    current: Option<String>,
 }
 
 impl TarCounter {
     const BLOCK: usize = 512;
+
+    fn current_name(&self) -> Option<&str> {
+        self.current.as_deref()
+    }
 
     /// Takes the next bytes of the archive; says how many were file content and how many files
     /// they completed.
@@ -1986,11 +2562,20 @@ impl TarCounter {
                     .min(chunk.len());
                 if self.regular {
                     content += take as u64;
+                } else if self.reading_long_name && self.long_name_buf.len() < 4096 {
+                    let room = 4096 - self.long_name_buf.len();
+                    self.long_name_buf
+                        .extend_from_slice(&chunk[..take.min(room)]);
                 }
                 self.data_left -= take as u64;
                 chunk = &chunk[take..];
-                if self.data_left == 0 && self.regular {
-                    files += 1;
+                if self.data_left == 0 {
+                    if self.regular {
+                        files += 1;
+                    } else if self.reading_long_name {
+                        self.reading_long_name = false;
+                        self.pending_long_name = Some(std::mem::take(&mut self.long_name_buf));
+                    }
                 }
                 continue;
             }
@@ -2013,7 +2598,26 @@ impl TarCounter {
                 continue;
             }
             let size = Self::size(&header[124..136]);
-            self.regular = matches!(header[156], b'0' | 0 | b'7');
+            let typeflag = header[156];
+            self.regular = matches!(typeflag, b'0' | 0 | b'7');
+            self.reading_long_name = typeflag == b'L';
+            if self.reading_long_name {
+                self.long_name_buf.clear();
+            } else if matches!(typeflag, b'0' | 0 | b'7' | b'5' | b'2') {
+                let raw_name = match self.pending_long_name.take() {
+                    Some(long) => long,
+                    None => Self::header_name(&header),
+                };
+                let end = raw_name
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(raw_name.len());
+                if let Ok(name) = std::str::from_utf8(&raw_name[..end])
+                    && !name.is_empty()
+                {
+                    self.current = Some(name.to_owned());
+                }
+            }
             self.data_left = size;
             self.pad_left = (Self::BLOCK as u64 - size % Self::BLOCK as u64) % Self::BLOCK as u64;
             if self.regular && size == 0 {
@@ -2021,6 +2625,24 @@ impl TarCounter {
             }
         }
         (content, files)
+    }
+
+    fn header_name(header: &[u8]) -> Vec<u8> {
+        fn trim(slice: &[u8]) -> &[u8] {
+            let end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+            &slice[..end]
+        }
+        let name = trim(&header[0..100]);
+        let prefix = trim(&header[345..500]);
+        if !prefix.is_empty() {
+            let mut full = Vec::with_capacity(prefix.len() + 1 + name.len());
+            full.extend_from_slice(prefix);
+            full.push(b'/');
+            full.extend_from_slice(name);
+            full
+        } else {
+            name.to_vec()
+        }
     }
 
     /// A header's size field: octal digits, or big-endian binary when its first bit is set.
@@ -2271,9 +2893,14 @@ mod tests {
             ctx: None,
             sent: &sent,
             bytes_total: 1000,
+            bytes_base: 0,
             files_total: 1,
+            current: None,
             tar: None,
+            started: Instant::now(),
             last: Instant::now(),
+            last_bytes_done: 0,
+            last_files_done: 0,
         };
         let started = tokio::time::Instant::now();
         let broken = relay(&mut source, &mut dest, Amount::Exactly(1000), &mut meter)

@@ -56,8 +56,8 @@ use legion_core::{Access, CreateKind, Door, Grant, Paths};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::xfer::{error as xfer_error, manifest, resolve_root};
 use legion_xfer::{
-    CaseCollision, Entry, EntryKind, Hash, ManifestOptions, SkippedEntry, Timestamp,
-    resolve_relative_path,
+    CaseCollision, Entry, EntryKind, Hash, IfExists, ManifestOptions, PutSession, RenamedEntry,
+    SkippedEntry, Timestamp, resolve_relative_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -153,6 +153,8 @@ pub(crate) enum Op {
         mode: Option<u32>,
         #[serde(default)]
         mtime: Option<Timestamp>,
+        #[serde(default)]
+        if_exists: IfExists,
     },
     Pack {
         root: String,
@@ -165,10 +167,25 @@ pub(crate) enum Op {
     Unpack {
         root: String,
         entries: Vec<Planned>,
+        #[serde(default)]
+        if_exists: IfExists,
     },
     Delete {
         root: String,
+        #[serde(default)]
         names: Vec<String>,
+        /// Check permissions and protected-tree rules without removing anything.
+        #[serde(default)]
+        dry_run: bool,
+        /// Also remove `root` itself (a file, symlink, or now-empty directory) after `names`.
+        #[serde(default)]
+        remove_root: bool,
+        /// When present, unlink a named regular file only if its current BLAKE3 hash still matches.
+        #[serde(default)]
+        expect_hashes: HashMap<String, Hash>,
+        /// When present with `remove_root`, unlink `root` only if its current BLAKE3 hash matches.
+        #[serde(default)]
+        expect_root_hash: Option<Hash>,
     },
 }
 
@@ -238,6 +255,10 @@ pub(crate) struct StatReply {
     /// Absent when that cannot be told without writing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub case_insensitive: Option<bool>,
+    /// The resolved filesystem path on this node (with `~` and symlinks resolved on existing
+    /// ancestors), used to detect moving a file onto itself or a tree into its own subtree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_path: Option<String>,
 }
 
 /// The line that ends a `manifest`.
@@ -270,6 +291,13 @@ pub(crate) struct PutDone {
     pub ok: bool,
     pub size: u64,
     pub hash: Hash,
+    /// Actual path written on this node (populated when `if_exists = "rename"` chooses a numbered
+    /// name, or in general when a file is placed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// `true` when `if_exists = "skip"` left an existing file untouched.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
 }
 
 /// The line that answers a `pack` before its archive: the names it left out, and why.
@@ -295,7 +323,17 @@ pub(crate) struct UnpackDone {
     pub symlinks: u64,
     pub bytes: u64,
     #[serde(default)]
+    pub files_skipped: u64,
+    #[serde(default)]
     pub skipped: Vec<SkippedEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renamed: Vec<RenamedEntry>,
+    /// Regular files unpacked and verified in this round (by their planned relative path).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_files: Vec<String>,
+    /// Symlinks unpacked in this round (by their planned relative path).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_symlinks: Vec<String>,
     /// Entries of the archive whose names differ only in letter case.
     #[serde(default)]
     pub case_collisions: Vec<CaseCollision>,
@@ -585,10 +623,33 @@ fn run<R: BufRead, W: Write>(
             hash,
             mode,
             mtime,
-        } => put(grant, &path, size, &hash, mode, mtime, input, output),
+            if_exists,
+        } => put(
+            grant, &path, size, &hash, mode, mtime, if_exists, input, output,
+        ),
         Op::Pack { root, names } => pack(grant, &root, &names, output),
-        Op::Unpack { root, entries } => unpack(grant, &root, &entries, input, output),
-        Op::Delete { root, names } => delete(grant, &root, &names, output),
+        Op::Unpack {
+            root,
+            entries,
+            if_exists,
+        } => unpack(grant, &root, &entries, if_exists, input, output),
+        Op::Delete {
+            root,
+            names,
+            dry_run,
+            remove_root,
+            expect_hashes,
+            expect_root_hash,
+        } => delete(
+            grant,
+            &root,
+            &names,
+            dry_run,
+            remove_root,
+            &expect_hashes,
+            expect_root_hash,
+            output,
+        ),
     }
 }
 
@@ -682,6 +743,7 @@ fn stat<W: Write>(
             .filter(|len| *len > 0)
     };
     let path = resolve_root(grant, path, Access::Read)?;
+    let resolved_path = Some(path.to_string_lossy().into_owned());
     let found = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -691,6 +753,7 @@ fn stat<W: Write>(
                     kind: "missing".to_owned(),
                     partial: partial(),
                     case_insensitive: case_insensitive(&path),
+                    resolved_path,
                     ..StatReply::default()
                 },
             );
@@ -702,6 +765,7 @@ fn stat<W: Write>(
         StatReply {
             kind: "dir".to_owned(),
             case_insensitive: case_insensitive(&path),
+            resolved_path,
             ..StatReply::default()
         }
     } else if kind.is_file() {
@@ -721,6 +785,7 @@ fn stat<W: Write>(
             hash: entry.and_then(|entry| entry.hash),
             partial: partial(),
             case_insensitive: None,
+            resolved_path,
         }
     } else {
         StatReply {
@@ -730,6 +795,7 @@ fn stat<W: Write>(
                 "other"
             }
             .to_owned(),
+            resolved_path,
             ..StatReply::default()
         }
     };
@@ -810,6 +876,7 @@ fn put<R: BufRead, W: Write>(
     hash: &str,
     mode: Option<u32>,
     mtime: Option<Timestamp>,
+    if_exists: IfExists,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Failure> {
@@ -821,17 +888,43 @@ fn put<R: BufRead, W: Write>(
     grant.check_path(&part, Access::Write)?;
     grant.check_create(&part, CreateKind::File, true)?;
     let hash: Hash = hash.parse().map_err(xfer_error)?;
-    if fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_dir()) {
-        return Err(Failure::Reply(
-            ErrorBody::new(
-                ErrorCode::Conflict,
-                format!(
-                    "{} is a directory, and a file cannot replace it.",
-                    target.display()
+    if let Ok(meta) = fs::symlink_metadata(&target) {
+        if if_exists == IfExists::Fail {
+            return Err(Failure::Reply(
+                ErrorBody::new(
+                    ErrorCode::Exists,
+                    format!("{} already exists.", target.display()),
+                )
+                .with_hint(
+                    "Pass if_exists=\"replace\", \"skip\", or \"rename\", or choose another path.",
                 ),
-            )
-            .with_hint("Name the file inside it instead."),
-        ));
+            ));
+        }
+        if if_exists == IfExists::Skip {
+            reply(output, &PutReady { offset: size })?;
+            return reply(
+                output,
+                &PutDone {
+                    ok: true,
+                    size: 0,
+                    hash,
+                    path: None,
+                    skipped: true,
+                },
+            );
+        }
+        if if_exists == IfExists::Replace && meta.is_dir() {
+            return Err(Failure::Reply(
+                ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "{} is a directory, and a file cannot replace it.",
+                        target.display()
+                    ),
+                )
+                .with_hint("Name the file inside it instead."),
+            ));
+        }
     }
     if let Some(parent) = target.parent()
         && !parent.as_os_str().is_empty()
@@ -840,27 +933,55 @@ fn put<R: BufRead, W: Write>(
             .map_err(|error| Failure::Reply(io_error("create", parent, &error)))?;
     }
     // The sender's offset is only a hint: what is on disk decides, so a sender that lost track
-    // of an earlier attempt still continues it rather than starting over.
-    let mut offset = legion_xfer::resume_offset(&target).map_err(xfer_error)?;
-    if offset > size {
-        offset = 0;
-    }
+    // of an earlier attempt still continues it rather than starting over, while a concurrent
+    // transfer to the same target falls back to its own private partial file.
+    let session = PutSession::open(&target, size, if_exists).map_err(xfer_error)?;
+    let offset = session.offset();
     reply(output, &PutReady { offset })?;
-    let done = feed(input, Some(size - offset), output, |fed| {
-        legion_xfer::put(&target, size, hash, offset, fed, mode)
-    })?
-    .map_err(xfer_error)?;
+    let grant_for_check = grant.clone();
+    let outcome = feed(input, Some(size - offset), output, move |fed| {
+        let mut policy_err: Option<ErrorBody> = None;
+        let res = session.finish(hash, fed, mode, |candidate| {
+            if let Err(err) = grant_for_check
+                .check_path(candidate, Access::Write)
+                .and_then(|checked| grant_for_check.check_create(&checked, CreateKind::File, true))
+            {
+                policy_err = Some(err);
+                return Err(legion_xfer::Error::PermissionDenied {
+                    path: candidate.to_path_buf(),
+                    source: io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "policy refused renamed target",
+                    ),
+                });
+            }
+            Ok(())
+        });
+        match (res, policy_err) {
+            (Ok(done), _) => Ok(done),
+            (Err(_), Some(err)) => Err(err),
+            (Err(err), None) => Err(xfer_error(err)),
+        }
+    })??;
     // The file is whole and in place; a time that cannot be set leaves it as it is, and a later
     // listing just sees it as changed.
-    if let Some(time) = mtime.and_then(system_time) {
-        let _ = fs::set_times(&target, FileTimes::new().set_modified(time));
+    if let Some(ref final_path) = outcome.path
+        && let Some(time) = mtime.and_then(system_time)
+    {
+        let _ = fs::set_times(final_path, FileTimes::new().set_modified(time));
     }
+    let renamed_path = outcome
+        .path
+        .filter(|final_path| final_path != &target)
+        .map(|p| p.to_string_lossy().into_owned());
     reply(
         output,
         &PutDone {
             ok: true,
-            size: done.size,
-            hash: done.hash,
+            size: outcome.report.size,
+            hash: outcome.report.hash,
+            path: renamed_path,
+            skipped: outcome.skipped,
         },
     )
 }
@@ -914,6 +1035,7 @@ fn unpack<R: BufRead, W: Write>(
     grant: &Grant,
     root: &str,
     entries: &[Planned],
+    if_exists: IfExists,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Failure> {
@@ -962,29 +1084,53 @@ fn unpack<R: BufRead, W: Write>(
         let watch = Rc::new(RefCell::new(Watch::new(plan)));
         let mut refused: HashMap<String, String> = HashMap::new();
         let guarded = Guarded::new(fed, Rc::clone(&watch));
-        let report = legion_xfer::unpack_filtered(&root, guarded, |rel, kind| {
-            let mut watch = watch.borrow_mut();
-            // The entry the unpack is about to write must be the one whose header was checked.
-            let checked_entry = watch.current.take();
-            if checked_entry.is_none_or(|(name, checked_kind)| name != rel || checked_kind != kind)
-            {
-                let _ = watch.refuse(rel, "is not the entry whose header was checked".to_owned());
-                return false;
-            }
-            drop(watch);
-            let create_kind = match kind {
-                EntryKind::File => CreateKind::File,
-                EntryKind::Dir => CreateKind::Dir,
-                EntryKind::Symlink => CreateKind::Symlink,
-            };
-            match checked_create(grant, &root, rel, create_kind) {
-                Ok(_) => true,
-                Err(error) => {
-                    refused.insert(rel.to_owned(), error.message);
-                    false
+        let report = legion_xfer::unpack_with_options(
+            &root,
+            guarded,
+            if_exists,
+            |rel, kind| {
+                let mut watch = watch.borrow_mut();
+                // The entry the unpack is about to write must be the one whose header was checked.
+                let checked_entry = watch.current.take();
+                if checked_entry
+                    .is_none_or(|(name, checked_kind)| name != rel || checked_kind != kind)
+                {
+                    let _ =
+                        watch.refuse(rel, "is not the entry whose header was checked".to_owned());
+                    return false;
                 }
-            }
-        });
+                drop(watch);
+                let create_kind = match kind {
+                    EntryKind::File => CreateKind::File,
+                    EntryKind::Dir => CreateKind::Dir,
+                    EntryKind::Symlink => CreateKind::Symlink,
+                };
+                match checked_create(grant, &root, rel, create_kind) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        refused.insert(rel.to_owned(), error.message);
+                        false
+                    }
+                }
+            },
+            |candidate, kind| {
+                let create_kind = match kind {
+                    EntryKind::File => CreateKind::File,
+                    EntryKind::Dir => CreateKind::Dir,
+                    EntryKind::Symlink => CreateKind::Symlink,
+                };
+                grant
+                    .check_path(candidate, Access::Write)
+                    .and_then(|checked| grant.check_create(&checked, create_kind, true))
+                    .map_err(|_| legion_xfer::Error::PermissionDenied {
+                        path: candidate.to_path_buf(),
+                        source: io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "policy refused renamed target",
+                        ),
+                    })
+            },
+        );
         let watch = watch.borrow();
         let mut violation = watch.refused.clone();
         if violation.is_none()
@@ -1016,15 +1162,23 @@ fn unpack<R: BufRead, W: Write>(
         })
         .collect();
     skipped.sort();
+    let files_count = report.files.len() as u64;
+    let dirs_count = report.dirs.len() as u64;
+    let symlinks_count = report.symlinks.len() as u64;
+    let files_skipped = report.skipped_existing.len() as u64;
     reply(
         output,
         &UnpackDone {
             ok: true,
-            files: report.files.len() as u64,
-            dirs: report.dirs.len() as u64,
-            symlinks: report.symlinks.len() as u64,
+            files: files_count,
+            dirs: dirs_count,
+            symlinks: symlinks_count,
             bytes: report.bytes,
+            files_skipped,
             skipped,
+            renamed: report.renamed,
+            verified_files: report.files,
+            verified_symlinks: report.symlinks,
             case_collisions: report.case_collisions,
         },
     )
@@ -1038,6 +1192,7 @@ fn unaccounted(watch: &Watch, report: &legion_xfer::UnpackReport) -> Option<(Str
         .iter()
         .chain(&report.dirs)
         .chain(&report.symlinks)
+        .chain(&report.skipped_existing)
         .map(String::as_str)
         .chain(report.skipped.iter().map(|entry| entry.path.as_str()))
         .collect();
@@ -1065,13 +1220,29 @@ fn unaccounted(watch: &Watch, report: &legion_xfer::UnpackReport) -> Option<(Str
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn delete<W: Write>(
     grant: &Grant,
     root: &str,
     names: &[String],
+    dry_run: bool,
+    remove_root: bool,
+    expect_hashes: &HashMap<String, Hash>,
+    expect_root_hash: Option<Hash>,
     output: &mut W,
 ) -> Result<(), Failure> {
-    let root = resolve_root(grant, root, Access::Write)?;
+    let checked_root = if remove_root {
+        let checked = grant.check_path(root, Access::Write)?;
+        if fs::symlink_metadata(&checked).is_ok_and(|meta| meta.file_type().is_dir()) {
+            grant.check_tree(&checked)?;
+        }
+        checked
+    } else {
+        resolve_root(grant, root, Access::Write)?
+    };
+    if dry_run {
+        return reply(output, &DeleteDone::default());
+    }
     let mut done = DeleteDone::default();
     let mut valid: Vec<(usize, String)> = Vec::with_capacity(names.len());
     for name in names {
@@ -1088,10 +1259,21 @@ fn delete<W: Write>(
     valid.dedup();
     busy(output, || {
         for (_, name) in valid {
-            match remove_one(grant, &root, &name) {
+            let expected = expect_hashes.get(&name).copied();
+            match remove_one(grant, &checked_root, &name, expected) {
                 Ok(true) => done.removed += 1,
                 Ok(false) => {}
                 Err(reason) => done.skipped.push(SkippedEntry { path: name, reason }),
+            }
+        }
+        if remove_root {
+            match remove_root_path(grant, &checked_root, expect_root_hash) {
+                Ok(true) => done.removed += 1,
+                Ok(false) => {}
+                Err(reason) => done.skipped.push(SkippedEntry {
+                    path: checked_root.to_string_lossy().into_owned(),
+                    reason,
+                }),
             }
         }
     })?;
@@ -1101,7 +1283,12 @@ fn delete<W: Write>(
 
 /// Removes one name under `root`, never following a symbolic link; says whether there was
 /// anything to remove, or why it was left.
-fn remove_one(grant: &Grant, root: &Path, name: &str) -> Result<bool, String> {
+fn remove_one(
+    grant: &Grant,
+    root: &Path,
+    name: &str,
+    expected_hash: Option<Hash>,
+) -> Result<bool, String> {
     let path = match named(grant, root, name, Access::Write) {
         Ok(path) => path,
         Err(Named::Missing) => return Ok(false),
@@ -1113,6 +1300,14 @@ fn remove_one(grant: &Grant, root: &Path, name: &str) -> Result<bool, String> {
         Err(error) => return Err(error.to_string()),
     };
     let kind = meta.file_type();
+    if kind.is_file()
+        && let Some(expected) = expected_hash
+    {
+        let current = legion_xfer::hash::hash_file(&path).map_err(|error| error.to_string())?;
+        if current != expected {
+            return Err("it changed after it was copied, so the source was kept".to_owned());
+        }
+    }
     let removed = if kind.is_dir() {
         grant.check_tree(&path).map_err(|error| error.message)?;
         fs::remove_dir(&path).map_err(|error| {
@@ -1131,6 +1326,50 @@ fn remove_one(grant: &Grant, root: &Path, name: &str) -> Result<bool, String> {
         fs::remove_file(&path).map_err(|error| error.to_string())
     };
     removed.map(|()| true)
+}
+
+/// Removes the source root itself (a single file, symlink, or now-empty directory) after checking
+/// its hash when `expected_hash` is given.
+fn remove_root_path(
+    grant: &Grant,
+    path: &Path,
+    expected_hash: Option<Hash>,
+) -> Result<bool, String> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    let kind = meta.file_type();
+    if kind.is_file() {
+        if let Some(expected) = expected_hash {
+            let current = legion_xfer::hash::hash_file(path).map_err(|error| error.to_string())?;
+            if current != expected {
+                return Err("it changed after it was copied, so the source was kept".to_owned());
+            }
+        }
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+        Ok(true)
+    } else if kind.is_dir() {
+        grant.check_tree(path).map_err(|error| error.message)?;
+        match fs::remove_dir(path) {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                if fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some()) {
+                    Ok(false)
+                } else {
+                    Err(error.to_string())
+                }
+            }
+        }
+    } else if kind.is_symlink() {
+        fs::remove_file(path)
+            .or_else(|error| fs::remove_dir(path).map_err(|_| error))
+            .map_err(|error| error.to_string())?;
+        Ok(true)
+    } else {
+        Err("only files, directories, and symbolic links can be removed".to_owned())
+    }
 }
 
 /// Runs `work` on a thread of its own and says `{"busy": true}` every [`HEARTBEAT`] until it is
