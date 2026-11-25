@@ -1128,6 +1128,10 @@ where
                 continue;
             }
             session_vars.insert(k.clone(), v.clone());
+        } else if key == "APPIMAGE_EXTRACT_AND_RUN"
+            && (v == OsStr::new("1") || v.to_string_lossy().eq_ignore_ascii_case("true"))
+        {
+            session_vars.insert(k.clone(), OsString::from("1"));
         }
     }
 
@@ -1434,6 +1438,13 @@ pub fn spawn_unix_swap_supervisor_with_env(
     plan: &UnixSwapPlan,
     sanitized: &SanitizedUnixEnv,
 ) -> Result<(), AppError> {
+    if let Some(script_diag) = plan
+        .log_path
+        .as_deref()
+        .and_then(|p| p.parent().map(|d| d.join("supervisor-script.sh.txt")))
+    {
+        let _ = fs::write(&script_diag, UNIX_SWAP_SUPERVISOR_SCRIPT);
+    }
     let (stdout_cfg, stderr_cfg) = open_supervisor_log_stdio(plan.log_path.as_deref());
     let mut cmd = Command::new("/bin/sh");
     cmd.env_clear()
@@ -1681,7 +1692,6 @@ pub fn stage_and_spawn_windows_nsis(
     let _ = fs::remove_dir_all(backup_dir);
     copy_dir_bounded(install_dir, backup_dir, 0)?;
 
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
@@ -1756,6 +1766,12 @@ pub fn stage_and_spawn_windows_nsis(
     let log_path = ready_marker_path.parent().map(|d| d.join("supervisor.log"));
     if let Some(lp) = &log_path {
         let _ = fs::remove_file(lp);
+        if let Some(dir) = lp.parent() {
+            let _ = fs::write(
+                dir.join("supervisor-script.ps1.txt"),
+                WINDOWS_NSIS_SUPERVISOR_SCRIPT,
+            );
+        }
     }
 
     let build_cmd = |flags: u32| {
@@ -1802,12 +1818,16 @@ pub fn stage_and_spawn_windows_nsis(
         cmd
     };
 
-    let base_flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
-    // Try breaking out of the parent's Windows Job Object first so exiting the app never kills
-    // the supervisor or NSIS installer; fall back without breakaway if the job forbids it.
+    // Match `legion-os::detach`: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` (never combined
+    // with `DETACHED_PROCESS`, which is mutually exclusive with `CREATE_NO_WINDOW`). Try breaking
+    // out of the parent's Windows Job Object first so exiting the app never kills the supervisor
+    // or NSIS installer; fall back without breakaway if the job forbids it (`ERROR_ACCESS_DENIED`).
+    let base_flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
     match build_cmd(base_flags | CREATE_BREAKAWAY_FROM_JOB).spawn() {
         Ok(_) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+        Err(err)
+            if err.kind() == io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(5) =>
+        {
             build_cmd(base_flags).spawn().map_err(|err2| {
                 AppError::new(
                     ErrorCode::Failed,

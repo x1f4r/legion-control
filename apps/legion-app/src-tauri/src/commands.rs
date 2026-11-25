@@ -381,7 +381,10 @@ pub async fn update_maybe_auto_install(
     trigger: Option<String>,
 ) -> Result<UpdateState, AppError> {
     let current = updater.0.snapshot();
-    if !current.auto_update || current.phase != "ready" || !current.can_self_install {
+    let ready_or_checking_downloaded = current.phase == "ready"
+        || (current.phase == "checking"
+            && current.available.as_ref().is_some_and(|a| a.downloaded));
+    if !current.auto_update || !ready_or_checking_downloaded || !current.can_self_install {
         return Ok(current);
     }
     let trigger_kind = trigger.as_deref().unwrap_or("startup");

@@ -2251,8 +2251,10 @@ impl UpdateManager {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn try_spawn_desktop_close_install(&self) -> bool {
         let st = self.snapshot();
+        let ready_or_checking_downloaded = st.phase == "ready"
+            || (st.phase == "checking" && st.available.as_ref().is_some_and(|a| a.downloaded));
         if !st.auto_update
-            || st.phase != "ready"
+            || !ready_or_checking_downloaded
             || !st.can_self_install
             || self.current_sequence == 0
         {

@@ -145,7 +145,7 @@ export function MachinesView({
                 ? html`
                     <button type="button" class="update-note-link" onClick=${onOpenWhatIsNew}>
                       <span>Updated to ${justUpdated.version}</span>
-                      <span aria-hidden="true"> · </span>
+                      <span aria-hidden="true">·</span>
                       <span class="update-note-action">What is new</span>
                     </button>
                   `

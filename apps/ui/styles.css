@@ -1662,6 +1662,7 @@ button.row:active {
   display: inline-flex;
   flex-wrap: wrap;
   align-items: center;
+  gap: 6px;
   min-height: 36px;
   padding: 0;
   border: 0;

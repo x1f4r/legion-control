@@ -746,7 +746,9 @@ function App() {
 
       refreshFleet(primary, { initialSnapshot: cachedSnap });
       triggerLearnInBackground();
-      checkUpdatesQuietly();
+      if (!startupAutoInstallRanRef.current && updateStateRef.current?.phase !== 'ready') {
+        checkUpdatesQuietly();
+      }
     },
     [link, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
   );
@@ -802,6 +804,9 @@ function App() {
         .then((res) => {
           if (alive && (!res || res.phase !== 'installing')) {
             setStartupUpdating(false);
+            if (res?.phase === 'checking') {
+              startupAutoInstallRanRef.current = false;
+            }
           }
         })
         .catch(() => {
