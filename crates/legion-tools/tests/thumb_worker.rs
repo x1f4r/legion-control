@@ -18,9 +18,12 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use image::codecs::bmp::BmpEncoder;
+use image::codecs::gif::GifEncoder;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
-use image::{ExtendedColorType, ImageBuffer, ImageEncoder, Rgb};
+use image::codecs::webp::WebPEncoder;
+use image::{ExtendedColorType, Frame, ImageBuffer, ImageEncoder, Luma, LumaA, Rgb, Rgba};
 use legion_core::{Call, Door, Node, Paths};
 use serde_json::json;
 
@@ -33,6 +36,7 @@ struct TimeoutGuard;
 impl Drop for TimeoutGuard {
     fn drop(&mut self) {
         legion_tools::fs::set_thumb_decode_timeout_for_test(None);
+        legion_tools::fs::set_thumb_timeout_cpu_busy_for_test(None);
     }
 }
 
@@ -49,6 +53,8 @@ fn main() -> ExitCode {
         .expect("build tokio runtime");
 
     runtime.block_on(async {
+        test_measured_baseline_and_honest_12mp_never_false_killed().await;
+        test_honest_corpus_all_formats_extremes_sizes_and_fits().await;
         test_lying_headers_and_sibling_survival().await;
         test_32_large_files_do_not_inflate_parent_rss().await;
         test_worker_memory_kill_caches_bad_file_and_keeps_siblings().await;
@@ -199,6 +205,428 @@ fn build_parser_diff_oom_jpeg() -> Vec<u8> {
     out.extend_from_slice(&[0xFF, 0xDA, 0x00, 12, 3, 1, 0, 2, 0, 3, 0, 0, 0, 0]);
     out.extend_from_slice(&[0x00, 0x00, 0xFF, 0xD9]);
     out
+}
+
+async fn test_measured_baseline_and_honest_12mp_never_false_killed() {
+    let baseline = legion_tools::fs::measured_worker_baseline_bytes_for_test();
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    eprintln!(
+        "thumb_worker measured baseline ({}-{}-{profile}): {} bytes ({:.2} MiB)",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        baseline,
+        baseline as f64 / (1024.0 * 1024.0)
+    );
+    assert!(
+        (2 * 1024 * 1024..=64 * 1024 * 1024).contains(&baseline),
+        "unexpected worker baseline RSS: {baseline} bytes"
+    );
+
+    // An honest 12 MP (4000x3000) baseline JPEG must always succeed on every OS and build profile
+    // without tripping the RSS watchdog or OS limit backstops.
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let honest_12mp = home.join("honest_12mp.jpg");
+    fs::write(&honest_12mp, encode_solid_jpeg(4000, 3000, [90, 140, 210])).unwrap();
+
+    let node = Node::new(
+        Paths::under(dir.path()).with_home(&home),
+        legion_tools::registry(),
+    );
+    let res = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": [honest_12mp.to_string_lossy()], "size": 256}),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        res["results"][0].get("ok").is_some(),
+        "honest 12 MP JPEG must never be killed by backstops: {}",
+        res["results"][0]
+    );
+    assert_eq!(res["results"][0]["ok"]["width"], json!(256));
+    assert_eq!(res["results"][0]["ok"]["height"], json!(192));
+}
+
+fn crc32_ieee_test(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in bytes {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn adler32_test(bytes: &[u8]) -> u32 {
+    let mut s1 = 1u32;
+    let mut s2 = 0u32;
+    for &b in bytes {
+        s1 = (s1 + u32::from(b)) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    (s2 << 16) | s1
+}
+
+fn build_interlaced_png_test(width: u32, height: u32, color_type: u8) -> Vec<u8> {
+    let ch: usize = if color_type == 6 { 4 } else { 3 };
+    const PASSES: [(u32, u32, u32, u32); 7] = [
+        (0, 0, 8, 8),
+        (4, 0, 8, 8),
+        (0, 4, 4, 8),
+        (2, 0, 4, 4),
+        (0, 2, 2, 4),
+        (1, 0, 2, 2),
+        (0, 1, 1, 2),
+    ];
+    let mut raw = Vec::new();
+    for (x0, y0, dx, dy) in PASSES {
+        if x0 >= width || y0 >= height {
+            continue;
+        }
+        let pw = (width - x0).div_ceil(dx) as usize;
+        let ph = (height - y0).div_ceil(dy) as usize;
+        raw.resize(raw.len() + ph * (1 + pw * ch), 0u8);
+    }
+    let mut zlib = Vec::with_capacity(raw.len() + 64);
+    zlib.extend_from_slice(&[0x78, 0x01]);
+    let mut pos = 0;
+    loop {
+        let rem = raw.len() - pos;
+        let len = rem.min(65535);
+        let fin = pos + len == raw.len();
+        zlib.push(u8::from(fin));
+        let len16 = len as u16;
+        zlib.extend_from_slice(&len16.to_le_bytes());
+        zlib.extend_from_slice(&(!len16).to_le_bytes());
+        zlib.extend_from_slice(&raw[pos..pos + len]);
+        pos += len;
+        if fin {
+            break;
+        }
+    }
+    zlib.extend_from_slice(&adler32_test(&raw).to_be_bytes());
+    let mut out = vec![137, 80, 78, 71, 13, 10, 26, 10];
+    let push = |out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let s = out.len();
+        out.extend_from_slice(tag);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&crc32_ieee_test(&out[s..]).to_be_bytes());
+    };
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, color_type, 0, 0, 1]);
+    push(&mut out, b"IHDR", &ihdr);
+    push(&mut out, b"IDAT", &zlib);
+    push(&mut out, b"IEND", &[]);
+    out
+}
+
+/// Wraps a simple `VP8L` lossless WebP into a libvips-style `VP8X` container with the EXIF flag
+/// set and a trailing `EXIF` chunk placed after the pixel payload (past the 128 KiB header peek
+/// when the payload exceeds 128 KiB).
+fn wrap_vp8l_with_vips_trailing_exif(vp8l_file: &[u8], width: u32, height: u32) -> Vec<u8> {
+    assert_eq!(&vp8l_file[12..16], b"VP8L");
+    let vp8l_chunk = &vp8l_file[12..];
+    let exif_payload = b"II\x2a\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    let mut body = Vec::with_capacity(4 + 18 + vp8l_chunk.len() + 1 + 8 + exif_payload.len());
+    body.extend_from_slice(b"WEBP");
+    body.extend_from_slice(b"VP8X");
+    body.extend_from_slice(&10u32.to_le_bytes());
+    body.extend_from_slice(&[0x08, 0, 0, 0]); // EXIF flag
+    let wm1 = width - 1;
+    let hm1 = height - 1;
+    body.extend_from_slice(&wm1.to_le_bytes()[..3]);
+    body.extend_from_slice(&hm1.to_le_bytes()[..3]);
+    body.extend_from_slice(vp8l_chunk);
+    if !vp8l_chunk.len().is_multiple_of(2) {
+        body.push(0);
+    }
+    body.extend_from_slice(b"EXIF");
+    body.extend_from_slice(&(exif_payload.len() as u32).to_le_bytes());
+    body.extend_from_slice(exif_payload);
+    if !exif_payload.len().is_multiple_of(2) {
+        body.push(0);
+    }
+    let mut riff = Vec::with_capacity(8 + body.len());
+    riff.extend_from_slice(b"RIFF");
+    riff.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    riff.extend_from_slice(&body);
+    riff
+}
+
+async fn test_honest_corpus_all_formats_extremes_sizes_and_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let mut corpus: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut add = |name: &str, bytes: Vec<u8>| {
+        let p = home.join(name);
+        fs::write(&p, bytes).unwrap();
+        corpus.push((name.to_owned(), p));
+    };
+
+    // 1. Extreme aspect ratios (previously OOM'd or failed in resize_to_fill / Triangle float buffers)
+    for (name, w, h) in [
+        ("strip_1x20000.png", 1u32, 20_000u32),
+        ("strip_20000x1.png", 20_000, 1),
+        ("strip_8192x100.png", 8192, 100),
+        ("strip_100x8192.png", 100, 8192),
+        ("shot_1280x720.png", 1280, 720),
+        ("edge_257x257.png", 257, 257),
+        ("edge_511x511.png", 511, 511),
+        ("edge_512x512.png", 512, 512),
+        ("edge_513x513.png", 513, 513),
+    ] {
+        let img = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_pixel(w, h, Rgb([70, 130, 190]));
+        let mut buf = Vec::new();
+        PngEncoder::new(&mut buf)
+            .write_image(&img, w, h, ExtendedColorType::Rgb8)
+            .unwrap();
+        add(name, buf);
+    }
+
+    // 2. Wide JPEG strip (20000x200) and progressive JPEG (2000x1500)
+    add(
+        "strip_20000x200.jpg",
+        encode_solid_jpeg(20_000, 200, [140, 90, 50]),
+    );
+    let mut prog_jpg = vec![0xFF, 0xD8];
+    prog_jpg.extend_from_slice(&minimal_progressive_444_jpeg_body(2000, 1500));
+    add("prog_444_2000x1500.jpg", prog_jpg);
+
+    // 3. PNG subtypes: RGBA8, Luma8, LumaA8, RGB16, RGBA16, interlaced RGB8 & RGBA8
+    {
+        let mut rgba =
+            ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(1280, 720, Rgba([40, 160, 220, 200]));
+        rgba.put_pixel(10, 10, Rgba([255, 0, 0, 128]));
+        let mut b = Vec::new();
+        PngEncoder::new(&mut b)
+            .write_image(&rgba, 1280, 720, ExtendedColorType::Rgba8)
+            .unwrap();
+        add("png_rgba8_1280x720.png", b);
+
+        let gray = ImageBuffer::<Luma<u8>, Vec<u8>>::from_pixel(1001, 601, Luma([140]));
+        let mut b = Vec::new();
+        PngEncoder::new(&mut b)
+            .write_image(&gray, 1001, 601, ExtendedColorType::L8)
+            .unwrap();
+        add("png_luma8_1001x601.png", b);
+
+        let graya = ImageBuffer::<LumaA<u8>, Vec<u8>>::from_pixel(1001, 601, LumaA([140, 180]));
+        let mut b = Vec::new();
+        PngEncoder::new(&mut b)
+            .write_image(&graya, 1001, 601, ExtendedColorType::La8)
+            .unwrap();
+        add("png_lumaa8_1001x601.png", b);
+
+        let rgb16 = vec![0x42u8; 1024 * 768 * 6];
+        let mut b = Vec::new();
+        PngEncoder::new(&mut b)
+            .write_image(&rgb16, 1024, 768, ExtendedColorType::Rgb16)
+            .unwrap();
+        add("png_rgb16_1024x768.png", b);
+
+        let rgba16 = vec![0x42u8; 1024 * 768 * 8];
+        let mut b = Vec::new();
+        PngEncoder::new(&mut b)
+            .write_image(&rgba16, 1024, 768, ExtendedColorType::Rgba16)
+            .unwrap();
+        add("png_rgba16_1024x768.png", b);
+
+        add(
+            "png_interlaced_rgb8.png",
+            build_interlaced_png_test(1000, 800, 2),
+        );
+        add(
+            "png_interlaced_rgba8.png",
+            build_interlaced_png_test(1000, 800, 6),
+        );
+    }
+
+    // 4. GIF (multi-frame 800x600)
+    {
+        let f1 = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(800, 600, Rgba([20, 180, 90, 255]));
+        let f2 = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(800, 600, Rgba([180, 40, 90, 255]));
+        let mut b = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut b);
+            enc.encode_frame(Frame::new(f1)).unwrap();
+            enc.encode_frame(Frame::new(f2)).unwrap();
+        }
+        add("anim_800x600.gif", b);
+    }
+
+    // 5. WebP lossless RGB, lossless RGBA, and libvips-style VP8X + VP8L (>128 KiB) + trailing EXIF
+    {
+        let mut noisy = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(1280, 720);
+        let mut state = 0x1234_5678u32;
+        for px in noisy.pixels_mut() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let r = (state >> 24) as u8;
+            let g = (state >> 16) as u8;
+            let b = (state >> 8) as u8;
+            *px = Rgb([r, g, b]);
+        }
+        let mut webp_rgb = Vec::new();
+        WebPEncoder::new_lossless(&mut webp_rgb)
+            .encode(&noisy, 1280, 720, ExtendedColorType::Rgb8)
+            .unwrap();
+        assert!(
+            webp_rgb.len() > 160 * 1024,
+            "noisy lossless WebP must exceed 128 KiB header peek to test trailing EXIF"
+        );
+        let vips_exif = wrap_vp8l_with_vips_trailing_exif(&webp_rgb, 1280, 720);
+        add("webp_lossless_rgb_1280x720.webp", webp_rgb);
+        add("webp_vips_trailing_exif_1280x720.webp", vips_exif);
+
+        let rgba =
+            ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(1280, 720, Rgba([30, 120, 210, 180]));
+        let mut webp_rgba = Vec::new();
+        WebPEncoder::new_lossless(&mut webp_rgba)
+            .encode(&rgba, 1280, 720, ExtendedColorType::Rgba8)
+            .unwrap();
+        add("webp_lossless_rgba_1280x720.webp", webp_rgba);
+    }
+
+    // 6. BMP 24-bit RGB and 32-bit RGBA
+    {
+        let rgb = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_pixel(1280, 720, Rgb([200, 100, 50]));
+        let mut b = Vec::new();
+        BmpEncoder::new(&mut b)
+            .encode(&rgb, 1280, 720, ExtendedColorType::Rgb8)
+            .unwrap();
+        add("bmp_24bit_1280x720.bmp", b);
+
+        let rgba =
+            ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(1280, 720, Rgba([200, 100, 50, 200]));
+        let mut b = Vec::new();
+        BmpEncoder::new(&mut b)
+            .encode(&rgba, 1280, 720, ExtendedColorType::Rgba8)
+            .unwrap();
+        add("bmp_32bit_1280x720.bmp", b);
+    }
+
+    // 7. When `magick` is installed, also test real lossy WebP, lossy WebP with alpha, and
+    // animated WebP (the exact subtypes that tripped the old factors).
+    let has_magick = std::process::Command::new("magick")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if has_magick {
+        for (name, args) in [
+            (
+                "webp_lossy_1920x1080.webp",
+                vec!["-size", "1920x1080", "plasma:fractal", "-quality", "80"],
+            ),
+            (
+                "webp_lossy_alpha_1920x1080.webp",
+                vec![
+                    "-size",
+                    "1920x1080",
+                    "plasma:fractal",
+                    "-alpha",
+                    "set",
+                    "-quality",
+                    "80",
+                ],
+            ),
+            (
+                "webp_animated_1280x720.webp",
+                vec![
+                    "-size",
+                    "1280x720",
+                    "plasma:fractal",
+                    "-size",
+                    "1280x720",
+                    "gradient:red-blue",
+                    "-quality",
+                    "75",
+                ],
+            ),
+        ] {
+            let p = home.join(name);
+            let st = std::process::Command::new("magick")
+                .args(&args)
+                .arg(&p)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if st.is_ok_and(|s| s.success()) && p.exists() {
+                corpus.push((name.to_owned(), p));
+            }
+        }
+    }
+
+    let node = Node::new(
+        Paths::under(dir.path()).with_home(&home),
+        legion_tools::registry(),
+    );
+    let paths: Vec<String> = corpus
+        .iter()
+        .map(|(_, p)| p.to_string_lossy().into_owned())
+        .collect();
+
+    // Run EVERY honest corpus file across ALL 5 sizes and BOTH fits through the real worker!
+    let mut total_calls = 0usize;
+    for size in [96u32, 128, 256, 384, 512] {
+        for fit in ["contain", "cover"] {
+            let res = node
+                .call(Call::new(
+                    Door::Cli,
+                    "fs.thumb",
+                    json!({"paths": paths, "size": size, "fit": fit}),
+                ))
+                .await
+                .unwrap();
+            let arr = res["results"].as_array().unwrap();
+            assert_eq!(arr.len(), corpus.len());
+            for (idx, item) in arr.iter().enumerate() {
+                let ok = item.get("ok").unwrap_or_else(|| {
+                    panic!(
+                        "honest corpus image {} failed at size={size} fit={fit}: {item}",
+                        corpus[idx].0
+                    )
+                });
+                let ow = ok["width"].as_u64().unwrap() as u32;
+                let oh = ok["height"].as_u64().unwrap() as u32;
+                assert!(ow >= 1 && oh >= 1);
+                if fit == "cover" {
+                    assert_eq!(
+                        (ow, oh),
+                        (size, size),
+                        "cover thumbnail for {} at size={size} must be {size}x{size}, got {ow}x{oh}",
+                        corpus[idx].0
+                    );
+                } else {
+                    assert!(
+                        ow <= size && oh <= size,
+                        "contain thumbnail for {} at size={size} exceeded bounds: {ow}x{oh}",
+                        corpus[idx].0
+                    );
+                }
+                total_calls += 1;
+            }
+        }
+    }
+    eprintln!(
+        "thumb_worker honest corpus passed: {} images x 10 (size, fit) combinations = {total_calls} worker decodes (0 failures)",
+        corpus.len()
+    );
 }
 
 async fn test_lying_headers_and_sibling_survival() {
@@ -409,14 +837,14 @@ async fn test_worker_memory_kill_caches_bad_file_and_keeps_siblings() {
         thumb_files.len()
     );
 
-    // Second call (even at a DIFFERENT thumbnail size!): served directly from the negative cache
+    // Second call with the SAME `(size=256, fit=contain)`: served directly from the negative cache
     // without re-spawning or re-killing a worker.
     let t0 = Instant::now();
     let res2 = node
         .call(Call::new(
             Door::Cli,
             "fs.thumb",
-            json!({"paths": [oom_jpg.to_string_lossy()], "size": 128}),
+            json!({"paths": [oom_jpg.to_string_lossy()], "size": 256}),
         ))
         .await
         .unwrap();
@@ -429,11 +857,49 @@ async fn test_worker_memory_kill_caches_bad_file_and_keeps_siblings() {
     );
     assert_eq!(
         res2["results"][0]["error"]["message"], arr1[0]["error"]["message"],
-        "second call must return the cached bad-file error"
+        "second call at the same size+fit must return the cached bad-file error"
+    );
+    assert!(
+        !arr1[0]["error"]["hint"]
+            .as_str()
+            .unwrap_or("")
+            .contains("header"),
+        "memory-limit error must not claim the header lied: {}",
+        arr1[0]
     );
     assert!(
         elapsed < Duration::from_millis(200),
         "cached bad-file hit should be fast, took {elapsed:?}"
+    );
+
+    // A call at a DIFFERENT `size` or `fit` must NOT reuse the `(256, contain)` negative record
+    // (it runs independently and writes its own per-`(size, fit)` record if it also hits the cap).
+    let count_before_other = fs::read_dir(&cache_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".thumb"))
+        .count();
+    let res_other_size = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": [oom_jpg.to_string_lossy()], "size": 128, "fit": "cover"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res_other_size["results"][0]["error"]["code"],
+        json!("failed")
+    );
+    let count_after_other = fs::read_dir(&cache_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".thumb"))
+        .count();
+    assert_eq!(
+        count_after_other,
+        count_before_other + 1,
+        "different size+fit must have its own bad-file record rather than sharing (256, contain)"
     );
 }
 
@@ -462,8 +928,39 @@ async fn test_worker_timeout_kills_slow_decode() {
     let cache_dir = paths.thumb_cache_dir();
     let node = Node::new(paths, legion_tools::registry());
 
+    // 1. Non-CPU-busy timeouts (e.g., transient host load starvation) must NEVER trigger back-off.
     legion_tools::fs::set_thumb_decode_timeout_for_test(Some(Duration::from_millis(50)));
+    legion_tools::fs::set_thumb_timeout_cpu_busy_for_test(Some(false));
     let _reset = TimeoutGuard;
+
+    for attempt in 1..=2 {
+        let res_load = node
+            .call(Call::new(
+                Door::Cli,
+                "fs.thumb",
+                json!({"paths": [slow_png.to_string_lossy()], "size": 256}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            res_load["results"][0]["error"]["code"],
+            json!("timeout"),
+            "non-cpu-busy attempt {attempt} must time out: {}",
+            res_load["results"][0]
+        );
+        assert!(
+            !res_load["results"][0]["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("back-off"),
+            "non-cpu-busy timeouts must not enter back-off: {}",
+            res_load["results"][0]
+        );
+    }
+
+    // 2. Deterministic CPU-busy timeouts (via test hook rather than host load) enter back-off
+    // after 2 hits on EVERY OS while NEVER writing a permanent bad-file entry on disk.
+    legion_tools::fs::set_thumb_timeout_cpu_busy_for_test(Some(true));
 
     let res = node
         .call(Call::new(
@@ -494,7 +991,7 @@ async fn test_worker_timeout_kills_slow_decode() {
         "a worker timeout must not write a bad-file entry to thumb-cache"
     );
 
-    // Trigger a second timeout (reaches repeated CPU-busy back-off threshold).
+    // Trigger a second CPU-busy timeout (reaches repeated back-off threshold).
     let res2 = node
         .call(Call::new(
             Door::Cli,
@@ -521,40 +1018,38 @@ async fn test_worker_timeout_kills_slow_decode() {
         "repeated timeouts must still not write a permanent bad-file entry on disk"
     );
 
-    // On Linux where `/proc/<pid>/stat` tracks CPU ticks cleanly, a third call immediately after
-    // restoring the normal timeout hits the short in-memory back-off without re-spawning a worker.
-    #[cfg(target_os = "linux")]
-    {
-        legion_tools::fs::set_thumb_decode_timeout_for_test(None);
-        let t0 = Instant::now();
-        let res3 = node
-            .call(Call::new(
-                Door::Cli,
-                "fs.thumb",
-                json!({"paths": [slow_png.to_string_lossy()], "size": 256}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            res3["results"][0]["error"]["code"],
-            json!("timeout"),
-            "third call after 2 CPU-busy timeouts must hit short in-memory back-off: {}",
-            res3["results"][0]
-        );
-        assert!(
-            res3["results"][0]["error"]["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("back-off"),
-            "expected back-off message: {}",
-            res3["results"][0]
-        );
-        assert!(
-            t0.elapsed() < Duration::from_millis(200),
-            "in-memory timeout back-off should return immediately, took {:?}",
-            t0.elapsed()
-        );
-    }
+    // Third call immediately after restoring the normal timeout hits the short in-memory back-off
+    // without re-spawning a worker (works deterministically on Linux, macOS, and Windows).
+    legion_tools::fs::set_thumb_decode_timeout_for_test(None);
+    legion_tools::fs::set_thumb_timeout_cpu_busy_for_test(None);
+    let t0 = Instant::now();
+    let res3 = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": [slow_png.to_string_lossy()], "size": 256}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res3["results"][0]["error"]["code"],
+        json!("timeout"),
+        "third call after 2 CPU-busy timeouts must hit short in-memory back-off: {}",
+        res3["results"][0]
+    );
+    assert!(
+        res3["results"][0]["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("back-off"),
+        "expected back-off message: {}",
+        res3["results"][0]
+    );
+    assert!(
+        t0.elapsed() < Duration::from_millis(200),
+        "in-memory timeout back-off should return immediately, took {:?}",
+        t0.elapsed()
+    );
 }
 
 async fn test_mpeg_ts_sniffing_in_find_and_thumb() {

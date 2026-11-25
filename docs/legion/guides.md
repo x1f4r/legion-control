@@ -64,24 +64,29 @@ symbolic links, and special files keep their existing `kind` and omit `category`
   Admission caps source files at 64 MiB and estimated peak decode memory at 256 MiB per image
   (admitting 48–61 MP baseline photos while capping heavier progressive/16-bit/interlaced images),
   with embedded MPF preview / EXIF IFD1 thumbnail fallback for over-cap JPEGs. Every worker enforces
-  an exact cross-OS live-heap cap via a capped global allocator, backed by OS limits (`RLIMIT_AS`
-  with virtual-address headroom on Linux, `RLIMIT_DATA` on other non-macOS Unix, suspended-create
-  Job Object limits on Windows), a 10 ms RSS watchdog on every platform (including macOS), and a
-  10 s wall-clock kill timeout. Each worker reserves its exact resident limit (`heap_cap + 9 MiB`)
-  from the shared in-flight budget of `min(512 MiB, effective RAM / 8)` (honoring cgroup v2/v1 and
-  Windows Job Object limits, floored at 256 MiB) across up to 16 concurrent decodes (scaled to CPU
-  cores, bounded by the shared byte budget) round-robin per principal with anti-starvation aging,
-  plus a 10 s wait timeout returning retryable `busy`. Only
-  memory kills decided by this node's own limits are cached as bad-file entries in `thumb-cache/`
-  (expiring after 7 days); external kills (`SIGKILL`/`SIGTERM`) and crashes return a transient
-  per-path error without poisoning the cache, and timeouts are never cached permanently as bad
-  (repeated CPU-busy timeouts of the same file trigger a 5-minute in-memory back-off). Output is
-  JPEG, or PNG when transparent. Video posters (including sniffed MPEG-TS `.ts` recordings) run
-  `ffmpeg` by resolved absolute path with a cleared minimal environment and `MALLOC_ARENA_MAX=2`
-  (`-threads 1` limits decoder, encoder, and filter threads rather than making `ffmpeg` strictly
-  single-threaded), enforced by the RSS watchdog (256 MiB resident limit for `<= 1080p`, up to
-  768 MiB for `> 1080p` up to 8K one at a time, reserving against the shared in-flight budget and
-  honoring rotation metadata) plus a +1 GiB address-space backstop (`-max_pixels 67108864`,
+  an exact cross-OS live-heap cap via a capped global allocator (sized at `1.35x estimated_peak +
+  8 MiB`, floored at `16 MiB`), backed by a 10 ms RSS watchdog on every platform (including macOS)
+  set at the measured per-platform worker baseline plus `heap_cap` plus `max(6 MiB, 10% of
+  heap_cap)`, OS backstop limits above that (`RLIMIT_AS` with virtual-address headroom on Linux,
+  `RLIMIT_DATA` on other non-macOS Unix, suspended-create Job Object limits on Windows), and a 10 s
+  wall-clock kill timeout. Each worker reserves its exact watchdog resident limit (`baseline +
+  heap_cap + max(6 MiB, 10%)`) from the shared in-flight budget of `min(512 MiB, effective RAM /
+  8)` (honoring cgroup v2/v1 and Windows Job Object limits, floored at 256 MiB) across up to 16
+  concurrent decodes (scaled to CPU cores, bounded by the shared byte budget) round-robin per
+  principal with anti-starvation aging, plus a 10 s wait timeout returning retryable `busy`. Only
+  allocator-cap memory kills (where the capped allocator stopped an image exceeding its heap cap)
+  are cached as bad-file entries in `thumb-cache/` keyed by file identity plus `size` and `fit`
+  (expiring after 1 day); backstop kills while under the heap cap, external kills
+  (`SIGKILL`/`SIGTERM`), and crashes return a transient per-path error without poisoning the cache,
+  and timeouts are never cached permanently as bad (repeated CPU-busy timeouts of the same
+  file/size/fit trigger a 5-minute in-memory back-off). Output is JPEG, or PNG when transparent.
+  Video posters (including sniffed MPEG-TS `.ts` recordings) run `ffmpeg` by resolved absolute path
+  with a cleared minimal environment and `MALLOC_ARENA_MAX=2` (`-threads 1` limits decoder,
+  encoder, and filter threads rather than making `ffmpeg` strictly single-threaded), enforced by
+  the RSS watchdog (256 MiB resident limit for `<= 1080p` sharing the 512 MiB pool; `> 1080p` 4K/8K
+  videos drain the shared pool and all video slots to run strictly alone under an exclusive
+  `min(768 MiB, max(256 MiB, effective RAM / 4))` resident budget, honoring rotation metadata) plus
+  a +1 GiB address-space backstop (`-max_pixels 67108864`,
   `-max_alloc 134217728`, `-protocol_whitelist file`, MOV/MP4 pinned with `-enable_drefs 0
   -use_absolute_path 0`, non-MOV `-format_whitelist` excluding MOV and playlists, video-only
   mapping, 15 s timeout) when `ffmpeg` is on `PATH` and report `unsupported` otherwise. Positive

@@ -533,14 +533,17 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
     let (stdout, stdout_bytes) = stdout_captured.unwrap_or_default();
     let (stderr, _) = stderr_captured.unwrap_or_default();
 
-    // Only classify a death as `killed_for_memory` when THIS node's own memory limit decided it:
+    // Only classify a death as `killed_for_memory` when THIS node requested a memory limit for the
+    // child and its own memory limit decided it:
     // - our RSS watchdog observed `rss > limit`,
-    // - our worker's `CappedAlloc` exited with `CAP_EXCEEDED_EXIT_CODE`, or
+    // - under an active `memory_limit`, our worker's `CappedAlloc` exited with
+    //   `CAP_EXCEEDED_EXIT_CODE` (`107`), or
     // - under an active `memory_limit`, stderr explicitly reports an allocation failure (e.g.
     //   Rust's `memory allocation of ... failed` under `RLIMIT_AS`) or Windows `STATUS_NO_MEMORY`.
-    // Never classify an unrelated external `SIGKILL` or arbitrary signal as a memory kill.
-    let mut killed_for_memory =
-        memory_watchdog_killed || exit_code == Some(crate::capped_alloc::CAP_EXCEEDED_EXIT_CODE);
+    // Never classify an unrelated child's exit code 107 or an external `SIGKILL` as a memory kill.
+    let mut killed_for_memory = memory_watchdog_killed
+        || (memory_limit.is_some()
+            && exit_code == Some(crate::capped_alloc::CAP_EXCEEDED_EXIT_CODE));
     if memory_limit.is_some()
         && !killed_for_memory
         && !timed_out
@@ -1000,5 +1003,23 @@ mod tests {
         assert!(out.cancelled);
         assert!(!out.timed_out);
         assert!(!out.success());
+    }
+
+    #[tokio::test]
+    async fn run_exit_107_without_memory_limit_is_not_killed_for_memory() {
+        let cmd = if cfg!(windows) {
+            CommandSpec::shell("exit /b 107")
+        } else {
+            CommandSpec::shell("exit 107")
+        };
+        let out = run(RunOptions::new(cmd)).await.unwrap();
+        assert_eq!(
+            out.exit_code,
+            Some(crate::capped_alloc::CAP_EXCEEDED_EXIT_CODE)
+        );
+        assert!(
+            !out.killed_for_memory,
+            "exit 107 must not be treated as killed_for_memory when no memory_limit was set"
+        );
     }
 }

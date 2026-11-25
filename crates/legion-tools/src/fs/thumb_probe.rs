@@ -38,57 +38,74 @@ const MAX_MPF_ENTRIES: usize = 16;
 
 // =================================================================================================
 // Measured peak decode bytes-per-pixel table (expressed in tenths of a byte per pixel, excluding
-// the input file buffer `source_bytes` which is added separately in `estimate_peak_bytes`).
+// one copy of `source_bytes` which is added in `estimate_peak_bytes`).
 //
-// Measured with the counting global allocator in `tests/thumb_mem.rs` against `image 0.25.10`
-// (`zune-jpeg 0.5.15`, `png 0.18.1`, `gif 0.14.2`, `image-webp 0.2.4`) using box-averaging
-// `DynamicImage::thumbnail` downscaling for >=2x reductions and post-resize EXIF orientation:
+// Method: every format and subtype below was measured by binary-searching the exact `CappedAlloc`
+// live-heap cap of the real out-of-process `__thumb-worker` binary (`image 0.25.10`: `zune-jpeg
+// 0.5.15`, `png 0.18.1`, `gif 0.14.2`, `image-webp 0.2.4`) down to 128 KiB resolution at `128
+// cover`, `512 cover`, and `512 contain` (using the bounded integer box/bilinear resizer and
+// post-resize EXIF orientation), then computing `(bisected_peak - source_bytes) / pixels`.
+//
+// Because `estimate_peak_bytes` is a prediction rather than an exact measurement, the worker's
+// armed `CappedAlloc` heap cap always applies a safety factor and floor (`1.35x + 8 MiB`, floored
+// at `16 MiB`; see `thumb_worker::heap_cap_from_estimate`) so every honest image peaks at <= ~70%
+// of its cap.
 // =================================================================================================
 
-/// Baseline JPEG 4:2:0 (SOF0): measured 3.03 B/px at 50 MP (144.6 MiB), 3.06 B/px at 12 MP.
+/// Baseline JPEG 4:2:0 (SOF0): worker-bisected 3.03 B/px at 50–60 MP (`r_p50.jpg` 178.5 MiB,
+/// `r_p60.jpg` 215.2 MiB), 3.06 B/px at 12 MP (`r_p12.jpg` 43.3 MiB).
 pub(crate) const BPP_X10_JPEG_BASELINE_420: u64 = 32; // 3.2 B/px
-/// Baseline JPEG 4:4:4 (SOF0): measured 3.02 B/px at 50 MP (144.0 MiB), 3.05 B/px at 4 MP.
+/// Baseline JPEG 4:4:4 (SOF0): worker-bisected 3.01–3.02 B/px at 12–64 MP (`pano64.jpg` 206.7 MiB).
 pub(crate) const BPP_X10_JPEG_BASELINE_444: u64 = 32; // 3.2 B/px
-/// Baseline JPEG 4-component (CMYK/YCCK) or unusual subsampling: conservative 4.5 B/px.
-pub(crate) const BPP_X10_JPEG_BASELINE_OTHER: u64 = 45; // 4.5 B/px
-/// Progressive JPEG 4:2:0 (SOF2): measured 6.04 B/px at 25 MP (144.1 MiB; RGB8 + 4:2:0 i16 DCT).
+/// Baseline JPEG 4:2:2 / CMYK / other subsampling: worker-bisected 3.05 B/px (`r_p24_422.jpg`
+/// 89.5 MiB) and 3.06 B/px (`cmyk6000.jpg` 93.2 MiB).
+pub(crate) const BPP_X10_JPEG_BASELINE_OTHER: u64 = 35; // 3.5 B/px
+/// Progressive JPEG 4:2:0 (SOF2): worker-bisected 6.06 B/px at 12 MP (`r_p12_prog.jpg` 77.7 MiB).
 pub(crate) const BPP_X10_JPEG_PROGRESSIVE_420: u64 = 62; // 6.2 B/px
-/// Progressive JPEG 4:2:2 (SOF2): RGB8 (3 B) + 4:2:2 i16 DCT planes (4 B) = ~7.0 B/px.
+/// Progressive JPEG 4:2:2 (SOF2): worker-bisected 7.08 B/px at 6 MP (41.5 MiB).
 pub(crate) const BPP_X10_JPEG_PROGRESSIVE_422: u64 = 74; // 7.4 B/px
-/// Progressive JPEG 4:4:4 (SOF2): measured 9.02 B/px at 25 MP (215.0 MiB; RGB8 + 4:4:4 i16 DCT).
+/// Progressive JPEG 4:4:4 (SOF2): worker-bisected 9.04 B/px at 6 MP (53.0 MiB).
 pub(crate) const BPP_X10_JPEG_PROGRESSIVE_444: u64 = 92; // 9.2 B/px
-/// Progressive JPEG 4-component (CMYK/YCCK): RGB8 (3 B) + 4 full i16 DCT planes (8 B) = ~11 B/px.
+/// Progressive JPEG 4-component (CMYK/YCCK): worker-bisected 8.12 B/px at 4 MP (32.5 MiB);
+/// conservative 11.5 B/px for 4 full i16 DCT planes.
 pub(crate) const BPP_X10_JPEG_PROGRESSIVE_OTHER: u64 = 115; // 11.5 B/px
 
-/// PNG 8-bit RGB (non-interlaced): measured 3.10 B/px at 4 MP (11.8 MiB).
+/// PNG 8-bit RGB (non-interlaced): worker-bisected 3.04 B/px at 8 MP (`shot16.png` 43.8 MiB).
 pub(crate) const BPP_X10_PNG_RGB8: u64 = 33; // 3.3 B/px
-/// PNG 8-bit RGBA (non-interlaced): measured 4.11 B/px at 4 MP (15.7 MiB).
+/// PNG 8-bit RGBA (non-interlaced): worker-bisected 4.01 B/px at 36 MP (`transp6000.png` 184.3 MiB).
 pub(crate) const BPP_X10_PNG_RGBA8: u64 = 43; // 4.3 B/px
-/// PNG 8-bit grayscale/indexed (non-interlaced): <= RGB8/RGBA8 (1-4 B/px); conservative 4.3 B/px.
+/// PNG 8-bit grayscale/gray-alpha/indexed: worker-bisected 1.06–3.06 B/px at 6 MP; conservative 4.3.
 pub(crate) const BPP_X10_PNG_OTHER8: u64 = 43; // 4.3 B/px
-/// PNG 16-bit RGB (non-interlaced): measured 6.13 B/px at 4 MP (23.4 MiB).
+/// PNG 16-bit RGB (non-interlaced): worker-bisected 6.07 B/px at 4 MP (42.7 MiB).
 pub(crate) const BPP_X10_PNG_RGB16: u64 = 63; // 6.3 B/px
-/// PNG 16-bit RGBA (non-interlaced): measured 8.15 B/px at 4 MP (31.1 MiB).
+/// PNG 16-bit RGBA (non-interlaced): worker-bisected 8.09 B/px at 4 MP (53.0 MiB).
 pub(crate) const BPP_X10_PNG_RGBA16: u64 = 83; // 8.3 B/px
-/// PNG interlaced (Adam7) 8-bit RGB: measured 6.07 B/px decode (2x RGB8 pass + output buffer).
+/// PNG interlaced (Adam7) 8-bit RGB: worker-bisected 3.03–3.07 B/px (`png 0.18` streams passes);
+/// 6.3 B/px keeps margin for worst-case pass buffers.
 pub(crate) const BPP_X10_PNG_INTERLACED_RGB8: u64 = 63; // 6.3 B/px
-/// PNG interlaced (Adam7) 8-bit RGBA/other: measured 8.07 B/px decode (2x RGBA8 pass + output).
+/// PNG interlaced (Adam7) 8-bit RGBA/other: worker-bisected 4.04–4.06 B/px; conservative 8.3 B/px.
 pub(crate) const BPP_X10_PNG_INTERLACED_RGBA8: u64 = 83; // 8.3 B/px
-/// PNG interlaced (Adam7) 16-bit RGB: 2x 16-bit RGB pass + output = ~12.2 B/px.
+/// PNG interlaced (Adam7) 16-bit RGB: worker-bisected 6.10 B/px at 4 MP; conservative 12.4 B/px.
 pub(crate) const BPP_X10_PNG_INTERLACED_RGB16: u64 = 124; // 12.4 B/px
-/// PNG interlaced (Adam7) 16-bit RGBA: measured 16.08 B/px decode (2x RGBA16 pass + output).
+/// PNG interlaced (Adam7) 16-bit RGBA: worker-bisected 8.09 B/px at 4 MP; conservative 16.4 B/px.
 pub(crate) const BPP_X10_PNG_INTERLACED_RGBA16: u64 = 164; // 16.4 B/px
 
-/// GIF first frame: measured 5.01 B/px at 4 MP (19.1 MiB; RGBA8 canvas + 1 B/px indexed LZW).
+/// GIF first frame: worker-bisected 5.02 B/px at 4 MP (21.1 MiB; RGBA8 canvas + indexed LZW).
 pub(crate) const BPP_X10_GIF: u64 = 52; // 5.2 B/px
-/// WebP lossy (VP8): measured 4.64 B/px at 4 MP (17.7 MiB; RGB8 + YUV420 macroblock planes).
-pub(crate) const BPP_X10_WEBP_LOSSY: u64 = 48; // 4.8 B/px
-/// WebP lossy with VP8X alpha chunk: VP8 YUV420 + alpha + RGBA8 (~5.8 B/px).
-pub(crate) const BPP_X10_WEBP_LOSSY_ALPHA: u64 = 60; // 6.0 B/px
-/// WebP lossless (VP8L): measured 7.00 B/px at 4 MP for RGB (RGBA8 decode + RGB8 conversion)
-/// and 4.07 B/px for RGBA.
-pub(crate) const BPP_X10_WEBP_LOSSLESS: u64 = 72; // 7.2 B/px
-/// BMP (24-bit RGB and 32-bit RGBA): measured 4.19 B/px decode at 4 MP (plus `source_bytes`).
+/// WebP lossy (VP8): worker-bisected 4.80–5.76 B/px across 0.5–12 MP (`lossy_3000x2000` 28.5 MiB,
+/// `webp12` 62.2 MiB, `r_w12` 72.1 MiB including `image-webp` chunk copy).
+pub(crate) const BPP_X10_WEBP_LOSSY: u64 = 58; // 5.8 B/px
+/// WebP lossy with alpha (`VP8X` + `ALPH` + `VP8 `): worker-bisected 10.51–10.77 B/px across
+/// 800x600 through 3000x2000 (`alpha_3000x2000` 60.9 MiB: YUV420 + alpha + RGBA8).
+pub(crate) const BPP_X10_WEBP_LOSSY_ALPHA: u64 = 108; // 10.8 B/px
+/// WebP lossless (VP8L): worker-bisected 7.07–8.47 B/px (`r_w24l` 24 MP 199.2 MiB,
+/// `lossless_3000x2000` 49.2 MiB, `webp12_lossless` 12 MP VP8X+EXIF 112.8 MiB).
+pub(crate) const BPP_X10_WEBP_LOSSLESS: u64 = 85; // 8.5 B/px
+/// Animated WebP (`VP8X` animation flag / `ANMF`): worker-bisected 10.00 B/px lossy (`anim12.webp`
+/// 12 MP 118.1 MiB) and 11.01 B/px lossless (3 MP 36.1 MiB).
+pub(crate) const BPP_X10_WEBP_ANIMATED: u64 = 112; // 11.2 B/px
+/// BMP (24-bit RGB and 32-bit RGBA): worker-bisected 3.01–3.02 B/px at 4 MP (plus `source_bytes`);
+/// 4.4 B/px covers 32-bit RGBA with alpha.
 pub(crate) const BPP_X10_BMP: u64 = 44; // 4.4 B/px
 
 /// Specific format and encoding subtype discovered from the image header before decoding pixels.
@@ -114,6 +131,7 @@ pub(crate) enum ImageSubtype {
     WebpLossy,
     WebpLossyAlpha,
     WebpLossless,
+    WebpAnimated,
     Bmp,
 }
 
@@ -141,6 +159,7 @@ impl ImageSubtype {
             ImageSubtype::WebpLossy => BPP_X10_WEBP_LOSSY,
             ImageSubtype::WebpLossyAlpha => BPP_X10_WEBP_LOSSY_ALPHA,
             ImageSubtype::WebpLossless => BPP_X10_WEBP_LOSSLESS,
+            ImageSubtype::WebpAnimated => BPP_X10_WEBP_ANIMATED,
             ImageSubtype::Bmp => BPP_X10_BMP,
         }
     }
@@ -168,6 +187,7 @@ impl ImageSubtype {
             ImageSubtype::WebpLossy => "lossy WebP",
             ImageSubtype::WebpLossyAlpha => "lossy WebP with alpha",
             ImageSubtype::WebpLossless => "lossless WebP",
+            ImageSubtype::WebpAnimated => "animated WebP",
             ImageSubtype::Bmp => "BMP",
         }
     }
@@ -325,15 +345,25 @@ pub(crate) fn probe_image_profile_with_source_size(
         }
     };
 
-    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
-    reader.limits(image_limits());
-    let (mut w, mut h) = reader.into_dimensions().map_err(|err| {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!("Cannot read image header of {}: {err}.", path.display()),
-        )
-        .with_hint("The image may be corrupted or exceed the thumbnail size and memory limits.")
-    })?;
+    // WebP `VP8X` files produced by tools such as libvips place trailing `EXIF`/`XMP ` chunks
+    // after a multi-megabyte `VP8 `/`VP8L` payload, causing `image-webp`'s decoder constructor to
+    // seek to EOF and fail with "expected chunk was missing" on a 128 KiB header prefix. Parse
+    // WebP headers directly from the RIFF prefix without seeking past the pixel chunk.
+    let (mut w, mut h, pre_webp_subtype) = if format == ImageFormat::WebP {
+        let (sub, ww, wh) = parse_webp_header(path, bytes)?;
+        (ww, wh, Some(sub))
+    } else {
+        let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+        reader.limits(image_limits());
+        let (ww, wh) = reader.into_dimensions().map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Cannot read image header of {}: {err}.", path.display()),
+            )
+            .with_hint("The image may be corrupted or exceed the thumbnail size and memory limits.")
+        })?;
+        (ww, wh, None)
+    };
 
     if w == 0 || h == 0 {
         return Err(ErrorBody::new(
@@ -378,12 +408,7 @@ pub(crate) fn probe_image_profile_with_source_size(
             }
             (ImageSubtype::Gif, None)
         }
-        ImageFormat::WebP => {
-            let (sub, ww, wh) = parse_webp_info(bytes);
-            w = w.max(ww);
-            h = h.max(wh);
-            (sub, None)
-        }
+        ImageFormat::WebP => (pre_webp_subtype.unwrap_or(ImageSubtype::WebpAnimated), None),
         ImageFormat::Bmp => (ImageSubtype::Bmp, None),
         _ => (ImageSubtype::JpegProgressiveOther, None),
     };
@@ -614,31 +639,40 @@ fn parse_vp8l_dims(payload: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-fn parse_webp_info(bytes: &[u8]) -> (ImageSubtype, u32, u32) {
-    // RIFF (4) + size (4) + WEBP (4) + FourCC (4) = 16 bytes.
+fn parse_webp_header(path: &Path, bytes: &[u8]) -> Result<(ImageSubtype, u32, u32), ErrorBody> {
+    let bad = |detail: &str| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Cannot read image header of {}: {detail}.", path.display()),
+        )
+        .with_hint("The image may be corrupted or exceed the thumbnail size and memory limits.")
+    };
+    // RIFF (4) + size (4) + WEBP (4) + FourCC (4) + chunk size (4) = 20 bytes.
     if bytes.len() < 20 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
-        return (ImageSubtype::WebpLossless, 0, 0);
+        return Err(bad("invalid WebP RIFF header"));
     }
     match &bytes[12..16] {
         b"VP8 " => {
-            let (w, h) = parse_vp8_dims(&bytes[20..]).unwrap_or((0, 0));
-            (ImageSubtype::WebpLossy, w, h)
+            let (w, h) = parse_vp8_dims(&bytes[20..]).ok_or_else(|| bad("malformed VP8 header"))?;
+            Ok((ImageSubtype::WebpLossy, w, h))
         }
         b"VP8L" => {
-            let (w, h) = parse_vp8l_dims(&bytes[20..]).unwrap_or((0, 0));
-            (ImageSubtype::WebpLossless, w, h)
+            let (w, h) =
+                parse_vp8l_dims(&bytes[20..]).ok_or_else(|| bad("malformed VP8L header"))?;
+            Ok((ImageSubtype::WebpLossless, w, h))
         }
         b"VP8X" => {
-            // Extended WebP: flags byte at offset 20 (bit 4 = alpha), canvas width/height minus 1
-            // as 24-bit LE at offsets 24..30, followed by sub-chunks starting at offset 30.
-            let has_alpha = bytes.get(20).is_some_and(|flags| (flags & 0x10) != 0);
-            let mut max_w = bytes
-                .get(24..27)
-                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], 0]) + 1);
-            let mut max_h = bytes
-                .get(27..30)
-                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], 0]) + 1);
-            let mut subtype: Option<ImageSubtype> = None;
+            // Extended WebP: flags byte at offset 20 (bit 1 = animation, bit 4 = alpha), canvas
+            // width/height minus 1 as 24-bit LE at offsets 24..30, followed by sub-chunks at 30.
+            if bytes.len() < 30 {
+                return Err(bad("truncated VP8X header"));
+            }
+            let flags = bytes[20];
+            let mut is_anim = (flags & 0x02) != 0;
+            let mut has_alpha = (flags & 0x10) != 0;
+            let mut max_w = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]) + 1;
+            let mut max_h = u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]) + 1;
+            let mut subtype: Option<ImageSubtype> = is_anim.then_some(ImageSubtype::WebpAnimated);
 
             let mut record_sub = |cand: ImageSubtype| {
                 subtype = Some(match subtype {
@@ -660,29 +694,44 @@ fn parse_webp_info(bytes: &[u8]) -> (ImageSubtype, u32, u32) {
                 let payload = bytes.get(payload_start..payload_end).unwrap_or(&[]);
 
                 match fourcc {
+                    b"ALPH" => {
+                        has_alpha = true;
+                    }
+                    b"ANIM" => {
+                        is_anim = true;
+                        record_sub(ImageSubtype::WebpAnimated);
+                    }
                     b"VP8L" => {
                         if let Some((w, h)) = parse_vp8l_dims(payload) {
                             max_w = max_w.max(w);
                             max_h = max_h.max(h);
                         }
-                        record_sub(ImageSubtype::WebpLossless);
+                        record_sub(if is_anim {
+                            ImageSubtype::WebpAnimated
+                        } else {
+                            ImageSubtype::WebpLossless
+                        });
                     }
                     b"VP8 " => {
                         if let Some((w, h)) = parse_vp8_dims(payload) {
                             max_w = max_w.max(w);
                             max_h = max_h.max(h);
                         }
-                        record_sub(if has_alpha {
+                        record_sub(if is_anim {
+                            ImageSubtype::WebpAnimated
+                        } else if has_alpha {
                             ImageSubtype::WebpLossyAlpha
                         } else {
                             ImageSubtype::WebpLossy
                         });
                     }
                     b"ANMF" if payload.len() >= 16 => {
+                        is_anim = true;
                         let fw = u32::from_le_bytes([payload[6], payload[7], payload[8], 0]) + 1;
                         let fh = u32::from_le_bytes([payload[9], payload[10], payload[11], 0]) + 1;
                         max_w = max_w.max(fw);
                         max_h = max_h.max(fh);
+                        record_sub(ImageSubtype::WebpAnimated);
                         let mut sub_pos = 16usize;
                         for _ in 0..4 {
                             let Some(sh) = payload.get(sub_pos..sub_pos + 8) else {
@@ -698,17 +747,11 @@ fn parse_webp_info(bytes: &[u8]) -> (ImageSubtype, u32, u32) {
                                     max_w = max_w.max(w);
                                     max_h = max_h.max(h);
                                 }
-                                record_sub(if has_alpha {
-                                    ImageSubtype::WebpLossyAlpha
-                                } else {
-                                    ImageSubtype::WebpLossy
-                                });
-                            } else if s_fcc == b"VP8L" {
-                                if let Some((w, h)) = parse_vp8l_dims(s_pay) {
-                                    max_w = max_w.max(w);
-                                    max_h = max_h.max(h);
-                                }
-                                record_sub(ImageSubtype::WebpLossless);
+                            } else if s_fcc == b"VP8L"
+                                && let Some((w, h)) = parse_vp8l_dims(s_pay)
+                            {
+                                max_w = max_w.max(w);
+                                max_h = max_h.max(h);
                             }
                             let s_pad = s_len.saturating_add(s_len & 1);
                             let Some(s_next) =
@@ -734,10 +777,18 @@ fn parse_webp_info(bytes: &[u8]) -> (ImageSubtype, u32, u32) {
                 }
                 pos = next;
             }
-            // Unknown VP8X payload: conservatively assume lossless (highest factor).
-            (subtype.unwrap_or(ImageSubtype::WebpLossless), max_w, max_h)
+            let resolved_sub = if is_anim {
+                ImageSubtype::WebpAnimated
+            } else {
+                subtype.unwrap_or(if has_alpha {
+                    ImageSubtype::WebpLossyAlpha
+                } else {
+                    ImageSubtype::WebpLossless
+                })
+            };
+            Ok((resolved_sub, max_w, max_h))
         }
-        _ => (ImageSubtype::WebpLossless, 0, 0),
+        _ => Err(bad("unsupported WebP chunk type")),
     }
 }
 
@@ -1516,6 +1567,37 @@ pub(crate) mod tests {
             !profile.fits_cap(),
             "12000x12000 VP8 frame inside 64x64 VP8X canvas must exceed cap: {profile:?}"
         );
+    }
+
+    #[test]
+    fn vips_webp_with_trailing_exif_beyond_header_peek_probes_cleanly() {
+        // Reproduces libvips `webp12.webp`: VP8X with EXIF flag (0x08), a 3.4 MiB VP8 chunk, and
+        // a trailing EXIF chunk at EOF — well past the 128 KiB header peek prefix.
+        let mut vp8_head = vec![0x90, 0x01, 0x00, 0x9D, 0x01, 0x2A];
+        vp8_head.extend_from_slice(&4000u16.to_le_bytes());
+        vp8_head.extend_from_slice(&3000u16.to_le_bytes());
+        vp8_head.resize(1024, 0);
+
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(b"RIFF");
+        prefix.extend_from_slice(&3_500_000u32.to_le_bytes());
+        prefix.extend_from_slice(b"WEBP");
+        prefix.extend_from_slice(b"VP8X");
+        prefix.extend_from_slice(&10u32.to_le_bytes());
+        prefix.extend_from_slice(&[0x08, 0, 0, 0]); // EXIF flag set
+        prefix.extend_from_slice(&[0x9F, 0x0F, 0x00]); // 4000 - 1 = 3999
+        prefix.extend_from_slice(&[0xB7, 0x0B, 0x00]); // 3000 - 1 = 2999
+        prefix.extend_from_slice(b"VP8 ");
+        prefix.extend_from_slice(&3_428_680u32.to_le_bytes()); // full chunk extends past 128 KiB peek
+        prefix.extend_from_slice(&vp8_head);
+
+        let (profile, _) =
+            probe_image_profile_with_source_size(Path::new("/vips_exif.webp"), &prefix, 3_428_912)
+                .expect("vips WebP with trailing EXIF must probe cleanly from 128 KiB prefix");
+        assert_eq!(profile.width, 4000);
+        assert_eq!(profile.height, 3000);
+        assert_eq!(profile.subtype, ImageSubtype::WebpLossy);
+        assert!(profile.fits_cap());
     }
 
     #[test]

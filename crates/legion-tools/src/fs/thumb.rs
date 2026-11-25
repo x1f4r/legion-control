@@ -23,8 +23,10 @@
 //!   exits immediately with [`CAP_EXCEEDED_EXIT_CODE`](legion_os::capped_alloc::CAP_EXCEEDED_EXIT_CODE)
 //!   on overshoot, backed by OS limits (`RLIMIT_AS` with headroom on Linux, `RLIMIT_DATA` on other
 //!   non-macOS Unix, suspended-create Job Object limits on Windows) and a 10 ms RSS watchdog. Each
-//!   worker reserves its exact resident limit (`heap_cap + 9 MiB`) from the shared in-flight byte
-//!   pool so the sum of live workers' limits never exceeds `min(512 MiB, effective_ram / 8)`.
+//!   worker reserves its exact watchdog limit (`measured_baseline + heap_cap + max(6 MiB, 10%)`)
+//!   from the shared in-flight byte pool so the sum of live workers' limits never exceeds
+//!   `min(512 MiB, effective_ram / 8)`. Backstop kills while `CappedAlloc` stayed under `heap_cap`
+//!   return a transient error with diagnostics and are never cached as bad.
 //! - **Embedded EXIF/MPF preview fallback**: when a JPEG exceeds the 256 MiB decode cap (such as a
 //!   200 MP photo or a 36+ MP progressive 4:4:4 JPEG), `fs.thumb` extracts an embedded MPF APP2
 //!   preview (preferred) or EXIF IFD1 thumbnail with strict overflow-safe offset/length bounds,
@@ -32,11 +34,15 @@
 //!   and applies the main image's EXIF orientation. Only when no usable embedded thumbnail exists
 //!   does it return the per-path `too_large` error (`ErrorCode::Failed` with
 //!   `details.reason = "too_large"`).
-//! - **In-flight byte-budget scheduling**: total in-flight image decodes across all sessions are
-//!   scheduled round-robin by principal against `min(512 MiB, total_machine_ram / 8)` (floored at
-//!   the 256 MiB per-image cap so an admitted image never deadlocks) and at most **8** concurrent
-//!   decodes, with a **10 s** bounded wait (returning retryable `busy`) and a **10 s** wall-clock
-//!   decode timeout.
+//! - **In-flight byte-budget scheduling**: total in-flight image decodes and `<= 1080p` video
+//!   posters across all sessions are scheduled round-robin by principal against
+//!   `min(512 MiB, effective_ram / 8)` (floored at the 256 MiB per-image admission cap so an
+//!   admitted image never deadlocks) across up to **16** concurrent decodes (scaled to CPU cores,
+//!   bounded by the shared byte budget), with a **10 s** bounded wait (returning retryable `busy`)
+//!   and a **10 s** wall-clock decode timeout. Exclusive `> 1080p` (4K/8K) video poster extractions
+//!   drain the entire shared pool and all video slots first so they run strictly one at a time
+//!   with zero concurrent images or videos under an exclusive `min(768 MiB, max(256 MiB,
+//!   effective_ram / 4))` resident budget.
 //! - **JPEG scaled IDCT note**: `image 0.25.10` decodes JPEGs via `zune-jpeg 0.5.15`, which does
 //!   not expose reduced-resolution scaled IDCT (`1/2`, `1/4`, `1/8`; its internal `idct4x4` and
 //!   `idct_1x1` are sparse-block optimizations that still output full 8×8 blocks). To minimize
@@ -85,7 +91,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
-use image::imageops::{self, FilterType};
+use image::imageops;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageFormat, ImageReader};
 use legion_core::media::{Category, classify_path};
@@ -108,7 +114,8 @@ use super::thumb_probe::{
     probe_image_profile, too_large_error,
 };
 use super::thumb_worker::{
-    WorkerOutcome, effective_decode_timeout, minimal_system_env, run_thumb_worker, worker_enabled,
+    WorkerOutcome, compute_worker_limits, effective_decode_timeout, heap_cap_from_estimate,
+    minimal_system_env, run_thumb_worker, worker_baseline_rss_bytes, worker_enabled,
 };
 use super::{
     cancelled_error, check_fs_path, check_regular_file, map_io_error, open_regular_file, platform,
@@ -124,12 +131,6 @@ const MAX_IN_FLIGHT_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 const MIN_IN_FLIGHT_IMAGES: usize = 8;
 const MAX_IN_FLIGHT_IMAGES_CAP: usize = 16;
 const MAX_IN_FLIGHT_VIDEOS: usize = 2;
-/// Fixed non-heap RSS allowance for a `__thumb-worker` process (binary, libc, stack — measured
-/// 5.2–5.7 MiB on Linux x86_64 release builds). Included in each worker's reservation so
-/// `sum(live worker resident limits) <= in_flight_budget`.
-const WORKER_FIXED_OVERHEAD_BYTES: u64 = 9 * 1024 * 1024;
-const MIN_IMAGE_HEAP_CAP_BYTES: u64 = 12 * 1024 * 1024;
-const MAX_IMAGE_HEAP_CAP_BYTES: u64 = MAX_IMAGE_DECODE_BYTES - WORKER_FIXED_OVERHEAD_BYTES;
 const IMAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const IMAGE_DECODE_TIMEOUT: Duration = Duration::from_secs(10);
 const VIDEO_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -681,6 +682,7 @@ enum ImagePrep {
         reserve_bytes: u64,
         heap_cap_bytes: u64,
         rss_limit_bytes: u64,
+        baseline_rss_bytes: u64,
     },
 }
 
@@ -706,29 +708,39 @@ async fn thumb_image(
         )
     })?;
 
-    let (key, bad_key, open_stamp, file, reserve_bytes, heap_cap_bytes, rss_limit_bytes) =
-        match prep {
-            Ok(ImagePrep::CacheHit(hit)) => return Ok(ThumbItem::from_cached(raw_path, hit)),
-            Ok(ImagePrep::CachedBad(err)) => return Ok(ThumbItem::from_error(raw_path, err)),
-            Ok(ImagePrep::Ready {
-                key,
-                bad_key,
-                open_stamp,
-                file,
-                reserve_bytes,
-                heap_cap_bytes,
-                rss_limit_bytes,
-            }) => (
-                key,
-                bad_key,
-                open_stamp,
-                file,
-                reserve_bytes,
-                heap_cap_bytes,
-                rss_limit_bytes,
-            ),
-            Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
-        };
+    let (
+        key,
+        bad_key,
+        open_stamp,
+        file,
+        reserve_bytes,
+        heap_cap_bytes,
+        rss_limit_bytes,
+        baseline_rss_bytes,
+    ) = match prep {
+        Ok(ImagePrep::CacheHit(hit)) => return Ok(ThumbItem::from_cached(raw_path, hit)),
+        Ok(ImagePrep::CachedBad(err)) => return Ok(ThumbItem::from_error(raw_path, err)),
+        Ok(ImagePrep::Ready {
+            key,
+            bad_key,
+            open_stamp,
+            file,
+            reserve_bytes,
+            heap_cap_bytes,
+            rss_limit_bytes,
+            baseline_rss_bytes,
+        }) => (
+            key,
+            bad_key,
+            open_stamp,
+            file,
+            reserve_bytes,
+            heap_cap_bytes,
+            rss_limit_bytes,
+            baseline_rss_bytes,
+        ),
+        Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
+    };
 
     if let Some(remaining) = timeout_backoff().active_remaining(&bad_key) {
         return Ok(ThumbItem::from_error(
@@ -792,6 +804,7 @@ async fn thumb_image(
             MAX_SOURCE_BYTES,
             heap_cap_bytes,
             rss_limit_bytes,
+            baseline_rss_bytes,
             decode_timeout,
             cancel.clone(),
         )
@@ -943,7 +956,14 @@ async fn thumb_video(
             size,
             fit,
         );
-        let bad_key = bad_cache_key(&resolved_stat, stamp.size, stamp.mtime_nanos, stamp.file_id);
+        let bad_key = bad_cache_key(
+            &resolved_stat,
+            stamp.size,
+            stamp.mtime_nanos,
+            stamp.file_id,
+            size,
+            fit,
+        );
         let hit = cache_get.get(&key);
         let bad = if hit.is_none() {
             cache_get.get_bad(&bad_key)
@@ -1224,6 +1244,8 @@ where
         open_stamp.size,
         open_stamp.mtime_nanos,
         open_stamp.file_id,
+        target_size,
+        fit,
     );
     if let Some(bad) = cache.get_bad(&bad_key) {
         return Ok(ImagePrep::CachedBad(bad));
@@ -1234,28 +1256,30 @@ where
         return Err(too_large_error(path, &peek.profile));
     }
 
-    // Reserve EXACTLY what the worker is allowed to use (`rss_limit_bytes == reserve_bytes`,
-    // `heap_cap_bytes == reserve_bytes - WORKER_FIXED_OVERHEAD_BYTES`) so the sum of all live
-    // workers' limits never exceeds the in-flight budget.
-    let heap_cap_bytes = if peek.uncertain_frame_bounds {
-        MAX_IMAGE_HEAP_CAP_BYTES
+    // Size `CappedAlloc` from `estimate * 1.35 + 8 MiB` (floored at 16 MiB) so every honest image
+    // peaks at <= ~70% of its cap, then reserve the exact watchdog resident limit
+    // (`baseline + heap_cap + max(6 MiB, 10%)`) from the shared in-flight pool so `CappedAlloc` is
+    // the exact limit, backstops never falsely kill honest images, and `sum(live limits) <= budget`.
+    let requested_heap_cap = if peek.uncertain_frame_bounds {
+        heap_cap_from_estimate(MAX_IMAGE_DECODE_BYTES)
     } else if peek.profile.fits_cap() {
-        peek.profile
-            .estimated_peak_bytes
-            .clamp(MIN_IMAGE_HEAP_CAP_BYTES, MAX_IMAGE_HEAP_CAP_BYTES)
+        heap_cap_from_estimate(peek.profile.estimated_peak_bytes)
     } else {
         // Over-cap JPEG with EXIF/MPF marker: reserve 2x source + preview headroom and cap the
         // worker tightly so it can only decode an embedded preview, never the full over-cap frame.
-        open_stamp
-            .size
-            .saturating_mul(2)
-            .saturating_add(32 * 1024 * 1024)
-            .clamp(MIN_IMAGE_HEAP_CAP_BYTES, MAX_IMAGE_HEAP_CAP_BYTES)
+        heap_cap_from_estimate(
+            open_stamp
+                .size
+                .saturating_mul(2)
+                .saturating_add(32 * 1024 * 1024)
+                .min(MAX_IMAGE_DECODE_BYTES),
+        )
     };
-    let reserve_bytes = heap_cap_bytes
-        .saturating_add(WORKER_FIXED_OVERHEAD_BYTES)
-        .min(MAX_IMAGE_DECODE_BYTES);
-    let rss_limit_bytes = reserve_bytes;
+    let budget = machine_in_flight_image_budget();
+    let baseline = worker_baseline_rss_bytes();
+    let (heap_cap_bytes, rss_limit_bytes, baseline_rss_bytes) =
+        compute_worker_limits(requested_heap_cap, budget, baseline);
+    let reserve_bytes = rss_limit_bytes;
 
     Ok(ImagePrep::Ready {
         key,
@@ -1265,6 +1289,7 @@ where
         reserve_bytes,
         heap_cap_bytes,
         rss_limit_bytes,
+        baseline_rss_bytes,
     })
 }
 
@@ -1406,35 +1431,43 @@ pub(crate) fn decode_and_render_image_checked(
     encode_thumbnail(&resized)
 }
 
-/// Resizes `img` for a square `target_size x target_size` thumbnail.
+/// Resizes `img` for a square `target_size x target_size` thumbnail using strictly bounded integer
+/// paths whose scratch memory depends ONLY on `target_size` (never `source_width * target_size`).
 ///
-/// For >=2x downscales on 8-bit `Rgb8`/`Rgba8`/`Luma8` images, uses a cache-friendly row-major
-/// integer box downscaler directly on the raw pixel slice (zero extra scratch buffers, ~3x faster
-/// than `imageops::thumbnail` on 12–50 MP photos). Other 16-bit/LumaA8 >=2x downscales use
-/// `DynamicImage::thumbnail`, and smaller downscales or `Cover` upscales use `FilterType::Triangle`.
+/// - For `Cover`, ALWAYS center-crops to a square view `(crop_x, crop_y, side, side)` first with
+///   zero copy so wide/tall strips (such as `20000x200` or `1x20000`) never allocate buffers
+///   proportional to the long axis.
+/// - For `>= 2x` downscales, uses the cache-friendly row-major integer box downscaler (8-bit) or
+///   `imageops::thumbnail` on the crop view (16-bit / `LumaA8`).
+/// - For `< 2x` downscales or upscales, uses a bounded integer bilinear resampler directly from
+///   the source/crop slice into the `dst_w x dst_h` output buffer (`<= 2 MiB`).
 fn resize_for_thumb(img: &DynamicImage, target_size: u32, fit: ThumbFit) -> DynamicImage {
     let (w, h) = (img.width(), img.height());
     match fit {
         ThumbFit::Contain => {
-            if w >= target_size.saturating_mul(2) && h >= target_size.saturating_mul(2) {
-                let (dw, dh) = contain_dimensions(w, h, target_size, target_size);
+            if w <= target_size && h <= target_size {
+                return img.clone();
+            }
+            let (dw, dh) = contain_dimensions(w, h, target_size, target_size);
+            if w >= dw.saturating_mul(2) || h >= dh.saturating_mul(2) {
                 fast_box_thumbnail(img, 0, 0, w, h, dw, dh)
-                    .unwrap_or_else(|| img.thumbnail(target_size, target_size))
-            } else if w > target_size || h > target_size {
-                img.resize(target_size, target_size, FilterType::Triangle)
+                    .unwrap_or_else(|| thumbnail_crop_rect(img, 0, 0, w, h, dw, dh))
             } else {
-                img.clone()
+                bilinear_resize_rect(img, 0, 0, w, h, dw, dh)
             }
         }
         ThumbFit::Cover => {
             let side = w.min(h);
-            if side >= target_size.saturating_mul(2) {
-                let x = (w - side) / 2;
-                let y = (h - side) / 2;
-                fast_box_thumbnail(img, x, y, side, side, target_size, target_size)
-                    .unwrap_or_else(|| thumbnail_crop_square(img, x, y, side, target_size))
+            let x = (w - side) / 2;
+            let y = (h - side) / 2;
+            if side == target_size {
+                crop_copy_rect(img, x, y, side, side)
+            } else if side >= target_size.saturating_mul(2) {
+                fast_box_thumbnail(img, x, y, side, side, target_size, target_size).unwrap_or_else(
+                    || thumbnail_crop_rect(img, x, y, side, side, target_size, target_size),
+                )
             } else {
-                img.resize_to_fill(target_size, target_size, FilterType::Triangle)
+                bilinear_resize_rect(img, x, y, side, side, target_size, target_size)
             }
         }
     }
@@ -1616,48 +1649,275 @@ fn box_downscale_8bit<const C: usize>(
     out
 }
 
-fn thumbnail_crop_square(
+fn thumbnail_crop_rect(
     img: &DynamicImage,
     x: u32,
     y: u32,
-    side: u32,
-    target_size: u32,
+    crop_w: u32,
+    crop_h: u32,
+    dst_w: u32,
+    dst_h: u32,
 ) -> DynamicImage {
     match img {
         DynamicImage::ImageLuma8(buf) => {
-            let view = imageops::crop_imm(buf, x, y, side, side);
-            DynamicImage::ImageLuma8(imageops::thumbnail(&*view, target_size, target_size))
+            let view = imageops::crop_imm(buf, x, y, crop_w, crop_h);
+            DynamicImage::ImageLuma8(imageops::thumbnail(&*view, dst_w, dst_h))
         }
         DynamicImage::ImageLumaA8(buf) => {
-            let view = imageops::crop_imm(buf, x, y, side, side);
-            DynamicImage::ImageLumaA8(imageops::thumbnail(&*view, target_size, target_size))
+            let view = imageops::crop_imm(buf, x, y, crop_w, crop_h);
+            DynamicImage::ImageLumaA8(imageops::thumbnail(&*view, dst_w, dst_h))
         }
         DynamicImage::ImageRgb8(buf) => {
-            let view = imageops::crop_imm(buf, x, y, side, side);
-            DynamicImage::ImageRgb8(imageops::thumbnail(&*view, target_size, target_size))
+            let view = imageops::crop_imm(buf, x, y, crop_w, crop_h);
+            DynamicImage::ImageRgb8(imageops::thumbnail(&*view, dst_w, dst_h))
         }
         DynamicImage::ImageRgba8(buf) => {
-            let view = imageops::crop_imm(buf, x, y, side, side);
-            DynamicImage::ImageRgba8(imageops::thumbnail(&*view, target_size, target_size))
+            let view = imageops::crop_imm(buf, x, y, crop_w, crop_h);
+            DynamicImage::ImageRgba8(imageops::thumbnail(&*view, dst_w, dst_h))
         }
         DynamicImage::ImageLuma16(buf) => {
-            let view = imageops::crop_imm(buf, x, y, side, side);
-            DynamicImage::ImageLuma16(imageops::thumbnail(&*view, target_size, target_size))
+            let view = imageops::crop_imm(buf, x, y, crop_w, crop_h);
+            DynamicImage::ImageLuma16(imageops::thumbnail(&*view, dst_w, dst_h))
         }
         DynamicImage::ImageLumaA16(buf) => {
-            let view = imageops::crop_imm(buf, x, y, side, side);
-            DynamicImage::ImageLumaA16(imageops::thumbnail(&*view, target_size, target_size))
+            let view = imageops::crop_imm(buf, x, y, crop_w, crop_h);
+            DynamicImage::ImageLumaA16(imageops::thumbnail(&*view, dst_w, dst_h))
         }
         DynamicImage::ImageRgb16(buf) => {
-            let view = imageops::crop_imm(buf, x, y, side, side);
-            DynamicImage::ImageRgb16(imageops::thumbnail(&*view, target_size, target_size))
+            let view = imageops::crop_imm(buf, x, y, crop_w, crop_h);
+            DynamicImage::ImageRgb16(imageops::thumbnail(&*view, dst_w, dst_h))
         }
         DynamicImage::ImageRgba16(buf) => {
-            let view = imageops::crop_imm(buf, x, y, side, side);
-            DynamicImage::ImageRgba16(imageops::thumbnail(&*view, target_size, target_size))
+            let view = imageops::crop_imm(buf, x, y, crop_w, crop_h);
+            DynamicImage::ImageRgba16(imageops::thumbnail(&*view, dst_w, dst_h))
         }
-        other => other.resize_to_fill(target_size, target_size, FilterType::Triangle),
+        other => {
+            let rgba = other.to_rgba8();
+            let view = imageops::crop_imm(&rgba, x, y, crop_w, crop_h);
+            DynamicImage::ImageRgba8(imageops::thumbnail(&*view, dst_w, dst_h))
+        }
     }
+}
+
+fn crop_copy_rect(img: &DynamicImage, x: u32, y: u32, crop_w: u32, crop_h: u32) -> DynamicImage {
+    match img {
+        DynamicImage::ImageLuma8(buf) => {
+            DynamicImage::ImageLuma8(imageops::crop_imm(buf, x, y, crop_w, crop_h).to_image())
+        }
+        DynamicImage::ImageLumaA8(buf) => {
+            DynamicImage::ImageLumaA8(imageops::crop_imm(buf, x, y, crop_w, crop_h).to_image())
+        }
+        DynamicImage::ImageRgb8(buf) => {
+            DynamicImage::ImageRgb8(imageops::crop_imm(buf, x, y, crop_w, crop_h).to_image())
+        }
+        DynamicImage::ImageRgba8(buf) => {
+            DynamicImage::ImageRgba8(imageops::crop_imm(buf, x, y, crop_w, crop_h).to_image())
+        }
+        DynamicImage::ImageLuma16(buf) => {
+            DynamicImage::ImageLuma16(imageops::crop_imm(buf, x, y, crop_w, crop_h).to_image())
+        }
+        DynamicImage::ImageLumaA16(buf) => {
+            DynamicImage::ImageLumaA16(imageops::crop_imm(buf, x, y, crop_w, crop_h).to_image())
+        }
+        DynamicImage::ImageRgb16(buf) => {
+            DynamicImage::ImageRgb16(imageops::crop_imm(buf, x, y, crop_w, crop_h).to_image())
+        }
+        DynamicImage::ImageRgba16(buf) => {
+            DynamicImage::ImageRgba16(imageops::crop_imm(buf, x, y, crop_w, crop_h).to_image())
+        }
+        other => {
+            let rgba = other.to_rgba8();
+            DynamicImage::ImageRgba8(imageops::crop_imm(&rgba, x, y, crop_w, crop_h).to_image())
+        }
+    }
+}
+
+/// Bounded integer bilinear resampler from `(crop_x, crop_y, crop_w, crop_h)` to `dst_w x dst_h`.
+///
+/// Allocates only the `dst_w x dst_h` output buffer (`<= 2 MiB` at 512px) plus a 1D x-lookup
+/// table of length `dst_w` (`<= 12 KiB`) — zero float buffers and zero memory scaling with source
+/// dimensions.
+fn bilinear_resize_rect(
+    img: &DynamicImage,
+    crop_x: u32,
+    crop_y: u32,
+    crop_w: u32,
+    crop_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> DynamicImage {
+    let (cx, cy, cw, ch, dw, dh) = (
+        crop_x as usize,
+        crop_y as usize,
+        crop_w as usize,
+        crop_h as usize,
+        dst_w as usize,
+        dst_h as usize,
+    );
+    match img {
+        DynamicImage::ImageLuma8(buf) => {
+            let raw = bilinear_u8::<1>(buf.as_raw(), buf.width() as usize, cx, cy, cw, ch, dw, dh);
+            DynamicImage::ImageLuma8(
+                image::GrayImage::from_raw(dst_w, dst_h, raw).unwrap_or_default(),
+            )
+        }
+        DynamicImage::ImageLumaA8(buf) => {
+            let raw = bilinear_u8::<2>(buf.as_raw(), buf.width() as usize, cx, cy, cw, ch, dw, dh);
+            DynamicImage::ImageLumaA8(
+                image::GrayAlphaImage::from_raw(dst_w, dst_h, raw).unwrap_or_default(),
+            )
+        }
+        DynamicImage::ImageRgb8(buf) => {
+            let raw = bilinear_u8::<3>(buf.as_raw(), buf.width() as usize, cx, cy, cw, ch, dw, dh);
+            DynamicImage::ImageRgb8(
+                image::RgbImage::from_raw(dst_w, dst_h, raw).unwrap_or_default(),
+            )
+        }
+        DynamicImage::ImageRgba8(buf) => {
+            let raw = bilinear_u8::<4>(buf.as_raw(), buf.width() as usize, cx, cy, cw, ch, dw, dh);
+            DynamicImage::ImageRgba8(
+                image::RgbaImage::from_raw(dst_w, dst_h, raw).unwrap_or_default(),
+            )
+        }
+        DynamicImage::ImageLuma16(buf) => {
+            let raw = bilinear_u16::<1>(buf.as_raw(), buf.width() as usize, cx, cy, cw, ch, dw, dh);
+            DynamicImage::ImageLuma16(
+                image::ImageBuffer::from_raw(dst_w, dst_h, raw).unwrap_or_default(),
+            )
+        }
+        DynamicImage::ImageLumaA16(buf) => {
+            let raw = bilinear_u16::<2>(buf.as_raw(), buf.width() as usize, cx, cy, cw, ch, dw, dh);
+            DynamicImage::ImageLumaA16(
+                image::ImageBuffer::from_raw(dst_w, dst_h, raw).unwrap_or_default(),
+            )
+        }
+        DynamicImage::ImageRgb16(buf) => {
+            let raw = bilinear_u16::<3>(buf.as_raw(), buf.width() as usize, cx, cy, cw, ch, dw, dh);
+            DynamicImage::ImageRgb16(
+                image::ImageBuffer::from_raw(dst_w, dst_h, raw).unwrap_or_default(),
+            )
+        }
+        DynamicImage::ImageRgba16(buf) => {
+            let raw = bilinear_u16::<4>(buf.as_raw(), buf.width() as usize, cx, cy, cw, ch, dw, dh);
+            DynamicImage::ImageRgba16(
+                image::ImageBuffer::from_raw(dst_w, dst_h, raw).unwrap_or_default(),
+            )
+        }
+        other => {
+            let rgba = other.to_rgba8();
+            let raw =
+                bilinear_u8::<4>(rgba.as_raw(), rgba.width() as usize, cx, cy, cw, ch, dw, dh);
+            DynamicImage::ImageRgba8(
+                image::RgbaImage::from_raw(dst_w, dst_h, raw).unwrap_or_default(),
+            )
+        }
+    }
+}
+
+fn bilinear_axis_sample(
+    dst_idx: usize,
+    crop_origin: usize,
+    crop_len: usize,
+    dst_len: usize,
+) -> (usize, usize, u32, u32) {
+    if crop_len <= 1 || dst_len <= 1 {
+        let i = crop_origin;
+        return (i, i, 256, 0);
+    }
+    let pos = ((dst_idx as f64 + 0.5) * (crop_len as f64) / (dst_len as f64) - 0.5)
+        .clamp(0.0, (crop_len - 1) as f64);
+    let i0 = pos.floor() as usize;
+    let i1 = (i0 + 1).min(crop_len - 1);
+    let w1 = ((pos - i0 as f64) * 256.0).round() as u32;
+    let w0 = 256 - w1;
+    (crop_origin + i0, crop_origin + i1, w0, w1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bilinear_u8<const C: usize>(
+    src: &[u8],
+    src_w: usize,
+    crop_x: usize,
+    crop_y: usize,
+    crop_w: usize,
+    crop_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<u8> {
+    let row_stride = src_w * C;
+    let mut out = vec![0u8; dst_w * dst_h * C];
+    let x_lut: Vec<(usize, usize, u32, u32)> = (0..dst_w)
+        .map(|ox| {
+            let (x0, x1, wx0, wx1) = bilinear_axis_sample(ox, crop_x, crop_w, dst_w);
+            (x0 * C, x1 * C, wx0, wx1)
+        })
+        .collect();
+
+    for oy in 0..dst_h {
+        let (y0, y1, wy0, wy1) = bilinear_axis_sample(oy, crop_y, crop_h, dst_h);
+        let r0 = &src[y0 * row_stride..(y0 + 1) * row_stride];
+        let r1 = &src[y1 * row_stride..(y1 + 1) * row_stride];
+        let out_row = &mut out[oy * dst_w * C..(oy + 1) * dst_w * C];
+        for (dst_px, &(bx0, bx1, wx0, wx1)) in out_row.as_chunks_mut::<C>().0.iter_mut().zip(&x_lut)
+        {
+            let w00 = wx0 * wy0;
+            let w10 = wx1 * wy0;
+            let w01 = wx0 * wy1;
+            let w11 = wx1 * wy1;
+            for ch in 0..C {
+                let sum = u32::from(r0[bx0 + ch]) * w00
+                    + u32::from(r0[bx1 + ch]) * w10
+                    + u32::from(r1[bx0 + ch]) * w01
+                    + u32::from(r1[bx1 + ch]) * w11;
+                dst_px[ch] = ((sum + 32_768) >> 16) as u8;
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bilinear_u16<const C: usize>(
+    src: &[u16],
+    src_w: usize,
+    crop_x: usize,
+    crop_y: usize,
+    crop_w: usize,
+    crop_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<u16> {
+    let row_stride = src_w * C;
+    let mut out = vec![0u16; dst_w * dst_h * C];
+    let x_lut: Vec<(usize, usize, u64, u64)> = (0..dst_w)
+        .map(|ox| {
+            let (x0, x1, wx0, wx1) = bilinear_axis_sample(ox, crop_x, crop_w, dst_w);
+            (x0 * C, x1 * C, u64::from(wx0), u64::from(wx1))
+        })
+        .collect();
+
+    for oy in 0..dst_h {
+        let (y0, y1, wy0, wy1) = bilinear_axis_sample(oy, crop_y, crop_h, dst_h);
+        let (wy0, wy1) = (u64::from(wy0), u64::from(wy1));
+        let r0 = &src[y0 * row_stride..(y0 + 1) * row_stride];
+        let r1 = &src[y1 * row_stride..(y1 + 1) * row_stride];
+        let out_row = &mut out[oy * dst_w * C..(oy + 1) * dst_w * C];
+        for (dst_px, &(bx0, bx1, wx0, wx1)) in out_row.as_chunks_mut::<C>().0.iter_mut().zip(&x_lut)
+        {
+            let w00 = wx0 * wy0;
+            let w10 = wx1 * wy0;
+            let w01 = wx0 * wy1;
+            let w11 = wx1 * wy1;
+            for ch in 0..C {
+                let sum = u64::from(r0[bx0 + ch]) * w00
+                    + u64::from(r0[bx1 + ch]) * w10
+                    + u64::from(r1[bx0 + ch]) * w01
+                    + u64::from(r1[bx1 + ch]) * w11;
+                dst_px[ch] = ((sum + 32_768) >> 16) as u16;
+            }
+        }
+    }
+    out
 }
 
 fn encode_thumbnail(img: &DynamicImage) -> Result<CachedThumb, ErrorBody> {

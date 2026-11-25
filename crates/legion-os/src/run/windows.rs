@@ -23,7 +23,7 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenProcess, OpenThread, PROCESS_SET_QUOTA,
-    PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME,
+    PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess,
 };
 
 const POST_KILL_WAIT: Duration = Duration::from_secs(2);
@@ -60,7 +60,11 @@ impl TreeDropGuard {
             let job = attach_memory_job(pid, limit.saturating_add(memory_headroom));
             // Always resume the suspended child after attempting Job Object attachment so it
             // begins executing with the limit already active (or falls back to the RSS watchdog).
-            resume_process_threads(pid);
+            // If resuming fails (for example ToolHelp snapshot or `OpenThread` fails), kill the
+            // suspended child immediately rather than leaving it frozen until the timeout.
+            if !resume_process_threads(pid) {
+                terminate_pid(pid);
+            }
             job
         });
         Self { mem_job }
@@ -140,16 +144,17 @@ fn attach_memory_job(pid: u32, commit_limit: u64) -> Option<HANDLE> {
 }
 
 /// Resumes the primary thread(s) of a child created with `CREATE_SUSPENDED` after its memory-limit
-/// Job Object has been attached.
-fn resume_process_threads(pid: u32) {
+/// Job Object has been attached. Returns `true` only if at least one thread of `pid` was
+/// successfully resumed.
+fn resume_process_threads(pid: u32) -> bool {
     // SAFETY: `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)` takes plain integer arguments and
     // returns an owned snapshot handle closed before returning.
     #[allow(unsafe_code)]
     let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }) else {
-        return;
+        return false;
     };
     if snap.is_invalid() {
-        return;
+        return false;
     }
 
     let mut entry = THREADENTRY32 {
@@ -157,6 +162,8 @@ fn resume_process_threads(pid: u32) {
         ..Default::default()
     };
 
+    let mut resumed_any = false;
+    let mut failed_any = false;
     // SAFETY: `snap` is a valid ToolHelp32 snapshot handle and `entry.dwSize` is initialized.
     #[allow(unsafe_code)]
     let mut has_next = unsafe { Thread32First(snap, &mut entry) }.is_ok();
@@ -164,13 +171,22 @@ fn resume_process_threads(pid: u32) {
         if entry.th32OwnerProcessID == pid {
             // SAFETY: opens the suspended thread owned by our child PID to resume it and closes the handle.
             #[allow(unsafe_code)]
-            if let Ok(thread) =
-                unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) }
-            {
-                #[allow(unsafe_code)]
-                unsafe {
-                    let _ = ResumeThread(thread);
-                    let _ = CloseHandle(thread);
+            match unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) } {
+                Ok(thread) => {
+                    #[allow(unsafe_code)]
+                    let prev_count = unsafe {
+                        let rc = ResumeThread(thread);
+                        let _ = CloseHandle(thread);
+                        rc
+                    };
+                    if prev_count != u32::MAX {
+                        resumed_any = true;
+                    } else {
+                        failed_any = true;
+                    }
+                }
+                Err(_) => {
+                    failed_any = true;
                 }
             }
         }
@@ -185,6 +201,20 @@ fn resume_process_threads(pid: u32) {
     #[allow(unsafe_code)]
     unsafe {
         let _ = CloseHandle(snap);
+    }
+    resumed_any && !failed_any
+}
+
+fn terminate_pid(pid: u32) {
+    // SAFETY: opens the suspended child PID with terminate right only, terminates it, and closes
+    // the handle immediately.
+    #[allow(unsafe_code)]
+    if let Ok(proc_handle) = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
+        #[allow(unsafe_code)]
+        unsafe {
+            let _ = TerminateProcess(proc_handle, 1);
+            let _ = CloseHandle(proc_handle);
+        }
     }
 }
 

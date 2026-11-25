@@ -1,13 +1,17 @@
 //! Race-free, non-blocking opening of regular files for reading.
 //!
-//! Checking `stat(path)` before `File::open(path)` has a TOCTOU window: if a named pipe (FIFO) is
-//! renamed into `path` between `stat` and `open`, `File::open` blocks forever waiting for a writer
-//! and exhausts the node's blocking thread pool.
+//! Checking `stat(path)` alone before `File::open(path)` has a TOCTOU window: if a named pipe
+//! (FIFO) is renamed into `path` between `stat` and `open`, `File::open` blocks forever waiting
+//! for a writer and exhausts the node's blocking thread pool. Conversely, opening a path with
+//! `O_NONBLOCK` without checking its type first still has side effects on special files (opening a
+//! FIFO wakes a blocked writer; opening a serial port can toggle control lines).
 //!
-//! [`open_regular_read`] eliminates that race on every platform:
-//! - **Unix**: opens with `O_NONBLOCK | O_NOCTTY`, checks `fstat` (`File::metadata`) on the open
-//!   file descriptor to reject directories, FIFOs, sockets, and devices, then clears `O_NONBLOCK`
-//!   so subsequent reads behave normally.
+//! [`open_regular_read`] combines both safeguards on every platform:
+//! - **Unix**: performs a no-follow `lstat` first (refusing directories, FIFOs, sockets, and
+//!   device nodes before calling `open`; following a symlink with `stat` only to verify its target
+//!   is a regular file before opening), then opens with `O_NONBLOCK | O_NOCTTY` (retrying briefly
+//!   on `EWOULDBLOCK`/`EAGAIN` for regular files under a write lease), verifies `fstat`
+//!   (`File::metadata`) on the open descriptor as the race guard, and clears `O_NONBLOCK`.
 //! - **Windows**: rejects non-disk handles (`GetFileType != FILE_TYPE_DISK`) and directories on
 //!   the open handle itself.
 
@@ -39,35 +43,74 @@ mod platform {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
+    use std::time::Duration;
 
     use super::OpenRegularError;
+
+    const EWOULDBLOCK_RETRY_DELAYS_MS: [u64; 5] = [5, 10, 20, 40, 80];
+
+    fn precheck_regular_type(path: &Path) -> std::result::Result<(), OpenRegularError> {
+        // No-follow stat first so FIFOs, sockets, and device nodes (such as serial ports) are
+        // refused before ever calling `open()` — avoiding side effects like waking a blocked FIFO
+        // writer or toggling modem control lines.
+        let lmeta = fs::symlink_metadata(path).map_err(OpenRegularError::Io)?;
+        let meta = if lmeta.file_type().is_symlink() {
+            fs::metadata(path).map_err(OpenRegularError::Io)?
+        } else {
+            lmeta
+        };
+        if meta.is_dir() {
+            return Err(OpenRegularError::IsDirectory);
+        }
+        if !meta.is_file() {
+            return Err(OpenRegularError::NotRegularFile);
+        }
+        Ok(())
+    }
 
     pub(super) fn open_regular_read_impl(
         path: &Path,
     ) -> std::result::Result<(File, Metadata), OpenRegularError> {
-        let file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(err) => {
-                // Opening a Unix domain socket returns ENXIO (Linux) or EOPNOTSUPP (macOS/BSD).
-                if matches!(err.raw_os_error(), Some(libc::ENXIO | libc::EOPNOTSUPP)) {
-                    if let Ok(meta) = fs::metadata(path) {
-                        if meta.is_dir() {
-                            return Err(OpenRegularError::IsDirectory);
-                        }
-                        if !meta.is_file() {
-                            return Err(OpenRegularError::NotRegularFile);
-                        }
+        let mut attempt = 0usize;
+        let file = loop {
+            precheck_regular_type(path)?;
+
+            match OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+                .open(path)
+            {
+                Ok(file) => break file,
+                Err(err) => {
+                    // Opening a regular file under a write lease with `O_NONBLOCK` can return
+                    // `EWOULDBLOCK`/`EAGAIN` briefly while the lease breaks; retry with short
+                    // backoff while re-checking the file type on every attempt.
+                    if err.kind() == io::ErrorKind::WouldBlock
+                        && let Some(&delay_ms) = EWOULDBLOCK_RETRY_DELAYS_MS.get(attempt)
+                    {
+                        attempt += 1;
+                        std::thread::sleep(Duration::from_millis(delay_ms));
+                        continue;
                     }
-                    return Err(OpenRegularError::NotRegularFile);
+                    // Opening a Unix domain socket returns ENXIO (Linux) or EOPNOTSUPP (macOS/BSD).
+                    if matches!(err.raw_os_error(), Some(libc::ENXIO | libc::EOPNOTSUPP)) {
+                        if let Ok(meta) = fs::metadata(path) {
+                            if meta.is_dir() {
+                                return Err(OpenRegularError::IsDirectory);
+                            }
+                            if !meta.is_file() {
+                                return Err(OpenRegularError::NotRegularFile);
+                            }
+                        }
+                        return Err(OpenRegularError::NotRegularFile);
+                    }
+                    return Err(OpenRegularError::Io(err));
                 }
-                return Err(OpenRegularError::Io(err));
             }
         };
 
+        // Race guard: verify on the open file descriptor itself (`fstat`) that the path was not
+        // swapped to a directory, FIFO, socket, or device between `lstat` and `open`.
         let meta = file.metadata().map_err(OpenRegularError::Io)?;
         if meta.is_dir() {
             return Err(OpenRegularError::IsDirectory);
@@ -217,5 +260,33 @@ mod tests {
             open_regular_read(Path::new("/dev/zero")),
             Err(OpenRegularError::NotRegularFile)
         ));
+
+        // A writer blocked on opening the FIFO for write must NOT be released when
+        // `open_regular_read` refuses the FIFO via no-follow stat before calling `open()`.
+        let writer_fifo = dir.path().join("blocked_writer.fifo");
+        let st = Command::new("mkfifo").arg(&writer_fifo).status().unwrap();
+        assert!(st.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer_path = writer_fifo.clone();
+        let writer = std::thread::spawn(move || {
+            let _ = std::fs::OpenOptions::new().write(true).open(&writer_path);
+            let _ = tx.send(());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert!(matches!(
+            open_regular_read(&writer_fifo),
+            Err(OpenRegularError::NotRegularFile)
+        ));
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(80))
+                .is_err(),
+            "open_regular_read must refuse a FIFO before open() so a blocked writer is not released"
+        );
+        // Unblock and clean up the writer thread by opening the read end once.
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&writer_fifo)
+            .ok();
+        let _ = writer.join();
     }
 }

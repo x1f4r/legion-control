@@ -34,16 +34,16 @@ use super::thumb::ThumbFit;
 /// Default maximum total size of cached thumbnail files on disk (256 MiB).
 pub(crate) const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
-const CACHE_VERSION: &str = "legion-thumb-v2";
-const BAD_CACHE_VERSION: &str = "legion-thumb-bad-v1";
+const CACHE_VERSION: &str = "legion-thumb-v3";
+const BAD_CACHE_VERSION: &str = "legion-thumb-bad-v2";
 const ENTRY_MAGIC: &[u8; 4] = b"LGTH";
-const ENTRY_VERSION: u8 = 1;
+const ENTRY_VERSION: u8 = 2;
 const MIME_JPEG_TAG: u8 = 1;
 const MIME_PNG_TAG: u8 = 2;
 const BAD_ENTRY_TAG: u8 = 3;
 const MAX_BAD_ERROR_BYTES: usize = 16 * 1024;
-/// Negative bad-file cache records expire after 7 days so files are retried once after expiry.
-pub(crate) const BAD_ENTRY_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+/// Negative bad-file cache records expire after 1 day so files are retried after expiry.
+pub(crate) const BAD_ENTRY_TTL: Duration = Duration::from_secs(24 * 3600);
 const ENTRY_HEADER_LEN: usize = 14;
 const LOCK_FILE: &str = "cache.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -119,13 +119,15 @@ pub(crate) fn cache_key(
 }
 
 /// Computes the deterministic BLAKE3 key for a negative bad-file cache entry tied to the source
-/// file's identity (independent of target `size` and `fit` so reopening a folder at any size does
-/// not repeatedly spawn and kill a worker on the same hostile/corrupt file).
+/// file's identity AND target `size` and `fit`, so a failure at one size/fit (for example `512
+/// cover`) never blocks another principal's request at a different size/fit (such as `128 cover`).
 pub(crate) fn bad_cache_key(
     resolved_path: &Path,
     source_size: u64,
     mtime_nanos: Option<i128>,
     file_id: Option<FileId>,
+    thumb_size: u32,
+    fit: ThumbFit,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(BAD_CACHE_VERSION.as_bytes());
@@ -161,6 +163,11 @@ pub(crate) fn bad_cache_key(
             hasher.update(&[0]);
         }
     }
+    hasher.update(&thumb_size.to_le_bytes());
+    hasher.update(&[match fit {
+        ThumbFit::Contain => 0,
+        ThumbFit::Cover => 1,
+    }]);
     hasher.finalize().to_hex().to_string()
 }
 
@@ -246,8 +253,8 @@ impl ThumbCache {
 
     /// Looks up a cached negative bad-file entry by [`bad_cache_key`], lock-free.
     ///
-    /// Entries older than [`BAD_ENTRY_TTL`] (7 days) are deleted and treated as a miss so the
-    /// file is retried once after expiry.
+    /// Entries older than [`BAD_ENTRY_TTL`] (1 day) are deleted and treated as a miss so the
+    /// file is retried after expiry.
     pub(crate) fn get_bad(&self, key: &str) -> Option<ErrorBody> {
         self.get_bad_at(key, now_unix_secs())
     }
@@ -278,8 +285,8 @@ impl ThumbCache {
     }
 
     /// Stores a negative bad-file entry atomically under `key` (sharing the same LRU byte cap,
-    /// reconciliation, and 7-day expiry as positive thumbnail entries) so reopening a folder with
-    /// a file rejected by this node's own memory limit does not repeat the kill.
+    /// reconciliation, and 1-day expiry as positive thumbnail entries) so reopening a folder with
+    /// a file rejected by this node's own memory limit does not repeat the kill for that size/fit.
     pub(crate) fn put_bad(&self, key: &str, error: &ErrorBody) {
         self.put_bad_at(key, error, now_unix_secs());
     }
@@ -881,13 +888,46 @@ mod tests {
     }
 
     #[test]
-    fn negative_bad_file_entries_round_trip_and_invalidate_on_identity_change() {
+    fn negative_bad_file_entries_round_trip_and_invalidate_on_identity_size_fit_or_version_change()
+    {
         let dir = tempfile::tempdir().unwrap();
         let cache =
             ThumbCache::with_limits(dir.path().join("bad-cache"), 4096, DEFAULT_STALE_TMP_AGE);
-        let k1 = bad_cache_key(Path::new("/bomb.gif"), 123, Some(500), fid(1, 10, 100));
-        let k2 = bad_cache_key(Path::new("/bomb.gif"), 123, Some(500), fid(1, 11, 100));
+        let k1 = bad_cache_key(
+            Path::new("/bomb.gif"),
+            123,
+            Some(500),
+            fid(1, 10, 100),
+            512,
+            ThumbFit::Cover,
+        );
+        let k2 = bad_cache_key(
+            Path::new("/bomb.gif"),
+            123,
+            Some(500),
+            fid(1, 11, 100),
+            512,
+            ThumbFit::Cover,
+        );
+        let k_other_size = bad_cache_key(
+            Path::new("/bomb.gif"),
+            123,
+            Some(500),
+            fid(1, 10, 100),
+            128,
+            ThumbFit::Cover,
+        );
+        let k_other_fit = bad_cache_key(
+            Path::new("/bomb.gif"),
+            123,
+            Some(500),
+            fid(1, 10, 100),
+            512,
+            ThumbFit::Contain,
+        );
         assert_ne!(k1, k2);
+        assert_ne!(k1, k_other_size);
+        assert_ne!(k1, k_other_fit);
 
         let err = ErrorBody::new(
             legion_core::proto::ErrorCode::Failed,
@@ -900,11 +940,21 @@ mod tests {
         assert_eq!(got.code, err.code);
         assert_eq!(got.message, err.message);
         assert_eq!(cache.get_bad(&k2), None);
+        assert_eq!(cache.get_bad(&k_other_size), None);
+        assert_eq!(cache.get_bad(&k_other_fit), None);
         // Positive lookup on the same key must not treat a bad entry as a valid thumbnail.
         assert_eq!(cache.get(&k1), None);
 
-        // Entries older than BAD_ENTRY_TTL (7 days) expire, are removed, and return None for retry.
-        let k_exp = bad_cache_key(Path::new("/old_bomb.gif"), 123, Some(500), fid(1, 12, 100));
+        // Entries older than BAD_ENTRY_TTL (1 day) expire, are removed, and return None for retry.
+        assert_eq!(BAD_ENTRY_TTL, Duration::from_secs(24 * 3600));
+        let k_exp = bad_cache_key(
+            Path::new("/old_bomb.gif"),
+            123,
+            Some(500),
+            fid(1, 12, 100),
+            256,
+            ThumbFit::Contain,
+        );
         cache.put_bad_at(&k_exp, &err, 1_000_000);
         assert!(
             cache
@@ -918,6 +968,25 @@ mod tests {
         assert!(
             !cache.entry_path(&k_exp).exists(),
             "expired bad entry must be deleted on miss"
+        );
+
+        // Legacy v1 records written by earlier builds are rejected and removed on read.
+        let legacy_key = bad_cache_key(
+            Path::new("/legacy.gif"),
+            123,
+            Some(500),
+            fid(1, 13, 100),
+            256,
+            ThumbFit::Contain,
+        );
+        let mut legacy = encode_bad_entry(&err, now_unix_secs()).unwrap();
+        legacy[4] = 1; // older ENTRY_VERSION = 1
+        let legacy_path = cache.entry_path(&legacy_key);
+        fs::write(&legacy_path, &legacy).unwrap();
+        assert_eq!(cache.get_bad(&legacy_key), None);
+        assert!(
+            !legacy_path.exists(),
+            "legacy v1 cache record must be discarded on read"
         );
     }
 }

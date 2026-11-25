@@ -22,14 +22,16 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::path::Path;
-use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::process::{Command, ExitCode, Stdio};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use legion_core::CancellationToken;
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_os::capped_alloc::{self, CAP_EXCEEDED_EXIT_CODE};
-use legion_os::run::{RunOptions, run};
+use legion_os::mem_limit::process_rss_bytes;
+use legion_os::run::{RunOptions, RunOutput, run};
 use legion_os::shell::CommandSpec;
 use serde_json::json;
 
@@ -39,7 +41,10 @@ use super::thumb_cache::CachedThumb;
 
 /// Hidden subcommand flag handled before Tokio starts in `legion-cli`.
 pub const THUMB_WORKER_MODE: &str = "__thumb-worker";
+const PROBE_BASELINE_ARG: &str = "--probe-baseline";
 
+const BASELINE_MAGIC: &[u8; 4] = b"LGTB";
+const BASELINE_FRAME_LEN: usize = 12;
 const WORKER_MAGIC: &[u8; 4] = b"LGTW";
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
@@ -54,13 +59,177 @@ const WORKER_MIN_SIZE: u32 = 96;
 const WORKER_MAX_SIZE: u32 = 512;
 const WORKER_HARD_MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const WORKER_HARD_MAX_HEAP_CAP_BYTES: u64 = 512 * 1024 * 1024;
-/// Generous virtual-address-space backstop added above the worker's RSS limit on Linux/Windows.
-/// Exact heap enforcement is performed by `CappedAlloc` and the 10 ms RSS watchdog; `RLIMIT_AS`
-/// stays purely as a backstop so allocator arenas or library mappings never cause false kills.
+/// Minimum backstop margin above `baseline + heap_cap` for allocator bookkeeping, page-size
+/// granularity (4 KiB x86 / 16 KiB Apple Silicon), Windows working-set DLL/heap accounting,
+/// thread stacks, and stdin read buffers (6 MiB floor, or 10% of `heap_cap`, whichever is larger).
+const BACKSTOP_MARGIN_FLOOR_BYTES: u64 = 6 * 1024 * 1024;
+const MIN_MEASURED_BASELINE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_MEASURED_BASELINE_BYTES: u64 = 64 * 1024 * 1024;
+/// Minimum heap cap allowed for any admitted image worker (16 MiB).
+pub(crate) const MIN_IMAGE_HEAP_CAP_BYTES: u64 = 16 * 1024 * 1024;
+/// Upper bound for any single image worker's heap cap after applying the safety factor and floor
+/// to an admitted image (`estimated_peak_bytes <= 256 MiB`), still strictly bounded by the shared
+/// in-flight pool budget.
+pub(crate) const MAX_WORKER_HEAP_CAP_BYTES: u64 = 384 * 1024 * 1024;
+/// Safety factor (`1.35x`) and additive floor (`+8 MiB`) applied to `estimated_peak_bytes` when
+/// sizing `CappedAlloc`'s exact live-heap cap. Chosen from worker-bisected peaks across the full
+/// honest corpus so every honest image peaks at `<= ~70%` of its cap (<= ~75% target) while lying
+/// headers still exceed their cap by 4x–45x.
+pub(crate) const HEAP_CAP_SAFETY_NUM: u64 = 135;
+pub(crate) const HEAP_CAP_SAFETY_DEN: u64 = 100;
+pub(crate) const HEAP_CAP_FLOOR_ADD_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Converts a header-predicted `estimated_peak_bytes` into a worker `CappedAlloc` live-heap cap:
+/// `clamp(estimate * 1.35 + 8 MiB, 16 MiB, 384 MiB)`.
+pub(crate) fn heap_cap_from_estimate(estimated_peak_bytes: u64) -> u64 {
+    estimated_peak_bytes
+        .saturating_mul(HEAP_CAP_SAFETY_NUM)
+        .div_ceil(HEAP_CAP_SAFETY_DEN)
+        .saturating_add(HEAP_CAP_FLOOR_ADD_BYTES)
+        .clamp(MIN_IMAGE_HEAP_CAP_BYTES, MAX_WORKER_HEAP_CAP_BYTES)
+}
+/// Generous virtual-address-space / commit backstop added above the worker's watchdog RSS limit on
+/// Linux (`RLIMIT_AS`), other non-macOS Unix (`RLIMIT_DATA`), and Windows (Job Object).
+/// Exact heap enforcement is performed by `CappedAlloc`; the watchdog and OS limit stay purely as
+/// backstops and must never fire for a worker whose live Rust heap stayed within `heap_cap`.
 const WORKER_RLIMIT_AS_HEADROOM: u64 = 256 * 1024 * 1024;
 
 static WORKER_ENABLED: AtomicBool = AtomicBool::new(false);
 static TEST_DECODE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
+static TEST_FORCE_TIMEOUT_CPU_BUSY: AtomicU8 = AtomicU8::new(0);
+static BASELINE_INIT: OnceLock<u64> = OnceLock::new();
+static OBSERVED_BASELINE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Returns a per-platform fallback startup RSS estimate used only when out-of-process worker
+/// probing is unavailable (for example, in unit tests without a worker binary).
+const fn fallback_worker_baseline_bytes() -> u64 {
+    #[cfg(all(target_os = "linux", not(debug_assertions)))]
+    {
+        4 * 1024 * 1024
+    }
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    {
+        12 * 1024 * 1024
+    }
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    {
+        8 * 1024 * 1024
+    }
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    {
+        16 * 1024 * 1024
+    }
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        12 * 1024 * 1024
+    }
+    #[cfg(all(windows, debug_assertions))]
+    {
+        18 * 1024 * 1024
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        12 * 1024 * 1024
+    }
+}
+
+/// Returns the backstop margin added above `baseline + heap_cap` for the RSS watchdog and OS
+/// backstops: `max(6 MiB, 10% of heap_cap)`.
+pub(crate) const fn backstop_margin_bytes(heap_cap_bytes: u64) -> u64 {
+    let pct = heap_cap_bytes / 10;
+    if pct > BACKSTOP_MARGIN_FLOOR_BYTES {
+        pct
+    } else {
+        BACKSTOP_MARGIN_FLOOR_BYTES
+    }
+}
+
+/// Probes the current binary's actual `__thumb-worker` startup resident memory (after process
+/// startup and before decoding) once per process, falling back to [`fallback_worker_baseline_bytes`]
+/// if out-of-process workers are disabled or the probe fails.
+pub(crate) fn worker_baseline_rss_bytes() -> u64 {
+    let initial = *BASELINE_INIT.get_or_init(|| {
+        let probed = if worker_enabled() {
+            probe_worker_baseline_once()
+        } else {
+            None
+        };
+        let baseline = probed
+            .map(|b| b.clamp(MIN_MEASURED_BASELINE_BYTES, MAX_MEASURED_BASELINE_BYTES))
+            .unwrap_or_else(fallback_worker_baseline_bytes);
+        OBSERVED_BASELINE_BYTES.fetch_max(baseline, Ordering::Relaxed);
+        baseline
+    });
+    OBSERVED_BASELINE_BYTES.load(Ordering::Relaxed).max(initial)
+}
+
+/// Test-only accessor returning the measured `__thumb-worker` startup baseline RSS in bytes.
+#[doc(hidden)]
+pub fn measured_worker_baseline_bytes_for_test() -> u64 {
+    worker_baseline_rss_bytes()
+}
+
+fn probe_worker_baseline_once() -> Option<u64> {
+    let exe = legion_core::current_exe()
+        .or_else(|_| std::env::current_exe())
+        .ok()?;
+    let mut cmd = Command::new(exe);
+    cmd.args([THUMB_WORKER_MODE, PROBE_BASELINE_ARG])
+        .env_clear()
+        .envs(minimal_system_env())
+        .env("MALLOC_ARENA_MAX", "2")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let (baseline, _) = split_baseline_preamble(&out.stdout);
+    baseline.filter(|&b| b > 0)
+}
+
+/// Computes `(heap_cap_bytes, watchdog_limit_bytes, baseline_rss_bytes)` for an admitted image
+/// worker so that:
+/// - `watchdog_limit_bytes == baseline_rss_bytes + heap_cap_bytes + backstop_margin_bytes(heap_cap_bytes)`
+/// - `watchdog_limit_bytes <= budget_bytes` (so reserving `watchdog_limit_bytes` guarantees
+///   `sum(live worker limits) <= budget_bytes` strictly).
+pub(crate) fn compute_worker_limits(
+    requested_heap_cap_bytes: u64,
+    budget_bytes: u64,
+    baseline_rss_bytes: u64,
+) -> (u64, u64, u64) {
+    let available = budget_bytes.saturating_sub(baseline_rss_bytes);
+    let max_cap_for_budget = if available <= BACKSTOP_MARGIN_FLOOR_BYTES {
+        MIN_IMAGE_HEAP_CAP_BYTES
+    } else {
+        // Solve `cap + max(6 MiB, cap / 10) <= available` without exceeding `MAX_WORKER_HEAP_CAP_BYTES`.
+        let by_pct = available.saturating_mul(10) / 11;
+        let by_floor = available.saturating_sub(BACKSTOP_MARGIN_FLOOR_BYTES);
+        by_pct
+            .min(by_floor)
+            .clamp(MIN_IMAGE_HEAP_CAP_BYTES, MAX_WORKER_HEAP_CAP_BYTES)
+    };
+    let heap_cap = requested_heap_cap_bytes.clamp(MIN_IMAGE_HEAP_CAP_BYTES, max_cap_for_budget);
+    let watchdog_limit = baseline_rss_bytes
+        .saturating_add(heap_cap)
+        .saturating_add(backstop_margin_bytes(heap_cap))
+        .min(budget_bytes);
+    (heap_cap, watchdog_limit, baseline_rss_bytes)
+}
+
+fn platform_label() -> String {
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    format!(
+        "{}-{}-{profile}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
 
 /// Enables out-of-process `__thumb-worker` decoding for this process.
 ///
@@ -84,6 +253,18 @@ pub fn set_thumb_decode_timeout_for_test(timeout: Option<Duration>) {
     TEST_DECODE_TIMEOUT_MS.store(ms, Ordering::Release);
 }
 
+/// Test-only override for the timeout `cpu_busy` classification (`None` restores the real OS CPU
+/// time check, `Some(true)` forces CPU-busy, `Some(false)` forces not CPU-busy).
+#[doc(hidden)]
+pub fn set_thumb_timeout_cpu_busy_for_test(forced: Option<bool>) {
+    let val = match forced {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    TEST_FORCE_TIMEOUT_CPU_BUSY.store(val, Ordering::Release);
+}
+
 pub(crate) fn effective_decode_timeout(default: Duration) -> Duration {
     match TEST_DECODE_TIMEOUT_MS.load(Ordering::Acquire) {
         0 => default,
@@ -97,9 +278,8 @@ pub(crate) enum WorkerOutcome {
     Ok(CachedThumb),
     /// The worker returned a structured error frame (corrupt file, header-probed `too_large`, etc.).
     Rejected(ErrorBody),
-    /// This node's own memory limit decided the failure (`CappedAlloc` exit 107, RSS watchdog
-    /// measured `rss > limit`, or explicit allocator OOM under our limit). Safe to cache as a
-    /// temporary expiring bad-file record.
+    /// `CappedAlloc` stopped the worker (`CAP_EXCEEDED_EXIT_CODE == 107`) because decoding exceeded
+    /// its exact live-heap cap. Eligible for an expiring per-`(file, size, fit)` bad-file record.
     MemoryLimitExceeded {
         error: ErrorBody,
         #[allow(dead_code)]
@@ -227,6 +407,12 @@ fn parse_worker_args(args: &[OsString]) -> Result<WorkerArgs, ErrorBody> {
 }
 
 fn run_worker_main(args: &[OsString]) -> ExitCode {
+    if args.first().is_some_and(|a| a == PROBE_BASELINE_ARG) {
+        let baseline = process_rss_bytes(std::process::id()).unwrap_or(0);
+        let _ = write_baseline_frame(baseline);
+        return ExitCode::SUCCESS;
+    }
+
     let parsed = match parse_worker_args(args) {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -242,6 +428,12 @@ fn run_worker_main(args: &[OsString]) -> ExitCode {
         heap_cap_usize,
         display_label,
     } = parsed;
+
+    // Sample this worker's own startup resident size after initialization and before decoding, and
+    // emit it as a 12-byte preamble frame (`LGTB` + u64) so the parent can track and log the real
+    // per-platform/per-build baseline.
+    let startup_rss = process_rss_bytes(std::process::id()).unwrap_or(0);
+    let _ = write_baseline_frame(startup_rss);
 
     // Arm the exact process-wide live-heap allocator cap BEFORE touching stdin or allocating
     // buffers for untrusted input.
@@ -314,6 +506,24 @@ fn run_worker_main(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn write_baseline_frame(baseline_rss_bytes: u64) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    out.write_all(BASELINE_MAGIC)?;
+    out.write_all(&baseline_rss_bytes.to_le_bytes())?;
+    out.flush()
+}
+
+fn split_baseline_preamble(raw: &[u8]) -> (Option<u64>, &[u8]) {
+    if raw.len() >= BASELINE_FRAME_LEN && &raw[..4] == BASELINE_MAGIC {
+        let baseline = u64::from_le_bytes([
+            raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11],
+        ]);
+        (Some(baseline), &raw[BASELINE_FRAME_LEN..])
+    } else {
+        (None, raw)
+    }
+}
+
 fn write_ok_frame(thumb: &CachedThumb) -> io::Result<()> {
     let mime_tag = match thumb.mime {
         "image/jpeg" => MIME_JPEG_TAG,
@@ -351,49 +561,50 @@ fn write_err_frame(err: &ErrorBody) -> io::Result<()> {
 }
 
 fn parse_worker_frame(raw: &[u8]) -> Option<Result<CachedThumb, ErrorBody>> {
-    if raw.len() < 5 || &raw[..4] != WORKER_MAGIC {
+    let (_, body) = split_baseline_preamble(raw);
+    if body.len() < 5 || &body[..4] != WORKER_MAGIC {
         return None;
     }
-    match raw[4] {
+    match body[4] {
         STATUS_OK => {
-            if raw.len() < 18 {
+            if body.len() < 18 {
                 return None;
             }
-            let mime = match raw[5] {
+            let mime = match body[5] {
                 MIME_JPEG_TAG => "image/jpeg",
                 MIME_PNG_TAG => "image/png",
                 _ => return None,
             };
-            let width = u32::from_le_bytes(raw[6..10].try_into().ok()?);
-            let height = u32::from_le_bytes(raw[10..14].try_into().ok()?);
-            let len = u32::from_le_bytes(raw[14..18].try_into().ok()?) as usize;
+            let width = u32::from_le_bytes(body[6..10].try_into().ok()?);
+            let height = u32::from_le_bytes(body[10..14].try_into().ok()?);
+            let len = u32::from_le_bytes(body[14..18].try_into().ok()?) as usize;
             if width == 0 || height == 0 || len == 0 || len > MAX_WORKER_STDOUT_BYTES {
                 return None;
             }
             let end = 18usize.checked_add(len)?;
-            if raw.len() != end {
+            if body.len() != end {
                 return None;
             }
             Some(Ok(CachedThumb {
                 mime,
                 width,
                 height,
-                bytes: raw[18..end].to_vec(),
+                bytes: body[18..end].to_vec(),
             }))
         }
         STATUS_ERR => {
-            if raw.len() < 9 {
+            if body.len() < 9 {
                 return None;
             }
-            let len = u32::from_le_bytes(raw[5..9].try_into().ok()?) as usize;
+            let len = u32::from_le_bytes(body[5..9].try_into().ok()?) as usize;
             if len == 0 || len > MAX_WORKER_ERR_BYTES {
                 return None;
             }
             let end = 9usize.checked_add(len)?;
-            if raw.len() != end {
+            if body.len() != end {
                 return None;
             }
-            let err: ErrorBody = serde_json::from_slice(&raw[9..end]).ok()?;
+            let err: ErrorBody = serde_json::from_slice(&body[9..end]).ok()?;
             Some(Err(err))
         }
         _ => None,
@@ -420,8 +631,8 @@ pub(crate) fn minimal_system_env() -> Vec<(OsString, OsString)> {
 }
 
 /// Runs the out-of-process `__thumb-worker` on the already-opened `file`, enforcing an exact
-/// `heap_cap_bytes` via [`capped_alloc`] plus `rss_limit_bytes` via the RSS watchdog and OS
-/// backstops, and `timeout` via hard termination.
+/// `heap_cap_bytes` via [`capped_alloc`] plus `rss_limit_bytes` (`baseline + heap_cap + margin`)
+/// via the RSS watchdog and OS backstops, and `timeout` via hard termination.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_thumb_worker(
     display_path: &Path,
@@ -432,6 +643,7 @@ pub(crate) async fn run_thumb_worker(
     max_source_bytes: u64,
     heap_cap_bytes: u64,
     rss_limit_bytes: u64,
+    baseline_rss_bytes: u64,
     timeout: Duration,
     cancel: CancellationToken,
 ) -> Result<WorkerOutcome, ErrorBody> {
@@ -483,13 +695,43 @@ pub(crate) async fn run_thumb_worker(
         )
     })?;
 
+    classify_worker_output(
+        display_path,
+        &output,
+        heap_cap_bytes,
+        rss_limit_bytes,
+        baseline_rss_bytes,
+        timeout,
+    )
+}
+
+fn classify_worker_output(
+    display_path: &Path,
+    output: &RunOutput,
+    heap_cap_bytes: u64,
+    rss_limit_bytes: u64,
+    baseline_rss_bytes: u64,
+    timeout: Duration,
+) -> Result<WorkerOutcome, ErrorBody> {
     if output.cancelled {
         return Err(cancelled_error("fs.thumb"));
     }
+
+    let (worker_baseline_rss, _) = split_baseline_preamble(&output.stdout_bytes);
+    if let Some(observed) = worker_baseline_rss
+        && (MIN_MEASURED_BASELINE_BYTES..=MAX_MEASURED_BASELINE_BYTES).contains(&observed)
+    {
+        OBSERVED_BASELINE_BYTES.fetch_max(observed, Ordering::Relaxed);
+    }
+
     if output.timed_out {
-        let cpu_busy = output
-            .cpu_time
-            .is_some_and(|cpu| cpu.mul_f32(2.0) >= timeout);
+        let cpu_busy = match TEST_FORCE_TIMEOUT_CPU_BUSY.load(Ordering::Acquire) {
+            1 => false,
+            2 => true,
+            _ => output
+                .cpu_time
+                .is_some_and(|cpu| cpu.mul_f32(2.0) >= timeout),
+        };
         let err = ErrorBody::new(
             ErrorCode::Timeout,
             format!(
@@ -505,39 +747,73 @@ pub(crate) async fn run_thumb_worker(
         });
     }
 
-    // Only classify as a memory-limit rejection (eligible for negative bad-file caching) when our
-    // own limit decided it: `CappedAlloc` exit code 107, our RSS watchdog observing `rss > limit`,
-    // or an explicit allocator OOM under our OS limit.
-    let cap_exceeded = output.exit_code == Some(CAP_EXCEEDED_EXIT_CODE);
-    if cap_exceeded || output.killed_for_memory {
-        let limit_mib = rss_limit_bytes / (1024 * 1024);
-        let enforced_by = if cap_exceeded {
-            "allocator_cap"
-        } else if output.memory_watchdog_killed {
-            "rss_watchdog"
-        } else {
-            "os_limit"
-        };
+    let platform = platform_label();
+
+    // `CappedAlloc` (`CAP_EXCEEDED_EXIT_CODE == 107`) is the exact deciding limit for image
+    // workers: only when the allocator itself stopped the worker for exceeding `heap_cap_bytes` is
+    // the file definitely at fault and eligible for expiring bad-file caching.
+    if output.exit_code == Some(CAP_EXCEEDED_EXIT_CODE) {
+        let cap_mib = heap_cap_bytes / (1024 * 1024);
         let err = ErrorBody::new(
             ErrorCode::Failed,
             format!(
-                "Decoding {} exceeded the {limit_mib} MiB thumbnail worker memory limit and was stopped.",
+                "Decoding {} needed more memory than the {cap_mib} MiB thumbnail limit and was stopped.",
                 display_path.display()
             ),
         )
-        .with_hint("The image requires more memory to decode than its header indicated; open or download the original file instead.")
+        .with_hint("This image needed more memory than Legion allows for a thumbnail; open or download the original file instead.")
         .with_details(json!({
             "reason": "too_large",
             "killed_for_memory": true,
-            "enforced_by": enforced_by,
-            "limit_bytes": rss_limit_bytes,
+            "enforced_by": "allocator_cap",
+            "platform": platform,
+            "baseline_rss_bytes": baseline_rss_bytes,
+            "worker_baseline_rss_bytes": worker_baseline_rss,
             "heap_cap_bytes": heap_cap_bytes,
+            "limit_bytes": rss_limit_bytes,
             "peak_rss_bytes": output.peak_rss_bytes,
         }));
         return Ok(WorkerOutcome::MemoryLimitExceeded {
             error: err,
             peak_rss_bytes: output.peak_rss_bytes,
         });
+    }
+
+    // A backstop kill (RSS watchdog or OS limit) while `CappedAlloc` stayed under `heap_cap_bytes`
+    // is NOT the file's fault: return a transient error, NEVER record the file as bad in cache,
+    // and emit full diagnostics (baseline, cap, limit, peak, platform).
+    if output.killed_for_memory {
+        let enforced_by = if output.memory_watchdog_killed {
+            "rss_watchdog"
+        } else {
+            "os_limit"
+        };
+        let _ = writeln!(
+            io::stderr(),
+            "legion: fs.thumb backstop ({enforced_by}) stopped worker under heap cap for {}: platform={platform} baseline={baseline_rss_bytes}B worker_baseline={worker_baseline_rss:?}B cap={heap_cap_bytes}B limit={rss_limit_bytes}B peak={}B",
+            display_path.display(),
+            output.peak_rss_bytes,
+        );
+        let err = ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Thumbnail worker for {} hit the {enforced_by} backstop while within its heap cap.",
+                display_path.display()
+            ),
+        )
+        .with_hint("This was not caused by the image exceeding its heap cap; the file was not marked bad. Retry fs.thumb.")
+        .with_details(json!({
+            "reason": "backstop_limit",
+            "transient": true,
+            "enforced_by": enforced_by,
+            "platform": platform,
+            "baseline_rss_bytes": baseline_rss_bytes,
+            "worker_baseline_rss_bytes": worker_baseline_rss,
+            "heap_cap_bytes": heap_cap_bytes,
+            "limit_bytes": rss_limit_bytes,
+            "peak_rss_bytes": output.peak_rss_bytes,
+        }));
+        return Ok(WorkerOutcome::TransientFailure(err));
     }
 
     if let Some(parsed) = parse_worker_frame(&output.stdout_bytes) {
@@ -644,5 +920,108 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(err3.code, ErrorCode::InvalidArgs);
+    }
+
+    #[test]
+    fn worker_limits_respect_measured_baseline_margin_and_budget() {
+        let budget_512 = 512 * 1024 * 1024;
+        // Linux release baseline (~4 MiB) + 43.3 MiB 12 MP heap cap + 6 MiB floor = 53.3 MiB -> 9 fit
+        let (cap, limit, base) =
+            compute_worker_limits(44 * 1024 * 1024, budget_512, 4 * 1024 * 1024);
+        assert_eq!(base, 4 * 1024 * 1024);
+        assert_eq!(cap, 44 * 1024 * 1024);
+        assert_eq!(limit, 54 * 1024 * 1024);
+        assert_eq!(budget_512 / limit, 9);
+
+        // Windows debug baseline (~14 MiB) + 132 MiB padded file cap + 13.2 MiB 10% margin = 159.2 MiB
+        let (cap_w, limit_w, _) =
+            compute_worker_limits(132 * 1024 * 1024, budget_512, 14 * 1024 * 1024);
+        assert_eq!(cap_w, 132 * 1024 * 1024);
+        assert_eq!(
+            limit_w,
+            14 * 1024 * 1024 + 132 * 1024 * 1024 + (132 * 1024 * 1024) / 10
+        );
+        assert!(limit_w <= budget_512);
+
+        // Small 256 MiB container budget: watchdog limit never exceeds budget
+        let budget_256 = 256 * 1024 * 1024;
+        let (cap_s, limit_s, _) =
+            compute_worker_limits(256 * 1024 * 1024, budget_256, 12 * 1024 * 1024);
+        assert!(limit_s <= budget_256);
+        assert_eq!(
+            limit_s,
+            12 * 1024 * 1024 + cap_s + backstop_margin_bytes(cap_s)
+        );
+    }
+
+    #[test]
+    fn backstop_kill_under_heap_cap_is_transient_while_allocator_cap_is_memory_exceeded() {
+        use legion_os::run::CapturedOutput;
+
+        let mut base_out = RunOutput {
+            exit_code: None,
+            signal: Some(9),
+            stdout: CapturedOutput::default(),
+            stdout_bytes: {
+                let mut b = Vec::new();
+                b.extend_from_slice(BASELINE_MAGIC);
+                b.extend_from_slice(&(11 * 1024 * 1024u64).to_le_bytes());
+                b
+            },
+            stderr: CapturedOutput::default(),
+            timed_out: false,
+            cancelled: false,
+            killed_for_memory: true,
+            memory_watchdog_killed: true,
+            peak_rss_bytes: 150 * 1024 * 1024,
+            cpu_time: None,
+            duration: Duration::from_millis(25),
+        };
+
+        // 1. Watchdog kill while allocator did NOT exit 107 -> TransientFailure (NOT cached bad!)
+        let outcome = classify_worker_output(
+            Path::new("/honest.jpg"),
+            &base_out,
+            132 * 1024 * 1024,
+            149 * 1024 * 1024,
+            10 * 1024 * 1024,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        match outcome {
+            WorkerOutcome::TransientFailure(err) => {
+                let d = err.details.expect("backstop diagnostics");
+                assert_eq!(d["transient"], json!(true));
+                assert_eq!(d["enforced_by"], json!("rss_watchdog"));
+                assert_eq!(d["baseline_rss_bytes"], json!(10 * 1024 * 1024u64));
+                assert_eq!(d["worker_baseline_rss_bytes"], json!(11 * 1024 * 1024u64));
+                assert_eq!(d["heap_cap_bytes"], json!(132 * 1024 * 1024u64));
+                assert_eq!(d["peak_rss_bytes"], json!(150 * 1024 * 1024u64));
+                assert!(d["platform"].is_string());
+            }
+            other => panic!("backstop kill under heap cap must be TransientFailure, got {other:?}"),
+        }
+
+        // 2. Allocator cap exit 107 -> MemoryLimitExceeded (eligible for bad-file cache)
+        base_out.exit_code = Some(CAP_EXCEEDED_EXIT_CODE);
+        base_out.signal = None;
+        base_out.memory_watchdog_killed = false;
+        let outcome2 = classify_worker_output(
+            Path::new("/liar.jpg"),
+            &base_out,
+            12 * 1024 * 1024,
+            28 * 1024 * 1024,
+            10 * 1024 * 1024,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        match outcome2 {
+            WorkerOutcome::MemoryLimitExceeded { error, .. } => {
+                let d = error.details.expect("allocator cap details");
+                assert_eq!(d["killed_for_memory"], json!(true));
+                assert_eq!(d["enforced_by"], json!("allocator_cap"));
+            }
+            other => panic!("allocator cap exit 107 must be MemoryLimitExceeded, got {other:?}"),
+        }
     }
 }

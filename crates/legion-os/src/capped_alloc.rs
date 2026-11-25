@@ -66,7 +66,8 @@ pub fn peak_bytes() -> usize {
     PEAK_BYTES.load(Ordering::Relaxed)
 }
 
-#[inline]
+#[cold]
+#[inline(never)]
 fn exit_cap_exceeded() -> ! {
     #[cfg(unix)]
     unsafe {
@@ -74,7 +75,13 @@ fn exit_cap_exceeded() -> ! {
     }
     #[cfg(windows)]
     unsafe {
-        windows::Win32::System::Threading::ExitProcess(CAP_EXCEEDED_EXIT_CODE as u32);
+        // Use `TerminateProcess(GetCurrentProcess(), ...)` rather than `ExitProcess` so no
+        // thread-local destructors or `DllMain` hooks run on a thread that is mid-allocation.
+        let _ = windows::Win32::System::Threading::TerminateProcess(
+            windows::Win32::System::Threading::GetCurrentProcess(),
+            CAP_EXCEEDED_EXIT_CODE as u32,
+        );
+        std::process::abort();
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -116,78 +123,108 @@ fn release(sub: usize) {
     }
 }
 
+#[cold]
+#[inline(never)]
+unsafe fn alloc_capped(layout: Layout, limit: usize) -> *mut u8 {
+    let size = layout.size();
+    if !try_reserve(size, limit) {
+        exit_cap_exceeded();
+    }
+    let ptr = unsafe { System.alloc(layout) };
+    if ptr.is_null() {
+        release(size);
+        exit_cap_exceeded();
+    }
+    ptr
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn alloc_zeroed_capped(layout: Layout, limit: usize) -> *mut u8 {
+    let size = layout.size();
+    if !try_reserve(size, limit) {
+        exit_cap_exceeded();
+    }
+    let ptr = unsafe { System.alloc_zeroed(layout) };
+    if ptr.is_null() {
+        release(size);
+        exit_cap_exceeded();
+    }
+    ptr
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn dealloc_capped(ptr: *mut u8, layout: Layout) {
+    release(layout.size());
+    unsafe { System.dealloc(ptr, layout) };
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn realloc_capped(ptr: *mut u8, layout: Layout, new_size: usize, limit: usize) -> *mut u8 {
+    let old_size = layout.size();
+    if new_size > old_size {
+        let delta = new_size - old_size;
+        if !try_reserve(delta, limit) {
+            exit_cap_exceeded();
+        }
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        if new_ptr.is_null() {
+            release(delta);
+            exit_cap_exceeded();
+        }
+        new_ptr
+    } else {
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        if new_ptr.is_null() {
+            exit_cap_exceeded();
+        }
+        release(old_size - new_size);
+        new_ptr
+    }
+}
+
 // SAFETY: Delegates all raw memory operations directly to `std::alloc::System`, preserving its
 // alignment, layout, and null/error contracts, and only tracks live sizes via lock-free atomics.
+// Only the single-load unarmed fast path is inlined so LTO does not bloat every allocation site.
 unsafe impl GlobalAlloc for CappedAlloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let limit = LIMIT_BYTES.load(Ordering::Relaxed);
         if limit == 0 {
-            return unsafe { System.alloc(layout) };
+            unsafe { System.alloc(layout) }
+        } else {
+            unsafe { alloc_capped(layout, limit) }
         }
-        let size = layout.size();
-        if !try_reserve(size, limit) {
-            exit_cap_exceeded();
-        }
-        let ptr = unsafe { System.alloc(layout) };
-        if ptr.is_null() {
-            release(size);
-            exit_cap_exceeded();
-        }
-        ptr
     }
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let limit = LIMIT_BYTES.load(Ordering::Relaxed);
         if limit == 0 {
-            return unsafe { System.alloc_zeroed(layout) };
+            unsafe { System.alloc_zeroed(layout) }
+        } else {
+            unsafe { alloc_zeroed_capped(layout, limit) }
         }
-        let size = layout.size();
-        if !try_reserve(size, limit) {
-            exit_cap_exceeded();
-        }
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        if ptr.is_null() {
-            release(size);
-            exit_cap_exceeded();
-        }
-        ptr
     }
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if LIMIT_BYTES.load(Ordering::Relaxed) != 0 {
-            release(layout.size());
+        if LIMIT_BYTES.load(Ordering::Relaxed) == 0 {
+            unsafe { System.dealloc(ptr, layout) };
+        } else {
+            unsafe { dealloc_capped(ptr, layout) };
         }
-        unsafe { System.dealloc(ptr, layout) };
     }
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let limit = LIMIT_BYTES.load(Ordering::Relaxed);
         if limit == 0 {
-            return unsafe { System.realloc(ptr, layout, new_size) };
-        }
-        let old_size = layout.size();
-        if new_size > old_size {
-            let delta = new_size - old_size;
-            if !try_reserve(delta, limit) {
-                exit_cap_exceeded();
-            }
-            let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-            if new_ptr.is_null() {
-                release(delta);
-                exit_cap_exceeded();
-            }
-            new_ptr
+            unsafe { System.realloc(ptr, layout, new_size) }
         } else {
-            let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-            if new_ptr.is_null() {
-                exit_cap_exceeded();
-            }
-            release(old_size - new_size);
-            new_ptr
+            unsafe { realloc_capped(ptr, layout, new_size, limit) }
         }
     }
 }

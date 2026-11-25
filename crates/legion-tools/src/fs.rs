@@ -17,8 +17,8 @@ mod thumb_worker;
 mod write;
 
 pub use thumb_worker::{
-    THUMB_WORKER_MODE, enable_thumb_worker_self, set_thumb_decode_timeout_for_test,
-    try_thumb_worker_cli,
+    THUMB_WORKER_MODE, enable_thumb_worker_self, measured_worker_baseline_bytes_for_test,
+    set_thumb_decode_timeout_for_test, set_thumb_timeout_cpu_busy_for_test, try_thumb_worker_cli,
 };
 
 use std::cmp::Ordering;
