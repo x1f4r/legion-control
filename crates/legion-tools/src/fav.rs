@@ -378,7 +378,7 @@ pub fn merge_favorites(a: &FavoritesFile, b: &FavoritesFile) -> FavoritesFile {
         };
         match merged {
             Incarnation::Live(rec) => {
-                out.entries.insert(id.to_owned(), rec);
+                out.entries.insert(id.to_owned(), *rec);
             }
             Incarnation::Removed(tomb) => {
                 out.removed.insert(id.to_owned(), tomb);
@@ -391,13 +391,13 @@ pub fn merge_favorites(a: &FavoritesFile, b: &FavoritesFile) -> FavoritesFile {
 
 #[derive(Clone, Debug)]
 enum Incarnation {
-    Live(FavoriteRecord),
+    Live(Box<FavoriteRecord>),
     Removed(FavoriteTombstone),
 }
 
 fn incarnation_state(file: &FavoritesFile, id: &str) -> Option<Incarnation> {
     if let Some(rec) = file.entries.get(id) {
-        Some(Incarnation::Live(rec.clone()))
+        Some(Incarnation::Live(Box::new(rec.clone())))
     } else {
         file.removed.get(id).cloned().map(Incarnation::Removed)
     }
@@ -416,7 +416,7 @@ fn merge_incarnation(a: Incarnation, b: Incarnation) -> Incarnation {
         std::cmp::Ordering::Less => b,
         std::cmp::Ordering::Equal => match (a, b) {
             (Incarnation::Live(ra), Incarnation::Live(rb)) => {
-                Incarnation::Live(merge_record_fields(&ra, &rb))
+                Incarnation::Live(Box::new(merge_record_fields(&ra, &rb)))
             }
             (Incarnation::Removed(ta), Incarnation::Removed(_)) => Incarnation::Removed(ta),
             // Impossible because `is_removed` is part of the total key.

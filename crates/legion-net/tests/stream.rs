@@ -1403,26 +1403,27 @@ paths = ["~/projects"]
         )
     });
     let mut gathered = Vec::new();
-    let read_next_json = |buf: &mut Vec<u8>, rx: &mpsc::Receiver<Vec<u8>>, skip_lines: usize| -> Value {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while buf.iter().filter(|&&b| b == b'\n').count() <= skip_lines {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for stream reply line {}: {:?}",
-                skip_lines + 1,
-                String::from_utf8_lossy(buf)
-            );
-            if let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(25)) {
-                buf.extend_from_slice(&chunk);
+    let read_next_json =
+        |buf: &mut Vec<u8>, rx: &mpsc::Receiver<Vec<u8>>, skip_lines: usize| -> Value {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while buf.iter().filter(|&&b| b == b'\n').count() <= skip_lines {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for stream reply line {}: {:?}",
+                    skip_lines + 1,
+                    String::from_utf8_lossy(buf)
+                );
+                if let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                    buf.extend_from_slice(&chunk);
+                }
             }
-        }
-        let line = String::from_utf8_lossy(buf)
-            .lines()
-            .nth(skip_lines)
-            .unwrap()
-            .to_owned();
-        serde_json::from_str(&line).unwrap()
-    };
+            let line = String::from_utf8_lossy(buf)
+                .lines()
+                .nth(skip_lines)
+                .unwrap()
+                .to_owned();
+            serde_json::from_str(&line).unwrap()
+        };
     let ready = read_next_json(&mut gathered, &out_rx, 1);
     assert_eq!(ready["locked"], true, "{ready}");
     let lock_id = ready["lock_id"].as_str().unwrap().to_owned();

@@ -302,7 +302,9 @@ fn format_claim_identity(id: &FileClaimIdentity) -> String {
     )
 }
 
-fn parse_claim_identity<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<FileClaimIdentity> {
+fn parse_claim_identity<'a>(
+    parts: &mut impl Iterator<Item = &'a str>,
+) -> Option<FileClaimIdentity> {
     let dev: u64 = parts.next()?.parse().ok()?;
     let ino: u64 = parts.next()?.parse().ok()?;
     let ctime_secs: i64 = parts.next()?.parse().ok()?;
@@ -961,9 +963,8 @@ pub fn sweep_abandoned_temps(state_dir: &Path, probe_max_age: Duration) -> usize
                         let name_ok = file_name.is_some_and(platform::is_sweepable_temp_name);
                         let is_probe =
                             file_name.is_some_and(|n| n.starts_with(".legion-move-probe-"));
-                        let meta_ok = fs::symlink_metadata(temp_path).is_ok_and(|m| {
-                            m.file_type().is_file() && (!is_probe || m.len() == 0)
-                        });
+                        let meta_ok = fs::symlink_metadata(temp_path)
+                            .is_ok_and(|m| m.file_type().is_file() && (!is_probe || m.len() == 0));
                         let id_matches =
                             platform::symlink_claim_identity(temp_path).is_ok_and(|id| {
                                 id.nlink == 1

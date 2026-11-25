@@ -1208,7 +1208,7 @@ impl HeldMoveLocks {
         self.lost.load(Ordering::SeqCst)
     }
 
-    fn from_lock_id(&self) -> Option<&str> {
+    fn source_lock_id(&self) -> Option<&str> {
         (!self.from_lock_id.is_empty()).then_some(self.from_lock_id.as_str())
     }
 
@@ -1462,7 +1462,10 @@ impl Transfer<'_> {
     /// entire duration of `probe_read`, then closes the stream (which deletes the marker).
     async fn confirm_held_probe(mut probe_conn: Conn) -> bool {
         let confirmed = if probe_conn.write(b"confirm\n").await.is_ok() {
-            matches!(probe_conn.first::<ProbeConfirm>().await, Ok(ProbeConfirm { held: true }))
+            matches!(
+                probe_conn.first::<ProbeConfirm>().await,
+                Ok(ProbeConfirm { held: true })
+            )
         } else {
             false
         };
@@ -1659,7 +1662,8 @@ impl Transfer<'_> {
                     }
                     return Ok(false);
                 }
-                if let Some(reason) = Self::non_local_reason(from_dir, &from.machine, &from_locality)
+                if let Some(reason) =
+                    Self::non_local_reason(from_dir, &from.machine, &from_locality)
                 {
                     if to_exists {
                         cache.insert(
@@ -1992,14 +1996,16 @@ impl Transfer<'_> {
                         from,
                         Some(expected_hash),
                         forbid,
-                        locks.from_lock_id(),
+                        locks.source_lock_id(),
                         skipped,
                     )
                     .await
                 }
                 Ok(false) => Ok(0),
                 Err(reason) => Err(ErrorBody::new(ErrorCode::Conflict, reason)
-                    .with_hint("Run the transfer again once no other move is modifying these paths.")
+                    .with_hint(
+                        "Run the transfer again once no other move is modifying these paths.",
+                    )
                     .with_machine(from.machine.clone())),
             }
         };
@@ -2063,7 +2069,7 @@ impl Transfer<'_> {
                     &to_delete,
                     &hashes,
                     false,
-                    locks.from_lock_id(),
+                    locks.source_lock_id(),
                     skipped,
                 )
                 .await

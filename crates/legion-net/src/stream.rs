@@ -562,9 +562,7 @@ impl ProbeReply {
         }
         match self.fs_locality {
             Some(ref loc) => loc.clone(),
-            None => ProbeFsLocality::Unknown(
-                "peer did not report filesystem locality".to_owned(),
-            ),
+            None => ProbeFsLocality::Unknown("peer did not report filesystem locality".to_owned()),
         }
     }
 }
@@ -2170,7 +2168,9 @@ fn delete<W: Write>(
             match remove_one(state_dir, grant, &checked_root, &name, expected, lock_id) {
                 RemoveOutcome::Removed => done.removed += 1,
                 RemoveOutcome::Absent => {}
-                RemoveOutcome::Skipped(reason) => done.skipped.push(SkippedEntry { path: name, reason }),
+                RemoveOutcome::Skipped(reason) => {
+                    done.skipped.push(SkippedEntry { path: name, reason })
+                }
                 RemoveOutcome::LockLost => return true,
             }
         }
@@ -2356,7 +2356,9 @@ fn remove_root_path(
             Err(error) => RemoveOutcome::Skipped(error.to_string()),
         }
     } else {
-        RemoveOutcome::Skipped("only files, directories, and symbolic links can be removed".to_owned())
+        RemoveOutcome::Skipped(
+            "only files, directories, and symbolic links can be removed".to_owned(),
+        )
     }
 }
 
@@ -2449,8 +2451,9 @@ fn probe_write<R: Read + Send + 'static, W: Write>(
                 grant.check_create(&marker_path, CreateKind::File, true)?;
                 match create_private_marker(&marker_path) {
                     Ok(file) => {
-                        let locality =
-                            ProbeFsLocality::from(legion_os::fs_kind::detect_fs_locality(&probe_dir));
+                        let locality = ProbeFsLocality::from(
+                            legion_os::fs_kind::detect_fs_locality(&probe_dir),
+                        );
                         let network_fs = match &locality {
                             ProbeFsLocality::Network(name) => Some(name.clone()),
                             _ => None,
@@ -3041,7 +3044,11 @@ fn has_active_move_lock_pin(state_dir: &Path, lock_id: &str) -> bool {
 }
 
 fn is_lock_file_held(lock_path: &Path) -> bool {
-    let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(lock_path) else {
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+    else {
         return false;
     };
     match file.try_lock() {
@@ -3176,8 +3183,11 @@ impl Drop for HeldLockFiles {
 /// and expiry deterministically without short wall-clock sleeps.
 trait LockClock {
     fn now(&self) -> Duration;
-    fn wait_cmd(&self, rx: &Receiver<String>, timeout: Duration)
-        -> Result<String, RecvTimeoutError>;
+    fn wait_cmd(
+        &self,
+        rx: &Receiver<String>,
+        timeout: Duration,
+    ) -> Result<String, RecvTimeoutError>;
 }
 
 struct RealLockClock {
@@ -5108,15 +5118,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         let mut out = Vec::new();
         hold_locks_loop(
-            &clock,
-            &state_dir,
-            &lock_id,
-            "owner",
-            None,
-            lease,
-            held,
-            &rx,
-            &mut out,
+            &clock, &state_dir, &lock_id, "owner", None, lease, held, &rx, &mut out,
         );
 
         let lines: Vec<LockRenewReply> = String::from_utf8(out)

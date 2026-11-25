@@ -455,10 +455,7 @@ fn parent_matches_scope(scope: RenameRecoveryScope<'_>, parent: &Path) -> bool {
             let p = normalize_scope_path(
                 &fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()),
             );
-            s == p
-                || s == "/"
-                || p.strip_prefix(&s)
-                    .is_some_and(|rest| rest.starts_with('/'))
+            s == p || s == "/" || p.strip_prefix(&s).is_some_and(|rest| rest.starts_with('/'))
         }
     }
 }
@@ -714,7 +711,10 @@ mod tests {
 
         let err3 = move_no_replace_fallback(state_dir.path(), &src_dir, &existing_dir).unwrap_err();
         assert_eq!(err3.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(fs::read(existing_dir.join("keep.txt")).unwrap(), b"keep-dir");
+        assert_eq!(
+            fs::read(existing_dir.join("keep.txt")).unwrap(),
+            b"keep-dir"
+        );
         assert_eq!(fs::read(src_dir.join("inside.txt")).unwrap(), b"dir-body");
 
         let free_dir = dir.path().join("free_dir");

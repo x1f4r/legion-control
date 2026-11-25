@@ -504,7 +504,9 @@ mod tests {
                 "expected network unix fs: {net}"
             );
         }
-        for local in ["apfs", "hfs", "ext4", "xfs", "btrfs", "tmpfs", "zfs", "vfat"] {
+        for local in [
+            "apfs", "hfs", "ext4", "xfs", "btrfs", "tmpfs", "zfs", "vfat",
+        ] {
             assert_eq!(
                 classify_unix_fs_name(local),
                 FsLocality::Local,

@@ -401,7 +401,10 @@ pub fn claim_identity_from_file(file: &File) -> io::Result<FileClaimIdentity> {
 #[cfg(unix)]
 fn system_time_to_unix_pair(t: SystemTime) -> (i64, u32) {
     match t.duration_since(UNIX_EPOCH) {
-        Ok(d) => (i64::try_from(d.as_secs()).unwrap_or(i64::MAX), d.subsec_nanos()),
+        Ok(d) => (
+            i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            d.subsec_nanos(),
+        ),
         Err(err) => {
             let d = err.duration();
             let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);

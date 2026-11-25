@@ -4886,7 +4886,11 @@ fn move_tree_shared_subfolder_and_inconclusive_probe_keep_source() {
         &laptop,
         &[("pi_unconf", &pi_unconf, "unconfirmed-probe-peer", vec![])],
     );
-    fs::write(laptop.home().join("unconf_copy.txt"), b"unconfirmed-payload").unwrap();
+    fs::write(
+        laptop.home().join("unconf_copy.txt"),
+        b"unconfirmed-payload",
+    )
+    .unwrap();
     let unconf_moved = ok(&transfer(
         &laptop,
         json!({"from": "~/unconf_copy.txt", "to": "pi_unconf:~/unconf_copy.txt", "move": true}),
@@ -5198,7 +5202,10 @@ fn move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop() {
             .flatten()
             .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("lock"))
         {
-            assert!(Instant::now() < wait_lock, "move A never acquired move lock");
+            assert!(
+                Instant::now() < wait_lock,
+                "move A never acquired move lock"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         std::thread::sleep(Duration::from_millis(450));
@@ -5212,7 +5219,10 @@ fn move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop() {
     let a_ok = ok(&out_a);
     assert_eq!(a_ok["source_removed"], 1, "{a_ok}");
     let b_err = refused(&out_b);
-    assert_eq!(b_err["code"], "conflict", "move B must see conflict while A holds pinned lock: {b_err}");
+    assert_eq!(
+        b_err["code"], "conflict",
+        "move B must see conflict while A holds pinned lock: {b_err}"
+    );
     assert!(!f_path.exists(), "A removed F cleanly");
     assert_eq!(
         fs::read(&d_path).unwrap(),
@@ -5343,7 +5353,8 @@ fn move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop() {
         // `stat(checksum: true)` to `box` right after locks are acquired (triggering `paused_marker`).
         fs::write(dst_node.home().join("stop.bin"), sig_body).unwrap();
 
-        let args_text = json!({"from": "pi:~/stop.bin", "to": "box:~/stop.bin", "move": true}).to_string();
+        let args_text =
+            json!({"from": "pi:~/stop.bin", "to": "box:~/stop.bin", "move": true}).to_string();
         let child = Command::new(LEGION_BIN)
             .args(["fs.transfer", "--args", &args_text, "--json"])
             .env("LEGION_HOME", legion_home_of(&laptop))
@@ -5370,7 +5381,13 @@ fn move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop() {
 
         // Freeze the mover process with SIGSTOP, then release `box`'s helper gate so only SIGSTOP
         // holds the mover back while `pi`'s and `box`'s locks expire on their own.
-        assert!(Command::new("kill").args(["-STOP", &pid]).status().unwrap().success());
+        assert!(
+            Command::new("kill")
+                .args(["-STOP", &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
         fs::write(&resume_marker, b"go").unwrap();
 
         // Wait until `pi`'s move-lock directory is completely empty (proving the lock genuinely
@@ -5391,7 +5408,13 @@ fn move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop() {
         }
 
         // Resume the mover with SIGCONT; it MUST detect the lost lock and keep the source!
-        assert!(Command::new("kill").args(["-CONT", &pid]).status().unwrap().success());
+        assert!(
+            Command::new("kill")
+                .args(["-CONT", &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
         let out = child.wait_with_output().unwrap();
         let output = Run {
             code: out.status.code().unwrap_or(-1),
