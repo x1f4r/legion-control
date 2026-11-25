@@ -645,6 +645,16 @@ export function formatDisagreementNotice(disagreement, technical = false) {
  * Never exposes tool names when `technical` is false.
  */
 export function describeConnectionRoute(entry, technical = false) {
+  if (entry?.via === 'local' || entry?.isLocalComputer) {
+    return {
+      kind: 'direct',
+      label: 'This computer',
+      hint: null,
+      isWarning: false,
+      isIdentityChanged: false,
+    };
+  }
+
   const node = entry?.node || 'this machine';
   const idChanged = entry?.identity_changed || null;
   const route = idChanged ? 'identity_changed' : entry?.route || 'direct';
@@ -691,16 +701,6 @@ export function describeConnectionRoute(entry, technical = false) {
     };
   }
 
-  if (entry?.via === 'local' || entry?.isLocalComputer) {
-    return {
-      kind: 'direct',
-      label: 'This computer',
-      hint: null,
-      isWarning: false,
-      isIdentityChanged: false,
-    };
-  }
-
   return {
     kind: 'direct',
     label: 'directly',
@@ -711,35 +711,94 @@ export function describeConnectionRoute(entry, technical = false) {
 }
 
 /**
- * Lists relay-only machines known via `linkState.routes` or the live fleet snapshot that do not
- * have their own direct node entry in `linkState.nodes`.
+ * Formats a stored learn-rejection entry for Settings -> Connections when Technical details is on.
+ */
+export function formatLearnRejectionTechnical(rejection) {
+  if (!rejection || typeof rejection !== 'object' || !rejection.reason) return null;
+  const code = rejection.code ? ` (${rejection.code})` : '';
+  const by = rejection.reported_by ? ` — reported by ${rejection.reported_by}` : '';
+  return `Direct route skipped${code}: ${rejection.reason}${by}`;
+}
+
+/**
+ * Lists relay-only machines known via `linkState.routes`, `linkState.learn_rejections`, or the
+ * live fleet snapshot that do not have their own direct node entry in `linkState.nodes`.
  */
 export function buildRelayedConnections(linkState, snapshot) {
-  const directNodes = new Set((linkState?.nodes || []).map((n) => n?.node).filter(Boolean));
-  const fallbackVia = linkState?.nodes?.[0]?.node || null;
+  const nodes = Array.isArray(linkState?.nodes) ? linkState.nodes : [];
+  const directNodes = new Set(nodes.map((n) => n?.node).filter(Boolean));
+  const localEntry = nodes.find((n) => n?.via === 'local' || n?.isLocalComputer) || null;
+  const hasLocalComputer = Boolean(localEntry);
+  const localDisplay = localEntry?.node || 'This computer';
+  const localSelfNames = new Set();
+  if (hasLocalComputer) {
+    localSelfNames.add('local');
+    localSelfNames.add('This computer');
+    if (localEntry?.node) localSelfNames.add(localEntry.node);
+    for (const m of snapshot?.machines || []) {
+      if (m?.this_node && m?.name) localSelfNames.add(m.name);
+    }
+  }
+  const isDirectOrLocal = (name) => !name || directNodes.has(name) || localSelfNames.has(name);
+  const normalizeHop = (name) => {
+    if (!name) return null;
+    if (hasLocalComputer && name === 'local') return localDisplay;
+    return name;
+  };
+  const fallbackVia = normalizeHop(nodes[0]?.node || null);
   const routes = linkState?.routes && typeof linkState.routes === 'object' ? linkState.routes : {};
+  const rejectionByMachine = new Map();
+  if (Array.isArray(linkState?.learn_rejections)) {
+    for (const rej of linkState.learn_rejections) {
+      if (!rej?.machine || isDirectOrLocal(rej.machine)) continue;
+      if (!rejectionByMachine.has(rej.machine)) {
+        const normalizedRej =
+          hasLocalComputer && rej.reported_by === 'local'
+            ? { ...rej, reported_by: localDisplay }
+            : rej;
+        rejectionByMachine.set(rej.machine, normalizedRej);
+      }
+    }
+  }
   const byName = new Map();
 
   for (const [name, info] of Object.entries(routes)) {
-    if (!name || directNodes.has(name)) continue;
+    if (isDirectOrLocal(name)) continue;
     byName.set(name, {
       node: name,
       route: info?.kind || 'relay',
-      route_via: info?.via || fallbackVia,
-      learned_from: info?.introducer || null,
+      route_via: normalizeHop(info?.via) || fallbackVia,
+      learned_from: normalizeHop(info?.introducer) || null,
       identity_changed: null,
+      learn_rejection: rejectionByMachine.get(name) || null,
       relayedOnly: true,
     });
   }
 
   for (const m of snapshot?.machines || []) {
-    if (!m?.name || directNodes.has(m.name) || byName.has(m.name)) continue;
+    if ((hasLocalComputer && m?.this_node) || isDirectOrLocal(m?.name) || byName.has(m.name)) {
+      continue;
+    }
     byName.set(m.name, {
       node: m.name,
       route: 'relay',
       route_via: fallbackVia,
       learned_from: null,
       identity_changed: null,
+      learn_rejection: rejectionByMachine.get(m.name) || null,
+      relayedOnly: true,
+    });
+  }
+
+  for (const [name, rej] of rejectionByMachine.entries()) {
+    if (isDirectOrLocal(name) || byName.has(name)) continue;
+    byName.set(name, {
+      node: name,
+      route: 'relay',
+      route_via: normalizeHop(rej?.reported_by) || fallbackVia,
+      learned_from: null,
+      identity_changed: null,
+      learn_rejection: rej,
       relayedOnly: true,
     });
   }

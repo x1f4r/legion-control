@@ -91,7 +91,7 @@ function classifyMintError(err) {
     };
   }
   return {
-    code: 'unreachable',
+    code: err?.code === 'timeout' ? 'timeout' : 'unreachable',
     message: err?.message || '',
     hint: err?.hint || '',
     details: err?.details || null,
@@ -1640,7 +1640,7 @@ export function FilesViewer({
             key: expectedKey,
             url: null,
             loading: false,
-            error: { code: 'unreachable', message: '' },
+            error: { code: 'unreachable', machine, message: '' },
             isFreshAddress: false,
             isMachinePreview: false,
           });
@@ -1709,6 +1709,7 @@ export function FilesViewer({
       loading: false,
       error: {
         code: inspection.code,
+        machine,
         message: inspection.message || '',
         status: inspection.status || null,
         errorCode: inspection.errorCode || null,
@@ -2041,12 +2042,38 @@ export function FilesViewer({
 
   function renderCommonMediaError(err, kindLabel) {
     const techHint = technicalErrorDetail(err);
-    if (err.code === 'unreachable') {
+    const withMachine = err.machine ? err : { ...err, machine };
+    if (err.details?.reason === 'relay_too_old') {
+      const relay = err.details?.relay || err.machine || 'This machine';
+      const target = err.details?.target || machine;
       return renderFallbackCard(
         "Couldn't reach this file",
         plainErrorMessage(
-          err,
-          `Couldn't load this file from ${machine}. Check that it's on and try again.`,
+          withMachine,
+          `${relay} needs an update before it can pass files along from ${target}.`,
+          { technical, deviceNoun },
+        ),
+        { showRetry: true, hint: techHint },
+      );
+    }
+    if (err.details?.reason === 'unknown_machine') {
+      const target = err.details?.target || machine;
+      return renderFallbackCard(
+        "Couldn't reach this file",
+        plainErrorMessage(
+          withMachine,
+          `This device doesn't know a machine called ${target}.`,
+          { technical, deviceNoun },
+        ),
+        { hideActions: true, hint: techHint },
+      );
+    }
+    if (err.code === 'unreachable' || err.code === 'timeout') {
+      return renderFallbackCard(
+        "Couldn't reach this file",
+        plainErrorMessage(
+          withMachine,
+          `Can't reach ${machine} right now.`,
           { technical, deviceNoun },
         ),
         { showRetry: true, hint: techHint },
@@ -2056,7 +2083,7 @@ export function FilesViewer({
       return renderFallbackCard(
         "Couldn't reach this file",
         plainErrorMessage(
-          err,
+          withMachine,
           `${machine} couldn't serve this file, or it may have moved.`,
           { technical, deviceNoun },
         ),
@@ -2075,7 +2102,7 @@ export function FilesViewer({
     if (err.code === 'denied') {
       return renderFallbackCard(
         "Can't open this file",
-        plainErrorMessage(err, "You're not allowed to open this file.", { technical, deviceNoun }),
+        plainErrorMessage(withMachine, "You're not allowed to open this file.", { technical, deviceNoun }),
         { hideActions: true, hint: techHint },
       );
     }
@@ -2108,8 +2135,8 @@ export function FilesViewer({
           return renderFallbackCard(
             "Couldn't reach this file",
             plainErrorMessage(
-              mediaError,
-              `Couldn't load this file from ${machine}. Check that it's on and try again.`,
+              mediaError.machine ? mediaError : { ...mediaError, machine },
+              `Can't reach ${machine} right now.`,
               { technical, deviceNoun },
             ),
             { showRetry: true, hint: technicalErrorDetail(mediaError) },
@@ -2164,8 +2191,8 @@ export function FilesViewer({
           return renderFallbackCard(
             "Couldn't reach this file",
             plainErrorMessage(
-              mediaError,
-              `Couldn't load this file from ${machine}. Check that it's on and try again.`,
+              mediaError.machine ? mediaError : { ...mediaError, machine },
+              `Can't reach ${machine} right now.`,
               { technical, deviceNoun },
             ),
             { showRetry: true, hint: technicalErrorDetail(mediaError) },
@@ -2201,8 +2228,8 @@ export function FilesViewer({
           return renderFallbackCard(
             "Couldn't reach this file",
             plainErrorMessage(
-              mediaError,
-              `Couldn't load this file from ${machine}. Check that it's on and try again.`,
+              mediaError.machine ? mediaError : { ...mediaError, machine },
+              `Can't reach ${machine} right now.`,
               { technical, deviceNoun },
             ),
             { showRetry: true, hint: technicalErrorDetail(mediaError) },

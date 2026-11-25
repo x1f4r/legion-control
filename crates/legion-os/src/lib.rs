@@ -17,6 +17,7 @@ pub mod hardware;
 pub mod lock;
 pub mod mem_limit;
 pub mod open_regular;
+pub mod pipe;
 pub mod procid;
 pub mod run;
 pub mod shell;

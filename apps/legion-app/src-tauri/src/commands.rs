@@ -521,6 +521,7 @@ pub async fn cancel(
 #[tauri::command]
 pub async fn pair(
     backend: State<'_, SharedBackend>,
+    content: State<'_, SharedContentServer>,
     invite: String,
     name: Option<String>,
 ) -> Result<AppState, AppError> {
@@ -533,7 +534,9 @@ pub async fn pair(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(default_device_name);
     validate_label_size("Device name", &resolved_name)?;
-    backend.0.pair(invite, resolved_name).await
+    let state = backend.0.pair(invite, resolved_name).await?;
+    content.0.revoke_stale_pairings();
+    Ok(state)
 }
 
 /// Removes a paired node from this device and revokes any content tickets issued under it.
@@ -1201,6 +1204,32 @@ pub(crate) async fn evaluate_and_quiesce_auto_install(
     true
 }
 
+/// Stops in-flight transfers, revokes and cancels active content streams (direct and relayed),
+/// and closes cached SSH sessions cleanly before the updater exits the app to swap binaries.
+///
+/// Mirrors cancellation teardown while preserving unfinished persisted transfers so they resume
+/// (or verify already-committed upload destinations) cleanly when the updated app starts.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) async fn quiesce_for_update_exit(
+    transfers: &Arc<crate::transfers::TransferManager>,
+    content: &Arc<crate::content::AppContentServer>,
+    backend: &Arc<dyn Backend>,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    transfers.shutdown();
+    content.shutdown();
+    if let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
+        let _ = transfers.wait_for_workers_stopped(remaining).await;
+    }
+    if let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
+        let _ = content.wait_for_active_streams_stopped(remaining).await;
+    }
+    if let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
+        let _ = tokio::time::timeout(remaining, backend.invalidate_sessions()).await;
+    }
+}
+
 /// Downloads (if needed), re-verifies, and installs the available app update.
 ///
 /// Checks native activity (user-started calls, device transfers including `cancelling`, content
@@ -1269,8 +1298,22 @@ pub async fn update_install(
             let win = app.get_webview_window("main");
             crate::notify_hidden_and_reset_desktop_player(&app, win.as_ref());
             let handle = app.clone();
+            let transfers = Arc::clone(&transfers.0);
+            let content = Arc::clone(&content.0);
+            let backend = Arc::clone(&backend.0);
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                let started = std::time::Instant::now();
+                quiesce_for_update_exit(
+                    &transfers,
+                    &content,
+                    &backend,
+                    crate::UPDATE_EXIT_QUIESCE_TIMEOUT,
+                )
+                .await;
+                let min_flush = std::time::Duration::from_millis(150);
+                if let Some(remaining) = min_flush.checked_sub(started.elapsed()) {
+                    tokio::time::sleep(remaining).await;
+                }
                 tauri_plugin_single_instance::destroy(&handle);
                 handle.exit(0);
             });
@@ -1345,8 +1388,22 @@ pub async fn update_maybe_auto_install(
             let win = app.get_webview_window("main");
             crate::notify_hidden_and_reset_desktop_player(&app, win.as_ref());
             let handle = app.clone();
+            let transfers = Arc::clone(&transfers.0);
+            let content = Arc::clone(&content.0);
+            let backend = Arc::clone(&backend.0);
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                let started = std::time::Instant::now();
+                quiesce_for_update_exit(
+                    &transfers,
+                    &content,
+                    &backend,
+                    crate::UPDATE_EXIT_QUIESCE_TIMEOUT,
+                )
+                .await;
+                let min_flush = std::time::Duration::from_millis(150);
+                if let Some(remaining) = min_flush.checked_sub(started.elapsed()) {
+                    tokio::time::sleep(remaining).await;
+                }
                 tauri_plugin_single_instance::destroy(&handle);
                 handle.exit(0);
             });

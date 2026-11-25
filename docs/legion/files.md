@@ -372,21 +372,26 @@ mount it:
   per-holder fair sharing and a short acquire timeout (`503 Service Unavailable` with `Retry-After`).
 - **The app**: the native side mounts `legion-content` behind `content_url({machine, path,
   download})`, `content_status({url})`, and `content_revoke({url})`, reading through
-  `Link::open_content`. Every platform (Linux, macOS, Windows, iOS/iPadOS, and Android) mounts it
-  lazily on a streaming HTTP/1.1 listener bound strictly to `127.0.0.1:0` on a system-chosen port
-  (deciding liveness from both Legion's own accept-task state and a short loopback
-  proof-of-ownership probe using a per-listener random 256-bit secret that is never logged or
-  placed in any URL — run on mobile resume and before minting once the last verified proof is
-  older than 2 seconds, answering only keyed challenge/response probes with `Connection: close`
-  under unauthenticated connection limits and returning the same generic `404` to callers without
-  the secret — and always tearing down and binding a fresh OS-chosen port on failure; capped at 32
-  simultaneous connections with a 5-second header-read timeout, a 2-second header timeout for
-  connections that have not yet presented a valid ticket, `Connection: close` on `404` and guard
-  rejections, eviction of the oldest unauthenticated connection before refusing a new one at the
-  cap, status tracking strictly after ticket lookup succeeds, exponential backoff on accept errors,
-  mobile resume recovery, and stopping 60 seconds after no live tickets or active streams remain),
-  protected by `HostOriginGuard` (loopback host+port and only that platform's bundled page
-  origins, never `null`) and `Cross-Origin-Resource-Policy: cross-origin`. On Android, `res/xml/network_security_config.xml`
+  `Link::open_content`. Both `Link::open_content` and `Link::open_put` follow the same direct-first
+  routing with relay fallback as RPC calls: they stream directly when the device has a direct route
+  to `machine`, and relay through a paired node advertising `stream.relay` (`op: "relay"`)
+  otherwise — never silently failing over after bytes were sent — so viewing pictures, playing
+  media, downloading, uploading, and opening externally all work on any machine in the fleet. Every
+  platform (Linux, macOS, Windows, iOS/iPadOS, and Android) mounts `legion-content` lazily on a
+  streaming HTTP/1.1 listener bound strictly to `127.0.0.1:0` on a system-chosen port (deciding
+  liveness from both Legion's own accept-task state and a short loopback proof-of-ownership probe
+  using a per-listener random 256-bit secret that is never logged or placed in any URL — run on
+  mobile resume and before minting once the last verified proof is older than 2 seconds, answering
+  only keyed challenge/response probes with `Connection: close` under unauthenticated connection
+  limits and returning the same generic `404` to callers without the secret — and always tearing
+  down and binding a fresh OS-chosen port on failure; capped at 32 simultaneous connections with a
+  5-second header-read timeout, a 2-second header timeout for connections that have not yet
+  presented a valid ticket, `Connection: close` on `404` and guard rejections, eviction of the
+  oldest unauthenticated connection before refusing a new one at the cap, status tracking strictly
+  after ticket lookup succeeds, exponential backoff on accept errors, mobile resume recovery, and
+  stopping 60 seconds after no live tickets or active streams remain), protected by
+  `HostOriginGuard` (loopback host+port and only that platform's bundled page origins, never `null`)
+  and `Cross-Origin-Resource-Policy: cross-origin`. On Android, `res/xml/network_security_config.xml`
   denies cleartext traffic globally while exempting only the loopback literal `127.0.0.1`, allowing
   WebView to stream and seek arbitrarily large media with flat memory without permitting cleartext
   to any other host. On Android, any app on the phone can connect to `127.0.0.1` and send any
@@ -423,9 +428,10 @@ The interface's content security policy grows by exactly what this needs: `img-s
   (`ACTION_OPEN_DOCUMENT` with persistable read URI grants released on completion/failure/cancel on
   Android; native file dialog on desktop) and issues session-only opaque upload handles so the web
   view can never name an arbitrary device file. Pre-selected local upload paths exist only behind
-  the debug compile-time flag `test-upload-paths`. Files are hashed in 64 KiB chunks, checked with
-  `fs.stat` to choose a non-colliding `name (2).ext` remote target before starting, and uploaded
-  over the bulk pipe's `put` through `Link::open_put` with remote `.legion-part` resume and BLAKE3
+  the debug compile-time flag `test-upload-paths`. Files are hashed in 64 KiB chunks and uploaded
+  over the bulk pipe's `put` through `Link::open_put` with `"if_exists": "fail"` (stepping to a
+  numbered `name (2).ext` sibling on `exists` when the node advertises `if_exists`, and keeping an
+  `fs.stat` pre-check for older nodes that do not), remote `.legion-part` resume and BLAKE3
   verification.
 
 Nothing here makes a person wait. Starting a download, an upload or a transfer returns at once;

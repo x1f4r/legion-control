@@ -468,8 +468,12 @@ function App() {
       const item = failedList[0];
       const verb = item.direction === 'upload' ? 'Upload' : 'Download';
       const name = item.name || 'file';
-      const detailText = item.error
-        ? plainErrorMessage(item.error, '', { technical: Boolean(settingsRef.current?.technical), deviceNoun })
+      const errObj =
+        item.error && typeof item.error === 'object'
+          ? { ...item.error, machine: item.error.machine || item.machine || null }
+          : item.error;
+      const detailText = errObj
+        ? plainErrorMessage(errObj, '', { technical: Boolean(settingsRef.current?.technical), deviceNoun })
         : '';
       const detail = detailText ? ` ${detailText}` : '';
       return `${verb} of ${name} failed.${detail}`;
@@ -993,6 +997,23 @@ function App() {
       });
   }, [link, mergeBackendState]);
 
+  // Refresh link route and learn-rejection state whenever Settings -> Connections opens so
+  // route changes caused by recent calls or streams (e.g. relay -> direct) appear immediately.
+  useEffect(() => {
+    if (link.kind !== 'app' || typeof link.state !== 'function') return;
+    if (route.section !== 'settings' || route.page !== 'connections') return;
+    let alive = true;
+    link
+      .state()
+      .then((st) => {
+        if (alive && st) mergeBackendState(st);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [link, route.section, route.page, mergeBackendState]);
+
   const checkUpdatesQuietly = useCallback(async () => {
     if (typeof link.checkUpdates !== 'function' || updateCheckInFlightRef.current) return;
     updateCheckInFlightRef.current = true;
@@ -1140,32 +1161,86 @@ function App() {
       applyLocalNodeMigration(realName);
       setLinkState((prev) => {
         if (!prev || !Array.isArray(prev.nodes)) return prev;
-        const seen = new Set();
+        const isSelfName = (name) =>
+          name === realName || isLocalConnectionName(name) || isPendingLocalName(name);
+        const mapLocalHop = (name) =>
+          isLocalConnectionName(name) || isPendingLocalName(name) ? realName : name;
+        const indexByName = new Map();
         const nextNodes = [];
         for (const n of prev.nodes) {
           if (!n) continue;
           const isLocalEntry =
             n.isLocalComputer ||
             n.nodeNamePending ||
+            n.via === LOCAL_PIPE_CONNECTION ||
             isLocalConnectionName(n.node) ||
             isPendingLocalName(n.node);
           const nodeName = isLocalEntry ? realName : n.node;
-          if (!nodeName || seen.has(nodeName)) continue;
-          seen.add(nodeName);
-          if (isLocalEntry) {
-            nextNodes.push({
-              ...n,
-              node: realName,
-              isLocalComputer: true,
-              nodeNamePending: false,
-              reachable: true,
-              whoami: n.whoami ? { ...n.whoami, node: realName } : n.whoami,
-            });
-          } else {
-            nextNodes.push(n);
+          if (!nodeName) continue;
+          const entry = isLocalEntry
+            ? {
+                ...n,
+                node: realName,
+                via: LOCAL_PIPE_CONNECTION,
+                route: 'direct',
+                route_via: null,
+                learned_from: null,
+                identity_changed: null,
+                isLocalComputer: true,
+                nodeNamePending: false,
+                reachable: true,
+                whoami: n.whoami ? { ...n.whoami, node: realName } : n.whoami,
+              }
+            : {
+                ...n,
+                route_via: mapLocalHop(n.route_via),
+                learned_from: mapLocalHop(n.learned_from),
+              };
+          if (indexByName.has(nodeName)) {
+            if (isLocalEntry) nextNodes[indexByName.get(nodeName)] = entry;
+            continue;
           }
+          indexByName.set(nodeName, nextNodes.length);
+          nextNodes.push(entry);
         }
-        const nextState = { ...prev, nodes: nextNodes };
+        let nextRoutes = prev.routes;
+        if (prev.routes && typeof prev.routes === 'object') {
+          const hadLocal = Object.keys(prev.routes).some((k) => isSelfName(k));
+          const rebuilt = {};
+          for (const [k, info] of Object.entries(prev.routes)) {
+            if (!k || isSelfName(k)) continue;
+            rebuilt[k] =
+              info && typeof info === 'object'
+                ? { ...info, via: mapLocalHop(info.via), introducer: mapLocalHop(info.introducer) }
+                : info;
+          }
+          if (hadLocal) {
+            rebuilt[realName] = { kind: 'direct', via: null, introducer: null };
+          }
+          nextRoutes = rebuilt;
+        }
+        const nextRejections = Array.isArray(prev.learn_rejections)
+          ? prev.learn_rejections
+              .filter((r) => r && !isSelfName(r.machine))
+              .map((r) => ({ ...r, reported_by: mapLocalHop(r.reported_by) }))
+          : prev.learn_rejections;
+        const nextDisagreements = Array.isArray(prev.disagreements)
+          ? prev.disagreements
+              .filter((d) => d && !isSelfName(d.machine))
+              .map((d) => ({
+                ...d,
+                reports: Array.isArray(d.reports)
+                  ? d.reports.map((r) => (r ? { ...r, reported_by: mapLocalHop(r.reported_by) } : r))
+                  : d.reports,
+              }))
+          : prev.disagreements;
+        const nextState = {
+          ...prev,
+          nodes: nextNodes,
+          routes: nextRoutes,
+          learn_rejections: nextRejections,
+          disagreements: nextDisagreements,
+        };
         nodeInfoRef.current = nextNodes[0] || null;
         return nextState;
       });
