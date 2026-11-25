@@ -701,6 +701,25 @@ impl AppContentServer {
         })
     }
 
+    /// Revokes the single content ticket identified by `raw_url` immediately (used when the viewer
+    /// closes, switches files, or tears down a media element). Returns `true` if a live ticket was
+    /// removed.
+    pub fn revoke_url(&self, raw_url: &str) -> bool {
+        let Some(ticket_id) = extract_ticket_id_from_url(raw_url) else {
+            return false;
+        };
+        let key_hash = ticket_hash(ticket_id);
+        let removed = self.tickets.revoke(ticket_id);
+        if removed {
+            let mut statuses = self
+                .ticket_statuses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            statuses.retain(|entry| entry.key_hash != key_hash);
+        }
+        removed
+    }
+
     /// Revokes every ticket belonging to pairings that are no longer live in [`Backend`].
     pub fn revoke_stale_pairings(&self) {
         let _ = self
@@ -4002,6 +4021,64 @@ mod tests {
             started.elapsed() >= Duration::from_millis(1500),
             "unauthenticated timeout fired unexpectedly early: {:?}",
             started.elapsed()
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn revoked_content_url_returns_404_on_replay() {
+        let payload = b"sensitive-audio-track-bytes".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/home/me/voice-note.flac".to_owned(), payload.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let minted = server
+            .mint_url("tower", "/home/me/voice-note.flac", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let path = minted
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+
+        let (status_before, head_before, body_before) = raw_http(
+            port,
+            &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status_before, 200, "{head_before}");
+        assert_eq!(body_before, payload);
+        assert!(server.content_status_for_url(&minted.url).ticket_live);
+
+        // Revoking the URL immediately invalidates the ticket; replaying it returns 404.
+        assert!(server.revoke_url(&minted.url));
+        assert!(!server.revoke_url(&minted.url));
+        assert!(!server.revoke_url("not-a-content-url"));
+        assert!(!server.content_status_for_url(&minted.url).ticket_live);
+
+        let (status_after, head_after, _) = raw_http(
+            port,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status_after, 404, "{head_after}");
+        assert!(
+            head_after
+                .to_ascii_lowercase()
+                .contains("connection: close"),
+            "replayed revoked URL should emit Connection: close:\n{head_after}"
         );
 
         server.shutdown();

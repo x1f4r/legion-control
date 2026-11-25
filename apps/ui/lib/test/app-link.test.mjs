@@ -351,6 +351,9 @@ test('createAppLink implements files-contract contentUrl and device transfer que
               expires_in: 900,
             });
           }
+          if (command === 'content_revoke') {
+            return Promise.resolve(true);
+          }
           if (command === 'transfer_download') {
             return Promise.resolve({ id: 'tr-1' });
           }
@@ -457,6 +460,11 @@ test('createAppLink implements files-contract contentUrl and device transfer que
       mime: 'application/pdf',
     });
     assert.equal(typeof link.contentStatus, 'function');
+    assert.equal(typeof link.revokeContentUrl, 'function');
+    assert.equal(await link.revokeContentUrl(urlRes.url), true);
+    const revokeCall = seen.find((c) => c.command === 'content_revoke');
+    assert.deepEqual(revokeCall.payload, { url: urlRes.url });
+    assert.equal(await link.revokeContentUrl(''), false);
 
     const list = await link.transfers();
     assert.equal(list.length, 1);

@@ -1266,6 +1266,7 @@ export function createMockFilesState({
   }
   const thumbAttemptByPath = new Map();
   const mockStatusByUrl = new Map();
+  const revokedMockUrls = new Set();
   let mockUrlSeq = 1;
 
   function normalizePath(p) {
@@ -1954,26 +1955,37 @@ export function createMockFilesState({
           }
           const cat = categoryFromName(name);
           if (cat === 'video') {
-            return { url: getVideoUrl(), expires_in: 900 };
+            return { url: `${getVideoUrl()}#mock-${mockUrlSeq++}`, expires_in: 900 };
           }
           if (cat === 'audio') {
-            return { url: getAudioUrl(), expires_in: 900 };
+            return { url: `${getAudioUrl()}#mock-${mockUrlSeq++}`, expires_in: 900 };
           }
           if (cat === 'image') {
             if (entry) {
               const pal = entry.palette || paletteFor(norm);
+              const url = makeSampleImageDataUrl({ ...pal, w: 720, h: 540 });
+              revokedMockUrls.delete(url);
+              mockStatusByUrl.delete(url);
               return {
-                url: makeSampleImageDataUrl({ ...pal, w: 720, h: 540 }),
+                url,
                 expires_in: 900,
               };
             }
             if (ext === 'svg') {
+              const url =
+                'data:image/svg+xml;charset=utf-8,' +
+                encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" fill="#3b6f7a"/></svg>');
+              revokedMockUrls.delete(url);
+              mockStatusByUrl.delete(url);
               return {
-                url: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" fill="#3b6f7a"/></svg>'),
+                url,
                 expires_in: 900,
               };
             }
-            return { url: `data:image/png;base64,${SAMPLE_PNG_BASE64}`, expires_in: 900 };
+            const url = `data:image/png;base64,${SAMPLE_PNG_BASE64}`;
+            revokedMockUrls.delete(url);
+            mockStatusByUrl.delete(url);
+            return { url, expires_in: 900 };
           }
           if (ext === 'vtt') {
             return {
@@ -2076,6 +2088,15 @@ export function createMockFilesState({
         },
 
         async contentStatus(url) {
+          if (revokedMockUrls.has(url)) {
+            return {
+              request_count: 0,
+              status: 404,
+              content_type: null,
+              stream_failed: false,
+              ticket_live: false,
+            };
+          }
           if (mockStatusByUrl.has(url)) {
             return { ...mockStatusByUrl.get(url) };
           }
@@ -2086,6 +2107,24 @@ export function createMockFilesState({
             stream_failed: false,
             ticket_live: true,
           };
+        },
+
+        async revokeContentUrl(url) {
+          const key = String(url || '').trim();
+          if (!key) return false;
+          const wasFresh = !revokedMockUrls.has(key);
+          revokedMockUrls.add(key);
+          if (typeof window !== 'undefined') {
+            if (!Array.isArray(window.__LEGION_MOCK_REVOKED_URLS__)) {
+              window.__LEGION_MOCK_REVOKED_URLS__ = [];
+            }
+            window.__LEGION_MOCK_REVOKED_URLS__.push(key);
+          }
+          const existing = mockStatusByUrl.get(key);
+          if (existing) {
+            mockStatusByUrl.set(key, { ...existing, status: 404, ticket_live: false });
+          }
+          return wasFresh;
         },
 
         async openExternally({ machine, path, name, size, mime }) {

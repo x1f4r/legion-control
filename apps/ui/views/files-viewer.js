@@ -238,6 +238,7 @@ export function FilesViewer({
   activeFileKeyRef.current = fileKey;
   const activeMediaUrlRef = useRef(mediaUrl);
   activeMediaUrlRef.current = mediaUrl;
+  const mintedUrlRef = useRef(null);
   const mediaStateRef = useRef(activeMedia);
   mediaStateRef.current = activeMedia;
   const openStateRef = useRef(activeOpen);
@@ -282,12 +283,34 @@ export function FilesViewer({
     }
   }
 
+  function revokeContentUrlNow(url) {
+    if (!url || typeof link?.revokeContentUrl !== 'function') return;
+    if (mintedUrlRef.current === url) {
+      mintedUrlRef.current = null;
+    }
+    try {
+      const res = link.revokeContentUrl(url);
+      if (res && typeof res.catch === 'function') res.catch(() => {});
+    } catch {
+      // Best-effort ticket cleanup when closing or replacing a viewer address.
+    }
+  }
+
+  function revokeActiveMintedUrl() {
+    const url = mintedUrlRef.current;
+    if (url) {
+      mintedUrlRef.current = null;
+      revokeContentUrlNow(url);
+    }
+  }
+
   useEffect(() => {
     return () => {
       if (noticeTimerRef.current) {
         window.clearTimeout(noticeTimerRef.current);
         noticeTimerRef.current = null;
       }
+      revokeActiveMintedUrl();
     };
   }, []);
 
@@ -331,6 +354,7 @@ export function FilesViewer({
       abortRef.current = null;
     }
     stopMediaElements();
+    revokeActiveMintedUrl();
     if (onClose) onClose();
   }
 
@@ -694,6 +718,7 @@ export function FilesViewer({
       return () => {
         ctrl.abort();
         stopMediaElements();
+        revokeActiveMintedUrl();
       };
     }
 
@@ -809,7 +834,10 @@ export function FilesViewer({
         link
           .contentUrl({ machine, path, signal: ctrl.signal })
           .then((res) => {
-            if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
+            if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) {
+              if (res?.url) revokeContentUrlNow(res.url);
+              return;
+            }
             if (!res?.url) {
               setMediaState({
                 key: targetKey,
@@ -821,6 +849,8 @@ export function FilesViewer({
               });
               return;
             }
+            revokeActiveMintedUrl();
+            mintedUrlRef.current = res.url;
             setMediaState({
               key: targetKey,
               url: res.url,
@@ -927,6 +957,7 @@ export function FilesViewer({
     return () => {
       ctrl.abort();
       stopMediaElements();
+      revokeActiveMintedUrl();
     };
   }, [
     machine,
@@ -1228,9 +1259,13 @@ export function FilesViewer({
       recoveryRef.current = { key: expectedKey, lastAttemptAt: now, inFlight: true };
       try {
         const res = await link.contentUrl({ machine, path, signal });
-        if (signal?.aborted || activeFileKeyRef.current !== expectedKey) return;
+        if (signal?.aborted || activeFileKeyRef.current !== expectedKey) {
+          if (res?.url) revokeContentUrlNow(res.url);
+          return;
+        }
         recoveryRef.current.inFlight = false;
         if (!res?.url) {
+          revokeContentUrlNow(expectedUrl);
           setMediaState({
             key: expectedKey,
             url: null,
@@ -1241,6 +1276,10 @@ export function FilesViewer({
           });
           return;
         }
+        if (expectedUrl && expectedUrl !== res.url) {
+          revokeContentUrlNow(expectedUrl);
+        }
+        mintedUrlRef.current = res.url;
         if (kind !== 'image') {
           pendingResumeRef.current = {
             key: expectedKey,
@@ -1262,6 +1301,7 @@ export function FilesViewer({
           return;
         }
         recoveryRef.current.inFlight = false;
+        revokeContentUrlNow(expectedUrl);
         setMediaState({
           key: expectedKey,
           url: null,
@@ -1282,12 +1322,17 @@ export function FilesViewer({
       !mediaStateRef.current.isMachinePreview
     ) {
       const ok = await fetchMachinePreview(expectedKey, signal);
-      if (ok || signal?.aborted || activeFileKeyRef.current !== expectedKey) return;
+      if (ok) {
+        revokeContentUrlNow(expectedUrl);
+        return;
+      }
+      if (signal?.aborted || activeFileKeyRef.current !== expectedKey) return;
     }
 
     if (activeFileKeyRef.current !== expectedKey || activeMediaUrlRef.current !== expectedUrl) {
       return;
     }
+    revokeContentUrlNow(expectedUrl);
     setMediaState({
       key: expectedKey,
       url: null,

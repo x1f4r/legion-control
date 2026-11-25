@@ -1006,9 +1006,13 @@ test('Files viewer: honest media errors, in-place Open in another app progress/c
       await page.locator('.viewer-top button[aria-label="Close"]').click();
     }
 
-    // 6. "Open in another app" shows visible in-place "Getting it ready… X of Y" progress + Cancel.
+    // 6. "Open in another app" shows visible in-place "Getting it ready… X of Y" progress + Cancel,
+    // and closing the viewer immediately revokes the minted content URL.
     await page.locator('.list a.row', { hasText: 'studio-master.flac' }).click();
-    await page.locator('.viewer audio').waitFor();
+    const flacAudio = page.locator('.viewer audio');
+    await flacAudio.waitFor();
+    const flacUrl = await flacAudio.getAttribute('src');
+    assert.ok(flacUrl, 'expected minted audio content URL');
     await page.locator('.viewer-bar button', { hasText: 'Open in…' }).click();
     const banner = page.locator('.viewer-open-banner');
     await banner.waitFor();
@@ -1016,6 +1020,45 @@ test('Files viewer: honest media errors, in-place Open in another app progress/c
     await banner.getByRole('button', { name: 'Cancel' }).click();
     await banner.waitFor({ state: 'hidden' });
     await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+    const revokedAfterClose = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
+    assert.ok(
+      revokedAfterClose.includes(flacUrl),
+      `closing viewer must revoke minted URL ${flacUrl}, saw ${JSON.stringify(revokedAfterClose)}`,
+    );
+
+    // 6b. Moving to another picture in the mounted viewer immediately revokes the previous URL,
+    // and closing revokes the active one.
+    await page.goto(`${server.url}/?mock=formats#/files/tower//home/me/Videos/Holiday`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.grid a.cell[aria-label="IMG_2041.jpg"]').click();
+    const imgEl = page.locator('.viewer img.viewer-img');
+    await imgEl.waitFor();
+    const firstPicUrl = await imgEl.getAttribute('src');
+    assert.ok(firstPicUrl, 'expected first picture URL');
+    await page.keyboard.press('ArrowRight');
+    await page.locator('.viewer-top .name', { hasText: 'IMG_2042.jpg' }).waitFor();
+    await page.waitForFunction(
+      (prev) => {
+        const cur = document.querySelector('.viewer img.viewer-img')?.getAttribute('src');
+        return Boolean(cur && cur !== prev);
+      },
+      firstPicUrl,
+    );
+    const secondPicUrl = await imgEl.getAttribute('src');
+    const revokedAfterSwitch = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
+    assert.ok(
+      revokedAfterSwitch.includes(firstPicUrl),
+      'switching files in viewer must revoke the previous picture URL',
+    );
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+    const revokedAfterSecondClose = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
+    assert.ok(
+      revokedAfterSecondClose.includes(secondPicUrl),
+      'closing viewer after switching files must revoke the second picture URL',
+    );
 
     // 7. When no app handles the file type (?mock=formats,no-handler), viewer shows an honest
     // message in place and offers Download instead of silently doing nothing.

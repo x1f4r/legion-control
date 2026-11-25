@@ -270,6 +270,7 @@ pub fn run() {
                 commands::ready,
                 commands::content_url,
                 commands::content_status,
+                commands::content_revoke,
                 commands::transfer_download,
                 commands::transfer_pick_uploads,
                 commands::transfer_upload,

@@ -59,6 +59,10 @@
  * @property {(url: string) => Promise<ContentUrlStatus | null>} [contentStatus]
  *   Inspect the local content server's observed HTTP status and stream health for `url`.
  *
+ * @property {(url: string) => Promise<boolean>} [revokeContentUrl]
+ *   Immediately revoke a previously minted content URL when the viewer closes, switches files,
+ *   or tears down a media element.
+ *
  * @property {(req: { machine: string, path: string, name?: string, size?: number, mime?: string }) => Promise<{ id: string }>} [download]
  *   Enqueue a non-blocking download to this device's Downloads folder and return `{ id }` at once.
  *   In the browser HTTP link, opens/triggers a download link to `contentUrl({ ..., download: true })`.

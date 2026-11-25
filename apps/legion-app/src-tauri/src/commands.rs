@@ -288,6 +288,13 @@ pub fn content_status(content: State<'_, SharedContentServer>, url: String) -> C
     content.0.content_status_for_url(&url)
 }
 
+/// Immediately revokes a previously minted content URL when the viewer closes, switches files, or
+/// tears down a media element. Returns `true` if a live ticket was removed.
+#[tauri::command]
+pub fn content_revoke(content: State<'_, SharedContentServer>, url: String) -> bool {
+    content.0.revoke_url(&url)
+}
+
 /// Enqueues a non-blocking download from `machine:path` into the device's Downloads folder.
 #[tauri::command]
 pub async fn transfer_download(

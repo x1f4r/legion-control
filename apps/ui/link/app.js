@@ -1015,6 +1015,9 @@ export function createAppLink() {
       });
       clearContentUnsupported([machine || selectedNode]);
       if (signal?.aborted) {
+        if (result?.url) {
+          invoke('content_revoke', { url: String(result.url) }).catch(() => {});
+        }
         throw {
           code: 'cancelled',
           message: 'The content request was cancelled.',
@@ -1045,6 +1048,16 @@ export function createAppLink() {
       return await invoke('content_status', { url: String(url || '') });
     } catch {
       return null;
+    }
+  }
+
+  async function revokeContentUrl(url) {
+    const raw = String(url || '').trim();
+    if (!raw) return false;
+    try {
+      return Boolean(await invoke('content_revoke', { url: raw }));
+    } catch {
+      return false;
     }
   }
 
@@ -1226,6 +1239,7 @@ export function createAppLink() {
     maybeAutoInstall,
     contentUrl,
     contentStatus,
+    revokeContentUrl,
     download,
     transfers,
     transferControl,
