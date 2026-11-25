@@ -220,9 +220,10 @@ and Android, which is the way onto an iPhone or iPad without an Apple developer 
 | Android | none: a controller | `.apk`, arm64 |
 | iOS, iPadOS | none: a controller | the app (needs Apple signing to reach a real device), the browser door meanwhile |
 
-Packages are named `legion` (and `legion-bin` for the prebuilt Arch binary). They never start
-anything or change configuration on install: `legion init` stays the first step, and the user unit
-is enabled by the user. When installed from a package, `meta.update` and `fleet.install` refuse
+Packages are named `legion` (and `legion-bin` for the prebuilt Arch binary); the Linux desktop app
+`.deb` package is named `legion-app` so it installs alongside the `legion` node package. They never
+start anything or change configuration on install: `legion init` stays the first step, and the user
+unit is enabled by the user. When installed from a package, `meta.update` and `fleet.install` refuse
 in-place replacement and point at `apt` or `pacman` instead.
 
 ## How it is verified
