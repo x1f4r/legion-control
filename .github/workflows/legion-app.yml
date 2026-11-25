@@ -136,15 +136,15 @@ jobs:
           if [ "$(cargo tauri --version 2>/dev/null || true)" != "tauri-cli 2.12.6" ]; then
             cargo install tauri-cli --version =2.12.6 --locked
           fi
-      - name: Run Android Kotlin unit tests
-        working-directory: apps/legion-app/src-tauri/gen/android
-        run: ./gradlew :app:testUniversalDebugUnitTest
       - name: Build Android debug APK (arm64 + x86_64)
         working-directory: apps/legion-app
         run: |
           set -euo pipefail
           export LEGION_BUILD_SEQUENCE="$(date -u +%Y%m%d%H%M)"
           cargo tauri android build --debug --apk --target aarch64 --target x86_64
+      - name: Run Android Kotlin unit tests
+        working-directory: apps/legion-app/src-tauri/gen/android
+        run: ./gradlew :app:testUniversalDebugUnitTest
       - name: Build local legion node binary for emulator content-media check
         run: |
           CARGO_TARGET_DIR="$RUNNER_TEMP/android-node-target" cargo build --locked --bin legion
