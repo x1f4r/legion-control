@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::content::{ContentStream, StreamOpenError, handshake_get};
 use crate::invite::{Enrolled, SshTarget, SshTimeouts};
 use crate::session::{CallError, Session};
 
@@ -2129,6 +2130,190 @@ impl Link {
         Ok((cancel, guard))
     }
 
+    /// Opens a streaming byte-range reader for `path` on `machine` via `legion stream`'s `get`
+    /// operation over the session this [`Link`] holds for `machine`.
+    ///
+    /// Follows the same routing and identity rules as calls: `machine` must be configured on this
+    /// [`Link`], its pinned host keys and `hello.node` identity are verified, and the operation
+    /// never falls back to another machine. Multiple content streams may be open concurrently on
+    /// one SSH connection; cancelling or dropping the returned [`ContentStream`] closes its
+    /// channel immediately without affecting the parent session.
+    pub async fn open_content(
+        &self,
+        machine: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<ContentStream, ErrorBody> {
+        self.open_content_with_cancel(machine, path, offset, length, CancellationToken::new())
+            .await
+    }
+
+    /// Like [`Link::open_content`], aborting the open handshake if `cancel` fires.
+    pub async fn open_content_with_cancel(
+        &self,
+        machine: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+        cancel: CancellationToken,
+    ) -> Result<ContentStream, ErrorBody> {
+        self.ensure_reaper();
+        if path.is_empty() {
+            return Err(
+                ErrorBody::new(ErrorCode::InvalidArgs, "Content path cannot be empty.")
+                    .with_hint("Pass an absolute or `~`-prefixed file path.")
+                    .with_machine(machine),
+            );
+        }
+
+        let live = self.get_or_open(machine, cancel.clone()).await?;
+        let flight = live.acquire_flight();
+        let (mut raw, opener, live, flight) =
+            match self.open_stream_on(&live, machine, cancel.clone()).await {
+                Ok((raw, opener)) => (raw, opener, live, flight),
+                Err(StreamOpenError::DeadSession(_)) => {
+                    // The cached session died before any stream bytes were sent; reopen once.
+                    drop(flight);
+                    self.invalidate_if_same(machine, &live.session);
+                    let fresh = self.get_or_open(machine, cancel.clone()).await?;
+                    let flight2 = fresh.acquire_flight();
+                    let (raw, opener) = self
+                        .open_stream_on(&fresh, machine, cancel.clone())
+                        .await
+                        .map_err(|err| match err {
+                            StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body) => {
+                                self.invalidate_if_same(machine, &fresh.session);
+                                body.with_machine(machine)
+                            }
+                            StreamOpenError::ChannelRefused(body) => body.with_machine(machine),
+                        })?;
+                    (raw, opener, fresh, flight2)
+                }
+                Err(StreamOpenError::ChannelRefused(body) | StreamOpenError::Failed(body)) => {
+                    return Err(body.with_machine(machine));
+                }
+            };
+
+        // Attach the in-flight session guard to the raw channel's lifecycle guard rather than to
+        // `ContentStream` itself so parking an idle stream releases both its SSH channel slot and
+        // its session flight pin; reopening acquires a fresh session if the old one closed.
+        let prev_guard = raw.guard.take();
+        raw.guard = Some(Box::new((prev_guard, flight)));
+
+        let reopener: Arc<dyn crate::content::StreamOpener> = Arc::new(LinkStreamOpener {
+            link: self.clone(),
+            machine: machine.to_owned(),
+            window_policy: opener.window_policy(),
+        });
+
+        handshake_get(
+            raw,
+            Some(reopener),
+            machine,
+            path,
+            offset,
+            length,
+            live.config_snapshot.principal.as_deref(),
+            self.inner.options.ssh_timeouts.handshake,
+            cancel,
+        )
+        .await
+    }
+
+    async fn open_stream_on(
+        &self,
+        live: &LiveSession,
+        machine: &str,
+        cancel: CancellationToken,
+    ) -> Result<
+        (
+            crate::content::RawStream,
+            Arc<dyn crate::content::StreamOpener>,
+        ),
+        StreamOpenError,
+    > {
+        let Some(opener) = live.session.stream_opener() else {
+            return Err(StreamOpenError::Failed(
+                ErrorBody::new(
+                    ErrorCode::Unsupported,
+                    format!("The session to {machine} does not support opening content streams."),
+                )
+                .with_hint("Use an SSH or local node transport.")
+                .with_machine(machine),
+            ));
+        };
+        let raw = opener.open_stream(cancel).await?;
+        Ok((raw, opener))
+    }
+}
+
+/// Session-backed [`crate::content::StreamOpener`] used by [`ContentStream`] when reopening a
+/// parked or idle-closed channel, transparently acquiring the current (or freshly reconnected)
+/// session for `machine`.
+struct LinkStreamOpener {
+    link: Link,
+    machine: String,
+    window_policy: Option<crate::content::WindowPolicy>,
+}
+
+impl crate::content::StreamOpener for LinkStreamOpener {
+    fn window_policy(&self) -> Option<crate::content::WindowPolicy> {
+        self.window_policy
+    }
+
+    fn open_stream(
+        &self,
+        cancel: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::content::RawStream, StreamOpenError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let live = self
+                .link
+                .get_or_open(&self.machine, cancel.clone())
+                .await
+                .map_err(StreamOpenError::Failed)?;
+            let flight = live.acquire_flight();
+            let (mut raw, flight) = match self
+                .link
+                .open_stream_on(&live, &self.machine, cancel.clone())
+                .await
+            {
+                Ok((raw, _)) => (raw, flight),
+                Err(StreamOpenError::DeadSession(_)) => {
+                    drop(flight);
+                    self.link.invalidate_if_same(&self.machine, &live.session);
+                    let fresh = self
+                        .link
+                        .get_or_open(&self.machine, cancel.clone())
+                        .await
+                        .map_err(StreamOpenError::Failed)?;
+                    let flight2 = fresh.acquire_flight();
+                    let (raw, _) = self
+                        .link
+                        .open_stream_on(&fresh, &self.machine, cancel)
+                        .await
+                        .map_err(|err| match err {
+                            StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body) => {
+                                self.link.invalidate_if_same(&self.machine, &fresh.session);
+                                StreamOpenError::Failed(body.with_machine(&self.machine))
+                            }
+                            StreamOpenError::ChannelRefused(body) => {
+                                StreamOpenError::ChannelRefused(body.with_machine(&self.machine))
+                            }
+                        })?;
+                    (raw, flight2)
+                }
+                Err(err) => return Err(err),
+            };
+            let prev_guard = raw.guard.take();
+            raw.guard = Some(Box::new((prev_guard, flight)));
+            Ok(raw)
+        })
+    }
+}
+
+impl Link {
     /// Calls `tool` on `node` with JSON `arguments` and optional `on` (passed through untouched to
     /// the node for forwarding or fan-out), streaming live events as JSON objects to `events`.
     pub async fn call(

@@ -1,10 +1,12 @@
 //! What a request must show before anything behind the listener sees it: a `Host` this server
 //! answers to, an `Origin` it trusts if it names one, and a token.
+//!
+//! `Host` and `Origin` checks delegate to [`legion_content::HostOriginGuard`] so the HTTP door
+//! and native app web views enforce identical rules.
 
-use std::net::IpAddr;
-
-use axum::http::header::{AUTHORIZATION, HOST, ORIGIN};
-use axum::http::{HeaderMap, Uri};
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, HeaderValue, Uri};
+use legion_content::HostOriginGuard;
 use legion_core::config::ServeConfig;
 use legion_core::tokens::Tokens;
 
@@ -19,125 +21,42 @@ pub(crate) enum Refusal {
     BadToken,
 }
 
+fn guard_for(port: u16, config: &ServeConfig) -> HostOriginGuard {
+    HostOriginGuard {
+        port,
+        allowed_hosts: config.hosts.clone(),
+        allowed_origins: config.origins.clone(),
+        allow_same_origin: config.ui,
+    }
+}
+
 /// Why a request is not well formed enough to judge, when it is not: every header the gate
 /// decides by is given once at most, so what is checked is what is used, and the host is named
 /// once, as text, in `Host` and in nothing that disagrees with it.
 pub(crate) fn malformed(headers: &HeaderMap, uri: &Uri) -> Option<&'static str> {
-    for (name, message) in [
-        (HOST, "The request names its host more than once."),
-        (ORIGIN, "The request gives more than one Origin."),
-        (
-            AUTHORIZATION,
-            "The request gives more than one Authorization.",
-        ),
-    ] {
-        if headers.get_all(name).iter().nth(1).is_some() {
-            return Some(message);
-        }
+    if headers.get_all(AUTHORIZATION).iter().nth(1).is_some() {
+        return Some("The request gives more than one Authorization.");
     }
-    let Some(host) = headers.get(HOST) else {
-        return Some("The request has no Host header.");
-    };
-    let Ok(host) = host.to_str() else {
-        return Some("The request's Host header is not text.");
-    };
-    if let Some(authority) = uri.authority()
-        && !authority.as_str().eq_ignore_ascii_case(host.trim())
-    {
-        return Some("The request names one host in its target and another in Host.");
-    }
-    None
+    HostOriginGuard::malformed(headers, uri)
 }
 
 /// Whether the request's `Host` is this server: a loopback name or address with the port it
-/// listens on, or one of the names `[serve] hosts` gives. A request naming no host is refused,
-/// since a client that names none cannot be told apart from one that names the wrong one.
-/// [`malformed`] has already made sure there is one `Host` and nothing disagreeing with it.
+/// listens on, or one of the names `[serve] hosts` gives.
 pub(crate) fn host_allowed(headers: &HeaderMap, port: u16, config: &ServeConfig) -> bool {
-    let named = headers.get(HOST).and_then(|value| value.to_str().ok());
-    let Some((host, given_port)) = named.and_then(split_authority) else {
-        return false;
-    };
-    let loopback = host == "localhost"
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
-    if loopback && given_port == Some(port) {
-        return true;
-    }
-    config
-        .hosts
-        .iter()
-        .any(|allowed| match split_authority(allowed) {
-            Some((name, None)) => name == host,
-            Some((name, Some(allowed_port))) => name == host && given_port == Some(allowed_port),
-            None => false,
-        })
+    guard_for(port, config).host_allowed(headers)
 }
 
 /// Whether a request's `Origin`, if it has one, is allowed: either listed in `[serve] origins`, or
 /// (when the built-in interface is enabled) same-origin with this request's already-validated
 /// `Host` header. A request without an `Origin` did not come from a browser page.
 pub(crate) fn origin_allowed(headers: &HeaderMap, config: &ServeConfig) -> bool {
-    let Some(origin) = headers.get(ORIGIN) else {
-        return true;
-    };
-    let Ok(origin) = origin.to_str() else {
-        return false;
-    };
-    if is_listed_origin(origin, config) {
-        return true;
-    }
-    config.ui && is_same_origin(headers, origin)
+    guard_for(0, config).origin_allowed(headers)
 }
 
 /// Returns the request's `Origin` header when it is explicitly listed in `[serve] origins` and
 /// should receive cross-origin CORS headers.
-pub(crate) fn listed_origin(
-    headers: &HeaderMap,
-    config: &ServeConfig,
-) -> Option<axum::http::HeaderValue> {
-    let origin = headers.get(ORIGIN)?;
-    let text = origin.to_str().ok()?;
-    is_listed_origin(text, config).then(|| origin.clone())
-}
-
-fn is_listed_origin(origin: &str, config: &ServeConfig) -> bool {
-    let origin = normalise_origin(origin);
-    config
-        .origins
-        .iter()
-        .any(|allowed| normalise_origin(allowed) == origin)
-}
-
-fn is_same_origin(headers: &HeaderMap, origin: &str) -> bool {
-    let Some(host_header) = headers.get(HOST).and_then(|v| v.to_str().ok()) else {
-        return false;
-    };
-    let Some((req_host, req_port)) = split_authority(host_header) else {
-        return false;
-    };
-    let trimmed = origin.trim();
-    let (default_port, rest) = if let Some(rest) = trimmed.strip_prefix("https://") {
-        (443u16, rest)
-    } else if let Some(rest) = trimmed.strip_prefix("http://") {
-        (80u16, rest)
-    } else {
-        return false;
-    };
-    if rest.contains(['/', '?', '#', '@']) {
-        return false;
-    }
-    let Some((orig_host, orig_port)) = split_authority(rest) else {
-        return false;
-    };
-    if orig_host != req_host {
-        return false;
-    }
-    match req_port {
-        Some(port) => orig_port.unwrap_or(default_port) == port,
-        None => orig_port.is_none() || orig_port == Some(default_port),
-    }
+pub(crate) fn listed_origin(headers: &HeaderMap, config: &ServeConfig) -> Option<HeaderValue> {
+    guard_for(0, config).listed_origin(headers)
 }
 
 /// Who the request's bearer token says it is.
@@ -164,42 +83,10 @@ pub(crate) fn principal(headers: &HeaderMap, tokens: &Tokens) -> Result<Authenti
         .ok_or(Refusal::BadToken)
 }
 
-/// `host` and `port` from `host[:port]` or `[v6][:port]`, the host in lower case and without a
-/// trailing dot. `None` when it is not one.
-fn split_authority(text: &str) -> Option<(String, Option<u16>)> {
-    let text = text.trim();
-    let (host, port) = if let Some(rest) = text.strip_prefix('[') {
-        let (host, after) = rest.split_once(']')?;
-        match after {
-            "" => (host, None),
-            after => (host, Some(after.strip_prefix(':')?)),
-        }
-    } else {
-        match text.rsplit_once(':') {
-            // Two colons and no brackets is a bare IPv6 address, which a Host header never is.
-            Some((host, _)) if host.contains(':') => return None,
-            Some((host, port)) => (host, Some(port)),
-            None => (text, None),
-        }
-    };
-    let port = match port {
-        Some(port) => Some(port.parse::<u16>().ok()?),
-        None => None,
-    };
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if host.is_empty() {
-        return None;
-    }
-    Some((host, port))
-}
-
-fn normalise_origin(origin: &str) -> String {
-    origin.trim().trim_end_matches('/').to_ascii_lowercase()
-}
-
 #[cfg(test)]
 mod tests {
     use axum::http::HeaderValue;
+    use axum::http::header::{HOST, ORIGIN};
 
     use super::*;
 
@@ -301,7 +188,6 @@ mod tests {
             &listed
         ));
 
-        // Same-origin browser requests from the served UI are allowed when ui = true.
         let same = headers(&[
             ("host", "127.0.0.1:7117"),
             ("origin", "http://127.0.0.1:7117"),

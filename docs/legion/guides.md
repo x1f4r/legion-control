@@ -1053,7 +1053,7 @@ curl -sS http://127.0.0.1:7117/v1/health
 ```
 
 ```json
-{"ok":true,"node":"tower","version":"0.1.0"}
+{"ok":true,"node":"tower","version":"0.1.0","content":true}
 ```
 
 List allowed tools for the token's principal:
@@ -1077,6 +1077,104 @@ curl -sS \
 ```
 
 Pass `"on": "pi"` or `"on": "all"` in the JSON body to target remote machines.
+
+### File content (`POST /v1/content`)
+
+To feed a file to an `<img>`, `<video>`, `<audio>`, or resumable download with byte-range access,
+mint a short-lived content address with `POST /v1/content`:
+
+```sh
+curl -sS \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"path":"~/projects/app/clip.mp4","on":"pi"}' \
+  http://127.0.0.1:7117/v1/content
+```
+
+```json
+{"url":"/v1/content/<ticket>/clip.mp4","expires_in":900}
+```
+
+Omit `"on"` to read a file on the node serving HTTP itself; when `"on"` names another machine in
+`fleet.toml`, the node reads the requested byte range through its own `legion stream` session to
+that machine. `"on"` must name a single machine (never `"all"` or a list).
+
+Fetch the returned same-origin address with `GET` or `HEAD`, with optional single-range `Range`,
+`If-Range` (matched against the strong `ETag` built from size and modification time), and
+`?download=1` to force `Content-Disposition: attachment`:
+
+```sh
+curl -sS -r 0-65535 http://127.0.0.1:7117/v1/content/<ticket>/clip.mp4 -o chunk.bin
+curl -sSI 'http://127.0.0.1:7117/v1/content/<ticket>/clip.mp4?download=1'
+```
+
+Security and lifecycle guarantees:
+
+- **Tickets, revocation bounds, and audit durability**: 256 random bits bound to one bearer token,
+  one principal, one machine, and one bounded file path (at most 4 KiB; `POST /v1/content` bodies
+  are capped at 16 KiB). Permissions are checked as `fs.read` when the ticket is minted, on every
+  `GET` or `HEAD`, on an independent 1-second liveness timer per active stream (not tied to body
+  polling or client read speed), and immediately before yielding another 64 KiB frame after socket
+  backpressure. Revoking a token or removing a principal revokes every ticket of that holder; a
+  narrowed path, expiry, or crossing the 6-hour hard limit ends only that ticket and leaves the
+  holder's other still-allowed tickets serving. Active content sockets request `SO_SNDBUF = 128 KiB`
+  before sending the response (effective kernel buffer varies by OS: 256 KiB on Linux due to kernel
+  doubling, ~128–147 KiB on macOS, 128 KiB on Windows), and for what the door itself decides (its
+  bearer tokens, local principals and paths in `policy.toml`, and ticket lifetime) detecting a
+  revocation cancels the connection first (before flushing audit records), stops handing bytes to
+  the socket, discards server buffers, releases any remote pipe, and sends TCP RST
+  (`SO_LINGER(0)`). That guarantees server-side cutoff within 2 seconds even for slow (20 KB/s) or
+  completely stalled readers, zero bytes handed to the socket after cutoff with the connection
+  closed, and at most the physical ceiling (`effective SO_SNDBUF + client effective SO_RCVBUF +
+  bytes the client reads before cutoff + 64 KiB`, collapsing to `effective SO_SNDBUF + client
+  effective SO_RCVBUF + 64 KiB` for a stalled reader) handed to the socket between revocation and
+  cutoff. For a file on a remote machine, the door does not watch that machine's `policy.toml`: a
+  policy change on the remote machine takes effect at that machine's next check of the stream, which
+  a slow reader delays, and the slow-reader timeout is the backstop. The send-buffer bound (256 KiB
+  effective on Linux) applies to the loopback hop only; behind Tailscale Serve (or another reverse
+  proxy), its own buffers sit beyond it. Bytes already received into the client OS's own TCP receive
+  buffer before revocation cannot be taken back and stay drainable by the client (varying by OS and
+  receive-buffer autotuning, e.g. ~128–256 KiB on Linux loopback and ~384–650 KiB on macOS
+  loopback). Tickets expire using a suspend-safe clock (15 minutes after last use, 6 hours absolute
+  maximum), are capped at 128 per token (evicting the oldest), and are never logged.
+  Minting writes one durable `content.ticket` entry; the first `GET` or `HEAD` on a ticket writes
+  one durable `content.open` entry immediately so every access survives `SIGKILL` or power loss;
+  ongoing reads coalesce to at most one `content.read` summary per ticket per minute (and
+  `stream.get` on remote nodes) with request count and bytes served.
+- **Headers and isolation**: every reply carries `X-Content-Type-Options: nosniff`,
+  `Cross-Origin-Resource-Policy: same-origin`, `Referrer-Policy: no-referrer`, `Cache-Control:
+  private, no-store`, and unconditionally
+  `Content-Security-Policy: sandbox; default-src 'none'; frame-ancestors 'none'`. `Content-Type`
+  comes from a fixed allow-list (raster images, SVG, video, audio, `text/vtt; charset=utf-8` for
+  `.vtt`, and `text/plain; charset=utf-8` for all other text files including HTML); unlisted types
+  — including PDF — are served as `application/octet-stream` with `Content-Disposition:
+  attachment`. Opened HTML, SVG, or PDF files can never run script or be framed inside the
+  interface's origin.
+- **Host, `Origin`, and third-party pages**: `/v1/content/<ticket>/<name>` enforces the same `Host`
+  and `Origin` checks as every other route. Because `<img>`, `<video>`, `<audio>`, and direct
+  downloads send no `Origin` header, an absent `Origin` is accepted on `GET` and `HEAD`; if a
+  browser sends an `Origin`, it must match the same origin or `[serve] origins` in `node.toml`,
+  otherwise the request is refused with `403`. Because `Cross-Origin-Resource-Policy` is always
+  `same-origin` on the HTTP door, listed cross-origin pages must fetch content using CORS
+  (`fetch()` or `crossorigin`) rather than no-cors embedding. Against a third-party page that
+  somehow learns a ticket, secrecy of the 256-bit ticket is the first barrier, while `Origin`
+  refusal, `Cross-Origin-Resource-Policy: same-origin`, `frame-ancestors 'none'`, and `sandbox;
+  default-src 'none'` block cross-origin reads, no-cors embeds, framing, and script execution.
+- **History and exposure**: a content address remains usable for up to 6 hours while in active use
+  and appears in browser history if opened directly in a tab; damage is limited because it grants
+  read-only access to one file, expires after 15 minutes idle or 6 hours total, cuts off active
+  readers within ~2 seconds when the token or `fs.read` policy is revoked, and never caches or
+  executes in the interface's origin.
+- **Concurrency and slow-reader protection**: active content streams are capped per ticket (8), per
+  holder (16), and globally (64), answering `429 Too Many Requests` with `Retry-After` and
+  `Connection: close`, and stalled or overly slow readers are disconnected after a write-idle
+  timeout (15 s) or minimum transfer rate window (40 KiB / 10 s) so API and UI routes stay
+  responsive. Remote reads reuse warm `keep_open` `legion stream` pipes from a dedicated per-target
+  content pool (separate from transfers and RPC, which never share permits with content), reading in
+  bounded windows with per-holder fair sharing and returning `503 Service Unavailable` with
+  `Retry-After` if acquiring a pipe times out. The web UI reads `"content": true` from `/v1/health`
+  once and remembers per-machine `unsupported` replies for the session so older remote nodes fall
+  back cleanly without breaking supported machines.
 
 ### Event stream (SSE)
 

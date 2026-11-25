@@ -1772,6 +1772,12 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
             }
             return { url: `data:image/png;base64,${SAMPLE_PNG_BASE64}`, expires_in: 900 };
           }
+          if (ext === 'vtt') {
+            return {
+              url: `data:text/vtt;charset=utf-8,${encodeURIComponent('WEBVTT\n\n00:00.000 --> 00:01.000\nMock caption\n')}`,
+              expires_in: 900,
+            };
+          }
           if (ext === 'pdf') {
             return { url: `data:application/pdf;base64,${SAMPLE_PDF_BASE64}`, expires_in: 900 };
           }
