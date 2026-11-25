@@ -7,6 +7,7 @@ import { Icon } from '../icons.js';
 import {
   baseFileName,
   changedPresetCutoff,
+  createThumbQueue,
   detectFileCapabilities,
   entryCategory,
   entryIconName,
@@ -15,7 +16,6 @@ import {
   formatFolderTotal,
   formatPathForDisplay,
   formatShowingCount,
-  isRetryableThumbError,
   isThumbEligible,
   parentFilePath,
   plainCategoryLabel,
@@ -62,7 +62,6 @@ import { SplitView } from './split-view.js';
 
 const PAGE_SIZE = 200;
 const RENDER_STEP = 120;
-const THUMB_BATCH_MAX = 32;
 const LONG_PRESS_MS = 450;
 
 const KIND_FILTER_LABELS = {
@@ -205,18 +204,11 @@ function joinMemberNames(members) {
   return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 }
 
-// ── Batched lazy thumbnail loader hook ───────────────────────────────────────────────────────
-
-const THUMB_MAX_RETRIES = 3;
-const THUMB_RETRY_BASE_MS = 350;
+// ── Batched lazy thumbnail loader hooks ──────────────────────────────────────────────────────
 
 function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, thumbCache }) {
   const [, setTick] = useState(0);
-  const queueRef = useRef(new Set());
-  const inFlightRef = useRef(new Set());
-  const retryCountRef = useRef(new Map());
-  const retryTimersRef = useRef(new Set());
-  const timerRef = useRef(null);
+  const queueRef = useRef(null);
   const observerRef = useRef(null);
   const entryMapRef = useRef(new Map());
 
@@ -229,98 +221,30 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, t
   }, [entries]);
 
   useEffect(() => {
-    retryCountRef.current.clear();
+    if (!enabled || !machine) {
+      queueRef.current = null;
+      return undefined;
+    }
+    const q = createThumbQueue({
+      machine,
+      link,
+      capsStore,
+      thumbCache,
+      onUpdate: () => setTick((n) => n + 1),
+    });
+    queueRef.current = q;
     return () => {
-      for (const tid of retryTimersRef.current) clearTimeout(tid);
-      retryTimersRef.current.clear();
+      q.dispose();
+      if (queueRef.current === q) queueRef.current = null;
     };
-  }, [machine, enabled]);
-
-  const flushRef = useRef(null);
-
-  const scheduleRetry = useCallback((p) => {
-    const attempt = retryCountRef.current.get(p) || 0;
-    if (attempt >= THUMB_MAX_RETRIES) return false;
-    retryCountRef.current.set(p, attempt + 1);
-    const delayMs = THUMB_RETRY_BASE_MS * (2 ** attempt);
-    const tid = window.setTimeout(() => {
-      retryTimersRef.current.delete(tid);
-      if (!inFlightRef.current.has(p)) {
-        queueRef.current.add(p);
-        if (!timerRef.current && flushRef.current) {
-          timerRef.current = window.setTimeout(() => flushRef.current?.(), 24);
-        }
-      }
-    }, delayMs);
-    retryTimersRef.current.add(tid);
-    return true;
-  }, []);
-
-  const flush = useCallback(() => {
-    timerRef.current = null;
-    if (!enabled || !machine || queueRef.current.size === 0) return;
-    const batch = [];
-    for (const p of queueRef.current) {
-      if (batch.length >= THUMB_BATCH_MAX) break;
-      batch.push(p);
-    }
-    for (const p of batch) {
-      queueRef.current.delete(p);
-      inFlightRef.current.add(p);
-    }
-    if (batch.length === 0) return;
-
-    const thumbPromise = capsStore
-      ? capsStore.call('fs.thumb', { paths: batch, size: 128, fit: 'cover' }, { on: machine }).then((r) => r.value)
-      : link.call('fs.thumb', { paths: batch, size: 128, fit: 'cover' }, { on: machine });
-    thumbPromise
-      .then((res) => {
-        const map = res?.thumbnails || {};
-        for (const p of batch) {
-          inFlightRef.current.delete(p);
-          const entry = entryMapRef.current.get(p);
-          const key = thumbCacheKey(machine, p, entry?.mtime || '', 128);
-          const item = map[p];
-          if (item?.content && item?.mime) {
-            retryCountRef.current.delete(p);
-            thumbCache.set(key, { url: `data:${item.mime};base64,${item.content}` });
-          } else if (isRetryableThumbError(item?.error) && scheduleRetry(p)) {
-            // Leave kind icon visible while waiting quietly for backoff retry.
-          } else {
-            retryCountRef.current.delete(p);
-            thumbCache.set(key, { failed: true });
-          }
-        }
-        setTick((n) => n + 1);
-        if (queueRef.current.size > 0 && !timerRef.current) {
-          timerRef.current = window.setTimeout(flush, 30);
-        }
-      })
-      .catch((err) => {
-        const retryable = isRetryableThumbError(err);
-        for (const p of batch) {
-          inFlightRef.current.delete(p);
-          if (retryable && scheduleRetry(p)) continue;
-          const entry = entryMapRef.current.get(p);
-          const key = thumbCacheKey(machine, p, entry?.mtime || '', 128);
-          thumbCache.set(key, { failed: true });
-        }
-      });
-  }, [enabled, machine, link, capsStore, thumbCache, scheduleRetry]);
-
-  flushRef.current = flush;
+  }, [enabled, machine, link, capsStore, thumbCache]);
 
   const requestPath = useCallback(
     (entry) => {
       if (!enabled || !machine || !entry || !isThumbEligible(entry)) return;
-      const key = thumbCacheKey(machine, entry.path, entry.mtime || '', 128);
-      if (thumbCache.get(key) || inFlightRef.current.has(entry.path)) return;
-      queueRef.current.add(entry.path);
-      if (!timerRef.current) {
-        timerRef.current = window.setTimeout(flush, 24);
-      }
+      queueRef.current?.enqueue({ path: entry.path, mtime: entry.mtime || '' });
     },
-    [enabled, machine, thumbCache, flush],
+    [enabled, machine],
   );
 
   // Immediately enqueue the first visible batch so initial paint fills thumbnails promptly.
@@ -334,13 +258,7 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, t
         count += 1;
       }
     }
-    return () => {
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-        timerRef.current = null;
-      }
-    };
-  }, [enabled, machine, entries, requestPath]);
+  }, [enabled, machine, entries, link, capsStore, thumbCache, requestPath]);
 
   useEffect(() => {
     if (!enabled || typeof IntersectionObserver === 'undefined') return undefined;
@@ -380,6 +298,61 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, t
   );
 
   return { getUrl, observeEl };
+}
+
+function useMultiMachineThumbs({ itemsByMachine, enabled, link, capsStore = null, thumbCache }) {
+  const [, setTick] = useState(0);
+  const queuesRef = useRef(new Map());
+
+  useEffect(() => {
+    const queues = queuesRef.current;
+    return () => {
+      for (const q of queues.values()) q.dispose();
+      queues.clear();
+    };
+  }, [enabled, link, capsStore, thumbCache]);
+
+  useEffect(() => {
+    const queues = queuesRef.current;
+    if (!enabled) {
+      for (const q of queues.values()) q.dispose();
+      queues.clear();
+      return;
+    }
+    const activeMachines = new Set(itemsByMachine.keys());
+    for (const [mName, q] of queues.entries()) {
+      if (!activeMachines.has(mName)) {
+        q.dispose();
+        queues.delete(mName);
+      }
+    }
+    for (const [mName, items] of itemsByMachine.entries()) {
+      if (!items || items.length === 0) continue;
+      let q = queues.get(mName);
+      if (!q) {
+        q = createThumbQueue({
+          machine: mName,
+          link,
+          capsStore,
+          thumbCache,
+          onUpdate: () => setTick((n) => n + 1),
+        });
+        queues.set(mName, q);
+      }
+      for (const item of items) {
+        q.enqueue(item);
+      }
+    }
+  }, [itemsByMachine, enabled, link, capsStore, thumbCache]);
+
+  return useCallback(
+    (machine, path, mtime = '') => {
+      if (!enabled || !machine || !path) return null;
+      const hit = thumbCache.get(thumbCacheKey(machine, path, mtime, 128));
+      return hit && !hit.failed ? hit.url : null;
+    },
+    [enabled, thumbCache],
+  );
 }
 
 // ── Thumbnail box (fixed size, zero layout shift) ────────────────────────────────────────────
@@ -424,66 +397,28 @@ export function FilesHome({
   onStartSearch,
 }) {
   const pinned = useMemo(() => (favourites || []).filter((f) => f.pinned), [favourites]);
-  const [tileThumbs, setTileThumbs] = useState({});
   const hasPinned = Boolean(caps?.hasFav && pinned.length > 0);
   const hasSync = Boolean(caps?.hasSync && syncFolders.length > 0);
   const firstSection = hasPinned ? 'pinned' : hasSync ? 'sync' : 'machines';
 
-  // Load thumbnails for pinned files, checking fs.thumb capability per pinned item's machine.
-  useEffect(() => {
-    if ((!capsStore && !caps?.hasThumb) || pinned.length === 0) return;
-    let alive = true;
-    const byMachine = new Map();
+  const pinnedByMachine = useMemo(() => {
+    const map = new Map();
     for (const p of pinned) {
-      if (p.kind === 'dir') continue;
-      const key = thumbCacheKey(p.machine, p.path, '', 128);
-      const hit = thumbCache.get(key);
-      if (hit && !hit.failed) {
-        setTileThumbs((prev) => (prev[p.id] ? prev : { ...prev, [p.id]: hit.url }));
-        continue;
-      }
-      if (!byMachine.has(p.machine)) byMachine.set(p.machine, []);
-      byMachine.get(p.machine).push(p);
+      if (!isThumbEligible(p)) continue;
+      if (!map.has(p.machine)) map.set(p.machine, []);
+      map.get(p.machine).push({ path: p.path, mtime: '' });
     }
-    for (const [mName, items] of byMachine.entries()) {
-      const fetchThumbs = async () => {
-        if (capsStore) {
-          if (!capsStore.isKnown(mName)) {
-            await capsStore.ensure(mName).catch(() => null);
-          }
-          if (!alive || !capsStore.hasTool(mName, 'fs.thumb')) return;
-          const r = await capsStore.call(
-            'fs.thumb',
-            { paths: items.map((i) => i.path), size: 128, fit: 'cover' },
-            { on: mName },
-          );
-          return r.value;
-        }
-        return link.call('fs.thumb', { paths: items.map((i) => i.path), size: 128, fit: 'cover' }, { on: mName });
-      };
-      fetchThumbs()
-        .then((res) => {
-          if (!alive || !res) return;
-          const map = res?.thumbnails || {};
-          const patch = {};
-          for (const item of items) {
-            const t = map[item.path];
-            if (t?.content && t?.mime) {
-              const url = `data:${t.mime};base64,${t.content}`;
-              thumbCache.set(thumbCacheKey(mName, item.path, '', 128), { url });
-              patch[item.id] = url;
-            }
-          }
-          if (Object.keys(patch).length > 0) {
-            setTileThumbs((prev) => ({ ...prev, ...patch }));
-          }
-        })
-        .catch(() => {});
-    }
-    return () => {
-      alive = false;
-    };
-  }, [capsStore, caps?.hasThumb, pinned, link, thumbCache]);
+    return map;
+  }, [pinned]);
+
+  // Batch-load thumbnails for pinned pictures/videos (up to 32 per machine call) with retry backoff.
+  const getPinnedThumbUrl = useMultiMachineThumbs({
+    itemsByMachine: pinnedByMachine,
+    enabled: Boolean((capsStore || caps?.hasThumb) && pinnedByMachine.size > 0),
+    link,
+    capsStore,
+    thumbCache,
+  });
 
   return html`
     <div>
@@ -515,7 +450,7 @@ export function FilesHome({
                   item.kind === 'dir'
                     ? routeHref({ section: 'files', view: 'folder', machine: item.machine, path: item.path })
                     : routeHref({ section: 'files', view: 'home', viewer: { machine: item.machine, path: item.path } });
-                const thumbUrl = tileThumbs[item.id];
+                const thumbUrl = isThumbEligible(item) ? getPinnedThumbUrl(item.machine, item.path, '') : null;
                 return html`
                   <a
                     key=${item.id}
@@ -1742,7 +1677,6 @@ export function FilesSearchView({
   const [truncatedByMachine, setTruncatedByMachine] = useState({});
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState(null);
-  const [, setThumbTick] = useState(0);
   const [searchRev, setSearchRev] = useState(0);
   const abortRef = useRef(null);
   const refreshResolversRef = useRef([]);
@@ -1764,52 +1698,28 @@ export function FilesSearchView({
     );
   }, [onRegisterRefresh]);
 
-  // Batch-load thumbnails for picture/video search hits, checking fs.thumb per machine.
-  useEffect(() => {
-    if (!capsStore && !caps?.hasThumb) return undefined;
-    let alive = true;
-    const byMachine = new Map();
+  // Batch-load thumbnails for picture/video search hits (up to 32 per machine call) with retry backoff.
+  const searchThumbsByMachine = useMemo(() => {
+    const map = new Map();
     for (const [mName, items] of Object.entries(resultsByMachine)) {
       if (!Array.isArray(items) || items.length === 0) continue;
-      if (capsStore && !capsStore.hasTool(mName, 'fs.thumb')) continue;
+      const eligible = [];
       for (const entry of items) {
         if (!isThumbEligible(entry)) continue;
-        const key = thumbCacheKey(mName, entry.path, entry.mtime || '', 128);
-        if (thumbCache.get(key)) continue;
-        if (!byMachine.has(mName)) byMachine.set(mName, []);
-        byMachine.get(mName).push(entry);
+        eligible.push({ path: entry.path, mtime: entry.mtime || '' });
       }
+      if (eligible.length > 0) map.set(mName, eligible);
     }
-    for (const [mName, entries] of byMachine.entries()) {
-      const batch = entries.slice(0, 16);
-      const req = capsStore
-        ? capsStore
-            .call('fs.thumb', { paths: batch.map((e) => e.path), size: 128, fit: 'cover' }, { on: mName })
-            .then((r) => r.value)
-        : link.call('fs.thumb', { paths: batch.map((e) => e.path), size: 128, fit: 'cover' }, { on: mName });
-      req
-        .then((res) => {
-          if (!alive) return;
-          const map = res?.thumbnails || {};
-          let didChange = false;
-          for (const entry of batch) {
-            const t = map[entry.path];
-            const key = thumbCacheKey(mName, entry.path, entry.mtime || '', 128);
-            if (t?.content && t?.mime) {
-              thumbCache.set(key, { url: `data:${t.mime};base64,${t.content}` });
-              didChange = true;
-            } else {
-              thumbCache.set(key, { failed: true });
-            }
-          }
-          if (didChange) setThumbTick((n) => n + 1);
-        })
-        .catch(() => {});
-    }
-    return () => {
-      alive = false;
-    };
-  }, [capsStore, caps?.hasThumb, resultsByMachine, link, thumbCache]);
+    return map;
+  }, [resultsByMachine]);
+
+  useMultiMachineThumbs({
+    itemsByMachine: searchThumbsByMachine,
+    enabled: Boolean(capsStore || caps?.hasThumb),
+    link,
+    capsStore,
+    thumbCache,
+  });
 
   const favKeySet = useMemo(
     () => new Set((favourites || []).map((f) => `${f.machine}\0${f.path}`)),
