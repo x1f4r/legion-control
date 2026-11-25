@@ -299,7 +299,7 @@ export function DeviceTransferRow({
     <div class="row">
       <div class="body">
         <span class=${technical ? 'title mono' : 'title'}>${title}</span>
-        <span class=${isFailed ? 'sub wrap' : 'sub'}>
+        <span class="sub wrap">
           ${sub}
           ${(isActive || isPaused) && pct != null ? html`<${ProgressBar} value=${pct} />` : null}
         </span>

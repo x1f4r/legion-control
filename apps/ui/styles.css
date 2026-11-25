@@ -1797,7 +1797,8 @@ button.row:active {
   padding: 4px 2px;
 }
 
-.where a:last-child {
+.where a:last-child,
+.where a.current {
   color: var(--text);
 }
 
@@ -1917,6 +1918,7 @@ button.row:active {
   place-items: center;
   align-content: center;
   gap: 6px;
+  border: 1px solid var(--line);
   color: var(--dim);
   font-size: var(--text-small);
   text-align: center;
@@ -1945,7 +1947,8 @@ button.row:active {
   min-width: 0;
 }
 
-.dock.tools .btn.icon[aria-pressed="true"] {
+.dock.tools .btn.icon[aria-pressed="true"],
+.files-wide-tools .btn.icon[aria-pressed="true"] {
   color: var(--accent);
 }
 
@@ -2285,12 +2288,12 @@ button.row:active {
   color: var(--dim);
 }
 
-/* Non-modal confirmation toast above the dock or nav (never blocks browsing). */
+/* Non-modal confirmation toast below the header so it never blocks bottom thumb controls. */
 .toast-banner {
   position: absolute;
   left: var(--pad);
   right: var(--pad);
-  bottom: calc(var(--safe-bottom) + 74px);
+  top: calc(var(--safe-top) + 62px);
   z-index: 25;
   display: flex;
   align-items: center;
@@ -2303,10 +2306,6 @@ button.row:active {
   box-shadow: 0 8px 24px rgb(0 0 0 / 0.35);
 }
 
-.app.docked .toast-banner {
-  bottom: calc(var(--safe-bottom) + 136px);
-}
-
 .toast-banner span {
   flex: 1;
   min-width: 0;
@@ -2316,6 +2315,10 @@ button.row:active {
 .sheet-sub {
   margin: 0 0 12px;
   color: var(--dim);
+}
+
+.sheet .seg + .label {
+  margin-top: 16px;
 }
 
 .sheet-cta {
@@ -2382,6 +2385,10 @@ button.row:active {
 }
 
 @container shell (min-width: 820px) {
+  .split > section:first-child .tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .grid {
     grid-template-columns: repeat(auto-fill, minmax(124px, 1fr));
     gap: 6px;
@@ -2396,12 +2403,9 @@ button.row:active {
   .toast-banner {
     left: auto;
     right: 28px;
-    bottom: 24px;
+    top: 20px;
+    bottom: auto;
     max-width: 420px;
-  }
-
-  .app.docked .toast-banner {
-    bottom: 84px;
   }
 }
 

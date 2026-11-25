@@ -244,6 +244,7 @@ function App() {
   const filesHistoryDepthRef = useRef(0);
   const filesSheetHistoryRef = useRef(false);
   const filesSelectHistoryRef = useRef(false);
+  const lastHashRef = useRef(window.location.hash);
   const filesBulkHandlersRef = useRef({});
   const toastTimerRef = useRef(null);
 
@@ -401,6 +402,7 @@ function App() {
 
   useEffect(() => {
     function syncRoute() {
+      lastHashRef.current = window.location.hash;
       const prevRoute = routeRef.current;
       if (prevRoute?.section === 'files' && prevRoute.view === 'folder' && !prevRoute.viewer && mainRef.current) {
         scrollByFolderRef.current.set(`${prevRoute.machine || ''}\0${prevRoute.path || '~'}`, mainRef.current.scrollTop);
@@ -417,25 +419,29 @@ function App() {
       });
     }
     function onPopState() {
-      if (sheetHistoryRef.current) {
+      const st = window.history.state;
+      if (sheetHistoryRef.current && !st?.legionSheet) {
         sheetHistoryRef.current = false;
         setConfirmRequest(null);
+        return;
       }
-      if (filesSheetHistoryRef.current) {
+      if (filesSheetHistoryRef.current && !st?.legionFilesSheet) {
         filesSheetHistoryRef.current = false;
         setFilesSheet(null);
         return;
       }
-      if (filesSelectHistoryRef.current) {
+      if (filesSelectHistoryRef.current && !st?.legionFilesSelect) {
         filesSelectHistoryRef.current = false;
         setFilesSelecting(false);
         setFilesSelectedPaths(new Set());
         return;
       }
-      if (filesHistoryDepthRef.current > 0) {
-        filesHistoryDepthRef.current -= 1;
+      if (window.location.hash !== lastHashRef.current) {
+        if (filesHistoryDepthRef.current > 0) {
+          filesHistoryDepthRef.current -= 1;
+        }
+        syncRoute();
       }
-      syncRoute();
     }
     window.addEventListener('hashchange', syncRoute);
     window.addEventListener('popstate', onPopState);
@@ -849,7 +855,16 @@ function App() {
         }
       },
       startSelect(initialPath) {
-        if (!filesSelectHistoryRef.current) {
+        if (filesSheetHistoryRef.current) {
+          setFilesSheet(null);
+          filesSheetHistoryRef.current = false;
+          if (!filesSelectHistoryRef.current) {
+            window.history.replaceState({ legionFilesSelect: true }, '');
+            filesSelectHistoryRef.current = true;
+          } else {
+            window.history.back();
+          }
+        } else if (!filesSelectHistoryRef.current) {
           window.history.pushState({ legionFilesSelect: true }, '');
           filesSelectHistoryRef.current = true;
         }
@@ -862,6 +877,23 @@ function App() {
         if (filesSelectHistoryRef.current) {
           filesSelectHistoryRef.current = false;
           window.history.back();
+        }
+      },
+      finishBulkAction() {
+        setFilesSheet(null);
+        setFilesSelecting(false);
+        setFilesSelectedPaths(new Set());
+        let pops = 0;
+        if (filesSheetHistoryRef.current) {
+          filesSheetHistoryRef.current = false;
+          pops += 1;
+        }
+        if (filesSelectHistoryRef.current) {
+          filesSelectHistoryRef.current = false;
+          pops += 1;
+        }
+        if (pops > 0) {
+          window.history.go(-pops);
         }
       },
       toggleSelect(path) {

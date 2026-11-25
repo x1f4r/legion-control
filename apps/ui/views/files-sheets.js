@@ -158,7 +158,7 @@ export function SendToSheet({
     const destMachine = dest;
     const targetDir = chosenDir;
     const isMove = effectiveMode === 'move';
-    onClose();
+    if (!onStarted) onClose();
 
     if (destMachine === '__device__') {
       const startedNames = [];
@@ -532,8 +532,8 @@ export function FolderMoreSheet({
           type="button"
           class="row"
           onClick=${() => {
-            onClose();
             if (onStartSelect) onStartSelect();
+            else onClose();
           }}
         >
           <span class="body">
@@ -548,8 +548,8 @@ export function FolderMoreSheet({
                 type="button"
                 class="row"
                 onClick=${() => {
-                  onClose();
                   if (onNewFolder) onNewFolder();
+                  else onClose();
                 }}
               >
                 <span class="body">

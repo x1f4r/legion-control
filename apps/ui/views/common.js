@@ -200,10 +200,16 @@ export function SwipeRow({ actionLabel, onAction, actions = null, disabled = fal
     if (decision === 'reveal') {
       e.stopPropagation();
       suppressClickRef.current = true;
+      window.setTimeout(() => {
+        suppressClickRef.current = false;
+      }, 0);
       setOpen(true);
     } else if (decision === 'close') {
       e.stopPropagation();
       suppressClickRef.current = true;
+      window.setTimeout(() => {
+        suppressClickRef.current = false;
+      }, 0);
       setOpen(false);
     }
   }
@@ -213,6 +219,7 @@ export function SwipeRow({ actionLabel, onAction, actions = null, disabled = fal
   }
 
   function onClickCapture(e) {
+    if (e.target?.closest?.('.swipe-actions')) return;
     if (suppressClickRef.current) {
       suppressClickRef.current = false;
       e.preventDefault();

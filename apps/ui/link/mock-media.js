@@ -43,7 +43,7 @@ export function makeSampleImageDataUrl({ a = '#3b6f7a', b = '#12262b', accent = 
       '<rect x="48" y="148" width="224" height="46" rx="10" fill="' + b + '" opacity="0.6"/>';
   }
   const svg =
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + w + ' ' + h + '" width="' + w + '" height="' + h + '">' +
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 240" preserveAspectRatio="xMidYMid slice" width="' + w + '" height="' + h + '">' +
     '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">' +
     '<stop offset="0%" stop-color="' + a + '"/><stop offset="100%" stop-color="' + b + '"/>' +
     '</linearGradient></defs>' +

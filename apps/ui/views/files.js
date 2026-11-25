@@ -984,22 +984,26 @@ export function FolderBrowser({
         : null}
 
       <nav ref=${crumbsRef} class="where" aria-label="Where this folder is">
-        ${crumbs.map(
-          (c, i) => html`
-            <span key=${`${c.label}-${i}`}>
-              ${i > 0 ? html`<i aria-hidden="true">›</i>` : null}
-              <a
-                href=${routeHref({ section: 'files', view: 'folder', machine, path: c.path })}
-                onClick=${(e) => {
-                  e.preventDefault();
-                  onNavigateFolder(machine, c.path);
-                }}
-              >
-                ${c.label}
-              </a>
-            </span>
-          `,
-        )}
+        ${crumbs.flatMap((c, i) => {
+          const isLast = i === crumbs.length - 1;
+          const out = [];
+          if (i > 0) out.push(html`<i key=${`sep-${i}`} aria-hidden="true">›</i>`);
+          out.push(html`
+            <a
+              key=${`${c.label}-${i}`}
+              class=${isLast ? 'current' : undefined}
+              aria-current=${isLast ? 'page' : undefined}
+              href=${routeHref({ section: 'files', view: 'folder', machine, path: c.path })}
+              onClick=${(e) => {
+                e.preventDefault();
+                onNavigateFolder(machine, c.path);
+              }}
+            >
+              ${c.label}
+            </a>
+          `);
+          return out;
+        })}
       </nav>
 
       ${error ? html`<${Notice} error=${error} />` : null}
@@ -1063,7 +1067,50 @@ export function FilesSearchView({
   const [truncatedByMachine, setTruncatedByMachine] = useState({});
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState(null);
+  const [, setThumbTick] = useState(0);
   const abortRef = useRef(null);
+
+  // Batch-load thumbnails for picture/video search hits across machines.
+  useEffect(() => {
+    if (!caps?.hasThumb) return undefined;
+    let alive = true;
+    const byMachine = new Map();
+    for (const [mName, items] of Object.entries(resultsByMachine)) {
+      if (!Array.isArray(items) || items.length === 0) continue;
+      for (const entry of items) {
+        if (!isThumbEligible(entry)) continue;
+        const key = thumbCacheKey(mName, entry.path, entry.mtime || '', 128);
+        if (thumbCache.get(key)) continue;
+        if (!byMachine.has(mName)) byMachine.set(mName, []);
+        byMachine.get(mName).push(entry);
+      }
+    }
+    for (const [mName, entries] of byMachine.entries()) {
+      const batch = entries.slice(0, 16);
+      link
+        .call('fs.thumb', { paths: batch.map((e) => e.path), size: 128, fit: 'cover' }, { on: mName })
+        .then((res) => {
+          if (!alive) return;
+          const map = res?.thumbnails || {};
+          let changed = false;
+          for (const entry of batch) {
+            const t = map[entry.path];
+            const key = thumbCacheKey(mName, entry.path, entry.mtime || '', 128);
+            if (t?.content && t?.mime) {
+              thumbCache.set(key, { url: `data:${t.mime};base64,${t.content}` });
+              changed = true;
+            } else {
+              thumbCache.set(key, { failed: true });
+            }
+          }
+          if (changed) setThumbTick((n) => n + 1);
+        })
+        .catch(() => {});
+    }
+    return () => {
+      alive = false;
+    };
+  }, [caps?.hasThumb, resultsByMachine, link, thumbCache]);
 
   const favKeySet = useMemo(
     () => new Set((favourites || []).map((f) => `${f.machine}\0${f.path}`)),
@@ -1210,69 +1257,74 @@ export function FilesSearchView({
     `;
   }
 
+  const totalMatches = machineOrder.reduce(
+    (sum, mName) => sum + (Array.isArray(resultsByMachine[mName]) ? resultsByMachine[mName].length : 0),
+    0,
+  );
+  const anyPending = machineOrder.some((mName) => resultsByMachine[mName] === undefined);
+
   return html`
     <div>
       ${error ? html`<${Notice} error=${error} />` : null}
       ${searching && Object.keys(resultsByMachine).length === 0
         ? html`<div class="empty">Searching…</div>`
-        : machineOrder.map((mName) => {
-            const items = resultsByMachine[mName];
-            if (items === undefined) {
+        : !searching && !anyPending && totalMatches === 0
+          ? html`<div class="empty">Nothing found.</div>`
+          : machineOrder.map((mName) => {
+              const items = resultsByMachine[mName];
+              if (items === undefined) {
+                return html`
+                  <div key=${mName}>
+                    <p class="label">${mName}</p>
+                    <div class="empty">Searching…</div>
+                  </div>
+                `;
+              }
+              if (items.length === 0) return null;
               return html`
                 <div key=${mName}>
                   <p class="label">${mName}</p>
-                  <div class="empty">Searching…</div>
+                  <div class="list">
+                    ${items.map((entry) => {
+                      const parent = parentFilePath(entry.path) || '~';
+                      const sub = [
+                        formatPathForDisplay(parent, { technical }),
+                        entry.kind !== 'dir' && entry.size != null ? formatBytes(entry.size) : null,
+                      ]
+                        .filter(Boolean)
+                        .join(' · ');
+                      const starred = caps?.hasFav && favKeySet.has(`${mName}\0${entry.path}`);
+                      const thumbHit = thumbCache.get(thumbCacheKey(mName, entry.path, entry.mtime || '', 128));
+                      const thumbUrl = thumbHit && !thumbHit.failed ? thumbHit.url : null;
+                      return html`
+                        <a
+                          key=${entry.path}
+                          class="row"
+                          href=${entry.kind === 'dir'
+                            ? routeHref({ section: 'files', view: 'folder', machine: mName, path: entry.path })
+                            : routeHref({ ...route, viewer: { machine: mName, path: entry.path } })}
+                          onClick=${(e) => {
+                            e.preventDefault();
+                            if (entry.kind === 'dir') onNavigateFolder(mName, entry.path);
+                            else onOpenFile(mName, entry, items);
+                          }}
+                        >
+                          <${EntryThumb} entry=${entry} thumbUrl=${thumbUrl} />
+                          <span class="body">
+                            <span class=${technical ? 'title mono' : 'title'}>${entry.name}</span>
+                            <span class="sub">${sub}</span>
+                          </span>
+                          ${starred ? html`<span class="star" aria-label="Favourite">★</span>` : null}
+                        </a>
+                      `;
+                    })}
+                  </div>
+                  ${truncatedByMachine[mName]
+                    ? html`<p class="search-note">Showing the first ${items.length} matches on ${mName}. Narrow your search to see more.</p>`
+                    : null}
                 </div>
               `;
-            }
-            return html`
-              <div key=${mName}>
-                <p class="label">${mName}</p>
-                ${items.length === 0
-                  ? html`<div class="empty">Nothing found.</div>`
-                  : html`
-                      <div class="list">
-                        ${items.map((entry) => {
-                          const parent = parentFilePath(entry.path) || '~';
-                          const sub = [
-                            formatPathForDisplay(parent, { technical }),
-                            entry.kind !== 'dir' && entry.size != null ? formatBytes(entry.size) : null,
-                          ]
-                            .filter(Boolean)
-                            .join(' · ');
-                          const starred = caps?.hasFav && favKeySet.has(`${mName}\0${entry.path}`);
-                          const thumbHit = thumbCache.get(thumbCacheKey(mName, entry.path, entry.mtime || '', 128));
-                          const thumbUrl = thumbHit && !thumbHit.failed ? thumbHit.url : null;
-                          return html`
-                            <a
-                              key=${entry.path}
-                              class="row"
-                              href=${entry.kind === 'dir'
-                                ? routeHref({ section: 'files', view: 'folder', machine: mName, path: entry.path })
-                                : routeHref({ ...route, viewer: { machine: mName, path: entry.path } })}
-                              onClick=${(e) => {
-                                e.preventDefault();
-                                if (entry.kind === 'dir') onNavigateFolder(mName, entry.path);
-                                else onOpenFile(mName, entry, items);
-                              }}
-                            >
-                              <${EntryThumb} entry=${entry} thumbUrl=${thumbUrl} />
-                              <span class="body">
-                                <span class=${technical ? 'title mono' : 'title'}>${entry.name}</span>
-                                <span class="sub">${sub}</span>
-                              </span>
-                              ${starred ? html`<span class="star" aria-label="Favourite">★</span>` : null}
-                            </a>
-                          `;
-                        })}
-                      </div>
-                    `}
-                ${truncatedByMachine[mName]
-                  ? html`<p class="search-note">Showing the first ${items.length} matches on ${mName}. Narrow your search to see more.</p>`
-                  : null}
-              </div>
-            `;
-          })}
+            })}
 
       ${!scopeMachine && offMachines.length > 0
         ? html`
@@ -2157,7 +2209,7 @@ export function FilesView({
               link=${link}
               onWakeMachine=${onWakeMachine}
               onStarted=${(info) => {
-                filesActions.endSelect();
+                filesActions.finishBulkAction();
                 if (onToast) {
                   onToast(info.message, { actionLabel: 'Activity', actionHref: '#/activity' });
                 }
