@@ -986,6 +986,58 @@ curl -sS \
 
 Pass `"on": "pi"` or `"on": "all"` in the JSON body to target remote machines.
 
+### File content (`POST /v1/content`)
+
+To feed a file to an `<img>`, `<video>`, `<audio>`, or resumable download with byte-range access,
+mint a short-lived content address with `POST /v1/content`:
+
+```sh
+curl -sS \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"path":"~/projects/app/clip.mp4","on":"pi"}' \
+  http://127.0.0.1:7117/v1/content
+```
+
+```json
+{"url":"/v1/content/<ticket>/clip.mp4","expires_in":900}
+```
+
+Omit `"on"` to read a file on the node serving HTTP itself; when `"on"` names another machine in
+`fleet.toml`, the node reads the requested byte range through its own `legion stream` session to
+that machine. `"on"` must name a single machine (never `"all"` or a list).
+
+Fetch the returned same-origin address with `GET` or `HEAD`, with optional single-range `Range`,
+`If-Range` (matched against the strong `ETag` built from size and modification time), and
+`?download=1` to force `Content-Disposition: attachment`:
+
+```sh
+curl -sS -r 0-65535 http://127.0.0.1:7117/v1/content/<ticket>/clip.mp4 -o chunk.bin
+curl -sSI 'http://127.0.0.1:7117/v1/content/<ticket>/clip.mp4?download=1'
+```
+
+Security and lifecycle guarantees:
+
+- **Tickets**: 256 random bits bound to one bearer token, one principal, one machine, and one file
+  path. Permissions are checked as `fs.read` when the ticket is minted and again on every `GET` or
+  `HEAD`. Tickets slide for 15 minutes from last use (6 hours absolute maximum), are capped at 128
+  per token (evicting the oldest), and stop working immediately when the token is removed,
+  replaced, or expired, or when the role loses `fs.read` on that path. Reads are written to the
+  audit log (`content.read`) and tickets are redacted from server logs.
+- **Headers and isolation**: every reply carries `X-Content-Type-Options: nosniff`,
+  `Cross-Origin-Resource-Policy: same-origin` (or `cross-origin` for an explicitly allowed CORS
+  origin), `Referrer-Policy: no-referrer`, and `Cache-Control: private, no-store`. `Content-Type`
+  comes from a fixed allow-list (raster images, SVG, video, audio, PDF, and
+  `text/plain; charset=utf-8` for all text files including HTML); unlisted types are served as
+  `application/octet-stream` with `Content-Disposition: attachment`. Every response except inline
+  PDF carries `Content-Security-Policy: sandbox; default-src 'none'` so opened HTML or SVG files
+  can never run script in the interface's origin.
+- **Host and `Origin` guards**: `/v1/content/<ticket>/<name>` enforces the same `Host` check as
+  every other route. Because `<img>`, `<video>`, `<audio>`, and direct downloads send no `Origin`
+  header, an absent `Origin` is accepted on `GET` and `HEAD` (the unguessable 256-bit ticket in
+  the path authenticates the read); if a browser does send an `Origin` header, it must match the
+  same origin or `[serve] origins` in `node.toml`, otherwise the request is refused with `403`.
+
 ### Event stream (SSE)
 
 Add `Accept: text/event-stream` to `POST /v1/call` to receive `stdout`, `stderr`, `progress`, and

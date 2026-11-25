@@ -116,7 +116,7 @@ where a reply line is awaited:
 | --- | --- | --- |
 | `manifest` | `{protocol, op, root, checksum?, exclude?}` | one JSON line per entry on stdout, then `{done, entries, skipped}` |
 | `stat` | `{protocol, op, path, checksum?, if_size?}` | one JSON line `{kind, size, mode?, hash?, mtime?, partial?, case_insensitive?}` on stdout |
-| `get` | `{protocol, op, path, offset?}` | one JSON line `{size}` on stdout, then the file's bytes from `offset` to the end |
+| `get` | `{protocol, op, path, offset?, length?}` | one JSON line `{size, offset, length, mtime}` on stdout, then `length` bytes from `offset` (to the end when `length` is absent) |
 | `put` | `{protocol, op, path, size, hash, mode?, mtime?}` | `{offset}` on stdout (what is on disk decides where it starts); bytes on stdin; `{ok, size, hash}` when verified and renamed |
 | `pack` | `{protocol, op, root, names: […]}` | `{ready, skipped}` on stdout, then a tar stream of those names |
 | `unpack` | `{protocol, op, root, entries: [{path, kind, size?, hash?, target?}]}` | `{ready}` on stdout; a tar stream on stdin (only the planned `entries` are accepted, verified before replacing the destination); `{ok, files, …}` when done |
@@ -375,8 +375,11 @@ replaced by their size.
   official SDK (`rmcp`) speaks both, so the door is built on it rather than written by hand.
 - **HTTP.** `legion serve` listens on a loopback address only (`127.0.0.1:7117` by default) and
   refuses any other: `GET /v1/health` (without a token), `GET /v1/tools`, `POST /v1/call` (with
-  optional `Accept: text/event-stream` for live events), and streamable-HTTP MCP at `/mcp`
-  (`?compact=1` or `Legion-Compact: 1`). Every request besides `/v1/health` needs a bearer token
+  optional `Accept: text/event-stream` for live events), `POST /v1/content` (which mints a
+  short-lived ticketed address `/v1/content/<ticket>/<name>` for range-capable `GET`/`HEAD` file
+  reads), and streamable-HTTP MCP at `/mcp`
+  (`?compact=1` or `Legion-Compact: 1`). Every request besides `/v1/health` and ticketed content
+  reads needs a bearer token
   from `tokens.toml`, where only the token's BLAKE3 hash is stored. Before a token is checked,
   `Host` must match this loopback address and port or `[serve] hosts` in `node.toml`, and any
   `Origin` header must be listed in `[serve] origins`. Publishing it beyond the machine is
