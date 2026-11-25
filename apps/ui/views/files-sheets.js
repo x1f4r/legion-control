@@ -94,12 +94,6 @@ export function SendToSheet({
   const canMove = isSameMachine
     ? Boolean(sourceCaps?.hasMove || sourceCaps?.hasTransferMove)
     : Boolean(sourceCaps?.hasTransferMove);
-  const moveNeedsNewerLegion =
-    !isSameMachine &&
-    Boolean(sourceCaps?.known) &&
-    Boolean(sourceCaps?.hasTransfer) &&
-    Boolean(sourceCaps?.hasRemove) &&
-    !sourceCaps?.hasTransferMove;
 
   useEffect(() => {
     if (!canMove && mode === 'move') setMode('copy');
@@ -359,9 +353,6 @@ export function SendToSheet({
                 Move
               </button>
             </div>
-            ${moveNeedsNewerLegion
-              ? html`<p class="sheet-note">${sourceMachine} needs a newer Legion to move files between machines. You can still copy them.</p>`
-              : null}
           `
         : null}
 

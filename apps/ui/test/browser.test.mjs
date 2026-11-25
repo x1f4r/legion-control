@@ -332,6 +332,11 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await page.locator('header.top button[aria-label="Back"]').click();
     await page.locator('a.machine', { hasText: 'tower' }).click();
     await page.getByText('Health').waitFor();
+    assert.equal(
+      await page.locator('.older-note').count(),
+      0,
+      'Current real node must not show an older-Legion note on Machine Overview',
+    );
     await assertNoToolNames(page, 'real phone tower overview');
     await maybeShot(page, 'real-phone-dark-machine-overview');
     await setTheme(page, 'light');
@@ -341,6 +346,12 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     // Horizontal swipe across machine parts: Overview -> Files; opens same Files browser at tower.
     await dispatchSwipe(page, 'main.main', { startX: 300, startY: 360, endX: 100, endY: 362 });
     await page.locator('nav.nav.parts a[aria-current="page"]', { hasText: 'Files' }).waitFor();
+    await page.locator('.list a.row', { hasText: 'docs' }).waitFor();
+    assert.equal(
+      await page.locator('.older-note').count(),
+      0,
+      'Current real node must not show an older-Legion note at Files root',
+    );
     await page.locator('.list a.row', { hasText: 'docs' }).click();
     await page.locator('.list a.row', { hasText: 'hello.txt' }).click();
     await page.locator('.viewer pre.viewer-text').getByText('Hello from Legion real server preview.').waitFor();
