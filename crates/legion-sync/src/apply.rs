@@ -5684,15 +5684,14 @@ fn fetch_and_verify_to_tmp<F: SyncFs, S: IndexStore>(
     ) {
         Ok(w) => w,
         Err(err) => {
-            if !err.is_crash() {
+            if !err.is_crash() && fs.remove_tmp(&tmp_name).is_ok() {
                 let _ = unregister_staged_tmp(store, &tmp_name);
             }
             return Err(err);
         }
     };
     if let Err(err) = writer.finish_sync() {
-        let _ = fs.remove_tmp(&tmp_name);
-        if !err.is_crash() {
+        if !err.is_crash() && fs.remove_tmp(&tmp_name).is_ok() {
             let _ = unregister_staged_tmp(store, &tmp_name);
         }
         return Err(err);
@@ -6178,8 +6177,9 @@ fn cleanup_staged_tmps<F: SyncFs, S: IndexStore>(
 ) -> Result<()> {
     let mut removed = Vec::new();
     for cand in candidates.iter().flatten() {
-        let _ = fs.remove_tmp(cand);
-        removed.push((*cand).to_string());
+        if fs.remove_tmp(cand).is_ok() {
+            removed.push((*cand).to_string());
+        }
     }
     if !removed.is_empty() {
         store.apply_batch(StoreBatch {

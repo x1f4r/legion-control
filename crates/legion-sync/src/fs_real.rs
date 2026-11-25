@@ -237,6 +237,9 @@ impl RealFs {
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {
                     fs::create_dir(&current)
                         .map_err(|e| SyncError::from_io(Some(anc.to_string()), e))?;
+                    if let Some(parent) = current.parent() {
+                        sync_dir(parent);
+                    }
                 }
                 Err(err) => return Err(SyncError::from_io(Some(anc.to_string()), err)),
             }
@@ -456,10 +459,22 @@ impl SyncFs for RealFs {
     fn ensure_internal_dirs(&self) -> Result<()> {
         fs::create_dir_all(&self.root)
             .map_err(|err| SyncError::from_io(Some(self.root.display().to_string()), err))?;
-        fs::create_dir_all(self.tmp_dir())
+        let meta_dir = self.meta_dir();
+        let tmp_dir = self.tmp_dir();
+        let bin_dir = self.bin_dir();
+        let created_meta = !meta_dir.exists();
+        let created_tmp = !tmp_dir.exists();
+        let created_bin = !bin_dir.exists();
+        fs::create_dir_all(&tmp_dir)
             .map_err(|err| SyncError::from_io(Some(SYNC_TMP_DIR.to_string()), err))?;
-        fs::create_dir_all(self.bin_dir())
+        fs::create_dir_all(&bin_dir)
             .map_err(|err| SyncError::from_io(Some(SYNC_BIN_DIR.to_string()), err))?;
+        if created_meta {
+            sync_dir(&self.root);
+        }
+        if created_meta || created_tmp || created_bin {
+            sync_dir(&meta_dir);
+        }
         Ok(())
     }
 
@@ -814,7 +829,12 @@ impl SyncFs for RealFs {
     fn remove_tmp(&self, tmp_name: &str) -> Result<()> {
         let full = self.resolve_tmp(tmp_name, false)?;
         match fs::remove_file(&full) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(parent) = full.parent() {
+                    sync_dir(parent);
+                }
+                Ok(())
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(SyncError::from_io(Some(Self::tmp_label(tmp_name)), err)),
         }

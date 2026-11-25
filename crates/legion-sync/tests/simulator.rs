@@ -233,17 +233,58 @@ struct FsSnapshot {
     next_gen: u64,
 }
 
+/// Shared tmp-write durability tracking for [`HonestSimFs`] power-loss mode.
+#[derive(Default)]
+struct PowerLossTmpState {
+    synced_tmp_data: BTreeSet<String>,
+    last_unsynced_tmp: Option<(String, Vec<u8>)>,
+    pending_power_loss: bool,
+}
+
+/// Durable-vs-volatile disk state used when [`HonestSimFs`] runs in power-loss mode.
+///
+/// Mirrors `RealFs`'s exact `fsync` / `sync_dir` calls:
+/// - File data written through [`SyncSimWriter`] is volatile until `finish_sync()` completes; a
+///   power loss before `finish_sync()` either drops the file or leaves a torn partial write
+///   (truncated prefix or zero-filled tail).
+/// - Directory entry mutations (creates, renames, unlinks, deferred group-commit renames, mkdirs)
+///   remain volatile until the affected parent directory is synced.
+/// - On power loss, any live entry whose strict ancestor directory was never synced into its own
+///   parent vanishes along with the unsynced ancestor directory.
+struct PowerLossDisk {
+    durable_marker: Option<FolderMarker>,
+    durable_deletion_log: Vec<u8>,
+    durable_live: BTreeMap<String, SimNode>,
+    durable_tmp: BTreeMap<String, Vec<u8>>,
+    durable_tmp_meta: TmpMetaMap,
+    durable_bin: BTreeMap<String, SimBinData>,
+    tmp_state: Arc<Mutex<PowerLossTmpState>>,
+    sync_created_ancestors: bool,
+    sync_remove_tmp: bool,
+    tear_rng: Rng,
+    power_losses: usize,
+}
+
 /// Send-safe writer staging into the in-memory `.legion-sync/tmp` map on `finish_sync`.
 struct SyncSimWriter {
     buf: Vec<u8>,
     name: String,
     target_tmp: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     fail_on_sync: Option<FsErrorKind>,
+    pl_tmp: Option<Arc<Mutex<PowerLossTmpState>>>,
 }
 
 impl Write for SyncSimWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.buf.extend_from_slice(buf);
+        if let Some(ref pl) = self.pl_tmp {
+            // Visible in volatile page cache while writing, but NOT yet fsync'd!
+            self.target_tmp
+                .lock()
+                .unwrap()
+                .insert(self.name.clone(), self.buf.clone());
+            pl.lock().unwrap().last_unsynced_tmp = Some((self.name.clone(), self.buf.clone()));
+        }
         Ok(buf.len())
     }
 
@@ -255,18 +296,37 @@ impl Write for SyncSimWriter {
 impl SyncWrite for SyncSimWriter {
     fn finish_sync(self: Box<Self>) -> legion_sync::Result<()> {
         if let Some(kind) = self.fail_on_sync {
+            if kind == FsErrorKind::Crash
+                && let Some(ref pl) = self.pl_tmp
+            {
+                let mut g = pl.lock().unwrap();
+                // Leave `last_unsynced_tmp` populated so power loss drops or tears it!
+                g.last_unsynced_tmp = Some((self.name.clone(), self.buf.clone()));
+                g.pending_power_loss = true;
+            }
             return Err(HonestSimFs::fault_err("finish_sync", kind));
         }
         let mut map = self.target_tmp.lock().unwrap();
-        map.insert(self.name, self.buf);
+        map.insert(self.name.clone(), self.buf);
+        drop(map);
+        if let Some(ref pl) = self.pl_tmp {
+            let mut g = pl.lock().unwrap();
+            g.synced_tmp_data.insert(self.name.clone());
+            if g.last_unsynced_tmp
+                .as_ref()
+                .is_some_and(|(n, _)| n == &self.name)
+            {
+                g.last_unsynced_tmp = None;
+            }
+        }
         Ok(())
     }
 }
 
 /// Honest in-memory filesystem enforcing platform case-insensitivity, macOS Unicode NFC/NFD
 /// normalization, Windows naming/length/symlink rules, unreadable subtrees, OS litter & ignored
-/// files, non-replacing renames & optional atomic swaps, crash/non-crash fault injection, and
-/// mid-apply human edit hooks.
+/// files, non-replacing renames & optional atomic swaps, crash/non-crash fault injection,
+/// power-loss durability simulation, and mid-apply human edit hooks.
 type TmpMetaMap = BTreeMap<String, (Timestamp, Option<u32>, u64)>;
 
 struct HonestSimFs {
@@ -292,6 +352,8 @@ struct HonestSimFs {
     mid_apply_fired: RefCell<Vec<MidApplyFired>>,
     free_space_budget: Cell<Option<u64>>,
     separate_mount_prefix: RefCell<Option<String>>,
+    power_loss_enabled: Cell<bool>,
+    power_loss: RefCell<Option<PowerLossDisk>>,
 }
 
 impl HonestSimFs {
@@ -319,7 +381,257 @@ impl HonestSimFs {
             mid_apply_fired: RefCell::new(Vec::new()),
             free_space_budget: Cell::new(None),
             separate_mount_prefix: RefCell::new(None),
+            power_loss_enabled: Cell::new(false),
+            power_loss: RefCell::new(None),
         }
+    }
+
+    fn enable_power_loss_mode(
+        &self,
+        seed: u64,
+        sync_created_ancestors: bool,
+        sync_remove_tmp: bool,
+    ) {
+        let mut tmp_state = PowerLossTmpState::default();
+        let tmp_snap = self.tmp.lock().unwrap().clone();
+        for k in tmp_snap.keys() {
+            tmp_state.synced_tmp_data.insert(k.clone());
+        }
+        *self.power_loss.borrow_mut() = Some(PowerLossDisk {
+            durable_marker: self.marker.borrow().clone(),
+            durable_deletion_log: self.deletion_log.borrow().clone(),
+            durable_live: self.live.borrow().clone(),
+            durable_tmp: tmp_snap,
+            durable_tmp_meta: self.tmp_meta.borrow().clone(),
+            durable_bin: self.bin.borrow().clone(),
+            tmp_state: Arc::new(Mutex::new(tmp_state)),
+            sync_created_ancestors,
+            sync_remove_tmp,
+            tear_rng: Rng::new(seed ^ 0xD15C_1055),
+            power_losses: 0,
+        });
+        self.power_loss_enabled.set(true);
+    }
+
+    fn power_loss_count(&self) -> usize {
+        self.power_loss
+            .borrow()
+            .as_ref()
+            .map_or(0, |pl| pl.power_losses)
+    }
+
+    fn pl_tmp_state(&self) -> Option<Arc<Mutex<PowerLossTmpState>>> {
+        if !self.power_loss_enabled.get() {
+            return None;
+        }
+        self.power_loss
+            .borrow()
+            .as_ref()
+            .map(|pl| Arc::clone(&pl.tmp_state))
+    }
+
+    fn pl_flush_all_durable(&self) {
+        if !self.power_loss_enabled.get() {
+            return;
+        }
+        let mut guard = self.power_loss.borrow_mut();
+        if let Some(pl) = guard.as_mut() {
+            pl.durable_marker = self.marker.borrow().clone();
+            pl.durable_deletion_log = self.deletion_log.borrow().clone();
+            pl.durable_live = self.live.borrow().clone();
+            pl.durable_bin = self.bin.borrow().clone();
+        }
+    }
+
+    fn pl_flush_live_dir(&self, dir: &str) {
+        if !self.power_loss_enabled.get() {
+            return;
+        }
+        let mut guard = self.power_loss.borrow_mut();
+        let Some(pl) = guard.as_mut() else {
+            return;
+        };
+        let live = self.live.borrow();
+        let is_direct_child = |k: &str| {
+            let p = k.rsplit_once('/').map_or("", |(parent, _)| parent);
+            p == dir
+        };
+        pl.durable_live
+            .retain(|k, _| !is_direct_child(k) || live.contains_key(k));
+        for (k, v) in live.iter() {
+            if is_direct_child(k) {
+                pl.durable_live.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    fn pl_flush_live_parent(&self, clean: &str) {
+        if !self.power_loss_enabled.get() {
+            return;
+        }
+        let parent = clean.rsplit_once('/').map_or("", |(p, _)| p);
+        self.pl_flush_live_dir(parent);
+    }
+
+    fn pl_flush_created_ancestors(&self, created: &[String]) {
+        if !self.power_loss_enabled.get() || created.is_empty() {
+            return;
+        }
+        let should_sync = self
+            .power_loss
+            .borrow()
+            .as_ref()
+            .is_some_and(|pl| pl.sync_created_ancestors);
+        if should_sync {
+            for anc in created {
+                self.pl_flush_live_parent(anc);
+            }
+        }
+    }
+
+    fn pl_flush_tmp_dir(&self) {
+        if !self.power_loss_enabled.get() {
+            return;
+        }
+        let mut guard = self.power_loss.borrow_mut();
+        let Some(pl) = guard.as_mut() else {
+            return;
+        };
+        let tmp = self.tmp.lock().unwrap();
+        let tmp_meta = self.tmp_meta.borrow();
+        let tmp_state = pl.tmp_state.lock().unwrap();
+        pl.durable_tmp.retain(|k, _| tmp.contains_key(k));
+        pl.durable_tmp_meta.retain(|k, _| tmp.contains_key(k));
+        for (k, v) in tmp.iter() {
+            if tmp_state.synced_tmp_data.contains(k) {
+                pl.durable_tmp.insert(k.clone(), v.clone());
+                if let Some(m) = tmp_meta.get(k) {
+                    pl.durable_tmp_meta.insert(k.clone(), *m);
+                }
+            }
+        }
+    }
+
+    fn pl_flush_bin_dir(&self) {
+        if !self.power_loss_enabled.get() {
+            return;
+        }
+        let mut guard = self.power_loss.borrow_mut();
+        if let Some(pl) = guard.as_mut() {
+            pl.durable_bin = self.bin.borrow().clone();
+        }
+    }
+
+    fn pl_mark_tmp_data_synced(&self, name: &str) {
+        if !self.power_loss_enabled.get() {
+            return;
+        }
+        if let Some(pl) = self.power_loss.borrow().as_ref() {
+            pl.tmp_state
+                .lock()
+                .unwrap()
+                .synced_tmp_data
+                .insert(name.to_string());
+        }
+    }
+
+    fn pl_is_tmp_data_synced(&self, name: &str) -> bool {
+        if !self.power_loss_enabled.get() {
+            return true;
+        }
+        self.power_loss
+            .borrow()
+            .as_ref()
+            .is_none_or(|pl| pl.tmp_state.lock().unwrap().synced_tmp_data.contains(name))
+    }
+
+    fn apply_pending_power_loss(&self) {
+        if !self.power_loss_enabled.get() {
+            return;
+        }
+        let pending = self
+            .power_loss
+            .borrow()
+            .as_ref()
+            .is_some_and(|pl| pl.tmp_state.lock().unwrap().pending_power_loss);
+        if pending {
+            self.simulate_power_loss();
+        }
+    }
+
+    /// Cuts power abruptly: discards every unsynced file write and unsynced directory entry
+    /// mutation, drops any live subtree whose newly created ancestor directory was never synced
+    /// into its parent, and optionally leaves a torn partial write (truncated prefix or
+    /// zero-filled tail) for the last unsynced tmp write.
+    fn simulate_power_loss(&self) {
+        if !self.power_loss_enabled.get() {
+            return;
+        }
+        let mut guard = self.power_loss.borrow_mut();
+        let Some(pl) = guard.as_mut() else {
+            return;
+        };
+
+        // Drop any durable live entry whose strict ancestor directory is NOT durable.
+        let durable_dirs: BTreeSet<String> = pl
+            .durable_live
+            .iter()
+            .filter_map(|(k, v)| matches!(v, SimNode::Dir { .. }).then_some(k.clone()))
+            .collect();
+        pl.durable_live.retain(|path, _| {
+            legion_sync::path::ancestors(path)
+                .into_iter()
+                .all(|anc| durable_dirs.contains(anc))
+        });
+
+        // Restore volatile views from durable state.
+        *self.marker.borrow_mut() = pl.durable_marker.clone();
+        *self.deletion_log.borrow_mut() = pl.durable_deletion_log.clone();
+        *self.live.borrow_mut() = pl.durable_live.clone();
+        *self.bin.borrow_mut() = pl.durable_bin.clone();
+
+        let mut restored_tmp = pl.durable_tmp.clone();
+        let mut restored_tmp_meta = pl.durable_tmp_meta.clone();
+
+        // Model the last unsynced write: either lost completely or torn (truncated / zero-tail).
+        let unsynced = {
+            let mut ts = pl.tmp_state.lock().unwrap();
+            ts.pending_power_loss = false;
+            ts.synced_tmp_data.clear();
+            for k in restored_tmp.keys() {
+                ts.synced_tmp_data.insert(k.clone());
+            }
+            ts.last_unsynced_tmp.take()
+        };
+        if let Some((name, full_bytes)) = unsynced {
+            if !full_bytes.is_empty() && pl.tear_rng.chance(2, 3) {
+                let cut = if full_bytes.len() == 1 {
+                    0
+                } else {
+                    1 + pl.tear_rng.range(full_bytes.len() - 1)
+                };
+                let torn = if pl.tear_rng.chance(1, 2) {
+                    full_bytes[..cut].to_vec()
+                } else {
+                    let mut z = vec![0u8; full_bytes.len()];
+                    z[..cut].copy_from_slice(&full_bytes[..cut]);
+                    z
+                };
+                restored_tmp.insert(name.clone(), torn);
+                restored_tmp_meta.remove(&name);
+                pl.tmp_state.lock().unwrap().synced_tmp_data.insert(name);
+            } else {
+                restored_tmp.remove(&name);
+                restored_tmp_meta.remove(&name);
+            }
+        }
+
+        // Persist post-reboot state as the new durable baseline.
+        pl.durable_tmp = restored_tmp.clone();
+        pl.durable_tmp_meta = restored_tmp_meta.clone();
+        *self.tmp.lock().unwrap() = restored_tmp;
+        *self.tmp_meta.borrow_mut() = restored_tmp_meta;
+        pl.power_losses += 1;
     }
 
     fn set_free_space(&self, bytes: Option<u64>) {
@@ -343,6 +655,8 @@ impl HonestSimFs {
                 gen_id,
             },
         );
+        drop(bin);
+        self.pl_flush_bin_dir();
         h
     }
 
@@ -382,6 +696,8 @@ impl HonestSimFs {
             mid_apply_fired: RefCell::new(Vec::new()),
             free_space_budget: Cell::new(None),
             separate_mount_prefix: RefCell::new(None),
+            power_loss_enabled: Cell::new(false),
+            power_loss: RefCell::new(None),
         }
     }
 
@@ -579,6 +895,7 @@ impl HonestSimFs {
                 }
             };
             self.mid_apply_fired.borrow_mut().push(fired);
+            self.pl_flush_all_durable();
         }
     }
 
@@ -646,6 +963,9 @@ impl HonestSimFs {
         }
         let (before, after) = self.tick_fault();
         if let Some(kind) = before {
+            if kind == FsErrorKind::Crash {
+                self.simulate_power_loss();
+            }
             return Err(Self::fault_err(op, kind));
         }
         let res = f()?;
@@ -653,6 +973,9 @@ impl HonestSimFs {
             self.maybe_fire_mid_apply(op, true);
         }
         if let Some(kind) = after {
+            if kind == FsErrorKind::Crash {
+                self.simulate_power_loss();
+            }
             return Err(Self::fault_err(op, kind));
         }
         Ok(res)
@@ -770,6 +1093,8 @@ impl HonestSimFs {
                 gen_id: self.alloc_gen(),
             },
         );
+        drop(live);
+        self.pl_flush_all_durable();
         prev_hash
     }
 
@@ -786,6 +1111,8 @@ impl HonestSimFs {
             .resolve_existing_key(&live, &clean)
             .unwrap_or_else(|| clean.clone());
         live.insert(target_key, SimNode::Dir { mtime });
+        drop(live);
+        self.pl_flush_all_durable();
     }
 
     fn user_symlink(&self, path: &str, target: String, mtime: Timestamp) {
@@ -801,6 +1128,8 @@ impl HonestSimFs {
             .resolve_existing_key(&live, &clean)
             .unwrap_or_else(|| clean.clone());
         live.insert(target_key, SimNode::Symlink { target, mtime });
+        drop(live);
+        self.pl_flush_all_durable();
     }
 
     fn user_remove_recursive(&self, path: &str) -> Vec<Hash> {
@@ -820,6 +1149,8 @@ impl HonestSimFs {
                 removed.push(hash);
             }
         }
+        drop(live);
+        self.pl_flush_all_durable();
         removed
     }
 
@@ -840,6 +1171,8 @@ impl HonestSimFs {
             live.entry(anc_key).or_insert(SimNode::Dir { mtime });
         }
         live.insert(to.to_string(), node);
+        drop(live);
+        self.pl_flush_all_durable();
         prev_to
     }
 
@@ -879,6 +1212,8 @@ impl HonestSimFs {
                 overwritten.push(hash);
             }
         }
+        drop(live);
+        self.pl_flush_all_durable();
         overwritten
     }
 
@@ -975,11 +1310,21 @@ impl SyncFs for HonestSimFs {
 
     fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
         *self.marker.borrow_mut() = Some(marker.clone());
+        if self.power_loss_enabled.get()
+            && let Some(pl) = self.power_loss.borrow_mut().as_mut()
+        {
+            pl.durable_marker = Some(marker.clone());
+        }
         Ok(())
     }
 
     fn append_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
         self.deletion_log.borrow_mut().extend_from_slice(bytes);
+        if self.power_loss_enabled.get()
+            && let Some(pl) = self.power_loss.borrow_mut().as_mut()
+        {
+            pl.durable_deletion_log.extend_from_slice(bytes);
+        }
         Ok(())
     }
 
@@ -989,6 +1334,11 @@ impl SyncFs for HonestSimFs {
 
     fn compact_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
         *self.deletion_log.borrow_mut() = bytes.to_vec();
+        if self.power_loss_enabled.get()
+            && let Some(pl) = self.power_loss.borrow_mut().as_mut()
+        {
+            pl.durable_deletion_log = bytes.to_vec();
+        }
         Ok(())
     }
 
@@ -1141,6 +1491,7 @@ impl SyncFs for HonestSimFs {
             return Err(Self::fault_err(&clean, FsErrorKind::PermissionDenied));
         }
         self.wrap_mut("create_dir_all_live", false, || {
+            let mut created_ancs = Vec::new();
             let mut live = self.live.borrow_mut();
             if Self::has_ancestor_conflict(&live, &clean) {
                 return Err(SyncError::Conflict {
@@ -1163,11 +1514,16 @@ impl SyncFs for HonestSimFs {
                             mtime: Timestamp::new(0, 0),
                         },
                     );
+                    created_ancs.push(anc.to_string());
                 }
             }
             if let Some(existing_key) = self.resolve_existing_key(&live, &clean) {
                 match live.get(&existing_key) {
-                    Some(SimNode::Dir { .. }) => Ok(()),
+                    Some(SimNode::Dir { .. }) => {
+                        drop(live);
+                        self.pl_flush_created_ancestors(&created_ancs);
+                        Ok(())
+                    }
                     _ => Err(SyncError::Conflict {
                         path: clean,
                         reason: "non-directory exists".to_string(),
@@ -1175,11 +1531,14 @@ impl SyncFs for HonestSimFs {
                 }
             } else {
                 live.insert(
-                    clean,
+                    clean.clone(),
                     SimNode::Dir {
                         mtime: Timestamp::new(0, 0),
                     },
                 );
+                drop(live);
+                self.pl_flush_created_ancestors(&created_ancs);
+                self.pl_flush_live_parent(&clean);
                 Ok(())
             }
         })
@@ -1244,7 +1603,11 @@ impl SyncFs for HonestSimFs {
                 });
             }
             match live.remove(&actual) {
-                Some(SimNode::Dir { .. }) => Ok(()),
+                Some(SimNode::Dir { .. }) => {
+                    drop(live);
+                    self.pl_flush_live_parent(&actual);
+                    Ok(())
+                }
                 Some(other) => {
                     live.insert(actual, other);
                     Err(SyncError::Conflict {
@@ -1285,6 +1648,7 @@ impl SyncFs for HonestSimFs {
                     kind: FsErrorKind::AlreadyExists,
                 });
             }
+            let mut created_ancs = Vec::new();
             for anc in legion_sync::path::ancestors(&clean) {
                 if self.resolve_existing_key(&live, anc).is_none() {
                     live.insert(
@@ -1293,15 +1657,19 @@ impl SyncFs for HonestSimFs {
                             mtime: Timestamp::new(0, 0),
                         },
                     );
+                    created_ancs.push(anc.to_string());
                 }
             }
             live.insert(
-                clean,
+                clean.clone(),
                 SimNode::Symlink {
                     target: target.to_string(),
                     mtime: Timestamp::new(0, 0),
                 },
             );
+            drop(live);
+            self.pl_flush_created_ancestors(&created_ancs);
+            self.pl_flush_live_parent(&clean);
             Ok(())
         })
     }
@@ -1318,7 +1686,11 @@ impl SyncFs for HonestSimFs {
                 });
             };
             match live.remove(&actual) {
-                Some(SimNode::Symlink { .. }) => Ok(()),
+                Some(SimNode::Symlink { .. }) => {
+                    drop(live);
+                    self.pl_flush_live_parent(&actual);
+                    Ok(())
+                }
                 Some(other) => {
                     live.insert(actual, other);
                     Err(SyncError::Conflict {
@@ -1389,6 +1761,7 @@ impl SyncFs for HonestSimFs {
                     kind: FsErrorKind::NotFound,
                 });
             };
+            let mut created_ancs = Vec::new();
             for anc in legion_sync::path::ancestors(&clean_to) {
                 if self.resolve_existing_key(&live, anc).is_none() {
                     live.insert(
@@ -1397,17 +1770,35 @@ impl SyncFs for HonestSimFs {
                             mtime: Timestamp::new(0, 0),
                         },
                     );
+                    created_ancs.push(anc.to_string());
                 }
             }
-            live.insert(clean_to, node);
+            live.insert(clean_to.clone(), node);
+            drop(live);
+            self.pl_flush_created_ancestors(&created_ancs);
+            self.pl_flush_live_parent(&clean_to);
+            self.pl_flush_live_parent(&actual_from);
             Ok(())
         })
+    }
+
+    fn sync_parent_dir_live(&self, live_rel: &str) {
+        if let Ok(clean) = validate_sync_path(live_rel) {
+            self.pl_flush_live_parent(&clean);
+        }
+    }
+
+    fn sync_tmp_dir(&self) {
+        self.pl_flush_tmp_dir();
     }
 
     fn create_tmp(&self, tmp_name: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
         validate_staged_tmp_token(tmp_name)?;
         let (before, after) = self.tick_fault();
         if let Some(kind) = before {
+            if kind == FsErrorKind::Crash {
+                self.simulate_power_loss();
+            }
             return Err(Self::fault_err("create_tmp", kind));
         }
         Ok(Box::new(SyncSimWriter {
@@ -1415,6 +1806,7 @@ impl SyncFs for HonestSimFs {
             name: tmp_name.to_string(),
             target_tmp: self.tmp.clone(),
             fail_on_sync: after,
+            pl_tmp: self.pl_tmp_state(),
         }))
     }
 
@@ -1422,6 +1814,9 @@ impl SyncFs for HonestSimFs {
         validate_staged_tmp_token(tmp_name)?;
         let (before, after) = self.tick_fault();
         if let Some(kind) = before {
+            if kind == FsErrorKind::Crash {
+                self.simulate_power_loss();
+            }
             return Err(Self::fault_err("open_tmp_append", kind));
         }
         let existing = self
@@ -1436,6 +1831,7 @@ impl SyncFs for HonestSimFs {
             name: tmp_name.to_string(),
             target_tmp: self.tmp.clone(),
             fail_on_sync: after,
+            pl_tmp: self.pl_tmp_state(),
         }))
     }
 
@@ -1502,6 +1898,28 @@ impl SyncFs for HonestSimFs {
     fn remove_tmp(&self, tmp_name: &str) -> legion_sync::Result<()> {
         validate_staged_tmp_token(tmp_name)?;
         self.tmp.lock().unwrap().remove(tmp_name);
+        self.tmp_meta.borrow_mut().remove(tmp_name);
+        if self.power_loss_enabled.get() {
+            let sync_rm = self
+                .power_loss
+                .borrow()
+                .as_ref()
+                .is_some_and(|pl| pl.sync_remove_tmp);
+            if sync_rm {
+                if let Some(pl) = self.power_loss.borrow().as_ref() {
+                    let mut ts = pl.tmp_state.lock().unwrap();
+                    ts.synced_tmp_data.remove(tmp_name);
+                    if ts
+                        .last_unsynced_tmp
+                        .as_ref()
+                        .is_some_and(|(n, _)| n == tmp_name)
+                    {
+                        ts.last_unsynced_tmp = None;
+                    }
+                }
+                self.pl_flush_tmp_dir();
+            }
+        }
         Ok(())
     }
 
@@ -1521,6 +1939,10 @@ impl SyncFs for HonestSimFs {
             return Err(Self::fault_err(&clean, FsErrorKind::PermissionDenied));
         }
         self.wrap_mut("commit_tmp_to_live_no_replace", true, || {
+            assert!(
+                self.pl_is_tmp_data_synced(tmp_name),
+                "power-loss bug: commit_tmp_to_live_no_replace called on unsynced tmp '{tmp_name}' for '{clean}'"
+            );
             let mut live = self.live.borrow_mut();
             if Self::has_ancestor_conflict(&live, &clean) {
                 return Err(SyncError::Conflict {
@@ -1561,6 +1983,7 @@ impl SyncFs for HonestSimFs {
                         )
                     });
             let hash = hash_bytes(&bytes);
+            let mut created_ancs = Vec::new();
             for anc in legion_sync::path::ancestors(&clean) {
                 if self.resolve_existing_key(&live, anc).is_none() {
                     live.insert(
@@ -1569,10 +1992,11 @@ impl SyncFs for HonestSimFs {
                             mtime: Timestamp::new(0, 0),
                         },
                     );
+                    created_ancs.push(anc.to_string());
                 }
             }
             live.insert(
-                clean,
+                clean.clone(),
                 SimNode::File {
                     bytes,
                     hash,
@@ -1581,8 +2005,102 @@ impl SyncFs for HonestSimFs {
                     gen_id,
                 },
             );
+            drop(live);
+            self.pl_flush_created_ancestors(&created_ancs);
+            self.pl_flush_live_parent(&clean);
+            self.pl_flush_tmp_dir();
             Ok(())
         })
+    }
+
+    fn commit_tmp_to_live_no_replace_deferred_dir_sync(
+        &self,
+        tmp_name: &str,
+        live_rel: &str,
+    ) -> legion_sync::Result<()> {
+        validate_staged_tmp_token(tmp_name)?;
+        let clean = self.check_live_path(live_rel)?;
+        self.guard_platform(&clean, EntryKind::File)?;
+        if self.is_unreadable(&clean) {
+            return Err(Self::fault_err(&clean, FsErrorKind::PermissionDenied));
+        }
+        self.wrap_mut(
+            "commit_tmp_to_live_no_replace_deferred_dir_sync",
+            true,
+            || {
+                assert!(
+                    self.pl_is_tmp_data_synced(tmp_name),
+                    "power-loss bug: deferred commit called on unsynced tmp '{tmp_name}' for '{clean}'"
+                );
+                let mut live = self.live.borrow_mut();
+                if Self::has_ancestor_conflict(&live, &clean) {
+                    return Err(SyncError::Conflict {
+                        path: clean.clone(),
+                        reason: "ancestor is not a directory".to_string(),
+                    });
+                }
+                if self.resolve_existing_key(&live, &clean).is_some() {
+                    return Err(SyncError::Fs {
+                        path: Some(clean),
+                        detail: "destination already exists".to_string(),
+                        kind: FsErrorKind::AlreadyExists,
+                    });
+                }
+                let bytes = self
+                    .tmp
+                    .lock()
+                    .unwrap()
+                    .remove(tmp_name)
+                    .ok_or_else(|| SyncError::Fs {
+                        path: Some(tmp_name.to_string()),
+                        detail: "tmp not found".to_string(),
+                        kind: FsErrorKind::NotFound,
+                    })?;
+                let (mtime, mode, gen_id) =
+                    self.tmp_meta
+                        .borrow_mut()
+                        .remove(tmp_name)
+                        .unwrap_or_else(|| {
+                            (
+                                Timestamp::new(0, 0),
+                                if self.caps.windows_naming {
+                                    None
+                                } else {
+                                    Some(0o644)
+                                },
+                                self.alloc_gen(),
+                            )
+                        });
+                let hash = hash_bytes(&bytes);
+                let mut created_ancs = Vec::new();
+                for anc in legion_sync::path::ancestors(&clean) {
+                    if self.resolve_existing_key(&live, anc).is_none() {
+                        live.insert(
+                            anc.to_string(),
+                            SimNode::Dir {
+                                mtime: Timestamp::new(0, 0),
+                            },
+                        );
+                        created_ancs.push(anc.to_string());
+                    }
+                }
+                live.insert(
+                    clean.clone(),
+                    SimNode::File {
+                        bytes,
+                        hash,
+                        mtime,
+                        mode,
+                        gen_id,
+                    },
+                );
+                drop(live);
+                // Intentionally defer live parent and tmp dir syncs until `sync_parent_dir_live` /
+                // `sync_tmp_dir` — matching `RealFs::commit_tmp_to_live_no_replace_deferred_dir_sync`!
+                self.pl_flush_created_ancestors(&created_ancs);
+                Ok(())
+            },
+        )
     }
 
     fn exchange_tmp_with_live(&self, tmp_name: &str, live_rel: &str) -> legion_sync::Result<bool> {
@@ -1652,6 +2170,11 @@ impl SyncFs for HonestSimFs {
                     .borrow_mut()
                     .insert(tmp_name.to_string(), (old_mt, old_md, old_g));
             }
+            drop(tmp);
+            drop(live);
+            self.pl_mark_tmp_data_synced(tmp_name);
+            self.pl_flush_live_parent(&clean);
+            self.pl_flush_tmp_dir();
             Ok(true)
         })
     }
@@ -1692,6 +2215,11 @@ impl SyncFs for HonestSimFs {
                     self.tmp_meta
                         .borrow_mut()
                         .insert(tmp_name.to_string(), (mtime, mode, gen_id));
+                    drop(tmp);
+                    drop(live);
+                    self.pl_mark_tmp_data_synced(tmp_name);
+                    self.pl_flush_tmp_dir();
+                    self.pl_flush_live_parent(&actual);
                     Ok(())
                 }
                 Some(other) => {
@@ -1747,6 +2275,10 @@ impl SyncFs for HonestSimFs {
                     gen_id,
                 },
             );
+            drop(bin);
+            drop(tmp);
+            self.pl_flush_bin_dir();
+            self.pl_flush_tmp_dir();
             Ok(())
         })
     }
@@ -1792,6 +2324,10 @@ impl SyncFs for HonestSimFs {
                             gen_id,
                         },
                     );
+                    drop(bin);
+                    drop(live);
+                    self.pl_flush_bin_dir();
+                    self.pl_flush_live_parent(&actual);
                     Ok(())
                 }
                 Some(other) => {
@@ -1823,6 +2359,7 @@ impl SyncFs for HonestSimFs {
                     gen_id,
                 },
             );
+            self.pl_flush_bin_dir();
             Ok(())
         })
     }
@@ -1875,6 +2412,7 @@ impl SyncFs for HonestSimFs {
                     kind: FsErrorKind::NotFound,
                 })?;
             self.tmp.lock().unwrap().insert(tmp_name.to_string(), bytes);
+            self.pl_mark_tmp_data_synced(tmp_name);
             Ok(())
         })
     }
@@ -1906,6 +2444,7 @@ impl SyncFs for HonestSimFs {
                         kind: FsErrorKind::NotFound,
                     })?;
             let hash = data.hash.unwrap_or_else(|| hash_bytes(&data.bytes));
+            let mut created_ancs = Vec::new();
             for anc in legion_sync::path::ancestors(&clean) {
                 if self.resolve_existing_key(&live, anc).is_none() {
                     live.insert(
@@ -1914,10 +2453,11 @@ impl SyncFs for HonestSimFs {
                             mtime: Timestamp::new(0, 0),
                         },
                     );
+                    created_ancs.push(anc.to_string());
                 }
             }
             live.insert(
-                clean,
+                clean.clone(),
                 SimNode::File {
                     bytes: data.bytes,
                     hash,
@@ -1930,6 +2470,10 @@ impl SyncFs for HonestSimFs {
                     gen_id: self.alloc_gen(),
                 },
             );
+            drop(live);
+            self.pl_flush_created_ancestors(&created_ancs);
+            self.pl_flush_live_parent(&clean);
+            self.pl_flush_bin_dir();
             Ok(())
         })
     }
@@ -1937,6 +2481,7 @@ impl SyncFs for HonestSimFs {
     fn remove_bin_file(&self, bin_name: &str) -> legion_sync::Result<()> {
         validate_flat_internal_name(bin_name)?;
         self.bin.borrow_mut().remove(bin_name);
+        self.pl_flush_bin_dir();
         Ok(())
     }
 
@@ -2430,6 +2975,7 @@ impl SimWorld {
         let ignore = IgnoreMatcher::compile(&ignore_patterns).unwrap();
         let mut members = Vec::with_capacity(n);
 
+        let power_loss_world = (seed % 4) == 1;
         for (i, id) in member_names.iter().enumerate() {
             let caps = if heterogeneous {
                 match i % 3 {
@@ -2445,6 +2991,9 @@ impl SimWorld {
             cfg.ignore = ignore_patterns.clone();
             cfg.initial_incarnation = Some(rng.next_u64() | 1);
             let fs = HonestSimFs::new(caps, supports_exchange);
+            if power_loss_world {
+                fs.enable_power_loss_mode(seed ^ ((i as u64 + 1) * 0x9E37), true, true);
+            }
             let store = FaultyIndexStore::new();
             let mut engine = SyncEngine::open(cfg, fs, store).unwrap();
             // Disable the mass-deletion brake on tiny 2..15-file randomized schedules unless
@@ -2865,6 +3414,7 @@ impl SimWorld {
     /// `recover()` completes cleanly with zero loss!).
     fn recover_member(&mut self, idx: usize, crash_during_recovery: bool) {
         let mid = self.members[idx].id.clone();
+        self.members[idx].engine.fs().apply_pending_power_loss();
         if crash_during_recovery {
             let op = self.rng.range(4);
             let after = self.rng.chance(1, 2);
@@ -2872,6 +3422,7 @@ impl SimWorld {
             let res = self.members[idx].engine.recover();
             let crashed = self.members[idx].engine.fs().crashed();
             self.members[idx].engine.fs().disarm_fault();
+            self.members[idx].engine.fs().apply_pending_power_loss();
             match res {
                 Ok(_) => {}
                 Err(err) if err.is_crash() && crashed => {
@@ -3165,6 +3716,16 @@ impl SimWorld {
                     "unexpected error syncing {dst_id} <- {src_id}: {err}"
                 ));
             }
+        }
+
+        // In power-loss mode, occasionally cut power right AFTER a sync returns (post-commit or
+        // post-error cleanup) and verify recovery preserves every committed file and leaves no
+        // ghost engine tmp files behind!
+        if self.members[dst_idx].engine.fs().power_loss_enabled.get() && self.rng.chance(1, 5) {
+            let crash_in_rec = self.rng.chance(1, 4);
+            self.members[dst_idx].engine.fs().simulate_power_loss();
+            self.recover_member(dst_idx, crash_in_rec);
+            self.scan_member(dst_idx);
         }
 
         self.record_live_presence();
@@ -6721,6 +7282,809 @@ fn run_lying_peer_regression_rate_limit_seed(root_seed: u64, seed: u64, _record_
     );
 }
 
+/// Scenario 21: Randomized asymmetric membership views (`p2`, `p2b`, `p6`, `p6b`):
+/// - subcase 0: member added on a subset of peers (unknown to others), relaying edits and
+///   deletions with dropped pages mid-sync;
+/// - subcase 1: member removed while offline, returning with unsynced edits and deletions after
+///   concurrent deletions and tombstone GC on active members;
+/// - subcase 2: removed and re-added member with concurrent delete-vs-edit and staggered re-add.
+fn run_asymmetric_membership_views_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    struct DropPagesPeer<'a>(SimPeer<'a>);
+    impl Peer for DropPagesPeer<'_> {
+        fn member_id(&self) -> &str {
+            self.0.member_id()
+        }
+        fn handshake(&self, c: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+            self.0.handshake(c)
+        }
+        fn records_since(
+            &self,
+            _i: u64,
+            _s: u64,
+            _l: usize,
+            _c: Option<&AtomicBool>,
+        ) -> legion_sync::Result<RecordsPage> {
+            Err(SyncError::PeerUnavailable {
+                member: self.0.member_id().to_string(),
+                detail: "simulated dropped page mid-sync".to_string(),
+            })
+        }
+        fn fetch_file(
+            &self,
+            p: &str,
+            h: Hash,
+            o: &FetchOptions,
+        ) -> legion_sync::Result<Box<dyn Read + Send>> {
+            self.0.fetch_file(p, h, o)
+        }
+    }
+
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let mk = |id: &str, members: &[&str], rng: &mut Rng| {
+        let mut cfg = FolderConfig::new(
+            "sim",
+            id.to_string(),
+            members.iter().map(|s| (*s).to_string()),
+        );
+        cfg.initial_incarnation = Some(rng.next_u64() | 1);
+        let mut e = SyncEngine::open(
+            cfg,
+            HonestSimFs::new(FsCapabilities::unix(), rng.chance(1, 2)),
+            FaultyIndexStore::new(),
+        )
+        .unwrap();
+        e.set_deletion_brake(brake_disabled());
+        e
+    };
+
+    let sync_slice =
+        |es: &mut [&mut SyncEngine<HonestSimFs, FaultyIndexStore>], t_base: i64, rng: &mut Rng| {
+            let n = es.len();
+            for round in 0..4i64 {
+                let mut pairs: Vec<(usize, usize)> = Vec::new();
+                for i in 0..n {
+                    for j in 0..n {
+                        if i != j {
+                            pairs.push((i, j));
+                        }
+                    }
+                }
+                for k in (1..pairs.len()).rev() {
+                    let s = rng.range(k + 1);
+                    pairs.swap(k, s);
+                }
+                for (i, j) in pairs {
+                    let now = Timestamp::new(t_base + round * 5, 0);
+                    let (dst, src) = if i < j {
+                        let (l, r) = es.split_at_mut(j);
+                        (&mut l[i], &r[0])
+                    } else {
+                        let (l, r) = es.split_at_mut(i);
+                        (&mut r[0], &l[j])
+                    };
+                    let dst_id = dst.meta().unwrap().local_member;
+                    let src_id = src.meta().unwrap().local_member;
+                    let _ = dst
+                        .pull_from_peer(&SimPeer::new(src, &dst_id, &src_id, PeerFault::None), now);
+                }
+            }
+        };
+
+    match rng.range(3) {
+        0 => {
+            // Subcase 0: `pi` added on `nas` (and optionally `laptop`), unknown to `tower`;
+            // concurrent edit + deletion + optional dropped page when `tower` finally learns `pi`.
+            let three = ["tower", "nas", "laptop"];
+            let four = ["tower", "nas", "laptop", "pi"];
+            let mut tower = mk("tower", &three, &mut rng);
+            let mut nas = mk("nas", &three, &mut rng);
+            let mut laptop = mk("laptop", &three, &mut rng);
+
+            let base_doc = format!("base-doc-{seed}").into_bytes();
+            let base_del = format!("base-del-{seed}").into_bytes();
+            tower
+                .fs()
+                .user_write_file("doc.txt", base_doc.clone(), hash_bytes(&base_doc), t0);
+            tower
+                .fs()
+                .user_write_file("gone.txt", base_del.clone(), hash_bytes(&base_del), t0);
+            tower.scan(t0).unwrap();
+            sync_slice(
+                &mut [&mut tower, &mut nas, &mut laptop],
+                t0.secs + 1,
+                &mut rng,
+            );
+
+            nas.add_member("pi").unwrap();
+            let laptop_knows_pi = rng.chance(1, 2);
+            if laptop_knows_pi {
+                laptop.add_member("pi").unwrap();
+            }
+            let mut pi = mk("pi", &four, &mut rng);
+            if laptop_knows_pi {
+                sync_slice(
+                    &mut [&mut nas, &mut laptop, &mut pi],
+                    t0.secs + 30,
+                    &mut rng,
+                );
+            } else {
+                sync_slice(&mut [&mut nas, &mut pi], t0.secs + 30, &mut rng);
+            }
+
+            // `pi` edits `doc.txt` (or deletes `gone.txt` while `laptop` edits `doc.txt`), relayed via `nas`!
+            let pi_edit = format!("pi-edit-{seed}").into_bytes();
+            let pi_edit_h = hash_bytes(&pi_edit);
+            let t1 = Timestamp::new(t0.secs + 80, 0);
+            pi.fs().user_write_file("doc.txt", pi_edit, pi_edit_h, t1);
+            pi.fs().user_remove_recursive("gone.txt");
+            pi.scan(t1).unwrap();
+            nas.pull_from_peer(&SimPeer::new(&pi, "nas", "pi", PeerFault::None), t1)
+                .unwrap();
+
+            // `tower` pulls from `nas` BEFORE knowing `pi` -> MUST hold back records naming `pi` unacked!
+            let rep_before = tower
+                .pull_from_peer(&SimPeer::new(&nas, "tower", "nas", PeerFault::None), t1)
+                .unwrap();
+            assert!(
+                rep_before.held_back >= 1,
+                "seed={root_seed}: tower must hold back records referencing unknown member pi"
+            );
+
+            // Optionally remove `laptop` before `tower` learns `pi`!
+            let drop_laptop = rng.chance(1, 2);
+            if drop_laptop {
+                for e in [&mut tower, &mut nas, &mut pi] {
+                    e.remove_member("laptop").unwrap();
+                }
+            } else if !laptop_knows_pi {
+                laptop.add_member("pi").unwrap();
+            }
+
+            // `tower` learns `pi`; optionally suffer a dropped page right after handshake!
+            tower.add_member("pi").unwrap();
+            if rng.chance(1, 2) {
+                let _ = pi.pull_from_peer(
+                    &DropPagesPeer(SimPeer::new(&tower, "pi", "tower", PeerFault::None)),
+                    Timestamp::new(t0.secs + 120, 0),
+                );
+            }
+
+            if drop_laptop {
+                sync_slice(
+                    &mut [&mut tower, &mut nas, &mut pi],
+                    t0.secs + 140,
+                    &mut rng,
+                );
+                for e in [&tower, &nas, &pi] {
+                    assert_eq!(
+                        e.fs().live_file_hash("doc.txt"),
+                        Some(pi_edit_h),
+                        "seed={root_seed}: pi edit lost on {}",
+                        e.meta().unwrap().local_member
+                    );
+                    assert_eq!(
+                        e.fs().live_file_hash("gone.txt"),
+                        None,
+                        "seed={root_seed}: pi deletion resurrected on {}",
+                        e.meta().unwrap().local_member
+                    );
+                    assert_eq!(e.store().held_back_count().unwrap(), 0);
+                    assert_eq!(e.status().unwrap().state, MemberState::UpToDate);
+                }
+            } else {
+                sync_slice(
+                    &mut [&mut tower, &mut nas, &mut laptop, &mut pi],
+                    t0.secs + 140,
+                    &mut rng,
+                );
+                for e in [&tower, &nas, &laptop, &pi] {
+                    assert_eq!(e.fs().live_file_hash("doc.txt"), Some(pi_edit_h));
+                    assert_eq!(e.fs().live_file_hash("gone.txt"), None);
+                    assert_eq!(e.store().held_back_count().unwrap(), 0);
+                    assert_eq!(e.status().unwrap().state, MemberState::UpToDate);
+                }
+            }
+        }
+        1 => {
+            // Subcase 1: `laptop` removed while offline, returns with unsynced edits AND deletions
+            // after active members concurrently deleted one file (and GC'd tombstones) and edited another!
+            let all = ["tower", "nas", "laptop"];
+            let mut tower = mk("tower", &all, &mut rng);
+            let mut nas = mk("nas", &all, &mut rng);
+            let mut laptop = mk("laptop", &all, &mut rng);
+
+            for name in ["keep_edit.txt", "del_by_active.txt", "del_by_offline.txt"] {
+                let b = format!("v1-{name}-{seed}").into_bytes();
+                tower
+                    .fs()
+                    .user_write_file(name, b.clone(), hash_bytes(&b), t0);
+            }
+            tower.scan(t0).unwrap();
+            sync_slice(
+                &mut [&mut tower, &mut nas, &mut laptop],
+                t0.secs + 1,
+                &mut rng,
+            );
+
+            // Offline `laptop` edits `keep_edit.txt` and `del_by_active.txt` (or leaves `del_by_active.txt` untouched)
+            // and deletes `del_by_offline.txt`.
+            let t1 = Timestamp::new(t0.secs + 50, 0);
+            let lap_keep = format!("laptop-offline-keep-{seed}").into_bytes();
+            let lap_keep_h = hash_bytes(&lap_keep);
+            laptop
+                .fs()
+                .user_write_file("keep_edit.txt", lap_keep, lap_keep_h, t1);
+            let laptop_also_edited_deleted = rng.chance(1, 2);
+            let lap_del_h = if laptop_also_edited_deleted {
+                let b = format!("laptop-saved-deleted-{seed}").into_bytes();
+                let h = hash_bytes(&b);
+                laptop.fs().user_write_file("del_by_active.txt", b, h, t1);
+                Some(h)
+            } else {
+                None
+            };
+            laptop.fs().user_remove_recursive("del_by_offline.txt");
+            laptop.scan(t1).unwrap();
+
+            // Active members remove `laptop`, delete `del_by_active.txt`, edit `del_by_offline.txt`, and GC!
+            tower.remove_member("laptop").unwrap();
+            nas.remove_member("laptop").unwrap();
+            let t2 = Timestamp::new(t0.secs + 60, 0);
+            tower.fs().user_remove_recursive("del_by_active.txt");
+            let active_saved = format!("tower-edited-offline-del-{seed}").into_bytes();
+            let active_saved_h = hash_bytes(&active_saved);
+            tower
+                .fs()
+                .user_write_file("del_by_offline.txt", active_saved, active_saved_h, t2);
+            tower.scan(t2).unwrap();
+            sync_slice(&mut [&mut tower, &mut nas], t0.secs + 70, &mut rng);
+            let _ = tower.gc_tombstones();
+            let _ = nas.gc_tombstones();
+
+            // Re-add `laptop` on `tower` first, optionally pull in random direction, then add on `nas`!
+            tower.add_member("laptop").unwrap();
+            let t3 = Timestamp::new(t0.secs + 120, 0);
+            if rng.chance(1, 2) {
+                let _ = tower.pull_from_peer(
+                    &SimPeer::new(&laptop, "tower", "laptop", PeerFault::None),
+                    t3,
+                );
+                let _ = laptop.pull_from_peer(
+                    &SimPeer::new(&tower, "laptop", "tower", PeerFault::None),
+                    t3,
+                );
+            } else {
+                let _ = laptop.pull_from_peer(
+                    &SimPeer::new(&tower, "laptop", "tower", PeerFault::None),
+                    t3,
+                );
+                let _ = tower.pull_from_peer(
+                    &SimPeer::new(&laptop, "tower", "laptop", PeerFault::None),
+                    t3,
+                );
+            }
+            nas.add_member("laptop").unwrap();
+            sync_slice(
+                &mut [&mut tower, &mut nas, &mut laptop],
+                t0.secs + 140,
+                &mut rng,
+            );
+
+            for e in [&tower, &nas, &laptop] {
+                let mid = e.meta().unwrap().local_member;
+                assert_eq!(
+                    e.fs().live_file_hash("keep_edit.txt"),
+                    Some(lap_keep_h),
+                    "seed={root_seed}: offline laptop edit lost on {mid}"
+                );
+                assert_eq!(
+                    e.fs().live_file_hash("del_by_offline.txt"),
+                    Some(active_saved_h),
+                    "seed={root_seed}: delete-vs-edit must preserve tower edit on {mid}"
+                );
+                if let Some(h) = lap_del_h {
+                    assert_eq!(
+                        e.fs().live_file_hash("del_by_active.txt"),
+                        Some(h),
+                        "seed={root_seed}: delete-vs-edit must preserve offline laptop edit on {mid}"
+                    );
+                } else {
+                    assert_eq!(
+                        e.fs().live_file_hash("del_by_active.txt"),
+                        None,
+                        "seed={root_seed}: untouched deleted file resurrected on {mid}"
+                    );
+                }
+                assert_eq!(e.store().held_back_count().unwrap(), 0);
+                assert_eq!(e.status().unwrap().state, MemberState::UpToDate);
+            }
+        }
+        _ => {
+            // Subcase 2: `p2b`-style relay edit + concurrent deletion + laptop removal +
+            // dropped page on rejoin, randomized order!
+            let three = ["tower", "nas", "laptop"];
+            let four = ["tower", "nas", "laptop", "pi"];
+            let mut tower = mk("tower", &three, &mut rng);
+            let mut nas = mk("nas", &three, &mut rng);
+            let mut laptop = mk("laptop", &three, &mut rng);
+
+            let v1 = format!("v1-{seed}").into_bytes();
+            tower
+                .fs()
+                .user_write_file("doc.txt", v1.clone(), hash_bytes(&v1), t0);
+            tower.scan(t0).unwrap();
+            sync_slice(
+                &mut [&mut tower, &mut nas, &mut laptop],
+                t0.secs + 1,
+                &mut rng,
+            );
+
+            nas.add_member("pi").unwrap();
+            laptop.add_member("pi").unwrap();
+            let mut pi = mk("pi", &four, &mut rng);
+            sync_slice(
+                &mut [&mut nas, &mut laptop, &mut pi],
+                t0.secs + 30,
+                &mut rng,
+            );
+
+            let lap_v2 = format!("laptop-relay-{seed}").into_bytes();
+            let lap_v2_h = hash_bytes(&lap_v2);
+            let t1 = Timestamp::new(t0.secs + 60, 0);
+            laptop.fs().user_write_file("doc.txt", lap_v2, lap_v2_h, t1);
+            laptop.scan(t1).unwrap();
+            pi.pull_from_peer(&SimPeer::new(&laptop, "pi", "laptop", PeerFault::None), t1)
+                .unwrap();
+
+            nas.fs().user_remove_recursive("doc.txt");
+            nas.scan(Timestamp::new(t0.secs + 62, 0)).unwrap();
+            drop(laptop);
+            for e in [&mut tower, &mut nas, &mut pi] {
+                e.remove_member("laptop").unwrap();
+            }
+            if rng.chance(1, 2) {
+                sync_slice(&mut [&mut tower, &mut nas], t0.secs + 80, &mut rng);
+                let _ = tower.gc_tombstones();
+                let _ = nas.gc_tombstones();
+            }
+            tower.add_member("pi").unwrap();
+            let t2 = Timestamp::new(t0.secs + 120, 0);
+            nas.pull_from_peer(&SimPeer::new(&pi, "nas", "pi", PeerFault::None), t2)
+                .unwrap();
+            tower
+                .pull_from_peer(&SimPeer::new(&pi, "tower", "pi", PeerFault::None), t2)
+                .unwrap();
+            let _ = pi.pull_from_peer(
+                &DropPagesPeer(SimPeer::new(&tower, "pi", "tower", PeerFault::None)),
+                t2,
+            );
+            sync_slice(
+                &mut [&mut tower, &mut nas, &mut pi],
+                t0.secs + 140,
+                &mut rng,
+            );
+
+            for e in [&tower, &nas, &pi] {
+                assert_eq!(
+                    e.fs().live_file_hash("doc.txt"),
+                    Some(lap_v2_h),
+                    "seed={root_seed}: relayed laptop edit lost on {}",
+                    e.meta().unwrap().local_member
+                );
+                assert_eq!(e.store().held_back_count().unwrap(), 0);
+                assert_eq!(e.status().unwrap().state, MemberState::UpToDate);
+            }
+        }
+    }
+}
+
+/// Scenario 22: Joiners carrying old pre-deletion copies arriving AFTER the deleter's index was
+/// rebuilt 1..=4 times (and tombstones were GC'd), plus optional intentional post-deletion
+/// re-creation of another deleted file (`p1` randomized generator).
+fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let has_nas = rng.chance(1, 2);
+    let init_members: Vec<&str> = if has_nas {
+        vec!["tower", "pi", "nas"]
+    } else {
+        vec!["tower", "pi"]
+    };
+    let mk = |id: &str, members: &[&str], rng: &mut Rng| {
+        let mut cfg = FolderConfig::new(
+            "sim",
+            id.to_string(),
+            members.iter().map(|s| (*s).to_string()),
+        );
+        cfg.initial_incarnation = Some(rng.next_u64() | 1);
+        let mut e = SyncEngine::open(
+            cfg,
+            HonestSimFs::new(FsCapabilities::unix(), rng.chance(1, 2)),
+            FaultyIndexStore::new(),
+        )
+        .unwrap();
+        e.set_deletion_brake(brake_disabled());
+        e
+    };
+
+    let sync_vec =
+        |es: &mut [SyncEngine<HonestSimFs, FaultyIndexStore>], t_base: i64, rng: &mut Rng| {
+            let n = es.len();
+            for round in 0..4i64 {
+                let mut pairs = Vec::new();
+                for i in 0..n {
+                    for j in 0..n {
+                        if i != j {
+                            pairs.push((i, j));
+                        }
+                    }
+                }
+                for k in (1..pairs.len()).rev() {
+                    let s = rng.range(k + 1);
+                    pairs.swap(k, s);
+                }
+                for (i, j) in pairs {
+                    let now = Timestamp::new(t_base + round * 5, 0);
+                    let (dst, src) = if i < j {
+                        let (l, r) = es.split_at_mut(j);
+                        (&mut l[i], &r[0])
+                    } else {
+                        let (l, r) = es.split_at_mut(i);
+                        (&mut r[0], &l[j])
+                    };
+                    let dst_id = dst.meta().unwrap().local_member;
+                    let src_id = src.meta().unwrap().local_member;
+                    dst.pull_from_peer(&SimPeer::new(src, &dst_id, &src_id, PeerFault::None), now)
+                        .unwrap();
+                }
+            }
+        };
+
+    let mut active: Vec<SyncEngine<HonestSimFs, FaultyIndexStore>> = init_members
+        .iter()
+        .map(|id| mk(id, &init_members, &mut rng))
+        .collect();
+
+    // Seed initial files: `keep.txt`, `tax1.pdf`, `tax2.pdf`, `recreate.txt`.
+    let keep_b = format!("keep-{seed}").into_bytes();
+    let keep_h = hash_bytes(&keep_b);
+    let tax1_b = format!("tax1-deleted-{seed}").into_bytes();
+    let tax2_b = format!("tax2-deleted-{seed}").into_bytes();
+    let rec_v1_b = format!("recreate-v1-{seed}").into_bytes();
+    let rec_v1_h = hash_bytes(&rec_v1_b);
+
+    active[0]
+        .fs()
+        .user_write_file("keep.txt", keep_b, keep_h, t0);
+    active[1]
+        .fs()
+        .user_write_file("tax1.pdf", tax1_b.clone(), hash_bytes(&tax1_b), t0);
+    active[1]
+        .fs()
+        .user_write_file("dir/tax2.pdf", tax2_b.clone(), hash_bytes(&tax2_b), t0);
+    active[1]
+        .fs()
+        .user_write_file("recreate.txt", rec_v1_b.clone(), rec_v1_h, t0);
+    active[0].scan(t0).unwrap();
+    active[1].scan(t0).unwrap();
+    sync_vec(&mut active, t0.secs + 1, &mut rng);
+
+    // Snapshot pre-deletion disk copy for future joiner(s).
+    let old_copy_snap = active[0].fs().snapshot();
+
+    // Deleter (`pi`, index 1) deletes `tax1.pdf`, `dir/tax2.pdf`, and optionally `recreate.txt`,
+    // syncs to all active members, and GCs tombstones!
+    let t1 = Timestamp::new(t0.secs + 50, 0);
+    active[1].fs().user_remove_recursive("tax1.pdf");
+    active[1].fs().user_remove_recursive("dir/tax2.pdf");
+    let do_recreate = rng.chance(1, 2);
+    if do_recreate {
+        active[1].fs().user_remove_recursive("recreate.txt");
+    }
+    active[1].scan(t1).unwrap();
+    sync_vec(&mut active, t1.secs + 1, &mut rng);
+    for e in &mut active {
+        let _ = e.gc_tombstones();
+    }
+
+    // Rebuild the deleter's index 1..=4 times, editing `keep.txt` between rebuilds so the
+    // deleter moves through retired incarnations and active members sync & GC each time!
+    let rebuilds = 1 + rng.range(4);
+    let mut latest_keep_h = keep_h;
+    for r in 0..rebuilds {
+        let tr = Timestamp::new(t0.secs + 100 + (r as i64) * 40, 0);
+        active[1].rebuild_from_disk(tr).unwrap();
+        sync_vec(&mut active, tr.secs + 1, &mut rng);
+        let edited = format!("keep-after-rebuild-{r}-{seed}").into_bytes();
+        latest_keep_h = hash_bytes(&edited);
+        let editor_idx = rng.range(active.len());
+        active[editor_idx].fs().user_write_file(
+            "keep.txt",
+            edited,
+            latest_keep_h,
+            Timestamp::new(tr.secs + 20, 0),
+        );
+        active[editor_idx]
+            .scan(Timestamp::new(tr.secs + 20, 0))
+            .unwrap();
+        sync_vec(&mut active, tr.secs + 21, &mut rng);
+        for e in &mut active {
+            let _ = e.gc_tombstones();
+        }
+    }
+
+    // Optional intentional post-deletion re-creation of `recreate.txt` (half with identical old
+    // bytes, half with brand-new bytes!).
+    let expected_recreate_h = if do_recreate {
+        let trc = Timestamp::new(t0.secs + 350, 0);
+        let (bytes, h) = if rng.chance(1, 2) {
+            (rec_v1_b, rec_v1_h)
+        } else {
+            let nb = format!("recreate-new-{seed}").into_bytes();
+            let nh = hash_bytes(&nb);
+            (nb, nh)
+        };
+        active[0]
+            .fs()
+            .user_write_file("recreate.txt", bytes, h, trc);
+        active[0].scan(trc).unwrap();
+        sync_vec(&mut active, trc.secs + 1, &mut rng);
+        Some(h)
+    } else {
+        Some(rec_v1_h)
+    };
+
+    // Now 1 or 2 joiners arrive carrying the pre-deletion old copy on disk (`join_mode = true`).
+    let joiner_count = 1 + rng.range(2);
+    let joiner_names = ["laptop", "studio"];
+    let mut final_members = init_members.clone();
+    for (j, &jid) in joiner_names.iter().enumerate().take(joiner_count) {
+        final_members.push(jid);
+        for e in &mut active {
+            e.add_member(jid).unwrap();
+        }
+        let jfs = HonestSimFs::from_snapshot(old_copy_snap.clone());
+        *jfs.marker.borrow_mut() = None;
+        let mut jcfg = FolderConfig::new(
+            "sim",
+            jid.to_string(),
+            final_members.iter().map(|s| (*s).to_string()),
+        );
+        jcfg.initial_incarnation = Some(rng.next_u64() | 1);
+        let mut je = SyncEngine::open(jcfg, jfs, FaultyIndexStore::new()).unwrap();
+        je.set_deletion_brake(brake_disabled());
+        je.scan(Timestamp::new(t0.secs + 400 + (j as i64) * 5, 0))
+            .unwrap();
+        active.push(je);
+    }
+
+    // Sync in randomized order (exercising joiner pulling first, deleter pulling first, and
+    // non-deleter pulling first!).
+    sync_vec(&mut active, t0.secs + 450, &mut rng);
+
+    for e in &active {
+        let mid = e.meta().unwrap().local_member;
+        assert_eq!(
+            e.fs().live_file_hash("tax1.pdf"),
+            None,
+            "seed={root_seed}: tax1.pdf resurrected on {mid} after {rebuilds} deleter rebuilds"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("dir/tax2.pdf"),
+            None,
+            "seed={root_seed}: dir/tax2.pdf resurrected on {mid} after {rebuilds} deleter rebuilds"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("keep.txt"),
+            Some(latest_keep_h),
+            "seed={root_seed}: keep.txt mismatch on {mid}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("recreate.txt"),
+            expected_recreate_h,
+            "seed={root_seed}: recreate.txt mismatch on {mid}"
+        );
+        assert_eq!(e.store().held_back_count().unwrap(), 0);
+        assert_eq!(e.status().unwrap().state, MemberState::UpToDate);
+    }
+}
+
+/// Scenario 23: Power-loss disk mode crash recovery — tests unsynced file writes (dropped or torn
+/// with truncated prefix / zero-filled tail), unsynced deferred group-commit renames, unsynced
+/// newly created ancestor directories, unsynced `remove_tmp` after failed fetch, post-commit
+/// power loss, and power loss during recovery itself.
+fn run_power_loss_crash_recovery_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let sync_created_ancestors = true;
+    let sync_remove_tmp = true;
+
+    let mut mk = |id: &str, supports_exchange: bool, pl_seed: u64| {
+        let mut cfg = FolderConfig::new("sim", id.to_string(), ["m0".into(), "m1".into()]);
+        cfg.initial_incarnation = Some(rng.next_u64() | 1);
+        let fs = HonestSimFs::new(FsCapabilities::unix(), supports_exchange);
+        fs.enable_power_loss_mode(pl_seed, sync_created_ancestors, sync_remove_tmp);
+        let mut e = SyncEngine::open(cfg, fs, FaultyIndexStore::new()).unwrap();
+        e.set_deletion_brake(brake_disabled());
+        e
+    };
+
+    let mut m0 = mk("m0", true, seed ^ 0x1111);
+    let mut m1 = mk("m1", (seed & 1) == 0, seed ^ 0x2222);
+
+    // Phase 1: Batch of brand-new nested files (exercises `apply_new_files_group_commit`,
+    // `commit_tmp_to_live_no_replace_deferred_dir_sync`, and nested ancestor dir creation!).
+    let mut expected: BTreeMap<String, Hash> = BTreeMap::new();
+    let paths = [
+        "deep/sub/a.txt",
+        "deep/sub/b.txt",
+        "deep/other/c.txt",
+        "top.txt",
+        "replace_me.txt",
+    ];
+    for p in paths {
+        let b = format!("v1-{p}-{seed}-payload-for-tearing-check").into_bytes();
+        let h = hash_bytes(&b);
+        m0.fs().user_write_file(p, b, h, t0);
+        expected.insert(p.to_string(), h);
+    }
+    m0.scan(t0).unwrap();
+
+    // Inject power-loss crashes at random points during initial batch pull (including during
+    // `finish_sync` -> torn tmp write, and during deferred rename -> reverted dir entries), plus
+    // power loss during `recover()` itself!
+    for attempt in 0..3 {
+        let op = rng.range(10);
+        let after = rng.chance(1, 2);
+        m1.fs().arm_crash(op, after);
+        let _ = m1.pull_from_peer(
+            &SimPeer::new(&m0, "m1", "m0", PeerFault::None),
+            Timestamp::new(t0.secs + 1 + attempt, 0),
+        );
+        m1.fs().disarm_fault();
+        m1.fs().apply_pending_power_loss();
+        if rng.chance(1, 2) {
+            m1.fs().arm_crash(rng.range(3), rng.chance(1, 2));
+            let _ = m1.recover();
+            m1.fs().disarm_fault();
+            m1.fs().apply_pending_power_loss();
+        }
+        m1.recover().unwrap();
+    }
+
+    // Complete pull cleanly, then IMMEDIATELY cut power right after commit (verifies EVERY
+    // committed index entry and every newly created ancestor directory is actually durable!).
+    let t1 = Timestamp::new(t0.secs + 20, 0);
+    m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t1)
+        .unwrap();
+    m1.fs().simulate_power_loss();
+    m1.recover().unwrap();
+    m1.scan(Timestamp::new(t1.secs + 1, 0)).unwrap();
+
+    // Phase 2: Replace existing file, delete a file, AND trigger a failed mid-fetch drop
+    // (`remove_tmp` + `unregister_staged_tmp`) followed immediately by power loss!
+    let t2 = Timestamp::new(t0.secs + 40, 0);
+    let rep_v2 = format!("v2-replace-{seed}-longer-payload-bytes").into_bytes();
+    let rep_v2_h = hash_bytes(&rep_v2);
+    m0.fs()
+        .user_write_file("replace_me.txt", rep_v2, rep_v2_h, t2);
+    expected.insert("replace_me.txt".to_string(), rep_v2_h);
+    m0.fs().user_remove_recursive("deep/other/c.txt");
+    expected.remove("deep/other/c.txt");
+    let new_drop = format!("drop-fetch-payload-{seed}-0123456789abcdef").into_bytes();
+    let new_drop_h = hash_bytes(&new_drop);
+    m0.fs()
+        .user_write_file("deep/dropped.txt", new_drop, new_drop_h, t2);
+    expected.insert("deep/dropped.txt".to_string(), new_drop_h);
+    m0.scan(t2).unwrap();
+
+    // Failed fetch (`DropAlways` calls `finish_sync` on resume attempts, then `remove_tmp` and
+    // `unregister_staged_tmp`), immediately followed by power loss!
+    let _ = m1.pull_from_peer(
+        &SimPeer::new(&m0, "m1", "m0", PeerFault::DropAlways),
+        Timestamp::new(t2.secs + 1, 0),
+    );
+    m1.fs().simulate_power_loss();
+    m1.recover().unwrap();
+    m1.scan(Timestamp::new(t2.secs + 2, 0)).unwrap();
+
+    // Power-loss crash during replace/delete apply too!
+    m1.fs().arm_crash(rng.range(6), rng.chance(1, 2));
+    let _ = m1.pull_from_peer(
+        &SimPeer::new(&m0, "m1", "m0", PeerFault::None),
+        Timestamp::new(t2.secs + 3, 0),
+    );
+    m1.fs().disarm_fault();
+    m1.fs().apply_pending_power_loss();
+    m1.recover().unwrap();
+
+    // Final convergence without crashes, followed by restoring a binned file into a deleted nested
+    // directory (`deep/other/c.txt`, where `deep/other` was deleted on disk) and immediately
+    // cutting power right after `restore_from_bin` removes the bin copy!
+    for r in 0..3i64 {
+        let tn = Timestamp::new(t2.secs + 10 + r * 2, 0);
+        m1.scan(tn).unwrap();
+        m0.scan(tn).unwrap();
+        m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), tn)
+            .unwrap();
+        m0.pull_from_peer(&SimPeer::new(&m1, "m0", "m1", PeerFault::None), tn)
+            .unwrap();
+    }
+    // Remove `deep/other` dir on m0 and sync so `deep/other` does not exist on m1 when restoring!
+    m0.fs().user_remove_recursive("deep/other");
+    m0.scan(Timestamp::new(t2.secs + 20, 0)).unwrap();
+    m1.pull_from_peer(
+        &SimPeer::new(&m0, "m1", "m0", PeerFault::None),
+        Timestamp::new(t2.secs + 21, 0),
+    )
+    .unwrap();
+    if let Some(binned_c) = m1
+        .list_bin()
+        .unwrap()
+        .into_iter()
+        .find(|b| b.original_path == "deep/other/c.txt")
+    {
+        let c_hash = binned_c.hash.unwrap();
+        let restored = m1
+            .restore_from_bin(
+                &binned_c.id,
+                None,
+                RestoreStrategy::Rename,
+                Timestamp::new(t2.secs + 22, 0),
+            )
+            .unwrap();
+        assert_eq!(restored, "deep/other/c.txt");
+        expected.insert("deep/other/c.txt".to_string(), c_hash);
+        // Immediate power loss right after `restore_from_bin` deletes the bin copy!
+        m1.fs().simulate_power_loss();
+        m1.recover().unwrap();
+        m1.scan(Timestamp::new(t2.secs + 23, 0)).unwrap();
+        for r in 0..2i64 {
+            let tn = Timestamp::new(t2.secs + 24 + r * 2, 0);
+            m0.pull_from_peer(&SimPeer::new(&m1, "m0", "m1", PeerFault::None), tn)
+                .unwrap();
+            m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), tn)
+                .unwrap();
+        }
+    }
+    m1.fs().simulate_power_loss();
+    m1.recover().unwrap();
+    m1.scan(Timestamp::new(t2.secs + 30, 0)).unwrap();
+
+    // Verify ZERO data loss, ZERO corrupt torn files promoted to live tree, and EXACT convergence!
+    assert!(
+        m1.fs().power_loss_count() >= 3,
+        "seed={root_seed}: power-loss mode must have fired"
+    );
+    assert!(
+        m1.fs().list_tmp().unwrap().is_empty(),
+        "seed={root_seed}: leftover tmp files after power-loss recovery"
+    );
+    let ignore = IgnoreMatcher::default();
+    let t_m0 = m0.fs().live_tree(&ignore);
+    let t_m1 = m1.fs().live_tree(&ignore);
+    assert_eq!(
+        t_m0, t_m1,
+        "seed={root_seed}: members diverged after power-loss recovery\n  m0={t_m0:?}\n  m1={t_m1:?}"
+    );
+    for (p, h) in &expected {
+        assert_eq!(
+            m1.fs().live_file_hash(p),
+            Some(*h),
+            "seed={root_seed}: file {p:?} lost or corrupted after power loss"
+        );
+    }
+    for path in t_m1.keys() {
+        assert!(
+            !path.starts_with("recovered-file"),
+            "seed={root_seed}: torn/removed engine tmp was wrongly rescued as live file {path:?}"
+        );
+    }
+    assert_eq!(m0.status().unwrap().state, MemberState::UpToDate);
+    assert_eq!(m1.status().unwrap().state, MemberState::UpToDate);
+}
+
 fn run_one_seed(seed: u64, record_trace: bool) {
     // Every seed runs the dense randomized schedule (all faults, mid-apply human edits before &
     // after swap/claim, bin restore, conflict resolution, clock jumps both ways, directory renames,
@@ -6735,9 +8099,8 @@ fn run_one_seed(seed: u64, record_trace: bool) {
     );
     world.run_schedule(32);
 
-    // Every seed also hits a dedicated deep scenario on a clean modulo cadence so across 50M
-    // seeds EACH scenario runs >2,300,000 independent times!
-    match seed % 21 {
+    // Every seed also hits a dedicated deep scenario on a clean modulo cadence.
+    match seed % 24 {
         0 => run_long_partition_zombie_seed(seed, seed ^ 0x5555_5555, record_trace),
         1 => run_conflict_and_delete_vs_edit_seed(seed, seed ^ 0xAAAA_AAAA, record_trace),
         2 => run_heterogeneous_and_case_rename_seed(seed, seed ^ 0x3333_3333, record_trace),
@@ -6764,7 +8127,10 @@ fn run_one_seed(seed: u64, record_trace: bool) {
         17 => run_late_write_into_bin_seed(seed, seed ^ 0x369C_F258, record_trace),
         18 => run_local_placement_failures_seed(seed, seed ^ 0x48C0_159D, record_trace),
         19 => run_index_loss_during_hold_seed(seed, seed ^ 0x5AD1_6BE2, record_trace),
-        _ => run_lying_peer_regression_rate_limit_seed(seed, seed ^ 0x6BE2_7CF3, record_trace),
+        20 => run_lying_peer_regression_rate_limit_seed(seed, seed ^ 0x6BE2_7CF3, record_trace),
+        21 => run_asymmetric_membership_views_seed(seed, seed ^ 0x7CF3_8D04, record_trace),
+        22 => run_joiner_after_deleter_rebuild_seed(seed, seed ^ 0x8D04_9E15, record_trace),
+        _ => run_power_loss_crash_recovery_seed(seed, seed ^ 0x9E15_AF26, record_trace),
     }
 }
 
@@ -6867,6 +8233,9 @@ fn simulator_all_dedicated_scenarios() {
         run_local_placement_failures_seed(s, s ^ 0x48C0_159D, true);
         run_index_loss_during_hold_seed(s, s ^ 0x5AD1_6BE2, true);
         run_lying_peer_regression_rate_limit_seed(s, s ^ 0x6BE2_7CF3, true);
+        run_asymmetric_membership_views_seed(s, s ^ 0x7CF3_8D04, true);
+        run_joiner_after_deleter_rebuild_seed(s, s ^ 0x8D04_9E15, true);
+        run_power_loss_crash_recovery_seed(s, s ^ 0x9E15_AF26, true);
     }
 }
 
@@ -7017,6 +8386,33 @@ fn simulator_idle_fetch_timeout_virtual_clock() {
         "got {err_eof:?}"
     );
     assert!(e1.fs().list_tmp().unwrap().is_empty());
+}
+
+#[test]
+fn simulator_power_loss_durability_proves_sync_invariants() {
+    // 1. Direct verification that creating a multi-level nested directory path and placing a file
+    // inside it survives an immediate post-commit power loss (depends on `ensure_parent_dirs`
+    // syncing every newly created ancestor's parent directory).
+    let fs = HonestSimFs::new(FsCapabilities::unix(), true);
+    fs.enable_power_loss_mode(42, true, true);
+    let mut w = fs.create_tmp(".legion-sync-fetch-1-aabbccdd.tmp").unwrap();
+    w.write_all(b"nested durable payload").unwrap();
+    w.finish_sync().unwrap();
+    fs.commit_tmp_to_live_no_replace(".legion-sync-fetch-1-aabbccdd.tmp", "a/b/c/file.txt")
+        .unwrap();
+    fs.simulate_power_loss();
+    assert_eq!(
+        fs.live_file_hash("a/b/c/file.txt"),
+        Some(hash_bytes(b"nested durable payload")),
+        "multi-level newly created ancestor directories must survive immediate power loss"
+    );
+
+    // 2. Hammer 128 independent seeds of each new scenario generator (21, 22, 23).
+    for s in 0..128u64 {
+        run_asymmetric_membership_views_seed(s, s ^ 0x7CF3_8D04, true);
+        run_joiner_after_deleter_rebuild_seed(s, s ^ 0x8D04_9E15, true);
+        run_power_loss_crash_recovery_seed(s, s ^ 0x9E15_AF26, true);
+    }
 }
 
 #[test]
