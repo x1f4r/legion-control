@@ -147,16 +147,12 @@ fn build_walker(
         }
         // On Windows, `ignore`'s built-in hidden filter only checks leading dots; honor the
         // Windows FILE_ATTRIBUTE_HIDDEN bit too so hidden directories are pruned consistently.
-        if !include_hidden
+        !(!include_hidden
             && platform::IS_WINDOWS
             && entry
                 .metadata()
                 .ok()
-                .is_some_and(|meta| platform::is_hidden_attr(&meta))
-        {
-            return false;
-        }
-        true
+                .is_some_and(|meta| platform::is_hidden_attr(&meta)))
     });
     builder
 }

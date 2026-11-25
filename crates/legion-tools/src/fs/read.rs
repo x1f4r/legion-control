@@ -237,14 +237,16 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
         Err(_) => return Ok(()),
     };
 
-    let mut children: Vec<(
-        String,
-        PathBuf,
-        fs::Metadata,
-        EntryKind,
-        Option<Category>,
-        Option<&'static str>,
-    )> = Vec::new();
+    struct ChildItem {
+        name: String,
+        path: PathBuf,
+        meta: fs::Metadata,
+        kind: EntryKind,
+        category: Option<Category>,
+        mime: Option<&'static str>,
+    }
+
+    let mut children: Vec<ChildItem> = Vec::new();
     for item in read_dir {
         if walk.cancel.is_cancelled() {
             return Err(cancelled_error("fs.list"));
@@ -279,27 +281,42 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
         {
             continue;
         }
-        children.push((name, child_path, meta, kind, category, mime));
+        children.push(ChildItem {
+            name,
+            path: child_path,
+            meta,
+            kind,
+            category,
+            mime,
+        });
     }
 
     children.sort_by(|a, b| {
-        let a_rank = usize::from(a.3 != EntryKind::Dir);
-        let b_rank = usize::from(b.3 != EntryKind::Dir);
+        let a_rank = usize::from(a.kind != EntryKind::Dir);
+        let b_rank = usize::from(b.kind != EntryKind::Dir);
         a_rank.cmp(&b_rank).then_with(|| {
             compare_by_sort(
                 walk.sort,
                 walk.order,
-                &a.0,
-                &b.0,
-                a.2.modified().ok(),
-                b.2.modified().ok(),
-                a.2.len(),
-                b.2.len(),
+                &a.name,
+                &b.name,
+                a.meta.modified().ok(),
+                b.meta.modified().ok(),
+                a.meta.len(),
+                b.meta.len(),
             )
         })
     });
 
-    for (name, child_path, meta, kind, category, mime) in children {
+    for child in children {
+        let ChildItem {
+            name,
+            path: child_path,
+            meta,
+            kind,
+            category,
+            mime,
+        } = child;
         if walk.cancel.is_cancelled() {
             return Err(cancelled_error("fs.list"));
         }
