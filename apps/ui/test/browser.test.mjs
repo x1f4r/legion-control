@@ -1131,6 +1131,10 @@ test('content URLs isolate HTML and SVG from the interface origin and allow <vid
       '</svg>',
     ].join('\n'),
   );
+  fs.writeFileSync(
+    path.join(docsDir, 'doc.pdf'),
+    '%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n%%EOF\n',
+  );
   fs.copyFileSync(sampleVideo, path.join(docsDir, 'sample.webm'));
 
   const server = await startServer(fleet.towerHome, fleet.towerUser);
@@ -1167,15 +1171,17 @@ test('content URLs isolate HTML and SVG from the interface origin and allow <vid
     const urls = await uiPage.evaluate(async () => {
       const { createHttpLink } = await import('/link/http.js');
       const link = createHttpLink();
-      const [html, svg, video] = await Promise.all([
+      const [html, svg, pdf, video] = await Promise.all([
         link.contentUrl({ path: '~/docs/xss.html' }),
         link.contentUrl({ path: '~/docs/xss.svg' }),
+        link.contentUrl({ path: '~/docs/doc.pdf' }),
         link.contentUrl({ path: '~/docs/sample.webm' }),
       ]);
-      return { html, svg, video };
+      return { html, svg, pdf, video };
     });
     assert.match(urls.html.url, /^\/v1\/content\/[^/]+\/xss\.html$/);
     assert.match(urls.svg.url, /^\/v1\/content\/[^/]+\/xss\.svg$/);
+    assert.match(urls.pdf.url, /^\/v1\/content\/[^/]+\/doc\.pdf$/);
     assert.match(urls.video.url, /^\/v1\/content\/[^/]+\/sample\.webm$/);
 
     // 2. Verify <video> seeking and <img> loading directly on the real Legion UI page
@@ -1276,7 +1282,9 @@ test('content URLs isolate HTML and SVG from the interface origin and allow <vid
     assert.deepEqual(uiConsoleErrors, [], `UI console/CSP errors during media test: ${uiConsoleErrors.join('\n')}`);
 
     // 3. Top-level navigation to .html and .svg content URLs: neither may run script or reach
-    //    the interface's origin, storage, or token.
+    //    the interface's origin, storage, or token; PDF is always forced to download as
+    //    application/octet-stream with the same sandbox + frame-ancestors 'none' CSP.
+    const expectedCsp = "sandbox; default-src 'none'; frame-ancestors 'none'";
     for (const [kind, relUrl, expectedType] of [
       ['html', urls.html.url, 'text/plain; charset=utf-8'],
       ['svg', urls.svg.url, 'image/svg+xml'],
@@ -1287,8 +1295,8 @@ test('content URLs isolate HTML and SVG from the interface origin and allow <vid
       assert.equal(resp.headers()['content-type'], expectedType, `${kind} content-type`);
       assert.equal(
         resp.headers()['content-security-policy'],
-        "sandbox; default-src 'none'",
-        `${kind} CSP must sandbox and forbid script`,
+        expectedCsp,
+        `${kind} CSP must sandbox, forbid script, and forbid framing`,
       );
       assert.equal(resp.headers()['x-content-type-options'], 'nosniff');
       await navPage.waitForTimeout(150);
@@ -1315,9 +1323,26 @@ test('content URLs isolate HTML and SVG from the interface origin and allow <vid
       await navPage.close();
     }
 
-    // 4. Inside <iframe> on a same-origin host page (sharing the interface's origin and token):
-    //    serve a minimal same-origin host harness via Playwright route interception while letting
-    //    /v1/content/* hit the real `legion serve` server untouched.
+    // PDF is never served inline: octet-stream + attachment + unconditional sandbox CSP.
+    const pdfHeaders = await uiPage.evaluate(async (pdfUrl) => {
+      const res = await fetch(pdfUrl);
+      return {
+        status: res.status,
+        contentType: res.headers.get('content-type'),
+        disposition: res.headers.get('content-disposition'),
+        csp: res.headers.get('content-security-policy'),
+        corp: res.headers.get('cross-origin-resource-policy'),
+      };
+    }, urls.pdf.url);
+    assert.equal(pdfHeaders.status, 200);
+    assert.equal(pdfHeaders.contentType, 'application/octet-stream');
+    assert.equal(pdfHeaders.disposition, 'attachment; filename="doc.pdf"');
+    assert.equal(pdfHeaders.csp, expectedCsp);
+    assert.equal(pdfHeaders.corp, 'same-origin');
+
+    // 4. Inside <iframe>, <object>, and <embed> on a same-origin host page (sharing the
+    //    interface's origin and token): frame-ancestors 'none' + sandbox CSP prevent framing
+    //    or script execution in every embedding vector.
     const hostPage = await ctx.newPage();
     await hostPage.route(`${server.url}/__test-iframe-host`, async (route) => {
       await route.fulfill({
@@ -1328,32 +1353,40 @@ test('content URLs isolate HTML and SVG from the interface origin and allow <vid
           '<script>window.__messages = []; window.addEventListener("message", (e) => window.__messages.push(e.data));</script>',
           `<iframe id="f-html" src="${urls.html.url}"></iframe>`,
           `<iframe id="f-svg" src="${urls.svg.url}"></iframe>`,
+          `<object id="o-svg" data="${urls.svg.url}" type="image/svg+xml"></object>`,
+          `<embed id="e-svg" src="${urls.svg.url}" type="image/svg+xml">`,
           '</body></html>',
         ].join('\n'),
       });
     });
 
-    const iframeResponses = new Map();
+    const embedResponses = new Map();
     hostPage.on('response', (res) => {
       if (res.url().includes('/v1/content/')) {
-        iframeResponses.set(new URL(res.url()).pathname, res.status());
+        const key = new URL(res.url()).pathname;
+        embedResponses.set(key, (embedResponses.get(key) || 0) + 1);
       }
     });
 
     await hostPage.goto(`${server.url}/__test-iframe-host`, { waitUntil: 'load' });
-    await hostPage.waitForTimeout(200);
+    await hostPage.waitForTimeout(250);
 
-    assert.equal(iframeResponses.get(urls.html.url), 200, 'HTML iframe must actually fetch from legion serve');
-    assert.equal(iframeResponses.get(urls.svg.url), 200, 'SVG iframe must actually fetch from legion serve');
+    assert.ok((embedResponses.get(urls.html.url) || 0) >= 1, 'HTML iframe must actually fetch from legion serve');
+    assert.ok((embedResponses.get(urls.svg.url) || 0) >= 1, 'SVG embeds must actually fetch from legion serve');
 
-    const iframeCheck = await hostPage.evaluate(() => {
+    const embedCheck = await hostPage.evaluate(() => {
       const checkIsolated = (id) => {
-        const frame = document.getElementById(id);
+        const el = document.getElementById(id);
         let domBlocked = false;
         try {
-          // Reading contentDocument on a sandboxed same-origin URL without allow-same-origin
-          // throws SecurityError or returns null.
-          domBlocked = frame.contentDocument === null;
+          const doc = el.contentDocument;
+          // frame-ancestors 'none' or opaque sandbox leaves contentDocument null or empty error doc.
+          domBlocked =
+            doc === null ||
+            doc.URL === 'about:blank' ||
+            doc.URL === 'chrome-error://chromewebdata/' ||
+            !doc.body ||
+            doc.body.innerText === '';
         } catch {
           domBlocked = true;
         }
@@ -1361,7 +1394,8 @@ test('content URLs isolate HTML and SVG from the interface origin and allow <vid
       };
       return {
         htmlIsolated: checkIsolated('f-html'),
-        svgIsolated: checkIsolated('f-svg'),
+        svgFrameIsolated: checkIsolated('f-svg'),
+        svgObjectIsolated: checkIsolated('o-svg'),
         pwnHtmlProp: Boolean(window.__pwned_html),
         pwnSvgProp: Boolean(window.__pwned_svg),
         messages: window.__messages,
@@ -1369,14 +1403,15 @@ test('content URLs isolate HTML and SVG from the interface origin and allow <vid
       };
     });
 
-    assert.equal(iframeCheck.htmlIsolated, true, 'HTML iframe must be isolated from parent origin');
-    assert.equal(iframeCheck.svgIsolated, true, 'SVG iframe must be isolated from parent origin');
-    assert.equal(iframeCheck.pwnHtmlProp, false, 'HTML iframe must not mutate parent');
-    assert.equal(iframeCheck.pwnSvgProp, false, 'SVG iframe must not mutate parent');
-    assert.deepEqual(iframeCheck.messages, [], 'Sandboxed iframes must not run script or postMessage');
-    assert.ok(!iframeCheck.storageKeys.includes('pwn_html'), 'HTML must not write localStorage');
-    assert.ok(!iframeCheck.storageKeys.includes('pwn_svg'), 'SVG onload must not write localStorage');
-    assert.ok(!iframeCheck.storageKeys.includes('pwn_svg_script'), 'SVG script must not write localStorage');
+    assert.equal(embedCheck.htmlIsolated, true, 'HTML iframe must be isolated/blocked from parent origin');
+    assert.equal(embedCheck.svgFrameIsolated, true, 'SVG iframe must be isolated/blocked from parent origin');
+    assert.equal(embedCheck.svgObjectIsolated, true, 'SVG <object> must be isolated/blocked from parent origin');
+    assert.equal(embedCheck.pwnHtmlProp, false, 'HTML iframe must not mutate parent');
+    assert.equal(embedCheck.pwnSvgProp, false, 'SVG iframe/object/embed must not mutate parent');
+    assert.deepEqual(embedCheck.messages, [], 'Embedded content must not run script or postMessage');
+    assert.ok(!embedCheck.storageKeys.includes('pwn_html'), 'HTML must not write localStorage');
+    assert.ok(!embedCheck.storageKeys.includes('pwn_svg'), 'SVG onload must not write localStorage');
+    assert.ok(!embedCheck.storageKeys.includes('pwn_svg_script'), 'SVG script must not write localStorage');
 
     await hostPage.close();
     await ctx.close();

@@ -2025,8 +2025,9 @@ impl Fleet {
 
         enum ReaderPhase {
             Data { remaining: u64 },
-            DoneTrailer { line: Vec<u8> },
-            CheckEof,
+            DoneTrailer { line: Vec<u8>, final_data: Vec<u8> },
+            CheckEof { final_data: Vec<u8> },
+            FlushFinal { data: Vec<u8>, offset: usize },
             Finished,
         }
 
@@ -2082,14 +2083,33 @@ impl Fleet {
                 loop {
                     match &mut this.phase {
                         ReaderPhase::Finished => return std::task::Poll::Ready(Ok(())),
+                        ReaderPhase::FlushFinal { data, offset } => {
+                            if *offset >= data.len() {
+                                this.phase = ReaderPhase::Finished;
+                                return std::task::Poll::Ready(Ok(()));
+                            }
+                            if buf.remaining() == 0 {
+                                return std::task::Poll::Ready(Ok(()));
+                            }
+                            let n = (data.len() - *offset).min(buf.remaining());
+                            buf.put_slice(&data[*offset..*offset + n]);
+                            *offset += n;
+                            if *offset >= data.len() {
+                                this.phase = ReaderPhase::Finished;
+                            }
+                            return std::task::Poll::Ready(Ok(()));
+                        }
                         ReaderPhase::Data { remaining } => {
                             if *remaining == 0 {
                                 this.phase = if this.keep_open {
                                     ReaderPhase::DoneTrailer {
                                         line: Vec::with_capacity(32),
+                                        final_data: Vec::new(),
                                     }
                                 } else {
-                                    ReaderPhase::CheckEof
+                                    ReaderPhase::CheckEof {
+                                        final_data: Vec::new(),
+                                    }
                                 };
                                 continue;
                             }
@@ -2123,14 +2143,31 @@ impl Fleet {
                                         )));
                                     }
                                     let take = avail.len().min(max_read);
-                                    buf.put_slice(&avail[..take]);
+                                    if (take as u64) < *remaining {
+                                        buf.put_slice(&avail[..take]);
+                                        std::pin::Pin::new(&mut parts.reader).consume(take);
+                                        *remaining -= take as u64;
+                                        return std::task::Poll::Ready(Ok(()));
+                                    }
+                                    // Final chunk: validate the done trailer / EOF and recycle
+                                    // the keep_open pipe BEFORE yielding the last bytes, since
+                                    // HTTP servers with Content-Length drop the body as soon as
+                                    // the final byte is written.
+                                    let final_data = avail[..take].to_vec();
                                     std::pin::Pin::new(&mut parts.reader).consume(take);
-                                    *remaining -= take as u64;
-                                    return std::task::Poll::Ready(Ok(()));
+                                    this.phase = if this.keep_open {
+                                        ReaderPhase::DoneTrailer {
+                                            line: Vec::with_capacity(32),
+                                            final_data,
+                                        }
+                                    } else {
+                                        ReaderPhase::CheckEof { final_data }
+                                    };
+                                    continue;
                                 }
                             }
                         }
-                        ReaderPhase::DoneTrailer { line } => {
+                        ReaderPhase::DoneTrailer { line, .. } => {
                             let Some(parts) = this.parts.as_mut() else {
                                 this.phase = ReaderPhase::Finished;
                                 return std::task::Poll::Ready(Ok(()));
@@ -2176,8 +2213,17 @@ impl Fleet {
                                             ));
                                         }
                                         this.recycle();
-                                        this.phase = ReaderPhase::Finished;
-                                        return std::task::Poll::Ready(Ok(()));
+                                        let prev = std::mem::replace(
+                                            &mut this.phase,
+                                            ReaderPhase::Finished,
+                                        );
+                                        if let ReaderPhase::DoneTrailer { final_data, .. } = prev {
+                                            this.phase = ReaderPhase::FlushFinal {
+                                                data: final_data,
+                                                offset: 0,
+                                            };
+                                        }
+                                        continue;
                                     }
                                     let n = avail.len();
                                     if line.len() + n > MAX_DONE_LINE {
@@ -2193,7 +2239,7 @@ impl Fleet {
                                 }
                             }
                         }
-                        ReaderPhase::CheckEof => {
+                        ReaderPhase::CheckEof { .. } => {
                             let Some(parts) = this.parts.as_mut() else {
                                 this.phase = ReaderPhase::Finished;
                                 return std::task::Poll::Ready(Ok(()));
@@ -2208,14 +2254,22 @@ impl Fleet {
                                 std::task::Poll::Ready(Ok(avail)) => {
                                     let extra = !avail.is_empty();
                                     this.parts = None;
-                                    this.phase = ReaderPhase::Finished;
                                     if extra {
+                                        this.phase = ReaderPhase::Finished;
                                         return std::task::Poll::Ready(Err(std::io::Error::new(
                                             std::io::ErrorKind::InvalidData,
                                             "remote content stream sent extra bytes past declared length",
                                         )));
                                     }
-                                    return std::task::Poll::Ready(Ok(()));
+                                    let prev =
+                                        std::mem::replace(&mut this.phase, ReaderPhase::Finished);
+                                    if let ReaderPhase::CheckEof { final_data } = prev {
+                                        this.phase = ReaderPhase::FlushFinal {
+                                            data: final_data,
+                                            offset: 0,
+                                        };
+                                    }
+                                    continue;
                                 }
                             }
                         }
@@ -3700,7 +3754,10 @@ rm -f "$marker"
             let mut buf = Vec::new();
             let err = opened.reader.read_to_end(&mut buf).await.unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{path}: {err}");
-            assert_eq!(buf, b"hello", "{path}: must never forward extra bytes");
+            assert!(
+                buf.len() <= 5 && b"hello".starts_with(&buf),
+                "{path}: must never forward extra bytes, got {buf:?}"
+            );
         }
 
         // Short EOF fails with UnexpectedEof.

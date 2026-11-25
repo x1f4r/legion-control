@@ -132,6 +132,10 @@ fn main() -> ExitCode {
             "content_tickets_ranges_headers_policy_revocation_and_remote",
             content_tickets_ranges_headers_policy_revocation_and_remote,
         ),
+        (
+            "content_special_names_limits_slow_readers_and_in_flight_revocation",
+            content_special_names_limits_slow_readers_and_in_flight_revocation,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -2573,6 +2577,11 @@ paths = [\"~/projects/**\"]
     )
     .unwrap();
     std::fs::write(projects.join("archive.bin"), b"\x00\x01\x02\x03").unwrap();
+    std::fs::write(
+        projects.join("captions.vtt"),
+        b"WEBVTT\n\n00:00.000 --> 00:01.000\nHello\n",
+    )
+    .unwrap();
     let outside_dir = home.home().join("private");
     std::fs::create_dir_all(&outside_dir).unwrap();
     let outside_file = outside_dir.join("secret.txt");
@@ -2634,12 +2643,10 @@ paths = [\"~/projects/**\"]
         full.header("cross-origin-resource-policy"),
         Some("same-origin")
     );
+    const EXPECTED_CSP: &str = "sandbox; default-src 'none'; frame-ancestors 'none'";
     assert_eq!(full.header("referrer-policy"), Some("no-referrer"));
     assert_eq!(full.header("cache-control"), Some("private, no-store"));
-    assert_eq!(
-        full.header("content-security-policy"),
-        Some("sandbox; default-src 'none'")
-    );
+    assert_eq!(full.header("content-security-policy"), Some(EXPECTED_CSP));
     let etag = full.header("etag").expect("missing ETag").to_owned();
 
     // Range: first byte, last byte, suffix, open-ended, unsatisfiable, If-Range match & mismatch.
@@ -2769,7 +2776,7 @@ paths = [\"~/projects/**\"]
         Some("https://app.example.net")
     );
 
-    // 4. Content-Type allow-list + CSP for html, svg, pdf, unknown bin.
+    // 4. Content-Type allow-list + unconditional sandbox CSP for html, svg, vtt, pdf, unknown bin.
     let html_url = server
         .post(
             "/v1/content",
@@ -2788,7 +2795,7 @@ paths = [\"~/projects/**\"]
     );
     assert_eq!(
         html_resp.header("content-security-policy"),
-        Some("sandbox; default-src 'none'")
+        Some(EXPECTED_CSP)
     );
 
     let svg_url = server
@@ -2806,7 +2813,28 @@ paths = [\"~/projects/**\"]
     assert_eq!(svg_resp.header("content-type"), Some("image/svg+xml"));
     assert_eq!(
         svg_resp.header("content-security-policy"),
-        Some("sandbox; default-src 'none'")
+        Some(EXPECTED_CSP)
+    );
+
+    let vtt_url = server
+        .post(
+            "/v1/content",
+            Some(&phone),
+            &json!({"path": "~/projects/app/captions.vtt"}),
+        )
+        .json()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let vtt_resp = http(server.port, "GET", &vtt_url, &[], b"");
+    assert_eq!(vtt_resp.status, 200);
+    assert_eq!(
+        vtt_resp.header("content-type"),
+        Some("text/vtt; charset=utf-8")
+    );
+    assert_eq!(
+        vtt_resp.header("content-security-policy"),
+        Some(EXPECTED_CSP)
     );
 
     let pdf_url = server
@@ -2821,11 +2849,17 @@ paths = [\"~/projects/**\"]
         .to_owned();
     let pdf_resp = http(server.port, "GET", &pdf_url, &[], b"");
     assert_eq!(pdf_resp.status, 200);
-    assert_eq!(pdf_resp.header("content-type"), Some("application/pdf"));
+    assert_eq!(
+        pdf_resp.header("content-type"),
+        Some("application/octet-stream")
+    );
+    assert_eq!(
+        pdf_resp.header("content-disposition"),
+        Some("attachment; filename=\"doc.pdf\"")
+    );
     assert_eq!(
         pdf_resp.header("content-security-policy"),
-        None,
-        "inline PDF must not carry sandbox CSP"
+        Some(EXPECTED_CSP)
     );
 
     let bin_url = server
@@ -2909,7 +2943,8 @@ paths = [\"~/projects/**\"]
         );
     }
 
-    // 7. Remote machine (`on: "pi"`) read by read-only `observer` role with range support.
+    // 7. Remote machine (`on: "pi"`) read by read-only `observer` role with multiple range reads
+    //    reusing the keep_open stream pipe and coalescing audit on both machines.
     let pi_created = server.post(
         "/v1/content",
         Some(&phone),
@@ -2917,26 +2952,21 @@ paths = [\"~/projects/**\"]
     );
     assert_eq!(pi_created.status, 200, "{}", pi_created.text());
     let pi_url = pi_created.json()["url"].as_str().unwrap().to_owned();
-    let pi_range = http(
-        server.port,
-        "GET",
-        &pi_url,
-        &[("Range", "bytes=1000-2023".to_owned())],
-        b"",
-    );
-    assert_eq!(pi_range.status, 206, "{}", pi_range.text());
-    assert_eq!(
-        pi_range.header("content-range"),
-        Some("bytes 1000-2023/8192")
-    );
-    assert_eq!(pi_range.body, &pi_bytes[1000..2024]);
-    assert!(
-        pi_home
-            .audit()
-            .iter()
-            .any(|e| e["tool"] == "stream.get" && e["principal"] == "phone"),
-        "remote node must audit stream.get for phone"
-    );
+    for (start, end) in [(1000usize, 2023usize), (4096, 5119), (0, 255)] {
+        let pi_range = http(
+            server.port,
+            "GET",
+            &pi_url,
+            &[("Range", format!("bytes={start}-{end}"))],
+            b"",
+        );
+        assert_eq!(pi_range.status, 206, "{}", pi_range.text());
+        assert_eq!(
+            pi_range.header("content-range"),
+            Some(format!("bytes {start}-{end}/8192").as_str())
+        );
+        assert_eq!(pi_range.body, &pi_bytes[start..=end]);
+    }
 
     // Non-single `on` is rejected with 400; unknown machine with 404.
     assert_eq!(
@@ -3035,7 +3065,7 @@ paths = [\"~/projects/**\"]
     let _phone_v3 = make_token(&home, &["phone", "phone"]);
     assert_eq!(http(server.port, "GET", &url_v2, &[], b"").status, 404);
 
-    // 11. Reads are audited and tickets never reach audit logs or server stderr.
+    // 11. Reads are audited (coalesced per ticket on both nodes) and tickets never reach logs.
     server.stop();
     let stderr = server.stderr();
     assert!(
@@ -3053,15 +3083,328 @@ paths = [\"~/projects/**\"]
     );
     let audit = home.audit();
     assert!(
-        audit.iter().any(|e| e["tool"] == "content.read"
+        audit.iter().any(|e| e["tool"] == "content.ticket"
             && e["principal"] == "phone"
             && e["target"] == "laptop"),
-        "missing local content.read audit entry"
+        "missing local content.ticket audit entry"
+    );
+    let local_reads: Vec<&Value> = audit
+        .iter()
+        .filter(|e| {
+            e["tool"] == "content.read"
+                && e["principal"] == "phone"
+                && e["target"] == "laptop"
+                && e["outcome"] == "ok"
+                && e["args"]["path"] == "~/projects/app/clip.mp4"
+        })
+        .collect();
+    assert!(
+        local_reads.len() <= 2,
+        "expected coalesced local content.read entries for clip.mp4, got {}",
+        local_reads.len()
     );
     assert!(
-        audit.iter().any(|e| e["tool"] == "content.read"
-            && e["principal"] == "phone"
-            && e["target"] == "pi"),
-        "missing remote content.read audit entry"
+        local_reads
+            .iter()
+            .any(|e| e["args"]["requests"].as_u64().unwrap_or(0) >= 5
+                && e["args"]["bytes_served"].as_u64().unwrap_or(0) > 4096),
+        "expected coalesced requests & bytes_served in local content.read: {local_reads:?}"
     );
+
+    let remote_reads: Vec<&Value> = audit
+        .iter()
+        .filter(|e| {
+            e["tool"] == "content.read"
+                && e["principal"] == "phone"
+                && e["target"] == "pi"
+                && e["outcome"] == "ok"
+        })
+        .collect();
+    assert_eq!(
+        remote_reads.len(),
+        1,
+        "expected 1 coalesced remote content.read entry for pi, got {remote_reads:?}"
+    );
+    assert_eq!(remote_reads[0]["args"]["requests"], json!(3));
+    assert_eq!(
+        remote_reads[0]["args"]["bytes_served"],
+        json!(1024 + 1024 + 256)
+    );
+
+    // Remote node `pi` also coalesced its keep_open `stream.get` audit entries into one line.
+    let pi_gets: Vec<Value> = pi_home
+        .audit()
+        .into_iter()
+        .filter(|e| e["tool"] == "stream.get" && e["principal"] == "phone" && e["outcome"] == "ok")
+        .collect();
+    assert_eq!(
+        pi_gets.len(),
+        1,
+        "expected 1 coalesced remote stream.get audit entry on pi, got {pi_gets:?}"
+    );
+    assert_eq!(pi_gets[0]["args"]["requests"], json!(4)); // 1 probe + 3 range reads
+    assert_eq!(pi_gets[0]["args"]["bytes_served"], json!(1024 + 1024 + 256));
+}
+
+fn content_special_names_limits_slow_readers_and_in_flight_revocation() {
+    let home = Home::new();
+    home.write_config("node.toml", "name = \"tower\"\n[serve]\nui = true\n");
+    let policy = "\
+[principals.phone]
+role = \"observer\"
+
+[principals.admin]
+role = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+paths = [\"~/projects/**\"]
+";
+    home.write_config("policy.toml", policy);
+    let phone = make_token(&home, &["phone", "phone"]);
+
+    let projects = home.home().join("projects").join("special");
+    std::fs::create_dir_all(&projects).unwrap();
+
+    // 1. Filenames with %, %41, #, spaces, non-ASCII, trailing dot (and ? on Unix).
+    let mut special_names = vec![
+        "100%.txt",
+        "a%41.txt",
+        "hash#1.txt",
+        "hello world.txt",
+        "café 日本.txt",
+        "trailing.",
+    ];
+    if cfg!(unix) {
+        special_names.push("what?.txt");
+    }
+    for name in &special_names {
+        std::fs::write(projects.join(name), format!("body-of-{name}")).unwrap();
+    }
+
+    // 12 MiB file for concurrent slow-reader + in-flight revocation checks.
+    let big_len = 12 * 1024 * 1024usize;
+    let big_path = projects.join("large.bin");
+    std::fs::write(&big_path, vec![b'M'; big_len]).unwrap();
+
+    // File we will delete after minting a ticket to verify error sanitization.
+    let vanished_path = projects.join("vanished.txt");
+    std::fs::write(&vanished_path, b"soon gone").unwrap();
+
+    let mut server = Server::start(&home);
+
+    // Special filenames round-trip cleanly through POST /v1/content and GET /v1/content/<t>/<n>.
+    for name in &special_names {
+        let rel_path = format!("~/projects/special/{name}");
+        let created = server.post("/v1/content", Some(&phone), &json!({"path": rel_path}));
+        assert_eq!(created.status, 200, "{name}: {}", created.text());
+        let url = created.json()["url"].as_str().unwrap().to_owned();
+        let got = http(server.port, "GET", &url, &[], b"");
+        assert_eq!(got.status, 200, "{name} -> {url}: {}", got.text());
+        assert_eq!(got.body, format!("body-of-{name}").as_bytes(), "{name}");
+    }
+
+    // 2. Overflowing Range bounds clamp or fall back to 200 OK instead of 416.
+    let pct_url = server
+        .post(
+            "/v1/content",
+            Some(&phone),
+            &json!({"path": "~/projects/special/100%.txt"}),
+        )
+        .json()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let expected_pct = b"body-of-100%.txt";
+    let huge_suffix = http(
+        server.port,
+        "GET",
+        &pct_url,
+        &[("Range", "bytes=-999999999999999999999999999999".to_owned())],
+        b"",
+    );
+    assert_eq!(huge_suffix.status, 206, "{}", huge_suffix.text());
+    assert_eq!(huge_suffix.body, expected_pct);
+    let huge_end = http(
+        server.port,
+        "GET",
+        &pct_url,
+        &[("Range", "bytes=0-999999999999999999999999999999".to_owned())],
+        b"",
+    );
+    assert_eq!(huge_end.status, 206, "{}", huge_end.text());
+    assert_eq!(huge_end.body, expected_pct);
+    let huge_start = http(
+        server.port,
+        "GET",
+        &pct_url,
+        &[("Range", "bytes=999999999999999999999999999999-".to_owned())],
+        b"",
+    );
+    assert_eq!(huge_start.status, 200, "{}", huge_start.text());
+    assert_eq!(huge_start.body, expected_pct);
+
+    // 3. Overlong path (> 4 KiB) returns 400; oversized POST /v1/content body (> 16 KiB) returns 413.
+    let long_path = format!("~/projects/special/{}.txt", "a".repeat(4200));
+    let long_resp = server.post("/v1/content", Some(&phone), &json!({"path": long_path}));
+    assert_eq!(long_resp.status, 400, "{}", long_resp.text());
+
+    let huge_body = format!("{{\"path\":\"{}\"}}", "b".repeat(20 * 1024));
+    let huge_resp = http(
+        server.port,
+        "POST",
+        "/v1/content",
+        &[
+            ("Authorization", format!("Bearer {phone}")),
+            ("Content-Type", "application/json".to_owned()),
+        ],
+        huge_body.as_bytes(),
+    );
+    assert_eq!(huge_resp.status, 413, "{}", huge_resp.text());
+
+    // 4. Error replies to ticket holders never leak absolute resolved paths.
+    let vanished_url = server
+        .post(
+            "/v1/content",
+            Some(&phone),
+            &json!({"path": "~/projects/special/vanished.txt"}),
+        )
+        .json()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::fs::remove_file(&vanished_path).unwrap();
+    let gone = http(server.port, "GET", &vanished_url, &[], b"");
+    assert_eq!(gone.status, 404, "{}", gone.text());
+    let abs_dir = projects.to_string_lossy().into_owned();
+    assert!(
+        !gone.text().contains(&abs_dir),
+        "error reply leaked absolute path {abs_dir}: {}",
+        gone.text()
+    );
+
+    // 5. Concurrent slow readers: 8 stalled readers fill the per-ticket cap -> 9th gets 429 +
+    //    Retry-After + Connection: close, while GET /v1/health, GET /, and POST /v1/call succeed.
+    let big_url = server
+        .post(
+            "/v1/content",
+            Some(&phone),
+            &json!({"path": "~/projects/special/large.bin"}),
+        )
+        .json()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut stalled = Vec::new();
+    for _ in 0..8 {
+        let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        s.set_read_timeout(Some(PATIENCE)).unwrap();
+        write!(
+            s,
+            "GET {big_url} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            server.port
+        )
+        .unwrap();
+        s.flush().unwrap();
+        stalled.push(s);
+    }
+    std::thread::sleep(Duration::from_millis(120));
+
+    let capped = http(server.port, "GET", &big_url, &[], b"");
+    assert_eq!(capped.status, 429, "{}", capped.text());
+    assert!(
+        capped.header("retry-after").is_some(),
+        "{:?}",
+        capped.headers
+    );
+    assert_eq!(capped.header("connection"), Some("close"));
+
+    // API and UI remain reachable while all 8 content readers are stalled.
+    assert_eq!(server.get("/v1/health", None).status, 200);
+    assert_eq!(server.get("/", None).status, 200);
+    assert_eq!(
+        server
+            .call(&phone, json!({"tool": "meta.version", "args": {}}))
+            .status,
+        200
+    );
+    drop(stalled);
+    std::thread::sleep(Duration::from_millis(120));
+
+    // 6. In-flight revocation: removing the token mid-stream aborts a 12 MiB download early.
+    let mut rev_stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    rev_stream.set_read_timeout(Some(PATIENCE)).unwrap();
+    write!(
+        rev_stream,
+        "GET {big_url} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        server.port
+    )
+    .unwrap();
+    rev_stream.flush().unwrap();
+    let mut reader = BufReader::new(rev_stream);
+    let (status, _) = read_head(&mut reader);
+    assert_eq!(status, 200);
+    let mut initial = vec![0u8; 64 * 1024];
+    reader.read_exact(&mut initial).unwrap();
+    // Revoke token mid-stream!
+    assert_eq!(home.run(&["token", "remove", "phone", "--json"]).code, 0);
+    let mut rest = Vec::new();
+    let _ = reader.read_to_end(&mut rest);
+    let received = initial.len() + rest.len();
+    assert!(
+        received < big_len,
+        "expected token revocation to abort 12 MiB stream early, received {received}/{big_len}"
+    );
+
+    // 7. In-flight policy loss: denying fs.read in policy.toml mid-stream aborts a 12 MiB download.
+    let phone2 = make_token(&home, &["phone", "phone"]);
+    let big_url2 = server
+        .post(
+            "/v1/content",
+            Some(&phone2),
+            &json!({"path": "~/projects/special/large.bin"}),
+        )
+        .json()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut pol_stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    pol_stream.set_read_timeout(Some(PATIENCE)).unwrap();
+    write!(
+        pol_stream,
+        "GET {big_url2} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        server.port
+    )
+    .unwrap();
+    pol_stream.flush().unwrap();
+    let mut reader2 = BufReader::new(pol_stream);
+    let (status2, _) = read_head(&mut reader2);
+    assert_eq!(status2, 200);
+    let mut initial2 = vec![0u8; 64 * 1024];
+    reader2.read_exact(&mut initial2).unwrap();
+    // Tighten policy mid-stream so observer loses fs.read!
+    home.write_config(
+        "policy.toml",
+        "\
+[principals.phone]
+role = \"observer\"
+
+[principals.admin]
+role = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+deny = [\"fs.read\"]
+paths = [\"~/projects/**\"]
+",
+    );
+    let mut rest2 = Vec::new();
+    let _ = reader2.read_to_end(&mut rest2);
+    let received2 = initial2.len() + rest2.len();
+    assert!(
+        received2 < big_len,
+        "expected policy revocation to abort 12 MiB stream early, received {received2}/{big_len}"
+    );
+
+    server.stop();
 }

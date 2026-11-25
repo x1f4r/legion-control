@@ -133,42 +133,72 @@ resumes from an offset.
 
 ### The pipe
 
-`legion stream`'s `get` gains `length`. Its reply line becomes
-`{size, offset, length, mtime}` followed by exactly `length` bytes (to the end when absent).
-`legion-link` gains `Link::open_content(machine, path, offset, length)`, which opens that
-operation on the session the link already has for that machine (a new exec channel on the ssh
-connection, or a child for a local node) and returns the size, modification time and an async
-reader. It follows the routing rules calls follow: it names its machine and never goes somewhere
-else.
+`legion stream`'s `get` gains `length` and optional `keep_open: true`. Its reply line becomes
+`{size, offset, length, mtime, file_id?, keep_open?}` followed by exactly `length` bytes (to the
+end when absent), and a `{"done": true}` line when `keep_open` is active so one remote `legion
+stream` pipe can serve many consecutive range requests without re-handshaking. `legion-link` gains
+`Link::open_content(machine, path, offset, length)`, which opens that operation on the session the
+link already has for that machine (a new exec channel on the ssh connection, or a child for a local
+node, capped below OpenSSH's default `MaxSessions` of 10 and chunked so an unread stream never
+stalls the shared SSH connection) and returns the size, modification time, file identity, and an
+async reader. It follows the routing rules calls follow: it names its machine and never goes
+somewhere else.
 
 ### Content addresses
 
 An `<img>` or `<video>` cannot send an `Authorization` header and must not run inside the
 interface's origin. So content is served from a **content address**: a URL holding a ticket.
 
-- A ticket is 256 random bits, made for one principal, one machine and one path. It is checked as
-  `fs.read` when made and again on every use, lives 15 minutes after its last use and 6 hours at
-  most, dies with the token or pairing it was made under, and each holder has a bounded number.
-- The address answers `GET` and `HEAD` with single-range support (`Range`, `If-Range`, an `ETag`
-  from size and modification time, `206` and `416` done properly), streaming with backpressure
-  and never reading a file into memory.
-- Every reply carries `X-Content-Type-Options: nosniff`,
-  `Cross-Origin-Resource-Policy`, `Referrer-Policy: no-referrer` and `Cache-Control: private,
-  no-store`. `Content-Type` comes from a short allow-list of types that are safe to show in place
-  (raster images, SVG, video, audio, PDF, and `text/plain; charset=utf-8` for every text file,
-  including HTML). Everything not on the list is `application/octet-stream` with
-  `Content-Disposition: attachment`. Everything except PDF carries
-  `Content-Security-Policy: sandbox; default-src 'none'`. The test that matters: an HTML or SVG
-  file opened through a content address never runs script with access to the interface.
+- A ticket is 256 random bits, made for one principal, one machine, and one bounded path (at most
+  4 KiB; `POST /v1/content` bodies are capped at 16 KiB). It is checked as `fs.read` when made, on
+  every request, and periodically while a response streams (every 2 MiB or 2 seconds), so revoking
+  a token, tightening `policy.toml`, or crossing the 6-hour hard cap stops an in-progress download.
+  Expiry uses a suspend-safe clock (the maximum of wall-clock and monotonic elapsed time): 15
+  minutes after its last use and 6 hours at most, capped per holder (128, LRU eviction) and
+  globally.
+- The address answers `GET` and `HEAD` with single-range support (`Range`, `If-Range`, a strong
+  `ETag` from size, modification time, and Unix file identity, `206` and `416` done properly),
+  streaming with backpressure and never reading a file into memory.
+- Every reply carries `X-Content-Type-Options: nosniff`, `Cross-Origin-Resource-Policy`
+  (`same-origin` on the HTTP door; `cross-origin` on a native loopback mount), `Referrer-Policy:
+  no-referrer`, `Cache-Control: private, no-store`, and unconditionally
+  `Content-Security-Policy: sandbox; default-src 'none'; frame-ancestors 'none'`. `Content-Type`
+  comes from a short allow-list of types safe to show in place (raster images, SVG, video, audio,
+  `text/vtt; charset=utf-8` for `.vtt` subtitles, and `text/plain; charset=utf-8` for every other
+  text file, including HTML). Everything not on the list — including PDF — is served as
+  `application/octet-stream` with `Content-Disposition: attachment`. The test that matters: an
+  HTML, SVG, or PDF file opened through a content address never runs script or embeds with access
+  to the interface.
 - `?download=1` forces `Content-Disposition: attachment` with the file's name.
+- **Concurrent reads and slow readers**: active content streams are capped per ticket (8), per
+  holder (16), and globally (64), refusing excess streams with `429 Too Many Requests`,
+  `Retry-After`, and `Connection: close`, and stalled or overly slow readers are closed after an
+  idle write timeout (15 s) or minimum progress window (40 KiB / 10 s) so one holder cannot starve
+  the API or UI.
+- **Audit coalescing**: minting a ticket writes one `content.ticket` entry (never logging the
+  ticket id); successful reads coalesce to at most one `content.read` entry per ticket per minute
+  (and one `stream.get` entry per principal/path per minute on a remote node) with request count
+  and bytes served.
+- **Lifetime and browser history**: a content address stays usable for up to 6 hours while in active
+  use and will appear in browser history if opened directly in a tab. Damage is bounded because the
+  ticket is read-only to one file, expires after 15 minutes of idleness (and 6 hours unconditionally),
+  dies immediately if the bearer token or `fs.read` policy is revoked, carries `Cache-Control:
+  private, no-store` and `Referrer-Policy: no-referrer`, and renders only in a sandboxed opaque
+  origin with `frame-ancestors 'none'`. If a third-party page somehow obtains a ticket, `Origin`
+  checks block cross-origin `fetch()` unless explicitly listed, `Cross-Origin-Resource-Policy:
+  same-origin` blocks no-cors subresource embedding, `frame-ancestors 'none'` blocks framing, and
+  `sandbox; default-src 'none'` isolates any top-level navigation.
 
-One module (crate `legion-content`) holds the ticket table, the range handling and the headers,
-over a small trait that opens a byte range. Two things mount it:
+One module (crate `legion-content`) holds the ticket table, the range handling, concurrency limits,
+the `Host`/`Origin` guard, and the headers, over a small trait that opens a byte range. Two things
+mount it:
 
 - **The HTTP door**: `POST /v1/content` (bearer token) with `{on, path}` returns
-  `{url, expires_in}`; the URL is `/v1/content/<ticket>/<file name>` on the same origin. The door
-  reads the file through the node, so a file on another machine comes over the node's own
-  session to it.
+  `{url, expires_in}`; the URL is `/v1/content/<ticket>/<file name>` on the same origin, with
+  `Cross-Origin-Resource-Policy: same-origin` always set (origins listed in `[serve] origins` read
+  content via CORS `fetch()` or `crossorigin`, not no-cors embedding). The door reads remote files
+  over pooled `keep_open` `legion stream` pipes and multiplexed SSH (`ControlMaster` on Unix),
+  capped below `MaxSessions` of 10 per target machine.
 - **The app**: the native side mounts the same module on a listener bound to `127.0.0.1` on a
   port the system picks, reading through `Link::open_content`. The interface asks the native
   command `content_url({machine, path})` for an address. The ticket in the path is the only

@@ -1018,25 +1018,45 @@ curl -sSI 'http://127.0.0.1:7117/v1/content/<ticket>/clip.mp4?download=1'
 
 Security and lifecycle guarantees:
 
-- **Tickets**: 256 random bits bound to one bearer token, one principal, one machine, and one file
-  path. Permissions are checked as `fs.read` when the ticket is minted and again on every `GET` or
-  `HEAD`. Tickets slide for 15 minutes from last use (6 hours absolute maximum), are capped at 128
-  per token (evicting the oldest), and stop working immediately when the token is removed,
-  replaced, or expired, or when the role loses `fs.read` on that path. Reads are written to the
-  audit log (`content.read`) and tickets are redacted from server logs.
+- **Tickets and revocation**: 256 random bits bound to one bearer token, one principal, one
+  machine, and one bounded file path (at most 4 KiB; `POST /v1/content` bodies are capped at 16
+  KiB). Permissions are checked as `fs.read` when the ticket is minted, on every `GET` or `HEAD`,
+  and periodically while streaming (every 2 MiB or 2 seconds), so revoking the token, tightening
+  `policy.toml`, or crossing the 6-hour hard limit cuts off active downloads. Tickets expire using
+  a suspend-safe clock (15 minutes after last use, 6 hours absolute maximum), are capped at 128 per
+  token (evicting the oldest), and are never logged; minting writes one `content.ticket` audit
+  entry and successful reads coalesce to at most one `content.read` (and `stream.get` on remote
+  nodes) per ticket per minute with request count and bytes served.
 - **Headers and isolation**: every reply carries `X-Content-Type-Options: nosniff`,
-  `Cross-Origin-Resource-Policy: same-origin` (or `cross-origin` for an explicitly allowed CORS
-  origin), `Referrer-Policy: no-referrer`, and `Cache-Control: private, no-store`. `Content-Type`
-  comes from a fixed allow-list (raster images, SVG, video, audio, PDF, and
-  `text/plain; charset=utf-8` for all text files including HTML); unlisted types are served as
-  `application/octet-stream` with `Content-Disposition: attachment`. Every response except inline
-  PDF carries `Content-Security-Policy: sandbox; default-src 'none'` so opened HTML or SVG files
-  can never run script in the interface's origin.
-- **Host and `Origin` guards**: `/v1/content/<ticket>/<name>` enforces the same `Host` check as
-  every other route. Because `<img>`, `<video>`, `<audio>`, and direct downloads send no `Origin`
-  header, an absent `Origin` is accepted on `GET` and `HEAD` (the unguessable 256-bit ticket in
-  the path authenticates the read); if a browser does send an `Origin` header, it must match the
-  same origin or `[serve] origins` in `node.toml`, otherwise the request is refused with `403`.
+  `Cross-Origin-Resource-Policy: same-origin`, `Referrer-Policy: no-referrer`, `Cache-Control:
+  private, no-store`, and unconditionally
+  `Content-Security-Policy: sandbox; default-src 'none'; frame-ancestors 'none'`. `Content-Type`
+  comes from a fixed allow-list (raster images, SVG, video, audio, `text/vtt; charset=utf-8` for
+  `.vtt`, and `text/plain; charset=utf-8` for all other text files including HTML); unlisted types
+  — including PDF — are served as `application/octet-stream` with `Content-Disposition:
+  attachment`. Opened HTML, SVG, or PDF files can never run script or be framed inside the
+  interface's origin.
+- **Host, `Origin`, and third-party pages**: `/v1/content/<ticket>/<name>` enforces the same `Host`
+  and `Origin` checks as every other route. Because `<img>`, `<video>`, `<audio>`, and direct
+  downloads send no `Origin` header, an absent `Origin` is accepted on `GET` and `HEAD`; if a
+  browser sends an `Origin`, it must match the same origin or `[serve] origins` in `node.toml`,
+  otherwise the request is refused with `403`. Because `Cross-Origin-Resource-Policy` is always
+  `same-origin` on the HTTP door, listed cross-origin pages must fetch content using CORS
+  (`fetch()` or `crossorigin`) rather than no-cors embedding. Against a third-party page that
+  somehow learns a ticket, secrecy of the 256-bit ticket is the first barrier, while `Origin`
+  refusal, `Cross-Origin-Resource-Policy: same-origin`, `frame-ancestors 'none'`, and `sandbox;
+  default-src 'none'` block cross-origin reads, no-cors embeds, framing, and script execution.
+- **History and exposure**: a content address remains usable for up to 6 hours while in active use
+  and appears in browser history if opened directly in a tab; damage is limited because it grants
+  read-only access to one file, expires after 15 minutes idle or 6 hours total, stops immediately
+  when the token or `fs.read` policy is revoked, and never caches or executes in the interface's
+  origin.
+- **Concurrency and slow-reader protection**: active content streams are capped per ticket (8), per
+  holder (16), and globally (64), answering `429 Too Many Requests` with `Retry-After` and
+  `Connection: close`, and stalled or overly slow readers are disconnected after a write-idle
+  timeout (15 s) or minimum transfer rate window (40 KiB / 10 s) so API and UI routes stay
+  responsive. Remote reads reuse pooled `keep_open` `legion stream` pipes and multiplexed SSH
+  connections (`ControlMaster` on Unix), capped at 8 concurrent streams per target machine.
 
 ### Event stream (SSE)
 
