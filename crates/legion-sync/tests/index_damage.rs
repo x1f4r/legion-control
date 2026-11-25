@@ -272,7 +272,7 @@ impl IndexStore for PanickingStore {
         caller_member: &str,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: legion_sync::PageLimit,
     ) -> legion_sync::Result<RecordsPage> {
         self.inner
             .records_since(caller_member, since_incarnation, since_seq, limit)

@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::model::{
     BinEntry, DeferredItem, FetchOptions, FolderMarker, FolderMeta, HandshakeHello, HeldBackRecord,
-    IndexRecord, MemberId, PeerCursor, PeerHandshake, PendingOp, RecordsPage, SyncProblem,
+    IndexRecord, MemberId, PageLimit, PeerCursor, PeerHandshake, PendingOp, RecordsPage,
+    SyncProblem,
 };
 use crate::path::IgnoreMatcher;
 
@@ -224,11 +225,15 @@ pub trait SyncFs {
 
     /// Syncs the parent directory of `live_rel` to durable storage (used for batched group
     /// commits).
-    fn sync_parent_dir_live(&self, _live_rel: &str) {}
+    fn sync_parent_dir_live(&self, _live_rel: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// Syncs `.legion-sync/tmp` to durable storage (used once at the end of a batched group
     /// commit).
-    fn sync_tmp_dir(&self) {}
+    fn sync_tmp_dir(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Creates a new staging file inside `.legion-sync/tmp/<tmp_name>`.
     fn create_tmp(&self, tmp_name: &str) -> Result<Box<dyn SyncWrite>>;
@@ -347,8 +352,9 @@ pub trait Peer {
     /// Exchanges bidirectional folder/incarnation/sequence-fingerprint identity before pulling.
     fn handshake(&self, caller: &HandshakeHello) -> Result<PeerHandshake>;
 
-    /// Fetches index records created or updated after `(since_incarnation, since_seq)`, up to
-    /// `limit` entries, from a single consistent snapshot of the peer's index.
+    /// Fetches index records created or updated after `(since_incarnation, since_seq)`, bounded by
+    /// both `limit.max_records` and `limit.max_bytes`, from a single consistent snapshot of the
+    /// peer's index.
     ///
     /// When `since_incarnation` differs from the peer's active incarnation, the peer starts from
     /// sequence `0`. Implementations should check `cancel` cooperatively if provided.
@@ -356,7 +362,7 @@ pub trait Peer {
         &self,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: PageLimit,
         cancel: Option<&AtomicBool>,
     ) -> Result<RecordsPage>;
 
@@ -484,15 +490,16 @@ pub trait IndexStore {
     /// `folded_path`.
     fn live_paths_for_folded(&self, folded_path: &str) -> Result<Vec<String>>;
 
-    /// Reads a consistent page of records with `seq > effective_since_seq` (up to `limit`),
-    /// together with the snapshot's incarnation, `local_seq`, direct `caller_acked` cursor, and
-    /// head fingerprint.
+    /// Reads a consistent page of records with `seq > effective_since_seq`, bounded by both
+    /// `limit.max_records` and `limit.max_bytes` (always admitting at least one record), together
+    /// with the snapshot's incarnation, `local_seq`, direct `caller_acked` cursor, and head
+    /// fingerprint.
     fn records_since(
         &self,
         caller_member: &str,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: PageLimit,
     ) -> Result<RecordsPage>;
 
     /// Returns all currently active tombstone records.

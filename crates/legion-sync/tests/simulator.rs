@@ -39,10 +39,10 @@ use legion_sync::{
     FolderMeta, FsCapabilities, FsErrorKind, FsMeta, FsWalkEntry, FsWalkResult, HeldBackRecord,
     INDEX_DAMAGED_PROBLEM_SENTENCE, IgnoreMatcher, InboundDeletionBrakeDecision, IndexRecord,
     IndexStore, MAX_FORCED_ROTATIONS_BEFORE_CONFIRM, MAX_VERSION_COUNTER, MemberId, MemberState,
-    MemoryIndexStore, Peer, PeerAckView, PeerCursor, PeerHandshake, PeerRollbackClaimDecision,
-    PendingOp, ProblemKind, RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION, ScanOptions,
-    StoreBatch, SyncEngine, SyncError, SyncFs, SyncWrite, VersionKey, VersionVector,
-    is_internal_sync_path, validate_sync_path,
+    MemoryIndexStore, PageLimit, Peer, PeerAckView, PeerCursor, PeerHandshake,
+    PeerRollbackClaimDecision, PendingOp, ProblemKind, RecordsPage, RestoreStrategy,
+    SYNC_PROTOCOL_VERSION, ScanOptions, StoreBatch, SyncEngine, SyncError, SyncFs, SyncWrite,
+    VersionKey, VersionVector, is_internal_sync_path, validate_sync_path,
 };
 use legion_xfer::hash::hash_bytes;
 use legion_xfer::{EntryKind, Hash, Timestamp};
@@ -241,6 +241,16 @@ struct PowerLossTmpState {
     pending_power_loss: bool,
 }
 
+/// Unsynced filesystem operation awaiting its enclosing directory's `fsync`, allowing
+/// [`HonestSimFs::simulate_power_loss`] to model partial persistence (an independent random subset
+/// of unsynced operations surviving a power cut while others revert).
+#[derive(Debug, Clone)]
+enum UnsyncedFsOp {
+    MoveTmpToLive { tmp_name: String, live_path: String },
+    CreateDir { path: String },
+    RemoveTmp { tmp_name: String },
+}
+
 /// Durable-vs-volatile disk state used when [`HonestSimFs`] runs in power-loss mode.
 ///
 /// Mirrors `RealFs`'s exact `fsync` / `sync_dir` calls:
@@ -261,6 +271,7 @@ struct PowerLossDisk {
     tmp_state: Arc<Mutex<PowerLossTmpState>>,
     sync_created_ancestors: bool,
     sync_remove_tmp: bool,
+    unsynced_ops: Vec<UnsyncedFsOp>,
     tear_rng: Rng,
     power_losses: usize,
 }
@@ -407,6 +418,7 @@ impl HonestSimFs {
             tmp_state: Arc::new(Mutex::new(tmp_state)),
             sync_created_ancestors,
             sync_remove_tmp,
+            unsynced_ops: Vec::new(),
             tear_rng: Rng::new(seed ^ 0xD15C_1055),
             power_losses: 0,
         });
@@ -463,6 +475,11 @@ impl HonestSimFs {
                 pl.durable_live.insert(k.clone(), v.clone());
             }
         }
+        pl.unsynced_ops.retain(|op| match op {
+            UnsyncedFsOp::CreateDir { path } => !is_direct_child(path),
+            UnsyncedFsOp::MoveTmpToLive { live_path, .. } => !is_direct_child(live_path),
+            UnsyncedFsOp::RemoveTmp { .. } => true,
+        });
     }
 
     fn pl_flush_live_parent(&self, clean: &str) {
@@ -486,6 +503,20 @@ impl HonestSimFs {
             for anc in created {
                 self.pl_flush_live_parent(anc);
             }
+        } else if let Some(pl) = self.power_loss.borrow_mut().as_mut() {
+            for anc in created {
+                pl.unsynced_ops
+                    .push(UnsyncedFsOp::CreateDir { path: anc.clone() });
+            }
+        }
+    }
+
+    fn pl_record_unsynced_op(&self, op: UnsyncedFsOp) {
+        if !self.power_loss_enabled.get() {
+            return;
+        }
+        if let Some(pl) = self.power_loss.borrow_mut().as_mut() {
+            pl.unsynced_ops.push(op);
         }
     }
 
@@ -510,6 +541,11 @@ impl HonestSimFs {
                 }
             }
         }
+        pl.unsynced_ops.retain(|op| match op {
+            UnsyncedFsOp::RemoveTmp { .. } => false,
+            UnsyncedFsOp::MoveTmpToLive { tmp_name, .. } => tmp.contains_key(tmp_name),
+            UnsyncedFsOp::CreateDir { .. } => true,
+        });
     }
 
     fn pl_flush_bin_dir(&self) {
@@ -559,10 +595,11 @@ impl HonestSimFs {
         }
     }
 
-    /// Cuts power abruptly: discards every unsynced file write and unsynced directory entry
-    /// mutation, drops any live subtree whose newly created ancestor directory was never synced
-    /// into its parent, and optionally leaves a torn partial write (truncated prefix or
-    /// zero-filled tail) for the last unsynced tmp write.
+    /// Cuts power abruptly with **partial persistence**: each unsynced directory operation
+    /// independently persists or reverts at random (modeling out-of-order page-cache flushes
+    /// rather than only all-or-nothing rollback), drops any live subtree whose newly created
+    /// ancestor directory did not persist, and leaves the last unsynced tmp write dropped or torn
+    /// (truncated prefix or zero-filled tail).
     fn simulate_power_loss(&self) {
         if !self.power_loss_enabled.get() {
             return;
@@ -571,6 +608,37 @@ impl HonestSimFs {
         let Some(pl) = guard.as_mut() else {
             return;
         };
+
+        // Partial persistence: independently decide for each unsynced operation whether it made it
+        // to media before power died or was lost in volatile cache.
+        let volatile_live = self.live.borrow().clone();
+        let pending_ops = std::mem::take(&mut pl.unsynced_ops);
+        for op in pending_ops {
+            if !pl.tear_rng.chance(1, 2) {
+                continue;
+            }
+            match op {
+                UnsyncedFsOp::CreateDir { path } => {
+                    if let Some(node @ SimNode::Dir { .. }) = volatile_live.get(&path) {
+                        pl.durable_live.insert(path, node.clone());
+                    }
+                }
+                UnsyncedFsOp::MoveTmpToLive {
+                    tmp_name,
+                    live_path,
+                } => {
+                    if let Some(node) = volatile_live.get(&live_path) {
+                        pl.durable_live.insert(live_path, node.clone());
+                        pl.durable_tmp.remove(&tmp_name);
+                        pl.durable_tmp_meta.remove(&tmp_name);
+                    }
+                }
+                UnsyncedFsOp::RemoveTmp { tmp_name } => {
+                    pl.durable_tmp.remove(&tmp_name);
+                    pl.durable_tmp_meta.remove(&tmp_name);
+                }
+            }
+        }
 
         // Drop any durable live entry whose strict ancestor directory is NOT durable.
         let durable_dirs: BTreeSet<String> = pl
@@ -1782,14 +1850,15 @@ impl SyncFs for HonestSimFs {
         })
     }
 
-    fn sync_parent_dir_live(&self, live_rel: &str) {
-        if let Ok(clean) = validate_sync_path(live_rel) {
-            self.pl_flush_live_parent(&clean);
-        }
+    fn sync_parent_dir_live(&self, live_rel: &str) -> legion_sync::Result<()> {
+        let clean = validate_sync_path(live_rel)?;
+        self.pl_flush_live_parent(&clean);
+        Ok(())
     }
 
-    fn sync_tmp_dir(&self) {
+    fn sync_tmp_dir(&self) -> legion_sync::Result<()> {
         self.pl_flush_tmp_dir();
+        Ok(())
     }
 
     fn create_tmp(&self, tmp_name: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
@@ -1918,6 +1987,10 @@ impl SyncFs for HonestSimFs {
                     }
                 }
                 self.pl_flush_tmp_dir();
+            } else {
+                self.pl_record_unsynced_op(UnsyncedFsOp::RemoveTmp {
+                    tmp_name: tmp_name.to_string(),
+                });
             }
         }
         Ok(())
@@ -2098,6 +2171,10 @@ impl SyncFs for HonestSimFs {
                 // Intentionally defer live parent and tmp dir syncs until `sync_parent_dir_live` /
                 // `sync_tmp_dir` — matching `RealFs::commit_tmp_to_live_no_replace_deferred_dir_sync`!
                 self.pl_flush_created_ancestors(&created_ancs);
+                self.pl_record_unsynced_op(UnsyncedFsOp::MoveTmpToLive {
+                    tmp_name: tmp_name.to_string(),
+                    live_path: clean,
+                });
                 Ok(())
             },
         )
@@ -2586,7 +2663,7 @@ impl IndexStore for FaultyIndexStore {
         caller_member: &str,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: PageLimit,
     ) -> legion_sync::Result<RecordsPage> {
         self.inner
             .records_since(caller_member, since_incarnation, since_seq, limit)
@@ -2755,7 +2832,7 @@ impl Peer for SimPeer<'_> {
         &self,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: PageLimit,
         cancel: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -5332,7 +5409,7 @@ fn run_hostile_peer_seed(root_seed: u64, seed: u64, record_trace: bool) {
             &self,
             since_incarnation: u64,
             since_seq: u64,
-            limit: usize,
+            limit: PageLimit,
             _cancel: Option<&AtomicBool>,
         ) -> legion_sync::Result<RecordsPage> {
             let start = if since_incarnation == 99 {
@@ -5340,7 +5417,7 @@ fn run_hostile_peer_seed(root_seed: u64, seed: u64, record_trace: bool) {
             } else {
                 0
             };
-            let end = (start + limit).min(self.records.len());
+            let end = (start + limit.max_records).min(self.records.len());
             Ok(RecordsPage {
                 incarnation: 99,
                 records: self.records[start..end].to_vec(),
@@ -6383,7 +6460,7 @@ fn run_adversary_counters_rotation_and_symlinks_seed(
             &self,
             _inc: u64,
             since_seq: u64,
-            _limit: usize,
+            _limit: PageLimit,
             _cancel: Option<&AtomicBool>,
         ) -> legion_sync::Result<RecordsPage> {
             let records: Vec<IndexRecord> = self
@@ -7163,7 +7240,7 @@ fn run_lying_peer_regression_rate_limit_seed(root_seed: u64, seed: u64, _record_
             &self,
             a: u64,
             b: u64,
-            l: usize,
+            l: PageLimit,
             c: Option<&AtomicBool>,
         ) -> legion_sync::Result<RecordsPage> {
             self.inner.records_since(a, b, l, c)
@@ -7348,7 +7425,7 @@ fn run_asymmetric_membership_views_seed(root_seed: u64, seed: u64, _record_trace
             &self,
             _i: u64,
             _s: u64,
-            _l: usize,
+            _l: PageLimit,
             _c: Option<&AtomicBool>,
         ) -> legion_sync::Result<RecordsPage> {
             Err(SyncError::PeerUnavailable {
@@ -8003,15 +8080,35 @@ fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trac
     }
 }
 
-/// Scenario 23: Power-loss disk mode crash recovery — tests unsynced file writes (dropped or torn
-/// with truncated prefix / zero-filled tail), unsynced deferred group-commit renames, unsynced
-/// newly created ancestor directories, unsynced `remove_tmp` after failed fetch, post-commit
-/// power loss, and power loss during recovery itself.
+fn cached_real_fs_durability_audit() -> &'static legion_sync::RealFsDurabilityAudit {
+    static AUDIT: std::sync::OnceLock<legion_sync::RealFsDurabilityAudit> =
+        std::sync::OnceLock::new();
+    AUDIT.get_or_init(|| {
+        let dir =
+            std::env::temp_dir().join(format!("legion-sync-real-fs-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let res = legion_sync::audit_real_fs_durability(&dir)
+            .expect("RealFs durability audit must succeed");
+        let _ = std::fs::remove_dir_all(&dir);
+        res
+    })
+}
+
+/// Scenario 23: Power-loss disk mode crash recovery — wired directly to the live [`RealFs`]
+/// durability audit so dropping a `sync_dir` call in `fs_real.rs` fails this generator at seed 0,
+/// and exercising partial-persistence power cuts across unsynced writes, deferred group-commit
+/// renames, nested ancestor directories, `remove_tmp`, bin restores, and recovery itself.
 fn run_power_loss_crash_recovery_seed(root_seed: u64, seed: u64, _record_trace: bool) {
     let mut rng = Rng::new(seed);
     let t0 = Timestamp::new(1_795_608_000, 0);
-    let sync_created_ancestors = true;
-    let sync_remove_tmp = true;
+    let audit = cached_real_fs_durability_audit();
+    assert!(
+        audit.unsynced_ops.is_empty(),
+        "seed={root_seed}: RealFs durability audit found unsynced directory mutations: {:?}",
+        audit.unsynced_ops
+    );
+    let sync_created_ancestors = audit.sync_created_ancestors;
+    let sync_remove_tmp = audit.sync_remove_tmp;
 
     let mut mk = |id: &str, supports_exchange: bool, pl_seed: u64| {
         let mut cfg = FolderConfig::new("sim", id.to_string(), ["m0".into(), "m1".into()]);
@@ -8394,7 +8491,7 @@ fn simulator_idle_fetch_timeout_virtual_clock() {
             &self,
             a: u64,
             b: u64,
-            l: usize,
+            l: PageLimit,
             c: Option<&AtomicBool>,
         ) -> legion_sync::Result<RecordsPage> {
             self.inner.records_since(a, b, l, c)
@@ -8503,11 +8600,18 @@ fn simulator_idle_fetch_timeout_virtual_clock() {
 
 #[test]
 fn simulator_power_loss_durability_proves_sync_invariants() {
+    // 0. Audit the real `RealFs` implementation first: removing any `sync_dir` in `fs_real.rs`
+    //    must fail this test AND Generator 23 immediately.
+    let audit = cached_real_fs_durability_audit();
+    assert!(
+        audit.sync_created_ancestors && audit.sync_remove_tmp && audit.unsynced_ops.is_empty(),
+        "RealFs durability audit failed: {audit:?}"
+    );
+
     // 1. Direct verification that creating a multi-level nested directory path and placing a file
-    // inside it survives an immediate post-commit power loss (depends on `ensure_parent_dirs`
-    // syncing every newly created ancestor's parent directory).
+    // inside it survives an immediate post-commit power loss (wired to `audit`).
     let fs = HonestSimFs::new(FsCapabilities::unix(), true);
-    fs.enable_power_loss_mode(42, true, true);
+    fs.enable_power_loss_mode(42, audit.sync_created_ancestors, audit.sync_remove_tmp);
     let mut w = fs.create_tmp(".legion-sync-fetch-1-aabbccdd.tmp").unwrap();
     w.write_all(b"nested durable payload").unwrap();
     w.finish_sync().unwrap();

@@ -400,7 +400,7 @@ impl Peer for BenchPeer {
         &self,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: legion_sync::PageLimit,
         _cancel: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         let start = if since_incarnation == self.incarnation {
@@ -408,7 +408,7 @@ impl Peer for BenchPeer {
         } else {
             0
         };
-        let end = (start + limit).min(self.records.len());
+        let end = (start + limit.max_records).min(self.records.len());
         let records = self.records[start..end].to_vec();
         let has_more = end < self.records.len();
         Ok(RecordsPage {

@@ -635,12 +635,13 @@ always-on machine) simply makes that happen sooner for everyone.
   machine's files across all counted pages; later deletions are judged by the window as usual).
 - **Pulling and safe replacement.** A member handshakes (exchanging pulled/acked positions and a
   bidirectional summary of any records one side could not accept from the other) and asks a peer for
-  the records it has not seen (`sync.index`, by `(incarnation, seq)`), validates and bounds every
-  page and record (invalid
-  or unauthorized records — including a peer forging this member's own counter above its local
-  clock or counters above `2^62` — are refused, reported durably, and never acknowledged; conflict
-  copy member names come strictly from the folder's member list; conflict status is derived locally
-  rather than trusted from peers). Before fetching a file, the engine checks available free space
+  the records it has not seen (`sync.index`, by `(incarnation, seq)`), validating and bounding every
+  page by both record count (up to 4,096 records) and serialized wire size (up to 4 MiB, always
+  admitting at least one record so a single large record never stalls) and validating every record
+  (invalid or unauthorized records — including a peer forging this member's own counter above its
+  local clock or counters above `2^62` — are refused, reported durably, and never acknowledged;
+  conflict copy member names come strictly from the folder's member list; conflict status is derived
+  locally rather than trusted from peers). Before fetching a file, the engine checks available free space
   against the declared size plus a safety margin; if it will not fit, the download does not start
   and the single record is held back with a plain-language space problem while unrelated records
   continue syncing. Any single record that cannot be placed for a local reason (disk full,
@@ -717,7 +718,15 @@ always-on machine) simply makes that happen sooner for everyone.
   anything. On filesystems without an atomic file-exchange call, the claim-then-rename fallback
   briefly leaves the replaced path absent between claiming the old file and renaming the new one
   into place (a concurrent creation in that gap is caught by non-replacing rename without data
-  loss).
+  loss). **Power-loss durability by OS:** on Linux and macOS, every staged file write, metadata
+  update, deletion-log write, marker write, bin write, directory creation (including each newly
+  created nested ancestor), rename, atomic exchange, and unlink flushes file data with `fsync` and
+  flushes every touched parent directory with `fsync` (propagating directory-sync errors rather
+  than ignoring them) before committing the index transaction; on Windows, ordinary user processes
+  cannot flush directory handles without `SeBackupPrivilege`, so file data and metadata use
+  `FlushFileBuffers` (`sync_all`) and atomic renames use `MoveFileExW` with
+  `MOVEFILE_WRITE_THROUGH` (while `ReplaceFileW` and `redb` database commits rely on NTFS metadata
+  journaling and file flushes).
 - **Why version-vector keys are never dropped.** Dropping a retired `(member, incarnation)` key from
   causal comparisons is only safe when every machine that could ever reconnect agrees on the exact
   membership set and has already propagated every edit or deletion carrying that key. Personal

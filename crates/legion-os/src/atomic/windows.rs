@@ -5,7 +5,7 @@
 //! or a concurrent reader holds the destination open. Retrying the rename preserves atomicity
 //! without ever deleting the destination first.
 
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io;
 use std::path::Path;
 
@@ -32,7 +32,7 @@ pub(super) fn apply_final_permissions(
 
 pub(super) fn replace_file(from: &Path, to: &Path) -> Result<()> {
     retry_sync_with_backoff(
-        || fs::rename(from, to),
+        || win_proc::move_file_replace_write_through(from, to),
         is_retryable_windows_replace_error,
         WINDOWS_REPLACE_TIMEOUT,
         WINDOWS_INITIAL_BACKOFF,
@@ -48,7 +48,7 @@ pub(super) fn replace_file(from: &Path, to: &Path) -> Result<()> {
 
 pub(super) async fn replace_file_async(from: &Path, to: &Path) -> Result<()> {
     retry_async_with_backoff(
-        || fs::rename(from, to),
+        || win_proc::move_file_replace_write_through(from, to),
         is_retryable_windows_replace_error,
         WINDOWS_REPLACE_TIMEOUT,
         WINDOWS_INITIAL_BACKOFF,

@@ -881,7 +881,7 @@ impl Peer for ChangingPeer<'_> {
         &self,
         a: u64,
         b: u64,
-        l: usize,
+        l: legion_sync::PageLimit,
         c: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         self.inner.records_since(a, b, l, c)
@@ -1724,7 +1724,7 @@ fn r10_inbound_brake_confirmations_per_page() {
 #[test]
 #[ignore]
 fn r10_inbound_brake_3000_files_default_page() {
-    run_r10_inbound_brake(3_000, 200, legion_sync::DEFAULT_PAGE_LIMIT);
+    run_r10_inbound_brake(3_000, 200, legion_sync::DEFAULT_PAGE_LIMIT.max_records);
 }
 
 struct LyingPeer<'a> {
@@ -1747,7 +1747,7 @@ impl Peer for LyingPeer<'_> {
         &self,
         a: u64,
         b: u64,
-        l: usize,
+        l: legion_sync::PageLimit,
         c: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         self.inner.records_since(a, b, l, c)
@@ -1941,10 +1941,10 @@ impl SyncFs for FullFs {
     fn rename_live_to_live_no_replace(&self, a: &str, b: &str) -> legion_sync::Result<()> {
         self.inner.rename_live_to_live_no_replace(a, b)
     }
-    fn sync_parent_dir_live(&self, p: &str) {
+    fn sync_parent_dir_live(&self, p: &str) -> legion_sync::Result<()> {
         self.inner.sync_parent_dir_live(p)
     }
-    fn sync_tmp_dir(&self) {
+    fn sync_tmp_dir(&self) -> legion_sync::Result<()> {
         self.inner.sync_tmp_dir()
     }
     fn create_tmp(&self, t: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
@@ -2354,10 +2354,10 @@ impl SyncFs for CrossDeviceSubdirFs {
     fn rename_live_to_live_no_replace(&self, a: &str, b: &str) -> legion_sync::Result<()> {
         self.inner.rename_live_to_live_no_replace(a, b)
     }
-    fn sync_parent_dir_live(&self, p: &str) {
+    fn sync_parent_dir_live(&self, p: &str) -> legion_sync::Result<()> {
         self.inner.sync_parent_dir_live(p)
     }
-    fn sync_tmp_dir(&self) {
+    fn sync_tmp_dir(&self) -> legion_sync::Result<()> {
         self.inner.sync_tmp_dir()
     }
     fn create_tmp(&self, t: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
@@ -3051,7 +3051,7 @@ impl Peer for VirtualTimedPeer<'_> {
         &self,
         a: u64,
         b: u64,
-        l: usize,
+        l: legion_sync::PageLimit,
         c: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         self.inner.records_since(a, b, l, c)
@@ -3111,7 +3111,7 @@ impl Peer for TimedPeer<'_> {
         &self,
         a: u64,
         b: u64,
-        l: usize,
+        l: legion_sync::PageLimit,
         c: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         self.inner.records_since(a, b, l, c)
@@ -3258,7 +3258,7 @@ impl Peer for InflatedVvPeer<'_> {
         &self,
         a: u64,
         b: u64,
-        l: usize,
+        l: legion_sync::PageLimit,
         c: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         let mut page = self.inner.records_since(a, b, l, c)?;
@@ -3371,11 +3371,11 @@ impl Peer for ManyOversizedPeer {
         &self,
         _since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: legion_sync::PageLimit,
         _cancel: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         let start = (since_seq as usize) + 1;
-        let end = (start + limit - 1).min(self.total_records);
+        let end = (start + limit.max_records - 1).min(self.total_records);
         let mut records = Vec::new();
         let mut chain_fingerprints = BTreeMap::new();
         for seq in start..=end {

@@ -84,7 +84,10 @@ pub mod version;
 pub use apply::{ApplyOutcome, RecoveryReport};
 pub use engine::{DEFAULT_PAGE_LIMIT, FOLDER_MARKER_PROBLEM_SENTENCE, PullReport, SyncEngine};
 pub use error::{FsErrorKind, INDEX_DAMAGED_PROBLEM_SENTENCE, Result, SyncError};
-pub use fs_real::{RealFs, check_folders_not_nested};
+pub use fs_real::{
+    RealFs, RealFsDurabilityAudit, RealFsDurabilityEvent, audit_real_fs_durability,
+    check_folders_not_nested,
+};
 pub use model::{
     BinEntry, BinReason, ConflictChoice, ConflictInfo, DEFAULT_BIN_RETENTION,
     DEFAULT_BRAKE_MIN_FILES, DEFAULT_BRAKE_MIN_PERCENT, DEFAULT_BRAKE_SETTLE_SECS,
@@ -94,14 +97,15 @@ pub use model::{
     FolderDeletionRecord, FolderId, FolderMarker, FolderMeta, FolderStatus, HandshakeHello,
     HeldBackRecord, INDEX_SCHEMA_VERSION, InboundDeletionBrake, InboundDeletionBrakeDecision,
     IndexRecord, MAX_ANCESTRY_HASHES, MAX_DEFERRAL_ATTEMPTS, MAX_FORCED_ROTATIONS_BEFORE_CONFIRM,
-    MAX_HELD_BACK_ENTRIES, MAX_LINK_TARGET_BYTES, MAX_PAGE_RECORDS, MAX_PEER_PROBLEMS,
-    MAX_VERSION_COUNTER, MAX_VV_INCARNATIONS_PER_MEMBER, MIN_PLAUSIBLE_CLOCK_SECS, MemberId,
-    MemberState, MemberStatus, PeerAckView, PeerCursor, PeerHandshake, PeerRefusalSummary,
-    PeerRollbackClaimDecision, PeerRollbackClaimState, PendingLocalDeletion, PendingOp,
-    ProblemKind, RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress,
-    chain_fingerprint, collapse_deletion_records, compact_deletion_log_bytes,
-    encode_deletion_log_entries, merge_deletion_record_into_list, parse_deletion_log,
-    parse_deletion_log_all, validate_folder_id, validate_member_id,
+    MAX_HELD_BACK_ENTRIES, MAX_LINK_TARGET_BYTES, MAX_PAGE_BYTES, MAX_PAGE_RECORDS,
+    MAX_PEER_PROBLEMS, MAX_VERSION_COUNTER, MAX_VV_INCARNATIONS_PER_MEMBER,
+    MIN_PLAUSIBLE_CLOCK_SECS, MemberId, MemberState, MemberStatus, PageLimit, PeerAckView,
+    PeerCursor, PeerHandshake, PeerRefusalSummary, PeerRollbackClaimDecision,
+    PeerRollbackClaimState, PendingLocalDeletion, PendingOp, ProblemKind, RecordsPage,
+    RestoreStrategy, SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, chain_fingerprint,
+    collapse_deletion_records, compact_deletion_log_bytes, encode_deletion_log_entries,
+    merge_deletion_record_into_list, parse_deletion_log, parse_deletion_log_all,
+    validate_folder_id, validate_member_id,
 };
 pub use path::{
     IgnoreMatcher, ParsedConflictPath, SYNC_BIN_DIR, SYNC_DELETIONS_LOG_FILE, SYNC_MARKER_FILE,

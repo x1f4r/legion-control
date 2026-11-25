@@ -4,6 +4,7 @@ use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use legion_os::atomic::{
@@ -51,6 +52,65 @@ fn canonical_or_lexical(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Filesystem mutation or directory sync recorded when [`RealFs::enable_durability_trace`] is
+/// turned on (disabled by default with zero runtime overhead).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RealFsDurabilityEvent {
+    /// Created directory `path` inside `parent`.
+    CreateDir {
+        /// Enclosing parent directory that received the new directory entry.
+        parent: PathBuf,
+        /// Newly created directory path.
+        path: PathBuf,
+    },
+    /// Atomically wrote or appended+synced a file `path` inside `parent`.
+    WriteFileSync {
+        /// Enclosing parent directory of the written file.
+        parent: PathBuf,
+        /// File path that was written and synced.
+        path: PathBuf,
+    },
+    /// Renamed or cross-device moved an entry between `src_parent` and `dst_parent`.
+    Rename {
+        /// Source parent directory whose entry was removed.
+        src_parent: PathBuf,
+        /// Destination parent directory whose entry was inserted.
+        dst_parent: PathBuf,
+    },
+    /// Atomically swapped two entries in `src_parent` and `dst_parent`.
+    Exchange {
+        /// First parent directory participating in the exchange.
+        src_parent: PathBuf,
+        /// Second parent directory participating in the exchange.
+        dst_parent: PathBuf,
+    },
+    /// Removed a file or directory `path` from `parent`.
+    Remove {
+        /// Enclosing parent directory from which `path` was unlinked.
+        parent: PathBuf,
+        /// Path that was removed.
+        path: PathBuf,
+    },
+    /// Flushed directory `dir` to durable storage (`fsync` on Unix).
+    SyncDir {
+        /// Directory handle that was flushed.
+        dir: PathBuf,
+    },
+}
+
+/// Summary of auditing [`RealFs`] directory-sync discipline across every mutating operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealFsDurabilityAudit {
+    /// `true` iff `ensure_parent_dirs` synced the parent directory of every newly created nested
+    /// ancestor directory before returning.
+    pub sync_created_ancestors: bool,
+    /// `true` iff `remove_tmp` synced the staging directory after unlinking a tmp file.
+    pub sync_remove_tmp: bool,
+    /// Descriptions of any mutating operation whose touched parent directory lacked a subsequent
+    /// [`RealFsDurabilityEvent::SyncDir`]. Empty when [`RealFs`] obeys every durability invariant.
+    pub unsynced_ops: Vec<String>,
+}
+
 /// Real filesystem backend rooted at one local sync folder directory.
 ///
 /// Opening a [`RealFs`] does *not* silently recreate `.legion-sync/` or its marker file, so an
@@ -60,6 +120,7 @@ fn canonical_or_lexical(path: &Path) -> PathBuf {
 pub struct RealFs {
     root: PathBuf,
     caps: FsCapabilities,
+    trace: Option<Arc<Mutex<Vec<RealFsDurabilityEvent>>>>,
 }
 
 impl RealFs {
@@ -70,7 +131,11 @@ impl RealFs {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let caps = detect_capabilities(&root);
-        Ok(Self { root, caps })
+        Ok(Self {
+            root,
+            caps,
+            trace: None,
+        })
     }
 
     /// Opens `root` with explicitly supplied [`FsCapabilities`] (useful for testing Windows or
@@ -79,7 +144,38 @@ impl RealFs {
         Ok(Self {
             root: root.as_ref().to_path_buf(),
             caps,
+            trace: None,
         })
+    }
+
+    /// Enables opt-in durability tracing of mutations and directory syncs for testing and auditing.
+    pub fn enable_durability_trace(&mut self) {
+        self.trace = Some(Arc::new(Mutex::new(Vec::new())));
+    }
+
+    /// Drains and returns all recorded [`RealFsDurabilityEvent`]s since tracing was enabled or last
+    /// drained.
+    pub fn take_durability_trace(&self) -> Vec<RealFsDurabilityEvent> {
+        self.trace
+            .as_ref()
+            .and_then(|t| t.lock().ok().map(|mut v| std::mem::take(&mut *v)))
+            .unwrap_or_default()
+    }
+
+    fn record_trace(&self, event: RealFsDurabilityEvent) {
+        if let Some(ref t) = self.trace
+            && let Ok(mut guard) = t.lock()
+        {
+            guard.push(event);
+        }
+    }
+
+    fn sync_dir(&self, dir: &Path) -> Result<()> {
+        sync_dir_os(dir)?;
+        self.record_trace(RealFsDurabilityEvent::SyncDir {
+            dir: dir.to_path_buf(),
+        });
+        Ok(())
     }
 
     /// Returns the root directory path of this sync folder.
@@ -238,7 +334,11 @@ impl RealFs {
                     fs::create_dir(&current)
                         .map_err(|e| SyncError::from_io(Some(anc.to_string()), e))?;
                     if let Some(parent) = current.parent() {
-                        sync_dir(parent);
+                        self.record_trace(RealFsDurabilityEvent::CreateDir {
+                            parent: parent.to_path_buf(),
+                            path: current.clone(),
+                        });
+                        self.sync_dir(parent)?;
                     }
                 }
                 Err(err) => return Err(SyncError::from_io(Some(anc.to_string()), err)),
@@ -252,8 +352,16 @@ impl RealFs {
             None => {
                 let dir = self.tmp_dir();
                 if create_parent {
+                    let existed = dir.exists();
                     fs::create_dir_all(&dir)
                         .map_err(|err| SyncError::from_io(Some(SYNC_TMP_DIR.to_string()), err))?;
+                    if !existed {
+                        self.record_trace(RealFsDurabilityEvent::CreateDir {
+                            parent: self.meta_dir(),
+                            path: dir.clone(),
+                        });
+                        self.sync_dir(&self.meta_dir())?;
+                    }
                 }
                 Ok(dir.join(tmp_name))
             }
@@ -284,11 +392,19 @@ impl RealFs {
     ) -> Result<()> {
         match rename_no_replace(src, dst) {
             Ok(()) => {
-                if let Some(parent) = dst.parent() {
-                    sync_dir(parent);
+                if let (Some(src_parent), Some(dst_parent)) = (src.parent(), dst.parent()) {
+                    self.record_trace(RealFsDurabilityEvent::Rename {
+                        src_parent: src_parent.to_path_buf(),
+                        dst_parent: dst_parent.to_path_buf(),
+                    });
                 }
-                if let Some(parent) = src.parent() {
-                    sync_dir(parent);
+                if let Some(parent) = dst.parent() {
+                    self.sync_dir(parent)?;
+                }
+                if let Some(parent) = src.parent()
+                    && dst.parent() != Some(parent)
+                {
+                    self.sync_dir(parent)?;
                 }
                 Ok(())
             }
@@ -333,14 +449,23 @@ impl RealFs {
                     let _ = fs::remove_file(&stage);
                     return Err(SyncError::from_os(Some(label.to_string()), os_err));
                 }
-                sync_dir(dst_parent);
+                self.record_trace(RealFsDurabilityEvent::Rename {
+                    src_parent: dst_parent.to_path_buf(),
+                    dst_parent: dst_parent.to_path_buf(),
+                });
+                self.sync_dir(dst_parent)?;
                 match fs::remove_file(src) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if let Some(parent) = src.parent() {
+                            self.record_trace(RealFsDurabilityEvent::Remove {
+                                parent: parent.to_path_buf(),
+                                path: src.to_path_buf(),
+                            });
+                            self.sync_dir(parent)?;
+                        }
+                    }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(SyncError::from_io(Some(label.to_string()), e)),
-                }
-                if let Some(parent) = src.parent() {
-                    sync_dir(parent);
                 }
                 Ok(())
             }
@@ -350,8 +475,16 @@ impl RealFs {
     fn resolve_bin(&self, bin_name: &str) -> Result<PathBuf> {
         validate_flat_internal_name(bin_name)?;
         let dir = self.bin_dir();
+        let existed = dir.exists();
         fs::create_dir_all(&dir)
             .map_err(|err| SyncError::from_io(Some(SYNC_BIN_DIR.to_string()), err))?;
+        if !existed {
+            self.record_trace(RealFsDurabilityEvent::CreateDir {
+                parent: self.meta_dir(),
+                path: dir.clone(),
+            });
+            self.sync_dir(&self.meta_dir())?;
+        }
         Ok(dir.join(bin_name))
     }
 }
@@ -410,9 +543,14 @@ impl SyncFs for RealFs {
             context: "serialize folder marker".to_string(),
             detail: err.to_string(),
         })?;
-        write_atomic(self.marker_path(), &bytes, WriteOptions::with_mode(0o600))
+        let marker_path = self.marker_path();
+        write_atomic(&marker_path, &bytes, WriteOptions::with_mode(0o600))
             .map_err(|err| SyncError::from_os(Some(SYNC_MARKER_FILE.to_string()), err))?;
-        sync_dir(&self.meta_dir());
+        self.record_trace(RealFsDurabilityEvent::WriteFileSync {
+            parent: self.meta_dir(),
+            path: marker_path,
+        });
+        self.sync_dir(&self.meta_dir())?;
         Ok(())
     }
 
@@ -431,7 +569,11 @@ impl SyncFs for RealFs {
             .map_err(|err| SyncError::from_io(Some(SYNC_DELETIONS_LOG_FILE.to_string()), err))?;
         file.sync_all()
             .map_err(|err| SyncError::from_io(Some(SYNC_DELETIONS_LOG_FILE.to_string()), err))?;
-        sync_dir(&self.meta_dir());
+        self.record_trace(RealFsDurabilityEvent::WriteFileSync {
+            parent: self.meta_dir(),
+            path,
+        });
+        self.sync_dir(&self.meta_dir())?;
         Ok(())
     }
 
@@ -452,7 +594,11 @@ impl SyncFs for RealFs {
         let path = self.meta_dir().join("deletions.log");
         write_atomic(&path, bytes, WriteOptions::with_mode(0o600))
             .map_err(|err| SyncError::from_os(Some(SYNC_DELETIONS_LOG_FILE.to_string()), err))?;
-        sync_dir(&self.meta_dir());
+        self.record_trace(RealFsDurabilityEvent::WriteFileSync {
+            parent: self.meta_dir(),
+            path,
+        });
+        self.sync_dir(&self.meta_dir())?;
         Ok(())
     }
 
@@ -470,10 +616,26 @@ impl SyncFs for RealFs {
         fs::create_dir_all(&bin_dir)
             .map_err(|err| SyncError::from_io(Some(SYNC_BIN_DIR.to_string()), err))?;
         if created_meta {
-            sync_dir(&self.root);
+            self.record_trace(RealFsDurabilityEvent::CreateDir {
+                parent: self.root.clone(),
+                path: meta_dir.clone(),
+            });
+            self.sync_dir(&self.root)?;
+        }
+        if created_tmp {
+            self.record_trace(RealFsDurabilityEvent::CreateDir {
+                parent: meta_dir.clone(),
+                path: tmp_dir,
+            });
+        }
+        if created_bin {
+            self.record_trace(RealFsDurabilityEvent::CreateDir {
+                parent: meta_dir.clone(),
+                path: bin_dir,
+            });
         }
         if created_meta || created_tmp || created_bin {
-            sync_dir(&meta_dir);
+            self.sync_dir(&meta_dir)?;
         }
         Ok(())
     }
@@ -651,7 +813,11 @@ impl SyncFs for RealFs {
             }),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 fs::create_dir(&full).map_err(|e| SyncError::from_io(Some(clean), e))?;
-                sync_dir(&parent);
+                self.record_trace(RealFsDurabilityEvent::CreateDir {
+                    parent: parent.clone(),
+                    path: full,
+                });
+                self.sync_dir(&parent)?;
                 Ok(())
             }
             Err(err) => Err(SyncError::from_io(Some(clean), err)),
@@ -683,7 +849,11 @@ impl SyncFs for RealFs {
         let full = self.resolve_live(&clean, EntryKind::Dir)?;
         fs::remove_dir(&full).map_err(|e| SyncError::from_io(Some(clean), e))?;
         if let Some(parent) = full.parent() {
-            sync_dir(parent);
+            self.record_trace(RealFsDurabilityEvent::Remove {
+                parent: parent.to_path_buf(),
+                path: full.clone(),
+            });
+            self.sync_dir(parent)?;
         }
         Ok(())
     }
@@ -694,7 +864,11 @@ impl SyncFs for RealFs {
         let parent = self.ensure_parent_dirs(&clean)?;
         let full = self.resolve_live(&clean, EntryKind::Symlink)?;
         create_symlink_no_replace(Path::new(target), &full, &clean)?;
-        sync_dir(&parent);
+        self.record_trace(RealFsDurabilityEvent::WriteFileSync {
+            parent: parent.clone(),
+            path: full,
+        });
+        self.sync_dir(&parent)?;
         Ok(())
     }
 
@@ -713,7 +887,11 @@ impl SyncFs for RealFs {
         }
         fs::remove_file(&full).map_err(|e| SyncError::from_io(Some(clean), e))?;
         if let Some(parent) = full.parent() {
-            sync_dir(parent);
+            self.record_trace(RealFsDurabilityEvent::Remove {
+                parent: parent.to_path_buf(),
+                path: full.clone(),
+            });
+            self.sync_dir(parent)?;
         }
         Ok(())
     }
@@ -756,24 +934,32 @@ impl SyncFs for RealFs {
         let full_to = self.resolve_live(&clean_to, EntryKind::File)?;
         rename_no_replace(&full_from, &full_to)
             .map_err(|err| SyncError::from_os(Some(clean_to), err))?;
-        sync_dir(&parent_to);
         if let Some(parent_from) = full_from.parent() {
-            sync_dir(parent_from);
+            self.record_trace(RealFsDurabilityEvent::Rename {
+                src_parent: parent_from.to_path_buf(),
+                dst_parent: parent_to.clone(),
+            });
+        }
+        self.sync_dir(&parent_to)?;
+        if let Some(parent_from) = full_from.parent()
+            && parent_from != parent_to
+        {
+            self.sync_dir(parent_from)?;
         }
         Ok(())
     }
 
-    fn sync_parent_dir_live(&self, live_rel: &str) {
-        if let Ok(clean) = validate_sync_path(live_rel)
-            && let Ok(full) = self.resolve_live(&clean, EntryKind::File)
-            && let Some(parent) = full.parent()
-        {
-            sync_dir(parent);
+    fn sync_parent_dir_live(&self, live_rel: &str) -> Result<()> {
+        let clean = validate_sync_path(live_rel)?;
+        let full = self.resolve_live(&clean, EntryKind::File)?;
+        if let Some(parent) = full.parent() {
+            self.sync_dir(parent)?;
         }
+        Ok(())
     }
 
-    fn sync_tmp_dir(&self) {
-        sync_dir(&self.tmp_dir());
+    fn sync_tmp_dir(&self) -> Result<()> {
+        self.sync_dir(&self.tmp_dir())
     }
 
     fn create_tmp(&self, tmp_name: &str) -> Result<Box<dyn SyncWrite>> {
@@ -813,6 +999,8 @@ impl SyncFs for RealFs {
                     .map_err(|e| SyncError::from_io(Some(label.clone()), e))?;
                 let times = FileTimes::new().set_modified(st);
                 file.set_times(times)
+                    .map_err(|e| SyncError::from_io(Some(label.clone()), e))?;
+                file.sync_all()
                     .map_err(|e| SyncError::from_io(Some(label), e))?;
             }
         }
@@ -831,7 +1019,11 @@ impl SyncFs for RealFs {
         match fs::remove_file(&full) {
             Ok(()) => {
                 if let Some(parent) = full.parent() {
-                    sync_dir(parent);
+                    self.record_trace(RealFsDurabilityEvent::Remove {
+                        parent: parent.to_path_buf(),
+                        path: full.clone(),
+                    });
+                    self.sync_dir(parent)?;
                 }
                 Ok(())
             }
@@ -851,11 +1043,17 @@ impl SyncFs for RealFs {
         let src = self.resolve_tmp(tmp_name, false)?;
         let dst = self.resolve_live(&clean, EntryKind::File)?;
         rename_no_replace(&src, &dst).map_err(|err| SyncError::from_os(Some(clean), err))?;
-        sync_dir(&parent);
+        if let Some(src_parent) = src.parent() {
+            self.record_trace(RealFsDurabilityEvent::Rename {
+                src_parent: src_parent.to_path_buf(),
+                dst_parent: parent.clone(),
+            });
+        }
+        self.sync_dir(&parent)?;
         if let Some(src_parent) = src.parent()
             && src_parent != parent
         {
-            sync_dir(src_parent);
+            self.sync_dir(src_parent)?;
         }
         Ok(())
     }
@@ -867,10 +1065,16 @@ impl SyncFs for RealFs {
     ) -> Result<()> {
         let clean = validate_sync_path(live_rel)?;
         self.guard_platform_path(&clean, EntryKind::File)?;
-        let _parent = self.ensure_parent_dirs(&clean)?;
+        let parent = self.ensure_parent_dirs(&clean)?;
         let src = self.resolve_tmp(tmp_name, false)?;
         let dst = self.resolve_live(&clean, EntryKind::File)?;
         rename_no_replace(&src, &dst).map_err(|err| SyncError::from_os(Some(clean), err))?;
+        if let Some(src_parent) = src.parent() {
+            self.record_trace(RealFsDurabilityEvent::Rename {
+                src_parent: src_parent.to_path_buf(),
+                dst_parent: parent,
+            });
+        }
         Ok(())
     }
 
@@ -882,13 +1086,19 @@ impl SyncFs for RealFs {
         let dst = self.resolve_live(&clean, EntryKind::File)?;
         match exchange_files(&src, &dst) {
             Ok(()) => {
+                if let (Some(src_parent), Some(dst_parent)) = (src.parent(), dst.parent()) {
+                    self.record_trace(RealFsDurabilityEvent::Exchange {
+                        src_parent: src_parent.to_path_buf(),
+                        dst_parent: dst_parent.to_path_buf(),
+                    });
+                }
                 if let Some(parent) = dst.parent() {
-                    sync_dir(parent);
+                    self.sync_dir(parent)?;
                 }
                 if let Some(src_parent) = src.parent()
                     && dst.parent() != Some(src_parent)
                 {
-                    sync_dir(src_parent);
+                    self.sync_dir(src_parent)?;
                 }
                 Ok(true)
             }
@@ -911,13 +1121,19 @@ impl SyncFs for RealFs {
         let backup = self.resolve_tmp(backup_tmp, true)?;
         match replace_with_backup(&staged, &target, &backup) {
             Ok(()) => {
+                if let (Some(src_parent), Some(dst_parent)) = (staged.parent(), target.parent()) {
+                    self.record_trace(RealFsDurabilityEvent::Exchange {
+                        src_parent: src_parent.to_path_buf(),
+                        dst_parent: dst_parent.to_path_buf(),
+                    });
+                }
                 if let Some(parent) = target.parent() {
-                    sync_dir(parent);
+                    self.sync_dir(parent)?;
                 }
                 if let Some(src_parent) = staged.parent()
                     && target.parent() != Some(src_parent)
                 {
-                    sync_dir(src_parent);
+                    self.sync_dir(src_parent)?;
                 }
                 Ok(true)
             }
@@ -933,13 +1149,19 @@ impl SyncFs for RealFs {
         let src = self.resolve_live(&clean, EntryKind::File)?;
         let dst = self.resolve_tmp(tmp_name, true)?;
         rename_no_replace(&src, &dst).map_err(|err| SyncError::from_os(Some(clean), err))?;
+        if let (Some(src_parent), Some(dst_parent)) = (src.parent(), dst.parent()) {
+            self.record_trace(RealFsDurabilityEvent::Rename {
+                src_parent: src_parent.to_path_buf(),
+                dst_parent: dst_parent.to_path_buf(),
+            });
+        }
         if let Some(dst_parent) = dst.parent() {
-            sync_dir(dst_parent);
+            self.sync_dir(dst_parent)?;
         }
         if let Some(parent) = src.parent()
             && dst.parent() != Some(parent)
         {
-            sync_dir(parent);
+            self.sync_dir(parent)?;
         }
         Ok(())
     }
@@ -967,6 +1189,11 @@ impl SyncFs for RealFs {
         let dst = self.resolve_bin(meta_name)?;
         write_atomic(&dst, bytes, WriteOptions::with_mode(0o600))
             .map_err(|err| SyncError::from_os(Some(format!("{SYNC_BIN_DIR}/{meta_name}")), err))?;
+        self.record_trace(RealFsDurabilityEvent::WriteFileSync {
+            parent: self.bin_dir(),
+            path: dst,
+        });
+        self.sync_dir(&self.bin_dir())?;
         Ok(())
     }
 
@@ -1023,7 +1250,11 @@ impl SyncFs for RealFs {
         let full = self.resolve_bin(bin_name)?;
         match fs::remove_file(&full) {
             Ok(()) => {
-                sync_dir(&self.bin_dir());
+                self.record_trace(RealFsDurabilityEvent::Remove {
+                    parent: self.bin_dir(),
+                    path: full,
+                });
+                self.sync_dir(&self.bin_dir())?;
                 Ok(())
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1384,14 +1615,258 @@ fn set_unix_mode(_path: &Path, _mode: u32, _label: &str) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn sync_dir(dir: &Path) {
-    if let Ok(handle) = File::open(dir) {
-        let _ = handle.sync_all();
-    }
+fn sync_dir_os(dir: &Path) -> Result<()> {
+    let handle =
+        File::open(dir).map_err(|e| SyncError::from_io(Some(dir.display().to_string()), e))?;
+    handle
+        .sync_all()
+        .map_err(|e| SyncError::from_io(Some(dir.display().to_string()), e))
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) {}
+fn sync_dir_os(_dir: &Path) -> Result<()> {
+    // Windows NTFS/ReFS does not allow ordinary user processes to call FlushFileBuffers on a
+    // directory handle without SeBackupPrivilege; directory durability on Windows relies on
+    // `MOVEFILE_WRITE_THROUGH` on `MoveFileExW` and `FlushFileBuffers` (`sync_all`) on files.
+    Ok(())
+}
+
+/// Exercises [`RealFs`] on `scratch_dir` across every mutating operation and checks that every
+/// mutated directory has a subsequent [`RealFsDurabilityEvent::SyncDir`].
+///
+/// Removing a `sync_dir` call from `RealFs` (for example in `ensure_parent_dirs`, `remove_tmp`, or
+/// `write_bin_meta`) causes this audit to report unsynced operations and flips the corresponding
+/// durability flags to `false`.
+pub fn audit_real_fs_durability(scratch_dir: &Path) -> Result<RealFsDurabilityAudit> {
+    let mut fs = RealFs::open(scratch_dir)?;
+    fs.enable_durability_trace();
+
+    let mut unsynced_ops = Vec::new();
+    let check_trace = |label: &str, events: &[RealFsDurabilityEvent], out: &mut Vec<String>| {
+        let mut dirty: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+        for ev in events {
+            match ev {
+                RealFsDurabilityEvent::CreateDir { parent, .. }
+                | RealFsDurabilityEvent::WriteFileSync { parent, .. }
+                | RealFsDurabilityEvent::Remove { parent, .. } => {
+                    dirty.insert(parent.clone());
+                }
+                RealFsDurabilityEvent::Rename {
+                    src_parent,
+                    dst_parent,
+                }
+                | RealFsDurabilityEvent::Exchange {
+                    src_parent,
+                    dst_parent,
+                } => {
+                    dirty.insert(src_parent.clone());
+                    dirty.insert(dst_parent.clone());
+                }
+                RealFsDurabilityEvent::SyncDir { dir } => {
+                    dirty.remove(dir);
+                }
+            }
+        }
+        for dir in dirty {
+            out.push(format!("{label}: missing sync_dir({})", dir.display()));
+        }
+    };
+
+    // 1. Internal dirs, marker, deletion log append + compact.
+    fs.ensure_internal_dirs()?;
+    check_trace(
+        "ensure_internal_dirs",
+        &fs.take_durability_trace(),
+        &mut unsynced_ops,
+    );
+
+    let marker = FolderMarker::new("audit".into(), "tower".into(), 1);
+    fs.write_marker(&marker)?;
+    check_trace(
+        "write_marker",
+        &fs.take_durability_trace(),
+        &mut unsynced_ops,
+    );
+
+    fs.append_deletion_log(b"{}\n")?;
+    check_trace(
+        "append_deletion_log",
+        &fs.take_durability_trace(),
+        &mut unsynced_ops,
+    );
+
+    fs.compact_deletion_log(b"{}\n")?;
+    check_trace(
+        "compact_deletion_log",
+        &fs.take_durability_trace(),
+        &mut unsynced_ops,
+    );
+
+    // 2. Multi-level nested directory creation (`ensure_parent_dirs` must sync EVERY ancestor!).
+    fs.create_dir_all_live("a/b/c")?;
+    let nested_events = fs.take_durability_trace();
+    let before_anc = unsynced_ops.len();
+    check_trace(
+        "create_dir_all_live(a/b/c)",
+        &nested_events,
+        &mut unsynced_ops,
+    );
+    let mut sync_created_ancestors = unsynced_ops.len() == before_anc;
+
+    // 3. Staged file commit into fresh nested directory (`commit_tmp_to_live_no_replace`).
+    {
+        let mut w = fs.create_tmp("audit_t1")?;
+        w.write_all(b"payload1")
+            .map_err(|e| SyncError::from_io(Some("audit_t1".into()), e))?;
+        w.finish_sync()?;
+    }
+    fs.commit_tmp_to_live_no_replace("audit_t1", "d1/d2/file1.txt")?;
+    let commit_events = fs.take_durability_trace();
+    let before_commit = unsynced_ops.len();
+    check_trace(
+        "commit_tmp_to_live_no_replace(d1/d2/file1.txt)",
+        &commit_events,
+        &mut unsynced_ops,
+    );
+    if unsynced_ops.len() != before_commit {
+        sync_created_ancestors = false;
+    }
+
+    // 4. Deferred dir sync group-commit path: newly created ancestors MUST be synced immediately
+    //    inside `ensure_parent_dirs` even before `sync_parent_dir_live` runs!
+    {
+        let mut w = fs.create_tmp("audit_t2")?;
+        w.write_all(b"payload2")
+            .map_err(|e| SyncError::from_io(Some("audit_t2".into()), e))?;
+        w.finish_sync()?;
+    }
+    fs.commit_tmp_to_live_no_replace_deferred_dir_sync("audit_t2", "e1/e2/file2.txt")?;
+    let def_events = fs.take_durability_trace();
+    // Check that every CreateDir parent inside deferred commit was synced immediately.
+    let mut dirty_create_parents: std::collections::BTreeSet<PathBuf> =
+        std::collections::BTreeSet::new();
+    for ev in &def_events {
+        match ev {
+            RealFsDurabilityEvent::CreateDir { parent, .. } => {
+                dirty_create_parents.insert(parent.clone());
+            }
+            RealFsDurabilityEvent::SyncDir { dir } => {
+                dirty_create_parents.remove(dir);
+            }
+            _ => {}
+        }
+    }
+    if !dirty_create_parents.is_empty() {
+        sync_created_ancestors = false;
+        for dir in dirty_create_parents {
+            unsynced_ops.push(format!(
+                "commit_tmp_to_live_no_replace_deferred_dir_sync: missing immediate ancestor sync_dir({})",
+                dir.display()
+            ));
+        }
+    }
+    fs.sync_parent_dir_live("e1/e2/file2.txt")?;
+    fs.sync_tmp_dir()?;
+    let mut combined_def = def_events;
+    combined_def.extend(fs.take_durability_trace());
+    check_trace(
+        "commit_tmp_deferred+flush",
+        &combined_def,
+        &mut unsynced_ops,
+    );
+
+    // 5. `remove_tmp` must sync `.legion-sync/tmp`.
+    {
+        let mut w = fs.create_tmp("audit_rm")?;
+        w.write_all(b"temp")
+            .map_err(|e| SyncError::from_io(Some("audit_rm".into()), e))?;
+        w.finish_sync()?;
+    }
+    let _ = fs.take_durability_trace();
+    fs.remove_tmp("audit_rm")?;
+    let rm_events = fs.take_durability_trace();
+    let before_rm = unsynced_ops.len();
+    check_trace("remove_tmp", &rm_events, &mut unsynced_ops);
+    let sync_remove_tmp = unsynced_ops.len() == before_rm;
+
+    // 6. Exchange / claim / bin / live rename / remove_empty_dir.
+    {
+        let mut w = fs.create_tmp("audit_ex")?;
+        w.write_all(b"replacement")
+            .map_err(|e| SyncError::from_io(Some("audit_ex".into()), e))?;
+        w.finish_sync()?;
+    }
+    let _ = fs.take_durability_trace();
+    if fs.exchange_tmp_with_live("audit_ex", "d1/d2/file1.txt")? {
+        check_trace(
+            "exchange_tmp_with_live",
+            &fs.take_durability_trace(),
+            &mut unsynced_ops,
+        );
+        fs.move_tmp_to_bin_no_replace("audit_ex", "b1.data")?;
+        check_trace(
+            "move_tmp_to_bin_no_replace",
+            &fs.take_durability_trace(),
+            &mut unsynced_ops,
+        );
+    } else {
+        fs.remove_tmp("audit_ex")?;
+        let _ = fs.take_durability_trace();
+        fs.move_live_to_tmp_no_replace("d1/d2/file1.txt", "audit_claim")?;
+        check_trace(
+            "move_live_to_tmp_no_replace",
+            &fs.take_durability_trace(),
+            &mut unsynced_ops,
+        );
+        fs.move_tmp_to_bin_no_replace("audit_claim", "b1.data")?;
+        check_trace(
+            "move_tmp_to_bin_no_replace",
+            &fs.take_durability_trace(),
+            &mut unsynced_ops,
+        );
+    }
+
+    fs.write_bin_meta("b1.json", b"{}")?;
+    check_trace(
+        "write_bin_meta",
+        &fs.take_durability_trace(),
+        &mut unsynced_ops,
+    );
+
+    fs.move_bin_to_live_no_replace("b1.data", "restored/r1/file.txt")?;
+    check_trace(
+        "move_bin_to_live_no_replace(restored/r1/file.txt)",
+        &fs.take_durability_trace(),
+        &mut unsynced_ops,
+    );
+
+    fs.remove_bin_file("b1.json")?;
+    check_trace(
+        "remove_bin_file",
+        &fs.take_durability_trace(),
+        &mut unsynced_ops,
+    );
+
+    fs.rename_live_to_live_no_replace("restored/r1/file.txt", "moved/m1/file.txt")?;
+    check_trace(
+        "rename_live_to_live_no_replace",
+        &fs.take_durability_trace(),
+        &mut unsynced_ops,
+    );
+
+    fs.remove_empty_dir_live("a/b/c")?;
+    check_trace(
+        "remove_empty_dir_live",
+        &fs.take_durability_trace(),
+        &mut unsynced_ops,
+    );
+
+    Ok(RealFsDurabilityAudit {
+        sync_created_ancestors,
+        sync_remove_tmp,
+        unsynced_ops,
+    })
+}
 
 #[cfg(unix)]
 fn create_symlink_no_replace(target: &Path, dest: &Path, label: &str) -> Result<()> {

@@ -23,10 +23,10 @@ use crate::model::{
     FolderDeletionLogEntry, FolderDeletionRecord, FolderMarker, FolderMeta, FolderStatus,
     HandshakeHello, HeldBackRecord, INDEX_SCHEMA_VERSION, InboundDeletionBrake,
     InboundDeletionBrakeDecision, IndexRecord, MAX_DEFERRAL_ATTEMPTS,
-    MAX_FORCED_ROTATIONS_BEFORE_CONFIRM, MAX_HELD_BACK_ENTRIES, MAX_PAGE_RECORDS,
-    MAX_PEER_PROBLEMS, MemberId, MemberState, MemberStatus, PeerAckView, PeerCursor, PeerHandshake,
-    PeerRefusalSummary, PeerRollbackClaimDecision, ProblemKind, RecordsPage, RestoreStrategy,
-    SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, collapse_deletion_records,
+    MAX_FORCED_ROTATIONS_BEFORE_CONFIRM, MAX_HELD_BACK_ENTRIES, MAX_PAGE_BYTES, MAX_PAGE_RECORDS,
+    MAX_PEER_PROBLEMS, MemberId, MemberState, MemberStatus, PageLimit, PeerAckView, PeerCursor,
+    PeerHandshake, PeerRefusalSummary, PeerRollbackClaimDecision, ProblemKind, RecordsPage,
+    RestoreStrategy, SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, collapse_deletion_records,
     compact_deletion_log_bytes, encode_deletion_log_entries, merge_deletion_record_into_list,
     parse_deletion_log_all, random_incarnation_id, validate_member_id,
 };
@@ -41,8 +41,9 @@ use crate::scan::{
 use crate::store_redb::RedbIndexStore;
 use crate::traits::{IndexStore, Peer, StoreBatch, SyncFs};
 
-/// Default number of records fetched per incremental page during [`SyncEngine::pull_from_peer`].
-pub const DEFAULT_PAGE_LIMIT: usize = 1024;
+/// Default record-count and wire-byte limit fetched per incremental page during
+/// [`SyncEngine::pull_from_peer`].
+pub const DEFAULT_PAGE_LIMIT: PageLimit = PageLimit::new(1024, MAX_PAGE_BYTES);
 
 /// Maximum consecutive retry attempts on a single path if local edits race with apply.
 const MAX_LOCAL_CHANGE_RETRIES: usize = 4;
@@ -1218,11 +1219,11 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         self.pull_from_peer_with_options(peer, DEFAULT_PAGE_LIMIT, &FetchOptions::default(), now)
     }
 
-    /// Pulls incremental index changes from `peer` with an explicit page size.
+    /// Pulls incremental index changes from `peer` with an explicit page limit.
     pub fn pull_from_peer_with_limit(
         &mut self,
         peer: &dyn Peer,
-        page_limit: usize,
+        page_limit: impl Into<PageLimit>,
         now: Timestamp,
     ) -> Result<PullReport> {
         self.pull_from_peer_with_options(peer, page_limit, &FetchOptions::default(), now)
@@ -1233,10 +1234,11 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     pub fn pull_from_peer_with_options(
         &mut self,
         peer: &dyn Peer,
-        page_limit: usize,
+        page_limit: impl Into<PageLimit>,
         fetch_opts: &FetchOptions,
         now: Timestamp,
     ) -> Result<PullReport> {
+        let page_limit = page_limit.into();
         let peer_id = peer.member_id().to_string();
         let res = self.guard_mut("pull_from_peer_with_options", |e| {
             e.pull_from_peer_with_options_inner(peer, page_limit, fetch_opts, now)
@@ -1273,7 +1275,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     fn pull_from_peer_with_options_inner(
         &mut self,
         peer: &dyn Peer,
-        page_limit: usize,
+        page_limit: PageLimit,
         fetch_opts: &FetchOptions,
         now: Timestamp,
     ) -> Result<PullReport> {
@@ -1474,7 +1476,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             Some(meta)
         };
 
-        let limit = page_limit.clamp(1, MAX_PAGE_RECORDS);
+        let limit = page_limit.clamped();
         let mut report = PullReport::default();
         let cancel_ref = fetch_opts.cancel.as_deref();
         let mut newly_held_back_this_pull: BTreeSet<String> = BTreeSet::new();
@@ -1543,6 +1545,21 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         sentence: format!(
                             "Peer '{peer_id}' sent {} records in one page, exceeding limit {MAX_PAGE_RECORDS}.",
                             page.records.len()
+                        ),
+                    },
+                )?;
+                break;
+            }
+            let page_wire_bytes = page.estimated_wire_bytes();
+            if page.records.len() > 1 && page_wire_bytes > MAX_PAGE_BYTES {
+                self.record_peer_problem(
+                    &peer_id,
+                    SyncProblem {
+                        path: String::new(),
+                        kind: ProblemKind::InvalidPeerRecord,
+                        peer: Some(peer_id.clone()),
+                        sentence: format!(
+                            "Peer '{peer_id}' sent a {page_wire_bytes}-byte page, exceeding limit {MAX_PAGE_BYTES} bytes."
                         ),
                     },
                 )?;
@@ -1806,7 +1823,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                             let Ok(next_page) = peer.records_since(
                                 page_incarnation,
                                 scan_seq,
-                                MAX_PAGE_RECORDS,
+                                PageLimit::new(MAX_PAGE_RECORDS, MAX_PAGE_BYTES),
                                 cancel_ref,
                             ) else {
                                 break;
@@ -3959,11 +3976,12 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         caller_member: &str,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: impl Into<PageLimit>,
     ) -> Result<RecordsPage> {
+        let limit = limit.into();
         self.guard_ref("serve_records_since", |e| {
             let _meta = e.check_serve_allowed(caller_member)?;
-            let capped_limit = limit.clamp(1, MAX_PAGE_RECORDS);
+            let capped_limit = limit.clamped();
             let mut page =
                 e.store
                     .records_since(caller_member, since_incarnation, since_seq, capped_limit)?;
@@ -4520,7 +4538,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         member,
                         meta.incarnation,
                         scan_seq,
-                        MAX_PAGE_RECORDS,
+                        PageLimit::new(MAX_PAGE_RECORDS, MAX_PAGE_BYTES),
                     )?;
                     if page.records.is_empty() {
                         break;
@@ -4913,7 +4931,7 @@ impl Peer for LocalOnlyPeer<'_> {
         &self,
         _since_incarnation: u64,
         _since_seq: u64,
-        _limit: usize,
+        _limit: PageLimit,
         _cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<RecordsPage> {
         Err(SyncError::PeerUnavailable {

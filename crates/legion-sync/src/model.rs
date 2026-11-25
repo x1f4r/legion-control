@@ -49,6 +49,77 @@ pub const MAX_ANCESTRY_HASHES: usize = 16;
 /// Maximum number of records accepted in one [`RecordsPage`].
 pub const MAX_PAGE_RECORDS: usize = 4_096;
 
+/// Maximum estimated wire byte budget for records in one [`RecordsPage`] (4 MiB).
+pub const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Record-count and wire-byte bounds for one [`RecordsPage`].
+///
+/// Both bounds are enforced together: a page stops once adding the next record would exceed either
+/// `max_records` or `max_bytes`, while always admitting at least one record so a single large
+/// record can never deadlock synchronization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageLimit {
+    /// Maximum number of records in one page (`1..=MAX_PAGE_RECORDS`).
+    pub max_records: usize,
+    /// Maximum estimated wire byte budget for records in one page (`1..=MAX_PAGE_BYTES`).
+    pub max_bytes: usize,
+}
+
+impl PageLimit {
+    /// Creates a [`PageLimit`] with explicit record-count and wire-byte budgets.
+    pub const fn new(max_records: usize, max_bytes: usize) -> Self {
+        Self {
+            max_records,
+            max_bytes,
+        }
+    }
+
+    /// Creates a [`PageLimit`] with `max_records` and the standard [`MAX_PAGE_BYTES`] byte budget.
+    pub const fn records(max_records: usize) -> Self {
+        Self {
+            max_records,
+            max_bytes: MAX_PAGE_BYTES,
+        }
+    }
+
+    /// Clamps both bounds into valid protocol limits (`1..=MAX_PAGE_RECORDS`, `1..=MAX_PAGE_BYTES`).
+    pub const fn clamped(self) -> Self {
+        let max_records = if self.max_records == 0 {
+            1
+        } else if self.max_records > MAX_PAGE_RECORDS {
+            MAX_PAGE_RECORDS
+        } else {
+            self.max_records
+        };
+        let max_bytes = if self.max_bytes == 0 {
+            1
+        } else if self.max_bytes > MAX_PAGE_BYTES {
+            MAX_PAGE_BYTES
+        } else {
+            self.max_bytes
+        };
+        Self {
+            max_records,
+            max_bytes,
+        }
+    }
+}
+
+impl Default for PageLimit {
+    fn default() -> Self {
+        Self {
+            max_records: 1024,
+            max_bytes: MAX_PAGE_BYTES,
+        }
+    }
+}
+
+impl From<usize> for PageLimit {
+    fn from(max_records: usize) -> Self {
+        Self::records(max_records)
+    }
+}
+
 /// Maximum number of distinct incarnations per member accepted in one incoming [`VersionVector`].
 pub const MAX_VV_INCARNATIONS_PER_MEMBER: usize = 64;
 
@@ -1089,6 +1160,28 @@ impl IndexRecord {
         }
         Hash::from_bytes(*hasher.finalize().as_bytes())
     }
+
+    /// Conservative estimate of this record's serialized wire byte footprint, used to enforce
+    /// [`PageLimit::max_bytes`] on both sender and receiver.
+    pub fn estimated_wire_bytes(&self) -> usize {
+        let base = 160usize;
+        let path_bytes = self.path.len();
+        let mod_bytes = self.modified_by.len();
+        let link_bytes = self.link_target.as_ref().map_or(0, String::len);
+        let hash_bytes = if self.hash.is_some() { 64 } else { 0 };
+        let ancestry_bytes = self.recent_hashes.len().saturating_mul(68);
+        let vv_bytes: usize = self
+            .version
+            .iter()
+            .map(|(k, _)| k.member.len().saturating_add(48))
+            .sum();
+        base.saturating_add(path_bytes)
+            .saturating_add(mod_bytes)
+            .saturating_add(link_bytes)
+            .saturating_add(hash_bytes)
+            .saturating_add(ancestry_bytes)
+            .saturating_add(vv_bytes)
+    }
 }
 
 /// Page of records returned by [`crate::Peer::records_since`] from one consistent snapshot.
@@ -1121,6 +1214,15 @@ pub struct RecordsPage {
         with = "u64_key_map"
     )]
     pub chain_fingerprints: BTreeMap<u64, Hash>,
+}
+
+impl RecordsPage {
+    /// Sum of [`IndexRecord::estimated_wire_bytes`] across all records in this page.
+    pub fn estimated_wire_bytes(&self) -> usize {
+        self.records.iter().fold(0usize, |acc, r| {
+            acc.saturating_add(r.estimated_wire_bytes())
+        })
+    }
 }
 
 /// Serializes and deserializes `BTreeMap<u64, V>` cleanly across both direct JSON and buffered

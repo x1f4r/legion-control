@@ -941,7 +941,7 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
         &self,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: legion_sync::PageLimit,
         _cancel: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         self.engine

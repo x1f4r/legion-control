@@ -32,8 +32,8 @@ use windows::Win32::Storage::FileSystem::{
     FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo,
     FileIdInfo, GetDiskFreeSpaceExW, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    MOVE_FILE_FLAGS, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, REPLACEFILE_IGNORE_ACL_ERRORS,
-    REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW, SYNCHRONIZE,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
+    REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW, SYNCHRONIZE,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
@@ -585,8 +585,9 @@ fn win32_error_to_io(err: &windows::core::Error) -> std::io::Error {
     }
 }
 
-/// Atomically rename `from` to `to` without `MOVEFILE_REPLACE_EXISTING` so Windows fails with
-/// `ERROR_ALREADY_EXISTS` / `ERROR_FILE_EXISTS` if `to` already exists.
+/// Atomically rename `from` to `to` with `MOVEFILE_WRITE_THROUGH` and without
+/// `MOVEFILE_REPLACE_EXISTING`, so Windows fails with `ERROR_ALREADY_EXISTS` /
+/// `ERROR_FILE_EXISTS` if `to` already exists and flushes the directory change before returning.
 pub(crate) fn move_file_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     let from_wide = to_wide_null(from.as_os_str());
     let to_wide = to_wide_null(to.as_os_str());
@@ -596,7 +597,26 @@ pub(crate) fn move_file_no_replace(from: &Path, to: &Path) -> std::io::Result<()
         MoveFileExW(
             PCWSTR::from_raw(from_wide.as_ptr()),
             PCWSTR::from_raw(to_wide.as_ptr()),
-            MOVE_FILE_FLAGS(0),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } {
+        Ok(()) => Ok(()),
+        Err(err) => Err(win32_error_to_io(&err)),
+    }
+}
+
+/// Atomically rename `from` to `to`, replacing an existing destination and requesting write-through
+/// durability (`MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`).
+pub(crate) fn move_file_replace_write_through(from: &Path, to: &Path) -> std::io::Result<()> {
+    let from_wide = to_wide_null(from.as_os_str());
+    let to_wide = to_wide_null(to.as_os_str());
+    // SAFETY: Both pointers reference NUL-terminated UTF-16 buffers that remain valid for the
+    // duration of the `MoveFileExW` call.
+    match unsafe {
+        MoveFileExW(
+            PCWSTR::from_raw(from_wide.as_ptr()),
+            PCWSTR::from_raw(to_wide.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     } {
         Ok(()) => Ok(()),

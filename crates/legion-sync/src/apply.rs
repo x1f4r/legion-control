@@ -2128,9 +2128,9 @@ fn flush_group_commit_records<F: SyncFs, S: IndexStore>(
         } else {
             format!("{parent}/x")
         };
-        fs.sync_parent_dir_live(&probe);
+        fs.sync_parent_dir_live(&probe)?;
     }
-    fs.sync_tmp_dir();
+    fs.sync_tmp_dir()?;
 
     let mut meta = load_meta_required(store)?;
     let mut batch = StoreBatch::default();

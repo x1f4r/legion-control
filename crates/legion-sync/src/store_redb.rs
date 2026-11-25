@@ -25,7 +25,7 @@ use crate::codec::{decode_record, decode_string_list, encode_record, encode_stri
 use crate::error::{INDEX_DAMAGED_PROBLEM_SENTENCE, Result, SyncError};
 use crate::model::{
     BinEntry, DeferredItem, FolderMeta, HeldBackRecord, INDEX_SCHEMA_VERSION, IndexRecord,
-    MemberId, PeerCursor, PendingOp, RecordsPage, SyncProblem,
+    MemberId, PageLimit, PeerCursor, PendingOp, RecordsPage, SyncProblem,
 };
 use crate::path::{fold_case, is_descendant_of};
 use crate::traits::{IndexStore, StoreBatch};
@@ -614,7 +614,7 @@ impl IndexStore for RedbIndexStore {
         caller_member: &str,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: PageLimit,
     ) -> Result<RecordsPage> {
         catch_redb(&self.path_label, || {
             self.records_since_inner(caller_member, since_incarnation, since_seq, limit)
@@ -891,8 +891,9 @@ impl RedbIndexStore {
         caller_member: &str,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: PageLimit,
     ) -> Result<RecordsPage> {
+        let cap = limit.clamped();
         let txn = self
             .db
             .begin_read()
@@ -944,9 +945,10 @@ impl RedbIndexStore {
         let mut records = Vec::new();
         let mut chain_fingerprints = BTreeMap::new();
         let mut has_more = false;
+        let mut used_bytes = 0usize;
         for item in range {
             let (_, path_guard) = item.map_err(|e| storage_err("step by_seq", e))?;
-            if records.len() >= limit {
+            if records.len() >= cap.max_records {
                 has_more = true;
                 break;
             }
@@ -955,6 +957,12 @@ impl RedbIndexStore {
                 .map_err(|e| storage_err("lookup record by_seq", e))?
             {
                 let rec = decode_record(rec_guard.value())?.for_wire();
+                let rec_bytes = rec.estimated_wire_bytes();
+                if !records.is_empty() && used_bytes.saturating_add(rec_bytes) > cap.max_bytes {
+                    has_more = true;
+                    break;
+                }
+                used_bytes = used_bytes.saturating_add(rec_bytes);
                 if let Some(fp_guard) = seq_fps_table
                     .get(rec.seq)
                     .map_err(|e| storage_err("read seq_fingerprint", e))?

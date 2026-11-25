@@ -54,7 +54,7 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
         &self,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: legion_sync::PageLimit,
         _cancel: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         self.engine
@@ -971,7 +971,7 @@ impl Peer for SyntheticLinuxPeer {
         &self,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: legion_sync::PageLimit,
         _cancel: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         let eff = if since_incarnation == self.incarnation {
@@ -988,8 +988,8 @@ impl Peer for SyntheticLinuxPeer {
             .filter(|r| r.seq > eff)
             .collect();
         records.sort_by_key(|r| r.seq);
-        let has_more = records.len() > limit;
-        records.truncate(limit);
+        let has_more = records.len() > limit.max_records;
+        records.truncate(limit.max_records);
         let head_fp = self.records.last().map(IndexRecord::head_fingerprint);
         Ok(RecordsPage {
             incarnation: self.incarnation,

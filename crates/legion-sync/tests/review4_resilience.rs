@@ -237,7 +237,7 @@ impl legion_sync::Peer for NoPages<'_> {
         &self,
         _i: u64,
         _s: u64,
-        _l: usize,
+        _l: legion_sync::PageLimit,
         _c: Option<&std::sync::atomic::AtomicBool>,
     ) -> legion_sync::Result<legion_sync::RecordsPage> {
         Err(legion_sync::SyncError::NotFound {
@@ -733,7 +733,7 @@ impl legion_sync::Peer for ForgedEvidenceLiar<'_> {
         &self,
         i: u64,
         s: u64,
-        l: usize,
+        l: legion_sync::PageLimit,
         c: Option<&std::sync::atomic::AtomicBool>,
     ) -> legion_sync::Result<legion_sync::RecordsPage> {
         self.0.records_since(i, s, l, c)

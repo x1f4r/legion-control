@@ -56,7 +56,7 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
         &self,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: legion_sync::PageLimit,
         _cancel: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         self.engine
@@ -307,10 +307,10 @@ impl SyncFs for HookFs {
             f.rename_live_to_live_no_replace(a, b)
         })
     }
-    fn sync_parent_dir_live(&self, p: &str) {
+    fn sync_parent_dir_live(&self, p: &str) -> legion_sync::Result<()> {
         self.inner.sync_parent_dir_live(p)
     }
-    fn sync_tmp_dir(&self) {
+    fn sync_tmp_dir(&self) -> legion_sync::Result<()> {
         self.inner.sync_tmp_dir()
     }
     fn create_tmp(&self, t: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {

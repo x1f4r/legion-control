@@ -74,7 +74,7 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
         &self,
         since_incarnation: u64,
         since_seq: u64,
-        limit: usize,
+        limit: legion_sync::PageLimit,
         _cancel: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         self.engine
@@ -545,7 +545,7 @@ impl Peer for FakePeer {
         &self,
         _since_incarnation: u64,
         _since_seq: u64,
-        _limit: usize,
+        _limit: legion_sync::PageLimit,
         _cancel: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         let mut p = self.pages.borrow_mut();
@@ -1841,7 +1841,7 @@ fn item_k_ranged_resumable_fetch_and_cancellation() {
             &self,
             _inc: u64,
             since_seq: u64,
-            _limit: usize,
+            _limit: legion_sync::PageLimit,
             cancel: Option<&AtomicBool>,
         ) -> legion_sync::Result<RecordsPage> {
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {

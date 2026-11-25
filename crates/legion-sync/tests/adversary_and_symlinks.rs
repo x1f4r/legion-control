@@ -54,7 +54,7 @@ impl Peer for LyingPeer {
         &self,
         _since_incarnation: u64,
         _since_seq: u64,
-        _limit: usize,
+        _limit: legion_sync::PageLimit,
         _cancel: Option<&AtomicBool>,
     ) -> legion_sync::Result<RecordsPage> {
         let mut p = self.pages.borrow_mut();
