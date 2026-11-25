@@ -49,9 +49,13 @@ One table in `legion-core` (`media`) maps a file extension to a **category** and
 | `archive` | zip, tar, gz, xz, zst, 7z, rar |
 | `other` | everything else |
 
-The table is by extension only, case-insensitive; nothing is opened to guess. `fs.list`,
-`fs.find` and `fs.stat` report `category` and `mime` for regular files. The existing `kind`
-(`file`, `dir`, `symlink`, `other`) keeps its meaning.
+The table is by extension only, case-insensitive; `fs.list` and `fs.stat` never open files to guess.
+As a targeted exception for `.ts`, `fs.find` and `fs.thumb` sniff the leading bytes of regular `.ts`
+files for MPEG-TS sync packets (`0x47` at 188/192-byte intervals, rejecting plain UTF-8 text) so
+video recordings named `.ts` match `categories: ["video"]` (`video/mp2t`) and thumbnail with
+`ffmpeg`, while TypeScript `.ts` files remain `text` (`text/typescript`). `fs.list`, `fs.find` and
+`fs.stat` report `category` and `mime` for regular files. The existing `kind` (`file`, `dir`,
+`symlink`, `other`) keeps its meaning.
 
 ## Tools
 
@@ -80,24 +84,34 @@ node.
   so unreachable machines are reported per key rather than failing the search.
 - `fs.thumb` (read): `{paths: [1..32], size: 96..512 = 256, fit: "contain" | "cover"}` returns
   exactly one entry per input path in input order: `{"results": [{path, ok: {mime, content
-  (base64), width, height}} | {path, error}]}`. Pictures are opened once and decoded on the node
-  (JPEG, PNG, GIF first frame, WebP, BMP; EXIF orientation applied) inside hard limits: source at
-  most 64 MiB and estimated peak decode memory at most 256 MiB per image (computed from header
-  dimensions and format/subtype factors — admitting 48–61 MP baseline JPEGs while capping heavier
-  progressive/16-bit/interlaced encodings). Over-cap JPEGs fall back to a validated embedded MPF
-  preview (preferred) or EXIF IFD1 thumbnail through the same limits with the main image's EXIF
-  orientation, returning a per-path `too_large` error only when none is usable. Image decodes run
-  off the async threads, scheduled round-robin by principal against an in-flight byte budget of
-  `min(512 MiB, machine RAM / 8)` (floored at 256 MiB) and at most 8 concurrent decodes, with a
-  10 s decode timeout and 10 s bounded wait (returning retryable `busy`). Output is JPEG, or PNG
-  when the source has transparency. Video posters run in a separate fair pool (2 concurrent) with
-  `ffmpeg` (no shell, `-threads 1`, `-protocol_whitelist file`, strict container
-  `-format_whitelist` blocking manifests and playlists, video-only mapping, hard time limit) when
-  the node has it on `PATH` and report `unsupported` otherwise. Results are cached lock-free on
-  hits in the state directory (`thumb-cache/`) under a key of path, OS file identity, metadata
-  change time, source size, modification time and parameters; the cache directory is reconciled
-  directly on disk against the 256 MiB cap (least recently used first by entry mtime). A
-  thumbnail of a file is allowed exactly when `fs.read` of it is.
+  (base64), width, height}} | {path, error}]}`. Pictures are opened once, header-peeked
+  (`<= 128 KiB`, cross-checking inner frame dimensions in JPEG/GIF/WebP against outer container
+  headers), reserved against the in-flight byte budget before reading the full file, and decoded
+  out-of-process in a memory-bounded worker that receives the already-opened file handle on `stdin`
+  and opens nothing by path (JPEG, PNG, GIF first frame, WebP, BMP; EXIF orientation applied).
+  Admission caps source files at 64 MiB and estimated peak decode memory at 256 MiB per image
+  (admitting 48–61 MP baseline JPEGs while capping heavier progressive/16-bit/interlaced encodings).
+  Over-cap JPEGs fall back to a validated embedded MPF preview (preferred) or EXIF IFD1 thumbnail
+  through the same limits with the main image's EXIF orientation, returning a per-path `too_large`
+  error only when none is usable. Outside enforcement backs every worker with an OS memory limit
+  (`RLIMIT_AS` on Linux, `RLIMIT_DATA` on other non-macOS Unix, Job Object memory limit on Windows),
+  a 10 ms RSS watchdog on every platform (including macOS), and a 10 s wall-clock kill timeout. If a
+  worker is killed for memory or crashes, `fs.thumb` returns a per-path error, keeps decoding other
+  paths in the batch, and records a negative bad-file entry in `thumb-cache/` keyed to that file
+  identity so reopening the folder does not repeat the kill. Image decodes are scheduled round-robin
+  by principal with anti-starvation aging against an in-flight byte budget of `min(512 MiB,
+  effective RAM / 8)` (floored at 256 MiB, honoring Linux cgroup v2/v1 and Windows Job Object memory
+  limits) and at most 8 concurrent decodes, with a 10 s bounded wait (returning retryable `busy`).
+  Output is JPEG, or PNG when the source has transparency. Video posters (including sniffed MPEG-TS
+  `.ts` recordings) run in a separate 2-slot fair pool with `ffmpeg` under the same OS memory limit
+  and RSS watchdog (no shell, `-threads 1`, `-max_pixels 67108864`, `-max_alloc 134217728`,
+  `-protocol_whitelist file`, MOV/MP4 demuxer pinned with `-enable_drefs 0 -use_absolute_path 0`,
+  non-MOV `-format_whitelist` excluding MOV and playlists/manifests, video-only mapping, 15 s time
+  limit) when `ffmpeg` is on `PATH` and report `unsupported` otherwise. Positive thumbnails and
+  negative bad-file entries share a process-wide lock-free cache handle in the state directory
+  (`thumb-cache/`) keyed by path, OS file identity, metadata change time, source size, modification
+  time and parameters, reconciled directly on disk against the 256 MiB LRU cap. A thumbnail of a
+  file is allowed exactly when `fs.read` of it is.
 
 ### Moving
 

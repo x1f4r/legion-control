@@ -72,6 +72,10 @@ harness = false
 name = "sys"
 harness = false
 
+[[test]]
+name = "thumb_worker"
+harness = false
+
 # Mirrors `[workspace.lints]` except `unsafe_code = "deny"` instead of `"forbid"` solely so the
 # standalone integration test binary `tests/thumb_mem.rs` can install a `#[global_allocator]` to
 # measure peak decode memory. The library itself keeps `#![forbid(unsafe_code)]` in `src/lib.rs`.

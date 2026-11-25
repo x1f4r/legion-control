@@ -326,6 +326,16 @@ fn measure_decode_bpp(label: &str, bytes: Vec<u8>, format: ImageFormat, pixels: 
 #[tokio::test]
 async fn baseline_50mp_is_admitted_under_cap_and_over_cap_progressive_falls_back_or_rejects() {
     let _guard = MEASURE_LOCK.lock().await;
+    // Memory/admission tests must not flake on wall-clock time on slow shared runners.
+    struct TimeoutReset;
+    impl Drop for TimeoutReset {
+        fn drop(&mut self) {
+            legion_tools::fs::set_thumb_decode_timeout_for_test(None);
+        }
+    }
+    legion_tools::fs::set_thumb_decode_timeout_for_test(Some(std::time::Duration::from_secs(120)));
+    let _reset = TimeoutReset;
+
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();

@@ -90,6 +90,37 @@ dbg_macro = "warn"
 # boxing it everywhere would cost readability for no measurable gain.
 result_large_err = "allow"
 
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.zune-core]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.adler2]
+opt-level = 3
+[profile.dev.package.simd-adler32]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.gif]
+opt-level = 3
+[profile.dev.package.weezl]
+opt-level = 3
+[profile.dev.package.image-webp]
+opt-level = 3
+[profile.dev.package.bytemuck]
+opt-level = 3
+[profile.dev.package.color_quant]
+opt-level = 3
+
 [profile.release]
 # Produce a small, stripped static binary for fleet distribution. `panic` is intentionally left at
 # the default `unwind` rather than `abort` because a long-lived server (`legion serve`, `legion
