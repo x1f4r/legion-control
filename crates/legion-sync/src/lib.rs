@@ -80,7 +80,7 @@ pub mod version;
 
 pub use apply::{ApplyOutcome, RecoveryReport};
 pub use engine::{DEFAULT_PAGE_LIMIT, FOLDER_MARKER_PROBLEM_SENTENCE, PullReport, SyncEngine};
-pub use error::{FsErrorKind, Result, SyncError};
+pub use error::{FsErrorKind, INDEX_DAMAGED_PROBLEM_SENTENCE, Result, SyncError};
 pub use fs_real::{RealFs, check_folders_not_nested};
 pub use model::{
     BinEntry, BinReason, ConflictChoice, ConflictInfo, DEFAULT_BIN_RETENTION,

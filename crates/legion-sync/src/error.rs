@@ -9,6 +9,10 @@ use legion_xfer::Hash;
 /// Convenience result alias for sync engine operations.
 pub type Result<T> = std::result::Result<T, SyncError>;
 
+/// Plain-language message shown when a folder's sync index is missing, empty, or damaged.
+pub const INDEX_DAMAGED_PROBLEM_SENTENCE: &str =
+    "This folder's sync record is damaged. Nothing was changed.";
+
 /// Category of filesystem failure reported by a [`crate::SyncFs`] implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsErrorKind {
@@ -165,6 +169,18 @@ pub enum SyncError {
         sentence: String,
     },
 
+    /// Local sync index file is missing beside an existing folder, 0-byte, corrupt, or panicked
+    /// inside the storage backend; the folder is stopped and nothing on disk was changed.
+    #[error("{sentence}")]
+    IndexDamaged {
+        /// Folder identifier or index path.
+        folder_id: String,
+        /// Plain-language explanation shown to the person.
+        sentence: String,
+        /// Underlying technical detail for diagnostics.
+        detail: String,
+    },
+
     /// Index file was written by a newer schema version than this build understands.
     #[error("sync index schema version {found} is newer than supported version {supported}")]
     SchemaTooNew {
@@ -229,7 +245,7 @@ impl SyncError {
             Self::PeerUnavailable { .. } => ErrorCode::Unreachable,
             Self::Timeout { .. } => ErrorCode::Timeout,
             Self::Cancelled { .. } => ErrorCode::Cancelled,
-            Self::FolderUnavailable { .. } => ErrorCode::Failed,
+            Self::FolderUnavailable { .. } | Self::IndexDamaged { .. } => ErrorCode::Failed,
             Self::Storage { .. } | Self::CorruptData { .. } => ErrorCode::Internal,
             Self::Fs { kind, .. } => match kind {
                 FsErrorKind::NotFound => ErrorCode::NotFound,
@@ -287,6 +303,10 @@ impl SyncError {
             ),
             Self::FolderUnavailable { .. } => Some(
                 "Reconnect the drive or restore the original folder before resuming sync."
+                    .to_string(),
+            ),
+            Self::IndexDamaged { .. } => Some(
+                "Run the explicit rebuild-from-disk action to recreate the sync index from the folder without changing any files."
                     .to_string(),
             ),
             Self::SchemaTooNew { .. } => Some(

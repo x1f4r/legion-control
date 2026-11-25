@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use legion_xfer::{EntryKind, Hash, Timestamp};
@@ -13,7 +14,7 @@ use crate::apply::{
     ApplyOutcome, RecoveryReport, StoreIndexView, apply_decision, apply_local_rename,
     apply_new_files_group_commit, expire_bin, recover_pending, resolve_conflict, restore_from_bin,
 };
-use crate::error::{Result, SyncError};
+use crate::error::{INDEX_DAMAGED_PROBLEM_SENTENCE, Result, SyncError};
 use crate::model::{
     BinEntry, ConflictChoice, ConflictInfo, DeferredItem, DeletionBrakeConfig,
     DeletionBrakeDecision, FORCED_ROTATION_COOLDOWN_SECS, FetchOptions, FolderConfig,
@@ -29,6 +30,7 @@ use crate::path::{
 };
 use crate::reconcile::{LocalIndexView, ReconcileDecision, reconcile_record};
 use crate::scan::{PendingStabilityTracker, ScanOptions, ScanReport, scan_folder, scan_subtree};
+use crate::store_redb::RedbIndexStore;
 use crate::traits::{IndexStore, Peer, StoreBatch, SyncFs};
 
 /// Default number of records fetched per incremental page during [`SyncEngine::pull_from_peer`].
@@ -72,6 +74,7 @@ pub struct PullReport {
 
 /// Core synchronization engine for one member's copy of a sync folder.
 pub struct SyncEngine<F: SyncFs, S: IndexStore> {
+    config: FolderConfig,
     fs: F,
     store: S,
     ignore: IgnoreMatcher,
@@ -82,170 +85,489 @@ pub struct SyncEngine<F: SyncFs, S: IndexStore> {
     active_progress: BTreeMap<MemberId, SyncProgress>,
     skipped_paths: BTreeSet<String>,
     folder_problem: Option<SyncProblem>,
+    index_damaged: bool,
     last_now: Timestamp,
+}
+
+fn index_damaged_problem() -> SyncProblem {
+    SyncProblem {
+        path: String::new(),
+        kind: ProblemKind::IndexDamaged,
+        peer: None,
+        sentence: INDEX_DAMAGED_PROBLEM_SENTENCE.to_string(),
+    }
+}
+
+fn engine_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "index store panicked".to_string()
+    }
+}
+
+impl<F: SyncFs> SyncEngine<F, RedbIndexStore> {
+    /// Explicit recovery action for a damaged or missing `redb` index file: removes any corrupt
+    /// database file at `db_path`, creates a fresh index, scans live files on disk under the join
+    /// rule, restores bin metadata sidecars from `.legion-sync/bin`, and replays
+    /// `.legion-sync/deletions.log` so previously deleted files are never resurrected.
+    pub fn rebuild_redb_from_disk(
+        config: FolderConfig,
+        fs: F,
+        db_path: impl AsRef<Path>,
+        now: Timestamp,
+    ) -> Result<(Self, ScanReport)> {
+        config.validate()?;
+        fs.check_not_nested()?;
+        if let Some(m) = fs.read_marker()?
+            && (m.folder_id != config.id || m.member_id != config.local_member)
+        {
+            return Err(SyncError::FolderUnavailable {
+                folder_id: config.id,
+                sentence: FOLDER_MARKER_PROBLEM_SENTENCE.to_string(),
+            });
+        }
+
+        let db_path = db_path.as_ref();
+        match std::fs::remove_file(db_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(SyncError::from_io(
+                    Some(db_path.display().to_string()),
+                    err,
+                ));
+            }
+        }
+
+        let store = RedbIndexStore::open(db_path)?;
+        let mut engine = Self::open(config, fs, store)?;
+        let report = engine.rebuild_from_disk(now)?;
+        Ok((engine, report))
+    }
 }
 
 impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     /// Opens or initializes a sync engine for `config`, checking schema version, nesting rules,
-    /// and folder identity marker, running crash recovery, and retrying any locally resolvable
-    /// unapplied records.
+    /// index integrity, and folder identity marker, running crash recovery, and retrying any
+    /// locally resolvable unapplied records.
+    ///
+    /// If the index store is empty beside an existing folder marker and a non-empty folder (or
+    /// active deletion log), or if the index store panics/reports corruption during open, the
+    /// engine enters a stopped damaged state (`ProblemKind::IndexDamaged`) without changing
+    /// anything on disk until [`Self::rebuild_from_disk`] is invoked explicitly.
     pub fn open(config: FolderConfig, fs: F, mut store: S) -> Result<Self> {
         config.validate()?;
-        let found_schema = store.schema_version()?;
-        if found_schema > INDEX_SCHEMA_VERSION {
-            return Err(SyncError::SchemaTooNew {
-                found: found_schema,
-                supported: INDEX_SCHEMA_VERSION,
-            });
-        }
         fs.check_not_nested()?;
-
         let ignore = IgnoreMatcher::compile(&config.ignore)?;
-        let mut folder_problem = None;
-        let mut needs_recover = true;
 
-        match store.load_meta()? {
-            None => {
-                // Brand-new store or reinstall with index wiped.
-                let existing_marker = fs.read_marker()?;
-                if let Some(ref m) = existing_marker
-                    && (m.folder_id != config.id || m.member_id != config.local_member)
-                {
-                    return Err(SyncError::FolderUnavailable {
-                        folder_id: config.id.clone(),
-                        sentence: FOLDER_MARKER_PROBLEM_SENTENCE.to_string(),
-                    });
-                }
-
-                let avoid_inc = existing_marker.as_ref().map(|m| m.incarnation);
-                let inc = choose_fresh_incarnation(config.initial_incarnation, avoid_inc)?;
-                fs.ensure_internal_dirs()?;
-                let marker = FolderMarker::new(config.id.clone(), config.local_member.clone(), inc);
-                fs.write_marker(&marker)?;
-
-                let meta = FolderMeta::new(&config, inc);
-                let batch = StoreBatch {
-                    folder_meta: Some(meta),
-                    ..StoreBatch::default()
-                };
-                store.apply_batch(batch)?;
-
-                // Item 6(b): when the folder marker already existed (index wiped while folder kept),
-                // read `.legion-sync/deletions.log` and re-issue active tombstones for absent paths
-                // so deleted files are never resurrected and peers still holding them delete them.
-                if existing_marker.is_some() {
-                    reissue_deletion_log_tombstones(&fs, &mut store)?;
-                }
+        let init_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_> {
+            let found_schema = store.schema_version()?;
+            if found_schema > INDEX_SCHEMA_VERSION {
+                return Err(SyncError::SchemaTooNew {
+                    found: found_schema,
+                    supported: INDEX_SCHEMA_VERSION,
+                });
             }
-            Some(existing) => {
-                if existing.folder_id != config.id {
-                    return Err(SyncError::InvalidConfig {
-                        message: format!(
-                            "index store belongs to folder {:?}, not {:?}",
-                            existing.folder_id, config.id
-                        ),
-                        hint: Some(
-                            "Open the index database that matches this sync folder id.".to_string(),
-                        ),
-                    });
-                }
-                if existing.local_member != config.local_member {
-                    return Err(SyncError::InvalidConfig {
-                        message: format!(
-                            "index store belongs to member {:?}, not {:?}",
-                            existing.local_member, config.local_member
-                        ),
-                        hint: Some("Each member must keep its own index store.".to_string()),
-                    });
-                }
 
-                match fs.read_marker()? {
-                    None => {
-                        if store.record_count()? > 0 {
-                            // Item B2: NEVER silently recreate `.legion-sync` when an index
-                            // already exists; stop with an actionable problem instead!
-                            folder_problem = Some(SyncProblem {
-                                path: String::new(),
-                                kind: ProblemKind::FolderMarkerMissing,
-                                peer: None,
-                                sentence: FOLDER_MARKER_PROBLEM_SENTENCE.to_string(),
-                            });
+            let mut folder_problem = None;
+            let mut needs_recover = true;
+            let mut index_damaged = false;
+
+            match store.load_meta()? {
+                None => {
+                    let existing_marker = fs.read_marker()?;
+                    if let Some(ref m) = existing_marker
+                        && (m.folder_id != config.id || m.member_id != config.local_member)
+                    {
+                        return Err(SyncError::FolderUnavailable {
+                            folder_id: config.id.clone(),
+                            sentence: FOLDER_MARKER_PROBLEM_SENTENCE.to_string(),
+                        });
+                    }
+
+                    if existing_marker.is_some() {
+                        // Item 7: a missing index beside an existing folder marker and a non-empty
+                        // folder (or active deletion log) is damaged, NOT brand new! Stop with a
+                        // clear problem and change nothing on disk until rebuilt explicitly.
+                        let has_live_entries = !fs.walk(&IgnoreMatcher::default())?.entries.is_empty();
+                        let has_del_log = !parse_deletion_log(&fs.read_deletion_log()?).is_empty();
+                        if has_live_entries || has_del_log {
+                            index_damaged = true;
+                            folder_problem = Some(index_damaged_problem());
                             needs_recover = false;
-                        } else {
-                            fs.ensure_internal_dirs()?;
-                            let marker = FolderMarker::new(
-                                existing.folder_id.clone(),
-                                existing.local_member.clone(),
-                                existing.incarnation,
-                            );
-                            fs.write_marker(&marker)?;
                         }
                     }
-                    Some(marker) => {
-                        if marker.folder_id != existing.folder_id
-                            || marker.member_id != existing.local_member
-                        {
-                            folder_problem = Some(SyncProblem {
-                                path: String::new(),
-                                kind: ProblemKind::FolderMarkerMissing,
-                                peer: None,
-                                sentence: FOLDER_MARKER_PROBLEM_SENTENCE.to_string(),
-                            });
-                            needs_recover = false;
-                        } else if marker.incarnation != existing.incarnation {
-                            // Item C + Item 6(a)/(b): marker and index disagree on incarnation ->
-                            // rotate to a fresh incarnation, carry all pending tombstones and
-                            // `.legion-sync/deletions.log`, and reconcile disk by Rule D!
-                            fs.ensure_internal_dirs()?;
-                            rotate_incarnation_on_marker_mismatch(
-                                &fs,
-                                &mut store,
-                                existing,
-                                marker.incarnation,
-                            )?;
-                        } else {
-                            fs.ensure_internal_dirs()?;
+
+                    if !index_damaged {
+                        let avoid_inc = existing_marker.as_ref().map(|m| m.incarnation);
+                        let inc = choose_fresh_incarnation(config.initial_incarnation, avoid_inc)?;
+                        fs.ensure_internal_dirs()?;
+                        let marker = FolderMarker::new(
+                            config.id.clone(),
+                            config.local_member.clone(),
+                            inc,
+                        );
+                        fs.write_marker(&marker)?;
+
+                        let meta = FolderMeta::new(&config, inc);
+                        let batch = StoreBatch {
+                            folder_meta: Some(meta),
+                            ..StoreBatch::default()
+                        };
+                        store.apply_batch(batch)?;
+                    }
+                }
+                Some(existing) => {
+                    if existing.folder_id != config.id {
+                        return Err(SyncError::InvalidConfig {
+                            message: format!(
+                                "index store belongs to folder {:?}, not {:?}",
+                                existing.folder_id, config.id
+                            ),
+                            hint: Some(
+                                "Open the index database that matches this sync folder id."
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                    if existing.local_member != config.local_member {
+                        return Err(SyncError::InvalidConfig {
+                            message: format!(
+                                "index store belongs to member {:?}, not {:?}",
+                                existing.local_member, config.local_member
+                            ),
+                            hint: Some("Each member must keep its own index store.".to_string()),
+                        });
+                    }
+
+                    match fs.read_marker()? {
+                        None => {
+                            if store.record_count()? > 0 {
+                                // Item B2: NEVER silently recreate `.legion-sync` when an index
+                                // already exists; stop with an actionable problem instead!
+                                folder_problem = Some(SyncProblem {
+                                    path: String::new(),
+                                    kind: ProblemKind::FolderMarkerMissing,
+                                    peer: None,
+                                    sentence: FOLDER_MARKER_PROBLEM_SENTENCE.to_string(),
+                                });
+                                needs_recover = false;
+                            } else {
+                                fs.ensure_internal_dirs()?;
+                                let marker = FolderMarker::new(
+                                    existing.folder_id.clone(),
+                                    existing.local_member.clone(),
+                                    existing.incarnation,
+                                );
+                                fs.write_marker(&marker)?;
+                            }
+                        }
+                        Some(marker) => {
+                            if marker.folder_id != existing.folder_id
+                                || marker.member_id != existing.local_member
+                            {
+                                folder_problem = Some(SyncProblem {
+                                    path: String::new(),
+                                    kind: ProblemKind::FolderMarkerMissing,
+                                    peer: None,
+                                    sentence: FOLDER_MARKER_PROBLEM_SENTENCE.to_string(),
+                                });
+                                needs_recover = false;
+                            } else if marker.incarnation != existing.incarnation {
+                                // Item C + Item 6(a)/(b): marker and index disagree on incarnation ->
+                                // rotate to a fresh incarnation, carry all pending tombstones and
+                                // `.legion-sync/deletions.log`, and reconcile disk by Rule D!
+                                fs.ensure_internal_dirs()?;
+                                rotate_incarnation_on_marker_mismatch(
+                                    &fs,
+                                    &mut store,
+                                    existing,
+                                    marker.incarnation,
+                                )?;
+                            } else {
+                                fs.ensure_internal_dirs()?;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        let skipped_paths: BTreeSet<String> = store
-            .list_problems()?
-            .into_iter()
-            .filter_map(|(_, prob)| {
-                (prob.kind == ProblemKind::FilesystemError && prob.peer.is_none())
-                    .then_some(prob.path)
-            })
-            .collect();
+            let skipped_paths: BTreeSet<String> = if index_damaged {
+                BTreeSet::new()
+            } else {
+                store
+                    .list_problems()?
+                    .into_iter()
+                    .filter_map(|(_, prob)| {
+                        (prob.kind == ProblemKind::FilesystemError && prob.peer.is_none())
+                            .then_some(prob.path)
+                    })
+                    .collect()
+            };
+
+            Ok((folder_problem, needs_recover, index_damaged, skipped_paths))
+        }));
+
+        let (folder_problem, needs_recover, index_damaged, skipped_paths) = match init_attempt {
+            Ok(Ok(tuple)) => tuple,
+            Ok(Err(SyncError::IndexDamaged { .. } | SyncError::CorruptData { .. })) => {
+                (Some(index_damaged_problem()), false, true, BTreeSet::new())
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(_) => (Some(index_damaged_problem()), false, true, BTreeSet::new()),
+        };
 
         let mut engine = Self {
+            bin_retention_secs: config.bin_retention_secs,
+            deletion_brake: config.deletion_brake,
+            config,
             fs,
             store,
             ignore,
-            bin_retention_secs: config.bin_retention_secs,
-            deletion_brake: config.deletion_brake,
             stability: PendingStabilityTracker::new(),
             unreachable_peers: BTreeSet::new(),
             active_progress: BTreeMap::new(),
             skipped_paths,
             folder_problem,
+            index_damaged,
             last_now: Timestamp::from_system_time(std::time::SystemTime::now()),
         };
         if needs_recover {
-            engine.recover()?;
-            if engine.store.held_back_count()? > 0 {
-                let now = engine.last_now;
-                let _ = engine.retry_held_back_local(now);
+            match engine.recover() {
+                Ok(_) => {
+                    if let Ok(count) = engine.guard_ref("held_back_count", |e| e.store.held_back_count())
+                        && count > 0
+                    {
+                        let now = engine.last_now;
+                        let _ = engine.retry_held_back_local(now);
+                    }
+                }
+                Err(SyncError::IndexDamaged { .. }) => {
+                    // Already transitioned cleanly into stopped damaged state.
+                }
+                Err(err) => return Err(err),
             }
         }
         Ok(engine)
     }
 
+    /// Returns `true` when this folder is stopped because its sync index is missing or damaged.
+    pub fn is_index_damaged(&self) -> bool {
+        self.index_damaged
+    }
+
+    fn check_not_damaged(&self) -> Result<()> {
+        if self.index_damaged {
+            return Err(SyncError::IndexDamaged {
+                folder_id: self.config.id.clone(),
+                sentence: INDEX_DAMAGED_PROBLEM_SENTENCE.to_string(),
+                detail: "folder is stopped until its index is rebuilt from disk".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn mark_index_damaged(&mut self, detail: String) -> SyncError {
+        self.index_damaged = true;
+        self.folder_problem = Some(index_damaged_problem());
+        SyncError::IndexDamaged {
+            folder_id: self.config.id.clone(),
+            sentence: INDEX_DAMAGED_PROBLEM_SENTENCE.to_string(),
+            detail,
+        }
+    }
+
+    fn guard_mut<T>(&mut self, op: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.check_not_damaged()?;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(Ok(val)) => Ok(val),
+            Ok(Err(SyncError::IndexDamaged { detail, .. })) => Err(self.mark_index_damaged(detail)),
+            Ok(Err(SyncError::CorruptData { context, detail })) => {
+                Err(self.mark_index_damaged(format!("corrupt {context}: {detail}")))
+            }
+            Ok(Err(err)) => Err(err),
+            Err(payload) => Err(self.mark_index_damaged(format!(
+                "panic during {op}: {}",
+                engine_panic_message(&*payload)
+            ))),
+        }
+    }
+
+    fn guard_ref<T>(&self, op: &str, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        self.check_not_damaged()?;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(res) => res,
+            Err(payload) => Err(SyncError::IndexDamaged {
+                folder_id: self.config.id.clone(),
+                sentence: INDEX_DAMAGED_PROBLEM_SENTENCE.to_string(),
+                detail: format!("panic during {op}: {}", engine_panic_message(&*payload)),
+            }),
+        }
+    }
+
+    /// Explicit recovery action: rebuilds this folder's sync index from live files on disk,
+    /// `.legion-sync/bin` metadata sidecars, and `.legion-sync/deletions.log` under a brand-new
+    /// incarnation and the join rule so no files are lost and no recorded deletions resurrect.
+    pub fn rebuild_from_disk(&mut self, now: Timestamp) -> Result<ScanReport> {
+        self.last_now = now;
+        self.fs.check_not_nested()?;
+        let existing_marker = self.fs.read_marker()?;
+        if let Some(ref m) = existing_marker
+            && (m.folder_id != self.config.id || m.member_id != self.config.local_member)
+        {
+            return Err(SyncError::FolderUnavailable {
+                folder_id: self.config.id.clone(),
+                sentence: FOLDER_MARKER_PROBLEM_SENTENCE.to_string(),
+            });
+        }
+
+        // Preserve every active deletion from `.legion-sync/deletions.log` (and from the store if
+        // readable) so rebuilding an index never resurrects deleted files.
+        let mut carried_deletions = parse_deletion_log(&self.fs.read_deletion_log()?);
+        let mut old_incarnation = existing_marker.as_ref().map(|m| m.incarnation);
+        let mut all_paths = Vec::new();
+        let mut all_peers = Vec::new();
+        let mut old_bin_ids = Vec::new();
+        let mut old_problem_keys = Vec::new();
+
+        if !self.index_damaged {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Ok(Some(m)) = self.store.load_meta() {
+                    old_incarnation = Some(m.incarnation);
+                }
+                if let Ok(tombs) = self.store.list_tombstones() {
+                    for tomb in tombs {
+                        carried_deletions.insert(
+                            tomb.path.clone(),
+                            FolderDeletionRecord {
+                                path: tomb.path,
+                                kind: tomb.kind,
+                                hashes: tomb.recent_hashes,
+                                version: tomb.version,
+                                mtime: tomb.mtime,
+                                modified_by: tomb.modified_by,
+                            },
+                        );
+                    }
+                }
+                let _ = self.store.scan_records_in_order(&mut |rec| {
+                    all_paths.push(rec.path);
+                    Ok(true)
+                });
+                if let Ok(cursors) = self.store.load_peer_cursors() {
+                    all_peers.extend(cursors.into_keys());
+                }
+                if let Ok(bins) = self.store.list_bin_entries() {
+                    old_bin_ids.extend(bins.into_iter().map(|b| b.id));
+                }
+                if let Ok(probs) = self.store.list_problems() {
+                    old_problem_keys.extend(probs.into_iter().map(|(k, _)| k));
+                }
+            }));
+        } else {
+            // Even when `index_damaged` was set because the store was empty beside an existing
+            // marker, clean out any partial records if the store is writable.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = self.store.scan_records_in_order(&mut |rec| {
+                    all_paths.push(rec.path);
+                    Ok(true)
+                });
+                if let Ok(cursors) = self.store.load_peer_cursors() {
+                    all_peers.extend(cursors.into_keys());
+                }
+                if let Ok(bins) = self.store.list_bin_entries() {
+                    old_bin_ids.extend(bins.into_iter().map(|b| b.id));
+                }
+                if let Ok(probs) = self.store.list_problems() {
+                    old_problem_keys.extend(probs.into_iter().map(|(k, _)| k));
+                }
+            }));
+        }
+
+        // Recover self-describing bin entries from `.legion-sync/bin/*.json` sidecars.
+        let mut recovered_bins = Vec::new();
+        if let Ok(bin_files) = self.fs.list_bin() {
+            for name in bin_files {
+                if name.ends_with(".json")
+                    && let Ok(Some(bytes)) = self.fs.read_bin_meta(&name)
+                    && let Ok(entry) = serde_json::from_slice::<BinEntry>(&bytes)
+                {
+                    recovered_bins.push(entry);
+                }
+            }
+        }
+
+        let new_inc = choose_fresh_incarnation(None, old_incarnation)?;
+        self.fs.ensure_internal_dirs()?;
+        let marker = FolderMarker::new(
+            self.config.id.clone(),
+            self.config.local_member.clone(),
+            new_inc,
+        );
+        self.fs.write_marker(&marker)?;
+
+        let new_meta = FolderMeta::new(&self.config, new_inc);
+        let reset_batch = StoreBatch {
+            folder_meta: Some(new_meta),
+            remove_records: all_paths,
+            remove_peer_cursors: all_peers,
+            remove_bin: old_bin_ids,
+            upsert_bin: recovered_bins,
+            remove_problems: old_problem_keys,
+            clear_seq_fingerprints: true,
+            clear_held_back: true,
+            clear_deferrals: true,
+            set_pending_op: Some(None),
+            ..StoreBatch::default()
+        };
+        let apply_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.store.apply_batch(reset_batch)
+        }));
+        match apply_res {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(err),
+            Err(payload) => {
+                return Err(self.mark_index_damaged(format!(
+                    "panic during rebuild_from_disk: {}",
+                    engine_panic_message(&*payload)
+                )));
+            }
+        }
+
+        self.index_damaged = false;
+        self.folder_problem = None;
+        self.skipped_paths.clear();
+
+        // Rescue any leftover files in `.legion-sync/tmp` per the core principle.
+        recover_pending(&self.fs, &mut self.store)?;
+
+        // Scan live disk under Rule D (`join_mode = true`), then re-issue every carried deletion
+        // whose path is absent on disk.
+        let report = scan_folder(
+            &self.fs,
+            &mut self.store,
+            &self.ignore,
+            DeletionBrakeConfig {
+                min_deleted_files: usize::MAX,
+                min_deleted_percent: 100,
+            },
+            &mut self.stability,
+            now,
+            ScanOptions {
+                allow_mass_deletion: true,
+                ..ScanOptions::default()
+            },
+        )?;
+        reissue_carried_deletions(&self.fs, &mut self.store, carried_deletions)?;
+        Ok(report)
+    }
+
     /// Runs crash recovery for any incomplete write-ahead operation and cleans `.legion-sync/tmp`.
     pub fn recover(&mut self) -> Result<RecoveryReport> {
-        recover_pending(&self.fs, &mut self.store)
+        self.guard_mut("recover", |e| recover_pending(&e.fs, &mut e.store))
     }
 
     /// Borrows the underlying filesystem implementation.
@@ -270,40 +592,46 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
     /// Returns the folder's current persistent metadata.
     pub fn meta(&self) -> Result<FolderMeta> {
-        self.store.load_meta()?.ok_or_else(|| SyncError::Storage {
-            context: "load folder metadata".to_string(),
-            detail: "index store is uninitialized".to_string(),
+        self.guard_ref("meta", |e| {
+            e.store.load_meta()?.ok_or_else(|| SyncError::Storage {
+                context: "load folder metadata".to_string(),
+                detail: "index store is uninitialized".to_string(),
+            })
         })
     }
 
     /// Updates the folder's custom ignore glob patterns.
     pub fn update_ignore(&mut self, patterns: Vec<String>) -> Result<()> {
         self.ignore = IgnoreMatcher::compile(&patterns)?;
+        self.config.ignore = patterns;
         Ok(())
     }
 
     /// Updates the folder's mass-deletion brake thresholds.
     pub fn set_deletion_brake(&mut self, config: DeletionBrakeConfig) {
         self.deletion_brake = config;
+        self.config.deletion_brake = config;
     }
 
     /// Pauses or resumes syncing for this folder.
     pub fn set_paused(&mut self, paused: bool) -> Result<()> {
-        let mut meta = self.meta()?;
-        if meta.paused != paused {
-            meta.paused = paused;
-            let batch = StoreBatch {
-                folder_meta: Some(meta),
-                ..StoreBatch::default()
-            };
-            self.store.apply_batch(batch)?;
-        }
-        Ok(())
+        self.guard_mut("set_paused", |e| {
+            let mut meta = e.meta()?;
+            if meta.paused != paused {
+                meta.paused = paused;
+                let batch = StoreBatch {
+                    folder_meta: Some(meta),
+                    ..StoreBatch::default()
+                };
+                e.store.apply_batch(batch)?;
+            }
+            Ok(())
+        })
     }
 
     /// Returns whether this folder is currently paused.
     pub fn is_paused(&self) -> Result<bool> {
-        Ok(self.meta()?.paused)
+        self.guard_ref("is_paused", |e| Ok(e.meta()?.paused))
     }
 
     /// Responds to a tripped mass-deletion brake (`ConfirmDeleted` or `Rescan`).
@@ -312,32 +640,34 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         decision: DeletionBrakeDecision,
         now: Timestamp,
     ) -> Result<ScanReport> {
-        self.verify_folder_marker()?;
-        let mut meta = self.meta()?;
-        if meta.pending_brake.is_none() {
-            return Err(SyncError::Conflict {
-                path: meta.folder_id,
-                reason: "no mass-deletion brake is currently awaiting confirmation".to_string(),
-            });
-        }
-        meta.pending_brake = None;
-        meta.paused = false;
-        let batch = StoreBatch {
-            folder_meta: Some(meta),
-            ..StoreBatch::default()
-        };
-        self.store.apply_batch(batch)?;
+        self.guard_mut("resolve_deletion_brake", |e| {
+            e.verify_folder_marker()?;
+            let mut meta = e.meta()?;
+            if meta.pending_brake.is_none() {
+                return Err(SyncError::Conflict {
+                    path: meta.folder_id,
+                    reason: "no mass-deletion brake is currently awaiting confirmation".to_string(),
+                });
+            }
+            meta.pending_brake = None;
+            meta.paused = false;
+            let batch = StoreBatch {
+                folder_meta: Some(meta),
+                ..StoreBatch::default()
+            };
+            e.store.apply_batch(batch)?;
 
-        match decision {
-            DeletionBrakeDecision::ConfirmDeleted => self.scan_with_options(
-                now,
-                ScanOptions {
-                    allow_mass_deletion: true,
-                    ..ScanOptions::default()
-                },
-            ),
-            DeletionBrakeDecision::Rescan => self.scan(now),
-        }
+            match decision {
+                DeletionBrakeDecision::ConfirmDeleted => e.scan_with_options_inner(
+                    now,
+                    ScanOptions {
+                        allow_mass_deletion: true,
+                        ..ScanOptions::default()
+                    },
+                ),
+                DeletionBrakeDecision::Rescan => e.scan_with_options_inner(now, ScanOptions::default()),
+            }
+        })
     }
 
     /// Records that `peer` is currently unreachable (reflected as `WaitingForMember` in status).
@@ -355,105 +685,111 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     pub fn add_member(&mut self, member: impl Into<MemberId>) -> Result<()> {
         let member = member.into();
         validate_member_id(&member)?;
-        let mut meta = self.meta()?;
-        if meta.members.insert(member.clone()) {
-            // Only flag a member in `rejoining_peers` when it was previously removed (so it may
-            // still carry an old unwiped index from before removal). Brand-new members already tag
-            // all pre-existing files with `from_join = true` on their initial scan, leaving
-            // post-join edits/renames free to recreate previously deleted content hashes.
-            let was_former = meta.former_members.remove(&member);
-            if was_former && member != meta.local_member {
-                meta.rejoining_peers.insert(member.clone());
+        self.config.members.insert(member.clone());
+        self.config.former_members.remove(&member);
+        self.guard_mut("add_member", |e| {
+            let mut meta = e.meta()?;
+            if meta.members.insert(member.clone()) {
+                let was_former = meta.former_members.remove(&member);
+                if was_former && member != meta.local_member {
+                    meta.rejoining_peers.insert(member.clone());
+                }
+                let remove_problems: Vec<String> = e
+                    .store
+                    .list_problems()?
+                    .into_iter()
+                    .filter(|(_, p)| p.peer.as_deref() == Some(member.as_str()))
+                    .map(|(k, _)| k)
+                    .collect();
+                let batch = StoreBatch {
+                    folder_meta: Some(meta),
+                    remove_peer_cursors: vec![member.clone()],
+                    remove_problems,
+                    ..StoreBatch::default()
+                };
+                e.store.apply_batch(batch)?;
             }
-            let remove_problems: Vec<String> = self
-                .store
-                .list_problems()?
-                .into_iter()
-                .filter(|(_, p)| p.peer.as_deref() == Some(member.as_str()))
-                .map(|(k, _)| k)
-                .collect();
-            let batch = StoreBatch {
-                folder_meta: Some(meta),
-                remove_peer_cursors: vec![member.clone()],
-                remove_problems,
-                ..StoreBatch::default()
-            };
-            self.store.apply_batch(batch)?;
-        }
-        if self.store.held_back_count()? > 0 {
-            let now = self.last_now;
-            let _ = self.retry_held_back_local(now);
-        }
-        Ok(())
+            if e.store.held_back_count()? > 0 {
+                let now = e.last_now;
+                let _ = e.retry_held_back_local(now);
+            }
+            Ok(())
+        })
     }
 
     /// Removes a member from this folder's member list, stops serving it, retains its name in
     /// `former_members` so historical version vectors remain verifiable, leaves all local files
     /// untouched, and runs tombstone garbage collection.
     pub fn remove_member(&mut self, member: &str) -> Result<usize> {
-        let mut meta = self.meta()?;
-        if !meta.members.remove(member) {
-            return Ok(0);
-        }
-        meta.former_members.insert(member.to_string());
-        meta.rejoining_peers.remove(member);
-        meta.last_forced_rotation_by_peer.remove(member);
-        self.unreachable_peers.remove(member);
-        self.active_progress.remove(member);
+        self.config.members.remove(member);
+        self.config.former_members.insert(member.to_string());
+        self.guard_mut("remove_member", |e| {
+            let mut meta = e.meta()?;
+            if !meta.members.remove(member) {
+                return Ok(0);
+            }
+            meta.former_members.insert(member.to_string());
+            meta.rejoining_peers.remove(member);
+            meta.last_forced_rotation_by_peer.remove(member);
+            e.unreachable_peers.remove(member);
+            e.active_progress.remove(member);
 
-        let remove_held_back: Vec<(MemberId, String)> = self
-            .store
-            .list_held_back()?
-            .into_iter()
-            .filter(|h| h.from_peer == member)
-            .map(|h| (h.from_peer, h.record.path))
-            .collect();
-        let remove_deferrals: Vec<(MemberId, String)> = self
-            .store
-            .list_deferrals()?
-            .into_iter()
-            .filter(|d| d.peer == member)
-            .map(|d| (d.peer, d.path))
-            .collect();
-        let remove_problems: Vec<String> = self
-            .store
-            .list_problems()?
-            .into_iter()
-            .filter(|(_, p)| p.peer.as_deref() == Some(member))
-            .map(|(k, _)| k)
-            .collect();
+            let remove_held_back: Vec<(MemberId, String)> = e
+                .store
+                .list_held_back()?
+                .into_iter()
+                .filter(|h| h.from_peer == member)
+                .map(|h| (h.from_peer, h.record.path))
+                .collect();
+            let remove_deferrals: Vec<(MemberId, String)> = e
+                .store
+                .list_deferrals()?
+                .into_iter()
+                .filter(|d| d.peer == member)
+                .map(|d| (d.peer, d.path))
+                .collect();
+            let remove_problems: Vec<String> = e
+                .store
+                .list_problems()?
+                .into_iter()
+                .filter(|(_, p)| p.peer.as_deref() == Some(member))
+                .map(|(k, _)| k)
+                .collect();
 
-        let batch = StoreBatch {
-            folder_meta: Some(meta),
-            remove_peer_cursors: vec![member.to_string()],
-            remove_held_back,
-            remove_deferrals,
-            remove_problems,
-            ..StoreBatch::default()
-        };
-        self.store.apply_batch(batch)?;
+            let batch = StoreBatch {
+                folder_meta: Some(meta),
+                remove_peer_cursors: vec![member.to_string()],
+                remove_held_back,
+                remove_deferrals,
+                remove_problems,
+                ..StoreBatch::default()
+            };
+            e.store.apply_batch(batch)?;
 
-        self.gc_tombstones()
+            e.gc_tombstones_inner()
+        })
     }
 
     /// Dismisses durable informational problems matching `kind` (and optional `peer`), returning
     /// the number of dismissed entries.
     pub fn dismiss_problem(&mut self, kind: ProblemKind, peer: Option<&str>) -> Result<usize> {
-        let keys: Vec<String> = self
-            .store
-            .list_problems()?
-            .into_iter()
-            .filter(|(_, p)| p.kind == kind && (peer.is_none() || p.peer.as_deref() == peer))
-            .map(|(k, _)| k)
-            .collect();
-        let count = keys.len();
-        if count > 0 {
-            self.store.apply_batch(StoreBatch {
-                remove_problems: keys,
-                ..StoreBatch::default()
-            })?;
-        }
-        Ok(count)
+        self.guard_mut("dismiss_problem", |e| {
+            let keys: Vec<String> = e
+                .store
+                .list_problems()?
+                .into_iter()
+                .filter(|(_, p)| p.kind == kind && (peer.is_none() || p.peer.as_deref() == peer))
+                .map(|(k, _)| k)
+                .collect();
+            let count = keys.len();
+            if count > 0 {
+                e.store.apply_batch(StoreBatch {
+                    remove_problems: keys,
+                    ..StoreBatch::default()
+                })?;
+            }
+            Ok(count)
+        })
     }
 
     /// Scans the local folder using default [`ScanOptions`].
@@ -463,6 +799,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
     /// Scans the local folder with explicit [`ScanOptions`].
     pub fn scan_with_options(
+        &mut self,
+        now: Timestamp,
+        options: ScanOptions,
+    ) -> Result<ScanReport> {
+        self.guard_mut("scan_with_options", |e| e.scan_with_options_inner(now, options))
+    }
+
+    fn scan_with_options_inner(
         &mut self,
         now: Timestamp,
         options: ScanOptions,
@@ -524,6 +868,15 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     /// Scans only the live entry or subtree rooted at `rel_root` without walking unrelated files
     /// (intended for incremental file-watcher notifications).
     pub fn scan_subtree(
+        &mut self,
+        rel_root: &str,
+        now: Timestamp,
+        options: ScanOptions,
+    ) -> Result<ScanReport> {
+        self.guard_mut("scan_subtree", |e| e.scan_subtree_inner(rel_root, now, options))
+    }
+
+    fn scan_subtree_inner(
         &mut self,
         rel_root: &str,
         now: Timestamp,
@@ -598,6 +951,18 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     /// Pulls incremental index changes from `peer` with explicit page limit and [`FetchOptions`]
     /// (timeout and cooperative cancellation).
     pub fn pull_from_peer_with_options(
+        &mut self,
+        peer: &dyn Peer,
+        page_limit: usize,
+        fetch_opts: &FetchOptions,
+        now: Timestamp,
+    ) -> Result<PullReport> {
+        self.guard_mut("pull_from_peer_with_options", |e| {
+            e.pull_from_peer_with_options_inner(peer, page_limit, fetch_opts, now)
+        })
+    }
+
+    fn pull_from_peer_with_options_inner(
         &mut self,
         peer: &dyn Peer,
         page_limit: usize,
@@ -2445,6 +2810,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     /// applying our current `(incarnation, seq)` past the tombstone's `seq`, prunes chained
     /// sequence fingerprints strictly below that floor, and compacts `.legion-sync/deletions.log`.
     pub fn gc_tombstones(&mut self) -> Result<usize> {
+        self.guard_mut("gc_tombstones", |e| e.gc_tombstones_inner())
+    }
+
+    fn gc_tombstones_inner(&mut self) -> Result<usize> {
         let meta = self.meta()?;
         let cursors = self.store.load_peer_cursors()?;
         let other_members: Vec<&MemberId> = meta
@@ -2506,6 +2875,16 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     /// `caller.peer_pulled` against our own chained sequence fingerprint history and returning
     /// both what we have pulled from `caller_member` and what we have fully applied/acknowledged.
     pub fn serve_handshake(
+        &self,
+        caller_member: &str,
+        caller: &HandshakeHello,
+    ) -> Result<PeerHandshake> {
+        self.guard_ref("serve_handshake", |e| {
+            e.serve_handshake_inner(caller_member, caller)
+        })
+    }
+
+    fn serve_handshake_inner(
         &self,
         caller_member: &str,
         caller: &HandshakeHello,
@@ -2588,13 +2967,18 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         since_seq: u64,
         limit: usize,
     ) -> Result<RecordsPage> {
-        let _meta = self.check_serve_allowed(caller_member)?;
-        let capped_limit = limit.clamp(1, MAX_PAGE_RECORDS);
-        let mut page =
-            self.store
-                .records_since(caller_member, since_incarnation, since_seq, capped_limit)?;
-        page.records.retain(|r| !is_internal_sync_path(&r.path));
-        Ok(page)
+        self.guard_ref("serve_records_since", |e| {
+            let _meta = e.check_serve_allowed(caller_member)?;
+            let capped_limit = limit.clamp(1, MAX_PAGE_RECORDS);
+            let mut page = e.store.records_since(
+                caller_member,
+                since_incarnation,
+                since_seq,
+                capped_limit,
+            )?;
+            page.records.retain(|r| !is_internal_sync_path(&r.path));
+            Ok(page)
+        })
     }
 
     /// Serves a live file's bytes from byte `offset` to `caller_member` after checking membership,
@@ -2606,36 +2990,39 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         expected_hash: Hash,
         offset: u64,
     ) -> Result<Box<dyn Read + Send>> {
-        let _meta = self.check_serve_allowed(caller_member)?;
-        let clean = validate_sync_path(path)?;
-        if is_internal_sync_path(&clean) || self.ignore.is_path_or_ancestor_ignored(&clean, false) {
-            return Err(SyncError::Denied {
-                member: caller_member.to_string(),
-                reason: format!("'{clean}' is excluded from syncing"),
-            });
-        }
+        self.guard_ref("serve_fetch_file_range", |e| {
+            let _meta = e.check_serve_allowed(caller_member)?;
+            let clean = validate_sync_path(path)?;
+            if is_internal_sync_path(&clean) || e.ignore.is_path_or_ancestor_ignored(&clean, false)
+            {
+                return Err(SyncError::Denied {
+                    member: caller_member.to_string(),
+                    reason: format!("'{clean}' is excluded from syncing"),
+                });
+            }
 
-        let Some(rec) = self.store.get_record(&clean)? else {
-            return Err(SyncError::NotFound {
-                what: format!("file {clean:?}"),
-            });
-        };
-        if rec.deleted || rec.kind != EntryKind::File {
-            return Err(SyncError::NotFound {
-                what: format!("live file {clean:?}"),
-            });
-        }
-        if let Some(indexed_hash) = rec.hash
-            && indexed_hash != expected_hash
-        {
-            return Err(SyncError::HashMismatch {
-                path: clean,
-                expected: expected_hash,
-                actual: indexed_hash,
-            });
-        }
+            let Some(rec) = e.store.get_record(&clean)? else {
+                return Err(SyncError::NotFound {
+                    what: format!("file {clean:?}"),
+                });
+            };
+            if rec.deleted || rec.kind != EntryKind::File {
+                return Err(SyncError::NotFound {
+                    what: format!("live file {clean:?}"),
+                });
+            }
+            if let Some(indexed_hash) = rec.hash
+                && indexed_hash != expected_hash
+            {
+                return Err(SyncError::HashMismatch {
+                    path: clean,
+                    expected: expected_hash,
+                    actual: indexed_hash,
+                });
+            }
 
-        self.fs.open_live_read_at(&clean, offset)
+            e.fs.open_live_read_at(&clean, offset)
+        })
     }
 
     /// Convenience wrapper serving a live file from offset `0`.
@@ -2735,21 +3122,25 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
     /// Lists all entries currently stored in `.legion-sync/bin`.
     pub fn list_bin(&self) -> Result<Vec<BinEntry>> {
-        let mut entries = self.store.list_bin_entries()?;
-        entries.sort_by(|a, b| {
-            b.deleted_at
-                .cmp(&a.deleted_at)
-                .then_with(|| a.original_path.cmp(&b.original_path))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        Ok(entries)
+        self.guard_ref("list_bin", |e| {
+            let mut entries = e.store.list_bin_entries()?;
+            entries.sort_by(|a, b| {
+                b.deleted_at
+                    .cmp(&a.deleted_at)
+                    .then_with(|| a.original_path.cmp(&b.original_path))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            Ok(entries)
+        })
     }
 
     /// Removes entries from `.legion-sync/bin` whose age at `now` meets or exceeds the folder's
     /// configured bin retention (30 days by default), refusing to run when `now` is implausible.
     pub fn expire_bin(&mut self, now: Timestamp) -> Result<Vec<BinEntry>> {
-        self.verify_folder_marker()?;
-        expire_bin(&self.fs, &mut self.store, self.bin_retention_secs, now)
+        self.guard_mut("expire_bin", |e| {
+            e.verify_folder_marker()?;
+            expire_bin(&e.fs, &mut e.store, e.bin_retention_secs, now)
+        })
     }
 
     /// Restores a bin entry back to the live folder (defaulting to its original path) and bumps
@@ -2761,41 +3152,38 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         strategy: RestoreStrategy,
         now: Timestamp,
     ) -> Result<String> {
-        self.verify_folder_marker()?;
-        restore_from_bin(
-            &self.fs,
-            &mut self.store,
-            entry_id,
-            dest_path,
-            strategy,
-            now,
-        )
+        self.guard_mut("restore_from_bin", |e| {
+            e.verify_folder_marker()?;
+            restore_from_bin(&e.fs, &mut e.store, entry_id, dest_path, strategy, now)
+        })
     }
 
     /// Lists all files currently having two versions (unresolved conflicts).
     pub fn list_conflicts(&self) -> Result<Vec<ConflictInfo>> {
-        let mut out = Vec::new();
-        for rec in self.store.list_conflicts()? {
-            if rec.deleted || rec.conflict_dismissed {
-                continue;
+        self.guard_ref("list_conflicts", |e| {
+            let mut out = Vec::new();
+            for rec in e.store.list_conflicts()? {
+                if rec.deleted || rec.conflict_dismissed {
+                    continue;
+                }
+                if let Some(orig) = rec.conflict_of {
+                    out.push(ConflictInfo {
+                        original_path: orig,
+                        conflict_path: rec.path,
+                        conflict_member: rec.modified_by,
+                        conflict_mtime: rec.mtime,
+                        conflict_size: rec.size,
+                        conflict_hash: rec.hash,
+                    });
+                }
             }
-            if let Some(orig) = rec.conflict_of {
-                out.push(ConflictInfo {
-                    original_path: orig,
-                    conflict_path: rec.path,
-                    conflict_member: rec.modified_by,
-                    conflict_mtime: rec.mtime,
-                    conflict_size: rec.size,
-                    conflict_hash: rec.hash,
-                });
-            }
-        }
-        out.sort_by(|a, b| {
-            a.original_path
-                .cmp(&b.original_path)
-                .then_with(|| a.conflict_path.cmp(&b.conflict_path))
-        });
-        Ok(out)
+            out.sort_by(|a, b| {
+                a.original_path
+                    .cmp(&b.original_path)
+                    .then_with(|| a.conflict_path.cmp(&b.conflict_path))
+            });
+            Ok(out)
+        })
     }
 
     /// Resolves one conflict copy according to `choice`.
@@ -2805,13 +3193,64 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         choice: ConflictChoice,
         now: Timestamp,
     ) -> Result<()> {
-        self.verify_folder_marker()?;
-        resolve_conflict(&self.fs, &mut self.store, conflict_path, choice, now)
+        self.guard_mut("resolve_conflict", |e| {
+            e.verify_folder_marker()?;
+            resolve_conflict(&e.fs, &mut e.store, conflict_path, choice, now)
+        })
+    }
+
+    fn damaged_status(&self) -> FolderStatus {
+        let prob = self
+            .folder_problem
+            .clone()
+            .unwrap_or_else(index_damaged_problem);
+        let state = MemberState::Problem {
+            sentence: prob.sentence.clone(),
+            problems: vec![prob],
+        };
+        let members = self
+            .config
+            .members
+            .iter()
+            .map(|m| MemberStatus {
+                member: m.clone(),
+                state: if m == &self.config.local_member {
+                    state.clone()
+                } else {
+                    MemberState::Paused
+                },
+                cursor_seq: 0,
+            })
+            .collect();
+        FolderStatus {
+            folder_id: self.config.id.clone(),
+            local_member: self.config.local_member.clone(),
+            state,
+            members,
+            conflicts: Vec::new(),
+            bin: Vec::new(),
+            pending_brake: None,
+            deferred: Vec::new(),
+        }
     }
 
     /// Returns the complete [`FolderStatus`] matching the exact five states from the design,
     /// together with conflicts, bin contents, any tripped deletion brake, and durable deferred items.
     pub fn status(&self) -> Result<FolderStatus> {
+        if self.index_damaged {
+            return Ok(self.damaged_status());
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.status_inner())) {
+            Ok(Ok(st)) => Ok(st),
+            Ok(Err(SyncError::IndexDamaged { .. } | SyncError::CorruptData { .. })) => {
+                Ok(self.damaged_status())
+            }
+            Ok(Err(err)) => Err(err),
+            Err(_) => Ok(self.damaged_status()),
+        }
+    }
+
+    fn status_inner(&self) -> Result<FolderStatus> {
         let meta = self.meta()?;
         let cursors = self.store.load_peer_cursors()?;
         let held = self.store.list_held_back()?;
@@ -3150,11 +3589,6 @@ fn collect_deletions_for_rotation<F: SyncFs, S: IndexStore>(
         );
     }
     Ok(map)
-}
-
-fn reissue_deletion_log_tombstones<F: SyncFs, S: IndexStore>(fs: &F, store: &mut S) -> Result<()> {
-    let deletions = parse_deletion_log(&fs.read_deletion_log()?);
-    reissue_carried_deletions(fs, store, deletions)
 }
 
 fn reissue_carried_deletions<F: SyncFs, S: IndexStore>(

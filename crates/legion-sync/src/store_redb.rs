@@ -25,7 +25,7 @@ use crate::codec::{
     decode_hash_list, decode_record, decode_string_list, encode_hash_list, encode_record,
     encode_string_list,
 };
-use crate::error::{Result, SyncError};
+use crate::error::{INDEX_DAMAGED_PROBLEM_SENTENCE, Result, SyncError};
 use crate::model::{
     BinEntry, DeferredItem, FolderMeta, HeldBackRecord, INDEX_SCHEMA_VERSION, IndexRecord,
     MAX_DELETED_HISTORY_PATHS, MemberId, PeerCursor, PendingOp, RecordsPage, SyncProblem,
@@ -61,13 +61,44 @@ const META_KEY_LIVE_FILES: &str = "live_file_count";
 pub struct RedbIndexStore {
     db: Database,
     schema_version: u32,
+    path_label: String,
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "storage backend panicked".to_string()
+    }
+}
+
+fn damaged_err(label: &str, detail: impl std::fmt::Display) -> SyncError {
+    SyncError::IndexDamaged {
+        folder_id: label.to_string(),
+        sentence: INDEX_DAMAGED_PROBLEM_SENTENCE.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+fn catch_redb<T>(label: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(res) => res,
+        Err(payload) => Err(damaged_err(
+            label,
+            format!("storage panic: {}", panic_payload_message(&*payload)),
+        )),
+    }
 }
 
 impl RedbIndexStore {
-    /// Opens an existing `redb` index file at `path` or creates a new one with all tables
-    /// initialized, refusing indexes whose schema version is newer than [`INDEX_SCHEMA_VERSION`].
+    /// Opens an existing `redb` index file at `path` (verifying its integrity and refusing 0-byte,
+    /// truncated, corrupt, or panicking files with [`SyncError::IndexDamaged`]) or creates a new
+    /// one with all tables initialized when `path` does not yet exist.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        let path_label = path.display().to_string();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -75,80 +106,180 @@ impl RedbIndexStore {
                 .map_err(|err| SyncError::from_io(Some(parent.display().to_string()), err))?;
         }
 
-        let db = Database::create(path).map_err(|err| SyncError::Storage {
-            context: format!("open redb index at {}", path.display()),
-            detail: err.to_string(),
-        })?;
-
-        let txn = db.begin_write().map_err(|err| SyncError::Storage {
-            context: "initialize redb tables".to_string(),
-            detail: err.to_string(),
-        })?;
-        let schema_version = {
-            let _ = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
-            let _ = txn.open_table(BY_SEQ_TABLE).map_err(table_err)?;
-            let _ = txn.open_table(TOMBSTONES_TABLE).map_err(table_err)?;
-            let _ = txn.open_table(CONFLICTS_TABLE).map_err(table_err)?;
-            let _ = txn.open_table(FOLDED_LIVE_TABLE).map_err(table_err)?;
-            let _ = txn.open_table(PEER_CURSORS_TABLE).map_err(table_err)?;
-            let _ = txn.open_table(BIN_ENTRIES_TABLE).map_err(table_err)?;
-            let _ = txn.open_table(HELD_BACK_TABLE).map_err(table_err)?;
-            let _ = txn.open_table(DELETED_HISTORY_TABLE).map_err(table_err)?;
-            let _ = txn.open_table(STAGED_TMPS_TABLE).map_err(table_err)?;
-            let _ = txn.open_table(SEQ_FINGERPRINTS_TABLE).map_err(table_err)?;
-            let _ = txn.open_table(PROBLEMS_TABLE).map_err(table_err)?;
-            let _ = txn.open_table(DEFERRALS_TABLE).map_err(table_err)?;
-            let mut meta_table = txn.open_table(META_TABLE).map_err(table_err)?;
-
-            let existing = meta_table
-                .get(META_KEY_SCHEMA)
-                .map_err(|e| storage_err("read schema_version", e))?
-                .map(|g| decode_u32_le("schema_version", g.value()))
-                .transpose()?;
-            match existing {
-                Some(found) if found > INDEX_SCHEMA_VERSION => {
-                    return Err(SyncError::SchemaTooNew {
-                        found,
-                        supported: INDEX_SCHEMA_VERSION,
-                    });
+        let existed = match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                if !meta.is_file() {
+                    return Err(damaged_err(
+                        &path_label,
+                        "index path exists but is not a regular file",
+                    ));
                 }
-                Some(found) => found,
-                None => {
-                    meta_table
-                        .insert(
-                            META_KEY_SCHEMA,
-                            INDEX_SCHEMA_VERSION.to_le_bytes().as_slice(),
-                        )
-                        .map_err(|e| storage_err("write schema_version", e))?;
-                    INDEX_SCHEMA_VERSION
+                if meta.len() == 0 {
+                    return Err(damaged_err(&path_label, "index file is 0 bytes"));
                 }
+                true
             }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => return Err(SyncError::from_io(Some(path_label), err)),
         };
-        txn.commit().map_err(|err| SyncError::Storage {
-            context: "commit initial redb tables".to_string(),
-            detail: err.to_string(),
-        })?;
 
-        Ok(Self { db, schema_version })
+        catch_redb(&path_label, || {
+            let mut db = if existed {
+                Database::open(path).map_err(|err| damaged_err(&path_label, err))?
+            } else {
+                Database::create(path).map_err(|err| SyncError::Storage {
+                    context: format!("create redb index at {path_label}"),
+                    detail: err.to_string(),
+                })?
+            };
+
+            if existed {
+                let intact = db
+                    .check_integrity()
+                    .map_err(|err| damaged_err(&path_label, err))?;
+                if !intact {
+                    return Err(damaged_err(&path_label, "redb integrity check returned false"));
+                }
+
+                // Read-only verification BEFORE opening any write transaction so a newer schema or
+                // corrupt payload never mutates the file.
+                let rtxn = db
+                    .begin_read()
+                    .map_err(|err| damaged_err(&path_label, err))?;
+                if let Ok(meta_table) = rtxn.open_table(META_TABLE) {
+                    if let Some(g) = meta_table
+                        .get(META_KEY_SCHEMA)
+                        .map_err(|err| damaged_err(&path_label, err))?
+                    {
+                        let found = decode_u32_le("schema_version", g.value())
+                            .map_err(|err| damaged_err(&path_label, err))?;
+                        if found > INDEX_SCHEMA_VERSION {
+                            return Err(SyncError::SchemaTooNew {
+                                found,
+                                supported: INDEX_SCHEMA_VERSION,
+                            });
+                        }
+                    }
+                    if let Some(g) = meta_table
+                        .get(META_KEY_FOLDER)
+                        .map_err(|err| damaged_err(&path_label, err))?
+                    {
+                        let _ = decode_json::<FolderMeta>("folder_meta", g.value())
+                            .map_err(|err| damaged_err(&path_label, err))?;
+                    }
+                }
+                if let Ok(records_table) = rtxn.open_table(RECORDS_TABLE) {
+                    let iter = records_table
+                        .iter()
+                        .map_err(|err| damaged_err(&path_label, err))?;
+                    for item in iter {
+                        let (_, v) = item.map_err(|err| damaged_err(&path_label, err))?;
+                        let _ = decode_record(v.value())
+                            .map_err(|err| damaged_err(&path_label, err))?;
+                    }
+                }
+                if let Ok(cursors_table) = rtxn.open_table(PEER_CURSORS_TABLE) {
+                    let iter = cursors_table
+                        .iter()
+                        .map_err(|err| damaged_err(&path_label, err))?;
+                    for item in iter {
+                        let (_, v) = item.map_err(|err| damaged_err(&path_label, err))?;
+                        let _ = decode_json::<PeerCursor>("peer_cursor", v.value())
+                            .map_err(|err| damaged_err(&path_label, err))?;
+                    }
+                }
+                drop(rtxn);
+            }
+
+            let txn = db.begin_write().map_err(|err| {
+                if existed {
+                    damaged_err(&path_label, err)
+                } else {
+                    SyncError::Storage {
+                        context: "initialize redb tables".to_string(),
+                        detail: err.to_string(),
+                    }
+                }
+            })?;
+            let schema_version = {
+                let _ = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
+                let _ = txn.open_table(BY_SEQ_TABLE).map_err(table_err)?;
+                let _ = txn.open_table(TOMBSTONES_TABLE).map_err(table_err)?;
+                let _ = txn.open_table(CONFLICTS_TABLE).map_err(table_err)?;
+                let _ = txn.open_table(FOLDED_LIVE_TABLE).map_err(table_err)?;
+                let _ = txn.open_table(PEER_CURSORS_TABLE).map_err(table_err)?;
+                let _ = txn.open_table(BIN_ENTRIES_TABLE).map_err(table_err)?;
+                let _ = txn.open_table(HELD_BACK_TABLE).map_err(table_err)?;
+                let _ = txn.open_table(DELETED_HISTORY_TABLE).map_err(table_err)?;
+                let _ = txn.open_table(STAGED_TMPS_TABLE).map_err(table_err)?;
+                let _ = txn.open_table(SEQ_FINGERPRINTS_TABLE).map_err(table_err)?;
+                let _ = txn.open_table(PROBLEMS_TABLE).map_err(table_err)?;
+                let _ = txn.open_table(DEFERRALS_TABLE).map_err(table_err)?;
+                let mut meta_table = txn.open_table(META_TABLE).map_err(table_err)?;
+
+                let existing = meta_table
+                    .get(META_KEY_SCHEMA)
+                    .map_err(|e| storage_err("read schema_version", e))?
+                    .map(|g| decode_u32_le("schema_version", g.value()))
+                    .transpose()?;
+                match existing {
+                    Some(found) if found > INDEX_SCHEMA_VERSION => {
+                        return Err(SyncError::SchemaTooNew {
+                            found,
+                            supported: INDEX_SCHEMA_VERSION,
+                        });
+                    }
+                    Some(found) => found,
+                    None => {
+                        meta_table
+                            .insert(
+                                META_KEY_SCHEMA,
+                                INDEX_SCHEMA_VERSION.to_le_bytes().as_slice(),
+                            )
+                            .map_err(|e| storage_err("write schema_version", e))?;
+                        INDEX_SCHEMA_VERSION
+                    }
+                }
+            };
+            txn.commit().map_err(|err| {
+                if existed {
+                    damaged_err(&path_label, err)
+                } else {
+                    SyncError::Storage {
+                        context: "commit initial redb tables".to_string(),
+                        detail: err.to_string(),
+                    }
+                }
+            })?;
+
+            Ok(Self {
+                db,
+                schema_version,
+                path_label: path_label.clone(),
+            })
+        })
     }
 
     /// Stamps `schema_version` directly into `META_TABLE` (intended for tests verifying
     /// forward-incompatible schema refusal).
     pub fn write_schema_version_for_test(&mut self, version: u32) -> Result<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| storage_err("begin write", e))?;
-        {
-            let mut meta_table = txn.open_table(META_TABLE).map_err(table_err)?;
-            meta_table
-                .insert(META_KEY_SCHEMA, version.to_le_bytes().as_slice())
-                .map_err(|e| storage_err("write schema_version", e))?;
-        }
-        txn.commit()
-            .map_err(|e| storage_err("commit schema_version", e))?;
-        self.schema_version = version;
-        Ok(())
+        let label = self.path_label.clone();
+        catch_redb(&label, || {
+            let txn = self
+                .db
+                .begin_write()
+                .map_err(|e| storage_err("begin write", e))?;
+            {
+                let mut meta_table = txn.open_table(META_TABLE).map_err(table_err)?;
+                meta_table
+                    .insert(META_KEY_SCHEMA, version.to_le_bytes().as_slice())
+                    .map_err(|e| storage_err("write schema_version", e))?;
+            }
+            txn.commit()
+                .map_err(|e| storage_err("commit schema_version", e))?;
+            self.schema_version = version;
+            Ok(())
+        })
     }
 }
 
@@ -303,52 +434,58 @@ impl IndexStore for RedbIndexStore {
     }
 
     fn load_meta(&self) -> Result<Option<FolderMeta>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(META_TABLE).map_err(table_err)?;
-        let Some(guard) = table
-            .get(META_KEY_FOLDER)
-            .map_err(|e| storage_err("read folder_meta", e))?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(decode_json("folder_meta", guard.value())?))
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(META_TABLE).map_err(table_err)?;
+            let Some(guard) = table
+                .get(META_KEY_FOLDER)
+                .map_err(|e| storage_err("read folder_meta", e))?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(decode_json("folder_meta", guard.value())?))
+        })
     }
 
     fn get_record(&self, path: &str) -> Result<Option<IndexRecord>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
-        let Some(guard) = table.get(path).map_err(|e| storage_err("get record", e))? else {
-            return Ok(None);
-        };
-        Ok(Some(decode_record(guard.value())?))
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
+            let Some(guard) = table.get(path).map_err(|e| storage_err("get record", e))? else {
+                return Ok(None);
+            };
+            Ok(Some(decode_record(guard.value())?))
+        })
     }
 
     fn scan_records_in_order(
         &self,
         visitor: &mut dyn FnMut(IndexRecord) -> Result<bool>,
     ) -> Result<()> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
-        let iter = table
-            .iter()
-            .map_err(|e| storage_err("iterate records", e))?;
-        for item in iter {
-            let (_, val) = item.map_err(|e| storage_err("step records iterator", e))?;
-            let rec = decode_record(val.value())?;
-            if !visitor(rec)? {
-                break;
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
+            let iter = table
+                .iter()
+                .map_err(|e| storage_err("iterate records", e))?;
+            for item in iter {
+                let (_, val) = item.map_err(|e| storage_err("step records iterator", e))?;
+                let rec = decode_record(val.value())?;
+                if !visitor(rec)? {
+                    break;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn scan_subtree_in_order(
@@ -356,74 +493,374 @@ impl IndexStore for RedbIndexStore {
         subtree_root: &str,
         visitor: &mut dyn FnMut(IndexRecord) -> Result<bool>,
     ) -> Result<()> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
-        if let Some(exact) = table
-            .get(subtree_root)
-            .map_err(|e| storage_err("get subtree root", e))?
-            && !visitor(decode_record(exact.value())?)?
-        {
-            return Ok(());
-        }
-        let prefix = format!("{subtree_root}/");
-        let range = table
-            .range((Bound::Included(prefix.as_str()), Bound::Unbounded))
-            .map_err(|e| storage_err("range subtree", e))?;
-        for item in range {
-            let (k, v) = item.map_err(|e| storage_err("step subtree range", e))?;
-            if !is_descendant_of(k.value(), subtree_root) {
-                break;
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
+            if let Some(exact) = table
+                .get(subtree_root)
+                .map_err(|e| storage_err("get subtree root", e))?
+                && !visitor(decode_record(exact.value())?)?
+            {
+                return Ok(());
             }
-            if !visitor(decode_record(v.value())?)? {
-                break;
+            let prefix = format!("{subtree_root}/");
+            let range = table
+                .range((Bound::Included(prefix.as_str()), Bound::Unbounded))
+                .map_err(|e| storage_err("range subtree", e))?;
+            for item in range {
+                let (k, v) = item.map_err(|e| storage_err("step subtree range", e))?;
+                if !is_descendant_of(k.value(), subtree_root) {
+                    break;
+                }
+                if !visitor(decode_record(v.value())?)? {
+                    break;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn has_live_descendant(&self, dir_path: &str) -> Result<bool> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
-        let prefix = format!("{dir_path}/");
-        let range = table
-            .range((Bound::Included(prefix.as_str()), Bound::Unbounded))
-            .map_err(|e| storage_err("range records", e))?;
-        for item in range {
-            let (k, v) = item.map_err(|e| storage_err("step range records", e))?;
-            let key = k.value();
-            if !is_descendant_of(key, dir_path) {
-                break;
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
+            let prefix = format!("{dir_path}/");
+            let range = table
+                .range((Bound::Included(prefix.as_str()), Bound::Unbounded))
+                .map_err(|e| storage_err("range records", e))?;
+            for item in range {
+                let (k, v) = item.map_err(|e| storage_err("step range records", e))?;
+                let key = k.value();
+                if !is_descendant_of(key, dir_path) {
+                    break;
+                }
+                let rec = decode_record(v.value())?;
+                if !rec.deleted {
+                    return Ok(true);
+                }
             }
-            let rec = decode_record(v.value())?;
-            if !rec.deleted {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+            Ok(false)
+        })
     }
 
     fn live_paths_for_folded(&self, folded_path: &str) -> Result<Vec<String>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(FOLDED_LIVE_TABLE).map_err(table_err)?;
-        let Some(guard) = table
-            .get(folded_path)
-            .map_err(|e| storage_err("get folded_live", e))?
-        else {
-            return Ok(Vec::new());
-        };
-        decode_string_list(guard.value())
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(FOLDED_LIVE_TABLE).map_err(table_err)?;
+            let Some(guard) = table
+                .get(folded_path)
+                .map_err(|e| storage_err("get folded_live", e))?
+            else {
+                return Ok(Vec::new());
+            };
+            decode_string_list(guard.value())
+        })
     }
 
     fn records_since(
+        &self,
+        caller_member: &str,
+        since_incarnation: u64,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<RecordsPage> {
+        catch_redb(&self.path_label, || {
+            self.records_since_inner(caller_member, since_incarnation, since_seq, limit)
+        })
+    }
+
+    fn list_tombstones(&self) -> Result<Vec<IndexRecord>> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let tombstones = txn.open_table(TOMBSTONES_TABLE).map_err(table_err)?;
+            let records = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
+            let iter = tombstones
+                .iter()
+                .map_err(|e| storage_err("iterate tombstones", e))?;
+            let mut out = Vec::new();
+            for item in iter {
+                let (k, _) = item.map_err(|e| storage_err("step tombstones", e))?;
+                if let Some(g) = records
+                    .get(k.value())
+                    .map_err(|e| storage_err("read tombstone record", e))?
+                {
+                    out.push(decode_record(g.value())?);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn list_conflicts(&self) -> Result<Vec<IndexRecord>> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let conflicts = txn.open_table(CONFLICTS_TABLE).map_err(table_err)?;
+            let records = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
+            let iter = conflicts
+                .iter()
+                .map_err(|e| storage_err("iterate conflicts", e))?;
+            let mut out = Vec::new();
+            for item in iter {
+                let (k, _) = item.map_err(|e| storage_err("step conflicts", e))?;
+                if let Some(g) = records
+                    .get(k.value())
+                    .map_err(|e| storage_err("read conflict record", e))?
+                {
+                    out.push(decode_record(g.value())?);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn load_peer_cursors(&self) -> Result<BTreeMap<MemberId, PeerCursor>> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(PEER_CURSORS_TABLE).map_err(table_err)?;
+            let iter = table
+                .iter()
+                .map_err(|e| storage_err("iterate peer_cursors", e))?;
+            let mut out = BTreeMap::new();
+            for item in iter {
+                let (k, v) = item.map_err(|e| storage_err("step peer_cursors", e))?;
+                out.insert(
+                    k.value().to_string(),
+                    decode_json("peer_cursor", v.value())?,
+                );
+            }
+            Ok(out)
+        })
+    }
+
+    fn list_bin_entries(&self) -> Result<Vec<BinEntry>> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(BIN_ENTRIES_TABLE).map_err(table_err)?;
+            let iter = table
+                .iter()
+                .map_err(|e| storage_err("iterate bin_entries", e))?;
+            let mut out = Vec::new();
+            for item in iter {
+                let (_, v) = item.map_err(|e| storage_err("step bin_entries", e))?;
+                out.push(decode_json("bin_entry", v.value())?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn get_bin_entry(&self, id: &str) -> Result<Option<BinEntry>> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(BIN_ENTRIES_TABLE).map_err(table_err)?;
+            let Some(guard) = table.get(id).map_err(|e| storage_err("get bin_entry", e))? else {
+                return Ok(None);
+            };
+            Ok(Some(decode_json("bin_entry", guard.value())?))
+        })
+    }
+
+    fn list_held_back(&self) -> Result<Vec<HeldBackRecord>> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(HELD_BACK_TABLE).map_err(table_err)?;
+            let iter = table
+                .iter()
+                .map_err(|e| storage_err("iterate held_back", e))?;
+            let mut out = Vec::new();
+            for item in iter {
+                let (_, v) = item.map_err(|e| storage_err("step held_back", e))?;
+                out.push(decode_json("held_back", v.value())?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn held_back_count(&self) -> Result<usize> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(HELD_BACK_TABLE).map_err(table_err)?;
+            let len = table.len().map_err(|e| storage_err("count held_back", e))?;
+            Ok(len as usize)
+        })
+    }
+
+    fn get_deleted_history(&self, path: &str) -> Result<Vec<Hash>> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(DELETED_HISTORY_TABLE).map_err(table_err)?;
+            let Some(guard) = table
+                .get(path)
+                .map_err(|e| storage_err("get deleted_history", e))?
+            else {
+                return Ok(Vec::new());
+            };
+            decode_hash_list(guard.value())
+        })
+    }
+
+    fn load_pending_op(&self) -> Result<Option<PendingOp>> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(META_TABLE).map_err(table_err)?;
+            let Some(guard) = table
+                .get(META_KEY_PENDING_OP)
+                .map_err(|e| storage_err("read pending_op", e))?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(decode_json("pending_op", guard.value())?))
+        })
+    }
+
+    fn list_staged_tmps(&self) -> Result<BTreeSet<String>> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(STAGED_TMPS_TABLE).map_err(table_err)?;
+            let iter = table
+                .iter()
+                .map_err(|e| storage_err("iterate staged_tmps", e))?;
+            let mut out = BTreeSet::new();
+            for item in iter {
+                let (k, _) = item.map_err(|e| storage_err("step staged_tmps", e))?;
+                out.insert(k.value().to_string());
+            }
+            Ok(out)
+        })
+    }
+
+    fn get_seq_fingerprint(&self, seq: u64) -> Result<Option<Hash>> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(SEQ_FINGERPRINTS_TABLE).map_err(table_err)?;
+            let Some(guard) = table
+                .get(seq)
+                .map_err(|e| storage_err("get seq_fingerprint", e))?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(decode_hash("seq_fingerprint", guard.value())?))
+        })
+    }
+
+    fn list_problems(&self) -> Result<Vec<(String, SyncProblem)>> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(PROBLEMS_TABLE).map_err(table_err)?;
+            let iter = table
+                .iter()
+                .map_err(|e| storage_err("iterate problems", e))?;
+            let mut out = Vec::new();
+            for item in iter {
+                let (k, v) = item.map_err(|e| storage_err("step problems", e))?;
+                out.push((
+                    k.value().to_string(),
+                    decode_json("sync_problem", v.value())?,
+                ));
+            }
+            Ok(out)
+        })
+    }
+
+    fn list_deferrals(&self) -> Result<Vec<DeferredItem>> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(DEFERRALS_TABLE).map_err(table_err)?;
+            let iter = table
+                .iter()
+                .map_err(|e| storage_err("iterate deferrals", e))?;
+            let mut out = Vec::new();
+            for item in iter {
+                let (_, v) = item.map_err(|e| storage_err("step deferrals", e))?;
+                out.push(decode_json("deferred_item", v.value())?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn record_count(&self) -> Result<u64> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
+            table.len().map_err(|e| storage_err("count records", e))
+        })
+    }
+
+    fn live_file_count(&self) -> Result<u64> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let table = txn.open_table(META_TABLE).map_err(table_err)?;
+            let Some(guard) = table
+                .get(META_KEY_LIVE_FILES)
+                .map_err(|e| storage_err("read live_file_count", e))?
+            else {
+                return Ok(0);
+            };
+            decode_u64_le("live_file_count", guard.value())
+        })
+    }
+
+    fn apply_batch(&mut self, batch: StoreBatch) -> Result<()> {
+        let label = self.path_label.clone();
+        catch_redb(&label, || self.apply_batch_inner(batch))
+    }
+}
+
+impl RedbIndexStore {
+    fn records_since_inner(
         &self,
         caller_member: &str,
         since_incarnation: u64,
@@ -535,252 +972,7 @@ impl IndexStore for RedbIndexStore {
         })
     }
 
-    fn list_tombstones(&self) -> Result<Vec<IndexRecord>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let tombstones = txn.open_table(TOMBSTONES_TABLE).map_err(table_err)?;
-        let records = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
-        let iter = tombstones
-            .iter()
-            .map_err(|e| storage_err("iterate tombstones", e))?;
-        let mut out = Vec::new();
-        for item in iter {
-            let (k, _) = item.map_err(|e| storage_err("step tombstones", e))?;
-            if let Some(g) = records
-                .get(k.value())
-                .map_err(|e| storage_err("read tombstone record", e))?
-            {
-                out.push(decode_record(g.value())?);
-            }
-        }
-        Ok(out)
-    }
-
-    fn list_conflicts(&self) -> Result<Vec<IndexRecord>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let conflicts = txn.open_table(CONFLICTS_TABLE).map_err(table_err)?;
-        let records = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
-        let iter = conflicts
-            .iter()
-            .map_err(|e| storage_err("iterate conflicts", e))?;
-        let mut out = Vec::new();
-        for item in iter {
-            let (k, _) = item.map_err(|e| storage_err("step conflicts", e))?;
-            if let Some(g) = records
-                .get(k.value())
-                .map_err(|e| storage_err("read conflict record", e))?
-            {
-                out.push(decode_record(g.value())?);
-            }
-        }
-        Ok(out)
-    }
-
-    fn load_peer_cursors(&self) -> Result<BTreeMap<MemberId, PeerCursor>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(PEER_CURSORS_TABLE).map_err(table_err)?;
-        let iter = table
-            .iter()
-            .map_err(|e| storage_err("iterate peer_cursors", e))?;
-        let mut out = BTreeMap::new();
-        for item in iter {
-            let (k, v) = item.map_err(|e| storage_err("step peer_cursors", e))?;
-            out.insert(
-                k.value().to_string(),
-                decode_json("peer_cursor", v.value())?,
-            );
-        }
-        Ok(out)
-    }
-
-    fn list_bin_entries(&self) -> Result<Vec<BinEntry>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(BIN_ENTRIES_TABLE).map_err(table_err)?;
-        let iter = table
-            .iter()
-            .map_err(|e| storage_err("iterate bin_entries", e))?;
-        let mut out = Vec::new();
-        for item in iter {
-            let (_, v) = item.map_err(|e| storage_err("step bin_entries", e))?;
-            out.push(decode_json("bin_entry", v.value())?);
-        }
-        Ok(out)
-    }
-
-    fn get_bin_entry(&self, id: &str) -> Result<Option<BinEntry>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(BIN_ENTRIES_TABLE).map_err(table_err)?;
-        let Some(guard) = table.get(id).map_err(|e| storage_err("get bin_entry", e))? else {
-            return Ok(None);
-        };
-        Ok(Some(decode_json("bin_entry", guard.value())?))
-    }
-
-    fn list_held_back(&self) -> Result<Vec<HeldBackRecord>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(HELD_BACK_TABLE).map_err(table_err)?;
-        let iter = table
-            .iter()
-            .map_err(|e| storage_err("iterate held_back", e))?;
-        let mut out = Vec::new();
-        for item in iter {
-            let (_, v) = item.map_err(|e| storage_err("step held_back", e))?;
-            out.push(decode_json("held_back", v.value())?);
-        }
-        Ok(out)
-    }
-
-    fn held_back_count(&self) -> Result<usize> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(HELD_BACK_TABLE).map_err(table_err)?;
-        let len = table.len().map_err(|e| storage_err("count held_back", e))?;
-        Ok(len as usize)
-    }
-
-    fn get_deleted_history(&self, path: &str) -> Result<Vec<Hash>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(DELETED_HISTORY_TABLE).map_err(table_err)?;
-        let Some(guard) = table
-            .get(path)
-            .map_err(|e| storage_err("get deleted_history", e))?
-        else {
-            return Ok(Vec::new());
-        };
-        decode_hash_list(guard.value())
-    }
-
-    fn load_pending_op(&self) -> Result<Option<PendingOp>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(META_TABLE).map_err(table_err)?;
-        let Some(guard) = table
-            .get(META_KEY_PENDING_OP)
-            .map_err(|e| storage_err("read pending_op", e))?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(decode_json("pending_op", guard.value())?))
-    }
-
-    fn list_staged_tmps(&self) -> Result<BTreeSet<String>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(STAGED_TMPS_TABLE).map_err(table_err)?;
-        let iter = table
-            .iter()
-            .map_err(|e| storage_err("iterate staged_tmps", e))?;
-        let mut out = BTreeSet::new();
-        for item in iter {
-            let (k, _) = item.map_err(|e| storage_err("step staged_tmps", e))?;
-            out.insert(k.value().to_string());
-        }
-        Ok(out)
-    }
-
-    fn get_seq_fingerprint(&self, seq: u64) -> Result<Option<Hash>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(SEQ_FINGERPRINTS_TABLE).map_err(table_err)?;
-        let Some(guard) = table
-            .get(seq)
-            .map_err(|e| storage_err("get seq_fingerprint", e))?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(decode_hash("seq_fingerprint", guard.value())?))
-    }
-
-    fn list_problems(&self) -> Result<Vec<(String, SyncProblem)>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(PROBLEMS_TABLE).map_err(table_err)?;
-        let iter = table
-            .iter()
-            .map_err(|e| storage_err("iterate problems", e))?;
-        let mut out = Vec::new();
-        for item in iter {
-            let (k, v) = item.map_err(|e| storage_err("step problems", e))?;
-            out.push((
-                k.value().to_string(),
-                decode_json("sync_problem", v.value())?,
-            ));
-        }
-        Ok(out)
-    }
-
-    fn list_deferrals(&self) -> Result<Vec<DeferredItem>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(DEFERRALS_TABLE).map_err(table_err)?;
-        let iter = table
-            .iter()
-            .map_err(|e| storage_err("iterate deferrals", e))?;
-        let mut out = Vec::new();
-        for item in iter {
-            let (_, v) = item.map_err(|e| storage_err("step deferrals", e))?;
-            out.push(decode_json("deferred_item", v.value())?);
-        }
-        Ok(out)
-    }
-
-    fn record_count(&self) -> Result<u64> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
-        table.len().map_err(|e| storage_err("count records", e))
-    }
-
-    fn live_file_count(&self) -> Result<u64> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| storage_err("begin read", e))?;
-        let table = txn.open_table(META_TABLE).map_err(table_err)?;
-        let Some(guard) = table
-            .get(META_KEY_LIVE_FILES)
-            .map_err(|e| storage_err("read live_file_count", e))?
-        else {
-            return Ok(0);
-        };
-        decode_u64_le("live_file_count", guard.value())
-    }
-
-    fn apply_batch(&mut self, batch: StoreBatch) -> Result<()> {
+    fn apply_batch_inner(&mut self, batch: StoreBatch) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }

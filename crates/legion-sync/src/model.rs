@@ -939,6 +939,8 @@ pub enum ProblemKind {
     PeerForcedRotation,
     /// A peer repeatedly tried to force incarnation rotation faster than once per hour.
     PeerRollbackRateLimited,
+    /// Local sync index file is missing, empty, or damaged; folder is stopped until rebuilt.
+    IndexDamaged,
 }
 
 /// Human-readable problem reported in [`FolderStatus`].

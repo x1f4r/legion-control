@@ -179,7 +179,15 @@ fn m4_reinstall_while_other_member_off_resurrects() {
     drop(tower);
     fs::remove_file(t.join("tower.redb")).unwrap();
     let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
-    tower.scan(ts(20)).unwrap();
+    // Item 7: missing index beside existing marker and non-empty folder stops as damaged until
+    // explicitly rebuilt from disk.
+    assert!(tower.is_index_damaged());
+    assert!(matches!(
+        tower.scan(ts(20)),
+        Err(legion_sync::SyncError::IndexDamaged { .. })
+    ));
+    tower.rebuild_from_disk(ts(20)).unwrap();
+    assert!(!tower.is_index_damaged());
     // Laptop returns.
     for k in 0..3 {
         let _ = tower.pull_from_peer(&EnginePeer::new(&laptop, "tower"), ts(30 + k));
@@ -191,6 +199,7 @@ fn m4_reinstall_while_other_member_off_resurrects() {
         t.join("laptop/old-tax-return.pdf").exists()
     );
     assert!(!t.join("tower/old-tax-return.pdf").exists(), "deleted file came back on tower");
+    assert!(!t.join("laptop/old-tax-return.pdf").exists(), "deleted file was not deleted on laptop");
 }
 
 /// After the restore, the person edits files that had also changed after the backup.

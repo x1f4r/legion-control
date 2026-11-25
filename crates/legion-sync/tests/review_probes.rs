@@ -386,7 +386,12 @@ fn probe_a5_reinstalled_member_propagates_deletions_and_edits() {
     drop(b);
     fs::remove_dir_all(mb.db.parent().unwrap()).unwrap();
     let mut b = mb.open();
-    b.scan(now()).unwrap();
+    // Item 7: missing index beside existing marker and non-empty folder stops as damaged until
+    // explicitly rebuilt from disk.
+    assert!(b.is_index_damaged());
+    assert!(matches!(b.scan(now()), Err(SyncError::IndexDamaged { .. })));
+    b.rebuild_from_disk(now()).unwrap();
+    assert!(!b.is_index_damaged());
     pull(&mut b, &a).unwrap();
     pull(&mut a, &b).unwrap();
 
