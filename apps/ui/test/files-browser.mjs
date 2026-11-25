@@ -355,11 +355,18 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.locator('.swipe-row:has-text("notes.txt") .swipe-action', { hasText: 'Send to' }).click();
     const localSend = page.locator('.sheet');
     await localSend.locator('button[role="radio"]', { hasText: 'tower' }).click();
+    const callsBefore = await page.evaluate(() => (window.__LEGION_MOCK_CALLS__ || []).length);
     await localSend.getByRole('button', { name: 'Copy here' }).click();
     await localSend.waitFor({ state: 'hidden' });
     await page.locator('.toast-banner', { hasText: /Copied notes\.txt to/ }).waitFor();
-    const lastCall = await page.evaluate(() => window.__LEGION_MOCK_LAST_CALL__);
-    assert.equal(lastCall?.tool, 'fs.copy', 'Same-machine copy must call fs.copy, not fs.transfer');
+    // The folder reloads right after the copy, so look at every call since the button was
+    // pressed rather than at the last one.
+    const toolsSince = await page.evaluate(
+      (from) => (window.__LEGION_MOCK_CALLS__ || []).slice(from).map((call) => call.tool),
+      callsBefore,
+    );
+    assert.ok(toolsSince.includes('fs.copy'), `Same-machine copy must call fs.copy: ${toolsSince}`);
+    assert.ok(!toolsSince.includes('fs.transfer'), `Same-machine copy must not start a transfer: ${toolsSince}`);
 
     // 11. Star and Pin via swipe + folder More, then verify on Files first screen.
     await dispatchSwipe(page, '.swipe-row:has-text("Beach.mp4")', { startX: 310, startY: 220, endX: 140, endY: 222 });

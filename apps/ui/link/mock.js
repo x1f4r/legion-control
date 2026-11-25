@@ -1361,6 +1361,10 @@ export function createMockLink(mode = '') {
     const { on, onEvent } = options || {};
     if (typeof window !== 'undefined') {
       window.__LEGION_MOCK_LAST_CALL__ = { tool, args, on: on ?? null };
+      // Tests that must not depend on what the screen calls next read the recent calls instead.
+      const recent = window.__LEGION_MOCK_CALLS__ || (window.__LEGION_MOCK_CALLS__ = []);
+      recent.push({ tool, args, on: on ?? null });
+      if (recent.length > 200) recent.splice(0, recent.length - 200);
     }
     if (kind === 'app' && !on && !MOCK_ANY_NODE_TOOLS.has(tool)) {
       throw {
