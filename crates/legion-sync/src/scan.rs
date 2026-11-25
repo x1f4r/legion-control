@@ -11,10 +11,13 @@ use std::time::Duration;
 use legion_xfer::{EntryKind, Hash, Timestamp};
 
 use crate::error::Result;
-use crate::model::{DeletionBrake, DeletionBrakeConfig, IndexRecord, MAX_ANCESTRY_HASHES};
+use crate::model::{
+    DeletionBrake, DeletionBrakeConfig, FolderDeletionLogEntry, IndexRecord, MAX_ANCESTRY_HASHES,
+    ProblemKind, SyncProblem, encode_deletion_log_entries,
+};
 use crate::path::{
-    IgnoreMatcher, is_descendant_of, is_legion_inflight_name, is_os_litter_name, path_depth,
-    validate_sync_path,
+    IgnoreMatcher, check_symlink_target_contained, is_descendant_of, is_legion_inflight_name,
+    is_os_litter_name, path_depth, validate_sync_path,
 };
 use crate::reconcile::derive_conflict_of;
 use crate::traits::{FsMeta, FsWalkEntry, IndexStore, StoreBatch, SyncFs};
@@ -56,6 +59,8 @@ pub struct ScanReport {
     pub held_back_unstable: Vec<String>,
     /// Paths that could not be inspected during the walk (`(path, reason)`).
     pub skipped_errors: Vec<(String, String)>,
+    /// Local entries held back by outbound policy (for example absolute or escaping symbolic links).
+    pub held_back_problems: Vec<SyncProblem>,
     /// `true` when the mass-deletion brake tripped, pausing the folder and recording 0 deletions.
     pub brake_tripped: bool,
 }
@@ -441,7 +446,6 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
     });
 
     let mut batch = StoreBatch::default();
-    let vkey = meta.version_key();
     let join_mode_active = meta.join_mode;
 
     for rec in stat_refreshes {
@@ -449,11 +453,11 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
     }
 
     let mut meta_dirty = kept_dirs_changed;
+    let mut del_log_entries: Vec<FolderDeletionLogEntry> = Vec::new();
 
     for old in deletes {
         let mut version = old.version;
-        let clock = meta.next_clock();
-        version.bump_above(vkey.clone(), clock);
+        meta.bump_version(&mut version);
         let seq = meta.next_seq();
         meta_dirty = true;
 
@@ -489,7 +493,9 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             conflict_of: None,
             conflict_dismissed: false,
         };
-        meta.record_seq_fingerprint(seq, rec.head_fingerprint());
+        let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
+        batch.upsert_seq_fingerprints.push((seq, chain));
+        del_log_entries.push(FolderDeletionLogEntry::from_tombstone(&rec));
         batch.upsert_records.push(rec);
         report.deleted += 1;
     }
@@ -502,12 +508,12 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         is_kind_change,
     } in upserts
     {
+        let was_deleted = prev.as_ref().is_some_and(|p| p.deleted);
         let is_new = prev.as_ref().is_none_or(|p| p.deleted);
         let mut version = prev
             .as_ref()
             .map_or_else(VersionVector::new, |p| p.version.clone());
-        let clock = meta.next_clock();
-        version.bump_above(vkey.clone(), clock);
+        meta.bump_version(&mut version);
         let seq = meta.next_seq();
         meta_dirty = true;
 
@@ -558,7 +564,13 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             conflict_dismissed,
         };
         rec.conflict_of = derive_conflict_of(&rec, &meta);
-        meta.record_seq_fingerprint(seq, rec.head_fingerprint());
+        let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
+        batch.upsert_seq_fingerprints.push((seq, chain));
+        if was_deleted {
+            del_log_entries.push(FolderDeletionLogEntry::Revived {
+                path: rec.path.clone(),
+            });
+        }
         batch.upsert_records.push(rec);
 
         if is_kind_change {
@@ -568,6 +580,11 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         } else {
             report.modified += 1;
         }
+    }
+
+    if !del_log_entries.is_empty() {
+        let encoded = encode_deletion_log_entries(&del_log_entries)?;
+        fs.append_deletion_log(&encoded)?;
     }
 
     if finish_join_mode {
@@ -596,7 +613,6 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
             context: "rescan_single_path".to_string(),
             detail: "index store is not initialized".to_string(),
         })?;
-    let vkey = meta.version_key();
     let prev = store.get_record(&clean)?;
     let disk_opt = fs.stat_live(&clean)?;
 
@@ -642,12 +658,13 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
 
             let mut upsert_records = Vec::with_capacity(to_tombstone.len());
             let mut upsert_deleted_history = Vec::new();
+            let mut upsert_seq_fingerprints = Vec::with_capacity(to_tombstone.len());
+            let mut del_log_entries = Vec::with_capacity(to_tombstone.len());
             let mut main_record = None;
             for item in to_tombstone {
                 let is_main = item.path == clean;
                 let mut version = item.version;
-                let clock = meta.next_clock();
-                version.bump_above(vkey.clone(), clock);
+                meta.bump_version(&mut version);
                 let seq = meta.next_seq();
                 let mut recent_hashes = item.recent_hashes;
                 if let Some(h) = item.hash {
@@ -677,7 +694,9 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                     conflict_of: None,
                     conflict_dismissed: false,
                 };
-                meta.record_seq_fingerprint(seq, rec.head_fingerprint());
+                let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
+                upsert_seq_fingerprints.push((seq, chain));
+                del_log_entries.push(FolderDeletionLogEntry::from_tombstone(&rec));
                 if is_main {
                     main_record = Some(rec.clone());
                 }
@@ -687,16 +706,30 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                 context: "rescan_single_path".to_string(),
                 detail: "missing main tombstone record".to_string(),
             })?;
+            if !del_log_entries.is_empty() {
+                let encoded = encode_deletion_log_entries(&del_log_entries)?;
+                fs.append_deletion_log(&encoded)?;
+            }
             let batch = StoreBatch {
                 folder_meta: Some(meta),
                 upsert_records,
                 upsert_deleted_history,
+                upsert_seq_fingerprints,
                 ..StoreBatch::default()
             };
             store.apply_batch(batch)?;
             Ok(SingleRescanOutcome::Updated(Box::new(record)))
         }
         (prev_opt, Some(disk_meta)) => {
+            if disk_meta.kind == EntryKind::Symlink
+                && check_symlink_target_contained(
+                    &clean,
+                    disk_meta.link_target.as_deref().unwrap_or_default(),
+                )
+                .is_err()
+            {
+                return Ok(SingleRescanOutcome::Unchanged);
+            }
             let hash = if disk_meta.kind == EntryKind::File {
                 let (h, bytes_read) = fs.hash_live(&clean)?;
                 let after = fs.stat_live(&clean)?;
@@ -750,8 +783,7 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
             let mut version = prev_opt
                 .as_ref()
                 .map_or_else(VersionVector::new, |p| p.version.clone());
-            let clock = meta.next_clock();
-            version.bump_above(vkey, clock);
+            meta.bump_version(&mut version);
             let seq = meta.next_seq();
             let mode = disk_meta.mode.or_else(|| {
                 prev_opt
@@ -776,6 +808,7 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                 .as_ref()
                 .is_some_and(|p| !p.deleted && !is_kind_change && p.conflict_dismissed);
 
+            let was_deleted = prev_opt.as_ref().is_some_and(|p| p.deleted);
             let mut record = IndexRecord {
                 path: clean,
                 kind: disk_meta.kind,
@@ -800,10 +833,17 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                 conflict_dismissed,
             };
             record.conflict_of = derive_conflict_of(&record, &meta);
-            meta.record_seq_fingerprint(seq, record.head_fingerprint());
+            let chain = meta.advance_chain_fingerprint(seq, record.head_fingerprint());
+            if was_deleted {
+                let encoded = encode_deletion_log_entries(&[FolderDeletionLogEntry::Revived {
+                    path: record.path.clone(),
+                }])?;
+                fs.append_deletion_log(&encoded)?;
+            }
             let batch = StoreBatch {
                 folder_meta: Some(meta),
                 upsert_records: vec![record.clone()],
+                upsert_seq_fingerprints: vec![(seq, chain)],
                 ..StoreBatch::default()
             };
             store.apply_batch(batch)?;
@@ -823,6 +863,21 @@ fn handle_new_disk_entry<F: SyncFs>(
     changes: &mut Vec<PendingChange>,
     report: &mut ScanReport,
 ) -> Result<bool> {
+    if entry.meta.kind == EntryKind::Symlink
+        && let Err(reason) = check_symlink_target_contained(
+            &entry.path,
+            entry.meta.link_target.as_deref().unwrap_or_default(),
+        )
+    {
+        report.held_back_problems.push(SyncProblem {
+            path: entry.path.clone(),
+            kind: ProblemKind::UnsupportedSymlink,
+            peer: None,
+            sentence: format!("'{}' was held back because {reason}.", entry.path),
+        });
+        return Ok(true);
+    }
+
     let hash = match entry.meta.kind {
         EntryKind::File => {
             match check_and_hash_file(
@@ -867,6 +922,20 @@ fn handle_existing_disk_entry<F: SyncFs>(
     changes: &mut Vec<PendingChange>,
     report: &mut ScanReport,
 ) -> Result<bool> {
+    if entry.meta.kind == EntryKind::Symlink
+        && let Err(reason) = check_symlink_target_contained(
+            &entry.path,
+            entry.meta.link_target.as_deref().unwrap_or_default(),
+        )
+    {
+        report.held_back_problems.push(SyncProblem {
+            path: entry.path.clone(),
+            kind: ProblemKind::UnsupportedSymlink,
+            peer: None,
+            sentence: format!("'{}' was held back because {reason}.", entry.path),
+        });
+        return Ok(true);
+    }
     // Item H: a directory that was deleted elsewhere and intentionally kept on disk only because
     // it still contains ignored or held-back files must NOT be revived as a new directory on scan.
     if rec.deleted

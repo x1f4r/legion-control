@@ -16,19 +16,20 @@ use crate::apply::{
 use crate::error::{Result, SyncError};
 use crate::model::{
     BinEntry, ConflictChoice, ConflictInfo, DeferredItem, DeletionBrakeConfig,
-    DeletionBrakeDecision, FetchOptions, FolderConfig, FolderMarker, FolderMeta, FolderStatus,
-    HeldBackRecord, INDEX_SCHEMA_VERSION, IndexRecord, MAX_DEFERRAL_ATTEMPTS,
+    DeletionBrakeDecision, FORCED_ROTATION_COOLDOWN_SECS, FetchOptions, FolderConfig,
+    FolderDeletionLogEntry, FolderDeletionRecord, FolderMarker, FolderMeta, FolderStatus,
+    HandshakeHello, HeldBackRecord, INDEX_SCHEMA_VERSION, IndexRecord, MAX_DEFERRAL_ATTEMPTS,
     MAX_HELD_BACK_ENTRIES, MAX_PAGE_RECORDS, MAX_PEER_PROBLEMS, MemberId, MemberState,
-    MemberStatus, PeerCursor, PeerHandshake, ProblemKind, RecordsPage, RestoreStrategy,
-    SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, random_incarnation_id, validate_member_id,
+    MemberStatus, PeerAckView, PeerCursor, PeerHandshake, ProblemKind, RecordsPage,
+    RestoreStrategy, SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, encode_deletion_log_entries,
+    parse_deletion_log, random_incarnation_id, validate_member_id,
 };
 use crate::path::{
     IgnoreMatcher, is_descendant_of, is_internal_sync_path, path_depth, validate_sync_path,
 };
-use crate::reconcile::{LocalIndexView, ReconcileDecision, derive_conflict_of, reconcile_record};
+use crate::reconcile::{LocalIndexView, ReconcileDecision, reconcile_record};
 use crate::scan::{PendingStabilityTracker, ScanOptions, ScanReport, scan_folder, scan_subtree};
 use crate::traits::{IndexStore, Peer, StoreBatch, SyncFs};
-use crate::version::VersionVector;
 
 /// Default number of records fetched per incremental page during [`SyncEngine::pull_from_peer`].
 pub const DEFAULT_PAGE_LIMIT: usize = 1024;
@@ -54,11 +55,12 @@ pub struct PullReport {
     pub kept: usize,
     /// Records ignored by fixed or per-folder ignore rules.
     pub ignored: usize,
-    /// Records held back as platform problems or unreadable subtrees.
+    /// Records held back as platform problems, unknown members, or unreadable subtrees.
     pub held_back: usize,
     /// Records deferred (with bounded retry counts).
     pub deferred: usize,
-    /// Malformed or unauthorized records from this peer that were skipped and reported.
+    /// Malformed or unauthorized records from this peer that were refused (not acknowledged) and
+    /// reported durably.
     pub invalid_skipped: usize,
     /// Local rename optimizations performed without downloading file bytes.
     pub local_renames: usize,
@@ -78,17 +80,15 @@ pub struct SyncEngine<F: SyncFs, S: IndexStore> {
     stability: PendingStabilityTracker,
     unreachable_peers: BTreeSet<MemberId>,
     active_progress: BTreeMap<MemberId, SyncProgress>,
-    scan_problems: Vec<SyncProblem>,
     skipped_paths: BTreeSet<String>,
     folder_problem: Option<SyncProblem>,
-    peer_problems: BTreeMap<MemberId, Vec<SyncProblem>>,
-    dir_kept_problems: BTreeMap<String, SyncProblem>,
-    deferred_items: BTreeMap<(MemberId, String), DeferredItem>,
+    last_now: Timestamp,
 }
 
 impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     /// Opens or initializes a sync engine for `config`, checking schema version, nesting rules,
-    /// and folder identity marker, and running crash recovery when the folder is valid.
+    /// and folder identity marker, running crash recovery, and retrying any locally resolvable
+    /// unapplied records.
     pub fn open(config: FolderConfig, fs: F, mut store: S) -> Result<Self> {
         config.validate()?;
         let found_schema = store.schema_version()?;
@@ -129,6 +129,13 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     ..StoreBatch::default()
                 };
                 store.apply_batch(batch)?;
+
+                // Item 6(b): when the folder marker already existed (index wiped while folder kept),
+                // read `.legion-sync/deletions.log` and re-issue active tombstones for absent paths
+                // so deleted files are never resurrected and peers still holding them delete them.
+                if existing_marker.is_some() {
+                    reissue_deletion_log_tombstones(&fs, &mut store)?;
+                }
             }
             Some(existing) => {
                 if existing.folder_id != config.id {
@@ -186,9 +193,9 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                             });
                             needs_recover = false;
                         } else if marker.incarnation != existing.incarnation {
-                            // Item C: marker and index disagree on incarnation -> rotate to a new
-                            // incarnation and reconcile disk by Rule D instead of reusing counters
-                            // or inventing deletions!
+                            // Item C + Item 6(a)/(b): marker and index disagree on incarnation ->
+                            // rotate to a fresh incarnation, carry all pending tombstones and
+                            // `.legion-sync/deletions.log`, and reconcile disk by Rule D!
                             fs.ensure_internal_dirs()?;
                             rotate_incarnation_on_marker_mismatch(
                                 &fs,
@@ -204,6 +211,15 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             }
         }
 
+        let skipped_paths: BTreeSet<String> = store
+            .list_problems()?
+            .into_iter()
+            .filter_map(|(_, prob)| {
+                (prob.kind == ProblemKind::FilesystemError && prob.peer.is_none())
+                    .then_some(prob.path)
+            })
+            .collect();
+
         let mut engine = Self {
             fs,
             store,
@@ -213,15 +229,16 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             stability: PendingStabilityTracker::new(),
             unreachable_peers: BTreeSet::new(),
             active_progress: BTreeMap::new(),
-            scan_problems: Vec::new(),
-            skipped_paths: BTreeSet::new(),
+            skipped_paths,
             folder_problem,
-            peer_problems: BTreeMap::new(),
-            dir_kept_problems: BTreeMap::new(),
-            deferred_items: BTreeMap::new(),
+            last_now: Timestamp::from_system_time(std::time::SystemTime::now()),
         };
         if needs_recover {
             engine.recover()?;
+            if engine.store.held_back_count()? > 0 {
+                let now = engine.last_now;
+                let _ = engine.retry_held_back_local(now);
+            }
         }
         Ok(engine)
     }
@@ -333,10 +350,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         self.unreachable_peers.remove(peer);
     }
 
-    /// Adds a member to this folder's member list.
-    ///
-    /// If the member was previously removed (re-added) or the folder already contains indexed
-    /// records, the member is flagged in `rejoining_peers` so Rule D applies on its first sync.
+    /// Adds a member to this folder's member list and immediately retries locally resolvable
+    /// unapplied records that were waiting for this member to become known.
     pub fn add_member(&mut self, member: impl Into<MemberId>) -> Result<()> {
         let member = member.into();
         validate_member_id(&member)?;
@@ -350,13 +365,24 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             if was_former && member != meta.local_member {
                 meta.rejoining_peers.insert(member.clone());
             }
+            let remove_problems: Vec<String> = self
+                .store
+                .list_problems()?
+                .into_iter()
+                .filter(|(_, p)| p.peer.as_deref() == Some(member.as_str()))
+                .map(|(k, _)| k)
+                .collect();
             let batch = StoreBatch {
                 folder_meta: Some(meta),
                 remove_peer_cursors: vec![member.clone()],
+                remove_problems,
                 ..StoreBatch::default()
             };
             self.store.apply_batch(batch)?;
-            self.peer_problems.remove(&member);
+        }
+        if self.store.held_back_count()? > 0 {
+            let now = self.last_now;
+            let _ = self.retry_held_back_local(now);
         }
         Ok(())
     }
@@ -371,19 +397,63 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
         meta.former_members.insert(member.to_string());
         meta.rejoining_peers.remove(member);
+        meta.last_forced_rotation_by_peer.remove(member);
         self.unreachable_peers.remove(member);
         self.active_progress.remove(member);
-        self.peer_problems.remove(member);
-        self.deferred_items.retain(|(p, _), _| p != member);
+
+        let remove_held_back: Vec<(MemberId, String)> = self
+            .store
+            .list_held_back()?
+            .into_iter()
+            .filter(|h| h.from_peer == member)
+            .map(|h| (h.from_peer, h.record.path))
+            .collect();
+        let remove_deferrals: Vec<(MemberId, String)> = self
+            .store
+            .list_deferrals()?
+            .into_iter()
+            .filter(|d| d.peer == member)
+            .map(|d| (d.peer, d.path))
+            .collect();
+        let remove_problems: Vec<String> = self
+            .store
+            .list_problems()?
+            .into_iter()
+            .filter(|(_, p)| p.peer.as_deref() == Some(member))
+            .map(|(k, _)| k)
+            .collect();
 
         let batch = StoreBatch {
             folder_meta: Some(meta),
             remove_peer_cursors: vec![member.to_string()],
+            remove_held_back,
+            remove_deferrals,
+            remove_problems,
             ..StoreBatch::default()
         };
         self.store.apply_batch(batch)?;
 
         self.gc_tombstones()
+    }
+
+    /// Dismisses durable informational problems matching `kind` (and optional `peer`), returning
+    /// the number of dismissed entries.
+    pub fn dismiss_problem(&mut self, kind: ProblemKind, peer: Option<&str>) -> Result<usize> {
+        let keys: Vec<String> = self
+            .store
+            .list_problems()?
+            .into_iter()
+            .filter(|(_, p)| p.kind == kind && (peer.is_none() || p.peer.as_deref() == peer))
+            .map(|(k, _)| k)
+            .collect();
+        let count = keys.len();
+        if count > 0 {
+            self.store.apply_batch(StoreBatch {
+                remove_problems: keys,
+                ..StoreBatch::default()
+            })?;
+        }
+        Ok(count)
     }
 
     /// Scans the local folder using default [`ScanOptions`].
@@ -397,6 +467,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         now: Timestamp,
         options: ScanOptions,
     ) -> Result<ScanReport> {
+        self.last_now = now;
         self.verify_folder_marker()?;
         let report = scan_folder(
             &self.fs,
@@ -412,24 +483,41 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             .iter()
             .map(|(p, _)| p.clone())
             .collect();
-        self.scan_problems = report
-            .skipped_errors
-            .iter()
-            .map(|(path, reason)| SyncProblem {
-                path: path.clone(),
-                kind: ProblemKind::FilesystemError,
-                peer: None,
-                sentence: format!("'{path}' could not be read: {reason}."),
-            })
-            .collect();
-        // Clean up any DirectoryKeptLocalFiles notices for paths that no longer exist on disk.
-        let mut still_kept = BTreeMap::new();
-        for (path, prob) in std::mem::take(&mut self.dir_kept_problems) {
-            if self.fs.stat_live(&path).ok().flatten().is_some() {
-                still_kept.insert(path, prob);
+
+        // Synchronize durable scan and dir_kept problems in one batch.
+        let existing_problems = self.store.list_problems()?;
+        let mut remove_problems = Vec::new();
+        for (key, prob) in existing_problems {
+            if key.starts_with(SCAN_PROBLEM_PREFIX) {
+                remove_problems.push(key);
+            } else if key.starts_with(DIR_KEPT_PROBLEM_PREFIX)
+                && self.fs.stat_live(&prob.path).ok().flatten().is_none()
+            {
+                remove_problems.push(key);
             }
         }
-        self.dir_kept_problems = still_kept;
+        let mut upsert_problems = Vec::new();
+        for (path, reason) in &report.skipped_errors {
+            upsert_problems.push((
+                scan_problem_key(ProblemKind::FilesystemError, path),
+                SyncProblem {
+                    path: path.clone(),
+                    kind: ProblemKind::FilesystemError,
+                    peer: None,
+                    sentence: format!("'{path}' could not be read: {reason}."),
+                },
+            ));
+        }
+        for prob in &report.held_back_problems {
+            upsert_problems.push((scan_problem_key(prob.kind, &prob.path), prob.clone()));
+        }
+        if !remove_problems.is_empty() || !upsert_problems.is_empty() {
+            self.store.apply_batch(StoreBatch {
+                remove_problems,
+                upsert_problems,
+                ..StoreBatch::default()
+            })?;
+        }
         Ok(report)
     }
 
@@ -441,6 +529,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         now: Timestamp,
         options: ScanOptions,
     ) -> Result<ScanReport> {
+        self.last_now = now;
         self.verify_folder_marker()?;
         let clean_root = validate_sync_path(rel_root)?;
         let report = scan_subtree(
@@ -455,16 +544,37 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         )?;
         self.skipped_paths
             .retain(|p| p != &clean_root && !is_descendant_of(p, &clean_root));
-        self.scan_problems
-            .retain(|p| p.path != clean_root && !is_descendant_of(&p.path, &clean_root));
+
+        let mut remove_problems = Vec::new();
+        for (key, prob) in self.store.list_problems()? {
+            if key.starts_with(SCAN_PROBLEM_PREFIX)
+                && (prob.path == clean_root || is_descendant_of(&prob.path, &clean_root))
+            {
+                remove_problems.push(key);
+            }
+        }
+        let mut upsert_problems = Vec::new();
         for (path, reason) in &report.skipped_errors {
             self.skipped_paths.insert(path.clone());
-            self.scan_problems.push(SyncProblem {
-                path: path.clone(),
-                kind: ProblemKind::FilesystemError,
-                peer: None,
-                sentence: format!("'{path}' could not be read: {reason}."),
-            });
+            upsert_problems.push((
+                scan_problem_key(ProblemKind::FilesystemError, path),
+                SyncProblem {
+                    path: path.clone(),
+                    kind: ProblemKind::FilesystemError,
+                    peer: None,
+                    sentence: format!("'{path}' could not be read: {reason}."),
+                },
+            ));
+        }
+        for prob in &report.held_back_problems {
+            upsert_problems.push((scan_problem_key(prob.kind, &prob.path), prob.clone()));
+        }
+        if !remove_problems.is_empty() || !upsert_problems.is_empty() {
+            self.store.apply_batch(StoreBatch {
+                remove_problems,
+                upsert_problems,
+                ..StoreBatch::default()
+            })?;
         }
         Ok(report)
     }
@@ -494,6 +604,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         fetch_opts: &FetchOptions,
         now: Timestamp,
     ) -> Result<PullReport> {
+        self.last_now = now;
         let meta = self.verify_folder_marker()?;
         if meta.paused {
             return Err(SyncError::Paused {
@@ -512,11 +623,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
 
         // Refuse syncing with a peer permanently flagged for alternating incarnations.
-        // One-time same-seq divergences are checked against `hs.incarnation` in
-        // `observe_peer_incarnation` below so a rolled-back machine that rotates to a fresh
-        // incarnation can recover while a live clone returning on an old incarnation trips
-        // `alternation_detected` permanently.
-        let initial_cursors = self.store.load_peer_cursors()?;
+        let mut initial_cursors = self.store.load_peer_cursors()?;
         if let Some(existing_cursor) = initial_cursors.get(&peer_id)
             && existing_cursor.alternation_detected
         {
@@ -526,50 +633,69 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             });
         }
 
-        // Handshake first: check folder ID, member ID, protocol version, and incarnation.
-        let hs = match peer.handshake() {
-            Ok(hs) => {
-                self.unreachable_peers.remove(&peer_id);
-                hs
+        // Bidirectional handshake FIRST (before any page moves in either direction!).
+        let mut meta = meta;
+        let mut hs = self.do_handshake(peer, &peer_id, &meta, initial_cursors.get(&peer_id))?;
+
+        let existing_for_peer = initial_cursors.get(&peer_id).cloned();
+        let peer_regressed_below_ack = existing_for_peer.as_ref().is_some_and(|c| {
+            c.incarnation == hs.incarnation
+                && c.acked_local_incarnation == meta.incarnation
+                && c.acked_local_seq > 0
+                && (match hs.caller_acked {
+                    Some(v) if v.incarnation == meta.incarnation => v.seq < c.acked_local_seq,
+                    None => true,
+                    _ => false,
+                } || match hs.caller_pulled {
+                    Some(v) if v.incarnation == meta.incarnation => v.seq < c.acked_local_seq,
+                    None => true,
+                    _ => false,
+                })
+        });
+
+        // Item 5: check the peer's statement about US before any page moves!
+        let mut own_rolled_back = hs.caller_regressed;
+        if !own_rolled_back
+            && !peer_regressed_below_ack
+            && let Some(view) = hs.caller_pulled
+            && !view_matches_local(&self.store, &meta, &view)?
+        {
+            own_rolled_back = true;
+        }
+        if !own_rolled_back
+            && !peer_regressed_below_ack
+            && let Some(view) = hs.caller_acked
+            && !view_matches_local(&self.store, &meta, &view)?
+        {
+            own_rolled_back = true;
+        }
+        if own_rolled_back {
+            self.recover_own_rollback(&peer_id, &meta, now)?;
+            meta = self.meta()?;
+            initial_cursors = self.store.load_peer_cursors()?;
+            hs = self.do_handshake(peer, &peer_id, &meta, initial_cursors.get(&peer_id))?;
+        }
+
+        // Item 5: check if the PEER went back in time BEFORE any page moves!
+        if let Some(existing_cursor) = initial_cursors.get(&peer_id)
+            && existing_cursor.incarnation == hs.incarnation
+            && (existing_cursor.seq > 0 || peer_regressed_below_ack)
+        {
+            let peer_went_back = peer_regressed_below_ack
+                || hs.snapshot_seq < existing_cursor.seq
+                || hs.caller_pull_matches == Some(false)
+                || (existing_cursor.seq > 0
+                    && hs.snapshot_seq == existing_cursor.seq
+                    && hs.head_fingerprint.is_some()
+                    && existing_cursor.head_fingerprint.is_some()
+                    && hs.head_fingerprint != existing_cursor.head_fingerprint);
+            if peer_went_back {
+                self.flag_duplicate_member(&peer_id, existing_cursor.clone(), false)?;
+                return Err(SyncError::Conflict {
+                    path: peer_id.clone(),
+                    reason: duplicate_member_sentence(&peer_id),
+                });
             }
-            Err(SyncError::PeerUnavailable { member, detail }) => {
-                self.unreachable_peers.insert(peer_id.clone());
-                return Err(SyncError::PeerUnavailable { member, detail });
-            }
-            Err(err) => return Err(err),
-        };
-        if hs.folder_id != meta.folder_id {
-            return Err(SyncError::InvalidConfig {
-                message: format!(
-                    "peer {peer_id:?} serves folder {:?}, expected {:?}",
-                    hs.folder_id, meta.folder_id
-                ),
-                hint: Some("Check the sync folder configuration on both machines.".to_string()),
-            });
-        }
-        if hs.member_id != peer_id {
-            return Err(SyncError::Denied {
-                member: peer_id,
-                reason: format!(
-                    "peer handshake claimed member {:?}, does not match expected peer",
-                    hs.member_id
-                ),
-            });
-        }
-        if hs.incarnation == 0 {
-            return Err(SyncError::CorruptData {
-                context: format!("handshake from {peer_id}"),
-                detail: "peer presented zero incarnation id".to_string(),
-            });
-        }
-        if hs.protocol_version == 0 || hs.protocol_version > SYNC_PROTOCOL_VERSION {
-            return Err(SyncError::Unsupported {
-                reason: format!(
-                    "peer {peer_id:?} speaks protocol version {}, supported up to {SYNC_PROTOCOL_VERSION}",
-                    hs.protocol_version
-                ),
-                hint: Some("Upgrade Legion on both machines to compatible versions.".to_string()),
-            });
         }
 
         let meta = if meta.join_mode {
@@ -582,8 +708,38 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             meta
         };
 
-        let mut cached_cursor =
-            Some(self.observe_peer_incarnation_with(&peer_id, hs.incarnation, initial_cursors)?);
+        let mut observed_cursor =
+            self.observe_peer_incarnation_with(&peer_id, hs.incarnation, initial_cursors)?;
+        let mut hs_ack_advanced = false;
+        if let Some(acked_view) = hs.caller_acked
+            && acked_view.incarnation == meta.incarnation
+            && acked_view.seq <= meta.local_seq
+            && view_matches_local(&self.store, &meta, &acked_view)?
+        {
+            let prev_acked = (
+                observed_cursor.acked_local_incarnation,
+                observed_cursor.acked_local_seq,
+            );
+            if observed_cursor.acked_local_incarnation != acked_view.incarnation {
+                observed_cursor.acked_local_incarnation = acked_view.incarnation;
+                observed_cursor.acked_local_seq = acked_view.seq;
+            } else {
+                observed_cursor.acked_local_seq =
+                    observed_cursor.acked_local_seq.max(acked_view.seq);
+            }
+            hs_ack_advanced = (
+                observed_cursor.acked_local_incarnation,
+                observed_cursor.acked_local_seq,
+            ) != prev_acked;
+            if hs_ack_advanced {
+                self.store.apply_batch(StoreBatch {
+                    set_peer_cursors: BTreeMap::from([(peer_id.clone(), observed_cursor.clone())]),
+                    ..StoreBatch::default()
+                })?;
+            }
+        }
+
+        let mut cached_cursor = Some(observed_cursor);
         let mut cached_meta: Option<FolderMeta> = if cached_cursor
             .as_ref()
             .is_some_and(|c| c.seq == 0 && meta.rejoining_peers.is_empty())
@@ -647,7 +803,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                             "Peer '{peer_id}' sent a page with an invalid zero incarnation id."
                         ),
                     },
-                );
+                )?;
                 break;
             }
 
@@ -663,18 +819,36 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                             page.records.len()
                         ),
                     },
-                );
+                )?;
                 break;
             }
 
-            // Item C: detect OUR OWN rollback/clone from the peer's direct acknowledgement!
+            // Re-check OUR OWN rollback from the page's direct acknowledgement too.
             let local_meta = match cached_meta.take() {
                 Some(m) => m,
                 None => self.meta()?,
             };
-            if self.detect_and_recover_own_rollback_with(&page, &local_meta)? {
-                // We rotated to a brand-new incarnation and reset peer cursors; loop again from 0!
-                continue;
+            if let Some((acked_inc, acked_seq)) = page.caller_acked {
+                let peer_regressed = cursor.incarnation == page.incarnation
+                    && cursor.acked_local_incarnation == local_meta.incarnation
+                    && acked_inc == local_meta.incarnation
+                    && acked_seq < cursor.acked_local_seq;
+                if peer_regressed {
+                    self.flag_duplicate_member(&peer_id, cursor, false)?;
+                    return Err(SyncError::Conflict {
+                        path: peer_id.clone(),
+                        reason: duplicate_member_sentence(&peer_id),
+                    });
+                }
+                let page_view = PeerAckView {
+                    incarnation: acked_inc,
+                    seq: acked_seq,
+                    fingerprint: page.caller_acked_fingerprint,
+                };
+                if !view_matches_local(&self.store, &local_meta, &page_view)? {
+                    self.recover_own_rollback(&peer_id, &local_meta, now)?;
+                    continue;
+                }
             }
 
             // Check if peer changed incarnation between handshake and page (or alternated!).
@@ -682,12 +856,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 cursor = self.observe_peer_incarnation(&peer_id, page.incarnation)?;
             }
 
-            // Item C: detect peer rollback or same-seq clone within the SAME incarnation.
+            // Detect peer rollback or same-seq divergence within the SAME incarnation.
             if page.incarnation == cursor.incarnation {
                 if page.snapshot_seq < cursor.seq {
-                    // Peer rolled back and has not yet rotated its incarnation; refuse to lower
-                    // our cursor and wait for it to pull from us and rotate.
-                    break;
+                    self.flag_duplicate_member(&peer_id, cursor, false)?;
+                    return Err(SyncError::Conflict {
+                        path: peer_id.clone(),
+                        reason: duplicate_member_sentence(&peer_id),
+                    });
                 }
                 if page.snapshot_seq == cursor.seq
                     && cursor.seq > 0
@@ -703,7 +879,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 }
             }
 
-            // Item E: update direct acknowledgement of OUR OWN current incarnation ONLY.
+            // Update direct acknowledgement of OUR OWN current incarnation ONLY.
             let mut ack_advanced = false;
             if let Some((acked_inc, acked_seq)) = page.caller_acked
                 && acked_inc == local_meta.incarnation
@@ -726,28 +902,28 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 cursor.incarnation = page.incarnation;
                 if page.snapshot_seq >= cursor.seq {
                     cursor.seq = page.snapshot_seq;
-                    if page.head_fingerprint.is_some() {
+                    if let Some(&fp) = page.chain_fingerprints.get(&cursor.seq) {
+                        cursor.head_fingerprint = Some(fp);
+                    } else if page.head_fingerprint.is_some() {
                         cursor.head_fingerprint = page.head_fingerprint;
                     }
                 }
+                let held_now = self.store.list_held_back()?;
+                let defs_now = self.store.list_deferrals()?;
+                recompute_peer_applied_ack(&peer_id, &mut cursor, &held_now, &defs_now);
                 let clear_rejoin = !page.has_more && local_meta.rejoining_peers.contains(&peer_id);
                 if cursor != cursor_before_page || clear_rejoin {
                     self.persist_peer_cursor_and_clear_rejoin(&peer_id, cursor, clear_rejoin)?;
                 }
                 self.active_progress.remove(&peer_id);
-                if ack_advanced {
+                if ack_advanced || hs_ack_advanced {
                     report.tombstones_gc += self.gc_tombstones()?;
                 }
                 break;
             }
 
-            // Record per-seq fingerprints from this page so partial cursor advances preserve an
-            // accurate head_fingerprint.
-            let mut seq_fingerprints: HashMap<u64, Hash> =
-                HashMap::with_capacity(page.records.len());
-            for r in &page.records {
-                seq_fingerprints.insert(r.seq, r.head_fingerprint());
-            }
+            let page_incarnation = page.incarnation;
+            let chain_fps = page.chain_fingerprints;
 
             let mut remaining_files = page.records.len() as u64;
             let mut remaining_bytes: u64 = page
@@ -777,62 +953,88 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     .then_with(|| a.seq.cmp(&b.seq)),
             });
 
-            // Item K: detect local rename pairs (delete + create with identical content hash
-            // already present locally) BEFORE executing individual deletes/fetches!
+            // Detect local rename pairs (delete + create with identical content hash already
+            // present locally) BEFORE executing individual deletes/fetches!
             let (rename_pairs, remaining_after_renames) =
                 self.extract_local_rename_pairs(&peer_id, ordered)?;
 
             let mut seq_results: BTreeMap<u64, bool> = BTreeMap::new();
-            let mut page_held_back: BTreeMap<String, HeldBackRecord> = BTreeMap::new();
-            let mut known_held_paths: BTreeSet<String> = if self.store.held_back_count()? > 0 {
-                self.store
-                    .list_held_back()?
-                    .into_iter()
-                    .map(|h| h.record.path)
-                    .collect()
-            } else {
-                BTreeSet::new()
-            };
+            let mut page_held_back: BTreeMap<(MemberId, String), HeldBackRecord> = BTreeMap::new();
+            let mut existing_held_by_key: BTreeMap<(MemberId, String), HeldBackRecord> =
+                if self.store.held_back_count()? > 0 {
+                    self.store
+                        .list_held_back()?
+                        .into_iter()
+                        .map(|h| ((h.from_peer.clone(), h.record.path.clone()), h))
+                        .collect()
+                } else {
+                    BTreeMap::new()
+                };
+            let mut known_held_keys: BTreeSet<(MemberId, String)> =
+                existing_held_by_key.keys().cloned().collect();
             let mut any_deferred = false;
+            let mut held_back_full = false;
             let mut deferred_files = 0u64;
             let mut deferred_bytes = 0u64;
 
             for (del_raw, del_tomb, add_raw, add_target) in rename_pairs {
                 let del_seq = del_raw.seq;
                 let add_seq = add_raw.seq;
-                match apply_local_rename(&self.fs, &mut self.store, del_tomb, add_target, now)? {
+                match apply_local_rename(
+                    &self.fs,
+                    &mut self.store,
+                    &peer_id,
+                    del_tomb,
+                    add_target,
+                    now,
+                )? {
                     ApplyOutcome::Applied => {
                         seq_results.insert(del_seq, true);
                         seq_results.insert(add_seq, true);
                         report.applied += 2;
                         report.local_renames += 1;
-                        self.clear_deferred(&peer_id, &del_raw.path);
-                        self.clear_deferred(&peer_id, &add_raw.path);
+                        self.clear_deferred(&peer_id, &del_raw.path)?;
+                        self.clear_deferred(&peer_id, &add_raw.path)?;
                     }
                     ApplyOutcome::LocalChangedRetry | ApplyOutcome::Deferred { .. } => {
                         let ok1 = self.process_one_remote(
                             peer,
                             &del_raw,
+                            page_incarnation,
+                            prev_chain_fp_for(del_seq, &chain_fps, &cursor),
                             fetch_opts,
                             now,
                             &mut report,
                             &mut page_held_back,
-                            &mut known_held_paths,
+                            &mut existing_held_by_key,
+                            &mut known_held_keys,
+                            &mut held_back_full,
                         )?;
                         seq_results.insert(del_seq, ok1);
+                        if held_back_full {
+                            any_deferred = true;
+                            break;
+                        }
                         let ok2 = self.process_one_remote(
                             peer,
                             &add_raw,
+                            page_incarnation,
+                            prev_chain_fp_for(add_seq, &chain_fps, &cursor),
                             fetch_opts,
                             now,
                             &mut report,
                             &mut page_held_back,
-                            &mut known_held_paths,
+                            &mut existing_held_by_key,
+                            &mut known_held_keys,
+                            &mut held_back_full,
                         )?;
                         seq_results.insert(add_seq, ok2);
                         if !ok1 || !ok2 {
                             any_deferred = true;
                             deferred_files += u64::from(!ok1) + u64::from(!ok2);
+                        }
+                        if held_back_full {
+                            break;
                         }
                     }
                     ApplyOutcome::DirKeptLocalFiles(_) => {
@@ -844,9 +1046,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             }
 
             // Split remaining records into Phase 1 (deletions, deepest-first), Phase 2 (live
-            // directories, shallowest-first, so every peer-authored directory receives the peer's
-            // exact version vector before child files run), and remaining live non-directory
-            // records.
+            // directories, shallowest-first), and remaining live non-directory records.
             let mut delete_records = Vec::new();
             let mut live_dir_records = Vec::new();
             let mut live_non_dir_records = Vec::new();
@@ -861,71 +1061,89 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             }
 
             // Phase 1: apply deletions first.
-            for remote in delete_records {
-                if cancel_ref.is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    return Err(SyncError::Cancelled {
-                        operation: format!("pull from {peer_id}"),
-                    });
+            if !held_back_full {
+                for remote in delete_records {
+                    if cancel_ref.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                        return Err(SyncError::Cancelled {
+                            operation: format!("pull from {peer_id}"),
+                        });
+                    }
+                    let remote_seq = remote.seq;
+                    let completed = self.process_one_remote(
+                        peer,
+                        &remote,
+                        page_incarnation,
+                        prev_chain_fp_for(remote_seq, &chain_fps, &cursor),
+                        fetch_opts,
+                        now,
+                        &mut report,
+                        &mut page_held_back,
+                        &mut existing_held_by_key,
+                        &mut known_held_keys,
+                        &mut held_back_full,
+                    )?;
+                    seq_results.insert(remote_seq, completed);
+                    if !completed {
+                        any_deferred = true;
+                        deferred_files += 1;
+                    }
+                    remaining_files = remaining_files.saturating_sub(1);
+                    self.update_progress(
+                        &peer_id,
+                        remaining_files + deferred_files,
+                        remaining_bytes + deferred_bytes,
+                    );
+                    if held_back_full {
+                        break;
+                    }
                 }
-                let remote_seq = remote.seq;
-                let completed = self.process_one_remote(
-                    peer,
-                    &remote,
-                    fetch_opts,
-                    now,
-                    &mut report,
-                    &mut page_held_back,
-                    &mut known_held_paths,
-                )?;
-                seq_results.insert(remote_seq, completed);
-                if !completed {
-                    any_deferred = true;
-                    deferred_files += 1;
-                }
-                remaining_files = remaining_files.saturating_sub(1);
-                self.update_progress(
-                    &peer_id,
-                    remaining_files + deferred_files,
-                    remaining_bytes + deferred_bytes,
-                );
             }
 
             // Phase 2: apply live directory records shallowest-first before child files.
-            for remote in live_dir_records {
-                if cancel_ref.is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    return Err(SyncError::Cancelled {
-                        operation: format!("pull from {peer_id}"),
-                    });
+            if !held_back_full {
+                for remote in live_dir_records {
+                    if cancel_ref.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                        return Err(SyncError::Cancelled {
+                            operation: format!("pull from {peer_id}"),
+                        });
+                    }
+                    let remote_seq = remote.seq;
+                    let completed = self.process_one_remote(
+                        peer,
+                        &remote,
+                        page_incarnation,
+                        prev_chain_fp_for(remote_seq, &chain_fps, &cursor),
+                        fetch_opts,
+                        now,
+                        &mut report,
+                        &mut page_held_back,
+                        &mut existing_held_by_key,
+                        &mut known_held_keys,
+                        &mut held_back_full,
+                    )?;
+                    seq_results.insert(remote_seq, completed);
+                    if !completed {
+                        any_deferred = true;
+                        deferred_files += 1;
+                    }
+                    remaining_files = remaining_files.saturating_sub(1);
+                    self.update_progress(
+                        &peer_id,
+                        remaining_files + deferred_files,
+                        remaining_bytes + deferred_bytes,
+                    );
+                    if held_back_full {
+                        break;
+                    }
                 }
-                let remote_seq = remote.seq;
-                let completed = self.process_one_remote(
-                    peer,
-                    &remote,
-                    fetch_opts,
-                    now,
-                    &mut report,
-                    &mut page_held_back,
-                    &mut known_held_paths,
-                )?;
-                seq_results.insert(remote_seq, completed);
-                if !completed {
-                    any_deferred = true;
-                    deferred_files += 1;
-                }
-                remaining_files = remaining_files.saturating_sub(1);
-                self.update_progress(
-                    &peer_id,
-                    remaining_files + deferred_files,
-                    remaining_bytes + deferred_bytes,
-                );
             }
 
-            // Phase 3: partition clean brand-new regular files (tracking full path + ancestor
-            // equivalence keys so no two colliding names enter the same batch) and commit them in
-            // ONE group-commit transaction BEFORE Phase 4 processes any remaining live records.
+            // Phase 3: partition clean brand-new regular files and commit in ONE group-commit
+            // transaction BEFORE Phase 4 processes any remaining live records.
             let mut batch_new_files: Vec<IndexRecord> = Vec::new();
+            let mut batch_raw_by_seq: HashMap<u64, IndexRecord> = HashMap::new();
             let mut other_live_records: Vec<IndexRecord> = Vec::new();
-            {
+            if !held_back_full {
                 let cur_meta = self.meta()?;
                 let caps = self.fs.capabilities();
                 let view = StoreIndexView::new(&self.store);
@@ -969,6 +1187,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                                 && self.fs.stat_live(&record.path)?.is_none()
                             {
                                 record.seq = remote.seq;
+                                batch_raw_by_seq.insert(remote.seq, remote.for_wire());
                                 seen_batch_paths.insert(record.path.clone());
                                 seen_batch_equiv.insert(leaf_equiv);
                                 for (anc_exact, anc_k) in anc_keys {
@@ -984,7 +1203,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 }
             }
 
-            if !batch_new_files.is_empty() {
+            if !held_back_full && !batch_new_files.is_empty() {
                 let batch_len = batch_new_files.len() as u64;
                 let batch_bytes: u64 = batch_new_files.iter().map(|r| r.size).sum();
                 let batch_res = apply_new_files_group_commit(
@@ -998,30 +1217,60 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 for seq in batch_res.applied_seqs {
                     seq_results.insert(seq, true);
                     report.applied += 1;
-                }
-                for (seq, path, reason) in batch_res.deferred {
-                    let completed = self.record_deferral(&peer_id, &path, reason, &mut report)?;
-                    seq_results.insert(seq, completed);
-                    if !completed {
-                        any_deferred = true;
-                        deferred_files += 1;
+                    if let Some(raw) = batch_raw_by_seq.get(&seq) {
+                        self.clear_deferred(&peer_id, &raw.path)?;
                     }
                 }
-                for fallback in batch_res.fallback_records {
-                    let remote_seq = fallback.seq;
-                    let completed = self.process_one_remote(
-                        peer,
-                        &fallback,
-                        fetch_opts,
-                        now,
-                        &mut report,
-                        &mut page_held_back,
-                        &mut known_held_paths,
-                    )?;
-                    seq_results.insert(remote_seq, completed);
-                    if !completed {
+                for (seq, path, reason) in batch_res.deferred {
+                    if let Some(raw) = batch_raw_by_seq.get(&seq) {
+                        let completed = self.record_deferral(
+                            &peer_id,
+                            raw,
+                            page_incarnation,
+                            prev_chain_fp_for(seq, &chain_fps, &cursor),
+                            reason,
+                            &mut report,
+                            &mut page_held_back,
+                            &mut existing_held_by_key,
+                            &mut known_held_keys,
+                            &mut held_back_full,
+                        )?;
+                        seq_results.insert(seq, completed);
+                        if !completed {
+                            any_deferred = true;
+                            deferred_files += 1;
+                        }
+                    } else {
+                        seq_results.insert(seq, false);
                         any_deferred = true;
                         deferred_files += 1;
+                        let _ = path;
+                    }
+                }
+                if !held_back_full {
+                    for fallback in batch_res.fallback_records {
+                        let remote_seq = fallback.seq;
+                        let completed = self.process_one_remote(
+                            peer,
+                            &fallback,
+                            page_incarnation,
+                            prev_chain_fp_for(remote_seq, &chain_fps, &cursor),
+                            fetch_opts,
+                            now,
+                            &mut report,
+                            &mut page_held_back,
+                            &mut existing_held_by_key,
+                            &mut known_held_keys,
+                            &mut held_back_full,
+                        )?;
+                        seq_results.insert(remote_seq, completed);
+                        if !completed {
+                            any_deferred = true;
+                            deferred_files += 1;
+                        }
+                        if held_back_full {
+                            break;
+                        }
                     }
                 }
                 remaining_files = remaining_files.saturating_sub(batch_len);
@@ -1033,44 +1282,52 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 );
             }
 
-            // Phase 4: apply remaining live records (symlinks, replacements, conflicts,
-            // and any case-clash candidates now checked against committed Phase 2/3 records).
-            for remote in other_live_records {
-                if cancel_ref.is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    return Err(SyncError::Cancelled {
-                        operation: format!("pull from {peer_id}"),
-                    });
-                }
-                let remote_seq = remote.seq;
-                let remote_bytes = if !remote.deleted && remote.kind == EntryKind::File {
-                    remote.size
-                } else {
-                    0
-                };
+            // Phase 4: apply remaining live records.
+            if !held_back_full {
+                for remote in other_live_records {
+                    if cancel_ref.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                        return Err(SyncError::Cancelled {
+                            operation: format!("pull from {peer_id}"),
+                        });
+                    }
+                    let remote_seq = remote.seq;
+                    let remote_bytes = if !remote.deleted && remote.kind == EntryKind::File {
+                        remote.size
+                    } else {
+                        0
+                    };
 
-                let completed = self.process_one_remote(
-                    peer,
-                    &remote,
-                    fetch_opts,
-                    now,
-                    &mut report,
-                    &mut page_held_back,
-                    &mut known_held_paths,
-                )?;
-                seq_results.insert(remote_seq, completed);
-                if !completed {
-                    any_deferred = true;
-                    deferred_files += 1;
-                    deferred_bytes += remote_bytes;
-                }
+                    let completed = self.process_one_remote(
+                        peer,
+                        &remote,
+                        page_incarnation,
+                        prev_chain_fp_for(remote_seq, &chain_fps, &cursor),
+                        fetch_opts,
+                        now,
+                        &mut report,
+                        &mut page_held_back,
+                        &mut existing_held_by_key,
+                        &mut known_held_keys,
+                        &mut held_back_full,
+                    )?;
+                    seq_results.insert(remote_seq, completed);
+                    if !completed {
+                        any_deferred = true;
+                        deferred_files += 1;
+                        deferred_bytes += remote_bytes;
+                    }
 
-                remaining_files = remaining_files.saturating_sub(1);
-                remaining_bytes = remaining_bytes.saturating_sub(remote_bytes);
-                self.update_progress(
-                    &peer_id,
-                    remaining_files + deferred_files,
-                    remaining_bytes + deferred_bytes,
-                );
+                    remaining_files = remaining_files.saturating_sub(1);
+                    remaining_bytes = remaining_bytes.saturating_sub(remote_bytes);
+                    self.update_progress(
+                        &peer_id,
+                        remaining_files + deferred_files,
+                        remaining_bytes + deferred_bytes,
+                    );
+                    if held_back_full {
+                        break;
+                    }
+                }
             }
 
             // Flush any batched held-back records from this page in ONE transaction!
@@ -1082,9 +1339,9 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 self.store.apply_batch(batch)?;
             }
 
-            // Compute highest contiguous processed `seq`.
+            // Compute highest contiguous pulled `seq`.
             let mut contiguous_seq = since_seq;
-            let mut all_done = true;
+            let mut all_done = !held_back_full;
             for (seq, ok) in &seq_results {
                 if *ok {
                     contiguous_seq = contiguous_seq.max(*seq);
@@ -1094,14 +1351,18 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 }
             }
 
-            cursor.incarnation = page.incarnation;
+            let held_now = self.store.list_held_back()?;
+            let defs_now = self.store.list_deferrals()?;
+
+            cursor.incarnation = page_incarnation;
             if all_done && !page.has_more {
                 cursor.seq = cursor.seq.max(page.snapshot_seq);
-                if page.head_fingerprint.is_some() {
-                    cursor.head_fingerprint = page.head_fingerprint;
-                } else if let Some(&fp) = seq_fingerprints.get(&cursor.seq) {
+                if let Some(&fp) = chain_fps.get(&cursor.seq) {
                     cursor.head_fingerprint = Some(fp);
+                } else if page.head_fingerprint.is_some() {
+                    cursor.head_fingerprint = page.head_fingerprint;
                 }
+                recompute_peer_applied_ack(&peer_id, &mut cursor, &held_now, &defs_now);
                 self.persist_peer_cursor_and_clear_rejoin(&peer_id, cursor, true)?;
                 self.active_progress.remove(&peer_id);
                 report.tombstones_gc += self.gc_tombstones()?;
@@ -1109,13 +1370,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             } else {
                 if contiguous_seq > cursor.seq {
                     cursor.seq = contiguous_seq;
-                    if let Some(&fp) = seq_fingerprints.get(&contiguous_seq) {
+                    if let Some(&fp) = chain_fps.get(&contiguous_seq) {
                         cursor.head_fingerprint = Some(fp);
                     }
                 }
+                recompute_peer_applied_ack(&peer_id, &mut cursor, &held_now, &defs_now);
                 self.persist_peer_cursor_and_clear_rejoin(&peer_id, cursor, false)?;
                 report.tombstones_gc += self.gc_tombstones()?;
-                if any_deferred || !all_done || contiguous_seq == since_seq {
+                if held_back_full || any_deferred || !all_done || contiguous_seq == since_seq {
                     self.update_progress(&peer_id, deferred_files, deferred_bytes);
                     break;
                 }
@@ -1124,6 +1386,85 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
         report.held_back_resolved += self.retry_held_back_for_peer(peer, fetch_opts, now)?;
         Ok(report)
+    }
+
+    fn do_handshake(
+        &mut self,
+        peer: &dyn Peer,
+        peer_id: &str,
+        meta: &FolderMeta,
+        cursor: Option<&PeerCursor>,
+    ) -> Result<PeerHandshake> {
+        let (peer_pulled, peer_acked) = match cursor.filter(|c| c.incarnation != 0) {
+            Some(c) => (
+                Some(PeerAckView {
+                    incarnation: c.incarnation,
+                    seq: c.seq,
+                    fingerprint: c.head_fingerprint,
+                }),
+                Some(PeerAckView {
+                    incarnation: c.incarnation,
+                    seq: c.applied_ack_seq,
+                    fingerprint: c.acked_fingerprint,
+                }),
+            ),
+            None => (None, None),
+        };
+        let hello = HandshakeHello {
+            folder_id: meta.folder_id.clone(),
+            member_id: meta.local_member.clone(),
+            incarnation: meta.incarnation,
+            snapshot_seq: meta.local_seq,
+            head_fingerprint: meta.head_fingerprint,
+            protocol_version: SYNC_PROTOCOL_VERSION,
+            peer_pulled,
+            peer_acked,
+        };
+        let hs = match peer.handshake(&hello) {
+            Ok(hs) => {
+                self.unreachable_peers.remove(peer_id);
+                hs
+            }
+            Err(SyncError::PeerUnavailable { member, detail }) => {
+                self.unreachable_peers.insert(peer_id.to_string());
+                return Err(SyncError::PeerUnavailable { member, detail });
+            }
+            Err(err) => return Err(err),
+        };
+        if hs.folder_id != meta.folder_id {
+            return Err(SyncError::InvalidConfig {
+                message: format!(
+                    "peer {peer_id:?} serves folder {:?}, expected {:?}",
+                    hs.folder_id, meta.folder_id
+                ),
+                hint: Some("Check the sync folder configuration on both machines.".to_string()),
+            });
+        }
+        if hs.member_id != peer_id {
+            return Err(SyncError::Denied {
+                member: peer_id.to_string(),
+                reason: format!(
+                    "peer handshake claimed member {:?}, does not match expected peer",
+                    hs.member_id
+                ),
+            });
+        }
+        if hs.incarnation == 0 {
+            return Err(SyncError::CorruptData {
+                context: format!("handshake from {peer_id}"),
+                detail: "peer presented zero incarnation id".to_string(),
+            });
+        }
+        if hs.protocol_version == 0 || hs.protocol_version > SYNC_PROTOCOL_VERSION {
+            return Err(SyncError::Unsupported {
+                reason: format!(
+                    "peer {peer_id:?} speaks protocol version {}, supported up to {SYNC_PROTOCOL_VERSION}",
+                    hs.protocol_version
+                ),
+                hint: Some("Upgrade Legion on both machines to compatible versions.".to_string()),
+            });
+        }
+        Ok(hs)
     }
 
     /// Pairs delete + create records within one page that share an identical file hash already
@@ -1214,17 +1555,21 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         &mut self,
         peer: &dyn Peer,
         remote: &IndexRecord,
+        peer_incarnation: u64,
+        prev_chain_fp: Option<Hash>,
         fetch_opts: &FetchOptions,
         now: Timestamp,
         report: &mut PullReport,
-        page_held_back: &mut BTreeMap<String, HeldBackRecord>,
-        known_held_paths: &mut BTreeSet<String>,
+        page_held_back: &mut BTreeMap<(MemberId, String), HeldBackRecord>,
+        existing_held_by_key: &mut BTreeMap<(MemberId, String), HeldBackRecord>,
+        known_held_keys: &mut BTreeSet<(MemberId, String)>,
+        held_back_full: &mut bool,
     ) -> Result<bool> {
         let caps = self.fs.capabilities();
         let peer_id = peer.member_id().to_string();
 
-        // Item B1: if this path lies under (or would affect) an unreadable local subtree, hold
-        // it back so that subtree waits while the rest of the folder keeps syncing!
+        // If this path lies under (or would affect) an unreadable local subtree, hold it back
+        // durably without acknowledging past it.
         if let Some(blocked_by) = self.skipped_blocker(&remote.path) {
             let problem = SyncProblem {
                 path: remote.path.clone(),
@@ -1235,13 +1580,21 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     remote.path, blocked_by
                 ),
             };
-            self.queue_held_back_bounded(
+            if !self.queue_held_back_bounded(
                 &peer_id,
                 remote.for_wire(),
+                peer_incarnation,
+                remote.seq,
+                prev_chain_fp,
                 problem,
+                false,
                 page_held_back,
-                known_held_paths,
-            );
+                existing_held_by_key,
+                known_held_keys,
+            )? {
+                *held_back_full = true;
+                return Ok(false);
+            }
             report.held_back += 1;
             return Ok(true);
         }
@@ -1255,46 +1608,112 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
             match decision {
                 ReconcileDecision::RejectInvalid { path, reason } => {
-                    // Item F / Probe B2: skip and report bad individual records without blocking
-                    // the peer forever!
-                    self.record_peer_problem(
+                    // Item 4 & 9: refuse invalid/forged records, store durably unapplied so they
+                    // are NEVER acknowledged (while pull position can still advance past them to
+                    // apply valid records), and report durably!
+                    let mut wire = remote.for_wire();
+                    wire.path = path.clone();
+                    let problem = SyncProblem {
+                        path: path.clone(),
+                        kind: ProblemKind::InvalidPeerRecord,
+                        peer: Some(peer_id.clone()),
+                        sentence: format!(
+                            "Refused invalid record '{path}' from '{peer_id}': {reason}."
+                        ),
+                    };
+                    if !self.queue_held_back_bounded(
                         &peer_id,
-                        SyncProblem {
-                            path: path.clone(),
-                            kind: ProblemKind::InvalidPeerRecord,
-                            peer: Some(peer_id.clone()),
-                            sentence: format!(
-                                "Skipped invalid record '{path}' from '{peer_id}': {reason}."
-                            ),
-                        },
-                    );
+                        wire,
+                        peer_incarnation,
+                        remote.seq,
+                        prev_chain_fp,
+                        problem,
+                        true,
+                        page_held_back,
+                        existing_held_by_key,
+                        known_held_keys,
+                    )? {
+                        *held_back_full = true;
+                        return Ok(false);
+                    }
                     report.invalid_skipped += 1;
+                    return Ok(true);
+                }
+                ReconcileDecision::NotYetKnownMember {
+                    path,
+                    member,
+                    reason,
+                } => {
+                    // Item 4: a record mentioning a member we don't know yet is "not yet", never
+                    // "invalid"; store durably unapplied so it is retried when membership arrives
+                    // and NEVER acknowledged until applied.
+                    let problem = SyncProblem {
+                        path: path.clone(),
+                        kind: ProblemKind::UnknownMember,
+                        peer: Some(peer_id.clone()),
+                        sentence: format!(
+                            "'{path}' is waiting until this machine knows about member '{member}' ({reason})."
+                        ),
+                    };
+                    if !self.queue_held_back_bounded(
+                        &peer_id,
+                        remote.for_wire(),
+                        peer_incarnation,
+                        remote.seq,
+                        prev_chain_fp,
+                        problem,
+                        false,
+                        page_held_back,
+                        existing_held_by_key,
+                        known_held_keys,
+                    )? {
+                        *held_back_full = true;
+                        return Ok(false);
+                    }
+                    report.held_back += 1;
+                    self.clear_deferred(&peer_id, &remote.path)?;
                     return Ok(true);
                 }
                 ReconcileDecision::Ignore => {
                     report.ignored += 1;
-                    self.clear_deferred(&peer_id, &remote.path);
+                    let key = (peer_id.clone(), remote.path.clone());
+                    page_held_back.remove(&key);
+                    existing_held_by_key.remove(&key);
+                    if known_held_keys.remove(&key) {
+                        self.clear_held_back_if_present(&peer_id, &remote.path)?;
+                    }
+                    self.clear_deferred(&peer_id, &remote.path)?;
                     return Ok(true);
                 }
                 ReconcileDecision::Keep => {
                     report.kept += 1;
-                    page_held_back.remove(&remote.path);
-                    if known_held_paths.remove(&remote.path) {
-                        self.clear_held_back_if_present(&remote.path)?;
+                    let key = (peer_id.clone(), remote.path.clone());
+                    page_held_back.remove(&key);
+                    existing_held_by_key.remove(&key);
+                    if known_held_keys.remove(&key) {
+                        self.clear_held_back_if_present(&peer_id, &remote.path)?;
                     }
-                    self.clear_deferred(&peer_id, &remote.path);
+                    self.clear_deferred(&peer_id, &remote.path)?;
                     return Ok(true);
                 }
                 ReconcileDecision::HoldBack { problem } => {
-                    self.queue_held_back_bounded(
+                    if !self.queue_held_back_bounded(
                         &peer_id,
                         remote.for_wire(),
+                        peer_incarnation,
+                        remote.seq,
+                        prev_chain_fp,
                         problem,
+                        false,
                         page_held_back,
-                        known_held_paths,
-                    );
+                        existing_held_by_key,
+                        known_held_keys,
+                    )? {
+                        *held_back_full = true;
+                        return Ok(false);
+                    }
                     report.held_back += 1;
-                    self.clear_deferred(&peer_id, &remote.path);
+                    self.clear_deferred(&peer_id, &remote.path)?;
                     return Ok(true);
                 }
                 other => {
@@ -1309,26 +1728,45 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     )? {
                         ApplyOutcome::Applied => {
                             report.applied += 1;
-                            page_held_back.remove(&remote.path);
-                            known_held_paths.remove(&remote.path);
-                            self.clear_deferred(&peer_id, &remote.path);
+                            let key = (peer_id.clone(), remote.path.clone());
+                            page_held_back.remove(&key);
+                            existing_held_by_key.remove(&key);
+                            known_held_keys.remove(&key);
+                            self.clear_deferred(&peer_id, &remote.path)?;
                             return Ok(true);
                         }
                         ApplyOutcome::DirKeptLocalFiles(problem) => {
                             report.applied += 1;
-                            page_held_back.remove(&remote.path);
-                            known_held_paths.remove(&remote.path);
-                            self.dir_kept_problems
-                                .entry(problem.path.clone())
-                                .or_insert(problem);
-                            self.clear_deferred(&peer_id, &remote.path);
+                            let key = (peer_id.clone(), remote.path.clone());
+                            page_held_back.remove(&key);
+                            existing_held_by_key.remove(&key);
+                            known_held_keys.remove(&key);
+                            self.store.apply_batch(StoreBatch {
+                                upsert_problems: vec![(
+                                    dir_kept_problem_key(&problem.path),
+                                    problem,
+                                )],
+                                ..StoreBatch::default()
+                            })?;
+                            self.clear_deferred(&peer_id, &remote.path)?;
                             return Ok(true);
                         }
                         ApplyOutcome::LocalChangedRetry => {
                             continue;
                         }
                         ApplyOutcome::Deferred { reason } => {
-                            return self.record_deferral(&peer_id, &remote.path, reason, report);
+                            return self.record_deferral(
+                                &peer_id,
+                                remote,
+                                peer_incarnation,
+                                prev_chain_fp,
+                                reason,
+                                report,
+                                page_held_back,
+                                existing_held_by_key,
+                                known_held_keys,
+                                held_back_full,
+                            );
                         }
                     }
                 }
@@ -1337,71 +1775,122 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
         self.record_deferral(
             &peer_id,
-            &remote.path,
+            remote,
+            peer_incarnation,
+            prev_chain_fp,
             format!("'{}' kept changing locally during sync", remote.path),
             report,
+            page_held_back,
+            existing_held_by_key,
+            known_held_keys,
+            held_back_full,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_deferral(
         &mut self,
         peer_id: &str,
-        path: &str,
+        remote: &IndexRecord,
+        peer_incarnation: u64,
+        prev_chain_fp: Option<Hash>,
         reason: String,
         report: &mut PullReport,
+        page_held_back: &mut BTreeMap<(MemberId, String), HeldBackRecord>,
+        existing_held_by_key: &mut BTreeMap<(MemberId, String), HeldBackRecord>,
+        known_held_keys: &mut BTreeSet<(MemberId, String)>,
+        held_back_full: &mut bool,
     ) -> Result<bool> {
         report.deferred += 1;
-        let key = (peer_id.to_string(), path.to_string());
-        let attempts = {
-            let entry = self
-                .deferred_items
-                .entry(key.clone())
-                .or_insert_with(|| DeferredItem {
-                    peer: peer_id.to_string(),
-                    path: path.to_string(),
-                    reason: reason.clone(),
-                    attempts: 0,
-                });
-            entry.attempts = entry.attempts.saturating_add(1);
-            entry.reason = reason.clone();
-            entry.attempts
-        };
+        let existing = self
+            .store
+            .list_deferrals()?
+            .into_iter()
+            .find(|d| d.peer == peer_id && d.path == remote.path);
+        let attempts = existing.map_or(1, |d| d.attempts.saturating_add(1));
 
-        // Item H: nothing defers forever! Once a record hits MAX_DEFERRAL_ATTEMPTS, promote it to
-        // a visible problem and advance past it.
+        // Item 4: once a record hits MAX_DEFERRAL_ATTEMPTS, promote it to a durable held-back
+        // unapplied record (never abandoned and never acknowledged past its `peer_seq`!) so other
+        // records in the page can still be pulled while the problem stays visible and retried.
         if attempts >= MAX_DEFERRAL_ATTEMPTS {
-            self.deferred_items.remove(&key);
-            self.record_peer_problem(
+            let problem = SyncProblem {
+                path: remote.path.clone(),
+                kind: ProblemKind::DeferredLimitExceeded,
+                peer: Some(peer_id.to_string()),
+                sentence: format!(
+                    "'{}' could not be synced after {attempts} attempts: {reason}.",
+                    remote.path
+                ),
+            };
+            if !self.queue_held_back_bounded(
                 peer_id,
-                SyncProblem {
-                    path: path.to_string(),
-                    kind: ProblemKind::DeferredLimitExceeded,
-                    peer: Some(peer_id.to_string()),
-                    sentence: format!(
-                        "'{path}' could not be synced after {attempts} attempts: {reason}."
-                    ),
-                },
-            );
+                remote.for_wire(),
+                peer_incarnation,
+                remote.seq,
+                prev_chain_fp,
+                problem,
+                false,
+                page_held_back,
+                existing_held_by_key,
+                known_held_keys,
+            )? {
+                *held_back_full = true;
+                return Ok(false);
+            }
+            self.clear_deferred(peer_id, &remote.path)?;
             return Ok(true);
         }
+
+        let item = DeferredItem {
+            peer: peer_id.to_string(),
+            path: remote.path.clone(),
+            reason,
+            attempts,
+            peer_incarnation,
+            peer_seq: remote.seq,
+            prev_chain_fingerprint: prev_chain_fp,
+        };
+        self.store.apply_batch(StoreBatch {
+            upsert_deferrals: vec![item],
+            ..StoreBatch::default()
+        })?;
         Ok(false)
     }
 
-    fn clear_deferred(&mut self, peer_id: &str, path: &str) {
-        self.deferred_items
-            .remove(&(peer_id.to_string(), path.to_string()));
+    fn clear_deferred(&mut self, peer_id: &str, path: &str) -> Result<()> {
+        let has_it = self
+            .store
+            .list_deferrals()?
+            .iter()
+            .any(|d| d.peer == peer_id && d.path == path);
+        if has_it {
+            self.store.apply_batch(StoreBatch {
+                remove_deferrals: vec![(peer_id.to_string(), path.to_string())],
+                ..StoreBatch::default()
+            })?;
+        }
+        Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn queue_held_back_bounded(
         &mut self,
         peer_id: &str,
         record: IndexRecord,
+        peer_incarnation: u64,
+        peer_seq: u64,
+        prev_chain_fp: Option<Hash>,
         problem: SyncProblem,
-        page_held_back: &mut BTreeMap<String, HeldBackRecord>,
-        known_held_paths: &mut BTreeSet<String>,
-    ) {
-        let already_present = known_held_paths.contains(&record.path);
-        if !already_present && known_held_paths.len() >= MAX_HELD_BACK_ENTRIES {
+        preserve_earliest_seq: bool,
+        page_held_back: &mut BTreeMap<(MemberId, String), HeldBackRecord>,
+        existing_held_by_key: &mut BTreeMap<(MemberId, String), HeldBackRecord>,
+        known_held_keys: &mut BTreeSet<(MemberId, String)>,
+    ) -> Result<bool> {
+        let key = (peer_id.to_string(), record.path.clone());
+        let already_present = known_held_keys.contains(&key);
+        if !already_present && known_held_keys.len() >= MAX_HELD_BACK_ENTRIES {
+            // Item 4: NEVER drop a held-back record; stop pulling from this peer with a visible
+            // durable problem instead!
             self.record_peer_problem(
                 peer_id,
                 SyncProblem {
@@ -1409,34 +1898,57 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     kind: ProblemKind::HeldBackLimitReached,
                     peer: Some(peer_id.to_string()),
                     sentence: format!(
-                        "Held-back problem list reached its limit of {MAX_HELD_BACK_ENTRIES} entries; resolve existing problems to track more."
+                        "Stopped pulling from '{peer_id}' because the unapplied problem list reached its limit of {MAX_HELD_BACK_ENTRIES} entries; resolve existing problems to continue."
                     ),
                 },
-            );
-            return;
+            )?;
+            return Ok(false);
         }
-        known_held_paths.insert(record.path.clone());
-        page_held_back.insert(
-            record.path.clone(),
-            HeldBackRecord {
-                record,
-                from_peer: peer_id.to_string(),
-                problem,
-            },
-        );
+
+        // If preserving the earliest unapplied invalid seq for a colliding key on the same
+        // incarnation, keep the smaller `peer_seq` so `applied_ack_seq` never advances past it.
+        let (effective_seq, effective_prev_fp) = if preserve_earliest_seq
+            && let Some(prev) = page_held_back
+                .get(&key)
+                .or_else(|| existing_held_by_key.get(&key))
+            && prev.peer_incarnation == peer_incarnation
+            && prev.peer_seq > 0
+            && prev.peer_seq < peer_seq
+        {
+            (prev.peer_seq, prev.prev_chain_fingerprint)
+        } else {
+            (peer_seq, prev_chain_fp)
+        };
+
+        let entry = HeldBackRecord {
+            record,
+            from_peer: peer_id.to_string(),
+            problem,
+            peer_incarnation,
+            peer_seq: effective_seq,
+            prev_chain_fingerprint: effective_prev_fp,
+        };
+        known_held_keys.insert(key.clone());
+        existing_held_by_key.insert(key.clone(), entry.clone());
+        page_held_back.insert(key, entry);
+        Ok(true)
     }
 
-    fn record_peer_problem(&mut self, peer_id: &str, problem: SyncProblem) {
-        let list = self.peer_problems.entry(peer_id.to_string()).or_default();
-        if list
+    fn record_peer_problem(&mut self, peer_id: &str, problem: SyncProblem) -> Result<()> {
+        let existing = self.store.list_problems()?;
+        let peer_count = existing
             .iter()
-            .any(|p| p.path == problem.path && p.kind == problem.kind)
-        {
-            return;
+            .filter(|(_, p)| p.peer.as_deref() == Some(peer_id))
+            .count();
+        let key = peer_problem_key(peer_id, problem.kind, &problem.path);
+        let already_exists = existing.iter().any(|(k, _)| k == &key);
+        if !already_exists && peer_count >= MAX_PEER_PROBLEMS {
+            return Ok(());
         }
-        if list.len() < MAX_PEER_PROBLEMS {
-            list.push(problem);
-        }
+        self.store.apply_batch(StoreBatch {
+            upsert_problems: vec![(key, problem)],
+            ..StoreBatch::default()
+        })
     }
 
     fn skipped_blocker(&self, path: &str) -> Option<String> {
@@ -1454,6 +1966,86 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
     fn is_blocked_by_skipped(&self, path: &str) -> bool {
         self.skipped_blocker(path).is_some()
+    }
+
+    /// Retries all durable unapplied records that can be resolved locally without fetching file
+    /// bytes from a peer (deletions, metadata merges, superseding tombstones, directory revivals,
+    /// and now-obsolete records), updating each affected peer's `applied_ack_seq`.
+    pub fn retry_held_back_local(&mut self, now: Timestamp) -> Result<usize> {
+        if self.store.held_back_count()? == 0 {
+            return Ok(0);
+        }
+        let held = self.store.list_held_back()?;
+        let caps = self.fs.capabilities();
+        let mut resolved = 0usize;
+        let mut touched_peers: BTreeSet<MemberId> = BTreeSet::new();
+
+        for item in held {
+            if self.is_blocked_by_skipped(&item.record.path) {
+                continue;
+            }
+            let cur_meta = self.meta()?;
+            let decision = {
+                let view = StoreIndexView::new(&self.store);
+                reconcile_record(
+                    &view,
+                    &item.record,
+                    &item.from_peer,
+                    &cur_meta,
+                    &caps,
+                    &self.ignore,
+                )
+            };
+            match decision {
+                ReconcileDecision::HoldBack { .. }
+                | ReconcileDecision::RejectInvalid { .. }
+                | ReconcileDecision::NotYetKnownMember { .. } => {}
+                ReconcileDecision::Keep | ReconcileDecision::Ignore => {
+                    self.clear_held_back_if_present(&item.from_peer, &item.record.path)?;
+                    touched_peers.insert(item.from_peer);
+                    resolved += 1;
+                }
+                local_only @ (ReconcileDecision::DeleteToBin { .. }
+                | ReconcileDecision::MetadataOnly { .. }
+                | ReconcileDecision::KeepAndSupersede { .. }
+                | ReconcileDecision::ReviveDir { .. }) => {
+                    let peer_stub = LocalOnlyPeer(&item.from_peer);
+                    let fetch_opts = FetchOptions::default();
+                    let effective_now = now.max(item.record.mtime);
+                    if let Ok(outcome @ (ApplyOutcome::Applied | ApplyOutcome::DirKeptLocalFiles(_))) =
+                        apply_decision(
+                            &self.fs,
+                            &mut self.store,
+                            &peer_stub,
+                            local_only,
+                            &self.ignore,
+                            &fetch_opts,
+                            effective_now,
+                        )
+                    {
+                        if let ApplyOutcome::DirKeptLocalFiles(prob) = outcome {
+                            self.store.apply_batch(StoreBatch {
+                                upsert_problems: vec![(dir_kept_problem_key(&prob.path), prob)],
+                                ..StoreBatch::default()
+                            })?;
+                        }
+                        self.clear_held_back_if_present(&item.from_peer, &item.record.path)?;
+                        touched_peers.insert(item.from_peer);
+                        resolved += 1;
+                    }
+                }
+                ReconcileDecision::Fetch { .. }
+                | ReconcileDecision::ConflictLocalLoses { .. }
+                | ReconcileDecision::ConflictRemoteLoses { .. } => {
+                    // Needs peer file transfer; will resolve on next pull from `item.from_peer`.
+                }
+            }
+        }
+
+        if resolved > 0 {
+            self.recompute_acks_for_peers(&touched_peers)?;
+        }
+        Ok(resolved)
     }
 
     fn retry_held_back_for_peer(
@@ -1490,13 +2082,15 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 )
             };
             match decision {
-                ReconcileDecision::HoldBack { .. } | ReconcileDecision::RejectInvalid { .. } => {}
+                ReconcileDecision::HoldBack { .. }
+                | ReconcileDecision::RejectInvalid { .. }
+                | ReconcileDecision::NotYetKnownMember { .. } => {}
                 ReconcileDecision::Keep | ReconcileDecision::Ignore => {
-                    self.clear_held_back_if_present(&item.record.path)?;
+                    self.clear_held_back_if_present(&peer_id, &item.record.path)?;
                     resolved += 1;
                 }
                 other => {
-                    if let Ok(ApplyOutcome::Applied | ApplyOutcome::DirKeptLocalFiles(_)) =
+                    if let Ok(outcome @ (ApplyOutcome::Applied | ApplyOutcome::DirKeptLocalFiles(_))) =
                         apply_decision(
                             &self.fs,
                             &mut self.store,
@@ -1507,20 +2101,63 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                             now,
                         )
                     {
-                        self.clear_held_back_if_present(&item.record.path)?;
+                        if let ApplyOutcome::DirKeptLocalFiles(prob) = outcome {
+                            self.store.apply_batch(StoreBatch {
+                                upsert_problems: vec![(dir_kept_problem_key(&prob.path), prob)],
+                                ..StoreBatch::default()
+                            })?;
+                        }
+                        self.clear_held_back_if_present(&peer_id, &item.record.path)?;
                         resolved += 1;
                     }
                 }
             }
         }
+        if resolved > 0 {
+            let mut set = BTreeSet::new();
+            set.insert(peer_id);
+            self.recompute_acks_for_peers(&set)?;
+        }
         Ok(resolved)
     }
 
-    fn clear_held_back_if_present(&mut self, path: &str) -> Result<()> {
+    fn recompute_acks_for_peers(&mut self, peers: &BTreeSet<MemberId>) -> Result<()> {
         let held = self.store.list_held_back()?;
-        if held.iter().any(|h| h.record.path == path) {
+        let defs = self.store.list_deferrals()?;
+        let cursors = self.store.load_peer_cursors()?;
+        let mut batch = StoreBatch::default();
+        for peer_id in peers {
+            if let Some(mut c) = cursors.get(peer_id).cloned() {
+                let before = c.clone();
+                recompute_peer_applied_ack(peer_id, &mut c, &held, &defs);
+                if c != before {
+                    batch.set_peer_cursors.insert(peer_id.clone(), c);
+                }
+            }
+            if held.len() < MAX_HELD_BACK_ENTRIES {
+                batch.remove_problems.push(peer_problem_key(
+                    peer_id,
+                    ProblemKind::HeldBackLimitReached,
+                    "",
+                ));
+            }
+        }
+        if !batch.is_empty() {
+            self.store.apply_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    fn clear_held_back_if_present(&mut self, peer_id: &str, path: &str) -> Result<()> {
+        let held = self.store.list_held_back()?;
+        if held
+            .iter()
+            .any(|h| h.from_peer == peer_id && h.record.path == path)
+        {
             let mut batch = StoreBatch::default();
-            batch.remove_held_back.push(path.to_string());
+            batch
+                .remove_held_back
+                .push((peer_id.to_string(), path.to_string()));
             self.store.apply_batch(batch)?;
         }
         Ok(())
@@ -1558,17 +2195,19 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     reason: duplicate_member_sentence(peer_id),
                 });
             }
-            // A rolled-back machine that diverged at the same seq just rotated to a brand-new
-            // unseen incarnation: clear the one-time same-seq refusal and record its old
-            // incarnation in `prior_incarnations` so any live clone returning with the old
-            // incarnation will trip permanent `alternation_detected` immediately!
+            // A rolled-back machine that diverged just rotated to a brand-new unseen incarnation:
+            // clear the one-time refusal and record its old incarnation in `prior_incarnations` so
+            // any live clone returning with the old incarnation trips permanent
+            // `alternation_detected` immediately!
             cursor.duplicate_detected = false;
-            if let Some(list) = self.peer_problems.get_mut(peer_id) {
-                list.retain(|p| p.kind != ProblemKind::DuplicateMemberId);
-                if list.is_empty() {
-                    self.peer_problems.remove(peer_id);
-                }
-            }
+            self.store.apply_batch(StoreBatch {
+                remove_problems: vec![peer_problem_key(
+                    peer_id,
+                    ProblemKind::DuplicateMemberId,
+                    "",
+                )],
+                ..StoreBatch::default()
+            })?;
         }
         if cursor.incarnation == 0 {
             cursor.incarnation = new_inc;
@@ -1594,9 +2233,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
 
         // Legitimate new incarnation (reinstall or rollback recovery): remember the old
-        // incarnation and reset the cursor to 0. All pre-existing files on the rotated peer
-        // already carry `from_join = true` for Rule D, while post-rotation user edits keep
-        // `from_join = false`.
+        // incarnation, reset pull & applied-ack positions to 0, and clear stale unapplied records
+        // from the old incarnation since we will pull the new incarnation from sequence 0.
         let old_inc = cursor.incarnation;
         if !cursor.prior_incarnations.contains(&old_inc) {
             cursor.prior_incarnations.push(old_inc);
@@ -1606,9 +2244,34 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
         cursor.incarnation = new_inc;
         cursor.seq = 0;
+        cursor.applied_ack_seq = 0;
         cursor.head_fingerprint = None;
+        cursor.acked_fingerprint = None;
 
-        let mut batch = StoreBatch::default();
+        let remove_held_back: Vec<(MemberId, String)> = self
+            .store
+            .list_held_back()?
+            .into_iter()
+            .filter(|h| h.from_peer == peer_id)
+            .map(|h| (h.from_peer, h.record.path))
+            .collect();
+        let remove_deferrals: Vec<(MemberId, String)> = self
+            .store
+            .list_deferrals()?
+            .into_iter()
+            .filter(|d| d.peer == peer_id)
+            .map(|d| (d.peer, d.path))
+            .collect();
+
+        let mut batch = StoreBatch {
+            remove_held_back,
+            remove_deferrals,
+            remove_problems: vec![
+                peer_problem_key(peer_id, ProblemKind::DuplicateMemberId, ""),
+                peer_problem_key(peer_id, ProblemKind::HeldBackLimitReached, ""),
+            ],
+            ..StoreBatch::default()
+        };
         batch
             .set_peer_cursors
             .insert(peer_id.to_string(), cursor.clone());
@@ -1637,87 +2300,114 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 peer: Some(peer_id.to_string()),
                 sentence: duplicate_member_sentence(peer_id),
             },
-        );
+        )?;
         Ok(())
     }
 
-    fn detect_and_recover_own_rollback_with(
+    /// Recovers when a peer's handshake or page shows our own index went back in time (backup
+    /// restore or clone): rate-limited to at most once per hour per peer, rotates to a fresh
+    /// incarnation, carries every pending tombstone + `.legion-sync/deletions.log`, runs a join
+    /// scan over disk so post-restore changes meet peers as two versions rather than silently
+    /// replacing them, and reports the forced rotation.
+    fn recover_own_rollback(
         &mut self,
-        page: &RecordsPage,
+        peer_id: &str,
         meta: &FolderMeta,
-    ) -> Result<bool> {
-        let Some((acked_inc, acked_seq)) = page.caller_acked else {
-            return Ok(false);
-        };
-        if acked_inc != meta.incarnation {
-            return Ok(false);
+        now: Timestamp,
+    ) -> Result<()> {
+        // Item 9: allow peer-forced rotation at most once an hour per peer and report it.
+        if let Some(&prev_ts) = meta.last_forced_rotation_by_peer.get(peer_id)
+            && now.secs >= prev_ts.secs
+            && (now.secs - prev_ts.secs) < FORCED_ROTATION_COOLDOWN_SECS as i64
+        {
+            let sentence = format!(
+                "Peer '{peer_id}' repeatedly claimed this folder's sync history went back in time; rotation is limited to once per hour."
+            );
+            self.record_peer_problem(
+                peer_id,
+                SyncProblem {
+                    path: String::new(),
+                    kind: ProblemKind::PeerRollbackRateLimited,
+                    peer: Some(peer_id.to_string()),
+                    sentence: sentence.clone(),
+                },
+            )?;
+            return Err(SyncError::Conflict {
+                path: peer_id.to_string(),
+                reason: sentence,
+            });
         }
 
-        let seq_ahead = acked_seq > meta.local_seq;
-        let head_diverged = acked_seq == meta.local_seq
-            && acked_seq > 0
-            && page.caller_acked_fingerprint.is_some()
-            && meta.head_fingerprint.is_some()
-            && page.caller_acked_fingerprint != meta.head_fingerprint;
-        let history_diverged = page.caller_acked_fingerprint.is_some()
-            && meta
-                .recent_seq_fingerprints
-                .get(&acked_seq)
-                .is_some_and(|fp| Some(*fp) != page.caller_acked_fingerprint);
+        // Item 6(a) + 6(b): collect EVERY pending tombstone from the store AND `.legion-sync/deletions.log`
+        // before resetting so NO deletion is ever dropped across rotation.
+        let carried_deletions = collect_deletions_for_rotation(&self.fs, &self.store)?;
 
-        if !seq_ahead && !head_diverged && !history_diverged {
-            return Ok(false);
-        }
-
-        // Item C: WE rolled back (backup restore or clone)! Start a brand-new random incarnation,
-        // update our marker, re-tag every currently live file under the new incarnation with
-        // `from_join = true` (Rule D), drop rolled-back tombstones, and reset peer cursors so we
-        // pull current state from peers from seq 0!
         let new_inc = choose_fresh_incarnation(None, Some(meta.incarnation))?;
         let marker = FolderMarker::new(meta.folder_id.clone(), meta.local_member.clone(), new_inc);
         self.fs.write_marker(&marker)?;
+
+        let mut all_paths = Vec::new();
+        self.store.scan_records_in_order(&mut |rec| {
+            all_paths.push(rec.path);
+            Ok(true)
+        })?;
+        let all_peers: Vec<MemberId> = self.store.load_peer_cursors()?.into_keys().collect();
 
         let mut new_meta = meta.clone();
         new_meta.incarnation = new_inc;
         new_meta.local_seq = 0;
         new_meta.local_clock = 0;
-        new_meta.join_mode = false;
+        new_meta.join_mode = true;
         new_meta.head_fingerprint = None;
-        new_meta.recent_seq_fingerprints.clear();
+        new_meta
+            .last_forced_rotation_by_peer
+            .insert(peer_id.to_string(), now);
 
-        let vkey = new_meta.version_key();
-        let mut live_records = Vec::new();
-        let mut remove_paths = Vec::new();
-        self.store.scan_records_in_order(&mut |rec| {
-            if rec.deleted {
-                remove_paths.push(rec.path);
-            } else {
-                live_records.push(rec);
-            }
-            Ok(true)
-        })?;
-
-        let mut batch = StoreBatch {
-            remove_records: remove_paths,
-            remove_peer_cursors: self.store.load_peer_cursors()?.into_keys().collect(),
+        let reset_batch = StoreBatch {
+            folder_meta: Some(new_meta),
+            remove_records: all_paths,
+            remove_peer_cursors: all_peers,
+            clear_seq_fingerprints: true,
+            clear_held_back: true,
+            clear_deferrals: true,
+            set_pending_op: Some(None),
             ..StoreBatch::default()
         };
+        self.store.apply_batch(reset_batch)?;
 
-        for mut rec in live_records {
-            let clock = new_meta.next_clock();
-            let seq = new_meta.next_seq();
-            rec.version = VersionVector::singleton(vkey.clone(), clock);
-            rec.seq = seq;
-            rec.modified_by = new_meta.local_member.clone();
-            rec.from_join = true;
-            rec.conflict_of = derive_conflict_of(&rec, &new_meta);
-            new_meta.record_seq_fingerprint(seq, rec.head_fingerprint());
-            batch.upsert_records.push(rec);
-        }
+        // Scan the actual live disk under Rule D (`join_mode = true`), then re-issue every carried
+        // tombstone whose path is absent on disk!
+        let _ = scan_folder(
+            &self.fs,
+            &mut self.store,
+            &self.ignore,
+            DeletionBrakeConfig {
+                min_deleted_files: usize::MAX,
+                min_deleted_percent: 100,
+            },
+            &mut self.stability,
+            now,
+            ScanOptions {
+                allow_mass_deletion: true,
+                ..ScanOptions::default()
+            },
+        )?;
 
-        batch.folder_meta = Some(new_meta);
-        self.store.apply_batch(batch)?;
-        Ok(true)
+        reissue_carried_deletions(&self.fs, &mut self.store, carried_deletions)?;
+
+        // Report the forced rotation durably (Item 9).
+        self.record_peer_problem(
+            peer_id,
+            SyncProblem {
+                path: String::new(),
+                kind: ProblemKind::PeerForcedRotation,
+                peer: Some(peer_id.to_string()),
+                sentence: format!(
+                    "Started a fresh sync history after '{peer_id}' reported a newer or divergent index for this folder."
+                ),
+            },
+        )?;
+        Ok(())
     }
 
     fn persist_peer_cursor_and_clear_rejoin(
@@ -1752,15 +2442,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     }
 
     /// Garbage-collects tombstones ONLY when every other current member has *directly* reported
-    /// acknowledging our current `(incarnation, seq)` past the tombstone's `seq` (Item E: zero
-    /// trust in third-party hearsay).
+    /// applying our current `(incarnation, seq)` past the tombstone's `seq`, prunes chained
+    /// sequence fingerprints strictly below that floor, and compacts `.legion-sync/deletions.log`.
     pub fn gc_tombstones(&mut self) -> Result<usize> {
-        let tombstones = self.store.list_tombstones()?;
-        if tombstones.is_empty() {
-            return Ok(0);
-        }
         let meta = self.meta()?;
-
         let cursors = self.store.load_peer_cursors()?;
         let other_members: Vec<&MemberId> = meta
             .members
@@ -1768,11 +2453,11 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             .filter(|m| *m != &meta.local_member)
             .collect();
 
-        // Compute the minimum directly acknowledged seq across every other active member for our
-        // current incarnation. If any member has never directly acknowledged this incarnation,
-        // `min_direct_ack` is 0 and no tombstone is collected.
+        // Compute the minimum directly acknowledged (applied) seq across every other active member
+        // for our current incarnation. If any member has never directly acknowledged this
+        // incarnation, `min_direct_ack` is 0 and neither tombstones nor fingerprints are pruned.
         let min_direct_ack = if other_members.is_empty() {
-            u64::MAX
+            meta.local_seq
         } else {
             let mut floor = u64::MAX;
             for member in &other_members {
@@ -1793,34 +2478,104 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             return Ok(0);
         }
 
+        let tombstones = self.store.list_tombstones()?;
         let mut to_remove = Vec::new();
-        for ts in tombstones {
+        for ts in &tombstones {
             if ts.seq <= min_direct_ack {
-                to_remove.push(ts.path);
+                to_remove.push(ts.path.clone());
             }
         }
 
         let removed = to_remove.len();
+        let batch = StoreBatch {
+            remove_records: to_remove,
+            prune_seq_fingerprints_below: Some(min_direct_ack),
+            ..StoreBatch::default()
+        };
+        self.store.apply_batch(batch)?;
+
+        // Item 6(b): compact `.legion-sync/deletions.log` under the exact same forgetting rule!
         if removed > 0 {
-            let batch = StoreBatch {
-                remove_records: to_remove,
-                ..StoreBatch::default()
-            };
-            self.store.apply_batch(batch)?;
+            let remaining = self.store.list_tombstones()?;
+            compact_deletion_log_from_tombstones(&self.fs, &remaining)?;
         }
         Ok(removed)
     }
 
-    /// Serves this member's handshake identity (folder ID, member ID, active incarnation,
-    /// current `local_seq`, protocol version) to `caller_member`.
-    pub fn serve_handshake(&self, caller_member: &str) -> Result<PeerHandshake> {
+    /// Serves this member's bidirectional handshake identity to `caller_member`, checking
+    /// `caller.peer_pulled` against our own chained sequence fingerprint history and returning
+    /// both what we have pulled from `caller_member` and what we have fully applied/acknowledged.
+    pub fn serve_handshake(
+        &self,
+        caller_member: &str,
+        caller: &HandshakeHello,
+    ) -> Result<PeerHandshake> {
         let meta = self.check_serve_allowed(caller_member)?;
+        let cursors = self.store.load_peer_cursors()?;
+        let caller_cursor = cursors.get(caller_member);
+        let (caller_pulled, caller_acked) = match caller_cursor.filter(|c| c.incarnation != 0) {
+            Some(c) => (
+                Some(PeerAckView {
+                    incarnation: c.incarnation,
+                    seq: c.seq,
+                    fingerprint: c.head_fingerprint,
+                }),
+                Some(PeerAckView {
+                    incarnation: c.incarnation,
+                    seq: c.applied_ack_seq,
+                    fingerprint: c.acked_fingerprint,
+                }),
+            ),
+            None => (None, None),
+        };
+        let mut caller_regressed = false;
+        let prev_acked_by_caller = caller_cursor
+            .filter(|c| c.acked_local_incarnation == meta.incarnation)
+            .map_or(0, |c| c.acked_local_seq);
+        let caller_same_inc = caller_cursor.is_some_and(|c| c.incarnation == caller.incarnation);
+        if caller_same_inc && prev_acked_by_caller > 0 {
+            let ack_regressed = match caller.peer_acked {
+                Some(ref v) if v.incarnation == meta.incarnation => v.seq < prev_acked_by_caller,
+                None => true,
+                _ => false,
+            };
+            if ack_regressed {
+                caller_regressed = true;
+            }
+        }
+        let caller_pull_matches = match caller.peer_pulled {
+            Some(ref view) if view.incarnation == meta.incarnation && view.seq > 0 => {
+                if caller_same_inc && view.seq < prev_acked_by_caller {
+                    caller_regressed = true;
+                    None
+                } else if meta.rejoining_peers.contains(caller_member)
+                    && view.seq <= meta.local_seq
+                    && self.store.get_seq_fingerprint(view.seq)?.is_none()
+                {
+                    None
+                } else {
+                    Some(view_matches_local(&self.store, &meta, view)?)
+                }
+            }
+            Some(ref view) => Some(view_matches_local(&self.store, &meta, view)?),
+            None => {
+                if caller_same_inc && prev_acked_by_caller > 0 {
+                    caller_regressed = true;
+                }
+                None
+            }
+        };
         Ok(PeerHandshake {
             folder_id: meta.folder_id,
             member_id: meta.local_member,
             incarnation: meta.incarnation,
             snapshot_seq: meta.local_seq,
+            head_fingerprint: meta.head_fingerprint,
             protocol_version: SYNC_PROTOCOL_VERSION,
+            caller_pulled,
+            caller_acked,
+            caller_pull_matches,
+            caller_regressed,
         })
     }
 
@@ -2055,11 +2810,18 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     }
 
     /// Returns the complete [`FolderStatus`] matching the exact five states from the design,
-    /// together with conflicts, bin contents, any tripped deletion brake, and deferred items.
+    /// together with conflicts, bin contents, any tripped deletion brake, and durable deferred items.
     pub fn status(&self) -> Result<FolderStatus> {
         let meta = self.meta()?;
         let cursors = self.store.load_peer_cursors()?;
         let held = self.store.list_held_back()?;
+        let stored_problems: Vec<SyncProblem> = self
+            .store
+            .list_problems()?
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        let deferred = self.store.list_deferrals()?;
         let conflicts = self.list_conflicts()?;
         let bin = self.list_bin()?;
 
@@ -2078,12 +2840,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 ),
             });
         }
-        all_problems.extend(self.scan_problems.clone());
-        all_problems.extend(self.dir_kept_problems.values().cloned());
+        all_problems.extend(stored_problems.iter().cloned());
         all_problems.extend(held.iter().map(|h| h.problem.clone()));
-        for probs in self.peer_problems.values() {
-            all_problems.extend(probs.iter().cloned());
-        }
         for (member, c) in &cursors {
             if c.duplicate_detected
                 && !all_problems.iter().any(|p| {
@@ -2103,8 +2861,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             a.path
                 .cmp(&b.path)
                 .then_with(|| a.kind.cmp(&b.kind))
+                .then_with(|| a.peer.cmp(&b.peer))
                 .then_with(|| a.sentence.cmp(&b.sentence))
         });
+        all_problems.dedup();
 
         let total_files_left: u64 = self.active_progress.values().map(|p| p.files_left).sum();
         let total_bytes_left: u64 = self.active_progress.values().map(|p| p.bytes_left).sum();
@@ -2151,9 +2911,12 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 .filter(|h| h.from_peer == *member)
                 .map(|h| h.problem.clone())
                 .collect();
-            if let Some(extra) = self.peer_problems.get(member) {
-                peer_problems.extend(extra.iter().cloned());
-            }
+            peer_problems.extend(
+                stored_problems
+                    .iter()
+                    .filter(|p| p.peer.as_deref() == Some(member.as_str()))
+                    .cloned(),
+            );
             if cursors.get(member).is_some_and(|c| c.duplicate_detected)
                 && !peer_problems
                     .iter()
@@ -2166,6 +2929,13 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     sentence: duplicate_member_sentence(member),
                 });
             }
+            peer_problems.sort_by(|a, b| {
+                a.path
+                    .cmp(&b.path)
+                    .then_with(|| a.kind.cmp(&b.kind))
+                    .then_with(|| a.sentence.cmp(&b.sentence))
+            });
+            peer_problems.dedup();
 
             let peer_state = if !peer_problems.is_empty() {
                 MemberState::Problem {
@@ -2196,8 +2966,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             });
         }
 
-        let deferred = self.deferred_items.values().cloned().collect();
-
         Ok(FolderStatus {
             folder_id: meta.folder_id,
             local_member: meta.local_member,
@@ -2209,6 +2977,261 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             deferred,
         })
     }
+}
+
+const SCAN_PROBLEM_PREFIX: &str = "scan\0";
+const DIR_KEPT_PROBLEM_PREFIX: &str = "dir_kept\0";
+
+fn scan_problem_key(kind: ProblemKind, path: &str) -> String {
+    format!("{SCAN_PROBLEM_PREFIX}{kind:?}\0{path}")
+}
+
+fn dir_kept_problem_key(path: &str) -> String {
+    format!("{DIR_KEPT_PROBLEM_PREFIX}{path}")
+}
+
+fn peer_problem_key(peer: &str, kind: ProblemKind, path: &str) -> String {
+    format!("peer\0{peer}\0{kind:?}\0{path}")
+}
+
+fn prev_chain_fp_for(
+    seq: u64,
+    chain_fps: &BTreeMap<u64, Hash>,
+    cursor: &PeerCursor,
+) -> Option<Hash> {
+    if seq <= 1 {
+        return None;
+    }
+    let prev = seq - 1;
+    chain_fps
+        .get(&prev)
+        .copied()
+        .or_else(|| (cursor.seq == prev).then_some(cursor.head_fingerprint).flatten())
+}
+
+fn recompute_peer_applied_ack(
+    peer_id: &str,
+    cursor: &mut PeerCursor,
+    held_back: &[HeldBackRecord],
+    deferrals: &[DeferredItem],
+) {
+    if cursor.incarnation == 0 {
+        cursor.applied_ack_seq = 0;
+        cursor.acked_fingerprint = None;
+        return;
+    }
+
+    let mut oldest: Option<(u64, Option<Hash>)> = None;
+    for h in held_back {
+        if h.from_peer == peer_id
+            && h.peer_incarnation == cursor.incarnation
+            && h.peer_seq > 0
+            && oldest.is_none_or(|(min_seq, _)| h.peer_seq < min_seq)
+        {
+            oldest = Some((h.peer_seq, h.prev_chain_fingerprint));
+        }
+    }
+    for d in deferrals {
+        if d.peer == peer_id
+            && d.peer_incarnation == cursor.incarnation
+            && d.peer_seq > 0
+            && oldest.is_none_or(|(min_seq, _)| d.peer_seq < min_seq)
+        {
+            oldest = Some((d.peer_seq, d.prev_chain_fingerprint));
+        }
+    }
+
+    match oldest {
+        None => {
+            cursor.applied_ack_seq = cursor.seq;
+            cursor.acked_fingerprint = cursor.head_fingerprint;
+        }
+        Some((min_unapplied_seq, prev_fp)) => {
+            let candidate = cursor.seq.min(min_unapplied_seq.saturating_sub(1));
+            if candidate == 0 {
+                cursor.applied_ack_seq = 0;
+                cursor.acked_fingerprint = None;
+            } else if candidate == min_unapplied_seq.saturating_sub(1) && prev_fp.is_some() {
+                cursor.applied_ack_seq = candidate;
+                cursor.acked_fingerprint = prev_fp;
+            } else if cursor.applied_ack_seq > candidate {
+                cursor.applied_ack_seq = 0;
+                cursor.acked_fingerprint = None;
+            }
+        }
+    }
+}
+
+/// Checks whether a peer's claimed view of OUR history (`(incarnation, seq, fingerprint)`) matches
+/// our own chained sequence fingerprint history.
+///
+/// Returns `Ok(false)` when `view` names our current incarnation with `seq > 0` and either:
+/// - `seq > meta.local_seq`, or
+/// - `seq` is missing/pruned from our sequence fingerprint table ("cannot check -> went back"), or
+/// - the stored chained fingerprint at `seq` disagrees with `view.fingerprint`.
+fn view_matches_local<S: IndexStore>(
+    store: &S,
+    meta: &FolderMeta,
+    view: &PeerAckView,
+) -> Result<bool> {
+    if view.incarnation != meta.incarnation || view.seq == 0 {
+        return Ok(true);
+    }
+    if view.seq > meta.local_seq {
+        return Ok(false);
+    }
+    let Some(expected_fp) = store.get_seq_fingerprint(view.seq)? else {
+        return Ok(false);
+    };
+    match view.fingerprint {
+        Some(fp) => Ok(fp == expected_fp),
+        None => Ok(false),
+    }
+}
+
+/// Minimal [`Peer`] stub used by [`SyncEngine::retry_held_back_local`] for local-only decisions
+/// (deletions, metadata merges, superseding tombstones, directory revivals) that never fetch bytes.
+struct LocalOnlyPeer<'a>(&'a str);
+
+impl Peer for LocalOnlyPeer<'_> {
+    fn member_id(&self) -> &str {
+        self.0
+    }
+
+    fn handshake(&self, _caller: &HandshakeHello) -> Result<PeerHandshake> {
+        Err(SyncError::PeerUnavailable {
+            member: self.0.to_string(),
+            detail: "local-only retry does not contact peer".to_string(),
+        })
+    }
+
+    fn records_since(
+        &self,
+        _since_incarnation: u64,
+        _since_seq: u64,
+        _limit: usize,
+        _cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<RecordsPage> {
+        Err(SyncError::PeerUnavailable {
+            member: self.0.to_string(),
+            detail: "local-only retry does not contact peer".to_string(),
+        })
+    }
+
+    fn fetch_file(
+        &self,
+        _path: &str,
+        _expected_hash: Hash,
+        _options: &FetchOptions,
+    ) -> Result<Box<dyn Read + Send>> {
+        Err(SyncError::PeerUnavailable {
+            member: self.0.to_string(),
+            detail: "local-only retry does not fetch files".to_string(),
+        })
+    }
+}
+
+fn collect_deletions_for_rotation<F: SyncFs, S: IndexStore>(
+    fs: &F,
+    store: &S,
+) -> Result<BTreeMap<String, FolderDeletionRecord>> {
+    let mut map = parse_deletion_log(&fs.read_deletion_log()?);
+    for tomb in store.list_tombstones()? {
+        map.insert(
+            tomb.path.clone(),
+            FolderDeletionRecord {
+                path: tomb.path,
+                kind: tomb.kind,
+                hashes: tomb.recent_hashes,
+                version: tomb.version,
+                mtime: tomb.mtime,
+                modified_by: tomb.modified_by,
+            },
+        );
+    }
+    Ok(map)
+}
+
+fn reissue_deletion_log_tombstones<F: SyncFs, S: IndexStore>(fs: &F, store: &mut S) -> Result<()> {
+    let deletions = parse_deletion_log(&fs.read_deletion_log()?);
+    reissue_carried_deletions(fs, store, deletions)
+}
+
+fn reissue_carried_deletions<F: SyncFs, S: IndexStore>(
+    fs: &F,
+    store: &mut S,
+    deletions: BTreeMap<String, FolderDeletionRecord>,
+) -> Result<()> {
+    if deletions.is_empty() {
+        return Ok(());
+    }
+    let Some(mut meta) = store.load_meta()? else {
+        return Ok(());
+    };
+    let mut batch = StoreBatch::default();
+    let mut reissued_tombstones = Vec::new();
+
+    for (path, rec) in deletions {
+        // Never overwrite a path that currently exists live on disk.
+        if fs.stat_live(&path)?.is_some() {
+            continue;
+        }
+        if store.get_record(&path)?.is_some_and(|r| !r.deleted) {
+            continue;
+        }
+        let mut version = rec.version;
+        meta.bump_version(&mut version);
+        let seq = meta.next_seq();
+        if !rec.hashes.is_empty() {
+            batch
+                .upsert_deleted_history
+                .push((path.clone(), rec.hashes.clone()));
+        }
+        let tomb = IndexRecord {
+            path,
+            kind: rec.kind,
+            size: 0,
+            mtime: rec.mtime,
+            disk_mtime: None,
+            disk_change_id: None,
+            mode: None,
+            hash: None,
+            link_target: None,
+            deleted: true,
+            version,
+            modified_by: meta.local_member.clone(),
+            seq,
+            recent_hashes: rec.hashes,
+            from_join: false,
+            conflict_of: None,
+            conflict_dismissed: false,
+        };
+        let chain = meta.advance_chain_fingerprint(seq, tomb.head_fingerprint());
+        batch.upsert_seq_fingerprints.push((seq, chain));
+        reissued_tombstones.push(tomb.clone());
+        batch.upsert_records.push(tomb);
+    }
+
+    if !reissued_tombstones.is_empty() {
+        batch.folder_meta = Some(meta);
+        store.apply_batch(batch)?;
+        let all_tombstones = store.list_tombstones()?;
+        compact_deletion_log_from_tombstones(fs, &all_tombstones)?;
+    }
+    Ok(())
+}
+
+fn compact_deletion_log_from_tombstones<F: SyncFs>(
+    fs: &F,
+    tombstones: &[IndexRecord],
+) -> Result<()> {
+    let entries: Vec<FolderDeletionLogEntry> = tombstones
+        .iter()
+        .filter(|r| r.deleted)
+        .map(FolderDeletionLogEntry::from_tombstone)
+        .collect();
+    let bytes = encode_deletion_log_entries(&entries)?;
+    fs.compact_deletion_log(&bytes)
 }
 
 fn choose_fresh_incarnation(explicit: Option<u64>, avoid: Option<u64>) -> Result<u64> {
@@ -2229,14 +3252,17 @@ fn choose_fresh_incarnation(explicit: Option<u64>, avoid: Option<u64>) -> Result
 /// Rotates to a fresh incarnation when `.legion-sync/marker.json` and the local index disagree on
 /// incarnation (e.g. one was restored from backup without the other).
 ///
-/// Clears old index entries without fabricating deletions and enters `join_mode = true` so the
-/// next scan indexes the actual files on disk under Rule D and peers supply anything missing.
+/// Carries every pending tombstone and `.legion-sync/deletions.log` into the new incarnation
+/// (never dropping deletions), clears old live records without fabricating deletions, and enters
+/// `join_mode = true` so the next scan indexes the actual files on disk under Rule D.
 fn rotate_incarnation_on_marker_mismatch<F: SyncFs, S: IndexStore>(
     fs: &F,
     store: &mut S,
     mut meta: FolderMeta,
     marker_inc: u64,
 ) -> Result<()> {
+    let carried_deletions = collect_deletions_for_rotation(fs, store)?;
+
     let mut new_inc = random_incarnation_id()?;
     while new_inc == meta.incarnation || new_inc == marker_inc {
         new_inc = random_incarnation_id()?;
@@ -2257,16 +3283,20 @@ fn rotate_incarnation_on_marker_mismatch<F: SyncFs, S: IndexStore>(
     meta.local_clock = 0;
     meta.join_mode = true;
     meta.head_fingerprint = None;
-    meta.recent_seq_fingerprints.clear();
 
     let batch = StoreBatch {
         folder_meta: Some(meta),
         remove_records: all_paths,
         remove_peer_cursors: all_peers,
+        clear_seq_fingerprints: true,
+        clear_held_back: true,
+        clear_deferrals: true,
         set_pending_op: Some(None),
         ..StoreBatch::default()
     };
-    store.apply_batch(batch)
+    store.apply_batch(batch)?;
+
+    reissue_carried_deletions(fs, store, carried_deletions)
 }
 
 fn duplicate_member_sentence(peer_id: &str) -> String {

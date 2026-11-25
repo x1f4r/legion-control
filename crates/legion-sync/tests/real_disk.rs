@@ -43,8 +43,8 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
         &self.member_id
     }
 
-    fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
-        self.engine.serve_handshake(&self.caller)
+    fn handshake(&self, caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+        self.engine.serve_handshake(&self.caller, caller)
     }
 
     fn records_since(
@@ -166,6 +166,18 @@ impl<F: SyncFs> SyncFs for CrashInjectingFs<F> {
 
     fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
         self.inner.write_marker(marker)
+    }
+
+    fn append_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
+        self.inner.append_deletion_log(bytes)
+    }
+
+    fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
+        self.inner.read_deletion_log()
+    }
+
+    fn compact_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
+        self.inner.compact_deletion_log(bytes)
     }
 
     fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
@@ -933,13 +945,18 @@ impl Peer for SyntheticLinuxPeer {
         &self.member_id
     }
 
-    fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
+    fn handshake(&self, _caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
         Ok(PeerHandshake {
             folder_id: "docs".to_string(),
             member_id: self.member_id.clone(),
             incarnation: self.incarnation,
             snapshot_seq: self.seq,
+            head_fingerprint: self.records.last().map(IndexRecord::head_fingerprint),
             protocol_version: SYNC_PROTOCOL_VERSION,
+            caller_pulled: None,
+            caller_acked: None,
+            caller_pull_matches: None,
+            caller_regressed: false,
         })
     }
 
@@ -975,6 +992,7 @@ impl Peer for SyntheticLinuxPeer {
             caller_acked: None,
             caller_acked_fingerprint: None,
             head_fingerprint: head_fp,
+            chain_fingerprints: BTreeMap::new(),
         })
     }
 
@@ -1249,28 +1267,53 @@ fn real_disk_syncs_symlinks_between_unix_members_and_refuses_symlink_escape() {
 
     let outside = tempfile::tempdir().unwrap();
     fs::write(outside.path().join("secret.txt"), b"outside").unwrap();
+    fs::create_dir_all(tmp.path().join("a/sub")).unwrap();
+    fs::write(tmp.path().join("a/root.txt"), b"inside").unwrap();
+    // Relative in-folder symlinks sync cleanly between Unix members.
+    std::os::unix::fs::symlink("../root.txt", tmp.path().join("a/sub/rel_link")).unwrap();
+    // Absolute and escaping symlinks are held back and listed (Item 9).
     std::os::unix::fs::symlink(outside.path(), tmp.path().join("a/link_dir")).unwrap();
-    a.scan(t0).unwrap();
+    std::os::unix::fs::symlink("../outside.txt", tmp.path().join("a/escape_link")).unwrap();
+    let scan = a.scan(t0).unwrap();
+    assert_eq!(scan.held_back_problems.len(), 2);
 
-    assert!(
-        a.store()
-            .get_record("link_dir/secret.txt")
-            .unwrap()
-            .is_none()
-    );
-    let rec = a.store().get_record("link_dir").unwrap().unwrap();
+    assert!(a.store().get_record("link_dir/secret.txt").unwrap().is_none());
+    assert!(a.store().get_record("link_dir").unwrap().is_none());
+    assert!(a.store().get_record("escape_link").unwrap().is_none());
+    let rec = a.store().get_record("sub/rel_link").unwrap().unwrap();
     assert_eq!(rec.kind, EntryKind::Symlink);
+    assert_eq!(rec.link_target.as_deref(), Some("../root.txt"));
+
+    match a.status().unwrap().state {
+        MemberState::Problem { problems, .. } => {
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.path == "link_dir" && p.kind == ProblemKind::UnsupportedSymlink)
+            );
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.path == "escape_link" && p.kind == ProblemKind::UnsupportedSymlink)
+            );
+        }
+        other => panic!("expected UnsupportedSymlink problems on a, got {other:?}"),
+    }
 
     b.pull_from_peer(&EnginePeer::new(&a, "beta"), t0).unwrap();
-    let meta = fs::symlink_metadata(tmp.path().join("b/link_dir")).unwrap();
+    // Relative in-folder symlink synced to b; escaping/absolute ones did NOT.
+    let meta = fs::symlink_metadata(tmp.path().join("b/sub/rel_link")).unwrap();
     assert!(meta.file_type().is_symlink());
     assert_eq!(
-        fs::read_link(tmp.path().join("b/link_dir")).unwrap(),
-        outside.path()
+        fs::read_link(tmp.path().join("b/sub/rel_link")).unwrap(),
+        std::path::PathBuf::from("../root.txt")
     );
+    assert!(fs::symlink_metadata(tmp.path().join("b/link_dir")).is_err());
+    assert!(fs::symlink_metadata(tmp.path().join("b/escape_link")).is_err());
 
+    // Even if a symlink exists locally on b, traversal through symlink ancestors is still refused.
     assert!(matches!(
-        b.fs().stat_live("link_dir/secret.txt"),
+        b.fs().stat_live("sub/rel_link/secret.txt"),
         Err(SyncError::InvalidPath { .. })
     ));
 }
@@ -1344,6 +1387,15 @@ fn real_disk_holds_back_file_mutating_during_scan_hash() {
         }
         fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
             self.inner.write_marker(marker)
+        }
+        fn append_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
+            self.inner.append_deletion_log(bytes)
+        }
+        fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
+            self.inner.read_deletion_log()
+        }
+        fn compact_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
+            self.inner.compact_deletion_log(bytes)
         }
         fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
             self.inner.ensure_internal_dirs()

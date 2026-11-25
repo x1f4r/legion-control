@@ -208,6 +208,7 @@ struct FsSnapshot {
     caps: FsCapabilities,
     supports_exchange: bool,
     marker: Option<FolderMarker>,
+    deletion_log: Vec<u8>,
     live: BTreeMap<String, SimNode>,
     bin: BTreeMap<String, SimBinData>,
     next_gen: u64,
@@ -251,6 +252,7 @@ struct HonestSimFs {
     caps: FsCapabilities,
     supports_exchange: bool,
     marker: RefCell<Option<FolderMarker>>,
+    deletion_log: RefCell<Vec<u8>>,
     live: RefCell<BTreeMap<String, SimNode>>,
     tmp: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     tmp_meta: RefCell<BTreeMap<String, (Timestamp, Option<u32>, u64)>>,
@@ -275,6 +277,7 @@ impl HonestSimFs {
             caps,
             supports_exchange,
             marker: RefCell::new(None),
+            deletion_log: RefCell::new(Vec::new()),
             live: RefCell::new(BTreeMap::new()),
             tmp: Arc::new(Mutex::new(BTreeMap::new())),
             tmp_meta: RefCell::new(BTreeMap::new()),
@@ -299,6 +302,7 @@ impl HonestSimFs {
             caps: self.caps,
             supports_exchange: self.supports_exchange,
             marker: self.marker.borrow().clone(),
+            deletion_log: self.deletion_log.borrow().clone(),
             live: self.live.borrow().clone(),
             bin: self.bin.borrow().clone(),
             next_gen: self.next_gen.get(),
@@ -310,6 +314,7 @@ impl HonestSimFs {
             caps: snap.caps,
             supports_exchange: snap.supports_exchange,
             marker: RefCell::new(snap.marker),
+            deletion_log: RefCell::new(snap.deletion_log),
             live: RefCell::new(snap.live),
             tmp: Arc::new(Mutex::new(BTreeMap::new())),
             tmp_meta: RefCell::new(BTreeMap::new()),
@@ -848,6 +853,20 @@ impl SyncFs for HonestSimFs {
 
     fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
         *self.marker.borrow_mut() = Some(marker.clone());
+        Ok(())
+    }
+
+    fn append_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
+        self.deletion_log.borrow_mut().extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
+        Ok(self.deletion_log.borrow().clone())
+    }
+
+    fn compact_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
+        *self.deletion_log.borrow_mut() = bytes.to_vec();
         Ok(())
     }
 
@@ -1852,8 +1871,24 @@ impl IndexStore for FaultyIndexStore {
         self.inner.load_pending_op()
     }
 
+    fn list_staged_tmps(&self) -> legion_sync::Result<BTreeSet<String>> {
+        self.inner.list_staged_tmps()
+    }
+
     fn record_count(&self) -> legion_sync::Result<u64> {
         self.inner.record_count()
+    }
+
+    fn get_seq_fingerprint(&self, seq: u64) -> legion_sync::Result<Option<Hash>> {
+        self.inner.get_seq_fingerprint(seq)
+    }
+
+    fn list_problems(&self) -> legion_sync::Result<Vec<(String, legion_sync::SyncProblem)>> {
+        self.inner.list_problems()
+    }
+
+    fn list_deferrals(&self) -> legion_sync::Result<Vec<legion_sync::DeferredItem>> {
+        self.inner.list_deferrals()
     }
 
     fn live_file_count(&self) -> legion_sync::Result<u64> {
@@ -1956,8 +1991,8 @@ impl Peer for SimPeer<'_> {
         self.member_id
     }
 
-    fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
-        self.engine.serve_handshake(self.caller)
+    fn handshake(&self, caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+        self.engine.serve_handshake(self.caller, caller)
     }
 
     fn records_since(
@@ -4189,14 +4224,27 @@ fn run_backup_reinstall_and_join_old_copy_seed(root_seed: u64, seed: u64, record
     assert_ne!(
         world.members[b].engine.meta().unwrap().incarnation,
         b_inc_before,
-        "backup restore must rotate incarnation"
+        "backup restore must rotate incarnation (b_meta={:?}, a_cursors={:?}, b_cursors={:?})",
+        world.members[b].engine.meta().unwrap(),
+        world.members[a].engine.store().load_peer_cursors().unwrap(),
+        world.members[b].engine.store().load_peer_cursors().unwrap(),
     );
     for m in &world.members {
         if !m.active {
             continue;
         }
         assert_eq!(m.engine.fs().live_file_hash("doc.txt"), Some(doc_v2));
-        assert_eq!(m.engine.fs().live_file_hash("gone.txt"), None);
+        assert_eq!(
+            m.engine.fs().live_file_hash("gone.txt"),
+            None,
+            "gone.txt resurrected on {} (b={b_id}, m_rec={:?}, a_rec={:?}, b_rec={:?}, a_del_hist={:?}, b_del_hist={:?})",
+            m.id,
+            m.engine.store().get_record("gone.txt").unwrap(),
+            world.members[a].engine.store().get_record("gone.txt").unwrap(),
+            world.members[b].engine.store().get_record("gone.txt").unwrap(),
+            world.members[a].engine.store().get_deleted_history("gone.txt").unwrap(),
+            world.members[b].engine.store().get_deleted_history("gone.txt").unwrap(),
+        );
         assert_eq!(
             m.engine.fs().live_file_hash("after_restore.txt"),
             Some(after_restore_hash),
@@ -4407,13 +4455,18 @@ fn run_hostile_peer_seed(root_seed: u64, seed: u64, record_trace: bool) {
         fn member_id(&self) -> &str {
             "m1"
         }
-        fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
+        fn handshake(&self, _caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
             Ok(PeerHandshake {
                 folder_id: "sim".into(),
                 member_id: "m1".into(),
                 incarnation: 99,
                 snapshot_seq: self.records.len() as u64,
+                head_fingerprint: self.records.last().map(IndexRecord::head_fingerprint),
                 protocol_version: SYNC_PROTOCOL_VERSION,
+                caller_pulled: None,
+                caller_acked: None,
+                caller_pull_matches: None,
+                caller_regressed: false,
             })
         }
         fn records_since(
@@ -4437,6 +4490,7 @@ fn run_hostile_peer_seed(root_seed: u64, seed: u64, record_trace: bool) {
                 caller_acked: None,
                 caller_acked_fingerprint: None,
                 head_fingerprint: self.records.last().map(IndexRecord::head_fingerprint),
+                chain_fingerprints: BTreeMap::new(),
             })
         }
         fn fetch_file(
@@ -4484,15 +4538,26 @@ fn run_hostile_peer_seed(root_seed: u64, seed: u64, record_trace: bool) {
         conflict_dismissed: false,
     };
 
+    let m0_meta = world.members[0].engine.meta().unwrap();
+    let mut forged_own = mk_rec(4, "forged_own.txt", "m1", 4, good_hash);
+    forged_own
+        .version
+        .set(VersionKey::new(&m0_meta.local_member, m0_meta.incarnation), u64::MAX);
+    let mut huge_cnt = mk_rec(5, "huge_cnt.txt", "m1", 4, good_hash);
+    huge_cnt
+        .version
+        .set(VersionKey::new("m1", 99), legion_sync::MAX_VERSION_COUNTER + 1);
     let peer = HostilePeer {
         records: vec![
             mk_rec(1, ".LEGION-SYNC/evil.txt", "m1", 4, good_hash),
             mk_rec(2, "\u{FF0E}legion-sync/nfkc.txt", "m1", 4, good_hash),
             mk_rec(3, "C:drive_rel.txt", "m1", 4, good_hash),
-            mk_rec(4, "forged.txt", "not_a_member", 4, good_hash),
-            mk_rec(5, "oversize.bin", "m1", 8, good_hash),
+            forged_own,
+            huge_cnt,
+            mk_rec(6, "unknown_member.txt", "not_a_member", 4, good_hash),
+            mk_rec(7, "oversize.bin", "m1", 8, good_hash),
             mk_rec(
-                6,
+                8,
                 "honest_after_bad.txt",
                 "m1",
                 good_bytes.len() as u64,
@@ -4504,8 +4569,24 @@ fn run_hostile_peer_seed(root_seed: u64, seed: u64, record_trace: bool) {
 
     let rep = world.members[0].engine.pull_from_peer(&peer, now).unwrap();
     assert!(
-        rep.invalid_skipped >= 4,
-        "bad records must be skipped and counted"
+        rep.invalid_skipped >= 5,
+        "bad/forged records must be refused and counted"
+    );
+    assert!(
+        rep.held_back >= 1,
+        "unknown syntactically valid member must be held back as 'not yet', not rejected as invalid"
+    );
+    assert_eq!(
+        world.members[0]
+            .engine
+            .store()
+            .load_peer_cursors()
+            .unwrap()
+            .get("m1")
+            .unwrap()
+            .applied_ack_seq,
+        0,
+        "applied_ack_seq must not advance past unapplied records"
     );
     assert_eq!(
         world.members[0]

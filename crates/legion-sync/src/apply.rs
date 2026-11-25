@@ -15,9 +15,10 @@ use legion_xfer::{EntryKind, Hash, Timestamp};
 
 use crate::error::{FsErrorKind, Result, SyncError};
 use crate::model::{
-    BinEntry, BinReason, ConflictChoice, ExpectedLocalSnapshot, FetchOptions, FolderMeta,
-    IndexRecord, MAX_ANCESTRY_HASHES, MIN_PLAUSIBLE_CLOCK_SECS, PendingOp, ProblemKind,
-    RestoreStrategy, SyncProblem, random_hex_token,
+    BinEntry, BinReason, ConflictChoice, ExpectedLocalSnapshot, FetchOptions,
+    FolderDeletionLogEntry, FolderMeta, IndexRecord, MAX_ANCESTRY_HASHES, MIN_PLAUSIBLE_CLOCK_SECS,
+    MemberId, PendingOp, ProblemKind, RestoreStrategy, SyncProblem, encode_deletion_log_entries,
+    random_hex_token,
 };
 use crate::path::{
     IgnoreMatcher, ancestors, conflict_copy_path, is_descendant_of, is_legion_inflight_name,
@@ -332,10 +333,11 @@ fn recover_place<F: SyncFs, S: IndexStore>(
         record_disk_stat(fs, &path, &mut target_record)?;
         let persisted_bin = bin_entry_if_present(fs, bin_entry)?;
         commit_records_and_clear_pending(
+            fs,
             store,
             vec![target_record],
             persisted_bin.into_iter().collect(),
-            vec![path],
+            Vec::new(),
             Vec::new(),
         )?;
         return Ok(());
@@ -433,10 +435,11 @@ fn recover_place<F: SyncFs, S: IndexStore>(
                                 true,
                             )? {
                                 commit_records_and_clear_pending(
+                                    fs,
                                     store,
                                     vec![target_record],
                                     persisted_bin.into_iter().collect(),
-                                    vec![path],
+                                    Vec::new(),
                                     Vec::new(),
                                 )?;
                             } else {
@@ -521,10 +524,11 @@ fn recover_place<F: SyncFs, S: IndexStore>(
                 record_disk_stat(fs, &path, &mut target_record)?;
                 let persisted_bin = bin_entry_if_present(fs, bin_entry)?;
                 commit_records_and_clear_pending(
+                    fs,
                     store,
                     vec![target_record],
                     persisted_bin.into_iter().collect(),
-                    vec![path],
+                    Vec::new(),
                     Vec::new(),
                 )?;
                 return Ok(());
@@ -535,10 +539,11 @@ fn recover_place<F: SyncFs, S: IndexStore>(
                     record_disk_stat(fs, &path, &mut target_record)?;
                     let persisted_bin = bin_entry_if_present(fs, bin_entry)?;
                     commit_records_and_clear_pending(
+                        fs,
                         store,
                         vec![target_record],
                         persisted_bin.into_iter().collect(),
-                        vec![path],
+                        Vec::new(),
                         Vec::new(),
                     )?;
                     return Ok(());
@@ -602,10 +607,11 @@ fn recover_delete<F: SyncFs, S: IndexStore>(
         }
         let persisted_bin = bin_entry_if_present(fs, bin_entry)?;
         commit_records_and_clear_pending(
+            fs,
             store,
             vec![target_record],
             persisted_bin.into_iter().collect(),
-            vec![path],
+            Vec::new(),
             Vec::new(),
         )?;
         return Ok(());
@@ -651,10 +657,11 @@ fn recover_local_rename<F: SyncFs, S: IndexStore>(
     if fs.stat_live(&from_path)?.is_none() && disk_matches_record(fs, &to_path, &to_record)? {
         record_disk_stat(fs, &to_path, &mut to_record)?;
         commit_records_and_clear_pending(
+            fs,
             store,
             vec![from_record, to_record],
             Vec::new(),
-            vec![from_path, to_path],
+            Vec::new(),
             Vec::new(),
         )?;
         return Ok(());
@@ -703,10 +710,11 @@ fn recover_conflict_local_loses<F: SyncFs, S: IndexStore>(
         record_disk_stat(fs, &orig_path, &mut winner_record)?;
         record_disk_stat(fs, &conflict_path, &mut loser_record)?;
         commit_records_and_clear_pending(
+            fs,
             store,
             vec![loser_record, winner_record],
             Vec::new(),
-            vec![orig_path, conflict_path],
+            Vec::new(),
             Vec::new(),
         )?;
         return Ok(());
@@ -774,18 +782,20 @@ fn recover_conflict_local_loses<F: SyncFs, S: IndexStore>(
             record_disk_stat(fs, &conflict_path, &mut loser_record)?;
             if winner_ok {
                 commit_records_and_clear_pending(
+                    fs,
                     store,
                     vec![loser_record, winner_record],
                     Vec::new(),
-                    vec![orig_path, conflict_path],
+                    Vec::new(),
                     Vec::new(),
                 )?;
             } else {
                 commit_records_and_clear_pending(
+                    fs,
                     store,
                     vec![loser_record],
                     Vec::new(),
-                    vec![conflict_path],
+                    Vec::new(),
                     Vec::new(),
                 )?;
                 mark_needs_rescan(store, &[&orig_path])?;
@@ -873,10 +883,11 @@ fn recover_conflict_remote_loses<F: SyncFs, S: IndexStore>(
     if disk_matches_record(fs, &conflict_path, &loser_record)? {
         record_disk_stat(fs, &conflict_path, &mut loser_record)?;
         commit_records_and_clear_pending(
+            fs,
             store,
             vec![loser_record, winner_record],
             Vec::new(),
-            vec![orig_path, conflict_path],
+            Vec::new(),
             Vec::new(),
         )?;
         return Ok(());
@@ -921,10 +932,11 @@ fn recover_restore_from_bin<F: SyncFs, S: IndexStore>(
         record_disk_stat(fs, &path, &mut target_record)?;
         let persisted_rep = bin_entry_if_present(fs, replacement_bin)?;
         commit_records_and_clear_pending(
+            fs,
             store,
             vec![target_record],
             persisted_rep.into_iter().collect(),
-            vec![path],
+            Vec::new(),
             vec![restored_bin_id.clone()],
         )?;
         if !restored_storage_name.is_empty() {
@@ -1013,10 +1025,11 @@ fn recover_resolve_keep_conflict<F: SyncFs, S: IndexStore>(
         record_disk_stat(fs, &orig_path, &mut promoted_record)?;
         let persisted_bin = bin_entry_if_present(fs, bin_entry)?;
         commit_records_and_clear_pending(
+            fs,
             store,
             vec![deleted_conflict_record, promoted_record],
             persisted_bin.into_iter().collect(),
-            vec![orig_path, conflict_path],
+            Vec::new(),
             Vec::new(),
         )?;
         return Ok(());
@@ -1086,22 +1099,28 @@ pub fn apply_decision<F: SyncFs, S: IndexStore>(
         ReconcileDecision::RejectInvalid { path, reason } => {
             Err(SyncError::InvalidPath { path, reason })
         }
+        ReconcileDecision::NotYetKnownMember { .. } => Ok(ApplyOutcome::Applied),
         ReconcileDecision::Ignore | ReconcileDecision::Keep => Ok(ApplyOutcome::Applied),
         ReconcileDecision::HoldBack { .. } => Ok(ApplyOutcome::Applied),
         ReconcileDecision::KeepAndSupersede { mut record } => {
             let mut meta = load_meta_required(store)?;
-            let vkey = meta.version_key();
-            let clock = meta.next_clock();
-            record.version.bump_above(vkey, clock);
+            meta.bump_version(&mut record.version);
             let seq = meta.next_seq();
             record.seq = seq;
             record.modified_by = meta.local_member.clone();
             record.from_join = false;
             record.conflict_of = derive_conflict_of(&record, &meta);
-            meta.record_seq_fingerprint(seq, record.head_fingerprint());
+            let chain = meta.advance_chain_fingerprint(seq, record.head_fingerprint());
+            if record.deleted {
+                let encoded = encode_deletion_log_entries(&[
+                    FolderDeletionLogEntry::from_tombstone(&record),
+                ])?;
+                fs.append_deletion_log(&encoded)?;
+            }
             let mut batch = StoreBatch {
                 folder_meta: Some(meta),
-                remove_held_back: vec![record.path.clone()],
+                remove_held_back: vec![(peer.member_id().to_string(), record.path.clone())],
+                upsert_seq_fingerprints: vec![(seq, chain)],
                 ..StoreBatch::default()
             };
             if record.deleted && !record.recent_hashes.is_empty() {
@@ -1128,20 +1147,19 @@ pub fn apply_decision<F: SyncFs, S: IndexStore>(
             }
             let path = record.path.clone();
             commit_records_and_clear_pending(
+                fs,
                 store,
                 vec![record],
                 Vec::new(),
-                vec![path],
+                vec![(peer.member_id().to_string(), path)],
                 Vec::new(),
             )?;
             Ok(ApplyOutcome::Applied)
         }
         ReconcileDecision::ReviveDir { path, base_version } => {
             let mut meta = load_meta_required(store)?;
-            let vkey = meta.version_key();
             let mut version = base_version;
-            let clock = meta.next_clock();
-            version.bump_above(vkey, clock);
+            meta.bump_version(&mut version);
             let seq = meta.next_seq();
             let stat = fs.stat_live(&path)?;
             let mtime = stat.as_ref().map_or(now, |m| m.mtime);
@@ -1164,11 +1182,16 @@ pub fn apply_decision<F: SyncFs, S: IndexStore>(
                 conflict_of: None,
                 conflict_dismissed: false,
             };
-            meta.record_seq_fingerprint(seq, revived.head_fingerprint());
+            let chain = meta.advance_chain_fingerprint(seq, revived.head_fingerprint());
+            let encoded = encode_deletion_log_entries(&[FolderDeletionLogEntry::Revived {
+                path: path.clone(),
+            }])?;
+            fs.append_deletion_log(&encoded)?;
             let batch = StoreBatch {
                 folder_meta: Some(meta),
                 upsert_records: vec![revived],
-                remove_held_back: vec![path],
+                remove_held_back: vec![(peer.member_id().to_string(), path)],
+                upsert_seq_fingerprints: vec![(seq, chain)],
                 ..StoreBatch::default()
             };
             store.apply_batch(batch)?;
@@ -1224,6 +1247,7 @@ pub fn apply_decision<F: SyncFs, S: IndexStore>(
 pub fn apply_local_rename<F: SyncFs, S: IndexStore>(
     fs: &F,
     store: &mut S,
+    peer_member: &str,
     from_record: IndexRecord,
     mut to_record: IndexRecord,
     now: Timestamp,
@@ -1308,10 +1332,14 @@ pub fn apply_local_rename<F: SyncFs, S: IndexStore>(
             return handle_local_changed(fs, store, &to_path, now);
         }
         commit_records_and_clear_pending(
+            fs,
             store,
             vec![from_record, to_record],
             Vec::new(),
-            vec![from_path, to_path],
+            vec![
+                (peer_member.to_string(), from_path),
+                (peer_member.to_string(), to_path),
+            ],
             Vec::new(),
         )?;
         Ok(ApplyOutcome::Applied)
@@ -1456,6 +1484,7 @@ pub fn apply_new_files_group_commit<F: SyncFs, S: IndexStore>(
                         let _ = flush_group_commit_records(
                             fs,
                             store,
+                            peer.member_id(),
                             &mut placed,
                             &synced_parents,
                             &mut tmps_to_unregister,
@@ -1472,6 +1501,7 @@ pub fn apply_new_files_group_commit<F: SyncFs, S: IndexStore>(
             place_staged_chunk(
                 fs,
                 store,
+                peer.member_id(),
                 staged,
                 &mut placed,
                 &mut synced_parents,
@@ -1486,6 +1516,7 @@ pub fn apply_new_files_group_commit<F: SyncFs, S: IndexStore>(
         flush_group_commit_records(
             fs,
             store,
+            peer.member_id(),
             &mut placed,
             &synced_parents,
             &mut tmps_to_unregister,
@@ -1511,6 +1542,7 @@ fn cleanup_staged_writers<F: SyncFs>(
 fn place_staged_chunk<F: SyncFs, S: IndexStore>(
     fs: &F,
     store: &mut S,
+    peer_id: &str,
     staged: Vec<(u64, IndexRecord, String, Box<dyn SyncWrite>)>,
     placed: &mut Vec<(u64, IndexRecord)>,
     synced_parents: &mut HashSet<String>,
@@ -1537,6 +1569,7 @@ fn place_staged_chunk<F: SyncFs, S: IndexStore>(
                 let _ = flush_group_commit_records(
                     fs,
                     store,
+                    peer_id,
                     placed,
                     synced_parents,
                     tmps_to_unregister,
@@ -1561,6 +1594,7 @@ fn place_staged_chunk<F: SyncFs, S: IndexStore>(
                     let _ = flush_group_commit_records(
                         fs,
                         store,
+                        peer_id,
                         placed,
                         synced_parents,
                         tmps_to_unregister,
@@ -1598,6 +1632,7 @@ fn place_staged_chunk<F: SyncFs, S: IndexStore>(
                     let _ = flush_group_commit_records(
                         fs,
                         store,
+                        peer_id,
                         placed,
                         synced_parents,
                         tmps_to_unregister,
@@ -1625,6 +1660,7 @@ fn place_staged_chunk<F: SyncFs, S: IndexStore>(
                     let _ = flush_group_commit_records(
                         fs,
                         store,
+                        peer_id,
                         placed,
                         synced_parents,
                         tmps_to_unregister,
@@ -1655,9 +1691,11 @@ fn place_staged_chunk<F: SyncFs, S: IndexStore>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flush_group_commit_records<F: SyncFs, S: IndexStore>(
     fs: &F,
     store: &mut S,
+    peer_id: &str,
     placed: &mut Vec<(u64, IndexRecord)>,
     synced_parents: &HashSet<String>,
     tmps_to_unregister: &mut Vec<String>,
@@ -1680,14 +1718,27 @@ fn flush_group_commit_records<F: SyncFs, S: IndexStore>(
     let mut batch = StoreBatch::default();
     let drained = std::mem::take(placed);
     let mut meta_dirty = !drained.is_empty();
+    let mut del_log_entries = Vec::new();
     for (remote_seq, mut rec) in drained {
+        if store.get_record(&rec.path)?.is_some_and(|p| p.deleted) {
+            del_log_entries.push(FolderDeletionLogEntry::Revived {
+                path: rec.path.clone(),
+            });
+        }
         let seq = meta.next_seq();
         rec.seq = seq;
         rec.conflict_of = derive_conflict_of(&rec, &meta);
-        meta.record_seq_fingerprint(seq, rec.head_fingerprint());
-        batch.remove_held_back.push(rec.path.clone());
+        let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
+        batch.upsert_seq_fingerprints.push((seq, chain));
+        batch
+            .remove_held_back
+            .push((peer_id.to_string(), rec.path.clone()));
         batch.upsert_records.push(rec);
         out.applied_seqs.push(remote_seq);
+    }
+    if !del_log_entries.is_empty() {
+        let encoded = encode_deletion_log_entries(&del_log_entries)?;
+        fs.append_deletion_log(&encoded)?;
     }
     for p in needs_rescan_paths.drain(..) {
         if meta.needs_rescan.insert(p) {
@@ -1834,10 +1885,11 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                         Vec::new()
                     };
                     commit_records_and_clear_pending(
+                        fs,
                         store,
                         vec![target],
                         bins,
-                        vec![path],
+                        vec![(peer.member_id().to_string(), path)],
                         Vec::new(),
                     )?;
                     return Ok(ApplyOutcome::Applied);
@@ -1974,10 +2026,11 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
         }
 
         commit_records_and_clear_pending(
+            fs,
             store,
             vec![target],
             persisted_bins,
-            vec![path],
+            vec![(peer.member_id().to_string(), path)],
             Vec::new(),
         )?;
         Ok(ApplyOutcome::Applied)
@@ -2063,11 +2116,16 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                 let seq = meta.next_seq();
                 let mut tomb = tombstone;
                 tomb.seq = seq;
-                meta.record_seq_fingerprint(seq, tomb.head_fingerprint());
+                let chain = meta.advance_chain_fingerprint(seq, tomb.head_fingerprint());
+                let encoded = encode_deletion_log_entries(&[
+                    FolderDeletionLogEntry::from_tombstone(&tomb),
+                ])?;
+                fs.append_deletion_log(&encoded)?;
                 let batch = StoreBatch {
                     folder_meta: Some(meta),
                     upsert_records: vec![tomb],
-                    remove_held_back: vec![path.clone()],
+                    remove_held_back: vec![(peer_member.to_string(), path.clone())],
+                    upsert_seq_fingerprints: vec![(seq, chain)],
                     set_pending_op: Some(None),
                     ..StoreBatch::default()
                 };
@@ -2128,10 +2186,11 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
             }
 
             commit_records_and_clear_pending(
+                fs,
                 store,
                 vec![tombstone],
                 litter_bins,
-                vec![path],
+                vec![(peer_member.to_string(), path)],
                 Vec::new(),
             )?;
             return Ok(ApplyOutcome::Applied);
@@ -2204,10 +2263,11 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
         }
 
         commit_records_and_clear_pending(
+            fs,
             store,
             vec![tombstone],
             persisted_bins,
-            vec![path],
+            vec![(peer_member.to_string(), path)],
             Vec::new(),
         )?;
         Ok(ApplyOutcome::Applied)
@@ -2454,10 +2514,11 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                         }) => {
                             let _ = fs.remove_tmp(tmp);
                             commit_records_and_clear_pending(
+                                fs,
                                 store,
                                 vec![loser_record],
                                 persisted_bins,
-                                vec![conflict_path],
+                                vec![(peer.member_id().to_string(), conflict_path)],
                                 Vec::new(),
                             )?;
                             mark_needs_rescan(store, &[&orig_path])?;
@@ -2474,10 +2535,11 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                     true,
                 )? {
                     commit_records_and_clear_pending(
+                        fs,
                         store,
                         vec![loser_record],
                         persisted_bins,
-                        vec![conflict_path],
+                        vec![(peer.member_id().to_string(), conflict_path)],
                         Vec::new(),
                     )?;
                     mark_needs_rescan(store, &[&orig_path])?;
@@ -2504,10 +2566,11 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                         ..
                     }) => {
                         commit_records_and_clear_pending(
+                            fs,
                             store,
                             vec![loser_record],
                             persisted_bins,
-                            vec![conflict_path],
+                            vec![(peer.member_id().to_string(), conflict_path)],
                             Vec::new(),
                         )?;
                         mark_needs_rescan(store, &[&orig_path])?;
@@ -2521,10 +2584,14 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
 
         // 7. Commit BOTH records atomically and clear pending op.
         commit_records_and_clear_pending(
+            fs,
             store,
             vec![loser_record, winner_record],
             persisted_bins,
-            vec![orig_path, conflict_path],
+            vec![
+                (peer.member_id().to_string(), orig_path),
+                (peer.member_id().to_string(), conflict_path),
+            ],
             Vec::new(),
         )?;
         Ok(ApplyOutcome::Applied)
@@ -2588,9 +2655,7 @@ fn apply_conflict_remote_loses<F: SyncFs, S: IndexStore>(
 
     if bump_winner_clock {
         let mut meta = load_meta_required(store)?;
-        let vkey = meta.version_key();
-        let clock = meta.next_clock();
-        winner_record.version.bump_above(vkey, clock);
+        meta.bump_version(&mut winner_record.version);
         let batch = StoreBatch {
             folder_meta: Some(meta),
             ..StoreBatch::default()
@@ -2688,10 +2753,14 @@ fn apply_conflict_remote_loses<F: SyncFs, S: IndexStore>(
         }
 
         commit_records_and_clear_pending(
+            fs,
             store,
             vec![loser_record, winner_record],
             Vec::new(),
-            vec![orig_path, conflict_path],
+            vec![
+                (peer.member_id().to_string(), orig_path),
+                (peer.member_id().to_string(), conflict_path),
+            ],
             Vec::new(),
         )?;
         Ok(ApplyOutcome::Applied)
@@ -2743,10 +2812,8 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                 finalize_independent_conflict_version(store, &mut loser)?;
 
                 let mut meta = load_meta_required(store)?;
-                let vkey = meta.version_key();
                 let mut dir_version = rec.version.clone();
-                let clock = meta.next_clock();
-                dir_version.bump_above(vkey, clock);
+                meta.bump_version(&mut dir_version);
                 let mut dir_record = IndexRecord {
                     path: anc.to_string(),
                     kind: EntryKind::Dir,
@@ -2890,10 +2957,11 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                     fs.create_dir_all_live(anc)?;
                     record_disk_stat(fs, anc, &mut dir_record)?;
                     commit_records_and_clear_pending(
+                        fs,
                         store,
                         vec![loser, dir_record],
                         persisted_bins,
-                        vec![anc.to_string(), conflict_path],
+                        Vec::new(),
                         Vec::new(),
                     )?;
                     Ok(true)
@@ -2905,12 +2973,11 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
             prev_deleted_or_none => {
                 fs.create_dir_all_live(anc)?;
                 let mut meta = load_meta_required(store)?;
-                let vkey = meta.version_key();
+                let was_deleted = prev_deleted_or_none.is_some();
                 let mut version = prev_deleted_or_none
                     .as_ref()
                     .map_or_else(VersionVector::new, |p| p.version.clone());
-                let clock = meta.next_clock();
-                version.bump_above(vkey, clock);
+                meta.bump_version(&mut version);
                 let seq = meta.next_seq();
                 let dir_stat = fs.stat_live(anc)?;
                 let dir_mtime = dir_stat.as_ref().map_or(now, |m| m.mtime);
@@ -2933,10 +3000,17 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                     conflict_of: None,
                     conflict_dismissed: false,
                 };
-                meta.record_seq_fingerprint(seq, dir_rec.head_fingerprint());
+                let chain = meta.advance_chain_fingerprint(seq, dir_rec.head_fingerprint());
+                if was_deleted {
+                    let encoded = encode_deletion_log_entries(&[FolderDeletionLogEntry::Revived {
+                        path: anc.to_string(),
+                    }])?;
+                    fs.append_deletion_log(&encoded)?;
+                }
                 let batch = StoreBatch {
                     folder_meta: Some(meta),
                     upsert_records: vec![dir_rec],
+                    upsert_seq_fingerprints: vec![(seq, chain)],
                     ..StoreBatch::default()
                 };
                 store.apply_batch(batch)?;
@@ -2956,7 +3030,6 @@ fn finalize_independent_conflict_version<S: IndexStore>(
     loser_record: &mut IndexRecord,
 ) -> Result<()> {
     let mut meta = load_meta_required(store)?;
-    let vkey = meta.version_key();
 
     if let Some(existing) = store.get_record(&loser_record.path)? {
         if !existing.deleted && existing.content_equal(loser_record) {
@@ -2965,8 +3038,7 @@ fn finalize_independent_conflict_version<S: IndexStore>(
         }
         if existing.deleted {
             let mut version = existing.version;
-            let clock = meta.next_clock();
-            version.bump_above(vkey, clock);
+            meta.bump_version(&mut version);
             loser_record.version = version;
             let batch = StoreBatch {
                 folder_meta: Some(meta),
@@ -2977,6 +3049,7 @@ fn finalize_independent_conflict_version<S: IndexStore>(
         }
     }
 
+    let vkey = meta.version_key();
     let clock = meta.next_clock();
     loser_record.version = VersionVector::singleton(vkey, clock);
     let batch = StoreBatch {
@@ -3068,6 +3141,7 @@ pub fn restore_from_bin<F: SyncFs, S: IndexStore>(
             &view,
             &target_path,
             entry.kind,
+            entry.link_target.as_deref(),
             &local_member,
             &caps,
             replacing,
@@ -3157,12 +3231,10 @@ pub fn restore_from_bin<F: SyncFs, S: IndexStore>(
     };
 
     let mut meta = load_meta_required(store)?;
-    let vkey = meta.version_key();
     let mut version = existing
         .as_ref()
         .map_or_else(VersionVector::new, |p| p.version.clone());
-    let clock = meta.next_clock();
-    version.bump_above(vkey, clock);
+    meta.bump_version(&mut version);
 
     let mut recent_hashes = existing
         .as_ref()
@@ -3390,10 +3462,11 @@ pub fn restore_from_bin<F: SyncFs, S: IndexStore>(
             record_disk_stat(fs, &target_path, &mut restored_record)?;
         }
         commit_records_and_clear_pending(
+            fs,
             store,
             vec![restored_record],
             persisted_bins,
-            vec![target_path.clone()],
+            Vec::new(),
             vec![entry.id.clone()],
         )?;
 
@@ -3447,7 +3520,6 @@ pub fn resolve_conflict<F: SyncFs, S: IndexStore>(
     match choice {
         ConflictChoice::KeepOriginal => {
             let mut meta = load_meta_required(store)?;
-            let vkey = meta.version_key();
             let bin_entry = build_bin_entry(
                 Some(&conflict_rec),
                 BinReason::ReplacedLocally,
@@ -3461,8 +3533,7 @@ pub fn resolve_conflict<F: SyncFs, S: IndexStore>(
             };
 
             let mut version = conflict_rec.version.clone();
-            let clock = meta.next_clock();
-            version.bump_above(vkey, clock);
+            meta.bump_version(&mut version);
             let mut recent_hashes = conflict_rec.recent_hashes.clone();
             if let Some(h) = conflict_rec.hash {
                 recent_hashes.retain(|x| *x != h);
@@ -3544,10 +3615,11 @@ pub fn resolve_conflict<F: SyncFs, S: IndexStore>(
                     }
                 }
                 commit_records_and_clear_pending(
+                    fs,
                     store,
                     vec![tombstone],
                     persisted_bins,
-                    vec![clean_conflict],
+                    Vec::new(),
                     Vec::new(),
                 )?;
                 Ok(())
@@ -3565,6 +3637,7 @@ pub fn resolve_conflict<F: SyncFs, S: IndexStore>(
                     &view,
                     &orig_path,
                     conflict_rec.kind,
+                    conflict_rec.link_target.as_deref(),
                     &local_member,
                     &caps,
                     Some(&orig_path),
@@ -3589,7 +3662,6 @@ pub fn resolve_conflict<F: SyncFs, S: IndexStore>(
             }
 
             let mut meta = load_meta_required(store)?;
-            let vkey = meta.version_key();
             let orig_live = orig_rec.as_ref().filter(|r| !r.deleted);
             let bin_entry = build_bin_entry(
                 orig_live,
@@ -3610,8 +3682,7 @@ pub fn resolve_conflict<F: SyncFs, S: IndexStore>(
             let mut orig_version = orig_rec
                 .as_ref()
                 .map_or_else(VersionVector::new, |r| r.version.clone());
-            let c1 = meta.next_clock();
-            orig_version.bump_above(vkey.clone(), c1);
+            meta.bump_version(&mut orig_version);
 
             let mut orig_recent = orig_rec
                 .as_ref()
@@ -3626,8 +3697,7 @@ pub fn resolve_conflict<F: SyncFs, S: IndexStore>(
             }
 
             let mut conflict_version = conflict_rec.version.clone();
-            let c2 = meta.next_clock();
-            conflict_version.bump_above(vkey, c2);
+            meta.bump_version(&mut conflict_version);
             let mut conflict_recent = conflict_rec.recent_hashes.clone();
             if let Some(ch) = conflict_rec.hash {
                 conflict_recent.retain(|h| *h != ch);
@@ -3769,10 +3839,11 @@ pub fn resolve_conflict<F: SyncFs, S: IndexStore>(
 
                 record_disk_stat(fs, &orig_path, &mut promoted)?;
                 commit_records_and_clear_pending(
+                    fs,
                     store,
                     vec![deleted_conflict, promoted],
                     persisted_bins,
-                    vec![orig_path, clean_conflict],
+                    Vec::new(),
                     Vec::new(),
                 )?;
                 Ok(())
@@ -3782,19 +3853,18 @@ pub fn resolve_conflict<F: SyncFs, S: IndexStore>(
         }
         ConflictChoice::KeepBoth => {
             let mut meta = load_meta_required(store)?;
-            let vkey = meta.version_key();
             let mut updated = conflict_rec;
-            let clock = meta.next_clock();
-            updated.version.bump_above(vkey, clock);
+            meta.bump_version(&mut updated.version);
             let seq = meta.next_seq();
             updated.seq = seq;
             updated.conflict_dismissed = true;
             updated.conflict_of = None;
-            meta.record_seq_fingerprint(seq, updated.head_fingerprint());
+            let chain = meta.advance_chain_fingerprint(seq, updated.head_fingerprint());
 
             let batch = StoreBatch {
                 folder_meta: Some(meta),
                 upsert_records: vec![updated],
+                upsert_seq_fingerprints: vec![(seq, chain)],
                 ..StoreBatch::default()
             };
             store.apply_batch(batch)?;
@@ -4686,11 +4756,12 @@ fn preserve_tmp_as_conflict_copy<F: SyncFs, S: IndexStore>(
     };
     rec.conflict_of =
         derive_conflict_of(&rec, &meta).or_else(|| Some(original_path.to_string()));
-    meta.record_seq_fingerprint(seq, rec.head_fingerprint());
+    let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
     let batch = StoreBatch {
         folder_meta: Some(meta),
         upsert_records: vec![rec.clone()],
         remove_staged_tmps: vec![tmp_name.to_string()],
+        upsert_seq_fingerprints: vec![(seq, chain)],
         ..StoreBatch::default()
     };
     store.apply_batch(batch)?;
@@ -4792,17 +4863,31 @@ fn clear_pending_op<S: IndexStore>(store: &mut S) -> Result<()> {
     store.apply_batch(batch)
 }
 
-fn commit_records_and_clear_pending<S: IndexStore>(
+fn commit_records_and_clear_pending<F: SyncFs, S: IndexStore>(
+    fs: &F,
     store: &mut S,
     records: Vec<IndexRecord>,
     bin_entries: Vec<BinEntry>,
-    clear_held_back_paths: Vec<String>,
+    clear_held_back: Vec<(MemberId, String)>,
     remove_bin_ids: Vec<String>,
 ) -> Result<()> {
     let mut meta = load_meta_required(store)?;
+    let own_key = meta.version_key();
     let mut batch = StoreBatch::default();
+    let mut del_log_entries = Vec::new();
 
     for mut rec in records {
+        let own_counter = rec.version.get(&own_key);
+        if own_counter > meta.local_clock {
+            meta.local_clock = own_counter;
+        }
+        if rec.deleted {
+            del_log_entries.push(FolderDeletionLogEntry::from_tombstone(&rec));
+        } else if store.get_record(&rec.path)?.is_some_and(|p| p.deleted) {
+            del_log_entries.push(FolderDeletionLogEntry::Revived {
+                path: rec.path.clone(),
+            });
+        }
         let seq = meta.next_seq();
         rec.seq = seq;
         if rec.deleted && !rec.recent_hashes.is_empty() {
@@ -4811,14 +4896,20 @@ fn commit_records_and_clear_pending<S: IndexStore>(
                 .push((rec.path.clone(), rec.recent_hashes.clone()));
         }
         rec.conflict_of = derive_conflict_of(&rec, &meta);
-        meta.record_seq_fingerprint(seq, rec.head_fingerprint());
+        let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
+        batch.upsert_seq_fingerprints.push((seq, chain));
         batch.upsert_records.push(rec);
+    }
+
+    if !del_log_entries.is_empty() {
+        let encoded = encode_deletion_log_entries(&del_log_entries)?;
+        fs.append_deletion_log(&encoded)?;
     }
 
     batch.folder_meta = Some(meta);
     batch.upsert_bin = bin_entries;
     batch.remove_bin = remove_bin_ids;
-    batch.remove_held_back = clear_held_back_paths;
+    batch.remove_held_back = clear_held_back;
     batch.set_pending_op = Some(None);
     store.apply_batch(batch)
 }

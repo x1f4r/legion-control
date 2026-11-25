@@ -43,8 +43,8 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
     fn member_id(&self) -> &str {
         &self.member_id
     }
-    fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
-        self.engine.serve_handshake(&self.caller)
+    fn handshake(&self, caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+        self.engine.serve_handshake(&self.caller, caller)
     }
     fn records_since(
         &self,
@@ -164,6 +164,15 @@ impl SyncFs for HookFs {
     }
     fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
         self.w("write_marker", "", |f| f.write_marker(marker))
+    }
+    fn append_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
+        self.inner.append_deletion_log(bytes)
+    }
+    fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
+        self.inner.read_deletion_log()
+    }
+    fn compact_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
+        self.inner.compact_deletion_log(bytes)
     }
     fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
         self.inner.ensure_internal_dirs()

@@ -262,6 +262,18 @@ impl SyncFs for StrictPlatformFs {
         Ok(())
     }
 
+    fn append_deletion_log(&self, _bytes: &[u8]) -> legion_sync::Result<()> {
+        Ok(())
+    }
+
+    fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    fn compact_deletion_log(&self, _bytes: &[u8]) -> legion_sync::Result<()> {
+        Ok(())
+    }
+
     fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
         Ok(())
     }
@@ -918,8 +930,8 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
         &self.member_id
     }
 
-    fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
-        self.engine.serve_handshake(&self.caller)
+    fn handshake(&self, caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+        self.engine.serve_handshake(&self.caller, caller)
     }
 
     fn records_since(

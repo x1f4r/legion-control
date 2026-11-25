@@ -16,9 +16,9 @@ use legion_xfer::{EntryKind, Hash, Timestamp};
 use crate::error::{Result, SyncError};
 use crate::model::FolderMarker;
 use crate::path::{
-    IgnoreMatcher, SYNC_BIN_DIR, SYNC_MARKER_FILE, SYNC_META_DIR, SYNC_TMP_DIR, ancestors,
-    check_fs_compatibility, is_dot_legion_sync_segment, validate_flat_internal_name,
-    validate_sync_path,
+    IgnoreMatcher, SYNC_BIN_DIR, SYNC_DELETIONS_LOG_FILE, SYNC_MARKER_FILE, SYNC_META_DIR,
+    SYNC_TMP_DIR, ancestors, check_fs_compatibility, is_dot_legion_sync_segment,
+    validate_flat_internal_name, validate_sync_path,
 };
 use crate::traits::{FsCapabilities, FsMeta, FsWalkEntry, FsWalkResult, SyncFs, SyncWrite};
 
@@ -285,6 +285,46 @@ impl SyncFs for RealFs {
         })?;
         write_atomic(self.marker_path(), &bytes, WriteOptions::with_mode(0o600))
             .map_err(|err| SyncError::from_os(Some(SYNC_MARKER_FILE.to_string()), err))?;
+        sync_dir(&self.meta_dir());
+        Ok(())
+    }
+
+    fn append_deletion_log(&self, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.ensure_internal_dirs()?;
+        let path = self.meta_dir().join("deletions.log");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|err| SyncError::from_io(Some(SYNC_DELETIONS_LOG_FILE.to_string()), err))?;
+        file.write_all(bytes)
+            .map_err(|err| SyncError::from_io(Some(SYNC_DELETIONS_LOG_FILE.to_string()), err))?;
+        file.sync_all()
+            .map_err(|err| SyncError::from_io(Some(SYNC_DELETIONS_LOG_FILE.to_string()), err))?;
+        sync_dir(&self.meta_dir());
+        Ok(())
+    }
+
+    fn read_deletion_log(&self) -> Result<Vec<u8>> {
+        let path = self.meta_dir().join("deletions.log");
+        match fs::read(&path) {
+            Ok(bytes) => Ok(bytes),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(err) => Err(SyncError::from_io(
+                Some(SYNC_DELETIONS_LOG_FILE.to_string()),
+                err,
+            )),
+        }
+    }
+
+    fn compact_deletion_log(&self, bytes: &[u8]) -> Result<()> {
+        self.ensure_internal_dirs()?;
+        let path = self.meta_dir().join("deletions.log");
+        write_atomic(&path, bytes, WriteOptions::with_mode(0o600))
+            .map_err(|err| SyncError::from_os(Some(SYNC_DELETIONS_LOG_FILE.to_string()), err))?;
         sync_dir(&self.meta_dir());
         Ok(())
     }

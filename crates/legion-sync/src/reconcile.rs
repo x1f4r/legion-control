@@ -10,11 +10,13 @@ use legion_xfer::{EntryKind, Hash};
 
 use crate::model::{
     BinReason, FolderMeta, IndexRecord, MAX_ANCESTRY_HASHES, MAX_LINK_TARGET_BYTES,
-    MAX_VV_INCARNATIONS_PER_MEMBER, ProblemKind, SyncProblem, validate_member_id,
+    MAX_VERSION_COUNTER, MAX_VV_INCARNATIONS_PER_MEMBER, MemberId, ProblemKind, SyncProblem,
+    validate_member_id,
 };
 use crate::path::{
-    IgnoreMatcher, ancestors, check_fs_compatibility, conflict_copy_path, fold_case,
-    fs_equivalence_key, parse_conflict_copy_path, validate_sync_path,
+    IgnoreMatcher, ancestors, check_fs_compatibility, check_symlink_target_contained,
+    conflict_copy_path, fold_case, fs_equivalence_key, parse_conflict_copy_path,
+    validate_sync_path,
 };
 use crate::traits::FsCapabilities;
 use crate::version::{VersionOrder, VersionVector};
@@ -37,12 +39,23 @@ pub trait LocalIndexView {
 /// Action decided by [`reconcile_record`] for one incoming peer record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconcileDecision {
-    /// Incoming record violated safety, size, member, or structural invariants and must be
-    /// skipped and reported without stalling the peer.
+    /// Incoming record violated safety, size, counter, or structural invariants and must be
+    /// refused (not acknowledged) and reported durably.
     RejectInvalid {
         /// Raw path sent by the peer (truncated if huge).
         path: String,
         /// Explanation of why the record was refused.
+        reason: String,
+    },
+    /// Incoming record is structurally valid but mentions a syntactically valid member name that
+    /// this machine has not learned about yet ("not yet", never "invalid"). Stored durably as
+    /// unapplied and retried once membership catches up; never acknowledged until applied.
+    NotYetKnownMember {
+        /// Validated relative path of the record.
+        path: String,
+        /// Unknown member name referenced by the record.
+        member: MemberId,
+        /// Human-readable explanation.
         reason: String,
     },
     /// Path is excluded by fixed or per-folder ignore rules.
@@ -116,52 +129,74 @@ pub enum ReconcileDecision {
     },
 }
 
-/// Validates every untrusted field of an incoming peer [`IndexRecord`] against `meta`.
-///
-/// Returns the canonical validated relative path on success, or a plain-language rejection reason.
-pub fn validate_incoming_record(
+/// Detailed result of validating an incoming peer [`IndexRecord`].
+enum RecordValidationError {
+    /// Structurally invalid or unauthorized record (forged counters, invalid syntax, etc.).
+    Invalid(String),
+    /// Syntactically valid record referencing a member this machine does not know yet.
+    UnknownMember {
+        path: String,
+        member: MemberId,
+        reason: String,
+    },
+}
+
+fn validate_incoming_record_detailed(
     remote: &IndexRecord,
     meta: &FolderMeta,
-) -> std::result::Result<String, String> {
-    let clean_path = validate_sync_path(&remote.path).map_err(|err| err.to_string())?;
+) -> std::result::Result<String, RecordValidationError> {
+    let clean_path =
+        validate_sync_path(&remote.path).map_err(|err| RecordValidationError::Invalid(err.to_string()))?;
 
-    if validate_member_id(&remote.modified_by).is_err()
-        || !meta.is_known_member(&remote.modified_by)
-    {
-        return Err(format!(
-            "record modifier {:?} is not a known member of folder {:?}",
-            remote.modified_by, meta.folder_id
-        ));
+    if validate_member_id(&remote.modified_by).is_err() {
+        return Err(RecordValidationError::Invalid(format!(
+            "record modifier {:?} is not a valid member identifier",
+            remote.modified_by
+        )));
     }
 
     if remote.mtime.nanos >= 1_000_000_000 {
-        return Err(format!(
+        return Err(RecordValidationError::Invalid(format!(
             "record has invalid nanosecond timestamp {}",
             remote.mtime.nanos
-        ));
+        )));
     }
 
     if remote.recent_hashes.len() > MAX_ANCESTRY_HASHES {
-        return Err(format!(
+        return Err(RecordValidationError::Invalid(format!(
             "record ancestry list has {} entries, exceeding limit of {MAX_ANCESTRY_HASHES}",
             remote.recent_hashes.len()
-        ));
+        )));
     }
 
+    let own_key = meta.version_key();
     let mut prev_member: Option<&str> = None;
     let mut member_inc_count: usize = 0;
-    for (key, _counter) in remote.version.iter() {
+    let mut first_unknown_member: Option<(MemberId, String)> = None;
+    for (key, counter) in remote.version.iter() {
         if key.incarnation == 0 {
-            return Err(format!(
+            return Err(RecordValidationError::Invalid(format!(
                 "version vector entry for {:?} has zero incarnation",
                 key.member
-            ));
+            )));
         }
-        if validate_member_id(&key.member).is_err() || !meta.is_known_member(&key.member) {
-            return Err(format!(
-                "version vector references unknown member {:?}",
+        if validate_member_id(&key.member).is_err() {
+            return Err(RecordValidationError::Invalid(format!(
+                "version vector references invalid member identifier {:?}",
                 key.member
-            ));
+            )));
+        }
+        if counter > MAX_VERSION_COUNTER {
+            return Err(RecordValidationError::Invalid(format!(
+                "version vector counter {counter} for {:?} exceeds maximum allowed value ({MAX_VERSION_COUNTER})",
+                key.member
+            )));
+        }
+        if *key == own_key && counter > meta.local_clock {
+            return Err(RecordValidationError::Invalid(format!(
+                "peer raised this machine's own version counter to {counter}, above locally issued {}",
+                meta.local_clock
+            )));
         }
         if prev_member == Some(key.member.as_str()) {
             member_inc_count += 1;
@@ -170,59 +205,110 @@ pub fn validate_incoming_record(
             member_inc_count = 1;
         }
         if member_inc_count > MAX_VV_INCARNATIONS_PER_MEMBER {
-            return Err(format!(
+            return Err(RecordValidationError::Invalid(format!(
                 "version vector has more than {MAX_VV_INCARNATIONS_PER_MEMBER} incarnations for member {:?}",
                 key.member
+            )));
+        }
+        if !meta.is_known_member(&key.member) && first_unknown_member.is_none() {
+            first_unknown_member = Some((
+                key.member.clone(),
+                format!(
+                    "version history mentions member {:?} which this machine does not know yet",
+                    key.member
+                ),
             ));
         }
     }
 
     if remote.deleted {
         if remote.size != 0 || remote.hash.is_some() || remote.link_target.is_some() {
-            return Err(
+            return Err(RecordValidationError::Invalid(
                 "deletion tombstone must have zero size and no file hash or symlink target"
                     .to_string(),
-            );
+            ));
         }
     } else {
         match remote.kind {
             EntryKind::File => {
                 if remote.hash.is_none() {
-                    return Err("live file record is missing its BLAKE3 hash".to_string());
+                    return Err(RecordValidationError::Invalid(
+                        "live file record is missing its BLAKE3 hash".to_string(),
+                    ));
                 }
                 if remote.link_target.is_some() {
-                    return Err("live file record must not carry a symlink target".to_string());
+                    return Err(RecordValidationError::Invalid(
+                        "live file record must not carry a symlink target".to_string(),
+                    ));
                 }
             }
             EntryKind::Dir => {
                 if remote.size != 0 || remote.hash.is_some() || remote.link_target.is_some() {
-                    return Err(
+                    return Err(RecordValidationError::Invalid(
                         "directory record must have zero size and no file hash or symlink target"
                             .to_string(),
-                    );
+                    ));
                 }
             }
             EntryKind::Symlink => {
                 if remote.size != 0 || remote.hash.is_some() {
-                    return Err("symlink record must have zero size and no file hash".to_string());
-                }
-                let Some(ref target) = remote.link_target else {
-                    return Err("live symlink record is missing link_target".to_string());
-                };
-                if target.is_empty() || target.len() > MAX_LINK_TARGET_BYTES {
-                    return Err(format!(
-                        "symlink target length {} is out of bounds (1..={MAX_LINK_TARGET_BYTES})",
-                        target.len()
+                    return Err(RecordValidationError::Invalid(
+                        "symlink record must have zero size and no file hash".to_string(),
                     ));
                 }
+                let Some(ref target) = remote.link_target else {
+                    return Err(RecordValidationError::Invalid(
+                        "live symlink record is missing link_target".to_string(),
+                    ));
+                };
+                if target.is_empty() || target.len() > MAX_LINK_TARGET_BYTES {
+                    return Err(RecordValidationError::Invalid(format!(
+                        "symlink target length {} is out of bounds (1..={MAX_LINK_TARGET_BYTES})",
+                        target.len()
+                    )));
+                }
                 if target.as_bytes().contains(&0) {
-                    return Err("symlink target contains a NUL byte".to_string());
+                    return Err(RecordValidationError::Invalid(
+                        "symlink target contains a NUL byte".to_string(),
+                    ));
                 }
             }
         }
     }
 
+    if !meta.is_known_member(&remote.modified_by) {
+        return Err(RecordValidationError::UnknownMember {
+            path: clean_path,
+            member: remote.modified_by.clone(),
+            reason: format!(
+                "record was last changed by member {:?} which this machine does not know yet",
+                remote.modified_by
+            ),
+        });
+    }
+    if let Some((member, reason)) = first_unknown_member {
+        return Err(RecordValidationError::UnknownMember {
+            path: clean_path,
+            member,
+            reason,
+        });
+    }
+
     Ok(clean_path)
+}
+
+/// Validates every untrusted field of an incoming peer [`IndexRecord`] against `meta`.
+///
+/// Returns the canonical validated relative path on success, or a plain-language rejection reason.
+pub fn validate_incoming_record(
+    remote: &IndexRecord,
+    meta: &FolderMeta,
+) -> std::result::Result<String, String> {
+    match validate_incoming_record_detailed(remote, meta) {
+        Ok(p) => Ok(p),
+        Err(RecordValidationError::Invalid(reason))
+        | Err(RecordValidationError::UnknownMember { reason, .. }) => Err(reason),
+    }
 }
 
 /// Computes the 6-lowercase-hex-character short content hash tag for `rec`.
@@ -279,11 +365,22 @@ pub fn reconcile_record(
     caps: &FsCapabilities,
     ignore: &IgnoreMatcher,
 ) -> ReconcileDecision {
-    let clean_path = match validate_incoming_record(remote, meta) {
+    let clean_path = match validate_incoming_record_detailed(remote, meta) {
         Ok(p) => p,
-        Err(reason) => {
+        Err(RecordValidationError::Invalid(reason)) => {
             return ReconcileDecision::RejectInvalid {
                 path: remote.path.chars().take(128).collect(),
+                reason,
+            };
+        }
+        Err(RecordValidationError::UnknownMember {
+            path,
+            member,
+            reason,
+        }) => {
+            return ReconcileDecision::NotYetKnownMember {
+                path,
+                member,
                 reason,
             };
         }
@@ -380,9 +477,15 @@ fn reconcile_without_local(
         }
     }
 
-    if let Some(problem) =
-        check_local_representable(local_view, clean_path, remote.kind, peer_member, caps, None)
-    {
+    if let Some(problem) = check_local_representable(
+        local_view,
+        clean_path,
+        remote.kind,
+        remote.link_target.as_deref(),
+        peer_member,
+        caps,
+        None,
+    ) {
         return ReconcileDecision::HoldBack { problem };
     }
 
@@ -557,6 +660,7 @@ fn reconcile_remote_newer(
         local_view,
         clean_path,
         remote.kind,
+        remote.link_target.as_deref(),
         peer_member,
         caps,
         if local.deleted {
@@ -643,6 +747,7 @@ fn reconcile_concurrent(
                 local_view,
                 clean_path,
                 remote.kind,
+                remote.link_target.as_deref(),
                 peer_member,
                 caps,
                 Some(clean_path),
@@ -701,9 +806,15 @@ fn reconcile_concurrent(
         };
     }
     if local.deleted && !remote.deleted {
-        if let Some(problem) =
-            check_local_representable(local_view, clean_path, remote.kind, peer_member, caps, None)
-        {
+        if let Some(problem) = check_local_representable(
+            local_view,
+            clean_path,
+            remote.kind,
+            remote.link_target.as_deref(),
+            peer_member,
+            caps,
+            None,
+        ) {
             return ReconcileDecision::HoldBack { problem };
         }
         let mut revived = sanitize_remote(remote, clean_path, meta);
@@ -850,6 +961,7 @@ fn build_remote_loses_conflict(
         local_view,
         &conflict_path,
         remote.kind,
+        remote.link_target.as_deref(),
         peer_member,
         caps,
         Some(&conflict_path),
@@ -890,6 +1002,7 @@ fn build_local_loses_conflict(
         local_view,
         clean_path,
         remote.kind,
+        remote.link_target.as_deref(),
         peer_member,
         caps,
         Some(clean_path),
@@ -905,6 +1018,7 @@ fn build_local_loses_conflict(
         local_view,
         &conflict_path,
         local.kind,
+        local.link_target.as_deref(),
         peer_member,
         caps,
         Some(&conflict_path),
@@ -968,12 +1082,14 @@ pub fn choose_conflict_path(
     }
 }
 
-/// Checks platform naming/length/symlink rules and case-insensitive / Unicode-normalizing
-/// collisions against the local index.
+/// Checks platform naming/length/symlink rules (including strict relative in-folder symlink
+/// containment) and case-insensitive / Unicode-normalizing collisions against the local index.
+#[allow(clippy::too_many_arguments)]
 pub fn check_local_representable(
     local_view: &dyn LocalIndexView,
     rel_path: &str,
     kind: EntryKind,
+    link_target: Option<&str>,
     peer_member: &str,
     caps: &FsCapabilities,
     replacing_exact: Option<&str>,
@@ -984,6 +1100,18 @@ pub fn check_local_representable(
             kind: prob_kind,
             peer: Some(peer_member.to_string()),
             sentence,
+        });
+    }
+
+    if kind == EntryKind::Symlink
+        && let Err(reason) =
+            check_symlink_target_contained(rel_path, link_target.unwrap_or_default())
+    {
+        return Some(SyncProblem {
+            path: rel_path.to_string(),
+            kind: ProblemKind::UnsupportedSymlink,
+            peer: Some(peer_member.to_string()),
+            sentence: format!("'{rel_path}' was held back because {reason}."),
         });
     }
 

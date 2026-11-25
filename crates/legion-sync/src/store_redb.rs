@@ -27,8 +27,8 @@ use crate::codec::{
 };
 use crate::error::{Result, SyncError};
 use crate::model::{
-    BinEntry, FolderMeta, HeldBackRecord, INDEX_SCHEMA_VERSION, IndexRecord,
-    MAX_DELETED_HISTORY_PATHS, MemberId, PeerCursor, PendingOp, RecordsPage,
+    BinEntry, DeferredItem, FolderMeta, HeldBackRecord, INDEX_SCHEMA_VERSION, IndexRecord,
+    MAX_DELETED_HISTORY_PATHS, MemberId, PeerCursor, PendingOp, RecordsPage, SyncProblem,
 };
 use crate::path::{fold_case, is_descendant_of};
 use crate::traits::{IndexStore, StoreBatch};
@@ -40,10 +40,17 @@ const CONFLICTS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("conflic
 const FOLDED_LIVE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("folded_live");
 const PEER_CURSORS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_cursors_v2");
 const BIN_ENTRIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("bin_entries");
-const HELD_BACK_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("held_back");
+const HELD_BACK_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("held_back_v2");
 const DELETED_HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("deleted_history");
 const STAGED_TMPS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("staged_tmps");
+const SEQ_FINGERPRINTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("seq_fingerprints");
+const PROBLEMS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("problems");
+const DEFERRALS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("deferrals");
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+
+fn peer_path_key(peer: &str, path: &str) -> String {
+    format!("{peer}\0{path}")
+}
 
 const META_KEY_SCHEMA: &str = "schema_version";
 const META_KEY_FOLDER: &str = "folder_meta";
@@ -88,6 +95,9 @@ impl RedbIndexStore {
             let _ = txn.open_table(HELD_BACK_TABLE).map_err(table_err)?;
             let _ = txn.open_table(DELETED_HISTORY_TABLE).map_err(table_err)?;
             let _ = txn.open_table(STAGED_TMPS_TABLE).map_err(table_err)?;
+            let _ = txn.open_table(SEQ_FINGERPRINTS_TABLE).map_err(table_err)?;
+            let _ = txn.open_table(PROBLEMS_TABLE).map_err(table_err)?;
+            let _ = txn.open_table(DEFERRALS_TABLE).map_err(table_err)?;
             let mut meta_table = txn.open_table(META_TABLE).map_err(table_err)?;
 
             let existing = meta_table
@@ -167,6 +177,14 @@ fn decode_u64_le(context: &str, bytes: &[u8]) -> Result<u64> {
         detail: format!("expected 8 bytes, got {}", bytes.len()),
     })?;
     Ok(u64::from_le_bytes(arr))
+}
+
+fn decode_hash(context: &str, bytes: &[u8]) -> Result<Hash> {
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| SyncError::CorruptData {
+        context: context.to_string(),
+        detail: format!("expected 32 bytes for hash, got {}", bytes.len()),
+    })?;
+    Ok(Hash::from_bytes(arr))
 }
 
 fn decode_json<T: serde::de::DeserializeOwned>(context: &str, bytes: &[u8]) -> Result<T> {
@@ -442,7 +460,10 @@ impl IndexStore for RedbIndexStore {
             Some(g) => {
                 let c = decode_json::<PeerCursor>("peer_cursor", g.value())?;
                 if c.incarnation != 0 {
-                    (Some((c.incarnation, c.seq)), c.head_fingerprint)
+                    (
+                        Some((c.incarnation, c.applied_ack_seq)),
+                        c.acked_fingerprint,
+                    )
                 } else {
                     (None, None)
                 }
@@ -452,11 +473,13 @@ impl IndexStore for RedbIndexStore {
 
         let by_seq = txn.open_table(BY_SEQ_TABLE).map_err(table_err)?;
         let records_table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
+        let seq_fps_table = txn.open_table(SEQ_FINGERPRINTS_TABLE).map_err(table_err)?;
         let range = by_seq
             .range((Bound::Excluded(effective_since), Bound::Unbounded))
             .map_err(|e| storage_err("range by_seq", e))?;
 
         let mut records = Vec::new();
+        let mut chain_fingerprints = BTreeMap::new();
         let mut has_more = false;
         for item in range {
             let (_, path_guard) = item.map_err(|e| storage_err("step by_seq", e))?;
@@ -468,8 +491,36 @@ impl IndexStore for RedbIndexStore {
                 .get(path_guard.value())
                 .map_err(|e| storage_err("lookup record by_seq", e))?
             {
-                records.push(decode_record(rec_guard.value())?.for_wire());
+                let rec = decode_record(rec_guard.value())?.for_wire();
+                if let Some(fp_guard) = seq_fps_table
+                    .get(rec.seq)
+                    .map_err(|e| storage_err("read seq_fingerprint", e))?
+                {
+                    chain_fingerprints
+                        .insert(rec.seq, decode_hash("seq_fingerprint", fp_guard.value())?);
+                }
+                if rec.seq > 1
+                    && let Some(prev_guard) = seq_fps_table
+                        .get(rec.seq - 1)
+                        .map_err(|e| storage_err("read prev seq_fingerprint", e))?
+                {
+                    chain_fingerprints.insert(
+                        rec.seq - 1,
+                        decode_hash("seq_fingerprint", prev_guard.value())?,
+                    );
+                }
+                records.push(rec);
             }
+        }
+        if snapshot_seq > 0
+            && let Some(fp_guard) = seq_fps_table
+                .get(snapshot_seq)
+                .map_err(|e| storage_err("read snapshot seq_fingerprint", e))?
+        {
+            chain_fingerprints.insert(
+                snapshot_seq,
+                decode_hash("seq_fingerprint", fp_guard.value())?,
+            );
         }
 
         Ok(RecordsPage {
@@ -480,6 +531,7 @@ impl IndexStore for RedbIndexStore {
             caller_acked,
             caller_acked_fingerprint,
             head_fingerprint,
+            chain_fingerprints,
         })
     }
 
@@ -652,6 +704,58 @@ impl IndexStore for RedbIndexStore {
         Ok(out)
     }
 
+    fn get_seq_fingerprint(&self, seq: u64) -> Result<Option<Hash>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| storage_err("begin read", e))?;
+        let table = txn.open_table(SEQ_FINGERPRINTS_TABLE).map_err(table_err)?;
+        let Some(guard) = table
+            .get(seq)
+            .map_err(|e| storage_err("get seq_fingerprint", e))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(decode_hash("seq_fingerprint", guard.value())?))
+    }
+
+    fn list_problems(&self) -> Result<Vec<(String, SyncProblem)>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| storage_err("begin read", e))?;
+        let table = txn.open_table(PROBLEMS_TABLE).map_err(table_err)?;
+        let iter = table
+            .iter()
+            .map_err(|e| storage_err("iterate problems", e))?;
+        let mut out = Vec::new();
+        for item in iter {
+            let (k, v) = item.map_err(|e| storage_err("step problems", e))?;
+            out.push((
+                k.value().to_string(),
+                decode_json("sync_problem", v.value())?,
+            ));
+        }
+        Ok(out)
+    }
+
+    fn list_deferrals(&self) -> Result<Vec<DeferredItem>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| storage_err("begin read", e))?;
+        let table = txn.open_table(DEFERRALS_TABLE).map_err(table_err)?;
+        let iter = table
+            .iter()
+            .map_err(|e| storage_err("iterate deferrals", e))?;
+        let mut out = Vec::new();
+        for item in iter {
+            let (_, v) = item.map_err(|e| storage_err("step deferrals", e))?;
+            out.push(decode_json("deferred_item", v.value())?);
+        }
+        Ok(out)
+    }
+
     fn record_count(&self) -> Result<u64> {
         let txn = self
             .db
@@ -696,6 +800,9 @@ impl IndexStore for RedbIndexStore {
             let mut held_back = txn.open_table(HELD_BACK_TABLE).map_err(table_err)?;
             let mut deleted_history = txn.open_table(DELETED_HISTORY_TABLE).map_err(table_err)?;
             let mut staged_tmps = txn.open_table(STAGED_TMPS_TABLE).map_err(table_err)?;
+            let mut seq_fps = txn.open_table(SEQ_FINGERPRINTS_TABLE).map_err(table_err)?;
+            let mut problems = txn.open_table(PROBLEMS_TABLE).map_err(table_err)?;
+            let mut deferrals = txn.open_table(DEFERRALS_TABLE).map_err(table_err)?;
 
             let mut live_files = match meta_table
                 .get(META_KEY_LIVE_FILES)
@@ -791,15 +898,32 @@ impl IndexStore for RedbIndexStore {
                     .map_err(|e| storage_err("upsert bin_entry", e))?;
             }
 
-            for path in &batch.remove_held_back {
+            if batch.clear_held_back {
+                let keys: Vec<String> = held_back
+                    .iter()
+                    .map_err(|e| storage_err("iter held_back", e))?
+                    .map(|res| {
+                        res.map(|(k, _)| k.value().to_string())
+                            .map_err(|e| storage_err("step held_back", e))
+                    })
+                    .collect::<Result<_>>()?;
+                for k in keys {
+                    held_back
+                        .remove(k.as_str())
+                        .map_err(|e| storage_err("clear held_back", e))?;
+                }
+            }
+            for (peer, path) in &batch.remove_held_back {
+                let key = peer_path_key(peer, path);
                 held_back
-                    .remove(path.as_str())
+                    .remove(key.as_str())
                     .map_err(|e| storage_err("remove held_back", e))?;
             }
             for item in &batch.upsert_held_back {
+                let key = peer_path_key(&item.from_peer, &item.record.path);
                 let encoded = encode_json("held_back", item)?;
                 held_back
-                    .insert(item.record.path.as_str(), encoded.as_slice())
+                    .insert(key.as_str(), encoded.as_slice())
                     .map_err(|e| storage_err("upsert held_back", e))?;
             }
 
@@ -869,6 +993,83 @@ impl IndexStore for RedbIndexStore {
                 staged_tmps
                     .insert(tmp.as_str(), ())
                     .map_err(|e| storage_err("add staged_tmp", e))?;
+            }
+
+            if batch.clear_seq_fingerprints {
+                let keys: Vec<u64> = seq_fps
+                    .iter()
+                    .map_err(|e| storage_err("iter seq_fingerprints", e))?
+                    .map(|res| {
+                        res.map(|(k, _)| k.value())
+                            .map_err(|e| storage_err("step seq_fingerprints", e))
+                    })
+                    .collect::<Result<_>>()?;
+                for k in keys {
+                    seq_fps
+                        .remove(k)
+                        .map_err(|e| storage_err("clear seq_fingerprint", e))?;
+                }
+            }
+            if let Some(min_keep) = batch.prune_seq_fingerprints_below {
+                let to_prune: Vec<u64> = seq_fps
+                    .range(..min_keep)
+                    .map_err(|e| storage_err("range prune seq_fingerprints", e))?
+                    .map(|res| {
+                        res.map(|(k, _)| k.value())
+                            .map_err(|e| storage_err("step prune seq_fingerprints", e))
+                    })
+                    .collect::<Result<_>>()?;
+                for k in to_prune {
+                    seq_fps
+                        .remove(k)
+                        .map_err(|e| storage_err("prune seq_fingerprint", e))?;
+                }
+            }
+            for &(seq, fp) in &batch.upsert_seq_fingerprints {
+                seq_fps
+                    .insert(seq, fp.as_bytes().as_slice())
+                    .map_err(|e| storage_err("upsert seq_fingerprint", e))?;
+            }
+
+            for key in &batch.remove_problems {
+                problems
+                    .remove(key.as_str())
+                    .map_err(|e| storage_err("remove problem", e))?;
+            }
+            for (key, prob) in &batch.upsert_problems {
+                let encoded = encode_json("sync_problem", prob)?;
+                problems
+                    .insert(key.as_str(), encoded.as_slice())
+                    .map_err(|e| storage_err("upsert problem", e))?;
+            }
+
+            if batch.clear_deferrals {
+                let keys: Vec<String> = deferrals
+                    .iter()
+                    .map_err(|e| storage_err("iter deferrals", e))?
+                    .map(|res| {
+                        res.map(|(k, _)| k.value().to_string())
+                            .map_err(|e| storage_err("step deferrals", e))
+                    })
+                    .collect::<Result<_>>()?;
+                for k in keys {
+                    deferrals
+                        .remove(k.as_str())
+                        .map_err(|e| storage_err("clear deferral", e))?;
+                }
+            }
+            for (peer, path) in &batch.remove_deferrals {
+                let key = peer_path_key(peer, path);
+                deferrals
+                    .remove(key.as_str())
+                    .map_err(|e| storage_err("remove deferral", e))?;
+            }
+            for item in &batch.upsert_deferrals {
+                let key = peer_path_key(&item.peer, &item.path);
+                let encoded = encode_json("deferred_item", item)?;
+                deferrals
+                    .insert(key.as_str(), encoded.as_slice())
+                    .map_err(|e| storage_err("upsert deferral", e))?;
             }
         }
         txn.commit()
