@@ -265,4 +265,21 @@ test('transfer job and device transfer formatting uses plain words by default an
     label: 'Cancelling',
     cls: '',
   });
+  assert.equal(
+    formatDeviceTransferSubtitle({ ...cancellingDl, error: null }, { deviceNoun: 'phone', technical: false }),
+    'Removing partial files…',
+  );
+  const cancellingProtocolErr = {
+    ...cancellingDl,
+    error: { code: 'unknown_tool', message: 'Unknown tool: fs.remove', machine: 'studio' },
+  };
+  const plainCancelErr = formatDeviceTransferSubtitle(cancellingProtocolErr, {
+    deviceNoun: 'phone',
+    technical: false,
+  });
+  assert.ok(!plainCancelErr.includes('fs.remove'), `Cancelling error must use plain formatting: ${plainCancelErr}`);
+  assert.match(
+    formatDeviceTransferSubtitle(cancellingProtocolErr, { deviceNoun: 'phone', technical: true }),
+    /fs\.remove/,
+  );
 });

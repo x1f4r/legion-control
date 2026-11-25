@@ -3,6 +3,7 @@
 
 import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
+import { plainErrorMessage } from '../lib/errors.js';
 import {
   baseFileName,
   entryCategory,
@@ -22,13 +23,18 @@ function isLocalMediaUrl(url) {
 }
 
 function classifyMintError(err) {
-  if (err?.code === 'unsupported') {
-    return { code: 'unsupported', message: err.message || '' };
+  if (err?.code === 'unsupported' || err?.code === 'needs_newer_legion') {
+    return { code: err.code, message: err.message || '', machine: err.machine || null };
   }
   if (err?.code === 'denied') {
-    return { code: 'denied', message: err.message || "You're not allowed to open this file." };
+    return {
+      code: 'denied',
+      message: err.message || "You're not allowed to open this file.",
+      details: err.details || null,
+      machine: err.machine || null,
+    };
   }
-  return { code: 'unreachable', message: err?.message || '' };
+  return { code: 'unreachable', message: err?.message || '', machine: err?.machine || null };
 }
 
 function safeStorage() {
@@ -55,6 +61,7 @@ export function FilesViewer({
   entry,
   siblings = [],
   link,
+  capsStore = null,
   caps,
   deviceNoun = 'phone',
   technical = false,
@@ -245,6 +252,23 @@ export function FilesViewer({
       error: null,
     });
 
+    const runCall = (tool, args, opts = {}) =>
+      capsStore
+        ? capsStore.call(tool, args, { ...opts, on: machine }).then((r) => r.value)
+        : link.call(tool, args, { ...opts, on: machine });
+
+    if (caps && caps.known === false) {
+      if (category === 'text') {
+        setTextState((prev) => ({ ...prev, key: targetKey, loading: true, error: null }));
+      } else if (category === 'image' || category === 'video' || category === 'audio') {
+        setMediaState({ key: targetKey, url: null, loading: true, error: null, isFreshAddress: false });
+      }
+      return () => {
+        ctrl.abort();
+        stopMediaElements();
+      };
+    }
+
     if (category === 'text') {
       setTextState((prev) =>
         prev.key === targetKey
@@ -260,8 +284,7 @@ export function FilesViewer({
               error: null,
             },
       );
-      link
-        .call('fs.read', { path, offset: 0, length: TEXT_CHUNK_BYTES }, { on: machine, signal: ctrl.signal })
+      runCall('fs.read', { path, offset: 0, length: TEXT_CHUNK_BYTES }, { signal: ctrl.signal })
         .then((res) => {
           if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
           if (res?.encoding === 'base64') {
@@ -330,8 +353,7 @@ export function FilesViewer({
           });
       } else if (category === 'image' && caps?.hasThumb) {
         setMediaState({ key: targetKey, url: null, loading: true, error: null, isFreshAddress: false });
-        link
-          .call('fs.thumb', { paths: [path], size: 512, fit: 'contain' }, { on: machine, signal: ctrl.signal })
+        runCall('fs.thumb', { paths: [path], size: 512, fit: 'contain' }, { signal: ctrl.signal })
           .then((res) => {
             if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
             const t = res?.thumbnails?.[path];
@@ -363,6 +385,46 @@ export function FilesViewer({
               isFreshAddress: false,
             });
           });
+      } else if (
+        category === 'image' &&
+        caps?.hasRead &&
+        effectiveEntry.size != null &&
+        effectiveEntry.size > 0 &&
+        effectiveEntry.size <= 1048576
+      ) {
+        // Inline fallback for small pictures on older machines without content addresses or thumbnails.
+        setMediaState({ key: targetKey, url: null, loading: true, error: null, isFreshAddress: false });
+        runCall('fs.read', { path, offset: 0, length: 1048576, encoding: 'base64' }, { signal: ctrl.signal })
+          .then((res) => {
+            if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
+            if (res?.eof && res?.content) {
+              setMediaState({
+                key: targetKey,
+                url: `data:${mime};base64,${res.content}`,
+                loading: false,
+                error: null,
+                isFreshAddress: false,
+              });
+            } else {
+              setMediaState({
+                key: targetKey,
+                url: null,
+                loading: false,
+                error: { code: 'unsupported', message: 'Preview is not available on this machine yet.' },
+                isFreshAddress: false,
+              });
+            }
+          })
+          .catch((err) => {
+            if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
+            setMediaState({
+              key: targetKey,
+              url: null,
+              loading: false,
+              error: err,
+              isFreshAddress: false,
+            });
+          });
       } else {
         setMediaState({
           key: targetKey,
@@ -378,7 +440,7 @@ export function FilesViewer({
       ctrl.abort();
       stopMediaElements();
     };
-  }, [machine, path, category, retryNonce]);
+  }, [machine, path, category, retryNonce, caps?.known, caps?.hasContentUrl, caps?.hasThumb, caps?.hasRead]);
 
   // Keyboard navigation inside viewer: Escape closes, Left/Right steps through pictures.
   useEffect(() => {
@@ -404,8 +466,10 @@ export function FilesViewer({
     if (!moreOpen || !technical || !caps?.hasHash || activeHash) return;
     let alive = true;
     const targetKey = fileKey;
-    link
-      .call('fs.hash', { path }, { on: machine })
+    const hashReq = capsStore
+      ? capsStore.call('fs.hash', { path }, { on: machine }).then((r) => r.value)
+      : link.call('fs.hash', { path }, { on: machine });
+    hashReq
       .then((res) => {
         if (alive && res?.hash && activeFileKeyRef.current === targetKey) {
           setHashInfo({ key: targetKey, value: res.hash });
@@ -415,18 +479,17 @@ export function FilesViewer({
     return () => {
       alive = false;
     };
-  }, [moreOpen, technical, caps?.hasHash, machine, path, fileKey, activeHash]);
+  }, [moreOpen, technical, caps?.hasHash, capsStore, machine, path, fileKey, activeHash]);
 
   async function loadMoreText() {
     if (activeText.loading || activeText.eof) return;
     const targetKey = fileKey;
     setTextState((prev) => ({ ...prev, key: targetKey, loading: true, error: null }));
     try {
-      const res = await link.call(
-        'fs.read',
-        { path, offset: activeText.loaded, length: TEXT_CHUNK_BYTES },
-        { on: machine, signal: abortRef.current?.signal },
-      );
+      const readOpts = { on: machine, signal: abortRef.current?.signal };
+      const res = capsStore
+        ? (await capsStore.call('fs.read', { path, offset: activeText.loaded, length: TEXT_CHUNK_BYTES }, readOpts)).value
+        : await link.call('fs.read', { path, offset: activeText.loaded, length: TEXT_CHUNK_BYTES }, readOpts);
       if (activeFileKeyRef.current !== targetKey) return;
       const chunk = String(res?.content ?? '');
       setTextState((prev) => ({
@@ -843,16 +906,20 @@ export function FilesViewer({
         if (mediaError.code === 'denied') {
           return renderFallbackCard(
             "Can't open this file",
-            mediaError.message || "You're not allowed to open this file.",
+            plainErrorMessage(mediaError, "You're not allowed to open this file.", { technical, deviceNoun }),
             { hideActions: true },
           );
         }
+        const fallbackMsg =
+          caps?.hasOpenExternally || caps?.hasDownload
+            ? 'Open it in another app that can, or download it first.'
+            : `This ${deviceNoun} can't show this kind of picture.`;
         const msg =
-          mediaError.code === 'unsupported'
+          mediaError.code === 'unsupported' || mediaError.code === 'needs_newer_legion'
             ? `This version of Legion on ${machine} doesn't serve picture previews yet.`
-            : caps?.hasOpenExternally || caps?.hasDownload
-              ? 'Open it in another app that can, or download it first.'
-              : `This ${deviceNoun} can't show this kind of picture.`;
+            : mediaError.code === 'decode'
+              ? fallbackMsg
+              : plainErrorMessage(mediaError, fallbackMsg, { technical, deviceNoun });
         return renderFallbackCard("Can't show this picture here", msg);
       }
       if (!mediaUrl) {
@@ -884,12 +951,12 @@ export function FilesViewer({
         if (mediaError.code === 'denied') {
           return renderFallbackCard(
             "Can't open this file",
-            mediaError.message || "You're not allowed to open this file.",
+            plainErrorMessage(mediaError, "You're not allowed to open this file.", { technical, deviceNoun }),
             { hideActions: true },
           );
         }
         const heading =
-          mediaError.code === 'unsupported'
+          mediaError.code === 'unsupported' || mediaError.code === 'needs_newer_legion'
             ? `Video playback isn't available from ${machine} yet`
             : `This ${deviceNoun} can't play this kind of video`;
         const body =
@@ -937,12 +1004,12 @@ export function FilesViewer({
         if (mediaError.code === 'denied') {
           return renderFallbackCard(
             "Can't open this file",
-            mediaError.message || "You're not allowed to open this file.",
+            plainErrorMessage(mediaError, "You're not allowed to open this file.", { technical, deviceNoun }),
             { hideActions: true },
           );
         }
         const heading =
-          mediaError.code === 'unsupported'
+          mediaError.code === 'unsupported' || mediaError.code === 'needs_newer_legion'
             ? `Audio playback isn't available from ${machine} yet`
             : `This ${deviceNoun} can't play this audio file`;
         const body =
@@ -984,7 +1051,7 @@ export function FilesViewer({
 
     if (category === 'text') {
       if (activeText.error) {
-        return html`<div class="said"><${Notice} error=${activeText.error} /></div>`;
+        return html`<div class="said"><${Notice} error=${activeText.error} technical=${technical} deviceNoun=${deviceNoun} /></div>`;
       }
       if (activeText.binary) {
         return renderFallbackCard(

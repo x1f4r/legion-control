@@ -2561,6 +2561,46 @@ button.row:active {
   color: var(--dim);
 }
 
+.older-note {
+  margin: 4px 2px 12px;
+  font-size: var(--text-sub);
+  color: var(--dim);
+  line-height: 1.4;
+}
+
+.older-note p {
+  margin: 0;
+}
+
+.older-note-tech {
+  margin-top: 4px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.folder-filter-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 4px 2px 10px;
+  font-size: var(--text-sub);
+  color: var(--dim);
+}
+
+.folder-limit-note {
+  margin: 14px 2px 6px;
+  font-size: var(--text-sub);
+  color: var(--dim);
+}
+
+.sheet-note {
+  margin: 8px 2px 0;
+  font-size: var(--text-sub);
+  color: var(--dim);
+  line-height: 1.4;
+}
+
 .transfer-ctl {
   display: flex;
   flex-wrap: wrap;
