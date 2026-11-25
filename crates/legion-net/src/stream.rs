@@ -45,7 +45,9 @@ use std::fs::{self, FileTimes};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::guard::{Expected, Guarded, Watch};
@@ -53,7 +55,9 @@ use legion_core::audit::{self, AuditLog, Entry as AuditEntry, Outcome};
 use legion_core::config::ConfigStore;
 use legion_core::policy::Policy;
 use legion_core::{Access, CreateKind, Door, Grant, Paths};
+use legion_os::atomic::{FileIdentity, file_identity, symlink_file_identity};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use legion_tools::device::registry::DevicesFile;
 use legion_tools::xfer::{error as xfer_error, manifest, resolve_root};
 use legion_xfer::{
     CaseCollision, Entry, EntryKind, Hash, IfExists, ManifestOptions, PutSession, RenamedEntry,
@@ -65,11 +69,42 @@ use serde_json::{Value, json};
 /// The version of this exchange: a header names it, and a node refuses one it does not speak.
 pub const STREAM_PROTOCOL: u32 = 1;
 
+/// Stream capability: destination honours `if_exists` (`fail`, `skip`, `replace`, `rename`).
+pub const CAP_IF_EXISTS: &str = "if_exists";
+/// Stream capability: node supports safe `move` (`delete` with `dry_run`, `remove_root`,
+/// `expect_hashes`, `expect_root_hash`, `forbid_file_id`, stored-file hash verification in
+/// `unpack`, and `file_id` reporting).
+pub const CAP_MOVE: &str = "move";
+/// Stream capability: node supports `probe_write` / `probe_read` directory distinctness probes.
+pub const CAP_PROBE: &str = "probe";
+/// Stream capability: node supports atomic two-step same-node `rename`.
+pub const CAP_RENAME: &str = "rename";
+
+/// Capabilities advertised in this node's stream greeting line.
+pub const STREAM_CAPABILITIES: [&str; 4] = [CAP_IF_EXISTS, CAP_MOVE, CAP_PROBE, CAP_RENAME];
+
 /// How often an operation at work on something long says so, where a reply line is awaited.
 pub const HEARTBEAT: Duration = Duration::from_secs(10);
 
+/// How many streamed bytes pass between live permission and device-revocation re-checks.
+const RECHECK_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Monotonic sequence number for unique sibling probe/rename temp names.
+static STREAM_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// The operations this node knows, as `unsupported` names them.
-const OPS: [&str; 7] = ["manifest", "stat", "get", "put", "pack", "unpack", "delete"];
+const OPS: [&str; 10] = [
+    "manifest",
+    "stat",
+    "get",
+    "put",
+    "pack",
+    "unpack",
+    "delete",
+    "probe_write",
+    "probe_read",
+    "rename",
+];
 
 /// The longest header read. A header carries the names a `pack` or `delete` acts on, which a
 /// transfer sends in batches well below this; anything longer is a client gone wrong.
@@ -186,7 +221,47 @@ pub(crate) enum Op {
         /// When present with `remove_root`, unlink `root` only if its current BLAKE3 hash matches.
         #[serde(default)]
         expect_root_hash: Option<Hash>,
+        /// When present with `remove_root`, refuse to unlink `root` if its current `(dev, ino)`
+        /// matches this destination file identity.
+        #[serde(default)]
+        forbid_file_id: Option<(u64, u64)>,
     },
+    /// Create or remove a uniquely named empty marker file in a directory to prove whether two
+    /// move endpoints refer to distinct directories (even across fleet aliases or network shares).
+    #[serde(rename = "probe_write")]
+    ProbeWrite {
+        action: ProbeWriteAction,
+        dir: String,
+        #[serde(default)]
+        marker: Option<String>,
+        /// When `true` with `action = "create"`, walk up to the nearest existing ancestor
+        /// directory of `dir` when `dir` itself does not exist yet.
+        #[serde(default)]
+        nearest_ancestor: bool,
+    },
+    /// Check whether a probe marker file appears in `dir` or any of its named subdirectories.
+    #[serde(rename = "probe_read")]
+    ProbeRead {
+        dir: String,
+        marker: String,
+        #[serde(default)]
+        subdirs: Vec<String>,
+    },
+    /// Atomically rename an entry on this node when `from` and `to` already refer to the exact
+    /// same file or directory in the same parent directory (case-only or Unicode-normalization
+    /// rename), stepping through a unique sibling temporary name when the filesystem needs it.
+    Rename {
+        from: String,
+        to: String,
+    },
+}
+
+/// Action for [`Op::ProbeWrite`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProbeWriteAction {
+    Create,
+    Remove,
 }
 
 impl Op {
@@ -199,6 +274,9 @@ impl Op {
             Op::Pack { .. } => "pack",
             Op::Unpack { .. } => "unpack",
             Op::Delete { .. } => "delete",
+            Op::ProbeWrite { .. } => "probe_write",
+            Op::ProbeRead { .. } => "probe_read",
+            Op::Rename { .. } => "rename",
         }
     }
 
@@ -211,9 +289,9 @@ impl Op {
 /// Maps a stream header's `op` name to the file tool and effect it corresponds to.
 pub(crate) fn op_tool(op: &str) -> Option<(&'static str, Effect)> {
     match op {
-        "manifest" | "stat" | "get" | "pack" => Some(("fs.read", Effect::Read)),
-        "put" | "unpack" => Some(("fs.write", Effect::Write)),
-        "delete" => Some(("fs.remove", Effect::Destroy)),
+        "manifest" | "stat" | "get" | "pack" | "probe_read" => Some(("fs.read", Effect::Read)),
+        "put" | "unpack" | "probe_write" => Some(("fs.write", Effect::Write)),
+        "delete" | "rename" => Some(("fs.remove", Effect::Destroy)),
         _ => None,
     }
 }
@@ -259,6 +337,15 @@ pub(crate) struct StatReply {
     /// ancestors), used to detect moving a file onto itself or a tree into its own subtree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_path: Option<String>,
+    /// Filesystem identity `(dev, ino, nlink)` of `path` when it exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<FileIdentity>,
+    /// Filesystem identity of `path`'s parent directory when it exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<FileIdentity>,
+    /// Filesystem identities of existing ancestor directories of `path` (for subtree detection).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ancestor_ids: Vec<FileIdentity>,
 }
 
 /// The line that ends a `manifest`.
@@ -298,6 +385,9 @@ pub(crate) struct PutDone {
     /// `true` when `if_exists = "skip"` left an existing file untouched.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skipped: bool,
+    /// Filesystem identity `(dev, ino, nlink)` of the placed file after commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<FileIdentity>,
 }
 
 /// The line that answers a `pack` before its archive: the names it left out, and why.
@@ -347,6 +437,23 @@ pub(crate) struct DeleteDone {
     pub skipped: Vec<SkippedEntry>,
 }
 
+/// The line that answers a `probe_write` or `probe_read`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) struct ProbeReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    #[serde(default)]
+    pub exists: bool,
+}
+
+/// The line that answers a same-node `rename`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) struct RenameDone {
+    pub ok: bool,
+}
+
 /// How an operation failed: in time to say so on stdout, or after its raw bytes had started.
 enum Failure {
     Reply(ErrorBody),
@@ -372,16 +479,18 @@ pub fn serve<R: Read, W: Write>(
     input: R,
     output: W,
 ) -> Result<(), ErrorBody> {
-    serve_with_door(host, pinned, Door::Stream, None, input, output)
+    serve_with_door(host, pinned, Door::Stream, None, None, input, output)
 }
 
 /// Like [`serve`], allowing the caller to specify the audit [`Door`] (for example [`Door::Ssh`]
-/// when served behind `legion gate`) and optional paired `device` name.
+/// when served behind `legion gate`), optional paired `device` name, and optional `pairing_id`
+/// (checked live during streaming so revoking a device stops an in-flight transfer promptly).
 pub fn serve_with_door<R: Read, W: Write>(
     host: &Host,
     pinned: Option<&str>,
     door: Door,
     device: Option<&str>,
+    pairing_id: Option<&str>,
     input: R,
     output: W,
 ) -> Result<(), ErrorBody> {
@@ -389,9 +498,12 @@ pub fn serve_with_door<R: Read, W: Write>(
     let mut input = BufReader::new(input);
     let mut output = BufWriter::with_capacity(OUTPUT_BUFFER, output);
     // Said before anything else, refusals included, so a reader can tell this node's replies
-    // from those of one too old to hold to what it asks.
-    let _ =
-        line(&mut output, &json!({ "protocol": STREAM_PROTOCOL })).and_then(|()| output.flush());
+    // and advertised capabilities from those of an older node.
+    let _ = line(
+        &mut output,
+        &json!({ "protocol": STREAM_PROTOCOL, "capabilities": STREAM_CAPABILITIES }),
+    )
+    .and_then(|()| output.flush());
     let (header, recorded) = match read_header(&mut input) {
         Ok(read) => read,
         Err(error) => {
@@ -402,12 +514,20 @@ pub fn serve_with_door<R: Read, W: Write>(
     };
     let tool = format!("stream.{}", header.op.name());
     let config = ConfigStore::new(host.paths.config_dir());
-    let (principal, result) = match authorise(host, &config, pinned, &header) {
+    let (principal, result) = match authorise(host, &config, pinned, pairing_id, &header) {
         Ok(grant) => {
             let principal = grant.principal().to_owned();
             (
                 Some(principal),
-                run(host, &grant, header.op, &mut input, &mut output),
+                run(
+                    host,
+                    &config,
+                    &grant,
+                    pairing_id,
+                    header.op,
+                    &mut input,
+                    &mut output,
+                ),
             )
         }
         Err((principal, error)) => (principal, Err(Failure::Reply(error))),
@@ -536,8 +656,14 @@ fn authorise(
     host: &Host,
     config: &ConfigStore,
     pinned: Option<&str>,
+    pairing_id: Option<&str>,
     header: &Header,
 ) -> Result<Grant, (Option<String>, ErrorBody)> {
+    if let Some(pid) = pairing_id
+        && let Err(error) = check_pairing_not_revoked(config, pid)
+    {
+        return Err((pinned.map(str::to_owned), error));
+    }
     let policy = config
         .get::<Policy>()
         .map_err(|error| (pinned.map(str::to_owned), error))?;
@@ -558,6 +684,160 @@ fn authorise(
     policy
         .authorize(&principal, &spec, &host.paths)
         .map_err(|error| (Some(principal), error))
+}
+
+/// Checks whether a paired device (`pairing_id`) has been removed in `devices.toml`.
+fn check_pairing_not_revoked(config: &ConfigStore, pairing_id: &str) -> Result<(), ErrorBody> {
+    if !config.path_of::<DevicesFile>().exists() {
+        return Ok(());
+    }
+    let devices = config.get::<DevicesFile>()?;
+    if devices.removed.contains_key(pairing_id) || !devices.devices.contains_key(pairing_id) {
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            "This paired device has been removed, so the transfer was stopped.",
+        )
+        .with_hint("Pair the device again if it should still have access."));
+    }
+    Ok(())
+}
+
+/// Live permission and device-revocation re-checker run periodically while streaming large files.
+#[derive(Clone)]
+struct StreamAuthCheck {
+    paths: Paths,
+    principal: String,
+    pairing_id: Option<String>,
+    tool: &'static str,
+    effect: Effect,
+    path: PathBuf,
+    access: Access,
+    create_kind: Option<CreateKind>,
+    denied: Arc<Mutex<Option<ErrorBody>>>,
+}
+
+impl StreamAuthCheck {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        host: &Host,
+        grant: &Grant,
+        pairing_id: Option<&str>,
+        tool: &'static str,
+        effect: Effect,
+        path: PathBuf,
+        access: Access,
+        create_kind: Option<CreateKind>,
+    ) -> Self {
+        Self {
+            paths: host.paths.clone(),
+            principal: grant.principal().to_owned(),
+            pairing_id: pairing_id.map(str::to_owned),
+            tool,
+            effect,
+            path,
+            access,
+            create_kind,
+            denied: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        let config = ConfigStore::new(self.paths.config_dir());
+        let res = (|| -> Result<(), ErrorBody> {
+            if let Some(ref pid) = self.pairing_id {
+                check_pairing_not_revoked(&config, pid)?;
+            }
+            let policy = config.get::<Policy>()?;
+            let spec = ToolSpec {
+                name: self.tool.to_owned(),
+                description: String::new(),
+                effect: self.effect,
+                input_schema: json!({"type": "object"}),
+            };
+            let live_grant = policy.authorize(&self.principal, &spec, &self.paths)?;
+            let checked = live_grant.check_path(&self.path, self.access)?;
+            if let Some(kind) = self.create_kind {
+                live_grant.check_create(&checked, kind, true)?;
+            }
+            Ok(())
+        })();
+        match res {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let message = error.message.clone();
+                if let Ok(mut slot) = self.denied.lock() {
+                    *slot = Some(error);
+                }
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
+            }
+        }
+    }
+
+    fn take_denied(&self) -> Option<ErrorBody> {
+        self.denied.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
+/// Wraps a writer so live policy and pairing status are re-checked every [`RECHECK_INTERVAL_BYTES`].
+struct RecheckingWriter<W> {
+    inner: W,
+    check: StreamAuthCheck,
+    since_check: u64,
+}
+
+impl<W: Write> RecheckingWriter<W> {
+    fn new(inner: W, check: StreamAuthCheck) -> Self {
+        Self {
+            inner,
+            check,
+            since_check: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for RecheckingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.since_check >= RECHECK_INTERVAL_BYTES {
+            self.check.verify()?;
+            self.since_check = 0;
+        }
+        let n = self.inner.write(buf)?;
+        self.since_check = self.since_check.saturating_add(n as u64);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Wraps a reader so live policy and pairing status are re-checked every [`RECHECK_INTERVAL_BYTES`].
+struct RecheckingReader<R> {
+    inner: R,
+    check: StreamAuthCheck,
+    since_check: u64,
+}
+
+impl<R: Read> RecheckingReader<R> {
+    fn new(inner: R, check: StreamAuthCheck) -> Self {
+        Self {
+            inner,
+            check,
+            since_check: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for RecheckingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.since_check >= RECHECK_INTERVAL_BYTES {
+            self.check.verify()?;
+            self.since_check = 0;
+        }
+        let n = self.inner.read(buf)?;
+        self.since_check = self.since_check.saturating_add(n as u64);
+        Ok(n)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -600,7 +880,9 @@ fn record(
 
 fn run<R: BufRead, W: Write>(
     host: &Host,
+    config: &ConfigStore,
     grant: &Grant,
+    pairing_id: Option<&str>,
     op: Op,
     input: &mut R,
     output: &mut W,
@@ -616,7 +898,7 @@ fn run<R: BufRead, W: Write>(
             checksum,
             if_size,
         } => stat(grant, &path, checksum, if_size, output),
-        Op::Get { path, offset } => get(grant, &path, offset, output),
+        Op::Get { path, offset } => get(host, grant, pairing_id, &path, offset, output),
         Op::Put {
             path,
             size,
@@ -625,14 +907,16 @@ fn run<R: BufRead, W: Write>(
             mtime,
             if_exists,
         } => put(
-            grant, &path, size, &hash, mode, mtime, if_exists, input, output,
+            host, grant, pairing_id, &path, size, &hash, mode, mtime, if_exists, input, output,
         ),
-        Op::Pack { root, names } => pack(grant, &root, &names, output),
+        Op::Pack { root, names } => pack(host, grant, pairing_id, &root, &names, output),
         Op::Unpack {
             root,
             entries,
             if_exists,
-        } => unpack(grant, &root, &entries, if_exists, input, output),
+        } => unpack(
+            host, grant, pairing_id, &root, &entries, if_exists, input, output,
+        ),
         Op::Delete {
             root,
             names,
@@ -640,6 +924,7 @@ fn run<R: BufRead, W: Write>(
             remove_root,
             expect_hashes,
             expect_root_hash,
+            forbid_file_id,
         } => delete(
             grant,
             &root,
@@ -648,8 +933,28 @@ fn run<R: BufRead, W: Write>(
             remove_root,
             &expect_hashes,
             expect_root_hash,
+            forbid_file_id,
             output,
         ),
+        Op::ProbeWrite {
+            action,
+            dir,
+            marker,
+            nearest_ancestor,
+        } => probe_write(
+            grant,
+            action,
+            &dir,
+            marker.as_deref(),
+            nearest_ancestor,
+            output,
+        ),
+        Op::ProbeRead {
+            dir,
+            marker,
+            subdirs,
+        } => probe_read(grant, &dir, &marker, &subdirs, output),
+        Op::Rename { from, to } => rename_same_file(host, config, grant, &from, &to, output),
     }
 }
 
@@ -744,6 +1049,22 @@ fn stat<W: Write>(
     };
     let path = resolve_root(grant, path, Access::Read)?;
     let resolved_path = Some(path.to_string_lossy().into_owned());
+    let parent_id = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .and_then(|p| file_identity(p).ok());
+    let ancestor_ids = || {
+        let mut ids = Vec::new();
+        for anc in path.ancestors().skip(1) {
+            if anc.as_os_str().is_empty() {
+                continue;
+            }
+            if let Ok(id) = file_identity(anc) {
+                ids.push(id);
+            }
+        }
+        ids
+    };
     let found = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -754,18 +1075,25 @@ fn stat<W: Write>(
                     partial: partial(),
                     case_insensitive: case_insensitive(&path),
                     resolved_path,
+                    file_id: None,
+                    parent_id,
+                    ancestor_ids: ancestor_ids(),
                     ..StatReply::default()
                 },
             );
         }
         Err(error) => return Err(Failure::Reply(io_error("look at", &path, &error))),
     };
+    let fid = file_identity(&path).ok();
     let kind = found.file_type();
     let answer = if kind.is_dir() {
         StatReply {
             kind: "dir".to_owned(),
             case_insensitive: case_insensitive(&path),
             resolved_path,
+            file_id: fid,
+            parent_id,
+            ancestor_ids: ancestor_ids(),
             ..StatReply::default()
         }
     } else if kind.is_file() {
@@ -786,6 +1114,9 @@ fn stat<W: Write>(
             partial: partial(),
             case_insensitive: None,
             resolved_path,
+            file_id: fid,
+            parent_id,
+            ancestor_ids: Vec::new(),
         }
     } else {
         StatReply {
@@ -796,6 +1127,8 @@ fn stat<W: Write>(
             }
             .to_owned(),
             resolved_path,
+            file_id: fid,
+            parent_id,
             ..StatReply::default()
         }
     };
@@ -853,7 +1186,14 @@ fn case_insensitive(path: &Path) -> Option<bool> {
     None
 }
 
-fn get<W: Write>(grant: &Grant, path: &str, offset: u64, output: &mut W) -> Result<(), Failure> {
+fn get<W: Write>(
+    host: &Host,
+    grant: &Grant,
+    pairing_id: Option<&str>,
+    path: &str,
+    offset: u64,
+    output: &mut W,
+) -> Result<(), Failure> {
     let path = grant.check_path(path, Access::Read)?;
     let source = legion_xfer::open_get(&path, offset).map_err(xfer_error)?;
     reply(
@@ -862,15 +1202,31 @@ fn get<W: Write>(grant: &Grant, path: &str, offset: u64, output: &mut W) -> Resu
             size: source.size(),
         },
     )?;
-    source
-        .stream_to(&mut *output)
-        .map_err(|error| Failure::Raw(xfer_error(error)))?;
+    let check = StreamAuthCheck::new(
+        host,
+        grant,
+        pairing_id,
+        "fs.read",
+        Effect::Read,
+        path,
+        Access::Read,
+        None,
+    );
+    let mut guarded = RecheckingWriter::new(&mut *output, check.clone());
+    if let Err(error) = source.stream_to(&mut guarded) {
+        if let Some(denied) = check.take_denied() {
+            return Err(Failure::Raw(denied));
+        }
+        return Err(Failure::Raw(xfer_error(error)));
+    }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn put<R: BufRead, W: Write>(
+    host: &Host,
     grant: &Grant,
+    pairing_id: Option<&str>,
     path: &str,
     size: u64,
     hash: &str,
@@ -910,6 +1266,7 @@ fn put<R: BufRead, W: Write>(
                     hash,
                     path: None,
                     skipped: true,
+                    file_id: None,
                 },
             );
         }
@@ -939,9 +1296,21 @@ fn put<R: BufRead, W: Write>(
     let offset = session.offset();
     reply(output, &PutReady { offset })?;
     let grant_for_check = grant.clone();
+    let check = StreamAuthCheck::new(
+        host,
+        grant,
+        pairing_id,
+        "fs.write",
+        Effect::Write,
+        target.clone(),
+        Access::Write,
+        Some(CreateKind::File),
+    );
+    let check_for_feed = check.clone();
     let outcome = feed(input, Some(size - offset), output, move |fed| {
+        let guarded = RecheckingReader::new(fed, check_for_feed.clone());
         let mut policy_err: Option<ErrorBody> = None;
-        let res = session.finish(hash, fed, mode, |candidate| {
+        let res = session.finish(hash, guarded, mode, |candidate| {
             if let Err(err) = grant_for_check
                 .check_path(candidate, Access::Write)
                 .and_then(|checked| grant_for_check.check_create(&checked, CreateKind::File, true))
@@ -957,6 +1326,9 @@ fn put<R: BufRead, W: Write>(
             }
             Ok(())
         });
+        if let Some(denied) = check_for_feed.take_denied() {
+            return Err(denied);
+        }
         match (res, policy_err) {
             (Ok(done), _) => Ok(done),
             (Err(_), Some(err)) => Err(err),
@@ -965,6 +1337,10 @@ fn put<R: BufRead, W: Write>(
     })??;
     // The file is whole and in place; a time that cannot be set leaves it as it is, and a later
     // listing just sees it as changed.
+    let placed_id = outcome
+        .path
+        .as_deref()
+        .and_then(|final_path| file_identity(final_path).ok());
     if let Some(ref final_path) = outcome.path
         && let Some(time) = mtime.and_then(system_time)
     {
@@ -982,12 +1358,15 @@ fn put<R: BufRead, W: Write>(
             hash: outcome.report.hash,
             path: renamed_path,
             skipped: outcome.skipped,
+            file_id: placed_id,
         },
     )
 }
 
 fn pack<W: Write>(
+    host: &Host,
     grant: &Grant,
+    pairing_id: Option<&str>,
     root: &str,
     names: &[String],
     output: &mut W,
@@ -1026,13 +1405,31 @@ fn pack<W: Write>(
         }
     }
     reply(output, &ready)?;
-    legion_xfer::pack(&root, &keep, &mut *output)
-        .map_err(|error| Failure::Raw(xfer_error(error)))?;
+    let check = StreamAuthCheck::new(
+        host,
+        grant,
+        pairing_id,
+        "fs.read",
+        Effect::Read,
+        root.clone(),
+        Access::Read,
+        None,
+    );
+    let mut guarded = RecheckingWriter::new(&mut *output, check.clone());
+    if let Err(error) = legion_xfer::pack(&root, &keep, &mut guarded) {
+        if let Some(denied) = check.take_denied() {
+            return Err(Failure::Raw(denied));
+        }
+        return Err(Failure::Raw(xfer_error(error)));
+    }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn unpack<R: BufRead, W: Write>(
+    host: &Host,
     grant: &Grant,
+    pairing_id: Option<&str>,
     root: &str,
     entries: &[Planned],
     if_exists: IfExists,
@@ -1080,11 +1477,24 @@ fn unpack<R: BufRead, W: Write>(
         ));
     }
     reply(output, &UnpackReady { ready: true })?;
+    let check = StreamAuthCheck::new(
+        host,
+        grant,
+        pairing_id,
+        "fs.write",
+        Effect::Write,
+        root.clone(),
+        Access::Write,
+        None,
+    );
+    let check_for_feed = check.clone();
     let (report, mut refused, violation) = feed(input, None, output, |fed| {
+        let rechecked = RecheckingReader::new(fed, check_for_feed.clone());
         let watch = Rc::new(RefCell::new(Watch::new(plan)));
         let mut refused: HashMap<String, String> = HashMap::new();
-        let guarded = Guarded::new(fed, Rc::clone(&watch));
-        let report = legion_xfer::unpack_with_options(
+        let guarded = Guarded::new(rechecked, Rc::clone(&watch));
+        let watch_for_hash = Rc::clone(&watch);
+        let report = legion_xfer::unpack_with_options_and_hashes(
             &root,
             guarded,
             if_exists,
@@ -1130,6 +1540,12 @@ fn unpack<R: BufRead, W: Write>(
                         ),
                     })
             },
+            |rel| {
+                watch_for_hash
+                    .borrow()
+                    .expected(rel)
+                    .and_then(|expected| expected.hash)
+            },
         );
         let watch = watch.borrow();
         let mut violation = watch.refused.clone();
@@ -1140,6 +1556,9 @@ fn unpack<R: BufRead, W: Write>(
         }
         (report, refused, violation)
     })?;
+    if let Some(denied) = check.take_denied() {
+        return Err(Failure::Reply(denied));
+    }
     if let Some((name, reason)) = violation {
         return Err(Failure::Reply(
             ErrorBody::new(
@@ -1229,6 +1648,7 @@ fn delete<W: Write>(
     remove_root: bool,
     expect_hashes: &HashMap<String, Hash>,
     expect_root_hash: Option<Hash>,
+    forbid_file_id: Option<(u64, u64)>,
     output: &mut W,
 ) -> Result<(), Failure> {
     let checked_root = if remove_root {
@@ -1267,7 +1687,7 @@ fn delete<W: Write>(
             }
         }
         if remove_root {
-            match remove_root_path(grant, &checked_root, expect_root_hash) {
+            match remove_root_path(grant, &checked_root, expect_root_hash, forbid_file_id) {
                 Ok(true) => done.removed += 1,
                 Ok(false) => {}
                 Err(reason) => done.skipped.push(SkippedEntry {
@@ -1329,17 +1749,28 @@ fn remove_one(
 }
 
 /// Removes the source root itself (a single file, symlink, or now-empty directory) after checking
-/// its hash when `expected_hash` is given.
+/// its hash when `expected_hash` is given and refusing if its filesystem identity matches
+/// `forbid_file_id`.
 fn remove_root_path(
     grant: &Grant,
     path: &Path,
     expected_hash: Option<Hash>,
+    forbid_file_id: Option<(u64, u64)>,
 ) -> Result<bool, String> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.to_string()),
     };
+    if let Some((forbid_dev, forbid_ino)) = forbid_file_id
+        && let Ok(current_id) = symlink_file_identity(path)
+        && current_id.dev == forbid_dev
+        && current_id.ino == forbid_ino
+    {
+        return Err(
+            "source and destination refer to the same file, so the source was kept".to_owned(),
+        );
+    }
     let kind = meta.file_type();
     if kind.is_file() {
         if let Some(expected) = expected_hash {
@@ -1370,6 +1801,275 @@ fn remove_root_path(
     } else {
         Err("only files, directories, and symbolic links can be removed".to_owned())
     }
+}
+
+fn validate_probe_marker(marker: &str) -> Result<(), Failure> {
+    let ok = marker.starts_with(".legion-move-probe-")
+        && marker.ends_with(".tmp")
+        && marker.len() <= 128
+        && !marker.contains(['/', '\\', '\0'])
+        && !marker.contains("..");
+    if !ok {
+        return Err(Failure::Reply(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Invalid move probe marker {marker:?}."),
+        )));
+    }
+    Ok(())
+}
+
+fn create_private_marker(path: &Path) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
+}
+
+fn probe_write<W: Write>(
+    grant: &Grant,
+    action: ProbeWriteAction,
+    dir: &str,
+    marker: Option<&str>,
+    nearest_ancestor: bool,
+    output: &mut W,
+) -> Result<(), Failure> {
+    match action {
+        ProbeWriteAction::Create => {
+            let checked = grant.check_path(dir, Access::Write)?;
+            let probe_dir = if fs::metadata(&checked).is_ok_and(|m| m.is_dir()) {
+                checked
+            } else if nearest_ancestor {
+                let mut found = None;
+                for anc in checked.ancestors().skip(1) {
+                    if anc.as_os_str().is_empty() {
+                        continue;
+                    }
+                    if fs::metadata(anc).is_ok_and(|m| m.is_dir()) {
+                        if let Ok(allowed) = grant.check_path(anc, Access::Write) {
+                            found = Some(allowed);
+                        }
+                        break;
+                    }
+                }
+                match found {
+                    Some(d) => d,
+                    None => {
+                        return reply(
+                            output,
+                            &ProbeReply {
+                                dir: None,
+                                marker: None,
+                                exists: false,
+                            },
+                        );
+                    }
+                }
+            } else {
+                return reply(
+                    output,
+                    &ProbeReply {
+                        dir: None,
+                        marker: None,
+                        exists: false,
+                    },
+                );
+            };
+
+            let pid = std::process::id();
+            let now_nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            for _ in 0..32 {
+                let seq = STREAM_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+                let name = format!(".legion-move-probe-{pid}-{now_nanos:x}-{seq}.tmp");
+                let marker_path = probe_dir.join(&name);
+                grant.check_path(&marker_path, Access::Write)?;
+                grant.check_create(&marker_path, CreateKind::File, true)?;
+                match create_private_marker(&marker_path) {
+                    Ok(file) => {
+                        drop(file);
+                        return reply(
+                            output,
+                            &ProbeReply {
+                                dir: Some(probe_dir.to_string_lossy().into_owned()),
+                                marker: Some(name),
+                                exists: true,
+                            },
+                        );
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => {
+                        return Err(Failure::Reply(io_error("create", &marker_path, &err)));
+                    }
+                }
+            }
+            Err(Failure::Reply(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Could not create a unique move probe marker in {}.",
+                    probe_dir.display()
+                ),
+            )))
+        }
+        ProbeWriteAction::Remove => {
+            let marker = marker.ok_or_else(|| {
+                Failure::Reply(ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    "probe_write remove requires `marker`.",
+                ))
+            })?;
+            validate_probe_marker(marker)?;
+            let checked_dir = grant.check_path(dir, Access::Write)?;
+            let marker_path = checked_dir.join(marker);
+            grant.check_path(&marker_path, Access::Write)?;
+            if let Ok(meta) = fs::symlink_metadata(&marker_path)
+                && meta.file_type().is_file()
+            {
+                let _ = fs::remove_file(&marker_path);
+            }
+            reply(
+                output,
+                &ProbeReply {
+                    dir: None,
+                    marker: None,
+                    exists: false,
+                },
+            )
+        }
+    }
+}
+
+fn probe_read<W: Write>(
+    grant: &Grant,
+    dir: &str,
+    marker: &str,
+    subdirs: &[String],
+    output: &mut W,
+) -> Result<(), Failure> {
+    validate_probe_marker(marker)?;
+    let checked_dir = grant.check_path(dir, Access::Read)?;
+    let mut exists = fs::symlink_metadata(checked_dir.join(marker)).is_ok();
+    if !exists {
+        for sub in subdirs {
+            if let Ok(sub_path) = named(grant, &checked_dir, sub, Access::Read)
+                && fs::symlink_metadata(sub_path.join(marker)).is_ok()
+            {
+                exists = true;
+                break;
+            }
+        }
+    }
+    reply(
+        output,
+        &ProbeReply {
+            dir: None,
+            marker: None,
+            exists,
+        },
+    )
+}
+
+fn rename_same_file<W: Write>(
+    host: &Host,
+    config: &ConfigStore,
+    grant: &Grant,
+    from: &str,
+    to: &str,
+    output: &mut W,
+) -> Result<(), Failure> {
+    // `rename` is authorised as `fs.remove`; also require `fs.write` so a role denied writing
+    // cannot rename entries.
+    let policy = config.get::<Policy>()?;
+    policy.authorize_name(
+        grant.principal(),
+        "fs.write",
+        Some(Effect::Write),
+        &host.paths,
+    )?;
+    let from_path = grant.check_path(from, Access::Write)?;
+    let to_path = grant.check_path(to, Access::Write)?;
+
+    let from_id = file_identity(&from_path)
+        .map_err(|err| Failure::Reply(io_error("inspect", &from_path, &err)))?;
+    let to_id = file_identity(&to_path)
+        .map_err(|err| Failure::Reply(io_error("inspect", &to_path, &err)))?;
+    if !from_id.same_file(&to_id) {
+        return Err(Failure::Reply(ErrorBody::new(
+            ErrorCode::Conflict,
+            format!(
+                "{} and {} do not refer to the same entry on this node.",
+                from_path.display(),
+                to_path.display()
+            ),
+        )));
+    }
+    let (Some(from_parent), Some(to_parent)) = (from_path.parent(), to_path.parent()) else {
+        return Err(Failure::Reply(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Cannot rename a filesystem root.",
+        )));
+    };
+    let from_parent_id = file_identity(from_parent)
+        .map_err(|err| Failure::Reply(io_error("inspect", from_parent, &err)))?;
+    let to_parent_id = file_identity(to_parent)
+        .map_err(|err| Failure::Reply(io_error("inspect", to_parent, &err)))?;
+    if !from_parent_id.same_file(&to_parent_id) {
+        return Err(Failure::Reply(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Source and destination are not in the same directory.",
+        )));
+    }
+    if from_path.file_name() == to_path.file_name() {
+        return Err(Failure::Reply(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Cannot rename {} onto itself.", from_path.display()),
+        )));
+    }
+
+    // Two-step rename through a unique sibling temporary name so case-only and Unicode
+    // normalization-only renames succeed reliably on case-insensitive filesystems (APFS, HFS+,
+    // NTFS, FAT/exFAT, SMB).
+    let pid = std::process::id();
+    let mut temp_path = None;
+    for _ in 0..32 {
+        let seq = STREAM_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let cand = from_parent.join(format!(".legion-rename-{pid}-{seq}.tmp"));
+        if fs::symlink_metadata(&cand).is_err() {
+            temp_path = Some(cand);
+            break;
+        }
+    }
+    let temp = temp_path.ok_or_else(|| {
+        Failure::Reply(ErrorBody::new(
+            ErrorCode::Failed,
+            "Could not allocate a temporary name for rename.",
+        ))
+    })?;
+    grant.check_path(&temp, Access::Write)?;
+    fs::rename(&from_path, &temp)
+        .map_err(|err| Failure::Reply(io_error("rename", &from_path, &err)))?;
+    if let Err(err) = fs::rename(&temp, &to_path) {
+        let _ = fs::rename(&temp, &from_path);
+        return Err(Failure::Reply(io_error("rename", &to_path, &err)));
+    }
+    #[cfg(unix)]
+    if let Ok(dir_handle) = fs::File::open(from_parent) {
+        let _ = dir_handle.sync_all();
+    }
+    reply(output, &RenameDone { ok: true })
 }
 
 /// Runs `work` on a thread of its own and says `{"busy": true}` every [`HEARTBEAT`] until it is

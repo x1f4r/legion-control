@@ -219,7 +219,7 @@ async fn run(command: Command) -> ExitCode {
         }
         Command::Stream { pinned } => {
             let shutdown = install_shutdown_token();
-            let code = serve_stream(&node, pinned, Door::Stream, None, shutdown).await;
+            let code = serve_stream(&node, pinned, Door::Stream, None, None, shutdown).await;
             router.shutdown().await;
             code
         }
@@ -292,6 +292,7 @@ async fn serve_stream(
     pinned: Option<String>,
     door: Door,
     device: Option<String>,
+    pairing_id: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
     let host = Host::new(node.paths().clone(), node.name());
@@ -301,6 +302,7 @@ async fn serve_stream(
             pinned.as_deref(),
             door,
             device.as_deref(),
+            pairing_id.as_deref(),
             io::stdin().lock(),
             io::stdout().lock(),
         )
@@ -447,7 +449,8 @@ async fn gate(
             .await
         }
         Subcommand::Stream => {
-            let code = serve_stream(&node, Some(pinned), Door::Ssh, device, shutdown).await;
+            let code =
+                serve_stream(&node, Some(pinned), Door::Ssh, device, pairing, shutdown).await;
             router.shutdown().await;
             code
         }

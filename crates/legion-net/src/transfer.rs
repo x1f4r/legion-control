@@ -49,8 +49,9 @@ use crate::config::{FleetFile, validate_machine_name};
 use crate::connector::PipeHandle;
 use crate::pool::Fleet;
 use crate::stream::{
-    self, DeleteDone, GetReady, Host, ManifestDone, PackReady, Planned, PutDone, PutReady,
-    StatReply, UnpackDone, UnpackReady,
+    self, CAP_IF_EXISTS, CAP_MOVE, CAP_PROBE, CAP_RENAME, DeleteDone, GetReady, Host,
+    ManifestDone, PackReady, Planned, ProbeReply, PutDone, PutReady, RenameDone, StatReply,
+    UnpackDone, UnpackReady,
 };
 
 /// How many bytes the relay and the in-process pipes hold at once: memory stays bounded however
@@ -554,7 +555,7 @@ async fn start_background(ctx: &Ctx, mut args: TransferArgs) -> Result<Value, Er
             .authorize_name(
                 ctx.principal(),
                 "fs.remove",
-                Some(Effect::Write),
+                Some(Effect::Destroy),
                 ctx.paths(),
             )
             .map_err(|err| err.with_machine(ctx.node_name()))?;
@@ -576,6 +577,11 @@ async fn start_background(ctx: &Ctx, mut args: TransferArgs) -> Result<Value, Er
             title: title.clone(),
             principal: ctx.principal().to_owned(),
             device: ctx.device().map(str::to_owned),
+            pairing_id: ctx.pairing_id().map(str::to_owned),
+            transfer_paths: vec![from.path.clone(), to.path.clone()],
+            transfer_local_from: (!from.remote).then(|| from.path.clone()),
+            transfer_local_to: (!to.remote).then(|| to.path.clone()),
+            transfer_move: args.move_source,
             exclusive: false,
         },
     )
@@ -607,6 +613,7 @@ async fn start_background(ctx: &Ctx, mut args: TransferArgs) -> Result<Value, Er
         files_total: None,
         current: None,
         rate: 0,
+        attempt: None,
     };
     let job_dir_for_write = created.dir.clone();
     if let Err(err) = tokio::task::spawn_blocking(move || {
@@ -908,20 +915,36 @@ async fn supervise_transfer(paths: Paths, id: &str) -> Result<(), String> {
     let fleet = Fleet::new(&paths);
     let mut registry = legion_tools::registry();
     crate::register(&mut registry, fleet.clone());
+    let paths_for_watcher = paths.clone();
+    let id_for_watcher = id.to_owned();
     let node = Node::new(paths, registry);
 
     let cancel_token = CancellationToken::new();
     let watcher_stop = CancellationToken::new();
+    let revoked_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let dir_for_watcher = dir.clone();
     let watcher = tokio::spawn({
         let cancel_token = cancel_token.clone();
         let watcher_stop = watcher_stop.clone();
+        let revoked_flag = Arc::clone(&revoked_flag);
         async move {
+            let mut ticks: u32 = 0;
             loop {
                 if transfer_job::transfer_cancel_requested(&dir_for_watcher) {
                     cancel_token.cancel();
                     break;
                 }
+                if ticks.is_multiple_of(5)
+                    && !transfer_job::is_transfer_job_authorized(
+                        &paths_for_watcher,
+                        &id_for_watcher,
+                    )
+                {
+                    revoked_flag.store(true, Ordering::Relaxed);
+                    cancel_token.cancel();
+                    break;
+                }
+                ticks = ticks.wrapping_add(1);
                 tokio::select! {
                     biased;
                     () = watcher_stop.cancelled() => break,
@@ -931,14 +954,19 @@ async fn supervise_transfer(paths: Paths, id: &str) -> Result<(), String> {
         }
     });
 
-    #[derive(Default)]
     struct MonotonicProgress {
         bytes_done: u64,
         files_done: u64,
+        attempt: u32,
         title: Option<String>,
     }
 
-    let state = Arc::new(Mutex::new(MonotonicProgress::default()));
+    let state = Arc::new(Mutex::new(MonotonicProgress {
+        bytes_done: 0,
+        files_done: 0,
+        attempt: 1,
+        title: None,
+    }));
     let dir_for_events = dir.clone();
     let move_source = req.args.move_source;
     let to_machine = req.to_machine.clone();
@@ -953,9 +981,15 @@ async fn supervise_transfer(paths: Paths, id: &str) -> Result<(), String> {
             let mut guard = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            progress.bytes_done = progress.bytes_done.max(guard.bytes_done);
+            let attempt = progress.attempt.unwrap_or(1);
+            if attempt > guard.attempt {
+                guard.attempt = attempt;
+                guard.bytes_done = progress.bytes_done;
+            } else {
+                progress.bytes_done = progress.bytes_done.max(guard.bytes_done);
+                guard.bytes_done = progress.bytes_done;
+            }
             progress.files_done = progress.files_done.max(guard.files_done);
-            guard.bytes_done = progress.bytes_done;
             guard.files_done = progress.files_done;
             if guard.title.is_none()
                 && let Some(total) = progress.files_total
@@ -1004,11 +1038,13 @@ async fn supervise_transfer(paths: Paths, id: &str) -> Result<(), String> {
             transfer_job::finish_transfer_job_ok(&dir, result)
         }
         Err(error) if error.code == ErrorCode::Cancelled || cancel_token.is_cancelled() => {
-            transfer_job::append_transfer_log(
-                &dir,
-                &format!("transfer cancelled: {}", error.message),
-            );
-            transfer_job::finish_transfer_job_cancelled(&dir, &error.message)
+            let detail = if revoked_flag.load(Ordering::Relaxed) {
+                "Cancelled because permissions or device access were revoked.".to_owned()
+            } else {
+                error.message
+            };
+            transfer_job::append_transfer_log(&dir, &format!("transfer cancelled: {detail}"));
+            transfer_job::finish_transfer_job_cancelled(&dir, &detail)
         }
         Err(error) => {
             transfer_job::append_transfer_log(&dir, &format!("transfer failed: {}", error.message));
@@ -1083,15 +1119,16 @@ impl Transfer<'_> {
         to: &End,
         args: &TransferArgs,
     ) -> Result<TransferReport, ErrorBody> {
-        let source: StatReply = self
-            .request(
+        let (source, from_caps): (StatReply, HashSet<String>) = self
+            .request_with_caps(
                 from,
                 json!({"op": "stat", "path": from.path, "checksum": true}),
+                &[],
             )
             .await?;
         match source.kind.as_str() {
-            "file" => self.file(from, to, &source, args).await,
-            "dir" => self.tree(from, to, &source, args).await,
+            "file" => self.file(from, to, &source, &from_caps, args).await,
+            "dir" => self.tree(from, to, &source, &from_caps, args).await,
             "missing" => Err(ErrorBody::new(
                 ErrorCode::NotFound,
                 format!("{} does not exist on {}.", from.path, from.machine),
@@ -1118,7 +1155,7 @@ impl Transfer<'_> {
     /// before any byte moves.
     async fn check_move_permission(&self, from: &End) -> Result<(), ErrorBody> {
         let _: DeleteDone = self
-            .request(
+            .request_required(
                 from,
                 json!({
                     "op": "delete",
@@ -1127,9 +1164,92 @@ impl Transfer<'_> {
                     "dry_run": true,
                     "remove_root": true,
                 }),
+                &[CAP_MOVE],
             )
             .await?;
         Ok(())
+    }
+
+    /// Ensures both endpoints advertise the stream capabilities required for `if_exists` and
+    /// `move`, refusing older peers before any bytes move.
+    fn check_peer_capabilities(
+        from: &End,
+        from_caps: &HashSet<String>,
+        to: &End,
+        to_caps: &HashSet<String>,
+        if_exists: IfExists,
+        args: &TransferArgs,
+    ) -> Result<(), ErrorBody> {
+        if if_exists != IfExists::Replace && !to_caps.contains(CAP_IF_EXISTS) {
+            return Err(missing_peer_capability(
+                &to.machine,
+                &format!("if_exists={:?}", args.if_exists),
+            ));
+        }
+        if args.move_source {
+            if !from_caps.contains(CAP_MOVE) || !from_caps.contains(CAP_PROBE) {
+                return Err(missing_peer_capability(&from.machine, "move"));
+            }
+            if !to_caps.contains(CAP_MOVE) || !to_caps.contains(CAP_PROBE) {
+                return Err(missing_peer_capability(&to.machine, "move"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates a uniquely named probe marker in `to_dir` (or its nearest existing ancestor when
+    /// `nearest_ancestor` is `true`) through `to`, checks through `from` whether that marker
+    /// appears in `from_dir` (or any listed `from_subdirs`), and always removes the marker.
+    async fn probe_same_directory(
+        &self,
+        from: &End,
+        from_dir: &str,
+        from_subdirs: &[String],
+        to: &End,
+        to_dir: &str,
+        nearest_ancestor: bool,
+    ) -> Result<bool, ErrorBody> {
+        let created: ProbeReply = self
+            .request_required(
+                to,
+                json!({
+                    "op": "probe_write",
+                    "action": "create",
+                    "dir": to_dir,
+                    "nearest_ancestor": nearest_ancestor,
+                }),
+                &[CAP_PROBE],
+            )
+            .await?;
+        let (Some(probe_dir), Some(marker)) = (created.dir, created.marker) else {
+            return Ok(false);
+        };
+        let check_res: Result<ProbeReply, ErrorBody> = self
+            .request_required(
+                from,
+                json!({
+                    "op": "probe_read",
+                    "dir": from_dir,
+                    "marker": marker,
+                    "subdirs": from_subdirs,
+                }),
+                &[CAP_PROBE],
+            )
+            .await;
+        // Always remove the probe marker, even if the read check failed.
+        let _ = self
+            .request_required::<ProbeReply>(
+                to,
+                json!({
+                    "op": "probe_write",
+                    "action": "remove",
+                    "dir": probe_dir,
+                    "marker": marker,
+                }),
+                &[CAP_PROBE],
+            )
+            .await;
+        Ok(check_res?.exists)
     }
 
     async fn file(
@@ -1137,6 +1257,7 @@ impl Transfer<'_> {
         from: &End,
         to: &End,
         source: &StatReply,
+        from_caps: &HashSet<String>,
         args: &TransferArgs,
     ) -> Result<TransferReport, ErrorBody> {
         let hash = source.hash.ok_or_else(|| {
@@ -1149,10 +1270,11 @@ impl Transfer<'_> {
         let size = source.size;
         let if_exists = IfExists::from(args.if_exists);
         let mut target = to.clone();
-        let mut there: StatReply = self
-            .request(
+        let (mut there, to_caps): (StatReply, HashSet<String>) = self
+            .request_with_caps(
                 to,
                 json!({"op": "stat", "path": to.path, "checksum": true, "if_size": size}),
+                &[],
             )
             .await?;
         if there.kind == "dir" || ends_in_separator(&to.path) {
@@ -1164,9 +1286,84 @@ impl Transfer<'_> {
                 )
                 .await?;
         }
+        Self::check_peer_capabilities(from, from_caps, &target, &to_caps, if_exists, args)?;
+        let mut probed_same_dir = false;
         if args.move_source {
-            check_not_same_or_subtree(from, &target, source, &there, false)?;
             self.check_move_permission(from).await?;
+            // On one node, check file identity first so case-only or Unicode-normalization-only
+            // renames are performed as atomic renames rather than refused or lost.
+            if from.machine == target.machine
+                && let (Some(src_id), Some(dst_id)) = (source.file_id, there.file_id)
+                && src_id.same_file(&dst_id)
+            {
+                let same_parent = source
+                    .parent_id
+                    .zip(there.parent_id)
+                    .is_some_and(|(a, b)| a.same_file(&b));
+                let src_name = file_name(&from.path);
+                let dst_name = file_name(&target.path);
+                let is_folding_rename = same_parent
+                    && src_name != dst_name
+                    && (src_id.nlink == 1
+                        || src_name.to_lowercase() == dst_name.to_lowercase());
+                if is_folding_rename {
+                    if !from_caps.contains(CAP_RENAME) {
+                        return Err(missing_peer_capability(&from.machine, "rename"));
+                    }
+                    if !args.dry_run {
+                        let _: RenameDone = self
+                            .request_required(
+                                from,
+                                json!({
+                                    "op": "rename",
+                                    "from": from.path,
+                                    "to": target.path,
+                                }),
+                                &[CAP_RENAME],
+                            )
+                            .await?;
+                    }
+                    return Ok(TransferReport {
+                        from: from.named(),
+                        to: target.named(),
+                        kind: "file",
+                        moved: true,
+                        renamed: vec![RenamedEntry {
+                            from: from.path.clone(),
+                            to: target.path.clone(),
+                        }],
+                        ..TransferReport::default()
+                    });
+                }
+                return Err(same_file_move_error(from, &target));
+            }
+            check_not_same_or_subtree(from, &target, source, &there, false)?;
+
+            // Across nodes, fleet aliases, or separate mounts (different `dev` or missing
+            // `file_id`), prove distinctness with a directory-pair probe before removing anything.
+            let need_probe = from.machine != target.machine
+                || source.file_id.is_none()
+                || there.file_id.is_some_and(|dst_id| {
+                    source
+                        .file_id
+                        .is_some_and(|src_id| src_id.dev != dst_id.dev)
+                });
+            if need_probe && !args.dry_run {
+                let from_parent = parent_dir_of(&from.path);
+                let to_parent = parent_dir_of(&target.path);
+                probed_same_dir = self
+                    .probe_same_directory(from, &from_parent, &[], &target, &to_parent, false)
+                    .await?;
+                if probed_same_dir && there.kind != "missing" {
+                    let proven_distinct_same_dev =
+                        source.file_id.zip(there.file_id).is_some_and(|(a, b)| {
+                            a.dev == b.dev && a.ino != b.ino
+                        });
+                    if !proven_distinct_same_dev {
+                        return Err(same_file_move_error(from, &target));
+                    }
+                }
+            }
         }
         let mut report = TransferReport {
             from: from.named(),
@@ -1191,15 +1388,27 @@ impl Transfer<'_> {
                 return Ok(report);
             }
             IfExists::Replace => match there.kind.as_str() {
-                "file" if there.size == size && there.hash == Some(hash) => {
+                "file"
+                    if there.size == size
+                        && there.hash == Some(hash)
+                        && !(args.move_source
+                            && from.machine != target.machine
+                            && source
+                                .file_id
+                                .zip(there.file_id)
+                                .is_some_and(|(a, b)| a.same_file(&b))) =>
+                {
                     report.files_unchanged = 1;
                     if args.move_source {
                         if args.dry_run {
                             report.source_removed = 1;
                             report.would_remove = Some(vec![from.path.clone()]);
                         } else {
+                            let forbid = (from.machine == target.machine || probed_same_dir)
+                                .then(|| there.file_id.map(|id| (id.dev, id.ino)))
+                                .flatten();
                             let removed = self
-                                .remove_source_root(from, Some(hash), &mut report.skipped)
+                                .remove_source_root(from, Some(hash), forbid, &mut report.skipped)
                                 .await?;
                             report.source_removed = removed;
                         }
@@ -1239,13 +1448,15 @@ impl Transfer<'_> {
             return Ok(report);
         }
         let (resumed, sent, done) = match self
-            .send_file(from, &target, source, partial, if_exists)
+            .send_file(from, &target, source, partial, if_exists, 1)
             .await
         {
             Err(error) if partial.is_some() && error.code == ErrorCode::Conflict => {
                 // What an earlier attempt left was not a prefix of this file (it changed since):
-                // the destination dropped it when the hash did not match, so start over once.
-                self.send_file(from, &target, source, None, if_exists)
+                // the destination dropped it when the hash did not match, so start over once on
+                // attempt 2 with honest per-attempt byte progress.
+                self.sent.bytes.store(0, Ordering::Relaxed);
+                self.send_file(from, &target, source, None, if_exists, 2)
                     .await?
             }
             other => other?,
@@ -1257,15 +1468,28 @@ impl Transfer<'_> {
         if let Some(ref actual_path) = done.path
             && if_exists == IfExists::Rename
         {
-            report.to = format!("{}:{actual_path}", target.machine);
+            let chosen_name = file_name(actual_path);
+            let reported_path = replace_path_filename(&target.path, chosen_name);
+            report.to = format!("{}:{reported_path}", target.machine);
         }
         report.files_sent = 1;
         report.bytes_sent = sent;
         report.resumed_from = (resumed > 0).then_some(resumed);
         if args.move_source {
+            // Re-verify post-copy file identity on the same machine (or same directory via alias)
+            // so a source sharing an inode with the placed destination is never removed.
+            if (from.machine == target.machine || probed_same_dir)
+                && let (Some(src_id), Some(dst_id)) = (source.file_id, done.file_id)
+                && src_id.same_file(&dst_id)
+            {
+                return Err(same_file_move_error(from, &target));
+            }
+            let forbid = (from.machine == target.machine || probed_same_dir)
+                .then(|| done.file_id.map(|id| (id.dev, id.ino)))
+                .flatten();
             let mut skipped = Vec::new();
             let removed = self
-                .remove_source_root(from, Some(hash), &mut skipped)
+                .remove_source_root(from, Some(hash), forbid, &mut skipped)
                 .await?;
             report.source_removed = removed;
             report.skipped = report.list(skipped);
@@ -1282,6 +1506,7 @@ impl Transfer<'_> {
         source_file: &StatReply,
         hint: Option<u64>,
         if_exists: IfExists,
+        attempt: u32,
     ) -> Result<(u64, u64, PutDone), ErrorBody> {
         let size = source_file.size;
         let Some(hash) = source_file.hash else {
@@ -1302,10 +1527,12 @@ impl Transfer<'_> {
         if let Some(mtime) = source_file.mtime {
             header["mtime"] = json!(mtime);
         }
+        let mut req_caps: Vec<&str> = Vec::new();
         if if_exists != IfExists::Replace {
             header["if_exists"] = json!(if_exists);
+            req_caps.push(CAP_IF_EXISTS);
         }
-        let mut dest = self.open(to, header).await?;
+        let mut dest = self.open_with_caps(to, header, &req_caps).await?;
         let started: PutReady = match dest.first().await {
             Ok(ready) => ready,
             Err(error) => {
@@ -1340,6 +1567,7 @@ impl Transfer<'_> {
             1,
             Some(file_name(&from.path).to_owned()),
             false,
+            attempt,
         );
         let relayed = relay(
             &mut source,
@@ -1386,15 +1614,72 @@ impl Transfer<'_> {
         from: &End,
         to: &End,
         source_stat: &StatReply,
+        from_caps: &HashSet<String>,
         args: &TransferArgs,
     ) -> Result<TransferReport, ErrorBody> {
         let if_exists = IfExists::from(args.if_exists);
-        let there: StatReply = self
-            .request(to, json!({"op": "stat", "path": to.path}))
+        let (there, to_caps): (StatReply, HashSet<String>) = self
+            .request_with_caps(to, json!({"op": "stat", "path": to.path}), &[])
             .await?;
+        Self::check_peer_capabilities(from, from_caps, to, &to_caps, if_exists, args)?;
         if args.move_source {
-            check_not_same_or_subtree(from, to, source_stat, &there, true)?;
             self.check_move_permission(from).await?;
+            if from.machine == to.machine {
+                if let (Some(src_id), Some(dst_id)) = (source_stat.file_id, there.file_id)
+                    && src_id.same_file(&dst_id)
+                {
+                    let same_parent = source_stat
+                        .parent_id
+                        .zip(there.parent_id)
+                        .is_some_and(|(a, b)| a.same_file(&b));
+                    let src_name = file_name(&from.path);
+                    let dst_name = file_name(&to.path);
+                    if same_parent && src_name != dst_name {
+                        if !from_caps.contains(CAP_RENAME) {
+                            return Err(missing_peer_capability(&from.machine, "rename"));
+                        }
+                        if !args.dry_run {
+                            let _: RenameDone = self
+                                .request_required(
+                                    from,
+                                    json!({
+                                        "op": "rename",
+                                        "from": from.path,
+                                        "to": to.path,
+                                    }),
+                                    &[CAP_RENAME],
+                                )
+                                .await?;
+                        }
+                        return Ok(TransferReport {
+                            from: from.named(),
+                            to: to.named(),
+                            kind: "tree",
+                            moved: true,
+                            renamed: vec![RenamedEntry {
+                                from: from.path.clone(),
+                                to: to.path.clone(),
+                            }],
+                            ..TransferReport::default()
+                        });
+                    }
+                    return Err(same_file_move_error(from, to));
+                }
+                if let Some(src_id) = source_stat.file_id
+                    && there.ancestor_ids.iter().any(|anc| anc.same_file(&src_id))
+                {
+                    return Err(ErrorBody::new(
+                        ErrorCode::InvalidArgs,
+                        format!(
+                            "Cannot move {} on {} into its own subdirectory {}.",
+                            from.path, from.machine, to.path
+                        ),
+                    )
+                    .with_hint("Choose a destination outside the source directory.")
+                    .with_machine(from.machine.clone()));
+                }
+            }
+            check_not_same_or_subtree(from, to, source_stat, &there, true)?;
         }
         let missing = match there.kind.as_str() {
             "missing" => true,
@@ -1417,6 +1702,31 @@ impl Transfer<'_> {
         let source = self
             .manifest(from, effective_checksum, &args.exclude)
             .await?;
+        let need_probe = args.move_source
+            && !args.dry_run
+            && (from.machine != to.machine
+                || source_stat.file_id.is_none()
+                || there.file_id.is_some_and(|dst_id| {
+                    source_stat
+                        .file_id
+                        .is_some_and(|src_id| src_id.dev != dst_id.dev)
+                }));
+        let mut probed_subdirs: HashSet<String> = HashSet::new();
+        if need_probe {
+            let source_subdirs: Vec<String> = source
+                .entries
+                .iter()
+                .filter(|e| e.kind == EntryKind::Dir)
+                .map(|e| e.path.clone())
+                .collect();
+            let same_or_subtree = self
+                .probe_same_directory(from, &from.path, &source_subdirs, to, &to.path, true)
+                .await?;
+            if same_or_subtree {
+                return Err(same_file_move_error(from, to));
+            }
+            probed_subdirs.insert(String::new());
+        }
         let dest = if missing {
             Manifest::default()
         } else {
@@ -1550,6 +1860,7 @@ impl Transfer<'_> {
             plan.totals.files_to_send,
             None,
             true,
+            1,
         );
         // A destination that does not exist yet is made even when there is nothing to put in it,
         // so an empty tree arrives as an empty directory.
@@ -1596,6 +1907,21 @@ impl Transfer<'_> {
                 verified.extend(done.verified_files);
                 verified.extend(done.verified_symlinks);
                 if !verified.is_empty() {
+                    if need_probe {
+                        for rel in &verified {
+                            let sub = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+                            if !sub.is_empty() && probed_subdirs.insert(sub.to_owned()) {
+                                let from_sub = join(&from.path, sub);
+                                let to_sub = join(&to.path, sub);
+                                if self
+                                    .probe_same_directory(from, &from_sub, &[], to, &to_sub, false)
+                                    .await?
+                                {
+                                    return Err(same_file_move_error(from, to));
+                                }
+                            }
+                        }
+                    }
                     let hashes = expected_hashes_for(&verified, &listed);
                     report.source_removed += self
                         .delete_verified(from, &verified, &hashes, false, &mut skipped)
@@ -1609,6 +1935,21 @@ impl Transfer<'_> {
         report.deleted += self.delete(to, &extras, &mut skipped).await?;
         if args.move_source {
             if !already_verified.is_empty() {
+                if need_probe {
+                    for rel in &already_verified {
+                        let sub = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+                        if !sub.is_empty() && probed_subdirs.insert(sub.to_owned()) {
+                            let from_sub = join(&from.path, sub);
+                            let to_sub = join(&to.path, sub);
+                            if self
+                                .probe_same_directory(from, &from_sub, &[], to, &to_sub, false)
+                                .await?
+                            {
+                                return Err(same_file_move_error(from, to));
+                            }
+                        }
+                    }
+                }
                 let hashes = expected_hashes_for(&already_verified, &listed);
                 report.source_removed += self
                     .delete_verified(from, &already_verified, &hashes, false, &mut skipped)
@@ -1668,6 +2009,7 @@ impl Transfer<'_> {
         &self,
         from: &End,
         expect_hash: Option<Hash>,
+        forbid_file_id: Option<(u64, u64)>,
         skipped: &mut Vec<SkippedEntry>,
     ) -> Result<u64, ErrorBody> {
         let mut header = json!({
@@ -1679,7 +2021,10 @@ impl Transfer<'_> {
         if let Some(hash) = expect_hash {
             header["expect_root_hash"] = json!(hash);
         }
-        let done: DeleteDone = self.request(from, header).await?;
+        if let Some((dev, ino)) = forbid_file_id {
+            header["forbid_file_id"] = json!([dev, ino]);
+        }
+        let done: DeleteDone = self.request_required(from, header, &[CAP_MOVE]).await?;
         skipped.extend(on(&from.machine, done.skipped));
         Ok(done.removed)
     }
@@ -1699,7 +2044,7 @@ impl Transfer<'_> {
         if chunks.is_empty() {
             if remove_root {
                 let done: DeleteDone = self
-                    .request(
+                    .request_required(
                         from,
                         json!({
                             "op": "delete",
@@ -1707,6 +2052,7 @@ impl Transfer<'_> {
                             "names": [],
                             "remove_root": true,
                         }),
+                        &[CAP_MOVE],
                     )
                     .await?;
                 removed += done.removed;
@@ -1729,7 +2075,7 @@ impl Transfer<'_> {
             if !chunk_hashes.is_empty() {
                 header["expect_hashes"] = json!(chunk_hashes);
             }
-            let done: DeleteDone = self.request(from, header).await?;
+            let done: DeleteDone = self.request_required(from, header, &[CAP_MOVE]).await?;
             removed += done.removed;
             skipped.extend(on(&from.machine, done.skipped));
         }
@@ -1781,10 +2127,12 @@ impl Transfer<'_> {
             .collect();
         skipped.extend(on(&from.machine, ready.skipped));
         let mut unpack_header = json!({"op": "unpack", "root": to.path, "entries": entries});
+        let mut req_caps: Vec<&str> = Vec::new();
         if if_exists != IfExists::Replace {
             unpack_header["if_exists"] = json!(if_exists);
+            req_caps.push(CAP_IF_EXISTS);
         }
-        let mut dest = match self.open(to, unpack_header).await {
+        let mut dest = match self.open_with_caps(to, unpack_header, &req_caps).await {
             Ok(dest) => dest,
             Err(error) => {
                 source.abort().await;
@@ -1837,14 +2185,47 @@ impl Transfer<'_> {
 
     /// One operation that answers with one line.
     async fn request<T: DeserializeOwned>(&self, end: &End, header: Value) -> Result<T, ErrorBody> {
-        let mut conn = self.open(end, header).await?;
+        let (reply, _) = self.request_with_caps(end, header, &[]).await?;
+        Ok(reply)
+    }
+
+    /// One operation that answers with one line and requires the peer to advertise `required_caps`.
+    async fn request_required<T: DeserializeOwned>(
+        &self,
+        end: &End,
+        header: Value,
+        required_caps: &[&str],
+    ) -> Result<T, ErrorBody> {
+        let (reply, _) = self.request_with_caps(end, header, required_caps).await?;
+        Ok(reply)
+    }
+
+    /// One operation that answers with one line, also returning the peer's advertised stream
+    /// capabilities from its handshake.
+    async fn request_with_caps<T: DeserializeOwned>(
+        &self,
+        end: &End,
+        header: Value,
+        required_caps: &[&str],
+    ) -> Result<(T, HashSet<String>), ErrorBody> {
+        let mut conn = self.open_with_caps(end, header, required_caps).await?;
         let answer = conn.first::<T>().await;
+        let caps = conn.capabilities.clone();
         conn.close().await;
-        answer
+        answer.map(|reply| (reply, caps))
     }
 
     async fn open(&self, end: &End, header: Value) -> Result<Conn, ErrorBody> {
-        Conn::open(self.fleet, self.ctx, self.sent, end, header).await
+        self.open_with_caps(end, header, &[]).await
+    }
+
+    async fn open_with_caps(
+        &self,
+        end: &End,
+        header: Value,
+        required_caps: &[&str],
+    ) -> Result<Conn, ErrorBody> {
+        Conn::open(self.fleet, self.ctx, self.sent, end, header, required_caps).await
     }
 }
 
@@ -2199,6 +2580,77 @@ fn file_name(path: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
+/// Builds the refusal returned when a peer runs an older Legion that does not advertise a
+/// required stream capability.
+fn missing_peer_capability(machine: &str, feature: &str) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Unsupported,
+        format!("{machine} runs an older legion that does not support {feature}."),
+    )
+    .with_hint(format!(
+        "Update legion on {machine} so it can honour {feature} safely."
+    ))
+    .with_machine(machine.to_owned())
+}
+
+/// Builds the refusal returned when a move's source and destination resolve to the same file or
+/// directory (whether via alias, bind mount, network share, or hard link).
+fn same_file_move_error(from: &End, to: &End) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::InvalidArgs,
+        format!(
+            "Cannot move {} to {}: both paths refer to the same file or directory.",
+            from.named(),
+            to.named()
+        ),
+    )
+    .with_hint("Choose a different destination path, or rename within one machine.")
+    .with_machine(from.machine.clone())
+}
+
+/// Returns the parent directory of `path` in the path syntax the caller wrote.
+fn parent_dir_of(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    if let Some(pos) = trimmed.rfind(['/', '\\']) {
+        let prefix = &trimmed[..pos];
+        if prefix.is_empty() {
+            return "/".to_owned();
+        }
+        // Preserve Windows drive root `C:\` or `C:/`.
+        if prefix.len() == 2 && prefix.as_bytes()[1] == b':' {
+            let sep = trimmed.as_bytes()[pos] as char;
+            return format!("{prefix}{sep}");
+        }
+        return prefix.to_owned();
+    }
+    if trimmed == "~" {
+        "~".to_owned()
+    } else {
+        ".".to_owned()
+    }
+}
+
+/// Replaces only the final filename segment of `path` with `new_name`, preserving the caller's
+/// prefix (`~/...`, `/...`, or Windows drive path). For `~` paths, always uses forward slashes so
+/// reported paths are identical across Unix and Windows.
+fn replace_path_filename(path: &str, new_name: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    if trimmed.starts_with("~/") || trimmed.starts_with("~\\") {
+        let normalized = trimmed.replace('\\', "/");
+        return match normalized.rfind('/') {
+            Some(pos) => format!("{}/{new_name}", &normalized[..pos]),
+            None => format!("~/{new_name}"),
+        };
+    }
+    match trimmed.rfind(['/', '\\']) {
+        Some(pos) => {
+            let sep = trimmed.as_bytes()[pos] as char;
+            format!("{}{sep}{new_name}", &trimmed[..pos])
+        }
+        None => new_name.to_owned(),
+    }
+}
+
 /// `dir` and `name` joined with the separator `dir` already uses.
 fn join(dir: &str, name: &str) -> String {
     if ends_in_separator(dir) {
@@ -2226,6 +2678,10 @@ struct Conn {
     noise_bytes: usize,
     /// Whether the other end has said, on its first line, that it speaks this protocol.
     greeted: bool,
+    /// Capabilities advertised by the other end in its greeting line.
+    capabilities: HashSet<String>,
+    /// Capabilities this operation requires the other end to advertise.
+    required_caps: Vec<String>,
     /// The longest reply line taken once the other end has answered.
     longest: usize,
     /// How many bytes of lines have been read, which bounds a listing as a whole.
@@ -2266,6 +2722,7 @@ impl Conn {
         sent: &Sent,
         end: &End,
         mut header: Value,
+        required_caps: &[&str],
     ) -> Result<Conn, ErrorBody> {
         header["protocol"] = json!(stream::STREAM_PROTOCOL);
         let (reader, writer, process): (BoxRead, BoxWrite, Process) = if end.remote {
@@ -2305,10 +2762,21 @@ impl Conn {
             let (server_out, client_in) = tokio::io::duplex(CHUNK);
             let host = Host::new(ctx.paths().clone(), ctx.node_name());
             let principal = ctx.principal().to_owned();
+            let door = ctx.door();
+            let device = ctx.device().map(str::to_owned);
+            let pairing_id = ctx.pairing_id().map(str::to_owned);
             let input = SyncIoBridge::new(server_in);
             let output = SyncIoBridge::new(server_out);
             let task = tokio::task::spawn_blocking(move || {
-                stream::serve(&host, Some(&principal), input, output)
+                stream::serve_with_door(
+                    &host,
+                    Some(&principal),
+                    door,
+                    device.as_deref(),
+                    pairing_id.as_deref(),
+                    input,
+                    output,
+                )
             });
             (
                 Box::new(client_in),
@@ -2328,6 +2796,8 @@ impl Conn {
             noise_lines: 0,
             noise_bytes: 0,
             greeted: false,
+            capabilities: HashSet::new(),
+            required_caps: required_caps.iter().map(|c| (*c).to_owned()).collect(),
             longest: LONGEST_REPLY,
             received: 0,
             opened: tokio::time::Instant::now(),
@@ -2386,8 +2856,20 @@ impl Conn {
                                 stream::STREAM_PROTOCOL
                             )));
                         }
+                        if let Some(caps) = fields.get("capabilities").and_then(Value::as_array) {
+                            for cap in caps.iter().filter_map(Value::as_str) {
+                                self.capabilities.insert(cap.to_owned());
+                            }
+                        }
                         self.greeted = true;
                         self.answered = true;
+                        if let Some(missing) = self
+                            .required_caps
+                            .iter()
+                            .find(|cap| !self.capabilities.contains(*cap))
+                        {
+                            return Err(missing_peer_capability(&self.machine, missing));
+                        }
                         continue;
                     }
                     if looks_like_a_reply(&fields) {
@@ -2977,8 +3459,10 @@ struct Meter<'a> {
     ctx: Option<&'a Ctx>,
     sent: &'a Sent,
     bytes_total: u64,
-    /// Bytes already on disk before this run started (for resumed single files).
+    /// Bytes already on disk before this attempt started (for resumed single files).
     bytes_base: u64,
+    /// Bytes transferred in this attempt (tracks reality even when a stale partial restarts from 0).
+    attempt_bytes: u64,
     files_total: u64,
     current: Option<String>,
     tar: Option<TarCounter>,
@@ -2986,9 +3470,11 @@ struct Meter<'a> {
     last: Instant,
     last_bytes_done: u64,
     last_files_done: u64,
+    attempt: u32,
 }
 
 impl<'a> Meter<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ctx: &'a Ctx,
         sent: &'a Sent,
@@ -2997,6 +3483,7 @@ impl<'a> Meter<'a> {
         files_total: u64,
         current: Option<String>,
         tar: bool,
+        attempt: u32,
     ) -> Meter<'a> {
         let now = Instant::now();
         Meter {
@@ -3004,6 +3491,7 @@ impl<'a> Meter<'a> {
             sent,
             bytes_total,
             bytes_base,
+            attempt_bytes: 0,
             files_total,
             current,
             tar: tar.then(TarCounter::default),
@@ -3011,6 +3499,7 @@ impl<'a> Meter<'a> {
             last: now,
             last_bytes_done: bytes_base.min(bytes_total),
             last_files_done: 0,
+            attempt,
         }
     }
 
@@ -3025,6 +3514,7 @@ impl<'a> Meter<'a> {
             }
             None => (chunk.len() as u64, 0),
         };
+        self.attempt_bytes = self.attempt_bytes.saturating_add(bytes);
         self.sent.bytes.fetch_add(bytes, Ordering::Relaxed);
         self.sent.files.fetch_add(files, Ordering::Relaxed);
         self.emit(false);
@@ -3038,7 +3528,7 @@ impl<'a> Meter<'a> {
         let Some(ctx) = self.ctx else {
             return;
         };
-        let transferred = self.sent.bytes.load(Ordering::Relaxed);
+        let transferred = self.attempt_bytes;
         let raw_bytes = self.bytes_base.saturating_add(transferred);
         let clamped_bytes = if self.bytes_total > 0 {
             raw_bytes.min(self.bytes_total)
@@ -3072,6 +3562,9 @@ impl<'a> Meter<'a> {
         });
         if let Some(ref current) = self.current {
             payload["current"] = json!(current);
+        }
+        if self.attempt > 1 {
+            payload["attempt"] = json!(self.attempt);
         }
         ctx.emit(EventKind::Progress, payload);
     }
@@ -3374,6 +3867,8 @@ mod tests {
             noise_lines: 0,
             noise_bytes: 0,
             greeted: false,
+            capabilities: HashSet::new(),
+            required_caps: Vec::new(),
             longest: LONGEST_REPLY,
             received: 0,
             opened: tokio::time::Instant::now(),
@@ -3449,6 +3944,8 @@ mod tests {
             last: Instant::now(),
             last_bytes_done: 0,
             last_files_done: 0,
+            attempt: 1,
+            attempt_bytes: 0,
         };
         let started = tokio::time::Instant::now();
         let broken = relay(&mut source, &mut dest, Amount::Exactly(1000), &mut meter)
@@ -3639,5 +4136,47 @@ mod tests {
             }
             assert_eq!((content, files), (71_000, 3), "chunk {chunk}");
         }
+    }
+
+    #[test]
+    fn replace_path_filename_preserves_caller_form_across_unix_and_windows() {
+        // Caller gave `~/…`: always reports `~/…` with forward slashes regardless of remote OS.
+        assert_eq!(replace_path_filename("~/doc.txt", "doc (2).txt"), "~/doc (2).txt");
+        assert_eq!(
+            replace_path_filename("~/sub/dir/doc.txt", "doc (2).txt"),
+            "~/sub/dir/doc (2).txt"
+        );
+        assert_eq!(
+            replace_path_filename(r"~\sub\doc.txt", "doc (2).txt"),
+            "~/sub/doc (2).txt"
+        );
+
+        // Combining with `file_name` on a Windows absolute path returned by a Windows peer:
+        let win_actual = r"C:\Users\runneradmin\AppData\Local\Temp\.tmpfBCY6H\home\doc (2).txt";
+        assert_eq!(
+            replace_path_filename("~/doc.txt", file_name(win_actual)),
+            "~/doc (2).txt"
+        );
+
+        // Absolute Unix and Windows paths keep their original directory and separator style.
+        assert_eq!(
+            replace_path_filename("/srv/data/doc.txt", "doc (2).txt"),
+            "/srv/data/doc (2).txt"
+        );
+        assert_eq!(
+            replace_path_filename(r"C:\Work\doc.txt", "doc (2).txt"),
+            r"C:\Work\doc (2).txt"
+        );
+        assert_eq!(
+            replace_path_filename("C:/Work/doc.txt", "doc (2).txt"),
+            "C:/Work/doc (2).txt"
+        );
+
+        // Parent dir extraction handles Unix, tilde, and Windows drive roots.
+        assert_eq!(parent_dir_of("~/doc.txt"), "~");
+        assert_eq!(parent_dir_of("~/a/b.txt"), "~/a");
+        assert_eq!(parent_dir_of("/doc.txt"), "/");
+        assert_eq!(parent_dir_of(r"C:\doc.txt"), r"C:\");
+        assert_eq!(parent_dir_of(r"C:\Work\doc.txt"), r"C:\Work");
     }
 }
