@@ -2253,6 +2253,8 @@ mod tests {
                             req.id,
                             serde_json::to_value(HelloResult {
                                 node: hello_node.clone(),
+                                node_explicit: None,
+                                node_id: None,
                                 version: VERSION.to_owned(),
                                 build: None,
                                 protocol: PROTOCOL,

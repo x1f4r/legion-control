@@ -71,6 +71,44 @@ fn an_error_body_leaves_out_what_it_does_not_have() {
             "details": {"rule": "fs.*"}
         }),
     );
+
+    // Forward-tolerant decoding: an unknown code from a newer peer falls back to `failed` and
+    // preserves the wire code under `details.unknown_code`.
+    let unknown_plain: ErrorBody = serde_json::from_value(json!({
+        "code": "future_code",
+        "message": "Something new happened."
+    }))
+    .unwrap();
+    assert_eq!(unknown_plain.code, ErrorCode::Failed);
+    assert_eq!(unknown_plain.message, "Something new happened.");
+    assert_eq!(
+        unknown_plain.details,
+        Some(json!({"unknown_code": "future_code"}))
+    );
+
+    let unknown_with_details: ErrorBody = serde_json::from_value(json!({
+        "code": "future_code",
+        "message": "Something new happened.",
+        "details": {"expected": "studio", "unknown_code": "spoofed"}
+    }))
+    .unwrap();
+    assert_eq!(unknown_with_details.code, ErrorCode::Failed);
+    assert_eq!(
+        unknown_with_details.details,
+        Some(json!({"expected": "studio", "unknown_code": "future_code"}))
+    );
+
+    let unknown_non_object_details: ErrorBody = serde_json::from_value(json!({
+        "code": "future_code",
+        "message": "Something new happened.",
+        "details": [1, 2]
+    }))
+    .unwrap();
+    assert_eq!(unknown_non_object_details.code, ErrorCode::Failed);
+    assert_eq!(
+        unknown_non_object_details.details,
+        Some(json!({"unknown_code": "future_code", "original_details": [1, 2]}))
+    );
 }
 
 #[test]
@@ -206,6 +244,8 @@ fn hello() {
     pin(
         HelloResult {
             node: "tower".into(),
+            node_explicit: None,
+            node_id: None,
             version: "0.1.0".into(),
             build: None,
             protocol: 1,
@@ -227,6 +267,8 @@ fn hello() {
     pin(
         HelloResult {
             node: "tower".into(),
+            node_explicit: Some(true),
+            node_id: Some("0123456789abcdef0123456789abcdef".into()),
             version: "0.1.0".into(),
             build: Some("a59ec0d12345".into()),
             protocol: 1,
@@ -238,6 +280,8 @@ fn hello() {
         },
         json!({
             "node": "tower",
+            "node_explicit": true,
+            "node_id": "0123456789abcdef0123456789abcdef",
             "version": "0.1.0",
             "build": "a59ec0d12345",
             "protocol": 1,
@@ -246,6 +290,30 @@ fn hello() {
             "systems": ["linux", "windows"],
             "system": "linux",
             "boot_id": "0f5b7c1e-2d1a-4c8e-9b3f-5a6d7e8f9012"
+        }),
+    );
+    pin(
+        HelloResult {
+            node: "someones-laptop".into(),
+            node_explicit: Some(false),
+            node_id: None,
+            version: "0.1.0".into(),
+            build: None,
+            protocol: 1,
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            systems: vec![],
+            system: None,
+            boot_id: None,
+        },
+        json!({
+            "node": "someones-laptop",
+            "node_explicit": false,
+            "version": "0.1.0",
+            "protocol": 1,
+            "os": "macos",
+            "arch": "aarch64",
+            "systems": []
         }),
     );
 }
