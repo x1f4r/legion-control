@@ -3600,6 +3600,8 @@ impl TransferManager {
 
         let mut retry_started: Option<Instant> = None;
         let mut attempt: u32 = 0;
+        let mut highest_ack_offset: u64 = 0;
+        let mut consecutive_cancelled_no_progress: u32 = 0;
         let mut sent_any_bytes = false;
 
         loop {
@@ -3677,11 +3679,19 @@ impl TransferManager {
                         self.update_progress(id, 0, total_size, None);
                         retry_started = None;
                         attempt = 0;
+                        highest_ack_offset = 0;
+                        consecutive_cancelled_no_progress = 0;
                         continue;
                     }
                     let app_err = AppError::from(err);
                     if self
-                        .should_retry(&app_err, &mut retry_started, &mut attempt, cancel)
+                        .should_retry_upload(
+                            &app_err,
+                            &mut retry_started,
+                            &mut attempt,
+                            &mut consecutive_cancelled_no_progress,
+                            cancel,
+                        )
                         .await?
                     {
                         continue;
@@ -3691,6 +3701,15 @@ impl TransferManager {
             };
 
             let resume_offset = put.offset();
+            if resume_offset > highest_ack_offset {
+                // Only acknowledged remote progress (`put.offset()` advancing) resets the
+                // retry window and unsolicited-cancellation counter — local `write_all` calls
+                // succeed into the local socket/channel buffer before the target saves anything.
+                highest_ack_offset = resume_offset;
+                retry_started = None;
+                attempt = 0;
+                consecutive_cancelled_no_progress = 0;
+            }
             if resume_offset > 0 || total_size == 0 {
                 sent_any_bytes = true;
             }
@@ -3802,8 +3821,6 @@ impl TransferManager {
                     ));
                 }
                 sent = sent.saturating_add(read_n as u64);
-                retry_started = None;
-                attempt = 0;
 
                 rate_window_bytes = rate_window_bytes.saturating_add(read_n as u64);
                 let elapsed = rate_window_start.elapsed();
@@ -3818,7 +3835,7 @@ impl TransferManager {
             };
 
             if let Some(err) = write_err {
-                put.cancel();
+                let peer_err = put.read_error_after_write_failure().await;
                 if self
                     .verify_uploaded_destination(
                         &initial.transfer.machine,
@@ -3838,13 +3855,40 @@ impl TransferManager {
                         finalized_in_cache: false,
                     });
                 }
+                let effective_err = peer_err.map(AppError::from).unwrap_or(err);
+                if use_if_exists_fail
+                    && effective_err.code == ErrorCode::Exists
+                    && let Some((next_path, next_name)) = advance_upload_candidate(
+                        &dir_prefix,
+                        sep,
+                        &base_name,
+                        &mut candidate_n,
+                        &mut fallback_exists_attempts,
+                    )
+                {
+                    remote_path = next_path;
+                    sent_any_bytes = false;
+                    self.lock_resolved_upload_path(id, &remote_path, &next_name);
+                    self.update_progress(id, 0, total_size, None);
+                    retry_started = None;
+                    attempt = 0;
+                    highest_ack_offset = 0;
+                    consecutive_cancelled_no_progress = 0;
+                    continue;
+                }
                 if self
-                    .should_retry(&err, &mut retry_started, &mut attempt, cancel)
+                    .should_retry_upload(
+                        &effective_err,
+                        &mut retry_started,
+                        &mut attempt,
+                        &mut consecutive_cancelled_no_progress,
+                        cancel,
+                    )
                     .await?
                 {
                     continue;
                 }
-                return Err(WorkerStop::Failed(err));
+                return Err(WorkerStop::Failed(effective_err));
             }
 
             match put.finish().await {
@@ -3876,6 +3920,8 @@ impl TransferManager {
                         self.update_progress(id, 0, total_size, None);
                         retry_started = None;
                         attempt = 0;
+                        highest_ack_offset = 0;
+                        consecutive_cancelled_no_progress = 0;
                         continue;
                     }
                     if self
@@ -3899,7 +3945,13 @@ impl TransferManager {
                     }
                     let app_err = AppError::from(err);
                     if self
-                        .should_retry(&app_err, &mut retry_started, &mut attempt, cancel)
+                        .should_retry_upload(
+                            &app_err,
+                            &mut retry_started,
+                            &mut attempt,
+                            &mut consecutive_cancelled_no_progress,
+                            cancel,
+                        )
                         .await?
                     {
                         continue;
@@ -3995,6 +4047,29 @@ impl TransferManager {
         settings.wifi_only_large
             && total_size >= settings.large_threshold_bytes
             && !self.platform.is_unmetered_wifi()
+    }
+
+    async fn should_retry_upload(
+        &self,
+        err: &AppError,
+        retry_started: &mut Option<Instant>,
+        attempt: &mut u32,
+        consecutive_cancelled_no_progress: &mut u32,
+        cancel: &CancellationToken,
+    ) -> Result<bool, WorkerStop> {
+        if cancel.is_cancelled() {
+            return Err(WorkerStop::Interrupted);
+        }
+        if err.code == ErrorCode::Cancelled {
+            *consecutive_cancelled_no_progress =
+                consecutive_cancelled_no_progress.saturating_add(1);
+            if *consecutive_cancelled_no_progress >= MAX_CONSECUTIVE_UNSOLICITED_UPLOAD_CANCELS {
+                return Err(WorkerStop::Failed(unsolicited_upload_cancel_error()));
+            }
+        } else {
+            *consecutive_cancelled_no_progress = 0;
+        }
+        self.should_retry(err, retry_started, attempt, cancel).await
     }
 
     async fn should_retry(
@@ -4176,6 +4251,13 @@ enum WorkerStop {
     WifiOnlyPause,
     Stalled(AppError),
     Failed(AppError),
+}
+
+const MAX_CONSECUTIVE_UNSOLICITED_UPLOAD_CANCELS: u32 = 3;
+
+fn unsolicited_upload_cancel_error() -> AppError {
+    AppError::new(ErrorCode::Cancelled, "The upload kept being interrupted.")
+        .with_hint("Resume the upload to try again.")
 }
 
 fn is_transient_error(err: &AppError) -> bool {
@@ -4659,6 +4741,9 @@ mod tests {
         race_create_on_put_finish: std::collections::HashSet<String>,
         cancel_after_put_commit: bool,
         cancel_mid_put_once: bool,
+        cancel_mid_put_no_progress: bool,
+        cancel_mid_put_with_progress_remaining: usize,
+        drop_mid_put_no_progress: bool,
         stat_calls: AtomicUsize,
         put_requests: Mutex<Vec<Value>>,
         active_streams: AtomicUsize,
@@ -4904,9 +4989,25 @@ mod tests {
                         }
                         let mut buf = vec![0u8; 16 * 1024];
                         let mut got = existing;
-                        let cancel_mid_once = {
+                        let (
+                            cancel_mid_once,
+                            cancel_no_progress,
+                            cancel_with_progress,
+                            drop_no_progress,
+                        ) = {
                             let mut st = remote.lock().unwrap();
-                            std::mem::take(&mut st.cancel_mid_put_once)
+                            let with_prog = if st.cancel_mid_put_with_progress_remaining > 0 {
+                                st.cancel_mid_put_with_progress_remaining -= 1;
+                                true
+                            } else {
+                                false
+                            };
+                            (
+                                std::mem::take(&mut st.cancel_mid_put_once),
+                                st.cancel_mid_put_no_progress,
+                                with_prog,
+                                st.drop_mid_put_no_progress,
+                            )
                         };
                         while got.len() < size {
                             tokio::select! {
@@ -4919,7 +5020,29 @@ mod tests {
                                     Ok(0) => break,
                                     Ok(n) => {
                                         got.extend_from_slice(&buf[..n]);
-                                        if cancel_mid_once && got.len() < size {
+                                        if drop_no_progress {
+                                            // Discard bytes without saving partials and close
+                                            // without a reply (simulates abrupt transport drop).
+                                            let _ = server_out.shutdown().await;
+                                            return;
+                                        }
+                                        if cancel_no_progress {
+                                            // Discard bytes without saving partials and send an
+                                            // unsolicited `cancelled` reply.
+                                            let err = json!({
+                                                "error": ErrorBody::new(
+                                                    ProtoCode::Cancelled,
+                                                    "The stream stopped because the node is shutting down.",
+                                                )
+                                                .with_machine("tower")
+                                            });
+                                            let _ = server_out
+                                                .write_all(format!("{err}\n").as_bytes())
+                                                .await;
+                                            let _ = server_out.shutdown().await;
+                                            return;
+                                        }
+                                        if (cancel_mid_once || cancel_with_progress) && got.len() < size {
                                             remote.lock().unwrap().partial_uploads.insert(path, got);
                                             let err = json!({
                                                 "error": ErrorBody::new(
@@ -9374,6 +9497,234 @@ mod tests {
                 .get("/home/me/Uploads/relayed-resumed.bin")
                 .map(Vec::as_slice),
             Some(payload_b.as_slice())
+        );
+
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_bounds_unsolicited_cancels_without_offset_progress_and_allows_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Arc::new(Mutex::new(MockRemoteState {
+            advertise_cap_if_exists: true,
+            cancel_mid_put_no_progress: true,
+            ..MockRemoteState::default()
+        }));
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        // Long retry window (60s): proves the 3-cancel bound stops the upload promptly rather
+        // than relying on the retry window or looping forever.
+        let mgr = TransferManager::with_options(
+            dir.path(),
+            backend,
+            platform.clone(),
+            2,
+            Duration::from_secs(60),
+        );
+
+        // Case 1: Large payload (> 64 KiB pipe buffer) where `put.write_all` succeeds locally on
+        // the first chunk before hitting BrokenPipe and recovering the peer's `cancelled` reply.
+        let payload_large: Vec<u8> = (0..180_000).map(|i| ((i * 5) % 251) as u8).collect();
+        let src_large = dir.path().join("bounded-large.bin");
+        fs::write(&src_large, &payload_large).unwrap();
+        platform
+            .picked_files
+            .lock()
+            .unwrap()
+            .push(PickedUploadFile {
+                local_path: src_large.to_string_lossy().into_owned(),
+                name: "bounded-large.bin".into(),
+                size: payload_large.len() as u64,
+                mime: None,
+            });
+        let id_large = mgr
+            .enqueue_upload("tower".into(), "/home/me/Uploads".into(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let failed_large = wait_for_state(&mgr, &id_large, |s| s.is_terminal()).await;
+        assert_eq!(failed_large.state, TransferState::Failed);
+        let err_large = failed_large
+            .error
+            .as_ref()
+            .expect("failed upload must carry an error");
+        assert_eq!(err_large.code, "cancelled");
+        assert!(
+            err_large.message.contains("kept being interrupted"),
+            "unexpected message: {}",
+            err_large.message
+        );
+        assert_eq!(
+            remote.lock().unwrap().put_requests.lock().unwrap().len(),
+            MAX_CONSECUTIVE_UNSOLICITED_UPLOAD_CANCELS as usize,
+            "must stop after exactly 3 unsolicited cancellations without progress"
+        );
+
+        // Case 2: Small payload (< 64 KiB) where `put.write_all` writes the whole file into the
+        // local buffer and `put.finish()` receives the peer's `cancelled` reply.
+        remote.lock().unwrap().put_requests.lock().unwrap().clear();
+        let payload_small: Vec<u8> = (0..8_192).map(|i| ((i * 3) % 251) as u8).collect();
+        let src_small = dir.path().join("bounded-small.bin");
+        fs::write(&src_small, &payload_small).unwrap();
+        {
+            let mut picked = platform.picked_files.lock().unwrap();
+            picked.clear();
+            picked.push(PickedUploadFile {
+                local_path: src_small.to_string_lossy().into_owned(),
+                name: "bounded-small.bin".into(),
+                size: payload_small.len() as u64,
+                mime: None,
+            });
+        }
+        let id_small = mgr
+            .enqueue_upload("tower".into(), "/home/me/Uploads".into(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let failed_small = wait_for_state(&mgr, &id_small, |s| s.is_terminal()).await;
+        assert_eq!(failed_small.state, TransferState::Failed);
+        let err_small = failed_small
+            .error
+            .as_ref()
+            .expect("failed small upload must carry an error");
+        assert_eq!(err_small.code, "cancelled");
+        assert!(err_small.message.contains("kept being interrupted"));
+        assert_eq!(
+            remote.lock().unwrap().put_requests.lock().unwrap().len(),
+            MAX_CONSECUTIVE_UNSOLICITED_UPLOAD_CANCELS as usize
+        );
+
+        // Once the peer stops cancelling, the user can resume the failed upload cleanly.
+        remote.lock().unwrap().cancel_mid_put_no_progress = false;
+        mgr.control(&id_large, TransferControlAction::Resume)
+            .await
+            .unwrap();
+        let resumed = wait_for_state(&mgr, &id_large, |s| s.is_terminal()).await;
+        assert_eq!(
+            resumed.state,
+            TransferState::Done,
+            "resumed upload must succeed after peer recovers, got: {:?}",
+            resumed.error
+        );
+        assert_eq!(
+            remote
+                .lock()
+                .unwrap()
+                .uploaded
+                .get("/home/me/Uploads/bounded-large.bin")
+                .map(Vec::as_slice),
+            Some(payload_large.as_slice())
+        );
+
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_resets_cancel_bound_on_offset_advance_and_expires_retry_window_without_progress()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Arc::new(Mutex::new(MockRemoteState {
+            advertise_cap_if_exists: true,
+            // Four consecutive unsolicited cancellations, each saving a partial chunk so
+            // `put.offset()` genuinely advances across attempts.
+            cancel_mid_put_with_progress_remaining: 4,
+            ..MockRemoteState::default()
+        }));
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        // Short retry window (2s) verifies BOTH:
+        //  A) advancing `put.offset()` resets both the 3-cancel bound AND the retry window
+        //     (4 interruptions take ~3s total yet still succeed), and
+        //  B) repeated transport drops with local `write_all` success but NO `put.offset()`
+        //     advance do NOT reset the retry window and fail promptly instead of looping forever.
+        let mgr = TransferManager::with_options(
+            dir.path(),
+            backend,
+            platform.clone(),
+            2,
+            Duration::from_secs(2),
+        );
+
+        // Part A: 4 unsolicited cancellations WITH remote offset progress -> resets on each
+        // acknowledged offset advance and completes `Done`.
+        let payload_prog: Vec<u8> = (0..220_000).map(|i| ((i * 13) % 251) as u8).collect();
+        let src_prog = dir.path().join("progress-resets.bin");
+        fs::write(&src_prog, &payload_prog).unwrap();
+        platform
+            .picked_files
+            .lock()
+            .unwrap()
+            .push(PickedUploadFile {
+                local_path: src_prog.to_string_lossy().into_owned(),
+                name: "progress-resets.bin".into(),
+                size: payload_prog.len() as u64,
+                mime: None,
+            });
+        let id_prog = mgr
+            .enqueue_upload("tower".into(), "/home/me/Uploads".into(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let done_prog = wait_for_state(&mgr, &id_prog, |s| s.is_terminal()).await;
+        assert_eq!(
+            done_prog.state,
+            TransferState::Done,
+            "4 cancellations with advancing put.offset() must reset counter & window and finish Done, got: {:?}",
+            done_prog.error
+        );
+        assert_eq!(
+            remote.lock().unwrap().put_requests.lock().unwrap().len(),
+            5,
+            "4 interrupted attempts + 1 final attempt"
+        );
+        assert_eq!(
+            remote
+                .lock()
+                .unwrap()
+                .uploaded
+                .get("/home/me/Uploads/progress-resets.bin")
+                .map(Vec::as_slice),
+            Some(payload_prog.as_slice())
+        );
+
+        // Part B: Abrupt EOF drops with local `write_all` success and `put.offset() == 0`
+        // must NOT reset `retry_started` and must fail once the 2s retry window elapses.
+        {
+            let mut st = remote.lock().unwrap();
+            st.put_requests.lock().unwrap().clear();
+            st.drop_mid_put_no_progress = true;
+        }
+        let payload_drop: Vec<u8> = (0..180_000).map(|i| ((i * 17) % 251) as u8).collect();
+        let src_drop = dir.path().join("drop-no-progress.bin");
+        fs::write(&src_drop, &payload_drop).unwrap();
+        {
+            let mut picked = platform.picked_files.lock().unwrap();
+            picked.clear();
+            picked.push(PickedUploadFile {
+                local_path: src_drop.to_string_lossy().into_owned(),
+                name: "drop-no-progress.bin".into(),
+                size: payload_drop.len() as u64,
+                mime: None,
+            });
+        }
+        let id_drop = mgr
+            .enqueue_upload("tower".into(), "/home/me/Uploads".into(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let failed_drop = wait_for_state(&mgr, &id_drop, |s| s.is_terminal()).await;
+        assert_eq!(
+            failed_drop.state,
+            TransferState::Failed,
+            "abrupt drops without put.offset() progress must hit retry window and fail"
+        );
+        assert_eq!(
+            failed_drop.error.as_ref().map(|e| e.code.as_str()),
+            Some("unreachable")
         );
 
         mgr.shutdown();

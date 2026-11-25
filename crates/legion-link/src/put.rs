@@ -178,6 +178,40 @@ impl PutStream {
         self.channel_cancel.cancel();
     }
 
+    /// Drops the upload writer and checks whether the remote peer already sent a structured error
+    /// frame (such as `cancelled`, `denied`, or `exists`) before closing the stream.
+    ///
+    /// Uses a short bounded read timeout so a half-closed peer can never stall error handling.
+    pub async fn read_error_after_write_failure(mut self) -> Option<ErrorBody> {
+        drop(self.writer.take());
+        let wait = self.timeout.min(Duration::from_secs(2));
+        let mut line = Vec::new();
+        let read_res = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => {
+                self.channel_cancel.cancel();
+                return None;
+            }
+            res = tokio::time::timeout(
+                wait,
+                read_bounded_line(&mut self.reader, &mut line, MAX_REPLY_LINE),
+            ) => res,
+        };
+        self.channel_cancel.cancel();
+        let Ok(Ok(n)) = read_res else {
+            return None;
+        };
+        if n == 0 {
+            return None;
+        }
+        let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(&line) else {
+            return None;
+        };
+        fields
+            .get("error")
+            .map(|error_val| crate::decode_remote_error(error_val, &self.machine))
+    }
+
     pub(crate) fn attach_flight(&mut self, guard: Box<dyn Send + Sync>) {
         self._flight = Some(guard);
     }
