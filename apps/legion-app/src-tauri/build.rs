@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=LEGION_BUILD_SEQUENCE");
     println!("cargo:rerun-if-env-changed=LEGION_BUILD_REV");
 
-    emit_build_identity();
+    emit_build_identity()?;
     check_workspace_version(&root_cargo);
 
     stage_frontend(&ui_dir, &dist_dir).map_err(|err| {
@@ -41,20 +41,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Emits `LEGION_APP_SEQUENCE` and `LEGION_APP_BUILD_ID` for the update rule and About screen.
-fn emit_build_identity() {
+fn emit_build_identity() -> Result<(), Box<dyn std::error::Error>> {
     let seq = match env::var("LEGION_BUILD_SEQUENCE") {
         Ok(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 0u64
             } else {
-                let parsed: u64 = trimmed.parse().unwrap_or_else(|err| {
-                    panic!("LEGION_BUILD_SEQUENCE={trimmed:?} must be a positive integer: {err}")
-                });
-                assert!(
-                    parsed > 0,
-                    "LEGION_BUILD_SEQUENCE must be greater than 0 (got 0)"
-                );
+                let parsed: u64 = trimmed.parse().map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "LEGION_BUILD_SEQUENCE={trimmed:?} must be a positive integer: {err}"
+                        ),
+                    )
+                })?;
+                if parsed == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "LEGION_BUILD_SEQUENCE must be greater than 0 (got 0)",
+                    )
+                    .into());
+                }
                 parsed
             }
         }
@@ -77,6 +85,7 @@ fn emit_build_identity() {
         })
         .unwrap_or_else(|| "dev".to_owned());
     println!("cargo:rustc-env=LEGION_APP_BUILD_ID={rev}");
+    Ok(())
 }
 
 /// Ensures the standalone app crate keeps the same version as the root workspace.

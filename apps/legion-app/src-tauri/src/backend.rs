@@ -469,6 +469,12 @@ pub trait Backend: Send + Sync {
 
     /// Dismisses a pending identity-change warning for `node` without changing its pinned target.
     fn dismiss_identity_change(&self, node: String) -> BoxFuture<'_, Result<AppState, AppError>>;
+
+    /// Returns the live [`legion_link::Link`] and every directly paired node eligible to serve
+    /// update sets (`update.list` / `update.read`), or `None` when not backed by a real link.
+    fn update_sources(&self) -> Result<Option<(legion_link::Link, Vec<String>)>, AppError> {
+        Ok(None)
+    }
 }
 
 /// Fallback backend returning honest unpaired responses.
