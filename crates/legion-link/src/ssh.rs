@@ -2,10 +2,13 @@
 //! keepalives, and stderr/exit-status reporting into [`Session`].
 
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use legion_proto::{ErrorBody, ErrorCode};
@@ -16,12 +19,14 @@ use russh::{
     AlgorithmKind, Channel, ChannelMsg, Disconnect, Preferred, cipher, compression, kex, mac,
 };
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::net::{TcpStream, lookup_host};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::command::{RemoteOs, Subcommand, remote_command};
+use crate::content::{RawStream, StreamOpenError, StreamOpener, WindowPolicy};
 use crate::invite::SshTarget;
 pub use crate::invite::SshTimeouts;
 use crate::key::DeviceKey;
@@ -30,8 +35,26 @@ use crate::stderr::StderrTail;
 
 pub use crate::{REASON_AUTH_FAILED, REASON_HOST_KEY_MISMATCH, REASON_TIMEOUT, REASON_UNREACHABLE};
 
-/// Internal duplex buffer size between the SSH channel pump tasks and the session streams.
+/// Internal duplex buffer size between the RPC SSH channel pump tasks and the session streams.
 const CHANNEL_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Maximum concurrent content stream channels allowed on one SSH connection (strictly below
+/// OpenSSH's default `MaxSessions = 10`, leaving room for the multiplexed RPC channel).
+const MAX_CONCURRENT_SSH_STREAMS: usize = 8;
+
+/// Initial pull-based window requested on an SSH `keep_open` `legion stream get` channel for fast
+/// time to first byte and minimal buffering on an unread stream.
+const SSH_STREAM_INITIAL_WINDOW: u64 = 256 * 1024;
+
+/// Maximum adaptive pull-based window requested on an SSH `keep_open` `legion stream get` channel.
+const SSH_STREAM_MAX_WINDOW: u64 = 4 * 1024 * 1024;
+
+/// Hard memory cap for one SSH stream channel's non-blocking receive buffer (current window plus
+/// one pipelined read-ahead window plus framing headroom).
+const SSH_STREAM_BUFFER_CAP: usize = (2 * SSH_STREAM_MAX_WINDOW as usize) + 256 * 1024;
+
+/// Per-channel SSH receive window size (4 MiB) so high-RTT links keep the pipe full.
+const SSH_CHANNEL_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
 
 /// A live in-process SSH exec channel split into async stdin/stdout streams and a lifecycle handle.
 pub struct SshPipe {
@@ -62,7 +85,9 @@ impl SshPipe {
 /// Lifecycle handle for an open [`SshPipe`], implementing [`TransportHandle`] so [`Session`]
 /// surfaces remote stderr and exit codes in its errors and disconnects cleanly on close.
 pub struct SshPipeHandle {
-    session: Option<client::Handle<HostKeyHandler>>,
+    session: Option<Arc<client::Handle<HostKeyHandler>>>,
+    stream_permits: Arc<Semaphore>,
+    connect_timeout: Duration,
     stderr: Arc<StderrTail>,
     exit_code: Arc<Mutex<Option<i32>>>,
     rx_task: Option<JoinHandle<()>>,
@@ -79,6 +104,16 @@ impl SshPipeHandle {
 impl TransportHandle for SshPipeHandle {
     fn stderr_tail(&self) -> Option<Arc<StderrTail>> {
         Some(Arc::clone(&self.stderr))
+    }
+
+    fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+        self.session.as_ref().map(|session| {
+            Arc::new(SshStreamOpener {
+                session: Arc::clone(session),
+                stream_permits: Arc::clone(&self.stream_permits),
+                connect_timeout: self.connect_timeout,
+            }) as Arc<dyn StreamOpener>
+        })
     }
 
     fn collect_exit_info(
@@ -703,7 +738,7 @@ async fn connect_one_addr(
             )
         })?;
 
-        Ok(bridge_channel(session, channel))
+        Ok(bridge_channel(session, channel, timeouts.connect))
     };
 
     tokio::select! {
@@ -1083,6 +1118,7 @@ fn build_ssh_config(
         preferred,
         keepalive_interval: timeouts.keepalive_interval,
         keepalive_max: timeouts.keepalive_max,
+        window_size: SSH_CHANNEL_WINDOW_SIZE,
         nodelay: true,
         ..client::Config::default()
     })
@@ -1091,6 +1127,7 @@ fn build_ssh_config(
 fn bridge_channel(
     session: client::Handle<HostKeyHandler>,
     channel: Channel<client::Msg>,
+    connect_timeout: Duration,
 ) -> SshPipe {
     let (mut read_half, write_half) = channel.split();
     let (stdout_read, stdout_write) = tokio::io::duplex(CHANNEL_BUFFER_BYTES);
@@ -1165,12 +1202,458 @@ fn bridge_channel(
         reader: stdout_read,
         writer: stdin_write,
         handle: SshPipeHandle {
-            session: Some(session),
+            session: Some(Arc::new(session)),
+            stream_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_SSH_STREAMS)),
+            connect_timeout,
             stderr,
             exit_code,
             rx_task: Some(rx_task),
             tx_task: Some(tx_task),
         },
+    }
+}
+
+struct SshStreamOpener {
+    session: Arc<client::Handle<HostKeyHandler>>,
+    stream_permits: Arc<Semaphore>,
+    connect_timeout: Duration,
+}
+
+impl StreamOpener for SshStreamOpener {
+    fn window_policy(&self) -> Option<WindowPolicy> {
+        Some(WindowPolicy {
+            initial_bytes: SSH_STREAM_INITIAL_WINDOW,
+            max_bytes: SSH_STREAM_MAX_WINDOW,
+        })
+    }
+
+    fn open_stream(
+        &self,
+        cancel: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>> {
+        Box::pin(async move {
+            let command = remote_command(RemoteOs::Unix, Subcommand::Stream, None)
+                .map_err(StreamOpenError::Failed)?;
+
+            let permit = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(StreamOpenError::Failed(ErrorBody::new(
+                        ErrorCode::Cancelled,
+                        "Opening the SSH stream channel was cancelled.",
+                    )));
+                }
+                res = tokio::time::timeout(
+                    self.connect_timeout,
+                    Arc::clone(&self.stream_permits).acquire_owned(),
+                ) => match res {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        return Err(StreamOpenError::DeadSession(
+                            ErrorBody::new(
+                                ErrorCode::Unreachable,
+                                "The SSH session closed while waiting for a stream slot.",
+                            )
+                            .with_details(json!({ "reason": REASON_UNREACHABLE })),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(StreamOpenError::ChannelRefused(
+                            ErrorBody::new(
+                                ErrorCode::Busy,
+                                "Too many concurrent content streams are open on this SSH connection.",
+                            )
+                            .with_hint("Retry once an existing stream finishes.")
+                            .with_details(json!({
+                                "reason": "channel_limit",
+                                "retryable": true,
+                            })),
+                        ));
+                    }
+                }
+            };
+
+            let open_fut = async {
+                // OpenSSH can briefly return `ChannelOpenFailure` while a just-closed channel is
+                // still being reaped in `server_loop2` even though our local permit count stays
+                // strictly below default `MaxSessions = 10`. Retry briefly before surfacing Busy.
+                const RETRY_DELAYS_MS: [u64; 4] = [5, 15, 40, 100];
+                let mut attempt = 0usize;
+                let channel = loop {
+                    match self
+                        .session
+                        .channel_open_session()
+                        .await
+                        .map_err(classify_channel_open_error)
+                    {
+                        Ok(channel) => break channel,
+                        Err(StreamOpenError::ChannelRefused(body)) => {
+                            let Some(&delay_ms) = RETRY_DELAYS_MS.get(attempt) else {
+                                return Err(StreamOpenError::ChannelRefused(body));
+                            };
+                            attempt += 1;
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                        Err(other) => return Err(other),
+                    }
+                };
+                channel.exec(true, command).await.map_err(|err| {
+                    let _ = err;
+                    StreamOpenError::DeadSession(
+                        ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            "Could not start `legion stream` on the SSH channel.",
+                        )
+                        .with_hint(
+                            "Check that the paired key is allowed to run `legion gate` on the node.",
+                        )
+                        .with_details(json!({ "reason": REASON_UNREACHABLE })),
+                    )
+                })?;
+                Ok(bridge_stream_channel(channel, permit))
+            };
+
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(StreamOpenError::Failed(ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    "Opening the SSH stream channel was cancelled.",
+                ))),
+                res = tokio::time::timeout(self.connect_timeout, open_fut) => match res {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(StreamOpenError::DeadSession(
+                        ErrorBody::new(
+                            ErrorCode::Timeout,
+                            format!(
+                                "Timed out opening an SSH stream channel after {}s.",
+                                self.connect_timeout.as_secs_f64()
+                            ),
+                        )
+                        .with_details(json!({ "reason": REASON_TIMEOUT })),
+                    )),
+                },
+            }
+        })
+    }
+}
+
+/// Distinguishes a server-side channel refusal (such as sshd `MaxSessions`) from a dead SSH
+/// transport so a transient channel refusal never tears down a healthy shared session.
+fn classify_channel_open_error(err: russh::Error) -> StreamOpenError {
+    match err {
+        russh::Error::ChannelOpenFailure(reason) => StreamOpenError::ChannelRefused(
+            ErrorBody::new(
+                ErrorCode::Busy,
+                format!("The SSH server refused to open another stream channel ({reason:?})."),
+            )
+            .with_hint(
+                "The server may be at its sshd MaxSessions limit; retry once a stream closes.",
+            )
+            .with_details(json!({
+                "reason": "channel_open_failure",
+                "retryable": true,
+            })),
+        ),
+        other => StreamOpenError::DeadSession(
+            ErrorBody::new(
+                ErrorCode::Unreachable,
+                format!("Could not open an SSH stream channel: {other}."),
+            )
+            .with_hint("Check sshd MaxSessions and that the connection is still up.")
+            .with_details(json!({ "reason": REASON_UNREACHABLE })),
+        ),
+    }
+}
+
+struct SshStreamGuard {
+    cancel: CancellationToken,
+    park: CancellationToken,
+    rx_finished: CancellationToken,
+}
+
+impl Drop for SshStreamGuard {
+    fn drop(&mut self) {
+        if !self.rx_finished.is_cancelled() && !self.park.is_cancelled() {
+            self.cancel.cancel();
+        }
+    }
+}
+
+#[derive(Default)]
+struct ChannelBufState {
+    queue: VecDeque<Box<dyn AsRef<[u8]> + Send>>,
+    head_offset: usize,
+    buffered: usize,
+    eof: bool,
+    reader_dropped: bool,
+    error: Option<io::Error>,
+    waker: Option<Waker>,
+}
+
+struct BoundedChannelReader {
+    state: Arc<Mutex<ChannelBufState>>,
+    cancel: CancellationToken,
+}
+
+impl Drop for BoundedChannelReader {
+    fn drop(&mut self) {
+        let should_cancel = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let incomplete = !state.eof;
+            state.reader_dropped = true;
+            state.queue.clear();
+            state.buffered = 0;
+            incomplete
+        };
+        if should_cancel {
+            self.cancel.cancel();
+        }
+    }
+}
+
+impl AsyncRead for BoundedChannelReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut copied = 0usize;
+        while buf.remaining() > 0 {
+            let Some(front) = state.queue.front() else {
+                break;
+            };
+            let slice = (**front).as_ref();
+            let front_len = slice.len();
+            let avail = &slice[state.head_offset..];
+            let take = avail.len().min(buf.remaining());
+            buf.put_slice(&avail[..take]);
+            state.head_offset += take;
+            state.buffered -= take;
+            copied += take;
+            if state.head_offset >= front_len {
+                state.queue.pop_front();
+                state.head_offset = 0;
+            }
+        }
+        if copied > 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(err) = state.error.take() {
+            return Poll::Ready(Err(err));
+        }
+        if state.eof {
+            return Poll::Ready(Ok(()));
+        }
+        state.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+/// Bridges an independent SSH exec channel for `legion stream` without ever blocking russh's
+/// single session reader loop: incoming packets are queued directly into a bounded per-channel
+/// buffer (`SSH_STREAM_BUFFER_CAP`), and the SSH channel and its concurrency permit close when
+/// the remote finishes or the reader is cancelled/dropped.
+fn bridge_stream_channel(channel: Channel<client::Msg>, permit: OwnedSemaphorePermit) -> RawStream {
+    let (mut read_half, write_half) = channel.split();
+    let (mut stdin_read, stdin_write) = tokio::io::duplex(CHANNEL_BUFFER_BYTES);
+
+    let buf_state = Arc::new(Mutex::new(ChannelBufState::default()));
+    let stderr = Arc::new(StderrTail::default());
+    let channel_cancel = CancellationToken::new();
+    let park_cancel = CancellationToken::new();
+    let rx_finished = CancellationToken::new();
+    let remote_closed_tok = CancellationToken::new();
+    let force_close_tok = CancellationToken::new();
+
+    let rx_state = Arc::clone(&buf_state);
+    let rx_stderr = Arc::clone(&stderr);
+    let rx_cancel = channel_cancel.clone();
+    let rx_park = park_cancel.clone();
+    let rx_done = rx_finished.clone();
+    let rx_remote_closed = remote_closed_tok.clone();
+    let rx_force_close = force_close_tok.clone();
+    tokio::spawn(async move {
+        // Hold the concurrency permit until `sshd` has sent `ChannelMsg::Close` (or the channel
+        // terminates / drain timeout elapses) so we never open a replacement channel while OpenSSH
+        // still counts the closing channel against `MaxSessions`.
+        let _permit = permit;
+        let mut stderr_buf = Vec::<u8>::new();
+        let mut eof_marked = false;
+        let mut remote_closed = false;
+        let mark_eof = |eof_marked: &mut bool| {
+            if !*eof_marked {
+                *eof_marked = true;
+                let mut state = rx_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.eof = true;
+                if let Some(waker) = state.waker.take() {
+                    waker.wake();
+                }
+            }
+        };
+        loop {
+            let msg = tokio::select! {
+                biased;
+                () = rx_cancel.cancelled() => break,
+                () = rx_park.cancelled() => break,
+                msg = read_half.wait() => msg,
+            };
+            let Some(msg) = msg else {
+                remote_closed = true;
+                break;
+            };
+            match msg {
+                ChannelMsg::Data { data } => {
+                    if data.is_empty() {
+                        continue;
+                    }
+                    let mut state = rx_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if state.reader_dropped {
+                        drop(state);
+                        rx_cancel.cancel();
+                        break;
+                    }
+                    if state.buffered.saturating_add(data.len()) > SSH_STREAM_BUFFER_CAP {
+                        state.error = Some(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "remote stream exceeded bounded window buffer",
+                        ));
+                        state.eof = true;
+                        eof_marked = true;
+                        if let Some(waker) = state.waker.take() {
+                            waker.wake();
+                        }
+                        drop(state);
+                        rx_cancel.cancel();
+                        break;
+                    }
+                    state.buffered += data.len();
+                    state.queue.push_back(Box::new(data));
+                    if let Some(waker) = state.waker.take() {
+                        waker.wake();
+                    }
+                }
+                ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    push_stderr_bytes(&rx_stderr, &mut stderr_buf, &data);
+                }
+                ChannelMsg::Eof => {
+                    mark_eof(&mut eof_marked);
+                    rx_done.cancel();
+                }
+                ChannelMsg::Close => {
+                    remote_closed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if !stderr_buf.is_empty() {
+            let text = String::from_utf8_lossy(&stderr_buf);
+            rx_stderr.push_line(&text);
+        }
+        mark_eof(&mut eof_marked);
+        rx_done.cancel();
+        if !remote_closed {
+            // Wait for `sshd` to send `SSH_MSG_CHANNEL_CLOSE` after `tx_task` sends `EOF`:
+            // `russh` automatically replies with `CHANNEL_CLOSE` via `close_from_peer` and
+            // delivers `ChannelMsg::Close` here as soon as OpenSSH has freed its `MaxSessions`
+            // slot. Only force a local `close()` if a misbehaving remote ignores stdin EOF.
+            let closed_cleanly = tokio::time::timeout(Duration::from_secs(2), async {
+                while let Some(msg) = read_half.wait().await {
+                    if matches!(msg, ChannelMsg::Close) {
+                        return true;
+                    }
+                }
+                true
+            })
+            .await
+            .unwrap_or(false);
+            if !closed_cleanly {
+                rx_force_close.cancel();
+            }
+        }
+        rx_remote_closed.cancel();
+    });
+
+    let tx_cancel = channel_cancel.clone();
+    let tx_park = park_cancel.clone();
+    let tx_remote_closed = remote_closed_tok;
+    let tx_force_close = force_close_tok;
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut stdin_open = true;
+        loop {
+            if !stdin_open {
+                tokio::select! {
+                    biased;
+                    () = tx_remote_closed.cancelled() => break,
+                    () = tx_force_close.cancelled() => {
+                        let _ = write_half.close().await;
+                        break;
+                    }
+                }
+            }
+            tokio::select! {
+                biased;
+                () = tx_remote_closed.cancelled() => break,
+                () = tx_force_close.cancelled() => {
+                    let _ = write_half.close().await;
+                    break;
+                }
+                () = tx_cancel.cancelled() => {
+                    let _ = write_half.eof().await;
+                    stdin_open = false;
+                }
+                () = tx_park.cancelled() => {
+                    let _ = write_half.eof().await;
+                    stdin_open = false;
+                }
+                read = stdin_read.read(&mut buf) => match read {
+                    Ok(0) => {
+                        let _ = write_half.eof().await;
+                        stdin_open = false;
+                    }
+                    Ok(n) => {
+                        if write_half.data(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = write_half.eof().await;
+                        stdin_open = false;
+                    }
+                }
+            }
+        }
+    });
+
+    RawStream {
+        reader: Box::new(BoundedChannelReader {
+            state: buf_state,
+            cancel: channel_cancel.clone(),
+        }),
+        writer: Box::new(stdin_write),
+        stderr: Some(stderr),
+        cancel: channel_cancel.clone(),
+        park: Some(park_cancel.clone()),
+        guard: Some(Box::new(SshStreamGuard {
+            cancel: channel_cancel,
+            park: park_cancel,
+            rx_finished,
+        })),
     }
 }
 

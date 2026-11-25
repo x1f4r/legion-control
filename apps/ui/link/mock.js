@@ -1106,7 +1106,7 @@ export function createMockLink(mode = '') {
     flags,
     activeNodeRef: () => activeNode,
     isAuthedRef: () => authed,
-    canReadRef: () => allowedTools.includes('fs.read'),
+    canReadRef: () => allowedTools.includes('fs.read') && !isDenyRead,
   });
 
   function resolveOne(target, tool, args, onEvent) {

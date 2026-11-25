@@ -14,11 +14,14 @@ publish = false
 [workspace.dependencies]
 legion-proto = { path = "crates/legion-proto" }
 legion-link = { path = "crates/legion-link" }
+legion-content = { path = "crates/legion-content" }
 legion-core = { path = "crates/legion-core" }
 legion-net = { path = "crates/legion-net" }
 legion-tools = { path = "crates/legion-tools" }
 legion-update = { path = "crates/legion-update" }
 legion-xfer = { path = "crates/legion-xfer" }
+bytes = "1.12.2"
+http = "1.5.0"
 dunce = "1.0.5"
 # Verifies offline Ed25519 release signatures over SHA256SUMS against the compiled-in public key.
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast"] }
@@ -39,6 +42,7 @@ serde_ignored = "0.1.14"
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 serde_path_to_error = "0.1.20"
 sha2 = "0.11.1"
+socket2 = "0.6.5"
 tar = "0.4.46"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
