@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { canBrowserImmersive, createBrowserImmersive } from '../immersive-browser.js';
 import { createAppLink, detectAppImmersiveCapability } from '../../link/app.js';
@@ -895,4 +898,92 @@ test('createTurnWatcher uses orientation events on injectable clock, guards post
   assert.equal(enterCount, 2);
 
   watcher.dispose();
+});
+
+test('iOS/iPadOS bridge attaches at WKWebView creation, fixes requestGeometryUpdate, resets on load/termination, and hides button when absent', async () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
+  const swiftSrc = fs.readFileSync(
+    path.join(repoRoot, 'apps/legion-app/src-tauri/gen/apple/Sources/legion-app/ImmersiveBridge.swift'),
+    'utf8',
+  );
+  const mainMmSrc = fs.readFileSync(
+    path.join(repoRoot, 'apps/legion-app/src-tauri/gen/apple/Sources/legion-app/main.mm'),
+    'utf8',
+  );
+  const docSrc = fs.readFileSync(path.join(repoRoot, 'docs/legion/player.md'), 'utf8');
+
+  // 1. No 3-second polling timer in ImmersiveBridge.swift; attaches deterministically at WKWebView creation.
+  assert.doesNotMatch(swiftSrc, /retryAttachSoon|attachAttempts|asyncAfter/);
+  assert.match(swiftSrc, /legion_ios_attach_webview/);
+  assert.match(swiftSrc, /legion_ios_reset_player_state/);
+  assert.match(swiftSrc, /injectionTime:\s*\.atDocumentStart/);
+  assert.match(mainMmSrc, /initWithFrame:configuration:/);
+  assert.match(mainMmSrc, /webViewWebContentProcessDidTerminate:/);
+
+  // 2. requestGeometryUpdate error closure must not hold setNeedsUpdateOfSupportedInterfaceOrientations.
+  assert.doesNotMatch(
+    swiftSrc,
+    /requestGeometryUpdate\([^)]*\)\s*\{\s*_ in\s+[\s\S]*?setNeedsUpdateOfSupportedInterfaceOrientations\(\)\s*\}/,
+  );
+  assert.match(
+    swiftSrc,
+    /requestGeometryUpdate\(\.iOS\(interfaceOrientations:\s*restoreMask\)\)\s*\{\s*_ in\s*\}\s*\n\s*vc\.setNeedsUpdateOfSupportedInterfaceOrientations\(\)/,
+  );
+
+  // 3. iPadOS multitasking note documented alongside Android tablets.
+  assert.match(docSrc, /iPadOS with multitasking.*bars hide and the video fills/);
+
+  // 4. Without the WKScriptMessageHandler on iOS, createAppLink reports canImmersive() === false (never a dead button);
+  //    with it present, posts immersive and keep_screen_on messages directly.
+  const prevWindow = globalThis.window;
+  const prevNavDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const invoked = [];
+  const posted = [];
+  try {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15' },
+    });
+
+    globalThis.window = {
+      __TAURI__: { core: { invoke: async (cmd) => invoked.push(cmd) } },
+    };
+    const linkNoHandler = createAppLink();
+    assert.equal(linkNoHandler.canImmersive(), false);
+    assert.deepEqual(await linkNoHandler.immersive(true, { orientation: 'landscape' }), {
+      active: false,
+      mode: 'none',
+    });
+    assert.deepEqual(invoked, []);
+
+    globalThis.window = {
+      __TAURI__: { core: { invoke: async (cmd) => invoked.push(cmd) } },
+      webkit: {
+        messageHandlers: {
+          legionImmersive: {
+            postMessage(msg) {
+              posted.push(msg);
+            },
+          },
+        },
+      },
+    };
+    const linkWithHandler = createAppLink();
+    assert.equal(linkWithHandler.canImmersive(), true);
+    assert.deepEqual(await linkWithHandler.immersive(true, { orientation: 'landscape' }), {
+      active: true,
+      mode: 'ios',
+    });
+    assert.equal(await linkWithHandler.keepScreenOn(true), true);
+    assert.deepEqual(posted, [
+      { type: 'immersive', on: true, orientation: 'landscape' },
+      { type: 'keep_screen_on', on: true },
+    ]);
+    assert.deepEqual(invoked, []);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevNavDesc) Object.defineProperty(globalThis, 'navigator', prevNavDesc);
+    else delete globalThis.navigator;
+  }
 });

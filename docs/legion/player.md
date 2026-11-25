@@ -58,7 +58,7 @@ One operation, `immersive(on)`, that each platform implements. The viewer calls 
 | Where | Entering does | Notes |
 | --- | --- | --- |
 | Android app | hides status and navigation bars (a swipe from the edge shows them briefly), draws into the cutout, turns to landscape for a wide video and portrait for a tall one | works with the phone's rotation lock on; Android 16+ tablets keep the tablet's current orientation while still hiding the system bars |
-| iOS and iPadOS app | hides the status bar and home indicator, turns the same way | |
+| iOS and iPadOS app | hides the status bar and home indicator, turns the same way | on iPadOS with multitasking, as on large Android screens, the bars hide and the video fills while the device is not turned for you |
 | Desktop app | makes the window full screen; leaving restores what it was | a window that was already full screen stays so |
 | Browser | full screen on the viewer, not on the video, so Legion's controls stay; turns to landscape where the browser allows | on a browser without it (iPhone Safari), the system's video full screen; where neither exists, no button |
 

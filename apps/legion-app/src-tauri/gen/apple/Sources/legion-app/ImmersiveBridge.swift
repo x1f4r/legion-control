@@ -4,20 +4,28 @@ import WebKit
 
 /// Origin-scoped WKWebView bridge implementing Legion's `immersive(on, { orientation })` and
 /// `keepScreenOn(on)` on iOS and iPadOS using `TaoUIViewController`'s dynamic properties.
+///
+/// The message handler and main-frame reset script are attached deterministically when each
+/// `WKWebView` is initialized (`main.mm`), with window-activation notifications kept as a
+/// non-polling fallback. Immersive state and the idle timer are reset on every main-frame load,
+/// on `webViewWebContentProcessDidTerminate`, and when the app terminates.
 @objcMembers
 final class LegionImmersiveBridge: NSObject, WKScriptMessageHandler {
   static let shared = LegionImmersiveBridge()
 
   private static let handlerName = "legionImmersive"
+  private static let resetUserScriptSource = """
+  (function(){try{var h=window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.legionImmersive;if(h&&typeof h.postMessage==='function'){h.postMessage({type:'reset'});}}catch(_){}})();
+  """
+
   private let attachedWebViews = NSHashTable<WKWebView>.weakObjects()
   private var observersInstalled = false
   private var immersiveActive = false
   private var orientationLocked = false
-  private var attachAttempts = 0
 
   func install() {
-    DispatchQueue.main.async { [weak self] in
-      guard let self else { return }
+    let setup = { [weak self] in
+      guard let self = self else { return }
       if !self.observersInstalled {
         self.observersInstalled = true
         let nc = NotificationCenter.default
@@ -41,24 +49,54 @@ final class LegionImmersiveBridge: NSObject, WKScriptMessageHandler {
         )
       }
       self.attachIfReady()
-      self.scheduleInitialAttachPass()
+    }
+    if Thread.isMainThread {
+      setup()
+    } else {
+      DispatchQueue.main.async(execute: setup)
     }
   }
 
-  private func scheduleInitialAttachPass() {
-    attachAttempts = 0
-    retryAttachSoon()
-  }
-
-  private func retryAttachSoon() {
-    guard attachAttempts < 30 else { return }
-    attachAttempts += 1
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-      guard let self else { return }
-      if !self.attachIfReady() {
-        self.retryAttachSoon()
+  func attach(to webView: WKWebView) {
+    if Thread.isMainThread {
+      attachOnMain(webView)
+    } else {
+      DispatchQueue.main.async { [weak self, weak webView] in
+        guard let self = self, let webView = webView else { return }
+        self.attachOnMain(webView)
       }
     }
+  }
+
+  func resetAll() {
+    let work = { [weak self] in
+      UIApplication.shared.isIdleTimerDisabled = false
+      guard let self = self else { return }
+      if self.immersiveActive || self.orientationLocked {
+        self.applyImmersive(on: false, orientation: "none")
+      }
+    }
+    if Thread.isMainThread {
+      work()
+    } else {
+      DispatchQueue.main.async(execute: work)
+    }
+  }
+
+  private func attachOnMain(_ webView: WKWebView) {
+    if attachedWebViews.contains(webView) {
+      return
+    }
+    let controller = webView.configuration.userContentController
+    controller.removeScriptMessageHandler(forName: Self.handlerName)
+    controller.add(self, name: Self.handlerName)
+    let resetScript = WKUserScript(
+      source: Self.resetUserScriptSource,
+      injectionTime: .atDocumentStart,
+      forMainFrameOnly: true
+    )
+    controller.addUserScript(resetScript)
+    attachedWebViews.add(webView)
   }
 
   @objc private func handleWindowEvent() {
@@ -66,7 +104,7 @@ final class LegionImmersiveBridge: NSObject, WKScriptMessageHandler {
   }
 
   @objc private func handleWillTerminate() {
-    UIApplication.shared.isIdleTimerDisabled = false
+    resetAll()
   }
 
   @discardableResult
@@ -75,12 +113,7 @@ final class LegionImmersiveBridge: NSObject, WKScriptMessageHandler {
     for window in allApplicationWindows() {
       guard let rootView = window.rootViewController?.view else { continue }
       for webView in findWebViews(in: rootView) {
-        if !attachedWebViews.contains(webView) {
-          let controller = webView.configuration.userContentController
-          controller.removeScriptMessageHandler(forName: Self.handlerName)
-          controller.add(self, name: Self.handlerName)
-          attachedWebViews.add(webView)
-        }
+        attachOnMain(webView)
         attachedAny = true
       }
     }
@@ -139,6 +172,8 @@ final class LegionImmersiveBridge: NSObject, WKScriptMessageHandler {
     case "keep_screen_on":
       let on = (body["on"] as? Bool) ?? false
       UIApplication.shared.isIdleTimerDisabled = on
+    case "reset":
+      resetAll()
     default:
       break
     }
@@ -154,6 +189,8 @@ final class LegionImmersiveBridge: NSObject, WKScriptMessageHandler {
   private func applyImmersive(on: Bool, orientation: String) {
     guard let window = activeWindow(),
           let vc = window.rootViewController else {
+      immersiveActive = false
+      orientationLocked = false
       return
     }
 
@@ -208,9 +245,8 @@ final class LegionImmersiveBridge: NSObject, WKScriptMessageHandler {
         } else if !on && wasLocked {
           let restoreMask: UIInterfaceOrientationMask =
             UIDevice.current.orientation.isLandscape ? defaultMask : .portrait
-          scene.requestGeometryUpdate(.iOS(interfaceOrientations: restoreMask)) { _ in
-            vc.setNeedsUpdateOfSupportedInterfaceOrientations()
-          }
+          scene.requestGeometryUpdate(.iOS(interfaceOrientations: restoreMask)) { _ in }
+          vc.setNeedsUpdateOfSupportedInterfaceOrientations()
         }
       }
     } else {
@@ -242,4 +278,16 @@ final class LegionImmersiveBridge: NSObject, WKScriptMessageHandler {
 @_cdecl("legion_install_ios_immersive_bridge")
 public func legionInstallIosImmersiveBridge() {
   LegionImmersiveBridge.shared.install()
+}
+
+@_cdecl("legion_ios_attach_webview")
+public func legionIosAttachWebview(_ webviewPtr: UnsafeMutableRawPointer?) {
+  guard let webviewPtr = webviewPtr else { return }
+  let webView = Unmanaged<WKWebView>.fromOpaque(webviewPtr).takeUnretainedValue()
+  LegionImmersiveBridge.shared.attach(to: webView)
+}
+
+@_cdecl("legion_ios_reset_player_state")
+public func legionIosResetPlayerState() {
+  LegionImmersiveBridge.shared.resetAll()
 }
