@@ -29,6 +29,10 @@ function parseArgs(argv) {
       opts.noOutFile = true;
       continue;
     }
+    if (name === 'verify-resume') {
+      opts.verifyResume = true;
+      continue;
+    }
     opts[name] = argv[i + 1] ?? '';
     i += 1;
   }
@@ -128,9 +132,19 @@ function prepareMedia(workDir) {
   fs.mkdirSync(mediaDir, { recursive: true });
   const imagePath = path.join(mediaDir, 'sample.png');
   const videoPath = path.join(mediaDir, 'sample.webm');
+  const htmlPath = path.join(mediaDir, 'probe.html');
+  const svgPath = path.join(mediaDir, 'probe.svg');
   fs.writeFileSync(imagePath, makeSolidPng(16, 16, [45, 136, 255, 255]));
   fs.copyFileSync(SAMPLE_WEBM, videoPath);
-  return { mediaDir, imagePath, videoPath };
+  fs.writeFileSync(
+    htmlPath,
+    '<!doctype html><html><body><script>try{window.parent.postMessage({legionProbe:true,ipc:Boolean(window.__TAURI__)},"*");}catch(_){}</script></body></html>\n',
+  );
+  fs.writeFileSync(
+    svgPath,
+    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><script>try{window.parent.postMessage({legionProbe:true,ipc:Boolean(window.__TAURI__)},"*");}catch(_){}</script></svg>\n',
+  );
+  return { mediaDir, imagePath, videoPath, htmlPath, svgPath };
 }
 
 function tomlEscape(value) {
@@ -171,7 +185,7 @@ async function main() {
   const nodeHome = path.join(workDir, 'node');
   fs.mkdirSync(nodeHome, { recursive: true });
 
-  const { mediaDir, imagePath, videoPath } = prepareMedia(workDir);
+  const { mediaDir, imagePath, videoPath, htmlPath, svgPath } = prepareMedia(workDir);
   const env = { ...process.env, LEGION_HOME: nodeHome };
 
   execFileSync(legionBin, ['init', '--name', 'tower'], { env, stdio: ['ignore', 'ignore', 'inherit'] });
@@ -181,13 +195,16 @@ async function main() {
 
   if (mode === 'local') {
     const spec = {
-      machine: 'tower',
+      machine: 'local',
       image_path: imagePath,
       video_path: videoPath,
+      html_path: htmlPath,
+      svg_path: svgPath,
+      ...(opts.verifyResume ? { verify_resume: true } : {}),
       ...(opts.noOutFile ? {} : { out_file: outFile }),
     };
     fs.writeFileSync(specPath, `${JSON.stringify(spec, null, 2)}\n`);
-    console.log(JSON.stringify({ nodeHome, specPath, outFile, imagePath, videoPath }));
+    console.log(JSON.stringify({ nodeHome, specPath, outFile, imagePath, videoPath, htmlPath, svgPath }));
     return;
   }
 
@@ -283,6 +300,9 @@ async function main() {
       invite,
       image_path: imagePath,
       video_path: videoPath,
+      html_path: htmlPath,
+      svg_path: svgPath,
+      ...(opts.verifyResume ? { verify_resume: true } : {}),
       ...(opts.noOutFile ? {} : { out_file: outFile }),
     };
     fs.writeFileSync(specPath, `${JSON.stringify(spec, null, 2)}\n`);
@@ -293,6 +313,8 @@ async function main() {
         outFile,
         imagePath,
         videoPath,
+        htmlPath,
+        svgPath,
         port,
         sshdPid: child.pid,
         pidFile,

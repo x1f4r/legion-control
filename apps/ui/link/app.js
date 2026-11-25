@@ -82,10 +82,18 @@ function writeCachedNodeIdentity(nodeName, entry) {
   }
 }
 
+function isIosPlatform() {
+  if (typeof navigator === 'undefined') return false;
+  const ua = String(navigator.userAgent || '');
+  if (/iPad|iPhone|iPod/i.test(ua)) return true;
+  return navigator.platform === 'MacIntel' && Number(navigator.maxTouchPoints || 0) > 1;
+}
+
 export function createAppLink() {
   const callPrefix = randomCallPrefix();
   let nextCallId = 1;
   let readySent = false;
+  const iosPlatform = isIosPlatform();
 
   async function runConfiguredMediaCheck() {
     if (typeof document === 'undefined' || !document.body) return;
@@ -107,36 +115,8 @@ export function createAppLink() {
       }
     };
 
-    const report = {
-      ok: false,
-      image_width: 0,
-      image_height: 0,
-      video_width: 0,
-      video_height: 0,
-      video_duration: 0,
-      image_origin: '',
-      video_origin: '',
-      error: null,
-    };
-
-    try {
-      if (spec.invite) {
-        const current = await rawState().catch(() => null);
-        const alreadyPaired =
-          Array.isArray(current?.nodes) && current.nodes.some((n) => n.node === spec.machine);
-        if (!alreadyPaired) {
-          await pair(spec.invite, 'ci-media');
-        }
-      }
-
-      const [imgTicket, vidTicket] = await Promise.all([
-        contentUrl({ machine: spec.machine, path: spec.image_path }),
-        contentUrl({ machine: spec.machine, path: spec.video_path }),
-      ]);
-      report.image_origin = originOf(imgTicket?.url || '');
-      report.video_origin = originOf(vidTicket?.url || '');
-
-      const imgResult = await new Promise((resolve, reject) => {
+    const loadImage = (url) =>
+      new Promise((resolve, reject) => {
         const img = new Image();
         const timer = window.setTimeout(() => reject(new Error('Image load timed out')), 20000);
         const done = (ok, err) => {
@@ -158,15 +138,13 @@ export function createAppLink() {
           }
         };
         img.onerror = () => done(false, new Error('Image element errored'));
-        img.src = imgTicket.url;
+        img.src = url;
       });
-      report.image_width = imgResult.width;
-      report.image_height = imgResult.height;
 
-      const vidResult = await new Promise((resolve, reject) => {
+    const loadVideo = (url, seekTo) =>
+      new Promise((resolve, reject) => {
         const video = document.createElement('video');
-        const wantSeek =
-          typeof spec.seek_to === 'number' && Number.isFinite(spec.seek_to) && spec.seek_to > 0;
+        const wantSeek = typeof seekTo === 'number' && Number.isFinite(seekTo) && seekTo > 0;
         video.muted = true;
         video.playsInline = true;
         video.setAttribute('playsinline', '');
@@ -207,7 +185,7 @@ export function createAppLink() {
         const onMeta = () => {
           if (wantSeek && !seekStarted) {
             seekStarted = true;
-            video.currentTime = spec.seek_to;
+            video.currentTime = seekTo;
           }
         };
         const onLoaded = () => {
@@ -218,7 +196,7 @@ export function createAppLink() {
           if (wantSeek) {
             if (!seekStarted) {
               seekStarted = true;
-              video.currentTime = spec.seek_to;
+              video.currentTime = seekTo;
             }
             return;
           }
@@ -236,22 +214,201 @@ export function createAppLink() {
         video.addEventListener('canplay', onLoaded);
         video.addEventListener('seeked', onSeeked);
         video.addEventListener('error', onError);
-        video.src = vidTicket.url;
+        video.src = url;
         video.load();
       });
+
+    const verifyContentIpcIsolation = async (machine, htmlPath, svgPath) => {
+      const checks = [];
+      if (htmlPath) checks.push({ kind: 'html', path: htmlPath });
+      if (svgPath) checks.push({ kind: 'svg', path: svgPath });
+      if (checks.length === 0) return null;
+
+      const appOrigin = window.location.origin;
+      let leakedIpc = false;
+      const onMsg = (evt) => {
+        if (evt?.data && typeof evt.data === 'object' && evt.data.legionProbe) {
+          leakedIpc = true;
+        }
+      };
+      window.addEventListener('message', onMsg);
+      try {
+        for (const item of checks) {
+          const ticket = await contentUrl({ machine, path: item.path });
+          // 1) Verify sandbox CSP + nosniff + non-HTML content-type on the content origin.
+          if (typeof fetch === 'function') {
+            const resp = await fetch(ticket.url);
+            if (!resp.ok) {
+              throw new Error(`IPC isolation ${item.kind} fetch returned ${resp.status}`);
+            }
+            const csp = String(resp.headers.get('content-security-policy') || '').toLowerCase();
+            const nosniff = String(resp.headers.get('x-content-type-options') || '').toLowerCase();
+            const ctype = String(resp.headers.get('content-type') || '').toLowerCase();
+            if (!csp.includes('sandbox') || !csp.includes("frame-ancestors 'none'")) {
+              throw new Error(`Missing sandbox/frame-ancestors CSP on ${item.kind}: ${csp}`);
+            }
+            if (nosniff !== 'nosniff') {
+              throw new Error(`Missing nosniff on ${item.kind}: ${nosniff}`);
+            }
+            if (item.kind === 'html' && ctype.includes('text/html')) {
+              throw new Error(`HTML content must not be served as text/html: ${ctype}`);
+            }
+          }
+
+          // 2) Attempt to frame the content URL and ensure neither script nor IPC is reachable.
+          const iframe = document.createElement('iframe');
+          iframe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:10px;height:10px;';
+          iframe.src = ticket.url;
+          document.body.appendChild(iframe);
+          await new Promise((r) => window.setTimeout(r, 400));
+          try {
+            const win = iframe.contentWindow;
+            if (win && win.__TAURI__) {
+              leakedIpc = true;
+            }
+          } catch {
+            // Cross-origin SecurityError is expected and proves isolation.
+          }
+          iframe.remove();
+
+          // 3) Attempt top-level navigation to the content URL; on_navigation must refuse it so
+          // the WebView stays on the bundled app origin.
+          try {
+            window.location.assign(ticket.url);
+          } catch {
+            // Blocked synchronously.
+          }
+          await new Promise((r) => window.setTimeout(r, 300));
+          if (window.location.origin !== appOrigin) {
+            throw new Error(`WebView navigated to content origin for ${item.kind}`);
+          }
+          if (leakedIpc) {
+            throw new Error(`Content ${item.kind} reached script or Tauri IPC`);
+          }
+        }
+        return true;
+      } finally {
+        window.removeEventListener('message', onMsg);
+      }
+    };
+
+    const waitForAppResume = () =>
+      new Promise((resolve, reject) => {
+        let sawBackground = false;
+        const cleanup = () => {
+          window.clearTimeout(timer);
+          document.removeEventListener('visibilitychange', onVis);
+          window.removeEventListener('pagehide', onBg);
+          window.removeEventListener('blur', onBg);
+          window.removeEventListener('focus', onFg);
+          window.removeEventListener('pageshow', onFg);
+        };
+        const timer = window.setTimeout(() => {
+          cleanup();
+          reject(new Error('Timed out waiting for app suspend/resume cycle'));
+        }, 45000);
+        const onBg = () => {
+          sawBackground = true;
+        };
+        const onFg = () => {
+          if (sawBackground && document.visibilityState !== 'hidden') {
+            cleanup();
+            resolve();
+          }
+        };
+        const onVis = () => {
+          if (document.visibilityState === 'hidden') {
+            sawBackground = true;
+          } else if (sawBackground) {
+            cleanup();
+            resolve();
+          }
+        };
+        document.addEventListener('visibilitychange', onVis);
+        window.addEventListener('pagehide', onBg);
+        window.addEventListener('blur', onBg);
+        window.addEventListener('focus', onFg);
+        window.addEventListener('pageshow', onFg);
+      });
+
+    const report = {
+      ok: false,
+      image_width: 0,
+      image_height: 0,
+      video_width: 0,
+      video_height: 0,
+      video_duration: 0,
+      image_origin: '',
+      video_origin: '',
+      ipc_isolation_ok: null,
+      resume_ok: spec.verify_resume ? false : null,
+      error: null,
+    };
+
+    try {
+      if (spec.invite) {
+        const current = await rawState().catch(() => null);
+        const alreadyPaired =
+          Array.isArray(current?.nodes) && current.nodes.some((n) => n.node === spec.machine);
+        if (!alreadyPaired) {
+          await pair(spec.invite, 'ci-media');
+        }
+      }
+
+      const [imgTicket, vidTicket] = await Promise.all([
+        contentUrl({ machine: spec.machine, path: spec.image_path }),
+        contentUrl({ machine: spec.machine, path: spec.video_path }),
+      ]);
+      report.image_origin = originOf(imgTicket?.url || '');
+      report.video_origin = originOf(vidTicket?.url || '');
+
+      const imgResult = await loadImage(imgTicket.url);
+      report.image_width = imgResult.width;
+      report.image_height = imgResult.height;
+
+      const vidResult = await loadVideo(vidTicket.url, spec.seek_to);
       report.video_width = vidResult.width;
       report.video_height = vidResult.height;
       report.video_duration = vidResult.duration;
       if (typeof vidResult.seekedTime === 'number') {
         report.seeked_time = vidResult.seekedTime;
       }
-      report.ok =
+
+      if (spec.html_path || spec.svg_path) {
+        report.ipc_isolation_ok = await verifyContentIpcIsolation(
+          spec.machine,
+          spec.html_path,
+          spec.svg_path,
+        );
+      }
+
+      const mediaPass =
         report.image_width > 0 &&
         report.image_height > 0 &&
         report.video_width > 0 &&
         report.video_height > 0 &&
         (typeof spec.seek_to !== 'number' ||
-          (typeof vidResult.seekedTime === 'number' && Math.abs(vidResult.seekedTime - spec.seek_to) < 5));
+          (typeof vidResult.seekedTime === 'number' && Math.abs(vidResult.seekedTime - spec.seek_to) < 5)) &&
+        (report.ipc_isolation_ok === null || report.ipc_isolation_ok === true);
+      report.ok = mediaPass;
+
+      if (spec.verify_resume && mediaPass) {
+        // Emit intermediate report so the simulator harness knows initial playback succeeded and
+        // can now background and foreground the app.
+        await invoke('media_check_report', { report: { ...report, resume_ok: false } }).catch(() => {});
+        await waitForAppResume();
+        // Give native resume hook a beat to probe/rebind the loopback listener if needed.
+        await new Promise((r) => window.setTimeout(r, 400));
+        const [imgAfter, vidAfter] = await Promise.all([
+          contentUrl({ machine: spec.machine, path: spec.image_path }),
+          contentUrl({ machine: spec.machine, path: spec.video_path }),
+        ]);
+        const imgRes2 = await loadImage(imgAfter.url);
+        const vidRes2 = await loadVideo(vidAfter.url, spec.seek_to);
+        report.resume_ok =
+          imgRes2.width > 0 && imgRes2.height > 0 && vidRes2.width > 0 && vidRes2.height > 0;
+        report.ok = mediaPass && report.resume_ok;
+      }
     } catch (err) {
       report.ok = false;
       report.error = err?.message ? String(err.message) : String(err);
@@ -383,7 +540,7 @@ export function createAppLink() {
           call('meta.whoami', {}, { on: targetNode }),
           call('meta.version', {}, { on: targetNode }).catch(() => null),
         ]);
-        if (primary.via !== 'local' && whoami?.node && whoami.node !== targetNode) {
+        if (!(primary.via === 'local' && targetNode === 'local') && whoami?.node && whoami.node !== targetNode) {
           throw {
             code: 'denied',
             message: `Expected identity from ${targetNode}, but ${whoami.node} answered.`,
@@ -708,13 +865,22 @@ export function createAppLink() {
     }
   }
 
+  async function pickUploads() {
+    try {
+      const picked = await invoke('transfer_pick_uploads');
+      return Array.isArray(picked) ? picked : [];
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
   async function upload(req = {}) {
-    const { machine, dir, files } = req || {};
+    const { machine, dir, handles } = req || {};
     try {
       return await invoke('transfer_upload', {
         machine: machine || '',
         dir: dir || '',
-        files: Array.isArray(files) ? files : null,
+        handles: Array.isArray(handles) ? handles : null,
       });
     } catch (err) {
       throw normalizeError(err);
@@ -760,12 +926,22 @@ export function createAppLink() {
     }
   }
 
+  async function showTransferInFolder(id) {
+    try {
+      return await invoke('show_transfer_in_folder', { id });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
   function onTransferEvent(listener) {
     const core = tauriCore();
     if (!core || typeof core.Channel !== 'function' || typeof listener !== 'function') {
       return () => {};
     }
     let active = true;
+    let watcherId = null;
+    let unwatchSent = false;
     const channel = new core.Channel();
     channel.onmessage = (list) => {
       if (!active) return;
@@ -775,9 +951,34 @@ export function createAppLink() {
         // Keep receiving queue updates if a view callback throws.
       }
     };
-    invoke('transfer_watch', { onEvent: channel }).catch(() => {});
-    return () => {
+    const releaseWatcher = () => {
       active = false;
+      if (unwatchSent || watcherId == null) return;
+      unwatchSent = true;
+      const id = watcherId;
+      invoke('transfer_unwatch', { watcherId: id }).catch(() => {});
+    };
+    const onUnload = () => {
+      releaseWatcher();
+    };
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('pagehide', onUnload);
+      window.addEventListener('beforeunload', onUnload);
+    }
+    invoke('transfer_watch', { onEvent: channel })
+      .then((id) => {
+        if (typeof id === 'number') {
+          watcherId = id;
+          if (!active) releaseWatcher();
+        }
+      })
+      .catch(() => {});
+    return () => {
+      if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+        window.removeEventListener('pagehide', onUnload);
+        window.removeEventListener('beforeunload', onUnload);
+      }
+      releaseWatcher();
     };
   }
 
@@ -799,7 +1000,7 @@ export function createAppLink() {
     }
   }
 
-  return {
+  const link = {
     kind: 'app',
     state,
     tools,
@@ -823,13 +1024,22 @@ export function createAppLink() {
     maybeAutoInstall,
     contentUrl,
     download,
-    upload,
-    openExternally,
     transfers,
     transferControl,
     openTransfer,
+    showTransferInFolder,
     onTransferEvent,
     transferSettings,
     setTransferSettings,
   };
+
+  // On iOS/iPadOS, native file-picker uploads and open-in-another-app are not yet wired; omit
+  // those methods so the interface hides unsupported actions instead of showing dead controls.
+  if (!iosPlatform) {
+    link.pickUploads = pickUploads;
+    link.upload = upload;
+    link.openExternally = openExternally;
+  }
+
+  return link;
 }

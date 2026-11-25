@@ -201,16 +201,20 @@ mount it:
   capped below `MaxSessions` of 10 per target machine.
 - **The app**: the native side mounts `legion-content` behind `content_url({machine, path,
   download})`, reading through `Link::open_content`. Linux, macOS, Windows, iOS and iPadOS mount it
-  lazily on a listener bound to `127.0.0.1` on a system-chosen port (stopping 60 seconds after no
-  live tickets or active streams remain), protected by `HostOriginGuard` (loopback host+port and
-  only that platform's bundled page origins, never `null`) and `Cross-Origin-Resource-Policy:
-  cross-origin`. Android keeps `android:usesCleartextTraffic="false"` in its manifest, which causes
-  Chromium WebView to refuse cleartext loopback HTTP; Android therefore mounts the same
-  `legion-content` crate on a Tauri custom URI scheme (`legion-content`, reached as
+  lazily on a listener bound to `127.0.0.1` on a system-chosen port (capped at 32 simultaneous
+  connections with a 5-second header-read timeout, exponential backoff on accept errors, iOS
+  resume recovery, and stopping 60 seconds after no live tickets or active streams remain),
+  protected by `HostOriginGuard` (loopback host+port and only that platform's bundled page origins,
+  never `null`) and `Cross-Origin-Resource-Policy: cross-origin`. Android keeps
+  `android:usesCleartextTraffic="false"` in its manifest, which causes Chromium WebView to refuse
+  cleartext loopback HTTP; Android therefore mounts the same `legion-content` crate on a Tauri
+  custom URI scheme (`legion-content`, reached as
   `http://legion-content.localhost/v1/content/<ticket>/<name>` and intercepted in-process via
-  `shouldInterceptRequest`), answering open-ended `Range` requests in bounded 2 MiB pieces. Tickets
-  are read-only, short-lived, exist only for files opened in the app, and die immediately when
-  their pairing is removed or replaced or when the app quits.
+  `shouldInterceptRequest`), answering open-ended `Range` requests in bounded 2 MiB pieces,
+  refusing unranged responses over 16 MiB with `413 Payload Too Large` before reading a byte, and
+  capping total concurrent buffered memory at 24 MiB. Tickets are read-only, short-lived, exist
+  only for files opened in the app, and die immediately when their pairing is removed or replaced
+  or when the app quits.
 
 The interface's content security policy grows by exactly what this needs: `img-src` and
 `media-src` for `http://127.0.0.1:*` (desktop and iOS) or `http://legion-content.localhost`
@@ -220,18 +224,30 @@ The interface's content security policy grows by exactly what this needs: `img-s
 
 - **Download to this device** (app): a native command streams the file into a private `.part` file
   with bounded 64 KiB memory, resumes from the partial file's byte offset across network drops,
-  pauses, or restarts, verifies the completed file against `fs.hash` (BLAKE3), and places it in the
-  device's Downloads destination (Android: shared `Downloads/Legion` through `MediaStore.Downloads`
-  with no broad storage permission; desktop: the user's Downloads folder; iOS and iPadOS:
+  pauses, or restarts, verifies the completed file against `fs.hash` (BLAKE3), sanitizes the file
+  name against the union of Windows, POSIX and Unicode control/format rules (stripping separators,
+  drive prefixes, NTFS streams, BiDi overrides and reserved Windows device names), and places it
+  without overwriting existing files (atomic `hard_link` / exclusive create with `name (2).ext`
+  numbering) into the device's Downloads destination (Android: shared `Downloads/Legion` through
+  `MediaStore.Downloads` with no broad storage permission; desktop: the user's Downloads folder,
+  marked with `:Zone.Identifier` on Windows and `com.apple.quarantine` on macOS; iOS and iPadOS:
   `Documents/Downloads` exposed to Apple Files). In a browser it is a link to the content address
   with `?download=1`.
-- **Open in another app** (app): downloads to the app's cache (`open-externally/`), verifies the
-  hash, and hands the file to the system viewer or chooser (on Android via a non-exported
-  `FileProvider` scoped solely to `cache/open-externally/` with a read URI grant and MIME type).
-- **Add from this device** (app): picks files via the system file picker (`ACTION_OPEN_DOCUMENT`
-  with persistable read URI grants released on completion/cancel on Android; native file dialog on
-  desktop), hashes in 64 KiB chunks, and uploads over the bulk pipe's `put` through
-  `Link::open_put` with remote `.legion-part` resume and BLAKE3 verification.
+- **Open in another app** (app): downloads to the app's cache (`open-externally/`, pruned by count,
+  age and total size), verifies the hash, derives MIME on the device strictly from the saved
+  file's real extension (never trusting remote MIME claims), and hands safe types to the system
+  viewer or chooser (always `Intent.createChooser` on Android via a non-exported `FileProvider`
+  scoped solely to `cache/open-externally/`). Executables, installers, scripts, shortcuts, disk
+  images and macro documents are never opened directly by Legion; finished rows offer "Show in
+  folder" instead, and tapping their completion notification on Android opens Downloads.
+- **Add from this device** (app): picks files exclusively via the native system file picker
+  (`ACTION_OPEN_DOCUMENT` with persistable read URI grants released on completion/failure/cancel on
+  Android; native file dialog on desktop) and issues session-only opaque upload handles so the web
+  view can never name an arbitrary device file. Pre-selected local upload paths exist only behind
+  the debug compile-time flag `test-upload-paths`. Files are hashed in 64 KiB chunks, checked with
+  `fs.stat` to choose a non-colliding `name (2).ext` remote target before starting, and uploaded
+  over the bulk pipe's `put` through `Link::open_put` with remote `.legion-part` resume and BLAKE3
+  verification.
 
 Nothing here makes a person wait. Starting a download, an upload or a transfer returns at once;
 the interface stays free to browse, play something else or leave Files, and the work shows in
@@ -256,13 +272,16 @@ so they do not depend on a screen being open:
   quitting outright asks for confirmation first. Unfinished transfers resume on the next start.
 - **iPhone and iPad**: runs the same queue while Legion is in the foreground; when iOS suspends
   the app, active transfers pause automatically and resume when Legion returns to the foreground.
-  `state()` reports `transfer_capabilities: { background: false, pauses_in_background: true }` so
-  the interface says this plainly. Downloads land in `Documents/Downloads` visible in Apple Files
-  (`UIFileSharingEnabled` and `LSSupportsOpeningDocumentsInPlace`).
+  `state()` reports `transfer_capabilities: { background: false, pauses_in_background: true,
+  can_upload: false, can_open_externally: false, can_open_downloads: false }` and the app link
+  omits upload and open-in-another-app until native iOS document picker / share-sheet bridges exist.
+  Downloads land in `Documents/Downloads` visible in Apple Files (`UIFileSharingEnabled` and
+  `LSSupportsOpeningDocumentsInPlace`).
 
-Two transfers run at once by default while the rest wait in order, and a persisted Wi-Fi-only
-setting (default off; threshold 50 MiB) pauses large transfers on metered networks and resumes
-them automatically on unmetered Wi-Fi.
+Two transfers run at once by default while the rest wait in order, stalled streams pause
+automatically with a visible reason, and a persisted Wi-Fi-only setting (default off; threshold
+50 MB in SI decimal units matching the interface) pauses large transfers on metered networks and
+resumes them automatically on unmetered Wi-Fi.
 
 ## The interface
 

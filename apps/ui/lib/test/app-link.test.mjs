@@ -345,6 +345,11 @@ test('createAppLink implements files-contract contentUrl and device transfer que
           if (command === 'transfer_download') {
             return Promise.resolve({ id: 'tr-1' });
           }
+          if (command === 'transfer_pick_uploads') {
+            return Promise.resolve([
+              { handle: 'up-00112233', name: 'note.txt', size: 12, mime: 'text/plain' },
+            ]);
+          }
           if (command === 'transfer_upload') {
             return Promise.resolve(payload.dir === '/cancelled' ? null : { id: 'tr-2', ids: ['tr-2'], count: 1 });
           }
@@ -359,15 +364,18 @@ test('createAppLink implements files-contract contentUrl and device transfer que
           if (command === 'transfer_control') {
             return Promise.resolve({ id: payload.id, state: payload.action === 'pause' ? 'paused' : 'cancelled' });
           }
-          if (command === 'open_transfer') {
+          if (command === 'open_transfer' || command === 'show_transfer_in_folder') {
             return Promise.resolve({ ok: true });
           }
           if (command === 'transfer_watch') {
             transferChannel = payload.onEvent;
+            return Promise.resolve(77);
+          }
+          if (command === 'transfer_unwatch') {
             return Promise.resolve();
           }
           if (command === 'transfer_settings' || command === 'transfer_set_settings') {
-            return Promise.resolve({ wifi_only_large: Boolean(payload?.wifiOnlyLarge), large_threshold_bytes: 52428800 });
+            return Promise.resolve({ wifi_only_large: Boolean(payload?.wifiOnlyLarge), large_threshold_bytes: 50000000 });
           }
           return Promise.resolve({});
         },
@@ -399,11 +407,28 @@ test('createAppLink implements files-contract contentUrl and device transfer que
       await link.download({ machine: 'tower', path: '/home/me/clip.webm', name: 'clip.webm', size: 100, mime: 'video/webm' }),
       { id: 'tr-1' },
     );
-    assert.deepEqual(await link.upload({ machine: 'tower', dir: '/home/me/uploads' }), {
-      id: 'tr-2',
-      ids: ['tr-2'],
-      count: 1,
+    const picked = await link.pickUploads();
+    assert.equal(picked[0].handle, 'up-00112233');
+    assert.deepEqual(
+      await link.upload({
+        machine: 'tower',
+        dir: '/home/me/uploads',
+        handles: ['up-00112233'],
+        files: [{ path: '/etc/passwd' }],
+      }),
+      {
+        id: 'tr-2',
+        ids: ['tr-2'],
+        count: 1,
+      },
+    );
+    const uploadCall = seen.find((c) => c.command === 'transfer_upload');
+    assert.deepEqual(uploadCall.payload, {
+      machine: 'tower',
+      dir: '/home/me/uploads',
+      handles: ['up-00112233'],
     });
+    assert.equal('files' in uploadCall.payload, false);
     assert.equal(await link.upload({ machine: 'tower', dir: '/cancelled' }), null);
     assert.deepEqual(
       await link.openExternally({ machine: 'tower', path: '/home/me/doc.pdf', mime: 'application/pdf' }),
@@ -417,25 +442,50 @@ test('createAppLink implements files-contract contentUrl and device transfer que
     const paused = await link.transferControl('tr-1', 'pause');
     assert.equal(paused.state, 'paused');
     assert.deepEqual(await link.openTransfer('tr-1'), { ok: true });
+    assert.deepEqual(await link.showTransferInFolder('tr-1'), { ok: true });
 
     const events = [];
     const unsub = link.onTransferEvent((items) => events.push(items));
     assert.ok(transferChannel);
+    await Promise.resolve();
     transferChannel.onmessage([{ id: 'tr-1', state: 'done' }]);
     assert.equal(events.length, 1);
     assert.equal(events[0][0].state, 'done');
     unsub();
+    await Promise.resolve();
+    assert.ok(seen.some((c) => c.command === 'transfer_unwatch' && c.payload.watcherId === 77));
     transferChannel.onmessage([{ id: 'tr-1', state: 'cancelled' }]);
     assert.equal(events.length, 1);
 
     const s = await link.setTransferSettings({ wifi_only_large: true });
     assert.equal(s.wifi_only_large, true);
-    assert.equal((await link.transferSettings()).large_threshold_bytes, 52428800);
+    assert.equal((await link.transferSettings()).large_threshold_bytes, 50000000);
   } finally {
     if (prevWindow === undefined) {
       delete globalThis.window;
     } else {
       globalThis.window = prevWindow;
+    }
+  }
+});
+
+test('createAppLink hides unsupported upload and openExternally methods on iOS', () => {
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15' },
+  });
+  try {
+    const link = createAppLink();
+    assert.equal(typeof link.download, 'function');
+    assert.equal(typeof link.upload, 'undefined');
+    assert.equal(typeof link.pickUploads, 'undefined');
+    assert.equal(typeof link.openExternally, 'undefined');
+  } finally {
+    if (prevNavigator) {
+      Object.defineProperty(globalThis, 'navigator', prevNavigator);
+    } else {
+      delete globalThis.navigator;
     }
   }
 });

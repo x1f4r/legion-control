@@ -136,6 +136,9 @@ jobs:
           if [ "$(cargo tauri --version 2>/dev/null || true)" != "tauri-cli 2.12.6" ]; then
             cargo install tauri-cli --version =2.12.6 --locked
           fi
+      - name: Run Android Kotlin unit tests
+        working-directory: apps/legion-app/src-tauri/gen/android
+        run: ./gradlew :app:testUniversalDebugUnitTest
       - name: Build Android debug APK (arm64 + x86_64)
         working-directory: apps/legion-app
         run: cargo tauri android build --debug --apk --target aarch64 --target x86_64
@@ -302,7 +305,7 @@ jobs:
           rm -rf "$UNPACKED"
           dpkg-deb -x "$DEB" "$UNPACKED"
           grep -qx 'Name=Legion' "$UNPACKED/usr/share/applications/legion-app.desktop"
-      - name: Launch Linux app under Xvfb, verify ready marker and content media decoding
+      - name: Launch Linux release and debug apps under Xvfb, verify ready marker and content media decoding
         run: |
           set -euo pipefail
           MEDIA_WORK="$RUNNER_TEMP/linux-media"
@@ -316,6 +319,7 @@ jobs:
             --legion "$MEDIA_WORK/bin/legion" \
             --out "$MEDIA_WORK/result.json" >/dev/null
 
+          # 1) Release binary: must paint ready and ignore LEGION_APP_MEDIA_CHECK_FILE (no test hooks in release).
           READY_FILE="$RUNNER_TEMP/legion-linux-ready.txt"
           rm -f "$READY_FILE" "$MEDIA_WORK/result.json"
           PATH="$MEDIA_WORK/bin:$PATH" \
@@ -326,18 +330,50 @@ jobs:
           WEBKIT_DISABLE_COMPOSITING_MODE=1 \
           dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" \
             apps/legion-app/src-tauri/target/release/legion-app \
+            >"$RUNNER_TEMP/legion-linux-release.log" 2>&1 &
+          REL_PID=$!
+          REL_READY=0
+          for i in $(seq 1 45); do
+            if [ -f "$READY_FILE" ] && grep -q "legion-app: interface ready" "$READY_FILE"; then
+              echo "Linux desktop release ready after ${i}s: $(cat "$READY_FILE")"
+              REL_READY=1
+              sleep 2
+              break
+            fi
+            sleep 1
+          done
+          kill "$REL_PID" 2>/dev/null || true
+          wait "$REL_PID" 2>/dev/null || true
+          cat "$RUNNER_TEMP/legion-linux-release.log" || true
+          [ "$REL_READY" -eq 1 ]
+          if [ -f "$MEDIA_WORK/result.json" ]; then
+            echo "ERROR: Release build unexpectedly honored LEGION_APP_MEDIA_CHECK_FILE"
+            exit 1
+          fi
+
+          # 2) Debug binary: verify content media decoding + HTML/SVG IPC isolation.
+          cargo build --manifest-path apps/legion-app/src-tauri/Cargo.toml --locked
+          rm -f "$READY_FILE" "$MEDIA_WORK/result.json"
+          PATH="$MEDIA_WORK/bin:$PATH" \
+          LEGION_HOME="$MEDIA_WORK/node" \
+          LEGION_APP_READY_FILE="$READY_FILE" \
+          LEGION_APP_MEDIA_CHECK_FILE="$MEDIA_WORK/media-check.json" \
+          WEBKIT_DISABLE_DMABUF_RENDERER=1 \
+          WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+          dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" \
+            apps/legion-app/src-tauri/target/debug/legion-app \
             >"$RUNNER_TEMP/legion-linux.log" 2>&1 &
           APP_PID=$!
           FOUND=0
           MEDIA_OK=0
           for i in $(seq 1 60); do
             if [ "$FOUND" -eq 0 ] && [ -f "$READY_FILE" ] && grep -q "legion-app: interface ready" "$READY_FILE"; then
-              echo "Linux desktop ready after ${i}s: $(cat "$READY_FILE")"
+              echo "Linux desktop debug ready after ${i}s: $(cat "$READY_FILE")"
               FOUND=1
             fi
             if [ "$MEDIA_OK" -eq 0 ] && [ -f "$MEDIA_WORK/result.json" ]; then
               cat "$MEDIA_WORK/result.json"
-              node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); if (!r.ok || r.image_width <= 0 || r.video_width <= 0) process.exit(1);' "$MEDIA_WORK/result.json"
+              node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); if (!r.ok || r.image_width <= 0 || r.video_width <= 0 || r.ipc_isolation_ok !== true) process.exit(1);' "$MEDIA_WORK/result.json"
               MEDIA_OK=1
             fi
             if [ "$FOUND" -eq 1 ] && [ "$MEDIA_OK" -eq 1 ]; then
@@ -390,11 +426,11 @@ jobs:
           if [ "$(cargo tauri --version 2>/dev/null || true)" != "tauri-cli 2.12.6" ]; then
             cargo install tauri-cli --version =2.12.6 --locked
           fi
-      - name: Build iOS simulator app
+      - name: Build iOS debug simulator app
         working-directory: apps/legion-app
         run: |
           set -euo pipefail
-          cargo tauri ios build --target aarch64-sim --no-sign --ci
+          cargo tauri ios build --debug --target aarch64-sim --no-sign --ci
           find src-tauri/gen/apple/build -maxdepth 4 -name '*.app'
       - name: Build local legion node binary for iOS simulator content-media check
         run: |
@@ -481,6 +517,7 @@ jobs:
               --work "$media_work" \
               --legion "$LEGION_BIN" \
               --host 127.0.0.1 \
+              --verify-resume \
               --out "$media_out" >/dev/null
             cp "$media_work/media-check.json" "$media_spec"
 
@@ -494,7 +531,9 @@ jobs:
 
             local found=0
             local media_ok=0
-            for i in $(seq 1 90); do
+            local resume_triggered=0
+            local resume_ok=0
+            for i in $(seq 1 110); do
               if [ "$found" -eq 0 ]; then
                 if [ -f "$ready_file" ] && grep -q "legion-app: interface ready" "$ready_file"; then
                   echo "$kind interface ready (file) after ${i}s: $(cat "$ready_file")"
@@ -506,10 +545,24 @@ jobs:
               fi
               if [ "$media_ok" -eq 0 ] && [ -f "$media_out" ]; then
                 cat "$media_out"
-                node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); if (!r.ok || r.image_width <= 0 || r.video_width <= 0) process.exit(1);' "$media_out"
+                node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); if (!r.ok || r.image_width <= 0 || r.video_width <= 0 || r.ipc_isolation_ok !== true) process.exit(1);' "$media_out"
                 media_ok=1
               fi
-              if [ "$found" -eq 1 ] && [ "$media_ok" -eq 1 ]; then
+              if [ "$media_ok" -eq 1 ] && [ "$resume_triggered" -eq 0 ]; then
+                echo "Backgrounding and resuming Legion on $kind to verify loopback survival..."
+                resume_triggered=1
+                xcrun simctl launch "$udid" com.apple.Preferences >/dev/null || true
+                sleep 3
+                xcrun simctl launch "$udid" com.x1f4r.legion >/dev/null || true
+              fi
+              if [ "$resume_triggered" -eq 1 ] && [ "$resume_ok" -eq 0 ] && [ -f "$media_out" ]; then
+                if node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.exit(r.ok && r.resume_ok === true ? 0 : 1);' "$media_out"; then
+                  echo "$kind post-resume loopback media check passed after ${i}s"
+                  cat "$media_out"
+                  resume_ok=1
+                fi
+              fi
+              if [ "$found" -eq 1 ] && [ "$media_ok" -eq 1 ] && [ "$resume_ok" -eq 1 ]; then
                 break
               fi
               if [ -n "$app_pid" ] && ! kill -0 "$app_pid" 2>/dev/null; then
@@ -525,8 +578,8 @@ jobs:
             cat "$stdout_log" || true
             echo "--- $kind stderr ---"
             cat "$stderr_log" || true
-            if [ "$found" -ne 1 ] || [ "$media_ok" -ne 1 ]; then
-              echo "Failed waiting for $kind ready ($found) and media check ($media_ok)"
+            if [ "$found" -ne 1 ] || [ "$media_ok" -ne 1 ] || [ "$resume_ok" -ne 1 ]; then
+              echo "Failed waiting for $kind ready ($found), media check ($media_ok), resume ($resume_ok)"
               cat "$media_work/sshd.log" || true
               ls -la "$data_dir/Library/Application Support" || true
               xcrun simctl io "$udid" screenshot "ci-shots/ios/${kind}-timeout.png" || true
@@ -662,27 +715,20 @@ jobs:
           LEGION_HOME="$MEDIA_WORK/node" \
           LEGION_APP_READY_FILE="$READY_FILE" \
           LEGION_APP_MEDIA_CHECK_FILE="$MEDIA_WORK/media-check.json" \
-            "$EXEC_PATH" >"$RUNNER_TEMP/legion-macos.log" 2>&1 &
+            "$EXEC_PATH" >"$RUNNER_TEMP/legion-macos-release.log" 2>&1 &
           APP_PID=$!
 
           FOUND=0
-          MEDIA_OK=0
           EXITED_EARLY=0
           for i in $(seq 1 60); do
             if [ "$FOUND" -eq 0 ] && [ -f "$READY_FILE" ] && grep -q "legion-app: interface ready" "$READY_FILE"; then
-              echo "macOS desktop ready after ${i}s: $(cat "$READY_FILE")"
+              echo "macOS desktop release ready after ${i}s: $(cat "$READY_FILE")"
               FOUND=1
-            fi
-            if [ "$MEDIA_OK" -eq 0 ] && [ -f "$MEDIA_WORK/result.json" ]; then
-              cat "$MEDIA_WORK/result.json"
-              node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); if (!r.ok || r.image_width <= 0 || r.video_width <= 0) process.exit(1);' "$MEDIA_WORK/result.json"
-              MEDIA_OK=1
-            fi
-            if [ "$FOUND" -eq 1 ] && [ "$MEDIA_OK" -eq 1 ]; then
+              sleep 2
               break
             fi
             if ! kill -0 "$APP_PID" 2>/dev/null; then
-              echo "ERROR: macOS desktop app (PID $APP_PID) exited early after ${i}s before ready/media checks"
+              echo "ERROR: macOS desktop release app (PID $APP_PID) exited early after ${i}s"
               EXITED_EARLY=1
               break
             fi
@@ -708,11 +754,46 @@ jobs:
 
           kill "$APP_PID" 2>/dev/null || true
           wait "$APP_PID" 2>/dev/null || true
-          cat "$RUNNER_TEMP/legion-macos.log" || true
-          if [ "$FOUND" -ne 1 ] || [ "$MEDIA_OK" -ne 1 ]; then
+          cat "$RUNNER_TEMP/legion-macos-release.log" || true
+          if [ "$FOUND" -ne 1 ]; then
             if [ "$EXITED_EARLY" -ne 1 ]; then
-              echo "ERROR: Timed out waiting for macOS desktop ready ($FOUND) and media check ($MEDIA_OK)"
+              echo "ERROR: Timed out waiting for macOS release ready"
             fi
+            exit 1
+          fi
+          if [ -f "$MEDIA_WORK/result.json" ]; then
+            echo "ERROR: macOS release build unexpectedly honored LEGION_APP_MEDIA_CHECK_FILE"
+            exit 1
+          fi
+
+          # Verify content media decoding + HTML/SVG IPC isolation using the debug binary.
+          cargo build --manifest-path apps/legion-app/src-tauri/Cargo.toml --locked
+          rm -f "$READY_FILE" "$MEDIA_WORK/result.json"
+          PATH="$MEDIA_WORK/bin:$PATH" \
+          LEGION_HOME="$MEDIA_WORK/node" \
+          LEGION_APP_READY_FILE="$READY_FILE" \
+          LEGION_APP_MEDIA_CHECK_FILE="$MEDIA_WORK/media-check.json" \
+            apps/legion-app/src-tauri/target/debug/legion-app >"$RUNNER_TEMP/legion-macos.log" 2>&1 &
+          DBG_PID=$!
+          MEDIA_OK=0
+          for i in $(seq 1 60); do
+            if [ -f "$MEDIA_WORK/result.json" ]; then
+              cat "$MEDIA_WORK/result.json"
+              node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); if (!r.ok || r.image_width <= 0 || r.video_width <= 0 || r.ipc_isolation_ok !== true) process.exit(1);' "$MEDIA_WORK/result.json"
+              MEDIA_OK=1
+              break
+            fi
+            if ! kill -0 "$DBG_PID" 2>/dev/null; then
+              echo "ERROR: macOS debug app (PID $DBG_PID) exited early after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          kill "$DBG_PID" 2>/dev/null || true
+          wait "$DBG_PID" 2>/dev/null || true
+          cat "$RUNNER_TEMP/legion-macos.log" || true
+          if [ "$MEDIA_OK" -ne 1 ]; then
+            echo "ERROR: macOS debug content media check failed"
             exit 1
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -912,22 +993,13 @@ jobs:
 
           $appProc = Start-Process -FilePath $exe.FullName -PassThru
           $found = $false
-          $mediaOk = $false
           for ($i = 1; $i -le 60; $i++) {
             if (-not $found -and (Test-Path -LiteralPath $readyFile) -and ((Get-Content -LiteralPath $readyFile -Raw) -match 'legion-app: interface ready')) {
-              Write-Host "Windows desktop ready after ${i}s: $((Get-Content -LiteralPath $readyFile -Raw).Trim())"
+              Write-Host "Windows desktop release ready after ${i}s: $((Get-Content -LiteralPath $readyFile -Raw).Trim())"
               $found = $true
+              Start-Sleep -Seconds 2
+              break
             }
-            if (-not $mediaOk -and (Test-Path -LiteralPath $mediaOut)) {
-              $raw = Get-Content -LiteralPath $mediaOut -Raw
-              Write-Host "Windows content media report: $raw"
-              $rep = $raw | ConvertFrom-Json
-              if (-not $rep.ok -or $rep.image_width -le 0 -or $rep.video_width -le 0) {
-                throw "Windows content media check failed: $raw"
-              }
-              $mediaOk = $true
-            }
-            if ($found -and $mediaOk) { break }
             if ($appProc.HasExited) {
               throw "Legion Windows process exited early with code $($appProc.ExitCode)"
             }
@@ -954,8 +1026,40 @@ jobs:
           if (-not $appProc.HasExited) {
             Stop-Process -Id $appProc.Id -Force -ErrorAction SilentlyContinue
           }
-          if (-not $found -or -not $mediaOk) {
-            throw "Timed out waiting for Windows ready ($found) and content media check ($mediaOk)"
+          if (-not $found) {
+            throw 'Timed out waiting for Windows release ready marker'
+          }
+          if (Test-Path -LiteralPath $mediaOut) {
+            throw 'Windows release binary unexpectedly honored LEGION_APP_MEDIA_CHECK_FILE'
+          }
+
+          # Verify content media decoding + HTML/SVG IPC isolation using the debug binary.
+          cargo build --manifest-path apps/legion-app/src-tauri/Cargo.toml --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item -LiteralPath $readyFile, $mediaOut -Force -ErrorAction SilentlyContinue
+          $dbgProc = Start-Process -FilePath 'apps\legion-app\src-tauri\target\debug\legion-app.exe' -PassThru
+          $mediaOk = $false
+          for ($i = 1; $i -le 60; $i++) {
+            if (Test-Path -LiteralPath $mediaOut) {
+              $raw = Get-Content -LiteralPath $mediaOut -Raw
+              Write-Host "Windows content media report: $raw"
+              $rep = $raw | ConvertFrom-Json
+              if (-not $rep.ok -or $rep.image_width -le 0 -or $rep.video_width -le 0 -or -not $rep.ipc_isolation_ok) {
+                throw "Windows content media check failed: $raw"
+              }
+              $mediaOk = $true
+              break
+            }
+            if ($dbgProc.HasExited) {
+              throw "Legion Windows debug process exited early with code $($dbgProc.ExitCode)"
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $dbgProc.HasExited) {
+            Stop-Process -Id $dbgProc.Id -Force -ErrorAction SilentlyContinue
+          }
+          if (-not $mediaOk) {
+            throw 'Timed out waiting for Windows debug content media check'
           }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

@@ -127,40 +127,54 @@ harmless one-time log.
   to allow only the bundled app origin and denies all `on_new_window` requests.
 - **Content addresses (`content_url`) by platform:**
   - **Linux, macOS, Windows, iOS and iPadOS:** `AppContentServer` mounts `legion-content` lazily on
-    `http://127.0.0.1:<ephemeral-port>` (stopping 60 seconds after no live tickets or active
-    streams remain), validates `Host` and `Origin` through `HostOriginGuard` (`tauri://localhost`
-    on Linux/macOS/iOS; `http://tauri.localhost` and `https://tauri.localhost` on Windows; never
-    `null`), and sets `Cross-Origin-Resource-Policy: cross-origin`.
+    `http://127.0.0.1:<ephemeral-port>` (capped at 32 simultaneous connections, 5-second
+    header-read timeout, exponential accept-error backoff, iOS resume recovery, and stopping 60
+    seconds after no live tickets or active streams remain), validates `Host` and `Origin` through
+    `HostOriginGuard` (`tauri://localhost` on Linux/macOS/iOS; `http://tauri.localhost` and
+    `https://tauri.localhost` on Windows; never `null`), and sets
+    `Cross-Origin-Resource-Policy: cross-origin`.
   - **Android:** `AndroidManifest.xml` enforces `usesCleartextTraffic="false"`, so Android WebView
     refuses cleartext `http://127.0.0.1:<port>` media loads. Android mounts the same
     `legion-content` crate on Tauri's custom URI scheme `legion-content`
     (`http://legion-content.localhost/v1/content/<ticket>/<name>`), intercepted in-process via
-    `shouldInterceptRequest` and answering open-ended ranges in bounded 2 MiB pieces.
+    `shouldInterceptRequest`, answering open-ended ranges in bounded 2 MiB pieces, rejecting
+    unranged requests over 16 MiB with `413 Payload Too Large` before reading any bytes, and
+    bounding total concurrent buffered memory to 24 MiB.
   - Tickets expire after 15 minutes idle / 6 hours max, and are revoked immediately on `unpair`,
     `repair_store`, `accept_identity_change`, and app exit.
 - **Background transfer queue (`transfers/*`) and what survives what:**
-  - Shared Rust queue (`concurrency = 2`, 64 KiB streaming buffers, persisted in
-    `<app_data_dir>/transfers/queue.json`, partial resume by byte offset, BLAKE3 verification via
-    `fs.hash` for downloads and `Link::open_put` for uploads, optional Wi-Fi-only rule for
-    transfers >= 50 MiB, default off).
+  - Shared Rust queue (`concurrency = 2`, 64 KiB streaming buffers, serialized monotonic
+    persistence in `<app_data_dir>/transfers/queue.json`, partial resume by byte offset, progress
+    stall timeouts, BLAKE3 verification via `fs.hash` for downloads and `Link::open_put` with
+    `fs.stat` non-overwrite naming for uploads, optional Wi-Fi-only rule for transfers >= 50 MB,
+    default off). Downloads sanitize file names against Windows/POSIX/Unicode rules, place without
+    overwriting, derive MIME on-device from the saved extension, refuse to open executable,
+    installer, script, shortcut or disk-image types directly (offering Show in folder instead), and
+    write Mark-of-the-Web (`:Zone.Identifier`) on Windows and `com.apple.quarantine` on macOS.
+    Uploads accept only session-scoped opaque handles minted by the native file picker; pre-selected
+    local paths exist only behind the debug compile-time flag `test-upload-paths`.
   - **Android:** `TransferForegroundService` (`foregroundServiceType="dataSync"`,
     `stopWithTask="false"`, `exported="false"`) bridged to Rust over an owner-only (`0o600`,
     256-bit random token) Unix domain socket `<app_data_dir>/transfers/bridge.sock`. Survives app
-    switching, screen lock, swiping Legion from Recents, and transient network outages; persists to
-    disk and resumes from partial files on next launch after `force-stop`, OOM, or reboot. Detaches
-    foreground state while paused to preserve Android 15+'s 6-hour rolling `dataSync` quota and
-    handles `onTimeout` cleanly by pausing active jobs and posting a tap-to-resume notification.
-    Downloads save to `Downloads/Legion` via `MediaStore.Downloads`; uploads use
-    `ACTION_OPEN_DOCUMENT` with persistable read grants released on terminal state; "Open in another
-    app" stages into `cache/open-externally/` behind a non-exported `FileProvider`.
+    switching, screen lock, swiping Legion from Recents (re-binding native plugins when
+    `MainActivity` recreates), and transient network outages; persists to disk and resumes from
+    partial files on next launch after `force-stop`, OOM, or reboot. Detaches foreground state
+    while paused to preserve Android 15+'s 6-hour rolling `dataSync` quota and handles `onTimeout`
+    cleanly by pausing active jobs and posting a tap-to-resume notification. Downloads save to
+    `Downloads/Legion` via `MediaStore.Downloads`; uploads use `ACTION_OPEN_DOCUMENT` with
+    persistable read grants released on completion/failure/cancel/pruning; "Open in another app"
+    stages into `cache/open-externally/` (pruned by count, age and size) behind a non-exported
+    `FileProvider` and always launches through `Intent.createChooser`.
   - **Desktop (Linux, macOS, Windows):** downloads land in the user's Downloads folder, uploads use
     the native file dialog (`rfd`), "Open in another app" uses `open`. Closing the window while the
-    queue is active hides the window, sends a system notification, and exits automatically once
-    drained; quitting outright asks for confirmation first.
+    queue is active hides the window, sends a system notification, and exits automatically once no
+    active transfers remain; quitting outright asks for confirmation first.
   - **iOS and iPadOS:** runs in foreground, pauses on `WindowEvent::Suspended`, resumes on
-    `WindowEvent::Resumed`, exposes `Documents/Downloads` in Apple Files (`UIFileSharingEnabled`
-    and `LSSupportsOpeningDocumentsInPlace`), and reports `background: false` and
-    `pauses_in_background: true` in `state().transfer_capabilities`.
+    `WindowEvent::Resumed` (also probing/recovering the loopback content listener), exposes
+    `Documents/Downloads` in Apple Files (`UIFileSharingEnabled` and
+    `LSSupportsOpeningDocumentsInPlace`), and reports `background: false`,
+    `pauses_in_background: true`, `can_upload: false`, `can_open_externally: false`, and
+    `can_open_downloads: false` in `state().transfer_capabilities`.
 
 ## Building
 
@@ -228,6 +242,11 @@ Legion from an iPhone or iPad.
   simulator) rather than a native `NSURL` call verified against a real iCloud backup.
 - **Edge-swipe back gesture:** `WKWebView.allowsBackForwardNavigationGestures` remains off because
   `tauri` `2.12.7` does not expose `wry`'s flag without `unsafe` pointer access.
+- **File uploads and open-in-another-app on iOS:** Native `UIDocumentPickerViewController` and
+  `UIDocumentInteractionController` Swift bridges are not wired yet, so `state().transfer_capabilities`
+  reports `can_upload: false`, `can_open_externally: false`, and `can_open_downloads: false`, the
+  app link omits those actions, and direct command calls return `unsupported`. Downloads still save
+  to `Documents/Downloads` visible in Apple Files.
 
 ### Android debug APK
 
