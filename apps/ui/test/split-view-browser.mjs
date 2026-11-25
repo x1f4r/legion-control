@@ -213,6 +213,7 @@ async function measureSplitGeometry(page) {
 
     const leftH = leftTitleRow?.querySelector('.pane-title');
     const rightH = rightTitleRow?.querySelector('.pane-title');
+    const leftFactEl = leftTitleRow?.querySelector('.split-fact');
     const rightFactEl = rightTitleRow?.querySelector('.split-fact');
     const leftLabelTextEl = leftLabelRow?.querySelector('.split-label-text') || leftLabelRow;
     const leftLabelFactEl = leftLabelRow?.querySelector('.split-label-fact');
@@ -261,6 +262,7 @@ async function measureSplitGeometry(page) {
       leftBodyGutter: leftBody ? getComputedStyle(leftBody).scrollbarGutter : '',
       rightBodyGutter: rightBody ? getComputedStyle(rightBody).scrollbarGutter : '',
       leftTitleBase: textBaseline(leftH),
+      leftFactBase: textBaseline(leftFactEl),
       rightTitleBase: textBaseline(rightH),
       rightFactBase: textBaseline(rightFactEl),
       rightFactBox: box(rightFactEl),
@@ -366,6 +368,11 @@ function assertSplitAligned(m, label, { expectRightContent = true, expectMatchin
     assertNear(m.leftLabelBase.baseline, m.leftLabelFactBase.baseline, 1, `${label} left label vs fact baseline`);
   }
 
+  // Left title fact sits on same baseline as left title text.
+  if (m.leftTitleBase && m.leftFactBase) {
+    assertNear(m.leftTitleBase.baseline, m.leftFactBase.baseline, 1, `${label} left title vs fact baseline`);
+  }
+
   if (expectRightContent) {
     // Both pane titles share the exact same type style and sit on one baseline within 1 px.
     assert.ok(m.leftTitleBase && m.rightTitleBase, `${label}: both pane titles must render text`);
@@ -417,6 +424,13 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
           await page.locator('.split-left a.machine', { hasText: 'tower' }).waitFor();
           await page.locator('.split-right h2.pane-title', { hasText: 'tower' }).waitFor();
           await page.locator('.split-right .list .gauge').first().waitFor();
+          // Counts sit on the section labels they describe ("ON … 3", "OFF … 2").
+          assert.equal(await page.locator('.split-left .split-label-text').innerText(), 'ON');
+          assert.equal(await page.locator('.split-left .split-label-fact').innerText(), '3');
+          assert.equal(
+            await page.locator('.split-left .label-row', { hasText: 'OFF' }).locator('.label-fact').innerText(),
+            '2',
+          );
         },
         expectRightFactAlignedWithList: false,
       },
@@ -428,6 +442,13 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
           await page.locator('.split-right .pane-title', { hasText: 'Home' }).waitFor();
           await page.locator('.split-right .split-fact', { hasText: /items/ }).waitFor();
           await page.locator('.split-right .split-body .list .row').first().waitFor();
+          // When PINNED is first, its label has no machines fact; "3 ON" sits on the MACHINES label.
+          assert.equal(await page.locator('.split-left .split-label-text').innerText(), 'PINNED');
+          assert.equal(await page.locator('.split-left .split-label-fact').count(), 0);
+          assert.equal(
+            await page.locator('.split-left .label-row', { hasText: 'MACHINES' }).locator('.label-fact').innerText(),
+            '3 ON',
+          );
         },
         expectRightFactAlignedWithList: true,
       },
@@ -438,6 +459,8 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
           await page.locator('.split-left .pane-title', { hasText: 'Activity' }).waitFor();
           await page.locator('.split-right .pane-title', { hasText: 'Photo backup' }).waitFor();
           await page.locator('.split-right .split-body .list').first().waitFor();
+          assert.equal(await page.locator('.split-left .split-label-text').innerText(), 'RUNNING NOW');
+          assert.equal(await page.locator('.split-left .split-label-fact').innerText(), '2');
         },
         expectRightFactAlignedWithList: true,
       },
@@ -448,6 +471,8 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
           await page.locator('.split-left .pane-title', { hasText: 'Settings' }).waitFor();
           await page.locator('.split-right .pane-title', { hasText: /This / }).waitFor();
           await page.locator('.split-right .split-body .list').first().waitFor();
+          assert.equal(await page.locator('.split-left .split-label-text').innerText(), 'GENERAL');
+          assert.equal(await page.locator('.split-left .split-label-fact').count(), 0);
         },
         expectRightFactAlignedWithList: false,
       },
@@ -458,6 +483,9 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
           await page.locator('.split-left .pane-title', { hasText: 'All tools' }).waitFor();
           await page.locator('.split-right .pane-title .pane-title-text').waitFor();
           await page.locator('.split-right .split-body .list, .split-right .split-body .field').first().waitFor();
+          // Total tool count sits on the All tools title, not on the first family label ("AUDIT").
+          await page.locator('.split-left .split-title .split-fact', { hasText: /^\d+$/ }).waitFor();
+          assert.equal(await page.locator('.split-left .split-label-fact').count(), 0);
         },
         expectRightFactAlignedWithList: false,
         // Tools detail starts with a description paragraph before the first form card.
@@ -588,6 +616,19 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
     const actEmptyMetrics = await measureSplitGeometry(edgePage);
     assertSplitAligned(actEmptyMetrics, 'activity empty right @ 1440x900', {
       expectRightContent: false,
+    });
+
+    // 3b-ii. Files when nothing is pinned or synced (?mock=old): MACHINES is first and carries "3 ON".
+    await edgePage.goto(`${server.url}/?mock=old#/files`, { waitUntil: 'domcontentloaded' });
+    await edgePage.locator('.split-left .split-label-text', { hasText: /^MACHINES$/i }).waitFor();
+    await edgePage.locator('.split-left .split-label-fact', { hasText: /^3 ON$/i }).waitFor();
+    await edgePage.locator('.split-right .pane-title', { hasText: 'Home' }).waitFor();
+    await edgePage.waitForTimeout(80);
+    const oldFilesMetrics = await measureSplitGeometry(edgePage);
+    assertSplitAligned(oldFilesMetrics, 'files machines-first @ 1440x900', {
+      expectRightContent: true,
+      expectMatchingFirstTop: false,
+      expectRightFactAlignedWithList: false,
     });
 
     // 3c. Files with a list long enough to scroll in BOTH panes.

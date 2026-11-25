@@ -765,6 +765,11 @@ textarea {
     margin-top: 0;
   }
 
+  .split-body .label {
+    margin-left: 0;
+    margin-right: 0;
+  }
+
   .split-body-empty {
     display: grid;
     place-items: center;
@@ -828,6 +833,18 @@ textarea {
 
 .label:first-child {
   margin-top: 8px;
+}
+
+.label.label-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.label.label-row .label-fact {
+  flex: none;
+  white-space: nowrap;
 }
 
 .lede {

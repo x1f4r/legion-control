@@ -712,7 +712,7 @@ export function ToolsView({
       totalTools > 0
         ? query.trim()
           ? `${shownTools} of ${totalTools}`
-          : `${totalTools} tools`
+          : String(totalTools)
         : null;
     const selectedFamily = selectedTool ? selectedTool.name.split('.')[0] : null;
 
@@ -724,9 +724,9 @@ export function ToolsView({
           </a>
           <span class="pane-title-text">All tools</span>
         `}
+        leftFact=${toolsCountFact}
         leftTools=${searchInputEl}
         leftLabel=${groups[0]?.family || 'Tools'}
-        leftLabelFact=${toolsCountFact}
         leftBody=${renderToolGroups(true)}
         rightTitle=${selectedTool
           ? html`

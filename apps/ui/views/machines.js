@@ -4,7 +4,6 @@ import { html } from '../vendor/preact-htm.js';
 import { Meter, Notice } from './common.js';
 import {
   formatMachineDetailSubtitle,
-  formatMachinesShortFact,
   formatMachineStatusPhrase,
 } from '../lib/activity.js';
 import { machineMetrics } from '../lib/format.js';
@@ -256,7 +255,16 @@ export function MachinesView({
 
             ${askingMachines.length > 0
               ? html`
-                  ${onlineMachines.length > 0 ? html`<p class="label">Checking</p>` : null}
+                  ${onlineMachines.length > 0
+                    ? wide
+                      ? html`
+                          <p class="label label-row">
+                            <span>Checking</span>
+                            <span class="label-fact">${askingMachines.length}</span>
+                          </p>
+                        `
+                      : html`<p class="label">Checking</p>`
+                    : null}
                   <div class="list">
                     ${askingMachines.map(
                       (m) => html`
@@ -275,7 +283,14 @@ export function MachinesView({
             ${showOffline && offMachines.length > 0
               ? html`
                   ${!(hideFirstLeftGroupLabel && firstLeftGroup === 'off')
-                    ? html`<p class="label">Off</p>`
+                    ? wide
+                      ? html`
+                          <p class="label label-row">
+                            <span>Off</span>
+                            <span class="label-fact">${offMachines.length}</span>
+                          </p>
+                        `
+                      : html`<p class="label">Off</p>`
                     : null}
                   <div class="list">
                     ${offMachines.map(
@@ -306,9 +321,14 @@ export function MachinesView({
           : firstLeftGroup === 'off'
             ? 'Off'
             : 'Machines';
-    const leftLabelFact = formatMachinesShortFact(machines, {
-      cachedAt: snapshot?.cachedAt ?? null,
-    });
+    const leftLabelFact =
+      firstLeftGroup === 'online'
+        ? String(onlineMachines.length)
+        : firstLeftGroup === 'asking'
+          ? String(askingMachines.length)
+          : firstLeftGroup === 'off'
+            ? String(offMachines.length)
+            : null;
 
     const effectiveTab = route.tab && route.tab !== 'more' ? route.tab : 'overview';
     const selectedWakePending = selectedMachine ? Boolean(wakePendingSet?.has(selectedMachine.name)) : false;

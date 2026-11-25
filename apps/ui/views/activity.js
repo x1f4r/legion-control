@@ -593,12 +593,7 @@ export function ActivityView({
   const hasSelected = Boolean(route.machine && route.jobId);
   const selectedKey = hasSelected ? `${route.machine}:${route.jobId}` : '';
 
-  const activeDeviceCount = (deviceTransfers || []).filter(
-    (t) => t.state === 'running' || t.state === 'queued',
-  ).length;
-  const runningCount = (snapshot?.runningJobs || []).length + activeDeviceCount;
-
-  const firstGroupLabel = useMemo(() => {
+  const firstGroup = useMemo(() => {
     const combined = (jobs || []).map((j) => ({ _kind: 'job', ...j }));
     for (const t of deviceTransfers || []) {
       const mappedState =
@@ -615,8 +610,10 @@ export function ActivityView({
       combined.push({ _kind: 'transfer', state: mappedState, created: t.created, finished: t.finished });
     }
     const groups = groupActivity(combined);
-    return groups[0]?.label || 'Recent';
+    return groups[0] || null;
   }, [jobs, deviceTransfers]);
+  const firstGroupLabel = firstGroup?.label || 'Recent';
+  const runningFact = firstGroup?.key === 'running' ? String(firstGroup.items.length) : null;
 
   const selectedJob = useMemo(() => {
     if (!hasSelected || !Array.isArray(jobs)) return null;
@@ -669,7 +666,7 @@ export function ActivityView({
       <${SplitView}
         leftTitle="Activity"
         leftLabel=${firstGroupLabel}
-        leftLabelFact=${runningCount > 0 ? `${runningCount} running` : null}
+        leftLabelFact=${runningFact}
         leftBody=${listPane}
         onLeftRefresh=${refreshActivityList}
         rightTitle=${hasSelected ? selectedTitle : null}

@@ -13,7 +13,6 @@ import {
   formatMachineDetailSubtitle,
   formatMachineStatusPhrase,
   formatMachinesHeaderSubtitle,
-  formatMachinesShortFact,
   formatTransferEta,
   formatTransferJobSubtitle,
   friendlyDeviceTransferState,
@@ -127,24 +126,6 @@ test('machine status phrases and header subtitle read in plain words', () => {
     ]),
     '3 are on, 1 is off',
   );
-  assert.equal(
-    formatMachinesShortFact([
-      { reachable: true },
-      { reachable: true },
-      { reachable: true },
-      { reachable: false },
-    ]),
-    '3 on, 1 off',
-  );
-  assert.equal(
-    formatMachinesShortFact([{ reachable: true }, { reachable: true }]),
-    '2 on',
-  );
-  assert.equal(
-    formatMachinesShortFact([{ reachable: false }, { reachable: false }]),
-    '2 off',
-  );
-  assert.equal(formatMachinesShortFact([]), '');
 });
 
 test('describePlainPermissions and formatCommandMeta summarize cleanly', () => {

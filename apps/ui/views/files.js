@@ -400,6 +400,7 @@ export function FilesHome({
   const hasPinned = Boolean(caps?.hasFav && pinned.length > 0);
   const hasSync = Boolean(caps?.hasSync && syncFolders.length > 0);
   const firstSection = hasPinned ? 'pinned' : hasSync ? 'sync' : 'machines';
+  const onlineMachineCount = (machines || []).filter((m) => m.reachable).length;
 
   const pinnedByMachine = useMemo(() => {
     const map = new Map();
@@ -514,7 +515,16 @@ export function FilesHome({
           `
         : null}
 
-      ${!(hideFirstLabel && firstSection === 'machines') ? html`<p class="label">Machines</p>` : null}
+      ${!(hideFirstLabel && firstSection === 'machines')
+        ? wide && machines.length > 0
+          ? html`
+              <p class="label label-row">
+                <span>Machines</span>
+                <span class="label-fact">${onlineMachineCount} on</span>
+              </p>
+            `
+          : html`<p class="label">Machines</p>`
+        : null}
       <div class="list">
         ${machines.map((m) => {
           const href = routeHref({ section: 'files', view: 'folder', machine: m.name, path: '~' });
@@ -3143,8 +3153,9 @@ export function FilesView({
     const onlineCount = machines.filter((m) => m.reachable).length;
     const hasPinned = Boolean(localCaps.hasFav && favourites.some((f) => f.pinned));
     const hasSync = Boolean(localCaps.hasSync && syncFolders.length > 0);
+    const firstSection = hasPinned ? 'pinned' : hasSync ? 'sync' : 'machines';
     const leftLabel = hasPinned ? 'Pinned' : hasSync ? 'Kept in sync' : 'Machines';
-    const leftLabelFact = machines.length > 0 ? `${onlineCount} on` : null;
+    const leftLabelFact = firstSection === 'machines' && machines.length > 0 ? `${onlineCount} on` : null;
 
     const leftTools = html`
       <input
