@@ -2,6 +2,7 @@
 
 import { computeFileCapabilities } from './capabilities.js';
 import { routeHref } from './route.js';
+import { thumbCacheKey } from './thumb-cache.js';
 
 export const FILE_CATEGORIES = ['image', 'video', 'audio', 'document', 'text', 'archive', 'other'];
 
@@ -643,6 +644,10 @@ export function formatShowingCount(shown, total, totalExact = true) {
   return `Showing ${shownText} of ${total.toLocaleString()}`;
 }
 
+export const THUMB_BATCH_MAX = 32;
+export const THUMB_MAX_RETRIES = 3;
+export const THUMB_RETRY_BASE_MS = 350;
+
 const RETRYABLE_THUMB_CODES = new Set([
   'busy',
   'rate_limited',
@@ -661,6 +666,175 @@ export function isRetryableThumbError(err) {
   if (err.retryable === true) return true;
   const code = typeof err.code === 'string' ? err.code.toLowerCase() : '';
   return RETRYABLE_THUMB_CODES.has(code);
+}
+
+/**
+ * Extracts per-path entries from `fs.thumb`'s `{ results: [{ path, ok | error }] }` wire reply
+ * into a null-prototype map keyed by path. Ok entries map to `{ mime, content, width, height }`;
+ * error entries map to `{ error }`.
+ */
+export function extractThumbMap(res) {
+  const map = Object.create(null);
+  if (!res || typeof res !== 'object' || !Array.isArray(res.results)) return map;
+  for (const item of res.results) {
+    if (!item || typeof item !== 'object' || typeof item.path !== 'string' || !item.path) continue;
+    if (item.ok && typeof item.ok === 'object' && !Array.isArray(item.ok)) {
+      map[item.path] = item.ok;
+    } else if (item.error) {
+      map[item.path] = { error: item.error };
+    }
+  }
+  return map;
+}
+
+/**
+ * Creates a per-machine batched `fs.thumb` loader (up to 32 paths per call) with quiet
+ * exponential backoff retries for retryable per-path or batch errors (such as `busy`).
+ */
+export function createThumbQueue({
+  machine,
+  link,
+  capsStore = null,
+  thumbCache,
+  onUpdate = null,
+  size = 128,
+  fit = 'cover',
+  debounceMs = 24,
+  batchGapMs = 30,
+  schedule = (fn, ms) => setTimeout(fn, ms),
+  cancel = (id) => clearTimeout(id),
+}) {
+  let alive = true;
+  const queue = new Map();
+  const inFlight = new Set();
+  const pendingRetry = new Set();
+  const retryCount = new Map();
+  const retryTimers = new Set();
+  let flushTimer = null;
+
+  function scheduleFlush(delayMs) {
+    if (!alive || flushTimer !== null) return;
+    flushTimer = schedule(flush, delayMs);
+  }
+
+  function scheduleRetry(item) {
+    const attempt = retryCount.get(item.path) || 0;
+    if (attempt >= THUMB_MAX_RETRIES) return false;
+    retryCount.set(item.path, attempt + 1);
+    pendingRetry.add(item.path);
+    const delayMs = THUMB_RETRY_BASE_MS * (2 ** attempt);
+    const tid = schedule(() => {
+      retryTimers.delete(tid);
+      pendingRetry.delete(item.path);
+      if (!alive || inFlight.has(item.path)) return;
+      queue.set(item.path, item);
+      scheduleFlush(debounceMs);
+    }, delayMs);
+    retryTimers.add(tid);
+    return true;
+  }
+
+  async function flush() {
+    flushTimer = null;
+    if (!alive || !machine || queue.size === 0) return;
+
+    const batch = [];
+    for (const item of queue.values()) {
+      if (batch.length >= THUMB_BATCH_MAX) break;
+      batch.push(item);
+    }
+    for (const item of batch) {
+      queue.delete(item.path);
+      inFlight.add(item.path);
+    }
+    if (batch.length === 0) return;
+
+    try {
+      if (capsStore) {
+        if (!capsStore.isKnown(machine)) {
+          await capsStore.ensure(machine).catch(() => null);
+        }
+        if (!alive) return;
+        if (!capsStore.hasTool(machine, 'fs.thumb')) {
+          for (const item of batch) inFlight.delete(item.path);
+          queue.clear();
+          return;
+        }
+      }
+
+      const paths = batch.map((item) => item.path);
+      const res = capsStore
+        ? (await capsStore.call('fs.thumb', { paths, size, fit }, { on: machine })).value
+        : await link.call('fs.thumb', { paths, size, fit }, { on: machine });
+      if (!alive) return;
+
+      const map = extractThumbMap(res);
+      let updated = false;
+      for (const item of batch) {
+        inFlight.delete(item.path);
+        const key = thumbCacheKey(machine, item.path, item.mtime, size);
+        const t = map[item.path];
+        if (t?.content && t?.mime) {
+          retryCount.delete(item.path);
+          thumbCache.set(key, { url: `data:${t.mime};base64,${t.content}` });
+          updated = true;
+        } else if (isRetryableThumbError(t?.error) && scheduleRetry(item)) {
+          // Leave placeholder visible while waiting quietly for backoff retry.
+        } else {
+          retryCount.delete(item.path);
+          thumbCache.set(key, { failed: true });
+        }
+      }
+      if (updated && onUpdate) onUpdate();
+    } catch (err) {
+      if (!alive) return;
+      const retryable = isRetryableThumbError(err);
+      for (const item of batch) {
+        inFlight.delete(item.path);
+        if (retryable && scheduleRetry(item)) continue;
+        retryCount.delete(item.path);
+        const key = thumbCacheKey(machine, item.path, item.mtime, size);
+        thumbCache.set(key, { failed: true });
+      }
+    } finally {
+      if (alive && queue.size > 0) {
+        scheduleFlush(batchGapMs);
+      }
+    }
+  }
+
+  return {
+    enqueue(item) {
+      if (!alive || !machine || !item?.path) return;
+      if (capsStore && capsStore.isKnown(machine) && !capsStore.hasTool(machine, 'fs.thumb')) return;
+      const mtime = item.mtime || '';
+      const key = thumbCacheKey(machine, item.path, mtime, size);
+      if (
+        thumbCache.get(key) ||
+        inFlight.has(item.path) ||
+        queue.has(item.path) ||
+        pendingRetry.has(item.path)
+      ) {
+        return;
+      }
+      queue.set(item.path, { path: item.path, mtime });
+      scheduleFlush(debounceMs);
+    },
+
+    dispose() {
+      alive = false;
+      if (flushTimer !== null) {
+        cancel(flushTimer);
+        flushTimer = null;
+      }
+      for (const tid of retryTimers) cancel(tid);
+      retryTimers.clear();
+      pendingRetry.clear();
+      queue.clear();
+      inFlight.clear();
+      retryCount.clear();
+    },
+  };
 }
 
 /**

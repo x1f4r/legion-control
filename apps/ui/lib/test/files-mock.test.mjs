@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHttpLink } from '../../link/http.js';
 import { createMockLink } from '../../link/mock.js';
-import { detectFileCapabilities } from '../files.js';
+import { detectFileCapabilities, extractThumbMap } from '../files.js';
 
 function withHttpMockEnv(fetchImpl, initialToken = 'lgn_test_token') {
   const prevFetch = globalThis.fetch;
@@ -76,7 +76,26 @@ test('mock link exposes all new Files tools, royalty-free media, fs.copy, favour
   assert.equal(list.total_exact, true);
 
   const thumbs = await link.call('fs.thumb', { paths: ['/home/me/Videos/Holiday/IMG_2041.jpg'] }, { on: 'tower' });
-  assert.equal(thumbs.thumbnails['/home/me/Videos/Holiday/IMG_2041.jpg'].mime, 'image/svg+xml');
+  assert.equal(thumbs.thumbnails, undefined);
+  assert.ok(Array.isArray(thumbs.results));
+  assert.equal(thumbs.results.length, 1);
+  assert.equal(thumbs.results[0].path, '/home/me/Videos/Holiday/IMG_2041.jpg');
+  assert.equal(thumbs.results[0].ok.mime, 'image/svg+xml');
+  assert.equal(extractThumbMap(thumbs)['/home/me/Videos/Holiday/IMG_2041.jpg'].mime, 'image/svg+xml');
+
+  await assert.rejects(
+    () => link.call('fs.thumb', { paths: [] }, { on: 'tower' }),
+    { code: 'invalid_args' },
+  );
+  await assert.rejects(
+    () =>
+      link.call(
+        'fs.thumb',
+        { paths: Array.from({ length: 33 }, (_, i) => `/home/me/p${i}.jpg`) },
+        { on: 'tower' },
+      ),
+    { code: 'invalid_args' },
+  );
 
   const vid = await link.contentUrl({ machine: 'tower', path: '/home/me/Videos/Holiday/Arrival.mp4' });
   assert.equal(vid.expires_in, 900);
@@ -153,8 +172,12 @@ test('mock link with large and inexact flags pages 5 000 entries and exposes tot
 test('mock link with thumb-retry returns retryable busy error once then succeeds', async () => {
   const link = createMockLink('thumb-retry');
   const first = await link.call('fs.thumb', { paths: ['/home/me/Videos/Holiday/IMG_2042.jpg'] }, { on: 'tower' });
-  assert.equal(first.thumbnails['/home/me/Videos/Holiday/IMG_2042.jpg'].error.code, 'busy');
-  assert.equal(first.thumbnails['/home/me/Videos/Holiday/IMG_2042.jpg'].error.retryable, true);
+  assert.equal(first.thumbnails, undefined);
+  assert.equal(first.results[0].path, '/home/me/Videos/Holiday/IMG_2042.jpg');
+  assert.equal(first.results[0].error.code, 'busy');
+  assert.equal(first.results[0].error.retryable, true);
+  assert.equal(extractThumbMap(first)['/home/me/Videos/Holiday/IMG_2042.jpg'].error.code, 'busy');
   const second = await link.call('fs.thumb', { paths: ['/home/me/Videos/Holiday/IMG_2042.jpg'] }, { on: 'tower' });
-  assert.equal(second.thumbnails['/home/me/Videos/Holiday/IMG_2042.jpg'].mime, 'image/svg+xml');
+  assert.equal(second.results[0].ok.mime, 'image/svg+xml');
+  assert.equal(extractThumbMap(second)['/home/me/Videos/Holiday/IMG_2042.jpg'].mime, 'image/svg+xml');
 });
