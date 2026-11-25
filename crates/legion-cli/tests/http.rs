@@ -3132,11 +3132,22 @@ paths = [\"~/projects/**\"]
     );
 
     // Remote node `pi` also coalesced its keep_open `stream.get` audit entries into one line.
-    let pi_gets: Vec<Value> = pi_home
-        .audit()
-        .into_iter()
-        .filter(|e| e["tool"] == "stream.get" && e["principal"] == "phone" && e["outcome"] == "ok")
-        .collect();
+    // On Windows `server.stop()` terminates `legion serve` directly, so the child `legion stream`
+    // helper on `pi` finishes flushing on stdin EOF asynchronously; wait briefly for it to land.
+    let pi_deadline = Instant::now() + PATIENCE;
+    let pi_gets: Vec<Value> = loop {
+        let gets: Vec<Value> = pi_home
+            .audit()
+            .into_iter()
+            .filter(|e| {
+                e["tool"] == "stream.get" && e["principal"] == "phone" && e["outcome"] == "ok"
+            })
+            .collect();
+        if !gets.is_empty() || Instant::now() >= pi_deadline {
+            break gets;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     assert_eq!(
         pi_gets.len(),
         1,
@@ -3166,16 +3177,17 @@ paths = [\"~/projects/**\"]
     let projects = home.home().join("projects").join("special");
     std::fs::create_dir_all(&projects).unwrap();
 
-    // 1. Filenames with %, %41, #, spaces, non-ASCII, trailing dot (and ? on Unix).
+    // 1. Filenames with %, %41, #, spaces, and non-ASCII are valid on every OS; trailing dots
+    //    and `?` are valid only on Unix and refused on Windows.
     let mut special_names = vec![
         "100%.txt",
         "a%41.txt",
         "hash#1.txt",
         "hello world.txt",
         "café 日本.txt",
-        "trailing.",
     ];
     if cfg!(unix) {
+        special_names.push("trailing.");
         special_names.push("what?.txt");
     }
     for name in &special_names {
@@ -3202,6 +3214,30 @@ paths = [\"~/projects/**\"]
         let got = http(server.port, "GET", &url, &[], b"");
         assert_eq!(got.status, 200, "{name} -> {url}: {}", got.text());
         assert_eq!(got.body, format!("body-of-{name}").as_bytes(), "{name}");
+    }
+
+    // On Windows, names ending in a dot/space, reserved device names, and NTFS ADS are refused
+    // with 400 invalid_args by policy path checks, and forbidden characters such as `?` cannot be
+    // opened as files.
+    #[cfg(windows)]
+    {
+        for forbidden in ["trailing.", "trailing ", "CON.txt", "file.txt:stream"] {
+            let rel_path = format!("~/projects/special/{forbidden}");
+            let refused = server.post("/v1/content", Some(&phone), &json!({"path": rel_path}));
+            assert_eq!(refused.status, 400, "{forbidden}: {}", refused.text());
+            assert_eq!(refused.json()["code"], json!("invalid_args"), "{forbidden}");
+        }
+        let question = server.post(
+            "/v1/content",
+            Some(&phone),
+            &json!({"path": "~/projects/special/what?.txt"}),
+        );
+        assert!(
+            question.status >= 400,
+            "expected Windows to refuse what?.txt, got {}: {}",
+            question.status,
+            question.text()
+        );
     }
 
     // 2. Overflowing Range bounds clamp or fall back to 200 OK instead of 416.

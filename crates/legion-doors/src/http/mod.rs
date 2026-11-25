@@ -410,6 +410,9 @@ impl Shared {
             .content_tickets
             .sweep_holders(|holder| content::holder_is_live(holder, None, tokens.as_deref(), now));
         self.content_audit.flush_removed(&self.node, &removed).await;
+        self.content_audit
+            .flush_missing(&self.node, |hash| self.content_tickets.contains_hash(hash))
+            .await;
         self.content_audit.flush_due(&self.node).await;
         let ended = self.sessions.stale(tokens.as_deref());
         self.close(ended).await;
@@ -1116,5 +1119,156 @@ mod tests {
         drop(stalled);
         shutdown.cancel();
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn content_audit_coalescer_flushes_on_holder_revocation_and_graceful_shutdown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("legion");
+        let user_home = dir.path().join("user");
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::create_dir_all(home.join("state")).unwrap();
+        std::fs::create_dir_all(&user_home).unwrap();
+
+        let file_a = user_home.join("a.bin");
+        let file_b = user_home.join("b.bin");
+        std::fs::write(&file_a, vec![b'A'; 4096]).unwrap();
+        std::fs::write(&file_b, vec![b'B'; 4096]).unwrap();
+
+        let paths = legion_core::Paths::under(&home);
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "[principals.phone]\nrole = \"observer\"\n[roles.observer]\nallow = [\"effect:read\"]\n",
+        )
+        .unwrap();
+
+        let node = Node::new(paths.clone(), legion_tools::registry());
+        let tok_a = node
+            .call(legion_core::Call::new(
+                legion_core::Door::Cli,
+                "token.add",
+                serde_json::json!({ "name": "tok-a", "principal": "phone" }),
+            ))
+            .await
+            .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let tok_b = node
+            .call(legion_core::Call::new(
+                legion_core::Door::Cli,
+                "token.add",
+                serde_json::json!({ "name": "tok-b", "principal": "phone" }),
+            ))
+            .await
+            .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let door = HttpDoor::new(node.clone(), Arc::new(legion_core::Local)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = door.serve(listener, stop.cancelled()).await;
+        });
+
+        async fn mint(port: u16, token: &str, path: &std::path::Path) -> String {
+            let body = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
+            let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let req = format!(
+                "POST /v1/content HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut raw = Vec::new();
+            s.read_to_end(&mut raw).await.unwrap();
+            let text = String::from_utf8(raw).unwrap();
+            let (_, json_body) = text.split_once("\r\n\r\n").unwrap();
+            serde_json::from_str::<serde_json::Value>(json_body).unwrap()["url"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+
+        async fn get_range(port: u16, url: &str, range: &str) -> u16 {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let req = format!(
+                "GET {url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: {range}\r\nConnection: close\r\n\r\n"
+            );
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut raw = Vec::new();
+            s.read_to_end(&mut raw).await.unwrap();
+            let line = String::from_utf8_lossy(&raw);
+            line.split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<u16>()
+                .unwrap()
+        }
+
+        let read_audit = || -> Vec<serde_json::Value> {
+            std::fs::read_to_string(paths.audit_log())
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+
+        let url_a = mint(port, &tok_a, &file_a).await;
+        let url_b = mint(port, &tok_b, &file_b).await;
+
+        // Three range reads on each ticket: 100 + 200 + 300 = 600 bytes.
+        for range in ["bytes=0-99", "bytes=100-299", "bytes=300-599"] {
+            assert_eq!(get_range(port, &url_a, range).await, 206);
+            assert_eq!(get_range(port, &url_b, range).await, 206);
+        }
+
+        // Revoking tok-a and hitting its ticket flushes tok-a's coalesced audit entry immediately
+        // while the server is still running (without waiting for the 60s window).
+        node.call(legion_core::Call::new(
+            legion_core::Door::Cli,
+            "token.remove",
+            serde_json::json!({ "name": "tok-a" }),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(get_range(port, &url_a, "bytes=0-9").await, 404);
+
+        let mid_audit = read_audit();
+        let a_reads: Vec<&serde_json::Value> = mid_audit
+            .iter()
+            .filter(|e| {
+                e["tool"] == "content.read"
+                    && e["outcome"] == "ok"
+                    && e["args"]["path"] == file_a.to_string_lossy().as_ref()
+            })
+            .collect();
+        assert_eq!(a_reads.len(), 1, "{mid_audit:?}");
+        assert_eq!(a_reads[0]["args"]["requests"], serde_json::json!(3));
+        assert_eq!(a_reads[0]["args"]["bytes_served"], serde_json::json!(600));
+
+        // Graceful shutdown flushes tok-b's pending coalesced audit entry before serve() exits.
+        shutdown.cancel();
+        server_task.await.unwrap();
+
+        let final_audit = read_audit();
+        let b_reads: Vec<&serde_json::Value> = final_audit
+            .iter()
+            .filter(|e| {
+                e["tool"] == "content.read"
+                    && e["outcome"] == "ok"
+                    && e["args"]["path"] == file_b.to_string_lossy().as_ref()
+            })
+            .collect();
+        assert_eq!(b_reads.len(), 1, "{final_audit:?}");
+        assert_eq!(b_reads[0]["args"]["requests"], serde_json::json!(3));
+        assert_eq!(b_reads[0]["args"]["bytes_served"], serde_json::json!(600));
     }
 }

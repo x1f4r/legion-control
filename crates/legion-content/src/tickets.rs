@@ -404,6 +404,12 @@ impl TicketTable {
         self.lock().entries.len()
     }
 
+    /// Whether a ticket with `key_hash` is currently present in the table (without modifying its
+    /// last-used timestamp).
+    pub fn contains_hash(&self, key_hash: &[u8; 32]) -> bool {
+        self.lock().entries.contains_key(key_hash)
+    }
+
     /// Whether no tickets are stored.
     pub fn is_empty(&self) -> bool {
         self.len() == 0

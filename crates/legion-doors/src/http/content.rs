@@ -150,6 +150,30 @@ impl ContentAuditCoalescer {
         write_snapshots(node, snapshots).await;
     }
 
+    /// Removes and flushes any bucket whose ticket is no longer present in the ticket table (for
+    /// example tickets evicted by the per-holder LRU cap or revoked during an in-flight stream).
+    pub(crate) async fn flush_missing(&self, node: &Node, is_present: impl Fn(&[u8; 32]) -> bool) {
+        let snapshots = {
+            let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
+            let now = Instant::now();
+            let missing: Vec<[u8; 32]> = buckets
+                .keys()
+                .copied()
+                .filter(|hash| !is_present(hash))
+                .collect();
+            let mut out = Vec::new();
+            for hash in missing {
+                if let Some(mut bucket) = buckets.remove(&hash)
+                    && let Some(snap) = take_delta(&mut bucket, now)
+                {
+                    out.push(snap);
+                }
+            }
+            out
+        };
+        write_snapshots(node, snapshots).await;
+    }
+
     /// Flushes every remaining bucket (called on door shutdown).
     pub(crate) async fn flush_all(&self, node: &Node) {
         let snapshots = {
@@ -441,12 +465,9 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
         .get::<ConnectionStreamFlag>()
         .map(|f| Arc::clone(&f.0));
 
-    // Reserve a shared atomic counter attached to the ticket's coalesced audit bucket if the
-    // ticket is known (no secret is logged; lookup inside `handle_request` validates everything).
-    let bytes_served = Arc::new(AtomicU64::new(0));
     let hooks = StreamHooks {
         limiter: Some(shared.content_limiter.clone()),
-        bytes_served: Some(Arc::clone(&bytes_served)),
+        bytes_served: None,
         active_guard: Some(Box::new(ActiveContentStreamGuard::new(conn_flag))),
     };
 
@@ -541,6 +562,16 @@ impl ContentSource for DoorContentSource {
                 tokens.as_deref(),
                 now,
             ) {
+                // Revoke all tickets for this holder and flush their coalesced read summaries
+                // immediately so revoked activity is never stranded in memory.
+                let removed = self
+                    .shared
+                    .content_tickets
+                    .revoke_holder_hashes(&ticket.holder);
+                self.shared
+                    .content_audit
+                    .flush_removed(&self.shared.node, &removed)
+                    .await;
                 return Err(OpenRangeError::TicketRevoked);
             }
             let req = ContentRequest {
