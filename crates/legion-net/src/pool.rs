@@ -6,20 +6,20 @@
 //! routed events with their source machine, and closes every session cleanly on shutdown or drop.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use legion_core::config::ConfigStore;
 use legion_core::policy::Policy;
 use legion_core::{
-    BoxFuture, Call, CancellationToken, Ctx, EventSink, MachineEffects, Node, Paths, RouteOutcome,
-    Router, VERSION,
+    BoxFuture, Call, CancellationToken, ContentError, ContentRequest, Ctx, EventSink,
+    MachineEffects, Node, OpenedContent, Paths, RouteOutcome, Router, VERSION, open_local_content,
 };
 pub use legion_proto::MAX_HOPS;
 use legion_proto::{CallParams, Effect, ErrorBody, ErrorCode, Target};
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::config::{FleetFile, MachineEntry, RemoteOs, ResolvedSystem, Transport};
@@ -29,6 +29,56 @@ use crate::state::StateStore;
 
 /// Maximum number of new remote connections opened concurrently during a fan-out or ping.
 const MAX_CONCURRENT_CONNECTS: usize = 8;
+
+/// Maximum concurrent active content `legion stream` pipes per target machine (separate from
+/// transfers and RPC).
+const MAX_CONTENT_PIPES_PER_TARGET: usize = 8;
+
+/// Maximum idle `keep_open` `legion stream` pipes kept warm per target machine for content reads.
+const MAX_IDLE_CONTENT_PIPES: usize = 4;
+
+/// How long an idle `keep_open` `legion stream` pipe stays warm before the background reaper
+/// closes it.
+const IDLE_CONTENT_PIPE_TTL: Duration = Duration::from_secs(60);
+
+/// How often the background reaper checks for expired idle content pipes.
+const IDLE_CONTENT_REAP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Maximum time a content read waits for a pipe from the per-target pool before returning `503`.
+const CONTENT_PIPE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Initial bounded window requested on a remote content read for fast time to first byte.
+const INITIAL_REMOTE_CONTENT_WINDOW: u64 = 256 * 1024;
+
+/// Maximum bounded window requested per remote content read before returning the pipe to the pool.
+const MAX_REMOTE_CONTENT_WINDOW: u64 = 1024 * 1024;
+
+/// Tuning options for [`Fleet`], primarily for tests that shorten idle TTLs or acquire timeouts.
+#[derive(Clone, Copy, Debug)]
+pub struct FleetOptions {
+    /// Maximum concurrent active content pipes per target machine.
+    pub max_content_pipes_per_target: usize,
+    /// Maximum idle warm `keep_open` content pipes retained per target machine.
+    pub max_idle_content_pipes: usize,
+    /// How long an idle warm content pipe stays open before the background reaper closes it.
+    pub idle_content_pipe_ttl: Duration,
+    /// How often the background reaper checks for expired idle content pipes.
+    pub idle_reap_interval: Duration,
+    /// Maximum wait to acquire a content pipe before returning [`ContentError::Busy`].
+    pub content_pipe_acquire_timeout: Duration,
+}
+
+impl Default for FleetOptions {
+    fn default() -> Self {
+        Self {
+            max_content_pipes_per_target: MAX_CONTENT_PIPES_PER_TARGET,
+            max_idle_content_pipes: MAX_IDLE_CONTENT_PIPES,
+            idle_content_pipe_ttl: IDLE_CONTENT_PIPE_TTL,
+            idle_reap_interval: IDLE_CONTENT_REAP_INTERVAL,
+            content_pipe_acquire_timeout: CONTENT_PIPE_ACQUIRE_TIMEOUT,
+        }
+    }
+}
 
 /// Default connect timeout for a single-system machine.
 const SINGLE_SYSTEM_TIMEOUT: Duration = Duration::from_secs(10);
@@ -76,6 +126,9 @@ struct PoolInner {
     slots: Mutex<HashMap<String, Arc<MachineSlot>>>,
     connect_permits: Arc<Semaphore>,
     state: StateStore,
+    options: FleetOptions,
+    reaper_started: AtomicBool,
+    shutdown: CancellationToken,
     /// Bumped on [`Fleet::close`] so an in-flight connect started before shutdown never installs a
     /// session afterwards.
     generation: AtomicU64,
@@ -85,6 +138,308 @@ struct MachineSlot {
     /// Serializes opening a new session for this machine so concurrent first calls share one.
     open_lock: tokio::sync::Mutex<()>,
     current: Mutex<Option<LiveEntry>>,
+    /// Dedicated content-read pipe pool with per-holder fair sharing, acquire timeout, and warm
+    /// `keep_open` pipe reuse.
+    content_pipes: Arc<ContentPipePool>,
+}
+
+struct IdleContentPipe {
+    stdin: tokio::process::ChildStdin,
+    reader: tokio::io::BufReader<tokio::process::ChildStdout>,
+    handle: crate::connector::PipeHandle,
+    stderr: Arc<crate::connector::StderrTail>,
+    systems_fingerprint: Vec<ResolvedSystem>,
+    last_used: Instant,
+}
+
+/// Per-target content pipe budget with per-holder fair sharing and warm idle pipe storage.
+struct ContentPipePool {
+    capacity: usize,
+    max_idle: usize,
+    idle_ttl: Duration,
+    state: Mutex<ContentPipePoolState>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct ContentPipePoolState {
+    active_total: usize,
+    active_by_holder: HashMap<String, usize>,
+    waiters_by_holder: HashMap<String, usize>,
+    idle: Vec<IdleContentPipe>,
+}
+
+struct ContentPipePermit {
+    pool: Arc<ContentPipePool>,
+    holder: String,
+}
+
+impl Drop for ContentPipePermit {
+    fn drop(&mut self) {
+        {
+            let mut state = self
+                .pool
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.active_total = state.active_total.saturating_sub(1);
+            if let Some(count) = state.active_by_holder.get_mut(&self.holder) {
+                if *count <= 1 {
+                    state.active_by_holder.remove(&self.holder);
+                } else {
+                    *count -= 1;
+                }
+            }
+        }
+        self.pool.notify.notify_waiters();
+    }
+}
+
+struct WaiterGuard {
+    pool: Arc<ContentPipePool>,
+    holder: String,
+}
+
+impl WaiterGuard {
+    fn register(pool: &Arc<ContentPipePool>, holder: &str) -> Self {
+        {
+            let mut state = pool
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *state
+                .waiters_by_holder
+                .entry(holder.to_owned())
+                .or_insert(0) += 1;
+        }
+        Self {
+            pool: Arc::clone(pool),
+            holder: holder.to_owned(),
+        }
+    }
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        {
+            let mut state = self
+                .pool
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(count) = state.waiters_by_holder.get_mut(&self.holder) {
+                if *count <= 1 {
+                    state.waiters_by_holder.remove(&self.holder);
+                } else {
+                    *count -= 1;
+                }
+            }
+        }
+        self.pool.notify.notify_waiters();
+    }
+}
+
+impl ContentPipePool {
+    fn new(capacity: usize, max_idle: usize, idle_ttl: Duration) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            max_idle,
+            idle_ttl,
+            state: Mutex::new(ContentPipePoolState::default()),
+            notify: Notify::new(),
+        }
+    }
+
+    fn can_acquire(state: &ContentPipePoolState, holder: &str, capacity: usize) -> bool {
+        if state.active_total >= capacity {
+            return false;
+        }
+        let other_waiting = state
+            .waiters_by_holder
+            .iter()
+            .any(|(other, &count)| other != holder && count > 0);
+        if other_waiting {
+            let fair_cap = (capacity / 2).max(1);
+            let held = state.active_by_holder.get(holder).copied().unwrap_or(0);
+            if held >= fair_cap {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn acquire(
+        self: &Arc<Self>,
+        holder: &str,
+        machine: &str,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<ContentPipePermit, ContentError> {
+        if cancel.is_cancelled() {
+            return Err(ContentError::Error(
+                ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    format!("Opening content on {machine} was cancelled."),
+                )
+                .with_machine(machine),
+            ));
+        }
+
+        // Fast path: grab a permit immediately when capacity and fair-share allow.
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if Self::can_acquire(&state, holder, self.capacity) {
+                state.active_total += 1;
+                *state.active_by_holder.entry(holder.to_owned()).or_insert(0) += 1;
+                return Ok(ContentPipePermit {
+                    pool: Arc::clone(self),
+                    holder: holder.to_owned(),
+                });
+            }
+        }
+
+        let _waiter = WaiterGuard::register(self, holder);
+        let deadline = Instant::now() + timeout;
+        let retry_after_secs = timeout.as_secs().max(1);
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if Self::can_acquire(&state, holder, self.capacity) {
+                    state.active_total += 1;
+                    *state.active_by_holder.entry(holder.to_owned()).or_insert(0) += 1;
+                    return Ok(ContentPipePermit {
+                        pool: Arc::clone(self),
+                        holder: holder.to_owned(),
+                    });
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ContentError::Busy {
+                    retry_after_secs,
+                    error: ErrorBody::new(
+                        ErrorCode::Busy,
+                        format!("All content pipes to {machine} are busy; try again shortly."),
+                    )
+                    .with_hint("Retry once an active remote content read finishes.")
+                    .with_machine(machine),
+                });
+            }
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(ContentError::Error(
+                        ErrorBody::new(
+                            ErrorCode::Cancelled,
+                            format!("Opening content on {machine} was cancelled."),
+                        )
+                        .with_machine(machine),
+                    ));
+                }
+                () = tokio::time::sleep(remaining) => {
+                    return Err(ContentError::Busy {
+                        retry_after_secs,
+                        error: ErrorBody::new(
+                            ErrorCode::Busy,
+                            format!("All content pipes to {machine} are busy; try again shortly."),
+                        )
+                        .with_hint("Retry once an active remote content read finishes.")
+                        .with_machine(machine),
+                    });
+                }
+                () = notified => {}
+            }
+        }
+    }
+
+    fn pop_idle(&self, fingerprint: &[ResolvedSystem]) -> Option<IdleContentPipe> {
+        let mut expired = Vec::new();
+        let popped = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = Instant::now();
+            let mut kept = Vec::with_capacity(state.idle.len());
+            for pipe in state.idle.drain(..) {
+                if now.saturating_duration_since(pipe.last_used) < self.idle_ttl
+                    && pipe.systems_fingerprint == fingerprint
+                {
+                    kept.push(pipe);
+                } else {
+                    expired.push(pipe);
+                }
+            }
+            state.idle = kept;
+            state.idle.pop()
+        };
+        drop(expired);
+        popped
+    }
+
+    fn return_idle(&self, pipe: IdleContentPipe) {
+        let mut evicted = Vec::new();
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = Instant::now();
+            let mut kept = Vec::with_capacity(state.idle.len() + 1);
+            for existing in state.idle.drain(..) {
+                if now.saturating_duration_since(existing.last_used) < self.idle_ttl {
+                    kept.push(existing);
+                } else {
+                    evicted.push(existing);
+                }
+            }
+            if self.max_idle == 0 {
+                evicted.push(pipe);
+            } else {
+                while kept.len() >= self.max_idle {
+                    evicted.push(kept.remove(0));
+                }
+                kept.push(pipe);
+            }
+            state.idle = kept;
+        }
+        drop(evicted);
+    }
+
+    fn take_expired_idle(&self) -> Vec<IdleContentPipe> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        let mut kept = Vec::with_capacity(state.idle.len());
+        let mut expired = Vec::new();
+        for pipe in state.idle.drain(..) {
+            if now.saturating_duration_since(pipe.last_used) < self.idle_ttl {
+                kept.push(pipe);
+            } else {
+                expired.push(pipe);
+            }
+        }
+        state.idle = kept;
+        expired
+    }
+
+    fn drain_all_idle(&self) -> Vec<IdleContentPipe> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut state.idle)
+    }
 }
 
 #[derive(Clone)]
@@ -100,14 +455,70 @@ struct LiveEntry {
 impl Fleet {
     /// Creates a new session pool using `paths.state_dir()` for its system/OS hint cache.
     pub fn new(paths: &Paths) -> Fleet {
+        Self::with_options(paths, FleetOptions::default())
+    }
+
+    /// Creates a new session pool with custom [`FleetOptions`].
+    pub fn with_options(paths: &Paths, options: FleetOptions) -> Fleet {
         Fleet {
             inner: Arc::new(PoolInner {
                 slots: Mutex::new(HashMap::new()),
                 connect_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTS)),
                 state: StateStore::new(paths.state_dir()),
+                options,
+                reaper_started: AtomicBool::new(false),
+                shutdown: CancellationToken::new(),
                 generation: AtomicU64::new(0),
             }),
         }
+    }
+
+    fn ensure_idle_reaper(&self) {
+        if self
+            .inner
+            .reaper_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let weak: Weak<PoolInner> = Arc::downgrade(&self.inner);
+        let interval = self
+            .inner
+            .options
+            .idle_reap_interval
+            .max(Duration::from_millis(10));
+        let shutdown = self.inner.shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(interval) => {}
+                }
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                let slots: Vec<Arc<MachineSlot>> = inner
+                    .slots
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .cloned()
+                    .collect();
+                let mut expired = Vec::new();
+                for slot in slots {
+                    expired.extend(slot.content_pipes.take_expired_idle());
+                }
+                for pipe in expired {
+                    tokio::spawn(async move {
+                        drop(pipe.stdin);
+                        drop(pipe.reader);
+                        pipe.handle.close(Duration::from_secs(1)).await;
+                    });
+                }
+            }
+        });
     }
 
     /// Gets the live pooled JSON-RPC session for `machine` from inside a tool, opening one if none
@@ -494,6 +905,88 @@ impl Fleet {
         Ok(pipe)
     }
 
+    /// Opens one fresh `legion stream` pipe for the dedicated content-read pool without consuming
+    /// any transfer stream permit.
+    async fn spawn_content_pipe(
+        &self,
+        config: &ConfigStore,
+        here: &str,
+        machine: &str,
+        cancel: CancellationToken,
+    ) -> Result<Pipe, ErrorBody> {
+        let fleet_file = config
+            .get::<FleetFile>()
+            .map_err(|err| ensure_machine(err, here))?;
+        let entry = lookup_machine(&fleet_file, machine, here)?;
+        if let Some(relay) = &entry.via {
+            return Err(ErrorBody::new(
+                ErrorCode::Unsupported,
+                format!(
+                    "Machine {machine} is reached via relay {relay}, so a direct pipe cannot be opened to it."
+                ),
+            )
+            .with_hint(format!(
+                "Configure a direct ssh or command transport for {machine} in fleet.toml."
+            ))
+            .with_machine(here));
+        }
+        let systems = entry.resolved_systems();
+        let slot = self.slot(machine);
+        let known = {
+            let guard = slot
+                .current
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.as_ref().and_then(|live| {
+                (live.session.is_alive() && live.systems_fingerprint == systems)
+                    .then(|| (live.active_system.clone(), live.active_os))
+            })
+        };
+
+        let (system, resolved_os) = if let Some(pair) = known {
+            pair
+        } else if systems.len() == 1 {
+            let only = systems[0].clone();
+            match only.transport {
+                Transport::Command { .. } => (only, None),
+                Transport::Ssh { os: Some(os), .. } => (only, Some(os)),
+                Transport::Ssh { os: None, .. } => {
+                    if let Some(cached) = self.inner.state.last_os(machine, &only.name) {
+                        (only, Some(cached))
+                    } else {
+                        let live = self
+                            .get_or_open(machine, entry, None, cancel.clone())
+                            .await?;
+                        (live.active_system, live.active_os)
+                    }
+                }
+            }
+        } else {
+            let live = self
+                .get_or_open(machine, entry, None, cancel.clone())
+                .await?;
+            (live.active_system, live.active_os)
+        };
+
+        let _permit = acquire_connect_permit(&self.inner.connect_permits, machine, &cancel).await?;
+        match &system.transport {
+            Transport::Command { argv } => Pipe::spawn_command(argv, Subcommand::Stream),
+            Transport::Ssh {
+                target, program, ..
+            } => {
+                let os = resolved_os.unwrap_or(RemoteOs::Unix);
+                Pipe::spawn_ssh(
+                    target,
+                    os,
+                    Subcommand::Stream,
+                    program.as_deref(),
+                    SINGLE_SYSTEM_TIMEOUT,
+                )
+            }
+        }
+        .map_err(|err| err.with_machine(machine))
+    }
+
     /// Runs `call` on a single named machine (locally if `machine` is this node, otherwise over
     /// the pooled session, or through an explicit `via` relay).
     ///
@@ -751,7 +1244,8 @@ impl Fleet {
         }
     }
 
-    /// Closes and removes any cached session for `machine`, e.g. after editing `fleet.toml`.
+    /// Closes and removes any cached session and idle stream pipes for `machine`, e.g. after
+    /// editing `fleet.toml`.
     pub async fn evict(&self, machine: &str) {
         let removed = {
             let mut slots = self
@@ -762,6 +1256,11 @@ impl Fleet {
             slots.remove(machine)
         };
         if let Some(slot) = removed {
+            for pipe in slot.content_pipes.drain_all_idle() {
+                drop(pipe.stdin);
+                drop(pipe.reader);
+                pipe.handle.close(Duration::from_secs(1)).await;
+            }
             let session = slot
                 .current
                 .lock()
@@ -773,9 +1272,11 @@ impl Fleet {
         }
     }
 
-    /// Closes every open session cleanly (EOF on stdin, short wait, then kill).
+    /// Closes every open session and idle stream pipe cleanly (EOF on stdin, short wait, then
+    /// kill).
     pub async fn close(&self) {
         self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        self.inner.shutdown.cancel();
         let slots: Vec<Arc<MachineSlot>> = {
             let mut map = self
                 .inner
@@ -786,6 +1287,13 @@ impl Fleet {
         };
         let mut closing = JoinSet::new();
         for slot in slots {
+            for pipe in slot.content_pipes.drain_all_idle() {
+                closing.spawn(async move {
+                    drop(pipe.stdin);
+                    drop(pipe.reader);
+                    pipe.handle.close(Duration::from_secs(1)).await;
+                });
+            }
             let live = slot
                 .current
                 .lock()
@@ -1347,10 +1855,16 @@ impl Fleet {
             .slots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let opts = self.inner.options;
         Arc::clone(map.entry(machine.to_owned()).or_insert_with(|| {
             Arc::new(MachineSlot {
                 open_lock: tokio::sync::Mutex::new(()),
                 current: Mutex::new(None),
+                content_pipes: Arc::new(ContentPipePool::new(
+                    opts.max_content_pipes_per_target,
+                    opts.max_idle_content_pipes,
+                    opts.idle_content_pipe_ttl,
+                )),
             })
         }))
     }
@@ -1653,6 +2167,7 @@ fn authorize_pipe_open(
 impl Drop for PoolInner {
     fn drop(&mut self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
+        self.shutdown.cancel();
         let slots: Vec<Arc<MachineSlot>> = self
             .slots
             .lock()
@@ -1661,6 +2176,7 @@ impl Drop for PoolInner {
             .map(|(_, slot)| slot)
             .collect();
         for slot in slots {
+            drop(slot.content_pipes.drain_all_idle());
             let live = slot
                 .current
                 .lock()
@@ -1774,6 +2290,942 @@ impl Router for Fleet {
     fn shutdown(&self) -> BoxFuture<'_, ()> {
         Box::pin(self.close())
     }
+
+    fn open_content<'a>(
+        &'a self,
+        node: &'a Node,
+        req: ContentRequest,
+    ) -> BoxFuture<'a, Result<OpenedContent, ContentError>> {
+        Box::pin(async move {
+            let here = node.name();
+            match req.machine.as_deref() {
+                None => open_local_content(node, &req).await,
+                Some(machine) if machine == here => open_local_content(node, &req).await,
+                Some(machine) => {
+                    let started = Instant::now();
+                    let args = json!({
+                        "path": req.path,
+                        "offset": req.offset,
+                        "length": req.length,
+                    });
+                    let outcome = self.open_remote_content(node, &here, machine, &req).await;
+                    if req.audit {
+                        let audit_result = match &outcome {
+                            Ok(_) => Ok(Value::Null),
+                            Err(ContentError::OutOfRange { size }) => Err(ErrorBody::new(
+                                ErrorCode::Conflict,
+                                format!(
+                                    "{} on {machine} cannot be read at byte {}: there are {size} bytes.",
+                                    req.path, req.offset
+                                ),
+                            )),
+                            Err(ContentError::Busy { error, .. } | ContentError::Error(error)) => {
+                                Err(error.clone())
+                            }
+                        };
+                        node.record_audit(
+                            machine.to_owned(),
+                            Some(req.principal.clone()),
+                            req.door,
+                            "content.read".to_owned(),
+                            &args,
+                            started,
+                            &audit_result,
+                        )
+                        .await;
+                    }
+                    outcome
+                }
+            }
+        })
+    }
+}
+
+const REMOTE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+const REMOTE_MAX_REPLY_LINE: usize = 1024 * 1024;
+const REMOTE_MAX_DONE_LINE: usize = 256;
+const REMOTE_MAX_NOISE_LINES: usize = 64;
+const REMOTE_MAX_NOISE_BYTES: usize = 64 * 1024;
+const REMOTE_STREAM_BUF: usize = 64 * 1024;
+
+struct ActiveRemotePipe {
+    stdin: tokio::process::ChildStdin,
+    reader: tokio::io::BufReader<tokio::process::ChildStdout>,
+    handle: crate::connector::PipeHandle,
+    stderr: Arc<crate::connector::StderrTail>,
+    systems_fingerprint: Vec<ResolvedSystem>,
+    _permit: ContentPipePermit,
+}
+
+struct OpenedRemoteWindow {
+    ready: crate::stream::GetReady,
+    mtime: legion_xfer::Timestamp,
+    keep_open: bool,
+    pipe: ActiveRemotePipe,
+}
+
+type FetchWindowFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>>;
+
+enum WindowReadState {
+    Fetching(FetchWindowFuture),
+    Buffered { data: Vec<u8>, pos: usize },
+    Idle,
+    Finished,
+}
+
+struct RemoteWindowContinuation {
+    fleet: Fleet,
+    node: Node,
+    here: String,
+    machine: String,
+    slot: Arc<MachineSlot>,
+    systems_fingerprint: Vec<ResolvedSystem>,
+    holder: String,
+    principal: String,
+    path: String,
+    next_offset: u64,
+    next_window_bytes: u64,
+    expected_size: u64,
+    expected_mtime: legion_xfer::Timestamp,
+    expected_file_id: Option<u64>,
+}
+
+/// Bounded-window reader over pooled remote `keep_open` `legion stream` pipes.
+///
+/// Each window is drained into memory and its pipe is returned to the pool immediately after the
+/// window's `{"done": true}` trailer, so a stalled or slow HTTP client holds zero remote pipes
+/// between windows.
+struct RemoteWindowedReader {
+    state: WindowReadState,
+    remaining: u64,
+    continuation: Option<RemoteWindowContinuation>,
+    cancel: CancellationToken,
+}
+
+impl tokio::io::AsyncRead for RemoteWindowedReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.cancel.is_cancelled() {
+            this.state = WindowReadState::Finished;
+            this.remaining = 0;
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "content stream was cancelled",
+            )));
+        }
+        if buf.remaining() == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        loop {
+            match &mut this.state {
+                WindowReadState::Finished => return std::task::Poll::Ready(Ok(())),
+                WindowReadState::Buffered { data, pos } => {
+                    if *pos >= data.len() {
+                        this.state = WindowReadState::Idle;
+                        continue;
+                    }
+                    let take = (data.len() - *pos).min(buf.remaining());
+                    buf.put_slice(&data[*pos..*pos + take]);
+                    *pos += take;
+                    this.remaining = this.remaining.saturating_sub(take as u64);
+                    if *pos >= data.len() {
+                        this.state = if this.remaining == 0 {
+                            WindowReadState::Finished
+                        } else {
+                            WindowReadState::Idle
+                        };
+                    }
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                WindowReadState::Fetching(fut) => match fut.as_mut().poll(cx) {
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                    std::task::Poll::Ready(Err(err)) => {
+                        this.state = WindowReadState::Finished;
+                        this.remaining = 0;
+                        return std::task::Poll::Ready(Err(err));
+                    }
+                    std::task::Poll::Ready(Ok(data)) => {
+                        if data.is_empty() {
+                            this.state = if this.remaining == 0 {
+                                WindowReadState::Finished
+                            } else {
+                                WindowReadState::Idle
+                            };
+                        } else {
+                            this.state = WindowReadState::Buffered { data, pos: 0 };
+                        }
+                    }
+                },
+                WindowReadState::Idle => {
+                    if this.remaining == 0 {
+                        this.state = WindowReadState::Finished;
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    let Some(cont) = this.continuation.as_mut() else {
+                        this.state = WindowReadState::Finished;
+                        this.remaining = 0;
+                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "remote content stream ended before delivering all bytes",
+                        )));
+                    };
+                    let want = this.remaining.min(cont.next_window_bytes);
+                    let offset = cont.next_offset;
+                    cont.next_offset = cont.next_offset.saturating_add(want);
+                    cont.next_window_bytes = cont
+                        .next_window_bytes
+                        .saturating_mul(2)
+                        .min(MAX_REMOTE_CONTENT_WINDOW);
+
+                    let fleet = cont.fleet.clone();
+                    let node = cont.node.clone();
+                    let here = cont.here.clone();
+                    let machine = cont.machine.clone();
+                    let slot = Arc::clone(&cont.slot);
+                    let systems_fingerprint = cont.systems_fingerprint.clone();
+                    let holder = cont.holder.clone();
+                    let principal = cont.principal.clone();
+                    let path = cont.path.clone();
+                    let expected_size = cont.expected_size;
+                    let expected_mtime = cont.expected_mtime;
+                    let expected_file_id = cont.expected_file_id;
+                    let cancel = this.cancel.clone();
+
+                    this.state = WindowReadState::Fetching(Box::pin(async move {
+                        let opened = fleet
+                            .open_remote_window(
+                                node.config(),
+                                &here,
+                                &machine,
+                                &slot,
+                                &systems_fingerprint,
+                                &holder,
+                                &principal,
+                                &path,
+                                offset,
+                                Some(want),
+                                &cancel,
+                            )
+                            .await
+                            .map_err(content_error_to_io)?;
+                        if opened.ready.size != expected_size
+                            || opened.mtime != expected_mtime
+                            || opened.ready.file_id != expected_file_id
+                        {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "file changed on remote node while streaming",
+                            ));
+                        }
+                        let expected_len = opened.ready.length;
+                        drain_window_and_recycle(
+                            opened.pipe,
+                            slot,
+                            opened.keep_open,
+                            expected_len,
+                            cancel,
+                        )
+                        .await
+                    }));
+                }
+            }
+        }
+    }
+}
+
+fn content_error_to_io(err: ContentError) -> std::io::Error {
+    match err {
+        ContentError::OutOfRange { size } => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("remote file shrank to {size} bytes while streaming"),
+        ),
+        ContentError::Busy { error, .. } => {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, error.message)
+        }
+        ContentError::Error(body) => match body.code {
+            ErrorCode::Denied => {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, body.message)
+            }
+            ErrorCode::Cancelled => {
+                std::io::Error::new(std::io::ErrorKind::Interrupted, body.message)
+            }
+            ErrorCode::Timeout => std::io::Error::new(std::io::ErrorKind::TimedOut, body.message),
+            _ => std::io::Error::other(body.message),
+        },
+    }
+}
+
+async fn drain_window_and_recycle(
+    mut pipe: ActiveRemotePipe,
+    slot: Arc<MachineSlot>,
+    keep_open: bool,
+    expected_len: u64,
+    cancel: CancellationToken,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncBufReadExt;
+
+    let cap = usize::try_from(expected_len).unwrap_or(0);
+    let mut data = Vec::with_capacity(cap);
+    let mut remaining = expected_len;
+
+    while remaining > 0 {
+        let avail = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "content stream was cancelled",
+                ));
+            }
+            res = pipe.reader.fill_buf() => res?,
+        };
+        if avail.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("remote content stream ended with {remaining} bytes remaining"),
+            ));
+        }
+        let take = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(avail.len());
+        data.extend_from_slice(&avail[..take]);
+        pipe.reader.consume(take);
+        remaining -= take as u64;
+    }
+
+    if keep_open {
+        let mut trailer = Vec::with_capacity(32);
+        loop {
+            let avail = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "content stream was cancelled",
+                    ));
+                }
+                res = pipe.reader.fill_buf() => res?,
+            };
+            if avail.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "remote content stream closed before done frame",
+                ));
+            }
+            if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                let take = pos + 1;
+                if trailer.len() + take > REMOTE_MAX_DONE_LINE {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "remote content stream sent extra data instead of done frame",
+                    ));
+                }
+                trailer.extend_from_slice(&avail[..take]);
+                pipe.reader.consume(take);
+                if !is_done_frame(&trailer) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "remote content stream sent an invalid done frame",
+                    ));
+                }
+                break;
+            }
+            let n = avail.len();
+            if trailer.len() + n > REMOTE_MAX_DONE_LINE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "remote content stream sent extra bytes past declared length",
+                ));
+            }
+            trailer.extend_from_slice(avail);
+            pipe.reader.consume(n);
+        }
+        // Return the healthy keep_open pipe to the idle pool before releasing the active permit.
+        let ActiveRemotePipe {
+            stdin,
+            reader,
+            handle,
+            stderr,
+            systems_fingerprint,
+            _permit,
+        } = pipe;
+        slot.content_pipes.return_idle(IdleContentPipe {
+            stdin,
+            reader,
+            handle,
+            stderr,
+            systems_fingerprint,
+            last_used: Instant::now(),
+        });
+        drop(_permit);
+    } else {
+        let avail = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "content stream was cancelled",
+                ));
+            }
+            res = pipe.reader.fill_buf() => res?,
+        };
+        if !avail.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "remote content stream sent extra bytes past declared length",
+            ));
+        }
+        drop(pipe);
+    }
+
+    Ok(data)
+}
+
+impl Fleet {
+    async fn open_remote_content(
+        &self,
+        node: &Node,
+        here: &str,
+        machine: &str,
+        req: &ContentRequest,
+    ) -> Result<OpenedContent, ContentError> {
+        // Authorise on this node first (every node a forwarded read crosses must allow fs.read).
+        let policy = node
+            .config()
+            .get::<Policy>()
+            .map_err(|err| ContentError::Error(ensure_machine(err, here)))?;
+        policy
+            .authorize_name(&req.principal, "fs.read", Some(Effect::Read), node.paths())
+            .map_err(|err| ContentError::Error(err.with_machine(here)))?;
+
+        let fleet_file = node
+            .config()
+            .get::<FleetFile>()
+            .map_err(|err| ContentError::Error(ensure_machine(err, here)))?;
+        let entry = lookup_machine(&fleet_file, machine, here).map_err(ContentError::Error)?;
+        let systems_fingerprint = entry.resolved_systems();
+        let slot = self.slot(machine);
+        self.ensure_idle_reaper();
+
+        let holder = req.holder.as_deref().unwrap_or(&req.principal);
+        let first_window_len = req.length.map_or(INITIAL_REMOTE_CONTENT_WINDOW, |n| {
+            n.min(INITIAL_REMOTE_CONTENT_WINDOW)
+        });
+        let opened = self
+            .open_remote_window(
+                node.config(),
+                here,
+                machine,
+                &slot,
+                &systems_fingerprint,
+                holder,
+                &req.principal,
+                &req.path,
+                req.offset,
+                Some(first_window_len),
+                &req.cancel,
+            )
+            .await?;
+
+        let ready = opened.ready;
+        let mtime = opened.mtime;
+        let keep_open = opened.keep_open;
+
+        // Zero-length probe (HEAD, If-Range, POST /v1/content, or empty file): validate the
+        // trailer/EOF immediately so the warm keep_open pipe returns to the pool right away.
+        if ready.length == 0 {
+            let drain_res = tokio::time::timeout(
+                REMOTE_HANDSHAKE_TIMEOUT,
+                drain_window_and_recycle(
+                    opened.pipe,
+                    Arc::clone(&slot),
+                    keep_open,
+                    0,
+                    req.cancel.clone(),
+                ),
+            )
+            .await;
+            match drain_res {
+                Ok(Ok(_)) => {
+                    return Ok(OpenedContent {
+                        size: ready.size,
+                        offset: ready.offset,
+                        length: 0,
+                        mtime_secs: mtime.secs,
+                        mtime_nanos: mtime.nanos,
+                        file_id: ready.file_id,
+                        reader: Box::new(tokio::io::empty()),
+                    });
+                }
+                Ok(Err(err)) => {
+                    return Err(ContentError::Error(
+                        ErrorBody::new(
+                            ErrorCode::Failed,
+                            format!("{machine} failed to finish a zero-length stream get: {err}."),
+                        )
+                        .with_machine(machine),
+                    ));
+                }
+                Err(_) => {
+                    return Err(ContentError::Error(
+                        ErrorBody::new(
+                            ErrorCode::Timeout,
+                            format!(
+                                "Timed out waiting for {machine} to finish a zero-length stream get."
+                            ),
+                        )
+                        .with_machine(machine),
+                    ));
+                }
+            }
+        }
+
+        let total_available = ready.size - ready.offset;
+        let total_length = req
+            .length
+            .map_or(total_available, |n| n.min(total_available));
+
+        let continuation = (ready.length < total_length).then(|| RemoteWindowContinuation {
+            fleet: self.clone(),
+            node: node.clone(),
+            here: here.to_owned(),
+            machine: machine.to_owned(),
+            slot: Arc::clone(&slot),
+            systems_fingerprint,
+            holder: holder.to_owned(),
+            principal: req.principal.clone(),
+            path: req.path.clone(),
+            next_offset: ready.offset.saturating_add(ready.length),
+            next_window_bytes: (INITIAL_REMOTE_CONTENT_WINDOW * 2).min(MAX_REMOTE_CONTENT_WINDOW),
+            expected_size: ready.size,
+            expected_mtime: mtime,
+            expected_file_id: ready.file_id,
+        });
+
+        let first_len = ready.length;
+        let first_pipe = opened.pipe;
+        let first_slot = Arc::clone(&slot);
+        let first_cancel = req.cancel.clone();
+        let first_fut: FetchWindowFuture = Box::pin(async move {
+            drain_window_and_recycle(first_pipe, first_slot, keep_open, first_len, first_cancel)
+                .await
+        });
+
+        Ok(OpenedContent {
+            size: ready.size,
+            offset: ready.offset,
+            length: total_length,
+            mtime_secs: mtime.secs,
+            mtime_nanos: mtime.nanos,
+            file_id: ready.file_id,
+            reader: Box::new(RemoteWindowedReader {
+                state: WindowReadState::Fetching(first_fut),
+                remaining: total_length,
+                continuation,
+                cancel: req.cancel.clone(),
+            }),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_remote_window(
+        &self,
+        config: &ConfigStore,
+        here: &str,
+        machine: &str,
+        slot: &Arc<MachineSlot>,
+        systems_fingerprint: &[ResolvedSystem],
+        holder: &str,
+        principal: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+        cancel: &CancellationToken,
+    ) -> Result<OpenedRemoteWindow, ContentError> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let mut header = json!({
+            "protocol": crate::stream::STREAM_PROTOCOL,
+            "op": "get",
+            "path": path,
+            "offset": offset,
+            "as": principal,
+            "keep_open": true,
+        });
+        if let Some(len) = length {
+            header["length"] = json!(len);
+        }
+        let mut line = header.to_string().into_bytes();
+        line.push(b'\n');
+
+        let mut tried_fresh = false;
+        loop {
+            let permit = slot
+                .content_pipes
+                .acquire(
+                    holder,
+                    machine,
+                    self.inner.options.content_pipe_acquire_timeout,
+                    cancel,
+                )
+                .await?;
+
+            let (mut stdin, mut reader, handle, stderr, reused) =
+                if let Some(idle) = slot.content_pipes.pop_idle(systems_fingerprint) {
+                    (idle.stdin, idle.reader, idle.handle, idle.stderr, true)
+                } else {
+                    tried_fresh = true;
+                    let pipe = self
+                        .spawn_content_pipe(config, here, machine, cancel.clone())
+                        .await
+                        .map_err(ContentError::Error)?;
+                    let stderr = pipe.stderr_tail().clone();
+                    let (stdin, stdout, handle) = pipe.into_parts();
+                    (
+                        stdin,
+                        BufReader::with_capacity(REMOTE_STREAM_BUF, stdout),
+                        handle,
+                        stderr,
+                        false,
+                    )
+                };
+
+            enum HandshakeFailure {
+                BrokenPipe(ContentError),
+                ProtocolError(ContentError),
+            }
+
+            let handshake = async {
+                stdin.write_all(&line).await.map_err(|err| {
+                    HandshakeFailure::BrokenPipe(ContentError::Error(
+                        ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            format!("Could not send stream get header to {machine}: {err}."),
+                        )
+                        .with_machine(machine),
+                    ))
+                })?;
+                stdin.flush().await.map_err(|err| {
+                    HandshakeFailure::BrokenPipe(ContentError::Error(
+                        ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            format!("Could not flush stream get header to {machine}: {err}."),
+                        )
+                        .with_machine(machine),
+                    ))
+                })?;
+
+                let mut greeted = reused;
+                let mut noise_lines = 0usize;
+                let mut noise_bytes = 0usize;
+                let mut reply_buf = Vec::new();
+                loop {
+                    reply_buf.clear();
+                    let mut total = 0usize;
+                    loop {
+                        let available = reader.fill_buf().await.map_err(|err| {
+                            HandshakeFailure::BrokenPipe(ContentError::Error(
+                                ErrorBody::new(
+                                    ErrorCode::Unreachable,
+                                    format!("Reading stream reply from {machine} failed: {err}."),
+                                )
+                                .with_machine(machine),
+                            ))
+                        })?;
+                        if available.is_empty() {
+                            break;
+                        }
+                        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                            let take = pos + 1;
+                            if total + take > REMOTE_MAX_REPLY_LINE {
+                                return Err(HandshakeFailure::ProtocolError(ContentError::Error(
+                                    ErrorBody::new(
+                                        ErrorCode::Failed,
+                                        format!("{machine} sent an oversized stream reply line."),
+                                    )
+                                    .with_machine(machine),
+                                )));
+                            }
+                            reply_buf.extend_from_slice(&available[..take]);
+                            reader.consume(take);
+                            total += take;
+                            break;
+                        }
+                        let n = available.len();
+                        if total + n > REMOTE_MAX_REPLY_LINE {
+                            return Err(HandshakeFailure::ProtocolError(ContentError::Error(
+                                ErrorBody::new(
+                                    ErrorCode::Failed,
+                                    format!("{machine} sent an oversized stream reply line."),
+                                )
+                                .with_machine(machine),
+                            )));
+                        }
+                        reply_buf.extend_from_slice(available);
+                        reader.consume(n);
+                        total += n;
+                    }
+                    if total == 0 {
+                        let mut err = ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            format!("The stream to {machine} closed before answering."),
+                        )
+                        .with_machine(machine);
+                        let text = stderr.text();
+                        if !text.is_empty() {
+                            err = err.with_hint(format!("Remote stderr: {text}"));
+                        }
+                        return Err(HandshakeFailure::BrokenPipe(ContentError::Error(err)));
+                    }
+
+                    if let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(&reply_buf) {
+                        if !greeted {
+                            if let Some(spoken) = fields.get("protocol") {
+                                if spoken.as_u64()
+                                    != Some(u64::from(crate::stream::STREAM_PROTOCOL))
+                                {
+                                    return Err(HandshakeFailure::ProtocolError(
+                                        ContentError::Error(
+                                            ErrorBody::new(
+                                                ErrorCode::Unsupported,
+                                                format!(
+                                                    "{machine} speaks stream protocol {spoken}, and this node speaks stream protocol {}.",
+                                                    crate::stream::STREAM_PROTOCOL
+                                                ),
+                                            )
+                                            .with_hint(
+                                                "Update legion on whichever machine is older.",
+                                            )
+                                            .with_machine(machine),
+                                        ),
+                                    ));
+                                }
+                                greeted = true;
+                                continue;
+                            }
+                        } else if fields.len() == 1
+                            && fields.get("busy") == Some(&Value::Bool(true))
+                        {
+                            continue;
+                        } else {
+                            if let Some(err_val) = fields.get("error")
+                                && let Ok(body) =
+                                    serde_json::from_value::<ErrorBody>(err_val.clone())
+                            {
+                                if body.code == ErrorCode::Conflict
+                                    && let Some(actual) = body
+                                        .details
+                                        .as_ref()
+                                        .and_then(|d| d.get("actual"))
+                                        .and_then(Value::as_u64)
+                                    && body
+                                        .details
+                                        .as_ref()
+                                        .and_then(|d| d.get("requested"))
+                                        .is_some()
+                                {
+                                    return Err(HandshakeFailure::ProtocolError(
+                                        ContentError::OutOfRange { size: actual },
+                                    ));
+                                }
+                                return Err(HandshakeFailure::ProtocolError(ContentError::Error(
+                                    body.with_machine(machine),
+                                )));
+                            }
+                            if let Ok(ready) = serde_json::from_value::<crate::stream::GetReady>(
+                                Value::Object(fields),
+                            ) {
+                                return Ok(ready);
+                            }
+                            return Err(HandshakeFailure::ProtocolError(ContentError::Error(
+                                ErrorBody::new(
+                                    ErrorCode::Failed,
+                                    format!(
+                                        "{machine} answered stream get with an unexpected line."
+                                    ),
+                                )
+                                .with_machine(machine),
+                            )));
+                        }
+                    }
+                    if greeted {
+                        return Err(HandshakeFailure::ProtocolError(ContentError::Error(
+                            ErrorBody::new(
+                                ErrorCode::Failed,
+                                format!("{machine} answered stream get with non-JSON output."),
+                            )
+                            .with_machine(machine),
+                        )));
+                    }
+                    noise_lines += 1;
+                    noise_bytes += reply_buf.len();
+                    if noise_lines > REMOTE_MAX_NOISE_LINES || noise_bytes > REMOTE_MAX_NOISE_BYTES
+                    {
+                        return Err(HandshakeFailure::ProtocolError(ContentError::Error(
+                            ErrorBody::new(
+                                ErrorCode::Unreachable,
+                                format!(
+                                    "{machine} sent too much non-protocol output before starting legion stream."
+                                ),
+                            )
+                            .with_machine(machine),
+                        )));
+                    }
+                }
+            };
+
+            let ready = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    drop(stdin);
+                    drop(reader);
+                    handle.close(Duration::from_secs(1)).await;
+                    return Err(ContentError::Error(
+                        ErrorBody::new(
+                            ErrorCode::Cancelled,
+                            format!("Opening content on {machine} was cancelled."),
+                        )
+                        .with_machine(machine),
+                    ));
+                }
+                res = tokio::time::timeout(REMOTE_HANDSHAKE_TIMEOUT, handshake) => match res {
+                    Ok(Ok(ready)) => ready,
+                    Ok(Err(HandshakeFailure::BrokenPipe(err))) => {
+                        drop(stdin);
+                        drop(reader);
+                        handle.close(Duration::from_secs(1)).await;
+                        drop(permit);
+                        if reused && !tried_fresh {
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    Ok(Err(HandshakeFailure::ProtocolError(err))) => {
+                        if reused && matches!(err, ContentError::OutOfRange { .. }) {
+                            // Keep-open pipe stays healthy after a pre-body range error.
+                            slot.content_pipes.return_idle(IdleContentPipe {
+                                stdin,
+                                reader,
+                                handle,
+                                stderr,
+                                systems_fingerprint: systems_fingerprint.to_vec(),
+                                last_used: Instant::now(),
+                            });
+                        } else {
+                            drop(stdin);
+                            drop(reader);
+                            handle.close(Duration::from_secs(1)).await;
+                        }
+                        return Err(err);
+                    }
+                    Err(_) => {
+                        drop(stdin);
+                        drop(reader);
+                        handle.close(Duration::from_secs(1)).await;
+                        return Err(ContentError::Error(
+                            ErrorBody::new(
+                                ErrorCode::Timeout,
+                                format!("Timed out waiting for {machine} to answer stream get."),
+                            )
+                            .with_machine(machine),
+                        ));
+                    }
+                }
+            };
+
+            let Some(mtime) = ready.mtime else {
+                drop(stdin);
+                drop(reader);
+                handle.close(Duration::from_secs(1)).await;
+                return Err(ContentError::Error(
+                    ErrorBody::new(
+                        ErrorCode::Unsupported,
+                        format!(
+                            "{machine} answered stream get without modification time (older legion version)."
+                        ),
+                    )
+                    .with_hint(
+                        "Update legion on that machine so it supports random-access content reads.",
+                    )
+                    .with_machine(machine),
+                ));
+            };
+
+            if let Err(err) = validate_remote_get_ready(machine, offset, length, &ready) {
+                drop(stdin);
+                drop(reader);
+                handle.close(Duration::from_secs(1)).await;
+                return Err(ContentError::Error(err));
+            }
+
+            let keep_open = ready.keep_open == Some(true);
+            return Ok(OpenedRemoteWindow {
+                ready,
+                mtime,
+                keep_open,
+                pipe: ActiveRemotePipe {
+                    stdin,
+                    reader,
+                    handle,
+                    stderr,
+                    systems_fingerprint: systems_fingerprint.to_vec(),
+                    _permit: permit,
+                },
+            });
+        }
+    }
+}
+
+fn validate_remote_get_ready(
+    machine: &str,
+    req_offset: u64,
+    req_length: Option<u64>,
+    ready: &crate::stream::GetReady,
+) -> Result<(), ErrorBody> {
+    if ready.offset != req_offset || ready.offset > ready.size {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{machine} answered stream get with an invalid offset."),
+        )
+        .with_machine(machine));
+    }
+    let available = ready.size - ready.offset;
+    let expected_len = req_length.map_or(available, |n| n.min(available));
+    if ready.length != expected_len {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{machine} answered stream get with an unexpected byte length."),
+        )
+        .with_machine(machine));
+    }
+    if ready.length > 0 {
+        let valid_end = ready
+            .offset
+            .checked_add(ready.length)
+            .and_then(|s| s.checked_sub(1))
+            .is_some_and(|end| end < ready.size);
+        if !valid_end {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{machine} answered stream get with an overflowing byte range."),
+            )
+            .with_machine(machine));
+        }
+    }
+    Ok(())
+}
+
+fn is_done_frame(line: &[u8]) -> bool {
+    let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(line) else {
+        return false;
+    };
+    map.len() == 1 && map.get("done") == Some(&Value::Bool(true))
 }
 
 impl Fleet {
@@ -2564,6 +4016,434 @@ device = \"{pad_id}\"
             "tombstone-only devices.toml must pass expiring-credential forward guard: {err_tomb:?}"
         );
 
+        fleet.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_content_rejects_lying_peer_and_queues_concurrent_streams_under_cap() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+
+        // 1. Misbehaving remote script that responds to `stream` with invalid length, wrong
+        //    offset, or extra bytes past declared length depending on requested path.
+        let lying_script = dir.path().join("lying-stream.sh");
+        std::fs::write(
+            &lying_script,
+            r#"#!/bin/sh
+if [ "$1" != "stream" ]; then
+  exit 1
+fi
+printf '{"protocol":1}\n'
+IFS= read -r req || exit 0
+case "$req" in
+  *wrong_offset*)
+    printf '{"size":100,"offset":5,"length":10,"mtime":{"secs":1700000000,"nanos":0},"keep_open":false}\n'
+    printf '0123456789'
+    ;;
+  *wrong_length*)
+    printf '{"size":100,"offset":0,"length":50,"mtime":{"secs":1700000000,"nanos":0},"keep_open":false}\n'
+    printf '0123456789'
+    ;;
+  *overflow*)
+    printf '{"size":18446744073709551615,"offset":10,"length":18446744073709551615,"mtime":{"secs":1700000000,"nanos":0},"keep_open":false}\n'
+    ;;
+  *extra_bytes*)
+    printf '{"size":10,"offset":0,"length":5,"mtime":{"secs":1700000000,"nanos":0},"keep_open":false}\n'
+    printf 'helloEXTRA_UNEXPECTED'
+    ;;
+  *bad_done*)
+    printf '{"size":10,"offset":0,"length":5,"mtime":{"secs":1700000000,"nanos":0},"keep_open":true}\n'
+    printf 'helloEXTRA_NOT_DONE\n'
+    ;;
+  *short_eof*)
+    printf '{"size":10,"offset":0,"length":10,"mtime":{"secs":1700000000,"nanos":0},"keep_open":true}\n'
+    printf '12345'
+    ;;
+  *)
+    printf '{"size":10,"offset":0,"length":10,"mtime":{"secs":1700000000,"nanos":0},"keep_open":true}\n'
+    printf '0123456789{"done":true}\n'
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        // 2. Slow-open remote script that records concurrent active processes in a counter file
+        //    so 12 concurrent opens queue cleanly under MAX_CONTENT_PIPES_PER_TARGET (8).
+        let active_dir = dir.path().join("active-streams");
+        std::fs::create_dir_all(&active_dir).unwrap();
+        let max_file = dir.path().join("max-concurrent.txt");
+        let capped_script = dir.path().join("capped-stream.sh");
+        std::fs::write(
+            &capped_script,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" != "stream" ]; then
+  exit 1
+fi
+marker="{active}/$$"
+: > "$marker"
+count=$(ls -1 "{active}" | wc -l)
+printf '%s\n' "$count" >> "{max}"
+printf '{{"protocol":1}}\n'
+IFS= read -r _req || true
+sleep 0.15
+printf '{{"size":4,"offset":0,"length":4,"mtime":{{"secs":1700000000,"nanos":0}},"keep_open":false}}\n'
+printf 'OKAY'
+rm -f "$marker"
+"#,
+                active = active_dir.display(),
+                max = max_file.display(),
+            ),
+        )
+        .unwrap();
+
+        let fleet_toml = format!(
+            "[machines.liar]\ncommand = [\"/bin/sh\", {}, \"rpc\"]\n\
+             [machines.capped]\ncommand = [\"/bin/sh\", {}, \"rpc\"]\n",
+            serde_json::to_string(&lying_script.to_string_lossy().into_owned()).unwrap(),
+            serde_json::to_string(&capped_script.to_string_lossy().into_owned()).unwrap(),
+        );
+        std::fs::write(paths.config_file("fleet.toml"), fleet_toml).unwrap();
+
+        let node = Node::new(paths.clone(), legion_tools::registry());
+        let fleet = Fleet::new(&paths);
+
+        let make_req =
+            |machine: &str, path: &str, offset: u64, length: Option<u64>| ContentRequest {
+                machine: Some(machine.to_owned()),
+                path: path.to_owned(),
+                offset,
+                length,
+                principal: "owner".to_owned(),
+                holder: None,
+                door: Door::Http,
+                audit: false,
+                cancel: CancellationToken::new(),
+            };
+
+        // Wrong offset / wrong length / overflow rejected before any bytes are delivered.
+        for (path, offset, len) in [
+            ("/wrong_offset", 0u64, Some(10u64)),
+            ("/wrong_length", 0, Some(10)),
+            ("/overflow", 10, None),
+        ] {
+            let err = fleet
+                .open_content(&node, make_req("liar", path, offset, len))
+                .await
+                .err()
+                .expect("must fail");
+            match err {
+                ContentError::Error(body) => assert_eq!(body.code, ErrorCode::Failed, "{path}"),
+                other => panic!("unexpected {other:?} for {path}"),
+            }
+        }
+
+        // Extra bytes past declared length (one-shot and keep_open) fail with InvalidData and
+        // never forward any extra bytes beyond the declared 5 bytes.
+        for path in ["/extra_bytes", "/bad_done"] {
+            let mut opened = fleet
+                .open_content(&node, make_req("liar", path, 0, Some(5)))
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            let err = opened.reader.read_to_end(&mut buf).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{path}: {err}");
+            assert!(
+                buf.len() <= 5 && b"hello".starts_with(&buf),
+                "{path}: must never forward extra bytes, got {buf:?}"
+            );
+        }
+
+        // Short EOF fails with UnexpectedEof.
+        let mut short = fleet
+            .open_content(&node, make_req("liar", "/short_eof", 0, Some(10)))
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let err = short.reader.read_to_end(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+
+        // 12 concurrent streams to `capped` queue cleanly under MAX_CONTENT_PIPES_PER_TARGET (8).
+        let mut join = JoinSet::new();
+        for _ in 0..12 {
+            let fleet = fleet.clone();
+            let node = node.clone();
+            join.spawn(async move {
+                let mut opened = fleet
+                    .open_content(
+                        &node,
+                        ContentRequest {
+                            machine: Some("capped".to_owned()),
+                            path: "/ok".to_owned(),
+                            offset: 0,
+                            length: Some(4),
+                            principal: "owner".to_owned(),
+                            holder: None,
+                            door: Door::Http,
+                            audit: false,
+                            cancel: CancellationToken::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                opened.reader.read_to_end(&mut out).await.unwrap();
+                assert_eq!(out, b"OKAY");
+            });
+        }
+        while let Some(res) = join.join_next().await {
+            res.unwrap();
+        }
+        let max_seen = std::fs::read_to_string(&max_file)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.trim().parse::<usize>().ok())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_seen > 0 && max_seen <= MAX_CONTENT_PIPES_PER_TARGET,
+            "expected peak concurrency in 1..={MAX_CONTENT_PIPES_PER_TARGET}, got {max_seen}"
+        );
+
+        fleet.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_content_pipe_reaper_closes_expired_pipes_at_ttl() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+
+        let exited_marker = dir.path().join("pipe-exited.txt");
+        let script = dir.path().join("keep-open-stream.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" != "stream" ]; then
+  exit 1
+fi
+printf '{{"protocol":1}}\n'
+while IFS= read -r _req; do
+  printf '{{"size":4,"offset":0,"length":4,"mtime":{{"secs":1700000000,"nanos":0}},"keep_open":true}}\n'
+  printf 'OKAY{{"done":true}}\n'
+done
+printf 'closed\n' > "{exited}"
+"#,
+                exited = exited_marker.display()
+            ),
+        )
+        .unwrap();
+        let fleet_toml = format!(
+            "[machines.far]\ncommand = [\"/bin/sh\", {}, \"rpc\"]\n",
+            serde_json::to_string(&script.to_string_lossy().into_owned()).unwrap(),
+        );
+        std::fs::write(paths.config_file("fleet.toml"), fleet_toml).unwrap();
+
+        let node = Node::new(paths.clone(), legion_tools::registry());
+        let fleet = Fleet::with_options(
+            &paths,
+            FleetOptions {
+                idle_content_pipe_ttl: Duration::from_millis(180),
+                idle_reap_interval: Duration::from_millis(40),
+                ..FleetOptions::default()
+            },
+        );
+
+        let mut opened = fleet
+            .open_content(
+                &node,
+                ContentRequest {
+                    machine: Some("far".to_owned()),
+                    path: "/a.bin".to_owned(),
+                    offset: 0,
+                    length: Some(4),
+                    principal: "owner".to_owned(),
+                    holder: Some("tok-a:h1".to_owned()),
+                    door: Door::Http,
+                    audit: false,
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        opened.reader.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"OKAY");
+
+        // Pipe should be warm right after completion, then reaped automatically past TTL without
+        // any further request arriving.
+        assert!(!exited_marker.exists(), "pipe closed before TTL");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !exited_marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "idle content pipe was not closed by background reaper after TTL"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        fleet.close().await;
+    }
+
+    #[tokio::test]
+    async fn content_pipe_pool_enforces_fair_share_and_acquire_timeout() {
+        let pool = Arc::new(ContentPipePool::new(4, 2, Duration::from_secs(60)));
+        let cancel = CancellationToken::new();
+
+        // Holder A acquires 2 permits (half of 4) and Holder B registers as a waiter while
+        // remaining 2 permits are taken by Holder A first (all 4 occupied).
+        let a1 = pool
+            .acquire("holder-a", "pi", Duration::from_secs(1), &cancel)
+            .await
+            .unwrap();
+        let a2 = pool
+            .acquire("holder-a", "pi", Duration::from_secs(1), &cancel)
+            .await
+            .unwrap();
+        let a3 = pool
+            .acquire("holder-a", "pi", Duration::from_secs(1), &cancel)
+            .await
+            .unwrap();
+        let a4 = pool
+            .acquire("holder-a", "pi", Duration::from_secs(1), &cancel)
+            .await
+            .unwrap();
+
+        // While all 4 are held, Holder B waiting with a short timeout gets ContentError::Busy
+        // with retry_after_secs >= 1.
+        let busy = pool
+            .acquire("holder-b", "pi", Duration::from_millis(120), &cancel)
+            .await
+            .err()
+            .expect("expected busy timeout");
+        match busy {
+            ContentError::Busy {
+                retry_after_secs,
+                error,
+            } => {
+                assert!(retry_after_secs >= 1);
+                assert_eq!(error.code, ErrorCode::Busy);
+            }
+            other => panic!("expected ContentError::Busy, got {other:?}"),
+        }
+
+        // Now Holder B waits while Holder A also tries to grab a 5th permit; when one of Holder
+        // A's permits drops (leaving A with 3 >= half=2), Holder A stays blocked and Holder B
+        // wins the freed slot immediately.
+        let pool_b = Arc::clone(&pool);
+        let cancel_b = cancel.clone();
+        let b_task = tokio::spawn(async move {
+            pool_b
+                .acquire("holder-b", "pi", Duration::from_secs(2), &cancel_b)
+                .await
+        });
+        let pool_a = Arc::clone(&pool);
+        let cancel_a = cancel.clone();
+        let a_extra = tokio::spawn(async move {
+            pool_a
+                .acquire("holder-a", "pi", Duration::from_millis(200), &cancel_a)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        drop(a4);
+
+        let b_permit = b_task.await.unwrap().expect("holder B must win freed slot");
+        assert!(
+            matches!(a_extra.await.unwrap(), Err(ContentError::Busy { .. })),
+            "holder A must not exceed half capacity while holder B was waiting"
+        );
+        drop((a1, a2, a3, b_permit));
+    }
+
+    #[tokio::test]
+    async fn transfer_pipe_takes_no_content_permit_and_has_no_per_target_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+
+        #[cfg(unix)]
+        let cmd_json = r#"["/bin/sh", "-c", "exec cat", "rpc"]"#;
+        #[cfg(windows)]
+        let cmd_json = r#"["cmd", "/C", "more", "rpc"]"#;
+
+        std::fs::write(
+            paths.config_dir().join("fleet.toml"),
+            format!("[machines.pi]\ncommand = {cmd_json}\n"),
+        )
+        .unwrap();
+
+        let config = ConfigStore::new(paths.config_dir());
+        let fleet = Fleet::with_options(
+            &paths,
+            FleetOptions {
+                max_content_pipes_per_target: 4,
+                max_idle_content_pipes: 2,
+                idle_content_pipe_ttl: Duration::from_secs(60),
+                idle_reap_interval: Duration::from_secs(60),
+                content_pipe_acquire_timeout: Duration::from_millis(100),
+            },
+        );
+        let cancel = CancellationToken::new();
+
+        // Exhaust every content pipe permit on `pi`.
+        let slot = fleet.slot("pi");
+        let mut content_permits = Vec::new();
+        for _ in 0..4 {
+            content_permits.push(
+                slot.content_pipes
+                    .acquire("holder-a", "pi", Duration::from_secs(1), &cancel)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            slot.content_pipes
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .active_total,
+            4
+        );
+
+        // Opening 16 concurrent transfer stream pipes on `pi` succeeds immediately without taking
+        // any content permit or hitting any per-target transfer cap.
+        let mut pipes = Vec::new();
+        for _ in 0..16 {
+            let pipe = tokio::time::timeout(
+                Duration::from_secs(5),
+                fleet.open_pipe_for(&config, "tower", "pi", Subcommand::Stream, cancel.clone()),
+            )
+            .await
+            .expect("transfer pipe open must not block on content pool or per-target cap")
+            .unwrap();
+            pipes.push(pipe);
+        }
+        assert_eq!(
+            slot.content_pipes
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .active_total,
+            4,
+            "transfer pipes must not acquire content pool permits"
+        );
+
+        for pipe in pipes {
+            pipe.close(Duration::from_millis(50)).await;
+        }
+        drop(content_permits);
         fleet.close().await;
     }
 }

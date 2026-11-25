@@ -298,17 +298,21 @@ async fn serve_stream(
 ) -> ExitCode {
     let host = Host::new(node.paths().clone(), node.name());
     let revoke_abort = CancellationToken::new();
-    let revoke_for_server = revoke_abort.clone();
+    let stream_options = legion_net::stream::StreamServeOptions {
+        pairing_id,
+        abort_on_revoke: Some(revoke_abort.clone()),
+        shutdown: Some(shutdown.clone()),
+        ..legion_net::stream::StreamServeOptions::default()
+    };
     let mut served = tokio::task::spawn_blocking(move || {
-        legion_net::stream::serve_with_cancel(
+        legion_net::stream::serve_with_options(
             &host,
             pinned.as_deref(),
             door,
             device.as_deref(),
-            pairing_id.as_deref(),
-            Some(revoke_for_server),
+            stream_options,
             io::stdin(),
-            io::stdout(),
+            io::stdout().lock(),
         )
     });
     let outcome = tokio::select! {

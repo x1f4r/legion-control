@@ -133,6 +133,26 @@ pub(crate) fn entry_mode(_meta: &fs::Metadata) -> Option<u32> {
     None
 }
 
+/// Returns a stable 64-bit file identity derived from `(dev, ino)` on Unix so coarse-timestamp
+/// filesystems can still distinguish atomically replaced files of equal size and mtime.
+#[cfg(unix)]
+pub(crate) fn file_id(meta: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut input = [0u8; 16];
+    input[..8].copy_from_slice(&meta.dev().to_le_bytes());
+    input[8..].copy_from_slice(&meta.ino().to_le_bytes());
+    let digest = blake3::hash(&input);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest.as_bytes()[..8]);
+    Some(u64::from_le_bytes(out))
+}
+
+/// Returns `None` on non-Unix platforms without raw OS file handles.
+#[cfg(not(unix))]
+pub(crate) fn file_id(_meta: &fs::Metadata) -> Option<u64> {
+    None
+}
+
 /// Creates a brand-new file with mode `0o600` on Unix so in-flight partial data is private.
 #[cfg(unix)]
 pub(crate) fn create_new_private(path: &Path) -> io::Result<File> {

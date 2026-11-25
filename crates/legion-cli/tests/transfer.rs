@@ -154,6 +154,10 @@ fn main() -> ExitCode {
             "move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop",
             move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop,
         ),
+        (
+            "concurrent_same_machine_and_crossed_transfers_never_deadlock",
+            concurrent_same_machine_and_crossed_transfers_never_deadlock,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -5442,6 +5446,190 @@ fn move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop() {
             fs::read(dst_node.home().join("stop.bin")).unwrap(),
             sig_body,
             "destination MUST remain intact"
+        );
+    }
+}
+
+fn concurrent_same_machine_and_crossed_transfers_never_deadlock() {
+    let laptop = node("laptop");
+    let pi = node("pi");
+    let nas = node("nas");
+    fleet(
+        &laptop,
+        &[("pi", &pi, "node", vec![]), ("nas", &nas, "node", vec![])],
+    );
+
+    let run_rpc_batch = |requests: Vec<Value>| {
+        let mut child = Command::new(LEGION_BIN)
+            .arg("rpc")
+            .env("LEGION_HOME", legion_home_of(&laptop))
+            .env("HOME", laptop.home())
+            .env("USERPROFILE", laptop.home())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let mut stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "jsonrpc": "2.0",
+                "id": "hello",
+                "method": "hello",
+                "params": {"client": "test", "version": "0", "protocol": 1}
+            })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        let hello_val: Value = serde_json::from_str(&hello).unwrap();
+        assert_eq!(hello_val["id"], json!("hello"), "unexpected hello: {hello}");
+        assert_eq!(hello_val["result"]["protocol"], json!(1));
+
+        let expected = requests.len();
+        for mut req in requests {
+            req["jsonrpc"] = json!("2.0");
+            writeln!(stdin, "{req}").unwrap();
+        }
+        stdin.flush().unwrap();
+        drop(stdin);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut results = Vec::new();
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 {
+                let val: Value = serde_json::from_str(&line).unwrap();
+                if val.get("result").is_some() || val.get("error").is_some() {
+                    results.push(val);
+                }
+                line.clear();
+            }
+            let _ = tx.send(results);
+        });
+
+        let results = rx.recv_timeout(PATIENCE).unwrap_or_else(|_| {
+            let _ = child.kill();
+            panic!("concurrent fs.transfer batch of {expected} deadlocked or timed out");
+        });
+        let status = child.wait().unwrap();
+        assert!(status.success(), "legion rpc exited with {status}");
+        assert_eq!(results.len(), expected, "missing replies: {results:?}");
+        for reply in &results {
+            assert!(
+                reply.get("result").is_some(),
+                "concurrent transfer failed: {reply}"
+            );
+        }
+    };
+
+    // 1. 16 concurrent same-machine remote transfers (`pi -> pi`) sharing one Fleet.
+    let src16 = pi.home().join("src16");
+    fs::create_dir_all(&src16).unwrap();
+    let mut batch16 = Vec::new();
+    for i in 0..16usize {
+        fs::write(src16.join(format!("f{i}.bin")), format!("payload-16-{i}")).unwrap();
+        batch16.push(json!({
+            "id": format!("same16-{i}"),
+            "method": "call",
+            "params": {
+                "tool": "fs.transfer",
+                "args": {
+                    "from": format!("pi:~/src16/f{i}.bin"),
+                    "to": format!("pi:~/dst16/f{i}.bin"),
+                }
+            }
+        }));
+    }
+    run_rpc_batch(batch16);
+    for i in 0..16usize {
+        assert_eq!(
+            fs::read_to_string(pi.home().join("dst16").join(format!("f{i}.bin"))).unwrap(),
+            format!("payload-16-{i}")
+        );
+    }
+
+    // 2. 64 concurrent same-machine remote transfers (`pi -> pi`) sharing one Fleet.
+    let src64 = pi.home().join("src64");
+    fs::create_dir_all(&src64).unwrap();
+    let mut batch64 = Vec::new();
+    for i in 0..64usize {
+        fs::write(src64.join(format!("f{i}.bin")), format!("payload-64-{i}")).unwrap();
+        batch64.push(json!({
+            "id": format!("same64-{i}"),
+            "method": "call",
+            "params": {
+                "tool": "fs.transfer",
+                "args": {
+                    "from": format!("pi:~/src64/f{i}.bin"),
+                    "to": format!("pi:~/dst64/f{i}.bin"),
+                }
+            }
+        }));
+    }
+    run_rpc_batch(batch64);
+    for i in 0..64usize {
+        assert_eq!(
+            fs::read_to_string(pi.home().join("dst64").join(format!("f{i}.bin"))).unwrap(),
+            format!("payload-64-{i}")
+        );
+    }
+
+    // 3. Crossed concurrent transfers between `pi` and `nas` (8 each way simultaneously).
+    let pi_cross = pi.home().join("cross-out");
+    let nas_cross = nas.home().join("cross-out");
+    fs::create_dir_all(&pi_cross).unwrap();
+    fs::create_dir_all(&nas_cross).unwrap();
+    let mut crossed = Vec::new();
+    for i in 0..8usize {
+        fs::write(pi_cross.join(format!("p{i}.bin")), format!("pi-to-nas-{i}")).unwrap();
+        fs::write(
+            nas_cross.join(format!("n{i}.bin")),
+            format!("nas-to-pi-{i}"),
+        )
+        .unwrap();
+        crossed.push(json!({
+            "id": format!("p2n-{i}"),
+            "method": "call",
+            "params": {
+                "tool": "fs.transfer",
+                "args": {
+                    "from": format!("pi:~/cross-out/p{i}.bin"),
+                    "to": format!("nas:~/cross-in/p{i}.bin"),
+                }
+            }
+        }));
+        crossed.push(json!({
+            "id": format!("n2p-{i}"),
+            "method": "call",
+            "params": {
+                "tool": "fs.transfer",
+                "args": {
+                    "from": format!("nas:~/cross-out/n{i}.bin"),
+                    "to": format!("pi:~/cross-in/n{i}.bin"),
+                }
+            }
+        }));
+    }
+    run_rpc_batch(crossed);
+    for i in 0..8usize {
+        assert_eq!(
+            fs::read_to_string(nas.home().join("cross-in").join(format!("p{i}.bin"))).unwrap(),
+            format!("pi-to-nas-{i}")
+        );
+        assert_eq!(
+            fs::read_to_string(pi.home().join("cross-in").join(format!("n{i}.bin"))).unwrap(),
+            format!("nas-to-pi-{i}")
         );
     }
 }

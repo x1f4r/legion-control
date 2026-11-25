@@ -1116,6 +1116,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "legion-content"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "blake3",
+ "bytes",
+ "getrandom 0.4.3",
+ "http",
+ "http-body",
+ "legion-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "legion-core"
 version = "0.1.0"
 dependencies = [
@@ -1146,11 +1163,13 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jiff",
+ "legion-content",
  "legion-core",
  "legion-tools",
  "rmcp",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-util",

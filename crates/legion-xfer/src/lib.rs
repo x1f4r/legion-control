@@ -27,11 +27,12 @@ pub use archive::{
 pub use error::{Error, Result};
 pub use file::{
     GetStream, IfExists, OwnedTempGuard, PART_SUFFIX, PROBE_SWEEP_AGE, PlaceOutcome, PutOutcome,
-    PutReport, PutSession, STALE_TEMP_AGE, default_xfer_state_dir, forget_probe_marker, get,
-    move_lock_state_path, numbered_candidate, open_get, part_lock_state_path, part_meta_state_path,
-    part_path, put, reclaim_stale_claim, record_probe_marker, register_owned_temp, resume_offset,
-    resume_offset_for, resume_offset_for_with_state, resume_offset_with_state,
-    sweep_abandoned_temps, sweep_stale_state, try_lock_state_file, write_partial_meta_in_state,
+    PutReport, PutSession, STALE_TEMP_AGE, StreamCheckedError, default_xfer_state_dir,
+    forget_probe_marker, get, move_lock_state_path, numbered_candidate, open_get, open_get_range,
+    part_lock_state_path, part_meta_state_path, part_path, put, reclaim_stale_claim,
+    record_probe_marker, register_owned_temp, resume_offset, resume_offset_for,
+    resume_offset_for_with_state, resume_offset_with_state, sweep_abandoned_temps,
+    sweep_stale_state, try_lock_state_file, write_partial_meta_in_state,
 };
 pub use hash::{Hash, HashingReader, HashingWriter};
 pub use manifest::{
