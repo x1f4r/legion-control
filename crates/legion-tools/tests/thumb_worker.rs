@@ -7,6 +7,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "support/audio_fixtures.rs"]
+mod audio_fixtures;
+
 use std::fs;
 use std::io::Write as _;
 use std::process::{ExitCode, Stdio};
@@ -68,6 +71,7 @@ fn main() -> ExitCode {
         test_fifo_swap_race_never_hangs_any_fs_or_xfer_tool().await;
         test_gif_many_extension_blocks_and_32_parallel_workers_stay_within_budget().await;
         test_worker_cli_rejects_absurd_args_without_allocating().await;
+        test_audio_tags_and_covers_through_real_worker_and_benchmarks().await;
     });
 
     ExitCode::SUCCESS
@@ -581,9 +585,9 @@ async fn test_honest_corpus_all_formats_extremes_sizes_and_fits() {
         .map(|(_, p)| p.to_string_lossy().into_owned())
         .collect();
 
-    // Run EVERY honest corpus file across ALL 5 sizes and BOTH fits through the real worker!
+    // Run EVERY honest corpus file across ALL sizes (including 1024) and BOTH fits through the real worker!
     let mut total_calls = 0usize;
-    for size in [96u32, 128, 256, 384, 512] {
+    for size in [96u32, 128, 256, 384, 512, 1024] {
         for fit in ["contain", "cover"] {
             let res = node
                 .call(Call::new(
@@ -624,7 +628,7 @@ async fn test_honest_corpus_all_formats_extremes_sizes_and_fits() {
         }
     }
     eprintln!(
-        "thumb_worker honest corpus passed: {} images x 10 (size, fit) combinations = {total_calls} worker decodes (0 failures)",
+        "thumb_worker honest corpus passed: {} images x 12 (size, fit) combinations = {total_calls} worker decodes (0 failures)",
         corpus.len()
     );
 }
@@ -2083,5 +2087,223 @@ async fn test_worker_cli_rejects_absurd_args_without_allocating() {
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("invalid_args"),
         "expected invalid_args error frame on stdout"
+    );
+}
+
+async fn test_audio_tags_and_covers_through_real_worker_and_benchmarks() {
+    use audio_fixtures as af;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let node = Node::new(
+        Paths::under(dir.path()).with_home(&home),
+        legion_tools::registry(),
+    );
+
+    // 1. Embedded parser-differential OOM JPEG inside an MP3: worker must tighten CappedAlloc down
+    //    to the cover's probe cap and exit 107 (enforced_by = allocator_cap), while a valid sibling
+    //    MP3 in the exact same call succeeds cleanly.
+    let small_cover = af::encode_solid_jpeg(160, 160, [210, 40, 40]);
+    let oom_mp3 = home.join("embedded_oom.mp3");
+    let good_mp3 = home.join("good_sibling.mp3");
+    fs::write(
+        &oom_mp3,
+        af::build_mp3_with_raw_cover("Bad cover", "image/jpeg", &build_parser_diff_oom_jpeg()),
+    )
+    .unwrap();
+    fs::write(
+        &good_mp3,
+        af::build_mp3_id3v23(&[("image/jpeg", 3, &small_cover)], true, false),
+    )
+    .unwrap();
+
+    let oom_res = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({
+                "paths": [oom_mp3.to_string_lossy(), good_mp3.to_string_lossy()],
+                "size": 256,
+                "fit": "cover"
+            }),
+        ))
+        .await
+        .unwrap();
+    let r_oom = &oom_res["results"][0];
+    assert_eq!(r_oom["error"]["code"], json!("failed"), "oom: {r_oom}");
+    assert_eq!(
+        r_oom["error"]["details"]["enforced_by"],
+        json!("allocator_cap"),
+        "embedded OOM cover must trip CappedAlloc after tightening: {r_oom}"
+    );
+    assert_eq!(
+        r_oom["error"]["details"]["killed_for_memory"],
+        json!(true),
+        "oom: {r_oom}"
+    );
+    assert!(
+        oom_res["results"][1].get("ok").is_some(),
+        "valid sibling MP3 must succeed: {}",
+        oom_res["results"][1]
+    );
+
+    // 2. Audio worker CLI rejects absurd arguments immediately without allocating.
+    let exe = std::env::current_exe().expect("current exe");
+    for bad_args in [
+        vec![
+            "__thumb-worker",
+            "--audio-tags",
+            "mp3",
+            "999999999999",
+            "/x.mp3",
+        ],
+        vec![
+            "__thumb-worker",
+            "--audio-cover",
+            "mp3",
+            "2048",
+            "contain",
+            "67108864",
+            "1",
+            "/x.mp3",
+        ],
+    ] {
+        let out = std::process::Command::new(&exe)
+            .args(&bad_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn audio worker");
+        assert_eq!(out.status.code(), Some(2), "{bad_args:?}");
+    }
+
+    // 3. Benchmark: `fs.tags` on 32 diverse audio paths (cold cache, real out-of-process worker).
+    let bench32_dir = tempfile::tempdir().unwrap();
+    let bench32_home = bench32_dir.path().join("home");
+    fs::create_dir_all(&bench32_home).unwrap();
+    let bench32_node = Node::new(
+        Paths::under(bench32_dir.path()).with_home(&bench32_home),
+        legion_tools::registry(),
+    );
+
+    let mut paths32 = Vec::with_capacity(32);
+    for i in 0..32usize {
+        let (ext, bytes) = match i % 8 {
+            0 => (
+                "mp3",
+                af::build_mp3_id3v23(&[("image/jpeg", 3, &small_cover)], true, false),
+            ),
+            1 => ("mp3", af::build_mp3_id3v24(Some(&small_cover))),
+            2 => ("wav", af::build_wav(true, Some(&small_cover), 4)),
+            3 => ("aiff", af::build_aiff(true, Some(&small_cover), 5)),
+            4 => (
+                "flac",
+                af::build_flac(
+                    &[("TITLE", "First song"), ("ARTIST", "Someone")],
+                    &[(3, "image/jpeg", &small_cover)],
+                    6,
+                ),
+            ),
+            5 => (
+                "ogg",
+                af::build_ogg_vorbis(
+                    &[("TITLE", "First song"), ("ARTIST", "Someone")],
+                    &[(3, "image/jpeg", &small_cover)],
+                    7,
+                ),
+            ),
+            6 => (
+                "opus",
+                af::build_ogg_opus(
+                    &[("TITLE", "First song"), ("ARTIST", "Someone")],
+                    &[(3, "image/jpeg", &small_cover)],
+                    8,
+                ),
+            ),
+            _ => (
+                "m4a",
+                af::build_mp4(true, Some((13, &small_cover)), 9, false, false),
+            ),
+        };
+        let p = bench32_home.join(format!("song_{i:02}.{ext}"));
+        fs::write(&p, bytes).unwrap();
+        paths32.push(p.to_string_lossy().into_owned());
+    }
+
+    legion_tools::fs::reset_peak_worker_rss_for_test();
+    let t_tags = Instant::now();
+    let res32 = bench32_node
+        .call(Call::new(Door::Cli, "fs.tags", json!({"paths": paths32})))
+        .await
+        .unwrap();
+    let tags_ms = t_tags.elapsed().as_secs_f64() * 1000.0;
+    let tags_peak_rss = legion_tools::fs::peak_worker_rss_for_test();
+    let arr32 = res32["results"].as_array().unwrap();
+    assert_eq!(arr32.len(), 32);
+    for (i, item) in arr32.iter().enumerate() {
+        assert!(item.get("ok").is_some(), "track {i} failed: {item}");
+        assert_eq!(item["ok"]["cover"], json!(true), "track {i}: {item}");
+    }
+    eprintln!(
+        "BENCH fs.tags 32 paths (cold, real worker): {:.1} ms | peak worker RSS = {} bytes ({:.2} MiB)",
+        tags_ms,
+        tags_peak_rss,
+        tags_peak_rss as f64 / (1024.0 * 1024.0)
+    );
+    assert!(
+        tags_peak_rss > 0 && tags_peak_rss < 128 * 1024 * 1024,
+        "unexpected peak worker RSS for fs.tags: {tags_peak_rss} bytes"
+    );
+
+    // 4. Benchmark: `fs.thumb` at size=1024 on an audio file with a real ~10 MiB embedded cover.
+    let bench10_dir = tempfile::tempdir().unwrap();
+    let bench10_home = bench10_dir.path().join("home");
+    fs::create_dir_all(&bench10_home).unwrap();
+    let bench10_node = Node::new(
+        Paths::under(bench10_dir.path()).with_home(&bench10_home),
+        legion_tools::registry(),
+    );
+    let big_cover_png = af::build_10mib_png_cover();
+    let big_cover_len = big_cover_png.len();
+    let big_mp3 = bench10_home.join("big_cover_10mib.mp3");
+    fs::write(
+        &big_mp3,
+        af::build_mp3_with_raw_cover("Large cover song", "image/png", &big_cover_png),
+    )
+    .unwrap();
+
+    legion_tools::fs::reset_peak_worker_rss_for_test();
+    let t_big = Instant::now();
+    let res_big = bench10_node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({
+                "paths": [big_mp3.to_string_lossy()],
+                "size": 1024,
+                "fit": "cover"
+            }),
+        ))
+        .await
+        .unwrap();
+    let big_ms = t_big.elapsed().as_secs_f64() * 1000.0;
+    let big_peak_rss = legion_tools::fs::peak_worker_rss_for_test();
+    let ok_big = res_big["results"][0]
+        .get("ok")
+        .unwrap_or_else(|| panic!("10 MiB embedded cover failed: {}", res_big["results"][0]));
+    assert_eq!(ok_big["width"], json!(1024));
+    assert_eq!(ok_big["height"], json!(1024));
+    eprintln!(
+        "BENCH fs.thumb 1024 cover from {:.2} MiB embedded picture (cold, real worker): {:.1} ms | peak worker RSS = {} bytes ({:.2} MiB)",
+        big_cover_len as f64 / (1024.0 * 1024.0),
+        big_ms,
+        big_peak_rss,
+        big_peak_rss as f64 / (1024.0 * 1024.0)
+    );
+    assert!(
+        big_peak_rss > 0 && big_peak_rss < 256 * 1024 * 1024,
+        "10 MiB embedded cover worker exceeded 256 MiB RSS: {big_peak_rss} bytes"
     );
 }

@@ -2,6 +2,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/audio_fixtures.rs"]
+mod audio_fixtures;
+
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -65,7 +68,7 @@ impl Fixture {
 }
 
 #[test]
-fn all_thirteen_fs_tools_are_registered_with_their_effects() {
+fn all_fourteen_fs_tools_are_registered_with_their_effects() {
     let registry = legion_tools::registry();
     let expected = [
         ("fs.copy", Effect::Write),
@@ -79,6 +82,7 @@ fn all_thirteen_fs_tools_are_registered_with_their_effects() {
         ("fs.read", Effect::Read),
         ("fs.remove", Effect::Destroy),
         ("fs.stat", Effect::Read),
+        ("fs.tags", Effect::Read),
         ("fs.thumb", Effect::Read),
         ("fs.write", Effect::Write),
     ];
@@ -2170,18 +2174,21 @@ async fn non_regular_files_are_refused_before_opening() {
         assert_eq!(err.code, ErrorCode::InvalidArgs, "{tool}: {err}");
     }
 
-    // `fs.thumb` refuses a FIFO with a per-path `invalid_args` immediately without blocking.
-    let thumb_fifo = tokio::time::timeout(
-        Duration::from_secs(2),
-        f.call("fs.thumb", json!({"paths": [f.p(&fifo)]})),
-    )
-    .await
-    .expect("fs.thumb blocked on FIFO")
-    .unwrap();
-    assert_eq!(
-        thumb_fifo["results"][0]["error"]["code"],
-        json!("invalid_args")
-    );
+    // `fs.thumb` and `fs.tags` refuse a FIFO with per-path `invalid_args` immediately without blocking.
+    for tool in ["fs.thumb", "fs.tags"] {
+        let fifo_res = tokio::time::timeout(
+            Duration::from_secs(2),
+            f.call(tool, json!({"paths": [f.p(&fifo)]})),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{tool} blocked on FIFO"))
+        .unwrap();
+        assert_eq!(
+            fifo_res["results"][0]["error"]["code"],
+            json!("invalid_args"),
+            "{tool}: {fifo_res}"
+        );
+    }
 
     // Grepping a directory containing a FIFO skips it without blocking and still matches regular files.
     let dir_grep = tokio::time::timeout(
@@ -3902,6 +3909,7 @@ paths = ["~/projects/**"]
             ("fs.copy", json!({"from": target_str, "to": f.p(&copy_dst)})),
             ("fs.find", json!({"path": target_str})),
             ("fs.grep", json!({"path": target_str, "pattern": "x"})),
+            ("fs.tags", json!({"paths": [target_str]})),
             ("fs.thumb", json!({"paths": [target_str], "size": 128})),
         ];
 
@@ -3918,10 +3926,10 @@ paths = ["~/projects/**"]
                 ("fs.stat", "dev_zero", Err(err)) => {
                     assert_eq!(err.code, ErrorCode::Denied, "{tool} {label}: {err}");
                 }
-                ("fs.thumb", _, Ok(val)) => {
+                ("fs.thumb" | "fs.tags", _, Ok(val)) => {
                     assert!(
                         val["results"][0].get("error").is_some(),
-                        "fs.thumb must report per-path error on {label}: {val}"
+                        "{tool} must report per-path error on {label}: {val}"
                     );
                 }
                 (_, _, Err(err)) => {
@@ -3970,4 +3978,683 @@ paths = ["~/projects/**"]
         rm.is_ok(),
         "fs.remove of fifo inside jail should complete: {rm:?}"
     );
+}
+
+fn decode_thumb_rgb(item: &Value) -> image::Rgb<u8> {
+    let content = item["ok"]["content"].as_str().expect("base64 content");
+    let raw = BASE64.decode(content).expect("valid base64");
+    let img = image::load_from_memory(&raw)
+        .expect("valid image")
+        .to_rgb8();
+    *img.get_pixel(img.width() / 2, img.height() / 2)
+}
+
+#[tokio::test]
+async fn tags_and_thumb_read_every_audio_format_with_and_without_tags_and_covers() {
+    use audio_fixtures as af;
+
+    let f = Fixture::new();
+    let red_jpg = af::encode_solid_jpeg(160, 160, [220, 20, 20]);
+    let blue_png = af::encode_solid_png(160, 160, [20, 40, 220]);
+    let alpha_png = af::encode_solid_rgba_png(160, 160, [40, 180, 120, 128]);
+
+    let mp3_v23 = f.work.join("v23_unsync.mp3");
+    let mp3_v22 = f.work.join("v22.mp3");
+    let mp3_v24 = f.work.join("v24_dli.mp3");
+    let mp3_v1 = f.work.join("v1_only.mp3");
+    let mp3_bare = f.work.join("bare.mp3");
+    let wav_tagged = f.work.join("tagged.wav");
+    let wav_bare = f.work.join("bare.wav");
+    let aiff_tagged = f.work.join("tagged.aiff");
+    let aif_bare = f.work.join("bare.aif");
+    let flac_tagged = f.work.join("tagged.flac");
+    let flac_bare = f.work.join("bare.flac");
+    let ogg_vorbis = f.work.join("tagged.ogg");
+    let ogg_opus = f.work.join("tagged.opus");
+    let m4a_tagged = f.work.join("tagged.m4a");
+    let m4b_tagged = f.work.join("book.m4b");
+    let mp4_audio = f.work.join("audio_only.mp4");
+
+    std::fs::write(
+        &mp3_v23,
+        af::build_mp3_id3v23(&[("image/jpeg", 3, &red_jpg)], true, true),
+    )
+    .unwrap();
+    std::fs::write(&mp3_v22, af::build_mp3_id3v22(Some(&red_jpg))).unwrap();
+    std::fs::write(&mp3_v24, af::build_mp3_id3v24(Some(&red_jpg))).unwrap();
+    std::fs::write(&mp3_v1, af::build_mp3_id3v1()).unwrap();
+    std::fs::write(&mp3_bare, af::build_mp3_no_tags()).unwrap();
+    std::fs::write(&wav_tagged, af::build_wav(true, Some(&red_jpg), 4)).unwrap();
+    std::fs::write(&wav_bare, af::build_wav(false, None, 2)).unwrap();
+    std::fs::write(&aiff_tagged, af::build_aiff(true, Some(&red_jpg), 6)).unwrap();
+    std::fs::write(&aif_bare, af::build_aiff(false, None, 3)).unwrap();
+    std::fs::write(
+        &flac_tagged,
+        af::build_flac(
+            &[
+                ("TITLE", "Flac song"),
+                ("ARTIST", "Someone"),
+                ("ALBUM", "Flac album"),
+                ("ALBUMARTIST", "Album artist"),
+                ("TRACKNUMBER", "2/9"),
+                ("DISCNUMBER", "1/2"),
+                ("DATE", "2025-02-01"),
+            ],
+            &[(3, "image/png", &alpha_png)],
+            8,
+        ),
+    )
+    .unwrap();
+    std::fs::write(&flac_bare, af::build_flac(&[], &[], 5)).unwrap();
+    std::fs::write(
+        &ogg_vorbis,
+        af::build_ogg_vorbis(
+            &[
+                ("TITLE", "Vorbis song"),
+                ("ARTIST", "Someone"),
+                ("ALBUM", "Ogg album"),
+                ("ALBUMARTIST", "Album artist"),
+                ("TRACKNUMBER", "4"),
+                ("DISCNUMBER", "1"),
+                ("DATE", "2024"),
+            ],
+            &[(3, "image/png", &blue_png)],
+            7,
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &ogg_opus,
+        af::build_ogg_opus(
+            &[
+                ("TITLE", "Opus song"),
+                ("ARTIST", "Someone"),
+                ("ALBUM", "Opus album"),
+                ("TRACKNUMBER", "5"),
+                ("DATE", "2025"),
+            ],
+            &[(3, "image/jpeg", &red_jpg)],
+            9,
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &m4a_tagged,
+        af::build_mp4(true, Some((13, &red_jpg)), 11, false, false),
+    )
+    .unwrap();
+    std::fs::write(
+        &m4b_tagged,
+        af::build_mp4(true, Some((14, &blue_png)), 12, true, false),
+    )
+    .unwrap();
+    std::fs::write(
+        &mp4_audio,
+        af::build_mp4(true, Some((13, &red_jpg)), 13, false, false),
+    )
+    .unwrap();
+
+    let all_paths = vec![
+        f.p(&mp3_v23),
+        f.p(&mp3_v22),
+        f.p(&mp3_v24),
+        f.p(&mp3_v1),
+        f.p(&mp3_bare),
+        f.p(&wav_tagged),
+        f.p(&wav_bare),
+        f.p(&aiff_tagged),
+        f.p(&aif_bare),
+        f.p(&flac_tagged),
+        f.p(&flac_bare),
+        f.p(&ogg_vorbis),
+        f.p(&ogg_opus),
+        f.p(&m4a_tagged),
+        f.p(&m4b_tagged),
+        f.p(&mp4_audio),
+    ];
+
+    let res = f
+        .call("fs.tags", json!({"paths": all_paths}))
+        .await
+        .unwrap();
+    let items = res["results"].as_array().unwrap();
+    assert_eq!(items.len(), all_paths.len());
+    for (i, item) in items.iter().enumerate() {
+        assert_eq!(item["path"], json!(all_paths[i]));
+        assert!(
+            item.get("ok").is_some(),
+            "path {} failed: {item}",
+            all_paths[i]
+        );
+    }
+
+    // ID3v2.3 with global unsync, extended header, mixed encodings, Xing duration.
+    let v23 = &items[0]["ok"];
+    assert_eq!(v23["title"], json!("First song"));
+    assert_eq!(v23["artist"], json!("Someone"));
+    assert_eq!(v23["album"], json!("First album"));
+    assert_eq!(v23["album_artist"], json!("Album artist"));
+    assert_eq!(v23["track"], json!(3));
+    assert_eq!(v23["disc"], json!(1));
+    assert_eq!(v23["year"], json!(2025));
+    assert!((v23["duration_s"].as_f64().unwrap() - 4.989).abs() < 0.1);
+    assert_eq!(v23["cover"], json!(true));
+
+    // ID3v2.2.
+    assert_eq!(items[1]["ok"]["title"], json!("Second song"));
+    assert_eq!(items[1]["ok"]["year"], json!(2022));
+    assert_eq!(items[1]["ok"]["cover"], json!(true));
+
+    // ID3v2.4 with DLI + per-frame unsync + TDRC.
+    assert_eq!(items[2]["ok"]["title"], json!("Fourth song"));
+    assert_eq!(items[2]["ok"]["year"], json!(2024));
+    assert_eq!(items[2]["ok"]["disc"], json!(2));
+    assert_eq!(items[2]["ok"]["cover"], json!(true));
+
+    // ID3v1.1.
+    assert_eq!(items[3]["ok"]["title"], json!("Old track"));
+    assert_eq!(items[3]["ok"]["artist"], json!("Someone"));
+    assert_eq!(items[3]["ok"]["album"], json!("Old album"));
+    assert_eq!(items[3]["ok"]["track"], json!(7));
+    assert_eq!(items[3]["ok"]["year"], json!(1999));
+    assert_eq!(items[3]["ok"]["cover"], json!(false));
+    assert!(items[3]["ok"].get("album_artist").is_none());
+
+    // Bare MP3: absent tag fields, positive duration_s, cover: false.
+    let bare = &items[4]["ok"];
+    assert!(bare.get("title").is_none());
+    assert!(bare.get("artist").is_none());
+    assert!(bare.get("album").is_none());
+    assert!(bare["duration_s"].as_f64().unwrap() > 0.1);
+    assert_eq!(bare["cover"], json!(false));
+
+    // WAV tagged & bare.
+    assert_eq!(items[5]["ok"]["title"], json!("Wave song"));
+    assert!((items[5]["ok"]["duration_s"].as_f64().unwrap() - 4.0).abs() < 0.05);
+    assert_eq!(items[5]["ok"]["cover"], json!(true));
+    assert!(items[6]["ok"].get("title").is_none());
+    assert!((items[6]["ok"]["duration_s"].as_f64().unwrap() - 2.0).abs() < 0.05);
+    assert_eq!(items[6]["ok"]["cover"], json!(false));
+
+    // AIFF / AIF tagged & bare.
+    assert_eq!(items[7]["ok"]["title"], json!("Aiff song"));
+    assert!((items[7]["ok"]["duration_s"].as_f64().unwrap() - 6.0).abs() < 0.05);
+    assert_eq!(items[7]["ok"]["cover"], json!(true));
+    assert!(items[8]["ok"].get("title").is_none());
+    assert!((items[8]["ok"]["duration_s"].as_f64().unwrap() - 3.0).abs() < 0.05);
+    assert_eq!(items[8]["ok"]["cover"], json!(false));
+
+    // FLAC tagged & bare.
+    assert_eq!(items[9]["ok"]["title"], json!("Flac song"));
+    assert_eq!(items[9]["ok"]["album_artist"], json!("Album artist"));
+    assert!((items[9]["ok"]["duration_s"].as_f64().unwrap() - 8.0).abs() < 0.05);
+    assert_eq!(items[9]["ok"]["cover"], json!(true));
+    assert!(items[10]["ok"].get("title").is_none());
+    assert!((items[10]["ok"]["duration_s"].as_f64().unwrap() - 5.0).abs() < 0.05);
+    assert_eq!(items[10]["ok"]["cover"], json!(false));
+
+    // Ogg Vorbis & Opus.
+    assert_eq!(items[11]["ok"]["title"], json!("Vorbis song"));
+    assert!((items[11]["ok"]["duration_s"].as_f64().unwrap() - 7.0).abs() < 0.05);
+    assert_eq!(items[11]["ok"]["cover"], json!(true));
+    assert_eq!(items[12]["ok"]["title"], json!("Opus song"));
+    assert!((items[12]["ok"]["duration_s"].as_f64().unwrap() - 9.0).abs() < 0.05);
+    assert_eq!(items[12]["ok"]["cover"], json!(true));
+
+    // M4A, M4B (mvhd v1), and audio-only MP4.
+    for (idx, expected_dur) in [(13, 11.0), (14, 12.0), (15, 13.0)] {
+        assert_eq!(items[idx]["ok"]["title"], json!("First song"));
+        assert_eq!(items[idx]["ok"]["artist"], json!("Someone"));
+        assert_eq!(items[idx]["ok"]["album_artist"], json!("Album artist"));
+        assert_eq!(items[idx]["ok"]["track"], json!(1));
+        assert_eq!(items[idx]["ok"]["disc"], json!(1));
+        assert_eq!(items[idx]["ok"]["year"], json!(2025));
+        assert!((items[idx]["ok"]["duration_s"].as_f64().unwrap() - expected_dur).abs() < 0.05);
+        assert_eq!(items[idx]["ok"]["cover"], json!(true));
+    }
+
+    // `fs.thumb` on all 16 audio files: embedded covers return thumbnails (PNG when transparent,
+    // JPEG when opaque) and files with no cover return per-path `not_found`.
+    let thumbs = f
+        .call(
+            "fs.thumb",
+            json!({"paths": all_paths, "size": 1024, "fit": "cover"}),
+        )
+        .await
+        .unwrap();
+    let titems = thumbs["results"].as_array().unwrap();
+    assert_eq!(titems.len(), all_paths.len());
+
+    // Transparent PNG cover inside FLAC preserves alpha -> image/png at 1024x1024.
+    assert_eq!(titems[9]["ok"]["mime"], json!("image/png"));
+    assert_eq!(titems[9]["ok"]["width"], json!(1024));
+    assert_eq!(titems[9]["ok"]["height"], json!(1024));
+
+    // Embedded JPEG/PNG covers across MP3 v2.3/v2.2/v2.4, WAV, AIFF, Ogg Vorbis, Opus, M4A, M4B, MP4.
+    for idx in [0, 1, 2, 5, 7, 11, 12, 13, 14, 15] {
+        assert!(
+            titems[idx].get("ok").is_some(),
+            "expected cover thumbnail for {}: {}",
+            all_paths[idx],
+            titems[idx]
+        );
+        assert_eq!(titems[idx]["ok"]["width"], json!(1024));
+        assert_eq!(titems[idx]["ok"]["height"], json!(1024));
+    }
+    // Blue PNG cover in Ogg Vorbis & M4B verifies cover color.
+    let vorbis_px = decode_thumb_rgb(&titems[11]);
+    assert!(vorbis_px.0[2] > 180 && vorbis_px.0[0] < 80, "{vorbis_px:?}");
+
+    // Files without embedded cover and without a folder cover return per-path `not_found`.
+    for idx in [3, 4, 6, 8, 10] {
+        assert_eq!(
+            titems[idx]["error"]["code"],
+            json!("not_found"),
+            "expected not_found for {}: {}",
+            all_paths[idx],
+            titems[idx]
+        );
+    }
+}
+
+#[tokio::test]
+async fn audio_cover_selection_prefers_front_then_first_then_folder_cover_with_policy_and_invalidation()
+ {
+    use audio_fixtures as af;
+
+    let f = Fixture::new();
+    let red_jpg = af::encode_solid_jpeg(160, 160, [220, 20, 20]);
+    let blue_jpg = af::encode_solid_jpeg(160, 160, [20, 30, 220]);
+    let green_jpg = af::encode_solid_jpeg(160, 160, [20, 190, 40]);
+
+    // 1. Multiple embedded pictures: back cover (type 4) first, front cover (type 3) second -> front (red) wins.
+    let multi_front = f.work.join("multi_front.mp3");
+    std::fs::write(
+        &multi_front,
+        af::build_mp3_id3v23(
+            &[
+                ("-->", 3, b"https://example.invalid/cover.jpg"),
+                ("image/jpeg", 4, &blue_jpg),
+                ("image/jpeg", 3, &red_jpg),
+            ],
+            false,
+            false,
+        ),
+    )
+    .unwrap();
+
+    // 2. Multiple non-front pictures (type 4 blue, type 6 green): first valid (blue) wins.
+    let multi_nonfront = f.work.join("multi_nonfront.mp3");
+    std::fs::write(
+        &multi_nonfront,
+        af::build_mp3_id3v23(
+            &[("image/jpeg", 4, &blue_jpg), ("image/jpeg", 6, &green_jpg)],
+            false,
+            false,
+        ),
+    )
+    .unwrap();
+
+    // 3. Only external URL `-->` picture -> ignored (treated as no embedded cover).
+    let url_only = f.work.join("url_only.mp3");
+    std::fs::write(
+        &url_only,
+        af::build_mp3_id3v23(
+            &[("-->", 3, b"https://example.invalid/cover.jpg")],
+            false,
+            false,
+        ),
+    )
+    .unwrap();
+
+    let multi_thumbs = f
+        .call(
+            "fs.thumb",
+            json!({
+                "paths": [f.p(&multi_front), f.p(&multi_nonfront), f.p(&url_only)],
+                "size": 128,
+                "fit": "cover"
+            }),
+        )
+        .await
+        .unwrap();
+    let px_front = decode_thumb_rgb(&multi_thumbs["results"][0]);
+    assert!(
+        px_front.0[0] > 180 && px_front.0[2] < 80,
+        "front cover (red) must win over earlier back cover, got {px_front:?}"
+    );
+    let px_first = decode_thumb_rgb(&multi_thumbs["results"][1]);
+    assert!(
+        px_first.0[2] > 180 && px_first.0[1] < 80,
+        "first picture (blue) must win when no front cover exists, got {px_first:?}"
+    );
+    assert_eq!(
+        multi_thumbs["results"][2]["error"]["code"],
+        json!("not_found"),
+        "external URL APIC must be ignored"
+    );
+
+    // 4. Folder cover fallback, case-insensitivity, priority order, live add/remove invalidation,
+    //    and non-regular file skipping (directory named `cover.jpg` skipped in favor of `ALBUM.PNG`).
+    let album_dir = f.work.join("album");
+    std::fs::create_dir_all(&album_dir).unwrap();
+    let song = album_dir.join("track01.flac");
+    std::fs::write(
+        &song,
+        af::build_flac(&[("TITLE", "Folder test"), ("ARTIST", "Someone")], &[], 4),
+    )
+    .unwrap();
+
+    // Initially no folder cover -> cover: false, fs.thumb -> not_found.
+    let t0 = f
+        .call("fs.tags", json!({"paths": [f.p(&song)]}))
+        .await
+        .unwrap();
+    assert_eq!(t0["results"][0]["ok"]["cover"], json!(false));
+    let th0 = f
+        .call("fs.thumb", json!({"paths": [f.p(&song)], "size": 128}))
+        .await
+        .unwrap();
+    assert_eq!(th0["results"][0]["error"]["code"], json!("not_found"));
+
+    // A directory named `cover.jpg` must be ignored; `ALBUM.PNG` (blue) is picked up immediately
+    // even though `track01.flac`'s parsed tags are already cached!
+    std::fs::create_dir_all(album_dir.join("cover.jpg")).unwrap();
+    let album_png = album_dir.join("ALBUM.PNG");
+    std::fs::write(&album_png, af::encode_solid_png(128, 128, [20, 30, 220])).unwrap();
+
+    let t1 = f
+        .call("fs.tags", json!({"paths": [f.p(&song)]}))
+        .await
+        .unwrap();
+    assert_eq!(
+        t1["results"][0]["ok"]["cover"],
+        json!(true),
+        "adding folder cover must reflect immediately even when tags are cached"
+    );
+    let th1 = f
+        .call("fs.thumb", json!({"paths": [f.p(&song)], "size": 128}))
+        .await
+        .unwrap();
+    let px_album = decode_thumb_rgb(&th1["results"][0]);
+    assert!(px_album.0[2] > 180 && px_album.0[1] < 80, "{px_album:?}");
+
+    // Adding `Folder.JPG` (green) beats `ALBUM.PNG` (priority: cover > folder > front > album).
+    let folder_jpg = album_dir.join("Folder.JPG");
+    std::fs::write(&folder_jpg, &green_jpg).unwrap();
+    let th2 = f
+        .call("fs.thumb", json!({"paths": [f.p(&song)], "size": 128}))
+        .await
+        .unwrap();
+    let px_folder = decode_thumb_rgb(&th2["results"][0]);
+    assert!(px_folder.0[1] > 150 && px_folder.0[0] < 80, "{px_folder:?}");
+
+    // Removing both folder covers immediately reverts `cover: false` and `not_found`.
+    std::fs::remove_file(&album_png).unwrap();
+    std::fs::remove_file(&folder_jpg).unwrap();
+    let t2 = f
+        .call("fs.tags", json!({"paths": [f.p(&song)]}))
+        .await
+        .unwrap();
+    assert_eq!(t2["results"][0]["ok"]["cover"], json!(false));
+    let th3 = f
+        .call("fs.thumb", json!({"paths": [f.p(&song)], "size": 128}))
+        .await
+        .unwrap();
+    assert_eq!(th3["results"][0]["error"]["code"], json!("not_found"));
+
+    // 5. Folder cover must satisfy `fs.read` policy: a symlink `cover.jpg` escaping allowed `paths`
+    //    is denied and ignored for a confined role, and a Unix FIFO named `cover.jpg` is skipped.
+    let outside = f.home.join("secret_cover.jpg");
+    std::fs::write(&outside, &red_jpg).unwrap();
+    std::fs::remove_dir(album_dir.join("cover.jpg")).unwrap();
+
+    #[cfg(unix)]
+    {
+        let escaping_cover = album_dir.join("cover.jpg");
+        std::os::unix::fs::symlink(&outside, &escaping_cover).unwrap();
+
+        let fifo_cover = album_dir.join("folder.jpg");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo_cover)
+            .status()
+            .unwrap();
+        assert!(st.success());
+
+        let policy = r#"
+[principals.listener]
+role = "music_only"
+
+[roles.music_only]
+allow = ["fs.read", "fs.tags", "fs.thumb"]
+paths = ["~/projects/album/**"]
+"#;
+        std::fs::create_dir_all(f.dir.path().join("config")).unwrap();
+        std::fs::write(f.dir.path().join("config").join("policy.toml"), policy).unwrap();
+
+        let confined_tags = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            f.call_as("listener", "fs.tags", json!({"paths": [f.p(&song)]})),
+        )
+        .await
+        .expect("fs.tags must not block on FIFO folder cover")
+        .unwrap();
+        assert_eq!(
+            confined_tags["results"][0]["ok"]["cover"],
+            json!(false),
+            "escaping symlink and FIFO folder covers must be ignored for confined caller"
+        );
+        let confined_thumb = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            f.call_as(
+                "listener",
+                "fs.thumb",
+                json!({"paths": [f.p(&song)], "size": 128}),
+            ),
+        )
+        .await
+        .expect("fs.thumb must not block on FIFO folder cover")
+        .unwrap();
+        assert_eq!(
+            confined_thumb["results"][0]["error"]["code"],
+            json!("not_found")
+        );
+
+        std::fs::remove_file(&escaping_cover).unwrap();
+        std::fs::remove_file(&fifo_cover).unwrap();
+    }
+
+    // 6. Modifying the audio file invalidates cached tags immediately.
+    std::fs::write(
+        &song,
+        af::build_flac(&[("TITLE", "Updated song"), ("ARTIST", "Someone")], &[], 10),
+    )
+    .unwrap();
+    let t_updated = f
+        .call("fs.tags", json!({"paths": [f.p(&song)]}))
+        .await
+        .unwrap();
+    assert_eq!(
+        t_updated["results"][0]["ok"]["title"],
+        json!("Updated song")
+    );
+    assert!(
+        (t_updated["results"][0]["ok"]["duration_s"]
+            .as_f64()
+            .unwrap()
+            - 10.0)
+            .abs()
+            < 0.05
+    );
+}
+
+#[tokio::test]
+async fn tags_and_audio_thumb_enforce_policy_and_handle_hostile_fixtures() {
+    use audio_fixtures as af;
+
+    let f = Fixture::new();
+    let red_jpg = af::encode_solid_jpeg(128, 128, [220, 20, 20]);
+
+    let good_mp3 = f.work.join("good.mp3");
+    std::fs::write(
+        &good_mp3,
+        af::build_mp3_id3v23(&[("image/jpeg", 3, &red_jpg)], false, false),
+    )
+    .unwrap();
+
+    // Non-audio regular file -> per-path `unsupported`.
+    let txt = f.work.join("notes.txt");
+    std::fs::write(&txt, "plain text").unwrap();
+
+    // Directory -> per-path `invalid_args`.
+    let subdir = f.work.join("subdir");
+    std::fs::create_dir_all(&subdir).unwrap();
+
+    // Oversized declared lengths (> 16 MiB) and truncated files for every format.
+    let oversized_id3 = f.work.join("oversized.mp3");
+    std::fs::write(&oversized_id3, af::build_oversized_id3v2_mp3()).unwrap();
+
+    let trunc_flac = f.work.join("trunc.flac");
+    std::fs::write(&trunc_flac, b"fLaC\x84\xFF\xFF\xFFshort").unwrap();
+
+    let trunc_wav = f.work.join("trunc.wav");
+    std::fs::write(&trunc_wav, b"RIFF\xFF\xFF\xFF\x7FWAVEID3 \xFF\xFF\xFF\x01").unwrap();
+
+    let trunc_aiff = f.work.join("trunc.aiff");
+    std::fs::write(&trunc_aiff, b"FORM\x7F\xFF\xFF\xFFAIFFID3 \x02\x00\x00\x00").unwrap();
+
+    let trunc_ogg = f.work.join("trunc.ogg");
+    std::fs::write(&trunc_ogg, b"OggS\x00\x02\x00\x00\x00").unwrap();
+
+    let trunc_m4a = f.work.join("trunc.m4a");
+    std::fs::write(
+        &trunc_m4a,
+        b"\x00\x00\x00\x01moov\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF",
+    )
+    .unwrap();
+
+    let empty_mp3 = f.work.join("empty.mp3");
+    std::fs::write(&empty_mp3, b"").unwrap();
+
+    // Hostile text: control chars, ANSI escapes, NULs, > 512 chars, whitespace+control-only artist.
+    let hostile_text = f.work.join("hostile_text.mp3");
+    std::fs::write(&hostile_text, af::build_hostile_text_mp3()).unwrap();
+
+    // Embedded PNG decompression bomb inside MP3.
+    let bomb_mp3 = f.work.join("bomb.mp3");
+    std::fs::write(
+        &bomb_mp3,
+        af::build_mp3_with_raw_cover(
+            "Bomb song",
+            "image/png",
+            &af::build_png_decompression_bomb(),
+        ),
+    )
+    .unwrap();
+
+    let batch = vec![
+        f.p(&good_mp3),
+        f.p(&txt),
+        f.p(&subdir),
+        f.p(&oversized_id3),
+        f.p(&trunc_flac),
+        f.p(&trunc_wav),
+        f.p(&trunc_aiff),
+        f.p(&trunc_ogg),
+        f.p(&trunc_m4a),
+        f.p(&empty_mp3),
+        f.p(&hostile_text),
+        f.p(&bomb_mp3),
+    ];
+
+    let res = f.call("fs.tags", json!({"paths": batch})).await.unwrap();
+    let items = res["results"].as_array().unwrap();
+    assert_eq!(items.len(), batch.len());
+
+    // Valid sibling survives the hostile batch.
+    assert_eq!(items[0]["ok"]["title"], json!("First song"));
+    assert_eq!(items[1]["error"]["code"], json!("unsupported"));
+    assert_eq!(items[2]["error"]["code"], json!("invalid_args"));
+    assert_eq!(items[3]["error"]["code"], json!("failed"));
+    for (idx, item) in items.iter().enumerate().take(10).skip(4) {
+        assert_eq!(
+            item["error"]["code"],
+            json!("failed"),
+            "truncated/empty file at {idx} must fail cleanly: {item}"
+        );
+    }
+
+    // Hostile text sanitized: control chars removed, trimmed, <= 512 chars, empty artist absent.
+    let ht = &items[10]["ok"];
+    let title = ht["title"].as_str().unwrap();
+    assert_eq!(title.chars().count(), 512);
+    assert!(!title.chars().any(|c| c.is_control()));
+    assert!(title.starts_with("[31mFirst song"));
+    assert!(
+        ht.get("artist").is_none(),
+        "control-only artist must be absent: {ht}"
+    );
+    assert_eq!(ht["album"], json!("CleanAlbum"));
+
+    // Embedded PNG bomb reports tags cleanly via `fs.tags`, and fails with `too_large` in `fs.thumb`
+    // while `good_mp3` still succeeds.
+    assert_eq!(items[11]["ok"]["title"], json!("Bomb song"));
+    let thumb_bomb = f
+        .call(
+            "fs.thumb",
+            json!({"paths": [f.p(&bomb_mp3), f.p(&good_mp3)], "size": 256}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(thumb_bomb["results"][0]["error"]["code"], json!("failed"));
+    assert_eq!(
+        thumb_bomb["results"][0]["error"]["details"]["reason"],
+        json!("too_large")
+    );
+    assert!(thumb_bomb["results"][1].get("ok").is_some());
+
+    // Role denied `fs.read` is denied `fs.tags` even when `fs.tags` is explicitly allowed.
+    let outside_mp3 = f.home.join("outside.mp3");
+    std::fs::copy(&good_mp3, &outside_mp3).unwrap();
+    let policy = r#"
+[principals.no_read]
+role = "no_read"
+
+[principals.jailed]
+role = "jailed"
+
+[roles.no_read]
+allow = ["fs.tags", "fs.list"]
+deny = ["fs.read"]
+
+[roles.jailed]
+allow = ["fs.read", "fs.tags"]
+paths = ["~/projects/**"]
+"#;
+    std::fs::create_dir_all(f.dir.path().join("config")).unwrap();
+    std::fs::write(f.dir.path().join("config").join("policy.toml"), policy).unwrap();
+
+    let denied = f
+        .call_as("no_read", "fs.tags", json!({"paths": [f.p(&good_mp3)]}))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code, ErrorCode::Denied);
+
+    let confined = f
+        .call_as(
+            "jailed",
+            "fs.tags",
+            json!({"paths": [f.p(&good_mp3), f.p(&outside_mp3)]}),
+        )
+        .await
+        .unwrap();
+    assert!(confined["results"][0].get("ok").is_some());
+    assert_eq!(confined["results"][1]["error"]["code"], json!("denied"));
+
+    // Argument validation: 0 and 33 paths rejected with `invalid_args`.
+    let too_many: Vec<String> = (0..33).map(|i| format!("~/projects/s{i}.mp3")).collect();
+    for bad in [json!({"paths": []}), json!({"paths": too_many})] {
+        let err = f.call("fs.tags", bad).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+    }
 }

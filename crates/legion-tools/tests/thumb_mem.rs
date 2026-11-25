@@ -5,6 +5,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/audio_fixtures.rs"]
+mod audio_fixtures;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -709,5 +712,130 @@ async fn benchmark_realistic_photo_timings_and_cold_32_batch() {
     eprintln!(
         "32x 12 MP cold batch       | peak={batch_peak_mib:>5.1} MiB | total={batch_ms:>6.1} ms ({:.1} ms/photo)",
         batch_ms / 32.0
+    );
+}
+
+#[tokio::test]
+async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_bounds() {
+    use audio_fixtures as af;
+
+    let _guard = MEASURE_LOCK.lock().await;
+
+    let cover = af::encode_solid_jpeg(96, 96, [200, 50, 50]);
+    let seeds: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "mp3",
+            af::build_mp3_id3v23(&[("image/jpeg", 3, &cover)], true, true),
+        ),
+        ("mp3", af::build_mp3_id3v22(Some(&cover))),
+        ("mp3", af::build_mp3_id3v24(Some(&cover))),
+        ("mp3", af::build_mp3_id3v1()),
+        ("wav", af::build_wav(true, Some(&cover), 2)),
+        ("aiff", af::build_aiff(true, Some(&cover), 2)),
+        (
+            "flac",
+            af::build_flac(&[("TITLE", "First song")], &[(3, "image/jpeg", &cover)], 3),
+        ),
+        (
+            "ogg",
+            af::build_ogg_vorbis(&[("TITLE", "First song")], &[(3, "image/jpeg", &cover)], 3),
+        ),
+        (
+            "opus",
+            af::build_ogg_opus(&[("TITLE", "First song")], &[(3, "image/jpeg", &cover)], 3),
+        ),
+        (
+            "m4a",
+            af::build_mp4(true, Some((13, &cover)), 4, false, false),
+        ),
+        (
+            "m4b",
+            af::build_mp4(true, Some((14, &cover)), 4, true, false),
+        ),
+    ];
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let node = Node::new(
+        Paths::under(dir.path()).with_home(&home),
+        legion_tools::registry(),
+    );
+
+    let mut rng = 0xA1B2_C3D4_E5F6_0708u64;
+    let mut next_u64 = || -> u64 {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+
+    let t0 = Instant::now();
+    reset_peak();
+
+    let mut cases = 0usize;
+    for (seed_idx, (ext, base)) in seeds.iter().enumerate() {
+        let mut batch = Vec::new();
+        // Deterministic truncations plus length/bit mutations.
+        for step in 0..16usize {
+            let mut mutated = base.clone();
+            match step % 4 {
+                0 => {
+                    let cut = (next_u64() as usize) % (mutated.len().max(1));
+                    mutated.truncate(cut);
+                }
+                1 => {
+                    // Corrupt declared lengths near the front with 0xFF/0x7F patterns.
+                    for _ in 0..4 {
+                        if !mutated.is_empty() {
+                            let off = (next_u64() as usize) % mutated.len().min(96);
+                            mutated[off] = if (next_u64() & 1) == 0 { 0xFF } else { 0x7F };
+                        }
+                    }
+                }
+                2 => {
+                    for _ in 0..8 {
+                        if !mutated.is_empty() {
+                            let off = (next_u64() as usize) % mutated.len();
+                            mutated[off] ^= (next_u64() & 0xFF) as u8;
+                        }
+                    }
+                }
+                _ => {
+                    let cut = (next_u64() as usize) % mutated.len().clamp(1, 128);
+                    mutated.truncate(cut);
+                    if mutated.len() >= 8 {
+                        let off = (next_u64() as usize) % (mutated.len() - 4);
+                        mutated[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+                    }
+                }
+            }
+            let p = home.join(format!("fuzz_{seed_idx}_{step}.{ext}"));
+            std::fs::write(&p, &mutated).unwrap();
+            batch.push(p.to_string_lossy().into_owned());
+            cases += 1;
+        }
+        let res = node
+            .call(Call::new(Door::Cli, "fs.tags", json!({"paths": batch})))
+            .await
+            .unwrap();
+        assert_eq!(res["results"].as_array().unwrap().len(), batch.len());
+    }
+
+    let elapsed = t0.elapsed();
+    let peak_delta = peak_delta_bytes();
+    eprintln!(
+        "audio property fuzz: {cases} mutated fixtures in {:.1} ms, peak heap delta = {:.2} MiB",
+        elapsed.as_secs_f64() * 1000.0,
+        peak_delta as f64 / (1024.0 * 1024.0)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "mutated audio property test took too long: {elapsed:?}"
+    );
+    assert!(
+        peak_delta < 32 * 1024 * 1024,
+        "mutated audio property test exceeded 32 MiB heap delta: {} bytes",
+        peak_delta
     );
 }
