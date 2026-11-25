@@ -659,6 +659,14 @@ pub struct TransferManager {
     shutdown_token: CancellationToken,
     #[allow(dead_code)]
     id_salt: AtomicU64,
+    #[cfg(test)]
+    download_pause_once: Mutex<Option<Arc<DownloadPauseGate>>>,
+}
+
+#[cfg(test)]
+struct DownloadPauseGate {
+    entered: Notify,
+    release: Notify,
 }
 
 impl TransferManager {
@@ -829,6 +837,8 @@ impl TransferManager {
             scheduler_started: AtomicBool::new(false),
             shutdown_token: CancellationToken::new(),
             id_salt: AtomicU64::new(salt),
+            #[cfg(test)]
+            download_pause_once: Mutex::new(None),
         });
 
         if changed {
@@ -2317,7 +2327,7 @@ impl TransferManager {
             let opened = if offset > 0 {
                 let probe = match target
                     .link
-                    .open_content_with_cancel(
+                    .open_content_for_transfer_with_cancel(
                         &target.link_node,
                         &initial.transfer.path,
                         0,
@@ -2374,7 +2384,7 @@ impl TransferManager {
 
                 match target
                     .link
-                    .open_content_with_cancel(
+                    .open_content_for_transfer_with_cancel(
                         &target.link_node,
                         &initial.transfer.path,
                         offset,
@@ -2398,7 +2408,7 @@ impl TransferManager {
             } else {
                 match target
                     .link
-                    .open_content_with_cancel(
+                    .open_content_for_transfer_with_cancel(
                         &target.link_node,
                         &initial.transfer.path,
                         0,
@@ -2508,6 +2518,18 @@ impl TransferManager {
                         }
                         self.update_progress(id, done, remote_size, current_rate);
                         self.maybe_broadcast_progress();
+                        #[cfg(test)]
+                        {
+                            let pause_gate = self
+                                .download_pause_once
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .take();
+                            if let Some(gate) = pause_gate {
+                                gate.entered.notify_one();
+                                gate.release.notified().await;
+                            }
+                        }
                     }
                     Err(err) => {
                         if cancel.is_cancelled() {
@@ -3631,23 +3653,32 @@ mod tests {
         stall_put: bool,
         active_streams: AtomicUsize,
         max_concurrent_observed: AtomicUsize,
+        opened_get_streams: AtomicUsize,
     }
 
     struct MockStreamOpener {
         remote: Arc<Mutex<MockRemoteState>>,
+        window_policy: Option<legion_link::content::WindowPolicy>,
     }
 
     impl StreamOpener for MockStreamOpener {
+        fn window_policy(&self) -> Option<legion_link::content::WindowPolicy> {
+            self.window_policy
+        }
+
         fn open_stream(
             &self,
             _cancel: CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>> {
             let remote = Arc::clone(&self.remote);
+            let supports_keep_open = self.window_policy.is_some();
             Box::pin(async move {
                 let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
                 let (server_in, client_out) = tokio::io::duplex(64 * 1024);
                 let stream_cancel = CancellationToken::new();
+                let stream_park = CancellationToken::new();
                 let watch_cancel = stream_cancel.clone();
+                let watch_park = stream_park.clone();
 
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(server_in);
@@ -3655,107 +3686,156 @@ mod tests {
                     if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
                         return;
                     }
-                    let req: Value = serde_json::from_str(&line).unwrap();
+                    let mut req: Value = serde_json::from_str(&line).unwrap();
                     let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
                     let op = req["op"].as_str().unwrap_or("");
                     if op == "get" {
-                        let path = req["path"].as_str().unwrap_or("").to_owned();
-                        let offset = req["offset"].as_u64().unwrap_or(0) as usize;
-                        let req_len = req
-                            .get("length")
-                            .and_then(Value::as_u64)
-                            .map(|n| n as usize);
+                        remote
+                            .lock()
+                            .unwrap()
+                            .opened_get_streams
+                            .fetch_add(1, Ordering::SeqCst);
+                        loop {
+                            let path = req["path"].as_str().unwrap_or("").to_owned();
+                            let offset = req["offset"].as_u64().unwrap_or(0) as usize;
+                            let req_len = req
+                                .get("length")
+                                .and_then(Value::as_u64)
+                                .map(|n| n as usize);
+                            let keep_open =
+                                supports_keep_open && req["keep_open"].as_bool() == Some(true);
 
-                        let (payload, delay_ms, fail_now, stall_get) = {
-                            let mut st = remote.lock().unwrap();
-                            let fail_now = if st.fail_first_gets > 0 && req_len != Some(0) {
-                                st.fail_first_gets -= 1;
-                                true
-                            } else {
-                                false
+                            let (payload, delay_ms, fail_now, stall_get) = {
+                                let mut st = remote.lock().unwrap();
+                                let fail_now = if st.fail_first_gets > 0 && req_len != Some(0) {
+                                    st.fail_first_gets -= 1;
+                                    true
+                                } else {
+                                    false
+                                };
+                                (
+                                    st.files.get(&path).cloned(),
+                                    st.per_chunk_delay_ms,
+                                    fail_now,
+                                    st.stall_get,
+                                )
                             };
-                            (
-                                st.files.get(&path).cloned(),
-                                st.per_chunk_delay_ms,
-                                fail_now,
-                                st.stall_get,
-                            )
-                        };
-                        if fail_now {
-                            let err = json!({
-                                "error": ErrorBody::new(ProtoCode::Unreachable, "temporary network drop")
-                            });
-                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
-                            return;
-                        }
-                        let Some(data) = payload else {
-                            let err = json!({
-                                "error": ErrorBody::new(ProtoCode::NotFound, "missing file")
-                            });
-                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
-                            return;
-                        };
-                        let avail = data.len().saturating_sub(offset);
-                        let len = req_len.map_or(avail, |n| n.min(avail));
-                        let ready = json!({
-                            "size": data.len(),
-                            "offset": offset,
-                            "length": len,
-                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
-                            "file_id": 11u64,
-                        });
-                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
-                        if len > 0 {
-                            let cur = remote
-                                .lock()
-                                .unwrap()
-                                .active_streams
-                                .fetch_add(1, Ordering::SeqCst)
-                                + 1;
-                            remote
-                                .lock()
-                                .unwrap()
-                                .max_concurrent_observed
-                                .fetch_max(cur, Ordering::SeqCst);
-                        }
-                        if stall_get && len > 0 {
-                            // Hold the stream open without sending bytes until cancelled or dropped.
-                            tokio::select! {
-                                () = watch_cancel.cancelled() => {}
-                                () = tokio::time::sleep(Duration::from_secs(30)) => {}
+                            if fail_now {
+                                let err = json!({
+                                    "error": ErrorBody::new(ProtoCode::Unreachable, "temporary network drop")
+                                });
+                                let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                                return;
                             }
-                            remote
-                                .lock()
-                                .unwrap()
-                                .active_streams
-                                .fetch_sub(1, Ordering::SeqCst);
-                            return;
-                        }
-                        let mut pos = offset;
-                        let end = offset + len;
-                        while pos < end {
-                            let next = (pos + 16 * 1024).min(end);
-                            if delay_ms > 0 {
+                            let Some(data) = payload else {
+                                let err = json!({
+                                    "error": ErrorBody::new(ProtoCode::NotFound, "missing file")
+                                });
+                                let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                                return;
+                            };
+                            let avail = data.len().saturating_sub(offset);
+                            let len = req_len.map_or(avail, |n| n.min(avail));
+                            let mut ready = json!({
+                                "size": data.len(),
+                                "offset": offset,
+                                "length": len,
+                                "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                                "file_id": 11u64,
+                            });
+                            if keep_open {
+                                ready["keep_open"] = Value::Bool(true);
+                            }
+                            if server_out
+                                .write_all(format!("{ready}\n").as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if len > 0 {
+                                let cur = remote
+                                    .lock()
+                                    .unwrap()
+                                    .active_streams
+                                    .fetch_add(1, Ordering::SeqCst)
+                                    + 1;
+                                remote
+                                    .lock()
+                                    .unwrap()
+                                    .max_concurrent_observed
+                                    .fetch_max(cur, Ordering::SeqCst);
+                            }
+                            if stall_get && len > 0 {
+                                // Hold the stream open without sending bytes until cancelled or dropped.
                                 tokio::select! {
-                                    biased;
-                                    () = watch_cancel.cancelled() => break,
-                                    () = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                                    () = watch_cancel.cancelled() => {}
+                                    () = watch_park.cancelled() => {}
+                                    () = tokio::time::sleep(Duration::from_secs(30)) => {}
                                 }
+                                remote
+                                    .lock()
+                                    .unwrap()
+                                    .active_streams
+                                    .fetch_sub(1, Ordering::SeqCst);
+                                return;
                             }
-                            if watch_cancel.is_cancelled() {
+                            let mut pos = offset;
+                            let end = offset + len;
+                            let mut stopped = false;
+                            while pos < end {
+                                let next = (pos + 16 * 1024).min(end);
+                                if delay_ms > 0 {
+                                    tokio::select! {
+                                        biased;
+                                        () = watch_cancel.cancelled() => { stopped = true; break; }
+                                        () = watch_park.cancelled() => { stopped = true; break; }
+                                        () = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                                    }
+                                }
+                                if watch_cancel.is_cancelled() || watch_park.is_cancelled() {
+                                    stopped = true;
+                                    break;
+                                }
+                                let write_ok = tokio::select! {
+                                    biased;
+                                    () = watch_cancel.cancelled() => false,
+                                    () = watch_park.cancelled() => false,
+                                    res = server_out.write_all(&data[pos..next]) => res.is_ok(),
+                                };
+                                if !write_ok {
+                                    stopped = true;
+                                    break;
+                                }
+                                pos = next;
+                            }
+                            if len > 0 {
+                                remote
+                                    .lock()
+                                    .unwrap()
+                                    .active_streams
+                                    .fetch_sub(1, Ordering::SeqCst);
+                            }
+                            if stopped {
+                                return;
+                            }
+                            if !keep_open {
                                 break;
                             }
-                            if server_out.write_all(&data[pos..next]).await.is_err() {
-                                break;
+                            if server_out.write_all(b"{\"done\":true}\n").await.is_err() {
+                                return;
                             }
-                            pos = next;
-                        }
-                        if len > 0 {
-                            remote
-                                .lock()
-                                .unwrap()
-                                .active_streams
-                                .fetch_sub(1, Ordering::SeqCst);
+                            line.clear();
+                            let next_read = tokio::select! {
+                                biased;
+                                () = watch_cancel.cancelled() => return,
+                                () = watch_park.cancelled() => return,
+                                res = reader.read_line(&mut line) => res,
+                            };
+                            if next_read.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            req = serde_json::from_str(&line).unwrap();
                         }
                     } else if op == "put" {
                         let path = req["path"].as_str().unwrap_or("").to_owned();
@@ -3828,7 +3908,7 @@ mod tests {
                     writer: Box::new(client_out),
                     stderr: None,
                     cancel: stream_cancel,
-                    park: None,
+                    park: Some(stream_park),
                     guard: None,
                 })
             })
@@ -3841,8 +3921,17 @@ mod tests {
 
     impl MockBackend {
         fn new(remote: Arc<Mutex<MockRemoteState>>) -> Self {
+            Self::with_options(remote, LinkOptions::default(), None)
+        }
+
+        fn with_options(
+            remote: Arc<Mutex<MockRemoteState>>,
+            link_options: LinkOptions,
+            window_policy: Option<legion_link::content::WindowPolicy>,
+        ) -> Self {
             let stream_opener: Arc<dyn StreamOpener> = Arc::new(MockStreamOpener {
                 remote: Arc::clone(&remote),
+                window_policy,
             });
             let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
                 let remote = Arc::clone(&remote);
@@ -3959,7 +4048,7 @@ mod tests {
                 ..LinkConfig::default()
             };
             Self {
-                link: Link::with_opener(cfg, LinkOptions::default(), opener),
+                link: Link::with_opener(cfg, link_options, opener),
             }
         }
     }
@@ -5850,5 +5939,124 @@ mod tests {
             assert_eq!(live.get(final_uri).unwrap(), &payload);
             mgr2.shutdown();
         }
+    }
+
+    #[tokio::test]
+    async fn download_survives_parked_stream_eviction_and_finishes_byte_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload: Vec<u8> = (0..(512 * 1024))
+            .map(|i| ((i * 37 + 11) % 251) as u8)
+            .collect();
+        let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+        remote
+            .lock()
+            .unwrap()
+            .files
+            .insert("/home/me/archive.bin".into(), payload.clone());
+
+        let mock_backend = Arc::new(MockBackend::with_options(
+            Arc::clone(&remote),
+            LinkOptions {
+                max_parked_streams: 1,
+                ..LinkOptions::default()
+            },
+            Some(legion_link::content::WindowPolicy {
+                initial_bytes: 64 * 1024,
+                max_bytes: 64 * 1024,
+            }),
+        ));
+        let backend: Arc<dyn Backend> = mock_backend.clone();
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        let mgr = TransferManager::with_options(
+            dir.path(),
+            backend,
+            platform.clone(),
+            2,
+            Duration::from_secs(5),
+        );
+
+        // Pause the download worker right after writing its first chunk so its ContentStream sits
+        // idle past the 2-second park timeout and releases its channel.
+        let gate = Arc::new(DownloadPauseGate {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        *mgr.download_pause_once.lock().unwrap() = Some(Arc::clone(&gate));
+
+        let entered = gate.entered.notified();
+        let id = mgr
+            .enqueue_download(
+                "tower".into(),
+                "/home/me/archive.bin".into(),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        entered.await;
+
+        // Wait past the 2s idle-park timeout so the download's stream parks and releases its channel.
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+        assert_eq!(
+            remote.lock().unwrap().active_streams.load(Ordering::SeqCst),
+            0,
+            "idle download stream must park and release its active channel"
+        );
+
+        // Now open and park two viewer streams on the same cap-1 Link so the second evicts the
+        // first from the link's ParkedStreamPool.
+        let mut viewer1 = mock_backend
+            .link
+            .open_content("tower", "/home/me/archive.bin", 0, None)
+            .await
+            .unwrap();
+        let mut one_byte = [0u8; 1];
+        viewer1.read_exact(&mut one_byte).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+
+        let mut viewer2 = mock_backend
+            .link
+            .open_content("tower", "/home/me/archive.bin", 0, None)
+            .await
+            .unwrap();
+        viewer2.read_exact(&mut one_byte).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+
+        // Confirm the cap-1 parked pool actually evicted viewer1 with PermissionDenied.
+        let mut drain_buf = [0u8; 64];
+        let evicted_err = viewer1
+            .read(&mut drain_buf)
+            .await
+            .expect_err("cap-1 parked pool must evict viewer1 when viewer2 parks");
+        assert_eq!(evicted_err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let opens_before_resume = remote
+            .lock()
+            .unwrap()
+            .opened_get_streams
+            .load(Ordering::SeqCst);
+
+        // Resume the paused download: because transfer downloads are exempt from the parked-stream
+        // eviction cap, the stream transparently reopens at the exact next byte offset and finishes
+        // byte-exact without error.
+        gate.release.notify_one();
+        let done = wait_for_state(&mgr, &id, |s| s == TransferState::Done).await;
+        assert!(done.error.is_none(), "unexpected error: {:?}", done.error);
+        let final_path = PathBuf::from(done.local_path.as_deref().unwrap());
+        assert_eq!(fs::read(&final_path).unwrap(), payload);
+        assert!(
+            remote
+                .lock()
+                .unwrap()
+                .opened_get_streams
+                .load(Ordering::SeqCst)
+                > opens_before_resume,
+            "parked download stream must have transparently reopened after parking"
+        );
+
+        drop(viewer2);
+        mgr.shutdown();
     }
 }

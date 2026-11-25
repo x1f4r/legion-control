@@ -2181,6 +2181,43 @@ impl Link {
         length: Option<u64>,
         cancel: CancellationToken,
     ) -> Result<ContentStream, ErrorBody> {
+        self.open_content_inner(
+            machine,
+            path,
+            offset,
+            length,
+            cancel,
+            Some(Arc::clone(&self.inner.parked_streams)),
+        )
+        .await
+    }
+
+    /// Like [`Link::open_content_with_cancel`], for background transfer-queue downloads.
+    ///
+    /// The returned stream still parks its SSH channel and trims buffers when idle, and
+    /// transparently reopens on the next read, but it is exempt from the per-link parked-stream
+    /// eviction cap so paused viewer streams cannot evict an in-progress download.
+    pub async fn open_content_for_transfer_with_cancel(
+        &self,
+        machine: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+        cancel: CancellationToken,
+    ) -> Result<ContentStream, ErrorBody> {
+        self.open_content_inner(machine, path, offset, length, cancel, None)
+            .await
+    }
+
+    async fn open_content_inner(
+        &self,
+        machine: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+        cancel: CancellationToken,
+        park_pool: Option<Arc<ParkedStreamPool>>,
+    ) -> Result<ContentStream, ErrorBody> {
         self.ensure_reaper();
         if path.is_empty() {
             return Err(
@@ -2222,7 +2259,7 @@ impl Link {
             self.inner.options.ssh_timeouts.handshake,
             cancel,
             ContentStreamOptions {
-                park_pool: Some(Arc::clone(&self.inner.parked_streams)),
+                park_pool,
                 ..ContentStreamOptions::default()
             },
         )

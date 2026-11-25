@@ -599,18 +599,27 @@ export function FilesViewer({
       return;
     }
 
-    // Second failure within 10 seconds (or no refresh capability): never loop. Probe the fresh
-    // address with HEAD so only an HTTP-reachable file reports a decode error.
+    // Second failure within 10 seconds (or no refresh capability): never loop.
+    // On the native app link, connect-src restricts fetch() to Tauri IPC so a cross-origin HEAD
+    // probe to the local content mount would always fail under CSP; contentUrl already probed the
+    // file via open_content(0, 0) over SSH/local when minting the fresh address, so a second media
+    // element error on that fresh address is a decode error rather than unreachable.
     let code = 'unreachable';
-    try {
-      const probe = await fetch(expectedUrl, { method: 'HEAD', signal });
-      if (signal?.aborted || activeFileKeyRef.current !== expectedKey) return;
-      if (probe.ok) {
+    if (link?.kind === 'app') {
+      if (mediaStateRef.current.key === expectedKey && mediaStateRef.current.isFreshAddress) {
         code = 'decode';
       }
-    } catch {
-      if (signal?.aborted || activeFileKeyRef.current !== expectedKey) return;
-      code = 'unreachable';
+    } else {
+      try {
+        const probe = await fetch(expectedUrl, { method: 'HEAD', signal });
+        if (signal?.aborted || activeFileKeyRef.current !== expectedKey) return;
+        if (probe.ok) {
+          code = 'decode';
+        }
+      } catch {
+        if (signal?.aborted || activeFileKeyRef.current !== expectedKey) return;
+        code = 'unreachable';
+      }
     }
     if (activeFileKeyRef.current !== expectedKey || activeMediaUrlRef.current !== expectedUrl) {
       return;

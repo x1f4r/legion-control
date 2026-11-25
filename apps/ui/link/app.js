@@ -1,5 +1,9 @@
 // Native app link: calls the Tauri 2 shell through window.__TAURI__.core.invoke and Channel.
 
+import { isFanOut } from '../lib/result.js';
+
+const CAPABILITY_TOOLS = new Set(['meta.version', 'meta.whoami', 'meta.tools']);
+
 function tauriCore() {
   const tauri = typeof window !== 'undefined' ? window.__TAURI__ : null;
   if (!tauri || !tauri.core || typeof tauri.core.invoke !== 'function') {
@@ -93,6 +97,7 @@ export function createAppLink() {
   const callPrefix = randomCallPrefix();
   let nextCallId = 1;
   let readySent = false;
+  let selectedNode = '';
   const iosPlatform = isIosPlatform();
   const unsupportedContentMachines = new Set();
   const contentSupportListeners = new Set();
@@ -118,6 +123,40 @@ export function createAppLink() {
       unsupportedContentMachines.add(key);
       notifyContentSupport();
     }
+  }
+
+  function clearContentUnsupported(machines) {
+    let changed = false;
+    for (const machine of machines) {
+      const key = machineKey(machine);
+      if (key && unsupportedContentMachines.delete(key)) {
+        changed = true;
+      }
+    }
+    if (changed) notifyContentSupport();
+  }
+
+  function noteCapabilityContact(tool, targetOn, result) {
+    if (!CAPABILITY_TOOLS.has(tool) || !result || typeof result !== 'object') return;
+    if (isFanOut(result)) {
+      const refreshed = [];
+      for (const [name, entry] of Object.entries(result.results || {})) {
+        if (entry && typeof entry === 'object' && entry.ok && !entry.error) {
+          refreshed.push(name);
+          if (typeof entry.ok.node === 'string') refreshed.push(entry.ok.node);
+        }
+      }
+      if (refreshed.length > 0) clearContentUnsupported(refreshed);
+      return;
+    }
+
+    const onKey = machineKey(targetOn);
+    const nodeKey = machineKey(result.node);
+    const refreshed = [];
+    if (onKey && onKey !== 'all') refreshed.push(onKey);
+    if (nodeKey) refreshed.push(nodeKey);
+    if (!onKey && selectedNode) refreshed.push(selectedNode);
+    if (refreshed.length > 0) clearContentUnsupported(refreshed);
   }
 
   function clearUnsupportedContentMachines() {
@@ -527,7 +566,12 @@ export function createAppLink() {
 
   async function tools(options = {}) {
     try {
-      return await invoke('tools', { on: options?.on ?? null });
+      const result = await invoke('tools', { on: options?.on ?? null });
+      const target = machineKey(options?.on) || selectedNode;
+      if (target && target !== 'all') {
+        clearContentUnsupported([target]);
+      }
+      return result;
     } catch (err) {
       throw normalizeError(err);
     }
@@ -575,7 +619,9 @@ export function createAppLink() {
       if (channel) {
         payload.onEvent = channel;
       }
-      return await invoke('call', payload);
+      const result = await invoke('call', payload);
+      noteCapabilityContact(tool, on, result);
+      return result;
     } catch (err) {
       throw normalizeError(err);
     } finally {
@@ -587,6 +633,7 @@ export function createAppLink() {
     try {
       const base = await rawState();
       if (!base?.ready || !Array.isArray(base.nodes) || base.nodes.length === 0) {
+        selectedNode = '';
         return base;
       }
 
@@ -594,6 +641,7 @@ export function createAppLink() {
 
       const primary = base.nodes[0];
       const targetNode = primary.node;
+      selectedNode = machineKey(targetNode);
 
       try {
         const [whoami, version] = await Promise.all([
@@ -767,6 +815,7 @@ export function createAppLink() {
   async function selectNode(node) {
     try {
       await invoke('select_node', { node });
+      selectedNode = machineKey(node);
       return await state();
     } catch (err) {
       throw normalizeError(err);
@@ -901,6 +950,7 @@ export function createAppLink() {
         path: path || '',
         download: Boolean(download),
       });
+      clearContentUnsupported([machine || selectedNode]);
       if (signal?.aborted) {
         throw {
           code: 'cancelled',

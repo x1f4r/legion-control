@@ -1207,15 +1207,26 @@ async fn collect_bounded_response(
                     out.extend_from_slice(&data);
                 }
             }
-            Err(_) => {
-                let msg = serde_json::to_vec(&ProtoErrorBody::new(
-                    ProtoErrorCode::Failed,
-                    "Content stream ended before completing.",
-                ))
-                .unwrap_or_default();
+            Err(err) => {
+                let (status, code, message) = if err.kind() == std::io::ErrorKind::PermissionDenied
+                {
+                    (
+                        StatusCode::GONE,
+                        ProtoErrorCode::NotFound,
+                        "Content stream expired or was evicted.",
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        ProtoErrorCode::Failed,
+                        "Content stream ended before completing.",
+                    )
+                };
+                let msg =
+                    serde_json::to_vec(&ProtoErrorBody::new(code, message)).unwrap_or_default();
                 let len = msg.len() as u64;
                 let mut err_resp = Response::new(msg);
-                *err_resp.status_mut() = StatusCode::BAD_GATEWAY;
+                *err_resp.status_mut() = status;
                 apply_base_security_headers(err_resp.headers_mut(), CorpPolicy::CrossOrigin);
                 err_resp
                     .headers_mut()
@@ -1279,66 +1290,113 @@ mod tests {
 
     struct MemoryFilesOpener {
         files: Arc<HashMap<String, Vec<u8>>>,
+        window_policy: Option<legion_link::content::WindowPolicy>,
     }
 
     impl StreamOpener for MemoryFilesOpener {
+        fn window_policy(&self) -> Option<legion_link::content::WindowPolicy> {
+            self.window_policy
+        }
+
         fn open_stream(
             &self,
             _cancel: CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>> {
             let files = Arc::clone(&self.files);
+            let supports_keep_open = self.window_policy.is_some();
             Box::pin(async move {
                 let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
                 let (server_in, client_out) = tokio::io::duplex(64 * 1024);
                 let cancel = CancellationToken::new();
+                let park = CancellationToken::new();
+                let watch_cancel = cancel.clone();
+                let watch_park = park.clone();
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(server_in);
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    let mut sent_protocol = false;
+                    loop {
+                        let mut line = String::new();
+                        let read_res = tokio::select! {
+                            biased;
+                            () = watch_cancel.cancelled() => return,
+                            () = watch_park.cancelled() => return,
+                            res = reader.read_line(&mut line) => res,
+                        };
+                        if read_res.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        if !sent_protocol {
+                            let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                            sent_protocol = true;
+                        }
+                        let path = req["path"].as_str().unwrap_or("");
+                        let Some(payload) = files.get(path) else {
+                            let err = json!({
+                                "error": ErrorBody::new(ProtoCode::NotFound, "file not found")
+                            });
+                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                            return;
+                        };
+                        let offset = req["offset"].as_u64().unwrap_or(0) as usize;
+                        let req_len = req
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize);
+                        if offset > payload.len() {
+                            let err = json!({
+                                "error": ErrorBody::new(ProtoCode::Conflict, "offset past end")
+                                    .with_details(json!({"actual": payload.len()}))
+                            });
+                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                            return;
+                        }
+                        let avail = payload.len() - offset;
+                        let len = req_len.map_or(avail, |n| n.min(avail));
+                        let keep_open =
+                            supports_keep_open && req["keep_open"].as_bool() == Some(true);
+                        let mut ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": len,
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": 77u64,
+                        });
+                        if keep_open {
+                            ready["keep_open"] = Value::Bool(true);
+                        }
+                        if server_out
+                            .write_all(format!("{ready}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let write_ok = tokio::select! {
+                            biased;
+                            () = watch_cancel.cancelled() => false,
+                            () = watch_park.cancelled() => false,
+                            res = server_out.write_all(&payload[offset..offset + len]) => res.is_ok(),
+                        };
+                        if !write_ok {
+                            return;
+                        }
+                        if keep_open {
+                            if server_out.write_all(b"{\"done\":true}\n").await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        let _ = server_out.shutdown().await;
                         return;
                     }
-                    let req: Value = serde_json::from_str(&line).unwrap();
-                    let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
-                    let path = req["path"].as_str().unwrap_or("");
-                    let Some(payload) = files.get(path) else {
-                        let err = json!({
-                            "error": ErrorBody::new(ProtoCode::NotFound, "file not found")
-                        });
-                        let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
-                        return;
-                    };
-                    let offset = req["offset"].as_u64().unwrap_or(0) as usize;
-                    let req_len = req
-                        .get("length")
-                        .and_then(Value::as_u64)
-                        .map(|n| n as usize);
-                    if offset > payload.len() {
-                        let err = json!({
-                            "error": ErrorBody::new(ProtoCode::Conflict, "offset past end")
-                                .with_details(json!({"actual": payload.len()}))
-                        });
-                        let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
-                        return;
-                    }
-                    let avail = payload.len() - offset;
-                    let len = req_len.map_or(avail, |n| n.min(avail));
-                    let ready = json!({
-                        "size": payload.len(),
-                        "offset": offset,
-                        "length": len,
-                        "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
-                        "file_id": 77u64,
-                    });
-                    let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
-                    let _ = server_out.write_all(&payload[offset..offset + len]).await;
-                    let _ = server_out.shutdown().await;
                 });
                 Ok(RawStream {
                     reader: Box::new(client_in),
                     writer: Box::new(client_out),
                     stderr: None,
                     cancel,
-                    park: None,
+                    park: Some(park),
                     guard: None,
                 })
             })
@@ -1353,8 +1411,17 @@ mod tests {
 
     impl MockContentBackend {
         fn new(files: HashMap<String, Vec<u8>>) -> Self {
+            Self::with_options(files, LinkOptions::default(), None)
+        }
+
+        fn with_options(
+            files: HashMap<String, Vec<u8>>,
+            link_options: LinkOptions,
+            window_policy: Option<legion_link::content::WindowPolicy>,
+        ) -> Self {
             let opener_files = Arc::new(MemoryFilesOpener {
                 files: Arc::new(files),
+                window_policy,
             });
             let session_opener: SessionOpener = Arc::new(move |entry, _, cancel| {
                 let opener_files = Arc::clone(&opener_files);
@@ -1420,7 +1487,7 @@ mod tests {
                 ..LinkConfig::default()
             };
             Self {
-                link: Link::with_opener(cfg, LinkOptions::default(), session_opener),
+                link: Link::with_opener(cfg, link_options, session_opener),
                 live: Arc::new(AtomicBool::new(true)),
                 holder: "pairing:tower:1".to_owned(),
             }
@@ -2111,5 +2178,225 @@ mod tests {
                 CONTENT_SANDBOX_CSP
             );
         }
+    }
+
+    async fn read_http_head_and_prefix(
+        stream: &mut TcpStream,
+        min_body_bytes: usize,
+    ) -> (u16, String, Vec<u8>) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "unexpected EOF before response headers");
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let body_start = split + 4;
+                if buf.len() - body_start >= min_body_bytes {
+                    let head = String::from_utf8_lossy(&buf[..split]).into_owned();
+                    let status: u16 = head
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    return (status, head, buf[body_start..].to_vec());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn evicted_parked_stream_aborts_loopback_cleanly_and_fresh_ticket_recovers() {
+        // Large enough to exceed loopback kernel TCP send/recv buffers so a paused client pauses
+        // hyper body polling and triggers ContentStream's 2-second idle park.
+        let payload: Vec<u8> = (0..(12 * 1024 * 1024))
+            .map(|i| ((i * 29 + 13) % 251) as u8)
+            .collect();
+        let mut files = HashMap::new();
+        files.insert("/home/me/movie.bin".to_owned(), payload.clone());
+
+        let backend = Arc::new(MockContentBackend::with_options(
+            files,
+            LinkOptions {
+                max_parked_streams: 1,
+                ..LinkOptions::default()
+            },
+            Some(legion_link::content::WindowPolicy {
+                initial_bytes: 256 * 1024,
+                max_bytes: 256 * 1024,
+            }),
+        ));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["tauri://localhost".to_owned()],
+        ));
+
+        let t1 = server
+            .mint_url("tower", "/home/me/movie.bin", false)
+            .await
+            .unwrap();
+        let t2 = server
+            .mint_url("tower", "/home/me/movie.bin", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let path1 = t1
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+        let path2 = t2
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+
+        // Start stream 1, read response headers + a small prefix, then pause past the 2s park timer.
+        let mut s1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s1.write_all(
+            format!("GET {path1} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let (status1, head1, mut body1) = read_http_head_and_prefix(&mut s1, 4096).await;
+        assert_eq!(status1, 200, "{head1}");
+        assert!(
+            head1
+                .to_ascii_lowercase()
+                .contains(&format!("content-length: {}", payload.len())),
+            "{head1}"
+        );
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+
+        // Start stream 2, pause past the 2s park timer so it parks and evicts stream 1 from the
+        // cap-1 ParkedStreamPool.
+        let mut s2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s2.write_all(
+            format!("GET {path2} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let (status2, head2, _body2) = read_http_head_and_prefix(&mut s2, 4096).await;
+        assert_eq!(status2, 200, "{head2}");
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+
+        // Resuming stream 1 must abort cleanly strictly before Content-Length rather than hanging
+        // or delivering corrupted bytes.
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            match s1.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body1.extend_from_slice(&chunk[..n]),
+            }
+        }
+        assert!(
+            body1.len() < payload.len(),
+            "evicted parked stream must abort before full Content-Length ({} vs {})",
+            body1.len(),
+            payload.len()
+        );
+        assert_eq!(body1, &payload[..body1.len()]);
+
+        // Minting a fresh ticket (what FilesViewer does on media error) recovers the exact tail.
+        let t3 = server
+            .mint_url("tower", "/home/me/movie.bin", false)
+            .await
+            .unwrap();
+        let path3 = t3
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+        let (status3, head3, rest) = raw_http(
+            port,
+            &format!(
+                "GET {path3} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes={}-\r\nConnection: close\r\n\r\n",
+                body1.len()
+            ),
+        )
+        .await;
+        assert_eq!(status3, 206, "{head3}");
+        body1.extend_from_slice(&rest);
+        assert_eq!(body1.len(), payload.len());
+        assert_eq!(body1, payload);
+
+        drop(s2);
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn custom_scheme_maps_evicted_parked_stream_to_410_gone() {
+        struct FailAfterPrefix {
+            prefix: Option<Vec<u8>>,
+            kind: std::io::ErrorKind,
+        }
+
+        impl tokio::io::AsyncRead for FailAfterPrefix {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if let Some(prefix) = self.prefix.take() {
+                    buf.put_slice(&prefix);
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    self.kind,
+                    "Content stream was closed while idle.",
+                )))
+            }
+        }
+
+        let budget = Arc::new(tokio::sync::Semaphore::new(64));
+        let buffered = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+
+        // 1) Evicted parked stream (PermissionDenied) -> 410 Gone with full security headers.
+        let mut ok_resp = Response::new(ContentBody::stream(
+            Box::new(FailAfterPrefix {
+                prefix: Some(b"partial".to_vec()),
+                kind: std::io::ErrorKind::PermissionDenied,
+            }),
+            1024,
+        ));
+        *ok_resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+        ok_resp
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("1024"));
+        let evicted =
+            collect_bounded_response(ok_resp, 1024 * 1024, &budget, &buffered, &peak).await;
+        assert_eq!(evicted.status(), StatusCode::GONE);
+        assert_eq!(
+            evicted.headers().get(X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            evicted.headers().get(CONTENT_SECURITY_POLICY).unwrap(),
+            CONTENT_SANDBOX_CSP
+        );
+        assert_eq!(
+            evicted.headers().get(CROSS_ORIGIN_RESOURCE_POLICY).unwrap(),
+            "cross-origin"
+        );
+
+        // 2) Non-eviction I/O error (BrokenPipe) -> 502 Bad Gateway.
+        let mut err_resp = Response::new(ContentBody::stream(
+            Box::new(FailAfterPrefix {
+                prefix: Some(b"partial".to_vec()),
+                kind: std::io::ErrorKind::BrokenPipe,
+            }),
+            1024,
+        ));
+        *err_resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+        let broken =
+            collect_bounded_response(err_resp, 1024 * 1024, &budget, &buffered, &peak).await;
+        assert_eq!(broken.status(), StatusCode::BAD_GATEWAY);
     }
 }

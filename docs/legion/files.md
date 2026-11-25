@@ -216,7 +216,9 @@ reader. On SSH connections:
   channel — closing the SSH channel, releasing its slot, and dropping its read/write buffers and
   channel queue down to at most 64 KiB of already-promised payload read-ahead. Parked streams are
   capped per `Link` (256 by default); opening or parking past the cap closes the least recently used
-  parked stream cleanly so its next read fails like an expired stream. On the next read after
+  parked stream cleanly so its next read fails like an expired stream. Native transfer-queue
+  downloads still park and trim buffers when idle, but are exempt from the parked eviction cap so
+  paused viewers cannot evict an in-progress download. On the next read after
   parking, or after any idle close (remote 120-second idle timeout or SSH session reconnect), a
   surviving stream transparently reopens at the exact next byte offset, verifying
   `(size, mtime, file_id)` (failing cleanly if the file changed on disk) with bounded consecutive

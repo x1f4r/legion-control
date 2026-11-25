@@ -499,18 +499,63 @@ test('createAppLink hides unsupported upload and openExternally methods on iOS',
   }
 });
 
-test('createAppLink advertises content support and remembers unsupported remote machines per session', async () => {
+test('createAppLink advertises content support, remembers unsupported remote machines, and forgets on capability contact', async () => {
   const prevWindow = globalThis.window;
+  let legacySupported = false;
+  let piSupported = false;
   globalThis.window = {
     __TAURI__: {
       core: {
         invoke(command, payload) {
+          if (command === 'state') {
+            return Promise.resolve({
+              ready: true,
+              nodes: [{ node: 'legacy', principal: 'phone', role: 'admin', via: 'ssh' }],
+            });
+          }
+          if (command === 'select_node') return Promise.resolve();
+          if (command === 'tools') return Promise.resolve([{ name: 'fs.list' }]);
+          if (command === 'call') {
+            if (payload.tool === 'fs.list') {
+              return Promise.resolve({ entries: [] });
+            }
+            if (payload.tool === 'meta.version' && payload.on === 'all') {
+              return Promise.resolve({
+                results: {
+                  legacy: { ok: { node: 'legacy', version: '0.2.0' } },
+                  pi: { error: { code: 'unreachable', message: 'offline' } },
+                },
+              });
+            }
+            if (payload.tool === 'meta.version') {
+              return Promise.resolve({ node: payload.on || 'legacy', version: '0.2.0' });
+            }
+            if (payload.tool === 'meta.whoami') {
+              return Promise.resolve({
+                node: payload.on || 'legacy',
+                principal: 'phone',
+                role: 'admin',
+                tools: ['fs.list'],
+              });
+            }
+            if (payload.tool === 'meta.tools') {
+              return Promise.resolve({ node: payload.on || 'legacy', tools: [] });
+            }
+            return Promise.resolve({});
+          }
           if (command === 'content_url') {
-            if (payload.machine === 'legacy') {
+            if (payload.machine === 'legacy' && !legacySupported) {
               return Promise.reject({
                 code: 'unsupported',
                 message: 'legacy answered stream get without modification time.',
                 machine: 'legacy',
+              });
+            }
+            if (payload.machine === 'pi' && !piSupported) {
+              return Promise.reject({
+                code: 'unsupported',
+                message: 'pi answered stream get without modification time.',
+                machine: 'pi',
               });
             }
             if (payload.path === '/huge.png') {
@@ -519,6 +564,13 @@ test('createAppLink advertises content support and remembers unsupported remote 
                 message: 'This file is too large to show here.',
                 machine: payload.machine,
                 details: { reason: 'too_large_for_inline' },
+              });
+            }
+            if (payload.path === '/offline.png') {
+              return Promise.reject({
+                code: 'unreachable',
+                message: 'Machine is unreachable.',
+                machine: payload.machine,
               });
             }
             return Promise.resolve({ url: 'http://127.0.0.1:42000/v1/content/tok/pic.png', expires_in: 900 });
@@ -540,12 +592,17 @@ test('createAppLink advertises content support and remembers unsupported remote 
     assert.equal(link.supportsContentFor('tower'), true);
     assert.equal(link.supportsContentFor('legacy'), true);
 
+    // Per-file size limits and transient errors must not mark a machine unsupported.
     await assert.rejects(() => link.contentUrl({ machine: 'tower', path: '/huge.png' }), {
       code: 'unsupported',
+    });
+    await assert.rejects(() => link.contentUrl({ machine: 'tower', path: '/offline.png' }), {
+      code: 'unreachable',
     });
     assert.equal(link.supportsContentFor('tower'), true);
     assert.equal(notifications, 0);
 
+    // Machine-level unsupported marks only that machine.
     await assert.rejects(() => link.contentUrl({ machine: 'legacy', path: '/a.png' }), {
       code: 'unsupported',
       machine: 'legacy',
@@ -554,9 +611,93 @@ test('createAppLink advertises content support and remembers unsupported remote 
     assert.equal(link.supportsContentFor('tower'), true);
     assert.equal(notifications, 1);
 
+    // Ordinary non-capability calls do not clear the unsupported marker.
+    await link.call('fs.list', { path: '~' }, { on: 'legacy' });
+    assert.equal(link.supportsContentFor('legacy'), false);
+    assert.equal(notifications, 1);
+
+    // Single-machine meta.version forgets unsupported for that machine only.
+    await assert.rejects(() => link.contentUrl({ machine: 'pi', path: '/b.png' }), {
+      code: 'unsupported',
+      machine: 'pi',
+    });
+    assert.equal(link.supportsContentFor('pi'), false);
+    assert.equal(notifications, 2);
+
+    await link.call('meta.version', {}, { on: 'legacy' });
+    assert.equal(link.supportsContentFor('legacy'), true);
+    assert.equal(link.supportsContentFor('pi'), false);
+    assert.equal(notifications, 3);
+
+    // Fan-out capability contact forgets only machines whose entries succeeded (not errors).
+    await assert.rejects(() => link.contentUrl({ machine: 'legacy', path: '/a.png' }), {
+      code: 'unsupported',
+    });
+    assert.equal(link.supportsContentFor('legacy'), false);
+    assert.equal(notifications, 4);
+
+    await link.call('meta.version', {}, { on: 'all' });
+    assert.equal(link.supportsContentFor('legacy'), true);
+    assert.equal(link.supportsContentFor('pi'), false);
+    assert.equal(notifications, 5);
+
+    // meta.whoami clears unsupported for that machine.
+    await link.call('meta.whoami', {}, { on: 'pi' });
+    assert.equal(link.supportsContentFor('pi'), true);
+    assert.equal(notifications, 6);
+
+    // meta.tools clears unsupported for that machine.
+    await assert.rejects(() => link.contentUrl({ machine: 'pi', path: '/b.png' }), {
+      code: 'unsupported',
+    });
+    assert.equal(link.supportsContentFor('pi'), false);
+    await link.call('meta.tools', {}, { on: 'pi' });
+    assert.equal(link.supportsContentFor('pi'), true);
+
+    // tools({ on }) clears unsupported for that machine.
+    await assert.rejects(() => link.contentUrl({ machine: 'pi', path: '/b.png' }), {
+      code: 'unsupported',
+    });
+    assert.equal(link.supportsContentFor('pi'), false);
+    await link.tools({ on: 'pi' });
+    assert.equal(link.supportsContentFor('pi'), true);
+
+    // state() refreshes meta.whoami/meta.version for the selected node and clears unsupported.
+    await assert.rejects(() => link.contentUrl({ machine: 'legacy', path: '/a.png' }), {
+      code: 'unsupported',
+    });
+    assert.equal(link.supportsContentFor('legacy'), false);
+    await link.state();
+    assert.equal(link.supportsContentFor('legacy'), true);
+
+    // Default-selected node tools() without explicit `on` also clears the selected node.
+    await assert.rejects(() => link.contentUrl({ machine: 'legacy', path: '/a.png' }), {
+      code: 'unsupported',
+    });
+    assert.equal(link.supportsContentFor('legacy'), false);
+    await link.tools();
+    assert.equal(link.supportsContentFor('legacy'), true);
+
+    // A successful contentUrl clears an earlier unsupported marker (e.g. after remote upgrade).
+    await assert.rejects(() => link.contentUrl({ machine: 'pi', path: '/b.png' }), {
+      code: 'unsupported',
+    });
+    assert.equal(link.supportsContentFor('pi'), false);
+    piSupported = true;
+    const minted = await link.contentUrl({ machine: 'pi', path: '/b.png' });
+    assert.ok(minted.url);
+    assert.equal(link.supportsContentFor('pi'), true);
+
+    // Session invalidation still clears any remaining unsupported markers.
+    legacySupported = false;
+    await assert.rejects(() => link.contentUrl({ machine: 'legacy', path: '/a.png' }), {
+      code: 'unsupported',
+    });
+    assert.equal(link.supportsContentFor('legacy'), false);
+    const beforeInvalidate = notifications;
     await link.invalidateSessions();
     assert.equal(link.supportsContentFor('legacy'), true);
-    assert.equal(notifications, 2);
+    assert.equal(notifications, beforeInvalidate + 1);
     unsub();
   } finally {
     if (prevWindow === undefined) {
