@@ -58,7 +58,8 @@ may read them; they are not secret, and the reader checks the signature itself.
 - `update.list` (read): the sets this node holds, each with channel, version, build, sequence,
   notes, artifacts, and which trusted key (if any) signed it.
 - `update.read` (read): `{channel, sequence, name, offset, length}` returns up to 1 MiB of one
-  listed file as base64, like `fs.read`. Only names listed in that set's `SHA256SUMS` exist.
+  listed file as base64, like `fs.read`. Only `SHA256SUMS`, `SHA256SUMS.sig`, and names listed in
+  that set's `SHA256SUMS` exist.
 - `update.publish` (admin): `{from}` takes a directory on this node, checks the set against the
   keys this node trusts, and stores it. Then, with the node's own authority, it tells the fleet
   machines it can reach, each of which pulls the set, checks it and stores it. A machine that was
@@ -77,7 +78,7 @@ A check asks every source it can reach and takes the newest set that passes the 
 
 | Install | How it updates |
 | --- | --- |
-| Android app (APK) | The app downloads the APK through a paired machine, checks it, and hands it to Android's package installer. Android also requires the APK to be signed with the same app key as the installed one. The first time, Android asks the person to allow Legion to install updates and to confirm; after that, on Android 12 and later, the app asks for updates without a prompt and Android applies them when it allows that. |
+| Android app (APK) | The app downloads the APK through a paired machine, checks it, and hands it to Android's package installer. Android also requires the APK to be signed with the same app key as the installed one. The first time, Android opens **Install unknown apps** once so the person allows Legion to install updates. After that, on Android 12 and later, Legion declares `UPDATE_PACKAGES_WITHOUT_USER_ACTION` and asks for `USER_ACTION_NOT_REQUIRED`, so Android applies updates without a confirmation prompt and restarts Legion onto the new version whenever no competing store holds update ownership and Android's 30-second silent-update throttle is not active; otherwise Android shows its standard "Update this app?" confirmation dialog. |
 | macOS app | Replaces its own bundle and restarts. |
 | Windows app | Runs the new installer silently and restarts. |
 | Linux app, AppImage | Replaces its own file and restarts. |
@@ -116,5 +117,7 @@ for those allowed to (`effect:admin`) and the package manager's command for pack
 machine of the fleet puts it in circulation. A stable release is the same set attached to a
 GitHub release and signed with the offline key by `scripts/sign-legion-release.mjs`.
 
-The Android version code and the desktop bundle version are derived from the sequence, so a
-platform's own downgrade protection agrees with Legion's.
+The Android version code (derived from the UTC `YYYYMMDDHHMM` sequence as Unix minutes, or small
+positive test sequences `1..=20_000_000`) and the desktop bundle versions (`<version>+<sequence>`
+on Linux, `CFBundleVersion=<sequence>` on macOS) are derived from the sequence, so a platform's own
+downgrade protection agrees with Legion's.
