@@ -13,6 +13,8 @@ use std::sync::Arc;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use tauri::Emitter;
 use tauri::WindowEvent;
 use tauri::webview::NewWindowResponse;
 use tauri::{Manager, RunEvent, Url, WebviewWindowBuilder};
@@ -129,6 +131,34 @@ fn build_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<tauri::Web
 
     #[cfg(target_os = "linux")]
     {
+        if let Ok(gtk_win) = window.gtk_window() {
+            use gtk::prelude::WidgetExt;
+            if let Some(gdk_win) = gtk_win.window()
+                && let Some(immersive) = app.try_state::<commands::DesktopImmersiveState>()
+            {
+                immersive.set_initial_observed_fullscreen(
+                    gdk_win.state().contains(gtk::gdk::WindowState::FULLSCREEN),
+                );
+            }
+            let state_app = app.clone();
+            let state_label = window.label().to_owned();
+            gtk_win.connect_window_state_event(move |_, event| {
+                let is_fs = event
+                    .new_window_state()
+                    .contains(gtk::gdk::WindowState::FULLSCREEN);
+                let changed_fs = event
+                    .changed_mask()
+                    .contains(gtk::gdk::WindowState::FULLSCREEN);
+                if let Some(immersive) = state_app.try_state::<commands::DesktopImmersiveState>()
+                    && immersive.record_window_state_fullscreen(is_fs, changed_fs)
+                    && let Some(win) = state_app.get_webview_window(&state_label)
+                {
+                    let _ = win.emit(commands::EVENT_IMMERSIVE_CHANGED, false);
+                }
+                gtk::glib::Propagation::Proceed
+            });
+        }
+
         let term_app = app.clone();
         let term_label = window.label().to_owned();
         let _ = window.with_webview(move |webview| {
@@ -283,20 +313,24 @@ pub fn run() {
         {
             let close_updater = Arc::clone(&updater);
             let close_transfers = Arc::clone(&transfers);
+            #[cfg(not(target_os = "linux"))]
             let resize_app = app.handle().clone();
+            #[cfg(not(target_os = "linux"))]
             let resize_label = window.label().to_owned();
             window.on_window_event(move |event| match event {
                 tauri::WindowEvent::CloseRequested { .. } if !close_transfers.has_active_work() => {
                     let _ = close_updater.try_spawn_desktop_close_install();
                 }
+                #[cfg(not(target_os = "linux"))]
                 tauri::WindowEvent::Resized(_) => {
                     if let Some(immersive) =
                         resize_app.try_state::<commands::DesktopImmersiveState>()
                         && immersive.is_active()
                         && let Some(win) = resize_app.get_webview_window(&resize_label)
-                        && !win.is_fullscreen().unwrap_or(true)
+                        && !commands::read_desktop_fullscreen(&win, &immersive).unwrap_or(true)
+                        && immersive.sync_external_fullscreen(false)
                     {
-                        immersive.sync_external_fullscreen(false);
+                        let _ = win.emit(commands::EVENT_IMMERSIVE_CHANGED, false);
                     }
                 }
                 _ => {}

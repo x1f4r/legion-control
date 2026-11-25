@@ -682,28 +682,50 @@ export function createAppLink() {
     };
 
     const verifyDesktopImmersive = async () => {
-      const waitTick = () => new Promise((r) => window.setTimeout(r, 150));
+      const waitTick = (ms = 150) => new Promise((r) => window.setTimeout(r, ms));
+      const waitForFullscreen = async (expected, timeoutMs = 1500) => {
+        const deadline = Date.now() + timeoutMs;
+        let last = await invoke('window_is_fullscreen');
+        while (last !== expected && Date.now() < deadline) {
+          await waitTick(40);
+          last = await invoke('window_is_fullscreen');
+        }
+        return last;
+      };
+
       const initial = await invoke('window_is_fullscreen');
       const entered = await immersive(true, { orientation: 'landscape' });
-      await waitTick();
-      const during = await invoke('window_is_fullscreen');
+      const during = await waitForFullscreen(true);
       const left = await immersive(false);
-      await waitTick();
-      const afterLeave = await invoke('window_is_fullscreen');
+      const afterLeave = await waitForFullscreen(false);
 
-      // Verify a window that was already full screen stays full screen after leaving immersive.
+      // Sequence A: WM makes window full screen -> player enters -> player exits -> window stays full screen.
       await invoke('debug_set_window_fullscreen', { fullscreen: true });
-      await waitTick();
-      const preFullscreen = await invoke('window_is_fullscreen');
-      await immersive(true, { orientation: 'landscape' });
-      await waitTick();
-      const duringPreFullscreen = await invoke('window_is_fullscreen');
-      await immersive(false);
-      await waitTick();
+      const preFullscreen = await waitForFullscreen(true);
+      const enteredPre = await immersive(true, { orientation: 'landscape' });
+      const duringPreFullscreen = await waitForFullscreen(true);
+      const leftPre = await immersive(false);
+      await waitTick(150);
       const afterPreFullscreen = await invoke('window_is_fullscreen');
       await invoke('debug_set_window_fullscreen', { fullscreen: false });
-      await waitTick();
-      const cleanedUp = await invoke('window_is_fullscreen');
+      const cleanedUp = await waitForFullscreen(false);
+
+      // Sequence B: Player enters full screen -> WM leaves full screen -> player syncs off.
+      const observedChanges = [];
+      const unsubImmersive = onImmersiveChange((active) => {
+        observedChanges.push(Boolean(active));
+      });
+      await ensureNativeImmersiveSubscription().catch(() => false);
+      const enteredSeqB = await immersive(true, { orientation: 'landscape' });
+      const duringSeqB = await waitForFullscreen(true);
+      await invoke('debug_set_window_fullscreen', { fullscreen: false });
+      const afterWmExit = await waitForFullscreen(false);
+      const notifyDeadline = Date.now() + 1500;
+      while (!observedChanges.includes(false) && Date.now() < notifyDeadline) {
+        await waitTick(40);
+      }
+      unsubImmersive();
+      const wmExitNotified = observedChanges.includes(false);
 
       const ok =
         initial === false &&
@@ -712,9 +734,15 @@ export function createAppLink() {
         left?.active === false &&
         afterLeave === false &&
         preFullscreen === true &&
+        enteredPre?.active === true &&
         duringPreFullscreen === true &&
+        leftPre?.active === false &&
         afterPreFullscreen === true &&
-        cleanedUp === false;
+        cleanedUp === false &&
+        enteredSeqB?.active === true &&
+        duringSeqB === true &&
+        afterWmExit === false &&
+        wmExitNotified === true;
       return {
         ok,
         initial,
@@ -724,6 +752,9 @@ export function createAppLink() {
         duringPreFullscreen,
         afterPreFullscreen,
         cleanedUp,
+        duringSeqB,
+        afterWmExit,
+        wmExitNotified,
       };
     };
 
@@ -1451,6 +1482,9 @@ export function createAppLink() {
 
   let desktopImmersiveActive = false;
   const immersiveListeners = new Set();
+  let nativeImmersiveUnlisten = null;
+  let nativeImmersiveReady = null;
+  let nativeImmersiveToken = null;
 
   function notifyImmersiveListeners(active) {
     for (const listener of immersiveListeners) {
@@ -1458,6 +1492,53 @@ export function createAppLink() {
         listener(Boolean(active));
       } catch {
         // Keep notifying remaining listeners.
+      }
+    }
+  }
+
+  function ensureNativeImmersiveSubscription() {
+    if (nativeImmersiveReady) return nativeImmersiveReady;
+    const ev = tauriEvent();
+    if (!ev) return Promise.resolve(false);
+    const token = {};
+    nativeImmersiveToken = token;
+    const onChanged = (event) => {
+      const next = Boolean(event?.payload);
+      if (!next && desktopImmersiveActive) {
+        desktopImmersiveActive = false;
+        notifyImmersiveListeners(false);
+      }
+    };
+    nativeImmersiveReady = Promise.resolve(ev.listen('legion://immersive-changed', onChanged))
+      .catch(() => null)
+      .then((unlisten) => {
+        if (typeof unlisten !== 'function') return false;
+        if (nativeImmersiveToken !== token || immersiveListeners.size === 0) {
+          try {
+            const res = unlisten();
+            if (res && typeof res.catch === 'function') res.catch(() => {});
+          } catch {
+            // Best-effort cleanup.
+          }
+          return false;
+        }
+        nativeImmersiveUnlisten = unlisten;
+        return true;
+      });
+    return nativeImmersiveReady;
+  }
+
+  function teardownNativeImmersiveSubscription() {
+    nativeImmersiveToken = null;
+    nativeImmersiveReady = null;
+    const unlisten = nativeImmersiveUnlisten;
+    nativeImmersiveUnlisten = null;
+    if (typeof unlisten === 'function') {
+      try {
+        const res = unlisten();
+        if (res && typeof res.catch === 'function') res.catch(() => {});
+      } catch {
+        // Best-effort cleanup.
       }
     }
   }
@@ -1532,23 +1613,30 @@ export function createAppLink() {
     immersiveListeners.add(listener);
     const isDesktop = currentImmersiveCap().mode === 'desktop';
     let onResize = null;
-    if (isDesktop && typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-      onResize = () => {
-        if (!desktopImmersiveActive) return;
-        invoke('window_is_fullscreen')
-          .then((fs) => {
-            if (desktopImmersiveActive && fs === false) {
-              desktopImmersiveActive = false;
-              invoke('window_set_immersive', { on: false }).catch(() => {});
-              notifyImmersiveListeners(false);
-            }
-          })
-          .catch(() => {});
-      };
-      window.addEventListener('resize', onResize);
+    if (isDesktop) {
+      if (tauriEvent()) {
+        ensureNativeImmersiveSubscription().catch(() => {});
+      } else if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+        onResize = () => {
+          if (!desktopImmersiveActive) return;
+          invoke('window_is_fullscreen')
+            .then((fs) => {
+              if (desktopImmersiveActive && fs === false) {
+                desktopImmersiveActive = false;
+                invoke('window_set_immersive', { on: false }).catch(() => {});
+                notifyImmersiveListeners(false);
+              }
+            })
+            .catch(() => {});
+        };
+        window.addEventListener('resize', onResize);
+      }
     }
     return () => {
       immersiveListeners.delete(listener);
+      if (immersiveListeners.size === 0) {
+        teardownNativeImmersiveSubscription();
+      }
       if (onResize && typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
         window.removeEventListener('resize', onResize);
       }

@@ -2577,6 +2577,7 @@ dependencies = [
  "flate2",
  "gethostname",
  "getrandom 0.4.3",
+ "gtk",
  "http",
  "http-body",
  "hyper",
