@@ -42,7 +42,6 @@ import {
   ROOT_SECTIONS,
   routeHref,
 } from './lib/route.js';
-import { describePowerConfirm } from './lib/schema.js';
 import {
   applySettingsToRoot,
   detectDeviceNoun,
@@ -52,13 +51,15 @@ import {
 import {
   ERROR_RETRY_INTERVAL_MS,
   PERIODIC_CHECK_INTERVAL_MS,
+  countActiveTransfers,
   isSafeForAutoInstall,
   shouldCheckOnResume,
 } from './lib/updates.js';
+import { createWakeController, setDefaultWakeController } from './lib/wake.js';
 import { createLink } from './link/index.js';
 import { ActionsView } from './views/actions.js';
 import { ActivityView } from './views/activity.js';
-import { Notice, Sheet } from './views/common.js';
+import { Notice, Sheet, WakeSheet } from './views/common.js';
 import { FilesDock, FilesView } from './views/files.js';
 import { CommandComposer } from './views/machine.js';
 import { MachinesView } from './views/machines.js';
@@ -94,6 +95,7 @@ const PASSIVE_REFRESH_TOOLS = new Set([
   'fleet.list',
   'fleet.ping',
   'sys.info',
+  'sys.procs',
   'power.status',
   'job.list',
   'meta.whoami',
@@ -322,6 +324,7 @@ function App() {
   const [whatIsNewOpen, setWhatIsNewOpen] = useState(false);
   const [startupUpdating, setStartupUpdating] = useState(false);
   const [wakeSentAt, setWakeSentAt] = useState({});
+  const [wakeUiState, setWakeUiState] = useState({ sheet: null, wakingMachines: new Set() });
   const [toast, setToast] = useState(null);
   const [deviceTransfers, setDeviceTransfers] = useState([]);
   const [filesSortPref, setFilesSortPref] = useState(() => readSortPreference(safeLocalStorage()));
@@ -351,10 +354,10 @@ function App() {
   pairingOpenRef.current = pairingOpen;
   const filesSheetRef = useRef(filesSheet);
   filesSheetRef.current = filesSheet;
+  const wakeSheetOpenRef = useRef(false);
+  wakeSheetOpenRef.current = Boolean(wakeUiState?.sheet);
   const activeTransfersCountRef = useRef(0);
-  activeTransfersCountRef.current = deviceTransfers.filter(
-    (t) => t.state === 'running' || t.state === 'queued',
-  ).length;
+  activeTransfersCountRef.current = countActiveTransfers(deviceTransfers);
 
   const nodeInfo = linkState?.nodes?.[0] || null;
   const nodeInfoRef = useRef(nodeInfo);
@@ -370,6 +373,9 @@ function App() {
     () => (nodeInfo?.whoami?.tools ? new Set(nodeInfo.whoami.tools) : null),
     [nodeInfo],
   );
+  const allowedSetRef = useRef(allowedSet);
+  allowedSetRef.current = allowedSet;
+  const wakeControllerRef = useRef(null);
 
   const deviceNoun = useMemo(
     () => detectDeviceNoun(link.kind, typeof navigator !== 'undefined' ? navigator.userAgent : '', viewportWidth),
@@ -663,6 +669,9 @@ function App() {
     function syncRoute() {
       lastHashRef.current = window.location.hash;
       const prevRoute = routeRef.current;
+      if (wakeControllerRef.current) {
+        wakeControllerRef.current.leaveScreen();
+      }
       if (prevRoute?.section === 'files' && prevRoute.view === 'folder' && !prevRoute.viewer && mainRef.current) {
         scrollByFolderRef.current.set(`${prevRoute.machine || ''}\0${prevRoute.path || '~'}`, mainRef.current.scrollTop);
       }
@@ -1056,7 +1065,10 @@ function App() {
                 userInteracted: userInteractedRef.current,
                 firstScreenShown: firstScreenShownRef.current,
                 hasOpenSheet: Boolean(
-                  confirmRequestRef.current || whatIsNewOpenRef.current || filesSheetRef.current,
+                  confirmRequestRef.current ||
+                    whatIsNewOpenRef.current ||
+                    filesSheetRef.current ||
+                    wakeSheetOpenRef.current,
                 ),
                 hasCommandDraft: Boolean(commandDraftRef.current.cmd?.trim()),
                 isRunningCommand: Boolean(commandDraftRef.current.running),
@@ -1132,7 +1144,10 @@ function App() {
             updateState: updateStateRef.current,
             trigger: 'background',
             hasOpenSheet: Boolean(
-              confirmRequestRef.current || whatIsNewOpenRef.current || filesSheetRef.current,
+              confirmRequestRef.current ||
+                whatIsNewOpenRef.current ||
+                filesSheetRef.current ||
+                wakeSheetOpenRef.current,
             ),
             hasCommandDraft: Boolean(commandDraftRef.current.cmd?.trim()),
             isRunningCommand: Boolean(commandDraftRef.current.running),
@@ -1276,48 +1291,129 @@ function App() {
     for (const [name, ts] of Object.entries(wakeSentAt)) {
       if (now - ts < WAKE_TTL_MS) out.add(name);
     }
+    if (wakeUiState?.wakingMachines) {
+      for (const name of wakeUiState.wakingMachines) out.add(name);
+    }
     return out;
-  }, [wakeSentAt]);
+  }, [wakeSentAt, wakeUiState]);
 
-  const onWakeMachine = useCallback(
-    (machine) => {
-      const args = { machine: machine.name };
-      const copy = describePowerConfirm('power.wake', machine.name, args);
-      const wakeRunner =
-        (snapshotRef.current?.machines || []).find((m) => m.reachable)?.name || nodeInfo?.node;
-      openConfirm({
-        title: copy.title,
-        summary: copy.summary,
-        targetName: machine.name,
-        args,
-        tool: 'power.wake',
-        effect: 'power',
-        confirmLabel: copy.confirmLabel,
-        canDryRun: true,
-        async onDryRun() {
-          return link.call('power.wake', { machine: machine.name, dry_run: true }, { on: wakeRunner });
-        },
-        async onConfirm() {
-          await link.call('power.wake', { machine: machine.name }, { on: wakeRunner });
-          markWakeSent(machine.name);
-          refreshFleet(nodeInfo, { forceOffline: true });
-        },
+  const handleUpdateMachineSys = useCallback((machineName, sys) => {
+    if (!machineName || !sys) return;
+    setSnapshot((prev) => {
+      if (!prev || !Array.isArray(prev.machines)) return prev;
+      let changed = false;
+      const nextMachines = prev.machines.map((m) => {
+        if (m.name !== machineName) return m;
+        changed = true;
+        return {
+          ...m,
+          reachable: true,
+          status: 'answering',
+          asking: false,
+          sys,
+        };
       });
-    },
-    [link, openConfirm, markWakeSent, refreshFleet, nodeInfo],
+      return changed ? { ...prev, machines: nextMachines } : prev;
+    });
+  }, []);
+
+  // Shared "Wake it and continue" controller (one wake and one sheet per machine).
+  const wakeController = useMemo(() => {
+    const customClock =
+      typeof window !== 'undefined' && window.__LEGION_TEST_WAKE_CLOCK__
+        ? window.__LEGION_TEST_WAKE_CLOCK__
+        : undefined;
+    const ctrl = createWakeController({
+      link,
+      clock: customClock,
+      getMachines: () => snapshotRef.current?.machines || [],
+      getLocalNode: () => nodeInfoRef.current?.node || null,
+      getAllowedSet: () => allowedSetRef.current,
+      onWakeSent(machineName) {
+        markWakeSent(machineName);
+      },
+      onWakeTimeout(machineName) {
+        setWakeSentAt((prev) => {
+          if (!prev[machineName]) return prev;
+          const next = { ...prev };
+          delete next[machineName];
+          return next;
+        });
+      },
+      async onMachineAwake(machineName) {
+        setSnapshot((prev) => {
+          if (!prev || !Array.isArray(prev.machines)) return prev;
+          return {
+            ...prev,
+            machines: prev.machines.map((m) =>
+              m.name === machineName
+                ? { ...m, reachable: true, status: 'answering', asking: false, error: null, reason: null }
+                : m,
+            ),
+          };
+        });
+        await refreshFleet(nodeInfoRef.current, { forceOffline: true });
+      },
+      onBackgroundComplete({ machine, kind }) {
+        const noun = kind === 'transfer' ? 'Transfer' : kind === 'command' ? 'Command' : 'Action';
+        showToast(`${noun} started on ${machine}.`, {
+          actionLabel: 'Activity',
+          actionHref: '#/activity',
+        });
+      },
+    });
+    return ctrl;
+  }, [link, markWakeSent, refreshFleet, showToast]);
+
+  wakeControllerRef.current = wakeController;
+
+  useEffect(() => {
+    setDefaultWakeController(wakeController);
+    setWakeUiState(wakeController.getState());
+    const unsub = wakeController.subscribe((st) => setWakeUiState(st));
+    return () => {
+      unsub();
+      wakeController.dispose();
+      setDefaultWakeController(null);
+    };
+  }, [wakeController]);
+
+  const ensureAwakeMachine = useCallback(
+    (machine, options) => wakeController.ensureAwake(machine, options),
+    [wakeController],
   );
 
   const filesActions = useMemo(
     () => ({
       pushHref(href) {
-        const cur = routeRef.current;
-        if (cur?.section === 'files' && cur.view === 'folder' && !cur.viewer && mainRef.current) {
-          scrollByFolderRef.current.set(`${cur.machine || ''}\0${cur.path || '~'}`, mainRef.current.scrollTop);
+        const pushDirect = (targetHref) => {
+          const cur = routeRef.current;
+          if (cur?.section === 'files' && cur.view === 'folder' && !cur.viewer && mainRef.current) {
+            scrollByFolderRef.current.set(`${cur.machine || ''}\0${cur.path || '~'}`, mainRef.current.scrollTop);
+          }
+          if (targetHref && targetHref !== window.location.hash) {
+            filesHistoryDepthRef.current += 1;
+            window.location.hash = targetHref;
+          }
+        };
+        if (href) {
+          const parsed = parseRoute(href);
+          if (parsed.section === 'files' && parsed.machine) {
+            const targetMachine = (snapshotRef.current?.machines || []).find(
+              (m) => m.name === parsed.machine,
+            );
+            const canWake = allowedSetRef.current ? allowedSetRef.current.has('power.wake') : false;
+            if (targetMachine && !targetMachine.reachable && targetMachine.canWake && canWake) {
+              wakeControllerRef.current?.ensureAwake(targetMachine, {
+                kind: 'files',
+                label: 'open its files',
+                onContinue: () => pushDirect(href),
+              });
+              return;
+            }
+          }
         }
-        if (href && href !== window.location.hash) {
-          filesHistoryDepthRef.current += 1;
-          window.location.hash = href;
-        }
+        pushDirect(href);
       },
       closeViewer() {
         if (filesHistoryDepthRef.current > 0) {
@@ -1487,7 +1583,9 @@ function App() {
 
   const inMachinePhone = !wide && route.section === 'machines' && Boolean(route.machine);
   const isPhoneCommand =
-    inMachinePhone && route.tab === 'command' && Boolean(selectedMachine?.reachable);
+    inMachinePhone &&
+    route.tab === 'command' &&
+    Boolean(selectedMachine?.reachable || (selectedMachine?.canWake && allowedSet?.has('power.wake')));
   const isActionsRoot =
     route.section === 'actions' && !route.action && !route.allTools;
   const hasFilesDock =
@@ -2011,6 +2109,7 @@ function App() {
                 jobId: id,
               });
             }}
+            onEnsureAwake=${ensureAwakeMachine}
           />
         </div>
       `;
@@ -2209,13 +2308,14 @@ function App() {
                           deviceNoun=${deviceNoun}
                           thumbCache=${thumbCache}
                           wakePendingSet=${wakePendingSet}
-                          onWakeMachine=${onWakeMachine}
+                          onEnsureAwake=${ensureAwakeMachine}
                           onWakeSent=${markWakeSent}
                           onRequestConfirm=${openConfirm}
                           onRefresh=${() => {
                             refreshFleet(nodeInfo, { forceOffline: true });
                             triggerLearnInBackground();
                           }}
+                          onUpdateMachineSys=${handleUpdateMachineSys}
                           commandRuns=${{ byMachine: commandRunsByMachine, draft: commandDraft }}
                           onCommandRunsChange=${commandRunsApi}
                         />
@@ -2245,7 +2345,7 @@ function App() {
                             filesActions=${filesActions}
                             wakePendingSet=${wakePendingSet}
                             onRefreshFleet=${(opts) => refreshFleet(nodeInfo, opts)}
-                            onWakeMachine=${onWakeMachine}
+                            onEnsureAwake=${ensureAwakeMachine}
                             onRequestConfirm=${openConfirm}
                             onToast=${showToast}
                           />
@@ -2279,6 +2379,7 @@ function App() {
                               wide=${wide}
                               query=${actionsQuery}
                               onWakeSent=${markWakeSent}
+                              onEnsureAwake=${ensureAwakeMachine}
                               onRequestConfirm=${openConfirm}
                               onRefreshFleet=${() => refreshFleet(nodeInfo)}
                             />
@@ -2387,6 +2488,16 @@ function App() {
               request=${confirmRequest}
               technical=${Boolean(settings.technical)}
               onClose=${closeConfirm}
+            />
+          `
+        : null}
+      ${wakeUiState?.sheet
+        ? html`
+            <${WakeSheet}
+              sheet=${wakeUiState.sheet}
+              onConfirm=${() => wakeController.confirmWake(wakeUiState.sheet.machineName)}
+              onRetry=${() => wakeController.retry(wakeUiState.sheet.machineName)}
+              onDismiss=${() => wakeController.dismiss(wakeUiState.sheet.machineName)}
             />
           `
         : null}

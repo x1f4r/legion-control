@@ -826,6 +826,10 @@ jobs:
           set -euo pipefail
           rm -rf src-tauri/gen/apple/build
           export LEGION_BUILD_SEQUENCE="$(date -u +%Y%m%d%H%M)"
+          # Xcode's build service does not forward arbitrary shell env vars to Run Script phases,
+          # so pass LEGION_BUILD_SEQUENCE via the gitignored gen/apple/.build-env read by "Build Rust Code".
+          trap 'rm -f src-tauri/gen/apple/.build-env' EXIT
+          printf 'LEGION_BUILD_SEQUENCE=%s\n' "$LEGION_BUILD_SEQUENCE" > src-tauri/gen/apple/.build-env
           cargo tauri ios build --debug --target aarch64-sim --no-sign --ci 2>&1 | tee "$RUNNER_TEMP/ios-sim-build.log"
           SIM_APP="$(find src-tauri/gen/apple/build -maxdepth 4 -name 'Legion.app' | head -n 1)"
           test -d "$SIM_APP"
@@ -1042,6 +1046,8 @@ jobs:
           set -euo pipefail
           rm -rf src-tauri/gen/apple/build
           export LEGION_BUILD_SEQUENCE="$(date -u +%Y%m%d%H%M)"
+          trap 'rm -f src-tauri/gen/apple/.build-env' EXIT
+          printf 'LEGION_BUILD_SEQUENCE=%s\n' "$LEGION_BUILD_SEQUENCE" > src-tauri/gen/apple/.build-env
           cargo tauri ios build --target aarch64 --no-sign --ci 2>&1 | tee "$RUNNER_TEMP/ios-ipa-build.log"
           IPA_COUNT="$(find src-tauri/gen/apple/build -maxdepth 4 -type f -name '*.ipa' | wc -l | tr -d '[:space:]')"
           test "$IPA_COUNT" -eq 1

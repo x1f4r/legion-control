@@ -17,6 +17,17 @@ export function shouldCheckOnResume(lastCheckedAt, nowMs = Date.now(), { phase }
 }
 
 /**
+ * Counts device transfers that represent active work blocking an app update:
+ * `queued`, `running`, and `cancelling` (still stopping workers or deleting leftover files).
+ */
+export function countActiveTransfers(transfers) {
+  if (!Array.isArray(transfers)) return 0;
+  return transfers.filter(
+    (t) => t && (t.state === 'running' || t.state === 'queued' || t.state === 'cancelling'),
+  ).length;
+}
+
+/**
  * Returns true only when it is safe to trigger an automatic update install without interrupting
  * anything the person started.
  *

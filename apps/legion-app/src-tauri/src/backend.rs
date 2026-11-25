@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use legion_link::LearnReport;
 use legion_link::proto::{ErrorBody as ProtoErrorBody, ErrorCode as ProtoErrorCode};
@@ -550,11 +551,35 @@ pub trait Backend: Send + Sync {
         Ok(None)
     }
 
-    /// Returns the count of native operations currently in flight (tool calls, pairing, unpairing,
-    /// learning, transfers, or content streams). Used by the updater to refuse automatic restarts
-    /// while native work is active.
+    /// Returns the count of user-started or state-mutating native operations currently in flight
+    /// (effectful or streaming tool calls, pairing, unpairing, learning, or identity changes).
+    ///
+    /// Passive non-streaming background refreshes (such as `sys.info` and `sys.procs` polling on
+    /// Machine Overview) are tracked separately via [`Self::background_refreshes`] so they never
+    /// permanently block automatic updates while still allowing installs to wait cleanly between
+    /// poll ticks.
     fn active_operations(&self) -> usize {
         0
+    }
+
+    /// Returns the count of passive non-streaming background refresh calls currently in flight.
+    fn background_refreshes(&self) -> usize {
+        0
+    }
+
+    /// Waits asynchronously up to `timeout` for any in-flight passive background refreshes to
+    /// finish so an install runs cleanly between poll ticks rather than cutting a call off
+    /// mid-flight. Returns `true` once zero background refreshes are in flight, or `false` on
+    /// timeout.
+    fn wait_for_background_refreshes(&self, _timeout: Duration) -> BoxFuture<'_, bool> {
+        Box::pin(async { true })
+    }
+
+    /// Synchronous counterpart to [`Self::wait_for_background_refreshes`] used by desktop
+    /// window-close and drain-exit hooks. Returns `true` once zero background refreshes are in
+    /// flight, or `false` on timeout.
+    fn wait_for_background_refreshes_sync(&self, _timeout: Duration) -> bool {
+        true
     }
 
     /// Resolves `machine` to its live [`ContentTarget`] for content serving and bulk transfers.

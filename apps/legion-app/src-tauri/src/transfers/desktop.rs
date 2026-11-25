@@ -235,7 +235,10 @@ impl TransferPlatform for DesktopTransferPlatform {
     }
 
     fn on_queue_updated(&self, summary: QueueNotificationSummary) {
-        if summary.active_count == 0 && self.hidden_while_draining.swap(false, Ordering::SeqCst) {
+        if summary.active_count == 0
+            && summary.cancelling_count == 0
+            && self.hidden_while_draining.swap(false, Ordering::SeqCst)
+        {
             if summary.paused_count > 0 {
                 notify_background_transfer(
                     "Transfers paused",

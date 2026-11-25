@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   ERROR_RETRY_INTERVAL_MS,
   RESUME_CHECK_INTERVAL_MS,
+  countActiveTransfers,
   describeUpdateSummary,
   formatDownloadPercent,
   formatUpdateTechnicalRows,
@@ -154,6 +155,47 @@ test('isSafeForAutoInstall only allows startup before interaction or silent Andr
       userInteracted: false,
     }),
     true,
+  );
+
+  // Transfers in queued, running, OR cancelling state all count as active work blocking updates
+  // until file removal finishes and the transfer reaches a terminal state.
+  assert.equal(
+    countActiveTransfers([
+      { id: '1', state: 'done' },
+      { id: '2', state: 'failed' },
+      { id: '3', state: 'cancelled' },
+      { id: '4', state: 'paused' },
+    ]),
+    0,
+  );
+  assert.equal(
+    countActiveTransfers([{ id: '1', state: 'cancelling' }]),
+    1,
+  );
+  assert.equal(
+    countActiveTransfers([
+      { id: '1', state: 'queued' },
+      { id: '2', state: 'running' },
+      { id: '3', state: 'cancelling' },
+      { id: '4', state: 'cancelled' },
+    ]),
+    3,
+  );
+  assert.equal(
+    isSafeForAutoInstall({
+      updateState: readyDesktop,
+      trigger: 'startup',
+      activeCalls: countActiveTransfers([{ id: '1', state: 'cancelling' }]),
+    }),
+    false,
+  );
+  assert.equal(
+    isSafeForAutoInstall({
+      updateState: readyAndroidSilent,
+      trigger: 'background',
+      activeCalls: countActiveTransfers([{ id: '1', state: 'cancelling' }]),
+    }),
+    false,
   );
 });
 

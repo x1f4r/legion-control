@@ -457,7 +457,11 @@ impl AndroidTransferPlatform {
                 && last_sent != Some((client_gen, seq))
             {
                 let fresh_connection = last_sent.map(|(g, _)| g) != Some(client_gen);
-                if fresh_connection && summary.active_count == 0 && summary.paused_count == 0 {
+                if fresh_connection
+                    && summary.active_count == 0
+                    && summary.paused_count == 0
+                    && summary.cancelling_count == 0
+                {
                     last_sent = Some((client_gen, seq));
                     continue;
                 }
@@ -751,17 +755,27 @@ impl TransferPlatform for AndroidTransferPlatform {
         })
     }
 
-    fn delete_saved_download<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, ()> {
+    fn delete_saved_download<'a>(
+        &'a self,
+        local_path: &'a str,
+    ) -> BoxFuture<'a, Result<(), AppError>> {
         Box::pin(async move {
             if !local_path.starts_with("content://") {
-                let _ = tokio::fs::remove_file(local_path).await;
-                return;
+                return crate::transfers::remove_file_if_present(Path::new(local_path)).await;
             }
-            if let Ok(client) = self.wait_for_client().await {
-                let _ = client
-                    .call("deleteSavedDownload", json!({ "uriOrPath": local_path }))
-                    .await;
+            let client = self.wait_for_client().await?;
+            let resp = client
+                .call("deleteSavedDownload", json!({ "uriOrPath": local_path }))
+                .await?;
+            if resp.get("ok").and_then(Value::as_bool) == Some(false) {
+                let msg = resp
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Android could not remove the saved download.");
+                return Err(AppError::new(ErrorCode::Failed, msg.to_owned())
+                    .with_hint("Legion will keep retrying removal."));
             }
+            Ok(())
         })
     }
 

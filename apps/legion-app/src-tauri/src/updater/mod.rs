@@ -1340,6 +1340,11 @@ impl UpdateManager {
         self.on_app_ready_at(now_unix_secs());
     }
 
+    /// Returns `true` once the first full screen has painted (`on_app_ready` has run).
+    pub fn is_first_screen_shown(&self) -> bool {
+        self.first_screen_shown.load(Ordering::SeqCst)
+    }
+
     /// Deterministic variant of [`Self::on_app_ready`] evaluating rollback retry timestamps at
     /// `now_unix` (seconds since Unix epoch).
     pub fn on_app_ready_at(&self, now_unix: i64) {
@@ -8181,7 +8186,9 @@ mod tests {
             }
 
             fn on_queue_updated(&self, summary: QueueNotificationSummary) {
-                if summary.active_count == 0 && self.hidden_for_drain.swap(false, Ordering::SeqCst)
+                if summary.active_count == 0
+                    && summary.cancelling_count == 0
+                    && self.hidden_for_drain.swap(false, Ordering::SeqCst)
                 {
                     self.drain_notified.store(true, Ordering::SeqCst);
                 }
@@ -8330,6 +8337,697 @@ mod tests {
             assert!(lock.verify_only);
             assert_eq!(lock.target_sequence, 202611250225);
             if let Some(sup_pid) = lock.supervisor_pid {
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-TERM", &sup_pid.to_string()])
+                    .status();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn cancelling_transfer_blocks_every_update_gate_until_cleanup_finishes() {
+        use std::sync::atomic::AtomicBool;
+
+        use crate::commands::{evaluate_and_quiesce_auto_install, has_active_native_work};
+        use crate::content::AppContentServer;
+        use crate::link_backend::LinkBackend;
+        use crate::store::AppStore;
+        use crate::transfers::{
+            PickedUploadFile, QueueNotificationSummary, TransferControlAction, TransferManager,
+            TransferPlatform, TransferState,
+        };
+        use crate::{
+            DesktopCloseOutcome, desktop_close_active_ops, handle_desktop_close_request,
+            try_spawn_close_install_after_drain,
+        };
+
+        struct BlockingCancelPlatform {
+            block_delete_part: AtomicBool,
+            hidden_for_drain: AtomicBool,
+            drain_notified: AtomicBool,
+        }
+
+        impl BlockingCancelPlatform {
+            fn new() -> Self {
+                Self {
+                    block_delete_part: AtomicBool::new(true),
+                    hidden_for_drain: AtomicBool::new(false),
+                    drain_notified: AtomicBool::new(false),
+                }
+            }
+        }
+
+        impl TransferPlatform for BlockingCancelPlatform {
+            fn pick_upload_files(
+                &self,
+            ) -> crate::backend::BoxFuture<'_, Result<Vec<PickedUploadFile>, AppError>>
+            {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+
+            fn finalize_download<'a>(
+                &'a self,
+                _id: &'a str,
+                part_path: &'a Path,
+                _file_name: &'a str,
+                _mime: Option<&'a str>,
+                _open_after_done: bool,
+            ) -> crate::backend::BoxFuture<'a, Result<String, AppError>> {
+                let out = part_path.to_string_lossy().into_owned();
+                Box::pin(async move { Ok(out) })
+            }
+
+            fn delete_part_file<'a>(
+                &'a self,
+                part_path: &'a Path,
+            ) -> crate::backend::BoxFuture<'a, Result<(), AppError>> {
+                let blocked = self.block_delete_part.load(Ordering::SeqCst);
+                let path = part_path.to_path_buf();
+                Box::pin(async move {
+                    if blocked {
+                        return Err(AppError::new(
+                            ErrorCode::Busy,
+                            "Simulated file lock holding partial transfer file.",
+                        ));
+                    }
+                    match fs::remove_file(&path) {
+                        Ok(()) => Ok(()),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(err) => Err(AppError::new(ErrorCode::Failed, err.to_string())),
+                    }
+                })
+            }
+
+            fn open_local_file<'a>(
+                &'a self,
+                _local_path: &'a str,
+                _mime: Option<&'a str>,
+            ) -> crate::backend::BoxFuture<'a, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn on_queue_updated(&self, summary: QueueNotificationSummary) {
+                if summary.active_count == 0
+                    && summary.cancelling_count == 0
+                    && self.hidden_for_drain.swap(false, Ordering::SeqCst)
+                {
+                    self.drain_notified.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let android_updates_dir = dir.path().join("android-updates");
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let appimage = dir.path().join("Legion.AppImage");
+        fs::write(&appimage, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let (rel_sk, rel_pk) = keypair(0x96);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250230,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"#!/bin/sh\nexit 0\n",
+                &rel_sk,
+            ),
+        );
+        let mut android_fleet = FakeFleet::new();
+        android_fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250230,
+                "Legion-android.apk",
+                Os::Android,
+                Arch::Aarch64,
+                InstallKind::Apk,
+                b"fake-apk-bytes",
+                &rel_sk,
+            ),
+        );
+
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+                appimage_path: appimage.clone(),
+            }),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        assert_eq!(
+            mgr.check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+                .await
+                .unwrap()
+                .phase,
+            "ready"
+        );
+
+        let android_mgr = UpdateManager::with_config_at(
+            android_updates_dir,
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        assert_eq!(
+            android_mgr
+                .check_with_client_at(&android_fleet, &["tower".to_owned()], false, false, t0)
+                .await
+                .unwrap()
+                .phase,
+            "ready"
+        );
+
+        let store = AppStore::in_dir(&data_dir);
+        let backend: Arc<dyn Backend> = Arc::new(LinkBackend::with_local_program(
+            store,
+            Some("/usr/bin/legion".to_owned()),
+        ));
+        let content = AppContentServer::new(Arc::clone(&backend));
+        let platform = Arc::new(BlockingCancelPlatform::new());
+        let transfers = TransferManager::with_cleanup_retry_interval(
+            &data_dir,
+            Arc::clone(&backend),
+            Arc::clone(&platform) as Arc<dyn TransferPlatform>,
+            2,
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+        );
+
+        let xfer_id = transfers
+            .enqueue_download(
+                "local".to_owned(),
+                "/tmp/large.bin".to_owned(),
+                Some("large.bin".to_owned()),
+                Some(8192),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let part_file = data_dir
+            .join("transfers")
+            .join("parts")
+            .join(format!("{xfer_id}.part"));
+        fs::write(&part_file, b"partial-download-bytes").unwrap();
+
+        // Simulate window hidden for drain before the transfer enters `Cancelling`.
+        platform.hidden_for_drain.store(true, Ordering::SeqCst);
+        let cancelled_snapshot = transfers
+            .control(&xfer_id, TransferControlAction::Cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            cancelled_snapshot.state,
+            TransferState::Cancelling,
+            "blocked part-file removal must hold the transfer in Cancelling"
+        );
+        assert!(part_file.exists());
+
+        // While the transfer is in `Cancelling`, EVERY update gate MUST treat it as active work:
+        assert!(
+            transfers.has_active_work(),
+            "Cancelling transfer must count as active work"
+        );
+        assert!(
+            !platform.drain_notified.load(Ordering::SeqCst),
+            "hidden-for-drain must not fire while a transfer is still Cancelling"
+        );
+        assert!(
+            has_active_native_work(backend.as_ref(), &transfers, &content, &mgr),
+            "manual Update now gate must treat Cancelling transfer as active work"
+        );
+        let active_ops = desktop_close_active_ops(backend.as_ref(), &transfers);
+        assert_eq!(active_ops, 1);
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("startup", active_ops, true, t0),
+            Err("native_activity_in_flight")
+        );
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("close", active_ops, false, t0),
+            Err("native_activity_in_flight")
+        );
+        assert_eq!(
+            android_mgr.evaluate_auto_install_gate_at("background", active_ops, true, t0),
+            Err("native_activity_in_flight")
+        );
+        assert!(
+            !evaluate_and_quiesce_auto_install(
+                &mgr,
+                backend.as_ref(),
+                &transfers,
+                &content,
+                "startup",
+                Duration::from_millis(100),
+            )
+            .await
+        );
+        assert!(
+            !evaluate_and_quiesce_auto_install(
+                &android_mgr,
+                backend.as_ref(),
+                &transfers,
+                &content,
+                "background",
+                Duration::from_millis(100),
+            )
+            .await
+        );
+        assert_eq!(
+            handle_desktop_close_request(&mgr, backend.as_ref(), &transfers),
+            DesktopCloseOutcome::HideForDrain
+        );
+        assert!(!try_spawn_close_install_after_drain(
+            &mgr,
+            backend.as_ref(),
+            &transfers
+        ));
+        assert!(
+            !updates_dir.join(desktop::UPDATE_LOCK_FILENAME).exists(),
+            "Cancelling transfer must prevent update.lock acquisition and supervisor spawn"
+        );
+
+        // Release the simulated file lock and start the cleanup retry loop: once file removal
+        // completes and the transfer reaches `Cancelled`, every gate unblocks cleanly.
+        platform.block_delete_part.store(false, Ordering::SeqCst);
+        transfers.start();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let state = transfers
+                .list()
+                .into_iter()
+                .find(|t| t.id == xfer_id)
+                .map(|t| t.state);
+            if state == Some(TransferState::Cancelled) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for Cancelling transfer to finish cleanup (state={state:?})"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        transfers.shutdown();
+
+        assert!(!part_file.exists());
+        assert!(!transfers.has_active_work());
+        assert!(
+            platform.drain_notified.load(Ordering::SeqCst),
+            "drain callback must fire once Cancelling finishes removing files"
+        );
+        assert!(!has_active_native_work(
+            backend.as_ref(),
+            &transfers,
+            &content,
+            &mgr
+        ));
+        let idle_ops = desktop_close_active_ops(backend.as_ref(), &transfers);
+        assert_eq!(idle_ops, 0);
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("startup", idle_ops, false, t0),
+            Ok(())
+        );
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("close", idle_ops, false, t0),
+            Ok(())
+        );
+        assert_eq!(
+            android_mgr.evaluate_auto_install_gate_at("background", idle_ops, false, t0),
+            Ok(())
+        );
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overview_background_refreshes_do_not_block_updates_and_never_get_cut_off_mid_call() {
+        use std::sync::atomic::AtomicBool;
+
+        use legion_link::proto::{HelloResult, PROTOCOL, Request, Response, method};
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::sync::Notify;
+
+        use crate::backend::CallRequest;
+        use crate::commands::{evaluate_and_quiesce_auto_install, has_active_native_work};
+        use crate::content::AppContentServer;
+        use crate::link_backend::LinkBackend;
+        use crate::store::AppStore;
+        use crate::transfers::{PickedUploadFile, TransferManager, TransferPlatform};
+        use crate::{DesktopCloseOutcome, handle_desktop_close_request_with_timeout};
+
+        struct NoopPlatform;
+        impl TransferPlatform for NoopPlatform {
+            fn pick_upload_files(
+                &self,
+            ) -> crate::backend::BoxFuture<'_, Result<Vec<PickedUploadFile>, AppError>>
+            {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn finalize_download<'a>(
+                &'a self,
+                _id: &'a str,
+                part_path: &'a Path,
+                _file_name: &'a str,
+                _mime: Option<&'a str>,
+                _open_after_done: bool,
+            ) -> crate::backend::BoxFuture<'a, Result<String, AppError>> {
+                let out = part_path.to_string_lossy().into_owned();
+                Box::pin(async move { Ok(out) })
+            }
+            fn open_local_file<'a>(
+                &'a self,
+                _local_path: &'a str,
+                _mime: Option<&'a str>,
+            ) -> crate::backend::BoxFuture<'a, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let appimage = dir.path().join("Legion.AppImage");
+        fs::write(&appimage, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let (rel_sk, rel_pk) = keypair(0x97);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250235,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"#!/bin/sh\nexit 0\n",
+                &rel_sk,
+            ),
+        );
+
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+                appimage_path: appimage.clone(),
+            }),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        assert_eq!(
+            mgr.check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+                .await
+                .unwrap()
+                .phase,
+            "ready"
+        );
+
+        let call_entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let entered_tx = Arc::clone(&call_entered);
+        let release_rx = Arc::clone(&release);
+        let opener: legion_link::SessionOpener = Arc::new(move |entry, _, cancel| {
+            let entered_tx = Arc::clone(&entered_tx);
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap_or_else(|_| {
+                            Request::new(legion_link::proto::Id::Number(0), "", Value::Null)
+                        });
+                        let reply = if req.method == method::HELLO {
+                            Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap_or(Value::Null),
+                            )
+                        } else {
+                            entered_tx.fetch_add(1, Ordering::SeqCst);
+                            release_rx.notified().await;
+                            Response::ok(req.id, serde_json::json!({ "ok": true }))
+                        };
+                        let mut out = serde_json::to_string(&reply).unwrap_or_default();
+                        out.push('\n');
+                        if server_w.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = server_w.flush().await;
+                    }
+                });
+                legion_link::Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let store = AppStore::in_dir(&data_dir);
+        let backend: Arc<LinkBackend> = Arc::new(LinkBackend::with_opener(
+            store,
+            Some("/usr/bin/legion".to_owned()),
+            opener,
+        ));
+        let backend_dyn: Arc<dyn Backend> = Arc::clone(&backend) as Arc<dyn Backend>;
+        let content = AppContentServer::new(Arc::clone(&backend_dyn));
+        let transfers = TransferManager::load_or_new(
+            &data_dir,
+            Arc::clone(&backend_dyn),
+            Arc::new(NoopPlatform),
+        );
+
+        // 1. Start a Machine Overview `sys.procs` poll and pause it mid-flight.
+        let b_poll = Arc::clone(&backend);
+        let poll_finished = Arc::new(AtomicBool::new(false));
+        let poll_finished_tx = Arc::clone(&poll_finished);
+        let poll_task = tokio::spawn(async move {
+            let res = b_poll
+                .call(
+                    CallRequest {
+                        id: None,
+                        tool: "sys.procs".to_owned(),
+                        args: serde_json::json!({ "group": true, "limit": 12 }),
+                        on: Some(Value::String("local".to_owned())),
+                    },
+                    None,
+                )
+                .await;
+            poll_finished_tx.store(true, Ordering::SeqCst);
+            res
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while call_entered.load(Ordering::SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(backend.active_operations(), 0);
+        assert_eq!(backend.background_refreshes(), 1);
+        assert!(
+            !has_active_native_work(backend.as_ref(), &transfers, &content, &mgr),
+            "Overview background poll must not make active native work appear busy"
+        );
+
+        // If the poll stays mid-flight past the grace timeout, desktop close defers cleanly
+        // instead of cutting the RPC off mid-call.
+        let mgr_ref = &mgr;
+        let b_close = Arc::clone(&backend);
+        let t_close = Arc::clone(&transfers);
+        let deferred = tokio::task::block_in_place(|| {
+            handle_desktop_close_request_with_timeout(
+                mgr_ref,
+                b_close.as_ref(),
+                &t_close,
+                Duration::from_millis(40),
+            )
+        });
+        assert_eq!(deferred, DesktopCloseOutcome::CloseNormally);
+        assert!(!updates_dir.join(desktop::UPDATE_LOCK_FILENAME).exists());
+
+        // Start a startup auto-install quiesce while the poll is mid-call, then let the poll
+        // finish 40 ms later: the install waits for the poll to finish (never cutting it off) and
+        // succeeds right between poll ticks!
+        let release_soon = Arc::clone(&release);
+        let finished_check = Arc::clone(&poll_finished);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert!(
+                !finished_check.load(Ordering::SeqCst),
+                "poll must still be in flight until released"
+            );
+            release_soon.notify_waiters();
+        });
+        let allowed_after_poll = evaluate_and_quiesce_auto_install(
+            &mgr,
+            backend.as_ref(),
+            &transfers,
+            &content,
+            "startup",
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            allowed_after_poll,
+            "auto-install must wait for in-flight Overview poll and then proceed between ticks"
+        );
+        assert!(
+            poll_finished.load(Ordering::SeqCst),
+            "Overview poll must finish cleanly before auto-install proceeds"
+        );
+        assert!(poll_task.await.unwrap().is_ok());
+
+        // 2. Now start a user-started `exec.run` call and pause it mid-flight:
+        //    it MUST block every update gate immediately!
+        call_entered.store(0, Ordering::SeqCst);
+        let b_exec = Arc::clone(&backend);
+        let exec_task = tokio::spawn(async move {
+            b_exec
+                .call(
+                    CallRequest {
+                        id: None,
+                        tool: "exec.run".to_owned(),
+                        args: serde_json::json!({ "cmd": "sleep 1" }),
+                        on: Some(Value::String("local".to_owned())),
+                    },
+                    None,
+                )
+                .await
+        });
+        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(3);
+        while call_entered.load(Ordering::SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < deadline2);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(backend.active_operations(), 1);
+        assert!(has_active_native_work(
+            backend.as_ref(),
+            &transfers,
+            &content,
+            &mgr
+        ));
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("close", backend.active_operations(), false),
+            Err("native_activity_in_flight")
+        );
+        let blocked_close = tokio::task::block_in_place(|| {
+            handle_desktop_close_request_with_timeout(
+                &mgr,
+                backend.as_ref(),
+                &transfers,
+                Duration::from_secs(1),
+            )
+        });
+        assert_eq!(blocked_close, DesktopCloseOutcome::CloseNormally);
+        assert!(!updates_dir.join(desktop::UPDATE_LOCK_FILENAME).exists());
+        release.notify_waiters();
+        assert!(exec_task.await.unwrap().is_ok());
+        assert_eq!(backend.active_operations(), 0);
+
+        // 3. Desktop close while a `sys.info` refresh is mid-flight waits cleanly for that call to
+        //    finish rather than cutting it off, then spawns the close-time supervisor between ticks.
+        #[cfg(unix)]
+        {
+            call_entered.store(0, Ordering::SeqCst);
+            let sys_done = Arc::new(AtomicBool::new(false));
+            let sys_done_tx = Arc::clone(&sys_done);
+            let b_sys = Arc::clone(&backend);
+            let sys_task = tokio::spawn(async move {
+                let res = b_sys
+                    .call(
+                        CallRequest {
+                            id: None,
+                            tool: "sys.info".to_owned(),
+                            args: serde_json::json!({}),
+                            on: Some(Value::String("local".to_owned())),
+                        },
+                        None,
+                    )
+                    .await;
+                sys_done_tx.store(true, Ordering::SeqCst);
+                res
+            });
+            let deadline3 = tokio::time::Instant::now() + Duration::from_secs(3);
+            while call_entered.load(Ordering::SeqCst) == 0 {
+                assert!(tokio::time::Instant::now() < deadline3);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let release_sys = Arc::clone(&release);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                release_sys.notify_waiters();
+            });
+            let outcome = tokio::task::block_in_place(|| {
+                handle_desktop_close_request_with_timeout(
+                    &mgr,
+                    backend.as_ref(),
+                    &transfers,
+                    Duration::from_secs(2),
+                )
+            });
+            assert_eq!(
+                outcome,
+                DesktopCloseOutcome::CloseWithUpdate,
+                "desktop close must wait for in-flight sys.info and install cleanly between ticks"
+            );
+            assert!(
+                sys_task.await.unwrap().is_ok(),
+                "sys.info call must complete cleanly before close-time update runs"
+            );
+            assert!(sys_done.load(Ordering::SeqCst));
+            if let Some(lock) = desktop::inspect_active_update_lock(&updates_dir)
+                && let Some(sup_pid) = lock.supervisor_pid
+            {
                 let _ = std::process::Command::new("/bin/kill")
                     .args(["-TERM", &sup_pid.to_string()])
                     .status();

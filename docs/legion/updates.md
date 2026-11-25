@@ -54,10 +54,19 @@ anything:
 - Standalone node binary: raw `LEGION_UPDATE_SEQUENCE=<N>` marker
 
 Every compiled marker found must agree with `--sequence` (conflicting markers are refused). Release
-build scripts (`apps/legion-app/build-android.sh`, `packaging/deb/build-deb.sh`) and CI workflows
-also run `scripts/make-update-set.mjs check-artifact --forbid-preview-key`, which requires each
-shipped binary to contain literally one `LEGION_UPDATE_SEQUENCE=<N>` marker, `LEGION_UPDATE_PREVIEW_KEY=none`
-(zero preview key fingerprints), and no preview-key build log notice.
+build scripts (`apps/legion-app/build-android.sh`, `packaging/deb/build-deb.sh`) and every platform
+build in CI (Linux `.deb`/AppImage, macOS `.app`/`.dmg`, Windows NSIS, Android debug APK, and iOS
+debug simulator `.app` and unsigned device `.ipa`) compile with the run's positive UTC
+`YYYYMMDDHHMM` `LEGION_BUILD_SEQUENCE` and run `scripts/make-update-set.mjs check-artifact --forbid-preview-key`,
+requiring each binary to contain literally one `LEGION_UPDATE_SEQUENCE=<N>` marker,
+`LEGION_UPDATE_PREVIEW_KEY=none` (zero preview key fingerprints), and no preview-key build log
+notice. On iOS, updates still come exclusively from TestFlight or the App Store, and carrying the
+run's positive sequence identifies the build in Settings > About (keeping it reported as "Managed
+outside Legion" rather than a sequence-0 local dev build); because Xcode's build service does not
+forward arbitrary shell environment variables into Run Script phases, iOS builds pass
+`LEGION_BUILD_SEQUENCE` to the `Build Rust Code` phase via the gitignored
+`apps/legion-app/src-tauri/gen/apple/.build-env` file. Local development builds omit
+`LEGION_BUILD_SEQUENCE`, compiling sequence `0` so they never advance a device's downgrade floor.
 
 Crate `legion-update` holds what both the node and the app need: parsing and checking a set,
 strict Ed25519 SPKI public key parsing, sequence floor recovery, sequence plausibility checks, and
@@ -194,13 +203,43 @@ Settings > About shows **Updates**:
   last desktop window, which verifies startup silently without opening a window and without racing
   against a concurrent reopen, or backgrounding Legion on Android when silent self-update is
   available). The native shell enforces every safety check itself (startup window, first-screen
-  latch, in-flight native calls/transfers/pairing, and request rate limiting); there is no idle
-  timer that interrupts an open session.
+  latch, in-flight user-started work, and request rate limiting); there is no idle timer that
+  interrupts an open session.
 - **What is new** with the set's notes, and after an update a quiet one-time unbordered row on the
   first screen: `Updated to 0.2.0 · What is new` with a subtle `×` dismiss button.
 - With Technical details enabled: channel, build, sequence (`0 (updates disabled)` on sequence-0
   builds), install kind, signer key fingerprint, source machine, checked machines, failed sequence
   info, and any raw diagnostic error detail.
+
+### What counts as active work
+
+Both automatic update gates (startup, desktop window close, and Android backgrounding) and the
+confirmation prompt on **Update now** distinguish between work a person started and passive
+background refreshes:
+
+- **Blocks updates (work a person started or state-mutating work):**
+  - Any tool call outside the passive refresh list (`exec.run`, `sys.kill`, `power.sleep`,
+    `power.reboot`, `power.shutdown`, `power.wake`, `power.boot`, `service.*`, `project.*`,
+    `job.start`, `job.cancel`, filesystem writes/deletes/moves/copies, device/config/update
+    mutations, and any unrecognized tool), plus **any** streaming call (`on_event`).
+  - Native state mutations (`pair`, `unpair`, `learn`, `repair_store`, and identity-change
+    acceptance or dismissal).
+  - Any device file transfer in `queued`, `running`, or `cancelling` state (a cancelled transfer
+    keeps blocking every update gate and desktop close-time drain until it finishes stopping its
+    worker and removing its partial or saved files).
+  - Active content preview/media streams and tracked external operations (such as camera QR
+    scanning).
+- **Background refreshes (do not permanently block updates, and are not cut off mid-call):**
+  - Non-streaming, read-only refresh calls (`fleet.list`, `fleet.ping`, `sys.info`, `sys.procs`,
+    `power.status`, `job.list`, `meta.whoami`, `meta.version`, `fs.list`, `fs.stat`, `fs.read`,
+    `fs.search`, `fav.list`, `sync.list`, and `tools` discovery), including the Machine Overview
+    5-second `sys.info` / `sys.procs` poll.
+  - These calls never increment the blocking active-work counter, so leaving Machine Overview open
+    does not permanently prevent automatic updates. Before starting an install, Legion waits briefly
+    (up to 2 seconds) for any currently executing background refresh to finish and re-checks that no
+    blocking work started, then proceeds cleanly between poll ticks. If a background refresh is
+    still mid-flight past that 2-second grace window, automatic installs defer rather than cutting
+    the call off mid-flight.
 
 The app checks when it starts, when it returns to the foreground after an hour or more (or after 5
 minutes if the last check failed with a timeout or unverifiable candidate), and every six hours

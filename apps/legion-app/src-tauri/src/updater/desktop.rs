@@ -159,6 +159,7 @@ impl Drop for UpdateLockGuard {
     fn drop(&mut self) {
         if !self.handed_over {
             let _ = fs::remove_file(&self.lock_path);
+            let _ = self._stage_file.unlock();
         }
     }
 }
@@ -1450,6 +1451,13 @@ fn extract_macos_app_tar_with_limit(
     // symlink loops.
     validate_all_symlink_chains(&pending_symlinks)?;
 
+    #[cfg(not(unix))]
+    if !pending_symlinks.is_empty() {
+        return Err(AppError::new(
+            ErrorCode::Unsupported,
+            "macOS app-tar extraction requires a Unix host.",
+        ));
+    }
     #[cfg(unix)]
     for (clean_rel, link_target) in &pending_symlinks {
         if let Some(parent_rel) = clean_rel.parent()
@@ -1473,13 +1481,6 @@ fn extract_macos_app_tar_with_limit(
                 format!("Could not create symlink {}: {err}", clean_rel.display()),
             )
         })?;
-    }
-    #[cfg(not(unix))]
-    if !pending_symlinks.is_empty() {
-        return Err(AppError::new(
-            ErrorCode::Unsupported,
-            "macOS app-tar extraction requires a Unix host.",
-        ));
     }
 
     // Locate the single top-level real `.app` bundle directory (refusing symlinks).

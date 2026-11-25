@@ -11,6 +11,13 @@ pub mod updater;
 use std::sync::Arc;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+/// Maximum time an update install waits for an in-flight passive background refresh (such as
+/// Machine Overview's 5-second `sys.info` / `sys.procs` poll) to finish cleanly before proceeding
+/// between poll ticks. Automatic installs defer cleanly if a refresh is still mid-call past this
+/// bound rather than cutting it off.
+pub(crate) const BACKGROUND_REFRESH_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(not(target_os = "android"))]
 use tauri::WindowEvent;
@@ -197,20 +204,49 @@ pub(crate) fn desktop_close_active_ops(
 }
 
 /// Coordinates desktop window close between active transfers and close-time auto-updates:
-/// hides to drain if any transfer is active (never spawning a supervisor), and only spawns the
-/// close-time update supervisor when both `!transfers.has_active_work()` and the native updater
-/// gate allow it.
+/// hides to drain if any transfer is active (`queued`, `running`, or `cancelling`, never spawning
+/// a supervisor), waits briefly for any mid-call passive background refresh to finish cleanly so
+/// installs run between poll ticks without cutting off an RPC, and only spawns the close-time
+/// update supervisor when both `!transfers.has_active_work()` and the native updater gate allow it.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub(crate) fn handle_desktop_close_request(
     updater: &UpdateManager,
     backend: &dyn Backend,
     transfers: &TransferManager,
 ) -> DesktopCloseOutcome {
+    handle_desktop_close_request_with_timeout(
+        updater,
+        backend,
+        transfers,
+        BACKGROUND_REFRESH_DRAIN_TIMEOUT,
+    )
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn handle_desktop_close_request_with_timeout(
+    updater: &UpdateManager,
+    backend: &dyn Backend,
+    transfers: &TransferManager,
+    refresh_drain_timeout: Duration,
+) -> DesktopCloseOutcome {
     if transfers.has_active_work() {
         return DesktopCloseOutcome::HideForDrain;
     }
     let active_ops = desktop_close_active_ops(backend, transfers);
-    if updater.try_spawn_desktop_close_install(active_ops) {
+    if updater
+        .evaluate_auto_install_gate("close", active_ops, false)
+        .is_err()
+    {
+        return DesktopCloseOutcome::CloseNormally;
+    }
+    if !backend.wait_for_background_refreshes_sync(refresh_drain_timeout) {
+        return DesktopCloseOutcome::CloseNormally;
+    }
+    if transfers.has_active_work() {
+        return DesktopCloseOutcome::HideForDrain;
+    }
+    let active_ops_after = desktop_close_active_ops(backend, transfers);
+    if updater.try_spawn_desktop_close_install(active_ops_after) {
         DesktopCloseOutcome::CloseWithUpdate
     } else {
         DesktopCloseOutcome::CloseNormally
@@ -218,18 +254,47 @@ pub(crate) fn handle_desktop_close_request(
 }
 
 /// Runs right before a hidden-for-drain desktop app exits once its transfer queue has drained,
-/// spawning a ready close-time update if no active transfers or native operations remain.
+/// waiting briefly for any mid-call passive background refresh to finish cleanly and spawning a
+/// ready close-time update if no active transfers or user-started native operations remain.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub(crate) fn try_spawn_close_install_after_drain(
     updater: &UpdateManager,
     backend: &dyn Backend,
     transfers: &TransferManager,
 ) -> bool {
+    try_spawn_close_install_after_drain_with_timeout(
+        updater,
+        backend,
+        transfers,
+        BACKGROUND_REFRESH_DRAIN_TIMEOUT,
+    )
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn try_spawn_close_install_after_drain_with_timeout(
+    updater: &UpdateManager,
+    backend: &dyn Backend,
+    transfers: &TransferManager,
+    refresh_drain_timeout: Duration,
+) -> bool {
     if transfers.has_active_work() {
         return false;
     }
     let active_ops = desktop_close_active_ops(backend, transfers);
-    updater.try_spawn_desktop_close_install(active_ops)
+    if updater
+        .evaluate_auto_install_gate("close", active_ops, false)
+        .is_err()
+    {
+        return false;
+    }
+    if !backend.wait_for_background_refreshes_sync(refresh_drain_timeout) {
+        return false;
+    }
+    if transfers.has_active_work() {
+        return false;
+    }
+    let active_ops_after = desktop_close_active_ops(backend, transfers);
+    updater.try_spawn_desktop_close_install(active_ops_after)
 }
 
 /// Registers the in-app `FilesTransferPlugin` Kotlin plugin on Android for the system file picker,

@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -753,8 +754,10 @@ pub async fn update_check(
         .await
 }
 
-/// Returns `true` when any native call, device transfer, content stream, or tracked external
-/// operation (such as camera scanning) is currently active.
+/// Returns `true` when any user-started native call, device transfer (`queued`, `running`, or
+/// `cancelling`), content stream, or tracked external operation (such as camera scanning) is
+/// currently active. Passive background refreshes (`sys.info`, `sys.procs`, etc.) are excluded so
+/// they do not block updates; installs instead drain them briefly between ticks.
 pub(crate) fn has_active_native_work(
     backend: &dyn Backend,
     transfers: &crate::transfers::TransferManager,
@@ -767,13 +770,51 @@ pub(crate) fn has_active_native_work(
         || updater.external_operations_count() > 0
 }
 
+/// Evaluates the native automatic-install gate and waits briefly for any in-flight passive
+/// background refreshes to complete so an automatic install runs cleanly between poll ticks
+/// without cutting off a refresh mid-call.
+///
+/// Returns `true` only when the gate permits installation, all in-flight background refreshes
+/// finished within `refresh_timeout`, and no user-started work (or first-screen paint for
+/// `"startup"`) started while waiting.
+pub(crate) async fn evaluate_and_quiesce_auto_install(
+    updater: &crate::updater::UpdateManager,
+    backend: &dyn Backend,
+    transfers: &crate::transfers::TransferManager,
+    content: &crate::content::AppContentServer,
+    trigger_kind: &str,
+    refresh_timeout: Duration,
+) -> bool {
+    let active_ops = backend
+        .active_operations()
+        .saturating_add(usize::from(transfers.has_active_work()))
+        .saturating_add(content.active_streams());
+    if updater
+        .evaluate_auto_install_gate(trigger_kind, active_ops, true)
+        .is_err()
+    {
+        return false;
+    }
+    if !backend.wait_for_background_refreshes(refresh_timeout).await {
+        return false;
+    }
+    if has_active_native_work(backend, transfers, content, updater) {
+        return false;
+    }
+    if trigger_kind == "startup" && updater.is_first_screen_shown() {
+        return false;
+    }
+    true
+}
+
 /// Downloads (if needed), re-verifies, and installs the available app update.
 ///
-/// Checks native activity (active calls, device transfers, content streams, and external
-/// operations) before replacing the app: on desktop, shows the same native confirmation prompt as
-/// quitting with active transfers unless `confirm_interrupt == Some(true)`; on Android, returns
-/// [`ErrorCode::Conflict`] so the interface can confirm before retrying with
-/// `confirm_interrupt = true`.
+/// Checks native activity (user-started calls, device transfers including `cancelling`, content
+/// streams, and external operations) before replacing the app: on desktop, shows the same native
+/// confirmation prompt as quitting with active transfers unless `confirm_interrupt == Some(true)`;
+/// on Android, returns [`ErrorCode::Conflict`] so the interface can confirm before retrying with
+/// `confirm_interrupt = true`. Waits briefly for any in-flight passive background refresh to finish
+/// cleanly before restarting.
 #[tauri::command]
 pub async fn update_install(
     app: tauri::AppHandle,
@@ -795,6 +836,10 @@ pub async fn update_install(
             )
             .with_hint("Confirm to interrupt active work and install the update."));
         }
+        let _ = backend
+            .0
+            .wait_for_background_refreshes(crate::BACKGROUND_REFRESH_DRAIN_TIMEOUT)
+            .await;
         let android_updater = app.state::<AndroidUpdaterHandle>();
         updater
             .0
@@ -821,6 +866,10 @@ pub async fn update_install(
                 return Ok(updater.0.snapshot());
             }
         }
+        let _ = backend
+            .0
+            .wait_for_background_refreshes(crate::BACKGROUND_REFRESH_DRAIN_TIMEOUT)
+            .await;
         let (st, should_exit) = updater.0.install_desktop(backend.0.as_ref(), false).await?;
         if should_exit {
             let handle = app.clone();
@@ -862,15 +911,15 @@ pub async fn update_maybe_auto_install(
     trigger: Option<String>,
 ) -> Result<UpdateState, AppError> {
     let trigger_kind = trigger.as_deref().unwrap_or("startup");
-    let active_ops = backend
-        .0
-        .active_operations()
-        .saturating_add(usize::from(transfers.0.has_active_work()))
-        .saturating_add(content.0.active_streams());
-    if updater
-        .0
-        .evaluate_auto_install_gate(trigger_kind, active_ops, true)
-        .is_err()
+    if !evaluate_and_quiesce_auto_install(
+        &updater.0,
+        backend.0.as_ref(),
+        &transfers.0,
+        &content.0,
+        trigger_kind,
+        crate::BACKGROUND_REFRESH_DRAIN_TIMEOUT,
+    )
+    .await
     {
         return Ok(updater.0.snapshot());
     }
