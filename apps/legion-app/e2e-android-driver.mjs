@@ -434,44 +434,41 @@ async function waitForMachineWithStats(page, machineName, timeoutMs = 30000) {
 }
 
 async function triggerPullRefresh(page) {
-  // Pull-down gesture on main.main (triggers forceOffline refresh + background learn).
+  // Touch pull-down gesture on main.main's ScrollContainer (triggers forceOffline refresh +
+  // background learn). Uses genuine CDP touch events matching ScrollContainer's touch-only
+  // pull-to-refresh gesture.
+  await page.evaluate(() => {
+    const target = document.querySelector('main.main');
+    if (target) target.scrollTop = 0;
+  });
   const box = await page.locator('main.main').boundingBox();
   assert.ok(box, 'Expected main.main bounding box');
   const cx = Math.round(box.x + box.width / 2);
-  const sy = Math.round(box.y + 40);
-  const ey = Math.round(box.y + 220);
-  await page.evaluate(
-    ({ x, startY, endY }) => {
-      const target = document.querySelector('main.main');
-      if (!target) return;
-      target.scrollTop = 0;
-      const down = new PointerEvent('pointerdown', {
-        bubbles: true,
-        pointerId: 1,
-        button: 0,
-        clientX: x,
-        clientY: startY,
+  const sy = Math.round(box.y + 48);
+  const ey = Math.round(box.y + 230);
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    await cdp.send('Input.dispatchTouchEvent', {
+      type: 'touchStart',
+      touchPoints: [{ x: cx, y: sy, id: 1 }],
+    });
+    await sleep(16);
+    const steps = 10;
+    for (let i = 1; i <= steps; i += 1) {
+      const y = Math.round(sy + ((ey - sy) * i) / steps);
+      await cdp.send('Input.dispatchTouchEvent', {
+        type: 'touchMove',
+        touchPoints: [{ x: cx, y, id: 1 }],
       });
-      const move = new PointerEvent('pointermove', {
-        bubbles: true,
-        pointerId: 1,
-        button: 0,
-        clientX: x,
-        clientY: endY,
-      });
-      const up = new PointerEvent('pointerup', {
-        bubbles: true,
-        pointerId: 1,
-        button: 0,
-        clientX: x,
-        clientY: endY,
-      });
-      target.dispatchEvent(down);
-      target.dispatchEvent(move);
-      target.dispatchEvent(up);
-    },
-    { x: cx, startY: sy, endY: ey },
-  );
+      await sleep(16);
+    }
+    await cdp.send('Input.dispatchTouchEvent', {
+      type: 'touchEnd',
+      touchPoints: [],
+    });
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
 }
 
 async function runCommandOnMachine(page, machineName, cmdText, expectedOutput) {
