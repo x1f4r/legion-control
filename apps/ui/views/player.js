@@ -467,17 +467,20 @@ export function VideoPlayer({
 
   useEffect(() => () => controller.dispose(), [controller]);
 
-  // Reset per-video state when the file changes inside the same mounted player instance.
-  useEffect(() => {
+  // Reset per-video state synchronously on file change so carry-over play intent is ready before
+  // `<video>` teardown and before any keyboard input can arrive on the next file.
+  useLayoutEffect(() => {
     const prevId = prevIdentityRef.current;
     if (prevId && (prevId.machine !== machine || prevId.path !== path)) {
       if (durationRef.current > 0) {
         resumeStore.save(prevId, currentTimeRef.current, durationRef.current);
       }
+      const v = videoRef.current;
+      const elPlaying = Boolean(v && !v.paused && !v.ended);
       const carryPlay = Boolean(
         pendingPlayIntentRef.current != null
           ? pendingPlayIntentRef.current
-          : ctrlPlayingRef.current || wasPlayingBeforeTeardownRef.current,
+          : ctrlPlayingRef.current || elPlaying || wasPlayingBeforeTeardownRef.current,
       );
       wasPlayingBeforeTeardownRef.current = false;
       wantPlayAfterSwapRef.current = carryPlay;
