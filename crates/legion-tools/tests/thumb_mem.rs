@@ -1,12 +1,27 @@
-//! Dedicated test binary with a counting global allocator that measures the real peak heap
-//! allocation of `fs.thumb` decoding a large progressive JPEG at the 25 MP ceiling and verifies
-//! that a progressive JPEG just above the ceiling is rejected before allocating pixel buffers.
+//! Dedicated test binary with a counting global allocator that measures real peak heap
+//! allocation across every supported image format/subtype and verifies `fs.thumb`'s 256 MiB
+//! per-image cap, 50 MP baseline JPEG admission, embedded EXIF/MPF fallback, and hostile metadata
+//! handling.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use image::codecs::bmp::BmpEncoder;
+use image::codecs::gif::GifEncoder;
+use image::codecs::jpeg::JpegEncoder;
+use image::codecs::png::PngEncoder;
+use image::codecs::webp::WebPEncoder;
+use image::imageops::FilterType;
+use image::{
+    DynamicImage, ExtendedColorType, Frame, ImageBuffer, ImageDecoder, ImageEncoder, ImageFormat,
+    ImageReader, Limits, Rgb, Rgba,
+};
 use legion_core::{Call, Door, Node, Paths};
 use serde_json::json;
 
@@ -14,6 +29,8 @@ struct CountingAlloc;
 
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Serialize tests in this binary because `CountingAlloc` tracks process-wide allocations.
+static MEASURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn reset_peak() {
     let live = LIVE_BYTES.load(Ordering::SeqCst);
@@ -67,120 +84,620 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static GLOBAL: CountingAlloc = CountingAlloc;
 
-/// Builds a tiny, valid 3-component 4:4:4 progressive JPEG (SOF2 `0xFFC2`) of `width x height`
-/// pixels with all-zero DC coefficients so `zune-jpeg` runs its full progressive coefficient
-/// allocation and inverse-DCT pipeline on a <10 KiB input file (works on Linux, macOS and Windows
-/// without external tools).
-fn build_progressive_jpeg(width: u16, height: u16) -> Vec<u8> {
+/// Builds a minimal valid 3-component JPEG (baseline SOF0 or progressive SOF2, 4:2:0 or 4:4:4) of
+/// `width x height` pixels with all-zero coefficients.
+fn build_jpeg(width: u16, height: u16, progressive: bool, subsampling_420: bool) -> Vec<u8> {
     let mut out = Vec::new();
-    // SOI
     out.extend_from_slice(&[0xFF, 0xD8]);
-
-    // DQT (table 0, 8-bit precision, all 16s)
     out.extend_from_slice(&[0xFF, 0xDB, 0x00, 67, 0x00]);
     out.extend_from_slice(&[16u8; 64]);
 
-    // SOF2 (Progressive DCT, 8-bit, 3 components, 1x1 sampling -> 4:4:4 so all 3 planes are full
-    // resolution, exercising worst-case progressive coefficient memory in zune-jpeg).
-    out.extend_from_slice(&[0xFF, 0xC2, 0x00, 17, 8]);
+    let sof = if progressive { 0xC2 } else { 0xC0 };
+    out.extend_from_slice(&[0xFF, sof, 0x00, 17, 8]);
     out.extend_from_slice(&height.to_be_bytes());
     out.extend_from_slice(&width.to_be_bytes());
-    out.push(3); // 3 components
-    for id in 1u8..=3 {
-        out.extend_from_slice(&[id, 0x11, 0]);
-    }
+    out.push(3);
+    let y_samp = if subsampling_420 { 0x22 } else { 0x11 };
+    out.extend_from_slice(&[1, y_samp, 0]);
+    out.extend_from_slice(&[2, 0x11, 0]);
+    out.extend_from_slice(&[3, 0x11, 0]);
 
-    // DHT (DC table 0: symbol 0 -> 1-bit code `0`)
+    // DHT DC table 0: symbol 0 -> 1-bit `0`
     out.extend_from_slice(&[0xFF, 0xC4, 0x00, 20, 0x00]);
     let mut dc_counts = [0u8; 16];
-    dc_counts[0] = 1; // one 1-bit symbol
+    dc_counts[0] = 1;
     out.extend_from_slice(&dc_counts);
-    out.push(0x00); // category 0 (DC diff = 0)
+    out.push(0x00);
 
-    // SOS (DC scan for all 3 components: Ss=0, Se=0, Ah=0, Al=0)
+    if !progressive {
+        // DHT AC table 0: symbol 0 (EOB) -> 1-bit `0`
+        out.extend_from_slice(&[0xFF, 0xC4, 0x00, 20, 0x10]);
+        let mut ac_counts = [0u8; 16];
+        ac_counts[0] = 1;
+        out.extend_from_slice(&ac_counts);
+        out.push(0x00);
+    }
+
     out.extend_from_slice(&[0xFF, 0xDA, 0x00, 12, 3]);
     for id in 1u8..=3 {
         out.extend_from_slice(&[id, 0x00]);
     }
-    out.extend_from_slice(&[0x00, 0x00, 0x00]);
+    if progressive {
+        out.extend_from_slice(&[0x00, 0x00, 0x00]);
+    } else {
+        out.extend_from_slice(&[0x00, 0x3F, 0x00]);
+    }
 
-    // Each MCU has 3 blocks, each emitting a single `0` bit (DC diff = 0).
-    let mcus = usize::from(width.div_ceil(8)) * usize::from(height.div_ceil(8));
-    let zero_bits = mcus * 3;
-    let zero_bytes = zero_bits.div_ceil(8);
+    let (mcu_w, mcu_h, blocks_per_mcu) = if subsampling_420 {
+        (16usize, 16usize, 6usize)
+    } else {
+        (8usize, 8usize, 3usize)
+    };
+    let mcus = usize::from(width).div_ceil(mcu_w) * usize::from(height).div_ceil(mcu_h);
+    let bits_per_block = if progressive { 1 } else { 2 };
+    let zero_bytes = (mcus * blocks_per_mcu * bits_per_block).div_ceil(8);
     out.resize(out.len() + zero_bytes, 0x00);
-
-    // EOI
     out.extend_from_slice(&[0xFF, 0xD9]);
     out
 }
 
+fn encode_quadrant_jpeg(width: u32, height: u32, corner_rgb: [u8; 3]) -> Vec<u8> {
+    let mut img = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let color = if x < width / 4 && y < height / 4 {
+                Rgb(corner_rgb)
+            } else {
+                Rgb([20, 40, 230])
+            };
+            img.put_pixel(x, y, color);
+        }
+    }
+    let mut jpeg = Vec::new();
+    JpegEncoder::new_with_quality(&mut jpeg, 92)
+        .encode(&img, width, height, ExtendedColorType::Rgb8)
+        .unwrap();
+    jpeg
+}
+
+fn build_exif_app1(orientation: u16, thumb_offset: u32, thumb_len: u32, extra: &[u8]) -> Vec<u8> {
+    let mut tiff = Vec::new();
+    tiff.extend_from_slice(b"II");
+    tiff.extend_from_slice(&42u16.to_le_bytes());
+    tiff.extend_from_slice(&8u32.to_le_bytes());
+    tiff.extend_from_slice(&1u16.to_le_bytes());
+    tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+    tiff.extend_from_slice(&3u16.to_le_bytes());
+    tiff.extend_from_slice(&1u32.to_le_bytes());
+    tiff.extend_from_slice(&orientation.to_le_bytes());
+    tiff.extend_from_slice(&0u16.to_le_bytes());
+    tiff.extend_from_slice(&26u32.to_le_bytes());
+    tiff.extend_from_slice(&2u16.to_le_bytes());
+    tiff.extend_from_slice(&0x0201u16.to_le_bytes());
+    tiff.extend_from_slice(&4u16.to_le_bytes());
+    tiff.extend_from_slice(&1u32.to_le_bytes());
+    tiff.extend_from_slice(&thumb_offset.to_le_bytes());
+    tiff.extend_from_slice(&0x0202u16.to_le_bytes());
+    tiff.extend_from_slice(&4u16.to_le_bytes());
+    tiff.extend_from_slice(&1u32.to_le_bytes());
+    tiff.extend_from_slice(&thumb_len.to_le_bytes());
+    tiff.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(tiff.len(), 56);
+    tiff.extend_from_slice(extra);
+
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&[0xFF, 0xE1]);
+    let seg_len = (2 + 6 + tiff.len()) as u16;
+    seg.extend_from_slice(&seg_len.to_be_bytes());
+    seg.extend_from_slice(b"Exif\0\0");
+    seg.extend_from_slice(&tiff);
+    seg
+}
+
+fn crc32_ieee(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn adler32(bytes: &[u8]) -> u32 {
+    let mut s1 = 1u32;
+    let mut s2 = 0u32;
+    for &b in bytes {
+        s1 = (s1 + u32::from(b)) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    (s2 << 16) | s1
+}
+
+fn build_interlaced_png(width: u32, height: u32, bit_depth: u8, color_type: u8) -> Vec<u8> {
+    let channels: usize = if color_type == 6 { 4 } else { 3 };
+    let bpp = channels * usize::from(bit_depth / 8);
+    const PASSES: [(u32, u32, u32, u32); 7] = [
+        (0, 0, 8, 8),
+        (4, 0, 8, 8),
+        (0, 4, 4, 8),
+        (2, 0, 4, 4),
+        (0, 2, 2, 4),
+        (1, 0, 2, 2),
+        (0, 1, 1, 2),
+    ];
+
+    let mut raw = Vec::new();
+    for (x0, y0, dx, dy) in PASSES {
+        if x0 >= width || y0 >= height {
+            continue;
+        }
+        let pw = (width - x0).div_ceil(dx) as usize;
+        let ph = (height - y0).div_ceil(dy) as usize;
+        raw.resize(raw.len() + ph * (1 + pw * bpp), 0u8);
+    }
+
+    let mut zlib = Vec::with_capacity(raw.len() + (raw.len() / 65535 + 1) * 5 + 6);
+    zlib.extend_from_slice(&[0x78, 0x01]);
+    let mut pos = 0;
+    loop {
+        let remaining = raw.len() - pos;
+        let chunk_len = remaining.min(65535);
+        let is_final = pos + chunk_len == raw.len();
+        zlib.push(if is_final { 0x01 } else { 0x00 });
+        let len16 = chunk_len as u16;
+        zlib.extend_from_slice(&len16.to_le_bytes());
+        zlib.extend_from_slice(&(!len16).to_le_bytes());
+        zlib.extend_from_slice(&raw[pos..pos + chunk_len]);
+        pos += chunk_len;
+        if is_final {
+            break;
+        }
+    }
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+    let push_chunk = |out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(tag);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&crc32_ieee(&out[start..]).to_be_bytes());
+    };
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[bit_depth, color_type, 0, 0, 1]);
+    push_chunk(&mut out, b"IHDR", &ihdr);
+    push_chunk(&mut out, b"IDAT", &zlib);
+    push_chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+fn measure_decode_bpp(label: &str, bytes: Vec<u8>, format: ImageFormat, pixels: u64) -> f64 {
+    let input_len = bytes.len();
+    reset_peak();
+    let t0 = Instant::now();
+
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(65_535);
+    limits.max_image_height = Some(65_535);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().unwrap();
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let img = DynamicImage::from_decoder(decoder).unwrap();
+    let mut resized = if img.width() >= 512 && img.height() >= 512 {
+        img.thumbnail(256, 256)
+    } else {
+        img.resize(256, 256, FilterType::Triangle)
+    };
+    drop(img);
+    resized.apply_orientation(orientation);
+    let rgb = resized.to_rgb8();
+    let mut out = Vec::new();
+    JpegEncoder::new_with_quality(&mut out, 82)
+        .encode(&rgb, rgb.width(), rgb.height(), ExtendedColorType::Rgb8)
+        .unwrap();
+    drop(out);
+    drop(rgb);
+    drop(resized);
+
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let delta = peak_delta_bytes();
+    let decode_only = delta.saturating_sub(input_len);
+    let decode_bpp = decode_only as f64 / pixels as f64;
+    eprintln!(
+        "{label:<28} | {:>4.1} MP | peak={:>6.2} MiB (decode={:>5.2} B/px) | {:>6.1} ms",
+        pixels as f64 / 1_000_000.0,
+        delta as f64 / (1024.0 * 1024.0),
+        decode_bpp,
+        elapsed_ms
+    );
+    decode_bpp
+}
+
 #[tokio::test]
-async fn progressive_jpeg_memory_is_bounded_and_above_cap_allocates_negligibly() {
+async fn baseline_50mp_is_admitted_under_cap_and_over_cap_progressive_falls_back_or_rejects() {
+    let _guard = MEASURE_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
 
-    // 1. 25 MP (5000 x 5000) progressive JPEG (the exact maximum allowed): must succeed and stay
-    // well below 260 MiB peak allocation (measured ~215 MiB on zune-jpeg).
-    let allowed_path = home.join("prog_25mp.jpg");
-    std::fs::write(&allowed_path, build_progressive_jpeg(5000, 5000)).unwrap();
+    // 1. 50 MP (8000 x 6250) baseline 4:2:0 JPEG: admitted and stays well below 256 MiB.
+    let base_50_path = home.join("base_50mp.jpg");
+    std::fs::write(&base_50_path, build_jpeg(8000, 6250, false, true)).unwrap();
 
-    // 2. 36 MP (6000 x 6000) progressive JPEG (above the 25 MP ceiling): must fail at header check
-    // with negligible peak heap allocation (< 4 MiB; measured ~0.4 MiB).
-    let rejected_path = home.join("prog_36mp.jpg");
-    std::fs::write(&rejected_path, build_progressive_jpeg(6000, 6000)).unwrap();
+    // 2. 25 MP (5000 x 5000) progressive 4:4:4 JPEG: admitted and stays below 256 MiB.
+    let prog_25_path = home.join("prog_25mp.jpg");
+    std::fs::write(&prog_25_path, build_jpeg(5000, 5000, true, false)).unwrap();
+
+    // 3. 36 MP (6000 x 6000) progressive 4:4:4 JPEG without embedded preview: rejected as
+    // `too_large` with negligible allocation (< 4 MiB).
+    let prog_36_path = home.join("prog_36mp.jpg");
+    let prog_36_bytes = build_jpeg(6000, 6000, true, false);
+    std::fs::write(&prog_36_path, &prog_36_bytes).unwrap();
+
+    // 4. 36 MP progressive 4:4:4 JPEG WITH an embedded EXIF IFD1 thumbnail and main Orientation=6
+    // (Rotate90): returns the rotated thumbnail without decoding the 36 MP main image!
+    let embedded_thumb = encode_quadrant_jpeg(200, 100, [240, 20, 20]);
+    let app1 = build_exif_app1(6, 56, embedded_thumb.len() as u32, &embedded_thumb);
+    let mut prog_36_with_exif = Vec::new();
+    prog_36_with_exif.extend_from_slice(&prog_36_bytes[..2]);
+    prog_36_with_exif.extend_from_slice(&app1);
+    prog_36_with_exif.extend_from_slice(&prog_36_bytes[2..]);
+    let prog_36_exif_path = home.join("prog_36mp_exif.jpg");
+    std::fs::write(&prog_36_exif_path, &prog_36_with_exif).unwrap();
 
     let node = Node::new(
         Paths::under(dir.path()).with_home(&home),
         legion_tools::registry(),
     );
 
+    // 50 MP baseline JPEG
     reset_peak();
-    let ok_res = node
+    let res_50 = node
         .call(Call::new(
             Door::Cli,
             "fs.thumb",
-            json!({"paths": [allowed_path.to_string_lossy()], "size": 256}),
+            json!({"paths": [base_50_path.to_string_lossy()], "size": 256}),
         ))
         .await
         .unwrap();
-    let peak_25mp_mib = peak_total_bytes() as f64 / (1024.0 * 1024.0);
-    let delta_25mp_mib = peak_delta_bytes() as f64 / (1024.0 * 1024.0);
+    let peak_50_mib = peak_total_bytes() as f64 / (1024.0 * 1024.0);
+    let delta_50_mib = peak_delta_bytes() as f64 / (1024.0 * 1024.0);
     eprintln!(
-        "25 MP progressive JPEG: peak_total={peak_25mp_mib:.1} MiB, peak_delta={delta_25mp_mib:.1} MiB"
+        "50 MP baseline 4:2:0 JPEG: peak_total={peak_50_mib:.1} MiB, peak_delta={delta_50_mib:.1} MiB"
     );
     assert!(
-        ok_res["results"][0].get("ok").is_some(),
-        "25 MP progressive JPEG should succeed: {ok_res}"
+        res_50["results"][0].get("ok").is_some(),
+        "50 MP baseline JPEG must succeed: {res_50}"
     );
-    assert_eq!(ok_res["results"][0]["ok"]["width"], json!(256));
-    assert_eq!(ok_res["results"][0]["ok"]["height"], json!(256));
+    assert_eq!(res_50["results"][0]["ok"]["width"], json!(256));
+    assert_eq!(res_50["results"][0]["ok"]["height"], json!(200));
     assert!(
-        peak_total_bytes() < 260 * 1024 * 1024,
-        "25 MP progressive JPEG peaked at {peak_25mp_mib:.1} MiB (expected < 260 MiB)"
+        peak_total_bytes() < 256 * 1024 * 1024,
+        "50 MP baseline JPEG peaked at {peak_50_mib:.1} MiB (must stay < 256 MiB)"
     );
 
-    // Measure peak allocation for a 36 MP progressive JPEG (> 25 MP cap) — must reject from the
-    // header without allocating DCT or RGB buffers.
+    // 25 MP progressive 4:4:4 JPEG
     reset_peak();
-    let rejected_res = node
+    let res_25 = node
         .call(Call::new(
             Door::Cli,
             "fs.thumb",
-            json!({"paths": [rejected_path.to_string_lossy()], "size": 256}),
+            json!({"paths": [prog_25_path.to_string_lossy()], "size": 256}),
         ))
         .await
         .unwrap();
-    let delta_36mp_mib = peak_delta_bytes() as f64 / (1024.0 * 1024.0);
-    eprintln!("36 MP progressive JPEG (rejected): peak_delta={delta_36mp_mib:.2} MiB");
+    let peak_25_mib = peak_total_bytes() as f64 / (1024.0 * 1024.0);
+    eprintln!("25 MP progressive 4:4:4 JPEG: peak_total={peak_25_mib:.1} MiB");
+    assert!(
+        res_25["results"][0].get("ok").is_some(),
+        "25 MP progressive JPEG must succeed: {res_25}"
+    );
+    assert!(
+        peak_total_bytes() < 256 * 1024 * 1024,
+        "25 MP progressive JPEG peaked at {peak_25_mib:.1} MiB (must stay < 256 MiB)"
+    );
+
+    // 36 MP progressive 4:4:4 JPEG without embedded thumbnail -> `too_large`
+    reset_peak();
+    let res_36 = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": [prog_36_path.to_string_lossy()], "size": 256}),
+        ))
+        .await
+        .unwrap();
+    let delta_36_mib = peak_delta_bytes() as f64 / (1024.0 * 1024.0);
+    eprintln!("36 MP progressive 4:4:4 JPEG (rejected): peak_delta={delta_36_mib:.2} MiB");
+    assert_eq!(res_36["results"][0]["error"]["code"], json!("failed"));
     assert_eq!(
-        rejected_res["results"][0]["error"]["code"],
-        json!("failed"),
-        "{rejected_res}"
+        res_36["results"][0]["error"]["details"]["reason"],
+        json!("too_large"),
+        "{res_36}"
     );
     assert!(
         peak_delta_bytes() < 4 * 1024 * 1024,
-        "rejected 36 MP progressive JPEG allocated {delta_36mp_mib:.2} MiB (expected < 4 MiB)"
+        "rejected 36 MP progressive JPEG allocated {delta_36_mib:.2} MiB"
+    );
+
+    // 36 MP progressive 4:4:4 JPEG WITH EXIF IFD1 thumbnail + Rotate90 -> succeeds cheaply!
+    reset_peak();
+    let res_36_exif = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": [prog_36_exif_path.to_string_lossy()], "size": 256}),
+        ))
+        .await
+        .unwrap();
+    let delta_exif_mib = peak_delta_bytes() as f64 / (1024.0 * 1024.0);
+    eprintln!("36 MP progressive JPEG via EXIF IFD1 fallback: peak_delta={delta_exif_mib:.2} MiB");
+    assert!(
+        res_36_exif["results"][0].get("ok").is_some(),
+        "over-cap progressive JPEG with EXIF thumbnail should succeed: {res_36_exif}"
+    );
+    assert_eq!(res_36_exif["results"][0]["ok"]["width"], json!(100));
+    assert_eq!(res_36_exif["results"][0]["ok"]["height"], json!(200));
+    let b64 = res_36_exif["results"][0]["ok"]["content"].as_str().unwrap();
+    let decoded = image::load_from_memory(&BASE64.decode(b64).unwrap())
+        .unwrap()
+        .to_rgb8();
+    let top_right = decoded.get_pixel(95, 5);
+    assert!(
+        top_right.0[0] > 180 && top_right.0[2] < 80,
+        "expected Rotate90 red corner, got {top_right:?}"
+    );
+    assert!(
+        peak_delta_bytes() < 8 * 1024 * 1024,
+        "EXIF fallback allocated {delta_exif_mib:.2} MiB"
+    );
+}
+
+#[tokio::test]
+async fn format_bytes_per_pixel_stays_within_documented_factors() {
+    let _guard = MEASURE_LOCK.lock().await;
+    let w = 1000u32;
+    let h = 1000u32;
+    let px = u64::from(w) * u64::from(h);
+
+    assert!(
+        measure_decode_bpp(
+            "jpeg_baseline_420",
+            build_jpeg(1000, 1000, false, true),
+            ImageFormat::Jpeg,
+            px
+        ) <= 3.5
+    );
+    assert!(
+        measure_decode_bpp(
+            "jpeg_baseline_444",
+            build_jpeg(1000, 1000, false, false),
+            ImageFormat::Jpeg,
+            px
+        ) <= 3.5
+    );
+    assert!(
+        measure_decode_bpp(
+            "jpeg_progressive_420",
+            build_jpeg(1000, 1000, true, true),
+            ImageFormat::Jpeg,
+            px
+        ) <= 6.5
+    );
+    assert!(
+        measure_decode_bpp(
+            "jpeg_progressive_444",
+            build_jpeg(1000, 1000, true, false),
+            ImageFormat::Jpeg,
+            px
+        ) <= 9.5
+    );
+
+    let rgb8 = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_pixel(w, h, Rgb([100, 150, 200]));
+    let mut png_rgb8 = Vec::new();
+    PngEncoder::new(&mut png_rgb8)
+        .write_image(&rgb8, w, h, ExtendedColorType::Rgb8)
+        .unwrap();
+    assert!(measure_decode_bpp("png_rgb8", png_rgb8, ImageFormat::Png, px) <= 3.5);
+
+    let rgba8 = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(w, h, Rgba([100, 150, 200, 255]));
+    let mut png_rgba8 = Vec::new();
+    PngEncoder::new(&mut png_rgba8)
+        .write_image(&rgba8, w, h, ExtendedColorType::Rgba8)
+        .unwrap();
+    assert!(measure_decode_bpp("png_rgba8", png_rgba8, ImageFormat::Png, px) <= 4.5);
+
+    let rgb16 = vec![0u8; (px as usize) * 6];
+    let mut png_rgb16 = Vec::new();
+    PngEncoder::new(&mut png_rgb16)
+        .write_image(&rgb16, w, h, ExtendedColorType::Rgb16)
+        .unwrap();
+    assert!(measure_decode_bpp("png_rgb16", png_rgb16, ImageFormat::Png, px) <= 6.5);
+
+    let rgba16 = vec![0u8; (px as usize) * 8];
+    let mut png_rgba16 = Vec::new();
+    PngEncoder::new(&mut png_rgba16)
+        .write_image(&rgba16, w, h, ExtendedColorType::Rgba16)
+        .unwrap();
+    assert!(measure_decode_bpp("png_rgba16", png_rgba16, ImageFormat::Png, px) <= 8.5);
+
+    assert!(
+        measure_decode_bpp(
+            "png_interlaced_rgb8",
+            build_interlaced_png(w, h, 8, 2),
+            ImageFormat::Png,
+            px
+        ) <= 6.5
+    );
+    assert!(
+        measure_decode_bpp(
+            "png_interlaced_rgba8",
+            build_interlaced_png(w, h, 8, 6),
+            ImageFormat::Png,
+            px
+        ) <= 8.5
+    );
+    assert!(
+        measure_decode_bpp(
+            "png_interlaced_rgba16",
+            build_interlaced_png(w, h, 16, 6),
+            ImageFormat::Png,
+            px
+        ) <= 16.5
+    );
+
+    let mut gif_bytes = Vec::new();
+    {
+        let mut enc = GifEncoder::new(&mut gif_bytes);
+        enc.encode_frame(Frame::new(rgba8.clone())).unwrap();
+    }
+    assert!(measure_decode_bpp("gif", gif_bytes, ImageFormat::Gif, px) <= 5.5);
+
+    let mut webp_ll = Vec::new();
+    WebPEncoder::new_lossless(&mut webp_ll)
+        .encode(&rgb8, w, h, ExtendedColorType::Rgb8)
+        .unwrap();
+    assert!(measure_decode_bpp("webp_lossless_rgb", webp_ll, ImageFormat::WebP, px) <= 7.5);
+
+    let mut bmp_rgb = Vec::new();
+    BmpEncoder::new(&mut bmp_rgb)
+        .encode(&rgb8, w, h, ExtendedColorType::Rgb8)
+        .unwrap();
+    assert!(measure_decode_bpp("bmp_rgb24", bmp_rgb, ImageFormat::Bmp, px) <= 4.6);
+}
+
+#[tokio::test]
+#[ignore = "run explicitly in --release mode for realistic photo decode timings"]
+async fn benchmark_realistic_photo_timings_and_cold_32_batch() {
+    let _guard = MEASURE_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Generate realistic high-detail textured photos via ffmpeg (real non-zero AC coefficients,
+    // realistic ~2-12 MiB file sizes) so timings reflect real phone/camera JPEGs.
+    let make_photo = |name: &str, size: &str, extra: &[&str]| {
+        let p = home.join(name);
+        let src = format!("testsrc2=size={size}:duration=0.1:rate=10");
+        let mut args = vec![
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &src,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "3",
+        ];
+        args.extend_from_slice(extra);
+        let p_str = p.to_string_lossy().into_owned();
+        args.push(&p_str);
+        let st = std::process::Command::new("ffmpeg")
+            .args(&args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "ffmpeg failed for {name}");
+        p
+    };
+
+    let p12 = make_photo("photo_12mp.jpg", "4000x3000", &["-pix_fmt", "yuvj420p"]);
+    let p50 = make_photo("photo_50mp.jpg", "8000x6250", &["-pix_fmt", "yuvj420p"]);
+    // Use pure-Rust progressive 4:4:4 JPEG (or magick/cjpeg if available for real photo texture).
+    let p25_prog = home.join("photo_25mp_prog.jpg");
+    let p25_base = make_photo(
+        "photo_25mp_base.jpg",
+        "5000x5000",
+        &["-pix_fmt", "yuvj444p"],
+    );
+    let converted_prog = std::process::Command::new("magick")
+        .args([
+            p25_base.to_str().unwrap(),
+            "-interlace",
+            "Plane",
+            "-sampling-factor",
+            "4:4:4",
+            "-quality",
+            "88",
+            p25_prog.to_str().unwrap(),
+        ])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !converted_prog {
+        std::fs::write(&p25_prog, build_jpeg(5000, 5000, true, false)).unwrap();
+    }
+
+    let node = Node::new(
+        Paths::under(dir.path()).with_home(&home),
+        legion_tools::registry(),
+    );
+
+    for (label, path) in [
+        ("12 MP baseline 4:2:0", &p12),
+        ("50 MP baseline 4:2:0", &p50),
+        ("25 MP progressive 4:4:4", &p25_prog),
+    ] {
+        let sz_kib = std::fs::metadata(path).unwrap().len() as f64 / 1024.0;
+        reset_peak();
+        let t0 = Instant::now();
+        let res = node
+            .call(Call::new(
+                Door::Cli,
+                "fs.thumb",
+                json!({"paths": [path.to_string_lossy()], "size": 256}),
+            ))
+            .await
+            .unwrap();
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let peak_mib = peak_total_bytes() as f64 / (1024.0 * 1024.0);
+        assert!(res["results"][0].get("ok").is_some(), "{label}: {res}");
+        eprintln!("{label:<26} | file={sz_kib:>7.1} KiB | peak={peak_mib:>5.1} MiB | {ms:>6.1} ms");
+    }
+
+    // Cold 32-photo batch of 12 MP phone photos (32 distinct files, empty cache dir).
+    let batch_dir = tempfile::tempdir().unwrap();
+    let batch_home = batch_dir.path().join("home");
+    std::fs::create_dir_all(&batch_home).unwrap();
+    let base_bytes = std::fs::read(&p12).unwrap();
+    let mut batch_paths = Vec::with_capacity(32);
+    for i in 0..32 {
+        let dst = batch_home.join(format!("img_{i:02}.jpg"));
+        std::fs::write(&dst, &base_bytes).unwrap();
+        batch_paths.push(dst.to_string_lossy().into_owned());
+    }
+    let batch_node = Node::new(
+        Paths::under(batch_dir.path()).with_home(&batch_home),
+        legion_tools::registry(),
+    );
+    reset_peak();
+    let t0 = Instant::now();
+    let res = batch_node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": batch_paths, "size": 256}),
+        ))
+        .await
+        .unwrap();
+    let batch_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let batch_peak_mib = peak_total_bytes() as f64 / (1024.0 * 1024.0);
+    let items = res["results"].as_array().unwrap();
+    assert_eq!(items.len(), 32);
+    assert!(items.iter().all(|it| it.get("ok").is_some()));
+    eprintln!(
+        "32x 12 MP cold batch       | peak={batch_peak_mib:>5.1} MiB | total={batch_ms:>6.1} ms ({:.1} ms/photo)",
+        batch_ms / 32.0
     );
 }

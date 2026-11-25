@@ -8,19 +8,34 @@
 //!   opened once, checked via the open handle's size, mtime, OS file identity (`dev`/`ino` or
 //!   Windows volume+file index) and metadata change time (`ctime` / NTFS `ChangeTime`), and read
 //!   directly from that handle so rename swaps cannot substitute another file.
-//! - **Bounded real decoder memory**: `zune-jpeg` buffers full `i16` DCT coefficients for
-//!   progressive JPEGs (~6 bytes/pixel) plus RGB8 output (~3 bytes/pixel) plus resize scratch
-//!   (~8.6 bytes/pixel measured; a 5000x5000 25 MP 4:4:4 progressive JPEG peaks at ~215 MiB as
-//!   verified by the counting-allocator test in `tests/thumb_mem.rs`). Therefore:
-//!   - Source file size is capped at **64 MiB**.
-//!   - Source image dimensions are capped at **25 megapixels** (`MAX_SOURCE_PIXELS = 25_000_000`,
-//!     verified from the header before allocating pixel buffers) and `Limits::max_alloc` at
-//!     **256 MiB**.
-//!   - Total in-flight image decodes across all sessions are capped at **50 megapixels** and at
-//!     most **8** concurrent decodes, scheduled round-robin by principal so peak concurrent decode
-//!     memory stays below ~450 MiB.
-//!   - Every image decode has a **10 s** wall-clock timeout and bounded limiter wait (**10 s**,
-//!     returning retryable `busy` on wait timeout).
+//! - **Per-format estimated decode memory cap (256 MiB)**: rather than a blanket pixel cap that
+//!   would reject 48–61 MP baseline phone/camera JPEGs, [`thumb_probe`](super::thumb_probe) reads
+//!   the format and encoding subtype from the header before decoding and multiplies pixels by a
+//!   counting-allocator-measured bytes-per-pixel factor (plus compressed source bytes and 2 MiB
+//!   overhead). Images whose estimated peak fits within **256 MiB** are decoded directly (e.g.,
+//!   50 MP baseline 4:2:0 JPEG peaks around ~145 MiB + source size; 25 MP progressive 4:4:4 JPEG
+//!   peaks around ~215 MiB).
+//! - **Embedded EXIF/MPF preview fallback**: when a JPEG exceeds the 256 MiB decode cap (such as a
+//!   200 MP photo or a 36+ MP progressive 4:4:4 JPEG), `fs.thumb` extracts an embedded MPF APP2
+//!   preview (preferred) or EXIF IFD1 thumbnail with strict overflow-safe offset/length bounds,
+//!   validates and decodes that embedded image through the exact same probe, limits, and scheduler,
+//!   and applies the main image's EXIF orientation. Only when no usable embedded thumbnail exists
+//!   does it return the per-path `too_large` error (`ErrorCode::Failed` with
+//!   `details.reason = "too_large"`).
+//! - **In-flight byte-budget scheduling**: total in-flight image decodes across all sessions are
+//!   scheduled round-robin by principal against `min(512 MiB, total_machine_ram / 8)` (floored at
+//!   the 256 MiB per-image cap so an admitted image never deadlocks) and at most **8** concurrent
+//!   decodes, with a **10 s** bounded wait (returning retryable `busy`) and a **10 s** wall-clock
+//!   decode timeout.
+//! - **JPEG scaled IDCT note**: `image 0.25.10` decodes JPEGs via `zune-jpeg 0.5.15`, which does
+//!   not expose reduced-resolution scaled IDCT (`1/2`, `1/4`, `1/8`; its internal `idct4x4` and
+//!   `idct_1x1` are sparse-block optimizations that still output full 8×8 blocks). To minimize
+//!   memory and decode time without switching decoders, `fs.thumb` passes the compressed input
+//!   buffer by value (so `JpegDecoder` drops the duplicate copy before pixel allocation),
+//!   downscales 2× or larger reductions with `DynamicImage::thumbnail` box-averaging (avoiding
+//!   `FilterType::Triangle`'s 8–25 MiB filter weight buffers), and applies EXIF orientation
+//!   *after* resizing (avoiding a second full-resolution frame allocation on rotated portrait
+//!   photos).
 //! - **Hardened `ffmpeg` video posters**:
 //!   - Videos use a separate fair pool (**2** concurrent `ffmpeg` subprocesses, round-robin by
 //!     principal, **15 s** wait timeout) so video floods never stall image thumbnails.
@@ -30,9 +45,9 @@
 //!     protocols, and attachment streams are strictly blocked.
 //!   - Passing an already-opened FD to `ffmpeg` is not used because `legion-os::run` feeds `stdin`
 //!     over a non-seekable pipe (breaking `-ss` seeking and MP4 files with trailing `moov` atoms),
-//!     sets `CLOEXEC` without `pre_exec`, and the workspace forbids `unsafe_code`; instead we
-//!     combine the protocol/format whitelists with a post-extraction `FileStamp` check (`FileId`,
-//!     `ctime`, size, mtime) so any swap during extraction fails with `conflict`.
+//!     sets `CLOEXEC` without `pre_exec`, and `legion-tools` keeps `#![forbid(unsafe_code)]`;
+//!     instead we combine the protocol/format whitelists with a post-extraction `FileStamp` check
+//!     (`FileId`, `ctime`, size, mtime) so any swap during extraction fails with `conflict`.
 
 use std::collections::HashMap;
 use std::fs::{self, File, Metadata};
@@ -46,9 +61,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
-use image::imageops::FilterType;
+use image::imageops::{self, FilterType};
 use image::metadata::Orientation;
-use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageFormat, ImageReader, Limits};
+use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageFormat, ImageReader};
 use legion_core::media::{Category, classify_path};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Access, CancellationToken, Ctx, Registry, ToolError};
@@ -58,10 +73,14 @@ use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tokio::task::JoinSet;
 
 use super::thumb_cache::{CachedThumb, ThumbCache, cache_key, temp_dir_in_cache};
-use super::thumb_limit::{AcquireError, FairPool};
+use super::thumb_limit::{AcquireError, FairPool, compute_image_in_flight_budget};
+use super::thumb_probe::{
+    ImageProfile, MAX_IMAGE_DECODE_BYTES, image_limits, probe_image_profile, too_large_error,
+};
 use super::{cancelled_error, check_fs_path, check_regular_file, map_io_error, platform};
 
 const MIN_PATHS: usize = 1;
@@ -70,14 +89,7 @@ const MIN_THUMB_SIZE: u32 = 96;
 const DEFAULT_THUMB_SIZE: u32 = 256;
 const MAX_THUMB_SIZE: u32 = 512;
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
-/// Single-image pixel ceiling (25 MP). Measured with a counting global allocator in
-/// `tests/thumb_mem.rs`: a 5000x5000 (25 MP) 4:4:4 progressive JPEG peaks at ~215 MiB in
-/// `zune-jpeg` (~8.6 bytes/pixel for i16 DCT planes + RGB8 output + resize scratch), keeping
-/// single decodes well below 256 MiB and 50 MP of concurrent in-flight work below ~450 MiB.
-const MAX_SOURCE_PIXELS: u64 = 25_000_000;
-const MAX_IMAGE_DIMENSION: u32 = 65_535;
-const MAX_DECODE_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_IN_FLIGHT_IMAGE_MP: usize = 50;
+const MAX_IN_FLIGHT_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_IN_FLIGHT_IMAGES: usize = 8;
 const MAX_IN_FLIGHT_VIDEOS: usize = 2;
 const IMAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -99,21 +111,33 @@ const FFMPEG_FORMAT_WHITELIST: &str =
 static IMAGE_POOL: OnceLock<Arc<FairPool>> = OnceLock::new();
 static VIDEO_POOL: OnceLock<Arc<FairPool>> = OnceLock::new();
 
+fn machine_in_flight_image_budget() -> u64 {
+    let total_ram = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
+    )
+    .map(|sys| sys.total_memory())
+    .unwrap_or(0);
+    compute_image_in_flight_budget(total_ram, MAX_IMAGE_DECODE_BYTES, MAX_IN_FLIGHT_IMAGE_BYTES)
+}
+
 fn image_pool() -> Arc<FairPool> {
     Arc::clone(
-        IMAGE_POOL.get_or_init(|| FairPool::new(MAX_IN_FLIGHT_IMAGE_MP, MAX_IN_FLIGHT_IMAGES)),
+        IMAGE_POOL
+            .get_or_init(|| FairPool::new(machine_in_flight_image_budget(), MAX_IN_FLIGHT_IMAGES)),
     )
 }
 
 fn video_pool() -> Arc<FairPool> {
-    Arc::clone(VIDEO_POOL.get_or_init(|| FairPool::new(MAX_IN_FLIGHT_VIDEOS, MAX_IN_FLIGHT_VIDEOS)))
+    Arc::clone(
+        VIDEO_POOL.get_or_init(|| FairPool::new(MAX_IN_FLIGHT_VIDEOS as u64, MAX_IN_FLIGHT_VIDEOS)),
+    )
 }
 
 pub(super) fn register(registry: &mut Registry) {
     registry.add_fn(
         "fs.thumb",
         Effect::Read,
-        "Generate thumbnails for 1 to 32 image or video paths on this node, returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory.",
+        "Generate thumbnails for 1 to 32 image or video paths on this node (64 MiB source cap, 256 MiB estimated decode memory per image with EXIF/MPF preview fallback for larger JPEGs, in-flight budget capped at min(512 MiB, RAM/8)), returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory.",
         thumb,
     );
 }
@@ -228,7 +252,6 @@ impl FileStamp {
 }
 
 async fn thumb(ctx: &Ctx, args: ThumbArgs) -> Result<ThumbResult, ToolError> {
-    // Enforce the contract: thumbnailing a file is allowed exactly when `fs.read` of it is.
     let read_spec = ctx.node().spec("fs.read")?;
     if !ctx.grant().allows(&read_spec) {
         return Err(ErrorBody::new(
@@ -388,7 +411,6 @@ async fn thumb_one(
         return Err(cancelled_error("fs.thumb"));
     }
 
-    // Check authorization BEFORE touching the file system or the thumbnail cache.
     let grant_for_check = grant.clone();
     let raw_for_check = raw_path.clone();
     let resolved = match tokio::task::spawn_blocking(move || {
@@ -417,9 +439,6 @@ async fn thumb_one(
             .await
         }
         _ => {
-            // Confirm existence / regular file type first only after category check, or report
-            // unsupported directly for non-image/non-video regular files. Still check regular file
-            // so missing paths report `not_found` and directories/FIFOs report `invalid_args`.
             let resolved_stat = resolved.clone();
             let stat_res = tokio::task::spawn_blocking(move || {
                 check_regular_file(
@@ -454,15 +473,16 @@ async fn thumb_one(
     }
 }
 
-/// Prepared image file opened once, verified against TOCTOU swaps, and header-probed before
-/// requesting megapixel capacity from the fair image pool.
+/// Prepared image file opened once, verified against TOCTOU swaps, and header-probed (or resolved
+/// to a validated embedded EXIF/MPF preview) before requesting byte-budget capacity from the fair
+/// image pool.
 enum ImagePrep {
     CacheHit(CachedThumb),
     Decode {
         key: String,
         bytes: Vec<u8>,
-        format: ImageFormat,
-        cost_mp: usize,
+        profile: ImageProfile,
+        override_orientation: Option<Orientation>,
     },
 }
 
@@ -488,20 +508,25 @@ async fn thumb_image(
         )
     })?;
 
-    let (key, bytes, format, cost_mp) = match prep {
+    let (key, bytes, profile, override_orientation) = match prep {
         Ok(ImagePrep::CacheHit(hit)) => return Ok(ThumbItem::from_cached(raw_path, hit)),
         Ok(ImagePrep::Decode {
             key,
             bytes,
-            format,
-            cost_mp,
-        }) => (key, bytes, format, cost_mp),
+            profile,
+            override_orientation,
+        }) => (key, bytes, profile, override_orientation),
         Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
     };
 
-    // Acquire pixel budget from the fair image pool (bounded wait, cancellable).
+    // Acquire estimated decode bytes from the fair image pool (bounded wait, cancellable).
     let permit = match image_pool()
-        .acquire(principal, cost_mp, IMAGE_WAIT_TIMEOUT, &cancel)
+        .acquire(
+            principal,
+            profile.estimated_peak_bytes,
+            IMAGE_WAIT_TIMEOUT,
+            &cancel,
+        )
         .await
     {
         Ok(permit) => permit,
@@ -522,13 +547,21 @@ async fn thumb_image(
     };
 
     // Decode off async threads with a hard wall-clock time limit. The permit lives inside the
-    // blocking closure so its megapixel budget stays reserved until decoding finishes or unwinds.
+    // blocking closure so its byte budget stays reserved until decoding finishes or unwinds.
     let abort_flag = Arc::new(AtomicBool::new(false));
     let abort_worker = Arc::clone(&abort_flag);
     let resolved_decode = resolved.clone();
     let mut handle = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        decode_and_render_image_checked(&resolved_decode, &bytes, format, size, fit, &abort_worker)
+        decode_and_render_image_checked(
+            &resolved_decode,
+            bytes,
+            profile,
+            override_orientation,
+            size,
+            fit,
+            &abort_worker,
+        )
     });
 
     let sleep = tokio::time::sleep(IMAGE_DECODE_TIMEOUT);
@@ -655,9 +688,42 @@ async fn thumb_video(
     }
 }
 
+/// Selects either the full image (when its estimated decode peak fits the 256 MiB cap) or the best
+/// validated embedded MPF/EXIF JPEG preview (with the main image's EXIF orientation).
+fn select_decode_source(
+    path: &Path,
+    bytes: Vec<u8>,
+) -> Result<(Vec<u8>, ImageProfile, Option<Orientation>), ErrorBody> {
+    let (profile, jpeg_meta) = probe_image_profile(path, &bytes)?;
+    if profile.fits_cap() {
+        return Ok((bytes, profile, None));
+    }
+
+    // Over the 256 MiB decode cap: attempt embedded MPF preview / EXIF IFD1 thumbnail fallback.
+    // Every embedded slice goes through the exact same header probe and 256 MiB cap so an embedded
+    // bomb cannot bypass limits.
+    if let Some(meta) = jpeg_meta {
+        for (start, end) in meta.embedded_thumbs {
+            let Some(slice) = bytes.get(start..end) else {
+                continue;
+            };
+            let candidate = slice.to_vec();
+            if let Ok((sub_profile, _)) = probe_image_profile(path, &candidate)
+                && sub_profile.format == ImageFormat::Jpeg
+                && sub_profile.fits_cap()
+            {
+                return Ok((candidate, sub_profile, Some(meta.orientation)));
+            }
+        }
+    }
+
+    Err(too_large_error(path, &profile))
+}
+
 /// Opens an image file once, checks its metadata and identity on the open handle, checks the
-/// lock-free cache, reads bytes from that same open handle on miss, and probes the image format
-/// and header dimensions (without allocating pixel buffers) before acquiring decode capacity.
+/// lock-free cache, reads bytes from that same open handle on miss, and probes the image format,
+/// subtype, and estimated decode memory (falling back to a validated EXIF/MPF preview when over
+/// cap) before acquiring decode capacity.
 fn prepare_image_open_once<F>(
     path: &Path,
     cache: &ThumbCache,
@@ -728,7 +794,6 @@ where
         return Ok(ImagePrep::CacheHit(hit));
     }
 
-    // Read directly from the already-open, already-verified file handle.
     let capacity = usize::try_from(open_stamp.size.min(MAX_SOURCE_BYTES)).unwrap_or(0);
     let mut bytes = Vec::with_capacity(capacity);
     (&file)
@@ -760,12 +825,12 @@ where
         return Err(changed_while_reading(path));
     }
 
-    let (format, cost_mp) = probe_image_header(path, &bytes)?;
+    let (decode_bytes, profile, override_orientation) = select_decode_source(path, bytes)?;
     Ok(ImagePrep::Decode {
         key,
-        bytes,
-        format,
-        cost_mp,
+        bytes: decode_bytes,
+        profile,
+        override_orientation,
     })
 }
 
@@ -780,113 +845,14 @@ fn changed_while_reading(path: &Path) -> ErrorBody {
     .with_hint("Retry fs.thumb once the file has finished changing.")
 }
 
-fn is_supported_image_extension(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
-    matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "jpg" | "jpeg" | "jpe" | "jfif" | "png" | "gif" | "webp" | "bmp" | "dib"
-    )
-}
-
-fn image_limits() -> Limits {
-    let mut limits = Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
-    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
-    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
-    limits
-}
-
-/// Inspects magic bytes and image header dimensions without decoding pixels, rejecting unsupported
-/// formats and images over [`MAX_SOURCE_PIXELS`] (25 MP) before acquiring megapixel budget.
-fn probe_image_header(path: &Path, bytes: &[u8]) -> Result<(ImageFormat, usize), ErrorBody> {
-    if bytes.is_empty() {
-        return Err(ErrorBody::new(
-            ErrorCode::Failed,
-            format!(
-                "{} is empty and cannot be decoded as an image.",
-                path.display()
-            ),
-        ));
-    }
-
-    let format = match image::guess_format(bytes) {
-        Ok(
-            fmt @ (ImageFormat::Jpeg
-            | ImageFormat::Png
-            | ImageFormat::Gif
-            | ImageFormat::WebP
-            | ImageFormat::Bmp),
-        ) => fmt,
-        _ => {
-            if is_supported_image_extension(path) {
-                return Err(ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!(
-                        "{} is not a valid JPEG, PNG, GIF, WebP or BMP image.",
-                        path.display()
-                    ),
-                )
-                .with_hint("The file may be truncated, corrupted, or misnamed."));
-            }
-            return Err(ErrorBody::new(
-                ErrorCode::Unsupported,
-                format!(
-                    "Thumbnails for {} are not supported on this node.",
-                    path.display()
-                ),
-            )
-            .with_hint("Supported raster formats are JPEG, PNG, GIF, WebP and BMP."));
-        }
-    };
-
-    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
-    reader.limits(image_limits());
-    let (w, h) = reader.into_dimensions().map_err(|err| {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!("Cannot read image header of {}: {err}.", path.display()),
-        )
-        .with_hint("The image may be corrupted or exceed the thumbnail size and memory limits.")
-    })?;
-
-    if w == 0 || h == 0 {
-        return Err(ErrorBody::new(
-            ErrorCode::Failed,
-            format!(
-                "{} declares zero image dimensions ({w}x{h}).",
-                path.display()
-            ),
-        ));
-    }
-    let pixels = u64::from(w).saturating_mul(u64::from(h));
-    if pixels > MAX_SOURCE_PIXELS {
-        return Err(ErrorBody::new(
-            ErrorCode::Failed,
-            format!(
-                "{} is {w}x{h} ({:.1} megapixels), exceeding the 25 megapixel thumbnail limit.",
-                path.display(),
-                pixels as f64 / 1_000_000.0
-            ),
-        )
-        .with_hint(
-            "Images larger than 25 megapixels are not thumbnailed to protect node memory.",
-        ));
-    }
-
-    let cost_mp = usize::try_from(pixels.div_ceil(1_000_000))
-        .unwrap_or(MAX_IN_FLIGHT_IMAGE_MP)
-        .clamp(1, MAX_IN_FLIGHT_IMAGE_MP);
-    Ok((format, cost_mp))
-}
-
-/// Decodes a header-verified raster image inside hard limits, applies EXIF orientation, resizes
-/// according to `fit`, and encodes JPEG (or PNG when transparent).
+/// Decodes a header-verified raster image inside hard limits, downscales before applying EXIF
+/// orientation (avoiding a second full-resolution allocation on rotated portrait photos), and
+/// encodes JPEG (or PNG when transparent).
 fn decode_and_render_image_checked(
     path: &Path,
-    bytes: &[u8],
-    format: ImageFormat,
+    bytes: Vec<u8>,
+    profile: ImageProfile,
+    override_orientation: Option<Orientation>,
     target_size: u32,
     fit: ThumbFit,
     abort: &AtomicBool,
@@ -897,8 +863,11 @@ fn decode_and_render_image_checked(
             format!("Decoding {} was aborted.", path.display()),
         ));
     }
+    if !profile.fits_cap() {
+        return Err(too_large_error(path, &profile));
+    }
 
-    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), profile.format);
     reader.limits(image_limits());
 
     let mut decoder = reader.into_decoder().map_err(|err| {
@@ -910,22 +879,21 @@ fn decode_and_render_image_checked(
     })?;
 
     let (w, h) = decoder.dimensions();
-    let pixels = u64::from(w).saturating_mul(u64::from(h));
-    if w == 0 || h == 0 || pixels > MAX_SOURCE_PIXELS {
+    if w != profile.width || h != profile.height {
         return Err(ErrorBody::new(
             ErrorCode::Failed,
             format!(
-                "{} is {w}x{h}, exceeding the 25 megapixel thumbnail limit.",
-                path.display()
+                "{} reported inconsistent image dimensions ({w}x{h} vs {}x{}).",
+                path.display(),
+                profile.width,
+                profile.height
             ),
-        )
-        .with_hint(
-            "Images larger than 25 megapixels are not thumbnailed to protect node memory.",
         ));
     }
 
-    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    let mut img = DynamicImage::from_decoder(decoder).map_err(|err| {
+    let orientation = override_orientation
+        .unwrap_or_else(|| decoder.orientation().unwrap_or(Orientation::NoTransforms));
+    let img = DynamicImage::from_decoder(decoder).map_err(|err| {
         ErrorBody::new(
             ErrorCode::Failed,
             format!("Cannot decode {}: {err}.", path.display()),
@@ -940,18 +908,13 @@ fn decode_and_render_image_checked(
         ));
     }
 
-    img.apply_orientation(orientation);
-
-    let resized = match fit {
-        ThumbFit::Contain => {
-            if img.width() > target_size || img.height() > target_size {
-                img.resize(target_size, target_size, FilterType::Triangle)
-            } else {
-                img
-            }
-        }
-        ThumbFit::Cover => img.resize_to_fill(target_size, target_size, FilterType::Triangle),
-    };
+    // Resize BEFORE applying EXIF orientation: `target_size x target_size` is square, so both
+    // `Contain` and `Cover` are symmetric under 90°/180°/270° rotations and flips, and rotating
+    // the tiny <=512px thumbnail avoids allocating a second full-resolution frame (e.g. +143 MiB
+    // on a 50 MP portrait photo).
+    let mut resized = resize_for_thumb(&img, target_size, fit);
+    drop(img);
+    resized.apply_orientation(orientation);
 
     if abort.load(Ordering::Acquire) {
         return Err(ErrorBody::new(
@@ -961,6 +924,81 @@ fn decode_and_render_image_checked(
     }
 
     encode_thumbnail(&resized)
+}
+
+/// Resizes `img` for a square `target_size x target_size` thumbnail.
+///
+/// For >=2x downscales, uses `DynamicImage::thumbnail` / `imageops::thumbnail` integer box
+/// averaging, which allocates only the tiny output buffer (eliminating `FilterType::Triangle`'s
+/// 8–25 MiB filter weight scratch on large photos) and runs >2x faster. Smaller downscales and
+/// `Cover` upscales use `FilterType::Triangle`.
+fn resize_for_thumb(img: &DynamicImage, target_size: u32, fit: ThumbFit) -> DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    match fit {
+        ThumbFit::Contain => {
+            if w >= target_size.saturating_mul(2) && h >= target_size.saturating_mul(2) {
+                img.thumbnail(target_size, target_size)
+            } else if w > target_size || h > target_size {
+                img.resize(target_size, target_size, FilterType::Triangle)
+            } else {
+                img.clone()
+            }
+        }
+        ThumbFit::Cover => {
+            let side = w.min(h);
+            if side >= target_size.saturating_mul(2) {
+                let x = (w - side) / 2;
+                let y = (h - side) / 2;
+                thumbnail_crop_square(img, x, y, side, target_size)
+            } else {
+                img.resize_to_fill(target_size, target_size, FilterType::Triangle)
+            }
+        }
+    }
+}
+
+fn thumbnail_crop_square(
+    img: &DynamicImage,
+    x: u32,
+    y: u32,
+    side: u32,
+    target_size: u32,
+) -> DynamicImage {
+    match img {
+        DynamicImage::ImageLuma8(buf) => {
+            let view = imageops::crop_imm(buf, x, y, side, side);
+            DynamicImage::ImageLuma8(imageops::thumbnail(&*view, target_size, target_size))
+        }
+        DynamicImage::ImageLumaA8(buf) => {
+            let view = imageops::crop_imm(buf, x, y, side, side);
+            DynamicImage::ImageLumaA8(imageops::thumbnail(&*view, target_size, target_size))
+        }
+        DynamicImage::ImageRgb8(buf) => {
+            let view = imageops::crop_imm(buf, x, y, side, side);
+            DynamicImage::ImageRgb8(imageops::thumbnail(&*view, target_size, target_size))
+        }
+        DynamicImage::ImageRgba8(buf) => {
+            let view = imageops::crop_imm(buf, x, y, side, side);
+            DynamicImage::ImageRgba8(imageops::thumbnail(&*view, target_size, target_size))
+        }
+        DynamicImage::ImageLuma16(buf) => {
+            let view = imageops::crop_imm(buf, x, y, side, side);
+            DynamicImage::ImageLuma16(imageops::thumbnail(&*view, target_size, target_size))
+        }
+        DynamicImage::ImageLumaA16(buf) => {
+            let view = imageops::crop_imm(buf, x, y, side, side);
+            DynamicImage::ImageLumaA16(imageops::thumbnail(&*view, target_size, target_size))
+        }
+        DynamicImage::ImageRgb16(buf) => {
+            let view = imageops::crop_imm(buf, x, y, side, side);
+            DynamicImage::ImageRgb16(imageops::thumbnail(&*view, target_size, target_size))
+        }
+        DynamicImage::ImageRgba16(buf) => {
+            let view = imageops::crop_imm(buf, x, y, side, side);
+            DynamicImage::ImageRgba16(imageops::thumbnail(&*view, target_size, target_size))
+        }
+        other => other.resize_to_fill(target_size, target_size, FilterType::Triangle),
+    }
 }
 
 fn encode_thumbnail(img: &DynamicImage) -> Result<CachedThumb, ErrorBody> {
@@ -1067,8 +1105,6 @@ async fn extract_video_poster(
     let frame_arg = frame_path.to_string_lossy().into_owned();
     let input_arg = platform::ffmpeg_input_arg(resolved);
 
-    // Try seeking 1 second in first for a representative frame; if the clip is shorter than 1 s
-    // and produces no frame, fall back once to the start of the stream.
     let seek_outcome =
         run_ffmpeg_extract(&input_arg, &frame_arg, Some("1"), deadline, cancel.clone()).await?;
 
@@ -1114,7 +1150,6 @@ async fn extract_video_poster(
         }
     }
 
-    // Confirm the source video did not change (size, mtime, inode/file-id, ctime) while ffmpeg ran.
     let resolved_check = resolved.to_path_buf();
     let frame_for_decode = frame_path.clone();
     tokio::task::spawn_blocking(move || {
@@ -1138,12 +1173,14 @@ async fn extract_video_poster(
                 ),
             ));
         }
-        let (format, _) = probe_image_header(&frame_for_decode, &frame_bytes)?;
+        let (decode_bytes, profile, override_orientation) =
+            select_decode_source(&frame_for_decode, frame_bytes)?;
         let no_abort = AtomicBool::new(false);
         decode_and_render_image_checked(
             &frame_for_decode,
-            &frame_bytes,
-            format,
+            decode_bytes,
+            profile,
+            override_orientation,
             target_size,
             fit,
             &no_abort,
@@ -1220,7 +1257,9 @@ fn first_line(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::thumb_probe::tests::{build_exif_app1, build_mpf_app2};
     use image::{ImageBuffer, Rgb, Rgba};
+    use serde_json::json;
 
     fn decode_helper(
         path: &Path,
@@ -1228,17 +1267,25 @@ mod tests {
         size: u32,
         fit: ThumbFit,
     ) -> Result<CachedThumb, ErrorBody> {
-        let (format, _) = probe_image_header(path, bytes)?;
-        decode_and_render_image_checked(path, bytes, format, size, fit, &AtomicBool::new(false))
+        let (decode_bytes, profile, override_orientation) =
+            select_decode_source(path, bytes.to_vec())?;
+        decode_and_render_image_checked(
+            path,
+            decode_bytes,
+            profile,
+            override_orientation,
+            size,
+            fit,
+            &AtomicBool::new(false),
+        )
     }
 
-    /// Builds a valid minimal JPEG with an EXIF APP1 orientation tag injected right after SOI.
-    fn jpeg_with_exif_orientation(width: u32, height: u32, orientation: u16) -> Vec<u8> {
+    fn encode_quadrant_jpeg(width: u32, height: u32, top_left_rgb: [u8; 3]) -> Vec<u8> {
         let mut img = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(width, height);
         for y in 0..height {
             for x in 0..width {
                 let color = if x < width / 4 && y < height / 4 {
-                    Rgb([240, 20, 20])
+                    Rgb(top_left_rgb)
                 } else {
                     Rgb([20, 40, 230])
                 };
@@ -1249,6 +1296,11 @@ mod tests {
         JpegEncoder::new_with_quality(&mut jpeg, 95)
             .encode(&img, width, height, image::ExtendedColorType::Rgb8)
             .unwrap();
+        jpeg
+    }
+
+    fn jpeg_with_exif_orientation(width: u32, height: u32, orientation: u16) -> Vec<u8> {
+        let jpeg = encode_quadrant_jpeg(width, height, [240, 20, 20]);
         assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
 
         let mut tiff = Vec::new();
@@ -1274,6 +1326,19 @@ mod tests {
         out
     }
 
+    fn over_cap_progressive_444_header_jpeg(width: u16, height: u16) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 67, 0x00];
+        out.extend_from_slice(&[16u8; 64]);
+        out.extend_from_slice(&[0xFF, 0xC2, 0x00, 17, 8]);
+        out.extend_from_slice(&height.to_be_bytes());
+        out.extend_from_slice(&width.to_be_bytes());
+        out.push(3);
+        out.extend_from_slice(&[1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0]);
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 12, 3, 1, 0, 2, 0, 3, 0, 0, 0, 0]);
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        out
+    }
+
     #[test]
     fn ffmpeg_args_enforce_protocol_format_whitelists_single_thread_and_video_only_map() {
         let args = build_ffmpeg_args("file:/clip.mp4", "/tmp/out.png", Some("1"));
@@ -1293,7 +1358,6 @@ mod tests {
         assert!(args.contains(&"-dn".to_owned()));
         let map_pos = idx("-map").expect("-map missing");
         assert_eq!(args[map_pos + 1], "0:v:0");
-        // Dangerous manifest demuxers must never be whitelisted.
         let formats: Vec<&str> = args[fmt_pos + 1].split(',').collect();
         for forbidden in ["dash", "hls", "concat", "m3u8", "http", "https"] {
             assert!(
@@ -1342,6 +1406,97 @@ mod tests {
     }
 
     #[test]
+    fn over_cap_progressive_jpeg_uses_embedded_exif_and_mpf_preview_with_main_orientation() {
+        // 1. Over-cap 6000x6000 (36 MP) progressive 4:4:4 JPEG (~318 MiB > 256 MiB) with an EXIF
+        // IFD1 200x100 thumbnail and main EXIF Orientation=6 (Rotate90).
+        let main = over_cap_progressive_444_header_jpeg(6000, 6000);
+        let exif_thumb = encode_quadrant_jpeg(200, 100, [240, 20, 20]);
+        let app1 = build_exif_app1(6, 56, exif_thumb.len() as u32, &exif_thumb);
+
+        let mut with_exif_only = Vec::new();
+        with_exif_only.extend_from_slice(&main[..2]);
+        with_exif_only.extend_from_slice(&app1);
+        with_exif_only.extend_from_slice(&main[2..]);
+
+        let rendered = decode_helper(
+            Path::new("/overcap_exif.jpg"),
+            &with_exif_only,
+            256,
+            ThumbFit::Contain,
+        )
+        .unwrap();
+        assert_eq!(rendered.width, 100);
+        assert_eq!(rendered.height, 200);
+        let dec = image::load_from_memory(&rendered.bytes).unwrap().to_rgb8();
+        let top_right = dec.get_pixel(95, 5);
+        assert!(
+            top_right.0[0] > 180 && top_right.0[2] < 80,
+            "expected Rotate90 red corner from EXIF IFD1 fallback, got {top_right:?}"
+        );
+
+        // 2. When BOTH an MPF Full-HD preview (green corner, 320x160) AND an EXIF IFD1 thumbnail
+        // (red corner, 200x100) are present, the larger MPF preview is preferred AND receives the
+        // main image's EXIF Orientation=6 (Rotate90 -> 160x320 -> Contain 256 -> 128x256).
+        let mpf_preview = encode_quadrant_jpeg(320, 160, [20, 230, 30]);
+        let preview_len = mpf_preview.len() as u32;
+        let placeholder_app2 = build_mpf_app2(&[(0x030000, 0, 0), (0x010002, preview_len, 1000)]);
+        // Layout: SOI (2) + APP1 + APP2 + main[2..] + mpf_preview
+        // `mpf_tiff_start` = 2 + app1.len() + 2 (marker) + 2 (len) + 4 ("MPF\0")
+        let mpf_tiff_start = 2 + app1.len() + 8;
+        let preview_start = 2 + app1.len() + placeholder_app2.len() + (main.len() - 2);
+        let rel_off = (preview_start - mpf_tiff_start) as u32;
+        let app2 = build_mpf_app2(&[(0x030000, 0, 0), (0x010002, preview_len, rel_off)]);
+        assert_eq!(app2.len(), placeholder_app2.len());
+
+        let mut with_mpf = Vec::new();
+        with_mpf.extend_from_slice(&main[..2]);
+        with_mpf.extend_from_slice(&app1);
+        with_mpf.extend_from_slice(&app2);
+        with_mpf.extend_from_slice(&main[2..]);
+        with_mpf.extend_from_slice(&mpf_preview);
+
+        let rendered_mpf = decode_helper(
+            Path::new("/overcap_mpf.jpg"),
+            &with_mpf,
+            256,
+            ThumbFit::Contain,
+        )
+        .unwrap();
+        assert_eq!(rendered_mpf.width, 128);
+        assert_eq!(rendered_mpf.height, 256);
+        let dec_mpf = image::load_from_memory(&rendered_mpf.bytes)
+            .unwrap()
+            .to_rgb8();
+        let top_right_mpf = dec_mpf.get_pixel(120, 8);
+        assert!(
+            top_right_mpf.0[1] > 170 && top_right_mpf.0[0] < 80,
+            "expected green corner from preferred MPF preview after Rotate90, got {top_right_mpf:?}"
+        );
+    }
+
+    #[test]
+    fn over_cap_jpeg_whose_embedded_thumbnail_is_a_bomb_returns_too_large() {
+        let main = over_cap_progressive_444_header_jpeg(6000, 6000);
+        // Embedded thumbnail is itself a 6000x6000 progressive 4:4:4 bomb!
+        let bomb_thumb = over_cap_progressive_444_header_jpeg(6000, 6000);
+        let app1 = build_exif_app1(1, 56, bomb_thumb.len() as u32, &bomb_thumb);
+
+        let mut doc = Vec::new();
+        doc.extend_from_slice(&main[..2]);
+        doc.extend_from_slice(&app1);
+        doc.extend_from_slice(&main[2..]);
+
+        let err = decode_helper(Path::new("/bomb_in_exif.jpg"), &doc, 256, ThumbFit::Contain)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Failed);
+        assert_eq!(
+            err.details.as_ref().and_then(|d| d.get("reason")),
+            Some(&json!("too_large")),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn transparent_png_stays_png_and_opaque_png_becomes_jpeg() {
         let mut transparent =
             ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(120, 120, Rgba([10, 20, 30, 255]));
@@ -1372,13 +1527,13 @@ mod tests {
 
     #[test]
     fn decompression_bomb_header_is_rejected_without_allocating() {
-        // Tiny valid PNG header declaring 6000 x 6000 pixels (36 MP > 25 MP limit).
+        // Tiny valid PNG header declaring 12000 x 12000 8-bit RGBA pixels (~590 MiB > 256 MiB cap).
         let mut bomb = Vec::new();
         bomb.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
         let mut ihdr = Vec::new();
         ihdr.extend_from_slice(b"IHDR");
-        ihdr.extend_from_slice(&6_000u32.to_be_bytes());
-        ihdr.extend_from_slice(&6_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&12_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&12_000u32.to_be_bytes());
         ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
         let crc = crc32_ieee(&ihdr);
         bomb.extend_from_slice(&13u32.to_be_bytes());
@@ -1399,8 +1554,9 @@ mod tests {
 
         let err = decode_helper(Path::new("/bomb.png"), &bomb, 256, ThumbFit::Contain).unwrap_err();
         assert_eq!(err.code, ErrorCode::Failed);
-        assert!(
-            err.message.contains("25 megapixel") || err.message.contains("limit"),
+        assert_eq!(
+            err.details.as_ref().and_then(|d| d.get("reason")),
+            Some(&json!("too_large")),
             "{err}"
         );
     }

@@ -12,6 +12,7 @@ mod search;
 mod thumb;
 mod thumb_cache;
 mod thumb_limit;
+mod thumb_probe;
 mod write;
 
 use std::cmp::Ordering;

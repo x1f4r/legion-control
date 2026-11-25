@@ -2,9 +2,10 @@
 //!
 //! Images and videos use separate pools so a batch of slow `ffmpeg` extractions cannot stall image
 //! thumbnails:
-//! - The **image pool** accounts for in-flight megapixels (`MAX_IN_FLIGHT_IMAGE_MP`) as well as
-//!   total concurrent image decodes (`MAX_IN_FLIGHT_IMAGES`), bounding real peak memory across
-//!   concurrent progressive JPEG decodes.
+//! - The **image pool** accounts for estimated in-flight decode bytes (`u64`) up to
+//!   `min(512 MiB, total_machine_ram / 8)` (floored at the 256 MiB per-image cap so a single
+//!   admitted image can always run) as well as total concurrent image decodes
+//!   (`MAX_IN_FLIGHT_IMAGES`), bounding real peak memory across concurrent decodes.
 //! - The **video pool** caps simultaneous `ffmpeg` subprocesses (`MAX_IN_FLIGHT_VIDEOS`).
 //!
 //! Both pools schedule waiting callers round-robin by principal so one caller sending many
@@ -19,6 +20,21 @@ use std::time::Duration;
 use legion_core::CancellationToken;
 use tokio::sync::Notify;
 
+/// Computes the image decode in-flight memory budget for this machine:
+/// `min(max_budget, total_ram_bytes / 8)`, clamped below to `per_image_cap` so a single admitted
+/// image can always run. When `total_ram_bytes` is 0 (unavailable), falls back to `max_budget`.
+pub(crate) fn compute_image_in_flight_budget(
+    total_ram_bytes: u64,
+    per_image_cap: u64,
+    max_budget: u64,
+) -> u64 {
+    if total_ram_bytes == 0 {
+        return max_budget.max(per_image_cap);
+    }
+    let eighth = total_ram_bytes / 8;
+    eighth.clamp(per_image_cap, max_budget.max(per_image_cap))
+}
+
 /// Why waiting for a pool permit did not succeed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AcquireError {
@@ -30,23 +46,23 @@ pub(crate) enum AcquireError {
 
 struct Waiter {
     id: u64,
-    cost: usize,
+    cost: u64,
     granted: Arc<AtomicBool>,
     notify: Arc<Notify>,
 }
 
 struct PoolState {
-    used_units: usize,
+    used_units: u64,
     used_slots: usize,
     active_by_principal: HashMap<String, usize>,
     queues: HashMap<String, VecDeque<Waiter>>,
     rr_order: VecDeque<String>,
 }
 
-/// Fair round-robin resource pool bounding both abstract units (for example megapixels) and raw
-/// concurrent slot count.
+/// Fair round-robin resource pool bounding both abstract units (estimated decode bytes for images,
+/// slots for videos) and raw concurrent slot count.
 pub(crate) struct FairPool {
-    max_units: usize,
+    max_units: u64,
     max_slots: usize,
     next_id: AtomicU64,
     state: Mutex<PoolState>,
@@ -57,7 +73,7 @@ pub(crate) struct FairPool {
 pub(crate) struct PoolPermit {
     pool: Arc<FairPool>,
     principal: String,
-    cost: usize,
+    cost: u64,
 }
 
 impl Drop for PoolPermit {
@@ -72,7 +88,7 @@ struct WaitGuard {
     pool: Arc<FairPool>,
     principal: String,
     id: u64,
-    cost: usize,
+    cost: u64,
     granted: Arc<AtomicBool>,
     armed: bool,
 }
@@ -90,7 +106,7 @@ impl Drop for WaitGuard {
 impl FairPool {
     /// Creates a new pool allowing up to `max_units` total units and `max_slots` simultaneous
     /// holders.
-    pub(crate) fn new(max_units: usize, max_slots: usize) -> Arc<FairPool> {
+    pub(crate) fn new(max_units: u64, max_slots: usize) -> Arc<FairPool> {
         Arc::new(FairPool {
             max_units: max_units.max(1),
             max_slots: max_slots.max(1),
@@ -110,7 +126,7 @@ impl FairPool {
     pub(crate) async fn acquire(
         self: &Arc<Self>,
         principal: &str,
-        cost: usize,
+        cost: u64,
         wait_timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<PoolPermit, AcquireError> {
@@ -210,7 +226,7 @@ impl FairPool {
         }
     }
 
-    fn release(&self, principal: &str, cost: usize) {
+    fn release(&self, principal: &str, cost: u64) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.used_units = state.used_units.saturating_sub(cost);
         state.used_slots = state.used_slots.saturating_sub(1);
@@ -223,7 +239,7 @@ impl FairPool {
         self.dispatch_locked(&mut state);
     }
 
-    fn cancel_or_release(&self, principal: &str, id: u64, cost: usize, granted: &AtomicBool) {
+    fn cancel_or_release(&self, principal: &str, id: u64, cost: u64, granted: &AtomicBool) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if granted.load(Ordering::Acquire) {
             state.used_units = state.used_units.saturating_sub(cost);
@@ -255,14 +271,10 @@ impl FairPool {
             if num_principals == 0 {
                 break;
             }
-            // Prefer a waiting principal with zero currently active slots if another principal
-            // already holds slots and only one slot remains, preventing monopoly starvation.
             let mut chosen_pos: Option<usize> = None;
             let multiple_principals = num_principals > 1;
             let last_slot_left = state.used_slots.saturating_add(1) == self.max_slots;
 
-            // First pass: check idle waiting principals first when multiple principals compete
-            // for the last slot; otherwise follow strict round-robin order.
             if multiple_principals && last_slot_left {
                 for (pos, principal) in state.rr_order.iter().enumerate() {
                     if state
@@ -330,33 +342,67 @@ impl FairPool {
 mod tests {
     use super::*;
 
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn in_flight_budget_scales_with_machine_memory() {
+        let cap = 256 * MIB;
+        let max = 512 * MIB;
+        // 64 GiB -> 512 MiB
+        assert_eq!(
+            compute_image_in_flight_budget(64 * 1024 * MIB, cap, max),
+            max
+        );
+        // 8 GiB -> 1 GiB/8 capped at 512 MiB
+        assert_eq!(
+            compute_image_in_flight_budget(8 * 1024 * MIB, cap, max),
+            max
+        );
+        // 4 GiB -> 512 MiB
+        assert_eq!(
+            compute_image_in_flight_budget(4 * 1024 * MIB, cap, max),
+            max
+        );
+        // 3 GiB -> 384 MiB
+        assert_eq!(
+            compute_image_in_flight_budget(3 * 1024 * MIB, cap, max),
+            384 * MIB
+        );
+        // 2 GiB -> 256 MiB
+        assert_eq!(
+            compute_image_in_flight_budget(2 * 1024 * MIB, cap, max),
+            cap
+        );
+        // 1 GiB -> floored at per-image cap (256 MiB) so an admitted image never deadlocks
+        assert_eq!(compute_image_in_flight_budget(1024 * MIB, cap, max), cap);
+        // Unknown (0) -> max_budget
+        assert_eq!(compute_image_in_flight_budget(0, cap, max), max);
+    }
+
     #[tokio::test]
-    async fn pixel_budget_caps_in_flight_megapixels_and_times_out_cleanly() {
-        let pool = FairPool::new(50, 8);
+    async fn byte_budget_caps_in_flight_memory_and_times_out_cleanly() {
+        let pool = FairPool::new(512 * MIB, 8);
         let cancel = CancellationToken::new();
 
-        // Two 25 MP decodes consume all 50 MP in flight.
         let p1 = pool
-            .acquire("alice", 25, Duration::from_secs(1), &cancel)
+            .acquire("alice", 256 * MIB, Duration::from_secs(1), &cancel)
             .await
             .unwrap();
         let p2 = pool
-            .acquire("alice", 25, Duration::from_secs(1), &cancel)
+            .acquire("alice", 256 * MIB, Duration::from_secs(1), &cancel)
             .await
             .unwrap();
 
-        // A third 10 MP decode must time out when the pool stays full.
         let err = pool
-            .acquire("bob", 10, Duration::from_millis(30), &cancel)
+            .acquire("bob", 64 * MIB, Duration::from_millis(30), &cancel)
             .await
             .err()
             .unwrap();
         assert_eq!(err, AcquireError::TimedOut);
 
-        // Releasing one 25 MP permit immediately allows a 20 MP decode.
         drop(p1);
         let p3 = pool
-            .acquire("bob", 20, Duration::from_secs(1), &cancel)
+            .acquire("bob", 200 * MIB, Duration::from_secs(1), &cancel)
             .await
             .unwrap();
         drop(p2);
@@ -364,11 +410,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_never_exceeds_in_flight_byte_budget() {
+        let budget = 300 * MIB;
+        let pool = FairPool::new(budget, 8);
+        let cancel = CancellationToken::new();
+        let live = Arc::new(AtomicU64::new(0));
+        let peak = Arc::new(AtomicU64::new(0));
+
+        let costs = [
+            40 * MIB,
+            150 * MIB,
+            220 * MIB,
+            90 * MIB,
+            180 * MIB,
+            60 * MIB,
+        ];
+        let principals = ["alice", "bob", "carol"];
+
+        let mut tasks = Vec::new();
+        for i in 0..24 {
+            let p = Arc::clone(&pool);
+            let c = cancel.clone();
+            let live_t = Arc::clone(&live);
+            let peak_t = Arc::clone(&peak);
+            let cost = costs[i % costs.len()];
+            let who = principals[i % principals.len()];
+            tasks.push(tokio::spawn(async move {
+                let _permit = p
+                    .acquire(who, cost, Duration::from_secs(5), &c)
+                    .await
+                    .unwrap();
+                let now = live_t.fetch_add(cost, Ordering::SeqCst) + cost;
+                peak_t.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(4)).await;
+                live_t.fetch_sub(cost, Ordering::SeqCst);
+            }));
+        }
+
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        let max_seen = peak.load(Ordering::SeqCst);
+        assert!(
+            max_seen <= budget,
+            "scheduler admitted {max_seen} bytes > budget {budget}"
+        );
+        assert!(max_seen >= 220 * MIB, "expected concurrent admissions");
+    }
+
+    #[tokio::test]
     async fn round_robin_fairness_prevents_one_principal_from_starving_others() {
         let pool = FairPool::new(2, 2);
         let cancel = CancellationToken::new();
 
-        // Principal A holds both video slots.
         let hold1 = pool
             .acquire("alice", 1, Duration::from_secs(1), &cancel)
             .await
@@ -378,7 +473,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Principal A queues 4 more requests, then Principal B queues 1.
         let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
         let mut alice_tasks = Vec::new();
         for _ in 0..4 {
@@ -393,7 +487,6 @@ mod tests {
                 o.lock().unwrap().push("alice");
             }));
         }
-        // Let Alice's tasks enqueue first.
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(15)).await;
 
@@ -410,8 +503,6 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(15)).await;
 
-        // Release ONE slot while Alice still holds the other: Bob (with 0 active slots) must be
-        // scheduled ahead of Alice's 4 queued requests!
         drop(hold1);
         bob_task.await.unwrap();
         drop(hold2);
@@ -449,7 +540,6 @@ mod tests {
         assert_eq!(handle.await.unwrap(), Some(AcquireError::Cancelled));
 
         drop(hold);
-        // Full capacity is still available after cancelling the waiter.
         let _reacquired = pool
             .acquire("carol", 1, Duration::from_secs(1), &hold_cancel)
             .await
