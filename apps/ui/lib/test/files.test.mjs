@@ -6,9 +6,11 @@ import {
   canOpenExternally,
   categoryFromName,
   changedPresetCutoff,
+  createThumbQueue,
   detectFileCapabilities,
   entryCategory,
   entryIconName,
+  extractThumbMap,
   filesFallbackBackRoute,
   filterEntries,
   folderDisplayName,
@@ -30,6 +32,9 @@ import {
   sortDescription,
   sortEntries,
   splitFileCrumbs,
+  THUMB_BATCH_MAX,
+  THUMB_MAX_RETRIES,
+  THUMB_RETRY_BASE_MS,
   toggleSelection,
   viewerModeFromName,
 } from '../files.js';
@@ -495,4 +500,252 @@ test('viewerModeFromName, canOpenExternally, and isExtensionlessName follow cano
   assert.equal(isExtensionlessName('.gitignore'), true);
   assert.equal(isExtensionlessName('notes.txt'), false);
   assert.equal(isExtensionlessName('archive.tar.gz'), false);
+});
+
+test('extractThumbMap converts real fs.thumb results and rejects legacy or malformed replies', () => {
+  const okMap = extractThumbMap({
+    results: [
+      { path: '/home/me/a.jpg', ok: { mime: 'image/jpeg', content: 'QUFB', width: 128, height: 96 } },
+      { path: '/home/me/b.png', ok: { mime: 'image/png', content: 'QkJC', width: 64, height: 64 } },
+    ],
+  });
+  assert.equal(Object.getPrototypeOf(okMap), null);
+  assert.deepEqual(okMap['/home/me/a.jpg'], { mime: 'image/jpeg', content: 'QUFB', width: 128, height: 96 });
+  assert.deepEqual(okMap['/home/me/b.png'], { mime: 'image/png', content: 'QkJC', width: 64, height: 64 });
+
+  const mixed = extractThumbMap({
+    results: [
+      { path: '/home/me/ok.jpg', ok: { mime: 'image/jpeg', content: 'T0s=', width: 128, height: 128 } },
+      { path: '/home/me/busy.jpg', error: { code: 'busy', message: 'Thumbnail decoding is busy.' } },
+      { path: '/home/me/missing.jpg', error: { code: 'not_found', message: 'File not found.' } },
+    ],
+  });
+  assert.equal(mixed['/home/me/ok.jpg'].content, 'T0s=');
+  assert.equal(mixed['/home/me/busy.jpg'].error.code, 'busy');
+  assert.equal(isRetryableThumbError(mixed['/home/me/busy.jpg'].error), true);
+  assert.equal(mixed['/home/me/missing.jpg'].error.code, 'not_found');
+  assert.equal(isRetryableThumbError(mixed['/home/me/missing.jpg'].error), false);
+
+  // Empty, malformed, and legacy `{ thumbnails }` shapes produce an empty map without throwing.
+  for (const bad of [
+    null,
+    undefined,
+    'not-an-object',
+    42,
+    [],
+    {},
+    { results: null },
+    { results: 'not-an-array' },
+    { results: [] },
+    {
+      results: [
+        null,
+        'str',
+        {},
+        { path: 123, ok: { mime: 'image/png', content: 'AA==' } },
+        { path: '', ok: { mime: 'image/png', content: 'AA==' } },
+        { path: '/home/me/no-payload.jpg' },
+        { path: '/home/me/bad-ok.jpg', ok: 'string' },
+        { path: '/home/me/arr-ok.jpg', ok: [] },
+      ],
+    },
+    {
+      thumbnails: {
+        '/home/me/legacy.jpg': { mime: 'image/jpeg', content: 'TEVH' },
+      },
+    },
+  ]) {
+    const out = extractThumbMap(bad);
+    assert.equal(Object.getPrototypeOf(out), null);
+    assert.deepEqual(Object.keys(out), []);
+  }
+});
+
+test('createThumbQueue batches at most 32 paths and retries busy errors with exponential backoff', async () => {
+  let nextId = 1;
+  const timers = new Map();
+  const schedule = (fn, ms) => {
+    const id = nextId++;
+    timers.set(id, { fn, ms });
+    return id;
+  };
+  const cancel = (id) => {
+    timers.delete(id);
+  };
+  const runAllTimers = async () => {
+    const snapshot = [...timers.entries()];
+    timers.clear();
+    for (const [, entry] of snapshot) {
+      await entry.fn();
+    }
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+
+  // 1. Batching > 32 paths splits cleanly into chunks of at most THUMB_BATCH_MAX (32).
+  const batchSizes = [];
+  const cache1 = createThumbCache({ maxEntries: 100 });
+  let updates1 = 0;
+  const q1 = createThumbQueue({
+    machine: 'tower',
+    link: {
+      async call(tool, args) {
+        assert.equal(tool, 'fs.thumb');
+        batchSizes.push(args.paths.length);
+        assert.ok(args.paths.length >= 1 && args.paths.length <= THUMB_BATCH_MAX);
+        return {
+          results: args.paths.map((p) => ({
+            path: p,
+            ok: { mime: 'image/jpeg', content: 'QUFB', width: 128, height: 128 },
+          })),
+        };
+      },
+    },
+    thumbCache: cache1,
+    onUpdate: () => {
+      updates1 += 1;
+    },
+    schedule,
+    cancel,
+  });
+
+  for (let i = 0; i < 40; i += 1) {
+    q1.enqueue({ path: `/home/me/pic-${i}.jpg`, mtime: '' });
+  }
+  await runAllTimers(); // batch 1 (32)
+  await runAllTimers(); // batch 2 (8)
+  assert.deepEqual(batchSizes, [32, 8]);
+  assert.equal(updates1, 2);
+  assert.equal(cache1.get(thumbCacheKey('tower', '/home/me/pic-0.jpg', '', 128))?.url, 'data:image/jpeg;base64,QUFB');
+  assert.equal(cache1.get(thumbCacheKey('tower', '/home/me/pic-39.jpg', '', 128))?.url, 'data:image/jpeg;base64,QUFB');
+  q1.dispose();
+
+  // 2. Per-path busy retries with backoff (350ms -> 700ms -> 1400ms), non-retryable stops immediately.
+  const cache2 = createThumbCache({ maxEntries: 50 });
+  const attempts = new Map();
+  const recordedDelays = [];
+  const trackingSchedule = (fn, ms) => {
+    recordedDelays.push(ms);
+    return schedule(fn, ms);
+  };
+  let updates2 = 0;
+  const q2 = createThumbQueue({
+    machine: 'tower',
+    link: {
+      async call(_tool, args) {
+        return {
+          results: args.paths.map((p) => {
+            const n = (attempts.get(p) || 0) + 1;
+            attempts.set(p, n);
+            if (p === '/home/me/recovers.jpg') {
+              return n === 1
+                ? { path: p, error: { code: 'busy', message: 'Busy.' } }
+                : { path: p, ok: { mime: 'image/png', content: 'T0s=', width: 128, height: 128 } };
+            }
+            if (p === '/home/me/always-busy.jpg') {
+              return { path: p, error: { code: 'busy', message: 'Still busy.' } };
+            }
+            return { path: p, error: { code: 'unsupported', message: 'No thumb.' } };
+          }),
+        };
+      },
+    },
+    thumbCache: cache2,
+    onUpdate: () => {
+      updates2 += 1;
+    },
+    debounceMs: 24,
+    schedule: trackingSchedule,
+    cancel,
+  });
+
+  q2.enqueue({ path: '/home/me/recovers.jpg', mtime: 't1' });
+  q2.enqueue({ path: '/home/me/always-busy.jpg', mtime: 't1' });
+  q2.enqueue({ path: '/home/me/bad.txt', mtime: 't1' });
+
+  // Initial flush.
+  await runAllTimers();
+  assert.equal(cache2.get(thumbCacheKey('tower', '/home/me/bad.txt', 't1', 128))?.failed, true);
+  assert.equal(cache2.get(thumbCacheKey('tower', '/home/me/recovers.jpg', 't1', 128)), null);
+  assert.equal(cache2.get(thumbCacheKey('tower', '/home/me/always-busy.jpg', 't1', 128)), null);
+
+  // Re-enqueueing while waiting in retry backoff must not bypass the backoff timer.
+  q2.enqueue({ path: '/home/me/recovers.jpg', mtime: 't1' });
+  assert.equal(attempts.get('/home/me/recovers.jpg'), 1);
+
+  // Retry 1 (backoff 350ms -> debounce 24ms).
+  await runAllTimers(); // retry timers fire and re-enqueue
+  await runAllTimers(); // flush runs
+  assert.equal(cache2.get(thumbCacheKey('tower', '/home/me/recovers.jpg', 't1', 128))?.url, 'data:image/png;base64,T0s=');
+  assert.equal(updates2, 1);
+  assert.equal(attempts.get('/home/me/bad.txt'), 1);
+
+  // Retries 2 and 3 for always-busy.jpg until THUMB_MAX_RETRIES exhausted.
+  for (let i = 1; i < THUMB_MAX_RETRIES; i += 1) {
+    await runAllTimers();
+    await runAllTimers();
+  }
+  assert.equal(attempts.get('/home/me/always-busy.jpg'), 1 + THUMB_MAX_RETRIES);
+  assert.equal(cache2.get(thumbCacheKey('tower', '/home/me/always-busy.jpg', 't1', 128))?.failed, true);
+  assert.ok(recordedDelays.includes(THUMB_RETRY_BASE_MS));
+  assert.ok(recordedDelays.includes(THUMB_RETRY_BASE_MS * 2));
+  assert.ok(recordedDelays.includes(THUMB_RETRY_BASE_MS * 4));
+  assert.equal(timers.size, 0);
+  q2.dispose();
+
+  // 3. Transient capability ensure failure leaves cache unpoisoned so re-enqueuing once
+  //    capabilities arrive fetches the thumbnail cleanly.
+  const cache3 = createThumbCache({ maxEntries: 20 });
+  let capsKnown = false;
+  let ensureAttempts = 0;
+  let thumbCalls = 0;
+  let updates3 = 0;
+  const fakeCapsStore = {
+    isKnown: () => capsKnown,
+    hasTool: (_m, tool) => capsKnown && tool === 'fs.thumb',
+    async ensure() {
+      ensureAttempts += 1;
+      if (ensureAttempts === 1) throw { code: 'unreachable', message: 'Timed out.' };
+      capsKnown = true;
+      return { status: 'known' };
+    },
+    async call(tool, args) {
+      assert.equal(tool, 'fs.thumb');
+      thumbCalls += 1;
+      return {
+        value: {
+          results: args.paths.map((p) => ({
+            path: p,
+            ok: { mime: 'image/png', content: 'T0s=', width: 128, height: 128 },
+          })),
+        },
+      };
+    },
+  };
+  const q3 = createThumbQueue({
+    machine: 'pi',
+    link: null,
+    capsStore: fakeCapsStore,
+    thumbCache: cache3,
+    onUpdate: () => {
+      updates3 += 1;
+    },
+    schedule,
+    cancel,
+  });
+
+  q3.enqueue({ path: '/home/me/late.png', mtime: '' });
+  await runAllTimers();
+  assert.equal(ensureAttempts, 1);
+  assert.equal(thumbCalls, 0);
+  assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late.png', '', 128)), null);
+
+  // Capabilities arrive later; re-enqueueing fetches the thumbnail.
+  capsKnown = true;
+  q3.enqueue({ path: '/home/me/late.png', mtime: '' });
+  await runAllTimers();
+  assert.equal(thumbCalls, 1);
+  assert.equal(updates3, 1);
+  assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late.png', '', 128))?.url, 'data:image/png;base64,T0s=');
+  q3.dispose();
 });

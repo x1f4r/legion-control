@@ -23,7 +23,7 @@ use crate::config::{
     FLEET_LOCK_FILE, FleetFile, MachineEntry, RemoteOs, SystemEntry, Transport,
     add_missing_machines, remove_machine, upsert_machine, validate_ssh_target,
 };
-use crate::pool::Fleet;
+use crate::pool::{Fleet, NameMismatch};
 
 /// Default `fleet.ping` timeout in seconds.
 const DEFAULT_PING_TIMEOUT_S: f64 = 8.0;
@@ -45,14 +45,14 @@ pub fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add(FleetTool::<NoArgs, ListResult, _>::new(
         "fleet.list",
         Effect::Read,
-        "List the machines configured in fleet.toml, their systems and transport targets, without making network connections.",
+        "List the machines configured in fleet.toml, their systems and transport targets, without making network connections. Includes `name_mismatch` for any machine whose last observed node name differed from its fleet name.",
         fleet.clone(),
         |fleet, ctx, args| Box::pin(fleet_list(fleet, ctx, args)),
     ));
     registry.add(FleetTool::<PingArgs, PingResult, _>::new(
         "fleet.ping",
         Effect::Read,
-        "Check whether machines in fleet.toml answer hello, concurrently, reporting their node name, system, version, platform and latency.",
+        "Check whether machines in fleet.toml answer hello, concurrently, reporting their node name, system, version, platform, latency, and any `name_mismatch` when a machine answers under a different name than its fleet name.",
         fleet.clone(),
         |fleet, ctx, args| Box::pin(fleet_ping(fleet, ctx, args)),
     ));
@@ -156,6 +156,8 @@ struct ListResult {
 struct ListedMachine {
     name: String,
     this_node: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name_mismatch: Option<NameMismatch>,
     systems: Vec<ListedSystem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     via: Option<String>,
@@ -178,7 +180,7 @@ enum SystemTarget {
     Command(Vec<String>),
 }
 
-async fn fleet_list(_fleet: &Fleet, ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
+async fn fleet_list(fleet: &Fleet, ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
     let file = ctx.config().get::<FleetFile>()?;
     let here = ctx.node_name();
     let machines = file
@@ -201,9 +203,21 @@ async fn fleet_list(_fleet: &Fleet, ctx: &Ctx, _args: NoArgs) -> Result<ListResu
                     },
                 })
                 .collect();
+            let this_node = name == here;
+            let name_mismatch = if this_node {
+                None
+            } else {
+                fleet.last_reported_node(name).and_then(|reported| {
+                    (reported.node != *name).then_some(NameMismatch {
+                        reported: reported.node,
+                        explicit: reported.explicit,
+                    })
+                })
+            };
             ListedMachine {
                 name: name.clone(),
-                this_node: name == here,
+                this_node,
+                name_mismatch,
                 systems,
                 via: entry.via.clone(),
                 mac: entry.mac.clone(),
@@ -240,6 +254,8 @@ struct PingEntry {
     reachable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name_mismatch: Option<NameMismatch>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -296,6 +312,7 @@ async fn fleet_ping(fleet: &Fleet, ctx: &Ctx, args: PingArgs) -> Result<PingResu
                     machine: outcome.machine,
                     reachable: outcome.reachable,
                     node: outcome.node,
+                    name_mismatch: outcome.name_mismatch,
                     system: outcome.system,
                     version: outcome.version,
                     os: outcome.os,
@@ -415,6 +432,7 @@ async fn fleet_add(fleet: &Fleet, ctx: &Ctx, args: AddArgs) -> Result<AddResult,
             format!("Updating fleet.toml stopped unexpectedly: {err}."),
         )
     })??;
+    fleet.clear_cached_node(&args.name);
     fleet.evict(&args.name).await;
     Ok(AddResult {
         name: args.name,
@@ -456,6 +474,7 @@ async fn fleet_remove(
             format!("Updating fleet.toml stopped unexpectedly: {err}."),
         )
     })??;
+    fleet.clear_cached_node(&args.name);
     fleet.evict(&args.name).await;
     Ok(RemoveResult {
         name: args.name,

@@ -337,9 +337,9 @@ fn load_live_policy_and_devices(
 ) -> Option<(Policy, Option<crate::device::registry::DevicesFile>)> {
     use legion_core::config::Document as _;
     let policy_file = paths.config_file(Policy::FILE);
-    let policy = match std::fs::read(&policy_file) {
-        Ok(bytes) => legion_core::config::parse::<Policy>(&policy_file, &bytes).ok()?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Policy::default(),
+    let policy = match legion_core::config::read_regular_file(&policy_file) {
+        Ok(Some(bytes)) => legion_core::config::parse::<Policy>(&policy_file, &bytes).ok()?,
+        Ok(None) => Policy::default(),
         Err(_) => return None,
     };
     // Fail closed if `devices.toml` exists on disk but cannot be read or parsed.

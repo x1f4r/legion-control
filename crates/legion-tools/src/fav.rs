@@ -12,7 +12,6 @@
 //! and `fav.list` omits entries outside the caller's `paths`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -747,8 +746,10 @@ pub fn record_truncation_notice(paths: &Paths, dropped_live: usize) {
 
 fn read_truncation_notice(paths: &Paths) -> usize {
     let path = truncation_notice_path(paths);
-    std::fs::read_to_string(&path)
+    legion_core::config::read_regular_file(&path)
         .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|val| val.get("dropped_live").and_then(Value::as_u64))
         .and_then(|n| usize::try_from(n).ok())
@@ -864,14 +865,7 @@ fn acquire_favorites_lock(lock_path: &Path) -> Result<FileLock, ErrorBody> {
 }
 
 fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>, ErrorBody> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(ErrorBody::new(
-            ErrorCode::Failed,
-            format!("{} cannot be read: {err}.", path.display()),
-        )),
-    }
+    legion_core::config::read_regular_file(path)
 }
 
 fn write_backup_if_present(
@@ -1066,7 +1060,9 @@ fn fleet_machine_os(paths: &Paths, machine: &str) -> Option<TargetOs> {
         _ => None,
     };
 
-    if let Ok(text) = std::fs::read_to_string(paths.config_file("fleet.toml"))
+    if let Ok(Some(bytes)) =
+        legion_core::config::read_regular_file(&paths.config_file("fleet.toml"))
+        && let Ok(text) = std::str::from_utf8(&bytes)
         && let Ok(doc) = text.parse::<DocumentMut>()
         && let Some(entry) = doc
             .get("machines")
@@ -1095,7 +1091,8 @@ fn fleet_machine_os(paths: &Paths, machine: &str) -> Option<TargetOs> {
         }
     }
 
-    if let Ok(bytes) = std::fs::read(paths.state_dir().join("fleet-cache.json"))
+    if let Ok(Some(bytes)) =
+        legion_core::config::read_regular_file(&paths.state_dir().join("fleet-cache.json"))
         && let Ok(cache) = serde_json::from_slice::<Value>(&bytes)
     {
         let last_sys = cache
@@ -1995,7 +1992,8 @@ fn parse_favorites_push_outcomes(sync_result: &Value) -> BTreeMap<String, FleetP
     out
 }
 
-fn format_timestamp(ts: Timestamp) -> String {
+/// Formats a `favorites.toml` RFC 3339 UTC timestamp to millisecond precision.
+pub fn format_timestamp(ts: Timestamp) -> String {
     ts.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 

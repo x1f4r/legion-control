@@ -357,7 +357,7 @@ impl Session {
             method::HELLO => {
                 let result = params::<HelloParams>(request.params).and_then(|params| {
                     self.node
-                        .hello(&params)
+                        .hello_for(&params, self.pinned.as_deref())
                         .map_err(|error| RpcError::new(TOOL_ERROR, error))
                         .and_then(|hello| to_value(&hello))
                 });

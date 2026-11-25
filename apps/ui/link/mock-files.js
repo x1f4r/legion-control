@@ -1489,41 +1489,52 @@ export function createMockFilesState({
         if (oldMachine) {
           throw { code: 'unknown_tool', message: 'Unknown tool: fs.thumb', hint: null, machine: machineName };
         }
-        const paths = Array.isArray(args?.paths) ? args.paths.slice(0, 32) : [];
-        const results = {};
+        const paths = Array.isArray(args?.paths) ? args.paths : [];
+        if (paths.length === 0 || paths.length > 32) {
+          throw {
+            code: 'invalid_args',
+            message: `fs.thumb accepts between 1 and 32 paths per call, and ${paths.length} were given.`,
+            hint: 'Pass a non-empty list of up to 32 file paths.',
+            machine: machineName,
+          };
+        }
+        const results = [];
         for (const p of paths) {
           const norm = normalizePath(p);
           const entry = findEntryOnMachine(machineName, norm);
           if (!entry || entry.kind !== 'file') {
-            results[p] = { error: { code: 'not_found', message: 'File not found.' } };
+            results.push({ path: p, error: { code: 'not_found', message: 'File not found.' } });
             continue;
           }
           if (entry.thumbFail) {
-            results[p] = { error: { code: 'unsupported', message: 'Thumbnail decoding failed.' } };
+            results.push({ path: p, error: { code: 'unsupported', message: 'Thumbnail decoding failed.' } });
             continue;
           }
           if (isThumbRetry && entry.name === 'IMG_2042.jpg') {
             const tries = thumbAttemptByPath.get(norm) || 0;
             thumbAttemptByPath.set(norm, tries + 1);
             if (tries < 1) {
-              results[p] = { error: { code: 'busy', message: 'Thumbnail worker busy.', retryable: true } };
+              results.push({ path: p, error: { code: 'busy', message: 'Thumbnail worker busy.', retryable: true } });
               continue;
             }
           }
           const cat = categoryFromName(entry.name);
           if (cat !== 'image' && cat !== 'video' && !entry.palette) {
-            results[p] = { error: { code: 'unsupported', message: 'No thumbnail for this kind.' } };
+            results.push({ path: p, error: { code: 'unsupported', message: 'No thumbnail for this kind.' } });
             continue;
           }
           const pal = entry.palette || paletteFor(norm);
-          results[p] = {
-            mime: 'image/svg+xml',
-            content: makeSampleImageBase64({ ...pal, w: 128, h: 128 }),
-            width: 128,
-            height: 128,
-          };
+          results.push({
+            path: p,
+            ok: {
+              mime: 'image/svg+xml',
+              content: makeSampleImageBase64({ ...pal, w: 128, h: 128 }),
+              width: 128,
+              height: 128,
+            },
+          });
         }
-        return { thumbnails: results };
+        return { results };
       }
 
       case 'fs.find': {

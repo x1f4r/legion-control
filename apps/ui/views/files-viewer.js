@@ -12,6 +12,7 @@ import {
   entryCategory,
   entryIconName,
   extensionFromName,
+  extractThumbMap,
   isExtensionlessName,
   mimeFromName,
   plainCategoryLabel,
@@ -632,7 +633,7 @@ export function FilesViewer({
         ? (await capsStore.call('fs.thumb', thumbArgs, { on: machine, signal })).value
         : await link.call('fs.thumb', thumbArgs, { on: machine, signal });
       if (signal?.aborted || activeFileKeyRef.current !== targetKey) return true;
-      const t = res?.thumbnails?.[path];
+      const t = extractThumbMap(res)[path];
       if (t?.content && t?.mime) {
         setMediaState({
           key: targetKey,
