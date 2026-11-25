@@ -740,12 +740,27 @@ export function VideoPlayer({
   useEffect(() => {
     function onKeyDown(e) {
       if (moreOpenRef.current) return;
+      const hasScrim = Boolean(document.querySelector('.scrim'));
+      if (e.key === 'Tab' && !hasScrim) {
+        const overlay = overlayRef.current;
+        if (overlay && overlay.inert) {
+          e.preventDefault();
+          e.stopImmediatePropagation?.();
+          overlay.inert = false;
+          controller.notifyActivity({ show: true });
+          controller.setFocusInside(true);
+          const first = overlay.querySelector(
+            'button:not([disabled]), [role="slider"], [tabindex="0"], a[href]',
+          );
+          first?.focus?.();
+          return;
+        }
+      }
       if (speedOpenRef.current && e.key === 'Escape') {
         e.preventDefault();
         setSpeedOpen(false);
         return;
       }
-      const hasScrim = Boolean(document.querySelector('.scrim'));
       const action = classifyPlayerKey(e, {
         mode: 'video',
         isFullscreen: isFullscreenRef.current,

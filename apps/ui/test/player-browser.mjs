@@ -269,6 +269,37 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
     assert.equal(hiddenState.inert, true);
     assert.equal(hiddenState.cursorHidden, true);
 
+    // 3b. Viewer is a modal: background file list is inert while open, and pressing Tab while the
+    // overlay is hidden reveals the overlay and focuses its first control inside the viewer.
+    const bgInertWhileOpen = await page.evaluate(() => Boolean(document.querySelector('.grid')?.closest('[inert]')));
+    assert.equal(bgInertWhileOpen, true);
+    await page.keyboard.press('Tab');
+    const afterHiddenTab = await page.evaluate(() => {
+      const overlay = document.querySelector('.player-overlay');
+      const firstBtn = overlay.querySelector('button');
+      const active = document.activeElement;
+      return {
+        hidden: overlay.classList.contains('hidden'),
+        inert: overlay.inert,
+        insideViewer: Boolean(document.querySelector('.viewer')?.contains(active)),
+        focusedFirst: active === firstBtn,
+      };
+    });
+    assert.equal(afterHiddenTab.hidden, false);
+    assert.equal(afterHiddenTab.inert, false);
+    assert.equal(afterHiddenTab.insideViewer, true);
+    assert.equal(afterHiddenTab.focusedFirst, true);
+    // Blur focus back out and let overlay hide again before testing stage taps below.
+    await page.evaluate(async () => {
+      document.activeElement?.blur?.();
+      window.__LEGION_TEST_PLAYER_CLOCK__.advance(3000);
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    });
+    assert.equal(
+      await page.evaluate(() => document.querySelector('.player-overlay').classList.contains('hidden')),
+      true,
+    );
+
     // Single tap toggles layer visible immediately; double tap on left third seeks -10 s and restores layer hidden.
     await page.evaluate(async () => {
       const stage = document.querySelector('.player-stage-hit');
@@ -370,9 +401,11 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
     assert.equal(await page.locator('.viewer button[aria-label="Previous video"]').count(), 1);
     assert.equal(await page.locator('.viewer button[aria-label="Next video"]').count(), 1);
 
-    // `Esc` closes the viewer when not in fullscreen and revokes the active video URL.
+    // `Esc` closes the viewer when not in fullscreen and revokes the active video URL, restoring background inert state.
     await page.keyboard.press('Escape');
     await page.locator('.viewer').waitFor({ state: 'hidden' });
+    const bgInertAfterClose = await page.evaluate(() => Boolean(document.querySelector('.grid')?.closest('[inert]')));
+    assert.equal(bgInertAfterClose, false);
     await page.waitForFunction(
       (u) => Array.isArray(window.__LEGION_MOCK_REVOKED_URLS__) && window.__LEGION_MOCK_REVOKED_URLS__.includes(u),
       nextVideoUrl,
@@ -799,8 +832,12 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
     assert.equal(afterAutoNext.revokedPrev, true, 'Auto-advancing to next song must revoke previous content URL');
     assert.notEqual(afterAutoNext.nextUrl, firstSongUrl);
 
-    // Play song -> MediaSession reflects "playing"; closing the music player clears metadata to null and playbackState to "none".
-    await page.locator('.music-play-btn').click();
+    // Ensure track is playing -> MediaSession reflects "playing"; closing the music player clears
+    // metadata to null and playbackState to "none".
+    const playBtnLabel = await page.locator('.music-play-btn').getAttribute('aria-label');
+    if (playBtnLabel === 'Play') {
+      await page.locator('.music-play-btn').click();
+    }
     await page.waitForFunction(
       () => navigator.mediaSession?.playbackState === 'playing',
       null,

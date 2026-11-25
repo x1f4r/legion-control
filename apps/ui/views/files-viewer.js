@@ -432,6 +432,65 @@ export function FilesViewer({
     };
   }, [fullscreenController, link]);
 
+  // Modal focus isolation: mark background shell siblings outside `.viewer` inert while open,
+  // and keep Tab focus cycling strictly inside `.viewer` when no sheet scrim is on top.
+  useEffect(() => {
+    const viewerEl = viewerRef.current;
+    if (!viewerEl) return undefined;
+    const saved = [];
+    let node = viewerEl;
+    while (node && node.parentElement) {
+      const parent = node.parentElement;
+      for (const sibling of Array.from(parent.children)) {
+        if (sibling === node) continue;
+        if (sibling.classList?.contains('scrim') || sibling.querySelector?.('.scrim')) continue;
+        saved.push([sibling, Boolean(sibling.inert)]);
+        sibling.inert = true;
+      }
+      if (parent.classList?.contains('app')) break;
+      node = parent;
+    }
+    if (document.activeElement && !viewerEl.contains(document.activeElement)) {
+      try {
+        viewerEl.focus({ preventScroll: true });
+      } catch {
+        // Ignore focus failures.
+      }
+    }
+
+    function onModalTab(e) {
+      if (e.key !== 'Tab' || e.defaultPrevented) return;
+      if (document.querySelector('.scrim')) return;
+      const focusables = Array.from(
+        viewerEl.querySelectorAll('button:not([disabled]), a[href], [role="slider"], [tabindex="0"]'),
+      ).filter((el) => !el.closest('[inert]') && el.offsetParent !== null);
+      if (focusables.length === 0) return;
+      const active = document.activeElement;
+      if (!viewerEl.contains(active) || active === viewerEl) {
+        e.preventDefault();
+        (e.shiftKey ? focusables[focusables.length - 1] : focusables[0]).focus();
+      } else if (!e.shiftKey && active === focusables[focusables.length - 1]) {
+        e.preventDefault();
+        focusables[0].focus();
+      } else if (e.shiftKey && active === focusables[0]) {
+        e.preventDefault();
+        focusables[focusables.length - 1].focus();
+      }
+    }
+
+    window.addEventListener('keydown', onModalTab);
+    return () => {
+      window.removeEventListener('keydown', onModalTab);
+      for (const [el, prev] of saved) {
+        try {
+          el.inert = prev;
+        } catch {
+          // Ignore detached nodes.
+        }
+      }
+    };
+  }, []);
+
   function syncOpenStateFromTransfers(list) {
     if (!Array.isArray(list)) return;
     const cur = openStateRef.current;
@@ -2143,7 +2202,7 @@ export function FilesViewer({
   }
 
   return html`
-    <div ref=${viewerRef} class=${viewerCls} role="dialog" aria-modal="true" aria-label=${name}>
+    <div ref=${viewerRef} class=${viewerCls} role="dialog" aria-modal="true" aria-label=${name} tabIndex="-1">
       ${useVideoPlayer
         ? html`
             <${VideoPlayer}

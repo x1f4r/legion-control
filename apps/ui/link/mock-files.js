@@ -2129,7 +2129,7 @@ export function createMockFilesState({
           }
           if (isSlowContent) {
             await new Promise((resolve, reject) => {
-              const tid = setTimeout(resolve, 180);
+              const tid = setTimeout(resolve, 400);
               signal?.addEventListener?.(
                 'abort',
                 () => {
