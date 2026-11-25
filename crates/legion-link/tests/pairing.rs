@@ -2189,3 +2189,742 @@ async fn real_sshd_mixed_versions_and_restore_pairing_probe() {
     assert_eq!(bad["ok"], json!(false), "{bad}");
     assert_eq!(bad["error"]["code"], json!("invalid_args"), "{bad}");
 }
+
+#[cfg(unix)]
+fn ssh_keygen_sign_proof(key: &DeviceKey, namespace: &str, msg: &[u8]) -> String {
+    let dir = strict_tempdir();
+    let kp = dir.path().join("k");
+    fs::write(&kp, key.to_openssh().unwrap().as_bytes()).unwrap();
+    fs::set_permissions(&kp, fs::Permissions::from_mode(0o600)).unwrap();
+    let mp = dir.path().join("m");
+    fs::write(&mp, msg).unwrap();
+    let out = Command::new(find_tool("ssh-keygen").unwrap())
+        .args(["-Y", "sign", "-n", namespace, "-f"])
+        .arg(&kp)
+        .arg(&mp)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "ssh-keygen -Y sign failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::read_to_string(dir.path().join("m.sig")).unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_sshd_pre_upgrade_invite_and_invalid_proof_denied_not_absent() {
+    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
+        eprintln!(
+            "skipping real_sshd_pre_upgrade_invite_and_invalid_proof_denied_not_absent: sshd/ssh-keygen unavailable"
+        );
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        eprintln!("skipping: built `legion` binary not found");
+        return;
+    };
+
+    let root = strict_tempdir();
+    let user_home = root.path().join("home");
+    let legion_home = root.path().join("legion");
+    let config_dir = legion_home.join("config");
+    let ssh_dir = user_home.join(".ssh");
+    let auth_keys = ssh_dir.join("authorized_keys");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&ssh_dir).unwrap();
+    let _ = fs::set_permissions(&user_home, fs::Permissions::from_mode(0o700));
+    let _ = fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700));
+
+    let Some(sshd) = ThrowawaySshd::start(&auth_keys, &user_home) else {
+        return;
+    };
+    fs::write(
+        config_dir.join("node.toml"),
+        format!(
+            "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_keys),
+            toml_literal(&sshd.host_key_pub),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        config_dir.join("policy.toml"),
+        "default = \"owner\"\n\n\
+         [roles.operator]\n\
+         allow = [\"effect:read\"]\n\n\
+         [roles.guest]\n\
+         allow = [\"meta.whoami\"]\n",
+    )
+    .unwrap();
+
+    let port_arg = format!("port={}", sshd.port);
+    let user_arg = format!("user={}", sshd.user);
+    let make_invite = |role: &str, name: &str| -> (String, String) {
+        let res = run_legion(
+            &legion_bin,
+            &legion_home,
+            &user_home,
+            &[
+                "device.invite",
+                &format!("role={role}"),
+                &format!("name={name}"),
+                "host=127.0.0.1",
+                &port_arg,
+                &user_arg,
+            ],
+        );
+        (
+            res["invite"].as_str().unwrap().to_owned(),
+            res["id"].as_str().unwrap().to_owned(),
+        )
+    };
+
+    // Part 1: On a FRESH key (never enrolled before), every invalid proof MUST return `denied`,
+    // enrol NOTHING, and keep the invite intact — directly catching any mutation that treats a
+    // failing proof as absent.
+    let (inv1_text, inv1_id) = make_invite("operator", "fresh-proof");
+    let inv1 = Invite::parse(&inv1_text).unwrap();
+    let fresh_key = DeviceKey::generate().unwrap();
+    let fresh_pub = fresh_key.public_key_line("fresh-proof").unwrap();
+    let attacker_key = DeviceKey::generate().unwrap();
+    let mut host_fps: Vec<String> = inv1
+        .host_keys
+        .iter()
+        .filter_map(|k| legion_link::public_key_fingerprint(k))
+        .collect();
+    host_fps.sort();
+    host_fps.dedup();
+    let canonical_msg = format!(
+        "legion-enrol-proof-v1\nid={}\npublic_key={}\nnode=tower\nhost_keys={}\n",
+        inv1.id,
+        fresh_key.public_key_line("").unwrap(),
+        host_fps.join(",")
+    );
+    let fake_hk = DeviceKey::generate().unwrap().public_key_line("").unwrap();
+    let invalid_proofs = [
+        (
+            "wrong_key",
+            attacker_key
+                .sign_enrol_proof(&inv1.id, &inv1.node, &inv1.host_keys)
+                .unwrap(),
+        ),
+        (
+            "wrong_invite",
+            fresh_key
+                .sign_enrol_proof("other-invite", &inv1.node, &inv1.host_keys)
+                .unwrap(),
+        ),
+        (
+            "wrong_node",
+            fresh_key
+                .sign_enrol_proof(&inv1.id, "pi", &inv1.host_keys)
+                .unwrap(),
+        ),
+        (
+            "wrong_host_keys",
+            fresh_key
+                .sign_enrol_proof(&inv1.id, &inv1.node, &[fake_hk])
+                .unwrap(),
+        ),
+        (
+            "wrong_namespace",
+            ssh_keygen_sign_proof(&fresh_key, "file", canonical_msg.as_bytes()),
+        ),
+        ("garbage", "not-a-valid-sshsig".to_owned()),
+    ];
+    for (label, bad_proof) in &invalid_proofs {
+        let reply = forced_enrol_raw(
+            &auth_keys,
+            &user_home,
+            &inv1_text,
+            &json!({
+                "enrol": 1,
+                "id": inv1_id,
+                "public_key": fresh_pub,
+                "name": "fresh-proof",
+                "proof": bad_proof,
+            }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(reply["ok"], json!(false), "{label}: {reply}");
+        assert_eq!(
+            reply["error"]["code"],
+            json!("denied"),
+            "{label}: invalid proof on fresh key must return denied, never treated as absent: {reply}"
+        );
+        assert!(
+            !config_dir.join("devices.toml").exists(),
+            "{label}: invalid proof must write nothing"
+        );
+        assert!(
+            fs::read_to_string(&auth_keys)
+                .unwrap()
+                .contains(&format!("legion-invite:{inv1_id}")),
+            "{label}: denied proof must leave invite intact"
+        );
+    }
+
+    // Valid `ssh-keygen -Y sign -n legion-enrol` proof on that same invite succeeds!
+    let valid_keygen_sig =
+        ssh_keygen_sign_proof(&fresh_key, "legion-enrol", canonical_msg.as_bytes());
+    let ok_reply = forced_enrol_raw(
+        &auth_keys,
+        &user_home,
+        &inv1_text,
+        &json!({
+            "enrol": 1,
+            "id": inv1_id,
+            "public_key": fresh_pub,
+            "name": "fresh-proof",
+            "proof": valid_keygen_sig,
+        }),
+        true,
+    )
+    .unwrap();
+    assert_eq!(ok_reply["ok"], json!(true), "{ok_reply}");
+    assert_eq!(ok_reply["principal"], json!("device:fresh-proof"));
+
+    // Part 2: On the now-unconfirmed leftover, an invalid proof MUST also return `denied` (NOT
+    // `conflict`) and leave the invite intact and leftover unchanged.
+    let (inv2_text, inv2_id) = make_invite("guest", "leftover-check");
+    let inv2 = Invite::parse(&inv2_text).unwrap();
+    let bad_on_existing = forced_enrol_raw(
+        &auth_keys,
+        &user_home,
+        &inv2_text,
+        &json!({
+            "enrol": 1,
+            "id": inv2_id,
+            "public_key": fresh_pub,
+            "name": "leftover-check",
+            "proof": attacker_key.sign_enrol_proof(&inv2.id, &inv2.node, &inv2.host_keys).unwrap(),
+        }),
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        bad_on_existing["error"]["code"],
+        json!("denied"),
+        "invalid proof on existing unconfirmed key must be denied, not conflict: {bad_on_existing}"
+    );
+    assert!(
+        fs::read_to_string(&auth_keys)
+            .unwrap()
+            .contains(&format!("legion-invite:{inv2_id}"))
+    );
+
+    // Part 3: Pre-upgrade invite (no `host_key_fingerprints` recorded in `state/devices.json`,
+    // simulating an invite created before upgrading):
+    //   3a. New phone sending its normal proof with a FRESH key succeeds cleanly!
+    let (pre_inv_text, pre_inv_id) = make_invite("operator", "pre-upgrade");
+    let state_file = legion_home.join("state").join("devices.json");
+    let mut state_val: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    state_val["invites"][&pre_inv_id]
+        .as_object_mut()
+        .unwrap()
+        .remove("host_key_fingerprints");
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&state_val).unwrap(),
+    )
+    .unwrap();
+
+    let pre_key = DeviceKey::generate().unwrap();
+    let pre_link = Link::new(LinkConfig {
+        device_key: Some(pre_key.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let pre_enrolled = pre_link
+        .pair(&pre_inv_text, "pre-upgrade")
+        .await
+        .unwrap_or_else(|e| {
+            panic!("new phone must pair cleanly with a pre-upgrade invite (no host_key_fingerprints): {e}")
+        });
+    assert_eq!(pre_enrolled.principal, "device:pre-upgrade");
+    assert_eq!(pre_enrolled.role, "operator");
+    pre_link.close().await;
+
+    //   3b. New phone sending its normal proof against a pre-upgrade invite for an EXISTING
+    //       unconfirmed key takes the no-proof path: refuses with Conflict (no replacement),
+    //       consumes the invite, and leaves the original leftover untouched.
+    let (pre_dup_text, pre_dup_id) = make_invite("guest", "pre-upgrade-dup");
+    let mut state_val2: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    state_val2["invites"][&pre_dup_id]
+        .as_object_mut()
+        .unwrap()
+        .remove("host_key_fingerprints");
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&state_val2).unwrap(),
+    )
+    .unwrap();
+    let pre_dup_inv = Invite::parse(&pre_dup_text).unwrap();
+    let dup_reply = forced_enrol_raw(
+        &auth_keys,
+        &user_home,
+        &pre_dup_text,
+        &json!({
+            "enrol": 1,
+            "id": pre_dup_id,
+            "public_key": pre_key.public_key_line("pre-upgrade-dup").unwrap(),
+            "name": "pre-upgrade-dup",
+            "proof": pre_key.sign_enrol_proof(&pre_dup_inv.id, &pre_dup_inv.node, &pre_dup_inv.host_keys).unwrap(),
+        }),
+        true,
+    )
+    .unwrap();
+    assert_eq!(dup_reply["error"]["code"], json!("conflict"), "{dup_reply}");
+    assert!(
+        dup_reply["error"].get("details").is_none(),
+        "pre-upgrade invite conflict must omit details: {dup_reply}"
+    );
+    assert!(
+        !fs::read_to_string(&auth_keys)
+            .unwrap()
+            .contains(&format!("legion-invite:{pre_dup_id}")),
+        "conflict on pre-upgrade invite must still consume the invite"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_sshd_concurrent_pair_same_machine_refuses_second_and_keeps_consistent_state() {
+    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
+        eprintln!(
+            "skipping real_sshd_concurrent_pair_same_machine_refuses_second_and_keeps_consistent_state: sshd/ssh-keygen unavailable"
+        );
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        eprintln!("skipping: built `legion` binary not found");
+        return;
+    };
+
+    let root = strict_tempdir();
+    let user_home = root.path().join("home");
+    let legion_home = root.path().join("legion");
+    let config_dir = legion_home.join("config");
+    let ssh_dir = user_home.join(".ssh");
+    let auth_keys = ssh_dir.join("authorized_keys");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&ssh_dir).unwrap();
+    let _ = fs::set_permissions(&user_home, fs::Permissions::from_mode(0o700));
+    let _ = fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700));
+
+    let Some(sshd) = ThrowawaySshd::start(&auth_keys, &user_home) else {
+        return;
+    };
+    fs::write(
+        config_dir.join("node.toml"),
+        format!(
+            "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_keys),
+            toml_literal(&sshd.host_key_pub),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        config_dir.join("policy.toml"),
+        "default = \"owner\"\n\n\
+         [roles.operator]\n\
+         allow = [\"effect:read\"]\n\n\
+         [roles.guest]\n\
+         allow = [\"meta.whoami\"]\n",
+    )
+    .unwrap();
+
+    let port_arg = format!("port={}", sshd.port);
+    let user_arg = format!("user={}", sshd.user);
+    let inv1 = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=phone1",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv2 = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=guest",
+            "name=phone2",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv1_text = inv1["invite"].as_str().unwrap().to_owned();
+    let inv2_text = inv2["invite"].as_str().unwrap().to_owned();
+    let inv2_id = inv2["id"].as_str().unwrap().to_owned();
+
+    let config_lock = legion_home.join("state").join("sync").join("config.lock");
+    let Some(mut holder) = hold_flock(&config_lock) else {
+        return;
+    };
+
+    let key = DeviceKey::generate().unwrap();
+    let link = Link::new(LinkConfig {
+        device_key: Some(key.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let accepted_before = sshd.log().matches("Accepted publickey").count();
+    let first_task = {
+        let link = link.clone();
+        let inv = inv1_text.clone();
+        tokio::spawn(async move { link.pair(&inv, "phone1").await })
+    };
+    wait_sshd_accepted(&sshd, accepted_before + 1).await;
+
+    // While first pairing is in flight for `tower`, a second concurrent `pair` for `tower` MUST
+    // fail immediately with Busy without sending anything or spending `inv2`.
+    let second_err = link
+        .pair(&inv2_text, "phone2")
+        .await
+        .expect_err("second concurrent pair for same machine must refuse with Busy");
+    assert_eq!(second_err.code, ErrorCode::Busy, "{second_err}");
+    assert_eq!(
+        second_err.details.as_ref().and_then(|d| d.get(DETAIL_SENT)),
+        Some(&json!(false))
+    );
+    assert!(
+        fs::read_to_string(&auth_keys)
+            .unwrap()
+            .contains(&format!("legion-invite:{inv2_id}")),
+        "refused second invite must remain unspent"
+    );
+
+    // Release `config.lock`: first pairing finishes and `Link` matches `meta.whoami`.
+    let _ = holder.kill();
+    let _ = holder.wait();
+    let first_ok = first_task
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("first pairing failed: {e}"));
+    assert_eq!(first_ok.principal, "device:phone1");
+    assert_eq!(
+        link.config()
+            .node("tower")
+            .and_then(|n| n.principal.clone()),
+        Some("device:phone1".to_owned())
+    );
+    let who = link
+        .call("tower", "meta.whoami", json!({}), None, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(who["principal"], json!("device:phone1"));
+    link.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_sshd_kill_point_recovery_same_invite_fresh_and_replacement() {
+    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
+        eprintln!(
+            "skipping real_sshd_kill_point_recovery_same_invite_fresh_and_replacement: sshd/ssh-keygen unavailable"
+        );
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        eprintln!("skipping: built `legion` binary not found");
+        return;
+    };
+
+    let root = strict_tempdir();
+    let user_home = root.path().join("home");
+    let legion_home = root.path().join("legion");
+    let config_dir = legion_home.join("config");
+    let ssh_dir = user_home.join(".ssh");
+    let auth_keys = ssh_dir.join("authorized_keys");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&ssh_dir).unwrap();
+    let _ = fs::set_permissions(&user_home, fs::Permissions::from_mode(0o700));
+    let _ = fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700));
+
+    let Some(sshd) = ThrowawaySshd::start(&auth_keys, &user_home) else {
+        return;
+    };
+    fs::write(
+        config_dir.join("node.toml"),
+        format!(
+            "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_keys),
+            toml_literal(&sshd.host_key_pub),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        config_dir.join("policy.toml"),
+        "default = \"owner\"\n\n[roles.operator]\nallow = [\"effect:read\"]\n",
+    )
+    .unwrap();
+
+    let port_arg = format!("port={}", sshd.port);
+    let user_arg = format!("user={}", sshd.user);
+    let make_invite = |name: &str| -> (String, String) {
+        let res = run_legion(
+            &legion_bin,
+            &legion_home,
+            &user_home,
+            &[
+                "device.invite",
+                "role=operator",
+                &format!("name={name}"),
+                "host=127.0.0.1",
+                &port_arg,
+                &user_arg,
+            ],
+        );
+        (
+            res["invite"].as_str().unwrap().to_owned(),
+            res["id"].as_str().unwrap().to_owned(),
+        )
+    };
+    let state_file = legion_home.join("state").join("devices.json");
+
+    // 1. Fresh enrolment killed after step 1 (uncommitted marker in state.unconfirmed, invite still
+    //    present, devices.toml absent): phone retries the SAME invite -> repair rolls back the
+    //    marker, keeps invite usable, and pairing succeeds!
+    let key1 = DeviceKey::generate().unwrap();
+    let (inv1_text, inv1_id) = make_invite("fresh-s1");
+    {
+        let mut st: Value =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        st["unconfirmed"] = json!({
+            "11111111111111111111111111111111": {
+                "pairing_id": "11111111111111111111111111111111",
+                "invite_id": inv1_id,
+                "name": "fresh-s1",
+                "principal": "device:fresh-s1",
+                "fingerprint": "SHA256:placeholder",
+                "created": "2026-11-26T00:00:00Z"
+            }
+        });
+        fs::write(&state_file, serde_json::to_string_pretty(&st).unwrap()).unwrap();
+    }
+    let link1 = Link::new(LinkConfig {
+        device_key: Some(key1.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let enrolled1 = link1
+        .pair(&inv1_text, "fresh-s1")
+        .await
+        .unwrap_or_else(|e| {
+            panic!("fresh step-1 rollback retry with same invite must succeed: {e}")
+        });
+    assert_eq!(enrolled1.principal, "device:fresh-s1");
+    assert!(!enrolled1.recovered);
+    link1.close().await;
+
+    // 2. Replacement killed after step 1 (`fresh-s1` is still unconfirmed because link1 never
+    //    opened a gate session; step 1 added `2222...` with `replaces_pairing_id` pointing at
+    //    `fresh-s1` without modifying `devices.toml`): phone retries the SAME invite `inv2` ->
+    //    repair rolls back `2222...`, keeps `fresh-s1` unconfirmed and `inv2` usable, and `inv2`
+    //    replaces `fresh-s1` cleanly!
+    let (inv2_text, inv2_id) = make_invite("rep-s1");
+    let pid_fresh1 = {
+        let st: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        st["unconfirmed"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone()
+    };
+    {
+        let mut st: Value =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        st["unconfirmed"].as_object_mut().unwrap().insert(
+            "22222222222222222222222222222222".to_owned(),
+            json!({
+                "pairing_id": "22222222222222222222222222222222",
+                "invite_id": inv2_id,
+                "name": "rep-s1",
+                "principal": "device:rep-s1",
+                "fingerprint": "SHA256:placeholder",
+                "created": "2026-11-26T00:00:01Z",
+                "replaces_pairing_id": pid_fresh1,
+            }),
+        );
+        fs::write(&state_file, serde_json::to_string_pretty(&st).unwrap()).unwrap();
+    }
+    let link2 = Link::new(LinkConfig {
+        device_key: Some(key1.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let enrolled2 = link2.pair(&inv2_text, "rep-s1").await.unwrap_or_else(|e| {
+        panic!("replacement step-1 rollback retry with same invite must succeed: {e}")
+    });
+    assert_eq!(enrolled2.principal, "device:rep-s1");
+    assert!(!enrolled2.recovered);
+    link2.close().await;
+
+    // 3. Fresh enrolment killed after step 2 (committed to devices.toml + policy.toml +
+    //    state.unconfirmed, leftover invite still in authorized_keys/state.invites, permanent key
+    //    line MISSING from authorized_keys): phone retries the SAME invite -> repair rolls
+    //    forward (adds key line, removes invite), enrolment sees NotFound, recovery probe picks up
+    //    the finished pairing!
+    let key3 = DeviceKey::generate().unwrap();
+    let (inv3_text, inv3_id) = make_invite("fresh-s2");
+    let inv3_line = fs::read_to_string(&auth_keys)
+        .unwrap()
+        .lines()
+        .find(|l| l.contains(&format!("legion-invite:{inv3_id}")))
+        .unwrap()
+        .to_owned();
+    let inv3_state_rec = {
+        let st: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        st["invites"][&inv3_id].clone()
+    };
+    let inv3 = Invite::parse(&inv3_text).unwrap();
+    let r3 = forced_enrol_raw(
+        &auth_keys,
+        &user_home,
+        &inv3_text,
+        &json!({
+            "enrol": 1,
+            "id": inv3_id,
+            "public_key": key3.public_key_line("fresh-s2").unwrap(),
+            "name": "fresh-s2",
+            "proof": key3.sign_enrol_proof(&inv3.id, &inv3.node, &inv3.host_keys).unwrap(),
+        }),
+        false,
+    );
+    assert!(r3.is_none());
+    // Rewind authorized_keys + state.invites to exact post-step-2 crash state (no key line, invite present).
+    {
+        let ak = fs::read_to_string(&auth_keys).unwrap();
+        let mut lines: Vec<String> = ak
+            .lines()
+            .filter(|l| !l.contains("legion-device:fresh-s2"))
+            .map(str::to_owned)
+            .collect();
+        lines.push(inv3_line);
+        fs::write(&auth_keys, format!("{}\n", lines.join("\n"))).unwrap();
+        let mut st: Value =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        st["invites"]
+            .as_object_mut()
+            .unwrap()
+            .insert(inv3_id.clone(), inv3_state_rec);
+        fs::write(&state_file, serde_json::to_string_pretty(&st).unwrap()).unwrap();
+    }
+    let link3 = Link::new(LinkConfig {
+        device_key: Some(key3.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let recovered3 = link3
+        .pair(&inv3_text, "fresh-s2")
+        .await
+        .unwrap_or_else(|e| {
+            panic!("fresh step-2 roll-forward retry with same invite must recover: {e}")
+        });
+    assert_eq!(recovered3.principal, "device:fresh-s2");
+    assert!(recovered3.recovered);
+    link3.close().await;
+
+    // 4. Replacement killed after step 2 (`rep-s1` still unconfirmed -> replaced by `rep-s2` in
+    //    devices.toml, but authorized_keys still has `rep-s1` + `inv4` and lacks `rep-s2`):
+    //    phone retries the SAME invite `inv4` -> repair rolls forward (`rep-s2` line added,
+    //    `rep-s1` line removed, `inv4` removed, old unconfirmed mark dropped) -> recovery probe
+    //    succeeds under `device:rep-s2`!
+    let (inv4_text, inv4_id) = make_invite("rep-s2");
+    let inv4_line = fs::read_to_string(&auth_keys)
+        .unwrap()
+        .lines()
+        .find(|l| l.contains(&format!("legion-invite:{inv4_id}")))
+        .unwrap()
+        .to_owned();
+    let old_rep1_line = fs::read_to_string(&auth_keys)
+        .unwrap()
+        .lines()
+        .find(|l| l.contains("legion-device:rep-s1"))
+        .unwrap()
+        .to_owned();
+    let (inv4_state_rec, old_rep1_pid, old_rep1_unconf) = {
+        let st: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        let (pid, rec) = st["unconfirmed"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, v)| v["name"] == json!("rep-s1"))
+            .unwrap();
+        (st["invites"][&inv4_id].clone(), pid.clone(), rec.clone())
+    };
+    let inv4 = Invite::parse(&inv4_text).unwrap();
+    let r4 = forced_enrol_raw(
+        &auth_keys,
+        &user_home,
+        &inv4_text,
+        &json!({
+            "enrol": 1,
+            "id": inv4_id,
+            "public_key": key1.public_key_line("rep-s2").unwrap(),
+            "name": "rep-s2",
+            "proof": key1.sign_enrol_proof(&inv4.id, &inv4.node, &inv4.host_keys).unwrap(),
+        }),
+        false,
+    );
+    assert!(r4.is_none());
+    // Rewind authorized_keys + state to exact post-step-2 replacement crash state.
+    {
+        let ak = fs::read_to_string(&auth_keys).unwrap();
+        let mut lines: Vec<String> = ak
+            .lines()
+            .filter(|l| !l.contains("legion-device:rep-s2"))
+            .map(str::to_owned)
+            .collect();
+        lines.push(old_rep1_line);
+        lines.push(inv4_line);
+        fs::write(&auth_keys, format!("{}\n", lines.join("\n"))).unwrap();
+        let mut st: Value =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        st["invites"]
+            .as_object_mut()
+            .unwrap()
+            .insert(inv4_id.clone(), inv4_state_rec);
+        let unconf = st["unconfirmed"].as_object_mut().unwrap();
+        for (_, val) in unconf.iter_mut() {
+            if val["name"] == json!("rep-s2") {
+                val["replaces_pairing_id"] = json!(old_rep1_pid);
+            }
+        }
+        unconf.insert(old_rep1_pid.clone(), old_rep1_unconf);
+        fs::write(&state_file, serde_json::to_string_pretty(&st).unwrap()).unwrap();
+    }
+    let link4 = Link::new(LinkConfig {
+        device_key: Some(key1.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let recovered4 = link4.pair(&inv4_text, "rep-s2").await.unwrap_or_else(|e| {
+        panic!("replacement step-2 roll-forward retry with same invite must recover: {e}")
+    });
+    assert_eq!(recovered4.principal, "device:rep-s2");
+    assert!(recovered4.recovered);
+    let ak_final = fs::read_to_string(&auth_keys).unwrap();
+    let key1_b64 = key1
+        .public_key_line("rep-s2")
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+    let key1_lines: Vec<_> = ak_final.lines().filter(|l| l.contains(&key1_b64)).collect();
+    assert_eq!(key1_lines.len(), 1, "{key1_lines:?}");
+    assert!(key1_lines[0].contains("device:rep-s2"), "{key1_lines:?}");
+    assert!(!ak_final.contains(&format!("legion-invite:{inv4_id}")));
+    link4.close().await;
+}

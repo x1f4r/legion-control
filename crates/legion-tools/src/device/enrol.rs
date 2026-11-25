@@ -669,9 +669,13 @@ fn process_enrol_blocking_impl(
     // Verify optional proof of possession before inspecting duplicates or writing anything.
     // Invalid proof is refused immediately with `Denied` and writes nothing; absent proof is
     // accepted for fresh enrolments from older clients but never allows replacing an unconfirmed
-    // entry or disclosing existing pairing details on conflict.
+    // entry or disclosing existing pairing details on conflict. An invite created before the
+    // machine recorded `host_key_fingerprints` cannot check a proof, so the proof counts as absent
+    // (taking the no-proof path: fresh keys enrol, existing keys get plain `Conflict` without
+    // details and nothing is replaced).
     let proof_verified = match request.proof.as_deref() {
         None => false,
+        Some(_) if invite.host_key_fingerprints.is_empty() => false,
         Some(raw_proof) => {
             if let Err(error) = verify_enrol_proof(
                 raw_proof,
@@ -1077,17 +1081,13 @@ fn process_enrol_blocking_impl(
     let added = Timestamp::from_second(now.as_second())
         .map(format_rfc3339)
         .unwrap_or_else(|_| format_rfc3339(now));
-    if let Some((old_id, old_dev)) = &replaced_unconfirmed {
-        state.unconfirmed.remove(old_id);
-        if state
-            .devices
-            .get(&old_dev.name)
-            .and_then(|rec| rec.pairing_id.as_deref())
-            == Some(old_id.as_str())
-        {
-            state.devices.remove(&old_dev.name);
-        }
-    }
+    // 1. Write ONLY the new local `state.unconfirmed` record (naming `forced_id` and, for a
+    //    replacement, `replaces_pairing_id`) to `state/devices.json` FIRST — leaving `forced_id`
+    //    in `state.invites` and leaving any replaced leftover's `state.unconfirmed` / `state.devices`
+    //    entries completely untouched until step 2 commits `devices.toml`.
+    //    If killed before step 2 commits, repair rolls back by removing only this new record (so
+    //    the old leftover stays unconfirmed and the invite remains usable); once step 2 commits,
+    //    repair rolls forward (key line, remove invite, drop what was replaced).
     state.unconfirmed.insert(
         pairing_id.clone(),
         UnconfirmedRecord {
@@ -1097,22 +1097,9 @@ fn process_enrol_blocking_impl(
             principal: principal.clone(),
             fingerprint: validated_key.fingerprint.clone(),
             created: precise_now,
+            replaces_pairing_id: replaced_unconfirmed.as_ref().map(|(id, _)| id.clone()),
         },
     );
-    state.devices.insert(
-        device_name.clone(),
-        DeviceRecord {
-            name: device_name.clone(),
-            principal: principal.clone(),
-            added,
-            fingerprint: validated_key.fingerprint.clone(),
-            pairing_id: Some(pairing_id.clone()),
-        },
-    );
-
-    // 1. Write the local `state.unconfirmed` record (still keeping `forced_id` in `state.invites`)
-    //    to `state/devices.json` FIRST, before touching `policy.toml`, `devices.toml`, or
-    //    `authorized_keys`. Any kill after this step leaves a durable marker for automatic repair.
     if let Err(error) = save_state(paths, &state) {
         return (Some(principal), None, None, base_args, Err(error));
     }
@@ -1313,6 +1300,30 @@ fn process_enrol_blocking_impl(
         step4_warnings.push(error.message);
     }
     state.invites.remove(forced_id);
+    if let Some((old_id, old_dev)) = &replaced_unconfirmed {
+        state.unconfirmed.remove(old_id);
+        if state
+            .devices
+            .get(&old_dev.name)
+            .and_then(|rec| rec.pairing_id.as_deref())
+            == Some(old_id.as_str())
+        {
+            state.devices.remove(&old_dev.name);
+        }
+    }
+    if let Some(rec) = state.unconfirmed.get_mut(&pairing_id) {
+        rec.replaces_pairing_id = None;
+    }
+    state.devices.insert(
+        device_name.clone(),
+        DeviceRecord {
+            name: device_name.clone(),
+            principal: principal.clone(),
+            added,
+            fingerprint: validated_key.fingerprint.clone(),
+            pairing_id: Some(pairing_id.clone()),
+        },
+    );
     #[cfg(test)]
     let step4_save_result = if kill_point == Some(EnrolKillPoint::FailStep4StateSave) {
         Err(ErrorBody::new(

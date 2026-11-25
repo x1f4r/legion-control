@@ -96,7 +96,7 @@ pub struct UnconfirmedRecord {
     /// Pairing identifier allocated for this enrolment.
     pub pairing_id: String,
     /// Single-use invite identifier that created this enrolment, used to remove a leftover invite
-    /// if the process was killed before removing it.
+    /// if the process was killed after `devices.toml` committed.
     pub invite_id: String,
     /// Unique sanitised device name chosen for this enrolment.
     pub name: String,
@@ -106,6 +106,15 @@ pub struct UnconfirmedRecord {
     pub fingerprint: String,
     /// RFC 3339 UTC timestamp when enrolment began.
     pub created: String,
+    /// Previous unconfirmed leftover's `pairing_id` that this enrolment is replacing, if any.
+    ///
+    /// Step 1 records this without removing the old `state.unconfirmed` entry; if the process is
+    /// killed before step 2 commits `devices.toml`, repair rolls back by dropping only this new
+    /// record so the old leftover stays unconfirmed and the invite stays usable. Once step 2
+    /// commits, repair (and step 4) rolls forward by removing the invite, dropping the replaced
+    /// record, and restoring the new permanent `authorized_keys` line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_pairing_id: Option<String>,
 }
 
 /// Non-secret metadata for one paired device.

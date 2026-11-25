@@ -4,6 +4,8 @@
 //! sessions lazily, reuses live sessions, reconnects once when a session died before sending a
 //! request, cancels in-flight calls by caller-chosen call id, and closes idle sessions.
 
+#[cfg(feature = "ssh")]
+use std::collections::HashSet;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
@@ -599,6 +601,11 @@ struct LinkInner {
     /// Serializes `pair`, `forget`, and `learn` mutations so device key generation, forgetting,
     /// and endpoint learning never race.
     mutation_lock: tokio::sync::Mutex<()>,
+    /// Nodes currently running an in-flight `pair` or `restore_pairing` exchange on this [`Link`],
+    /// preventing two concurrent pairings for the same machine from racing and storing an earlier
+    /// reply over a later replacement.
+    #[cfg(feature = "ssh")]
+    pairing_nodes: Mutex<HashSet<String>>,
     slots: Mutex<HashMap<String, Arc<NodeSlot>>>,
     /// Sessions displaced by a config update while callers may still hold clones; reaped by
     /// `close_idle` once no caller holds a reference or in-flight call, or closed by `forget`.
@@ -721,6 +728,46 @@ impl Drop for ActiveCallGuard {
     }
 }
 
+#[cfg(feature = "ssh")]
+struct PairingNodeGuard {
+    inner: Arc<LinkInner>,
+    node: String,
+}
+
+#[cfg(feature = "ssh")]
+impl PairingNodeGuard {
+    fn try_acquire(inner: &Arc<LinkInner>, node: &str) -> Result<Self, ErrorBody> {
+        let mut active = inner
+            .pairing_nodes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(node.to_owned()) {
+            return Err(ErrorBody::new(
+                ErrorCode::Busy,
+                format!("Pairing with {node} is already in progress."),
+            )
+            .with_machine(node)
+            .with_hint("Wait for the current pairing attempt to finish, then try again.")
+            .with_details(json!({ crate::DETAIL_SENT: false })));
+        }
+        Ok(Self {
+            inner: Arc::clone(inner),
+            node: node.to_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "ssh")]
+impl Drop for PairingNodeGuard {
+    fn drop(&mut self) {
+        self.inner
+            .pairing_nodes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.node);
+    }
+}
+
 /// Restricts which route(s) [`Link::open_content_with_policy`] may use to reach a target machine.
 ///
 /// Used by ticketed content servers to bind a ticket strictly to the paired relay (or upgraded
@@ -760,6 +807,8 @@ impl Link {
                 options,
                 opener,
                 mutation_lock: tokio::sync::Mutex::new(()),
+                #[cfg(feature = "ssh")]
+                pairing_nodes: Mutex::new(HashSet::new()),
                 slots: Mutex::new(HashMap::new()),
                 retired: Mutex::new(Vec::new()),
                 active_calls: Mutex::new(HashMap::new()),
@@ -898,6 +947,7 @@ impl Link {
             .with_machine(&invite.node)
             .with_details(json!({ crate::DETAIL_SENT: false })));
         }
+        let _pairing_guard = PairingNodeGuard::try_acquire(&self.inner, &invite.node)?;
 
         // Hold `mutation_lock` only while reading local config before the network exchange so
         // `forget` and other local mutations are never blocked while waiting for the node.
@@ -1029,6 +1079,7 @@ impl Link {
             .with_machine(&invite.node)
             .with_details(json!({ crate::DETAIL_SENT: false })));
         }
+        let _pairing_guard = PairingNodeGuard::try_acquire(&self.inner, &invite.node)?;
 
         let existing_key = {
             let _mutation_guard = tokio::select! {
@@ -9554,6 +9605,202 @@ mod tests {
         assert_eq!(err.code, ErrorCode::Unreachable, "{err:?}");
         assert_eq!(other_hits.load(Ordering::SeqCst), 0);
 
+        link.close().await;
+    }
+
+    #[cfg(feature = "ssh")]
+    #[tokio::test]
+    async fn concurrent_pair_and_restore_for_same_node_are_serialised_with_busy_while_other_node_proceeds()
+     {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+
+        use crate::invite::Invite;
+        use crate::key::DeviceKey;
+
+        let host_key = DeviceKey::from_seed([11u8; 32])
+            .public_key_line("host")
+            .unwrap();
+        let make_invite = |node: &str, id: &str, principal: &str| -> String {
+            Invite {
+                v: 1,
+                id: id.to_owned(),
+                node: node.to_owned(),
+                hosts: vec![format!("{node}.example.net")],
+                port: 22,
+                user: "me".to_owned(),
+                host_keys: vec![host_key.clone()],
+                key: STANDARD.encode([22u8; 32]),
+                principal: principal.to_owned(),
+                expires: "2026-11-24T12:00:00Z".to_owned(),
+            }
+            .encode()
+            .unwrap()
+        };
+
+        let device_key = DeviceKey::from_seed([33u8; 32]).to_openssh().unwrap();
+        let link = Link::new(LinkConfig {
+            device_key: Some(device_key),
+            ..LinkConfig::default()
+        });
+
+        let inv_tower_1 = make_invite("tower", "inv-tower-1", "device:phone1");
+        let inv_tower_2 = make_invite("tower", "inv-tower-2", "device:phone2");
+        let inv_pi = make_invite("pi", "inv-pi-1", "device:phone-pi");
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let started_c = Arc::clone(&started);
+        let release_c = Arc::clone(&release);
+        let link_c = link.clone();
+        let inv_tower_1_c = inv_tower_1.clone();
+        let first_task = tokio::spawn(async move {
+            link_c
+                .pair_with(
+                    &inv_tower_1_c,
+                    "phone1",
+                    CancellationToken::new(),
+                    move |invite, _key, name, _timeouts, _allow, _cancel| async move {
+                        started_c.notify_one();
+                        release_c.notified().await;
+                        Ok(Enrolled {
+                            node: invite.node.clone(),
+                            principal: invite.principal.clone(),
+                            role: "operator".to_owned(),
+                            device: name,
+                            target: invite.target(),
+                            fleet: BTreeMap::new(),
+                            not_synced_to: Vec::new(),
+                            sync_command: None,
+                            recovered: false,
+                        })
+                    },
+                )
+                .await
+        });
+
+        // Wait until first pairing is actively in flight for `tower`.
+        started.notified().await;
+
+        // 1. Concurrent `pair` for the SAME machine (`tower`) MUST refuse immediately with Busy
+        //    and DETAIL_SENT = false, without ever entering `enrol_fn`.
+        let second_entered = Arc::new(AtomicBool::new(false));
+        let second_entered_c = Arc::clone(&second_entered);
+        let busy_pair = link
+            .pair_with(
+                &inv_tower_2,
+                "phone2",
+                CancellationToken::new(),
+                move |invite, _key, name, _timeouts, _allow, _cancel| async move {
+                    second_entered_c.store(true, Ordering::SeqCst);
+                    Ok(Enrolled {
+                        node: invite.node.clone(),
+                        principal: invite.principal.clone(),
+                        role: "operator".to_owned(),
+                        device: name,
+                        target: invite.target(),
+                        fleet: BTreeMap::new(),
+                        not_synced_to: Vec::new(),
+                        sync_command: None,
+                        recovered: false,
+                    })
+                },
+            )
+            .await
+            .expect_err("concurrent pair for same node must fail with Busy");
+        assert_eq!(busy_pair.code, ErrorCode::Busy, "{busy_pair:?}");
+        assert_eq!(busy_pair.machine.as_deref(), Some("tower"));
+        assert_eq!(
+            busy_pair
+                .details
+                .as_ref()
+                .and_then(|d| d.get(crate::DETAIL_SENT)),
+            Some(&json!(false))
+        );
+        assert!(
+            !second_entered.load(Ordering::SeqCst),
+            "second pair for same node must never enter enrol_fn while first is in flight"
+        );
+
+        // 2. Concurrent `restore_pairing` for the SAME machine (`tower`) MUST also refuse with Busy.
+        let busy_restore = link
+            .restore_pairing(&inv_tower_2, "", "phone2", CancellationToken::new())
+            .await
+            .expect_err("concurrent restore_pairing for same node must fail with Busy");
+        assert_eq!(busy_restore.code, ErrorCode::Busy, "{busy_restore:?}");
+        assert_eq!(
+            busy_restore
+                .details
+                .as_ref()
+                .and_then(|d| d.get(crate::DETAIL_SENT)),
+            Some(&json!(false))
+        );
+
+        // 3. Pairing a DIFFERENT machine (`pi`) concurrently MUST still proceed unblocked.
+        let pi_ok = link
+            .pair_with(
+                &inv_pi,
+                "phone-pi",
+                CancellationToken::new(),
+                |invite, _key, name, _timeouts, _allow, _cancel| async move {
+                    Ok(Enrolled {
+                        node: invite.node.clone(),
+                        principal: invite.principal.clone(),
+                        role: "operator".to_owned(),
+                        device: name,
+                        target: invite.target(),
+                        fleet: BTreeMap::new(),
+                        not_synced_to: Vec::new(),
+                        sync_command: None,
+                        recovered: false,
+                    })
+                },
+            )
+            .await
+            .expect("pairing a different node must not be blocked");
+        assert_eq!(pi_ok.node, "pi");
+        assert_eq!(pi_ok.principal, "device:phone-pi");
+
+        // 4. Release first `tower` pairing: succeeds and stores `device:phone1`.
+        release.notify_one();
+        let tower_first = first_task.await.unwrap().unwrap();
+        assert_eq!(tower_first.principal, "device:phone1");
+        assert_eq!(
+            link.config()
+                .node("tower")
+                .and_then(|n| n.principal.clone()),
+            Some("device:phone1".to_owned())
+        );
+
+        // 5. Once finished, a sequential pairing for `tower` is allowed again.
+        let tower_second = link
+            .pair_with(
+                &inv_tower_2,
+                "phone2",
+                CancellationToken::new(),
+                |invite, _key, name, _timeouts, _allow, _cancel| async move {
+                    Ok(Enrolled {
+                        node: invite.node.clone(),
+                        principal: invite.principal.clone(),
+                        role: "operator".to_owned(),
+                        device: name,
+                        target: invite.target(),
+                        fleet: BTreeMap::new(),
+                        not_synced_to: Vec::new(),
+                        sync_command: None,
+                        recovered: false,
+                    })
+                },
+            )
+            .await
+            .expect("sequential pair after first completes must succeed");
+        assert_eq!(tower_second.principal, "device:phone2");
+        assert_eq!(
+            link.config()
+                .node("tower")
+                .and_then(|n| n.principal.clone()),
+            Some("device:phone2".to_owned())
+        );
         link.close().await;
     }
 }

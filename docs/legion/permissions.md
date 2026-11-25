@@ -225,12 +225,13 @@ During pairing itself, the temporary key in the invite is single-use, carries a 
 `legion gate --enrol <id>` (ignoring `SSH_ORIGINAL_COMMAND`). Exact expiry is enforced by
 `legion gate --enrol` against `state/devices.json`, so an expired temporary key stops working at
 its exact expiry time and its line is swept on the next `device.*` command. Enrolment also refuses
-the invite's own temporary key, rejects an invalid `proof` signature with `denied` without writing,
-requires a valid OpenSSH `SSHSIG` (`legion-enrol`) proof of possession to replace a single local
-unconfirmed leftover or to receive existing-pairing details on a confirmed duplicate key, and
-consumes the invite on any `conflict`. Local unconfirmed state stays strictly in `state/devices.json`
-(never in `devices.toml`) and clears only when that device completes its first authenticated
-`legion gate` session on this node.
+the invite's own temporary key, rejects an invalid `proof` signature with `denied` without writing
+(treating the proof as absent when an invite created before upgrading records no host-key
+fingerprints), requires a valid OpenSSH `SSHSIG` (`legion-enrol`) proof of possession to replace a
+single local unconfirmed leftover or to receive existing-pairing details on a confirmed duplicate
+key, and consumes the invite on any `conflict`. Local unconfirmed state stays strictly in
+`state/devices.json` (never in `devices.toml`) and clears only when that device completes its first
+allowed `legion gate` session on this node (never on a denied, removed, or quarantined session).
 Note that the invite text is a secret until used and is returned by `device.invite`; if an AI agent
 invokes `device.invite`, the live invite enters the agent's transcript, so run `legion pair` in
 your own terminal when you want to keep it out of agent transcripts.

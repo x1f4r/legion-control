@@ -897,14 +897,18 @@ What happens during pairing:
    config and `authorized_keys`, enforces exact UTC expiry from `state/devices.json` (an expired
    temporary key stops working at its exact expiry because `legion gate --enrol` refuses it and the
    expired line is swept on the next `device.*` command), and refuses enrolling the invite's own
-   temporary key. An invalid `proof` is refused with `denied` without changing state. Every newly
+   temporary key. An invalid `proof` is refused with `denied` without changing state; an invite
+   created before the machine recorded pinned host-key fingerprints cannot check a proof, so its
+   proof counts as absent (allowing fresh keys to enrol while taking the no-proof conflict path for
+   existing keys). Every newly
    enrolled device starts locally marked unconfirmed in `state/devices.json` (never in fleet-synced
    `devices.toml`, so older nodes still parse `devices.toml` cleanly and fleet merges never clear
    local unconfirmed state) until that device opens its first real authenticated `legion gate`
    session on this machine. If the same public key is already enrolled as a single local
    unconfirmed leftover, a valid `proof` replaces it in place with whatever the new invite grants
    (and removes any leftover unused `device:*` principal); without a valid proof (such as an older
-   client), replacement is refused with a plain `conflict` and no extra details. If the key is
+   client or a pre-upgrade invite), replacement is refused with a plain `conflict` and no extra
+   details. If the key is
    already confirmed (or matches any other key in `authorized_keys` or `devices.toml`), enrolment
    refuses with `conflict` (returning existing-pairing details only when `proof` verified), and
    every `conflict` consumes the invite immediately from both `authorized_keys` and
@@ -912,16 +916,22 @@ What happens during pairing:
    machine with its own device key against the pinned host keys so **Restore pairing** works
    reliably even against older nodes that omit conflict details, while post-send `not_found` and
    `auth_failed` recovery probes run only for dedicated `device:` principals (never shared
-   principals).
-4. Enrolment commits in a crash-safe four-step order: (a) record the local unconfirmed entry and
-   device metadata in `state/devices.json` (keeping the invite in `state/devices.json`), (b) write
-   `policy.toml` and `devices.toml`, (c) append the permanent
-   `restrict,command="<legion> gate --as <principal> --device <name> --pairing <id> ..."` line to
+   principals). On the client side, `legion-link` serialises pairing and restore attempts per
+   machine so a second concurrent attempt for the same machine is refused with `busy` instead of
+   racing and persisting an older reply over a newer replacement.
+4. Enrolment commits in a crash-safe four-step order: (a) add only the new local unconfirmed entry
+   (naming the invite and, for a replacement, the replaced pairing id, without touching the old
+   record or invite) in `state/devices.json`, (b) write
+   `policy.toml` and `devices.toml`, (c) reconcile the permanent
+   `restrict,command="<legion> gate --as <principal> --device <name> --pairing <id> ..."` line in
    `authorized_keys` while keeping the invite line intact, and (d) remove the invite line from
-   `authorized_keys` and the invite record from `state/devices.json`. Startup (`serve`, `rpc`,
-   `mcp`, `gate`) and every `device.*` command repair any interrupted enrolment by removing
-   leftover invites and restoring missing `authorized_keys` lines for committed `devices.toml`
-   entries. Enrolment then pushes `devices.toml` in parallel to reachable machines in `fleet.toml`
+   `authorized_keys` and update `state/devices.json` (dropping the invite and any replaced record).
+   Startup (`serve`, `rpc`, `mcp`, `gate`) and every `device.*` command repair any interrupted
+   enrolment with one rule: roll forward if step (b) committed to `devices.toml` (restoring the
+   permanent key line, removing the leftover invite, and dropping any replaced record), otherwise
+   roll back (removing only the new uncommitted record so the invite stays usable and any earlier
+   unconfirmed leftover keeps its mark). Enrolment then pushes `devices.toml` in parallel to
+   reachable machines in `fleet.toml`
    (reporting per-machine outcomes under `fleet`) and writes an audit record (`door: "ssh"`,
    `tool: "device.enrol"`, `device: "<name>"`). The temporary key immediately stops working. Every
    subsequent call served through `legion gate` is reported and audited with `door: "ssh"` (and

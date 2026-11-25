@@ -4,7 +4,7 @@
 //! rpc`) on desktops when a `legion` binary is installed. State is persisted atomically in
 //! [`AppStore`] without ever logging keys or invites.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -496,6 +496,44 @@ impl Drop for ActivePairGuard {
     }
 }
 
+struct NodePairingGuard {
+    pairing_nodes: Arc<Mutex<HashSet<String>>>,
+    node: String,
+}
+
+impl NodePairingGuard {
+    fn try_acquire(
+        pairing_nodes: &Arc<Mutex<HashSet<String>>>,
+        node: &str,
+    ) -> Result<Self, AppError> {
+        let mut active = pairing_nodes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(node.to_owned()) {
+            return Err(AppError::new(
+                ErrorCode::Busy,
+                format!("Pairing with {node} is already in progress."),
+            )
+            .with_machine(node)
+            .with_hint("Wait for the current pairing attempt to finish, then try again.")
+            .with_details(serde_json::json!({ "sent": false })));
+        }
+        Ok(Self {
+            pairing_nodes: Arc::clone(pairing_nodes),
+            node: node.to_owned(),
+        })
+    }
+}
+
+impl Drop for NodePairingGuard {
+    fn drop(&mut self) {
+        self.pairing_nodes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.node);
+    }
+}
+
 /// Production backend implementation over [`legion_link::Link`].
 pub struct LinkBackend {
     store: AppStore,
@@ -506,6 +544,9 @@ pub struct LinkBackend {
     next_call_seq: AtomicU64,
     /// In-flight pairing cancellation tokens, cleared via [`ActivePairGuard`] on exit.
     active_pairs: Arc<Mutex<Vec<(u64, CancellationToken)>>>,
+    /// Nodes currently running an in-flight `pair` or `restore_pairing` (through store commit),
+    /// preventing concurrent pairings for the same machine from racing and persisting out of order.
+    pairing_nodes: Arc<Mutex<HashSet<String>>>,
     /// Count of currently active user-started or state-mutating native operations.
     in_flight_ops: Arc<AtomicUsize>,
     /// Tracker for currently active passive non-streaming background refresh calls.
@@ -727,6 +768,7 @@ impl LinkBackend {
             mutate_lock: AsyncMutex::new(()),
             next_call_seq: AtomicU64::new(1),
             active_pairs: Arc::new(Mutex::new(Vec::new())),
+            pairing_nodes: Arc::new(Mutex::new(HashSet::new())),
             in_flight_ops: Arc::new(AtomicUsize::new(0)),
             bg_refreshes: Arc::new(BackgroundRefreshTracker::with_clock(drain_clock)),
         }
@@ -1184,6 +1226,8 @@ impl Backend for LinkBackend {
 
             let parsed = Invite::parse(trimmed_invite).map_err(AppError::from)?;
             let target_node_name = parsed.node.clone();
+            let _node_pair_guard =
+                NodePairingGuard::try_acquire(&self.pairing_nodes, &target_node_name)?;
             let device_label = {
                 let trimmed = name.trim();
                 if trimmed.is_empty() {
@@ -1272,6 +1316,8 @@ impl Backend for LinkBackend {
             let trimmed_principal = existing_principal.trim();
             let parsed = Invite::parse(trimmed_invite).map_err(AppError::from)?;
             let target_node_name = parsed.node.clone();
+            let _node_pair_guard =
+                NodePairingGuard::try_acquire(&self.pairing_nodes, &target_node_name)?;
             let device_label = {
                 let trimmed = name.trim();
                 if trimmed.is_empty() {

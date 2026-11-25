@@ -7689,9 +7689,21 @@ role = "observer"
 
     #[tokio::test]
     async fn enrol_crash_kill_points_repaired_on_start_and_next_mutation() {
-        // Test 1: Kill after step 1 (`state.unconfirmed` written, before `devices.toml` /
-        // `policy.toml` / `authorized_keys`). Next run removes the leftover invite and prunes
-        // the orphan unconfirmed record without creating a device.
+        let host_fps_of = |inv: &serde_json::Value| -> Vec<String> {
+            keys::host_key_fingerprints(
+                &inv["host_keys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        // Test 1 (Fresh enrolment, kill at step 1): `state.unconfirmed` written BEFORE
+        // `devices.toml` / `policy.toml` / `authorized_keys`. Repair MUST roll back by removing
+        // ONLY the new uncommitted record, leaving the invite intact and usable so retrying with
+        // the SAME invite succeeds.
         {
             let h = Harness::new();
             let inv = h
@@ -7702,10 +7714,13 @@ role = "observer"
                 .await
                 .unwrap();
             let inv_id = inv["id"].as_str().unwrap().to_owned();
-            let key = generate_ephemeral_ed25519().unwrap();
+            let fps = host_fps_of(&inv);
+            let seed = [0x51u8; 32];
+            let pub_key = keys::ed25519_public_key_from_seed(&seed);
+            let proof = keys::sign_enrol_proof(&seed, &inv_id, "tower", &fps);
             let req = format!(
                 "{}\n",
-                json!({"enrol": 1, "id": inv_id, "public_key": key.public_key, "name": "kill-step1"})
+                json!({"enrol": 1, "id": inv_id, "public_key": pub_key, "name": "kill-step1", "proof": proof})
             );
             let reply = enrol::run_enrol_with_kill_point(
                 &h.node,
@@ -7734,21 +7749,297 @@ role = "observer"
                     .contains(&format!("legion-invite:{inv_id}"))
             );
 
-            // Startup repair removes leftover invite and prunes orphan unconfirmed marker.
+            // Startup repair rolls back ONLY the uncommitted record; invite stays usable.
             let node_file = h.node.config().get::<NodeFile>().unwrap();
             registry::repair_incomplete_enrolments_at_start(h.node.paths(), "tower", &node_file);
             let state = store::load_state(h.node.paths()).unwrap();
             assert!(
                 state.unconfirmed.is_empty(),
-                "orphan unconfirmed must be pruned"
+                "uncommitted step-1 marker must be rolled back"
             );
             assert!(
-                !state.invites.contains_key(&inv_id),
-                "leftover invite must be removed"
+                state.invites.contains_key(&inv_id),
+                "step-1 rollback must keep invite usable in state.invites"
             );
             let auth = std::fs::read_to_string(&h.auth_keys).unwrap();
-            assert!(!auth.contains(&format!("legion-invite:{inv_id}")), "{auth}");
+            assert!(
+                auth.contains(&format!("legion-invite:{inv_id}")),
+                "step-1 rollback must keep invite line in authorized_keys:\n{auth}"
+            );
             assert!(!auth.contains("legion-device:kill-step1"), "{auth}");
+
+            // Retrying with the SAME invite now succeeds cleanly!
+            let retry = run_enrol(&h.node, &inv_id, req.as_bytes()).await;
+            assert!(
+                retry.is_ok(),
+                "retry with same invite after step-1 rollback must succeed: {retry:?}"
+            );
+            let reg = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+            assert_eq!(reg.devices.len(), 1);
+            assert!(
+                std::fs::read_to_string(&h.auth_keys)
+                    .unwrap()
+                    .contains("legion-device:kill-step1")
+            );
+        }
+
+        // Test 1b (Replacement, kill at step 1): Step 1 adds the new record naming
+        // `replaces_pairing_id` without removing the old leftover's unconfirmed mark.
+        // Repair rolls back ONLY the new record: the old leftover stays unconfirmed and the
+        // invite stays intact, so retrying with the SAME invite replaces the leftover cleanly!
+        {
+            let h = Harness::new();
+            let seed = [0x5au8; 32];
+            let pub_key = keys::ed25519_public_key_from_seed(&seed);
+
+            let inv1 = h
+                .call(
+                    "device.invite",
+                    json!({"role": "observer", "name": "p1", "host": "tower.example", "user": "me"}),
+                )
+                .await
+                .unwrap();
+            let id1 = inv1["id"].as_str().unwrap().to_owned();
+            let fps1 = host_fps_of(&inv1);
+            let req1 = format!(
+                "{}\n",
+                json!({"enrol": 1, "id": id1, "public_key": pub_key, "name": "p1", "proof": keys::sign_enrol_proof(&seed, &id1, "tower", &fps1)})
+            );
+            assert!(run_enrol(&h.node, &id1, req1.as_bytes()).await.is_ok());
+            let pid1 = store::load_state(h.node.paths())
+                .unwrap()
+                .unconfirmed
+                .keys()
+                .next()
+                .unwrap()
+                .clone();
+
+            let inv2 = h
+                .call(
+                    "device.invite",
+                    json!({"role": "observer", "name": "p2", "host": "tower.example", "user": "me"}),
+                )
+                .await
+                .unwrap();
+            let id2 = inv2["id"].as_str().unwrap().to_owned();
+            let fps2 = host_fps_of(&inv2);
+            let req2 = format!(
+                "{}\n",
+                json!({"enrol": 1, "id": id2, "public_key": pub_key, "name": "p2", "proof": keys::sign_enrol_proof(&seed, &id2, "tower", &fps2)})
+            );
+            let kill_reply = enrol::run_enrol_with_kill_point(
+                &h.node,
+                &id2,
+                req2.as_bytes(),
+                enrol::EnrolKillPoint::AfterUnconfirmedState,
+            )
+            .await;
+            assert!(!kill_reply.is_ok());
+
+            let node_file = h.node.config().get::<NodeFile>().unwrap();
+            registry::repair_incomplete_enrolments_at_start(h.node.paths(), "tower", &node_file);
+            let st_after = store::load_state(h.node.paths()).unwrap();
+            assert!(
+                st_after.unconfirmed.contains_key(&pid1),
+                "old leftover {pid1} must keep its unconfirmed mark after step-1 kill + repair"
+            );
+            assert_eq!(
+                st_after.unconfirmed.len(),
+                1,
+                "only old leftover {pid1} should remain in state.unconfirmed: {:?}",
+                st_after.unconfirmed
+            );
+            assert!(
+                st_after.invites.contains_key(&id2),
+                "invite {id2} must remain usable after step-1 replacement rollback"
+            );
+            assert!(
+                std::fs::read_to_string(&h.auth_keys)
+                    .unwrap()
+                    .contains(&format!("legion-invite:{id2}"))
+            );
+
+            // Retrying with the SAME invite `id2` replaces `pid1` cleanly.
+            let retry = run_enrol(&h.node, &id2, req2.as_bytes()).await;
+            assert!(
+                retry.is_ok(),
+                "retry with same invite after step-1 replacement rollback must succeed: {retry:?}"
+            );
+            let reg = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+            assert_eq!(reg.devices.len(), 1);
+            assert_eq!(reg.devices.values().next().unwrap().principal, "device:p2");
+            assert!(reg.removed.contains_key(&pid1));
+            let st_final = store::load_state(h.node.paths()).unwrap();
+            assert!(!st_final.unconfirmed.contains_key(&pid1));
+            assert_eq!(st_final.unconfirmed.len(), 1);
+            let auth_final = std::fs::read_to_string(&h.auth_keys).unwrap();
+            let b64 = pub_key.split_whitespace().nth(1).unwrap();
+            let matching_lines: Vec<_> = auth_final.lines().filter(|l| l.contains(b64)).collect();
+            assert_eq!(matching_lines.len(), 1, "{matching_lines:?}");
+            assert!(matching_lines[0].contains("device:p2"));
+            assert!(!auth_final.contains(&format!("legion-invite:{id2}")));
+        }
+
+        // Test 2b (Replacement, kill at step 2 AND kill at step 3): Step 2 committed the
+        // replacement to `devices.toml` and `policy.toml` -> startup repair rolls forward
+        // (restores new key line, drops old key line, drops old unconfirmed mark, removes invite).
+        {
+            let h = Harness::new();
+            let seed = [0x6bu8; 32];
+            let pub_key = keys::ed25519_public_key_from_seed(&seed);
+            let b64 = pub_key.split_whitespace().nth(1).unwrap().to_owned();
+
+            let inv1 = h
+                .call(
+                    "device.invite",
+                    json!({"role": "observer", "name": "q1", "host": "tower.example", "user": "me"}),
+                )
+                .await
+                .unwrap();
+            let id1 = inv1["id"].as_str().unwrap().to_owned();
+            let fps1 = host_fps_of(&inv1);
+            let req1 = format!(
+                "{}\n",
+                json!({"enrol": 1, "id": id1, "public_key": pub_key, "name": "q1", "proof": keys::sign_enrol_proof(&seed, &id1, "tower", &fps1)})
+            );
+            assert!(run_enrol(&h.node, &id1, req1.as_bytes()).await.is_ok());
+            let pid1 = store::load_state(h.node.paths())
+                .unwrap()
+                .unconfirmed
+                .keys()
+                .next()
+                .unwrap()
+                .clone();
+
+            // Kill at step 2 of replacement.
+            let inv2 = h
+                .call(
+                    "device.invite",
+                    json!({"role": "observer", "name": "q2", "host": "tower.example", "user": "me"}),
+                )
+                .await
+                .unwrap();
+            let id2 = inv2["id"].as_str().unwrap().to_owned();
+            let fps2 = host_fps_of(&inv2);
+            let req2 = format!(
+                "{}\n",
+                json!({"enrol": 1, "id": id2, "public_key": pub_key, "name": "q2", "proof": keys::sign_enrol_proof(&seed, &id2, "tower", &fps2)})
+            );
+            let r2 = enrol::run_enrol_with_kill_point(
+                &h.node,
+                &id2,
+                req2.as_bytes(),
+                enrol::EnrolKillPoint::AfterDevicesAndPolicy,
+            )
+            .await;
+            assert!(!r2.is_ok());
+
+            let node_file = h.node.config().get::<NodeFile>().unwrap();
+            registry::repair_incomplete_enrolments_at_start(h.node.paths(), "tower", &node_file);
+            let auth2 = std::fs::read_to_string(&h.auth_keys).unwrap();
+            let lines2: Vec<_> = auth2.lines().filter(|l| l.contains(&b64)).collect();
+            assert_eq!(lines2.len(), 1, "{lines2:?}");
+            assert!(lines2[0].contains("device:q2"), "{lines2:?}");
+            assert!(!auth2.contains(&format!("legion-invite:{id2}")), "{auth2}");
+            let st2 = store::load_state(h.node.paths()).unwrap();
+            assert!(!st2.invites.contains_key(&id2));
+            assert!(!st2.unconfirmed.contains_key(&pid1));
+            assert_eq!(st2.unconfirmed.len(), 1);
+            let pid2 = st2.unconfirmed.keys().next().unwrap().clone();
+            assert!(st2.unconfirmed[&pid2].replaces_pairing_id.is_none());
+
+            // Kill at step 3 of a subsequent replacement (`q2` -> `q3`).
+            let inv3 = h
+                .call(
+                    "device.invite",
+                    json!({"role": "observer", "name": "q3", "host": "tower.example", "user": "me"}),
+                )
+                .await
+                .unwrap();
+            let id3 = inv3["id"].as_str().unwrap().to_owned();
+            let fps3 = host_fps_of(&inv3);
+            let req3 = format!(
+                "{}\n",
+                json!({"enrol": 1, "id": id3, "public_key": pub_key, "name": "q3", "proof": keys::sign_enrol_proof(&seed, &id3, "tower", &fps3)})
+            );
+            let r3 = enrol::run_enrol_with_kill_point(
+                &h.node,
+                &id3,
+                req3.as_bytes(),
+                enrol::EnrolKillPoint::AfterAuthKeysBeforeInviteRemoval,
+            )
+            .await;
+            assert!(!r3.is_ok());
+            registry::repair_incomplete_enrolments_at_start(h.node.paths(), "tower", &node_file);
+            let auth3 = std::fs::read_to_string(&h.auth_keys).unwrap();
+            let lines3: Vec<_> = auth3.lines().filter(|l| l.contains(&b64)).collect();
+            assert_eq!(lines3.len(), 1, "{lines3:?}");
+            assert!(lines3[0].contains("device:q3"), "{lines3:?}");
+            assert!(!auth3.contains(&format!("legion-invite:{id3}")), "{auth3}");
+            let st3 = store::load_state(h.node.paths()).unwrap();
+            assert!(!st3.invites.contains_key(&id3));
+            assert!(!st3.unconfirmed.contains_key(&pid2));
+            assert_eq!(st3.unconfirmed.len(), 1);
+            let pid3 = st3.unconfirmed.keys().next().unwrap().clone();
+            // Gate verification succeeds under the rolled-forward `device:q3` pairing.
+            registry::verify_gate_device(
+                h.node.paths(),
+                "tower",
+                &node_file,
+                "q3",
+                &pid3,
+                "device:q3",
+                None,
+            )
+            .unwrap();
+        }
+
+        // Test 2c: Kill after step 2 -> owner lists and removes -> startup repair must never
+        // resurrect the removed device or its invite.
+        {
+            let h = Harness::new();
+            let seed = [0x7cu8; 32];
+            let pub_key = keys::ed25519_public_key_from_seed(&seed);
+            let inv1 = h
+                .call(
+                    "device.invite",
+                    json!({"role": "observer", "name": "r1", "host": "tower.example", "user": "me"}),
+                )
+                .await
+                .unwrap();
+            let id1 = inv1["id"].as_str().unwrap().to_owned();
+            let fps1 = host_fps_of(&inv1);
+            let req1 = format!(
+                "{}\n",
+                json!({"enrol": 1, "id": id1, "public_key": pub_key, "name": "r1", "proof": keys::sign_enrol_proof(&seed, &id1, "tower", &fps1)})
+            );
+            let _ = enrol::run_enrol_with_kill_point(
+                &h.node,
+                &id1,
+                req1.as_bytes(),
+                enrol::EnrolKillPoint::AfterDevicesAndPolicy,
+            )
+            .await;
+            let listed = h.call("device.list", json!({})).await.unwrap();
+            let pid = listed["devices"][0]["id"].as_str().unwrap().to_owned();
+            h.call("device.remove", json!({"id": pid})).await.unwrap();
+            let node_file = h.node.config().get::<NodeFile>().unwrap();
+            registry::repair_incomplete_enrolments_at_start(h.node.paths(), "tower", &node_file);
+            let auth = std::fs::read_to_string(&h.auth_keys).unwrap();
+            assert!(
+                !auth.contains("device:r1"),
+                "removed device resurrected: {auth}"
+            );
+            assert!(
+                !auth.contains(&format!("legion-invite:{id1}")),
+                "invite resurrected: {auth}"
+            );
+            assert!(
+                store::load_state(h.node.paths())
+                    .unwrap()
+                    .unconfirmed
+                    .is_empty()
+            );
         }
 
         // Test 2 (Kill Point A): Kill after step 2 (`devices.toml` + `policy.toml` written,
@@ -8126,6 +8417,405 @@ role = "observer"
             !std::fs::read_to_string(&h.auth_keys)
                 .unwrap()
                 .contains(&format!("legion-invite:{cp_id}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn enrol_pre_upgrade_invite_without_host_key_fingerprints_takes_no_proof_path() {
+        let h = Harness::new();
+        let seed_fresh = [0x81u8; 32];
+        let fresh_pub = keys::ed25519_public_key_from_seed(&seed_fresh);
+        let host_fps_of = |inv: &serde_json::Value| -> Vec<String> {
+            keys::host_key_fingerprints(
+                &inv["host_keys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let strip_invite_fps = |inv_id: &str| {
+            let mut st = store::load_state(h.node.paths()).unwrap();
+            st.invites
+                .get_mut(inv_id)
+                .unwrap()
+                .host_key_fingerprints
+                .clear();
+            store::save_state(h.node.paths(), &st).unwrap();
+        };
+
+        // 1. Pre-upgrade invite (no recorded host_key_fingerprints) + new phone sending a proof
+        //    for a fresh key MUST enrol cleanly (proof counts as absent, not invalid).
+        let inv1 = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "pre-upgrade-phone", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let id1 = inv1["id"].as_str().unwrap().to_owned();
+        let fps1 = host_fps_of(&inv1);
+        strip_invite_fps(&id1);
+        let req1 = format!(
+            "{}\n",
+            json!({
+                "enrol": 1,
+                "id": id1,
+                "public_key": fresh_pub,
+                "name": "pre-upgrade-phone",
+                "proof": keys::sign_enrol_proof(&seed_fresh, &id1, "tower", &fps1),
+            })
+        );
+        let enrolled = run_enrol(&h.node, &id1, req1.as_bytes()).await;
+        assert!(
+            enrolled.is_ok(),
+            "new phone with proof must enrol cleanly against pre-upgrade invite: {enrolled:?}"
+        );
+
+        // 2. Pre-upgrade invite + new phone sending a proof for an EXISTING unconfirmed key MUST
+        //    take the no-proof path: refuse with Conflict (no details), leave the leftover intact,
+        //    and consume the invite.
+        let inv2 = h
+            .call(
+                "device.invite",
+                json!({"role": "nobody", "name": "pre-upgrade-replace", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let id2 = inv2["id"].as_str().unwrap().to_owned();
+        let fps2 = host_fps_of(&inv2);
+        strip_invite_fps(&id2);
+        let req2 = format!(
+            "{}\n",
+            json!({
+                "enrol": 1,
+                "id": id2,
+                "public_key": fresh_pub,
+                "name": "pre-upgrade-replace",
+                "proof": keys::sign_enrol_proof(&seed_fresh, &id2, "tower", &fps2),
+            })
+        );
+        match run_enrol(&h.node, &id2, req2.as_bytes()).await {
+            EnrolReply::Err { ok: false, error } => {
+                assert_eq!(error.code, ErrorCode::Conflict, "{error:?}");
+                assert!(
+                    error.details.is_none(),
+                    "pre-upgrade invite takes no-proof path and must omit details: {error:?}"
+                );
+            }
+            other => panic!("expected Conflict without details, got {other:?}"),
+        }
+        assert!(
+            !std::fs::read_to_string(&h.auth_keys)
+                .unwrap()
+                .contains(&format!("legion-invite:{id2}")),
+            "conflict on pre-upgrade invite must still consume the invite"
+        );
+        let reg = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+        assert_eq!(reg.devices.len(), 1);
+        let (pid, dev) = reg.devices.iter().next().unwrap();
+        assert_eq!(dev.principal, "device:pre-upgrade-phone");
+
+        // 3. Confirm device, then pre-upgrade invite with proof STILL gets plain Conflict without
+        //    details and consumes the invite.
+        let node_file = h.node.config().get::<NodeFile>().unwrap();
+        registry::verify_gate_device(
+            h.node.paths(),
+            "tower",
+            &node_file,
+            &dev.name,
+            pid,
+            &dev.principal,
+            None,
+        )
+        .unwrap();
+        let inv3 = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "pre-upgrade-conf", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let id3 = inv3["id"].as_str().unwrap().to_owned();
+        let fps3 = host_fps_of(&inv3);
+        strip_invite_fps(&id3);
+        let req3 = format!(
+            "{}\n",
+            json!({
+                "enrol": 1,
+                "id": id3,
+                "public_key": fresh_pub,
+                "name": "pre-upgrade-conf",
+                "proof": keys::sign_enrol_proof(&seed_fresh, &id3, "tower", &fps3),
+            })
+        );
+        match run_enrol(&h.node, &id3, req3.as_bytes()).await {
+            EnrolReply::Err { ok: false, error } => {
+                assert_eq!(error.code, ErrorCode::Conflict, "{error:?}");
+                assert!(error.details.is_none(), "{error:?}");
+            }
+            other => panic!("expected Conflict without details, got {other:?}"),
+        }
+        assert!(
+            !std::fs::read_to_string(&h.auth_keys)
+                .unwrap()
+                .contains(&format!("legion-invite:{id3}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_gate_device_denied_sessions_never_clear_unconfirmed_mark() {
+        let h = Harness::new();
+        let node_file = h.node.config().get::<NodeFile>().unwrap();
+
+        // 1. Enrol and confirm owner device A so it can pair child device B.
+        let inv_a = h
+            .call(
+                "device.invite",
+                json!({"role": "owner", "allow_owner": true, "name": "owner-a", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let id_a = inv_a["id"].as_str().unwrap().to_owned();
+        let key_a = generate_ephemeral_ed25519().unwrap();
+        let req_a = format!(
+            "{}\n",
+            json!({"enrol": 1, "id": id_a, "public_key": key_a.public_key, "name": "owner-a"})
+        );
+        assert!(run_enrol(&h.node, &id_a, req_a.as_bytes()).await.is_ok());
+        let reg_a = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+        let (pid_a, dev_a) = reg_a
+            .devices
+            .iter()
+            .find(|(_, d)| d.name == "owner-a")
+            .map(|(id, d)| (id.clone(), d.clone()))
+            .unwrap();
+        registry::verify_gate_device(
+            h.node.paths(),
+            "tower",
+            &node_file,
+            &dev_a.name,
+            &pid_a,
+            &dev_a.principal,
+            None,
+        )
+        .unwrap();
+
+        // 2. Owner device A pairs child device B (born locally unconfirmed).
+        let mut call_b = Call::new(
+            Door::Ssh,
+            "device.invite",
+            json!({"role": "observer", "name": "child-b", "host": "tower.example", "user": "me"}),
+        );
+        call_b.pinned = Some(dev_a.principal.clone());
+        call_b.device = Some(dev_a.name.clone());
+        call_b.pairing_id = Some(pid_a.clone());
+        let inv_b = h.node.call(call_b).await.unwrap();
+        let id_b = inv_b["id"].as_str().unwrap().to_owned();
+        let key_b = generate_ephemeral_ed25519().unwrap();
+        let req_b = format!(
+            "{}\n",
+            json!({"enrol": 1, "id": id_b, "public_key": key_b.public_key, "name": "child-b"})
+        );
+        assert!(run_enrol(&h.node, &id_b, req_b.as_bytes()).await.is_ok());
+        let reg_b = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+        let (pid_b, dev_b) = reg_b
+            .devices
+            .iter()
+            .find(|(_, d)| d.name == "child-b")
+            .map(|(id, d)| (id.clone(), d.clone()))
+            .unwrap();
+        assert!(
+            store::load_state(h.node.paths())
+                .unwrap()
+                .unconfirmed
+                .contains_key(&pid_b),
+            "child-b starts unconfirmed"
+        );
+
+        // 3. Wrong device name or wrong principal -> Denied, unconfirmed mark MUST stay!
+        for (wrong_name, wrong_principal, label) in [
+            ("wrong-name", dev_b.principal.as_str(), "wrong name"),
+            (dev_b.name.as_str(), "device:wrong", "wrong principal"),
+        ] {
+            let err = registry::verify_gate_device(
+                h.node.paths(),
+                "tower",
+                &node_file,
+                wrong_name,
+                &pid_b,
+                wrong_principal,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{label}: {err:?}");
+            assert!(
+                store::load_state(h.node.paths())
+                    .unwrap()
+                    .unconfirmed
+                    .contains_key(&pid_b),
+                "{label} denial must never clear local unconfirmed mark"
+            );
+        }
+
+        // 4. `entry.conflict = true` and `entry.role_conflict = true` -> Denied, unconfirmed mark
+        //    MUST stay!
+        for (set_conflict, set_role_conflict, label) in [
+            (true, false, "immutable conflict"),
+            (false, true, "role conflict"),
+        ] {
+            let mut reg = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+            let entry = reg.devices.get_mut(&pid_b).unwrap();
+            entry.conflict = set_conflict;
+            entry.role_conflict = set_role_conflict;
+            {
+                let _cfg = registry::lock_config(h.node.paths()).unwrap();
+                registry::save_devices_locked(h.node.paths(), &reg).unwrap();
+            }
+            let err = registry::verify_gate_device(
+                h.node.paths(),
+                "tower",
+                &node_file,
+                &dev_b.name,
+                &pid_b,
+                &dev_b.principal,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{label}: {err:?}");
+            assert!(
+                store::load_state(h.node.paths())
+                    .unwrap()
+                    .unconfirmed
+                    .contains_key(&pid_b),
+                "{label} denial must never clear local unconfirmed mark"
+            );
+        }
+        // Restore conflict flags to false and reconcile key line back before quarantine test.
+        {
+            let mut reg = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+            let entry = reg.devices.get_mut(&pid_b).unwrap();
+            entry.conflict = false;
+            entry.role_conflict = false;
+            let _cfg = registry::lock_config(h.node.paths()).unwrap();
+            registry::save_devices_locked(h.node.paths(), &reg).unwrap();
+        }
+        let _ = h.call("device.list", json!({})).await.unwrap();
+        assert!(
+            store::load_state(h.node.paths())
+                .unwrap()
+                .unconfirmed
+                .contains_key(&pid_b)
+        );
+
+        // 5. Disk key mismatch -> Denied, unconfirmed mark MUST stay!
+        let other_key = generate_ephemeral_ed25519().unwrap();
+        let disk_before = std::fs::read_to_string(&h.auth_keys).unwrap();
+        let orig_b64 = key_b.public_key.split_whitespace().nth(1).unwrap();
+        let other_b64 = other_key.public_key.split_whitespace().nth(1).unwrap();
+        assert!(disk_before.contains(orig_b64));
+        std::fs::write(&h.auth_keys, disk_before.replace(orig_b64, other_b64)).unwrap();
+        let mismatch_err = registry::verify_gate_device(
+            h.node.paths(),
+            "tower",
+            &node_file,
+            &dev_b.name,
+            &pid_b,
+            &dev_b.principal,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(mismatch_err.code, ErrorCode::Denied, "{mismatch_err:?}");
+        assert!(
+            store::load_state(h.node.paths())
+                .unwrap()
+                .unconfirmed
+                .contains_key(&pid_b),
+            "disk key mismatch denial must never clear local unconfirmed mark"
+        );
+
+        // 6. Remove creator A -> child B becomes QUARANTINED while remaining live in devices.toml.
+        //    Attempting to open a gate session MUST be Denied and MUST NOT clear `unconfirmed`
+        //    or confirm quarantine!
+        h.call("device.remove", json!({"id": pid_a})).await.unwrap();
+        let quarantine_err = registry::verify_gate_device(
+            h.node.paths(),
+            "tower",
+            &node_file,
+            &dev_b.name,
+            &pid_b,
+            &dev_b.principal,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(quarantine_err.code, ErrorCode::Denied, "{quarantine_err:?}");
+        assert!(
+            quarantine_err.message.contains("quarantined"),
+            "{quarantine_err:?}"
+        );
+        assert!(
+            store::load_state(h.node.paths())
+                .unwrap()
+                .unconfirmed
+                .contains_key(&pid_b),
+            "quarantined gate session must NEVER clear local unconfirmed mark"
+        );
+        let reg_q = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+        assert!(
+            reg_q.devices[&pid_b].confirmed_at.is_none(),
+            "quarantined gate session must NEVER confirm quarantine"
+        );
+
+        // 7. Removed (tombstoned) device A opening a gate session -> Denied, never re-activates
+        //    or confirms anything.
+        let removed_err = registry::verify_gate_device(
+            h.node.paths(),
+            "tower",
+            &node_file,
+            &dev_a.name,
+            &pid_a,
+            &dev_a.principal,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(removed_err.code, ErrorCode::Denied, "{removed_err:?}");
+        assert!(
+            !registry::load_devices_raw(h.node.paths())
+                .unwrap()
+                .unwrap()
+                .devices
+                .contains_key(&pid_a)
+        );
+
+        // 8. Owner confirms quarantined B (`device.set confirm=true`), which lifts quarantine
+        //    while keeping local `unconfirmed` intact until B opens a genuine allowed session!
+        h.call("device.set", json!({"id": pid_b, "confirm": true}))
+            .await
+            .unwrap();
+        assert!(
+            store::load_state(h.node.paths())
+                .unwrap()
+                .unconfirmed
+                .contains_key(&pid_b),
+            "owner quarantine confirmation must not clear local unconfirmed before B connects"
+        );
+        registry::verify_gate_device(
+            h.node.paths(),
+            "tower",
+            &node_file,
+            &dev_b.name,
+            &pid_b,
+            &dev_b.principal,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !store::load_state(h.node.paths())
+                .unwrap()
+                .unconfirmed
+                .contains_key(&pid_b),
+            "genuine allowed gate session must clear local unconfirmed mark"
         );
     }
 }
