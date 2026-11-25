@@ -202,7 +202,7 @@ export function createAppLink() {
           call('meta.whoami', {}, { on: targetNode }),
           call('meta.version', {}, { on: targetNode }).catch(() => null),
         ]);
-        if (whoami?.node && whoami.node !== targetNode) {
+        if (primary.via !== 'local' && whoami?.node && whoami.node !== targetNode) {
           throw {
             code: 'denied',
             message: `Expected identity from ${targetNode}, but ${whoami.node} answered.`,
@@ -480,6 +480,144 @@ export function createAppLink() {
     }
   }
 
+  async function contentUrl(req = {}) {
+    const { machine, path, download = false, signal } = req || {};
+    if (signal?.aborted) {
+      throw {
+        code: 'cancelled',
+        message: 'The content request was cancelled.',
+        hint: null,
+        machine: machine || null,
+        details: null,
+      };
+    }
+    try {
+      const result = await invoke('content_url', {
+        machine: machine || '',
+        path: path || '',
+        download: Boolean(download),
+      });
+      if (signal?.aborted) {
+        throw {
+          code: 'cancelled',
+          message: 'The content request was cancelled.',
+          hint: null,
+          machine: machine || null,
+          details: null,
+        };
+      }
+      return result;
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function download(req = {}) {
+    const { machine, path, name, size, mime } = req || {};
+    try {
+      return await invoke('transfer_download', {
+        machine: machine || '',
+        path: path || '',
+        name: name ?? null,
+        size: typeof size === 'number' && Number.isFinite(size) ? size : null,
+        mime: mime ?? null,
+      });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function upload(req = {}) {
+    const { machine, dir, files } = req || {};
+    try {
+      return await invoke('transfer_upload', {
+        machine: machine || '',
+        dir: dir || '',
+        files: Array.isArray(files) ? files : null,
+      });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function openExternally(req = {}) {
+    const { machine, path, name, mime } = req || {};
+    try {
+      return await invoke('transfer_open_externally', {
+        machine: machine || '',
+        path: path || '',
+        name: name ?? null,
+        mime: mime ?? null,
+      });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function transfers() {
+    try {
+      const list = await invoke('transfers');
+      return Array.isArray(list) ? list : [];
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function transferControl(id, action) {
+    try {
+      return await invoke('transfer_control', { id, action });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function openTransfer(id) {
+    try {
+      return await invoke('open_transfer', { id });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  function onTransferEvent(listener) {
+    const core = tauriCore();
+    if (!core || typeof core.Channel !== 'function' || typeof listener !== 'function') {
+      return () => {};
+    }
+    let active = true;
+    const channel = new core.Channel();
+    channel.onmessage = (list) => {
+      if (!active) return;
+      try {
+        listener(Array.isArray(list) ? list : []);
+      } catch {
+        // Keep receiving queue updates if a view callback throws.
+      }
+    };
+    invoke('transfer_watch', { onEvent: channel }).catch(() => {});
+    return () => {
+      active = false;
+    };
+  }
+
+  async function transferSettings() {
+    try {
+      return await invoke('transfer_settings');
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function setTransferSettings(req = {}) {
+    try {
+      return await invoke('transfer_set_settings', {
+        wifiOnlyLarge: Boolean(req?.wifi_only_large ?? req?.wifiOnlyLarge),
+      });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
   return {
     kind: 'app',
     state,
@@ -502,5 +640,15 @@ export function createAppLink() {
     setAutoUpdate,
     dismissUpdateNotice,
     maybeAutoInstall,
+    contentUrl,
+    download,
+    upload,
+    openExternally,
+    transfers,
+    transferControl,
+    openTransfer,
+    onTransferEvent,
+    transferSettings,
+    setTransferSettings,
   };
 }

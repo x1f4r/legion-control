@@ -5,10 +5,13 @@ pub mod commands;
 pub mod content;
 pub mod link_backend;
 pub mod store;
+pub mod transfers;
 pub mod updater;
 
 use std::sync::Arc;
 
+#[cfg(not(target_os = "android"))]
+use tauri::WindowEvent;
 use tauri::webview::NewWindowResponse;
 use tauri::{Manager, RunEvent, Url, WebviewWindowBuilder};
 
@@ -17,7 +20,19 @@ use crate::commands::SharedBackend;
 use crate::content::{AppContentServer, SharedContentServer};
 use crate::link_backend::LinkBackend;
 use crate::store::AppStore;
+#[cfg(target_os = "ios")]
+use crate::transfers::PauseReason;
+use crate::transfers::{SharedTransfers, TransferManager, TransferPlatform};
 use crate::updater::{SharedUpdater, UpdateManager};
+
+#[cfg(target_os = "android")]
+struct SharedAndroidTransferPlatform(Arc<transfers::android::AndroidTransferPlatform>);
+
+#[cfg(target_os = "android")]
+struct SharedAndroidTransferPlugin(Arc<transfers::android::AndroidTransferPluginHandle>);
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct SharedDesktopTransferPlatform(Arc<transfers::desktop::DesktopTransferPlatform>);
 
 /// Returns `true` only for the bundled app origin on the current platform.
 ///
@@ -67,6 +82,24 @@ fn android_app_updater_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
         .build()
 }
 
+/// Registers the in-app `FilesTransferPlugin` Kotlin plugin on Android for the system file picker,
+/// lazy notification permission dialog, and `LocalSocket` bridge connection to
+/// `TransferForegroundService`.
+#[cfg(target_os = "android")]
+fn android_files_transfer_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("files-transfer")
+        .setup(|app, api| {
+            let handle = api.register_android_plugin("com.x1f4r.legion", "FilesTransferPlugin")?;
+            let shared = Arc::new(transfers::android::AndroidTransferPluginHandle(handle));
+            app.manage(SharedAndroidTransferPlugin(Arc::clone(&shared)));
+            if let Some(platform) = app.try_state::<SharedAndroidTransferPlatform>() {
+                platform.0.attach_plugin(shared);
+            }
+            Ok(())
+        })
+        .build()
+}
+
 /// Starts the Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -93,6 +126,9 @@ pub fn run() {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(desktop) = app.try_state::<SharedDesktopTransferPlatform>() {
+            desktop.0.clear_hidden_for_drain();
+        }
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.unminimize();
             let _ = window.show();
@@ -108,9 +144,44 @@ pub fn run() {
         let content_server = Arc::new(AppContentServer::new(Arc::clone(&backend)));
         let updater =
             UpdateManager::for_app(&data_dir, Some(app.package_info().version.to_string()));
+
+        #[cfg(target_os = "android")]
+        let platform: Arc<dyn TransferPlatform> = {
+            let android_platform = transfers::android::AndroidTransferPlatform::new(&data_dir)
+                .map_err(|err| std::io::Error::other(err.message))?;
+            app.manage(SharedAndroidTransferPlatform(Arc::clone(&android_platform)));
+            if let Some(plugin) = app.try_state::<SharedAndroidTransferPlugin>() {
+                android_platform.attach_plugin(Arc::clone(&plugin.0));
+            }
+            android_platform
+        };
+
+        #[cfg(target_os = "ios")]
+        let platform: Arc<dyn TransferPlatform> = Arc::new(
+            transfers::ios::IosTransferPlatform::new(app.handle(), &data_dir),
+        );
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let platform: Arc<dyn TransferPlatform> = {
+            let desktop_platform = Arc::new(transfers::desktop::DesktopTransferPlatform::new(
+                app.handle().clone(),
+                &data_dir,
+            ));
+            app.manage(SharedDesktopTransferPlatform(Arc::clone(&desktop_platform)));
+            desktop_platform
+        };
+
+        let transfers = TransferManager::load_or_new(&data_dir, Arc::clone(&backend), platform);
+        #[cfg(target_os = "android")]
+        if let Some(android_platform) = app.try_state::<SharedAndroidTransferPlatform>() {
+            android_platform.0.attach_manager(&transfers);
+        }
+        transfers.start();
+
         app.manage(store);
         app.manage(SharedBackend(backend));
         app.manage(SharedContentServer(content_server));
+        app.manage(SharedTransfers(transfers));
         app.manage(SharedUpdater(Arc::new(updater)));
 
         let window_config = app
@@ -132,6 +203,7 @@ pub fn run() {
     let builder = builder
         .plugin(android_barcode_scanner_plugin())
         .plugin(android_app_updater_plugin())
+        .plugin(android_files_transfer_plugin())
         .invoke_handler(tauri::generate_handler![
             commands::state,
             commands::tools,
@@ -148,6 +220,15 @@ pub fn run() {
             commands::device_name,
             commands::ready,
             commands::content_url,
+            commands::transfer_download,
+            commands::transfer_upload,
+            commands::transfer_open_externally,
+            commands::transfers,
+            commands::transfer_control,
+            commands::open_transfer,
+            commands::transfer_watch,
+            commands::transfer_settings,
+            commands::transfer_set_settings,
             commands::scan_invite,
             commands::update_state,
             commands::update_watch,
@@ -177,6 +258,15 @@ pub fn run() {
             commands::device_name,
             commands::ready,
             commands::content_url,
+            commands::transfer_download,
+            commands::transfer_upload,
+            commands::transfer_open_externally,
+            commands::transfers,
+            commands::transfer_control,
+            commands::open_transfer,
+            commands::transfer_watch,
+            commands::transfer_settings,
+            commands::transfer_set_settings,
             commands::scan_invite,
             commands::update_state,
             commands::update_watch,
@@ -204,6 +294,15 @@ pub fn run() {
         commands::device_name,
         commands::ready,
         commands::content_url,
+        commands::transfer_download,
+        commands::transfer_upload,
+        commands::transfer_open_externally,
+        commands::transfers,
+        commands::transfer_control,
+        commands::open_transfer,
+        commands::transfer_watch,
+        commands::transfer_settings,
+        commands::transfer_set_settings,
         commands::update_state,
         commands::update_watch,
         commands::update_check,
@@ -219,10 +318,83 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Legion application");
 
-    app.run(|app_handle, event| {
-        if let RunEvent::Exit = event {
+    app.run(|app_handle, event| match event {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::CloseRequested { api, .. },
+            ..
+        } => {
+            let transfers = app_handle.state::<SharedTransfers>();
+            if transfers.0.has_active_work() {
+                api.prevent_close();
+                if let Some(window) = app_handle.get_webview_window(&label) {
+                    let _ = window.hide();
+                }
+                if let Some(desktop) = app_handle.try_state::<SharedDesktopTransferPlatform>() {
+                    desktop.0.mark_hidden_for_drain();
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => {
+            if let Some(desktop) = app_handle.try_state::<SharedDesktopTransferPlatform>() {
+                desktop.0.clear_hidden_for_drain();
+            }
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+        #[cfg(target_os = "ios")]
+        RunEvent::WindowEvent {
+            event: WindowEvent::Suspended,
+            ..
+        } => {
+            app_handle
+                .state::<SharedTransfers>()
+                .0
+                .pause_all_active(PauseReason::Background);
+        }
+        #[cfg(target_os = "ios")]
+        RunEvent::WindowEvent {
+            event: WindowEvent::Resumed,
+            ..
+        } => {
+            app_handle
+                .state::<SharedTransfers>()
+                .0
+                .resume_paused_for(PauseReason::Background);
+        }
+        RunEvent::ExitRequested { code, api, .. } => {
+            let transfers = app_handle.state::<SharedTransfers>();
+            #[cfg(target_os = "android")]
+            {
+                if code.is_none() && transfers.0.has_unfinished_or_paused() {
+                    api.prevent_exit();
+                }
+            }
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                if code.is_none() && transfers.0.has_active_work() {
+                    if !transfers::desktop::confirm_quit_with_active_transfers() {
+                        api.prevent_exit();
+                    } else {
+                        transfers.0.shutdown();
+                    }
+                }
+            }
+            #[cfg(target_os = "ios")]
+            {
+                let _ = (code, api, transfers);
+            }
+        }
+        RunEvent::Exit => {
+            app_handle.state::<SharedTransfers>().0.shutdown();
             app_handle.state::<SharedContentServer>().0.shutdown();
         }
+        _ => {}
     });
 }
 

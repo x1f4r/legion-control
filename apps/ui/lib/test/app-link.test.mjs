@@ -326,3 +326,116 @@ test('createAppLink wraps native update commands and live update watch channel',
     }
   }
 });
+
+test('createAppLink implements files-contract contentUrl and device transfer queue methods', async () => {
+  const prevWindow = globalThis.window;
+  const seen = [];
+  let transferChannel = null;
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          seen.push({ command, payload });
+          if (command === 'content_url') {
+            return Promise.resolve({
+              url: 'http://127.0.0.1:43210/v1/content/tok/pic.jpg',
+              expires_in: 900,
+            });
+          }
+          if (command === 'transfer_download') {
+            return Promise.resolve({ id: 'tr-1' });
+          }
+          if (command === 'transfer_upload') {
+            return Promise.resolve(payload.dir === '/cancelled' ? null : { id: 'tr-2', ids: ['tr-2'], count: 1 });
+          }
+          if (command === 'transfer_open_externally') {
+            return Promise.resolve({ id: 'tr-3', ok: true });
+          }
+          if (command === 'transfers') {
+            return Promise.resolve([
+              { id: 'tr-1', direction: 'download', state: 'running', bytes_done: 10, bytes_total: 100 },
+            ]);
+          }
+          if (command === 'transfer_control') {
+            return Promise.resolve({ id: payload.id, state: payload.action === 'pause' ? 'paused' : 'cancelled' });
+          }
+          if (command === 'open_transfer') {
+            return Promise.resolve({ ok: true });
+          }
+          if (command === 'transfer_watch') {
+            transferChannel = payload.onEvent;
+            return Promise.resolve();
+          }
+          if (command === 'transfer_settings' || command === 'transfer_set_settings') {
+            return Promise.resolve({ wifi_only_large: Boolean(payload?.wifiOnlyLarge), large_threshold_bytes: 52428800 });
+          }
+          return Promise.resolve({});
+        },
+        Channel: class FakeChannel {
+          constructor() {
+            this.onmessage = null;
+          }
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+
+    const urlRes = await link.contentUrl({ machine: 'tower', path: '/home/me/pic.jpg', download: true });
+    assert.equal(urlRes.url, 'http://127.0.0.1:43210/v1/content/tok/pic.jpg');
+    assert.equal(urlRes.expires_in, 900);
+    const urlCall = seen.find((c) => c.command === 'content_url');
+    assert.deepEqual(urlCall.payload, { machine: 'tower', path: '/home/me/pic.jpg', download: true });
+
+    const aborted = new AbortController();
+    aborted.abort();
+    await assert.rejects(() => link.contentUrl({ machine: 'tower', path: '/a', signal: aborted.signal }), {
+      code: 'cancelled',
+    });
+
+    assert.deepEqual(
+      await link.download({ machine: 'tower', path: '/home/me/clip.webm', name: 'clip.webm', size: 100, mime: 'video/webm' }),
+      { id: 'tr-1' },
+    );
+    assert.deepEqual(await link.upload({ machine: 'tower', dir: '/home/me/uploads' }), {
+      id: 'tr-2',
+      ids: ['tr-2'],
+      count: 1,
+    });
+    assert.equal(await link.upload({ machine: 'tower', dir: '/cancelled' }), null);
+    assert.deepEqual(
+      await link.openExternally({ machine: 'tower', path: '/home/me/doc.pdf', mime: 'application/pdf' }),
+      { id: 'tr-3', ok: true },
+    );
+
+    const list = await link.transfers();
+    assert.equal(list.length, 1);
+    assert.equal(list[0].id, 'tr-1');
+
+    const paused = await link.transferControl('tr-1', 'pause');
+    assert.equal(paused.state, 'paused');
+    assert.deepEqual(await link.openTransfer('tr-1'), { ok: true });
+
+    const events = [];
+    const unsub = link.onTransferEvent((items) => events.push(items));
+    assert.ok(transferChannel);
+    transferChannel.onmessage([{ id: 'tr-1', state: 'done' }]);
+    assert.equal(events.length, 1);
+    assert.equal(events[0][0].state, 'done');
+    unsub();
+    transferChannel.onmessage([{ id: 'tr-1', state: 'cancelled' }]);
+    assert.equal(events.length, 1);
+
+    const s = await link.setTransferSettings({ wifi_only_large: true });
+    assert.equal(s.wifi_only_large, true);
+    assert.equal((await link.transferSettings()).large_threshold_bytes, 52428800);
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+});

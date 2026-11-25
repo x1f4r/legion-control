@@ -18,6 +18,11 @@ use crate::backend::{
     RepairResult, UnpairResult,
 };
 use crate::content::{ContentUrlResult, SharedContentServer};
+use crate::transfers::{
+    DeviceTransfer, OpenExternallyResult, OpenTransferResult, SharedTransfers,
+    TransferControlAction, TransferIdResult, TransferSettings, UploadEnqueueResult,
+    UploadFileInput,
+};
 #[cfg(target_os = "android")]
 use crate::updater::android::AndroidUpdaterHandle;
 use crate::updater::{SharedUpdater, UpdateState};
@@ -249,6 +254,112 @@ pub async fn content_url(
         .0
         .mint_url(&machine, &path, download.unwrap_or(false))
         .await
+}
+
+/// Enqueues a non-blocking download from `machine:path` into the device's Downloads folder.
+#[tauri::command]
+pub async fn transfer_download(
+    transfers: State<'_, SharedTransfers>,
+    machine: String,
+    path: String,
+    name: Option<String>,
+    size: Option<u64>,
+    mime: Option<String>,
+) -> Result<TransferIdResult, AppError> {
+    validate_label_size("Machine name", &machine)?;
+    if let Some(ref raw_name) = name {
+        validate_label_size("File name", raw_name)?;
+    }
+    let id = transfers
+        .0
+        .enqueue_download(machine, path, name, size, mime, false)
+        .await?;
+    Ok(TransferIdResult { id })
+}
+
+/// Picks local files (unless `files` is pre-supplied) and enqueues non-blocking bulk-pipe `put`
+/// uploads into `machine:dir`. Returns `None` if the user cancelled the file picker.
+#[tauri::command]
+pub async fn transfer_upload(
+    transfers: State<'_, SharedTransfers>,
+    machine: String,
+    dir: String,
+    files: Option<Vec<UploadFileInput>>,
+) -> Result<Option<UploadEnqueueResult>, AppError> {
+    validate_label_size("Machine name", &machine)?;
+    transfers.0.enqueue_upload(machine, dir, files).await
+}
+
+/// Enqueues a download to the app cache that opens in another app once verified.
+#[tauri::command]
+pub async fn transfer_open_externally(
+    transfers: State<'_, SharedTransfers>,
+    machine: String,
+    path: String,
+    name: Option<String>,
+    mime: Option<String>,
+) -> Result<OpenExternallyResult, AppError> {
+    validate_label_size("Machine name", &machine)?;
+    if let Some(ref raw_name) = name {
+        validate_label_size("File name", raw_name)?;
+    }
+    let id = transfers
+        .0
+        .enqueue_download(machine, path, name, None, mime, true)
+        .await?;
+    Ok(OpenExternallyResult { id, ok: true })
+}
+
+/// Lists all current and recent device transfers (newest first).
+#[tauri::command]
+pub fn transfers(transfers: State<'_, SharedTransfers>) -> Vec<DeviceTransfer> {
+    transfers.0.list()
+}
+
+/// Pauses, resumes, or cancels one device transfer by id.
+#[tauri::command]
+pub async fn transfer_control(
+    transfers: State<'_, SharedTransfers>,
+    id: String,
+    action: TransferControlAction,
+) -> Result<DeviceTransfer, AppError> {
+    validate_label_size("Transfer id", &id)?;
+    transfers.0.control(&id, action).await
+}
+
+/// Opens a finished downloaded file using the platform's default viewer or chooser.
+#[tauri::command]
+pub async fn open_transfer(
+    transfers: State<'_, SharedTransfers>,
+    id: String,
+) -> Result<OpenTransferResult, AppError> {
+    validate_label_size("Transfer id", &id)?;
+    transfers.0.open_transfer(&id).await
+}
+
+/// Subscribes `on_event` to throttled live snapshots of the transfer queue.
+#[tauri::command]
+pub fn transfer_watch(
+    transfers: State<'_, SharedTransfers>,
+    on_event: Channel<Vec<DeviceTransfer>>,
+) -> Result<(), AppError> {
+    transfers.0.watch(on_event);
+    Ok(())
+}
+
+/// Returns the current transfer queue settings (`wifi_only_large`, `large_threshold_bytes`).
+#[tauri::command]
+pub fn transfer_settings(transfers: State<'_, SharedTransfers>) -> TransferSettings {
+    transfers.0.settings()
+}
+
+/// Updates the "large transfers on Wi-Fi only" setting.
+#[tauri::command]
+pub fn transfer_set_settings(
+    transfers: State<'_, SharedTransfers>,
+    wifi_only_large: bool,
+) -> TransferSettings {
+    transfers.0.set_wifi_only_large(wifi_only_large)
 }
 
 /// Dismisses a pending identity-change warning for `node` without altering its pinned target.
