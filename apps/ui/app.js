@@ -11,6 +11,7 @@ import {
   plainRefusalParts,
 } from './lib/activity.js';
 import { createCache } from './lib/cache.js';
+import { plainErrorMessage } from './lib/errors.js';
 import {
   hydrateFleetCache,
   refreshFleetProgressive,
@@ -413,7 +414,14 @@ function App() {
       const item = failedList[0];
       const verb = item.direction === 'upload' ? 'Upload' : 'Download';
       const name = item.name || 'file';
-      const detail = item.error?.message ? ` ${item.error.message}` : '';
+      const errObj =
+        item.error && typeof item.error === 'object'
+          ? { ...item.error, machine: item.error.machine || item.machine || null }
+          : item.error;
+      const detailText = errObj
+        ? plainErrorMessage(errObj, '', { technical: Boolean(settingsRef.current?.technical), deviceNoun })
+        : '';
+      const detail = detailText ? ` ${detailText}` : '';
       return `${verb} of ${name} failed.${detail}`;
     }
     return `${failedList.length} transfers failed.`;
@@ -1509,7 +1517,12 @@ function App() {
           }
           return;
         } catch (err) {
-          showToast(err?.message || 'Could not open this download.');
+          showToast(
+            plainErrorMessage(err, 'Could not open this download.', {
+              technical: Boolean(settingsRef.current?.technical),
+              deviceNoun,
+            }),
+          );
           return;
         }
       }

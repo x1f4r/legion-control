@@ -726,7 +726,11 @@ export function createAppLink() {
 
   async function learn() {
     try {
-      return await invoke('learn');
+      const result = await invoke('learn');
+      if (Array.isArray(result?.report?.added) && result.report.added.length > 0) {
+        clearUnsupportedContentMachines();
+      }
+      return result;
     } catch (err) {
       throw normalizeError(err);
     }
@@ -915,7 +919,8 @@ export function createAppLink() {
       const normalized = normalizeError(err);
       if (
         normalized.code === 'unsupported' &&
-        normalized.details?.reason !== 'too_large_for_inline'
+        normalized.details?.reason !== 'too_large_for_inline' &&
+        normalized.details?.reason !== 'relay_too_old'
       ) {
         const target = machineKey(machine) || machineKey(normalized.machine);
         markContentUnsupported(target);

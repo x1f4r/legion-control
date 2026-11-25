@@ -877,7 +877,7 @@ test('Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses
     await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
     await page.locator('.toast-banner', { hasText: 'Uploading to tower. Watch progress in Activity.' }).waitFor();
     const failToast = page.locator('.toast-banner.error', {
-      hasText: /Upload of Upload-\d+\.jpg failed\. Connection dropped\./,
+      hasText: /Upload of Upload-\d+\.jpg failed\. Can't reach tower right now\./,
     });
     await failToast.waitFor({ timeout: 5000 });
     await assertToastDoesNotCoverFirstRow(page, 'narrow failure toast');

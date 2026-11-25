@@ -566,3 +566,62 @@ test('createAppLink advertises content support and remembers unsupported remote 
     }
   }
 });
+
+test('createAppLink does not mark relay or target unsupported on relay_too_old and clears cache when learn adds direct routes', async () => {
+  const prevWindow = globalThis.window;
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          if (command === 'content_url') {
+            if (payload.machine === 'studio') {
+              return Promise.reject({
+                code: 'unsupported',
+                message: 'tower needs an update before it can pass files along from studio.',
+                machine: 'tower',
+                details: { reason: 'relay_too_old', relay: 'tower', target: 'studio' },
+              });
+            }
+            return Promise.reject({
+              code: 'unsupported',
+              message: 'legacy answered stream get without modification time.',
+              machine: 'legacy',
+            });
+          }
+          if (command === 'learn') {
+            return Promise.resolve({
+              report: { introducer: 'tower', added: ['legacy'], updated: [], identity_changed: [], skipped: [] },
+              state: { ready: true, nodes: [{ node: 'tower' }, { node: 'legacy' }] },
+            });
+          }
+          return Promise.resolve({});
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    await assert.rejects(() => link.contentUrl({ machine: 'studio', path: '/pic.png' }), {
+      code: 'unsupported',
+    });
+    // Neither the old relay nor the target should be falsely marked unsupported for direct content.
+    assert.equal(link.supportsContentFor('tower'), true);
+    assert.equal(link.supportsContentFor('studio'), true);
+
+    await assert.rejects(() => link.contentUrl({ machine: 'legacy', path: '/pic.png' }), {
+      code: 'unsupported',
+    });
+    assert.equal(link.supportsContentFor('legacy'), false);
+
+    // Learning new direct routes clears cached unsupported entries.
+    await link.learn();
+    assert.equal(link.supportsContentFor('legacy'), true);
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+});

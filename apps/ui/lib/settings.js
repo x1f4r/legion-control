@@ -701,13 +701,31 @@ export function describeConnectionRoute(entry, technical = false) {
 }
 
 /**
- * Lists relay-only machines known via `linkState.routes` or the live fleet snapshot that do not
- * have their own direct node entry in `linkState.nodes`.
+ * Formats a stored learn-rejection entry for Settings -> Connections when Technical details is on.
+ */
+export function formatLearnRejectionTechnical(rejection) {
+  if (!rejection || typeof rejection !== 'object' || !rejection.reason) return null;
+  const code = rejection.code ? ` (${rejection.code})` : '';
+  const by = rejection.reported_by ? ` — reported by ${rejection.reported_by}` : '';
+  return `Direct route skipped${code}: ${rejection.reason}${by}`;
+}
+
+/**
+ * Lists relay-only machines known via `linkState.routes`, `linkState.learn_rejections`, or the
+ * live fleet snapshot that do not have their own direct node entry in `linkState.nodes`.
  */
 export function buildRelayedConnections(linkState, snapshot) {
   const directNodes = new Set((linkState?.nodes || []).map((n) => n?.node).filter(Boolean));
   const fallbackVia = linkState?.nodes?.[0]?.node || null;
   const routes = linkState?.routes && typeof linkState.routes === 'object' ? linkState.routes : {};
+  const rejectionByMachine = new Map();
+  if (Array.isArray(linkState?.learn_rejections)) {
+    for (const rej of linkState.learn_rejections) {
+      if (rej?.machine && !rejectionByMachine.has(rej.machine)) {
+        rejectionByMachine.set(rej.machine, rej);
+      }
+    }
+  }
   const byName = new Map();
 
   for (const [name, info] of Object.entries(routes)) {
@@ -718,6 +736,7 @@ export function buildRelayedConnections(linkState, snapshot) {
       route_via: info?.via || fallbackVia,
       learned_from: info?.introducer || null,
       identity_changed: null,
+      learn_rejection: rejectionByMachine.get(name) || null,
       relayedOnly: true,
     });
   }
@@ -730,6 +749,20 @@ export function buildRelayedConnections(linkState, snapshot) {
       route_via: fallbackVia,
       learned_from: null,
       identity_changed: null,
+      learn_rejection: rejectionByMachine.get(m.name) || null,
+      relayedOnly: true,
+    });
+  }
+
+  for (const [name, rej] of rejectionByMachine.entries()) {
+    if (!name || directNodes.has(name) || byName.has(name)) continue;
+    byName.set(name, {
+      node: name,
+      route: 'relay',
+      route_via: rej?.reported_by || fallbackVia,
+      learned_from: null,
+      identity_changed: null,
+      learn_rejection: rej,
       relayedOnly: true,
     });
   }

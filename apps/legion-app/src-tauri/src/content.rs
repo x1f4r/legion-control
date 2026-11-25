@@ -203,7 +203,12 @@ impl ContentSource for LinkContentSource {
                 Ok(target) => target,
                 Err(_) => return Err(OpenRangeError::TicketRevoked),
             };
-            if target.holder != ticket.holder {
+            // Allow an active relayed (`fleet:<epoch>`) ticket whose fleet epoch is still live
+            // to keep serving seamlessly when background `learn()` upgrades that machine to a
+            // direct (`pairing:<machine>:<epoch>`) route mid-playback.
+            let upgraded_from_fleet = ticket.holder.starts_with("fleet:")
+                && self.backend.is_pairing_holder_live(&ticket.holder);
+            if target.holder != ticket.holder && !upgraded_from_fleet {
                 return Err(OpenRangeError::TicketRevoked);
             }
 
@@ -2111,5 +2116,424 @@ mod tests {
                 CONTENT_SANDBOX_CSP
             );
         }
+    }
+
+    #[tokio::test]
+    async fn relayed_picture_and_ranged_media_work_on_loopback_and_custom_scheme_then_switch_to_direct()
+     {
+        use std::sync::atomic::AtomicUsize;
+
+        let png_bytes = vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0, 1, 2, 3, 4,
+        ];
+        let media_bytes: Vec<u8> = (0..96 * 1024usize).map(|i| (i % 251) as u8).collect();
+        let mut studio_files = HashMap::new();
+        studio_files.insert("/home/me/photo.png".to_owned(), png_bytes.clone());
+        studio_files.insert("/home/me/video.mp4".to_owned(), media_bytes.clone());
+        let studio_files = Arc::new(studio_files);
+
+        let relay_hits = Arc::new(AtomicUsize::new(0));
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let studio_key = legion_link::DeviceKey::from_seed([55u8; 32])
+            .public_key_line("studio")
+            .unwrap();
+        let tower_key = legion_link::DeviceKey::from_seed([56u8; 32])
+            .public_key_line("tower")
+            .unwrap();
+
+        struct FleetRelayStreamOpener {
+            node: String,
+            files: Arc<HashMap<String, Vec<u8>>>,
+            relay_hits: Arc<AtomicUsize>,
+            direct_hits: Arc<AtomicUsize>,
+        }
+
+        impl StreamOpener for FleetRelayStreamOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let node = self.node.clone();
+                let files = Arc::clone(&self.files);
+                let relay_hits = Arc::clone(&self.relay_hits);
+                let direct_hits = Arc::clone(&self.direct_hits);
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                    let cancel = CancellationToken::new();
+                    tokio::spawn(async move {
+                        let _ = server_out
+                            .write_all(
+                                format!(
+                                    "{}\n",
+                                    json!({
+                                        "protocol": 1,
+                                        "capabilities": [legion_link::CAP_STREAM_RELAY]
+                                    })
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let inner = if node == "tower" && req["op"] == json!("relay") {
+                            assert_eq!(req["on"], json!("studio"));
+                            relay_hits.fetch_add(1, Ordering::SeqCst);
+                            &req["request"]
+                        } else {
+                            assert_eq!(node, "studio");
+                            direct_hits.fetch_add(1, Ordering::SeqCst);
+                            &req
+                        };
+                        let path = inner["path"].as_str().unwrap_or("");
+                        let Some(payload) = files.get(path) else {
+                            let err = json!({
+                                "error": ErrorBody::new(ProtoCode::NotFound, "not found")
+                                    .with_machine("studio")
+                            });
+                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                            return;
+                        };
+                        let offset = inner["offset"].as_u64().unwrap_or(0) as usize;
+                        let avail = payload.len().saturating_sub(offset);
+                        let len = inner
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .map_or(avail, |n| (n as usize).min(avail));
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": len,
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": 99u64,
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        let _ = server_out.write_all(&payload[offset..offset + len]).await;
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel,
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        struct RelayedContentBackend {
+            link: Link,
+            live: Arc<AtomicBool>,
+        }
+
+        impl Backend for RelayedContentBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                // Phone is paired ONLY with `tower`; `studio` routes via the link with fleet holder.
+                let holder = if self.link.config().node(machine).is_some() {
+                    format!("pairing:{machine}:1")
+                } else {
+                    "fleet:1".to_owned()
+                };
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "device:pixel".to_owned(),
+                    holder,
+                })
+            }
+            fn is_pairing_holder_live(&self, _holder: &str) -> bool {
+                self.live.load(Ordering::SeqCst)
+            }
+        }
+
+        let session_opener: SessionOpener = {
+            let studio_files = Arc::clone(&studio_files);
+            let relay_hits = Arc::clone(&relay_hits);
+            let direct_hits = Arc::clone(&direct_hits);
+            let studio_key = studio_key.clone();
+            Arc::new(move |entry, _, cancel| {
+                let studio_files = Arc::clone(&studio_files);
+                let relay_hits = Arc::clone(&relay_hits);
+                let direct_hits = Arc::clone(&direct_hits);
+                let studio_key = studio_key.clone();
+                Box::pin(async move {
+                    let node_name = entry.node.clone();
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let node_for_rpc = node_name.clone();
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_link::proto::Request =
+                                serde_json::from_str(&line).unwrap();
+                            let reply = if req.method == legion_link::proto::method::HELLO {
+                                ProtoResp::ok(
+                                    req.id,
+                                    serde_json::to_value(HelloResult {
+                                        node: node_for_rpc.clone(),
+                                        version: VERSION.to_owned(),
+                                        build: None,
+                                        protocol: PROTOCOL,
+                                        os: "linux".to_owned(),
+                                        arch: "x86_64".to_owned(),
+                                        systems: vec![],
+                                        system: None,
+                                        boot_id: None,
+                                    })
+                                    .unwrap(),
+                                )
+                            } else {
+                                ProtoResp::ok(
+                                    req.id,
+                                    json!({
+                                        "results": {
+                                            "studio": {
+                                                "ok": {
+                                                    "node": "studio",
+                                                    "hosts": ["studio.example.net"],
+                                                    "port": 22,
+                                                    "user": "me",
+                                                    "host_keys": [studio_key],
+                                                }
+                                            }
+                                        }
+                                    }),
+                                )
+                            };
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    let stream_opener = Arc::new(FleetRelayStreamOpener {
+                        node: node_name.clone(),
+                        files: studio_files,
+                        relay_hits,
+                        direct_hits,
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(FakeTransport {
+                            opener: stream_opener,
+                        }),
+                        &node_name,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|err| err.into_error())
+                })
+            })
+        };
+
+        let cfg = LinkConfig {
+            device_key: Some("dummy".to_owned()),
+            nodes: vec![NodeLink::ssh(
+                "tower",
+                SshTarget {
+                    hosts: vec!["tower.example.net".to_owned()],
+                    port: 22,
+                    user: "me".to_owned(),
+                    host_keys: vec![tower_key],
+                },
+                Some("device:pixel".to_owned()),
+            )],
+            ..LinkConfig::default()
+        };
+        let link = Link::with_opener(cfg, LinkOptions::default(), session_opener);
+        let live = Arc::new(AtomicBool::new(true));
+        let backend = Arc::new(RelayedContentBackend {
+            link: link.clone(),
+            live: Arc::clone(&live),
+        });
+
+        // 1) Loopback mount (desktop/iOS): picture GET + ranged media read on `studio` via relay `tower`.
+        let lb = Arc::new(AppContentServer::with_config(
+            backend.clone(),
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["tauri://localhost".to_owned()],
+        ));
+        let pic = lb
+            .mint_url("studio", "/home/me/photo.png", false)
+            .await
+            .unwrap();
+        let lb_port = lb.loopback_port().unwrap();
+        let pic_path = pic
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{lb_port}"))
+            .unwrap();
+        let (status, _, body) = raw_http(
+            lb_port,
+            &format!(
+                "GET {pic_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, png_bytes);
+
+        let vid = lb
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let vid_path = vid
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{lb_port}"))
+            .unwrap();
+        let (rstatus, _, rbody) = raw_http(
+            lb_port,
+            &format!(
+                "GET {vid_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nRange: bytes=4096-12287\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(rstatus, 206);
+        assert_eq!(rbody, &media_bytes[4096..=12287]);
+
+        // 2) Custom-scheme mount (Android): picture + ranged media read on `studio` via relay `tower`.
+        let cs = Arc::new(AppContentServer::with_config(
+            backend.clone(),
+            ContentMountMode::CustomScheme,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+        let cs_pic = cs
+            .mint_url("studio", "/home/me/photo.png", false)
+            .await
+            .unwrap();
+        let resp_pic = cs
+            .handle_custom_scheme(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&cs_pic.url)
+                    .body(Vec::new())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(resp_pic.status(), StatusCode::OK);
+        assert_eq!(resp_pic.body(), &png_bytes);
+
+        let cs_vid = cs
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let resp_vid = cs
+            .handle_custom_scheme(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&cs_vid.url)
+                    .header("range", "bytes=16384-32767")
+                    .body(Vec::new())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(resp_vid.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp_vid.body(), &media_bytes[16384..=32767]);
+        assert!(relay_hits.load(Ordering::SeqCst) >= 4);
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+
+        // 3) Learn a direct route to `studio` -> subsequent reads switch to direct!
+        let learned = link.learn().await.unwrap();
+        assert_eq!(learned.added, vec!["studio".to_owned()]);
+        let relay_before = relay_hits.load(Ordering::SeqCst);
+        let resp_direct = cs
+            .handle_custom_scheme(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&cs_vid.url)
+                    .header("range", "bytes=0-1023")
+                    .body(Vec::new())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(resp_direct.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp_direct.body(), &media_bytes[0..=1023]);
+        assert_eq!(relay_hits.load(Ordering::SeqCst), relay_before);
+        assert!(direct_hits.load(Ordering::SeqCst) >= 1);
+
+        // 4) Unpairing revokes the holder -> relayed ticket is refused with 404 (TicketRevoked).
+        live.store(false, Ordering::SeqCst);
+        let resp_revoked = cs
+            .handle_custom_scheme(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&cs_pic.url)
+                    .body(Vec::new())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(resp_revoked.status(), StatusCode::NOT_FOUND);
+
+        lb.shutdown();
+        link.close().await;
     }
 }

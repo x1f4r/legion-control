@@ -349,6 +349,21 @@ pub struct DisagreementView {
     pub reports: Vec<DisagreementEntryView>,
 }
 
+/// Structured reason why a learned `device.endpoint` answer was rejected during `learn`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearnRejectionView {
+    /// Fleet machine name whose direct endpoint was rejected.
+    pub machine: String,
+    /// Stable reason code (`"name_mismatch"`, `"malformed_endpoint"`, `"shared_host_keys"`,
+    /// or `"too_many"`).
+    pub code: String,
+    /// Technical explanation of why the endpoint was rejected.
+    pub reason: String,
+    /// Paired introducer that reported the rejected endpoint, if applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_by: Option<String>,
+}
+
 /// Platform background transfer capabilities reported in [`AppState`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferCapabilities {
@@ -408,15 +423,17 @@ impl TransferCapabilities {
 /// Resolved link handle and pairing holder identity for content serving and device transfers.
 #[derive(Clone)]
 pub struct ContentTarget {
-    /// Live `legion-link` handle holding the machine's session.
+    /// Live `legion-link` handle that routes direct or relayed streams for `machine`.
     pub link: legion_link::Link,
-    /// Node key configured on `link` (`"local"` for the desktop local pipe, or the SSH node name).
+    /// Target machine name passed to `link` (`"local"` for the desktop local pipe, or the machine
+    /// name routed directly or via relay).
     pub link_node: String,
     /// Machine name displayed to the user.
     pub machine: String,
     /// Principal name associated with this target.
     pub principal: String,
-    /// Opaque holder string bound to this specific pairing epoch (`pairing:<link_node>:<epoch>`).
+    /// Opaque holder string bound to this pairing epoch (`pairing:<link_node>:<epoch>` or
+    /// `fleet:<epoch>` for relayed-only machines).
     pub holder: String,
 }
 
@@ -441,6 +458,9 @@ pub struct AppState {
     /// New machines not pinned because paired introducers disagreed on their endpoints or keys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disagreements: Vec<DisagreementView>,
+    /// Machines whose `device.endpoint` answer was rejected during `learn`, with technical reasons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub learn_rejections: Vec<LearnRejectionView>,
     /// Fleet delivery summary from the most recent pairing in this session, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_paired: Option<PairSummary>,
@@ -579,6 +599,7 @@ impl Backend for Unpaired {
                 can_scan: cfg!(any(target_os = "android", target_os = "ios")),
                 routes: BTreeMap::new(),
                 disagreements: Vec::new(),
+                learn_rejections: Vec::new(),
                 last_paired: None,
                 transfer_capabilities: TransferCapabilities::current_platform(),
             })
@@ -701,6 +722,7 @@ mod tests {
             can_scan: true,
             routes: BTreeMap::new(),
             disagreements: Vec::new(),
+            learn_rejections: Vec::new(),
             last_paired: None,
             transfer_capabilities: TransferCapabilities::current_platform(),
         };
@@ -729,6 +751,7 @@ mod tests {
             can_scan: false,
             routes: BTreeMap::new(),
             disagreements: Vec::new(),
+            learn_rejections: Vec::new(),
             last_paired: None,
             transfer_capabilities: TransferCapabilities::current_platform(),
         };

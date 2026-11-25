@@ -34,6 +34,7 @@ import {
   recordRecentFile,
   writeFolderViewMode,
 } from '../lib/files-store.js';
+import { plainErrorMessage } from '../lib/errors.js';
 import { formatBytes, formatElapsed, formatRelativeTime, primaryDisk } from '../lib/format.js';
 import { routeHref } from '../lib/route.js';
 import { thumbCacheKey } from '../lib/thumb-cache.js';
@@ -1949,10 +1950,10 @@ export function FilesView({
         }
         loadFavourites();
       } catch (err) {
-        if (onToast) onToast(err?.message || 'Could not update favourite.');
+        if (onToast) onToast(plainErrorMessage(err, 'Could not update favourite.', { technical, deviceNoun }));
       }
     },
-    [caps.hasFavWrite, favourites, link, localNode, loadFavourites, onToast],
+    [caps.hasFavWrite, favourites, link, localNode, loadFavourites, onToast, technical, deviceNoun],
   );
 
   const togglePin = useCallback(
@@ -1971,10 +1972,10 @@ export function FilesView({
         }
         loadFavourites();
       } catch (err) {
-        if (onToast) onToast(err?.message || 'Could not update pin.');
+        if (onToast) onToast(plainErrorMessage(err, 'Could not update pin.', { technical, deviceNoun }));
       }
     },
-    [caps.hasFavWrite, favourites, link, localNode, loadFavourites, onToast],
+    [caps.hasFavWrite, favourites, link, localNode, loadFavourites, onToast, technical, deviceNoun],
   );
 
   const startDownload = useCallback(
@@ -2003,7 +2004,7 @@ export function FilesView({
       const transferIds = started.map((r) => r?.id).filter(Boolean);
       if (onToast) {
         if (started.length === 0 && firstError) {
-          onToast(firstError?.message || 'Could not start download.', { tone: 'error' });
+          onToast(plainErrorMessage(firstError, 'Could not start download.', { technical, deviceNoun }), { tone: 'error' });
           return;
         }
         onToast(
@@ -2014,7 +2015,7 @@ export function FilesView({
         );
       }
     },
-    [caps.hasDownload, link, onToast],
+    [caps.hasDownload, link, onToast, technical, deviceNoun],
   );
 
   const startUpload = useCallback(
@@ -2041,11 +2042,14 @@ export function FilesView({
         })
         .catch((err) => {
           if (onToast && err?.code !== 'cancelled') {
-            onToast(err?.message || `Could not upload to ${machine}.`, { tone: 'error' });
+            onToast(
+              plainErrorMessage(err, `Could not upload to ${machine}.`, { technical, deviceNoun }),
+              { tone: 'error' },
+            );
           }
         });
     },
-    [caps.hasUpload, link, onToast],
+    [caps.hasUpload, link, onToast, technical, deviceNoun],
   );
 
   const startOpenExternally = useCallback(
@@ -2062,10 +2066,15 @@ export function FilesView({
           if (onToast) onToast(`Opening ${entry.name || baseFileName(entry.path)} in another app.`);
         })
         .catch((err) => {
-          if (onToast) onToast(err?.message || 'Could not open in another app.');
+          if (onToast) {
+            onToast(
+              plainErrorMessage(err, 'Could not open in another app.', { technical, deviceNoun }),
+              { tone: 'error' },
+            );
+          }
         });
     },
-    [caps.hasOpenExternally, link, onToast],
+    [caps.hasOpenExternally, link, onToast, technical, deviceNoun],
   );
 
   const requestDelete = useCallback(

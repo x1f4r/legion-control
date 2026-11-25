@@ -3216,7 +3216,13 @@ impl TransferManager {
                     }
                     Err(err) => {
                         let app_err = AppError::from(err);
-                        if app_err.code == ErrorCode::NotFound {
+                        let is_unknown_machine = app_err
+                            .details
+                            .as_ref()
+                            .and_then(|d| d.get("reason"))
+                            .and_then(Value::as_str)
+                            == Some(legion_link::REASON_UNKNOWN_MACHINE);
+                        if app_err.code == ErrorCode::NotFound && !is_unknown_machine {
                             return Ok((candidate_path, candidate_name, n));
                         }
                         if self
@@ -7231,5 +7237,478 @@ mod tests {
             );
             mgr.shutdown();
         }
+    }
+
+    #[tokio::test]
+    async fn relayed_download_upload_and_open_externally_then_learn_switches_to_direct() {
+        let dir = tempfile::tempdir().unwrap();
+        let sample_download: Vec<u8> = (0..40_000usize)
+            .map(|i| ((i * 3 + 7) % 251) as u8)
+            .collect();
+        let sample_upload: Vec<u8> = (0..32_000usize)
+            .map(|i| ((i * 5 + 1) % 251) as u8)
+            .collect();
+        let upload_src = dir.path().join("notes.bin");
+        fs::write(&upload_src, &sample_upload).unwrap();
+
+        let studio_files = Arc::new(Mutex::new(HashMap::from([(
+            "/home/me/photo.png".to_owned(),
+            sample_download.clone(),
+        )])));
+        let studio_uploaded = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
+        let relay_stream_hits = Arc::new(AtomicUsize::new(0));
+        let direct_stream_hits = Arc::new(AtomicUsize::new(0));
+        let tower_key = legion_link::DeviceKey::from_seed([81u8; 32])
+            .public_key_line("tower")
+            .unwrap();
+        let studio_key = legion_link::DeviceKey::from_seed([82u8; 32])
+            .public_key_line("studio")
+            .unwrap();
+
+        struct FleetRelayOpener {
+            node: String,
+            files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            uploaded: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            relay_hits: Arc<AtomicUsize>,
+            direct_hits: Arc<AtomicUsize>,
+        }
+
+        impl StreamOpener for FleetRelayOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let node = self.node.clone();
+                let files = Arc::clone(&self.files);
+                let uploaded = Arc::clone(&self.uploaded);
+                let relay_hits = Arc::clone(&self.relay_hits);
+                let direct_hits = Arc::clone(&self.direct_hits);
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                    let cancel = CancellationToken::new();
+                    tokio::spawn(async move {
+                        let _ = server_out
+                            .write_all(
+                                format!(
+                                    "{}\n",
+                                    json!({
+                                        "protocol": 1,
+                                        "capabilities": [legion_link::CAP_STREAM_RELAY]
+                                    })
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let inner = if node == "tower" && req["op"] == json!("relay") {
+                            assert_eq!(req["on"], json!("studio"));
+                            relay_hits.fetch_add(1, Ordering::SeqCst);
+                            &req["request"]
+                        } else {
+                            assert_eq!(node, "studio");
+                            direct_hits.fetch_add(1, Ordering::SeqCst);
+                            &req
+                        };
+                        match inner["op"].as_str().unwrap_or("") {
+                            "get" => {
+                                let path = inner["path"].as_str().unwrap_or("");
+                                let Some(data) = files.lock().unwrap().get(path).cloned() else {
+                                    let err = json!({
+                                        "error": ErrorBody::new(ProtoCode::NotFound, "missing")
+                                            .with_machine("studio")
+                                    });
+                                    let _ =
+                                        server_out.write_all(format!("{err}\n").as_bytes()).await;
+                                    return;
+                                };
+                                let offset = inner["offset"].as_u64().unwrap_or(0) as usize;
+                                let avail = data.len().saturating_sub(offset);
+                                let len = inner
+                                    .get("length")
+                                    .and_then(Value::as_u64)
+                                    .map_or(avail, |n| (n as usize).min(avail));
+                                let ready = json!({
+                                    "size": data.len(),
+                                    "offset": offset,
+                                    "length": len,
+                                    "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                                    "file_id": 21u64,
+                                });
+                                let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                                let _ = server_out.write_all(&data[offset..offset + len]).await;
+                            }
+                            "put" => {
+                                let path = inner["path"].as_str().unwrap_or("").to_owned();
+                                let size = inner["size"].as_u64().unwrap_or(0) as usize;
+                                let hash = inner["hash"].as_str().unwrap_or("").to_owned();
+                                let _ = server_out.write_all(b"{\"offset\":0}\n").await;
+                                let mut got = vec![0u8; size];
+                                reader.read_exact(&mut got).await.unwrap();
+                                uploaded.lock().unwrap().insert(path, got);
+                                let done = json!({ "ok": true, "size": size, "hash": hash });
+                                let _ = server_out.write_all(format!("{done}\n").as_bytes()).await;
+                            }
+                            _ => {}
+                        }
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel,
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        struct RelayedTransferBackend {
+            link: Link,
+        }
+
+        impl Backend for RelayedTransferBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                let holder = if self.link.config().node(machine).is_some() {
+                    format!("pairing:{machine}:1")
+                } else {
+                    "fleet:1".to_owned()
+                };
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "device:pixel".to_owned(),
+                    holder,
+                })
+            }
+            fn is_pairing_holder_live(&self, _: &str) -> bool {
+                true
+            }
+        }
+
+        let opener: SessionOpener = {
+            let files = Arc::clone(&studio_files);
+            let uploaded = Arc::clone(&studio_uploaded);
+            let relay_hits = Arc::clone(&relay_stream_hits);
+            let direct_hits = Arc::clone(&direct_stream_hits);
+            let studio_key = studio_key.clone();
+            Arc::new(move |entry, _, cancel| {
+                let files = Arc::clone(&files);
+                let uploaded = Arc::clone(&uploaded);
+                let relay_hits = Arc::clone(&relay_hits);
+                let direct_hits = Arc::clone(&direct_hits);
+                let studio_key = studio_key.clone();
+                Box::pin(async move {
+                    let node_name = entry.node.clone();
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let node_for_rpc = node_name.clone();
+                    let files_rpc = Arc::clone(&files);
+                    let uploaded_rpc = Arc::clone(&uploaded);
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_link::proto::Request =
+                                serde_json::from_str(&line).unwrap();
+                            let reply = if req.method == "hello" {
+                                ProtoResp::ok(
+                                    req.id,
+                                    serde_json::to_value(HelloResult {
+                                        node: node_for_rpc.clone(),
+                                        version: VERSION.to_owned(),
+                                        build: None,
+                                        protocol: PROTOCOL,
+                                        os: "linux".to_owned(),
+                                        arch: "x86_64".to_owned(),
+                                        systems: vec![],
+                                        system: None,
+                                        boot_id: None,
+                                    })
+                                    .unwrap(),
+                                )
+                            } else if req.method == "call" {
+                                let tool =
+                                    req.params.get("tool").and_then(Value::as_str).unwrap_or("");
+                                if tool == "device.endpoint" {
+                                    ProtoResp::ok(
+                                        req.id,
+                                        json!({
+                                            "results": {
+                                                "studio": {
+                                                    "ok": {
+                                                        "node": "studio",
+                                                        "hosts": ["studio.example.net"],
+                                                        "port": 22,
+                                                        "user": "me",
+                                                        "host_keys": [studio_key],
+                                                    }
+                                                }
+                                            }
+                                        }),
+                                    )
+                                } else {
+                                    let path = req
+                                        .params
+                                        .pointer("/args/path")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    let data =
+                                        files_rpc.lock().unwrap().get(path).cloned().or_else(
+                                            || uploaded_rpc.lock().unwrap().get(path).cloned(),
+                                        );
+                                    if tool == "fs.stat" {
+                                        if let Some(d) = data {
+                                            ProtoResp::ok(
+                                                req.id,
+                                                json!({ "kind": "file", "size": d.len() }),
+                                            )
+                                        } else {
+                                            ProtoResp::error(
+                                                req.id,
+                                                legion_link::proto::RpcError::new(
+                                                    -32000,
+                                                    ErrorBody::new(
+                                                        ProtoCode::NotFound,
+                                                        "not found",
+                                                    )
+                                                    .with_machine("studio"),
+                                                ),
+                                            )
+                                        }
+                                    } else if let Some(d) = data {
+                                        let h = format!("blake3:{}", blake3::hash(&d).to_hex());
+                                        ProtoResp::ok(
+                                            req.id,
+                                            json!({ "path": path, "size": d.len(), "hash": h }),
+                                        )
+                                    } else {
+                                        ProtoResp::error(
+                                            req.id,
+                                            legion_link::proto::RpcError::new(
+                                                -32000,
+                                                ErrorBody::new(ProtoCode::NotFound, "not found")
+                                                    .with_machine("studio"),
+                                            ),
+                                        )
+                                    }
+                                }
+                            } else {
+                                ProtoResp::ok(req.id, json!({}))
+                            };
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    let stream_opener = Arc::new(FleetRelayOpener {
+                        node: node_name.clone(),
+                        files,
+                        uploaded,
+                        relay_hits,
+                        direct_hits,
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(FakeTransport {
+                            opener: stream_opener,
+                        }),
+                        &node_name,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|e| e.into_error())
+                })
+            })
+        };
+
+        // Phone is paired ONLY with `tower`; `studio` is reached only through the fleet.
+        let link = Link::with_opener(
+            LinkConfig {
+                device_key: Some("dummy".to_owned()),
+                nodes: vec![NodeLink::ssh(
+                    "tower",
+                    SshTarget {
+                        hosts: vec!["tower.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![tower_key],
+                    },
+                    Some("device:pixel".to_owned()),
+                )],
+                ..LinkConfig::default()
+            },
+            LinkOptions::default(),
+            opener,
+        );
+        let backend: Arc<dyn Backend> = Arc::new(RelayedTransferBackend { link: link.clone() });
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        let mgr = TransferManager::with_options(
+            dir.path(),
+            backend,
+            platform.clone(),
+            2,
+            Duration::from_secs(2),
+        );
+
+        // 1. Download from `studio` via relay `tower`.
+        let dl_id = mgr
+            .enqueue_download(
+                "studio".into(),
+                "/home/me/photo.png".into(),
+                None,
+                Some(sample_download.len() as u64),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let dl_done = wait_for_state(&mgr, &dl_id, |s| s == TransferState::Done).await;
+        assert_eq!(
+            fs::read(dl_done.local_path.as_deref().unwrap()).unwrap(),
+            sample_download
+        );
+
+        // 2. Open in another app from `studio` via relay `tower`.
+        let open_id = mgr
+            .enqueue_download(
+                "studio".into(),
+                "/home/me/photo.png".into(),
+                None,
+                Some(sample_download.len() as u64),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        let _ = wait_for_state(&mgr, &open_id, |s| s == TransferState::Done).await;
+        assert_eq!(platform.opened.lock().unwrap().len(), 1);
+
+        // 3. Upload to `studio` via relay `tower`.
+        platform
+            .picked_files
+            .lock()
+            .unwrap()
+            .push(PickedUploadFile {
+                local_path: upload_src.to_string_lossy().into_owned(),
+                name: "notes.bin".into(),
+                size: sample_upload.len() as u64,
+                mime: None,
+            });
+        let picked = mgr.pick_uploads().await.unwrap();
+        let up = mgr
+            .enqueue_upload(
+                "studio".into(),
+                "/home/me/uploads".into(),
+                Some(vec![picked[0].handle.clone()]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let up_done = wait_for_state(&mgr, &up.id, |s| s == TransferState::Done).await;
+        assert_eq!(up_done.path, "/home/me/uploads/notes.bin");
+        assert_eq!(
+            studio_uploaded
+                .lock()
+                .unwrap()
+                .get("/home/me/uploads/notes.bin")
+                .unwrap(),
+            &sample_upload
+        );
+        assert!(relay_stream_hits.load(Ordering::SeqCst) >= 3);
+        assert_eq!(direct_stream_hits.load(Ordering::SeqCst), 0);
+
+        // 4. Learn `studio` directly -> subsequent download switches to direct!
+        let learned = link.learn().await.unwrap();
+        assert_eq!(learned.added, vec!["studio".to_owned()]);
+        let relay_before = relay_stream_hits.load(Ordering::SeqCst);
+        let dl2_id = mgr
+            .enqueue_download(
+                "studio".into(),
+                "/home/me/photo.png".into(),
+                None,
+                Some(sample_download.len() as u64),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let dl2_done = wait_for_state(&mgr, &dl2_id, |s| s == TransferState::Done).await;
+        assert_eq!(
+            fs::read(dl2_done.local_path.as_deref().unwrap()).unwrap(),
+            sample_download
+        );
+        assert_eq!(relay_stream_hits.load(Ordering::SeqCst), relay_before);
+        assert!(direct_stream_hits.load(Ordering::SeqCst) >= 1);
+
+        mgr.shutdown();
+        link.close().await;
     }
 }

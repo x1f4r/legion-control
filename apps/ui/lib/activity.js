@@ -1,5 +1,6 @@
 // Plain-language formatting for activity rows, machine status phrases, and role summaries.
 
+import { plainErrorMessage } from './errors.js';
 import {
   busyReasonLabel,
   clampPct,
@@ -607,11 +608,7 @@ export function formatDeviceTransferSubtitle(transfer, { deviceNoun = 'phone', t
   const destLabel = isUp ? `From this ${deviceNoun} to ${transfer.machine}` : `To this ${deviceNoun}`;
 
   if (transfer.state === 'cancelling') {
-    const msg =
-      typeof transfer.error === 'string'
-        ? transfer.error
-        : transfer.error?.message || 'Removing partial files…';
-    return msg;
+    return plainErrorMessage(transfer.error, 'Removing partial files…', { technical, deviceNoun });
   }
 
   if (transfer.state === 'running' || transfer.state === 'paused' || transfer.state === 'queued') {
@@ -631,11 +628,15 @@ export function formatDeviceTransferSubtitle(transfer, { deviceNoun = 'phone', t
   }
 
   if (transfer.state === 'failed') {
-    const msg =
-      typeof transfer.error === 'string'
-        ? transfer.error
-        : transfer.error?.message || 'Stopped before finishing. Tap Resume to continue from where it stopped.';
-    return msg;
+    const errObj =
+      transfer.error && typeof transfer.error === 'object'
+        ? { ...transfer.error, machine: transfer.error.machine || transfer.machine || null }
+        : transfer.error;
+    return plainErrorMessage(
+      errObj,
+      'Stopped before finishing. Tap Resume to continue from where it stopped.',
+      { technical, deviceNoun },
+    );
   }
 
   if (transfer.state === 'done') {

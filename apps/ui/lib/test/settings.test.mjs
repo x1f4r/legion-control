@@ -18,6 +18,7 @@ import {
   formatDeviceRemovedNotice,
   formatDisagreementNotice,
   formatInvitedDeviceSyncNotice,
+  formatLearnRejectionTechnical,
   formatPairSyncNotice,
   isInviteOwnerStrength,
   isPairingId,
@@ -567,4 +568,56 @@ allow = ["effect:read", "effect:exec"]
   assert.match(plainNotice.detail, /Received by pi and tower/);
   assert.match(plainNotice.detail, /studio will get it at the next sync/);
   assert.ok(!plainNotice.detail.includes('fleet.sync'));
+});
+
+test('buildRelayedConnections attaches learn rejections and formats technical reason only', () => {
+  const linkState = {
+    nodes: [{ node: 'tower', via: 'ssh', origin: 'paired' }],
+    routes: {
+      tower: { kind: 'direct' },
+      studio: { kind: 'relay', via: 'tower' },
+    },
+    learn_rejections: [
+      {
+        machine: 'studio',
+        code: 'name_mismatch',
+        reason: 'studio calls itself someones-laptop.',
+        reported_by: 'tower',
+      },
+      {
+        machine: 'broken',
+        code: 'malformed_endpoint',
+        reason: 'Endpoint host list was empty.',
+        reported_by: 'tower',
+      },
+    ],
+  };
+  const snapshot = {
+    machines: [
+      { name: 'tower', status: 'up' },
+      { name: 'studio', status: 'up' },
+      { name: 'pi', status: 'up' },
+    ],
+  };
+  const relayed = buildRelayedConnections(linkState, snapshot);
+  const byName = new Map(relayed.map((r) => [r.node, r]));
+
+  assert.equal(byName.has('tower'), false);
+  assert.equal(byName.get('studio')?.route_via, 'tower');
+  assert.equal(byName.get('studio')?.learn_rejection?.code, 'name_mismatch');
+  assert.equal(byName.get('pi')?.route_via, 'tower');
+  assert.equal(byName.get('pi')?.learn_rejection, null);
+  assert.equal(byName.get('broken')?.route_via, 'tower');
+  assert.equal(byName.get('broken')?.learn_rejection?.code, 'malformed_endpoint');
+
+  // Plain route line for relayed machine is short ("through tower").
+  assert.equal(describeConnectionRoute(byName.get('studio'), false).label, 'through tower');
+
+  // Technical details formats the rejection code, reason, and reporter.
+  const tech = formatLearnRejectionTechnical(byName.get('studio').learn_rejection);
+  assert.equal(
+    tech,
+    'Direct route skipped (name_mismatch): studio calls itself someones-laptop. — reported by tower',
+  );
+  assert.equal(formatLearnRejectionTechnical(null), null);
 });

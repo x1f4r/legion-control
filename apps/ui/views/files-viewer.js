@@ -11,6 +11,7 @@ import {
   plainCategoryLabel,
 } from '../lib/files.js';
 import { readTextWrapPreference, writeTextWrapPreference } from '../lib/files-store.js';
+import { formatErrorForDisplay } from '../lib/errors.js';
 import { formatBytes, formatRelativeTime } from '../lib/format.js';
 import { CopyButton, Notice, Sheet } from './common.js';
 
@@ -471,12 +472,28 @@ export function FilesViewer({
   }
 
   function renderStage() {
+    const isRouteOrAccessError = (err) =>
+      err &&
+      (err.details?.reason === 'relay_too_old' ||
+        err.details?.reason === 'unknown_machine' ||
+        err.code === 'unreachable' ||
+        err.code === 'timeout' ||
+        err.code === 'denied');
+
     if (category === 'image') {
       if (mediaError) {
+        if (isRouteOrAccessError(mediaError)) {
+          return html`<div class="said"><${Notice} error=${mediaError} technical=${technical} deviceNoun=${deviceNoun} /></div>`;
+        }
+        const formatted = formatErrorForDisplay({
+          error: mediaError,
+          technical,
+          deviceNoun,
+        });
         const msg =
           mediaError.code === 'unsupported'
             ? `This version of Legion on ${machine} doesn't serve picture previews yet.`
-            : mediaError.message || 'Could not load this picture.';
+            : `${formatted.machinePrefix}${formatted.heading}` || 'Could not load this picture.';
         return renderFallbackCard("Can't show this picture here", msg);
       }
       if (!mediaUrl) {
@@ -495,6 +512,9 @@ export function FilesViewer({
 
     if (category === 'video') {
       if (mediaError) {
+        if (isRouteOrAccessError(mediaError)) {
+          return html`<div class="said"><${Notice} error=${mediaError} technical=${technical} deviceNoun=${deviceNoun} /></div>`;
+        }
         const heading =
           mediaError.code === 'unsupported'
             ? `Video playback isn't available from ${machine} yet`
@@ -525,6 +545,9 @@ export function FilesViewer({
 
     if (category === 'audio') {
       if (mediaError) {
+        if (isRouteOrAccessError(mediaError)) {
+          return html`<div class="said"><${Notice} error=${mediaError} technical=${technical} deviceNoun=${deviceNoun} /></div>`;
+        }
         const heading =
           mediaError.code === 'unsupported'
             ? `Audio playback isn't available from ${machine} yet`

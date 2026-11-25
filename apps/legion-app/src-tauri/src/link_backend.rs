@@ -21,8 +21,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::backend::{
     AppError, AppState, Backend, BoxFuture, CallId, CallRequest, CancelResult,
     ConflictingIdentityInfo, ContentTarget, DisagreementEntryView, DisagreementView, ErrorCode,
-    IdentityChangedInfo, LearnResult, MachineRouteView, Needs, NodeLink, PairPendingPeer,
-    PairSummary, RepairInfo, RepairResult, TransferCapabilities, UnpairResult,
+    IdentityChangedInfo, LearnRejectionView, LearnResult, MachineRouteView, Needs, NodeLink,
+    PairPendingPeer, PairSummary, RepairInfo, RepairResult, TransferCapabilities, UnpairResult,
 };
 use crate::commands::default_device_name;
 use crate::store::{AppStore, AppStoreData, StoredNodeMeta};
@@ -130,10 +130,15 @@ struct BackendState {
     preferred_relay: Option<(String, Instant)>,
     last_paired: Option<PairSummary>,
     disagreements: Vec<DisagreementView>,
+    learn_rejections: Vec<LearnRejectionView>,
     /// Monotonic pairing epoch per configured link node (`"local"` or node name). Bumped on pair
     /// / identity-change acceptance and removed on unpair / repair so content tickets issued under
     /// a removed or replaced pairing die immediately.
     pairing_epochs: HashMap<String, u64>,
+    /// Monotonic fleet epoch for tickets issued to relayed-only fleet machines (not directly
+    /// configured on this device). Bumped on unpair, repair, or identity change so revoking any
+    /// relay immediately invalidates relayed tickets too.
+    fleet_pairing_epoch: u64,
     next_pairing_epoch: u64,
     link: Link,
 }
@@ -143,6 +148,12 @@ impl BackendState {
         let next = self.next_pairing_epoch;
         self.next_pairing_epoch = self.next_pairing_epoch.saturating_add(1);
         next
+    }
+
+    fn bump_fleet_epoch(&mut self) -> u64 {
+        let epoch = self.alloc_epoch();
+        self.fleet_pairing_epoch = epoch;
+        epoch
     }
 
     fn set_fresh_epoch(&mut self, node: &str) -> u64 {
@@ -179,6 +190,10 @@ fn format_pairing_holder(link_node: &str, epoch: u64) -> String {
     format!("pairing:{link_node}:{epoch}")
 }
 
+fn format_fleet_holder(epoch: u64) -> String {
+    format!("fleet:{epoch}")
+}
+
 fn parse_pairing_holder(holder: &str) -> Option<(&str, u64)> {
     let rest = holder.strip_prefix("pairing:")?;
     let (node, epoch_str) = rest.rsplit_once(':')?;
@@ -187,6 +202,10 @@ fn parse_pairing_holder(holder: &str) -> Option<(&str, u64)> {
     }
     let epoch = epoch_str.parse::<u64>().ok()?;
     Some((node, epoch))
+}
+
+fn parse_fleet_holder(holder: &str) -> Option<u64> {
+    holder.strip_prefix("fleet:")?.parse::<u64>().ok()
 }
 
 impl LinkBackend {
@@ -253,8 +272,10 @@ impl LinkBackend {
             preferred_relay: None,
             last_paired: None,
             disagreements: Vec::new(),
+            learn_rejections: Vec::new(),
             pairing_epochs: HashMap::new(),
-            next_pairing_epoch: 1,
+            fleet_pairing_epoch: 1,
+            next_pairing_epoch: 2,
             link,
         };
         if state.store_error.is_none() {
@@ -605,6 +626,7 @@ impl Backend for LinkBackend {
                 guard.preferred_relay = None;
                 guard.last_paired = Some(pair_summary);
                 guard.disagreements.retain(|d| d.machine != node_name);
+                guard.learn_rejections.retain(|r| r.machine != node_name);
                 guard.set_fresh_epoch(&node_name);
                 build_app_state(&guard, self.store.path())
             };
@@ -684,6 +706,7 @@ impl Backend for LinkBackend {
                 guard.active_node = resolve_active_node(&guard.data, local_program.as_deref());
                 guard.preferred_relay = None;
                 guard.sync_pairing_epochs();
+                guard.bump_fleet_epoch();
                 guard.disagreements.retain_mut(|d| {
                     if d.machine == trimmed {
                         return false;
@@ -691,6 +714,9 @@ impl Backend for LinkBackend {
                     d.reports.retain(|r| r.reported_by != trimmed);
                     d.reports.len() >= 2
                 });
+                guard
+                    .learn_rejections
+                    .retain(|r| r.machine != trimmed && r.reported_by.as_deref() != Some(trimmed));
                 (device, guard.link.clone())
             };
 
@@ -794,7 +820,9 @@ impl Backend for LinkBackend {
                 guard.preferred_relay = None;
                 guard.last_paired = None;
                 guard.disagreements.clear();
+                guard.learn_rejections.clear();
                 guard.pairing_epochs.clear();
+                guard.bump_fleet_epoch();
                 guard.sync_pairing_epochs();
                 (old, build_app_state(&guard, self.store.path()))
             };
@@ -887,6 +915,16 @@ impl Backend for LinkBackend {
                             .collect(),
                     })
                     .collect();
+                guard.learn_rejections = report
+                    .rejected_details
+                    .iter()
+                    .map(|r| LearnRejectionView {
+                        machine: r.machine.clone(),
+                        code: r.code.clone(),
+                        reason: r.reason.clone(),
+                        reported_by: r.reported_by.clone(),
+                    })
+                    .collect();
                 build_app_state(&guard, self.store.path())
             };
 
@@ -931,6 +969,7 @@ impl Backend for LinkBackend {
                     .map_err(AppError::from)?;
                 guard.data = updated;
                 guard.set_fresh_epoch(trimmed);
+                guard.bump_fleet_epoch();
                 build_app_state(&guard, self.store.path())
             };
             Ok(state)
@@ -1053,17 +1092,18 @@ impl Backend for LinkBackend {
         if !any_configured {
             return Err(AppError::not_paired());
         }
-        Err(AppError::new(
-            ErrorCode::NotFound,
-            format!("Machine `{trimmed}` is not paired on this device."),
-        )
-        .with_hint("Pair with that machine or refresh learned fleet routes first."))
+        // Any fleet machine not directly configured on this device routes through `Link`
+        // (direct-first with relay fallback), matching RPC call routing without a separate path.
+        Ok(ContentTarget {
+            link,
+            link_node: trimmed.to_owned(),
+            machine: trimmed.to_owned(),
+            principal: "device".to_owned(),
+            holder: format_fleet_holder(guard.fleet_pairing_epoch),
+        })
     }
 
     fn is_pairing_holder_live(&self, holder: &str) -> bool {
-        let Some((node, epoch)) = parse_pairing_holder(holder) else {
-            return false;
-        };
         let guard = self
             .state
             .lock()
@@ -1071,7 +1111,14 @@ impl Backend for LinkBackend {
         if guard.store_error.is_some() {
             return false;
         }
-        guard.pairing_epochs.get(node).copied() == Some(epoch)
+        if let Some((node, epoch)) = parse_pairing_holder(holder) {
+            return guard.pairing_epochs.get(node).copied() == Some(epoch);
+        }
+        if let Some(epoch) = parse_fleet_holder(holder) {
+            let any_configured = !guard.data.link.nodes.is_empty() || guard.local_program.is_some();
+            return any_configured && guard.fleet_pairing_epoch == epoch;
+        }
+        false
     }
 }
 
@@ -1179,6 +1226,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
             can_scan,
             routes: BTreeMap::new(),
             disagreements: Vec::new(),
+            learn_rejections: Vec::new(),
             last_paired: None,
             transfer_capabilities: TransferCapabilities::current_platform(),
         };
@@ -1349,6 +1397,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
         can_scan,
         routes,
         disagreements: state.disagreements.clone(),
+        learn_rejections: state.learn_rejections.clone(),
         last_paired: state.last_paired.clone(),
         transfer_capabilities: TransferCapabilities::current_platform(),
     }
@@ -2919,14 +2968,87 @@ mod tests {
         assert!(local_target.holder.starts_with("pairing:local:"));
 
         // Without a live `meta.whoami` identity proof, an unpaired machine name is never guessed
-        // onto the local pipe.
+        // onto the local pipe: it routes as `"tower"` via the link (and an empty app with neither
+        // paired nodes nor a local binary still fails with `NotPaired`).
         let fresh_dir = tempfile::tempdir()?;
         let fresh_backend = LinkBackend::with_local_program(
             AppStore::in_dir(fresh_dir.path()),
             Some("/usr/bin/legion".to_owned()),
         );
-        assert!(fresh_backend.content_target("tower").is_err());
+        let relayed_target = fresh_backend.content_target("tower")?;
+        assert_eq!(relayed_target.link_node, "tower");
+        assert!(relayed_target.holder.starts_with("fleet:"));
+        assert!(fresh_backend.is_pairing_holder_live(&relayed_target.holder));
         assert_eq!(fresh_backend.content_target("local")?.link_node, "local");
+
+        let empty_dir = tempfile::tempdir()?;
+        let empty_backend =
+            LinkBackend::with_local_program(AppStore::in_dir(empty_dir.path()), None);
+        assert_eq!(
+            empty_backend
+                .content_target("tower")
+                .err()
+                .ok_or("expected NotPaired error")?
+                .code,
+            ErrorCode::NotPaired
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fleet_relayed_content_holder_revokes_on_unpair_and_learn_rejections_surface_in_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let mut initial = AppStoreData::default();
+        initial.link.upsert_node(sample_ssh_node("tower"));
+        store.save(&initial)?;
+
+        let backend = LinkBackend::with_local_program(store, None);
+
+        // Phone paired ONLY with `tower` can open content targets for fleet machine `studio`
+        // (never returning "not paired on this device").
+        let studio_target = backend.content_target("studio")?;
+        assert_eq!(studio_target.link_node, "studio");
+        assert!(studio_target.holder.starts_with("fleet:"));
+        assert!(backend.is_pairing_holder_live(&studio_target.holder));
+
+        // Recording learn rejections surfaces them in `AppState::learn_rejections`.
+        {
+            let mut guard = backend.state.lock().unwrap_or_else(|p| p.into_inner());
+            guard
+                .learn_rejections
+                .push(crate::backend::LearnRejectionView {
+                    machine: "studio".to_owned(),
+                    code: "name_mismatch".to_owned(),
+                    reason: "studio calls itself someones-laptop.".to_owned(),
+                    reported_by: Some("tower".to_owned()),
+                });
+        }
+        let st = backend.state().await?;
+        assert_eq!(st.learn_rejections.len(), 1);
+        assert_eq!(st.learn_rejections[0].machine, "studio");
+        assert_eq!(st.learn_rejections[0].code, "name_mismatch");
+        assert_eq!(
+            st.learn_rejections[0].reason,
+            "studio calls itself someones-laptop."
+        );
+        assert_eq!(st.learn_rejections[0].reported_by.as_deref(), Some("tower"));
+
+        // Unpairing `tower` bumps the fleet epoch (revoking the relayed holder) and prunes
+        // rejections reported by `tower`.
+        backend.unpair("tower".to_owned()).await?;
+        assert!(!backend.is_pairing_holder_live(&studio_target.holder));
+        let after = backend.state().await?;
+        assert!(after.learn_rejections.is_empty());
+        assert_eq!(
+            backend
+                .content_target("studio")
+                .err()
+                .ok_or("expected NotPaired error")?
+                .code,
+            ErrorCode::NotPaired
+        );
         Ok(())
     }
 }

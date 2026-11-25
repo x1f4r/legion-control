@@ -570,6 +570,7 @@ export function createMockLink(mode = '') {
   const isPartial = flags.has('partial');
   const isPrimaryOffline = flags.has('aoff');
   const isDisagree = flags.has('disagree');
+  const isReject = flags.has('reject');
   const isAutoEnrol = flags.has('enrol');
   const isFirst = flags.has('first');
   const isRepair = flags.has('repair');
@@ -1875,6 +1876,16 @@ export function createMockLink(mode = '') {
           },
         ]
       : [];
+    const learn_rejections = isReject
+      ? [
+          {
+            machine: 'nas',
+            code: 'name_mismatch',
+            reason: 'nas calls itself someones-nas.',
+            reported_by: 'tower',
+          },
+        ]
+      : [];
     return {
       ready: true,
       needs: null,
@@ -1883,6 +1894,7 @@ export function createMockLink(mode = '') {
       nodes,
       routes,
       disagreements,
+      learn_rejections,
       last_paired: lastPaired,
     };
   }
