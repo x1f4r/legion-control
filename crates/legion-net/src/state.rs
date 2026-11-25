@@ -12,12 +12,24 @@ use crate::config::RemoteOs;
 
 const CACHE_FILE: &str = "fleet-cache.json";
 
+/// Last node name, explicitness, and identity reported by a peer machine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReportedNode {
+    pub(crate) node: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) explicit: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) node_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct CacheData {
     #[serde(default)]
     last_system: BTreeMap<String, String>,
     #[serde(default)]
     last_os: BTreeMap<String, RemoteOs>,
+    #[serde(default)]
+    last_node: BTreeMap<String, ReportedNode>,
 }
 
 /// Persisted optimization hints for faster reconnects across processes.
@@ -80,9 +92,42 @@ impl StateStore {
         self.save(&data);
     }
 
+    pub(crate) fn last_node(&self, machine: &str) -> Option<ReportedNode> {
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.load().last_node.get(machine).cloned()
+    }
+
+    pub(crate) fn record_node(&self, machine: &str, entry: ReportedNode) {
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut data = self.load();
+        if data.last_node.get(machine) == Some(&entry) {
+            return;
+        }
+        data.last_node.insert(machine.to_owned(), entry);
+        self.save(&data);
+    }
+
+    pub(crate) fn clear_node(&self, machine: &str) {
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut data = self.load();
+        if data.last_node.remove(machine).is_some() {
+            self.save(&data);
+        }
+    }
+
     fn load(&self) -> CacheData {
-        std::fs::read(&self.path)
+        legion_core::config::read_regular_file(&self.path)
             .ok()
+            .flatten()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default()
     }
@@ -123,5 +168,26 @@ mod tests {
             reloaded.last_os("tower", "windows"),
             Some(RemoteOs::Windows)
         );
+
+        assert_eq!(reloaded.last_node("studio"), None);
+        reloaded.record_node(
+            "studio",
+            ReportedNode {
+                node: "someones-laptop".to_owned(),
+                explicit: Some(false),
+                node_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+            },
+        );
+        let reloaded2 = StateStore::new(dir.path());
+        assert_eq!(
+            reloaded2.last_node("studio"),
+            Some(ReportedNode {
+                node: "someones-laptop".to_owned(),
+                explicit: Some(false),
+                node_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+            })
+        );
+        reloaded2.clear_node("studio");
+        assert_eq!(StateStore::new(dir.path()).last_node("studio"), None);
     }
 }

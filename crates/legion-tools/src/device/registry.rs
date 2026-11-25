@@ -1496,14 +1496,9 @@ pub fn lock_config(paths: &Paths) -> Result<FileLock, ErrorBody> {
 /// them via [`legacy_single_stamp_device_ids`].
 pub fn load_devices_raw(paths: &Paths) -> Result<Option<DevicesFile>, ErrorBody> {
     let path = paths.config_file(DevicesFile::FILE);
-    match std::fs::read(&path) {
-        Ok(bytes) => parse::<DevicesFile>(&path, &bytes).map(Some),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(ErrorBody::new(
-            ErrorCode::Failed,
-            format!("{} cannot be read: {error}.", path.display()),
-        )
-        .with_hint("Make devices.toml readable by the account legion runs as.")),
+    match legion_core::config::read_regular_file(&path)? {
+        Some(bytes) => parse::<DevicesFile>(&path, &bytes).map(Some),
+        None => Ok(None),
     }
 }
 
@@ -1576,7 +1571,7 @@ pub fn save_devices_locked_with_policy(
     }
     parse::<DevicesFile>(&target, text.as_bytes())?;
 
-    if let Ok(existing) = std::fs::read(&target) {
+    if let Some(existing) = legion_core::config::read_regular_file(&target)? {
         let backup = paths
             .state_dir()
             .join("sync")
@@ -1654,16 +1649,7 @@ pub fn upsert_device_principal_locked(
     }
 
     let path = paths.config_file(Policy::FILE);
-    let existing_bytes = match std::fs::read(&path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", path.display()),
-            ));
-        }
-    };
+    let existing_bytes = legion_core::config::read_regular_file(&path)?;
 
     let (previous_policy, mut doc) = match &existing_bytes {
         Some(bytes) => {
@@ -1790,15 +1776,8 @@ pub fn remove_device_principal_locked(
         return Ok(false);
     }
     let path = paths.config_file(Policy::FILE);
-    let existing_bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", path.display()),
-            ));
-        }
+    let Some(existing_bytes) = legion_core::config::read_regular_file(&path)? else {
+        return Ok(false);
     };
     let parsed = parse::<Policy>(&path, &existing_bytes)?;
     if parsed
@@ -1904,23 +1883,20 @@ pub fn reconcile_device_principals_locked(
 ) -> Result<Vec<String>, ErrorBody> {
     let policy_path = paths.config_file(Policy::FILE);
     let read_policy = || -> Result<Policy, ErrorBody> {
-        match std::fs::read(&policy_path) {
-            Ok(bytes) => parse::<Policy>(&policy_path, &bytes),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Policy::default()),
-            Err(error) => Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", policy_path.display()),
-            )),
+        match legion_core::config::read_regular_file(&policy_path)? {
+            Some(bytes) => parse::<Policy>(&policy_path, &bytes),
+            None => Ok(Policy::default()),
         }
     };
 
     let tokens_path = paths.config_file(Tokens::FILE);
-    let token_principals: HashSet<String> = match std::fs::read(&tokens_path) {
-        Ok(bytes) => parse::<Tokens>(&tokens_path, &bytes)
-            .map(|t| t.tokens.values().map(|e| e.principal.to_string()).collect())
-            .unwrap_or_default(),
-        Err(_) => HashSet::new(),
-    };
+    let token_principals: HashSet<String> =
+        match legion_core::config::read_regular_file(&tokens_path) {
+            Ok(Some(bytes)) => parse::<Tokens>(&tokens_path, &bytes)
+                .map(|t| t.tokens.values().map(|e| e.principal.to_string()).collect())
+                .unwrap_or_default(),
+            Ok(None) | Err(_) => HashSet::new(),
+        };
 
     // 1. Clean up tombstoned registry-owned `device:*` principals first (only when `policy.toml`
     //    marks `device = "<tombstone_id>"` and no HTTP token uses the principal).
@@ -2740,15 +2716,9 @@ pub fn reconcile_devices_and_auth_keys_with_config_lock(
     let _auth_guard = lock_auth_keys(&target, &write_path)?;
 
     let policy_path = paths.config_file(Policy::FILE);
-    let live_policy = match std::fs::read(&policy_path) {
-        Ok(bytes) => parse::<Policy>(&policy_path, &bytes)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Policy::default(),
-        Err(error) => {
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", policy_path.display()),
-            ));
-        }
+    let live_policy = match legion_core::config::read_regular_file(&policy_path)? {
+        Some(bytes) => parse::<Policy>(&policy_path, &bytes)?,
+        None => Policy::default(),
     };
 
     let existing_devices = load_devices_raw(paths)?;
@@ -2873,15 +2843,9 @@ pub fn verify_gate_device(
     }
 
     let policy_path = paths.config_file(Policy::FILE);
-    let live_policy = match std::fs::read(&policy_path) {
-        Ok(bytes) => parse::<Policy>(&policy_path, &bytes)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Policy::default(),
-        Err(error) => {
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", policy_path.display()),
-            ));
-        }
+    let live_policy = match legion_core::config::read_regular_file(&policy_path)? {
+        Some(bytes) => parse::<Policy>(&policy_path, &bytes)?,
+        None => Policy::default(),
     };
 
     let principal_conflicts = device_principal_conflicts(&devices, &live_policy);
@@ -3201,16 +3165,11 @@ fn save_and_reconcile_devices_locked(
 
     let mut warnings = confirmation_warnings;
     warnings.extend(reconcile_device_principals_locked(paths, &merged).map_err(after_save)?);
-    let reconciled_policy = match std::fs::read(policy_path) {
-        Ok(bytes) => parse::<Policy>(policy_path, &bytes).map_err(after_save)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Policy::default(),
-        Err(error) => {
-            return Err(after_save(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", policy_path.display()),
-            )));
-        }
-    };
+    let reconciled_policy =
+        match legion_core::config::read_regular_file(policy_path).map_err(after_save)? {
+            Some(bytes) => parse::<Policy>(policy_path, &bytes).map_err(after_save)?,
+            None => Policy::default(),
+        };
 
     let target = resolve_target(paths, node_file).map_err(after_save)?;
     let caller_account = caller_account_for_target(&target).map_err(after_save)?;
@@ -3284,30 +3243,20 @@ pub fn apply_devices_merge_blocking(
     let _cfg_guard = lock_config(paths).map_err(MergeApplyError::BeforeSave)?;
 
     let devices_path = paths.config_file(DevicesFile::FILE);
-    let bytes_before = match std::fs::read(&devices_path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(MergeApplyError::BeforeSave(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", devices_path.display()),
-            )));
-        }
-    };
+    let bytes_before = legion_core::config::read_regular_file(&devices_path)
+        .map_err(MergeApplyError::BeforeSave)?;
     check_precondition(bytes_before.as_deref()).map_err(MergeApplyError::BeforeSave)?;
     let now = Timestamp::now();
     validate_incoming_tombstone_timestamps(incoming, now).map_err(MergeApplyError::BeforeSave)?;
 
     let policy_path = paths.config_file(Policy::FILE);
-    let live_policy = match std::fs::read(&policy_path) {
-        Ok(bytes) => parse::<Policy>(&policy_path, &bytes).map_err(MergeApplyError::BeforeSave)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Policy::default(),
-        Err(error) => {
-            return Err(MergeApplyError::BeforeSave(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", policy_path.display()),
-            )));
+    let live_policy = match legion_core::config::read_regular_file(&policy_path)
+        .map_err(MergeApplyError::BeforeSave)?
+    {
+        Some(bytes) => {
+            parse::<Policy>(&policy_path, &bytes).map_err(MergeApplyError::BeforeSave)?
         }
+        None => Policy::default(),
     };
 
     let had_existing_file = bytes_before.is_some();
@@ -3567,7 +3516,7 @@ pub fn apply_devices_merge_blocking(
 /// Lists sorted peer machine names configured under `[machines]` in `fleet.toml`, excluding `here`.
 pub fn fleet_peer_names(paths: &Paths, here: &str) -> Vec<String> {
     let fleet_path = paths.config_file("fleet.toml");
-    let Ok(bytes) = std::fs::read(&fleet_path) else {
+    let Ok(Some(bytes)) = legion_core::config::read_regular_file(&fleet_path) else {
         return Vec::new();
     };
     let Ok(text) = std::str::from_utf8(&bytes) else {

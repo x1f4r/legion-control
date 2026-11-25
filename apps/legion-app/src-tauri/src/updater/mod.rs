@@ -20,13 +20,15 @@ pub mod android;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod desktop;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::task::Poll;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -35,14 +37,15 @@ use legion_update::{
     Arch, Artifact, CHECKSUMS_FILENAME, Channel, InstallKind, MANIFEST_FILENAME,
     MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, MAX_SIG_BYTES, MAX_SUMS_BYTES, Os, Program,
     SIGNATURE_FILENAME, SequenceFloorState, SignerKind, TargetPlatform, TrustAnchors,
-    VerifiedSetMeta, compiled_sequence_marker, read_sequence_floor, recover_sequence_floor,
-    select_verified_artifact, verify_artifact_file, verify_set_metadata,
+    VerifiedSetMeta, compiled_preview_key_marker, compiled_sequence_marker, read_sequence_floor,
+    recover_sequence_floor, select_verified_artifact, verify_artifact_file, verify_set_metadata,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::ipc::Channel as IpcChannel;
 use tempfile::NamedTempFile;
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 use crate::backend::{AppError, Backend, BoxFuture, ErrorCode};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -79,19 +82,85 @@ const MAX_SMALL_FILE_CHUNKS: usize = 32;
 const MIN_EXPECTED_CHUNK_BYTES: u64 = 4096;
 
 /// Minimum sustained download progress rate (16 KiB/s) enforced after [`PROGRESS_GRACE_WINDOW`].
-const MIN_PROGRESS_BYTES_PER_SEC: u64 = 16 * 1024;
+pub const MIN_PROGRESS_BYTES_PER_SEC: u64 = 16 * 1024;
 
 /// Grace window before enforcing [`MIN_PROGRESS_BYTES_PER_SEC`].
 const PROGRESS_GRACE_WINDOW: Duration = Duration::from_secs(5);
 
-/// Overall wall-clock deadline for one check + download pass.
-const OVERALL_CHECK_DEADLINE: Duration = Duration::from_secs(180);
+/// Minimum sustained metadata progress rate (4 KiB/s) enforced after [`METADATA_PROGRESS_GRACE`].
+const MIN_METADATA_BYTES_PER_SEC: u64 = 4 * 1024;
 
-/// Per-node timeout for `update.list` and metadata `update.read` calls.
-const CHECK_CALL_TIMEOUT: Duration = Duration::from_secs(12);
+/// Grace window before enforcing [`MIN_METADATA_BYTES_PER_SEC`] during metadata reads.
+const METADATA_PROGRESS_GRACE: Duration = Duration::from_secs(2);
+
+/// Per-node timeout for concurrent `update.list` calls.
+const LIST_NODE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Shorter `update.list` timeout for nodes already deprioritized from an earlier timeout or bad set.
+const BAD_NODE_LIST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Per-RPC timeout for metadata `update.read` calls (`SHA256SUMS`, `SHA256SUMS.sig`, `update.json`).
+const METADATA_CALL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Per-(candidate, node) wall-clock budget for reading and verifying a candidate's metadata files.
+const METADATA_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Total metadata wall-clock budget spent probing any single node within one update check.
+const METADATA_NODE_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Maximum metadata verification/timeout failures tolerated from one node within a single check
+/// before skipping that node's remaining candidates in that check.
+const MAX_METADATA_FAILURES_PER_NODE_PER_CHECK: usize = 4;
+
+/// How long a node or `(channel, sequence, node)` source stays deprioritized before decay forgets it.
+pub const BAD_NODE_TTL: Duration = Duration::from_secs(20 * 60);
+
+/// Minimum wall-clock deadline for an artifact download attempt.
+const MIN_DOWNLOAD_DEADLINE: Duration = Duration::from_secs(180);
+
+/// Extra slack added on top of `remaining_bytes / MIN_PROGRESS_BYTES_PER_SEC` for an artifact download.
+const DOWNLOAD_DEADLINE_SLACK: Duration = Duration::from_secs(60);
+
+/// Upper cap on a single artifact download deadline (10 hours; > 512 MiB at 16 KiB/s).
+const MAX_DOWNLOAD_DEADLINE: Duration = Duration::from_secs(10 * 3600);
+
+/// Maximum time after launch during which a `"startup"` automatic install may run (and only
+/// before the interface has shown its first full screen).
+pub const STARTUP_AUTO_INSTALL_WINDOW: Duration = Duration::from_secs(15);
+
+/// Minimum interval enforced natively between page-initiated `update_maybe_auto_install` requests.
+pub const AUTO_INSTALL_RATE_LIMIT: Duration = Duration::from_secs(5);
 
 /// Per-chunk timeout for artifact `update.read` calls.
 const CHUNK_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Minimum cooldown (1 hour) after a first desktop rollback before retrying the same sequence once
+/// automatically at a later natural install point.
+pub const ROLLBACK_RETRY_COOLDOWN_SECS: i64 = 60 * 60;
+
+/// Hard floor under all automatic install triggers: at most one automatic install attempt per hour
+/// per install, regardless of sequence (manual "Update now" and "Try again" are exempt from this
+/// floor but still record their attempt).
+pub const AUTO_INSTALL_HOURLY_FLOOR_SECS: i64 = 60 * 60;
+
+/// Number of rollbacks or started attempts on the same sequence before Legion skips automatic
+/// installation until a newer sequence arrives or the user taps "Try again".
+pub const MAX_AUTO_ROLLBACK_ATTEMPTS: u32 = 2;
+
+/// Plain-language headline shown when a new desktop build failed to start and was rolled back.
+pub const ROLLBACK_REASON: &str =
+    "The new version did not start cleanly, so Legion kept the previous copy.";
+
+/// Computes the download deadline scaled to `remaining_bytes` and [`MIN_PROGRESS_BYTES_PER_SEC`],
+/// guaranteeing an honest node sustaining at least the rate floor can always finish.
+pub fn download_deadline_for_bytes(remaining_bytes: u64) -> Duration {
+    let at_floor_secs = remaining_bytes.div_ceil(MIN_PROGRESS_BYTES_PER_SEC);
+    let total_secs = at_floor_secs.saturating_add(DOWNLOAD_DEADLINE_SLACK.as_secs());
+    Duration::from_secs(total_secs.clamp(
+        MIN_DOWNLOAD_DEADLINE.as_secs(),
+        MAX_DOWNLOAD_DEADLINE.as_secs(),
+    ))
+}
 
 /// Build-time app semantic version from `Cargo.toml`.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -103,6 +172,7 @@ pub const APP_BUILD_ID: &str = env!("LEGION_APP_BUILD_ID");
 /// static `LEGION_UPDATE_SEQUENCE=<seq>\0` marker in compiled binaries for packaging inspection.
 pub fn current_app_sequence() -> u64 {
     let _ = std::hint::black_box(compiled_sequence_marker());
+    let _ = std::hint::black_box(compiled_preview_key_marker());
     env!("LEGION_APP_SEQUENCE").parse::<u64>().unwrap_or(0)
 }
 
@@ -198,12 +268,38 @@ pub struct RollbackInfo {
     pub sequence: u64,
     /// Plain-language explanation.
     pub reason: String,
+    /// Optional captured startup output or supervisor exit reason shown ONLY under Technical details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Exact install directory state recorded by the supervisor (`"restored_previous"` or
+    /// `"new_kept_files_in_use"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_state: Option<String>,
 }
 
-/// Persisted record of an update sequence that failed to install or take effect on this device.
+/// Marker written by a desktop supervisor when it deferred cleanly before touching the install
+/// because another process held the install open past the pre-swap wait bound.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DeferredInstallRecord {
+    sequence: u64,
+    #[serde(default)]
+    reason: String,
+}
+
+fn default_failed_attempts() -> u32 {
+    1
+}
+
+fn default_failed_skipped() -> bool {
+    true
+}
+
+/// Persisted record of an update sequence that failed to install or start on this device.
 ///
-/// Failed sequences are never retried automatically; the user can tap "Try again" manually, and
-/// automatic updates resume as soon as a strictly newer sequence is published.
+/// After a first desktop rollback, the same sequence is retried once automatically at a later
+/// natural install point at least [`ROLLBACK_RETRY_COOLDOWN_SECS`] (1 hour) later. After a second
+/// rollback (or a non-rollback install error), `skipped` becomes `true` and the sequence is skipped
+/// until a strictly newer sequence arrives or the user taps "Try again".
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailedUpdateRecord {
     /// Update channel of the failed set.
@@ -216,6 +312,19 @@ pub struct FailedUpdateRecord {
     pub reason: String,
     /// RFC 3339 UTC timestamp when the failure was recorded.
     pub failed_at: String,
+    /// Number of failed attempts recorded for this sequence.
+    #[serde(default = "default_failed_attempts")]
+    pub attempts: u32,
+    /// True once automatic installation of this sequence is skipped until a newer sequence arrives
+    /// or the user taps "Try again".
+    #[serde(default = "default_failed_skipped")]
+    pub skipped: bool,
+    /// RFC 3339 UTC timestamp after which a single automatic retry is permitted (`None` when skipped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<String>,
+    /// Captured first-start output or supervisor diagnostic shown ONLY under Technical details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Complete updater state exposed to the interface via `update_state` and `update_watch`.
@@ -360,7 +469,7 @@ impl UpdateSourceClient for LinkUpdateClient {
         let node = node.to_owned();
         Box::pin(async move {
             let routed = tokio::time::timeout(
-                CHECK_CALL_TIMEOUT,
+                LIST_NODE_TIMEOUT,
                 link.call_machine(&node, "update.list", json!({}), |_| {}),
             )
             .await
@@ -533,6 +642,10 @@ impl PlatformEnv {
     }
 }
 
+fn default_pending_stage() -> String {
+    "swapped".to_owned()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PendingInstallRecord {
     channel: Channel,
@@ -542,6 +655,17 @@ struct PendingInstallRecord {
     notes: String,
     from_sequence: u64,
     started_at: String,
+    /// Lifecycle stage reached by the install: `"staged"`, `"swapping"`, `"swapped"`, or
+    /// `"started"`. Legacy records without `stage` default to `"swapped"`.
+    #[serde(default = "default_pending_stage")]
+    stage: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StartedAttemptRecord {
+    sequence: u64,
+    attempts: u32,
+    last_started_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -560,6 +684,12 @@ struct PersistedPrefs {
     failed_sequences: Vec<u64>,
     #[serde(default)]
     failed_updates: Vec<FailedUpdateRecord>,
+    #[serde(default)]
+    started_attempts: Vec<StartedAttemptRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_install_attempt_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stale_update_notice: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cached_available: Option<AvailableUpdateInfo>,
 }
@@ -578,6 +708,9 @@ impl Default for PersistedPrefs {
             rolled_back: None,
             failed_sequences: Vec::new(),
             failed_updates: Vec::new(),
+            started_attempts: Vec::new(),
+            last_install_attempt_at: None,
+            stale_update_notice: None,
             cached_available: None,
         }
     }
@@ -587,6 +720,73 @@ impl PersistedPrefs {
     fn has_failed(&self, sequence: u64) -> bool {
         self.failed_sequences.contains(&sequence)
             || self.failed_updates.iter().any(|r| r.sequence == sequence)
+            || self.started_attempts_count(sequence) >= MAX_AUTO_ROLLBACK_ATTEMPTS
+    }
+
+    fn started_attempts_count(&self, sequence: u64) -> u32 {
+        self.started_attempts
+            .iter()
+            .find(|r| r.sequence == sequence)
+            .map_or(0, |r| r.attempts)
+    }
+
+    fn record_started_attempt(&mut self, sequence: u64, now_unix: i64) -> u32 {
+        let now_str = format_rfc3339_utc(now_unix);
+        self.last_install_attempt_at = Some(now_str.clone());
+        let next = self.started_attempts_count(sequence).saturating_add(1);
+        self.started_attempts.retain(|r| r.sequence != sequence);
+        self.started_attempts.push(StartedAttemptRecord {
+            sequence,
+            attempts: next,
+            last_started_at: now_str,
+        });
+        if self.started_attempts.len() > 16 {
+            let drain = self.started_attempts.len() - 16;
+            self.started_attempts.drain(0..drain);
+        }
+        next
+    }
+
+    fn decrement_started_attempt(&mut self, sequence: u64) {
+        if let Some(rec) = self
+            .started_attempts
+            .iter_mut()
+            .find(|r| r.sequence == sequence)
+        {
+            rec.attempts = rec.attempts.saturating_sub(1);
+        }
+        self.started_attempts.retain(|r| r.attempts > 0);
+    }
+
+    fn ensure_started_attempts_at_least(
+        &mut self,
+        sequence: u64,
+        min_attempts: u32,
+        now_unix: i64,
+    ) {
+        if min_attempts == 0 {
+            return;
+        }
+        let now_str = format_rfc3339_utc(now_unix);
+        if let Some(rec) = self
+            .started_attempts
+            .iter_mut()
+            .find(|r| r.sequence == sequence)
+        {
+            if rec.attempts < min_attempts {
+                rec.attempts = min_attempts;
+            }
+            return;
+        }
+        self.started_attempts.push(StartedAttemptRecord {
+            sequence,
+            attempts: min_attempts,
+            last_started_at: now_str,
+        });
+        if self.started_attempts.len() > 16 {
+            let drain = self.started_attempts.len() - 16;
+            self.started_attempts.drain(0..drain);
+        }
     }
 
     fn failed_record(&self, sequence: u64) -> Option<FailedUpdateRecord> {
@@ -595,21 +795,112 @@ impl PersistedPrefs {
             .find(|r| r.sequence == sequence)
             .cloned()
             .or_else(|| {
-                self.failed_sequences
-                    .contains(&sequence)
-                    .then(|| FailedUpdateRecord {
-                        channel: Channel::Stable,
-                        version: String::new(),
+                let started = self.started_attempts_count(sequence);
+                if self.failed_sequences.contains(&sequence)
+                    || started >= MAX_AUTO_ROLLBACK_ATTEMPTS
+                {
+                    let version = self
+                        .cached_available
+                        .as_ref()
+                        .filter(|a| a.sequence == sequence)
+                        .map_or_else(String::new, |a| a.version.clone());
+                    let channel = self
+                        .cached_available
+                        .as_ref()
+                        .filter(|a| a.sequence == sequence)
+                        .map_or(Channel::Stable, |a| a.channel);
+                    let failed_at = self
+                        .started_attempts
+                        .iter()
+                        .find(|r| r.sequence == sequence)
+                        .map_or_else(now_rfc3339_utc, |r| r.last_started_at.clone());
+                    Some(FailedUpdateRecord {
+                        channel,
+                        version,
                         sequence,
-                        reason: "A previous attempt to install this version failed.".to_owned(),
-                        failed_at: now_rfc3339_utc(),
+                        reason: ROLLBACK_REASON.to_owned(),
+                        failed_at,
+                        attempts: started.max(MAX_AUTO_ROLLBACK_ATTEMPTS),
+                        skipped: true,
+                        retry_after: None,
+                        detail: None,
                     })
+                } else {
+                    None
+                }
             })
     }
 
+    /// Returns whether automatic installation of `sequence` itself is blocked due to prior failures,
+    /// rollback cooldown, or reaching [`MAX_AUTO_ROLLBACK_ATTEMPTS`] started attempts.
+    fn sequence_failure_block_reason_at(
+        &self,
+        sequence: u64,
+        now_unix: i64,
+    ) -> Option<&'static str> {
+        if self.started_attempts_count(sequence) >= MAX_AUTO_ROLLBACK_ATTEMPTS {
+            return Some("sequence_skipped");
+        }
+        if let Some(rec) = self.failed_updates.iter().find(|r| r.sequence == sequence) {
+            if rec.skipped || rec.attempts >= MAX_AUTO_ROLLBACK_ATTEMPTS {
+                return Some("sequence_skipped");
+            }
+            if let Some(retry_at) = rec.retry_after.as_deref().and_then(parse_rfc3339_utc) {
+                if now_unix < retry_at {
+                    return Some("rollback_retry_cooldown");
+                }
+            } else {
+                return Some("sequence_skipped");
+            }
+        }
+        if self.failed_sequences.contains(&sequence) {
+            return Some("sequence_skipped");
+        }
+        if let Some(started) = self
+            .started_attempts
+            .iter()
+            .find(|r| r.sequence == sequence && r.attempts > 0)
+            && let Some(last_ts) = parse_rfc3339_utc(&started.last_started_at)
+            && last_ts <= now_unix.saturating_add(300)
+            && now_unix.saturating_sub(last_ts) < ROLLBACK_RETRY_COOLDOWN_SECS
+        {
+            return Some("rollback_retry_cooldown");
+        }
+        None
+    }
+
+    /// Returns `Some("auto_install_hourly_floor")` whenever any install attempt started within the
+    /// last [`AUTO_INSTALL_HOURLY_FLOOR_SECS`] (1 hour), regardless of sequence.
+    fn hourly_floor_block_reason_at(&self, now_unix: i64) -> Option<&'static str> {
+        if let Some(last_ts) = self
+            .last_install_attempt_at
+            .as_deref()
+            .and_then(parse_rfc3339_utc)
+            && last_ts <= now_unix.saturating_add(300)
+            && now_unix.saturating_sub(last_ts) < AUTO_INSTALL_HOURLY_FLOOR_SECS
+        {
+            return Some("auto_install_hourly_floor");
+        }
+        None
+    }
+
+    fn auto_block_reason_at(&self, sequence: u64, now_unix: i64) -> Option<&'static str> {
+        self.sequence_failure_block_reason_at(sequence, now_unix)
+            .or_else(|| self.hourly_floor_block_reason_at(now_unix))
+    }
+
+    fn is_sequence_blocked_at(&self, sequence: u64, now_unix: i64) -> bool {
+        self.sequence_failure_block_reason_at(sequence, now_unix)
+            .is_some()
+    }
+
     fn record_failure(&mut self, record: FailedUpdateRecord) {
-        if !self.failed_sequences.contains(&record.sequence) {
-            self.failed_sequences.push(record.sequence);
+        if record.skipped {
+            if !self.failed_sequences.contains(&record.sequence) {
+                self.failed_sequences.push(record.sequence);
+            }
+        } else {
+            self.failed_sequences.retain(|&s| s != record.sequence);
         }
         self.failed_updates
             .retain(|r| r.sequence != record.sequence);
@@ -628,6 +919,14 @@ impl PersistedPrefs {
     fn clear_failure(&mut self, sequence: u64) {
         self.failed_sequences.retain(|&s| s != sequence);
         self.failed_updates.retain(|r| r.sequence != sequence);
+        self.started_attempts.retain(|r| r.sequence != sequence);
+        if self
+            .rolled_back
+            .as_ref()
+            .is_some_and(|r| r.sequence == sequence)
+        {
+            self.rolled_back = None;
+        }
     }
 }
 
@@ -649,8 +948,64 @@ struct VerifiedCandidate {
     all_nodes: Vec<String>,
 }
 
+/// One contiguous byte range `[start, end)` written into a `.part` file by `node`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PartRange {
+    start: u64,
+    end: u64,
+    node: String,
+}
+
+/// Sidecar provenance persisted beside `<artifact>.part` (`<artifact>.part.meta.json`) recording
+/// which paired node contributed each byte range.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PartMetadata {
+    sha256: String,
+    expected_size: u64,
+    #[serde(default)]
+    ranges: Vec<PartRange>,
+}
+
+enum CandidateFetchError {
+    /// Set metadata verified cleanly, but the signed manifest carries no artifact for this OS/arch/kind.
+    NotForThisPlatform {
+        bytes_read: usize,
+        elapsed: Duration,
+    },
+    /// Check was cancelled by a newer generation.
+    Cancelled,
+    /// Metadata read timed out, stalled, or failed cryptographic/manifest verification.
+    Failed {
+        err: AppError,
+        bytes_read: usize,
+        elapsed: Duration,
+    },
+}
+
+enum DownloadFailure {
+    /// Download was cancelled by a newer generation (`.part` preserved).
+    Cancelled(AppError),
+    /// Network disconnect, timeout, rate floor, or protocol error (`.part` preserved).
+    Interrupted(AppError),
+    /// Complete `.part` reached signed size but failed final SHA-256 verification (`.part` discarded).
+    HashMismatch {
+        err: AppError,
+        contributors: Vec<String>,
+    },
+}
+
 /// Shared managed state holding the app's [`UpdateManager`].
 pub struct SharedUpdater(pub Arc<UpdateManager>);
+
+/// RAII guard for native UI/command activity outside [`Backend`] (such as Android QR scanner
+/// activity) so automatic updates never fire while it is active.
+pub struct ExternalOpGuard(Arc<AtomicUsize>);
+
+impl Drop for ExternalOpGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Native app update coordinator persisted under `<updates_base>/updates/`.
 pub struct UpdateManager {
@@ -665,12 +1020,25 @@ pub struct UpdateManager {
     state: Mutex<UpdateState>,
     prefs: Mutex<PersistedPrefs>,
     watchers: Mutex<Vec<IpcChannel<UpdateState>>>,
-    /// Tracks `(channel, sequence, node)` sources that returned corrupt bytes, stalled, or errored
-    /// so future checks and multi-node fallbacks try healthy nodes first.
-    bad_sources: Mutex<BTreeSet<(Channel, u64, String)>>,
+    /// Tracks `(channel, sequence, node)` sources that failed or stalled on a specific update set,
+    /// with timestamps so entries decay after [`BAD_NODE_TTL`].
+    bad_sources: Mutex<BTreeMap<(Channel, u64, String), Instant>>,
+    /// Tracks nodes that timed out or served unverifiable sets across checks so they are tried last
+    /// on subsequent checks and automatically forgotten after [`BAD_NODE_TTL`].
+    bad_nodes: Mutex<BTreeMap<String, Instant>>,
     /// Generation counter used to immediately cancel a stalled background check whenever a manual
     /// check or install starts (no mutex is ever held across network waits).
     cancel_tx: watch::Sender<u64>,
+    /// Monotonic launch timestamp used to enforce [`STARTUP_AUTO_INSTALL_WINDOW`] natively.
+    launched_at: Instant,
+    /// Set once `commands::ready` reports that the interface painted its first full screen,
+    /// permanently closing the `"startup"` auto-install window for this session.
+    first_screen_shown: AtomicBool,
+    /// Last page-initiated `update_maybe_auto_install` request timestamp for native rate limiting.
+    last_auto_install_request: Mutex<Option<Instant>>,
+    /// Count of in-flight native operations tracked directly on the updater (for example Android
+    /// QR camera scanning during pairing or future content streams).
+    external_operations: Arc<AtomicUsize>,
 }
 
 impl UpdateManager {
@@ -707,9 +1075,50 @@ impl UpdateManager {
         current_build: String,
         current_sequence: u64,
     ) -> Self {
+        Self::with_config_at(
+            updates_dir,
+            anchors,
+            os,
+            arch,
+            platform,
+            current_version,
+            current_build,
+            current_sequence,
+            now_unix_secs(),
+        )
+    }
+
+    /// Creates an update manager evaluating persisted rollback retry windows at `now_unix`
+    /// (seconds since Unix epoch), used directly by deterministic retry tests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_config_at(
+        updates_dir: PathBuf,
+        anchors: TrustAnchors,
+        os: Os,
+        arch: Arch,
+        platform: PlatformEnv,
+        current_version: String,
+        current_build: String,
+        current_sequence: u64,
+        now_unix: i64,
+    ) -> Self {
         let floor_path = updates_dir.join("floor.json");
         let sequence_floor = read_floor_value(&floor_path).max(current_sequence);
-        let prefs = load_prefs(&updates_dir.join("prefs.json")).unwrap_or_default();
+        let mut prefs = load_prefs(&updates_dir.join("prefs.json")).unwrap_or_default();
+
+        // Reconcile any unread `rollback-*.json`, `deferred-*.json`, `stale-lock.json`, and
+        // interrupted `pending_install` records at construction time BEFORE anything can ask the
+        // auto-install gate, and clean interrupted staging leftovers when no update lock is held.
+        let (reconciled_dirty, saw_rollback, rollback_detail) = reconcile_supervisor_records_at(
+            &updates_dir,
+            current_sequence,
+            &platform,
+            &mut prefs,
+            now_unix,
+        );
+        if reconciled_dirty {
+            let _ = save_prefs(&updates_dir.join("prefs.json"), &prefs);
+        }
 
         let current = CurrentBuildInfo {
             version: current_version.clone(),
@@ -744,6 +1153,8 @@ impl UpdateManager {
         let mut manual_command = None;
         let mut manual_sha256 = None;
         let mut failed_update = None;
+        let mut initial_last_error = None;
+        let mut initial_last_error_detail = None;
         if !seq_zero_disabled
             && let Some(cached) = &prefs.cached_available
             && cached.sequence > current_sequence
@@ -773,7 +1184,11 @@ impl UpdateManager {
                     manual_command = platform.manual_command_for(Some(&art_path));
                 }
 
-                if let Some(fail_rec) = prefs.failed_record(cached.sequence) {
+                if prefs.is_sequence_blocked_at(cached.sequence, now_unix)
+                    && let Some(fail_rec) = prefs.failed_record(cached.sequence)
+                {
+                    initial_last_error = Some(fail_rec.reason.clone());
+                    initial_last_error_detail = fail_rec.detail.clone();
                     failed_update = Some(fail_rec);
                     initial_phase = "error".to_owned();
                 } else if manual_command.is_some() {
@@ -785,6 +1200,27 @@ impl UpdateManager {
                 }
                 available = Some(item);
             }
+        }
+        if failed_update.is_none()
+            && let Some(last_fail) = prefs
+                .failed_updates
+                .iter()
+                .filter(|r| {
+                    r.sequence > sequence_floor
+                        && prefs.is_sequence_blocked_at(r.sequence, now_unix)
+                })
+                .max_by_key(|r| r.sequence)
+                .cloned()
+        {
+            if initial_last_error_detail.is_none() {
+                initial_last_error_detail = last_fail.detail.clone();
+            }
+            failed_update = Some(last_fail);
+        } else if saw_rollback && initial_last_error_detail.is_none() {
+            initial_last_error_detail = rollback_detail;
+        }
+        if initial_last_error.is_none() && prefs.stale_update_notice.is_some() {
+            initial_last_error = prefs.stale_update_notice.clone();
         }
 
         let initial_state = UpdateState {
@@ -805,8 +1241,8 @@ impl UpdateManager {
             rolled_back: prefs.rolled_back.clone(),
             failed_update,
             android: None,
-            last_error: None,
-            last_error_detail: None,
+            last_error: initial_last_error,
+            last_error_detail: initial_last_error_detail,
         };
 
         let (cancel_tx, _rx) = watch::channel(0u64);
@@ -823,8 +1259,13 @@ impl UpdateManager {
             state: Mutex::new(initial_state),
             prefs: Mutex::new(prefs),
             watchers: Mutex::new(Vec::new()),
-            bad_sources: Mutex::new(BTreeSet::new()),
+            bad_sources: Mutex::new(BTreeMap::new()),
+            bad_nodes: Mutex::new(BTreeMap::new()),
             cancel_tx,
+            launched_at: Instant::now(),
+            first_screen_shown: AtomicBool::new(false),
+            last_auto_install_request: Mutex::new(None),
+            external_operations: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -896,6 +1337,18 @@ impl UpdateManager {
     ///   when a `pending_install` did not take effect (`current_sequence != pending.sequence`) or
     ///   when the desktop watchdog left a rollback marker.
     pub fn on_app_ready(&self) {
+        self.on_app_ready_at(now_unix_secs());
+    }
+
+    /// Returns `true` once the first full screen has painted (`on_app_ready` has run).
+    pub fn is_first_screen_shown(&self) -> bool {
+        self.first_screen_shown.load(Ordering::SeqCst)
+    }
+
+    /// Deterministic variant of [`Self::on_app_ready`] evaluating rollback retry timestamps at
+    /// `now_unix` (seconds since Unix epoch).
+    pub fn on_app_ready_at(&self, now_unix: i64) {
+        self.first_screen_shown.store(true, Ordering::SeqCst);
         if ensure_updates_root(&self.updates_dir).is_err() {
             return;
         }
@@ -938,72 +1391,50 @@ impl UpdateManager {
         };
 
         let mut prefs = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let mut prefs_dirty = false;
-        let mut saw_rollback = false;
+        let (mut prefs_dirty, saw_rollback, rollback_detail) = reconcile_supervisor_records_at(
+            &self.updates_dir,
+            self.current_sequence,
+            &self.platform,
+            &mut prefs,
+            now_unix,
+        );
 
-        // 1. Check for a desktop rollback marker left by the detached supervisor.
-        if let Some((rb_path, rb)) = read_and_take_rollback(&self.updates_dir) {
-            let _ = fs::remove_file(rb_path);
-            let channel = prefs
-                .pending_install
-                .as_ref()
-                .map_or(Channel::Stable, |p| p.channel);
-            prefs.record_failure(FailedUpdateRecord {
-                channel,
-                version: rb.version.clone(),
-                sequence: rb.sequence,
-                reason: rb.reason.clone(),
-                failed_at: now_rfc3339_utc(),
-            });
-            prefs.pending_install = None;
-            prefs.rolled_back = Some(rb);
-            prefs_dirty = true;
-            saw_rollback = true;
-        }
-
-        // 2. Check whether a pending update completed or failed to take effect on this start.
+        // Confirm a matching pending update once the new build renders its first frame (or
+        // verifies in headless close-update mode).
         if let Some(pending) = prefs.pending_install.clone()
             && self.current_sequence > 0
             && !saw_rollback
+            && pending.sequence == self.current_sequence
         {
-            if pending.sequence == self.current_sequence {
-                prefs.pending_install = None;
-                prefs.rolled_back = None;
-                prefs.cached_available = None;
-                prefs
-                    .failed_sequences
-                    .retain(|&s| s > self.current_sequence);
-                prefs
-                    .failed_updates
-                    .retain(|r| r.sequence > self.current_sequence);
-                prefs.just_updated = Some(JustUpdatedInfo {
-                    channel: pending.channel,
-                    version: pending.version,
-                    build: pending.build,
-                    sequence: pending.sequence,
-                    notes: pending.notes,
-                    updated_at: now_rfc3339_utc(),
-                });
-                prefs_dirty = true;
-                cleanup_old_downloads(&self.updates_dir, self.current_sequence);
-            } else {
-                // Pending install was recorded, but the running build after restart does NOT have
-                // the expected sequence (for example, an artifact with a mismatched compiled
-                // sequence or an aborted/ineffective install). Record it as failed so Legion never
-                // loops retrying it automatically.
-                let reason = format!(
-                    "Version {} did not take effect after installation, so Legion will not retry it automatically.",
-                    pending.version
-                );
-                prefs.record_failure(FailedUpdateRecord {
-                    channel: pending.channel,
-                    version: pending.version,
-                    sequence: pending.sequence,
-                    reason,
-                    failed_at: now_rfc3339_utc(),
-                });
-                prefs.pending_install = None;
-                prefs_dirty = true;
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            desktop::clear_pending_stage(&self.updates_dir, pending.sequence);
+            prefs.pending_install = None;
+            prefs.rolled_back = None;
+            prefs.stale_update_notice = None;
+            prefs.cached_available = None;
+            prefs
+                .failed_sequences
+                .retain(|&s| s > self.current_sequence);
+            prefs
+                .failed_updates
+                .retain(|r| r.sequence > self.current_sequence);
+            prefs
+                .started_attempts
+                .retain(|r| r.sequence > self.current_sequence);
+            prefs.just_updated = Some(JustUpdatedInfo {
+                channel: pending.channel,
+                version: pending.version,
+                build: pending.build,
+                sequence: pending.sequence,
+                notes: pending.notes,
+                updated_at: format_rfc3339_utc(now_unix),
+            });
+            prefs_dirty = true;
+            cleanup_old_downloads(&self.updates_dir, self.current_sequence);
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                let _ = fs::remove_file(self.updates_dir.join(desktop::NEW_START_LOG_FILENAME));
+                let _ = fs::remove_file(self.updates_dir.join(desktop::ROLLBACK_PS_FILENAME));
             }
         }
 
@@ -1017,11 +1448,13 @@ impl UpdateManager {
         st.sequence_floor = new_floor.max(self.current_sequence);
         st.just_updated = prefs.just_updated.clone();
         st.rolled_back = prefs.rolled_back.clone();
-        if let Some(detail) = floor_recovery_detail {
+        if let Some(detail) = floor_recovery_detail.as_ref() {
             st.last_error = Some(
                 "Legion rebuilt a damaged update floor file at the running version.".to_owned(),
             );
-            st.last_error_detail = Some(detail);
+            st.last_error_detail = Some(detail.clone());
+        } else if prefs.stale_update_notice.is_some() && st.last_error.is_none() {
+            st.last_error = prefs.stale_update_notice.clone();
         }
         if let Some(avail) = &st.available {
             if avail.sequence <= st.sequence_floor {
@@ -1032,8 +1465,11 @@ impl UpdateManager {
                 if st.phase != "unsupported" {
                     st.phase = "up_to_date".to_owned();
                 }
-            } else if let Some(fail) = prefs.failed_record(avail.sequence) {
+            } else if prefs.is_sequence_blocked_at(avail.sequence, now_unix)
+                && let Some(fail) = prefs.failed_record(avail.sequence)
+            {
                 st.last_error = Some(fail.reason.clone());
+                st.last_error_detail = fail.detail.clone().or(floor_recovery_detail);
                 st.failed_update = Some(fail);
                 if st.phase != "unsupported" {
                     st.phase = "error".to_owned();
@@ -1042,11 +1478,16 @@ impl UpdateManager {
         } else if let Some(last_fail) = prefs
             .failed_updates
             .iter()
-            .filter(|r| r.sequence > st.sequence_floor)
+            .filter(|r| {
+                r.sequence > st.sequence_floor && prefs.is_sequence_blocked_at(r.sequence, now_unix)
+            })
             .max_by_key(|r| r.sequence)
             .cloned()
         {
+            st.last_error_detail = last_fail.detail.clone().or(floor_recovery_detail);
             st.failed_update = Some(last_fail);
+        } else if saw_rollback && let Some(detail) = rollback_detail {
+            st.last_error_detail = Some(detail);
         }
         self.publish_state(st);
     }
@@ -1065,9 +1506,10 @@ impl UpdateManager {
         }))
     }
 
-    /// Dismisses the one-time `just_updated` and/or `rolled_back` notice.
+    /// Dismisses the one-time `just_updated`, `rolled_back`, and/or stale-lock notice.
     pub fn dismiss_notice(&self) -> Result<UpdateState, AppError> {
         let mut prefs = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let cleared_stale = prefs.stale_update_notice.take();
         prefs.just_updated = None;
         prefs.rolled_back = None;
         save_prefs(&self.updates_dir.join("prefs.json"), &prefs)?;
@@ -1078,6 +1520,9 @@ impl UpdateManager {
         Ok(self.update_state(|st| {
             st.just_updated = None;
             st.rolled_back = None;
+            if cleared_stale.is_some() && st.last_error == cleared_stale {
+                st.last_error = None;
+            }
         }))
     }
 
@@ -1117,6 +1562,20 @@ impl UpdateManager {
         force_download: bool,
         is_metered: bool,
     ) -> Result<UpdateState, AppError> {
+        self.check_with_client_at(client, nodes, force_download, is_metered, now_unix_secs())
+            .await
+    }
+
+    /// Deterministic variant of [`Self::check_with_client`] evaluating rollback retry windows at
+    /// `now_unix` (seconds since Unix epoch).
+    pub async fn check_with_client_at(
+        &self,
+        client: &dyn UpdateSourceClient,
+        nodes: &[String],
+        force_download: bool,
+        is_metered: bool,
+        now_unix: i64,
+    ) -> Result<UpdateState, AppError> {
         if self.current_sequence == 0 {
             return Ok(self.update_state(|st| {
                 st.phase = "unsupported".to_owned();
@@ -1135,7 +1594,6 @@ impl UpdateManager {
         };
 
         let (my_gen, mut cancel_rx) = self.bump_generation();
-        let deadline = Instant::now() + OVERALL_CHECK_DEADLINE;
         let floor_path = self.updates_dir.join("floor.json");
         let _ = ensure_updates_root(&self.updates_dir);
 
@@ -1162,27 +1620,60 @@ impl UpdateManager {
         });
 
         let checked_at = now_rfc3339_utc();
-        let mut by_key: BTreeMap<(Channel, u64), CandidateSource> = BTreeMap::new();
         let mut answered_nodes = Vec::new();
         let mut last_query_detail: Option<String> = None;
+        let mut had_timeout = false;
 
-        for node in nodes {
-            let list_res = run_cancellable(&mut cancel_rx, deadline, client.list_sets(node)).await;
-            match list_res {
+        // Ask all paired nodes concurrently during listing, each with its own short time budget
+        // completely separate from the download deadline. Order clean nodes ahead of previously
+        // deprioritized nodes so fair candidate merging favors healthy machines first.
+        let ordered_list_nodes = self.order_nodes_general(nodes);
+        let list_futs: Vec<ListNodeFuture<'_>> = ordered_list_nodes
+            .iter()
+            .map(|node| {
+                let node_name = node.clone();
+                let timeout = if self.is_node_deprioritized(node) {
+                    BAD_NODE_LIST_TIMEOUT
+                } else {
+                    LIST_NODE_TIMEOUT
+                };
+                Box::pin(async move {
+                    let res = tokio::time::timeout(timeout, client.list_sets(&node_name))
+                        .await
+                        .map_err(|_| ());
+                    (node_name, res)
+                }) as ListNodeFuture<'_>
+            })
+            .collect();
+
+        let list_results = tokio::select! {
+            biased;
+            _ = cancel_rx.changed() => {
+                return Ok(self.snapshot());
+            }
+            res = join_all_futures(list_futs) => res,
+        };
+
+        if *cancel_rx.borrow() != my_gen {
+            return Ok(self.snapshot());
+        }
+
+        // Cap eligible candidates per node BEFORE merging round-robin across nodes so two flooding
+        // nodes can never fill `MAX_CANDIDATES_TOTAL` and crowd out an honest node listed later.
+        let mut per_node_candidates: Vec<(String, Vec<(Channel, u64)>)> = Vec::new();
+        for (node, res) in list_results {
+            match res {
                 Ok(Ok(listed)) => {
                     answered_nodes.push(node.clone());
-                    let mut accepted_from_node = 0usize;
-                    // Sort newest first BEFORE truncating per-node candidate cap so a flood of old
-                    // or fake sequences cannot push valid new sets out (and a flood of fake high
-                    // sequences is capped at MAX_CANDIDATES_PER_NODE).
                     let mut sets = listed.sets;
                     sets.sort_by(|a, b| {
                         b.sequence
                             .cmp(&a.sequence)
                             .then_with(|| a.channel.cmp(&b.channel))
                     });
+                    let mut node_cands: Vec<(Channel, u64)> = Vec::new();
                     for set in sets {
-                        if accepted_from_node >= MAX_CANDIDATES_PER_NODE {
+                        if node_cands.len() >= MAX_CANDIDATES_PER_NODE {
                             break;
                         }
                         if set.sequence <= self.current_sequence || set.sequence <= floor {
@@ -1199,45 +1690,55 @@ impl UpdateManager {
                         {
                             continue;
                         }
-                        if !by_key.contains_key(&(set.channel, set.sequence))
-                            && by_key.len() >= MAX_CANDIDATES_TOTAL
-                        {
-                            continue;
-                        }
-                        accepted_from_node += 1;
-                        let entry =
-                            by_key
-                                .entry((set.channel, set.sequence))
-                                .or_insert_with(|| CandidateSource {
-                                    channel: set.channel,
-                                    sequence: set.sequence,
-                                    nodes: Vec::new(),
-                                });
-                        if !entry.nodes.contains(node) {
-                            entry.nodes.push(node.clone());
+                        let key = (set.channel, set.sequence);
+                        if !node_cands.contains(&key) {
+                            node_cands.push(key);
                         }
                     }
+                    per_node_candidates.push((node, node_cands));
                 }
                 Ok(Err(err)) => {
+                    if err.code == ErrorCode::Timeout {
+                        had_timeout = true;
+                        self.mark_bad_node(&node);
+                    }
                     if err.code != ErrorCode::UnknownTool {
                         last_query_detail = Some(format!("{node}: {}", err.message));
                     }
                 }
-                Err(cancelled_or_timeout) => {
-                    if *cancel_rx.borrow() != my_gen {
-                        return Ok(self.snapshot());
-                    }
-                    last_query_detail = Some(cancelled_or_timeout.message);
-                    break;
+                Err(()) => {
+                    had_timeout = true;
+                    self.mark_bad_node(&node);
+                    last_query_detail =
+                        Some(format!("{node}: Timed out asking {node} for updates."));
                 }
             }
         }
 
-        if *cancel_rx.borrow() != my_gen {
-            return Ok(self.snapshot());
+        let mut by_key: BTreeMap<(Channel, u64), CandidateSource> = BTreeMap::new();
+        for rank in 0..MAX_CANDIDATES_PER_NODE {
+            for (node, node_cands) in &per_node_candidates {
+                let Some(&(channel, sequence)) = node_cands.get(rank) else {
+                    continue;
+                };
+                if let Some(entry) = by_key.get_mut(&(channel, sequence)) {
+                    if !entry.nodes.contains(node) {
+                        entry.nodes.push(node.clone());
+                    }
+                } else if by_key.len() < MAX_CANDIDATES_TOTAL {
+                    by_key.insert(
+                        (channel, sequence),
+                        CandidateSource {
+                            channel,
+                            sequence,
+                            nodes: vec![node.clone()],
+                        },
+                    );
+                }
+            }
         }
 
-        // Order candidates newest sequence first (preferring stable on an exact tie).
+        // Order merged candidates newest sequence first (preferring stable on an exact tie).
         let mut candidates: Vec<CandidateSource> = by_key.into_values().collect();
         candidates.sort_by(|a, b| {
             b.sequence
@@ -1247,53 +1748,145 @@ impl UpdateManager {
 
         let prefs_snapshot = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let mut metadata_budget_by_node: BTreeMap<String, usize> = BTreeMap::new();
+        let mut metadata_time_by_node: BTreeMap<String, Duration> = BTreeMap::new();
+        let mut metadata_failures_by_node: BTreeMap<String, usize> = BTreeMap::new();
         let mut chosen: Option<VerifiedCandidate> = None;
         let mut newest_failed_verified: Option<(VerifiedCandidate, FailedUpdateRecord)> = None;
         let mut refusal_detail: Option<String> = None;
+        let mut had_unverifiable_candidate = false;
 
         'outer: for cand in candidates {
             let ordered_nodes = self.order_nodes_for(cand.channel, cand.sequence, &cand.nodes);
-            for node in &ordered_nodes {
-                let used = metadata_budget_by_node.get(node).copied().unwrap_or(0);
-                if used >= MAX_METADATA_BYTES_PER_NODE {
+            let eligible_nodes: Vec<String> = ordered_nodes
+                .iter()
+                .filter(|node| {
+                    let used_bytes = metadata_budget_by_node.get(*node).copied().unwrap_or(0);
+                    let used_time = metadata_time_by_node
+                        .get(*node)
+                        .copied()
+                        .unwrap_or(Duration::ZERO);
+                    let failures = metadata_failures_by_node.get(*node).copied().unwrap_or(0);
+                    used_bytes < MAX_METADATA_BYTES_PER_NODE
+                        && used_time < METADATA_NODE_TOTAL_TIMEOUT
+                        && failures < MAX_METADATA_FAILURES_PER_NODE_PER_CHECK
+                })
+                .cloned()
+                .collect();
+            if eligible_nodes.is_empty() {
+                continue;
+            }
+
+            // Probe clean nodes concurrently first (so a slow sibling node holding the same
+            // candidate costs nothing), then fall back to previously deprioritized nodes.
+            let (clean_wave, bad_wave): (Vec<String>, Vec<String>) = eligible_nodes
+                .into_iter()
+                .partition(|n| !self.is_source_or_node_bad(cand.channel, cand.sequence, n));
+
+            for wave in [clean_wave, bad_wave] {
+                if wave.is_empty() {
                     continue;
                 }
-                let budget_left = MAX_METADATA_BYTES_PER_NODE - used;
-                let verify_fut = self.fetch_and_verify_candidate(
-                    client,
-                    node,
-                    &cand,
-                    &ordered_nodes,
-                    target,
-                    &floor_path,
-                    budget_left,
-                    deadline,
-                    &mut cancel_rx,
-                );
-                match verify_fut.await {
-                    Ok((verified, bytes_read)) => {
+                let outcome = self
+                    .probe_candidate_nodes_concurrent(
+                        client,
+                        &cand,
+                        &ordered_nodes,
+                        &wave,
+                        target,
+                        &floor_path,
+                        &metadata_budget_by_node,
+                        &metadata_time_by_node,
+                        my_gen,
+                        &mut cancel_rx,
+                    )
+                    .await;
+
+                match outcome {
+                    WaveOutcome::Cancelled => {
+                        return Ok(self.snapshot());
+                    }
+                    WaveOutcome::NotForThisPlatform {
+                        node,
+                        bytes_read,
+                        elapsed,
+                        errors,
+                    } => {
                         *metadata_budget_by_node.entry(node.clone()).or_insert(0) += bytes_read;
+                        *metadata_time_by_node.entry(node).or_insert(Duration::ZERO) += elapsed;
+                        for (bad_node, err, b_read, b_elapsed) in errors {
+                            *metadata_budget_by_node.entry(bad_node.clone()).or_insert(0) += b_read;
+                            *metadata_time_by_node
+                                .entry(bad_node.clone())
+                                .or_insert(Duration::ZERO) += b_elapsed;
+                            *metadata_failures_by_node
+                                .entry(bad_node.clone())
+                                .or_insert(0) += 1;
+                            if err.code == ErrorCode::Timeout {
+                                had_timeout = true;
+                            }
+                            self.mark_bad_source(cand.channel, cand.sequence, &bad_node);
+                        }
+                        continue 'outer;
+                    }
+                    WaveOutcome::Verified {
+                        verified,
+                        bytes_read,
+                        elapsed,
+                        errors,
+                    } => {
+                        *metadata_budget_by_node
+                            .entry(verified.source_node.clone())
+                            .or_insert(0) += bytes_read;
+                        *metadata_time_by_node
+                            .entry(verified.source_node.clone())
+                            .or_insert(Duration::ZERO) += elapsed;
+                        for (bad_node, err, b_read, b_elapsed) in errors {
+                            *metadata_budget_by_node.entry(bad_node.clone()).or_insert(0) += b_read;
+                            *metadata_time_by_node
+                                .entry(bad_node.clone())
+                                .or_insert(Duration::ZERO) += b_elapsed;
+                            *metadata_failures_by_node
+                                .entry(bad_node.clone())
+                                .or_insert(0) += 1;
+                            if err.code == ErrorCode::Timeout {
+                                had_timeout = true;
+                            }
+                            self.mark_bad_source(cand.channel, cand.sequence, &bad_node);
+                        }
+                        self.clear_bad_node(cand.channel, cand.sequence, &verified.source_node);
                         let seq = verified.meta.manifest.sequence;
-                        if !force_download && let Some(fail_rec) = prefs_snapshot.failed_record(seq)
+                        if !force_download
+                            && prefs_snapshot.is_sequence_blocked_at(seq, now_unix)
+                            && let Some(fail_rec) = prefs_snapshot.failed_record(seq)
                         {
-                            // Skip failed sequences automatically so a newer/alternate valid set
-                            // can still be chosen, while remembering the newest failed one so the
-                            // user can tap "Try again".
+                            // Skip sequences currently blocked by rollback cooldown or skip limit
+                            // so a newer/alternate valid set can still be chosen, while remembering
+                            // the newest blocked one so the user can tap "Try again".
                             if newest_failed_verified.is_none() {
-                                newest_failed_verified = Some((verified, fail_rec));
+                                newest_failed_verified = Some((*verified, fail_rec));
                             }
                             continue 'outer;
                         }
-                        chosen = Some(verified);
+                        chosen = Some(*verified);
                         break 'outer;
                     }
-                    Err((err, bytes_read)) => {
-                        *metadata_budget_by_node.entry(node.clone()).or_insert(0) += bytes_read;
-                        if *cancel_rx.borrow() != my_gen {
-                            return Ok(self.snapshot());
+                    WaveOutcome::AllFailed(errors) => {
+                        for (bad_node, err, b_read, b_elapsed) in errors {
+                            *metadata_budget_by_node.entry(bad_node.clone()).or_insert(0) += b_read;
+                            *metadata_time_by_node
+                                .entry(bad_node.clone())
+                                .or_insert(Duration::ZERO) += b_elapsed;
+                            *metadata_failures_by_node
+                                .entry(bad_node.clone())
+                                .or_insert(0) += 1;
+                            if err.code == ErrorCode::Timeout {
+                                had_timeout = true;
+                            } else {
+                                had_unverifiable_candidate = true;
+                            }
+                            self.mark_bad_source(cand.channel, cand.sequence, &bad_node);
+                            refusal_detail = Some(format!("{bad_node}: {}", err.message));
                         }
-                        self.mark_bad_source(cand.channel, cand.sequence, node);
-                        refusal_detail = Some(format!("{node}: {}", err.message));
                     }
                 }
             }
@@ -1356,14 +1949,15 @@ impl UpdateManager {
                 st.last_checked_at = Some(checked_at);
                 st.checked_nodes = answered_nodes;
                 st.last_error = Some(fail_rec.reason);
-                st.last_error_detail = floor_recovery_detail;
+                st.last_error_detail = fail_rec.detail.or(floor_recovery_detail);
             }));
         }
 
         let Some(chosen) = chosen else {
             self.record_last_checked(&checked_at, None);
-            if answered_nodes.is_empty()
-                && !nodes.is_empty()
+            let had_no_answers = answered_nodes.is_empty() && !nodes.is_empty();
+            let check_incomplete = had_timeout || had_unverifiable_candidate;
+            if (had_no_answers || check_incomplete)
                 && let Some(existing) = prev_state.available.as_ref()
                 && existing.downloaded
                 && existing.sequence > floor
@@ -1376,10 +1970,28 @@ impl UpdateManager {
                         "Legion rebuilt a damaged update floor file at the running version."
                             .to_owned()
                     });
-                    st.last_error_detail = floor_recovery_detail.or(last_query_detail);
+                    st.last_error_detail = floor_recovery_detail
+                        .or(refusal_detail)
+                        .or(last_query_detail);
                 }));
             }
-            let had_no_answers = answered_nodes.is_empty() && !nodes.is_empty();
+            if check_incomplete {
+                return Ok(self.update_state(|st| {
+                    st.phase = "error".to_owned();
+                    st.available = None;
+                    st.manual_command = None;
+                    st.manual_sha256 = None;
+                    st.progress = None;
+                    st.metered_paused = false;
+                    st.failed_update = None;
+                    st.last_checked_at = Some(checked_at);
+                    st.checked_nodes = answered_nodes;
+                    st.last_error = Some("Could not check for updates right now.".to_owned());
+                    st.last_error_detail = floor_recovery_detail
+                        .or(refusal_detail)
+                        .or(last_query_detail);
+                }));
+            }
             return Ok(self.update_state(|st| {
                 st.phase = "up_to_date".to_owned();
                 st.available = None;
@@ -1545,13 +2157,7 @@ impl UpdateManager {
         });
 
         match self
-            .download_verified_candidate_with_fallback(
-                client,
-                &chosen,
-                my_gen,
-                &mut cancel_rx,
-                deadline,
-            )
+            .download_verified_candidate_with_fallback(client, &chosen, my_gen, &mut cancel_rx)
             .await
         {
             Ok((final_size, winning_node)) => {
@@ -1638,12 +2244,49 @@ impl UpdateManager {
         Ok((self.platform.manual_command_for(Some(art_path)), None))
     }
 
-    fn order_nodes_for(&self, channel: Channel, sequence: u64, nodes: &[String]) -> Vec<String> {
-        let bad = self.bad_sources.lock().unwrap_or_else(|p| p.into_inner());
+    fn prune_expired_reputation(&self, now: Instant) {
+        {
+            let mut bad = self.bad_sources.lock().unwrap_or_else(|p| p.into_inner());
+            bad.retain(|_, ts| now.saturating_duration_since(*ts) < BAD_NODE_TTL);
+        }
+        {
+            let mut bad = self.bad_nodes.lock().unwrap_or_else(|p| p.into_inner());
+            bad.retain(|_, ts| now.saturating_duration_since(*ts) < BAD_NODE_TTL);
+        }
+    }
+
+    fn is_node_deprioritized(&self, node: &str) -> bool {
+        let now = Instant::now();
+        let mut bad = self.bad_nodes.lock().unwrap_or_else(|p| p.into_inner());
+        bad.retain(|_, ts| now.saturating_duration_since(*ts) < BAD_NODE_TTL);
+        bad.contains_key(node)
+    }
+
+    fn is_source_or_node_bad(&self, channel: Channel, sequence: u64, node: &str) -> bool {
+        let now = Instant::now();
+        self.prune_expired_reputation(now);
+        let src_bad = self
+            .bad_sources
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&(channel, sequence, node.to_owned()));
+        if src_bad {
+            return true;
+        }
+        self.bad_nodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(node)
+    }
+
+    fn order_nodes_general(&self, nodes: &[String]) -> Vec<String> {
+        let now = Instant::now();
+        self.prune_expired_reputation(now);
+        let bad = self.bad_nodes.lock().unwrap_or_else(|p| p.into_inner());
         let mut good_list = Vec::new();
         let mut bad_list = Vec::new();
         for n in nodes {
-            if bad.contains(&(channel, sequence, n.clone())) {
+            if bad.contains_key(n) {
                 bad_list.push(n.clone());
             } else {
                 good_list.push(n.clone());
@@ -1653,12 +2296,174 @@ impl UpdateManager {
         good_list
     }
 
-    fn mark_bad_source(&self, channel: Channel, sequence: u64, node: &str) {
-        let mut bad = self.bad_sources.lock().unwrap_or_else(|p| p.into_inner());
+    fn order_nodes_for(&self, channel: Channel, sequence: u64, nodes: &[String]) -> Vec<String> {
+        let now = Instant::now();
+        self.prune_expired_reputation(now);
+        let bad_src = self.bad_sources.lock().unwrap_or_else(|p| p.into_inner());
+        let bad_nodes = self.bad_nodes.lock().unwrap_or_else(|p| p.into_inner());
+        let mut clean_list = Vec::new();
+        let mut node_bad_list = Vec::new();
+        let mut src_bad_list = Vec::new();
+        for n in nodes {
+            if bad_src.contains_key(&(channel, sequence, n.clone())) {
+                src_bad_list.push(n.clone());
+            } else if bad_nodes.contains_key(n) {
+                node_bad_list.push(n.clone());
+            } else {
+                clean_list.push(n.clone());
+            }
+        }
+        clean_list.extend(node_bad_list);
+        clean_list.extend(src_bad_list);
+        clean_list
+    }
+
+    fn mark_bad_node(&self, node: &str) {
+        let now = Instant::now();
+        let mut bad = self.bad_nodes.lock().unwrap_or_else(|p| p.into_inner());
+        bad.retain(|_, ts| now.saturating_duration_since(*ts) < BAD_NODE_TTL);
         if bad.len() >= 128 {
             bad.clear();
         }
-        bad.insert((channel, sequence, node.to_owned()));
+        bad.insert(node.to_owned(), now);
+    }
+
+    fn mark_bad_source(&self, channel: Channel, sequence: u64, node: &str) {
+        let now = Instant::now();
+        {
+            let mut bad = self.bad_sources.lock().unwrap_or_else(|p| p.into_inner());
+            bad.retain(|_, ts| now.saturating_duration_since(*ts) < BAD_NODE_TTL);
+            if bad.len() >= 128 {
+                bad.clear();
+            }
+            bad.insert((channel, sequence, node.to_owned()), now);
+        }
+        self.mark_bad_node(node);
+    }
+
+    fn clear_bad_node(&self, channel: Channel, sequence: u64, node: &str) {
+        self.bad_sources
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(channel, sequence, node.to_owned()));
+        self.bad_nodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(node);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn probe_candidate_nodes_concurrent(
+        &self,
+        client: &dyn UpdateSourceClient,
+        cand: &CandidateSource,
+        ordered_nodes: &[String],
+        wave_nodes: &[String],
+        target: TargetPlatform,
+        floor_path: &Path,
+        metadata_budget_by_node: &BTreeMap<String, usize>,
+        metadata_time_by_node: &BTreeMap<String, Duration>,
+        my_gen: u64,
+        cancel_rx: &mut watch::Receiver<u64>,
+    ) -> WaveOutcome {
+        let mut futs: Vec<(String, Option<CandidateProbeFuture<'_>>)> = wave_nodes
+            .iter()
+            .map(|node| {
+                let used_bytes = metadata_budget_by_node.get(node).copied().unwrap_or(0);
+                let budget_left = MAX_METADATA_BYTES_PER_NODE.saturating_sub(used_bytes);
+                let used_time = metadata_time_by_node
+                    .get(node)
+                    .copied()
+                    .unwrap_or(Duration::ZERO);
+                let time_left = METADATA_NODE_TOTAL_TIMEOUT.saturating_sub(used_time);
+                let deprioritized = self.is_source_or_node_bad(cand.channel, cand.sequence, node);
+                let cand_budget = if deprioritized {
+                    Duration::from_secs(5).min(time_left)
+                } else {
+                    METADATA_CANDIDATE_TIMEOUT.min(time_left)
+                };
+                let call_budget = if deprioritized {
+                    Duration::from_secs(3)
+                } else {
+                    METADATA_CALL_TIMEOUT
+                };
+                let node_deadline = Instant::now() + cand_budget;
+                let node_cancel = cancel_rx.clone();
+                let fut: CandidateProbeFuture<'_> = Box::pin(self.fetch_and_verify_candidate(
+                    client,
+                    node,
+                    cand,
+                    ordered_nodes,
+                    target,
+                    floor_path,
+                    budget_left,
+                    node_deadline,
+                    call_budget,
+                    my_gen,
+                    node_cancel,
+                ));
+                (node.clone(), Some(fut))
+            })
+            .collect();
+
+        let race_fut = async {
+            let mut errors: Vec<(String, AppError, usize, Duration)> = Vec::new();
+            let mut pending = futs.len();
+            std::future::poll_fn(|cx| {
+                for (node, slot) in &mut futs {
+                    let Some(fut) = slot.as_mut() else {
+                        continue;
+                    };
+                    if let Poll::Ready(res) = fut.as_mut().poll(cx) {
+                        *slot = None;
+                        pending -= 1;
+                        match res {
+                            Ok((verified, bytes_read, elapsed)) => {
+                                return Poll::Ready(WaveOutcome::Verified {
+                                    verified: Box::new(verified),
+                                    bytes_read,
+                                    elapsed,
+                                    errors: std::mem::take(&mut errors),
+                                });
+                            }
+                            Err(CandidateFetchError::NotForThisPlatform {
+                                bytes_read,
+                                elapsed,
+                            }) => {
+                                return Poll::Ready(WaveOutcome::NotForThisPlatform {
+                                    node: node.clone(),
+                                    bytes_read,
+                                    elapsed,
+                                    errors: std::mem::take(&mut errors),
+                                });
+                            }
+                            Err(CandidateFetchError::Cancelled) => {
+                                return Poll::Ready(WaveOutcome::Cancelled);
+                            }
+                            Err(CandidateFetchError::Failed {
+                                err,
+                                bytes_read,
+                                elapsed,
+                            }) => {
+                                errors.push((node.clone(), err, bytes_read, elapsed));
+                            }
+                        }
+                    }
+                }
+                if pending == 0 {
+                    Poll::Ready(WaveOutcome::AllFailed(std::mem::take(&mut errors)))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await
+        };
+
+        tokio::select! {
+            biased;
+            _ = cancel_rx.changed() => WaveOutcome::Cancelled,
+            outcome = race_fut => outcome,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1672,9 +2477,24 @@ impl UpdateManager {
         floor_path: &Path,
         budget_left: usize,
         deadline: Instant,
-        cancel_rx: &mut watch::Receiver<u64>,
-    ) -> Result<(VerifiedCandidate, usize), (AppError, usize)> {
+        call_timeout: Duration,
+        my_gen: u64,
+        mut cancel_rx: watch::Receiver<u64>,
+    ) -> Result<(VerifiedCandidate, usize, Duration), CandidateFetchError> {
+        let started = Instant::now();
         let mut read_total = 0usize;
+
+        let map_read_err = |err: AppError, read_total: usize, rx: &watch::Receiver<u64>| {
+            if *rx.borrow() != my_gen || err.code == ErrorCode::Cancelled {
+                CandidateFetchError::Cancelled
+            } else {
+                CandidateFetchError::Failed {
+                    err,
+                    bytes_read: read_total,
+                    elapsed: started.elapsed(),
+                }
+            }
+        };
 
         let sums_bytes = read_small_file(
             client,
@@ -1684,10 +2504,11 @@ impl UpdateManager {
             CHECKSUMS_FILENAME,
             MAX_SUMS_BYTES.min(budget_left),
             deadline,
-            cancel_rx,
+            call_timeout,
+            &mut cancel_rx,
         )
         .await
-        .map_err(|e| (e, read_total))?;
+        .map_err(|e| map_read_err(e, read_total, &cancel_rx))?;
         read_total += sums_bytes.len();
 
         let sig_budget = MAX_SIG_BYTES.min(budget_left.saturating_sub(read_total));
@@ -1699,25 +2520,29 @@ impl UpdateManager {
             SIGNATURE_FILENAME,
             sig_budget,
             deadline,
-            cancel_rx,
+            call_timeout,
+            &mut cancel_rx,
         )
         .await
-        .map_err(|e| (e, read_total))?;
+        .map_err(|e| map_read_err(e, read_total, &cancel_rx))?;
         read_total += sig_bytes.len();
 
-        let sig_text = String::from_utf8(sig_bytes).map_err(|err| {
-            (
-                AppError::new(
-                    ErrorCode::Denied,
-                    format!("{SIGNATURE_FILENAME} from {node} is not valid UTF-8: {err}"),
-                ),
-                read_total,
-            )
+        let sig_text = String::from_utf8(sig_bytes).map_err(|err| CandidateFetchError::Failed {
+            err: AppError::new(
+                ErrorCode::Denied,
+                format!("{SIGNATURE_FILENAME} from {node} is not valid UTF-8: {err}"),
+            ),
+            bytes_read: read_total,
+            elapsed: started.elapsed(),
         })?;
         // Verify signature before reading update.json so untrusted sets are refused immediately.
         self.anchors
             .verify_for_channel(cand.channel, &sums_bytes, &sig_text)
-            .map_err(|e| (AppError::new(ErrorCode::Denied, e.message), read_total))?;
+            .map_err(|e| CandidateFetchError::Failed {
+                err: AppError::new(ErrorCode::Denied, e.message),
+                bytes_read: read_total,
+                elapsed: started.elapsed(),
+            })?;
 
         let manifest_budget = MAX_MANIFEST_BYTES.min(budget_left.saturating_sub(read_total));
         let manifest_bytes = read_small_file(
@@ -1728,45 +2553,66 @@ impl UpdateManager {
             MANIFEST_FILENAME,
             manifest_budget,
             deadline,
-            cancel_rx,
+            call_timeout,
+            &mut cancel_rx,
         )
         .await
-        .map_err(|e| (e, read_total))?;
+        .map_err(|e| map_read_err(e, read_total, &cancel_rx))?;
         read_total += manifest_bytes.len();
 
         let meta = verify_set_metadata(&sums_bytes, &sig_text, &manifest_bytes, &self.anchors)
-            .map_err(|e| (AppError::new(e.code.into(), e.message), read_total))?;
-        let artifact = select_verified_artifact(&meta, self.current_sequence, floor_path, target)
-            .map_err(|e| (AppError::new(e.code.into(), e.message), read_total))?
-            .clone();
+            .map_err(|e| CandidateFetchError::Failed {
+                err: AppError::new(e.code.into(), e.message),
+                bytes_read: read_total,
+                elapsed: started.elapsed(),
+            })?;
+        let artifact =
+            match select_verified_artifact(&meta, self.current_sequence, floor_path, target) {
+                Ok(art) => art.clone(),
+                Err(e) if e.code == legion_link::proto::ErrorCode::NotFound => {
+                    // Valid signed set that simply carries no artifact for this OS/arch/kind (for
+                    // example a node-only update set). Do not blame the node or flag an error.
+                    return Err(CandidateFetchError::NotForThisPlatform {
+                        bytes_read: read_total,
+                        elapsed: started.elapsed(),
+                    });
+                }
+                Err(e) => {
+                    return Err(CandidateFetchError::Failed {
+                        err: AppError::new(e.code.into(), e.message),
+                        bytes_read: read_total,
+                        elapsed: started.elapsed(),
+                    });
+                }
+            };
 
         if meta.manifest.channel != cand.channel || meta.manifest.sequence != cand.sequence {
-            return Err((
-                AppError::new(
+            return Err(CandidateFetchError::Failed {
+                err: AppError::new(
                     ErrorCode::Denied,
                     format!(
                         "Update set from {node} claims {}/{} instead of {}/{}.",
                         meta.manifest.channel, meta.manifest.sequence, cand.channel, cand.sequence
                     ),
                 ),
-                read_total,
-            ));
+                bytes_read: read_total,
+                elapsed: started.elapsed(),
+            });
         }
 
         let expected_sha256 = meta
             .sums
             .get(&artifact.name)
-            .ok_or_else(|| {
-                (
-                    AppError::new(
-                        ErrorCode::Denied,
-                        format!(
-                            "Artifact {} is missing from {CHECKSUMS_FILENAME}.",
-                            artifact.name
-                        ),
+            .ok_or_else(|| CandidateFetchError::Failed {
+                err: AppError::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Artifact {} is missing from {CHECKSUMS_FILENAME}.",
+                        artifact.name
                     ),
-                    read_total,
-                )
+                ),
+                bytes_read: read_total,
+                elapsed: started.elapsed(),
             })?
             .to_owned();
 
@@ -1790,6 +2636,7 @@ impl UpdateManager {
                 all_nodes,
             },
             read_total,
+            started.elapsed(),
         ))
     }
 
@@ -1799,7 +2646,6 @@ impl UpdateManager {
         cand: &VerifiedCandidate,
         my_gen: u64,
         cancel_rx: &mut watch::Receiver<u64>,
-        deadline: Instant,
     ) -> Result<(u64, String), AppError> {
         let ordered = self.order_nodes_for(
             cand.meta.manifest.channel,
@@ -1810,7 +2656,10 @@ impl UpdateManager {
             ErrorCode::Failed,
             "No paired machine could serve the update artifact.",
         );
-        let mut poisoned_part_from_earlier_node = false;
+        // Overall download budget is separate from listing/metadata and scales with signed size
+        // and the rate floor, with headroom for multi-node fallback.
+        let overall_deadline =
+            Instant::now() + download_deadline_for_bytes(cand.artifact.size).saturating_mul(2);
 
         for node in ordered {
             if *cancel_rx.borrow() != my_gen {
@@ -1819,15 +2668,20 @@ impl UpdateManager {
                     "Update check was superseded by a newer request.",
                 ));
             }
-            // If an earlier node failed partway through, start fresh on the next node so bytes
-            // from a hostile first node can never poison the hash of a healthy second node.
-            let reset_part = poisoned_part_from_earlier_node;
             match self
-                .download_from_single_node(client, &node, cand, reset_part, deadline, cancel_rx)
+                .download_from_single_node(client, &node, cand, false, overall_deadline, cancel_rx)
                 .await
             {
-                Ok(final_size) => return Ok((final_size, node)),
-                Err(err) => {
+                Ok(final_size) => {
+                    self.clear_bad_node(
+                        cand.meta.manifest.channel,
+                        cand.meta.manifest.sequence,
+                        &node,
+                    );
+                    return Ok((final_size, node));
+                }
+                Err(DownloadFailure::Cancelled(err)) => return Err(err),
+                Err(DownloadFailure::Interrupted(err)) => {
                     if *cancel_rx.borrow() != my_gen {
                         return Err(err);
                     }
@@ -1837,7 +2691,73 @@ impl UpdateManager {
                         &node,
                     );
                     last_err = AppError::new(err.code, format!("{node}: {}", err.message));
-                    poisoned_part_from_earlier_node = true;
+                }
+                Err(DownloadFailure::HashMismatch { err, contributors }) => {
+                    if *cancel_rx.borrow() != my_gen {
+                        return Err(err);
+                    }
+                    // Final SHA-256 verification failed: `.part` was already discarded. Mark every
+                    // contributing node bad so we remember who wrote bytes into the failed file.
+                    let had_other_contributor = contributors.iter().any(|c| c != &node);
+                    for contributor in &contributors {
+                        self.mark_bad_source(
+                            cand.meta.manifest.channel,
+                            cand.meta.manifest.sequence,
+                            contributor,
+                        );
+                    }
+                    if !contributors.contains(&node) {
+                        self.mark_bad_source(
+                            cand.meta.manifest.channel,
+                            cand.meta.manifest.sequence,
+                            &node,
+                        );
+                    }
+                    last_err = AppError::new(err.code, format!("{node}: {}", err.message));
+
+                    // If this node only resumed partial bytes written by another node, retry THIS
+                    // node once from offset 0 before blaming it so a poisoned prefix from an
+                    // earlier node never permanently condemns a healthy node.
+                    if had_other_contributor {
+                        match self
+                            .download_from_single_node(
+                                client,
+                                &node,
+                                cand,
+                                true,
+                                overall_deadline,
+                                cancel_rx,
+                            )
+                            .await
+                        {
+                            Ok(final_size) => {
+                                self.clear_bad_node(
+                                    cand.meta.manifest.channel,
+                                    cand.meta.manifest.sequence,
+                                    &node,
+                                );
+                                return Ok((final_size, node));
+                            }
+                            Err(DownloadFailure::Cancelled(retry_err)) => return Err(retry_err),
+                            Err(
+                                DownloadFailure::Interrupted(retry_err)
+                                | DownloadFailure::HashMismatch { err: retry_err, .. },
+                            ) => {
+                                if *cancel_rx.borrow() != my_gen {
+                                    return Err(retry_err);
+                                }
+                                self.mark_bad_source(
+                                    cand.meta.manifest.channel,
+                                    cand.meta.manifest.sequence,
+                                    &node,
+                                );
+                                last_err = AppError::new(
+                                    retry_err.code,
+                                    format!("{node}: {}", retry_err.message),
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1850,18 +2770,18 @@ impl UpdateManager {
         node: &str,
         cand: &VerifiedCandidate,
         reset_part: bool,
-        deadline: Instant,
+        overall_deadline: Instant,
         cancel_rx: &mut watch::Receiver<u64>,
-    ) -> Result<u64, AppError> {
+    ) -> Result<u64, DownloadFailure> {
         let expected_size = cand.artifact.size;
         if expected_size == 0 || expected_size > MAX_DOWNLOAD_BYTES {
-            return Err(AppError::new(
+            return Err(DownloadFailure::Interrupted(AppError::new(
                 ErrorCode::Denied,
                 format!(
                     "Artifact {} declares invalid signed size {expected_size}.",
                     cand.artifact.name
                 ),
-            ));
+            )));
         }
 
         let set_dir = download_dir_for(
@@ -1869,58 +2789,54 @@ impl UpdateManager {
             cand.meta.manifest.channel,
             cand.meta.manifest.sequence,
         );
-        ensure_updates_root(&self.updates_dir)?;
-        ensure_updates_root(&self.updates_dir.join("downloads"))?;
-        ensure_updates_root(&set_dir)?;
+        ensure_updates_root(&self.updates_dir).map_err(DownloadFailure::Interrupted)?;
+        ensure_updates_root(&self.updates_dir.join("downloads"))
+            .map_err(DownloadFailure::Interrupted)?;
+        ensure_updates_root(&set_dir).map_err(DownloadFailure::Interrupted)?;
 
-        write_atomic(&set_dir.join(CHECKSUMS_FILENAME), &cand.sums_bytes)?;
-        write_atomic(&set_dir.join(SIGNATURE_FILENAME), cand.sig_text.as_bytes())?;
-        write_atomic(&set_dir.join(MANIFEST_FILENAME), &cand.manifest_bytes)?;
+        write_atomic(&set_dir.join(CHECKSUMS_FILENAME), &cand.sums_bytes)
+            .map_err(DownloadFailure::Interrupted)?;
+        write_atomic(&set_dir.join(SIGNATURE_FILENAME), cand.sig_text.as_bytes())
+            .map_err(DownloadFailure::Interrupted)?;
+        write_atomic(&set_dir.join(MANIFEST_FILENAME), &cand.manifest_bytes)
+            .map_err(DownloadFailure::Interrupted)?;
 
         let final_path = set_dir.join(&cand.artifact.name);
         let part_path = set_dir.join(format!("{}.part", cand.artifact.name));
-        let part_hash_marker = set_dir.join(format!("{}.part.sha256", cand.artifact.name));
+        let part_meta_path = set_dir.join(format!("{}.part.meta.json", cand.artifact.name));
+        let legacy_hash_marker = set_dir.join(format!("{}.part.sha256", cand.artifact.name));
+        let _ = fs::remove_file(&legacy_hash_marker);
 
         if reset_part {
             let _ = fs::remove_file(&part_path);
+            let _ = fs::remove_file(&part_meta_path);
         }
 
-        // Resume any leftover `.part` file only if it matches the exact expected SHA-256 and fits
-        // within the signed `expected_size`.
-        let mut offset = 0u64;
-        if part_path.is_file() {
-            let prev_hash = fs::read_to_string(&part_hash_marker).unwrap_or_default();
-            if prev_hash.trim() == cand.expected_sha256 {
-                offset = fs::symlink_metadata(&part_path)
-                    .ok()
-                    .filter(|m| m.file_type().is_file())
-                    .map_or(0, |m| m.len());
-                if offset > expected_size {
-                    offset = 0;
-                    let _ = fs::remove_file(&part_path);
-                }
-            } else {
-                let _ = fs::remove_file(&part_path);
-            }
-        }
-        write_atomic(&part_hash_marker, cand.expected_sha256.as_bytes())?;
+        let (mut offset, mut part_meta) = load_or_init_part_state(
+            &part_path,
+            &part_meta_path,
+            &cand.expected_sha256,
+            expected_size,
+        )
+        .map_err(DownloadFailure::Interrupted)?;
+        save_part_metadata(&part_meta_path, &part_meta).map_err(DownloadFailure::Interrupted)?;
 
         let mut file = if offset > 0 {
             OpenOptions::new()
                 .append(true)
                 .open(&part_path)
                 .map_err(|err| {
-                    AppError::new(
+                    DownloadFailure::Interrupted(AppError::new(
                         ErrorCode::Failed,
                         format!("Could not resume download {}: {err}", part_path.display()),
-                    )
+                    ))
                 })?
         } else {
             fs::File::create(&part_path).map_err(|err| {
-                AppError::new(
+                DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!("Could not create download {}: {err}", part_path.display()),
-                )
+                ))
             })?
         };
 
@@ -1933,19 +2849,32 @@ impl UpdateManager {
             });
         }
 
-        let max_chunks = (expected_size / MIN_EXPECTED_CHUNK_BYTES)
+        // Scale the attempt deadline with the remaining bytes and rate floor so an honest slow
+        // link (at or above MIN_PROGRESS_BYTES_PER_SEC) can always finish.
+        let remaining_at_start = expected_size.saturating_sub(offset);
+        let attempt_deadline = (Instant::now() + download_deadline_for_bytes(remaining_at_start))
+            .min(overall_deadline);
+
+        let max_chunks = (remaining_at_start / MIN_EXPECTED_CHUNK_BYTES)
             .saturating_add(64)
             .min(usize::MAX as u64) as usize;
         let started_at = Instant::now();
         let initial_offset = offset;
         let mut chunks_seen = 0usize;
+        let mut bytes_since_meta_save = 0u64;
+
+        let persist_progress = |file: &mut fs::File, meta: &PartMetadata| {
+            let _ = file.flush();
+            let _ = save_part_metadata(&part_meta_path, meta);
+        };
 
         while offset < expected_size {
             let remaining = expected_size - offset;
             let req_len = DOWNLOAD_CHUNK_BYTES.min(remaining);
-            let reply = run_cancellable(
+            let call_deadline = (Instant::now() + CHUNK_CALL_TIMEOUT).min(attempt_deadline);
+            let reply = match run_cancellable(
                 cancel_rx,
-                deadline,
+                call_deadline,
                 client.read_chunk(
                     node,
                     cand.meta.manifest.channel,
@@ -1955,71 +2884,97 @@ impl UpdateManager {
                     req_len,
                 ),
             )
-            .await??;
+            .await
+            {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(err)) => {
+                    persist_progress(&mut file, &part_meta);
+                    return Err(DownloadFailure::Interrupted(err));
+                }
+                Err(err) if err.code == ErrorCode::Cancelled => {
+                    persist_progress(&mut file, &part_meta);
+                    return Err(DownloadFailure::Cancelled(err));
+                }
+                Err(err) => {
+                    persist_progress(&mut file, &part_meta);
+                    return Err(DownloadFailure::Interrupted(err));
+                }
+            };
 
             if reply.offset != offset {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!(
                         "Unexpected chunk offset {} (expected {offset}) for {}.",
                         reply.offset, cand.artifact.name
                     ),
-                ));
+                )));
             }
             if reply.size != expected_size {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!(
                         "Reported size {} for {} does not match signed size {expected_size}.",
                         reply.size, cand.artifact.name
                     ),
-                ));
+                )));
             }
-            let chunk = BASE64.decode(reply.content.as_bytes()).map_err(|err| {
-                let _ = fs::remove_file(&part_path);
-                AppError::new(
-                    ErrorCode::Failed,
-                    format!("Invalid base64 chunk for {}: {err}", cand.artifact.name),
-                )
-            })?;
+            let chunk = match BASE64.decode(reply.content.as_bytes()) {
+                Ok(c) => c,
+                Err(err) => {
+                    persist_progress(&mut file, &part_meta);
+                    return Err(DownloadFailure::Interrupted(AppError::new(
+                        ErrorCode::Failed,
+                        format!("Invalid base64 chunk for {}: {err}", cand.artifact.name),
+                    )));
+                }
+            };
             if chunk.len() as u64 != reply.length {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!("Inconsistent chunk length for {}.", cand.artifact.name),
-                ));
+                )));
             }
             if chunk.len() as u64 > req_len {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!(
                         "Chunk length {} exceeded requested {req_len} bytes for {}.",
                         chunk.len(),
                         cand.artifact.name
                     ),
-                ));
+                )));
             }
             if offset.saturating_add(chunk.len() as u64) > expected_size {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!(
                         "Download exceeded signed size ({expected_size} bytes) for {}.",
                         cand.artifact.name
                     ),
-                ));
+                )));
             }
             if !chunk.is_empty() {
-                file.write_all(&chunk).map_err(|err| {
-                    AppError::new(
+                let write_start = offset;
+                if let Err(err) = file.write_all(&chunk) {
+                    persist_progress(&mut file, &part_meta);
+                    return Err(DownloadFailure::Interrupted(AppError::new(
                         ErrorCode::Failed,
                         format!("Could not write downloaded update: {err}"),
-                    )
-                })?;
+                    )));
+                }
                 offset = offset.saturating_add(chunk.len() as u64);
+                record_part_range(&mut part_meta, write_start, offset, node);
+                bytes_since_meta_save = bytes_since_meta_save.saturating_add(chunk.len() as u64);
+                if bytes_since_meta_save >= DOWNLOAD_CHUNK_BYTES {
+                    let _ = save_part_metadata(&part_meta_path, &part_meta);
+                    bytes_since_meta_save = 0;
+                }
                 self.update_state(|st| {
                     st.progress = Some(DownloadProgress {
                         downloaded_bytes: offset,
@@ -2033,54 +2988,58 @@ impl UpdateManager {
                 break;
             }
             if reply.eof {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!("Download ended early at {offset} bytes (expected {expected_size})."),
-                ));
+                )));
             }
             if chunk.is_empty() {
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     "Download stopped making progress.",
-                ));
+                )));
             }
             if chunks_seen >= max_chunks {
-                let _ = fs::remove_file(&part_path);
-                return Err(AppError::new(
+                persist_progress(&mut file, &part_meta);
+                return Err(DownloadFailure::Interrupted(AppError::new(
                     ErrorCode::Failed,
                     format!(
                         "Download used too many tiny chunks ({chunks_seen}) for {}.",
                         cand.artifact.name
                     ),
-                ));
+                )));
             }
             let elapsed = started_at.elapsed();
             if elapsed >= PROGRESS_GRACE_WINDOW {
                 let received = offset.saturating_sub(initial_offset);
                 let min_bytes = (elapsed.as_secs_f64() * MIN_PROGRESS_BYTES_PER_SEC as f64) as u64;
                 if received < min_bytes {
-                    return Err(AppError::new(
+                    persist_progress(&mut file, &part_meta);
+                    return Err(DownloadFailure::Interrupted(AppError::new(
                         ErrorCode::Timeout,
                         format!(
                             "Download rate fell below {} KiB/s.",
                             MIN_PROGRESS_BYTES_PER_SEC / 1024
                         ),
-                    ));
+                    )));
                 }
             }
         }
 
-        file.sync_all().map_err(|err| {
-            AppError::new(
+        if let Err(err) = file.sync_all() {
+            persist_progress(&mut file, &part_meta);
+            return Err(DownloadFailure::Interrupted(AppError::new(
                 ErrorCode::Failed,
                 format!("Could not flush downloaded update: {err}"),
-            )
-        })?;
+            )));
+        }
         drop(file);
+        let _ = save_part_metadata(&part_meta_path, &part_meta);
 
         // Stream-verify the complete `.part` file against signed size + SHA-256 on a blocking
-        // thread before renaming into place.
+        // thread before renaming into place. Only discard `.part` when this final verification fails.
         let meta_clone = cand.meta.clone();
         let art_name = cand.artifact.name.clone();
         let part_check = part_path.clone();
@@ -2089,25 +3048,34 @@ impl UpdateManager {
         })
         .await
         .map_err(|err| {
-            AppError::new(
+            DownloadFailure::Interrupted(AppError::new(
                 ErrorCode::Internal,
                 format!("Artifact verification stopped unexpectedly: {err}"),
-            )
+            ))
         })?;
 
         if let Err(err) = verify_res {
+            let mut contributors = Vec::new();
+            for range in &part_meta.ranges {
+                if !contributors.contains(&range.node) {
+                    contributors.push(range.node.clone());
+                }
+            }
             let _ = fs::remove_file(&part_path);
-            let _ = fs::remove_file(&part_hash_marker);
-            return Err(AppError::new(ErrorCode::Denied, err.message));
+            let _ = fs::remove_file(&part_meta_path);
+            return Err(DownloadFailure::HashMismatch {
+                err: AppError::new(ErrorCode::Denied, err.message),
+                contributors,
+            });
         }
 
         fs::rename(&part_path, &final_path).map_err(|err| {
-            AppError::new(
+            DownloadFailure::Interrupted(AppError::new(
                 ErrorCode::Failed,
                 format!("Could not finalize downloaded update: {err}"),
-            )
+            ))
         })?;
-        let _ = fs::remove_file(&part_hash_marker);
+        let _ = fs::remove_file(&part_meta_path);
         Ok(offset)
     }
 
@@ -2129,8 +3097,23 @@ impl UpdateManager {
         }
     }
 
+    #[cfg(any(target_os = "android", test))]
     fn record_pending_install(&self, avail: &AvailableUpdateInfo) -> Result<(), AppError> {
+        self.record_started_attempt_and_pending_at(avail, "swapped", now_unix_secs())
+    }
+
+    /// Atomically persists (with fsync) that attempt N of `avail.sequence` started at `now_unix`,
+    /// updates the global `last_install_attempt_at` timestamp for the 1-hour automatic floor, and
+    /// records `pending_install` at `stage` (`"staged"` on desktop before spawning a supervisor,
+    /// `"swapped"` on Android).
+    fn record_started_attempt_and_pending_at(
+        &self,
+        avail: &AvailableUpdateInfo,
+        stage: &str,
+        now_unix: i64,
+    ) -> Result<(), AppError> {
         let mut prefs = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        prefs.record_started_attempt(avail.sequence, now_unix);
         prefs.pending_install = Some(PendingInstallRecord {
             channel: avail.channel,
             version: avail.version.clone(),
@@ -2138,9 +3121,12 @@ impl UpdateManager {
             sequence: avail.sequence,
             notes: avail.notes.clone(),
             from_sequence: self.current_sequence,
-            started_at: now_rfc3339_utc(),
+            started_at: format_rfc3339_utc(now_unix),
+            stage: stage.to_owned(),
         });
         save_prefs(&self.updates_dir.join("prefs.json"), &prefs)?;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        desktop::write_pending_stage(&self.updates_dir, avail.sequence, stage)?;
         let mut guard = self.prefs.lock().unwrap_or_else(|p| p.into_inner());
         *guard = prefs;
         Ok(())
@@ -2148,9 +3134,24 @@ impl UpdateManager {
 
     fn clear_pending_install(&self) {
         let mut prefs = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        if prefs.pending_install.take().is_some()
-            && save_prefs(&self.updates_dir.join("prefs.json"), &prefs).is_ok()
-        {
+        if let Some(pending) = prefs.pending_install.take() {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            desktop::clear_pending_stage(&self.updates_dir, pending.sequence);
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let _ = pending;
+            if save_prefs(&self.updates_dir.join("prefs.json"), &prefs).is_ok() {
+                let mut guard = self.prefs.lock().unwrap_or_else(|p| p.into_inner());
+                *guard = prefs;
+            }
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn clear_pending_and_refund_attempt(&self, sequence: u64) {
+        let mut prefs = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        prefs.pending_install = None;
+        prefs.decrement_started_attempt(sequence);
+        if save_prefs(&self.updates_dir.join("prefs.json"), &prefs).is_ok() {
             let mut guard = self.prefs.lock().unwrap_or_else(|p| p.into_inner());
             *guard = prefs;
         }
@@ -2165,14 +3166,23 @@ impl UpdateManager {
         sequence: u64,
         reason: &str,
     ) -> FailedUpdateRecord {
+        let mut prefs = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let prev_attempts = prefs
+            .failed_updates
+            .iter()
+            .find(|r| r.sequence == sequence)
+            .map_or(0, |r| r.attempts);
         let record = FailedUpdateRecord {
             channel,
             version: version.to_owned(),
             sequence,
             reason: reason.to_owned(),
             failed_at: now_rfc3339_utc(),
+            attempts: prev_attempts.saturating_add(1),
+            skipped: true,
+            retry_after: None,
+            detail: None,
         };
-        let mut prefs = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
         prefs.pending_install = None;
         prefs.record_failure(record.clone());
         if save_prefs(&self.updates_dir.join("prefs.json"), &prefs).is_ok() {
@@ -2182,23 +3192,79 @@ impl UpdateManager {
         record
     }
 
-    fn clear_failed_sequence(&self, sequence: u64) {
+    /// Clears any recorded failure/skip state for `sequence` (invoked when the user taps "Try
+    /// again") and restores `phase = "ready"` if that sequence is already downloaded on disk.
+    pub fn clear_failed_sequence(&self, sequence: u64) {
         let mut prefs = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        if prefs.has_failed(sequence) {
+        let had_entry = prefs.has_failed(sequence)
+            || prefs
+                .rolled_back
+                .as_ref()
+                .is_some_and(|r| r.sequence == sequence);
+        if had_entry {
             prefs.clear_failure(sequence);
             if save_prefs(&self.updates_dir.join("prefs.json"), &prefs).is_ok() {
                 let mut guard = self.prefs.lock().unwrap_or_else(|p| p.into_inner());
                 *guard = prefs;
             }
         }
+        self.update_state(|st| {
+            if st
+                .failed_update
+                .as_ref()
+                .is_some_and(|f| f.sequence == sequence)
+            {
+                st.failed_update = None;
+                st.last_error = None;
+                st.last_error_detail = None;
+            }
+            if st
+                .rolled_back
+                .as_ref()
+                .is_some_and(|r| r.sequence == sequence)
+            {
+                st.rolled_back = None;
+            }
+            if st.phase == "error"
+                && st
+                    .available
+                    .as_ref()
+                    .is_some_and(|a| a.sequence == sequence && a.downloaded)
+                && st.can_self_install
+            {
+                st.phase = "ready".to_owned();
+            }
+        });
     }
 
-    /// Returns whether `sequence` already failed previously on this device.
+    /// Returns whether `sequence` has any failure record on this device.
     pub fn sequence_failed_before(&self, sequence: u64) -> bool {
         self.prefs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .has_failed(sequence)
+    }
+
+    /// Returns the number of currently active tracked external operations (such as camera scanning).
+    pub fn external_operations_count(&self) -> usize {
+        self.external_operations.load(Ordering::Acquire)
+    }
+
+    /// Returns the reason automatic installation of `sequence` is currently blocked at `now_unix`,
+    /// or `None` when automatic installation (including a single retry >= 1 hour after a first
+    /// rollback) is permitted.
+    pub fn auto_install_block_reason_at(
+        &self,
+        sequence: u64,
+        now_unix: i64,
+    ) -> Option<&'static str> {
+        if has_unread_supervisor_records(&self.updates_dir) {
+            return Some("unread_supervisor_record");
+        }
+        self.prefs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .auto_block_reason_at(sequence, now_unix)
     }
 
     /// Re-verifies the currently ready downloaded update on disk and returns its verified info,
@@ -2244,19 +3310,129 @@ impl UpdateManager {
         Ok((avail, expected_size, expected_sha256, verified_art))
     }
 
-    /// Synchronous hook called when the last desktop window closes: if automatic updates are on
-    /// and a verified update is ready (and has not failed before), stages it via copy-while-hashing
-    /// and spawns the detached swapper in `verify_only` mode so the new build verifies startup and
-    /// exits cleanly without popping a window open.
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    pub fn try_spawn_desktop_close_install(&self) -> bool {
+    /// Tracks an in-flight native operation outside [`Backend`] (such as Android QR camera
+    /// scanning during pairing) for the lifetime of the returned guard so automatic updates do not
+    /// fire while it is active.
+    pub fn track_external_operation(&self) -> ExternalOpGuard {
+        self.external_operations.fetch_add(1, Ordering::AcqRel);
+        ExternalOpGuard(Arc::clone(&self.external_operations))
+    }
+
+    /// Evaluates natively whether an automatic update install is allowed right now.
+    ///
+    /// The native side—never the web page—enforces all safety rules:
+    /// - Page-initiated requests are rate-limited to at most once every [`AUTO_INSTALL_RATE_LIMIT`].
+    /// - Any in-flight native call, pairing, transfer, or content stream (`active_ops > 0`) refuses
+    ///   automatic installation across every trigger (`"startup"`, `"background"`, and `"close"`).
+    /// - `"startup"` is allowed only within [`STARTUP_AUTO_INSTALL_WINDOW`] of launch and strictly
+    ///   before `on_app_ready` has recorded the first full screen.
+    /// - `"background"` is allowed only on Android.
+    /// - `"close"` is accepted only from the native desktop window-close handler (`from_page == false`).
+    pub fn evaluate_auto_install_gate(
+        &self,
+        trigger: &str,
+        active_ops: usize,
+        from_page: bool,
+    ) -> Result<(), &'static str> {
+        self.evaluate_auto_install_gate_at(trigger, active_ops, from_page, now_unix_secs())
+    }
+
+    /// Deterministic variant of [`Self::evaluate_auto_install_gate`] evaluating rollback retry
+    /// cooldowns at `now_unix` (seconds since Unix epoch).
+    pub fn evaluate_auto_install_gate_at(
+        &self,
+        trigger: &str,
+        active_ops: usize,
+        from_page: bool,
+        now_unix: i64,
+    ) -> Result<(), &'static str> {
+        let now = Instant::now();
+        if from_page {
+            let mut last = self
+                .last_auto_install_request
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(prev) = *last
+                && now.saturating_duration_since(prev) < AUTO_INSTALL_RATE_LIMIT
+            {
+                return Err("rate_limited");
+            }
+            *last = Some(now);
+        }
+
+        let total_active_ops =
+            active_ops.saturating_add(self.external_operations.load(Ordering::Acquire));
+        if total_active_ops > 0 {
+            return Err("native_activity_in_flight");
+        }
+
+        match trigger {
+            "startup" => {
+                if self.first_screen_shown.load(Ordering::SeqCst) {
+                    return Err("first_screen_already_shown");
+                }
+                if now.saturating_duration_since(self.launched_at) > STARTUP_AUTO_INSTALL_WINDOW {
+                    return Err("startup_window_elapsed");
+                }
+            }
+            "background" => {
+                if self.os != Os::Android {
+                    return Err("background_android_only");
+                }
+            }
+            "close" => {
+                if from_page {
+                    return Err("close_native_only");
+                }
+            }
+            _ => return Err("unsupported_trigger"),
+        }
+
+        if self.current_sequence == 0 {
+            return Err("sequence_zero");
+        }
+        if has_unread_supervisor_records(&self.updates_dir) {
+            return Err("unread_supervisor_record");
+        }
         let st = self.snapshot();
         let ready_or_checking_downloaded = st.phase == "ready"
             || (st.phase == "checking" && st.available.as_ref().is_some_and(|a| a.downloaded));
-        if !st.auto_update
-            || !ready_or_checking_downloaded
-            || !st.can_self_install
-            || self.current_sequence == 0
+        if !st.auto_update || !st.can_self_install || !ready_or_checking_downloaded {
+            return Err("not_ready");
+        }
+        if let Some(avail) = st.available.as_ref()
+            && let Some(reason) = self.auto_install_block_reason_at(avail.sequence, now_unix)
+        {
+            return Err(reason);
+        }
+        if let Some(reason) = self
+            .prefs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .hourly_floor_block_reason_at(now_unix)
+        {
+            return Err(reason);
+        }
+        Ok(())
+    }
+
+    /// Synchronous hook called when the last desktop window closes: if automatic updates are on,
+    /// no native operations are in flight, and a verified update is ready (and not blocked by
+    /// unread supervisor records, rollback cooldown, skip limit, or the 1-hour floor), stages it
+    /// via copy-while-hashing and spawns the detached swapper in `verify_only` mode so the new
+    /// build verifies startup and exits cleanly without popping a window open.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn try_spawn_desktop_close_install(&self, active_ops: usize) -> bool {
+        self.try_spawn_desktop_close_install_at(active_ops, now_unix_secs())
+    }
+
+    /// Deterministic variant of [`Self::try_spawn_desktop_close_install`] evaluating attempt floors
+    /// and cooldowns at `now_unix`.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn try_spawn_desktop_close_install_at(&self, active_ops: usize, now_unix: i64) -> bool {
+        if self
+            .evaluate_auto_install_gate_at("close", active_ops, false, now_unix)
+            .is_err()
         {
             return false;
         }
@@ -2265,17 +3441,23 @@ impl UpdateManager {
         else {
             return false;
         };
-        if self.sequence_failed_before(avail.sequence) {
+        if self
+            .auto_install_block_reason_at(avail.sequence, now_unix)
+            .is_some()
+        {
             return false;
         }
-        self.spawn_desktop_install_inner(
-            &avail,
-            &artifact_path,
-            &expected_sha256,
-            expected_size,
-            true,
+        matches!(
+            self.spawn_desktop_install_inner_at(
+                &avail,
+                &artifact_path,
+                &expected_sha256,
+                expected_size,
+                true,
+                now_unix,
+            ),
+            Ok(true)
         )
-        .is_ok()
     }
 
     /// Installs the verified update on desktop hosts and returns `true` when the caller should exit
@@ -2356,7 +3538,11 @@ impl UpdateManager {
             })??
         };
 
-        if auto_triggered && self.sequence_failed_before(avail.sequence) {
+        if auto_triggered
+            && self
+                .auto_install_block_reason_at(avail.sequence, now_unix_secs())
+                .is_some()
+        {
             return Ok((self.snapshot(), false));
         }
 
@@ -2380,14 +3566,14 @@ impl UpdateManager {
                 Err(AppError::new(ErrorCode::Unsupported, reason.clone()))
             }
             _ => {
-                self.spawn_desktop_install_inner(
+                let spawned = self.spawn_desktop_install_inner(
                     &avail,
                     &artifact_path,
                     &expected_sha256,
                     expected_size,
                     false,
                 )?;
-                Ok((self.snapshot(), true))
+                Ok((self.snapshot(), spawned))
             }
         }
     }
@@ -2400,17 +3586,63 @@ impl UpdateManager {
         expected_sha256: &str,
         expected_size: u64,
         verify_only: bool,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
+        self.spawn_desktop_install_inner_at(
+            avail,
+            artifact_path,
+            expected_sha256,
+            expected_size,
+            verify_only,
+            now_unix_secs(),
+        )
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn spawn_desktop_install_inner_at(
+        &self,
+        avail: &AvailableUpdateInfo,
+        artifact_path: &Path,
+        expected_sha256: &str,
+        expected_size: u64,
+        verify_only: bool,
+        now_unix: i64,
+    ) -> Result<bool, AppError> {
+        // Exclusive update lock: only one instance may stage, record pending_install, and spawn
+        // the supervisor for an update. A second instance seeing an active lock does nothing.
+        let Some(lock_guard) =
+            desktop::try_acquire_update_lock(&self.updates_dir, avail.sequence, verify_only)?
+        else {
+            return Ok(false);
+        };
+
         let ready_marker = self
             .updates_dir
             .join(format!("started-{}.ok", avail.sequence));
         let rollback_marker = self
             .updates_dir
             .join(format!("rollback-{}.json", avail.sequence));
+        let deferred_marker = self
+            .updates_dir
+            .join(format!("deferred-{}.json", avail.sequence));
         let rollback_json = serde_json::to_string(&RollbackInfo {
             version: avail.version.clone(),
             sequence: avail.sequence,
-            reason: "The new version did not start cleanly, so Legion kept the previous copy."
+            reason: ROLLBACK_REASON.to_owned(),
+            detail: None,
+            install_state: Some("restored_previous".to_owned()),
+        })
+        .unwrap_or_else(|_| "{}".to_owned());
+        let rollback_kept_new_json = serde_json::to_string(&RollbackInfo {
+            version: avail.version.clone(),
+            sequence: avail.sequence,
+            reason: ROLLBACK_REASON.to_owned(),
+            detail: None,
+            install_state: Some("new_kept_files_in_use".to_owned()),
+        })
+        .unwrap_or_else(|_| "{}".to_owned());
+        let deferred_json = serde_json::to_string(&DeferredInstallRecord {
+            sequence: avail.sequence,
+            reason: "Install files were still in use; deferred without changing the install."
                 .to_owned(),
         })
         .unwrap_or_else(|_| "{}".to_owned());
@@ -2419,14 +3651,14 @@ impl UpdateManager {
         match &self.platform {
             #[cfg(unix)]
             PlatformEnv::Desktop(DesktopInstall::LinuxAppImage { appimage_path }) => {
-                self.record_pending_install(avail)?;
+                self.record_started_attempt_and_pending_at(avail, "staged", now_unix)?;
                 self.update_state(|st| {
                     st.phase = "installing".to_owned();
                     st.failed_update = None;
                     st.last_error = None;
                     st.last_error_detail = None;
                 });
-                if let Err(err) = desktop::stage_and_spawn_linux_appimage(
+                let sup_pid = match desktop::stage_and_spawn_linux_appimage(
                     artifact_path,
                     expected_sha256,
                     expected_size,
@@ -2434,39 +3666,47 @@ impl UpdateManager {
                     &ready_marker,
                     &rollback_marker,
                     rollback_json,
+                    rollback_kept_new_json,
+                    &deferred_marker,
+                    deferred_json,
+                    avail.sequence,
                     DEFAULT_STARTUP_WAIT_SECS,
                     verify_only,
                 ) {
-                    self.clear_pending_install();
-                    let rec = self.record_failed_update(
-                        avail.channel,
-                        &avail.version,
-                        avail.sequence,
-                        "Legion could not start the update helper.",
-                    );
-                    self.update_state(|st| {
-                        st.phase = "error".to_owned();
-                        st.failed_update = Some(rec);
-                        st.last_error = Some("Legion could not start the update.".to_owned());
-                        st.last_error_detail = Some(err.message.clone());
-                    });
-                    return Err(err);
-                }
-                Ok(())
+                    Ok(pid) => pid,
+                    Err(err) => {
+                        self.clear_pending_install();
+                        let rec = self.record_failed_update(
+                            avail.channel,
+                            &avail.version,
+                            avail.sequence,
+                            "Legion could not start the update helper.",
+                        );
+                        self.update_state(|st| {
+                            st.phase = "error".to_owned();
+                            st.failed_update = Some(rec);
+                            st.last_error = Some("Legion could not start the update.".to_owned());
+                            st.last_error_detail = Some(err.message.clone());
+                        });
+                        return Err(err);
+                    }
+                };
+                let _ = lock_guard.hand_over_to_supervisor(sup_pid);
+                Ok(true)
             }
             #[cfg(unix)]
             PlatformEnv::Desktop(DesktopInstall::MacosAppBundle {
                 bundle_dir,
                 executable_rel,
             }) => {
-                self.record_pending_install(avail)?;
+                self.record_started_attempt_and_pending_at(avail, "staged", now_unix)?;
                 self.update_state(|st| {
                     st.phase = "installing".to_owned();
                     st.failed_update = None;
                     st.last_error = None;
                     st.last_error_detail = None;
                 });
-                if let Err(err) = desktop::stage_and_spawn_macos_bundle(
+                let sup_pid = match desktop::stage_and_spawn_macos_bundle(
                     artifact_path,
                     expected_sha256,
                     expected_size,
@@ -2476,32 +3716,40 @@ impl UpdateManager {
                     &ready_marker,
                     &rollback_marker,
                     rollback_json,
+                    rollback_kept_new_json,
+                    &deferred_marker,
+                    deferred_json,
+                    avail.sequence,
                     DEFAULT_STARTUP_WAIT_SECS,
                     verify_only,
                 ) {
-                    self.clear_pending_install();
-                    let rec = self.record_failed_update(
-                        avail.channel,
-                        &avail.version,
-                        avail.sequence,
-                        "Legion could not unpack the macOS update.",
-                    );
-                    self.update_state(|st| {
-                        st.phase = "error".to_owned();
-                        st.failed_update = Some(rec);
-                        st.last_error = Some("Legion could not start the update.".to_owned());
-                        st.last_error_detail = Some(err.message.clone());
-                    });
-                    return Err(err);
-                }
-                Ok(())
+                    Ok(pid) => pid,
+                    Err(err) => {
+                        self.clear_pending_install();
+                        let rec = self.record_failed_update(
+                            avail.channel,
+                            &avail.version,
+                            avail.sequence,
+                            "Legion could not unpack the macOS update.",
+                        );
+                        self.update_state(|st| {
+                            st.phase = "error".to_owned();
+                            st.failed_update = Some(rec);
+                            st.last_error = Some("Legion could not start the update.".to_owned());
+                            st.last_error_detail = Some(err.message.clone());
+                        });
+                        return Err(err);
+                    }
+                };
+                let _ = lock_guard.hand_over_to_supervisor(sup_pid);
+                Ok(true)
             }
             #[cfg(windows)]
             PlatformEnv::Desktop(DesktopInstall::WindowsNsis {
                 install_dir,
                 exe_path,
             }) => {
-                self.record_pending_install(avail)?;
+                self.record_started_attempt_and_pending_at(avail, "staged", now_unix)?;
                 self.update_state(|st| {
                     st.phase = "installing".to_owned();
                     st.failed_update = None;
@@ -2511,7 +3759,7 @@ impl UpdateManager {
                 let backup_dir = self
                     .updates_dir
                     .join(format!("backup-{}", self.current_sequence));
-                if let Err(err) = desktop::stage_and_spawn_windows_nsis(
+                let sup_pid = match desktop::stage_and_spawn_windows_nsis(
                     artifact_path,
                     expected_sha256,
                     expected_size,
@@ -2522,25 +3770,33 @@ impl UpdateManager {
                     &ready_marker,
                     &rollback_marker,
                     rollback_json,
+                    rollback_kept_new_json,
+                    &deferred_marker,
+                    deferred_json,
+                    avail.sequence,
                     DEFAULT_STARTUP_WAIT_SECS,
                     verify_only,
                 ) {
-                    self.clear_pending_install();
-                    let rec = self.record_failed_update(
-                        avail.channel,
-                        &avail.version,
-                        avail.sequence,
-                        "Legion could not start the Windows installer.",
-                    );
-                    self.update_state(|st| {
-                        st.phase = "error".to_owned();
-                        st.failed_update = Some(rec);
-                        st.last_error = Some("Legion could not start the update.".to_owned());
-                        st.last_error_detail = Some(err.message.clone());
-                    });
-                    return Err(err);
-                }
-                Ok(())
+                    Ok(pid) => pid,
+                    Err(err) => {
+                        self.clear_pending_install();
+                        let rec = self.record_failed_update(
+                            avail.channel,
+                            &avail.version,
+                            avail.sequence,
+                            "Legion could not start the Windows installer.",
+                        );
+                        self.update_state(|st| {
+                            st.phase = "error".to_owned();
+                            st.failed_update = Some(rec);
+                            st.last_error = Some("Legion could not start the update.".to_owned());
+                            st.last_error_detail = Some(err.message.clone());
+                        });
+                        return Err(err);
+                    }
+                };
+                let _ = lock_guard.hand_over_to_supervisor(sup_pid);
+                Ok(true)
             }
             _ => Err(AppError::new(
                 ErrorCode::Unsupported,
@@ -2630,7 +3886,11 @@ impl UpdateManager {
             })??
         };
 
-        if auto_triggered && self.sequence_failed_before(avail.sequence) {
+        if auto_triggered
+            && self
+                .auto_install_block_reason_at(avail.sequence, now_unix_secs())
+                .is_some()
+        {
             return Ok(self.snapshot());
         }
 
@@ -2690,7 +3950,7 @@ impl UpdateManager {
         match outcome.status.as_str() {
             "installed" => Ok(self.snapshot()),
             "cancelled" | "deferred_background" => {
-                self.clear_pending_install();
+                self.clear_pending_and_refund_attempt(avail.sequence);
                 Ok(self.update_state(|st| {
                     st.phase = "ready".to_owned();
                     st.last_error = None;
@@ -2698,7 +3958,7 @@ impl UpdateManager {
                 }))
             }
             "needs_permission" => {
-                self.clear_pending_install();
+                self.clear_pending_and_refund_attempt(avail.sequence);
                 Ok(self.update_state(|st| {
                     st.phase = "needs_permission".to_owned();
                     st.last_error = Some(
@@ -2736,6 +3996,171 @@ impl UpdateManager {
     }
 }
 
+type ListNodeOutcome = (String, Result<Result<NodeUpdateList, AppError>, ()>);
+type ListNodeFuture<'a> = BoxFuture<'a, ListNodeOutcome>;
+type CandidateProbeFuture<'a> =
+    BoxFuture<'a, Result<(VerifiedCandidate, usize, Duration), CandidateFetchError>>;
+
+enum WaveOutcome {
+    Verified {
+        verified: Box<VerifiedCandidate>,
+        bytes_read: usize,
+        elapsed: Duration,
+        errors: Vec<(String, AppError, usize, Duration)>,
+    },
+    NotForThisPlatform {
+        node: String,
+        bytes_read: usize,
+        elapsed: Duration,
+        errors: Vec<(String, AppError, usize, Duration)>,
+    },
+    AllFailed(Vec<(String, AppError, usize, Duration)>),
+    Cancelled,
+}
+
+async fn join_all_futures<T>(mut futs: Vec<BoxFuture<'_, T>>) -> Vec<T> {
+    let mut results: Vec<Option<T>> = (0..futs.len()).map(|_| None).collect();
+    let mut remaining = futs.len();
+    std::future::poll_fn(|cx| {
+        for (i, fut) in futs.iter_mut().enumerate() {
+            if results[i].is_none()
+                && let Poll::Ready(val) = fut.as_mut().poll(cx)
+            {
+                results[i] = Some(val);
+                remaining -= 1;
+            }
+        }
+        if remaining == 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    results.into_iter().flatten().collect()
+}
+
+fn load_or_init_part_state(
+    part_path: &Path,
+    meta_path: &Path,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> Result<(u64, PartMetadata), AppError> {
+    let fresh = || PartMetadata {
+        sha256: expected_sha256.to_owned(),
+        expected_size,
+        ranges: Vec::new(),
+    };
+    if !part_path.is_file() {
+        let _ = fs::remove_file(meta_path);
+        return Ok((0, fresh()));
+    }
+    let Ok(raw_meta) = fs::read(meta_path) else {
+        let _ = fs::remove_file(part_path);
+        let _ = fs::remove_file(meta_path);
+        return Ok((0, fresh()));
+    };
+    let Ok(mut meta) = serde_json::from_slice::<PartMetadata>(&raw_meta) else {
+        let _ = fs::remove_file(part_path);
+        let _ = fs::remove_file(meta_path);
+        return Ok((0, fresh()));
+    };
+    if meta.sha256 != expected_sha256 || meta.expected_size != expected_size {
+        let _ = fs::remove_file(part_path);
+        let _ = fs::remove_file(meta_path);
+        return Ok((0, fresh()));
+    }
+    let file_len = fs::symlink_metadata(part_path)
+        .ok()
+        .filter(|m| m.file_type().is_file())
+        .map_or(0, |m| m.len());
+    if file_len > expected_size {
+        let _ = fs::remove_file(part_path);
+        let _ = fs::remove_file(meta_path);
+        return Ok((0, fresh()));
+    }
+    // Validate contiguous provenance ranges starting at 0.
+    let mut meta_end = 0u64;
+    for r in &meta.ranges {
+        if r.start != meta_end || r.end < r.start || r.end > expected_size {
+            let _ = fs::remove_file(part_path);
+            let _ = fs::remove_file(meta_path);
+            return Ok((0, fresh()));
+        }
+        meta_end = r.end;
+    }
+    if file_len > meta_end {
+        // Truncate unattributed tail bytes after an abrupt crash so every byte has provenance.
+        let f = OpenOptions::new()
+            .write(true)
+            .open(part_path)
+            .map_err(|err| {
+                AppError::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Could not align partial download {}: {err}",
+                        part_path.display()
+                    ),
+                )
+            })?;
+        f.set_len(meta_end).map_err(|err| {
+            AppError::new(
+                ErrorCode::Failed,
+                format!(
+                    "Could not align partial download {}: {err}",
+                    part_path.display()
+                ),
+            )
+        })?;
+        return Ok((meta_end, meta));
+    }
+    if file_len < meta_end {
+        // Clamp provenance ranges to actual on-disk length.
+        let mut clamped = Vec::new();
+        for mut r in meta.ranges {
+            if r.start >= file_len {
+                break;
+            }
+            if r.end > file_len {
+                r.end = file_len;
+            }
+            if r.end > r.start {
+                clamped.push(r);
+            }
+        }
+        meta.ranges = clamped;
+    }
+    Ok((file_len, meta))
+}
+
+fn record_part_range(meta: &mut PartMetadata, start: u64, end: u64, node: &str) {
+    if end <= start {
+        return;
+    }
+    if let Some(last) = meta.ranges.last_mut()
+        && last.node == node
+        && last.end == start
+    {
+        last.end = end;
+        return;
+    }
+    meta.ranges.push(PartRange {
+        start,
+        end,
+        node: node.to_owned(),
+    });
+}
+
+fn save_part_metadata(path: &Path, meta: &PartMetadata) -> Result<(), AppError> {
+    let bytes = serde_json::to_vec(meta).map_err(|err| {
+        AppError::new(
+            ErrorCode::Internal,
+            format!("Could not serialize partial download metadata: {err}"),
+        )
+    })?;
+    write_atomic(path, &bytes)
+}
+
 async fn run_cancellable<T, F>(
     cancel_rx: &mut watch::Receiver<u64>,
     deadline: Instant,
@@ -2748,7 +4173,7 @@ where
     if now >= deadline {
         return Err(AppError::new(
             ErrorCode::Timeout,
-            "Update check exceeded its overall time budget.",
+            "Update request exceeded its time budget.",
         ));
     }
     let remaining = deadline.saturating_duration_since(now);
@@ -2761,7 +4186,7 @@ where
         res = tokio::time::timeout(remaining, fut) => res.map_err(|_| {
             AppError::new(
                 ErrorCode::Timeout,
-                "Update check exceeded its overall time budget.",
+                "Update request exceeded its time budget.",
             )
         }),
     }
@@ -2776,6 +4201,7 @@ async fn read_small_file(
     name: &str,
     max_bytes: usize,
     deadline: Instant,
+    call_timeout: Duration,
     cancel_rx: &mut watch::Receiver<u64>,
 ) -> Result<Vec<u8>, AppError> {
     if max_bytes == 0 {
@@ -2784,14 +4210,16 @@ async fn read_small_file(
             format!("Metadata budget exceeded while reading {name} from {node}."),
         ));
     }
+    let started_at = Instant::now();
     let mut out = Vec::new();
     let mut offset = 0u64;
     let mut chunks = 0usize;
     loop {
         let req_len = DOWNLOAD_CHUNK_BYTES.min((max_bytes as u64).saturating_sub(offset));
+        let call_deadline = (Instant::now() + call_timeout).min(deadline);
         let reply = run_cancellable(
             cancel_rx,
-            deadline,
+            call_deadline,
             client.read_chunk(node, channel, sequence, name, offset, req_len),
         )
         .await??;
@@ -2860,6 +4288,19 @@ async fn read_small_file(
                 ErrorCode::Denied,
                 format!("Reading {name} from {node} exceeded the small-file chunk cap."),
             ));
+        }
+        let elapsed = started_at.elapsed();
+        if elapsed >= METADATA_PROGRESS_GRACE {
+            let min_bytes = (elapsed.as_secs_f64() * MIN_METADATA_BYTES_PER_SEC as f64) as u64;
+            if offset < min_bytes {
+                return Err(AppError::new(
+                    ErrorCode::Timeout,
+                    format!(
+                        "Metadata download rate for {name} from {node} fell below {} KiB/s.",
+                        MIN_METADATA_BYTES_PER_SEC / 1024
+                    ),
+                ));
+            }
         }
     }
     Ok(out)
@@ -3023,6 +4464,241 @@ fn cleanup_other_downloads(updates_dir: &Path, keep_channel: Channel, keep_seque
     }
 }
 
+fn has_unread_supervisor_records(updates_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(updates_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        if (s.starts_with("rollback-") || s.starts_with("deferred-")) && s.ends_with(".json") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Reconciles supervisor outcome markers (`stale-lock.json`, `deferred-*.json`, `rollback-*.json`),
+/// interrupted `pending_install` records, and leftover staging files.
+///
+/// Called both in [`UpdateManager::with_config_at`] (before anything can ask the auto-install gate)
+/// and again in [`UpdateManager::on_app_ready_at`]. Leaves a matching `pending_install`
+/// (`pending.sequence == current_sequence`) intact so `on_app_ready_at` confirms it into
+/// `just_updated` only after first paint.
+fn reconcile_supervisor_records_at(
+    updates_dir: &Path,
+    current_sequence: u64,
+    platform: &PlatformEnv,
+    prefs: &mut PersistedPrefs,
+    now_unix: i64,
+) -> (bool, bool, Option<String>) {
+    let mut prefs_dirty = false;
+    let mut saw_rollback = false;
+    let mut rollback_detail: Option<String> = None;
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        if desktop::take_stale_lock_notice(updates_dir).is_some() {
+            prefs.stale_update_notice = Some(desktop::STALE_UPDATE_NOTICE.to_owned());
+            prefs_dirty = true;
+        }
+        if let PlatformEnv::Desktop(desk) = platform {
+            desktop::cleanup_interrupted_staging_files(updates_dir, desk);
+        }
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let _ = platform;
+
+    // 0. Consume all clean pre-swap deferral records left by a desktop supervisor.
+    while let Some((defer_path, deferred)) = read_and_take_deferred(updates_dir) {
+        let _ = fs::remove_file(defer_path);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        desktop::clear_pending_stage(updates_dir, deferred.sequence);
+        if prefs
+            .pending_install
+            .as_ref()
+            .is_some_and(|p| p.sequence == deferred.sequence)
+        {
+            prefs.pending_install = None;
+            prefs.decrement_started_attempt(deferred.sequence);
+            prefs_dirty = true;
+        }
+    }
+
+    // 1. Consume all desktop rollback markers left by a detached supervisor.
+    while let Some((rb_path, rb)) = read_and_take_rollback(updates_dir) {
+        let _ = fs::remove_file(rb_path);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        desktop::clear_pending_stage(updates_dir, rb.sequence);
+
+        // If the running copy IS the sequence named by the rollback record (for example
+        // `new_kept_files_in_use` or `new_kept_backup_missing` where the new copy is running fine),
+        // the install succeeded: never show a rollback notice about keeping a previous copy.
+        if current_sequence > 0 && rb.sequence == current_sequence {
+            prefs.rolled_back = None;
+            prefs.stale_update_notice = None;
+            prefs.failed_sequences.retain(|&s| s > current_sequence);
+            prefs
+                .failed_updates
+                .retain(|r| r.sequence > current_sequence);
+            prefs
+                .started_attempts
+                .retain(|r| r.sequence > current_sequence);
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                let _ = fs::remove_file(updates_dir.join(desktop::NEW_START_LOG_FILENAME));
+                let _ = fs::remove_file(updates_dir.join(desktop::ROLLBACK_PS_FILENAME));
+            }
+            prefs_dirty = true;
+            continue;
+        }
+
+        let channel = prefs
+            .pending_install
+            .as_ref()
+            .map_or(Channel::Stable, |p| p.channel);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let rb = {
+            let captured = desktop::read_captured_startup_detail(updates_dir);
+            let state_note = match rb.install_state.as_deref() {
+                Some("new_kept_files_in_use") => Some(
+                    "Previous copy could not be restored because install files were in use; kept new copy intact."
+                        .to_owned(),
+                ),
+                Some("new_kept_backup_missing") => Some(
+                    "Previous copy backup was missing; kept new copy in place.".to_owned(),
+                ),
+                Some("restore_incomplete") => Some(
+                    "Previous copy could not be fully restored after a rollback error.".to_owned(),
+                ),
+                _ => None,
+            };
+            let detail = match (rb.detail.or(state_note), captured) {
+                (Some(a), Some(b)) if !a.contains(&b) => Some(format!("{a}\n{b}")),
+                (Some(a), _) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            RollbackInfo { detail, ..rb }
+        };
+        let prev_attempts = prefs
+            .failed_updates
+            .iter()
+            .find(|r| r.sequence == rb.sequence)
+            .map_or(0, |r| r.attempts);
+        let started_count = prefs.started_attempts_count(rb.sequence);
+        let attempts = prev_attempts.saturating_add(1).max(started_count);
+        prefs.ensure_started_attempts_at_least(rb.sequence, attempts, now_unix);
+        let skipped = attempts >= MAX_AUTO_ROLLBACK_ATTEMPTS;
+        let retry_after = if skipped {
+            None
+        } else {
+            Some(format_rfc3339_utc(
+                now_unix.saturating_add(ROLLBACK_RETRY_COOLDOWN_SECS),
+            ))
+        };
+        rollback_detail = rb.detail.clone();
+        prefs.record_failure(FailedUpdateRecord {
+            channel,
+            version: rb.version.clone(),
+            sequence: rb.sequence,
+            reason: if rb.reason.trim().is_empty() {
+                ROLLBACK_REASON.to_owned()
+            } else {
+                rb.reason.clone()
+            },
+            failed_at: format_rfc3339_utc(now_unix),
+            attempts,
+            skipped,
+            retry_after,
+            detail: rb.detail.clone(),
+        });
+        prefs.pending_install = None;
+        prefs.rolled_back = Some(rb);
+        prefs_dirty = true;
+        saw_rollback = true;
+    }
+
+    // Clear any stale persisted rollback notice if the running copy now IS that sequence.
+    if current_sequence > 0
+        && prefs
+            .rolled_back
+            .as_ref()
+            .is_some_and(|r| r.sequence == current_sequence)
+    {
+        prefs.rolled_back = None;
+        prefs.failed_sequences.retain(|&s| s > current_sequence);
+        prefs
+            .failed_updates
+            .retain(|r| r.sequence > current_sequence);
+        prefs
+            .started_attempts
+            .retain(|r| r.sequence > current_sequence);
+        prefs_dirty = true;
+    }
+
+    // 2. Reconcile a mismatched `pending_install` when no rollback/deferral file existed and no
+    //    active update lock is held. If the install never progressed past `"staged"` or
+    //    `"swapping"` (old copy is still running), treat it as a clean deferral (decrementing the
+    //    started-attempt count and recording NO failure); only `"swapped"`/`"started"` without a
+    //    confirmed new sequence counts as a failed start.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let lock_active = desktop::inspect_active_update_lock(updates_dir).is_some();
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let lock_active = false;
+
+    if !lock_active
+        && !saw_rollback
+        && current_sequence > 0
+        && let Some(pending) = prefs.pending_install.clone()
+        && pending.sequence != current_sequence
+    {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let effective_stage = {
+            let s = desktop::read_pending_stage(updates_dir, pending.sequence)
+                .unwrap_or_else(|| pending.stage.clone());
+            desktop::clear_pending_stage(updates_dir, pending.sequence);
+            s
+        };
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let effective_stage = pending.stage.clone();
+
+        if matches!(effective_stage.as_str(), "staged" | "swapping") {
+            prefs.pending_install = None;
+            prefs.decrement_started_attempt(pending.sequence);
+            prefs_dirty = true;
+        } else {
+            let reason = format!(
+                "Version {} did not take effect after installation, so Legion will not retry it automatically.",
+                pending.version
+            );
+            let prev_attempts = prefs
+                .failed_updates
+                .iter()
+                .find(|r| r.sequence == pending.sequence)
+                .map_or(0, |r| r.attempts);
+            let started_count = prefs.started_attempts_count(pending.sequence);
+            let attempts = prev_attempts.saturating_add(1).max(started_count);
+            prefs.ensure_started_attempts_at_least(pending.sequence, attempts, now_unix);
+            prefs.record_failure(FailedUpdateRecord {
+                channel: pending.channel,
+                version: pending.version,
+                sequence: pending.sequence,
+                reason,
+                failed_at: format_rfc3339_utc(now_unix),
+                attempts,
+                skipped: true,
+                retry_after: None,
+                detail: None,
+            });
+            prefs.pending_install = None;
+            prefs_dirty = true;
+        }
+    }
+
+    (prefs_dirty, saw_rollback, rollback_detail)
+}
+
 fn read_and_take_rollback(updates_dir: &Path) -> Option<(PathBuf, RollbackInfo)> {
     let entries = fs::read_dir(updates_dir).ok()?;
     for entry in entries.flatten() {
@@ -3030,10 +4706,30 @@ fn read_and_take_rollback(updates_dir: &Path) -> Option<(PathBuf, RollbackInfo)>
         let Some(s) = name.to_str() else { continue };
         if s.starts_with("rollback-") && s.ends_with(".json") {
             let path = entry.path();
-            if let Ok(bytes) = fs::read(&path)
-                && let Ok(info) = serde_json::from_slice::<RollbackInfo>(&bytes)
-            {
-                return Some((path, info));
+            if let Ok(bytes) = fs::read(&path) {
+                let slice = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+                if let Ok(info) = serde_json::from_slice::<RollbackInfo>(slice) {
+                    return Some((path, info));
+                }
+            }
+            let _ = fs::remove_file(&path);
+        }
+    }
+    None
+}
+
+fn read_and_take_deferred(updates_dir: &Path) -> Option<(PathBuf, DeferredInstallRecord)> {
+    let entries = fs::read_dir(updates_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        if s.starts_with("deferred-") && s.ends_with(".json") {
+            let path = entry.path();
+            if let Ok(bytes) = fs::read(&path) {
+                let slice = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+                if let Ok(info) = serde_json::from_slice::<DeferredInstallRecord>(slice) {
+                    return Some((path, info));
+                }
             }
             let _ = fs::remove_file(&path);
         }
@@ -3151,11 +4847,15 @@ pub fn current_arch() -> Arch {
     }
 }
 
-fn now_rfc3339_utc() -> String {
-    let secs = SystemTime::now()
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs() as i64
+}
+
+fn format_rfc3339_utc(unix_secs: i64) -> String {
+    let secs = unix_secs.max(0) as u64;
     let days = (secs / 86_400) as i64;
     let sod = secs % 86_400;
     let hour = sod / 3_600;
@@ -3172,6 +4872,46 @@ fn now_rfc3339_utc() -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = y + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn parse_rfc3339_utc(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || (bytes[10] != b'T' && bytes[10] != b't')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || !s.ends_with('Z')
+    {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: i64 = s.get(11..13)?.parse().ok()?;
+    let minute: i64 = s.get(14..16)?.parse().ok()?;
+    let second: i64 = s.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if month > 2 { month - 3 } else { month + 9 } as u64;
+    let doy = (153 * mp + 2) / 5 + (day as u64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + (doe as i64) - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn now_rfc3339_utc() -> String {
+    format_rfc3339_utc(now_unix_secs())
 }
 
 #[cfg(test)]
@@ -3797,54 +5537,56 @@ mod tests {
             );
         }
 
-        // .deb downloads and copies-while-hashing into private `<updates>/verified/` directory.
-        let dir = tempfile::tempdir().unwrap();
-        let deb_bytes = b"fake-deb-package-bytes";
-        let mut fleet = FakeFleet::new();
-        fleet.add_set(
-            "tower",
-            build_fake_set(
-                Channel::Stable,
-                "0.2.0",
-                202611250210,
-                "legion-app_0.2.0_amd64.deb",
-                Os::Linux,
-                Arch::X86_64,
-                InstallKind::Deb,
-                deb_bytes,
-                &rel_sk,
-            ),
-        );
-        let mgr = UpdateManager::with_config(
-            dir.path().join("updates"),
-            anchors,
-            Os::Linux,
-            Arch::X86_64,
-            PlatformEnv::Desktop(DesktopInstall::LinuxDeb {
-                package: "legion-app".to_owned(),
-            }),
-            "0.1.0".to_owned(),
-            "old".to_owned(),
-            202611250200,
-        );
-        let st = mgr
-            .check_with_client(&fleet, &nodes, false, false)
-            .await
-            .unwrap();
-        assert_eq!(st.phase, "manual", "{st:?}");
-        let cmd = st.manual_command.unwrap();
-        assert!(cmd.starts_with("sudo apt-get install "));
-        assert!(
-            cmd.contains("/verified/legion-app_0.2.0_amd64.deb"),
-            "{cmd}"
-        );
-        assert_eq!(
-            st.manual_sha256.as_deref(),
-            Some(sha256_bytes(deb_bytes).as_str())
-        );
+        // .deb installs exist only on Linux (`sudo apt-get install` with POSIX quoting and Unix
+        // `0700` private directory permissions), so test the live staging path on Unix hosts.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let deb_bytes = b"fake-deb-package-bytes";
+            let mut fleet = FakeFleet::new();
+            fleet.add_set(
+                "tower",
+                build_fake_set(
+                    Channel::Stable,
+                    "0.2.0",
+                    202611250210,
+                    "legion-app_0.2.0_amd64.deb",
+                    Os::Linux,
+                    Arch::X86_64,
+                    InstallKind::Deb,
+                    deb_bytes,
+                    &rel_sk,
+                ),
+            );
+            let mgr = UpdateManager::with_config(
+                dir.path().join("updates"),
+                anchors,
+                Os::Linux,
+                Arch::X86_64,
+                PlatformEnv::Desktop(DesktopInstall::LinuxDeb {
+                    package: "legion-app".to_owned(),
+                }),
+                "0.1.0".to_owned(),
+                "old".to_owned(),
+                202611250200,
+            );
+            let st = mgr
+                .check_with_client(&fleet, &nodes, false, false)
+                .await
+                .unwrap();
+            assert_eq!(st.phase, "manual", "{st:?}");
+            let cmd = st.manual_command.unwrap();
+            assert!(cmd.starts_with("sudo apt-get install "));
+            assert!(
+                cmd.contains("/verified/legion-app_0.2.0_amd64.deb"),
+                "{cmd}"
+            );
+            assert_eq!(
+                st.manual_sha256.as_deref(),
+                Some(sha256_bytes(deb_bytes).as_str())
+            );
             let vdir_mode = fs::metadata(dir.path().join("updates/verified"))
                 .unwrap()
                 .permissions()
@@ -4173,8 +5915,15 @@ mod tests {
             .check_with_client(&f2, &nodes, false, false)
             .await
             .unwrap();
-        assert_eq!(st2.phase, "up_to_date");
+        assert_eq!(
+            st2.phase, "error",
+            "unverifiable candidate must not report up_to_date: {st2:?}"
+        );
         assert!(st2.available.is_none());
+        assert_eq!(
+            st2.last_error.as_deref(),
+            Some("Could not check for updates right now.")
+        );
 
         let mut f3 = FakeFleet::new();
         let mut set3 = build_fake_set(
@@ -4197,8 +5946,15 @@ mod tests {
             .check_with_client(&f3, &nodes, false, false)
             .await
             .unwrap();
-        assert_eq!(st3.phase, "up_to_date");
+        assert_eq!(
+            st3.phase, "error",
+            "tampered manifest must not report up_to_date: {st3:?}"
+        );
         assert!(st3.available.is_none());
+        assert_eq!(
+            st3.last_error.as_deref(),
+            Some("Could not check for updates right now.")
+        );
 
         let mut f4 = FakeFleet::new();
         let mut set4 = build_fake_set(
@@ -4226,5 +5982,3059 @@ mod tests {
                 .join("Legion.apk")
                 .exists()
         );
+    }
+
+    struct DelayedFleet {
+        sets: HashMap<String, Vec<FakeSet>>,
+        list_delay: HashMap<String, Duration>,
+        /// `(chunk_size, delay_per_chunk)` for metadata files per node.
+        meta_throttle: HashMap<String, (usize, Duration)>,
+        /// `(chunk_size, delay_per_chunk)` for artifact files per node.
+        art_throttle: HashMap<String, (usize, Duration)>,
+        /// Optional byte limit after which `node` disconnects on artifact reads.
+        disconnect_after_offset: HashMap<String, u64>,
+        disconnect_used: Mutex<HashMap<String, bool>>,
+        meta_reads_by_node: Mutex<HashMap<String, usize>>,
+    }
+
+    impl DelayedFleet {
+        fn new() -> Self {
+            Self {
+                sets: HashMap::new(),
+                list_delay: HashMap::new(),
+                meta_throttle: HashMap::new(),
+                art_throttle: HashMap::new(),
+                disconnect_after_offset: HashMap::new(),
+                disconnect_used: Mutex::new(HashMap::new()),
+                meta_reads_by_node: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn add_set(&mut self, node: &str, set: FakeSet) {
+            self.sets.entry(node.to_owned()).or_default().push(set);
+        }
+
+        fn meta_reads(&self, node: &str) -> usize {
+            self.meta_reads_by_node
+                .lock()
+                .unwrap()
+                .get(node)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl UpdateSourceClient for DelayedFleet {
+        fn list_sets(&self, node: &str) -> BoxFuture<'_, Result<NodeUpdateList, AppError>> {
+            let delay = self.list_delay.get(node).copied();
+            let listed = self.sets.get(node).map(|sets| NodeUpdateList {
+                node: node.to_owned(),
+                sets: sets
+                    .iter()
+                    .map(|s| NodeListedSet {
+                        channel: s.channel,
+                        sequence: s.sequence,
+                        artifacts: s.artifacts.clone(),
+                    })
+                    .collect(),
+            });
+            let node_owned = node.to_owned();
+            Box::pin(async move {
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+                listed.ok_or_else(|| {
+                    AppError::new(ErrorCode::Unreachable, format!("{node_owned} offline"))
+                })
+            })
+        }
+
+        fn read_chunk(
+            &self,
+            node: &str,
+            channel: Channel,
+            sequence: u64,
+            name: &str,
+            offset: u64,
+            length: u64,
+        ) -> BoxFuture<'_, Result<UpdateReadChunk, AppError>> {
+            let is_meta = matches!(
+                name,
+                CHECKSUMS_FILENAME | SIGNATURE_FILENAME | MANIFEST_FILENAME
+            );
+            if is_meta {
+                *self
+                    .meta_reads_by_node
+                    .lock()
+                    .unwrap()
+                    .entry(node.to_owned())
+                    .or_insert(0) += 1;
+            } else if let Some(&limit) = self.disconnect_after_offset.get(node)
+                && offset >= limit
+            {
+                let mut used = self.disconnect_used.lock().unwrap();
+                if !used.get(node).copied().unwrap_or(false) {
+                    used.insert(node.to_owned(), true);
+                    return Box::pin(async {
+                        Err(AppError::new(
+                            ErrorCode::Unreachable,
+                            "Simulated mid-stream disconnect",
+                        ))
+                    });
+                }
+            }
+            let throttle = if is_meta {
+                self.meta_throttle.get(node).copied()
+            } else {
+                self.art_throttle.get(node).copied()
+            };
+            let bytes = self
+                .sets
+                .get(node)
+                .and_then(|sets| {
+                    sets.iter()
+                        .find(|s| s.channel == channel && s.sequence == sequence)
+                })
+                .and_then(|s| s.files.get(name))
+                .cloned();
+            let name_owned = name.to_owned();
+            Box::pin(async move {
+                let (cap, delay) = throttle.unwrap_or((512 * 1024, Duration::ZERO));
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let bytes = bytes.ok_or_else(|| {
+                    AppError::new(ErrorCode::NotFound, format!("missing {name_owned}"))
+                })?;
+                let start = (offset as usize).min(bytes.len());
+                let take = (length as usize)
+                    .min(cap)
+                    .min(bytes.len().saturating_sub(start));
+                let slice = &bytes[start..start + take];
+                Ok(UpdateReadChunk {
+                    size: bytes.len() as u64,
+                    offset,
+                    length: slice.len() as u64,
+                    content: BASE64.encode(slice),
+                    eof: start + take >= bytes.len(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_metadata_from_one_node_does_not_freeze_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x91);
+        let (evil_sk, _) = keypair(0x92);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let mut fleet = DelayedFleet::new();
+        // Hostile node advertises higher bogus sequence and stalls 25s per 1-byte metadata chunk.
+        fleet.add_set(
+            "evil",
+            build_fake_set(
+                Channel::Stable,
+                "9.9.9",
+                202611250300,
+                "Legion.apk",
+                Os::Android,
+                Arch::Universal,
+                InstallKind::Apk,
+                b"evil",
+                &evil_sk,
+            ),
+        );
+        fleet
+            .meta_throttle
+            .insert("evil".to_owned(), (1, Duration::from_secs(25)));
+        // Honest node holds genuine update at lower sequence.
+        fleet.add_set(
+            "honest",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion.apk",
+                Os::Android,
+                Arch::Universal,
+                InstallKind::Apk,
+                b"real-apk-payload",
+                &rel_sk,
+            ),
+        );
+
+        let mgr = UpdateManager::with_config(
+            dir.path().join("updates"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+
+        let t0 = Instant::now();
+        let st = mgr
+            .check_with_client(
+                &fleet,
+                &["evil".to_owned(), "honest".to_owned()],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(st.phase, "ready", "{st:?}");
+        assert_eq!(st.available.as_ref().unwrap().sequence, 202611250210);
+        assert_eq!(st.available.as_ref().unwrap().source_node, "honest");
+        assert!(
+            elapsed <= METADATA_CANDIDATE_TIMEOUT,
+            "slow metadata node must be cut off within candidate budget, took {elapsed:?}"
+        );
+        assert!(mgr.is_node_deprioritized("evil"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_metadata_on_genuine_set_raced_concurrently_wins_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x93);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let genuine = build_fake_set(
+            Channel::Stable,
+            "0.2.0",
+            202611250210,
+            "Legion.apk",
+            Os::Android,
+            Arch::Universal,
+            InstallKind::Apk,
+            b"genuine-apk-payload",
+            &rel_sk,
+        );
+        let mut fleet = DelayedFleet::new();
+        fleet.add_set("evil", genuine.clone());
+        fleet.add_set("honest", genuine);
+        fleet
+            .meta_throttle
+            .insert("evil".to_owned(), (1, Duration::from_secs(25)));
+
+        let mgr = UpdateManager::with_config(
+            dir.path().join("updates"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+
+        let t0 = Instant::now();
+        let st = mgr
+            .check_with_client(
+                &fleet,
+                &["evil".to_owned(), "honest".to_owned()],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(st.phase, "ready", "{st:?}");
+        assert_eq!(st.available.as_ref().unwrap().source_node, "honest");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "concurrent metadata probe should finish immediately via honest node, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_metadata_rate_floor_aborts_trickle_and_never_reports_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x94);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let mut fleet = DelayedFleet::new();
+        fleet.add_set(
+            "trickler",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion.apk",
+                Os::Android,
+                Arch::Universal,
+                InstallKind::Apk,
+                b"payload",
+                &rel_sk,
+            ),
+        );
+        // 1 byte per second is faster than METADATA_CALL_TIMEOUT (8s) so only the metadata rate
+        // floor catches it promptly.
+        fleet
+            .meta_throttle
+            .insert("trickler".to_owned(), (1, Duration::from_secs(1)));
+
+        let mgr = UpdateManager::with_config(
+            dir.path().join("updates"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+
+        let t0 = Instant::now();
+        let st = mgr
+            .check_with_client(&fleet, &["trickler".to_owned()], false, false)
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(
+            st.phase, "error",
+            "timed-out check must never report up_to_date: {st:?}"
+        );
+        assert_eq!(
+            st.last_error.as_deref(),
+            Some("Could not check for updates right now.")
+        );
+        assert!(
+            elapsed <= Duration::from_secs(5),
+            "metadata rate floor should abort 1 B/s trickle quickly, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bad_node_is_deprioritized_across_checks_and_forgotten_after_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x95);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let set1 = build_fake_set(
+            Channel::Stable,
+            "0.2.0",
+            202611250210,
+            "Legion.apk",
+            Os::Android,
+            Arch::Universal,
+            InstallKind::Apk,
+            b"payload-1",
+            &rel_sk,
+        );
+        let mut fleet = DelayedFleet::new();
+        fleet.add_set("slow", set1.clone());
+        fleet.add_set("fast", set1);
+        fleet
+            .list_delay
+            .insert("slow".to_owned(), Duration::from_secs(60));
+
+        let mgr = UpdateManager::with_config(
+            dir.path().join("updates"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+
+        // Check 1: slow node times out on list_sets (concurrently with fast node), fast succeeds.
+        let t0 = Instant::now();
+        let st1 = mgr
+            .check_with_client(
+                &fleet,
+                &["slow".to_owned(), "fast".to_owned()],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(st1.phase, "ready", "{st1:?}");
+        assert!(t0.elapsed() <= LIST_NODE_TIMEOUT + Duration::from_secs(1));
+        assert!(mgr.is_node_deprioritized("slow"));
+
+        let ordered = mgr.order_nodes_for(
+            Channel::Stable,
+            202611250211,
+            &["slow".to_owned(), "fast".to_owned()],
+        );
+        assert_eq!(ordered, vec!["fast".to_owned(), "slow".to_owned()]);
+
+        // Check 2 (within TTL): slow recovers on listing, but clean wave tries fast FIRST without
+        // touching slow's metadata!
+        fleet.list_delay.remove("slow");
+        let set2 = build_fake_set(
+            Channel::Stable,
+            "0.2.1",
+            202611250211,
+            "Legion.apk",
+            Os::Android,
+            Arch::Universal,
+            InstallKind::Apk,
+            b"payload-2",
+            &rel_sk,
+        );
+        fleet.add_set("slow", set2.clone());
+        fleet.add_set("fast", set2);
+        let slow_reads_before = fleet.meta_reads("slow");
+        let st2 = mgr
+            .check_with_client(
+                &fleet,
+                &["slow".to_owned(), "fast".to_owned()],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(st2.phase, "ready", "{st2:?}");
+        assert_eq!(st2.available.as_ref().unwrap().source_node, "fast");
+        assert_eq!(
+            fleet.meta_reads("slow"),
+            slow_reads_before,
+            "deprioritized node must not be queried ahead of a clean node"
+        );
+
+        // Advance past BAD_NODE_TTL: slow node is forgotten and treated normally again.
+        tokio::time::advance(BAD_NODE_TTL + Duration::from_secs(1)).await;
+        assert!(!mgr.is_node_deprioritized("slow"));
+        let ordered_after_ttl = mgr.order_nodes_for(
+            Channel::Stable,
+            202611250212,
+            &["slow".to_owned(), "fast".to_owned()],
+        );
+        assert_eq!(
+            ordered_after_ttl,
+            vec!["slow".to_owned(), "fast".to_owned()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_link_6mib_at_24kib_s_completes_with_one_and_two_nodes_and_resumes_across_checks()
+    {
+        let (rel_sk, rel_pk) = keypair(0x96);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        // Exact reviewer scenario: 6 MiB payload at 24 KiB/s (~256s > old 180s fixed deadline).
+        let payload_6m: Vec<u8> = (0..(6 * 1024 * 1024))
+            .map(|i| ((i * 31) & 0xFF) as u8)
+            .collect();
+        let set_6m = build_fake_set(
+            Channel::Stable,
+            "0.2.0",
+            202611250210,
+            "Legion.apk",
+            Os::Android,
+            Arch::Universal,
+            InstallKind::Apk,
+            &payload_6m,
+            &rel_sk,
+        );
+
+        // Case 1: single slow node at 24 KiB/s (24 KiB per 1s) completes in one pass.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut fleet = DelayedFleet::new();
+            fleet.add_set("a", set_6m.clone());
+            fleet
+                .art_throttle
+                .insert("a".to_owned(), (24 * 1024, Duration::from_secs(1)));
+
+            let mgr = UpdateManager::with_config(
+                dir.path().join("updates"),
+                anchors,
+                Os::Android,
+                Arch::Aarch64,
+                PlatformEnv::Android,
+                "0.1.0".to_owned(),
+                "old".to_owned(),
+                202611250200,
+            );
+            let st = mgr
+                .check_with_client(&fleet, &["a".to_owned()], false, false)
+                .await
+                .unwrap();
+            assert_eq!(st.phase, "ready", "1-node 6 MiB @ 24 KiB/s failed: {st:?}");
+            assert!(st.available.unwrap().downloaded);
+        }
+
+        // Case 2: two slow nodes at 24 KiB/s where `a` disconnects at 4 MiB; `b` resumes from
+        // 4 MiB (preserving `.part` progress!) and finishes the remaining 2 MiB cleanly.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut fleet = DelayedFleet::new();
+            fleet.add_set("a", set_6m.clone());
+            fleet.add_set("b", set_6m);
+            fleet
+                .art_throttle
+                .insert("a".to_owned(), (24 * 1024, Duration::from_secs(1)));
+            fleet
+                .art_throttle
+                .insert("b".to_owned(), (24 * 1024, Duration::from_secs(1)));
+            fleet
+                .disconnect_after_offset
+                .insert("a".to_owned(), 4 * 1024 * 1024);
+
+            let mgr = UpdateManager::with_config(
+                dir.path().join("updates"),
+                anchors,
+                Os::Android,
+                Arch::Aarch64,
+                PlatformEnv::Android,
+                "0.1.0".to_owned(),
+                "old".to_owned(),
+                202611250200,
+            );
+            let t0 = Instant::now();
+            let st = mgr
+                .check_with_client(&fleet, &["a".to_owned(), "b".to_owned()], false, false)
+                .await
+                .unwrap();
+            let elapsed = t0.elapsed();
+            assert_eq!(st.phase, "ready", "2-node 6 MiB @ 24 KiB/s failed: {st:?}");
+            assert!(st.available.unwrap().downloaded);
+            // Total transfer time stays ~256s (proving `b` resumed from 4 MiB instead of restarting!).
+            assert!(
+                elapsed < Duration::from_secs(300),
+                "expected b to resume from 4 MiB without re-downloading, took {elapsed:?}"
+            );
+        }
+
+        // Case 3: 11 MiB APK at 24 KiB/s interrupted mid-way completes across checks without losing `.part`.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let updates_dir = dir.path().join("updates");
+            let payload_11m = vec![0x3Cu8; 11 * 1024 * 1024];
+            let set_11m = build_fake_set(
+                Channel::Stable,
+                "0.2.1",
+                202611250211,
+                "Legion.apk",
+                Os::Android,
+                Arch::Universal,
+                InstallKind::Apk,
+                &payload_11m,
+                &rel_sk,
+            );
+            let mut fleet = DelayedFleet::new();
+            fleet.add_set("a", set_11m);
+            fleet
+                .art_throttle
+                .insert("a".to_owned(), (24 * 1024, Duration::from_secs(1)));
+            fleet
+                .disconnect_after_offset
+                .insert("a".to_owned(), 5 * 1024 * 1024);
+
+            let mgr = UpdateManager::with_config(
+                updates_dir.clone(),
+                anchors,
+                Os::Android,
+                Arch::Aarch64,
+                PlatformEnv::Android,
+                "0.1.0".to_owned(),
+                "old".to_owned(),
+                202611250200,
+            );
+
+            // Check 1 disconnects after 5 MiB -> `.part` and `.part.meta.json` stay intact!
+            let st1 = mgr
+                .check_with_client(&fleet, &["a".to_owned()], false, false)
+                .await
+                .unwrap();
+            assert_eq!(st1.phase, "error", "{st1:?}");
+            let set_dir = download_dir_for(&updates_dir, Channel::Stable, 202611250211);
+            let part_len = fs::metadata(set_dir.join("Legion.apk.part")).unwrap().len();
+            assert!(
+                part_len >= 5 * 1024 * 1024,
+                "expected >= 5 MiB preserved, got {part_len}"
+            );
+            let meta: PartMetadata = serde_json::from_slice(
+                &fs::read(set_dir.join("Legion.apk.part.meta.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(meta.ranges.len(), 1);
+            assert_eq!(meta.ranges[0].node, "a");
+            assert_eq!(meta.ranges[0].end, part_len);
+
+            // Check 2 resumes from >= 5 MiB and finishes the remaining <= 6 MiB cleanly!
+            let t_resume = Instant::now();
+            let st2 = mgr
+                .check_with_client(&fleet, &["a".to_owned()], false, false)
+                .await
+                .unwrap();
+            assert_eq!(st2.phase, "ready", "{st2:?}");
+            assert!(st2.available.unwrap().downloaded);
+            assert!(
+                t_resume.elapsed() < Duration::from_secs(290),
+                "check 2 should only transfer remaining ~6 MiB, took {:?}",
+                t_resume.elapsed()
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poisoned_partial_from_first_node_retries_second_node_clean_and_blames_only_poisoner() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x97);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let payload = vec![0x5Au8; 64 * 1024];
+        let good_set = build_fake_set(
+            Channel::Stable,
+            "0.2.0",
+            202611250210,
+            "Legion.apk",
+            Os::Android,
+            Arch::Universal,
+            InstallKind::Apk,
+            &payload,
+            &rel_sk,
+        );
+        let mut poisoned_set = good_set.clone();
+        let mut poisoned_bytes = payload.clone();
+        poisoned_bytes[0] ^= 0xFF;
+        poisoned_set
+            .files
+            .insert("Legion.apk".to_owned(), poisoned_bytes);
+
+        let mut fleet = DelayedFleet::new();
+        fleet.add_set("poisoner", poisoned_set);
+        fleet.add_set("honest", good_set);
+        fleet
+            .art_throttle
+            .insert("poisoner".to_owned(), (16 * 1024, Duration::ZERO));
+        fleet
+            .art_throttle
+            .insert("honest".to_owned(), (16 * 1024, Duration::ZERO));
+        // Poisoner writes 32 KiB of corrupted bytes and then disconnects!
+        fleet
+            .disconnect_after_offset
+            .insert("poisoner".to_owned(), 32 * 1024);
+
+        let mgr = UpdateManager::with_config(
+            dir.path().join("updates"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+
+        let nodes = vec!["poisoner".to_owned(), "honest".to_owned()];
+        let st = mgr
+            .check_with_client(&fleet, &nodes, false, false)
+            .await
+            .unwrap();
+        assert_eq!(st.phase, "ready", "{st:?}");
+        assert_eq!(st.available.as_ref().unwrap().source_node, "honest");
+        assert!(st.available.as_ref().unwrap().downloaded);
+        // Honest node was exonerated after clean retry; poisoner remains deprioritized!
+        assert!(mgr.is_node_deprioritized("poisoner"));
+        assert!(!mgr.is_node_deprioritized("honest"));
+        assert_eq!(
+            mgr.order_nodes_for(Channel::Stable, 202611250210, &nodes),
+            vec!["honest".to_owned(), "poisoner".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn fair_candidate_merging_prevents_two_flooding_nodes_crowding_out_honest_third_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x98);
+        let (bad_sk, _) = keypair(0x99);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let mut fleet = FakeFleet::new();
+        // Two flooding nodes each advertise 16 distinct bogus higher sequences (32 total == cap).
+        for (idx, flooder) in ["flood1", "flood2"].iter().enumerate() {
+            for i in 0..20u64 {
+                let seq = 202611260000 + (idx as u64) * 100 + i;
+                fleet.add_set(
+                    flooder,
+                    build_fake_set(
+                        Channel::Stable,
+                        "9.9.9",
+                        seq,
+                        "Legion.apk",
+                        Os::Android,
+                        Arch::Universal,
+                        InstallKind::Apk,
+                        b"evil",
+                        &bad_sk,
+                    ),
+                );
+            }
+        }
+        // Third node is honest and listed LAST with the real signed update at a lower sequence.
+        fleet.add_set(
+            "honest",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion.apk",
+                Os::Android,
+                Arch::Universal,
+                InstallKind::Apk,
+                b"real-apk-bytes",
+                &rel_sk,
+            ),
+        );
+
+        let mgr = UpdateManager::with_config(
+            dir.path().join("updates"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+        let st = mgr
+            .check_with_client(
+                &fleet,
+                &[
+                    "flood1".to_owned(),
+                    "flood2".to_owned(),
+                    "honest".to_owned(),
+                ],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(st.phase, "ready", "{st:?}");
+        assert_eq!(st.available.as_ref().unwrap().sequence, 202611250210);
+        assert_eq!(st.available.as_ref().unwrap().source_node, "honest");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_install_gate_enforces_startup_window_first_screen_in_flight_ops_and_rate_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rel_sk, rel_pk) = keypair(0x9A);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"ready-appimage",
+                &rel_sk,
+            ),
+        );
+
+        // Desktop manager with ready update right at launch.
+        let mgr = UpdateManager::with_config(
+            dir.path().join("desktop"),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+                appimage_path: dir.path().join("Legion.AppImage"),
+            }),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+        let st = mgr
+            .check_with_client(&fleet, &["tower".to_owned()], false, false)
+            .await
+            .unwrap();
+        assert_eq!(st.phase, "ready");
+
+        // 1. Within startup window, before first screen, zero in-flight ops -> startup allowed.
+        assert_eq!(mgr.evaluate_auto_install_gate("startup", 0, true), Ok(()));
+
+        // 2. Immediate repeat request from page is rate-limited natively.
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("startup", 0, true),
+            Err("rate_limited")
+        );
+
+        // 3. After rate-limit window, in-flight native work still blocks startup and close.
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("startup", 1, true),
+            Err("native_activity_in_flight")
+        );
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("close", 1, false),
+            Err("native_activity_in_flight")
+        );
+        assert_eq!(mgr.evaluate_auto_install_gate("close", 0, false), Ok(()));
+        // Page can never spoof desktop close or background or unknown triggers.
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("close", 0, true),
+            Err("close_native_only")
+        );
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("background", 0, true),
+            Err("background_android_only")
+        );
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("idle", 0, true),
+            Err("unsupported_trigger")
+        );
+
+        // 4. Once startup window elapses, startup is refused even if page never called `ready()`.
+        tokio::time::advance(STARTUP_AUTO_INSTALL_WINDOW + Duration::from_secs(1)).await;
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("startup", 0, true),
+            Err("startup_window_elapsed")
+        );
+
+        // 5. Fresh manager: as soon as first full screen paints (`on_app_ready`), startup is closed
+        //    permanently even 1ms after launch!
+        let mgr2 = UpdateManager::with_config(
+            dir.path().join("desktop"),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+                appimage_path: dir.path().join("Legion.AppImage"),
+            }),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+        assert_eq!(mgr2.snapshot().phase, "ready");
+        mgr2.on_app_ready();
+        assert_eq!(
+            mgr2.evaluate_auto_install_gate("startup", 0, true),
+            Err("first_screen_already_shown")
+        );
+
+        // 6. Android manager allows `"background"` when idle, refuses when native work is in flight.
+        let mut android_fleet = FakeFleet::new();
+        android_fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion.apk",
+                Os::Android,
+                Arch::Universal,
+                InstallKind::Apk,
+                b"ready-apk",
+                &rel_sk,
+            ),
+        );
+        let android_mgr = UpdateManager::with_config(
+            dir.path().join("android"),
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+        android_mgr
+            .check_with_client(&android_fleet, &["tower".to_owned()], false, false)
+            .await
+            .unwrap();
+        android_mgr.on_app_ready();
+        assert_eq!(
+            android_mgr.evaluate_auto_install_gate("startup", 0, true),
+            Err("first_screen_already_shown")
+        );
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        assert_eq!(
+            android_mgr.evaluate_auto_install_gate("background", 1, true),
+            Err("native_activity_in_flight")
+        );
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        let scan_guard = android_mgr.track_external_operation();
+        assert_eq!(
+            android_mgr.evaluate_auto_install_gate("background", 0, true),
+            Err("native_activity_in_flight")
+        );
+        drop(scan_guard);
+        tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
+        assert_eq!(
+            android_mgr.evaluate_auto_install_gate("background", 0, true),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rfc3339_utc_round_trip() {
+        for ts in [
+            0i64,
+            1_700_000_000,
+            1_795_593_600,
+            1_893_456_000,
+            2_000_000_000,
+        ] {
+            let formatted = format_rfc3339_utc(ts);
+            assert_eq!(
+                parse_rfc3339_utc(&formatted),
+                Some(ts),
+                "round-trip failed for {ts} -> {formatted}"
+            );
+        }
+        assert!(parse_rfc3339_utc("not-a-timestamp").is_none());
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn rollback_retries_once_after_one_hour_and_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let appimage = dir.path().join("Legion.AppImage");
+        let (rel_sk, rel_pk) = keypair(0x91);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600; // 2026-11-25T08:00:00Z
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"v2-appimage",
+                &rel_sk,
+            ),
+        );
+
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage.clone(),
+        });
+
+        // 1. Download v2 on seq1 and begin install.
+        let mgr1 = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let st1 = mgr1
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap();
+        assert_eq!(st1.phase, "ready");
+        let avail_v2 = st1.available.unwrap();
+        mgr1.record_started_attempt_and_pending_at(&avail_v2, "staged", t0)
+            .unwrap();
+
+        // 2. Simulate first rollback with captured startup log + supervisor log.
+        fs::write(
+            updates_dir.join("supervisor.log"),
+            "supervisor: new_pid=9001 exited with rc=1 after 2 ticks\nsupervisor: ready marker missing after 34 ticks; rolling back\n",
+        )
+        .unwrap();
+        fs::write(
+            updates_dir.join(desktop::NEW_START_LOG_FILENAME),
+            "transient display error\n",
+        )
+        .unwrap();
+        fs::write(
+            updates_dir.join("rollback-202611250210.json"),
+            serde_json::to_vec(&RollbackInfo {
+                version: "0.2.0".to_owned(),
+                sequence: 202611250210,
+                reason: ROLLBACK_REASON.to_owned(),
+                detail: None,
+                install_state: Some("restored_previous".to_owned()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Relaunched seq1 right after rollback (at t0 + 10s): records attempt 1 (not skipped),
+        // surfaces captured detail under Technical details, and blocks immediate auto-retry.
+        let mgr_after_rb1 = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0 + 10,
+        );
+        mgr_after_rb1.on_app_ready_at(t0 + 10);
+        let st_rb1 = mgr_after_rb1.snapshot();
+        assert_eq!(st_rb1.phase, "error");
+        let fail1 = st_rb1.failed_update.as_ref().unwrap();
+        assert_eq!(fail1.attempts, 1);
+        assert!(!fail1.skipped);
+        assert!(
+            st_rb1
+                .last_error_detail
+                .as_deref()
+                .is_some_and(|d| d.contains("transient display error")),
+            "expected captured startup error under Technical details: {:?}",
+            st_rb1.last_error_detail
+        );
+
+        // 30 minutes later (< 1 hour): next app start MUST still respect the 1-hour cooldown.
+        let mgr_too_soon = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0 + 10 + 1800,
+        );
+        assert_eq!(mgr_too_soon.snapshot().phase, "error");
+        assert!(
+            mgr_too_soon
+                .evaluate_auto_install_gate_at("startup", 0, true, t0 + 10 + 1800)
+                .is_err()
+        );
+
+        // 3. Next app start >= 1 hour later: same sequence is eligible for its single automatic
+        //    retry (phase == "ready", auto-install gate allows startup install).
+        let retry_time = t0 + 10 + ROLLBACK_RETRY_COOLDOWN_SECS;
+        let mgr_retry = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            retry_time,
+        );
+        let st_retry = mgr_retry.snapshot();
+        assert_eq!(st_retry.phase, "ready", "{st_retry:?}");
+        assert!(st_retry.failed_update.is_none());
+        assert_eq!(
+            mgr_retry.evaluate_auto_install_gate_at("startup", 0, true, retry_time),
+            Ok(())
+        );
+        mgr_retry
+            .record_started_attempt_and_pending_at(&avail_v2, "staged", retry_time)
+            .unwrap();
+
+        // 4. Retry succeeds: new build boots at seq 202611250210 -> just_updated recorded,
+        //    failure cleared, and new-start.log removed.
+        let mgr_v2 = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.2.0".to_owned(),
+            "new".to_owned(),
+            202611250210,
+            retry_time + 5,
+        );
+        mgr_v2.on_app_ready_at(retry_time + 5);
+        let st_v2 = mgr_v2.snapshot();
+        assert_eq!(st_v2.phase, "up_to_date");
+        assert_eq!(st_v2.just_updated.as_ref().unwrap().sequence, 202611250210);
+        assert!(st_v2.rolled_back.is_none());
+        assert!(st_v2.failed_update.is_none());
+        assert!(!updates_dir.join(desktop::NEW_START_LOG_FILENAME).exists());
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn two_rollbacks_skip_sequence_try_again_clears_and_newer_sequence_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let appimage = dir.path().join("Legion.AppImage");
+        let (rel_sk, rel_pk) = keypair(0x92);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"broken-v2-appimage",
+                &rel_sk,
+            ),
+        );
+
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage.clone(),
+        });
+
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let st = mgr
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap();
+        let avail_v2 = st.available.unwrap();
+
+        // Rollback #1 at t0 + 10.
+        mgr.record_started_attempt_and_pending_at(&avail_v2, "staged", t0)
+            .unwrap();
+        fs::write(
+            updates_dir.join("rollback-202611250210.json"),
+            serde_json::to_vec(&RollbackInfo {
+                version: "0.2.0".to_owned(),
+                sequence: 202611250210,
+                reason: ROLLBACK_REASON.to_owned(),
+                detail: None,
+                install_state: Some("restored_previous".to_owned()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mgr_rb1 = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0 + 10,
+        );
+        mgr_rb1.on_app_ready_at(t0 + 10);
+        assert!(!mgr_rb1.snapshot().failed_update.as_ref().unwrap().skipped);
+
+        // Rollback #2 at t0 + 10 + 1 hour (automatic retry fails again).
+        let t_retry = t0 + 10 + ROLLBACK_RETRY_COOLDOWN_SECS;
+        let mgr_retry = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t_retry,
+        );
+        assert_eq!(mgr_retry.snapshot().phase, "ready");
+        mgr_retry
+            .record_started_attempt_and_pending_at(&avail_v2, "staged", t_retry)
+            .unwrap();
+        fs::write(
+            updates_dir.join(desktop::NEW_START_LOG_FILENAME),
+            "fatal: missing libwebkit2gtk-4.1.so.0\n",
+        )
+        .unwrap();
+        fs::write(
+            updates_dir.join("rollback-202611250210.json"),
+            serde_json::to_vec(&RollbackInfo {
+                version: "0.2.0".to_owned(),
+                sequence: 202611250210,
+                reason: ROLLBACK_REASON.to_owned(),
+                detail: None,
+                install_state: Some("restored_previous".to_owned()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mgr_rb2 = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t_retry + 10,
+        );
+        mgr_rb2.on_app_ready_at(t_retry + 10);
+        let st_rb2 = mgr_rb2.snapshot();
+        assert_eq!(st_rb2.phase, "error");
+        assert_eq!(st_rb2.last_error.as_deref(), Some(ROLLBACK_REASON));
+        let fail2 = st_rb2.failed_update.as_ref().unwrap();
+        assert_eq!(fail2.attempts, 2);
+        assert!(fail2.skipped, "second rollback must mark sequence skipped");
+        assert!(fail2.retry_after.is_none());
+        assert!(
+            st_rb2
+                .last_error_detail
+                .as_deref()
+                .is_some_and(|d| d.contains("libwebkit2gtk-4.1.so.0")),
+            "second rollback must surface captured startup error: {:?}",
+            st_rb2.last_error_detail
+        );
+
+        // Even 24 hours later, seq 202611250210 remains skipped on launch AND on check!
+        let t_next_day = t_retry + 24 * 3600;
+        let mgr_next_day = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t_next_day,
+        );
+        assert_eq!(mgr_next_day.snapshot().phase, "error");
+        assert_eq!(
+            mgr_next_day.auto_install_block_reason_at(202611250210, t_next_day),
+            Some("sequence_skipped")
+        );
+        let st_check_skipped = mgr_next_day
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t_next_day)
+            .await
+            .unwrap();
+        assert_eq!(st_check_skipped.phase, "error");
+        assert_eq!(
+            st_check_skipped.last_error.as_deref(),
+            Some(ROLLBACK_REASON)
+        );
+        assert!(st_check_skipped.failed_update.as_ref().unwrap().skipped);
+        assert!(
+            st_check_skipped
+                .last_error_detail
+                .as_deref()
+                .is_some_and(|d| d.contains("libwebkit2gtk-4.1.so.0"))
+        );
+
+        // "Try again" clears the skip for that sequence and restores phase == "ready".
+        mgr_next_day.clear_failed_sequence(202611250210);
+        let st_cleared = mgr_next_day.snapshot();
+        assert_eq!(st_cleared.phase, "ready", "{st_cleared:?}");
+        assert!(st_cleared.failed_update.is_none());
+        assert!(st_cleared.rolled_back.is_none());
+        assert_eq!(
+            mgr_next_day.auto_install_block_reason_at(202611250210, t_next_day),
+            None
+        );
+        let mgr_after_clear = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t_next_day + 5,
+        );
+        assert_eq!(mgr_after_clear.snapshot().phase, "ready");
+        assert_eq!(
+            mgr_after_clear.evaluate_auto_install_gate_at("startup", 0, true, t_next_day + 5),
+            Ok(())
+        );
+
+        // Re-skip seq 202611250210, then publish strictly newer seq 202611250215:
+        // the newer sequence MUST be completely unaffected by the older sequence's skip.
+        mgr_after_clear.record_failed_update(
+            Channel::Stable,
+            "0.2.0",
+            202611250210,
+            ROLLBACK_REASON,
+        );
+        assert_eq!(
+            mgr_after_clear.auto_install_block_reason_at(202611250210, t_next_day + 10),
+            Some("sequence_skipped")
+        );
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.1",
+                202611250215,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"fixed-v2.1-appimage",
+                &rel_sk,
+            ),
+        );
+        let st_newer = mgr_after_clear
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t_next_day + 10)
+            .await
+            .unwrap();
+        assert_eq!(st_newer.phase, "ready", "{st_newer:?}");
+        assert_eq!(st_newer.available.as_ref().unwrap().sequence, 202611250215);
+        assert!(st_newer.failed_update.is_none());
+        let mgr_newer_boot = UpdateManager::with_config_at(
+            updates_dir,
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t_next_day + 20,
+        );
+        assert_eq!(mgr_newer_boot.snapshot().phase, "ready");
+        assert_eq!(
+            mgr_newer_boot.evaluate_auto_install_gate_at("startup", 0, true, t_next_day + 20),
+            Ok(())
+        );
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn deferred_update_clears_pending_install_without_counting_as_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let appimage = dir.path().join("Legion.AppImage");
+        let (rel_sk, rel_pk) = keypair(0x93);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250220,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"v2-appimage",
+                &rel_sk,
+            ),
+        );
+
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage,
+        });
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let st = mgr
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap();
+        let avail = st.available.unwrap();
+        mgr.record_started_attempt_and_pending_at(&avail, "staged", t0)
+            .unwrap();
+
+        // Simulate a supervisor deferring cleanly pre-swap (even with a UTF-8 BOM prefix).
+        let mut deferred_bytes = vec![0xEF, 0xBB, 0xBF];
+        deferred_bytes.extend_from_slice(
+            br#"{"sequence":202611250220,"reason":"Install files were in use"}"#,
+        );
+        fs::write(
+            updates_dir.join("deferred-202611250220.json"),
+            deferred_bytes,
+        )
+        .unwrap();
+
+        let mgr_next = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0 + 20,
+        );
+        mgr_next.on_app_ready_at(t0 + 20);
+        let st_next = mgr_next.snapshot();
+        assert_eq!(st_next.phase, "ready", "deferred update must stay ready");
+        assert!(
+            st_next.failed_update.is_none(),
+            "deferred update must NOT count as a failed update"
+        );
+        assert!(
+            !mgr_next.sequence_failed_before(202611250220),
+            "deferred update must NOT increment failed_updates or failed_sequences"
+        );
+        assert_eq!(
+            mgr_next.auto_install_block_reason_at(202611250220, t0 + 20),
+            Some("auto_install_hourly_floor"),
+            "global 1-hour floor still caps automatic retries within 1 hour of any attempt"
+        );
+        assert_eq!(
+            mgr_next
+                .auto_install_block_reason_at(202611250220, t0 + AUTO_INSTALL_HOURLY_FLOOR_SECS),
+            None,
+            "deferred update has zero failures recorded once the 1-hour floor elapses"
+        );
+        assert!(
+            !updates_dir.join("deferred-202611250220.json").exists(),
+            "deferred marker should be consumed"
+        );
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn reviewer_probe_startup_gate_refuses_immediately_after_rollback_before_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let appimage = dir.path().join("Legion.AppImage");
+        let (rel_sk, rel_pk) = keypair(0x95);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250230,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"broken-v2",
+                &rel_sk,
+            ),
+        );
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage,
+        });
+
+        let mgr1 = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let st1 = mgr1
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap();
+        let avail = st1.available.unwrap();
+        mgr1.record_started_attempt_and_pending_at(&avail, "staged", t0)
+            .unwrap();
+
+        // Supervisor rolls back, writes rollback-202611250230.json, and relaunches v1.
+        fs::write(
+            updates_dir.join("rollback-202611250230.json"),
+            serde_json::to_vec(&RollbackInfo {
+                version: "0.2.0".to_owned(),
+                sequence: 202611250230,
+                reason: ROLLBACK_REASON.to_owned(),
+                detail: None,
+                install_state: Some("restored_previous".to_owned()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Reviewer's exact probe: construct UpdateManager on relaunch and IMMEDIATELY ask the
+        // startup auto-install gate BEFORE `on_app_ready` has run!
+        let mgr_relaunched = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0 + 15,
+        );
+        assert!(
+            !updates_dir.join("rollback-202611250230.json").exists(),
+            "rollback record must be read and consumed during UpdateManager construction"
+        );
+        assert_eq!(mgr_relaunched.snapshot().phase, "error");
+        assert!(
+            mgr_relaunched
+                .evaluate_auto_install_gate_at("startup", 0, true, t0 + 15)
+                .is_err(),
+            "startup gate MUST refuse immediately after rollback before on_app_ready"
+        );
+
+        // Second safeguard check: even if an unread rollback or deferred record appears on disk
+        // AFTER construction (e.g. after the cooldown elapsed), the gate itself MUST refuse!
+        let t_later = t0 + 15 + ROLLBACK_RETRY_COOLDOWN_SECS + 10;
+        let mgr_later = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t_later,
+        );
+        assert_eq!(mgr_later.snapshot().phase, "ready");
+        fs::write(
+            updates_dir.join("deferred-202611250230.json"),
+            br#"{"sequence":202611250230,"reason":"unread"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            mgr_later.evaluate_auto_install_gate_at("startup", 0, true, t_later),
+            Err("unread_supervisor_record"),
+            "gate must refuse while any unread supervisor record exists on disk"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn endless_loop_impossible_broken_update_spawns_at_most_two_supervisors() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant as StdInstant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let appimage = dir.path().join("Legion.AppImage");
+        let spawn_counter = dir.path().join("v2-launches.txt");
+        let (rel_sk, rel_pk) = keypair(0x96);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        fs::write(&appimage, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&appimage, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Broken v2 AppImage: logs its launch and exits 1 without ever writing `started-*.ok`.
+        let broken_v2 = format!(
+            "#!/bin/sh\nprintf 'attempt\\n' >> '{}'\nexit 1\n",
+            spawn_counter.display()
+        );
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250235,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                broken_v2.as_bytes(),
+                &rel_sk,
+            ),
+        );
+
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage.clone(),
+        });
+
+        // Initial check & download on v1.
+        let mgr_init = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let st_init = mgr_init
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap();
+        assert_eq!(st_init.phase, "ready");
+
+        // Drive 8 relaunches across immediate restarts, 30 min, 61 min, 2 hours, 6 hours, 24 hours,
+        // asking the startup gate BEFORE `on_app_ready` on every single boot. Even if we delete
+        // rollback files before one relaunch, the persisted started-attempt counter caps spawns
+        // at EXACTLY 2!
+        let boot_times = [
+            t0,
+            t0 + 15,
+            t0 + 45,
+            t0 + 1800,
+            t0 + 3700,
+            t0 + 3715,
+            t0 + 7500,
+            t0 + 86_400,
+        ];
+        let mut supervisors_spawned = 0usize;
+        for (idx, &now) in boot_times.iter().enumerate() {
+            let mgr = UpdateManager::with_config_at(
+                updates_dir.clone(),
+                anchors,
+                Os::Linux,
+                Arch::X86_64,
+                platform.clone(),
+                "0.1.0".to_owned(),
+                "old".to_owned(),
+                202611250200,
+                now,
+            );
+            if mgr
+                .evaluate_auto_install_gate_at("startup", 0, true, now)
+                .is_ok()
+            {
+                let (avail, size, sha, art_path) = mgr.prepare_verified_install().unwrap();
+                let mut exited_old = std::process::Command::new("/bin/sh")
+                    .args(["-c", "exit 0"])
+                    .spawn()
+                    .unwrap();
+                let dead_pid = exited_old.id();
+                let _ = exited_old.wait();
+
+                // Persist started attempt + pending install (exactly as production spawn does)
+                // and run a real short-wait Unix swap supervisor with our broken v2.
+                let lock = desktop::try_acquire_update_lock(&updates_dir, avail.sequence, true)
+                    .unwrap()
+                    .unwrap();
+                mgr.record_started_attempt_and_pending_at(&avail, "staged", now)
+                    .unwrap();
+                let staged = dir.path().join(format!(".Legion.AppImage.new-loop-{idx}"));
+                desktop::copy_and_verify_sha256(&art_path, &staged, &sha, size, 0o755).unwrap();
+                let rb_path = updates_dir.join(format!("rollback-{}.json", avail.sequence));
+                let sup_pid = desktop::spawn_unix_swap_supervisor(&desktop::UnixSwapPlan {
+                    old_pid: dead_pid,
+                    old_ppid: None,
+                    target_path: appimage.clone(),
+                    staged_new_path: staged,
+                    backup_path: dir.path().join(".Legion.AppImage.prev"),
+                    exec_path: appimage.clone(),
+                    ready_marker_path: updates_dir.join(format!("started-{}.ok", avail.sequence)),
+                    rollback_marker_path: rb_path.clone(),
+                    rollback_json: serde_json::to_string(&RollbackInfo {
+                        version: avail.version.clone(),
+                        sequence: avail.sequence,
+                        reason: ROLLBACK_REASON.to_owned(),
+                        detail: None,
+                        install_state: Some("restored_previous".to_owned()),
+                    })
+                    .unwrap(),
+                    rollback_kept_new_json: "{}".to_owned(),
+                    deferred_marker_path: None,
+                    deferred_json: None,
+                    target_sequence: avail.sequence,
+                    update_lock_path: Some(updates_dir.join(desktop::UPDATE_LOCK_FILENAME)),
+                    stage_file_path: Some(desktop::pending_stage_path(
+                        &updates_dir,
+                        avail.sequence,
+                    )),
+                    reopen_marker_path: None,
+                    log_path: Some(updates_dir.join("supervisor.log")),
+                    new_start_log_path: Some(updates_dir.join(desktop::NEW_START_LOG_FILENAME)),
+                    rollback_ps_path: None,
+                    single_instance_dbus_name: None,
+                    single_instance_socket_path: None,
+                    pre_swap_wait_secs: 2,
+                    wait_secs: 2,
+                    exit_grace_secs: 1,
+                    rollback_retries: 4,
+                    verify_only: true,
+                })
+                .unwrap();
+                lock.hand_over_to_supervisor(sup_pid).unwrap();
+                supervisors_spawned += 1;
+
+                // Wait for the supervisor to finish rolling back and release update.lock.
+                let deadline = StdInstant::now() + Duration::from_secs(10);
+                while StdInstant::now() < deadline {
+                    if rb_path.exists() && !updates_dir.join(desktop::UPDATE_LOCK_FILENAME).exists()
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                assert!(
+                    rb_path.exists(),
+                    "expected rollback on broken v2 attempt {idx}"
+                );
+            }
+            mgr.on_app_ready_at(now);
+        }
+
+        assert_eq!(
+            supervisors_spawned, 2,
+            "broken update must spawn EXACTLY two supervisors across repeated relaunches"
+        );
+        let launched = fs::read_to_string(&spawn_counter).unwrap();
+        assert_eq!(launched.lines().count(), 2);
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn hourly_floor_limits_automatic_installs_across_different_sequences_while_manual_exempt()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let appimage = dir.path().join("Legion.AppImage");
+        let (rel_sk, rel_pk) = keypair(0x97);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250240,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"v2-payload",
+                &rel_sk,
+            ),
+        );
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage,
+        });
+
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let st1 = mgr
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap();
+        mgr.record_started_attempt_and_pending_at(&st1.available.unwrap(), "staged", t0)
+            .unwrap();
+
+        // Rollback seq 240 at t0 + 10s, then publish a brand-new seq 245 at t0 + 20m.
+        fs::write(
+            updates_dir.join("rollback-202611250240.json"),
+            serde_json::to_vec(&RollbackInfo {
+                version: "0.2.0".to_owned(),
+                sequence: 202611250240,
+                reason: ROLLBACK_REASON.to_owned(),
+                detail: None,
+                install_state: Some("restored_previous".to_owned()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.1",
+                202611250245,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"v2.1-payload",
+                &rel_sk,
+            ),
+        );
+
+        let mgr_soon = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0 + 1200,
+        );
+        let st_new = mgr_soon
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0 + 1200)
+            .await
+            .unwrap();
+        assert_eq!(
+            st_new.phase, "ready",
+            "newer sequence downloads cleanly for manual install"
+        );
+        assert_eq!(st_new.available.as_ref().unwrap().sequence, 202611250245);
+        assert_eq!(
+            mgr_soon.evaluate_auto_install_gate_at("startup", 0, true, t0 + 1200),
+            Err("auto_install_hourly_floor"),
+            "1-hour floor must block automatic install even for a brand-new sequence"
+        );
+
+        // Once 1 full hour has elapsed since t0, automatic install of the new sequence is allowed.
+        let mgr_after_hour = UpdateManager::with_config_at(
+            updates_dir,
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0 + AUTO_INSTALL_HOURLY_FLOOR_SECS,
+        );
+        assert_eq!(
+            mgr_after_hour.evaluate_auto_install_gate_at(
+                "startup",
+                0,
+                true,
+                t0 + AUTO_INSTALL_HOURLY_FLOOR_SECS
+            ),
+            Ok(())
+        );
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn pending_install_stage_distinguishes_pre_swap_deferral_from_post_swap_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let appimage = dir.path().join("Legion.AppImage");
+        let (rel_sk, rel_pk) = keypair(0x98);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250250,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"v2-payload",
+                &rel_sk,
+            ),
+        );
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage,
+        });
+
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let avail = mgr
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap()
+            .available
+            .unwrap();
+
+        // 1. Supervisor stopped at `"staged"` (or `"swapping"`) before swap completed, leaving no
+        //    deferred/rollback file: next start treats it as a deferral (zero failure, not skipped).
+        for stage in ["staged", "swapping"] {
+            mgr.record_started_attempt_and_pending_at(&avail, stage, t0)
+                .unwrap();
+            let mgr_next = UpdateManager::with_config_at(
+                updates_dir.clone(),
+                anchors,
+                Os::Linux,
+                Arch::X86_64,
+                platform.clone(),
+                "0.1.0".to_owned(),
+                "old".to_owned(),
+                202611250200,
+                t0 + 10,
+            );
+            assert_eq!(
+                mgr_next.snapshot().phase,
+                "ready",
+                "stage {stage} stopped before swap must stay ready"
+            );
+            assert!(
+                !mgr_next.sequence_failed_before(202611250250),
+                "stage {stage} stopped before swap must not record failure"
+            );
+            assert!(mgr_next.snapshot().failed_update.is_none());
+        }
+
+        // 2. Supervisor reached `"swapped"` and old sequence is running without rollback marker:
+        //    next start records a real failed start with `skipped: true`.
+        mgr.record_started_attempt_and_pending_at(&avail, "staged", t0 + 100)
+            .unwrap();
+        desktop::write_pending_stage(&updates_dir, 202611250250, "swapped").unwrap();
+        let mgr_swapped = UpdateManager::with_config_at(
+            updates_dir,
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0 + 120,
+        );
+        assert_eq!(mgr_swapped.snapshot().phase, "error");
+        let fail = mgr_swapped.snapshot().failed_update.unwrap();
+        assert_eq!(fail.sequence, 202611250250);
+        assert!(fail.skipped);
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn rollback_kept_new_running_target_sequence_reports_success_with_no_rollback_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let appimage = dir.path().join("Legion.AppImage");
+        let (rel_sk, rel_pk) = keypair(0x99);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250255,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"v2-payload",
+                &rel_sk,
+            ),
+        );
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage,
+        });
+
+        let mgr1 = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let avail = mgr1
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap()
+            .available
+            .unwrap();
+        mgr1.record_started_attempt_and_pending_at(&avail, "staged", t0)
+            .unwrap();
+
+        // Supervisor timed out and wrote `rollback-202611250255.json` with `new_kept_files_in_use`,
+        // but the new build 202611250255 IS what is now running!
+        fs::write(
+            updates_dir.join("rollback-202611250255.json"),
+            serde_json::to_vec(&RollbackInfo {
+                version: "0.2.0".to_owned(),
+                sequence: 202611250255,
+                reason: ROLLBACK_REASON.to_owned(),
+                detail: None,
+                install_state: Some("new_kept_files_in_use".to_owned()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mgr_v2 = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.2.0".to_owned(),
+            "new".to_owned(),
+            202611250255,
+            t0 + 40,
+        );
+        assert!(
+            mgr_v2.snapshot().rolled_back.is_none(),
+            "running the target sequence must never show a rollback notice about a previous copy"
+        );
+        assert!(mgr_v2.snapshot().failed_update.is_none());
+        mgr_v2.on_app_ready_at(t0 + 40);
+        let st_v2 = mgr_v2.snapshot();
+        assert_eq!(st_v2.phase, "up_to_date");
+        assert!(st_v2.rolled_back.is_none());
+        assert!(st_v2.failed_update.is_none());
+        assert_eq!(st_v2.just_updated.as_ref().unwrap().sequence, 202611250255);
+        assert!(!updates_dir.join("rollback-202611250255.json").exists());
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn stale_lock_notice_surfaces_under_updates_and_clears_on_dismiss() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let (_rel_sk, rel_pk) = keypair(0x9a);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: dir.path().join("Legion.AppImage"),
+        });
+
+        desktop::record_stale_lock_notice(&updates_dir, "lock exceeded 180s");
+        let mgr = UpdateManager::with_config(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+        );
+        assert_eq!(
+            mgr.snapshot().last_error.as_deref(),
+            Some(desktop::STALE_UPDATE_NOTICE)
+        );
+        assert!(
+            !updates_dir
+                .join(desktop::STALE_LOCK_MARKER_FILENAME)
+                .exists()
+        );
+
+        let dismissed = mgr.dismiss_notice().unwrap();
+        assert!(dismissed.last_error.is_none());
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn second_instance_cannot_stage_while_update_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let appimage = dir.path().join("Legion.AppImage");
+        fs::write(&appimage, b"v1-appimage").unwrap();
+        let (rel_sk, rel_pk) = keypair(0x94);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250225,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"v2-appimage",
+                &rel_sk,
+            ),
+        );
+
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage.clone(),
+        });
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let st = mgr
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap();
+        assert_eq!(st.phase, "ready");
+        let (avail, size, sha, art_path) = mgr.prepare_verified_install().unwrap();
+
+        // Hold the exclusive update lock as Instance 1.
+        let lock1 = desktop::try_acquire_update_lock(&updates_dir, avail.sequence, false)
+            .unwrap()
+            .expect("instance 1 must acquire lock");
+
+        // Instance 2 attempting to stage/spawn MUST return Ok(false) without staging any copy,
+        // without touching pending_install, and without spawning a second supervisor.
+        let spawned = mgr
+            .spawn_desktop_install_inner(&avail, &art_path, &sha, size, false)
+            .unwrap();
+        assert!(
+            !spawned,
+            "second instance must not stage or spawn a supervisor while update.lock is held"
+        );
+        assert!(
+            !dir.path()
+                .join(format!(".Legion.AppImage.new-{}", std::process::id()))
+                .exists(),
+            "second instance must not create a second staged copy"
+        );
+        assert!(
+            !mgr.try_spawn_desktop_close_install(0),
+            "close-update path must also skip when update.lock is held"
+        );
+
+        drop(lock1);
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn desktop_close_update_waits_for_active_transfer_drain_and_installs_after_queue_empties()
+    {
+        use std::sync::atomic::AtomicBool;
+
+        use crate::link_backend::LinkBackend;
+        use crate::store::AppStore;
+        use crate::transfers::{
+            PickedUploadFile, QueueNotificationSummary, TransferControlAction, TransferManager,
+            TransferPlatform,
+        };
+        use crate::{
+            DesktopCloseOutcome, desktop_close_active_ops, handle_desktop_close_request,
+            try_spawn_close_install_after_drain,
+        };
+
+        struct DrainTestPlatform {
+            hidden_for_drain: AtomicBool,
+            drain_notified: AtomicBool,
+        }
+
+        impl DrainTestPlatform {
+            fn new() -> Self {
+                Self {
+                    hidden_for_drain: AtomicBool::new(false),
+                    drain_notified: AtomicBool::new(false),
+                }
+            }
+        }
+
+        impl TransferPlatform for DrainTestPlatform {
+            fn pick_upload_files(
+                &self,
+            ) -> crate::backend::BoxFuture<'_, Result<Vec<PickedUploadFile>, AppError>>
+            {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+
+            fn finalize_download<'a>(
+                &'a self,
+                _id: &'a str,
+                part_path: &'a Path,
+                _file_name: &'a str,
+                _mime: Option<&'a str>,
+                _open_after_done: bool,
+            ) -> crate::backend::BoxFuture<'a, Result<String, AppError>> {
+                let out = part_path.to_string_lossy().into_owned();
+                Box::pin(async move { Ok(out) })
+            }
+
+            fn open_local_file<'a>(
+                &'a self,
+                _local_path: &'a str,
+                _mime: Option<&'a str>,
+            ) -> crate::backend::BoxFuture<'a, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn on_queue_updated(&self, summary: QueueNotificationSummary) {
+                if summary.active_count == 0
+                    && summary.cancelling_count == 0
+                    && self.hidden_for_drain.swap(false, Ordering::SeqCst)
+                {
+                    self.drain_notified.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let appimage = dir.path().join("Legion.AppImage");
+        fs::write(&appimage, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let (rel_sk, rel_pk) = keypair(0x95);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250225,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"#!/bin/sh\nexit 0\n",
+                &rel_sk,
+            ),
+        );
+
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage.clone(),
+        });
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let st = mgr
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap();
+        assert_eq!(st.phase, "ready");
+
+        let store = AppStore::in_dir(&data_dir);
+        let backend: Arc<dyn Backend> = Arc::new(LinkBackend::with_local_program(
+            store,
+            Some("/usr/bin/legion".to_owned()),
+        ));
+        let drain_platform = Arc::new(DrainTestPlatform::new());
+        let transfers = TransferManager::load_or_new(
+            &data_dir,
+            Arc::clone(&backend),
+            Arc::clone(&drain_platform) as Arc<dyn TransferPlatform>,
+        );
+
+        // Queue an active device transfer without starting workers so it stays active deterministically.
+        let xfer_id = transfers
+            .enqueue_download(
+                "local".to_owned(),
+                "/tmp/sample.bin".to_owned(),
+                Some("sample.bin".to_owned()),
+                Some(4096),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(transfers.has_active_work());
+
+        // 1. Closing the window while a transfer is active MUST hide for drain and NEVER spawn
+        //    an update supervisor or acquire update.lock.
+        assert_eq!(
+            handle_desktop_close_request(&mgr, backend.as_ref(), &transfers),
+            DesktopCloseOutcome::HideForDrain
+        );
+        assert!(
+            !updates_dir.join(desktop::UPDATE_LOCK_FILENAME).exists(),
+            "active transfer must prevent update.lock acquisition on window close"
+        );
+        assert!(
+            !updates_dir.join("supervisor.log").exists(),
+            "active transfer must prevent supervisor spawn on window close"
+        );
+        assert_eq!(mgr.snapshot().phase, "ready");
+
+        // Defense in depth: passing active transfer count into the native updater gate also
+        // refuses startup and close auto-installs while transfers are active.
+        let active_ops = desktop_close_active_ops(backend.as_ref(), &transfers);
+        assert!(active_ops >= 1);
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("startup", active_ops, true, t0),
+            Err("native_activity_in_flight")
+        );
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("close", active_ops, false, t0),
+            Err("native_activity_in_flight")
+        );
+        assert!(!try_spawn_close_install_after_drain(
+            &mgr,
+            backend.as_ref(),
+            &transfers
+        ));
+
+        // 2. Window is now hidden waiting for the queue to drain. Complete/drain the transfer so
+        //    no active work remains and verify the drain callback fires.
+        drain_platform
+            .hidden_for_drain
+            .store(true, Ordering::SeqCst);
+        transfers
+            .control(&xfer_id, TransferControlAction::Cancel)
+            .await
+            .unwrap();
+        assert!(!transfers.has_active_work());
+        assert!(
+            drain_platform.drain_notified.load(Ordering::SeqCst),
+            "draining the active transfer queue must notify the hidden desktop window"
+        );
+
+        // 3. Now that the queue has drained, the native gate permits close-time update install.
+        let idle_ops = desktop_close_active_ops(backend.as_ref(), &transfers);
+        assert_eq!(idle_ops, 0);
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("close", idle_ops, false, t0),
+            Ok(())
+        );
+
+        #[cfg(unix)]
+        {
+            assert!(
+                try_spawn_close_install_after_drain(&mgr, backend.as_ref(), &transfers),
+                "ready update must spawn verify-only close supervisor once hidden transfer queue drains"
+            );
+            assert_eq!(mgr.snapshot().phase, "installing");
+            let lock = desktop::inspect_active_update_lock(&updates_dir)
+                .expect("close supervisor must hold update.lock after drain");
+            assert!(lock.verify_only);
+            assert_eq!(lock.target_sequence, 202611250225);
+            if let Some(sup_pid) = lock.supervisor_pid {
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-TERM", &sup_pid.to_string()])
+                    .status();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn cancelling_transfer_blocks_every_update_gate_until_cleanup_finishes() {
+        use std::sync::atomic::AtomicBool;
+
+        use crate::commands::{evaluate_and_quiesce_auto_install, has_active_native_work};
+        use crate::content::AppContentServer;
+        use crate::link_backend::LinkBackend;
+        use crate::store::AppStore;
+        use crate::transfers::{
+            PickedUploadFile, QueueNotificationSummary, TransferControlAction, TransferManager,
+            TransferPlatform, TransferState,
+        };
+        use crate::{
+            DesktopCloseOutcome, desktop_close_active_ops, handle_desktop_close_request,
+            try_spawn_close_install_after_drain,
+        };
+
+        struct BlockingCancelPlatform {
+            block_delete_part: AtomicBool,
+            hidden_for_drain: AtomicBool,
+            drain_notified: AtomicBool,
+        }
+
+        impl BlockingCancelPlatform {
+            fn new() -> Self {
+                Self {
+                    block_delete_part: AtomicBool::new(true),
+                    hidden_for_drain: AtomicBool::new(false),
+                    drain_notified: AtomicBool::new(false),
+                }
+            }
+        }
+
+        impl TransferPlatform for BlockingCancelPlatform {
+            fn pick_upload_files(
+                &self,
+            ) -> crate::backend::BoxFuture<'_, Result<Vec<PickedUploadFile>, AppError>>
+            {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+
+            fn finalize_download<'a>(
+                &'a self,
+                _id: &'a str,
+                part_path: &'a Path,
+                _file_name: &'a str,
+                _mime: Option<&'a str>,
+                _open_after_done: bool,
+            ) -> crate::backend::BoxFuture<'a, Result<String, AppError>> {
+                let out = part_path.to_string_lossy().into_owned();
+                Box::pin(async move { Ok(out) })
+            }
+
+            fn delete_part_file<'a>(
+                &'a self,
+                part_path: &'a Path,
+            ) -> crate::backend::BoxFuture<'a, Result<(), AppError>> {
+                let blocked = self.block_delete_part.load(Ordering::SeqCst);
+                let path = part_path.to_path_buf();
+                Box::pin(async move {
+                    if blocked {
+                        return Err(AppError::new(
+                            ErrorCode::Busy,
+                            "Simulated file lock holding partial transfer file.",
+                        ));
+                    }
+                    match fs::remove_file(&path) {
+                        Ok(()) => Ok(()),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(err) => Err(AppError::new(ErrorCode::Failed, err.to_string())),
+                    }
+                })
+            }
+
+            fn open_local_file<'a>(
+                &'a self,
+                _local_path: &'a str,
+                _mime: Option<&'a str>,
+            ) -> crate::backend::BoxFuture<'a, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn on_queue_updated(&self, summary: QueueNotificationSummary) {
+                if summary.active_count == 0
+                    && summary.cancelling_count == 0
+                    && self.hidden_for_drain.swap(false, Ordering::SeqCst)
+                {
+                    self.drain_notified.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let android_updates_dir = dir.path().join("android-updates");
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let appimage = dir.path().join("Legion.AppImage");
+        fs::write(&appimage, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let (rel_sk, rel_pk) = keypair(0x96);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250230,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"#!/bin/sh\nexit 0\n",
+                &rel_sk,
+            ),
+        );
+        let mut android_fleet = FakeFleet::new();
+        android_fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250230,
+                "Legion-android.apk",
+                Os::Android,
+                Arch::Aarch64,
+                InstallKind::Apk,
+                b"fake-apk-bytes",
+                &rel_sk,
+            ),
+        );
+
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+                appimage_path: appimage.clone(),
+            }),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        assert_eq!(
+            mgr.check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+                .await
+                .unwrap()
+                .phase,
+            "ready"
+        );
+
+        let android_mgr = UpdateManager::with_config_at(
+            android_updates_dir,
+            anchors,
+            Os::Android,
+            Arch::Aarch64,
+            PlatformEnv::Android,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        assert_eq!(
+            android_mgr
+                .check_with_client_at(&android_fleet, &["tower".to_owned()], false, false, t0)
+                .await
+                .unwrap()
+                .phase,
+            "ready"
+        );
+
+        let store = AppStore::in_dir(&data_dir);
+        let backend: Arc<dyn Backend> = Arc::new(LinkBackend::with_local_program(
+            store,
+            Some("/usr/bin/legion".to_owned()),
+        ));
+        let content = AppContentServer::new(Arc::clone(&backend));
+        let platform = Arc::new(BlockingCancelPlatform::new());
+        let transfers = TransferManager::with_cleanup_retry_interval(
+            &data_dir,
+            Arc::clone(&backend),
+            Arc::clone(&platform) as Arc<dyn TransferPlatform>,
+            2,
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+        );
+
+        let xfer_id = transfers
+            .enqueue_download(
+                "local".to_owned(),
+                "/tmp/large.bin".to_owned(),
+                Some("large.bin".to_owned()),
+                Some(8192),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let part_file = data_dir
+            .join("transfers")
+            .join("parts")
+            .join(format!("{xfer_id}.part"));
+        fs::write(&part_file, b"partial-download-bytes").unwrap();
+
+        // Simulate window hidden for drain before the transfer enters `Cancelling`.
+        platform.hidden_for_drain.store(true, Ordering::SeqCst);
+        let cancelled_snapshot = transfers
+            .control(&xfer_id, TransferControlAction::Cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            cancelled_snapshot.state,
+            TransferState::Cancelling,
+            "blocked part-file removal must hold the transfer in Cancelling"
+        );
+        assert!(part_file.exists());
+
+        // While the transfer is in `Cancelling`, EVERY update gate MUST treat it as active work:
+        assert!(
+            transfers.has_active_work(),
+            "Cancelling transfer must count as active work"
+        );
+        assert!(
+            !platform.drain_notified.load(Ordering::SeqCst),
+            "hidden-for-drain must not fire while a transfer is still Cancelling"
+        );
+        assert!(
+            has_active_native_work(backend.as_ref(), &transfers, &content, &mgr),
+            "manual Update now gate must treat Cancelling transfer as active work"
+        );
+        let active_ops = desktop_close_active_ops(backend.as_ref(), &transfers);
+        assert_eq!(active_ops, 1);
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("startup", active_ops, true, t0),
+            Err("native_activity_in_flight")
+        );
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("close", active_ops, false, t0),
+            Err("native_activity_in_flight")
+        );
+        assert_eq!(
+            android_mgr.evaluate_auto_install_gate_at("background", active_ops, true, t0),
+            Err("native_activity_in_flight")
+        );
+        assert!(
+            !evaluate_and_quiesce_auto_install(
+                &mgr,
+                backend.as_ref(),
+                &transfers,
+                &content,
+                "startup",
+                Duration::from_millis(100),
+            )
+            .await
+        );
+        assert!(
+            !evaluate_and_quiesce_auto_install(
+                &android_mgr,
+                backend.as_ref(),
+                &transfers,
+                &content,
+                "background",
+                Duration::from_millis(100),
+            )
+            .await
+        );
+        assert_eq!(
+            handle_desktop_close_request(&mgr, backend.as_ref(), &transfers),
+            DesktopCloseOutcome::HideForDrain
+        );
+        assert!(!try_spawn_close_install_after_drain(
+            &mgr,
+            backend.as_ref(),
+            &transfers
+        ));
+        assert!(
+            !updates_dir.join(desktop::UPDATE_LOCK_FILENAME).exists(),
+            "Cancelling transfer must prevent update.lock acquisition and supervisor spawn"
+        );
+
+        // Release the simulated file lock and start the cleanup retry loop: once file removal
+        // completes and the transfer reaches `Cancelled`, every gate unblocks cleanly.
+        platform.block_delete_part.store(false, Ordering::SeqCst);
+        transfers.start();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let state = transfers
+                .list()
+                .into_iter()
+                .find(|t| t.id == xfer_id)
+                .map(|t| t.state);
+            if state == Some(TransferState::Cancelled) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for Cancelling transfer to finish cleanup (state={state:?})"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        transfers.shutdown();
+
+        assert!(!part_file.exists());
+        assert!(!transfers.has_active_work());
+        assert!(
+            platform.drain_notified.load(Ordering::SeqCst),
+            "drain callback must fire once Cancelling finishes removing files"
+        );
+        assert!(!has_active_native_work(
+            backend.as_ref(),
+            &transfers,
+            &content,
+            &mgr
+        ));
+        let idle_ops = desktop_close_active_ops(backend.as_ref(), &transfers);
+        assert_eq!(idle_ops, 0);
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("startup", idle_ops, false, t0),
+            Ok(())
+        );
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("close", idle_ops, false, t0),
+            Ok(())
+        );
+        assert_eq!(
+            android_mgr.evaluate_auto_install_gate_at("background", idle_ops, false, t0),
+            Ok(())
+        );
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overview_background_refreshes_do_not_block_updates_and_never_get_cut_off_mid_call() {
+        use std::sync::atomic::AtomicBool;
+
+        use legion_link::proto::{HelloResult, PROTOCOL, Request, Response, method};
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::sync::Notify;
+
+        use crate::backend::CallRequest;
+        use crate::commands::{evaluate_and_quiesce_auto_install, has_active_native_work};
+        use crate::content::AppContentServer;
+        use crate::link_backend::LinkBackend;
+        use crate::store::AppStore;
+        use crate::transfers::{PickedUploadFile, TransferManager, TransferPlatform};
+        use crate::{DesktopCloseOutcome, handle_desktop_close_request_with_timeout};
+
+        struct NoopPlatform;
+        impl TransferPlatform for NoopPlatform {
+            fn pick_upload_files(
+                &self,
+            ) -> crate::backend::BoxFuture<'_, Result<Vec<PickedUploadFile>, AppError>>
+            {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn finalize_download<'a>(
+                &'a self,
+                _id: &'a str,
+                part_path: &'a Path,
+                _file_name: &'a str,
+                _mime: Option<&'a str>,
+                _open_after_done: bool,
+            ) -> crate::backend::BoxFuture<'a, Result<String, AppError>> {
+                let out = part_path.to_string_lossy().into_owned();
+                Box::pin(async move { Ok(out) })
+            }
+            fn open_local_file<'a>(
+                &'a self,
+                _local_path: &'a str,
+                _mime: Option<&'a str>,
+            ) -> crate::backend::BoxFuture<'a, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let appimage = dir.path().join("Legion.AppImage");
+        fs::write(&appimage, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let (rel_sk, rel_pk) = keypair(0x97);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250235,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"#!/bin/sh\nexit 0\n",
+                &rel_sk,
+            ),
+        );
+
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+                appimage_path: appimage.clone(),
+            }),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        assert_eq!(
+            mgr.check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+                .await
+                .unwrap()
+                .phase,
+            "ready"
+        );
+
+        let call_entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let entered_tx = Arc::clone(&call_entered);
+        let release_rx = Arc::clone(&release);
+        let opener: legion_link::SessionOpener = Arc::new(move |entry, _, cancel| {
+            let entered_tx = Arc::clone(&entered_tx);
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap_or_else(|_| {
+                            Request::new(legion_link::proto::Id::Number(0), "", Value::Null)
+                        });
+                        let reply = if req.method == method::HELLO {
+                            Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap_or(Value::Null),
+                            )
+                        } else {
+                            entered_tx.fetch_add(1, Ordering::SeqCst);
+                            release_rx.notified().await;
+                            Response::ok(req.id, serde_json::json!({ "ok": true }))
+                        };
+                        let mut out = serde_json::to_string(&reply).unwrap_or_default();
+                        out.push('\n');
+                        if server_w.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = server_w.flush().await;
+                    }
+                });
+                legion_link::Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let store = AppStore::in_dir(&data_dir);
+        let backend: Arc<LinkBackend> = Arc::new(LinkBackend::with_opener(
+            store,
+            Some("/usr/bin/legion".to_owned()),
+            opener,
+        ));
+        let backend_dyn: Arc<dyn Backend> = Arc::clone(&backend) as Arc<dyn Backend>;
+        let content = AppContentServer::new(Arc::clone(&backend_dyn));
+        let transfers = TransferManager::load_or_new(
+            &data_dir,
+            Arc::clone(&backend_dyn),
+            Arc::new(NoopPlatform),
+        );
+
+        // 1. Start a Machine Overview `sys.procs` poll and pause it mid-flight.
+        let b_poll = Arc::clone(&backend);
+        let poll_finished = Arc::new(AtomicBool::new(false));
+        let poll_finished_tx = Arc::clone(&poll_finished);
+        let poll_task = tokio::spawn(async move {
+            let res = b_poll
+                .call(
+                    CallRequest {
+                        id: None,
+                        tool: "sys.procs".to_owned(),
+                        args: serde_json::json!({ "group": true, "limit": 12 }),
+                        on: Some(Value::String("local".to_owned())),
+                    },
+                    None,
+                )
+                .await;
+            poll_finished_tx.store(true, Ordering::SeqCst);
+            res
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while call_entered.load(Ordering::SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(backend.active_operations(), 0);
+        assert_eq!(backend.background_refreshes(), 1);
+        assert!(
+            !has_active_native_work(backend.as_ref(), &transfers, &content, &mgr),
+            "Overview background poll must not make active native work appear busy"
+        );
+
+        // If the poll stays mid-flight past the grace timeout, desktop close defers cleanly
+        // instead of cutting the RPC off mid-call.
+        let mgr_ref = &mgr;
+        let b_close = Arc::clone(&backend);
+        let t_close = Arc::clone(&transfers);
+        let deferred = tokio::task::block_in_place(|| {
+            handle_desktop_close_request_with_timeout(
+                mgr_ref,
+                b_close.as_ref(),
+                &t_close,
+                Duration::from_millis(40),
+            )
+        });
+        assert_eq!(deferred, DesktopCloseOutcome::CloseNormally);
+        assert!(!updates_dir.join(desktop::UPDATE_LOCK_FILENAME).exists());
+
+        // Start a startup auto-install quiesce while the poll is mid-call, then let the poll
+        // finish 40 ms later: the install waits for the poll to finish (never cutting it off) and
+        // succeeds right between poll ticks!
+        let release_soon = Arc::clone(&release);
+        let finished_check = Arc::clone(&poll_finished);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert!(
+                !finished_check.load(Ordering::SeqCst),
+                "poll must still be in flight until released"
+            );
+            release_soon.notify_waiters();
+        });
+        let allowed_after_poll = evaluate_and_quiesce_auto_install(
+            &mgr,
+            backend.as_ref(),
+            &transfers,
+            &content,
+            "startup",
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            allowed_after_poll,
+            "auto-install must wait for in-flight Overview poll and then proceed between ticks"
+        );
+        assert!(
+            poll_finished.load(Ordering::SeqCst),
+            "Overview poll must finish cleanly before auto-install proceeds"
+        );
+        assert!(poll_task.await.unwrap().is_ok());
+
+        // 2. Now start a user-started `exec.run` call and pause it mid-flight:
+        //    it MUST block every update gate immediately!
+        call_entered.store(0, Ordering::SeqCst);
+        let b_exec = Arc::clone(&backend);
+        let exec_task = tokio::spawn(async move {
+            b_exec
+                .call(
+                    CallRequest {
+                        id: None,
+                        tool: "exec.run".to_owned(),
+                        args: serde_json::json!({ "cmd": "sleep 1" }),
+                        on: Some(Value::String("local".to_owned())),
+                    },
+                    None,
+                )
+                .await
+        });
+        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(3);
+        while call_entered.load(Ordering::SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < deadline2);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(backend.active_operations(), 1);
+        assert!(has_active_native_work(
+            backend.as_ref(),
+            &transfers,
+            &content,
+            &mgr
+        ));
+        assert_eq!(
+            mgr.evaluate_auto_install_gate("close", backend.active_operations(), false),
+            Err("native_activity_in_flight")
+        );
+        let blocked_close = tokio::task::block_in_place(|| {
+            handle_desktop_close_request_with_timeout(
+                &mgr,
+                backend.as_ref(),
+                &transfers,
+                Duration::from_secs(1),
+            )
+        });
+        assert_eq!(blocked_close, DesktopCloseOutcome::CloseNormally);
+        assert!(!updates_dir.join(desktop::UPDATE_LOCK_FILENAME).exists());
+        release.notify_waiters();
+        assert!(exec_task.await.unwrap().is_ok());
+        assert_eq!(backend.active_operations(), 0);
+
+        // 3. Desktop close while a `sys.info` refresh is mid-flight waits cleanly for that call to
+        //    finish rather than cutting it off, then spawns the close-time supervisor between ticks.
+        #[cfg(unix)]
+        {
+            call_entered.store(0, Ordering::SeqCst);
+            let sys_done = Arc::new(AtomicBool::new(false));
+            let sys_done_tx = Arc::clone(&sys_done);
+            let b_sys = Arc::clone(&backend);
+            let sys_task = tokio::spawn(async move {
+                let res = b_sys
+                    .call(
+                        CallRequest {
+                            id: None,
+                            tool: "sys.info".to_owned(),
+                            args: serde_json::json!({}),
+                            on: Some(Value::String("local".to_owned())),
+                        },
+                        None,
+                    )
+                    .await;
+                sys_done_tx.store(true, Ordering::SeqCst);
+                res
+            });
+            let deadline3 = tokio::time::Instant::now() + Duration::from_secs(3);
+            while call_entered.load(Ordering::SeqCst) == 0 {
+                assert!(tokio::time::Instant::now() < deadline3);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let release_sys = Arc::clone(&release);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                release_sys.notify_waiters();
+            });
+            let outcome = tokio::task::block_in_place(|| {
+                handle_desktop_close_request_with_timeout(
+                    &mgr,
+                    backend.as_ref(),
+                    &transfers,
+                    Duration::from_secs(2),
+                )
+            });
+            assert_eq!(
+                outcome,
+                DesktopCloseOutcome::CloseWithUpdate,
+                "desktop close must wait for in-flight sys.info and install cleanly between ticks"
+            );
+            assert!(
+                sys_task.await.unwrap().is_ok(),
+                "sys.info call must complete cleanly before close-time update runs"
+            );
+            assert!(sys_done.load(Ordering::SeqCst));
+            if let Some(lock) = desktop::inspect_active_update_lock(&updates_dir)
+                && let Some(sup_pid) = lock.supervisor_pid
+            {
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-TERM", &sup_pid.to_string()])
+                    .status();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
 }

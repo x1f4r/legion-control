@@ -1438,11 +1438,9 @@ impl Grant {
         // If `node.toml` configures `[devices] authorized_keys`, protect that file (following any
         // symlink) together with its `.legion.lock` and `.legion-tmp-*` atomic-write siblings from
         // non-admin file tools. (Path guards apply to file tools, not to roles that allow `exec`.)
-        if let Ok(bytes) = std::fs::read(self.paths.config_file(crate::config::NodeFile::FILE))
-            && let Ok(node) = crate::config::parse::<crate::config::NodeFile>(
-                &self.paths.config_file(crate::config::NodeFile::FILE),
-                &bytes,
-            )
+        let node_path = self.paths.config_file(crate::config::NodeFile::FILE);
+        if let Ok(Some(bytes)) = crate::config::read_regular_file(&node_path)
+            && let Ok(node) = crate::config::parse::<crate::config::NodeFile>(&node_path, &bytes)
             && let Some(configured) = node.devices.authorized_keys
         {
             let full = expand_tilde(Path::new(&configured), self.paths.home())

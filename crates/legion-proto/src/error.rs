@@ -1,11 +1,12 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// What went wrong, from a set closed on purpose: an agent branches on it, so every door uses the
-/// same thirteen words and a new failure picks the nearest one rather than inventing a fourteenth.
+/// same thirteen words and a new failure picks the nearest one rather than inventing another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -97,7 +98,10 @@ impl FromStr for ErrorCode {
 ///
 /// `message` says what happened in one sentence and `hint`, when there is something to do, says
 /// what. Both are written for someone who has never read the source.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// Deserialization is forward-tolerant: an unrecognized `code` string from a newer peer decodes as
+/// [`ErrorCode::Failed`] while preserving the original string under `details.unknown_code`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ErrorBody {
     /// The code an agent branches on.
     pub code: ErrorCode,
@@ -112,6 +116,57 @@ pub struct ErrorBody {
     /// Anything structured a caller may want to act on, such as the line a file failed to parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+}
+
+impl<'de> Deserialize<'de> for ErrorBody {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct RawErrorBody {
+            code: String,
+            message: String,
+            #[serde(default)]
+            hint: Option<String>,
+            #[serde(default)]
+            machine: Option<String>,
+            #[serde(default)]
+            details: Option<Value>,
+        }
+
+        let raw = RawErrorBody::deserialize(deserializer)?;
+        let (code, details) = match raw.code.parse::<ErrorCode>() {
+            Ok(known) => (known, raw.details),
+            Err(_) => {
+                if raw.code.is_empty() {
+                    return Err(de::Error::custom("error code cannot be empty"));
+                }
+                let merged = match raw.details {
+                    None => {
+                        let mut map = Map::new();
+                        map.insert("unknown_code".to_owned(), Value::String(raw.code));
+                        Value::Object(map)
+                    }
+                    Some(Value::Object(mut map)) => {
+                        map.insert("unknown_code".to_owned(), Value::String(raw.code));
+                        Value::Object(map)
+                    }
+                    Some(other) => {
+                        let mut map = Map::new();
+                        map.insert("unknown_code".to_owned(), Value::String(raw.code));
+                        map.insert("original_details".to_owned(), other);
+                        Value::Object(map)
+                    }
+                };
+                (ErrorCode::Failed, Some(merged))
+            }
+        };
+        Ok(ErrorBody {
+            code,
+            message: raw.message,
+            hint: raw.hint,
+            machine: raw.machine,
+            details,
+        })
+    }
 }
 
 impl ErrorBody {

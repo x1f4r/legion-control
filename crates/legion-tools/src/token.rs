@@ -390,11 +390,7 @@ fn update(
                 other => failed(format!("{} cannot be locked", lock.display()), &other),
             }
         })?;
-    let bytes = match std::fs::read(file) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(failed(format!("{} cannot be read", file.display()), &error)),
-    };
+    let bytes = legion_core::config::read_regular_file(file)?;
     let current = match &bytes {
         Some(bytes) => parse::<Tokens>(file, bytes)?,
         None => Tokens::default(),
