@@ -2561,8 +2561,11 @@ test('delayed capability replies still render thumbnails in pinned strip, folder
   fs.mkdirSync(piGallery, { recursive: true });
   const piAmberPath = path.join(piGallery, 'pi-amber.png');
   const piVioletPath = path.join(piGallery, 'pi-violet.png');
+  const piSongPath = path.join(piGallery, 'pi-song.flac');
+  const piSongCoverBase64 = makeSolidPng(128, 128, 45, 175, 155).toString('base64');
   fs.writeFileSync(piAmberPath, makeSolidPng(160, 120, 225, 165, 35));
   fs.writeFileSync(piVioletPath, makeSolidPng(160, 120, 125, 70, 200));
+  fs.writeFileSync(piSongPath, Buffer.from('fLaC\x00\x00\x00\x22'));
 
   const legacyMedia = path.join(legacyUser, 'media');
   fs.mkdirSync(legacyMedia, { recursive: true });
@@ -2606,9 +2609,10 @@ test('delayed capability replies still render thumbnails in pinned strip, folder
     ].join('\n'),
   );
 
-  // Pin a picture that lives on `pi` so Files home renders the tile via tower's fav.list while
-  // pi's own capabilities are still held back.
+  // Pin a picture and a song that live on `pi` so Files home renders both tiles via tower's
+  // fav.list while pi's own capabilities are still held back.
   runLegion(['fav.add', 'machine=pi', `path=${piAmberPath}`, 'pinned=true', '--json'], towerHome, towerUser);
+  runLegion(['fav.add', 'machine=pi', `path=${piSongPath}`, 'pinned=true', '--json'], towerHome, towerUser);
   const tokenOut = JSON.parse(runLegion(['token.add', 'name=ui', 'principal=ui', '--json'], towerHome, towerUser));
 
   const server = await startServer(towerHome, towerUser);
@@ -2672,6 +2676,31 @@ test('delayed capability replies still render thumbnails in pinned strip, folder
         legacyCapsGate.markArrived();
         await legacyCapsGate.waitRelease();
       }
+      if (body && body.on === 'pi' && body.tool === 'meta.whoami') {
+        const resp = await route.fetch();
+        const data = await resp.json();
+        if (Array.isArray(data?.tools) && !data.tools.includes('fs.tags')) {
+          data.tools = [...data.tools, 'fs.tags'];
+        }
+        await route.fulfill({ response: resp, json: data });
+        return;
+      }
+      if (body && body.on === 'pi' && body.tool === 'fs.thumb') {
+        const resp = await route.fetch();
+        const data = await resp.json();
+        if (Array.isArray(data?.results)) {
+          data.results = data.results.map((item) =>
+            item && item.path === piSongPath && !item.ok
+              ? {
+                  path: piSongPath,
+                  ok: { mime: 'image/png', content: piSongCoverBase64, width: 128, height: 128 },
+                }
+              : item,
+          );
+        }
+        await route.fulfill({ response: resp, json: data });
+        return;
+      }
       await route.continue();
     });
 
@@ -2682,11 +2711,15 @@ test('delayed capability replies still render thumbnails in pinned strip, folder
     await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
 
     const pinnedTile = page.locator('.tiles a.tile', { hasText: 'pi-amber.png' });
+    const pinnedSongTile = page.locator('.tiles a.tile', { hasText: 'pi-song.flac' });
     await pinnedTile.waitFor({ timeout: 10_000 });
+    await pinnedSongTile.waitFor({ timeout: 10_000 });
     await piCapsGate.waitArrived();
     assert.equal(await pinnedTile.locator('img').count(), 0, 'Pinned tile should show icon while pi caps are held');
+    assert.equal(await pinnedSongTile.locator('img').count(), 0, 'Pinned song tile should show icon while pi caps are held');
     piCapsGate.release();
     await waitForLoadedThumb(pinnedTile, 'delayed-caps pinned pi-amber.png');
+    await waitForLoadedThumb(pinnedSongTile, 'delayed-caps pinned pi-song.flac');
 
     // 2. Folder listing mounts while pi's capability reply is held back on a fresh reload.
     piCapsGate = makeGate();
@@ -2696,13 +2729,17 @@ test('delayed capability replies still render thumbnails in pinned strip, folder
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.locator('header.top h1', { hasText: 'gallery' }).waitFor({ timeout: 10_000 });
     await piCapsGate.waitArrived();
-    assert.equal(await page.locator('.grid a.cell img').count(), 0, 'Listing should wait until pi caps arrive');
+    assert.equal(await page.locator('.grid a.cell img').count(), 0, 'Listing grid should wait until pi caps arrive');
+    assert.equal(await page.locator('.list a.row img').count(), 0, 'Listing song cover should wait until pi caps arrive');
     piCapsGate.release();
     for (const name of ['pi-amber.png', 'pi-violet.png']) {
       const cell = page.locator(`.grid a.cell[aria-label="${name}"]`);
       await cell.waitFor({ timeout: 10_000 });
       await waitForLoadedThumb(cell, `delayed-caps listing ${name}`);
     }
+    const songRow = page.locator('.list a.row', { hasText: 'pi-song.flac' });
+    await songRow.waitFor({ timeout: 10_000 });
+    await waitForLoadedThumb(songRow, 'delayed-caps listing pi-song.flac');
 
     // 3. Viewer renders while legacy's capability reply is held back; releasing loads the fs.thumb preview.
     legacyCapsGate = makeGate();

@@ -740,12 +740,16 @@ test('createThumbQueue batches at most 32 paths and retries busy errors with exp
   assert.equal(thumbCalls, 0);
   assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late.png', '', 128)), null);
 
-  // Capabilities arrive later; re-enqueueing fetches the thumbnail.
+  // Capabilities arrive later; re-enqueueing fetches both picture and song cover thumbnails.
+  assert.equal(isThumbEligible({ name: 'late-song.flac', kind: 'file' }, { includeAudio: false }), false);
+  assert.equal(isThumbEligible({ name: 'late-song.flac', kind: 'file' }, { includeAudio: true }), true);
   capsKnown = true;
   q3.enqueue({ path: '/home/me/late.png', mtime: '' });
+  q3.enqueue({ path: '/home/me/late-song.flac', mtime: '' });
   await runAllTimers();
   assert.equal(thumbCalls, 1);
   assert.equal(updates3, 1);
   assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late.png', '', 128))?.url, 'data:image/png;base64,T0s=');
+  assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late-song.flac', '', 128))?.url, 'data:image/png;base64,T0s=');
   q3.dispose();
 });

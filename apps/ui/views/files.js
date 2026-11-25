@@ -267,9 +267,14 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, i
           const p = item.target?.dataset?.thumbPath;
           if (!p) continue;
           const entry = entryMapRef.current.get(p);
-          if (entry) requestPath(entry);
-          obs.unobserve(item.target);
-          observedElsRef.current.delete(item.target);
+          if (entry && isThumbEligible(entry, { includeAudio })) {
+            requestPath(entry);
+            obs.unobserve(item.target);
+            observedElsRef.current.delete(item.target);
+          } else if (!entry || entryCategory(entry) !== 'audio') {
+            obs.unobserve(item.target);
+            observedElsRef.current.delete(item.target);
+          }
         }
       },
       { rootMargin: '200px 0px' },
@@ -404,6 +409,12 @@ export function FilesHome({
   onOpenFile,
   onStartSearch,
 }) {
+  const [capsRev, setCapsRev] = useState(0);
+  useEffect(() => {
+    if (!capsStore) return undefined;
+    return capsStore.subscribe(() => setCapsRev((n) => n + 1));
+  }, [capsStore]);
+
   const pinned = useMemo(() => (favourites || []).filter((f) => f.pinned), [favourites]);
   const pinnedByMachine = useMemo(() => {
     const map = new Map();
@@ -416,7 +427,7 @@ export function FilesHome({
       map.get(p.machine).push({ path: p.path, mtime: '' });
     }
     return map;
-  }, [pinned, capsStore, caps?.hasAudioCovers]);
+  }, [pinned, capsStore, caps?.hasAudioCovers, capsRev]);
 
   // Batch-load thumbnails for pinned pictures/videos/audio covers (up to 32 per machine call) with retry backoff.
   const getPinnedThumbUrl = useMultiMachineThumbs({
@@ -457,7 +468,12 @@ export function FilesHome({
                   item.kind === 'dir'
                     ? routeHref({ section: 'files', view: 'folder', machine: item.machine, path: item.path })
                     : routeHref({ section: 'files', view: 'home', viewer: { machine: item.machine, path: item.path } });
-                const thumbUrl = isThumbEligible(item) ? getPinnedThumbUrl(item.machine, item.path, '') : null;
+                const includeAudio = capsStore
+                  ? Boolean(capsStore.fileCapabilities(item.machine).hasAudioCovers)
+                  : Boolean(caps?.hasAudioCovers);
+                const thumbUrl = isThumbEligible(item, { includeAudio })
+                  ? getPinnedThumbUrl(item.machine, item.path, '')
+                  : null;
                 return html`
                   <a
                     key=${item.id}
@@ -1685,6 +1701,12 @@ export function FilesSearchView({
     );
   }, [onRegisterRefresh]);
 
+  const [searchCapsRev, setSearchCapsRev] = useState(0);
+  useEffect(() => {
+    if (!capsStore) return undefined;
+    return capsStore.subscribe(() => setSearchCapsRev((n) => n + 1));
+  }, [capsStore]);
+
   // Batch-load thumbnails for picture/video/audio search hits (up to 32 per machine call) with retry backoff.
   const searchThumbsByMachine = useMemo(() => {
     const map = new Map();
@@ -1701,7 +1723,7 @@ export function FilesSearchView({
       if (eligible.length > 0) map.set(mName, eligible);
     }
     return map;
-  }, [resultsByMachine, capsStore, caps?.hasAudioCovers]);
+  }, [resultsByMachine, capsStore, caps?.hasAudioCovers, searchCapsRev]);
 
   useMultiMachineThumbs({
     itemsByMachine: searchThumbsByMachine,
