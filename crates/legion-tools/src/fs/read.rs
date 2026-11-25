@@ -128,6 +128,7 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
     }
     let root = check_fs_path(ctx.grant(), &args.path, Access::Read)?;
     let own_dirs = OwnDirFilter::for_ctx(ctx);
+    let state_dir = ctx.paths().state_dir().to_path_buf();
     let max_depth = args.depth;
     let include_hidden = args.hidden;
     let limit = usize::try_from(args.limit).unwrap_or(usize::MAX);
@@ -141,6 +142,7 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             )
             .with_hint("Use fs.stat or fs.read for a file, or pass its parent directory."));
         }
+        legion_xfer::recover_pending_renames(&state_dir, Some(&root));
         let root_str = path_to_string(&root);
         let reply_bytes = serde_json::to_vec(&ListResult {
             path: root_str.clone(),

@@ -18,6 +18,7 @@ pub mod manifest;
 pub mod path;
 pub mod plan;
 mod platform;
+pub mod rename;
 
 pub use archive::{
     PackReport, PlacedFileMeta, RenamedEntry, UnpackReport, pack, unpack, unpack_filtered,
@@ -25,11 +26,13 @@ pub use archive::{
 };
 pub use error::{Error, Result};
 pub use file::{
-    GetStream, IfExists, PART_SUFFIX, PlaceOutcome, PutOutcome, PutReport, PutSession,
-    STALE_TEMP_AGE, default_xfer_state_dir, get, move_lock_state_path, numbered_candidate,
-    open_get, part_lock_state_path, part_meta_state_path, part_path, put, reclaim_stale_claim,
-    resume_offset, resume_offset_for, resume_offset_for_with_state, resume_offset_with_state,
-    sweep_stale_state, sweep_stale_temps, try_lock_state_file, write_partial_meta_in_state,
+    GetStream, IfExists, OwnedTempGuard, PART_SUFFIX, PROBE_SWEEP_AGE, PlaceOutcome, PutOutcome,
+    PutReport, PutSession, STALE_TEMP_AGE, default_xfer_state_dir, forget_probe_marker, get,
+    move_lock_state_path, numbered_candidate, open_get, part_lock_state_path, part_meta_state_path,
+    part_path, put, reclaim_stale_claim, record_probe_marker, register_owned_temp, resume_offset,
+    resume_offset_for, resume_offset_for_with_state, resume_offset_with_state,
+    sweep_abandoned_temps, sweep_stale_state, sweep_stale_temps, try_lock_state_file,
+    write_partial_meta_in_state,
 };
 pub use hash::{Hash, HashingReader, HashingWriter};
 pub use manifest::{
@@ -38,3 +41,10 @@ pub use manifest::{
 pub use path::{resolve_relative_path, validate_relative_path};
 pub use plan::{Plan, PlanConflict, PlanOptions, PlanTotals};
 pub use platform::{is_legion_internal_name, is_sweepable_temp_name};
+pub use rename::{
+    FsNameBehavior, PendingRenameIntent, PendingRenameRecovery, SameEntryDecision,
+    case_insensitive, case_insensitive_in_dir, classify_same_entry, decide_pending_rename_recovery,
+    directory_contains_exact_name, move_no_replace_raw, names_fold_equivalent, pending_renames_dir,
+    probe_dir_name_behavior, recover_pending_renames, rename_intent_key, unicode_normalizing,
+    unicode_normalizing_in_dir, unlink_held_lock, visible_rename_temp_name,
+};

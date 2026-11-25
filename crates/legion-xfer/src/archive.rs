@@ -326,6 +326,8 @@ where
 {
     fs::create_dir_all(root).map_err(|e| classify_io(root, e))?;
     let canonical_root = fs::canonicalize(root).map_err(|e| classify_io(root, e))?;
+    let _ = crate::file::sweep_abandoned_temps(state_dir, crate::file::PROBE_SWEEP_AGE);
+    let _ = crate::file::sweep_stale_state(state_dir, crate::file::STALE_TEMP_AGE);
     let case_insensitive = is_case_insensitive_dir(&canonical_root)?;
 
     let mut archive = Archive::new(reader);
@@ -482,7 +484,7 @@ where
                 }
 
                 let expected_size = entry.size();
-                let (mut tmp_file, mut guard) = create_temp_file(&parent)?;
+                let (mut tmp_file, mut guard) = create_temp_file(&parent, state_dir)?;
                 let written = io::copy(&mut entry, &mut tmp_file)?;
                 if written != expected_size {
                     return Err(Error::Io {
@@ -1174,11 +1176,14 @@ fn unique_temp_path(parent: &Path) -> PathBuf {
     parent.join(format!(".legion-unpack-{pid}-{seq}.tmp"))
 }
 
-fn create_temp_file(parent: &Path) -> Result<(File, TempFileGuard)> {
+fn create_temp_file(parent: &Path, state_dir: &Path) -> Result<(File, TempFileGuard)> {
     loop {
         let path = unique_temp_path(parent);
         match platform::create_new_private(&path) {
-            Ok(file) => return Ok((file, TempFileGuard::new(path))),
+            Ok(file) => {
+                let owned = crate::file::register_owned_temp(state_dir, &path, &file);
+                return Ok((file, TempFileGuard::new(path, owned)));
+            }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(classify_io(&path, err)),
         }
@@ -1188,11 +1193,15 @@ fn create_temp_file(parent: &Path) -> Result<(File, TempFileGuard)> {
 /// Deletes a temporary unpack file on drop unless disarmed after a successful rename.
 struct TempFileGuard {
     path: Option<PathBuf>,
+    owned: Option<crate::file::OwnedTempGuard>,
 }
 
 impl TempFileGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
+    fn new(path: PathBuf, owned: Option<crate::file::OwnedTempGuard>) -> Self {
+        Self {
+            path: Some(path),
+            owned,
+        }
     }
 
     fn path(&self) -> &Path {
@@ -1201,6 +1210,7 @@ impl TempFileGuard {
 
     fn disarm(&mut self) {
         self.path = None;
+        self.owned.take();
     }
 }
 
@@ -1209,6 +1219,7 @@ impl Drop for TempFileGuard {
         if let Some(path) = self.path.take() {
             let _ = fs::remove_file(path);
         }
+        self.owned.take();
     }
 }
 
@@ -1872,7 +1883,8 @@ mod tests {
         }
 
         let dst = tempfile::tempdir().unwrap();
-        let (_file, guard) = create_temp_file(dst.path()).unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let (_file, guard) = create_temp_file(dst.path(), state_dir.path()).unwrap();
         let direct_mode = fs::symlink_metadata(guard.path())
             .unwrap()
             .permissions()

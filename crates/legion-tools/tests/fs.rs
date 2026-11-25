@@ -199,6 +199,52 @@ async fn list_orders_directories_first_handles_depth_hidden_and_truncation() {
     );
 }
 
+#[tokio::test]
+async fn list_recovers_interrupted_two_step_rename_and_cleans_up_intent_and_lock() {
+    let f = Fixture::new();
+    let state_dir = f.dir.path().join("state");
+    let temp_name = legion_xfer::visible_rename_temp_name(std::ffi::OsStr::new("Draft.txt"), 77, 1);
+    std::fs::write(f.work.join(&temp_name), "recovered body").unwrap();
+
+    let renames_dir = legion_xfer::pending_renames_dir(&state_dir);
+    std::fs::create_dir_all(&renames_dir).unwrap();
+    let key = legion_xfer::rename_intent_key(&f.work, &temp_name);
+    let intent_path = renames_dir.join(format!("{key}.json"));
+    let lock_path = renames_dir.join(format!("{key}.lock"));
+    let orphan_lock = renames_dir.join("orphan-rename.lock");
+    let intent = legion_xfer::PendingRenameIntent {
+        parent: f.work.to_string_lossy().into_owned(),
+        from_name: "Draft.txt".to_owned(),
+        temp_name: temp_name.clone(),
+        to_name: "draft.txt".to_owned(),
+    };
+    std::fs::write(&intent_path, serde_json::to_vec(&intent).unwrap()).unwrap();
+    std::fs::write(&lock_path, b"").unwrap();
+    std::fs::write(&orphan_lock, b"").unwrap();
+
+    let listed = f
+        .call("fs.list", json!({"path": "~/projects"}))
+        .await
+        .unwrap();
+    let names: Vec<&str> = listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["draft.txt"]);
+    assert_eq!(
+        std::fs::read_to_string(f.work.join("draft.txt")).unwrap(),
+        "recovered body"
+    );
+    assert!(!intent_path.exists(), "intent json should be removed");
+    assert!(!lock_path.exists(), "intent lock should be removed");
+    assert!(
+        !orphan_lock.exists(),
+        "orphaned rename lock should be swept"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn list_and_stat_report_symlinks_without_following_and_include_unix_mode() {

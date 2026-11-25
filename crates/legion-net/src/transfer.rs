@@ -1403,7 +1403,9 @@ impl Transfer<'_> {
     /// Always probes `(from_dir, to_dir)` by creating a unique marker in `to_dir` and checking
     /// whether it appears in `from_dir`, caching conclusive results for the transfer.
     ///
-    /// Never treats an error or missing directory as distinct: returns
+    /// Keeps the `probe_write` stream open with `hold: true` while `probe_read` runs so the marker
+    /// is removed automatically on close and tracked by an ownership flock if either process is
+    /// killed. Never treats an error or missing directory as distinct: returns
     /// [`DirPairProof::Inconclusive`] so callers keep both the copy and the source.
     async fn prove_dir_pair(
         &self,
@@ -1417,20 +1419,21 @@ impl Transfer<'_> {
         if let Some(cached) = cache.get(&key) {
             return cached.clone();
         }
-        let created: ProbeReply = match self
-            .request_required(
+        let mut probe_conn = match self
+            .open_with_caps(
                 to,
                 json!({
                     "op": "probe_write",
                     "action": "create",
                     "dir": to_dir,
                     "nearest_ancestor": false,
+                    "hold": true,
                 }),
                 &[CAP_PROBE],
             )
             .await
         {
-            Ok(reply) => reply,
+            Ok(conn) => conn,
             Err(err) => {
                 return DirPairProof::Inconclusive(format!(
                     "could not probe {} on {}: {}",
@@ -1438,7 +1441,18 @@ impl Transfer<'_> {
                 ));
             }
         };
-        let (Some(probe_dir), Some(marker)) = (created.dir, created.marker) else {
+        let created: ProbeReply = match probe_conn.first().await {
+            Ok(reply) => reply,
+            Err(err) => {
+                probe_conn.abort().await;
+                return DirPairProof::Inconclusive(format!(
+                    "could not probe {} on {}: {}",
+                    to_dir, to.machine, err.message
+                ));
+            }
+        };
+        let (Some(_probe_dir), Some(marker)) = (created.dir, created.marker) else {
+            probe_conn.close().await;
             return DirPairProof::Inconclusive(format!(
                 "{} on {} could not be probed for directory distinctness",
                 to_dir, to.machine
@@ -1456,19 +1470,8 @@ impl Transfer<'_> {
                 &[CAP_PROBE],
             )
             .await;
-        // Always remove the probe marker, even if the read check failed.
-        let _ = self
-            .request_required::<ProbeReply>(
-                to,
-                json!({
-                    "op": "probe_write",
-                    "action": "remove",
-                    "dir": probe_dir,
-                    "marker": marker,
-                }),
-                &[CAP_PROBE],
-            )
-            .await;
+        // Closing the held `probe_write` stream signals it to unlink the marker and exit cleanly.
+        probe_conn.close().await;
         let to_network_fs = created.network_fs;
         match check_res {
             Ok(reply) => {
@@ -1510,23 +1513,32 @@ impl Transfer<'_> {
         to_exists: bool,
         cache: &mut HashMap<(String, String), DirPairProof>,
     ) -> Result<bool, ErrorBody> {
-        let created: ProbeReply = match self
-            .request_required(
+        let mut probe_conn = match self
+            .open_with_caps(
                 to,
                 json!({
                     "op": "probe_write",
                     "action": "create",
                     "dir": to_dir,
                     "nearest_ancestor": !to_exists,
+                    "hold": true,
                 }),
                 &[CAP_PROBE],
             )
             .await
         {
-            Ok(reply) => reply,
+            Ok(conn) => conn,
             Err(_) => return Ok(false),
         };
-        let (Some(probe_dir), Some(marker)) = (created.dir, created.marker) else {
+        let created: ProbeReply = match probe_conn.first().await {
+            Ok(reply) => reply,
+            Err(_) => {
+                probe_conn.abort().await;
+                return Ok(false);
+            }
+        };
+        let (Some(_probe_dir), Some(marker)) = (created.dir, created.marker) else {
+            probe_conn.close().await;
             return Ok(false);
         };
         let check_res: Result<ProbeReply, ErrorBody> = self
@@ -1541,18 +1553,7 @@ impl Transfer<'_> {
                 &[CAP_PROBE],
             )
             .await;
-        let _ = self
-            .request_required::<ProbeReply>(
-                to,
-                json!({
-                    "op": "probe_write",
-                    "action": "remove",
-                    "dir": probe_dir,
-                    "marker": marker,
-                }),
-                &[CAP_PROBE],
-            )
-            .await;
+        probe_conn.close().await;
         let to_network_fs = created.network_fs;
         match check_res {
             Ok(reply) => {

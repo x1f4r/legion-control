@@ -62,13 +62,22 @@ use legion_os::atomic::{
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::device::registry::DevicesFile;
 use legion_tools::xfer::{error as xfer_error, manifest, resolve_root};
+pub use legion_xfer::recover_pending_renames;
 use legion_xfer::{
     CaseCollision, Entry, EntryKind, Hash, IfExists, ManifestOptions, PlacedFileMeta, PutSession,
-    RenamedEntry, SkippedEntry, Timestamp, resolve_relative_path,
+    RenamedEntry, SkippedEntry, Timestamp, case_insensitive, case_insensitive_in_dir,
+    directory_contains_exact_name, move_no_replace_raw, pending_renames_dir,
+    probe_dir_name_behavior, rename_intent_key, resolve_relative_path, unicode_normalizing,
+    unicode_normalizing_in_dir, visible_rename_temp_name,
 };
+pub(crate) use legion_xfer::{
+    FsNameBehavior, PendingRenameIntent, SameEntryDecision, classify_same_entry,
+    names_fold_equivalent,
+};
+#[cfg(test)]
+use legion_xfer::{PendingRenameRecovery, decide_pending_rename_recovery};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use unicode_normalization::UnicodeNormalization;
 
 /// The version of this exchange: a header names it, and a node refuses one it does not speak.
 pub const STREAM_PROTOCOL: u32 = 1;
@@ -255,6 +264,11 @@ pub(crate) enum Op {
         /// directory of `dir` when `dir` itself does not exist yet.
         #[serde(default)]
         nearest_ancestor: bool,
+        /// When `true` with `action = "create"`, keep the stream open after replying, hold an
+        /// ownership flock under `<state_dir>/xfer/temps/`, and delete the marker automatically
+        /// when the caller closes stdin, sends `"remove"`, or times out.
+        #[serde(default)]
+        hold: bool,
     },
     /// Check whether a probe marker file appears in `dir` or any of its named subdirectories.
     #[serde(rename = "probe_read")]
@@ -1169,28 +1183,38 @@ fn run<R: Read + Send + 'static, W: Write>(
             expect_hashes,
             expect_root_hash,
             forbid_file_id,
-        } => delete(
-            grant,
-            &root,
-            &names,
-            dry_run,
-            remove_root,
-            &expect_hashes,
-            expect_root_hash,
-            forbid_file_id,
-            output,
-        ),
+        } => {
+            legion_xfer::sweep_abandoned_temps(
+                host.paths.state_dir(),
+                legion_xfer::PROBE_SWEEP_AGE,
+            );
+            delete(
+                grant,
+                &root,
+                &names,
+                dry_run,
+                remove_root,
+                &expect_hashes,
+                expect_root_hash,
+                forbid_file_id,
+                output,
+            )
+        }
         Op::ProbeWrite {
             action,
             dir,
             marker,
             nearest_ancestor,
+            hold,
         } => probe_write(
+            host,
             grant,
             action,
             &dir,
             marker.as_deref(),
             nearest_ancestor,
+            hold,
+            input,
             output,
         ),
         Op::ProbeRead {
@@ -1258,7 +1282,9 @@ fn list<W: Write>(
     output: &mut W,
 ) -> Result<(), Failure> {
     let root = resolve_root(grant, root, Access::Read)?;
-    recover_pending_renames(host.paths.state_dir(), Some(&root));
+    let state_dir = host.paths.state_dir();
+    recover_pending_renames(state_dir, Some(&root));
+    legion_xfer::sweep_abandoned_temps(state_dir, legion_xfer::PROBE_SWEEP_AGE);
     let options = ManifestOptions { checksum, exclude };
     let listing = busy(output, || manifest(grant, &host.paths, &root, &options))??;
     write_listing(output, listing.entries, listing.skipped)
@@ -1314,6 +1340,7 @@ fn stat<W: Write>(
     let given = grant.check_path(path, Access::Read)?;
     let state_dir = host.paths.state_dir();
     recover_pending_renames(state_dir, given.parent());
+    legion_xfer::sweep_abandoned_temps(state_dir, legion_xfer::PROBE_SWEEP_AGE);
     legion_xfer::reclaim_stale_claim(state_dir, &given);
     let is_symlink = fs::symlink_metadata(&given).is_ok_and(|meta| meta.file_type().is_symlink());
     let expected_hash = if_hash.and_then(|s| s.parse::<Hash>().ok());
@@ -1433,255 +1460,6 @@ fn stat<W: Write>(
         }
     };
     reply(output, &answer)
-}
-
-/// How a directory's file system compares entry names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FsNameBehavior {
-    /// Whether names differing only in letter case refer to the same entry (e.g. NTFS, default
-    /// APFS).
-    pub case_insensitive: bool,
-    /// Whether canonically equivalent Unicode forms (NFC vs NFD) refer to the same entry (e.g.
-    /// APFS, HFS+).
-    pub unicode_normalizing: bool,
-}
-
-/// Decision for a move or rename between two paths on the same machine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SameEntryDecision {
-    /// Distinct files (or destination absent): proceed as an ordinary transfer or non-replacing
-    /// rename.
-    DistinctEntries,
-    /// Exact same directory entry (same parent directory and byte-identical entry name): no-op,
-    /// must be refused.
-    SameEntryNoOp,
-    /// Same directory entry spelled differently (same parent directory, same underlying file,
-    /// names differ byte-for-byte only by case and/or Unicode normalization under the file
-    /// system's rules, and neither path is a symbolic link): perform a case/normalization rename.
-    CaseOrNormalizationRename,
-    /// Same underlying file through a different directory entry or path (hard link, symlink,
-    /// different parent directory, or case-different hardlink on a case-sensitive file system):
-    /// refuse as moving or renaming onto itself.
-    RefuseSameFileAlias,
-}
-
-/// Pure decision function classifying a same-machine move or rename from parent identities, exact
-/// caller entry names, file-identity equality, symlink status, and file system case/normalization
-/// behavior.
-pub(crate) fn classify_same_entry(
-    src_parent: Option<FileIdentity>,
-    dst_parent: Option<FileIdentity>,
-    src_name: &OsStr,
-    dst_name: &OsStr,
-    same_file: bool,
-    either_symlink: bool,
-    fs: FsNameBehavior,
-) -> SameEntryDecision {
-    let same_parent = src_parent
-        .zip(dst_parent)
-        .is_some_and(|(a, b)| a.same_file(&b));
-    if same_parent && src_name.as_encoded_bytes() == dst_name.as_encoded_bytes() {
-        return SameEntryDecision::SameEntryNoOp;
-    }
-    if !same_file {
-        return SameEntryDecision::DistinctEntries;
-    }
-    if same_parent && !either_symlink && names_fold_equivalent(src_name, dst_name, fs) {
-        return SameEntryDecision::CaseOrNormalizationRename;
-    }
-    SameEntryDecision::RefuseSameFileAlias
-}
-
-/// Whether two entry names fold to the same key under `fs`'s case and Unicode normalization rules.
-pub(crate) fn names_fold_equivalent(a: &OsStr, b: &OsStr, fs: FsNameBehavior) -> bool {
-    if a.as_encoded_bytes() == b.as_encoded_bytes() {
-        return true;
-    }
-    if !fs.case_insensitive && !fs.unicode_normalizing {
-        return false;
-    }
-    let (Some(a), Some(b)) = (a.to_str(), b.to_str()) else {
-        return false;
-    };
-    let fold = |s: &str| -> String {
-        if fs.unicode_normalizing && fs.case_insensitive {
-            let decomposed: String = s.nfd().collect();
-            decomposed.to_lowercase().nfd().collect()
-        } else if fs.unicode_normalizing {
-            s.nfd().collect()
-        } else {
-            s.to_lowercase()
-        }
-    };
-    fold(a) == fold(b)
-}
-
-/// Whether the file system holding `path`, or the nearest directory above it that exists,
-/// ignores letter case, told without writing anything: a name in that directory is looked up again
-/// with the case of its letters flipped, and the two are the same file only where case is ignored.
-///
-/// Only names inside the directory are on its file system: the directory's own name, and those
-/// above it, are in the directory that holds it, which a mount point's is not. `None` when the
-/// directory holds no suitable name to flip, which a tree transfer takes as ignoring case so
-/// colliding names are still held back.
-fn case_insensitive(path: &Path) -> Option<bool> {
-    let dir = path
-        .ancestors()
-        .find(|dir| fs::metadata(dir).is_ok_and(|meta| meta.is_dir()))?;
-    case_insensitive_in_dir(dir)
-}
-
-fn case_insensitive_in_dir(dir: &Path) -> Option<bool> {
-    if !fs::metadata(dir).is_ok_and(|meta| meta.is_dir()) {
-        return None;
-    }
-    let inside = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .take(64)
-        .filter_map(Result::ok)
-        .map(|entry| entry.path());
-    for candidate in inside {
-        // A link and what it leads to are the same file whatever their names.
-        let Ok(meta) = fs::symlink_metadata(&candidate) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        let (Some(parent), Some(name)) = (
-            candidate.parent(),
-            candidate.file_name().and_then(|name| name.to_str()),
-        ) else {
-            continue;
-        };
-        let flipped: String = name
-            .chars()
-            .flat_map(|c| {
-                if c.is_lowercase() {
-                    c.to_uppercase().collect::<Vec<_>>()
-                } else if c.is_uppercase() {
-                    c.to_lowercase().collect::<Vec<_>>()
-                } else {
-                    vec![c]
-                }
-            })
-            .collect();
-        if flipped == name {
-            continue;
-        }
-        let twin = parent.join(flipped);
-        if fs::symlink_metadata(&twin).is_err() {
-            return Some(false);
-        }
-        // Directories cannot be hardlinked on POSIX, and regular files with `nlink == 1` have no
-        // hardlink aliases, so a same-file hit on either proves case-insensitivity without risking
-        // hardlink spoofing.
-        if meta.is_dir() || file_identity(&candidate).is_ok_and(|id| id.nlink == 1) {
-            return Some(same_file::is_same_file(&candidate, &twin).unwrap_or(false));
-        }
-    }
-    None
-}
-
-/// Whether the file system holding `path` folds canonically equivalent Unicode forms (NFC vs NFD),
-/// told without writing anything when a decomposable entry already exists in the directory.
-fn unicode_normalizing(path: &Path) -> Option<bool> {
-    let dir = path
-        .ancestors()
-        .find(|dir| fs::metadata(dir).is_ok_and(|meta| meta.is_dir()))?;
-    unicode_normalizing_in_dir(dir)
-}
-
-fn unicode_normalizing_in_dir(dir: &Path) -> Option<bool> {
-    if !fs::metadata(dir).is_ok_and(|meta| meta.is_dir()) {
-        return None;
-    }
-    let inside = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .take(64)
-        .filter_map(Result::ok)
-        .map(|entry| entry.path());
-    for candidate in inside {
-        let Ok(meta) = fs::symlink_metadata(&candidate) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        let (Some(parent), Some(name)) = (
-            candidate.parent(),
-            candidate.file_name().and_then(|name| name.to_str()),
-        ) else {
-            continue;
-        };
-        let nfc: String = name.nfc().collect();
-        let nfd: String = name.nfd().collect();
-        if nfc == nfd {
-            continue;
-        }
-        let other = if name == nfc { nfd } else { nfc };
-        let twin = parent.join(other);
-        if fs::symlink_metadata(&twin).is_err() {
-            return Some(false);
-        }
-        if meta.is_dir() || file_identity(&candidate).is_ok_and(|id| id.nlink == 1) {
-            return Some(same_file::is_same_file(&candidate, &twin).unwrap_or(false));
-        }
-    }
-    None
-}
-
-/// Probes `dir`'s exact case-sensitivity and Unicode-normalization behavior, using read-only
-/// inspection first and falling back to an ephemeral unique probe file when `dir` has no suitable
-/// entry.
-fn probe_dir_name_behavior(dir: &Path) -> FsNameBehavior {
-    let ci = case_insensitive_in_dir(dir).unwrap_or_else(|| {
-        probe_dir_pair(
-            dir,
-            |pid, seq| format!(".legion-CaseProbe-{pid}-{seq}.tmp"),
-            |pid, seq| format!(".legion-caseprobe-{pid}-{seq}.tmp"),
-        )
-        .unwrap_or(cfg!(any(windows, target_os = "macos")))
-    });
-    let norm = unicode_normalizing_in_dir(dir).unwrap_or_else(|| {
-        probe_dir_pair(
-            dir,
-            |pid, seq| format!(".legion-NormProbe-e\u{0301}-{pid}-{seq}.tmp"),
-            |pid, seq| format!(".legion-NormProbe-\u{00e9}-{pid}-{seq}.tmp"),
-        )
-        .unwrap_or(cfg!(target_os = "macos"))
-    });
-    FsNameBehavior {
-        case_insensitive: ci,
-        unicode_normalizing: norm,
-    }
-}
-
-fn probe_dir_pair(
-    dir: &Path,
-    make_a: impl Fn(u32, u64) -> String,
-    make_b: impl Fn(u32, u64) -> String,
-) -> Option<bool> {
-    let pid = std::process::id();
-    for _ in 0..8 {
-        let seq = STREAM_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let a = dir.join(make_a(pid, seq));
-        let b = dir.join(make_b(pid, seq));
-        match fs::OpenOptions::new().write(true).create_new(true).open(&a) {
-            Ok(file) => {
-                drop(file);
-                let folded = fs::symlink_metadata(&b).is_ok()
-                    && same_file::is_same_file(&a, &b).unwrap_or(false);
-                let _ = fs::remove_file(&a);
-                return Some(folded);
-            }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return None,
-        }
-    }
-    None
 }
 
 fn get<W: Write>(
@@ -2391,14 +2169,20 @@ fn create_private_marker(path: &Path) -> io::Result<fs::File> {
     }
 }
 
-fn probe_write<W: Write>(
+#[allow(clippy::too_many_arguments)]
+fn probe_write<R: Read + Send + 'static, W: Write>(
+    host: &Host,
     grant: &Grant,
     action: ProbeWriteAction,
     dir: &str,
     marker: Option<&str>,
     nearest_ancestor: bool,
+    hold: bool,
+    input: &mut Option<BufReader<R>>,
     output: &mut W,
 ) -> Result<(), Failure> {
+    let state_dir = host.paths.state_dir();
+    legion_xfer::sweep_abandoned_temps(state_dir, legion_xfer::PROBE_SWEEP_AGE);
     match action {
         ProbeWriteAction::Create => {
             let checked = grant.check_path(dir, Access::Write)?;
@@ -2440,6 +2224,43 @@ fn probe_write<W: Write>(
                 grant.check_create(&marker_path, CreateKind::File, true)?;
                 match create_private_marker(&marker_path) {
                     Ok(file) => {
+                        if hold {
+                            let owned =
+                                legion_xfer::register_owned_temp(state_dir, &marker_path, &file);
+                            drop(file);
+                            let res = reply(
+                                output,
+                                &ProbeReply {
+                                    dir: Some(probe_dir.to_string_lossy().into_owned()),
+                                    marker: Some(name),
+                                    exists: true,
+                                    network_fs: legion_os::fs_kind::detect_network_fs(&probe_dir),
+                                    ..ProbeReply::default()
+                                },
+                            );
+                            if res.is_ok()
+                                && let Some(mut reader) = input.take()
+                            {
+                                let (tx, rx) = mpsc::channel::<()>();
+                                let _ = std::thread::Builder::new()
+                                    .name("legion-probe-hold".into())
+                                    .spawn(move || {
+                                        let mut line = String::new();
+                                        let _ = reader.read_line(&mut line);
+                                        let _ = tx.send(());
+                                    });
+                                let _ = rx.recv_timeout(legion_xfer::PROBE_SWEEP_AGE);
+                            }
+                            if let Ok(meta) = fs::symlink_metadata(&marker_path)
+                                && meta.file_type().is_file()
+                                && meta.len() == 0
+                            {
+                                let _ = fs::remove_file(&marker_path);
+                            }
+                            drop(owned);
+                            return res;
+                        }
+                        legion_xfer::record_probe_marker(state_dir, &marker_path, &file);
                         drop(file);
                         return reply(
                             output,
@@ -2483,6 +2304,7 @@ fn probe_write<W: Write>(
             {
                 let _ = fs::remove_file(&marker_path);
             }
+            legion_xfer::forget_probe_marker(state_dir, &marker_path);
             reply(
                 output,
                 &ProbeReply {
@@ -2571,286 +2393,6 @@ fn requested_entry_name(raw: &str, checked: &Path, windows_separators: bool) -> 
     }
 }
 
-/// Lists `dir` and checks whether an entry with the exact byte sequence `expected` is present,
-/// rather than calling `exists()` (which folds case or Unicode normalization on folding volumes).
-fn directory_contains_exact_name(dir: &Path, expected: &OsStr) -> io::Result<bool> {
-    let expected_bytes = expected.as_encoded_bytes();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_name().as_encoded_bytes() == expected_bytes {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Intent record written in `<state_dir>/xfer/renames/<key>.json` before step 1 of a two-step
-/// case/normalization rename so an interrupted rename can always be completed or reversed on the
-/// next transfer or listing.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PendingRenameIntent {
-    parent: String,
-    from_name: String,
-    temp_name: String,
-    to_name: String,
-}
-
-fn pending_renames_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join("xfer").join("renames")
-}
-
-fn rename_intent_key(parent: &Path, temp_name: &str) -> String {
-    let mut data =
-        Vec::with_capacity(parent.as_os_str().as_encoded_bytes().len() + 1 + temp_name.len());
-    data.extend_from_slice(parent.as_os_str().as_encoded_bytes());
-    data.push(0);
-    data.extend_from_slice(temp_name.as_bytes());
-    legion_xfer::hash::hash_bytes(&data).to_hex()
-}
-
-/// Builds a **visible** sibling intermediate filename (`legion-renaming-*`, never dot-prefixed and
-/// never filtered by [`legion_xfer::is_legion_internal_name`]) so if a two-step rename is
-/// interrupted mid-flight, the entry remains visible to both people and listings while recovery
-/// waits to run.
-fn visible_rename_temp_name(from_name: &OsStr, pid: u32, seq: u64) -> String {
-    let lossy = from_name.to_string_lossy();
-    let safe: String = lossy
-        .chars()
-        .filter(|c| !matches!(c, '/' | '\\' | '\0'))
-        .take(80)
-        .collect();
-    if safe.is_empty() {
-        format!("legion-renaming-{pid}-{seq}")
-    } else {
-        format!("legion-renaming-{pid}-{seq}-{safe}")
-    }
-}
-
-/// Recovery action decided for an interrupted two-step rename from the directory's exact entry
-/// names and the filesystem's case/Unicode folding rules.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PendingRenameRecovery {
-    /// Complete step 2 (`temp_name -> to_name`) without replacing anything, then remove the intent
-    /// record.
-    CompleteToFinal,
-    /// Reverse step 1 (`temp_name -> from_name`) without replacing anything (when `to_name` is
-    /// occupied on a filesystem where `from_name` is still a distinct free slot), then remove the
-    /// intent record.
-    ReverseToOriginal,
-    /// `temp_name` is no longer present in the directory (crash before step 1, crash after step 2,
-    /// or user already resolved it): remove the stale intent record and leave directory entries
-    /// untouched.
-    DropStaleIntent,
-    /// Both `temp_name` and a conflicting entry occupying the target/original namespace exist:
-    /// leave the visible `temp_name` and the conflicting entry untouched so no data is ever
-    /// overwritten, and keep the intent record so recovery can finish if the conflict is cleared.
-    KeepBoth,
-}
-
-/// Pure recovery decision from exact directory entry names (raw encoded bytes from `read_dir`),
-/// the intent's `(from_name, temp_name, to_name)`, and the directory's case/Unicode folding rules.
-fn decide_pending_rename_recovery(
-    entries: &[OsString],
-    from_name: &OsStr,
-    temp_name: &OsStr,
-    to_name: &OsStr,
-    fs: FsNameBehavior,
-) -> PendingRenameRecovery {
-    let exact_present = |needle: &OsStr| {
-        let want = needle.as_encoded_bytes();
-        entries.iter().any(|e| e.as_encoded_bytes() == want)
-    };
-    let slot_occupied = |target: &OsStr| {
-        let temp_bytes = temp_name.as_encoded_bytes();
-        entries
-            .iter()
-            .any(|e| e.as_encoded_bytes() != temp_bytes && names_fold_equivalent(e, target, fs))
-    };
-
-    if !exact_present(temp_name) {
-        return PendingRenameRecovery::DropStaleIntent;
-    }
-
-    let has_from = exact_present(from_name);
-    let has_to = exact_present(to_name);
-    let to_slot_busy = has_to || slot_occupied(to_name);
-    let from_slot_busy = has_from || slot_occupied(from_name);
-
-    match (has_from, has_to) {
-        (false, false) => {
-            if !to_slot_busy {
-                PendingRenameRecovery::CompleteToFinal
-            } else if !from_slot_busy {
-                PendingRenameRecovery::ReverseToOriginal
-            } else {
-                PendingRenameRecovery::KeepBoth
-            }
-        }
-        (true, false) => {
-            if !to_slot_busy {
-                PendingRenameRecovery::CompleteToFinal
-            } else {
-                PendingRenameRecovery::KeepBoth
-            }
-        }
-        (false, true) => {
-            if !from_slot_busy {
-                PendingRenameRecovery::ReverseToOriginal
-            } else {
-                PendingRenameRecovery::KeepBoth
-            }
-        }
-        (true, true) => PendingRenameRecovery::KeepBoth,
-    }
-}
-
-fn normalize_scope_path(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
-    let mut normalized = stripped.replace('\\', "/");
-    while normalized.len() > 1 && normalized.ends_with('/') {
-        if normalized.len() == 3 && normalized.as_bytes()[1] == b':' {
-            break;
-        }
-        normalized.pop();
-    }
-    if cfg!(windows) {
-        normalized.make_ascii_lowercase();
-    }
-    normalized
-}
-
-fn paths_overlap_scope(scope: &Path, parent: &Path) -> bool {
-    if let (Ok(s_id), Ok(p_id)) = (file_identity(scope), file_identity(parent))
-        && s_id.same_file(&p_id)
-    {
-        return true;
-    }
-    let s = normalize_scope_path(&fs::canonicalize(scope).unwrap_or_else(|_| scope.to_path_buf()));
-    let p =
-        normalize_scope_path(&fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()));
-    let is_prefix = |ancestor: &str, child: &str| {
-        ancestor == child
-            || ancestor == "/"
-            || child
-                .strip_prefix(ancestor)
-                .is_some_and(|rest| rest.starts_with('/'))
-    };
-    is_prefix(&s, &p) || is_prefix(&p, &s)
-}
-
-/// Completes or reverses any interrupted two-step case/normalization renames whose intent records
-/// remain under `<state_dir>/xfer/renames/`.
-///
-/// Decides purely from `read_dir(&parent)`'s exact entry names (compared byte for byte) so case
-/// folding or path canonicalisation can never confuse `from_name`, `to_name`, and `temp_name`.
-pub fn recover_pending_renames(state_dir: &Path, scope_dir: Option<&Path>) {
-    let dir = pending_renames_dir(state_dir);
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(OsStr::to_str) != Some("json") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
-            continue;
-        };
-        let lock_path = dir.join(format!("{stem}.lock"));
-        let Ok(Some(_lock)) = legion_xfer::try_lock_state_file(&lock_path) else {
-            continue;
-        };
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
-        };
-        let Ok(intent) = serde_json::from_slice::<PendingRenameIntent>(&bytes) else {
-            let _ = fs::remove_file(&path);
-            continue;
-        };
-        let parent = PathBuf::from(&intent.parent);
-        if let Some(scope) = scope_dir
-            && !paths_overlap_scope(scope, &parent)
-        {
-            continue;
-        }
-        let dir_entries: Vec<OsString> = match fs::read_dir(&parent) {
-            Ok(rd) => rd.filter_map(Result::ok).map(|e| e.file_name()).collect(),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                let _ = fs::remove_file(&path);
-                continue;
-            }
-            Err(_) => continue,
-        };
-        let from_name = OsStr::new(&intent.from_name);
-        let temp_name = OsStr::new(&intent.temp_name);
-        let to_name = OsStr::new(&intent.to_name);
-        // Only probe directory folding behavior when `temp_name` is actually present so cleaning
-        // up a stale intent never writes a probe file.
-        let has_temp = dir_entries
-            .iter()
-            .any(|e| e.as_encoded_bytes() == temp_name.as_encoded_bytes());
-        let fs_behavior = if has_temp {
-            probe_dir_name_behavior(&parent)
-        } else {
-            FsNameBehavior {
-                case_insensitive: false,
-                unicode_normalizing: false,
-            }
-        };
-        let action = decide_pending_rename_recovery(
-            &dir_entries,
-            from_name,
-            temp_name,
-            to_name,
-            fs_behavior,
-        );
-        let temp_path = parent.join(temp_name);
-        let to_path = parent.join(to_name);
-        let from_path = parent.join(from_name);
-        match action {
-            PendingRenameRecovery::DropStaleIntent => {
-                let _ = fs::remove_file(&path);
-            }
-            PendingRenameRecovery::CompleteToFinal => {
-                if move_no_replace_raw(&temp_path, &to_path).is_ok()
-                    && directory_contains_exact_name(&parent, to_name).unwrap_or(false)
-                {
-                    #[cfg(unix)]
-                    if let Ok(dir_handle) = fs::File::open(&parent) {
-                        let _ = dir_handle.sync_all();
-                    }
-                    let _ = fs::remove_file(&path);
-                }
-            }
-            PendingRenameRecovery::ReverseToOriginal => {
-                if move_no_replace_raw(&temp_path, &from_path).is_ok()
-                    && directory_contains_exact_name(&parent, from_name).unwrap_or(false)
-                {
-                    #[cfg(unix)]
-                    if let Ok(dir_handle) = fs::File::open(&parent) {
-                        let _ = dir_handle.sync_all();
-                    }
-                    let _ = fs::remove_file(&path);
-                }
-            }
-            PendingRenameRecovery::KeepBoth => {}
-        }
-    }
-}
-
-fn move_no_replace_raw(src: &Path, dst: &Path) -> io::Result<()> {
-    match legion_os::atomic::rename_no_replace(src, dst) {
-        Ok(()) => Ok(()),
-        Err(legion_os::atomic::RenameNoReplaceError::Unsupported) => fs::rename(src, dst),
-        Err(legion_os::atomic::RenameNoReplaceError::AlreadyExists) => Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "destination already exists",
-        )),
-        Err(legion_os::atomic::RenameNoReplaceError::Io(err)) => Err(err),
-    }
-}
-
 fn perform_recoverable_two_step_rename(
     state_dir: &Path,
     grant: &Grant,
@@ -2888,7 +2430,7 @@ fn perform_recoverable_two_step_rename(
     let key = rename_intent_key(from_parent, &temp_name);
     let lock_path = renames_dir.join(format!("{key}.lock"));
     let intent_path = renames_dir.join(format!("{key}.json"));
-    let _intent_lock = legion_xfer::try_lock_state_file(&lock_path)
+    let intent_lock = legion_xfer::try_lock_state_file(&lock_path)
         .map_err(xfer_error)?
         .ok_or_else(|| {
             Failure::Reply(ErrorBody::new(
@@ -2917,15 +2459,18 @@ fn perform_recoverable_two_step_rename(
 
     if let Err(err) = move_no_replace_raw(&from_path, &temp_path) {
         let _ = fs::remove_file(&intent_path);
+        legion_xfer::unlink_held_lock(&lock_path, intent_lock);
         return Err(Failure::Reply(io_error("rename", &temp_path, &err)));
     }
     if let Err(err) = move_no_replace_raw(&temp_path, &to_path) {
         if fs::rename(&temp_path, &from_path).is_ok() {
             let _ = fs::remove_file(&intent_path);
+            legion_xfer::unlink_held_lock(&lock_path, intent_lock);
         }
         return Err(Failure::Reply(io_error("rename", &to_path, &err)));
     }
     let _ = fs::remove_file(&intent_path);
+    legion_xfer::unlink_held_lock(&lock_path, intent_lock);
     Ok(())
 }
 
@@ -3140,10 +2685,7 @@ impl HeldLockFiles {
 impl Drop for HeldLockFiles {
     fn drop(&mut self) {
         for (path, file) in self.files.drain(..).rev() {
-            // Unlink while the exclusive flock is still held; `try_lock_state_file` verifies the
-            // locked inode matches the live path and retries if it raced with this unlink.
-            let _ = fs::remove_file(&path);
-            drop(file);
+            legion_xfer::unlink_held_lock(&path, file);
         }
     }
 }
@@ -3167,9 +2709,8 @@ fn sweep_and_count_principal_locks(state_dir: &Path, principal: &str) -> usize {
         };
         match file.try_lock() {
             Ok(()) => {
-                // Unlocked leftover (for example after SIGKILL): remove while holding the flock.
-                let _ = fs::remove_file(&path);
-                drop(file);
+                // Unlocked leftover (for example after SIGKILL): remove cleanly.
+                legion_xfer::unlink_held_lock(&path, file);
             }
             Err(_) => {
                 // Actively held by another process: count toward `principal`'s quota if valid.

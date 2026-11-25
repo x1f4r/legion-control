@@ -89,21 +89,28 @@ node.
   refused before any byte moves otherwise. Before any source file is removed, each `(source_dir,
   dest_dir)` directory pair is probed with a unique marker (cached per pair within a transfer) so
   moving a file, tree, or bind-mounted or symlinked subfolder onto itself is caught regardless of
-  machine names, devices, or mounts; when a probe finds the same directory or cannot conclude,
-  both the copy and the source are kept and the report names which folders could not be told apart.
-  Source removal runs only while holding exclusive per-path locks in the node's state directory on
-  both source and destination taken in a fixed `(machine, path)` order (returning a retryable
-  `conflict` when busy), re-verifying under those locks that the destination still exists, is
-  distinct from the source, and matches its recorded identity, size, and modification time (or
-  re-hashing when they differ). Case-only or Unicode-normalization-only renames within one
-  directory on one machine try a direct rename first and fall back to a recoverable two-step
-  rename through a visible intermediate name (`legion-renaming-*`) recorded under the node's state
-  directory only when direct rename is a no-op; interrupted two-step renames are completed or
-  reversed on the next listing or transfer. Only `<name>.legion-part` lives beside a destination
-  file during a transfer; lock, metadata, claim, and rename recovery sidecars live under the node's
-  state directory. A tree is verified file by file and a source file is removed only once its copy
-  is verified; an interrupted move (even if the transfer worker is killed mid-flight) leaves every
-  file in at least one place.
+  machine names, devices, or mounts; when a probe finds the same directory, encounters a network
+  file system (such as NFS, SMB/CIFS, SSHFS, 9p, or a remote drive), or cannot conclude, the copy
+  completes, the source is kept, and the report names which folders could not be told apart and
+  why. Source removal runs only while holding exclusive per-path locks in the node's state
+  directory on both source and destination taken in a fixed `(machine, path)` order (with a short
+  renewable lease, a per-principal active lock bound, and a retryable `conflict` when busy telling
+  the caller the copy finished, the source was kept, and running the transfer again will finish
+  the move), re-verifying under those locks that the destination still exists, is distinct from
+  the source, and matches its recorded identity, size, and modification time (or re-hashing when
+  they differ). Case-only or Unicode-normalization-only renames within one directory on one
+  machine try a direct rename first and fall back to a recoverable two-step rename through a
+  visible intermediate name (`legion-renaming-*`) recorded under the node's state directory only
+  when direct rename is a no-op; interrupted two-step renames are completed or reversed on the
+  next `fs.list`, `manifest`, or transfer touching that directory. During a transfer, resumable
+  copies keep `<name>.legion-part` beside the destination, and brief `.legion-put-*`,
+  `.legion-unpack-*.tmp`, and `.legion-move-probe-*.tmp` temporaries (as well as visible
+  `legion-renaming-*` entries during two-step renames) may appear beside the destination and are
+  swept automatically by recorded file identity and age if a process is killed; lock, metadata,
+  claim, temp-ownership, and rename recovery sidecars live under the node's state directory. A
+  tree is verified file by file and a source file is removed only once its copy is verified; an
+  interrupted move (even if the transfer worker is killed mid-flight) leaves every file in at least
+  one place.
 - `background`: start the transfer as a job on the node that runs it and return
   `{job: {id, machine}}` at once. The job belongs to the caller's principal (and pairing id when
   started by a paired device), is listed by `job.list` with `kind: "transfer"` and a `title` a
@@ -112,9 +119,12 @@ node.
   offset 0 so `bytes_done` stays honest per attempt) in `job.status`, and survives the caller
   disconnecting. Its owner may cancel it with `job.cancel` without holding `effect:exec`;
   cancelling keeps the partial file, so starting the same transfer again resumes. Removing the
-  paired device, revoking its transfer permissions, or leaving `policy.toml` unparsable cancels
-  active background transfers and stops in-flight streams within a few MiB or about two seconds
-  (whichever comes first, even on slow or stalled links).
+  paired device, revoking its transfer permissions, or leaving `policy.toml` or `devices.toml`
+  unparsable cancels active background transfers and stops in-flight streams within a few MiB or
+  about two seconds on a receiving or local stream (and up to about five seconds on the controller
+  side of a push while remote streams settle). Before treating a policy or devices file as broken
+  or as having removed a right, the node re-reads it twice after brief (~200 ms) pauses so a
+  transient in-place save of unchanged rules does not interrupt an active transfer.
 
 A controller starts a machine-to-machine transfer on the source machine
 (`on: A`, `from: /path`, `to: "B:/path"`), and on the destination when the source cannot reach
@@ -133,16 +143,20 @@ see the same list.
   `fav.remove`: `{id}`.
 
 They live in `favorites.toml` beside `policy.toml`, a shared document like `devices.toml` but
-with no bearing on access: each entry carries a stamp (`updated_at`, `updated_on`), the newer
-stamp wins field by field, a removal is a stamped tombstone kept for 90 days, and two nodes that
-exchange the file end up equal whatever the order. Because tombstones expire after 90 days, a
-favourite removed while another machine was offline for more than 90 days can reappear when that
-machine reconnects and syncs. Entries stamped more than 24 hours in the future are skipped
-individually with a warning, and machines booting with an unset clock stamp at least at the
-binary's build time. A node that changes it pushes it to the peers it can reach (coalescing rapid
-bursts), and `fleet.sync` and the sync runner carry it to the rest. `fav.list` leaves out entries
-outside the caller's `paths`. One list per fleet is deliberate for now; a list per person waits
-for people to exist in the model.
+with no bearing on access: each entry carries independent last-writer-wins registers (existence,
+base fields, label, and pinned) ordered by `(updated_at, updated_on)` so merging is commutative,
+associative, and idempotent with no trimming inside the merge. Creation limits are enforced by the
+`fav.*` tools, oversized received documents are refused whole, and removals older than 90 days
+relative to the document's own newest stamp are dropped identically by every node. Because
+tombstones expire after 90 days, a favourite removed while another machine was offline for more
+than 90 days can reappear when that machine reconnects and syncs. Entries stamped more than 24
+hours in the future are skipped individually with a warning, and machines booting with an unset
+clock stamp at least at the binary's build time. A node that changes it pushes it to the peers it
+can reach (coalescing rapid bursts), and `fleet.sync` and the sync runner carry it to the rest.
+`fav.list` leaves out entries outside the caller's `paths`; existing entries whose path is not
+valid on the reading node's operating system are still listed with a note and remain removable by
+id. One list per fleet is deliberate for now; a list per person waits for people to exist in the
+model.
 
 ### Sync folders
 

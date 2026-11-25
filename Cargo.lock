@@ -1261,11 +1261,13 @@ dependencies = [
  "blake3",
  "globset",
  "legion-os",
+ "same-file",
  "serde",
  "serde_json",
  "tar",
  "tempfile",
  "thiserror",
+ "unicode-normalization",
 ]
 
 [[package]]
