@@ -122,6 +122,22 @@ fn main() -> ExitCode {
             "favourites_two_node_convergence_auto_push_and_hostile_peer",
             favourites_two_node_convergence_auto_push_and_hostile_peer,
         ),
+        (
+            "move_same_file_aliases_symlinks_hardlinks_and_case_normalization_rename",
+            move_same_file_aliases_symlinks_hardlinks_and_case_normalization_rename,
+        ),
+        (
+            "older_v1_peer_copies_work_and_new_features_are_refused",
+            older_v1_peer_copies_work_and_new_features_are_refused,
+        ),
+        (
+            "revoking_device_or_policy_stops_running_transfer_and_live_stream",
+            revoking_device_or_policy_stops_running_transfer_and_live_stream,
+        ),
+        (
+            "stale_partial_restart_reports_honest_per_attempt_progress",
+            stale_partial_restart_reports_honest_per_attempt_progress,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -257,9 +273,74 @@ fn helper(args: &[String]) -> ExitCode {
             });
             exit_of(child.wait().unwrap())
         }
+        // Simulates an older v1 peer (before stream capabilities) by stripping `capabilities` from
+        // the greeting line while forwarding everything else unchanged.
+        "legacy-v1" if subcommand == "stream" => {
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut child_in = child.stdin.take().unwrap();
+            std::thread::spawn(move || {
+                let mut stdin = std::io::stdin().lock();
+                let _ = std::io::copy(&mut stdin, &mut child_in);
+            });
+            let mut child_out = BufReader::new(child.stdout.take().unwrap());
+            let mut first = Vec::new();
+            let n = child_out.read_until(b'\n', &mut first).unwrap();
+            let mut stdout = std::io::stdout().lock();
+            if n > 0 {
+                if let Ok(mut greeting) = serde_json::from_slice::<Value>(&first)
+                    && let Some(obj) = greeting.as_object_mut()
+                    && obj.contains_key("protocol")
+                {
+                    obj.remove("capabilities");
+                    writeln!(stdout, "{greeting}").unwrap();
+                } else {
+                    stdout.write_all(&first).unwrap();
+                }
+                stdout.flush().unwrap();
+            }
+            let _ = std::io::copy(&mut child_out, &mut stdout);
+            stdout.flush().unwrap();
+            exit_of(child.wait().unwrap())
+        }
+        // Holds a `put` stream open after forwarding `limit` bytes: touches `ready_marker` once
+        // paused and waits until `release_marker` appears before forwarding the rest. Used to
+        // test concurrent puts deterministically in both completion orders.
+        "hold-put" if subcommand == "stream" => {
+            let ready_marker = Path::new(&extra[0]);
+            let release_marker = Path::new(&extra[1]);
+            let limit: u64 = extra[2].parse().unwrap();
+            let mut input = BufReader::new(std::io::stdin());
+            let mut header = Vec::new();
+            input.read_until(b'\n', &mut header).unwrap();
+            let header_val: Value = serde_json::from_slice(&header).unwrap_or(Value::Null);
+            let is_put = header_val["op"].as_str() == Some("put");
+            let mut child = command.stdin(Stdio::piped()).spawn().unwrap();
+            let mut child_in = child.stdin.take().unwrap();
+            child_in.write_all(&header).unwrap();
+            child_in.flush().unwrap();
+            if is_put && !ready_marker.exists() {
+                let _ = std::io::copy(&mut (&mut input).take(limit), &mut child_in);
+                let _ = child_in.flush();
+                fs::write(ready_marker, b"paused").unwrap();
+                let wait_until = Instant::now() + Duration::from_secs(20);
+                while !release_marker.exists() && Instant::now() < wait_until {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+            }
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut input, &mut child_in);
+            });
+            exit_of(child.wait().unwrap())
+        }
         // A source that does not keep to the protocol, in the way `extra[0]` names.
         "evil" if subcommand == "stream" => evil(&extra[0], Path::new(home), command),
-        "cut" | "cut-op" | "slow" | "evil" => exit_of(command.status().unwrap()),
+        "cut" | "cut-op" | "slow" | "evil" | "legacy-v1" | "hold-put" => {
+            exit_of(command.status().unwrap())
+        }
         other => {
             eprintln!("unknown helper mode {other}");
             ExitCode::from(2)
@@ -2078,17 +2159,15 @@ fn if_exists_modes_and_concurrent_rename_race() {
         b"existing-content"
     );
 
-    // rename: writes `doc (2).txt`, then `doc (3).txt`
+    // rename: writes `doc (2).txt`, then `doc (3).txt` and preserves caller's `~/` form with `/`
+    // on every OS (including Windows).
     let ren1 = ok(&transfer(
         &laptop,
         json!({"from": "~/doc.txt", "to": "pi:~/doc.txt", "if_exists": "rename"}),
         &[],
     ));
     assert_eq!(ren1["files_sent"], 1, "{ren1}");
-    assert!(
-        ren1["to"].as_str().unwrap().ends_with("/doc (2).txt"),
-        "{ren1}"
-    );
+    assert_eq!(ren1["to"], "pi:~/doc (2).txt", "{ren1}");
     assert_eq!(
         fs::read(pi.home().join("doc (2).txt")).unwrap(),
         b"new-content"
@@ -2103,10 +2182,7 @@ fn if_exists_modes_and_concurrent_rename_race() {
         json!({"from": "~/doc.txt", "to": "pi:~/doc.txt", "if_exists": "rename"}),
         &[],
     ));
-    assert!(
-        ren2["to"].as_str().unwrap().ends_with("/doc (3).txt"),
-        "{ren2}"
-    );
+    assert_eq!(ren2["to"], "pi:~/doc (3).txt", "{ren2}");
     assert_eq!(
         fs::read(pi.home().join("doc (3).txt")).unwrap(),
         b"new-content"
@@ -2158,11 +2234,103 @@ fn if_exists_modes_and_concurrent_rename_race() {
     assert_eq!(fs::read(dst_tree.join("b (2).txt")).unwrap(), b"src-b");
     assert_eq!(fs::read(dst_tree.join("a.txt")).unwrap(), b"dst-a");
 
-    // --- Two concurrent transfers racing for the same destination name under `rename` ---
+    // --- Deterministic concurrent transfers to the same destination name under `rename` ---
+    // Hold the first `put` open mid-stream while the second `put` runs to completion, in BOTH
+    // orders (A held while B runs, then B held while A runs), plus an unthrottled race.
     let payload_a = data(512 * 1024, 101);
     let payload_b = data(512 * 1024, 202);
     fs::write(laptop.home().join("race_a.bin"), &payload_a).unwrap();
     fs::write(laptop.home().join("race_b.bin"), &payload_b).unwrap();
+
+    for (order_idx, (held_src, held_bytes, fast_src, fast_bytes)) in [
+        ("race_a.bin", &payload_a, "race_b.bin", &payload_b),
+        ("race_b.bin", &payload_b, "race_a.bin", &payload_a),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let target_name = format!("det_race_{order_idx}.bin");
+        let target_2 = format!("det_race_{order_idx} (2).bin");
+        let target_3 = format!("det_race_{order_idx} (3).bin");
+        fs::write(pi.home().join(&target_name), b"initial").unwrap();
+
+        let ready = laptop.home().join(format!("hold_ready_{order_idx}"));
+        let release = laptop.home().join(format!("hold_release_{order_idx}"));
+        fleet(
+            &laptop,
+            &[(
+                "pi",
+                &pi,
+                "hold-put",
+                vec![
+                    ready.to_string_lossy().into_owned(),
+                    release.to_string_lossy().into_owned(),
+                    "131072".to_owned(),
+                ],
+            )],
+        );
+
+        let lh = legion_home_of(&laptop);
+        let uh = laptop.home().to_path_buf();
+        let target_for_held = target_name.clone();
+        let held_handle = std::thread::spawn(move || {
+            let args = json!({
+                "from": format!("~/{held_src}"),
+                "to": format!("pi:~/{target_for_held}"),
+                "if_exists": "rename",
+            })
+            .to_string();
+            let out = Command::new(LEGION_BIN)
+                .args(["fs.transfer", "--args", &args])
+                .env("LEGION_HOME", &lh)
+                .env("HOME", &uh)
+                .env("USERPROFILE", &uh)
+                .env_remove("XDG_CONFIG_HOME")
+                .env_remove("XDG_STATE_HOME")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "held {held_src} failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_slice::<Value>(&out.stdout).unwrap()
+        });
+
+        // Wait until the held `put` is open and paused at 128 KiB on `pi`.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "held put did not pause in time (order {order_idx})"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        // Run the second transfer to completion while the first `put` is still open!
+        let fast_res = ok(&transfer(
+            &laptop,
+            json!({
+                "from": format!("~/{fast_src}"),
+                "to": format!("pi:~/{target_name}"),
+                "if_exists": "rename",
+            }),
+            &[],
+        ));
+        assert_eq!(fast_res["to"], format!("pi:~/{target_2}"), "{fast_res}");
+        assert_eq!(fs::read(pi.home().join(&target_2)).unwrap(), *fast_bytes);
+
+        // Release the held transfer; it finishes without seeing fast_src's bytes and takes (3).
+        fs::write(&release, b"go").unwrap();
+        let held_res = held_handle.join().unwrap();
+        assert_eq!(held_res["to"], format!("pi:~/{target_3}"), "{held_res}");
+        assert_eq!(fs::read(pi.home().join(&target_3)).unwrap(), *held_bytes);
+        assert_eq!(fs::read(pi.home().join(&target_name)).unwrap(), b"initial");
+    }
+
+    // Also run an unthrottled concurrent race with the plain connector.
+    fleet(&laptop, &[("pi", &pi, "node", vec![])]);
     fs::write(pi.home().join("race.bin"), b"initial").unwrap();
 
     let legion_home = legion_home_of(&laptop);
@@ -2206,8 +2374,8 @@ fn if_exists_modes_and_concurrent_rename_race() {
         "concurrent renames must land at distinct paths: {r1} vs {r2}"
     );
     assert!(
-        (to1.ends_with("/race (2).bin") && to2.ends_with("/race (3).bin"))
-            || (to1.ends_with("/race (3).bin") && to2.ends_with("/race (2).bin")),
+        (to1 == "pi:~/race (2).bin" && to2 == "pi:~/race (3).bin")
+            || (to1 == "pi:~/race (3).bin" && to2 == "pi:~/race (2).bin"),
         "unexpected race destinations: {to1} and {to2}"
     );
     let b2 = fs::read(pi.home().join("race (2).bin")).unwrap();
@@ -2502,6 +2670,101 @@ allow = ["*"]
                 fs::read(dst.home().join("album").join(rel)).unwrap(),
                 *bytes,
                 "{stage_name}: {rel}"
+            );
+        }
+    }
+
+    // 7. Kill the detached `transfer-supervise` worker process itself with SIGKILL mid-flight:
+    //    every file must still exist in at least one place, and re-running completes the move.
+    {
+        let ctl = node("ctl");
+        let dst = node("dst");
+        fleet(&ctl, &[("dst", &dst, "slow", vec![])]);
+        let src_dir = ctl.home().join("worker_kill_album");
+        fs::create_dir_all(src_dir.join("sub")).unwrap();
+        let expected: Vec<(&str, Vec<u8>)> = vec![
+            ("a.bin", data(120_000, 61)),
+            ("b.bin", data(120_000, 62)),
+            ("sub/c.bin", data(120_000, 63)),
+        ];
+        for (rel, bytes) in &expected {
+            fs::write(src_dir.join(rel), bytes).unwrap();
+        }
+        let started = ok(&transfer(
+            &ctl,
+            json!({
+                "from": "~/worker_kill_album",
+                "to": "dst:~/worker_kill_album",
+                "move": true,
+                "background": true
+            }),
+            &[],
+        ));
+        let job_id = started["job"]["id"].as_str().unwrap().to_owned();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let worker_pid = loop {
+            let st = ok(&call_tool(&ctl, "job.status", json!({"id": &job_id}), &[]));
+            if st["progress"]["bytes_done"].as_u64().unwrap_or(0) > 0
+                && let Some(pid) = st["detach"]["process"]["pid"].as_u64()
+            {
+                break u32::try_from(pid).unwrap();
+            }
+            assert!(Instant::now() < deadline, "worker made no progress: {st}");
+            std::thread::sleep(Duration::from_millis(30));
+        };
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .args(["-9", &worker_pid.to_string()])
+                .status();
+        }
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/PID", &worker_pid.to_string()])
+                .status();
+        }
+        // Wait until the worker process is gone and job.status sees `interrupted` (or finished).
+        let kill_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = ok(&call_tool(&ctl, "job.status", json!({"id": &job_id}), &[]));
+            let state = st["state"].as_str().unwrap();
+            if state != "running" && state != "starting" {
+                break;
+            }
+            assert!(
+                Instant::now() < kill_deadline,
+                "worker did not stop after SIGKILL: {st}"
+            );
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        // Invariant: NO file is ever in zero places after killing the worker process.
+        for (rel, bytes) in &expected {
+            let in_src = fs::read(src_dir.join(rel)).ok();
+            let in_dst = fs::read(dst.home().join("worker_kill_album").join(rel)).ok();
+            assert!(
+                in_src.as_deref() == Some(bytes.as_slice())
+                    || in_dst.as_deref() == Some(bytes.as_slice()),
+                "worker SIGKILL lost {rel} from both source and destination!"
+            );
+        }
+        // Re-running completes cleanly.
+        fleet(&ctl, &[("dst", &dst, "node", vec![])]);
+        let done = ok(&transfer(
+            &ctl,
+            json!({
+                "from": "~/worker_kill_album",
+                "to": "dst:~/worker_kill_album",
+                "move": true
+            }),
+            &[],
+        ));
+        assert_eq!(done["moved"], true, "{done}");
+        assert!(!src_dir.exists());
+        for (rel, bytes) in &expected {
+            assert_eq!(
+                fs::read(dst.home().join("worker_kill_album").join(rel)).unwrap(),
+                *bytes
             );
         }
     }
@@ -2897,4 +3160,584 @@ fn favourites_two_node_convergence_auto_push_and_hostile_peer() {
         fs::read_to_string(config_of(&pi).join("favorites.toml")).unwrap(),
         pi_toml
     );
+}
+
+fn move_same_file_aliases_symlinks_hardlinks_and_case_normalization_rename() {
+    let laptop = node("laptop");
+    // Register `twin` in `fleet.toml` pointing at `laptop`'s OWN home & config (same-machine alias).
+    fleet(&laptop, &[("twin", &laptop, "node", vec![])]);
+
+    // 1. Single-file move onto same file via fleet alias `twin`: MUST be refused, file intact!
+    let payload = b"only-copy-must-never-be-deleted";
+    fs::write(laptop.home().join("only-copy.bin"), payload).unwrap();
+    let err = refused(&transfer(
+        &laptop,
+        json!({"from": "~/only-copy.bin", "to": "twin:~/only-copy.bin", "move": true}),
+        &[],
+    ));
+    assert_eq!(err["code"], "invalid_args", "{err}");
+    assert_eq!(
+        fs::read(laptop.home().join("only-copy.bin")).unwrap(),
+        payload,
+        "only-copy.bin must remain intact after refused alias move"
+    );
+
+    // 2. Directory tree move onto itself and onto its own subtree via alias `twin`: MUST be refused!
+    let tree = laptop.home().join("alias_tree");
+    fs::create_dir_all(tree.join("sub")).unwrap();
+    fs::write(tree.join("root.txt"), b"root-data").unwrap();
+    fs::write(tree.join("sub/leaf.txt"), b"leaf-data").unwrap();
+
+    let err_same_tree = refused(&transfer(
+        &laptop,
+        json!({"from": "~/alias_tree", "to": "twin:~/alias_tree", "move": true}),
+        &[],
+    ));
+    assert_eq!(err_same_tree["code"], "invalid_args", "{err_same_tree}");
+    assert_eq!(fs::read(tree.join("root.txt")).unwrap(), b"root-data");
+    assert_eq!(fs::read(tree.join("sub/leaf.txt")).unwrap(), b"leaf-data");
+
+    let err_subtree = refused(&transfer(
+        &laptop,
+        json!({"from": "~/alias_tree", "to": "twin:~/alias_tree/sub/inside", "move": true}),
+        &[],
+    ));
+    assert_eq!(err_subtree["code"], "invalid_args", "{err_subtree}");
+    assert_eq!(fs::read(tree.join("root.txt")).unwrap(), b"root-data");
+    assert_eq!(fs::read(tree.join("sub/leaf.txt")).unwrap(), b"leaf-data");
+
+    // 3. Same-node hard link, symlink, and symlinked parent directory: ALL refused!
+    let hl_orig = laptop.home().join("hl_orig.bin");
+    let hl_link = laptop.home().join("hl_link.bin");
+    fs::write(&hl_orig, b"hardlink-data").unwrap();
+    fs::hard_link(&hl_orig, &hl_link).unwrap();
+    let err_hl = refused(&transfer(
+        &laptop,
+        json!({"from": "~/hl_orig.bin", "to": "~/hl_link.bin", "move": true}),
+        &[],
+    ));
+    assert_eq!(err_hl["code"], "invalid_args", "{err_hl}");
+    assert_eq!(fs::read(&hl_orig).unwrap(), b"hardlink-data");
+    assert_eq!(fs::read(&hl_link).unwrap(), b"hardlink-data");
+
+    #[cfg(unix)]
+    {
+        let sym_orig = laptop.home().join("sym_orig.bin");
+        let sym_link = laptop.home().join("sym_link.bin");
+        fs::write(&sym_orig, b"symlink-data").unwrap();
+        std::os::unix::fs::symlink(&sym_orig, &sym_link).unwrap();
+        let err_sym = refused(&transfer(
+            &laptop,
+            json!({"from": "~/sym_orig.bin", "to": "~/sym_link.bin", "move": true}),
+            &[],
+        ));
+        assert_eq!(err_sym["code"], "invalid_args", "{err_sym}");
+        assert_eq!(fs::read(&sym_orig).unwrap(), b"symlink-data");
+
+        let real_dir = laptop.home().join("real_dir");
+        let link_dir = laptop.home().join("link_dir");
+        fs::create_dir_all(&real_dir).unwrap();
+        fs::write(real_dir.join("inside.txt"), b"inside-data").unwrap();
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+        let err_dir_sym = refused(&transfer(
+            &laptop,
+            json!({"from": "~/real_dir/inside.txt", "to": "~/link_dir/inside.txt", "move": true}),
+            &[],
+        ));
+        assert_eq!(err_dir_sym["code"], "invalid_args", "{err_dir_sym}");
+        assert_eq!(
+            fs::read(real_dir.join("inside.txt")).unwrap(),
+            b"inside-data"
+        );
+
+        let err_tree_sym = refused(&transfer(
+            &laptop,
+            json!({"from": "~/real_dir", "to": "~/link_dir", "move": true}),
+            &[],
+        ));
+        assert_eq!(err_tree_sym["code"], "invalid_args", "{err_tree_sym}");
+        assert_eq!(
+            fs::read(real_dir.join("inside.txt")).unwrap(),
+            b"inside-data"
+        );
+    }
+
+    // 4. Case-only and Unicode-normalization-only two-step atomic rename via `stream` `rename`.
+    fs::write(laptop.home().join("Report.txt"), b"report-contents").unwrap();
+    let rename_reply = stream_request(
+        &laptop,
+        json!({"op": "rename", "from": "~/Report.txt", "to": "~/report.txt"}),
+    );
+    assert_eq!(rename_reply["ok"], true, "{rename_reply}");
+    assert_eq!(
+        fs::read(laptop.home().join("report.txt")).unwrap(),
+        b"report-contents"
+    );
+
+    let nfd_name = "cafe\u{0301}.txt";
+    let nfc_name = "caf\u{00e9}.txt";
+    fs::write(laptop.home().join(nfd_name), b"unicode-contents").unwrap();
+    let unicode_reply = stream_request(
+        &laptop,
+        json!({"op": "rename", "from": format!("~/{nfd_name}"), "to": format!("~/{nfc_name}")}),
+    );
+    assert_eq!(unicode_reply["ok"], true, "{unicode_reply}");
+    assert_eq!(
+        fs::read(laptop.home().join(nfc_name)).unwrap(),
+        b"unicode-contents"
+    );
+}
+
+fn stream_request(target: &Home, mut header: Value) -> Value {
+    if let Some(obj) = header.as_object_mut() {
+        obj.entry("protocol").or_insert_with(|| json!(1));
+    }
+    let mut child = Command::new(LEGION_BIN)
+        .arg("stream")
+        .env("LEGION_HOME", target.state().parent().unwrap())
+        .env("HOME", target.home())
+        .env("USERPROFILE", target.home())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, "{header}").unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stream failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines.len() >= 2, "expected greeting + reply: {stdout}");
+    serde_json::from_str(lines[1]).unwrap()
+}
+
+fn older_v1_peer_copies_work_and_new_features_are_refused() {
+    let laptop = node("laptop");
+    let old_pi = node("old_pi");
+    fleet(&laptop, &[("old_pi", &old_pi, "legacy-v1", vec![])]);
+
+    // 1. Plain single-file copy in both directions keeps working against a v1 peer without caps.
+    fs::write(laptop.home().join("plain.txt"), b"from-new").unwrap();
+    let pushed = ok(&transfer(
+        &laptop,
+        json!({"from": "~/plain.txt", "to": "old_pi:~/plain.txt"}),
+        &[],
+    ));
+    assert_eq!(pushed["files_sent"], 1, "{pushed}");
+    assert_eq!(
+        fs::read(old_pi.home().join("plain.txt")).unwrap(),
+        b"from-new"
+    );
+
+    fs::write(old_pi.home().join("from_old.txt"), b"from-old").unwrap();
+    let pulled = ok(&transfer(
+        &laptop,
+        json!({"from": "old_pi:~/from_old.txt", "to": "~/from_old.txt"}),
+        &[],
+    ));
+    assert_eq!(pulled["files_sent"], 1, "{pulled}");
+    assert_eq!(
+        fs::read(laptop.home().join("from_old.txt")).unwrap(),
+        b"from-old"
+    );
+
+    // Plain tree copy also works.
+    let src_dir = laptop.home().join("plain_dir");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(src_dir.join("a.txt"), b"tree-a").unwrap();
+    let tree_ok = ok(&transfer(
+        &laptop,
+        json!({"from": "~/plain_dir", "to": "old_pi:~/plain_dir"}),
+        &[],
+    ));
+    assert_eq!(tree_ok["files_sent"], 1, "{tree_ok}");
+    assert_eq!(
+        fs::read(old_pi.home().join("plain_dir/a.txt")).unwrap(),
+        b"tree-a"
+    );
+
+    // 2. Every `if_exists` mode other than `replace` is refused with `unsupported`, naming `old_pi`.
+    fs::write(laptop.home().join("updated.txt"), b"new-body").unwrap();
+    for mode in ["fail", "skip", "rename"] {
+        let err = refused(&transfer(
+            &laptop,
+            json!({"from": "~/updated.txt", "to": "old_pi:~/plain.txt", "if_exists": mode}),
+            &[],
+        ));
+        assert_eq!(err["code"], "unsupported", "mode={mode}: {err}");
+        assert_eq!(err["machine"], "old_pi", "mode={mode}: {err}");
+        assert!(
+            err["message"].as_str().unwrap().contains("old_pi"),
+            "mode={mode}: {err}"
+        );
+        assert_eq!(
+            fs::read(old_pi.home().join("plain.txt")).unwrap(),
+            b"from-new",
+            "old_pi destination must stay untouched on mode={mode}"
+        );
+    }
+
+    // 3. `move: true` is refused in BOTH directions with `unsupported`, naming `old_pi`, and leaves
+    //    both source and destination untouched.
+    let err_push_move = refused(&transfer(
+        &laptop,
+        json!({"from": "~/updated.txt", "to": "old_pi:~/moved_to_old.txt", "move": true}),
+        &[],
+    ));
+    assert_eq!(err_push_move["code"], "unsupported", "{err_push_move}");
+    assert_eq!(err_push_move["machine"], "old_pi", "{err_push_move}");
+    assert!(laptop.home().join("updated.txt").exists());
+    assert!(!old_pi.home().join("moved_to_old.txt").exists());
+
+    let err_pull_move = refused(&transfer(
+        &laptop,
+        json!({"from": "old_pi:~/from_old.txt", "to": "~/moved_from_old.txt", "move": true}),
+        &[],
+    ));
+    assert_eq!(err_pull_move["code"], "unsupported", "{err_pull_move}");
+    assert_eq!(err_pull_move["machine"], "old_pi", "{err_pull_move}");
+    assert!(old_pi.home().join("from_old.txt").exists());
+    assert!(!laptop.home().join("moved_from_old.txt").exists());
+}
+
+fn revoking_device_or_policy_stops_running_transfer_and_live_stream() {
+    let laptop = node("laptop");
+    let pi = node("pi");
+    fleet(&laptop, &[("pi", &pi, "slow", vec![])]);
+
+    let pairing_id = "abcdef0123456789abcdef0123456789";
+    let device_policy = r#"
+[principals.write_only]
+role = "write_only"
+
+[principals.rev_bg]
+role = "mover"
+
+[principals.stream_rev]
+role = "mover"
+
+[principals."device:phone"]
+role = "mover"
+device = "abcdef0123456789abcdef0123456789"
+
+[roles.write_only]
+allow = ["effect:read", "effect:write"]
+
+[roles.mover]
+allow = ["effect:read", "effect:write"]
+
+[roles.ro]
+allow = ["effect:read"]
+"#;
+    laptop.write_config("policy.toml", device_policy);
+    pi.write_config("policy.toml", device_policy);
+
+    // 1. Background `move: true` requires `effect:destroy` up front (not merely `effect:write`).
+    fs::write(laptop.home().join("no_destroy.bin"), b"keep-me").unwrap();
+    let err_destroy = refused(&transfer(
+        &laptop,
+        json!({
+            "from": "~/no_destroy.bin",
+            "to": "pi:~/no_destroy.bin",
+            "move": true,
+            "background": true
+        }),
+        &["--as", "write_only"],
+    ));
+    assert_eq!(err_destroy["code"], "denied", "{err_destroy}");
+    assert!(laptop.home().join("no_destroy.bin").exists());
+
+    // 2. Removing a paired device via `device.remove` cancels its running background transfer job!
+    let auth_keys_path = laptop.home().join(".ssh/authorized_keys");
+    fs::create_dir_all(auth_keys_path.parent().unwrap()).unwrap();
+    fs::write(&auth_keys_path, "").unwrap();
+    laptop.write_config(
+        "node.toml",
+        &format!(
+            "name = \"laptop\"\n[devices]\nauthorized_keys = {:?}\n",
+            auth_keys_path.to_string_lossy()
+        ),
+    );
+    laptop.write_config(
+        "devices.toml",
+        &format!(
+            r#"
+version = 1
+
+[devices.{pairing_id}]
+name = "phone"
+principal = "device:phone"
+role = "mover"
+public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea"
+paired_at = "2026-11-01T00:00:00Z"
+paired_on = "laptop"
+updated_at = "2026-11-01T00:00:00Z"
+updated_on = "laptop"
+name_updated_at = "2026-11-01T00:00:00Z"
+name_updated_on = "laptop"
+role_updated_at = "2026-11-01T00:00:00Z"
+role_updated_on = "laptop"
+"#
+        ),
+    );
+    // Reconcile `authorized_keys` from `devices.toml` so `legion gate` accepts the paired key.
+    ok(&call_tool(&laptop, "device.list", json!({}), &[]));
+    let big = data(12 * 1024 * 1024, 91);
+    fs::write(laptop.home().join("phone_big.bin"), &big).unwrap();
+
+    // Start the background transfer through `legion gate --home <dir> --as device:phone --device phone --pairing <id>`.
+    let rpc_cmd = remote_command(RemoteOs::Unix, Subcommand::Rpc, None).unwrap();
+    let mut gate_child = Command::new(LEGION_BIN)
+        .args([
+            "gate",
+            "--home",
+            laptop.state().parent().unwrap().to_str().unwrap(),
+            "--as",
+            "device:phone",
+            "--device",
+            "phone",
+            "--pairing",
+            pairing_id,
+        ])
+        .env("LEGION_HOME", laptop.state().parent().unwrap())
+        .env("HOME", laptop.home())
+        .env("USERPROFILE", laptop.home())
+        .env("SSH_ORIGINAL_COMMAND", &rpc_cmd)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut gate_in = gate_child.stdin.take().unwrap();
+    let mut gate_out = BufReader::new(gate_child.stdout.take().unwrap());
+    writeln!(
+        gate_in,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": "g1",
+            "method": "call",
+            "params": {
+                "tool": "fs.transfer",
+                "args": {
+                    "from": "~/phone_big.bin",
+                    "to": "pi:~/phone_big.bin",
+                    "background": true
+                }
+            }
+        })
+    )
+    .unwrap();
+    gate_in.flush().unwrap();
+    let mut line = String::new();
+    gate_out.read_line(&mut line).unwrap();
+    drop(gate_in);
+    let mut gate_err = String::new();
+    let _ = gate_child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut gate_err);
+    let _ = gate_child.wait();
+    let gate_reply: Value = serde_json::from_str(&line)
+        .unwrap_or_else(|e| panic!("gate failed ({e}): stdout={line:?} stderr={gate_err:?}"));
+    let phone_job_id = gate_reply["result"]["job"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("gate start failed: {gate_reply}"))
+        .to_owned();
+
+    // Wait until the transfer job is actively moving bytes.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let st = ok(&call_tool(
+            &laptop,
+            "job.status",
+            json!({"id": &phone_job_id}),
+            &[],
+        ));
+        if st["progress"]["bytes_done"].as_u64().unwrap_or(0) > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "phone transfer made no progress: {st}"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
+    // Owner removes `phone`: background transfer MUST be cancelled immediately and NOT left running!
+    let removed = ok(&call_tool(
+        &laptop,
+        "device.remove",
+        json!({"name": "phone"}),
+        &[],
+    ));
+    assert_eq!(removed["removed"], true, "{removed}");
+    assert!(
+        removed["jobs_left_running"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|id| id != &phone_job_id),
+        "transfer job should not be left running after device.remove: {removed}"
+    );
+    let st_after_remove = ok(&call_tool(
+        &laptop,
+        "job.status",
+        json!({"id": &phone_job_id}),
+        &[],
+    ));
+    assert_eq!(st_after_remove["state"], "cancelled", "{st_after_remove}");
+
+    // 3. Downgrading a principal's role via `config.write policy.toml` cancels its running transfer!
+    let bg_rev = ok(&transfer(
+        &laptop,
+        json!({
+            "from": "~/phone_big.bin",
+            "to": "pi:~/rev_bg.bin",
+            "background": true
+        }),
+        &["--as", "rev_bg"],
+    ));
+    let rev_job_id = bg_rev["job"]["id"].as_str().unwrap().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let st = ok(&call_tool(
+            &laptop,
+            "job.status",
+            json!({"id": &rev_job_id}),
+            &[],
+        ));
+        if st["progress"]["bytes_done"].as_u64().unwrap_or(0) > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rev_bg transfer made no progress: {st}"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let downgraded_policy = device_policy.replace(
+        "[principals.rev_bg]\nrole = \"mover\"",
+        "[principals.rev_bg]\nrole = \"ro\"",
+    );
+    ok(&call_tool(
+        &laptop,
+        "config.write",
+        json!({"document": "policy.toml", "content": downgraded_policy}),
+        &[],
+    ));
+    let st_after_policy = ok(&call_tool(
+        &laptop,
+        "job.wait",
+        json!({"id": &rev_job_id, "timeout_s": 15}),
+        &[],
+    ));
+    assert_eq!(st_after_policy["state"], "cancelled", "{st_after_policy}");
+
+    // 4. Mid-stream 4 MiB live policy re-check on a single large file (> 8 MiB) stops `put` on `pi`.
+    let huge = data(9 * 1024 * 1024, 92);
+    fs::write(laptop.home().join("stream_rev.bin"), &huge).unwrap();
+    let bg_stream = ok(&transfer(
+        &laptop,
+        json!({
+            "from": "~/stream_rev.bin",
+            "to": "pi:~/stream_rev.bin",
+            "background": true
+        }),
+        &["--as", "stream_rev"],
+    ));
+    let stream_job_id = bg_stream["job"]["id"].as_str().unwrap().to_owned();
+    let part = pi.home().join("stream_rev.bin.legion-part");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if fs::metadata(&part).map_or(0, |m| m.len()) >= 256 * 1024 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "stream_rev partial never grew");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // Revoke `stream_rev`'s write permission on `pi` while the single-file stream is mid-flight!
+    pi.write_config(
+        "policy.toml",
+        &device_policy.replace(
+            "[principals.stream_rev]\nrole = \"mover\"",
+            "[principals.stream_rev]\nrole = \"ro\"",
+        ),
+    );
+    let stream_done = ok(&call_tool(
+        &laptop,
+        "job.wait",
+        json!({"id": &stream_job_id, "timeout_s": 25}),
+        &[],
+    ));
+    assert_eq!(stream_done["state"], "failed", "{stream_done}");
+    assert_eq!(stream_done["error"]["code"], "denied", "{stream_done}");
+    assert!(!pi.home().join("stream_rev.bin").exists());
+}
+
+fn stale_partial_restart_reports_honest_per_attempt_progress() {
+    let laptop = node("laptop");
+    let pi = node("pi");
+    fleet(&laptop, &[("pi", &pi, "node", vec![])]);
+
+    let body = data(128 * 1024, 99);
+    fs::write(laptop.home().join("restart.bin"), &body).unwrap();
+    // Seed a corrupted `.legion-part` on `pi` WITH a matching `.legion-part.meta` sidecar so
+    // attempt 1 resumes from 64 KiB, detects the hash mismatch on finish, and retries cleanly on
+    // attempt 2 from offset 0.
+    let hashed = ok(&call_tool(
+        &laptop,
+        "fs.hash",
+        json!({"path": "~/restart.bin"}),
+        &[],
+    ));
+    let expected_hash = hashed["hash"].as_str().unwrap();
+    fs::write(
+        pi.home().join("restart.bin.legion-part"),
+        vec![0xAA; 64 * 1024],
+    )
+    .unwrap();
+    fs::write(
+        pi.home().join("restart.bin.legion-part.meta"),
+        format!("{} {expected_hash}\n", body.len()),
+    )
+    .unwrap();
+
+    let started = ok(&transfer(
+        &laptop,
+        json!({
+            "from": "~/restart.bin",
+            "to": "pi:~/restart.bin",
+            "background": true
+        }),
+        &[],
+    ));
+    let job_id = started["job"]["id"].as_str().unwrap().to_owned();
+    let waited = ok(&call_tool(
+        &laptop,
+        "job.wait",
+        json!({"id": &job_id, "timeout_s": 30}),
+        &[],
+    ));
+    assert_eq!(waited["state"], "succeeded", "{waited}");
+    assert_eq!(waited["progress"]["attempt"], 2, "{waited}");
+    assert_eq!(
+        waited["progress"]["bytes_done"],
+        body.len() as u64,
+        "{waited}"
+    );
+    assert_eq!(fs::read(pi.home().join("restart.bin")).unwrap(), body);
 }

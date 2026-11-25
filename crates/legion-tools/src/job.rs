@@ -236,7 +236,12 @@ fn can_see_job(ctx: &Ctx, record: &JobRecord) -> bool {
                 return false;
             };
             policy
-                .authorize_name(ctx.principal(), "job.start", Some(Effect::Exec), ctx.paths())
+                .authorize_name(
+                    ctx.principal(),
+                    "job.start",
+                    Some(Effect::Exec),
+                    ctx.paths(),
+                )
                 .is_ok()
                 || policy
                     .authorize_name(ctx.principal(), "exec.run", Some(Effect::Exec), ctx.paths())
@@ -263,7 +268,8 @@ fn transfer_record_still_authorized(
             return false;
         }
     }
-    let Ok(grant) = policy.authorize_name(&record.principal, "fs.transfer", Some(Effect::Write), paths)
+    let Ok(grant) =
+        policy.authorize_name(&record.principal, "fs.transfer", Some(Effect::Write), paths)
     else {
         return false;
     };
@@ -280,14 +286,10 @@ fn transfer_record_still_authorized(
     {
         return false;
     }
-    if record.transfer_move
+    !(record.transfer_move
         && policy
             .authorize_name(&record.principal, "fs.remove", Some(Effect::Destroy), paths)
-            .is_err()
-    {
-        return false;
-    }
-    true
+            .is_err())
 }
 
 fn load_live_policy_and_devices(
@@ -300,7 +302,9 @@ fn load_live_policy_and_devices(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Policy::default(),
         Err(_) => return None,
     };
-    let devices = crate::device::registry::load_devices_raw(paths).ok().flatten();
+    let devices = crate::device::registry::load_devices_raw(paths)
+        .ok()
+        .flatten();
     Some((policy, devices))
 }
 
@@ -352,8 +356,7 @@ pub async fn cancel_transfer_jobs_for_device(
             (None, _) => record.device.as_deref() == Some(device_owned.as_str()),
         };
         let matches_dedicated_principal = principal_owned.as_deref().is_some_and(|p| {
-            p.starts_with(crate::device::registry::DEVICE_PRINCIPAL_PREFIX)
-                && record.principal == p
+            p.starts_with(crate::device::registry::DEVICE_PRINCIPAL_PREFIX) && record.principal == p
         });
         if !matches_device && !matches_dedicated_principal {
             continue;

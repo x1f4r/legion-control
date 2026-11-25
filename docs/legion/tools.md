@@ -647,7 +647,7 @@ Write UTF-8 text or base64 bytes to a file atomically, supporting overwrite, cre
 
 Effect: `exec`
 
-Stop a running background job and its entire process tree. Asks the job supervisor to terminate the command cleanly and escalates to stopping the detached process group or systemd scope if it does not finish within a short grace period; set `force: true` to stop the detached handle immediately. Returns only once the job is gone or reports any surviving process ids. Any principal with the exec effect can cancel any job on this node. A caller without the exec effect may still cancel a transfer job they started themselves (matched by principal and `kind: "transfer"`), and nothing else. Cancelling a job that already finished is not an error and returns its final state.
+Stop a running background job and its entire process tree. Asks the job supervisor to terminate the command cleanly and escalates to stopping the detached process group or systemd scope if it does not finish within a short grace period; set `force: true` to stop the detached handle immediately. Returns only once the job is gone or reports any surviving process ids. Any principal with the exec effect can cancel any visible job on this node. A caller without the exec effect may still cancel a transfer job they started themselves (matched by principal, pairing id when paired, and `kind: "transfer"`), and nothing else. Cancelling a job that already finished is not an error and returns its final state.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -658,7 +658,7 @@ Stop a running background job and its entire process tree. Asks the job supervis
 
 Effect: `read`
 
-List background jobs recorded on this node, newest first, with their id, name, current derived state, timestamps, exit code, and command summary. Filter by `state` to find running, failed, or interrupted jobs. Any principal with the read effect sees every job's command and output on this node. Reading never modifies job files.
+List background jobs recorded on this node, newest first, with their id, name, current derived state, timestamps, exit code, and command summary. Filter by `state` to find running, failed, or interrupted jobs. Any principal with the read effect sees its own jobs, and unconfined roles see every job's command and output on this node; path-confined roles see another principal's transfer job only when every path it names is inside their `paths`, and another principal's command job only when allowed `job.start` or `exec.run`. Reading never modifies job files.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -669,7 +669,7 @@ List background jobs recorded on this node, newest first, with their id, name, c
 
 Effect: `read`
 
-Read captured stdout and stderr from a background job without loading the whole log into memory. Stdout and stderr are merged into one log: each stream stays in its own order and lines (up to 64 KiB) are written whole under one lock so the two streams never split a line mid-way, while relative order between stdout and stderr is unspecified. Pass `offset` (feeding back `next_offset` from each reply) to stream new output incrementally while the job runs, or omit `offset` to read the last `tail` lines (default 100, max 5000). Replies are capped at `limit` bytes (default 65536, max 1048576), never split a UTF-8 character, and replace invalid UTF-8 bytes. Large logs rotate once into `output.log.1` and are read across both segments transparently; `output_dropped` and `dropped_bytes` report when earlier output was discarded by rotation. Any principal with the read effect sees every job's command and output on this node.
+Read captured stdout and stderr from a background job without loading the whole log into memory. Stdout and stderr are merged into one log: each stream stays in its own order and lines (up to 64 KiB) are written whole under one lock so the two streams never split a line mid-way, while relative order between stdout and stderr is unspecified. Pass `offset` (feeding back `next_offset` from each reply) to stream new output incrementally while the job runs, or omit `offset` to read the last `tail` lines (default 100, max 5000). Replies are capped at `limit` bytes (default 65536, max 1048576), never split a UTF-8 character, and replace invalid UTF-8 bytes. Large logs rotate once into `output.log.1` and are read across both segments transparently; `output_dropped` and `dropped_bytes` report when earlier output was discarded by rotation. Any principal with the read effect sees its own jobs, and unconfined roles see every job's command and output on this node; path-confined roles only see jobs within their scope.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -698,7 +698,7 @@ Start a command as a detached background job that outlives this call, this legio
 
 Effect: `read`
 
-Inspect one background job's full record (without environment values), current derived state, exit code or signal, duration, output size, and failure or interruption detail without modifying anything on disk. Pass an `id` from `job.start` or `job.list`; use `job.logs` to read output or `job.wait` to wait until it finishes.
+Inspect one background job's full record (without environment values), current derived state, exit code or signal, duration, output size, and failure or interruption detail without modifying anything on disk. Pass an `id` from `job.start` or `job.list`; use `job.logs` to read output or `job.wait` to wait until it finishes. Jobs hidden by path confinement report `not_found`.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |

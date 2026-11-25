@@ -84,17 +84,25 @@ node.
 
 - `if_exists`: `fail`, `skip`, `replace` or `rename` (default `replace`, as today; `rename`
   writes `name (2).ext`).
-- `move`: after the destination is verified by hash, remove the source. It needs the caller to be
-  allowed `fs.remove` on the source and is refused before any byte moves otherwise. A tree is
-  verified file by file and a source file is removed only once its copy is verified; an
-  interrupted move leaves every file in at least one place.
+- `move`: after the destination is verified by hash (re-read from disk after `sync_all`), remove
+  the source. It needs the caller to be allowed `fs.remove` (`effect:destroy`) on the source and is
+  refused before any byte moves otherwise. Source and destination are checked by file identity on
+  one machine and by a directory-pair probe across aliases, mounts, or machines so moving a file or
+  directory onto itself is refused rather than deleting the only copy; case-only or
+  Unicode-normalization-only renames within one directory on one machine are performed as a
+  two-step atomic rename. A tree is verified file by file and a source file is removed only once
+  its copy is verified; an interrupted move (even if the transfer worker is killed mid-flight)
+  leaves every file in at least one place.
 - `background`: start the transfer as a job on the node that runs it and return
-  `{job: {id, machine}}` at once. The job belongs to the caller's principal, is listed by
-  `job.list` with `kind: "transfer"` and a `title` a person can read ("Copy Holiday.mp4 to pi"),
-  reports `progress` (`bytes_done`, `bytes_total`, `files_done`, `files_total`, `current`,
-  `rate`) in `job.status`, and survives the caller disconnecting. Its owner may cancel it with
-  `job.cancel` without holding `effect:exec`; cancelling keeps the partial file, so starting the
-  same transfer again resumes.
+  `{job: {id, machine}}` at once. The job belongs to the caller's principal (and pairing id when
+  started by a paired device), is listed by `job.list` with `kind: "transfer"` and a `title` a
+  person can read ("Copy Holiday.mp4 to pi"), reports `progress` (`bytes_done`, `bytes_total`,
+  `files_done`, `files_total`, `current`, `rate`, and `attempt` when a stale partial restarts from
+  offset 0 so `bytes_done` stays honest per attempt) in `job.status`, and survives the caller
+  disconnecting. Its owner may cancel it with `job.cancel` without holding `effect:exec`;
+  cancelling keeps the partial file, so starting the same transfer again resumes. Removing the
+  paired device or revoking its transfer permissions cancels active background transfers and stops
+  in-flight streams promptly.
 
 A controller starts a machine-to-machine transfer on the source machine
 (`on: A`, `from: /path`, `to: "B:/path"`), and on the destination when the source cannot reach
@@ -115,10 +123,14 @@ see the same list.
 They live in `favorites.toml` beside `policy.toml`, a shared document like `devices.toml` but
 with no bearing on access: each entry carries a stamp (`updated_at`, `updated_on`), the newer
 stamp wins field by field, a removal is a stamped tombstone kept for 90 days, and two nodes that
-exchange the file end up equal whatever the order. A node that changes it pushes it to the peers
-it can reach, and `fleet.sync` and the sync runner carry it to the rest. `fav.list` leaves out
-entries outside the caller's `paths`. One list per fleet is deliberate for now; a list per person
-waits for people to exist in the model.
+exchange the file end up equal whatever the order. Because tombstones expire after 90 days, a
+favourite removed while another machine was offline for more than 90 days can reappear when that
+machine reconnects and syncs. Entries stamped more than 24 hours in the future are skipped
+individually with a warning, and machines booting with an unset clock stamp at least at the
+binary's build time. A node that changes it pushes it to the peers it can reach (coalescing rapid
+bursts), and `fleet.sync` and the sync runner carry it to the rest. `fav.list` leaves out entries
+outside the caller's `paths`. One list per fleet is deliberate for now; a list per person waits
+for people to exist in the model.
 
 ### Sync folders
 

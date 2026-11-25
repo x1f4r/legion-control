@@ -11,13 +11,13 @@
 //! owner-only restrictions. Every incoming file is strictly validated and size-bounded on receipt,
 //! and `fav.list` omits entries outside the caller's `paths`.
 
-use std::collections::{BTreeMap, HashMap};
 use std::collections::hash_map::RandomState;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jiff::Timestamp;
@@ -1411,16 +1411,12 @@ fn coalescer_for(state_dir: &Path) -> Arc<PushCoalescer> {
     static MAP: OnceLock<StdMutex<HashMap<PathBuf, Arc<PushCoalescer>>>> = OnceLock::new();
     let map = MAP.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
-    Arc::clone(
-        guard
-            .entry(state_dir.to_path_buf())
-            .or_insert_with(|| {
-                Arc::new(PushCoalescer {
-                    state: tokio::sync::Mutex::new(PushState::default()),
-                    settled: tokio::sync::Notify::new(),
-                })
-            }),
-    )
+    Arc::clone(guard.entry(state_dir.to_path_buf()).or_insert_with(|| {
+        Arc::new(PushCoalescer {
+            state: tokio::sync::Mutex::new(PushState::default()),
+            settled: tokio::sync::Notify::new(),
+        })
+    }))
 }
 
 /// Pushes `favorites.toml` to every reachable peer in `fleet.toml` with node authority,
@@ -1431,7 +1427,14 @@ pub async fn push_favorites_to_fleet(
     device: Option<String>,
     credential_expires: Option<Timestamp>,
 ) -> BTreeMap<String, FleetPushOutcome> {
-    push_favorites_with_interval(node, door, device, credential_expires, FAV_PUSH_MIN_INTERVAL).await
+    push_favorites_with_interval(
+        node,
+        door,
+        device,
+        credential_expires,
+        FAV_PUSH_MIN_INTERVAL,
+    )
+    .await
 }
 
 async fn push_favorites_with_interval(
@@ -2269,7 +2272,10 @@ paths = [{:?}]
 
         let ab = merge_favorites(&a, &b);
         let ba = merge_favorites(&b, &a);
-        assert_eq!(ab, ba, "merge must remain commutative past 1000 live entries");
+        assert_eq!(
+            ab, ba,
+            "merge must remain commutative past 1000 live entries"
+        );
         assert_eq!(ab.entries.len(), 1200);
         assert_eq!(ab.removed.len(), 2600);
         ab.validate().unwrap();
@@ -2288,11 +2294,7 @@ paths = [{:?}]
         for i in 0..50 {
             a.entries.insert(
                 format!("live-{i:04}"),
-                sample_record(
-                    &format!("live-{i:04}"),
-                    "2026-11-01T00:00:00.000Z",
-                    "tower",
-                ),
+                sample_record(&format!("live-{i:04}"), "2026-11-01T00:00:00.000Z", "tower"),
             );
         }
         // Enough tombstones to exceed MAX_FAVORITES_BYTES (~1 MiB) when serialized.
@@ -2320,7 +2322,11 @@ paths = [{:?}]
         let ab = merge_favorites(&a, &b);
         let ba = merge_favorites(&b, &a);
         assert_eq!(ab, ba, "bounded merge must be strictly commutative");
-        assert_eq!(merge_favorites(&ab, &ab), ab, "bounded merge must be idempotent");
+        assert_eq!(
+            merge_favorites(&ab, &ab),
+            ab,
+            "bounded merge must be idempotent"
+        );
         assert!(ab.to_toml_string().len() <= MAX_FAVORITES_BYTES);
         assert_eq!(
             ab.entries.len(),
@@ -2339,9 +2345,10 @@ paths = [{:?}]
         let future_ts = "2026-11-28T00:00:00.000Z"; // > 24h in future
 
         let mut incoming = FavoritesFile::default();
-        incoming
-            .entries
-            .insert("good-live".to_owned(), sample_record("good", valid_ts, "pi"));
+        incoming.entries.insert(
+            "good-live".to_owned(),
+            sample_record("good", valid_ts, "pi"),
+        );
         incoming.entries.insert(
             "future-live".to_owned(),
             sample_record("future", future_ts, "pi"),
