@@ -1554,3 +1554,241 @@ test('Player: deleting a picture, full-screen video, music track, or deep-linked
     await server.stop();
   }
 });
+
+
+test('Player: window-hidden pause stays resumable across loopback teardown, mints one fresh URL on play, and never loops on a dead URL', async () => {
+  const sampleVideoBuf = Buffer.from(SAMPLE_VIDEO_WEBM_BASE64, 'base64');
+  let activeGeneration = 1;
+  let deadGeneration = 0;
+  let serveBrokenFresh = false;
+  const ticketHits = new Map();
+
+  // Serve UI plus a controllable `/test-media/<gen>/clip.webm` loopback endpoint so we can
+  // simulate a loopback listener teardown that kills generation 1 while keeping generation 2 alive.
+  const server = http.createServer((req, res) => {
+    const parsed = new URL(req.url || '/', 'http://127.0.0.1');
+    const mediaMatch = /^\/test-media\/(\d+)\/clip\.webm$/.exec(parsed.pathname);
+    if (mediaMatch) {
+      const gen = Number(mediaMatch[1]);
+      ticketHits.set(gen, (ticketHits.get(gen) || 0) + 1);
+      if (gen <= deadGeneration || (serveBrokenFresh && gen >= 2)) {
+        res.writeHead(410, { 'Content-Type': 'text/plain' });
+        res.end('Gone');
+        return;
+      }
+      const range = req.headers.range;
+      if (range) {
+        const m = /^bytes=(\d+)-(\d*)$/.exec(range);
+        const start = m ? Number(m[1]) : 0;
+        const end = m && m[2] ? Math.min(Number(m[2]), sampleVideoBuf.length - 1) : sampleVideoBuf.length - 1;
+        const slice = sampleVideoBuf.subarray(start, end + 1);
+        res.writeHead(206, {
+          'Content-Type': 'video/webm',
+          'Accept-Ranges': 'bytes',
+          'Content-Range': `bytes ${start}-${end}/${sampleVideoBuf.length}`,
+          'Content-Length': String(slice.length),
+        });
+        if (req.method === 'HEAD') res.end();
+        else res.end(slice);
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'video/webm',
+        'Accept-Ranges': 'bytes',
+        'Content-Length': String(sampleVideoBuf.length),
+      });
+      if (req.method === 'HEAD') res.end();
+      else res.end(sampleVideoBuf);
+      return;
+    }
+
+    let rel = decodeURIComponent(parsed.pathname);
+    if (rel === '/') rel = '/index.html';
+    const full = path.resolve(UI_ROOT, `.${rel}`);
+    if (!full.startsWith(UI_ROOT) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
+      res.writeHead(404);
+      res.end('Not found');
+      return;
+    }
+    const ext = path.extname(full).toLowerCase();
+    const headers = {
+      'Content-Type': MIME_BY_EXT[ext] || 'application/octet-stream',
+      'X-Content-Type-Options': 'nosniff',
+    };
+    if (ext === '.html') {
+      headers['Content-Security-Policy'] = MOCK_TEST_CSP;
+    }
+    res.writeHead(200, headers);
+    fs.createReadStream(full).pipe(res);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    // 1. Playing video -> desktop window hides -> loopback tears down old URL -> stays paused
+    //    without retrying while hidden -> pressing Play mints one fresh URL and resumes playing.
+    {
+      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+      await context.addInitScript((origin) => {
+        window.__TEST_MINTS__ = [];
+        window.__TEST_REVOKES__ = [];
+        window.__TEST_GEN__ = 1;
+        window.__LEGION_MOCK_OVERRIDE_CONTENT_URL__ = async ({ path: p }) => {
+          if (String(p || '').endsWith('.mp4')) {
+            const gen = window.__TEST_GEN__++;
+            const url = `${origin}/test-media/${gen}/clip.webm`;
+            window.__TEST_MINTS__.push(url);
+            return { url, expires_in: 120 };
+          }
+          return null;
+        };
+        window.__LEGION_MOCK_ON_REVOKE_CONTENT_URL__ = (url) => {
+          window.__TEST_REVOKES__.push(url);
+        };
+      }, baseUrl);
+
+      const page = await context.newPage();
+      page.on('console', (msg) => {
+        if (msg.type() === 'error') consoleErrors.push(msg.text());
+      });
+      page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+      await page.goto(`${baseUrl}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+      await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+      await page.waitForFunction(() => {
+        const v = document.querySelector('.viewer video');
+        return Boolean(v && v.readyState >= 1);
+      });
+
+      // Play to ~1.2 s so we verify position preservation across teardown + fresh mint.
+      await page.evaluate(async () => {
+        const v = document.querySelector('.viewer video');
+        v.currentTime = 1.2;
+        await v.play();
+      });
+      await page.waitForFunction(() => {
+        const v = document.querySelector('.viewer video');
+        return Boolean(v && !v.paused && v.currentTime >= 1.1);
+      });
+      assert.equal(await page.evaluate(() => window.__TEST_MINTS__.length), 1);
+
+      // Hide desktop window -> pauses in place, then simulate loopback teardown killing gen 1
+      // and firing an aborted-stream error on the paused video element.
+      await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__?.());
+      deadGeneration = 1;
+      await page.evaluate(() => {
+        const v = document.querySelector('.viewer video');
+        v.dispatchEvent(new Event('error'));
+      });
+      await page.waitForTimeout(300);
+
+      // Must NOT auto-mint while hidden/paused and must NOT unmount into an error screen.
+      assert.equal(await page.evaluate(() => window.__TEST_MINTS__.length), 1);
+      assert.equal(await page.locator('.viewer video.viewer-video').count(), 1);
+      assert.equal(await page.locator('.viewer-stage .said').count(), 0);
+      assert.equal(await page.evaluate(() => document.querySelector('.viewer video')?.paused), true);
+
+      // User returns and presses Space (Play) -> mints ONE fresh URL (gen 2), revokes gen 1,
+      // seeks back near 1.2 s, and resumes playback.
+      await page.keyboard.press('Space');
+      await page.waitForFunction(
+        () => {
+          const v = document.querySelector('.viewer video');
+          return Boolean(
+            v &&
+              v.getAttribute('src')?.includes('/test-media/2/clip.webm') &&
+              v.readyState >= 1 &&
+              !v.paused,
+          );
+        },
+        null,
+        { timeout: 5000 },
+      );
+      const stateAfterResume = await page.evaluate(() => {
+        const v = document.querySelector('.viewer video');
+        return {
+          mints: window.__TEST_MINTS__.length,
+          revokes: window.__TEST_REVOKES__,
+          currentTime: v?.currentTime ?? 0,
+          paused: v?.paused ?? true,
+        };
+      });
+      assert.equal(stateAfterResume.mints, 2);
+      assert.ok(
+        stateAfterResume.revokes.some((u) => u.includes('/test-media/1/clip.webm')),
+        `Expected dead URL gen 1 to be revoked, got ${JSON.stringify(stateAfterResume.revokes)}`,
+      );
+      assert.ok(stateAfterResume.currentTime >= 1.0, `Expected resumed time near 1.2s, got ${stateAfterResume.currentTime}`);
+      assert.equal(stateAfterResume.paused, false);
+      await context.close();
+    }
+
+    // 2. If the freshly minted URL after teardown ALSO fails (e.g. server still down), stop after
+    //    ONE fresh mint and never retry a dead URL in a loop.
+    {
+      deadGeneration = 0;
+      serveBrokenFresh = false;
+      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+      await context.addInitScript((origin) => {
+        window.__TEST_MINTS__ = [];
+        window.__TEST_GEN__ = 1;
+        window.__LEGION_MOCK_OVERRIDE_CONTENT_URL__ = async ({ path: p }) => {
+          if (String(p || '').endsWith('.mp4')) {
+            const gen = window.__TEST_GEN__++;
+            const url = `${origin}/test-media/${gen}/clip.webm`;
+            window.__TEST_MINTS__.push(url);
+            return { url, expires_in: 120 };
+          }
+          return null;
+        };
+      }, baseUrl);
+
+      const page = await context.newPage();
+      page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+      await page.goto(`${baseUrl}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+      await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+      await page.waitForFunction(() => {
+        const v = document.querySelector('.viewer video');
+        return Boolean(v && v.readyState >= 1);
+      });
+
+      await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__?.());
+      deadGeneration = 1;
+      serveBrokenFresh = true;
+      await page.evaluate(() => {
+        const v = document.querySelector('.viewer video');
+        v.dispatchEvent(new Event('error'));
+      });
+      await page.waitForTimeout(200);
+      assert.equal(await page.evaluate(() => window.__TEST_MINTS__.length), 1);
+
+      // Press Play -> mints exactly ONE fresh URL (gen 2), which returns 410 -> settles on honest
+      // error screen without ever minting gen 3 or looping.
+      await page.keyboard.press('Space');
+      await page.locator('.viewer-stage .said').waitFor({ timeout: 5000 });
+      await page.waitForTimeout(300);
+      assert.equal(await page.evaluate(() => window.__TEST_MINTS__.length), 2);
+      await context.close();
+    }
+
+    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+  } finally {
+    await browser.close();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

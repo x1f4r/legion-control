@@ -273,6 +273,7 @@ export function FilesViewer({
   const playbackRef = useRef({ key: fileKey, time: 0, wantPlay: false });
   const pendingResumeRef = useRef(null);
   const recoveryRef = useRef({ key: fileKey, lastAttemptAt: 0, inFlight: false });
+  const windowHiddenPauseRef = useRef(null);
   const prevHasContentRef = useRef(hasContentUrl);
 
   // Gesture state for picture zoom/pan/swipe.
@@ -438,6 +439,8 @@ export function FilesViewer({
 
   // When a desktop window hides (e.g. closing while background transfers drain) or closes,
   // pause active media right where it is and leave full screen so reopening shows it paused.
+  // If the loopback content listener tears down the stream while hidden, stay paused and
+  // resumable and mint one fresh URL when the person presses play again.
   useEffect(() => {
     if (typeof link?.onWindowHidden !== 'function') return undefined;
     return link.onWindowHidden(() => {
@@ -446,15 +449,31 @@ export function FilesViewer({
         pendingResumeRef.current = { ...pendingResumeRef.current, play: false };
       }
       musicAutoPlayRef.current = null;
+      let savedTime =
+        playbackRef.current.key === activeFileKeyRef.current ? playbackRef.current.time : 0;
       for (const ref of [videoRef, audioRef]) {
         const el = ref.current;
-        if (el && !el.paused) {
-          try {
-            el.pause();
-          } catch {
-            // Ignore pause errors on unready elements.
+        if (el) {
+          if (typeof el.currentTime === 'number' && Number.isFinite(el.currentTime) && el.currentTime > 0) {
+            savedTime = el.currentTime;
+          }
+          if (!el.paused) {
+            try {
+              el.pause();
+            } catch {
+              // Ignore pause errors on unready elements.
+            }
           }
         }
+      }
+      if (activeMediaUrlRef.current && !isLocalMediaUrl(activeMediaUrlRef.current)) {
+        windowHiddenPauseRef.current = {
+          key: activeFileKeyRef.current,
+          url: activeMediaUrlRef.current,
+          time: savedTime,
+          teardownDetected: false,
+          refreshInFlight: false,
+        };
       }
       if (fullscreenController.getState().active) {
         fullscreenController.leave();
@@ -465,10 +484,19 @@ export function FilesViewer({
   }, [link, fullscreenController]);
 
   // Modal focus isolation: mark background shell siblings outside `.viewer` inert while open,
-  // and keep Tab focus cycling strictly inside `.viewer` when no sheet scrim is on top.
-  useEffect(() => {
+  // keep Tab focus cycling strictly inside `.viewer` when no sheet scrim is on top, and return
+  // focus to the element that opened the viewer once closed.
+  useLayoutEffect(() => {
     const viewerEl = viewerRef.current;
     if (!viewerEl) return undefined;
+    const openerEl =
+      document.activeElement &&
+      document.activeElement !== document.body &&
+      document.activeElement !== document.documentElement &&
+      typeof document.activeElement.focus === 'function' &&
+      !viewerEl.contains(document.activeElement)
+        ? document.activeElement
+        : null;
     const saved = [];
     let node = viewerEl;
     while (node && node.parentElement) {
@@ -518,6 +546,13 @@ export function FilesViewer({
           el.inert = prev;
         } catch {
           // Ignore detached nodes.
+        }
+      }
+      if (openerEl && openerEl.isConnected && !openerEl.closest?.('[inert]')) {
+        try {
+          openerEl.focus({ preventScroll: true });
+        } catch {
+          // Ignore focus restoration errors.
         }
       }
     };
@@ -842,6 +877,7 @@ export function FilesViewer({
     playbackRef.current = { key: targetKey, time: 0, wantPlay: false };
     pendingResumeRef.current = null;
     recoveryRef.current = { key: targetKey, lastAttemptAt: 0, inFlight: false };
+    windowHiddenPauseRef.current = null;
     setMediaState({
       key: targetKey,
       url: null,
@@ -1430,10 +1466,127 @@ export function FilesViewer({
     }
   }
 
-  async function handleMediaElementError(kind, expectedKey, expectedUrl, el) {
-    if (activeFileKeyRef.current !== expectedKey || activeMediaUrlRef.current !== expectedUrl) {
-      return;
+  function handleBeforeResumePlay(kind, expectedKey, expectedUrl, el) {
+    const hidden = windowHiddenPauseRef.current;
+    if (!hidden || hidden.key !== expectedKey || hidden.url !== expectedUrl) {
+      return false;
     }
+    if (hidden.refreshInFlight) return true;
+
+    const brokenAfterHide =
+      hidden.teardownDetected || Boolean(el?.error) || el?.networkState === 3;
+    const canRefresh = Boolean(
+      !isLocalMediaUrl(expectedUrl) &&
+        caps?.hasContentUrl &&
+        typeof link?.contentUrl === 'function',
+    );
+    const savedTime =
+      el && typeof el.currentTime === 'number' && Number.isFinite(el.currentTime) && el.currentTime > 0
+        ? el.currentTime
+        : hidden.time > 0
+          ? hidden.time
+          : playbackRef.current.key === expectedKey
+            ? playbackRef.current.time
+            : 0;
+    if (!brokenAfterHide || !canRefresh) {
+      windowHiddenPauseRef.current = null;
+      playbackRef.current = { key: expectedKey, time: savedTime, wantPlay: true };
+      return false;
+    }
+
+    hidden.refreshInFlight = true;
+
+    const signal = abortRef.current?.signal;
+    recoveryRef.current = { key: expectedKey, lastAttemptAt: Date.now(), inFlight: true };
+    link
+      .contentUrl({ machine, path, signal })
+      .then((res) => {
+        if (windowHiddenPauseRef.current === hidden) {
+          windowHiddenPauseRef.current = null;
+        }
+        if (signal?.aborted || activeFileKeyRef.current !== expectedKey) {
+          if (res?.url) revokeContentUrlNow(res.url);
+          return;
+        }
+        recoveryRef.current.inFlight = false;
+        if (!res?.url) {
+          revokeContentUrlNow(expectedUrl);
+          setMediaState({
+            key: expectedKey,
+            url: null,
+            loading: false,
+            error: { code: 'unreachable', message: '' },
+            isFreshAddress: false,
+            isMachinePreview: false,
+          });
+          return;
+        }
+        if (expectedUrl && expectedUrl !== res.url) {
+          revokeContentUrlNow(expectedUrl);
+        }
+        mintedUrlRef.current = res.url;
+        pendingResumeRef.current = {
+          key: expectedKey,
+          url: res.url,
+          time: savedTime,
+          play: true,
+        };
+        setMediaState({
+          key: expectedKey,
+          url: res.url,
+          loading: false,
+          error: null,
+          isFreshAddress: true,
+          isMachinePreview: false,
+        });
+      })
+      .catch((err) => {
+        if (windowHiddenPauseRef.current === hidden) {
+          windowHiddenPauseRef.current = null;
+        }
+        if (err?.code === 'cancelled' || signal?.aborted || activeFileKeyRef.current !== expectedKey) {
+          return;
+        }
+        recoveryRef.current.inFlight = false;
+        revokeContentUrlNow(expectedUrl);
+        setMediaState({
+          key: expectedKey,
+          url: null,
+          loading: false,
+          error: classifyMintError(err),
+          isFreshAddress: false,
+          isMachinePreview: false,
+        });
+      });
+    return true;
+  }
+
+  function handleMediaElementError(kind, expectedKey, expectedUrl, el) {
+    if (activeFileKeyRef.current !== expectedKey || activeMediaUrlRef.current !== expectedUrl) {
+      return false;
+    }
+
+    const hidden = windowHiddenPauseRef.current;
+    if (
+      kind !== 'image' &&
+      hidden &&
+      hidden.key === expectedKey &&
+      hidden.url === expectedUrl
+    ) {
+      // Loopback stream aborted while paused for a hidden desktop window: keep the element
+      // paused and resumable without retrying the dead URL until the person presses play again.
+      hidden.teardownDetected = true;
+      if (el && typeof el.currentTime === 'number' && Number.isFinite(el.currentTime) && el.currentTime > 0) {
+        hidden.time = el.currentTime;
+      }
+      return true;
+    }
+
+    void handleMediaElementErrorAsync(kind, expectedKey, expectedUrl, el);
+    return false;
+  }
+
+  async function handleMediaElementErrorAsync(kind, expectedKey, expectedUrl, el) {
 
     const now = Date.now();
     const rec = recoveryRef.current;
@@ -2303,9 +2456,10 @@ export function FilesViewer({
               onMediaTime=${(el) => noteMediaTime(expectedKey, el)}
               onMediaPlay=${(el) => noteMediaPlay(expectedKey, el)}
               onMediaPause=${(el) => noteMediaPause(expectedKey, el)}
-              onMediaError=${(el) => {
-                if (expectedUrl) handleMediaElementError('video', expectedKey, expectedUrl, el);
-              }}
+              onBeforePlay=${(el) =>
+                expectedUrl ? handleBeforeResumePlay('video', expectedKey, expectedUrl, el) : false}
+              onMediaError=${(el) =>
+                expectedUrl ? handleMediaElementError('video', expectedKey, expectedUrl, el) : false}
             />
             ${openBanner ? html`<div class="player-open-banner-wrap">${openBanner}</div>` : null}
           `
@@ -2334,9 +2488,10 @@ export function FilesViewer({
                 onMediaTime=${(el) => noteMediaTime(expectedKey, el)}
                 onMediaPlay=${(el) => noteMediaPlay(expectedKey, el)}
                 onMediaPause=${(el) => noteMediaPause(expectedKey, el)}
-                onMediaError=${(el) => {
-                  if (expectedUrl) handleMediaElementError('audio', expectedKey, expectedUrl, el);
-                }}
+                onBeforePlay=${(el) =>
+                  expectedUrl ? handleBeforeResumePlay('audio', expectedKey, expectedUrl, el) : false}
+                onMediaError=${(el) =>
+                  expectedUrl ? handleMediaElementError('audio', expectedKey, expectedUrl, el) : false}
               />
               ${openBanner ? html`<div class="player-open-banner-wrap">${openBanner}</div>` : null}
             `

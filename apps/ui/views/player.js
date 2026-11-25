@@ -343,9 +343,14 @@ export function VideoPlayer({
   onMediaTime,
   onMediaPlay,
   onMediaPause,
+  onBeforePlay,
   onMediaError,
 }) {
   const videoRef = useRef(null);
+  const onBeforePlayRef = useRef(onBeforePlay);
+  onBeforePlayRef.current = onBeforePlay;
+  const onMediaErrorRef = useRef(onMediaError);
+  onMediaErrorRef.current = onMediaError;
   const bindVideoRef = useCallback(
     (el) => {
       videoRef.current = el;
@@ -473,7 +478,17 @@ export function VideoPlayer({
     const prevId = prevIdentityRef.current;
     if (prevId && (prevId.machine !== machine || prevId.path !== path)) {
       if (durationRef.current > 0) {
-        resumeStore.save(prevId, currentTimeRef.current, durationRef.current);
+        const sameFileLocalRename =
+          prevId.path === path &&
+          (prevId.machine === 'local' || prevId.machine === 'This computer') &&
+          machine &&
+          machine !== 'local' &&
+          machine !== 'This computer';
+        resumeStore.save(
+          sameFileLocalRename ? { ...prevId, machine } : prevId,
+          currentTimeRef.current,
+          durationRef.current,
+        );
       }
       const v = videoRef.current;
       const elPlaying = Boolean(v && !v.paused && !v.ended);
@@ -724,6 +739,19 @@ export function VideoPlayer({
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
     controller.notifyActivity({ show: true });
+    if (
+      v &&
+      mediaUrlRef.current &&
+      (v.paused || v.ended || v.error || v.readyState < 1) &&
+      onBeforePlayRef.current?.(v) === true
+    ) {
+      wantPlayAfterSwapRef.current = true;
+      pendingPlayIntentRef.current = true;
+      setPendingPlayIntent(true);
+      controller.setError(false);
+      controller.setLoading(true);
+      return;
+    }
     const loadingNext = !v || !mediaUrlRef.current || v.readyState < 1;
     if (loadingNext) {
       const nextWant = !wantPlayAfterSwapRef.current;
@@ -743,7 +771,11 @@ export function VideoPlayer({
           // Ignore seek errors.
         }
       }
-      v.play().catch(() => {});
+      v.play().catch((err) => {
+        if (err?.name !== 'NotAllowedError' && (v.error || v.networkState === 3)) {
+          onMediaErrorRef.current?.(v);
+        }
+      });
     } else {
       v.pause();
       controller.setPlaying(false);
@@ -1114,8 +1146,8 @@ export function VideoPlayer({
         onError=${(e) => {
           if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
           wantPlayAfterSwapRef.current = false;
+          if (onMediaError && onMediaError(e.currentTarget) === true) return;
           controller.setError(true);
-          if (onMediaError) onMediaError(e.currentTarget);
         }}
       />
 
@@ -1361,9 +1393,14 @@ export function MusicPlayer({
   onMediaTime,
   onMediaPlay,
   onMediaPause,
+  onBeforePlay,
   onMediaError,
 }) {
   const audioRef = useRef(null);
+  const onBeforePlayRef = useRef(onBeforePlay);
+  onBeforePlayRef.current = onBeforePlay;
+  const onMediaErrorRef = useRef(onMediaError);
+  onMediaErrorRef.current = onMediaError;
   const bindAudioRef = useCallback(
     (el) => {
       audioRef.current = el;
@@ -1458,7 +1495,17 @@ export function MusicPlayer({
     const prevId = prevIdentityRef.current;
     if (prevId && (prevId.machine !== machine || prevId.path !== path)) {
       if (durationRef.current > 0) {
-        resumeStore.save(prevId, currentTimeRef.current, durationRef.current);
+        const sameFileLocalRename =
+          prevId.path === path &&
+          (prevId.machine === 'local' || prevId.machine === 'This computer') &&
+          machine &&
+          machine !== 'local' &&
+          machine !== 'This computer';
+        resumeStore.save(
+          sameFileLocalRename ? { ...prevId, machine } : prevId,
+          currentTimeRef.current,
+          durationRef.current,
+        );
       }
       prevIdentityRef.current = identityRef.current;
     } else {
@@ -1634,6 +1681,16 @@ export function MusicPlayer({
 
   const togglePlay = useCallback(() => {
     const a = audioRef.current;
+    if (
+      a &&
+      mediaUrlRef.current &&
+      (a.paused || a.ended || a.error || a.readyState < 1) &&
+      onBeforePlayRef.current?.(a) === true
+    ) {
+      autoPlayNextRef.current = { path: pathRef.current, play: true };
+      setPlaying(true);
+      return;
+    }
     const loadingNext = !a || !mediaUrlRef.current || a.readyState < 1;
     if (loadingNext) {
       const currentWant = Boolean(
@@ -1653,7 +1710,11 @@ export function MusicPlayer({
           // Ignore seek errors.
         }
       }
-      a.play().catch(() => {});
+      a.play().catch((err) => {
+        if (err?.name !== 'NotAllowedError' && (a.error || a.networkState === 3)) {
+          onMediaErrorRef.current?.(a);
+        }
+      });
     } else {
       autoPlayNextRef.current = null;
       a.pause();
@@ -1753,7 +1814,12 @@ export function MusicPlayer({
         // Some browsers do not support every action name.
       }
     };
-    safeSet('play', () => audioRef.current?.play?.().catch(() => {}));
+    safeSet('play', () => {
+      const a = audioRef.current;
+      if (!a || a.paused || a.ended || a.error || a.readyState < 1) {
+        togglePlay();
+      }
+    });
     safeSet('pause', () => audioRef.current?.pause?.());
     safeSet('previoustrack', handlePrev);
     safeSet('nexttrack', queue.next ? handleNext : null);
@@ -1776,7 +1842,7 @@ export function MusicPlayer({
         safeSet(action, null);
       }
     };
-  }, [display.title, tags?.artist, tags?.album, coverUrl, queue.prev, queue.next, handlePrev, handleNext, commitSeek]);
+  }, [display.title, tags?.artist, tags?.album, coverUrl, queue.prev, queue.next, handlePrev, handleNext, commitSeek, togglePlay]);
 
   useEffect(() => {
     const ms = typeof navigator !== 'undefined' ? navigator.mediaSession : null;

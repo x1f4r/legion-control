@@ -2199,6 +2199,19 @@ export function createMockFilesState({
               expires_in: 900,
             };
           }
+          if (typeof window !== 'undefined' && typeof window.__LEGION_MOCK_OVERRIDE_CONTENT_URL__ === 'function') {
+            const override = await window.__LEGION_MOCK_OVERRIDE_CONTENT_URL__({
+              machine: target,
+              path: norm,
+              name,
+              entry,
+            });
+            if (override?.url) {
+              revokedMockUrls.delete(override.url);
+              mockStatusByUrl.delete(override.url);
+              return override;
+            }
+          }
           const cat = categoryFromName(name);
           if (cat === 'video') {
             return { url: `${getVideoUrl()}#mock-${mockUrlSeq++}`, expires_in: 900 };
@@ -2363,6 +2376,9 @@ export function createMockFilesState({
               window.__LEGION_MOCK_REVOKED_URLS__ = [];
             }
             window.__LEGION_MOCK_REVOKED_URLS__.push(key);
+            if (typeof window.__LEGION_MOCK_ON_REVOKE_CONTENT_URL__ === 'function') {
+              window.__LEGION_MOCK_ON_REVOKE_CONTENT_URL__(key);
+            }
           }
           const existing = mockStatusByUrl.get(key);
           if (existing) {
