@@ -373,6 +373,44 @@ export function createFolderChangesStore({
     }
   }
 
+  function renameMachine(fromName, toName) {
+    const from = String(fromName || '').trim();
+    const to = String(toName || '').trim();
+    if (!from || !to || from === to) return false;
+    let changed = false;
+
+    if (homeByMachine.has(from)) {
+      const home = homeByMachine.get(from);
+      homeByMachine.delete(from);
+      if (!homeByMachine.has(to)) homeByMachine.set(to, home);
+      changed = true;
+    }
+
+    const fromPrefix = `${from}\0`;
+    const renameMapKeys = (mapObj, keepLatest = false) => {
+      for (const [k, v] of Array.from(mapObj.entries())) {
+        if (!k.startsWith(fromPrefix)) continue;
+        const destKey = `${to}\0${k.slice(fromPrefix.length)}`;
+        mapObj.delete(k);
+        if (!mapObj.has(destKey) || (keepLatest && v > (mapObj.get(destKey) || 0))) {
+          mapObj.set(destKey, v);
+        }
+        changed = true;
+      }
+    };
+    renameMapKeys(lastChangedByKey, true);
+    renameMapKeys(lastLoadedByKey, true);
+    renameMapKeys(cache, false);
+
+    for (const sub of listeners) {
+      if (sub.machine === from) {
+        sub.machine = to;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
   /**
    * Observes device transfer queue snapshots (from `link.transfers` / `link.onTransferEvent`)
    * and announces destination folders ONLY when an upload transitions into `done`.
@@ -475,6 +513,7 @@ export function createFolderChangesStore({
     setCached,
     deleteCached,
     clearCache,
+    renameMachine,
     observeDeviceTransfers,
     observeTransferJobs,
     dispose,

@@ -360,6 +360,11 @@ export function createMockFilesState({
   const isFailUpload = flags.has('fail-upload');
   const isFormats = flags.has('formats');
   const isNoHandler = flags.has('no-handler');
+  const isLongNames = flags.has('longnames');
+  const isLongList = flags.has('longlist');
+  const LONG_MACHINE_NAME = 'studio-rendering-workstation-north-01';
+  const LONG_FOLDER_NAME =
+    '2026-annual-architecture-deliverables-and-reference-assets-quarterly-verified-archive-release';
 
   const day = 86400;
   const longLogText = makeLongLogText();
@@ -719,8 +724,75 @@ export function createMockFilesState({
     trees.tower.set('/home/me/Archive5000', big);
   }
 
+  if (isLongNames) {
+    const longFolderPath = `/home/me/${LONG_FOLDER_NAME}`;
+    trees[LONG_MACHINE_NAME] = new Map([
+      [
+        '/home/me',
+        [
+          makeEntry(longFolderPath, { kind: 'dir', mtime: isoAgo(day) }),
+          makeEntry('/home/me/Documents', { kind: 'dir', mtime: isoAgo(day * 2) }),
+          makeEntry('/home/me/notes.txt', { size: 420, mtime: isoAgo(3600) }),
+        ],
+      ],
+      [
+        longFolderPath,
+        [
+          makeEntry(`${longFolderPath}/reference-diagrams`, { kind: 'dir', mtime: isoAgo(day) }),
+          makeEntry(`${longFolderPath}/overview-specification-v4.pdf`, { size: 2_840_000, mtime: isoAgo(day * 2) }),
+          makeEntry(`${longFolderPath}/render-pass-01.jpg`, {
+            size: 4_200_000,
+            mtime: isoAgo(day * 2),
+            palette: PALETTES[2],
+            sampleMedia: 'image',
+          }),
+          makeEntry(`${longFolderPath}/render-pass-02.jpg`, {
+            size: 3_950_000,
+            mtime: isoAgo(day * 3),
+            palette: PALETTES[3],
+            sampleMedia: 'image',
+          }),
+          makeEntry(`${longFolderPath}/scene-checklist-final.txt`, { size: 1_840, mtime: isoAgo(3600) }),
+          makeEntry(`${longFolderPath}/asset-bundle-2026.zip`, { size: 248_000_000, mtime: isoAgo(day * 4) }),
+        ],
+      ],
+      [`${longFolderPath}/reference-diagrams`, []],
+      ['/home/me/Documents', []],
+    ]);
+  }
+
+  if (isLongList) {
+    const towerHome = trees.tower.get('/home/me');
+    for (let i = 1; i <= 36; i += 1) {
+      const idx = String(i).padStart(2, '0');
+      const ext = i % 4 === 0 ? 'jpg' : i % 4 === 1 ? 'pdf' : i % 4 === 2 ? 'txt' : 'zip';
+      towerHome.push(
+        makeEntry(`/home/me/item-${idx}-${ext === 'jpg' ? 'photo' : ext === 'pdf' ? 'report' : ext === 'txt' ? 'notes' : 'archive'}.${ext}`, {
+          size: 48_000 * (i + 2),
+          mtime: isoAgo(day * (i + 1)),
+          sampleMedia: ext === 'jpg' ? 'image' : null,
+          palette: ext === 'jpg' ? PALETTES[i % PALETTES.length] : null,
+        }),
+      );
+    }
+    for (let i = 1; i <= 12; i += 1) {
+      const mName = `node-${String(i).padStart(2, '0')}`;
+      trees[mName] = new Map([
+        [
+          '/home/me',
+          [
+            makeEntry('/home/me/Documents', { kind: 'dir', mtime: isoAgo(day * i) }),
+            makeEntry('/home/me/logs.txt', { size: 2048, mtime: isoAgo(3600 * i) }),
+          ],
+        ],
+        ['/home/me/Documents', []],
+      ]);
+    }
+  }
+
   // Root `/` directory pointing to `/home` for Unix root browsing tests.
-  for (const mName of ['tower', 'pi', 'studio']) {
+  for (const mName of Object.keys(trees)) {
+    if (!trees[mName] || mName === 'laptop') continue;
     trees[mName].set('/', [
       makeEntry('/home', { kind: 'dir', mtime: isoAgo(day * 100) }),
       makeEntry('/etc', { kind: 'dir', mtime: isoAgo(day * 20) }),

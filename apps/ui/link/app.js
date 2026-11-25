@@ -1,5 +1,10 @@
 // Native app link: calls the Tauri 2 shell through window.__TAURI__.core.invoke and Channel.
 
+import {
+  isRealMachineName,
+  LOCAL_PIPE_CONNECTION,
+  PENDING_LOCAL_MACHINE_NAME,
+} from '../lib/local-machine.js';
 import { isFanOut } from '../lib/result.js';
 
 const CAPABILITY_TOOLS = new Set(['meta.version', 'meta.whoami', 'meta.tools']);
@@ -109,6 +114,8 @@ export function createAppLink() {
   const iosPlatform = isIosPlatform();
   const unsupportedContentMachines = new Set();
   const contentSupportListeners = new Set();
+  let hasLocalPipe = false;
+  let localPipeNode = null;
   const appResumeListeners = new Set();
   let nativeResumeUnlistens = null;
   let nativeResumeReady = null;
@@ -200,6 +207,195 @@ export function createAppLink() {
     return typeof machine === 'string' ? machine.trim() : '';
   }
 
+  function localDisplayName() {
+    return localPipeNode || PENDING_LOCAL_MACHINE_NAME;
+  }
+
+  function isLocalTargetName(name) {
+    if (!hasLocalPipe || typeof name !== 'string') return false;
+    const trimmed = name.trim();
+    if (!trimmed) return false;
+    return (
+      trimmed === LOCAL_PIPE_CONNECTION ||
+      trimmed === PENDING_LOCAL_MACHINE_NAME ||
+      Boolean(localPipeNode && trimmed === localPipeNode)
+    );
+  }
+
+  function wireTargetFor(on) {
+    if (on == null || on === '') return on;
+    if (Array.isArray(on)) {
+      return on.map((item) => wireTargetFor(item));
+    }
+    if (isLocalTargetName(on)) {
+      return LOCAL_PIPE_CONNECTION;
+    }
+    return on;
+  }
+
+  function displayMachineFor(name) {
+    if (!hasLocalPipe || typeof name !== 'string') return name;
+    if (name === LOCAL_PIPE_CONNECTION) return localDisplayName();
+    if (name === PENDING_LOCAL_MACHINE_NAME && localPipeNode) return localPipeNode;
+    return name;
+  }
+
+  function noteLocalNodeName(name) {
+    if (!hasLocalPipe || !isRealMachineName(name)) return false;
+    const trimmed = name.trim();
+    if (localPipeNode === trimmed) return false;
+    const prevDisplay = localPipeNode || PENDING_LOCAL_MACHINE_NAME;
+    localPipeNode = trimmed;
+
+    let supportChanged = false;
+    for (const oldName of [LOCAL_PIPE_CONNECTION, PENDING_LOCAL_MACHINE_NAME, prevDisplay]) {
+      if (oldName !== trimmed && unsupportedContentMachines.has(oldName)) {
+        unsupportedContentMachines.delete(oldName);
+        unsupportedContentMachines.add(trimmed);
+        supportChanged = true;
+      }
+    }
+    if (supportChanged) notifyContentSupport();
+
+    if (typeof window !== 'undefined' && window.localStorage) {
+      try {
+        const legacyKey = `legion.nodeIdentity.${LOCAL_PIPE_CONNECTION}`;
+        const destKey = `legion.nodeIdentity.${trimmed}`;
+        const legacyRaw = window.localStorage.getItem(legacyKey);
+        if (legacyRaw && !window.localStorage.getItem(destKey)) {
+          window.localStorage.setItem(destKey, legacyRaw);
+        }
+        if (legacyRaw) window.localStorage.removeItem(legacyKey);
+      } catch {
+        // Ignore storage errors.
+      }
+    }
+    return true;
+  }
+
+  function formatError(err) {
+    const out = normalizeError(err);
+    if (hasLocalPipe && out.machine === LOCAL_PIPE_CONNECTION) {
+      return { ...out, machine: localDisplayName() };
+    }
+    return out;
+  }
+
+  function normalizeTransferItem(item) {
+    if (!hasLocalPipe || !item || typeof item !== 'object') return item;
+    if (item.machine === LOCAL_PIPE_CONNECTION) {
+      return { ...item, machine: localDisplayName() };
+    }
+    return item;
+  }
+
+  function rewriteCallResult(tool, res, calledLocalPipe) {
+    if (!hasLocalPipe || !res || typeof res !== 'object') return res;
+
+    if (
+      calledLocalPipe &&
+      (tool === 'meta.whoami' || tool === 'sys.info' || tool === 'meta.version') &&
+      isRealMachineName(res.node)
+    ) {
+      noteLocalNodeName(res.node);
+    }
+
+    if (tool === 'fleet.list') {
+      const answeredLocally =
+        res.answered_by === LOCAL_PIPE_CONNECTION || (!res.answered_by && calledLocalPipe);
+      if (answeredLocally) {
+        if (isRealMachineName(res.node)) {
+          noteLocalNodeName(res.node);
+        } else if (Array.isArray(res.machines)) {
+          const self = res.machines.find((m) => m?.this_node && isRealMachineName(m.name));
+          if (self) noteLocalNodeName(self.name);
+        }
+      }
+    }
+
+    const display = localDisplayName();
+    let out = res;
+    const ensureCopy = () => {
+      if (out === res) out = { ...res };
+      return out;
+    };
+
+    if (res.answered_by === LOCAL_PIPE_CONNECTION) {
+      ensureCopy().answered_by = display;
+    }
+    if (res.node === LOCAL_PIPE_CONNECTION) {
+      ensureCopy().node = display;
+    }
+    if (res.machine === LOCAL_PIPE_CONNECTION) {
+      ensureCopy().machine = display;
+    }
+    if (res.results && typeof res.results === 'object' && !Array.isArray(res.results)) {
+      if (Object.prototype.hasOwnProperty.call(res.results, LOCAL_PIPE_CONNECTION)) {
+        const nextResults = { ...res.results };
+        if (!Object.prototype.hasOwnProperty.call(nextResults, display)) {
+          nextResults[display] = nextResults[LOCAL_PIPE_CONNECTION];
+        }
+        delete nextResults[LOCAL_PIPE_CONNECTION];
+        ensureCopy().results = nextResults;
+      }
+    }
+    return out;
+  }
+
+  function normalizeBackendState(raw) {
+    if (!raw || typeof raw !== 'object' || !Array.isArray(raw.nodes)) return raw;
+    const rawHasLocal = raw.nodes.some(
+      (n) => n && (n.via === LOCAL_PIPE_CONNECTION || n.node === LOCAL_PIPE_CONNECTION),
+    );
+    if (rawHasLocal) hasLocalPipe = true;
+    if (!hasLocalPipe) return raw;
+
+    const display = localDisplayName();
+    const pending = !localPipeNode;
+    const seen = new Set();
+    const normalizedNodes = [];
+
+    for (const entry of raw.nodes) {
+      if (!entry || typeof entry !== 'object') continue;
+      const isLocalEntry =
+        entry.via === LOCAL_PIPE_CONNECTION || entry.node === LOCAL_PIPE_CONNECTION;
+      const nodeName = isLocalEntry ? display : entry.node;
+      if (!nodeName || seen.has(nodeName)) continue;
+      seen.add(nodeName);
+      if (isLocalEntry) {
+        normalizedNodes.push({
+          ...entry,
+          node: nodeName,
+          isLocalComputer: true,
+          nodeNamePending: pending,
+        });
+      } else {
+        normalizedNodes.push(entry);
+      }
+    }
+
+    let nextRoutes = raw.routes;
+    if (raw.routes && typeof raw.routes === 'object' && LOCAL_PIPE_CONNECTION in raw.routes) {
+      nextRoutes = { ...raw.routes };
+      if (!(display in nextRoutes)) {
+        nextRoutes[display] = nextRoutes[LOCAL_PIPE_CONNECTION];
+      }
+      delete nextRoutes[LOCAL_PIPE_CONNECTION];
+    }
+
+    let nextHealth = raw.health;
+    if (raw.health && typeof raw.health === 'object' && raw.health.node === LOCAL_PIPE_CONNECTION) {
+      nextHealth = { ...raw.health, node: display };
+    }
+
+    return {
+      ...raw,
+      health: nextHealth,
+      routes: nextRoutes,
+      nodes: normalizedNodes,
+    };
+  }
+
   function notifyContentSupport() {
     for (const listener of contentSupportListeners) {
       try {
@@ -236,16 +432,16 @@ export function createAppLink() {
       const refreshed = [];
       for (const [name, entry] of Object.entries(result.results || {})) {
         if (entry && typeof entry === 'object' && entry.ok && !entry.error) {
-          refreshed.push(name);
-          if (typeof entry.ok.node === 'string') refreshed.push(entry.ok.node);
+          refreshed.push(displayMachineFor(name));
+          if (typeof entry.ok.node === 'string') refreshed.push(displayMachineFor(entry.ok.node));
         }
       }
       if (refreshed.length > 0) clearContentUnsupported(refreshed);
       return;
     }
 
-    const onKey = machineKey(targetOn);
-    const nodeKey = machineKey(result.node);
+    const onKey = machineKey(displayMachineFor(targetOn));
+    const nodeKey = machineKey(displayMachineFor(result.node));
     const refreshed = [];
     if (onKey && onKey !== 'all') refreshed.push(onKey);
     if (nodeKey) refreshed.push(nodeKey);
@@ -261,7 +457,7 @@ export function createAppLink() {
   }
 
   function supportsContentFor(machine) {
-    const key = machineKey(machine);
+    const key = machineKey(displayMachineFor(machine));
     return !key || !unsupportedContentMachines.has(key);
   }
 
@@ -782,20 +978,21 @@ export function createAppLink() {
     try {
       return await invoke('state');
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
   async function tools(options = {}) {
     try {
-      const result = await invoke('tools', { on: options?.on ?? null });
-      const target = machineKey(options?.on) || selectedNode;
+      const wireOn = wireTargetFor(options?.on ?? null);
+      const result = await invoke('tools', { on: wireOn ?? null });
+      const target = machineKey(displayMachineFor(options?.on)) || selectedNode;
       if (target && target !== 'all') {
         clearContentUnsupported([target]);
       }
       return result;
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
@@ -803,12 +1000,19 @@ export function createAppLink() {
     const { on, onEvent, signal } = options || {};
     const id = `${callPrefix}-${nextCallId++}`;
     const core = tauriCore();
+    const wireOn = wireTargetFor(on ?? null);
+    const calledLocalPipe =
+      hasLocalPipe && (wireOn === LOCAL_PIPE_CONNECTION || wireOn === null);
 
     const channel = core && typeof core.Channel === 'function' ? new core.Channel() : null;
     if (channel && typeof onEvent === 'function') {
       channel.onmessage = (evt) => {
         try {
-          onEvent(evt);
+          const normalizedEvt =
+            hasLocalPipe && evt && typeof evt === 'object' && evt.machine === LOCAL_PIPE_CONNECTION
+              ? { ...evt, machine: localDisplayName() }
+              : evt;
+          onEvent(normalizedEvt);
         } catch {
           // Keep receiving events if a view callback throws.
         }
@@ -836,16 +1040,17 @@ export function createAppLink() {
         id,
         tool,
         args: args && typeof args === 'object' ? args : {},
-        on: on ?? null,
+        on: wireOn ?? null,
       };
       if (channel) {
         payload.onEvent = channel;
       }
-      const result = await invoke('call', payload);
-      noteCapabilityContact(tool, on, result);
-      return result;
+      const res = await invoke('call', payload);
+      const rewritten = rewriteCallResult(tool, res, calledLocalPipe);
+      noteCapabilityContact(tool, displayMachineFor(on), rewritten);
+      return rewritten;
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     } finally {
       if (signal) signal.removeEventListener('abort', onAbort);
     }
@@ -859,42 +1064,77 @@ export function createAppLink() {
         return base;
       }
 
+      if (
+        base.nodes.some(
+          (n) => n && (n.via === LOCAL_PIPE_CONNECTION || n.node === LOCAL_PIPE_CONNECTION),
+        )
+      ) {
+        hasLocalPipe = true;
+      }
+
       await ensureLocalNetworkPermission();
 
       const primary = base.nodes[0];
-      const targetNode = primary.node;
-      selectedNode = machineKey(targetNode);
+      const rawTargetNode = primary.node;
+      const primaryIsLocalPipe =
+        primary.via === LOCAL_PIPE_CONNECTION || rawTargetNode === LOCAL_PIPE_CONNECTION;
+      const probeTarget = primaryIsLocalPipe ? LOCAL_PIPE_CONNECTION : rawTargetNode;
+      selectedNode = machineKey(primaryIsLocalPipe ? localDisplayName() : rawTargetNode);
 
       try {
         const [whoami, version] = await Promise.all([
-          call('meta.whoami', {}, { on: targetNode }),
-          call('meta.version', {}, { on: targetNode }).catch(() => null),
+          call('meta.whoami', {}, { on: probeTarget }),
+          call('meta.version', {}, { on: probeTarget }).catch(() => null),
         ]);
-        if (!(primary.via === 'local' && targetNode === 'local') && whoami?.node && whoami.node !== targetNode) {
+        if (!primaryIsLocalPipe && whoami?.node && whoami.node !== rawTargetNode) {
           throw {
             code: 'denied',
-            message: `Expected identity from ${targetNode}, but ${whoami.node} answered.`,
+            message: `Expected identity from ${rawTargetNode}, but ${whoami.node} answered.`,
             hint: 'Check the connection settings for this machine.',
-            machine: targetNode,
-            details: { reason: 'node_mismatch', expected: targetNode, actual: whoami.node },
+            machine: rawTargetNode,
+            details: { reason: 'node_mismatch', expected: rawTargetNode, actual: whoami.node },
           };
         }
+        if (primaryIsLocalPipe && isRealMachineName(whoami?.node)) {
+          noteLocalNodeName(whoami.node);
+        }
+        const resolvedNodeName = primaryIsLocalPipe ? localDisplayName() : rawTargetNode;
+        selectedNode = machineKey(resolvedNodeName);
+        const nodeNamePending = primaryIsLocalPipe && !localPipeNode;
         const checkedAt = new Date().toISOString();
-        const latest = await rawState().catch(() => base);
+        const latestRaw = await rawState().catch(() => base);
+        const latest = normalizeBackendState(latestRaw);
         const nodes =
-          Array.isArray(latest?.nodes) && latest.nodes.length > 0 ? latest.nodes : base.nodes;
-        const currentPrimary = nodes[0]?.node === targetNode ? nodes[0] : primary;
+          Array.isArray(latest?.nodes) && latest.nodes.length > 0
+            ? latest.nodes
+            : normalizeBackendState(base).nodes;
+        const currentPrimary =
+          nodes[0]?.node === resolvedNodeName ||
+          (primaryIsLocalPipe && nodes[0]?.via === LOCAL_PIPE_CONNECTION)
+            ? nodes[0]
+            : primary;
         const resolvedPrincipal = whoami.principal || currentPrimary.principal;
         const resolvedRole = whoami.role || currentPrimary.role;
-        writeCachedNodeIdentity(targetNode, {
-          principal: resolvedPrincipal,
-          role: resolvedRole,
-          tools: Array.isArray(whoami.tools) ? whoami.tools : null,
-          checkedAt,
-        });
+        if (isRealMachineName(resolvedNodeName)) {
+          writeCachedNodeIdentity(resolvedNodeName, {
+            principal: resolvedPrincipal,
+            role: resolvedRole,
+            tools: Array.isArray(whoami.tools) ? whoami.tools : null,
+            checkedAt,
+          });
+        }
+        const normalizedWhoami =
+          whoami && typeof whoami === 'object'
+            ? {
+                ...whoami,
+                node: isRealMachineName(whoami.node) ? whoami.node : resolvedNodeName,
+              }
+            : whoami;
         const enriched = {
           ...currentPrimary,
-          node: targetNode,
+          node: resolvedNodeName,
+          isLocalComputer: primaryIsLocalPipe,
+          nodeNamePending,
           principal: resolvedPrincipal,
           role: resolvedRole,
           reachable: true,
@@ -904,29 +1144,45 @@ export function createAppLink() {
           version: version?.version || '',
           build: version?.build || null,
           protocol: version?.protocol ?? 1,
-          whoami,
+          whoami: normalizedWhoami,
         };
         return {
           ...latest,
-          nodes: [enriched, ...nodes.filter((n) => n.node !== targetNode)],
+          nodes: [
+            enriched,
+            ...nodes.filter(
+              (n) =>
+                n.node !== resolvedNodeName &&
+                n.node !== rawTargetNode &&
+                n.node !== LOCAL_PIPE_CONNECTION,
+            ),
+          ],
         };
       } catch (err) {
-        const normalized = normalizeError(err);
+        const normalized = formatError(err);
         if (isPairingError(normalized)) {
           return {
-            ...base,
+            ...normalizeBackendState(base),
             error: normalized,
           };
         }
         // Selected machine did not answer: keep it selected and mark it unreachable with its
         // last known role ("as of <when>"), never substituting another node's identity.
-        const cached = readCachedNodeIdentity(targetNode);
-        const lastRole = cached?.role || (primary.role && primary.role !== 'unknown' ? primary.role : null);
+        const resolvedNodeName = primaryIsLocalPipe ? localDisplayName() : rawTargetNode;
+        selectedNode = machineKey(resolvedNodeName);
+        const nodeNamePending = primaryIsLocalPipe && !localPipeNode;
+        const cached = isRealMachineName(resolvedNodeName)
+          ? readCachedNodeIdentity(resolvedNodeName)
+          : null;
+        const lastRole =
+          cached?.role || (primary.role && primary.role !== 'unknown' ? primary.role : null);
         const lastPrincipal = cached?.principal || primary.principal || '';
         const checkedAt = cached?.checkedAt || primary.role_checked_at || null;
         const offlinePrimary = {
           ...primary,
-          node: targetNode,
+          node: resolvedNodeName,
+          isLocalComputer: primaryIsLocalPipe,
+          nodeNamePending,
           principal: lastPrincipal,
           role: lastRole || primary.role || 'unknown',
           reachable: false,
@@ -935,7 +1191,7 @@ export function createAppLink() {
           unreachableError: normalized,
           whoami: lastRole
             ? {
-                node: targetNode,
+                node: resolvedNodeName,
                 principal: lastPrincipal,
                 role: lastRole,
                 tools: Array.isArray(cached?.tools) ? cached.tools : null,
@@ -943,9 +1199,16 @@ export function createAppLink() {
               }
             : null,
         };
+        const normalizedBase = normalizeBackendState(base);
+        const restNodes = (normalizedBase.nodes || []).filter(
+          (n) =>
+            n.node !== resolvedNodeName &&
+            n.node !== rawTargetNode &&
+            n.node !== LOCAL_PIPE_CONNECTION,
+        );
         return {
-          ...base,
-          nodes: [offlinePrimary, ...base.nodes.slice(1)],
+          ...normalizedBase,
+          nodes: [offlinePrimary, ...restNodes],
         };
       }
     } finally {
@@ -996,9 +1259,16 @@ export function createAppLink() {
 
   async function learn() {
     try {
-      return await invoke('learn');
+      const res = await invoke('learn');
+      if (!hasLocalPipe || !res || typeof res !== 'object') return res;
+      const report =
+        res.report && typeof res.report === 'object' && res.report.introducer === LOCAL_PIPE_CONNECTION
+          ? { ...res.report, introducer: localDisplayName() }
+          : res.report;
+      const nextState = res.state ? normalizeBackendState(res.state) : res.state;
+      return { ...res, report, state: nextState };
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
@@ -1011,7 +1281,7 @@ export function createAppLink() {
       clearUnsupportedContentMachines();
       return await state();
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
@@ -1020,7 +1290,7 @@ export function createAppLink() {
       await invoke('dismiss_identity_change', { node });
       return await state();
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
@@ -1030,17 +1300,17 @@ export function createAppLink() {
       clearUnsupportedContentMachines();
       return res;
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
   async function selectNode(node) {
     try {
-      await invoke('select_node', { node });
-      selectedNode = machineKey(node);
+      await invoke('select_node', { node: wireTargetFor(node) });
+      selectedNode = machineKey(displayMachineFor(node));
       return await state();
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
@@ -1171,11 +1441,11 @@ export function createAppLink() {
     }
     try {
       const result = await invoke('content_url', {
-        machine: machine || '',
+        machine: wireTargetFor(machine) || '',
         path: path || '',
         download: Boolean(download),
       });
-      clearContentUnsupported([machine || selectedNode]);
+      clearContentUnsupported([displayMachineFor(machine) || selectedNode]);
       if (signal?.aborted) {
         if (result?.url) {
           invoke('content_revoke', { url: String(result.url) }).catch(() => {});
@@ -1190,12 +1460,12 @@ export function createAppLink() {
       }
       return result;
     } catch (err) {
-      const normalized = normalizeError(err);
+      const normalized = formatError(err);
       if (
         normalized.code === 'unsupported' &&
         normalized.details?.reason !== 'too_large_for_inline'
       ) {
-        const target = machineKey(machine) || machineKey(normalized.machine);
+        const target = machineKey(displayMachineFor(machine)) || machineKey(normalized.machine);
         markContentUnsupported(target);
         if (normalized.machine && machineKey(normalized.machine) !== target) {
           markContentUnsupported(normalized.machine);
@@ -1227,14 +1497,14 @@ export function createAppLink() {
     const { machine, path, name, size, mime } = req || {};
     try {
       return await invoke('transfer_download', {
-        machine: machine || '',
+        machine: wireTargetFor(machine) || '',
         path: path || '',
         name: name ?? null,
         size: typeof size === 'number' && Number.isFinite(size) ? size : null,
         mime: mime ?? null,
       });
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
@@ -1243,7 +1513,7 @@ export function createAppLink() {
       const picked = await invoke('transfer_pick_uploads');
       return Array.isArray(picked) ? picked : [];
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
@@ -1251,12 +1521,12 @@ export function createAppLink() {
     const { machine, dir, handles } = req || {};
     try {
       return await invoke('transfer_upload', {
-        machine: machine || '',
+        machine: wireTargetFor(machine) || '',
         dir: dir || '',
         handles: Array.isArray(handles) ? handles : null,
       });
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
@@ -1264,23 +1534,23 @@ export function createAppLink() {
     const { machine, path, name, size, mime } = req || {};
     try {
       return await invoke('transfer_open_externally', {
-        machine: machine || '',
+        machine: wireTargetFor(machine) || '',
         path: path || '',
         name: name ?? null,
         size: typeof size === 'number' && Number.isFinite(size) ? size : null,
         mime: mime ?? null,
       });
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
   async function transfers() {
     try {
       const list = await invoke('transfers');
-      return Array.isArray(list) ? list : [];
+      return Array.isArray(list) ? list.map(normalizeTransferItem) : [];
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
@@ -1288,15 +1558,19 @@ export function createAppLink() {
     try {
       return await invoke('transfer_control', { id, action });
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
   async function openTransfer(id) {
     try {
-      return await invoke('open_transfer', { id });
+      const res = await invoke('open_transfer', { id });
+      if (hasLocalPipe && res?.viewer?.machine === LOCAL_PIPE_CONNECTION) {
+        return { ...res, viewer: { ...res.viewer, machine: localDisplayName() } };
+      }
+      return res;
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
@@ -1304,7 +1578,7 @@ export function createAppLink() {
     try {
       return await invoke('show_transfer_in_folder', { id });
     } catch (err) {
-      throw normalizeError(err);
+      throw formatError(err);
     }
   }
 
@@ -1320,7 +1594,8 @@ export function createAppLink() {
     channel.onmessage = (list) => {
       if (!active) return;
       try {
-        listener(Array.isArray(list) ? list : []);
+        const normalized = Array.isArray(list) ? list.map(normalizeTransferItem) : [];
+        listener(normalized);
       } catch {
         // Keep receiving queue updates if a view callback throws.
       }
@@ -1379,6 +1654,8 @@ export function createAppLink() {
     supportsContent: true,
     supportsContentFor,
     onContentSupportChange,
+    getLocalMachineName: () => localPipeNode,
+    setLocalMachineName: (name) => noteLocalNodeName(name),
     state,
     tools,
     call,

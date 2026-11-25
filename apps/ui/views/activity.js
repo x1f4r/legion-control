@@ -3,7 +3,7 @@
 
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Notice, ProgressBar, SwipeRow } from './common.js';
-import { ScrollContainer } from './scroll-container.js';
+import { SplitView } from './split-view.js';
 import {
   formatActivityDuration,
   formatActivitySubtitle,
@@ -367,6 +367,7 @@ export function ActivityGroups({
   canCancel = false,
   canControlTransfers = false,
   selectedKey = '',
+  hideFirstLabel = false,
   hrefForJob,
   onStopJob,
   onControlTransfer,
@@ -412,9 +413,9 @@ export function ActivityGroups({
   return html`
     <div>
       ${groups.map(
-        (group) => html`
+        (group, idx) => html`
           <div key=${group.key}>
-            <p class="label">${group.label}</p>
+            ${!(hideFirstLabel && idx === 0) ? html`<p class="label">${group.label}</p>` : null}
             <div class="list">
               ${group.items.map((item) => {
                 if (item._kind === 'transfer') {
@@ -592,6 +593,33 @@ export function ActivityView({
   const hasSelected = Boolean(route.machine && route.jobId);
   const selectedKey = hasSelected ? `${route.machine}:${route.jobId}` : '';
 
+  const firstGroup = useMemo(() => {
+    const combined = (jobs || []).map((j) => ({ _kind: 'job', ...j }));
+    for (const t of deviceTransfers || []) {
+      const mappedState =
+        t.state === 'running' ||
+        t.state === 'queued' ||
+        t.state === 'paused' ||
+        t.state === 'cancelling'
+          ? 'running'
+          : t.state === 'done'
+            ? 'succeeded'
+            : t.state === 'failed'
+              ? 'failed'
+              : 'cancelled';
+      combined.push({ _kind: 'transfer', state: mappedState, created: t.created, finished: t.finished });
+    }
+    const groups = groupActivity(combined);
+    return groups[0] || null;
+  }, [jobs, deviceTransfers]);
+  const firstGroupLabel = firstGroup?.label || 'Recent';
+  const runningFact = firstGroup?.key === 'running' ? String(firstGroup.items.length) : null;
+
+  const selectedJob = useMemo(() => {
+    if (!hasSelected || !Array.isArray(jobs)) return null;
+    return jobs.find((j) => j.machine === route.machine && j.id === route.jobId) || null;
+  }, [hasSelected, jobs, route.machine, route.jobId]);
+
   const refreshActivityList = async () => {
     await Promise.all([
       load(targetNames),
@@ -617,6 +645,7 @@ export function ActivityView({
         canCancel=${canCancel}
         canControlTransfers=${canControlTransfers}
         selectedKey=${wide ? selectedKey : ''}
+        hideFirstLabel=${wide && !error}
         hrefForJob=${(job) => routeHref({ section: 'activity', machine: job.machine, jobId: job.id })}
         onStopJob=${handleStopJob}
         onControlTransfer=${handleControlTransfer}
@@ -625,34 +654,44 @@ export function ActivityView({
     </section>
   `;
 
-  const hasAnyItems = (jobs && jobs.length > 0) || (deviceTransfers && deviceTransfers.length > 0);
+  if (wide) {
+    const selectedTitle = selectedJob
+      ? technical
+        ? selectedJob.command || selectedJob.name || selectedJob.id
+        : friendlyJobName(selectedJob)
+      : 'Activity';
+    const selectedState = selectedJob ? friendlyJobState(selectedJob, technical) : null;
 
-  if (wide && (hasSelected || !jobs || hasAnyItems)) {
     return html`
-      <div class="split">
-        <${ScrollContainer} as="section" onRefresh=${refreshActivityList}>
-          ${listPane}
-        <//>
-        <${ScrollContainer} as="section">
-          ${hasSelected
-            ? html`
-                <${ActivityDetail}
-                  machineName=${route.machine}
-                  nodeName=${localNode}
-                  jobId=${route.jobId}
-                  link=${link}
-                  allowedSet=${allowedSet}
-                  technical=${technical}
-                  onObserveTransferJobs=${onObserveTransferJobs}
-                  onChanged=${() => {
-                    load();
-                    if (onRefreshFleet) onRefreshFleet();
-                  }}
-                />
-              `
-            : html`<div class="empty">Select an item to see its details.</div>`}
-        <//>
-      </div>
+      <${SplitView}
+        leftTitle="Activity"
+        leftLabel=${firstGroupLabel}
+        leftLabelFact=${runningFact}
+        leftBody=${listPane}
+        onLeftRefresh=${refreshActivityList}
+        rightTitle=${hasSelected ? selectedTitle : null}
+        rightFact=${hasSelected && selectedState ? selectedState.label : null}
+        rightLabel=${hasSelected ? 'Details' : null}
+        rightLabelFact=${hasSelected ? route.machine : null}
+        rightEmpty=${!hasSelected ? 'Choose an item on the left.' : null}
+        rightBody=${hasSelected
+          ? html`
+              <${ActivityDetail}
+                machineName=${route.machine}
+                nodeName=${localNode}
+                jobId=${route.jobId}
+                link=${link}
+                allowedSet=${allowedSet}
+                technical=${technical}
+                onObserveTransferJobs=${onObserveTransferJobs}
+                onChanged=${() => {
+                  load();
+                  if (onRefreshFleet) onRefreshFleet();
+                }}
+              />
+            `
+          : null}
+      />
     `;
   }
 
