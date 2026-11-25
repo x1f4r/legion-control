@@ -150,22 +150,271 @@ impl Drop for OperationGuard {
     }
 }
 
+/// Wake callback invoked by a [`DrainClock`] when a synchronous refresh-drain wait expires.
+pub(crate) type SyncWakeFn = Arc<dyn Fn() + Send + Sync>;
+
+/// Monotonic clock and wait abstraction for [`BackgroundRefreshTracker`] so unit tests can drive
+/// refresh-drain timeouts and ordering deterministically without wall-clock sleeps.
+pub(crate) trait DrainClock: Send + Sync + 'static {
+    fn now(&self) -> Duration;
+    fn sleep_until(&self, deadline: Duration) -> BoxFuture<'static, ()>;
+    fn wait_condvar<'a>(
+        &self,
+        condvar: &Condvar,
+        guard: std::sync::MutexGuard<'a, usize>,
+        deadline: Duration,
+        wake: SyncWakeFn,
+    ) -> std::sync::MutexGuard<'a, usize>;
+}
+
+/// Production [`DrainClock`] backed by `std::time::Instant`, `Condvar::wait_timeout`, and
+/// `tokio::time::sleep_until`.
+pub(crate) struct RealDrainClock {
+    origin: Instant,
+}
+
+impl RealDrainClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl DrainClock for RealDrainClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    fn sleep_until(&self, deadline: Duration) -> BoxFuture<'static, ()> {
+        let target = tokio::time::Instant::from_std(self.origin + deadline);
+        Box::pin(tokio::time::sleep_until(target))
+    }
+
+    fn wait_condvar<'a>(
+        &self,
+        condvar: &Condvar,
+        guard: std::sync::MutexGuard<'a, usize>,
+        deadline: Duration,
+        _wake: SyncWakeFn,
+    ) -> std::sync::MutexGuard<'a, usize> {
+        let remaining = deadline.saturating_sub(self.now());
+        if remaining.is_zero() {
+            return guard;
+        }
+        condvar
+            .wait_timeout(guard, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0
+    }
+}
+
+#[cfg(test)]
+struct ManualDrainClockState {
+    now: Duration,
+    next_sync_id: u64,
+    async_waiters: Vec<(Duration, tokio::sync::oneshot::Sender<()>)>,
+    sync_waiters: Vec<(u64, Duration, SyncWakeFn)>,
+}
+
+/// Deterministic [`DrainClock`] for tests: virtual time advances only via [`Self::advance`], and
+/// [`Self::wait_for_waiter`] lets a test observe that an async or sync drain waiter has entered its
+/// wait before releasing an in-flight refresh or advancing past the timeout.
+#[cfg(test)]
+pub(crate) struct ManualDrainClock {
+    state: Mutex<ManualDrainClockState>,
+    waiter_added: Notify,
+}
+
+#[cfg(test)]
+impl ManualDrainClock {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ManualDrainClockState {
+                now: Duration::ZERO,
+                next_sync_id: 1,
+                async_waiters: Vec::new(),
+                sync_waiters: Vec::new(),
+            }),
+            waiter_added: Notify::new(),
+        })
+    }
+
+    pub(crate) fn advance(&self, delta: Duration) {
+        let (ready_async, ready_sync) = {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.now = guard.now.saturating_add(delta);
+            let now = guard.now;
+            let mut remaining_async = Vec::new();
+            let mut ready_async = Vec::new();
+            for (deadline, tx) in guard.async_waiters.drain(..) {
+                if tx.is_closed() {
+                    continue;
+                }
+                if deadline <= now {
+                    ready_async.push(tx);
+                } else {
+                    remaining_async.push((deadline, tx));
+                }
+            }
+            guard.async_waiters = remaining_async;
+
+            let mut remaining_sync = Vec::new();
+            let mut ready_sync = Vec::new();
+            for (id, deadline, wake) in guard.sync_waiters.drain(..) {
+                if deadline <= now {
+                    ready_sync.push(wake);
+                } else {
+                    remaining_sync.push((id, deadline, wake));
+                }
+            }
+            guard.sync_waiters = remaining_sync;
+            (ready_async, ready_sync)
+        };
+        for tx in ready_async {
+            let _ = tx.send(());
+        }
+        for wake in ready_sync {
+            wake();
+        }
+    }
+
+    pub(crate) fn pending_waiters(&self) -> usize {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.async_waiters.retain(|(_, tx)| !tx.is_closed());
+        guard.async_waiters.len() + guard.sync_waiters.len()
+    }
+
+    pub(crate) async fn wait_for_waiters(&self, expected: usize) {
+        loop {
+            let notified = self.waiter_added.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.pending_waiters() >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn wait_for_waiter(&self) {
+        self.wait_for_waiters(1).await;
+    }
+}
+
+#[cfg(test)]
+impl DrainClock for ManualDrainClock {
+    fn now(&self) -> Duration {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .now
+    }
+
+    fn sleep_until(&self, deadline: Duration) -> BoxFuture<'static, ()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard
+                .async_waiters
+                .retain(|(_, sender)| !sender.is_closed());
+            if deadline <= guard.now {
+                return Box::pin(async {});
+            }
+            guard.async_waiters.push((deadline, tx));
+        }
+        self.waiter_added.notify_waiters();
+        Box::pin(async move {
+            let _ = rx.await;
+        })
+    }
+
+    fn wait_condvar<'a>(
+        &self,
+        condvar: &Condvar,
+        guard: std::sync::MutexGuard<'a, usize>,
+        deadline: Duration,
+        wake: SyncWakeFn,
+    ) -> std::sync::MutexGuard<'a, usize> {
+        let id = {
+            let mut st = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if deadline <= st.now {
+                return guard;
+            }
+            let id = st.next_sync_id;
+            st.next_sync_id = st.next_sync_id.wrapping_add(1);
+            st.sync_waiters.push((id, deadline, wake));
+            id
+        };
+        self.waiter_added.notify_waiters();
+        let next = condvar
+            .wait(guard)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let mut st = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            st.sync_waiters.retain(|(entry_id, _, _)| *entry_id != id);
+        }
+        next
+    }
+}
+
 /// Tracks in-flight passive background refresh calls so updates never permanently block while
 /// polling screens (such as Machine Overview) are open, yet wait briefly for any mid-call refresh
 /// to finish before proceeding between poll ticks.
-#[derive(Default)]
 struct BackgroundRefreshTracker {
-    in_flight: Mutex<usize>,
-    condvar: Condvar,
+    in_flight: Arc<Mutex<usize>>,
+    condvar: Arc<Condvar>,
     notify: Notify,
+    clock: Arc<dyn DrainClock>,
+}
+
+impl Default for BackgroundRefreshTracker {
+    fn default() -> Self {
+        Self::with_clock(Arc::new(RealDrainClock::new()))
+    }
 }
 
 impl BackgroundRefreshTracker {
+    fn with_clock(clock: Arc<dyn DrainClock>) -> Self {
+        Self {
+            in_flight: Arc::new(Mutex::new(0)),
+            condvar: Arc::new(Condvar::new()),
+            notify: Notify::new(),
+            clock,
+        }
+    }
+
     fn count(&self) -> usize {
         *self
             .in_flight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn sync_waker(&self) -> SyncWakeFn {
+        let in_flight = Arc::clone(&self.in_flight);
+        let condvar = Arc::clone(&self.condvar);
+        Arc::new(move || {
+            let _guard = in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            condvar.notify_all();
+        })
     }
 
     fn wait_sync(&self, timeout: Duration) -> bool {
@@ -176,23 +425,15 @@ impl BackgroundRefreshTracker {
         if *count == 0 {
             return true;
         }
-        let deadline = Instant::now() + timeout;
+        let deadline = self.clock.now().saturating_add(timeout);
+        let wake = self.sync_waker();
         while *count > 0 {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            if self.clock.now() >= deadline {
                 return false;
             }
-            let (next, res) = self
-                .condvar
-                .wait_timeout(count, remaining)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            count = next;
-            if *count == 0 {
-                return true;
-            }
-            if res.timed_out() {
-                return false;
-            }
+            count = self
+                .clock
+                .wait_condvar(&self.condvar, count, deadline, Arc::clone(&wake));
         }
         true
     }
@@ -201,7 +442,9 @@ impl BackgroundRefreshTracker {
         if self.count() == 0 {
             return true;
         }
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = self.clock.now().saturating_add(timeout);
+        let timer = self.clock.sleep_until(deadline);
+        tokio::pin!(timer);
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -211,9 +454,10 @@ impl BackgroundRefreshTracker {
             if self.count() == 0 {
                 return true;
             }
-            match tokio::time::timeout_at(deadline, notified).await {
-                Ok(()) => continue,
-                Err(_) => return self.count() == 0,
+            tokio::select! {
+                biased;
+                _ = &mut notified => continue,
+                _ = &mut timer => return self.count() == 0,
             }
         }
     }
@@ -393,13 +637,13 @@ impl LinkBackend {
     /// explicitly archives the damaged file via [`Backend::repair_store`].
     pub fn from_store(store: AppStore) -> Self {
         let local_program = discover_local_legion();
-        Self::init(store, local_program, None)
+        Self::init(store, local_program, None, Arc::new(RealDrainClock::new()))
     }
 
     /// Creates a backend with an explicit local binary override (used in unit tests).
     #[cfg(test)]
     pub fn with_local_program(store: AppStore, local_program: Option<String>) -> Self {
-        Self::init(store, local_program, None)
+        Self::init(store, local_program, None, Arc::new(RealDrainClock::new()))
     }
 
     /// Creates a backend with a custom [`legion_link::SessionOpener`] for deterministic unit tests.
@@ -409,13 +653,31 @@ impl LinkBackend {
         local_program: Option<String>,
         opener: legion_link::SessionOpener,
     ) -> Self {
-        Self::init(store, local_program, Some(opener))
+        Self::init(
+            store,
+            local_program,
+            Some(opener),
+            Arc::new(RealDrainClock::new()),
+        )
+    }
+
+    /// Creates a backend with both a custom [`legion_link::SessionOpener`] and an injected
+    /// [`DrainClock`] so refresh-drain tests run deterministically without wall-clock sleeps.
+    #[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
+    pub(crate) fn with_opener_and_clock(
+        store: AppStore,
+        local_program: Option<String>,
+        opener: legion_link::SessionOpener,
+        clock: Arc<dyn DrainClock>,
+    ) -> Self {
+        Self::init(store, local_program, Some(opener), clock)
     }
 
     fn init(
         store: AppStore,
         local_program: Option<String>,
         opener: Option<legion_link::SessionOpener>,
+        drain_clock: Arc<dyn DrainClock>,
     ) -> Self {
         let (data, store_error) = match store.load() {
             Ok(data) => (data, None),
@@ -466,7 +728,7 @@ impl LinkBackend {
             next_call_seq: AtomicU64::new(1),
             active_pairs: Arc::new(Mutex::new(Vec::new())),
             in_flight_ops: Arc::new(AtomicUsize::new(0)),
-            bg_refreshes: Arc::new(BackgroundRefreshTracker::default()),
+            bg_refreshes: Arc::new(BackgroundRefreshTracker::with_clock(drain_clock)),
         }
     }
 
@@ -3608,17 +3870,19 @@ mod tests {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn passive_overview_polls_do_not_increment_active_operations_and_drain_cleanly()
     -> Result<(), Box<dyn std::error::Error>> {
         use legion_link::proto::{HelloResult, PROTOCOL, Request, Response, method};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::sync::Semaphore;
 
         let dir = tempfile::tempdir()?;
         let store = AppStore::in_dir(dir.path());
         let call_seen = Arc::new(AtomicUsize::new(0));
         let call_started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let clock = ManualDrainClock::new();
 
         let seen_tx = Arc::clone(&call_seen);
         let started_tx = Arc::clone(&call_started);
@@ -3664,11 +3928,14 @@ mod tests {
                             }
                             let _ = server_w.flush().await;
                         } else {
-                            // Hold each tool call until `release` fires so we can assert live
-                            // counters mid-call.
+                            // Hold each tool call on a permit-storing semaphore so wakeups can
+                            // never be lost under load.
                             seen_tx.fetch_add(1, Ordering::SeqCst);
                             started_tx.notify_waiters();
-                            release_rx.notified().await;
+                            let Ok(permit) = release_rx.acquire().await else {
+                                break;
+                            };
+                            permit.forget();
                             let reply = Response::ok(req.id, serde_json::json!({ "ok": true }));
                             let mut out = serde_json::to_string(&reply).unwrap_or_default();
                             out.push('\n');
@@ -3691,11 +3958,28 @@ mod tests {
             })
         });
 
-        let backend = Arc::new(LinkBackend::with_opener(
+        let backend = Arc::new(LinkBackend::with_opener_and_clock(
             store,
             Some("/usr/bin/legion".to_owned()),
             opener,
+            Arc::clone(&clock) as Arc<dyn DrainClock>,
         ));
+
+        let wait_for_seen = |target: usize| {
+            let call_seen = Arc::clone(&call_seen);
+            let call_started = Arc::clone(&call_started);
+            async move {
+                loop {
+                    let notified = call_started.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if call_seen.load(Ordering::SeqCst) >= target {
+                        return;
+                    }
+                    notified.await;
+                }
+            }
+        };
 
         // 1. Machine Overview polling `sys.info` + `sys.procs` concurrently:
         //    `active_operations()` stays 0 while `background_refreshes()` tracks both calls.
@@ -3726,13 +4010,9 @@ mod tests {
             .await
         });
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while backend.background_refreshes() < 2 || call_seen.load(Ordering::SeqCst) < 1 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for Overview polls to enter flight"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        wait_for_seen(1).await;
+        while backend.background_refreshes() < 2 {
+            tokio::task::yield_now().await;
         }
         assert_eq!(
             backend.active_operations(),
@@ -3741,22 +4021,25 @@ mod tests {
         );
         assert_eq!(backend.background_refreshes(), 2);
 
-        // Waiting with a short timeout while refreshes are still mid-call returns false cleanly
-        // rather than proceeding mid-call or hanging.
-        assert!(
-            !backend
-                .wait_for_background_refreshes(Duration::from_millis(30))
+        // Waiting past the grace timeout while refreshes are still mid-call returns false cleanly
+        // rather than proceeding mid-call or hanging (driven deterministically via ManualDrainClock).
+        let b_timeout_async = Arc::clone(&backend);
+        let timeout_async_task = tokio::spawn(async move {
+            b_timeout_async
+                .wait_for_background_refreshes(Duration::from_secs(2))
                 .await
-        );
-        let b_sync = Arc::clone(&backend);
-        assert!(
-            !tokio::task::spawn_blocking(move || {
-                b_sync.wait_for_background_refreshes_sync(Duration::from_millis(30))
-            })
-            .await?
-        );
+        });
+        let b_timeout_sync = Arc::clone(&backend);
+        let timeout_sync_task = tokio::task::spawn_blocking(move || {
+            b_timeout_sync.wait_for_background_refreshes_sync(Duration::from_secs(2))
+        });
+        clock.wait_for_waiters(2).await;
+        clock.advance(Duration::from_secs(2));
+        assert!(!timeout_async_task.await?);
+        assert!(!timeout_sync_task.await?);
 
-        // Once the in-flight refreshes finish, both async and sync waiters unblock immediately.
+        // Once the in-flight refreshes finish, both async and sync waiters unblock immediately
+        // without advancing the clock.
         let b_wait = Arc::clone(&backend);
         let wait_async_task = tokio::spawn(async move {
             b_wait
@@ -3767,15 +4050,8 @@ mod tests {
         let wait_sync_task = tokio::task::spawn_blocking(move || {
             b_sync_wait.wait_for_background_refreshes_sync(Duration::from_secs(2))
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        // Release both queued calls (the duplex server processes requests sequentially).
-        for _ in 0..4 {
-            release.notify_waiters();
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            if backend.background_refreshes() == 0 {
-                break;
-            }
-        }
+        clock.wait_for_waiters(2).await;
+        release.add_permits(2);
         assert!(wait_async_task.await?);
         assert!(wait_sync_task.await?);
         assert!(sys_task.await?.is_ok());
@@ -3799,23 +4075,96 @@ mod tests {
             )
             .await
         });
-        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(3);
-        while call_seen.load(Ordering::SeqCst) == 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline2,
-                "timed out waiting for sys.kill to enter flight"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for_seen(1).await;
         assert_eq!(
             backend.active_operations(),
             1,
             "user-started sys.kill must increment active_operations()"
         );
         assert_eq!(backend.background_refreshes(), 0);
-        release.notify_waiters();
+        release.add_permits(1);
         assert!(kill_task.await?.is_ok());
         assert_eq!(backend.active_operations(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn background_refresh_tracker_real_clock_smoke() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Single real-time smoke test exercising `RealDrainClock` across both async and sync
+        // waiters with margins orders of magnitude apart (20 ms timeout vs 10 s unblock ceiling).
+        let tracker = Arc::new(BackgroundRefreshTracker::default());
+        {
+            let mut count = tracker
+                .in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *count = 1;
+        }
+        let guard = BackgroundRefreshGuard(Arc::clone(&tracker));
+
+        assert!(!tracker.wait_async(Duration::from_millis(20)).await);
+        let t_sync_timeout = Arc::clone(&tracker);
+        assert!(
+            !tokio::task::spawn_blocking(move || {
+                t_sync_timeout.wait_sync(Duration::from_millis(20))
+            })
+            .await?
+        );
+
+        let t_async = Arc::clone(&tracker);
+        let async_waiter =
+            tokio::spawn(async move { t_async.wait_async(Duration::from_secs(10)).await });
+        let t_sync = Arc::clone(&tracker);
+        let sync_waiter =
+            tokio::task::spawn_blocking(move || t_sync.wait_sync(Duration::from_secs(10)));
+        drop(guard);
+
+        assert!(async_waiter.await?);
+        assert!(sync_waiter.await?);
+        assert_eq!(tracker.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_refresh_tracker_manual_clock_unit() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Exercises `ManualDrainClock` on every target (including Android/iOS).
+        let clock = ManualDrainClock::new();
+        let tracker = Arc::new(BackgroundRefreshTracker::with_clock(
+            Arc::clone(&clock) as Arc<dyn DrainClock>
+        ));
+        {
+            let mut count = tracker
+                .in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *count = 1;
+        }
+        let guard = BackgroundRefreshGuard(Arc::clone(&tracker));
+
+        let t_async = Arc::clone(&tracker);
+        let async_timeout =
+            tokio::spawn(async move { t_async.wait_async(Duration::from_secs(2)).await });
+        clock.wait_for_waiter().await;
+        let t_sync = Arc::clone(&tracker);
+        let sync_timeout =
+            tokio::task::spawn_blocking(move || t_sync.wait_sync(Duration::from_secs(2)));
+        clock.wait_for_waiters(2).await;
+        clock.advance(Duration::from_secs(2));
+        assert!(!async_timeout.await?);
+        assert!(!sync_timeout.await?);
+
+        let t_async2 = Arc::clone(&tracker);
+        let async_ok =
+            tokio::spawn(async move { t_async2.wait_async(Duration::from_secs(2)).await });
+        let t_sync2 = Arc::clone(&tracker);
+        let sync_ok =
+            tokio::task::spawn_blocking(move || t_sync2.wait_sync(Duration::from_secs(2)));
+        clock.wait_for_waiters(2).await;
+        drop(guard);
+        assert!(async_ok.await?);
+        assert!(sync_ok.await?);
         Ok(())
     }
 

@@ -28,6 +28,7 @@ use legion_os::atomic::{WriteOptions, write_atomic};
 use legion_os::file_id::FileId;
 use legion_os::lock::{FileLock, LockMode};
 
+use super::audio_tags::ParsedAudioTags;
 use super::platform;
 use super::thumb::ThumbFit;
 
@@ -36,12 +37,16 @@ pub(crate) const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 const CACHE_VERSION: &str = "legion-thumb-v3";
 const BAD_CACHE_VERSION: &str = "legion-thumb-bad-v2";
+const TAGS_CACHE_VERSION: &str = "legion-tags-v1";
+const BAD_TAGS_CACHE_VERSION: &str = "legion-tags-bad-v1";
 const ENTRY_MAGIC: &[u8; 4] = b"LGTH";
 const ENTRY_VERSION: u8 = 2;
 const MIME_JPEG_TAG: u8 = 1;
 const MIME_PNG_TAG: u8 = 2;
 const BAD_ENTRY_TAG: u8 = 3;
+const TAGS_ENTRY_TAG: u8 = 4;
 const MAX_BAD_ERROR_BYTES: usize = 16 * 1024;
+const MAX_TAGS_ENTRY_BYTES: usize = 32 * 1024;
 /// Negative bad-file cache records expire after 1 day so files are retried after expiry.
 pub(crate) const BAD_ENTRY_TTL: Duration = Duration::from_secs(24 * 3600);
 const ENTRY_HEADER_LEN: usize = 14;
@@ -171,6 +176,84 @@ pub(crate) fn bad_cache_key(
     hasher.finalize().to_hex().to_string()
 }
 
+/// Computes the deterministic BLAKE3 cache key for one audio file's parsed tags under the exact
+/// same file-identity rules as [`cache_key`].
+pub(crate) fn tags_cache_key(
+    resolved_path: &Path,
+    source_size: u64,
+    mtime_nanos: Option<i128>,
+    file_id: Option<FileId>,
+) -> String {
+    file_stamp_key(
+        TAGS_CACHE_VERSION,
+        resolved_path,
+        source_size,
+        mtime_nanos,
+        file_id,
+    )
+}
+
+/// Computes the deterministic BLAKE3 key for an expiring negative bad-file entry recorded when
+/// parsing an audio file's tags tripped the worker's allocator heap cap.
+pub(crate) fn tags_bad_cache_key(
+    resolved_path: &Path,
+    source_size: u64,
+    mtime_nanos: Option<i128>,
+    file_id: Option<FileId>,
+) -> String {
+    file_stamp_key(
+        BAD_TAGS_CACHE_VERSION,
+        resolved_path,
+        source_size,
+        mtime_nanos,
+        file_id,
+    )
+}
+
+fn file_stamp_key(
+    version: &str,
+    resolved_path: &Path,
+    source_size: u64,
+    mtime_nanos: Option<i128>,
+    file_id: Option<FileId>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(version.as_bytes());
+    let path_bytes = resolved_path.as_os_str().as_encoded_bytes();
+    hasher.update(&(path_bytes.len() as u64).to_le_bytes());
+    hasher.update(path_bytes);
+    hasher.update(&source_size.to_le_bytes());
+    match mtime_nanos {
+        Some(nanos) => {
+            hasher.update(&[1]);
+            hasher.update(&nanos.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    match file_id {
+        Some(id) => {
+            hasher.update(&[1]);
+            hasher.update(&id.volume.to_le_bytes());
+            hasher.update(&id.index.to_le_bytes());
+            match id.change_time {
+                Some(ct) => {
+                    hasher.update(&[1]);
+                    hasher.update(&ct.to_le_bytes());
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            }
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 /// Process-local hints used to avoid rescanning a huge cache directory on every single miss while
 /// still reconciling on startup, periodically, and whenever usage approaches `max_bytes`.
 #[derive(Debug)]
@@ -293,6 +376,27 @@ impl ThumbCache {
 
     pub(crate) fn put_bad_at(&self, key: &str, error: &ErrorBody, recorded_at_secs: u64) {
         let Some(encoded) = encode_bad_entry(error, recorded_at_secs) else {
+            return;
+        };
+        self.write_encoded(key, &encoded);
+    }
+
+    /// Looks up cached parsed audio tags by [`tags_cache_key`], lock-free.
+    pub(crate) fn get_tags(&self, key: &str) -> Option<ParsedAudioTags> {
+        let entry_path = self.entry_path(key);
+        let raw = fs::read(&entry_path).ok()?;
+        let Some(tags) = decode_tags_entry(&raw) else {
+            let _ = fs::remove_file(&entry_path);
+            return None;
+        };
+        let _ = self.touch_recency(&entry_path);
+        Some(tags)
+    }
+
+    /// Stores parsed audio tags atomically under `key` inside the shared thumbnail cache directory
+    /// and 256 MiB LRU cap.
+    pub(crate) fn put_tags(&self, key: &str, tags: &ParsedAudioTags) {
+        let Some(encoded) = encode_tags_entry(tags) else {
             return;
         };
         self.write_encoded(key, &encoded);
@@ -559,6 +663,32 @@ fn decode_bad_entry(raw: &[u8]) -> Option<(u64, ErrorBody)> {
     let recorded_at = u64::from_le_bytes(raw[6..14].try_into().ok()?);
     let err: ErrorBody = serde_json::from_slice(&raw[ENTRY_HEADER_LEN..]).ok()?;
     Some((recorded_at, err))
+}
+
+fn encode_tags_entry(tags: &ParsedAudioTags) -> Option<Vec<u8>> {
+    let payload = serde_json::to_vec(tags).ok()?;
+    if payload.is_empty() || payload.len() > MAX_TAGS_ENTRY_BYTES {
+        return None;
+    }
+    let mut out = Vec::with_capacity(ENTRY_HEADER_LEN + payload.len());
+    out.extend_from_slice(ENTRY_MAGIC);
+    out.push(ENTRY_VERSION);
+    out.push(TAGS_ENTRY_TAG);
+    out.extend_from_slice(&[0u8; 8]);
+    out.extend_from_slice(&payload);
+    Some(out)
+}
+
+fn decode_tags_entry(raw: &[u8]) -> Option<ParsedAudioTags> {
+    if raw.len() <= ENTRY_HEADER_LEN
+        || raw.len() > ENTRY_HEADER_LEN + MAX_TAGS_ENTRY_BYTES
+        || &raw[..4] != ENTRY_MAGIC
+        || raw[4] != ENTRY_VERSION
+        || raw[5] != TAGS_ENTRY_TAG
+    {
+        return None;
+    }
+    serde_json::from_slice(&raw[ENTRY_HEADER_LEN..]).ok()
 }
 
 /// Creates a throwaway directory for temporary `ffmpeg` frame output inside the cache directory
@@ -988,5 +1118,118 @@ mod tests {
             !legacy_path.exists(),
             "legacy v1 cache record must be discarded on read"
         );
+    }
+
+    #[test]
+    fn audio_tags_entries_round_trip_invalidate_on_file_change_and_share_lru_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            ThumbCache::with_limits(dir.path().join("tags-cache"), 4096, DEFAULT_STALE_TMP_AGE);
+
+        let k_base = tags_cache_key(
+            Path::new("/music/song.mp3"),
+            4096,
+            Some(500),
+            fid(1, 10, 100),
+        );
+        assert_ne!(
+            k_base,
+            tags_cache_key(
+                Path::new("/music/other.mp3"),
+                4096,
+                Some(500),
+                fid(1, 10, 100)
+            )
+        );
+        assert_ne!(
+            k_base,
+            tags_cache_key(
+                Path::new("/music/song.mp3"),
+                4097,
+                Some(500),
+                fid(1, 10, 100)
+            )
+        );
+        assert_ne!(
+            k_base,
+            tags_cache_key(
+                Path::new("/music/song.mp3"),
+                4096,
+                Some(501),
+                fid(1, 10, 100)
+            )
+        );
+        assert_ne!(
+            k_base,
+            tags_cache_key(
+                Path::new("/music/song.mp3"),
+                4096,
+                Some(500),
+                fid(1, 11, 100)
+            )
+        );
+        assert_ne!(
+            k_base,
+            tags_cache_key(
+                Path::new("/music/song.mp3"),
+                4096,
+                Some(500),
+                fid(1, 10, 101)
+            )
+        );
+        assert_ne!(
+            k_base,
+            tags_bad_cache_key(
+                Path::new("/music/song.mp3"),
+                4096,
+                Some(500),
+                fid(1, 10, 100)
+            )
+        );
+
+        let tags = ParsedAudioTags {
+            title: Some("First song".to_owned()),
+            artist: Some("Someone".to_owned()),
+            album: Some("First album".to_owned()),
+            album_artist: Some("Album artist".to_owned()),
+            track: Some(1),
+            disc: Some(1),
+            year: Some(2025),
+            duration_s: Some(123.5),
+            has_embedded_cover: true,
+        };
+        cache.put_tags(&k_base, &tags);
+        assert_eq!(cache.get_tags(&k_base), Some(tags.clone()));
+        // A tags record must never decode as a thumbnail or a bad-file record.
+        assert_eq!(cache.get(&k_base), None);
+        assert_eq!(cache.get_bad(&k_base), None);
+
+        // Corrupt tags record is removed on read.
+        let k_corrupt = tags_cache_key(Path::new("/music/bad.mp3"), 10, Some(1), fid(1, 99, 1));
+        let corrupt_path = cache.entry_path(&k_corrupt);
+        fs::write(&corrupt_path, b"corrupt-tags").unwrap();
+        assert_eq!(cache.get_tags(&k_corrupt), None);
+        assert!(!corrupt_path.exists());
+
+        // Tags entries participate in the shared LRU byte budget with thumbnail entries.
+        let tiny_cache =
+            ThumbCache::with_limits(dir.path().join("tiny-shared"), 300, DEFAULT_STALE_TMP_AGE);
+        tiny_cache.put_tags(&k_base, &tags);
+        assert!(tiny_cache.get_tags(&k_base).is_some());
+        let thumb_k = cache_key(
+            Path::new("/a.jpg"),
+            10,
+            Some(1),
+            fid(1, 1, 1),
+            256,
+            ThumbFit::Contain,
+        );
+        tiny_cache.put(&thumb_k, &sample(5, 250));
+        assert_eq!(
+            tiny_cache.get_tags(&k_base),
+            None,
+            "older tags entry must be evicted when thumbnail pushes shared cache over cap"
+        );
+        assert!(tiny_cache.get(&thumb_k).is_some());
     }
 }
