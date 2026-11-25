@@ -137,6 +137,7 @@ export function FilesViewer({
   capsStore = null,
   caps,
   thumbCache = null,
+  onRegisterPopState = null,
   deviceNoun = 'phone',
   technical = false,
   isStarred = false,
@@ -1021,8 +1022,8 @@ export function FilesViewer({
     capsStore,
   ]);
 
-  const useVideoPlayer = category === 'video' && !skipMediaPlayer && !mediaError && Boolean(mediaUrl);
-  const useMusicPlayer = category === 'audio' && !skipMediaPlayer && !mediaError && Boolean(mediaUrl);
+  const useVideoPlayer = category === 'video' && !skipMediaPlayer && !mediaError;
+  const useMusicPlayer = category === 'audio' && !skipMediaPlayer && !mediaError;
   const usingCustomPlayer = useVideoPlayer || useMusicPlayer;
 
   // Keyboard navigation inside viewer: Escape closes, Left/Right steps through pictures.
@@ -2125,10 +2126,12 @@ export function FilesViewer({
               entry=${effectiveEntry}
               name=${name}
               mediaUrl=${expectedUrl}
+              mediaLoading=${mediaLoading || !expectedUrl}
               mediaRef=${videoRef}
               siblings=${siblings}
               link=${link}
               viewerRef=${viewerRef}
+              onRegisterPopState=${onRegisterPopState}
               moreOpen=${moreOpen}
               onOpenMore=${() => setMoreOpen(true)}
               onClose=${handleClose}
@@ -2137,7 +2140,9 @@ export function FilesViewer({
               onMediaTime=${(el) => noteMediaTime(expectedKey, el)}
               onMediaPlay=${(el) => noteMediaPlay(expectedKey, el)}
               onMediaPause=${(el) => noteMediaPause(expectedKey, el)}
-              onMediaError=${(el) => handleMediaElementError('video', expectedKey, expectedUrl, el)}
+              onMediaError=${(el) => {
+                if (expectedUrl) handleMediaElementError('video', expectedKey, expectedUrl, el);
+              }}
               onFullscreenStateChange=${(active) => setVideoFullscreen(Boolean(active))}
             />
             ${openBanner ? html`<div class="player-open-banner-wrap">${openBanner}</div>` : null}
@@ -2150,6 +2155,7 @@ export function FilesViewer({
                 entry=${effectiveEntry}
                 name=${name}
                 mediaUrl=${expectedUrl}
+                mediaLoading=${mediaLoading || !expectedUrl}
                 mediaRef=${audioRef}
                 autoPlayNextRef=${musicAutoPlayRef}
                 siblings=${siblings}
@@ -2166,7 +2172,9 @@ export function FilesViewer({
                 onMediaTime=${(el) => noteMediaTime(expectedKey, el)}
                 onMediaPlay=${(el) => noteMediaPlay(expectedKey, el)}
                 onMediaPause=${(el) => noteMediaPause(expectedKey, el)}
-                onMediaError=${(el) => handleMediaElementError('audio', expectedKey, expectedUrl, el)}
+                onMediaError=${(el) => {
+                  if (expectedUrl) handleMediaElementError('audio', expectedKey, expectedUrl, el);
+                }}
               />
               ${openBanner ? html`<div class="player-open-banner-wrap">${openBanner}</div>` : null}
             `

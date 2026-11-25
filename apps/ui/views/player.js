@@ -327,10 +327,12 @@ export function VideoPlayer({
   entry,
   name,
   mediaUrl,
+  mediaLoading = false,
   mediaRef = null,
   siblings = [],
   link,
   viewerRef,
+  onRegisterPopState = null,
   moreOpen = false,
   onOpenMore,
   onClose,
@@ -398,6 +400,7 @@ export function VideoPlayer({
   const fullscreenSourceRef = useRef(null);
   fullscreenSourceRef.current = fullscreenSource;
   const pushedFsHistoryRef = useRef(false);
+  const fsHistoryTokenRef = useRef(0);
   const suppressNextPopRef = useRef(false);
   const leavingFsUntilRef = useRef(0);
   const activeSeekSeqRef = useRef(0);
@@ -412,6 +415,18 @@ export function VideoPlayer({
   queueRef.current = queue;
   const durationRef = useRef(duration);
   durationRef.current = duration;
+  const currentTimeRef = useRef(currentTime);
+  currentTimeRef.current = currentTime;
+  const mediaUrlRef = useRef(mediaUrl);
+  mediaUrlRef.current = mediaUrl;
+  const prevIdentityRef = useRef(identity);
+  const ctrlPlayingRef = useRef(ctrl.playing);
+  ctrlPlayingRef.current = ctrl.playing;
+  const wantPlayAfterSwapRef = useRef(false);
+  const activeViewerHashRef = useRef(typeof window !== 'undefined' ? window.location.hash : '');
+  if (typeof window !== 'undefined' && window.location.hash) {
+    activeViewerHashRef.current = window.location.hash;
+  }
 
   const commitSeekOnMedia = useCallback((targetTime, seq) => {
     activeSeekSeqRef.current = seq;
@@ -452,8 +467,18 @@ export function VideoPlayer({
 
   useEffect(() => () => controller.dispose(), [controller]);
 
-  // Reset per-video state when path/url changes.
+  // Reset per-video state when the file changes inside the same mounted player instance.
   useEffect(() => {
+    const prevId = prevIdentityRef.current;
+    if (prevId && (prevId.machine !== machine || prevId.path !== path)) {
+      if (durationRef.current > 0) {
+        resumeStore.save(prevId, currentTimeRef.current, durationRef.current);
+      }
+      wantPlayAfterSwapRef.current = Boolean(ctrlPlayingRef.current);
+      prevIdentityRef.current = identityRef.current;
+    } else {
+      prevIdentityRef.current = identityRef.current;
+    }
     resumedAppliedRef.current = false;
     lastSavedAtRef.current = 0;
     setCurrentTime(0);
@@ -463,7 +488,14 @@ export function VideoPlayer({
     controller.setError(false);
     controller.setLoading(true);
     controller.dismissResumeChip();
-  }, [machine, path, mediaUrl, controller]);
+  }, [machine, path, controller, resumeStore]);
+
+  // When a newly minted mediaUrl arrives for the current file, clear error and enter loading until metadata arrives.
+  useEffect(() => {
+    if (!mediaUrl) {
+      controller.setLoading(true);
+    }
+  }, [mediaUrl, controller]);
 
   // Re-evaluate full-screen availability once `<video>` and `.viewer` have mounted.
   useEffect(() => {
@@ -498,10 +530,11 @@ export function VideoPlayer({
     if (onFullscreenStateChange) onFullscreenStateChange(isFullscreen, fullscreenSource);
   }, [isFullscreen, fullscreenSource, onFullscreenStateChange]);
 
-  // Screen stays on while video plays (in or out of full screen); released on pause/end/close.
+  // Screen stays on while video plays (including across a file swap while playing); released on pause/end/close.
+  const holdScreenOn = Boolean(ctrl.playing || (mediaLoading && wantPlayAfterSwapRef.current));
   useEffect(() => {
-    link?.keepScreenOn?.(Boolean(ctrl.playing));
-  }, [link, ctrl.playing]);
+    link?.keepScreenOn?.(holdScreenOn);
+  }, [link, holdScreenOn]);
 
   const portraitImmersiveRef = useRef(false);
 
@@ -536,7 +569,12 @@ export function VideoPlayer({
       setFullscreenSource(source);
       if (source === 'button' && !pushedFsHistoryRef.current && res?.mode !== 'webkit-video') {
         try {
-          window.history.pushState({ legionFullscreen: true }, '');
+          const token = fsHistoryTokenRef.current + 1;
+          fsHistoryTokenRef.current = token;
+          const baseState =
+            window.history.state && typeof window.history.state === 'object' ? window.history.state : {};
+          window.history.replaceState({ ...baseState, legionViewerEntry: token }, '');
+          window.history.pushState({ legionFullscreen: true, legionFullscreenToken: token }, '');
           pushedFsHistoryRef.current = true;
         } catch {
           // Ignore restricted history APIs.
@@ -606,20 +644,48 @@ export function VideoPlayer({
     };
   }, [link, mediaUrl]);
 
-  // Android / browser Back gesture while button-entered full screen leaves full screen without closing viewer.
+  // Android / browser Back gesture while button-entered full screen leaves full screen without
+  // closing the viewer or reverting to an earlier sibling file.
   useEffect(() => {
-    function onPopState() {
-      if (suppressNextPopRef.current) {
-        suppressNextPopRef.current = false;
-        return;
-      }
-      if (pushedFsHistoryRef.current && !window.history.state?.legionFullscreen) {
-        leaveFullscreen({ fromPopState: true });
+    function syncUnderlyingHash() {
+      const targetHash = activeViewerHashRef.current;
+      if (targetHash && typeof window !== 'undefined' && window.location.hash !== targetHash) {
+        try {
+          window.history.replaceState(window.history.state, '', targetHash);
+        } catch {
+          // Ignore restricted history APIs.
+        }
       }
     }
+    function handlePop() {
+      const st = window.history.state;
+      const landedOnViewerEntry = Boolean(
+        fsHistoryTokenRef.current && st && st.legionViewerEntry === fsHistoryTokenRef.current,
+      );
+      if (suppressNextPopRef.current) {
+        suppressNextPopRef.current = false;
+        if (landedOnViewerEntry) {
+          syncUnderlyingHash();
+          return true;
+        }
+        return false;
+      }
+      if (pushedFsHistoryRef.current && !st?.legionFullscreen && landedOnViewerEntry) {
+        syncUnderlyingHash();
+        leaveFullscreen({ fromPopState: true });
+        return true;
+      }
+      return false;
+    }
+    if (typeof onRegisterPopState === 'function') {
+      return onRegisterPopState(handlePop);
+    }
+    const onPopState = () => {
+      handlePop();
+    };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
-  }, [leaveFullscreen]);
+  }, [leaveFullscreen, onRegisterPopState]);
 
   // Turning a phone or tablet to landscape enters full screen; turning back leaves it if turning entered it.
   useEffect(() => {
@@ -678,7 +744,7 @@ export function VideoPlayer({
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
-    if (!v) return;
+    if (!v || !mediaUrlRef.current) return;
     controller.notifyActivity({ show: true });
     if (v.paused || v.ended) {
       if (v.ended) {
@@ -690,6 +756,7 @@ export function VideoPlayer({
       }
       v.play().catch(() => {});
     } else {
+      wantPlayAfterSwapRef.current = false;
       v.pause();
       controller.setPlaying(false);
     }
@@ -921,12 +988,13 @@ export function VideoPlayer({
       <video
         ref=${bindVideoRef}
         class="viewer-video"
-        src=${mediaUrl}
+        src=${mediaUrl || undefined}
         playsinline
         preload="metadata"
         aria-label=${name}
         onLoadedMetadata=${(e) => {
           const v = e.currentTarget;
+          if (!mediaUrlRef.current || !v.getAttribute('src')) return;
           const dur = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : entry?.duration_s || 0;
           if (dur > 0) setDuration(dur);
           setBufferedEnd(readBufferedEnd(v));
@@ -946,36 +1014,50 @@ export function VideoPlayer({
             }
           }
           controller.setLoading(false);
+          if (!recovered && wantPlayAfterSwapRef.current) {
+            wantPlayAfterSwapRef.current = false;
+            v.play().catch(() => {});
+          }
         }}
         onLoadedData=${(e) => {
+          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
           setBufferedEnd(readBufferedEnd(e.currentTarget));
           controller.onCanPlay();
         }}
         onCanPlay=${(e) => {
+          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
           setBufferedEnd(readBufferedEnd(e.currentTarget));
           controller.onCanPlay();
         }}
         onPlay=${(e) => {
+          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
           onMediaPlay?.(e.currentTarget);
           controller.setPlaying(true);
         }}
         onPlaying=${(e) => {
+          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
           onMediaPlay?.(e.currentTarget);
           controller.setPlaying(true);
           controller.onCanPlay();
         }}
         onPause=${(e) => {
           const v = e.currentTarget;
+          if (!mediaUrlRef.current || !v.getAttribute('src')) return;
           onMediaPause?.(v);
           if (Number.isFinite(v.duration) && v.duration > 0) {
             resumeStore.save(identityRef.current, v.currentTime, v.duration);
           }
           if (!v.ended) controller.setPlaying(false);
         }}
-        onWaiting=${() => controller.onWaiting()}
-        onStalled=${() => controller.onWaiting()}
+        onWaiting=${() => {
+          if (mediaUrlRef.current) controller.onWaiting();
+        }}
+        onStalled=${() => {
+          if (mediaUrlRef.current) controller.onWaiting();
+        }}
         onSeeked=${(e) => {
           const v = e.currentTarget;
+          if (!mediaUrlRef.current || !v.getAttribute('src')) return;
           onMediaTime?.(v);
           setCurrentTime(Number.isFinite(v.currentTime) ? v.currentTime : 0);
           setBufferedEnd(readBufferedEnd(v));
@@ -986,6 +1068,7 @@ export function VideoPlayer({
         }}
         onTimeUpdate=${(e) => {
           const v = e.currentTarget;
+          if (!mediaUrlRef.current || !v.getAttribute('src')) return;
           onMediaTime?.(v);
           if (controller.getState().pendingSeekTime != null) return;
           const t = Number.isFinite(v.currentTime) ? v.currentTime : 0;
@@ -997,13 +1080,21 @@ export function VideoPlayer({
             resumeStore.save(identityRef.current, t, v.duration, now);
           }
         }}
-        onProgress=${(e) => setBufferedEnd(readBufferedEnd(e.currentTarget))}
+        onProgress=${(e) => {
+          if (mediaUrlRef.current && e.currentTarget.getAttribute('src')) {
+            setBufferedEnd(readBufferedEnd(e.currentTarget));
+          }
+        }}
         onEnded=${(e) => {
+          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
+          wantPlayAfterSwapRef.current = false;
           onMediaPause?.(e.currentTarget);
           resumeStore.clear(identityRef.current);
           controller.setEnded(true);
         }}
         onError=${(e) => {
+          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
+          wantPlayAfterSwapRef.current = false;
           controller.setError(true);
           if (onMediaError) onMediaError(e.currentTarget);
         }}
@@ -1028,7 +1119,7 @@ export function VideoPlayer({
           `
         : null}
 
-      ${ctrl.stalled
+      ${ctrl.stalled || mediaLoading
         ? html`<div class="player-spinner" role="status" aria-label="Buffering"><span></span></div>`
         : null}
 
@@ -1234,6 +1325,7 @@ export function MusicPlayer({
   entry,
   name,
   mediaUrl,
+  mediaLoading = false,
   mediaRef = null,
   autoPlayNextRef: externalAutoPlayRef = null,
   siblings = [],
@@ -1304,6 +1396,9 @@ export function MusicPlayer({
   durationRef.current = duration;
   const currentTimeRef = useRef(currentTime);
   currentTimeRef.current = currentTime;
+  const mediaUrlRef = useRef(mediaUrl);
+  mediaUrlRef.current = mediaUrl;
+  const prevIdentityRef = useRef(identity);
   const moreOpenRef = useRef(moreOpen);
   moreOpenRef.current = moreOpen;
 
@@ -1318,8 +1413,17 @@ export function MusicPlayer({
     if (a) a.playbackRate = playbackRate;
   }, [playbackRate]);
 
-  // Reset per-track state when switching songs.
+  // Reset per-track state when switching songs inside the same mounted player instance.
   useEffect(() => {
+    const prevId = prevIdentityRef.current;
+    if (prevId && (prevId.machine !== machine || prevId.path !== path)) {
+      if (durationRef.current > 0) {
+        resumeStore.save(prevId, currentTimeRef.current, durationRef.current);
+      }
+      prevIdentityRef.current = identityRef.current;
+    } else {
+      prevIdentityRef.current = identityRef.current;
+    }
     resumedAppliedRef.current = false;
     lastSavedAtRef.current = 0;
     setTags(null);
@@ -1346,7 +1450,7 @@ export function MusicPlayer({
     } else {
       setCoverUrl(null);
     }
-  }, [machine, path, entry?.mtime, thumbCache]);
+  }, [machine, path, entry?.mtime, thumbCache, resumeStore]);
 
   // Load tags (`fs.tags`) and high-res cover (`fs.thumb`) via per-machine capabilities, silently
   // falling back to filename + music tile on machines that lack them.
@@ -1474,7 +1578,7 @@ export function MusicPlayer({
 
   const togglePlay = useCallback(() => {
     const a = audioRef.current;
-    if (!a) return;
+    if (!a || !mediaUrlRef.current) return;
     if (a.paused || a.ended) {
       if (a.ended) {
         try {
@@ -1747,7 +1851,7 @@ export function MusicPlayer({
                 aria-label=${playing ? 'Pause' : 'Play'}
                 onClick=${togglePlay}
               >
-                ${stalled
+                ${stalled || mediaLoading
                   ? html`<span class="music-spinner" aria-hidden="true"></span>`
                   : html`<${Icon} name=${playing ? 'pause' : 'play'} />`}
               </button>
@@ -1785,11 +1889,12 @@ export function MusicPlayer({
 
       <audio
         ref=${bindAudioRef}
-        src=${mediaUrl}
+        src=${mediaUrl || undefined}
         preload="metadata"
         aria-label=${display.title}
         onLoadedMetadata=${(e) => {
           const a = e.currentTarget;
+          if (!mediaUrlRef.current || !a.getAttribute('src')) return;
           const dur = Number.isFinite(a.duration) && a.duration > 0 ? a.duration : entry?.duration_s || 0;
           if (dur > 0) setDuration(dur);
           setBufferedEnd(readBufferedEnd(a));
@@ -1819,29 +1924,36 @@ export function MusicPlayer({
           }
         }}
         onPlay=${(e) => {
+          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
           onMediaPlay?.(e.currentTarget);
           setPlaying(true);
         }}
         onPlaying=${(e) => {
+          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
           onMediaPlay?.(e.currentTarget);
           setPlaying(true);
           clearStallTimer();
         }}
         onPause=${(e) => {
           const a = e.currentTarget;
+          if (!mediaUrlRef.current || !a.getAttribute('src')) return;
           onMediaPause?.(a);
           if (Number.isFinite(a.duration) && a.duration > 0) {
             resumeStore.save(identityRef.current, a.currentTime, a.duration);
           }
           setPlaying(false);
         }}
-        onWaiting=${() => startStallTimer()}
+        onWaiting=${() => {
+          if (mediaUrlRef.current) startStallTimer();
+        }}
         onCanPlay=${(e) => {
+          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
           setBufferedEnd(readBufferedEnd(e.currentTarget));
           clearStallTimer();
         }}
         onSeeked=${(e) => {
           const a = e.currentTarget;
+          if (!mediaUrlRef.current || !a.getAttribute('src')) return;
           onMediaTime?.(a);
           setPendingSeekTime(null);
           setCurrentTime(Number.isFinite(a.currentTime) ? a.currentTime : 0);
@@ -1853,6 +1965,7 @@ export function MusicPlayer({
         }}
         onTimeUpdate=${(e) => {
           const a = e.currentTarget;
+          if (!mediaUrlRef.current || !a.getAttribute('src')) return;
           onMediaTime?.(a);
           if (pendingSeekTime != null) return;
           const t = Number.isFinite(a.currentTime) ? a.currentTime : 0;
@@ -1864,8 +1977,13 @@ export function MusicPlayer({
             resumeStore.save(identityRef.current, t, a.duration, now);
           }
         }}
-        onProgress=${(e) => setBufferedEnd(readBufferedEnd(e.currentTarget))}
+        onProgress=${(e) => {
+          if (mediaUrlRef.current && e.currentTarget.getAttribute('src')) {
+            setBufferedEnd(readBufferedEnd(e.currentTarget));
+          }
+        }}
         onEnded=${(e) => {
+          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
           onMediaPause?.(e.currentTarget);
           resumeStore.clear(identityRef.current);
           clearStallTimer();
@@ -1877,6 +1995,7 @@ export function MusicPlayer({
           }
         }}
         onError=${(e) => {
+          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
           clearStallTimer();
           setPlaying(false);
           if (onMediaError) onMediaError(e.currentTarget);

@@ -373,6 +373,7 @@ export function createMockFilesState({
   const isFailUpload = flags.has('fail-upload');
   const isBigMusic = flags.has('big-music') || isLarge;
   const isSlowCover = flags.has('slow-cover');
+  const isSlowContent = flags.has('slow-content');
   const isFormats = flags.has('formats');
   const isNoHandler = flags.has('no-handler');
 
@@ -2125,6 +2126,22 @@ export function createMockFilesState({
           const { machine, path, signal } = options || {};
           if (signal?.aborted) {
             throw { code: 'cancelled', message: 'Loading was stopped.', hint: null, machine: machine || null };
+          }
+          if (isSlowContent) {
+            await new Promise((resolve, reject) => {
+              const tid = setTimeout(resolve, 180);
+              signal?.addEventListener?.(
+                'abort',
+                () => {
+                  clearTimeout(tid);
+                  reject({ code: 'cancelled', message: 'Loading was stopped.', hint: null, machine: machine || null });
+                },
+                { once: true },
+              );
+            });
+            if (signal?.aborted) {
+              throw { code: 'cancelled', message: 'Loading was stopped.', hint: null, machine: machine || null };
+            }
           }
           if (!isAuthedRef()) {
             throw {

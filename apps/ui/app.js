@@ -296,6 +296,7 @@ function App() {
   const refreshAbortRef = useRef(null);
   const refreshInFlightRef = useRef(false);
   const screenRefreshRef = useRef(null);
+  const popStateInterceptorRef = useRef(null);
   const swipeRef = useRef(null);
   const touchSwipeRef = useRef(null);
   const scrollByFolderRef = useRef(new Map());
@@ -879,6 +880,10 @@ function App() {
         setFilesSelectedPaths(new Set());
         return;
       }
+      if (popStateInterceptorRef.current?.()) {
+        lastHashRef.current = window.location.hash;
+        return;
+      }
       if (window.location.hash !== lastHashRef.current) {
         if (filesHistoryDepthRef.current > 0) {
           filesHistoryDepthRef.current -= 1;
@@ -1364,6 +1369,15 @@ function App() {
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, [link, capsStore, linkState?.ready, nodeInfo, refreshFleet, settings.refreshSeconds]);
+
+  const registerPopStateInterceptor = useCallback((fn) => {
+    popStateInterceptorRef.current = typeof fn === 'function' ? fn : null;
+    return () => {
+      if (popStateInterceptorRef.current === fn) {
+        popStateInterceptorRef.current = null;
+      }
+    };
+  }, []);
 
   const openConfirm = useCallback((req) => {
     if (!sheetHistoryRef.current) {
@@ -2602,6 +2616,7 @@ function App() {
                             capsStore=${capsStore}
                             folderChanges=${folderChanges}
                             onRegisterRefresh=${registerScreenRefresh}
+                            onRegisterPopState=${registerPopStateInterceptor}
                             nodeInfo=${nodeInfo}
                             tools=${tools}
                             allowedSet=${allowedSet}

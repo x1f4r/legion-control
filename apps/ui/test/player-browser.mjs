@@ -484,6 +484,132 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
   }
 });
 
+test('Player: instance and full screen survive file changes (next, prev, song end, Back, and keys during loading)', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+    const page = await context.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    // 1. Video full screen survives N and P: one immersive(true), zero immersive(false) in between,
+    // same player DOM node stays mounted, Back leaves full screen on the CURRENT file, second Back closes.
+    await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+    await page.locator('.viewer video.viewer-video[src]').waitFor();
+
+    await page.evaluate(() => {
+      window.__LEGION_MOCK_IMMERSIVE_CALLS__.length = 0;
+      window.__LEGION_VIDEO_WRAP_REF__ = document.querySelector('.player-video-wrap');
+    });
+
+    await page.locator('.viewer button[aria-label="Full screen"]').click();
+    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor();
+
+    await page.keyboard.press('n');
+    await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor();
+    await page.locator('.viewer video.viewer-video[src]').waitFor();
+
+    await page.keyboard.press('p');
+    await page.locator('.player-top .name', { hasText: 'Arrival.mp4' }).waitFor();
+    await page.locator('.viewer video.viewer-video[src]').waitFor();
+
+    await page.keyboard.press('n');
+    await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor();
+    await page.locator('.viewer video.viewer-video[src]').waitFor();
+
+    const afterSkips = await page.evaluate(() => ({
+      immersiveCalls: window.__LEGION_MOCK_IMMERSIVE_CALLS__.map((c) => c.on),
+      sameInstance: document.querySelector('.player-video-wrap') === window.__LEGION_VIDEO_WRAP_REF__,
+      stillFullscreen: Boolean(document.querySelector('.viewer button[aria-label="Exit full screen"]')),
+    }));
+    assert.deepEqual(afterSkips.immersiveCalls, [true]);
+    assert.equal(afterSkips.sameInstance, true);
+    assert.equal(afterSkips.stillFullscreen, true);
+
+    // First Back leaves full screen and stays on Beach.mp4 (never reopens Arrival.mp4).
+    await page.evaluate(() => window.history.back());
+    await page.locator('.viewer button[aria-label="Full screen"]').waitFor({ timeout: 5000 });
+    assert.equal(await page.locator('.player-top .name').textContent(), 'Beach.mp4');
+
+    // Second Back closes the viewer cleanly.
+    await page.evaluate(() => window.history.back());
+    await page.locator('.viewer').waitFor({ state: 'hidden', timeout: 5000 });
+
+    // 2. Keys pressed while the next file is still loading (slow contentUrl mint) are not lost.
+    await page.goto(`${server.url}/?mock=slow-content#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+    await page.evaluate(() => {
+      window.__LEGION_MOCK_IMMERSIVE_CALLS__.length = 0;
+    });
+    await page.locator('.viewer button[aria-label="Full screen"]').click();
+    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor();
+
+    // Press N -> Beach.mp4 starts minting (src absent, loading spinner visible) -> immediately press P -> back to Arrival.mp4!
+    await page.keyboard.press('n');
+    await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor();
+    const whileLoading = await page.evaluate(() => ({
+      hasSrc: document.querySelector('.viewer video.viewer-video')?.hasAttribute('src'),
+      hasSpinner: Boolean(document.querySelector('.player-spinner')),
+    }));
+    assert.equal(whileLoading.hasSrc, false);
+    assert.equal(whileLoading.hasSpinner, true);
+    await page.keyboard.press('p');
+    await page.locator('.player-top .name', { hasText: 'Arrival.mp4' }).waitFor();
+    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+    const afterSlowSkip = await page.evaluate(() => ({
+      immersiveCalls: window.__LEGION_MOCK_IMMERSIVE_CALLS__.map((c) => c.on),
+      stillFullscreen: Boolean(document.querySelector('.viewer button[aria-label="Exit full screen"]')),
+    }));
+    assert.deepEqual(afterSlowSkip.immersiveCalls, [true]);
+    assert.equal(afterSlowSkip.stillFullscreen, true);
+
+    // 3. Music player keeps the exact same DOM instance across song end, next, and previous.
+    await page.goto(`${server.url}/?mock=slow-content#/files/tower/%2Fhome%2Fme%2FMusic%2FAlbum`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.list a.row', { hasText: '01 - Morning Light.flac' }).click();
+    await page.locator('.music-screen').waitFor();
+    await page.locator('.viewer audio[src]').waitFor({ state: 'attached', timeout: 5000 });
+    await page.evaluate(() => {
+      window.__LEGION_MUSIC_NODE_REF__ = document.querySelector('.music-screen');
+      document.querySelector('.viewer audio').dispatchEvent(new Event('ended'));
+    });
+    await page.locator('.music-title', { hasText: 'Rain on Glass' }).waitFor({ timeout: 5000 });
+    const sameMusicNode = await page.evaluate(
+      () => document.querySelector('.music-screen') === window.__LEGION_MUSIC_NODE_REF__,
+    );
+    assert.equal(sameMusicNode, true);
+
+    // Key pressed while audio URL is still minting is not lost (press Escape to close during load).
+    await page.keyboard.press('n');
+    await page.keyboard.press('Escape');
+    await page.locator('.viewer').waitFor({ state: 'hidden', timeout: 5000 });
+
+    assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+    await context.close();
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});
+
 test('Player: music screen, tags, covers in listing, MediaSession, auto-advance, large library, and reduced motion', async () => {
   const server = await startStaticUiServer();
   const browser = await chromium.launch({

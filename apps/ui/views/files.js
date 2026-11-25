@@ -2469,6 +2469,7 @@ export function FilesView({
   capsStore = null,
   folderChanges = null,
   onRegisterRefresh = null,
+  onRegisterPopState = null,
   nodeInfo,
   tools,
   allowedSet,
@@ -3118,6 +3119,7 @@ export function FilesView({
               caps=${viewerCaps}
               capsStore=${capsStore}
               thumbCache=${thumbCache}
+              onRegisterPopState=${onRegisterPopState}
               deviceNoun=${deviceNoun}
               technical=${technical}
               isStarred=${Boolean(viewerFav)}
