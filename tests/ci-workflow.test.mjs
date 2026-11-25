@@ -190,6 +190,21 @@ test('legion-app.yml covers every platform with timeouts, credential-free checko
       /Phase 2: concurrent second start/,
       `legion-app.yml:${id} must verify a concurrent second start during an update`,
     );
+    assert.match(
+      body,
+      /verify_updated\(\)[\s\S]*&& \[ ! -e "\$APP_DATA\/update\.lock" \]/,
+      `legion-app.yml:${id} must wait for update.lock release inside verify_updated`,
+    );
+    assert.match(
+      body,
+      /verify_updated\(\)[\s\S]*count_app_instances[\s\S]*rollback-\*\.json/,
+      `legion-app.yml:${id} must verify single running instance and rollback absence inside verify_updated`,
+    );
+    assert.match(
+      body,
+      /FAIL \((?:Linux|macOS) self-update\):/,
+      `legion-app.yml:${id} must print a named single-line failure reason before diagnostics`,
+    );
   }
   {
     const winBody = appJobs.get('windows-desktop').join('\n');
@@ -229,6 +244,21 @@ test('legion-app.yml covers every platform with timeouts, credential-free checko
       winBody,
       /Phase 2: concurrent second start/,
       'legion-app.yml:windows-desktop must verify a concurrent second start during an update',
+    );
+    assert.match(
+      winBody,
+      /function Verify-Updated[\s\S]*-not \(Test-Path -LiteralPath \$updateLock\)/,
+      'legion-app.yml:windows-desktop must wait for update.lock release inside Verify-Updated',
+    );
+    assert.match(
+      winBody,
+      /function Verify-Updated[\s\S]*Get-AppInstances[\s\S]*rollback-\*\.json/,
+      'legion-app.yml:windows-desktop must verify single running instance and rollback absence inside Verify-Updated',
+    );
+    assert.match(
+      winBody,
+      /Write-Host "FAIL \(Windows self-update\):/,
+      'legion-app.yml:windows-desktop must print a named single-line failure reason before diagnostics',
     );
   }
 

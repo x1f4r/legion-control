@@ -485,10 +485,10 @@ jobs:
           dump_diag() {
             local rc=$?
             set +e
-            pkill -f "$WORK/run/Legion.AppImage" 2>/dev/null || true
-            rm -rf apps/legion-app/src-tauri/target/release/bundle
+            local fail_reason=""
+            [ -f "$DIAG/fail-reason.txt" ] && fail_reason="$(cat "$DIAG/fail-reason.txt" 2>/dev/null || true)"
             {
-              echo "=== Linux self-update diagnostics (exit=$rc) ==="
+              echo "=== Linux self-update diagnostics (exit=$rc, reason=${fail_reason:-none}) ==="
               echo "--- ps aux ---"
               ps aux
               echo "--- $APP_DATA tree ---"
@@ -496,6 +496,8 @@ jobs:
               echo "--- $WORK/run tree ---"
               ls -la "$WORK/run" 2>/dev/null || true
             } > "$DIAG/summary.txt"
+            pkill -f "$WORK/run/Legion.AppImage" 2>/dev/null || true
+            rm -rf apps/legion-app/src-tauri/target/release/bundle
             for f in prefs.json floor.json current-build.json last-state.json supervisor.log supervisor-script.sh.txt new-start.log rollback-ps.txt update.lock; do
               [ -f "$APP_DATA/$f" ] && cp "$APP_DATA/$f" "$DIAG/$f"
             done
@@ -503,6 +505,9 @@ jobs:
               [ -f "$f" ] && cp "$f" "$DIAG/$(basename "$f")"
             done
             if [ "$rc" -ne 0 ]; then
+              if [ -z "$fail_reason" ]; then
+                echo "FAIL (Linux self-update): step failed with exit code $rc before inner verifier reported a reason" >&2
+              fi
               for f in "$DIAG"/*; do
                 [ -f "$f" ] || continue
                 echo "===== DIAG $(basename "$f") ====="
@@ -577,6 +582,52 @@ jobs:
           set -euo pipefail
           PID1=""
           PID2=""
+          fail() {
+            local msg="$*"
+            printf '%s\n' "$msg" > "$DIAG/fail-reason.txt"
+            ps -Aww -o pid=,ppid=,stat=,comm=,args= > "$DIAG/fail-ps.txt" 2>/dev/null || true
+            echo "FAIL (Linux self-update): $msg" >&2
+            exit 1
+          }
+          count_app_instances() {
+            local target_real count=0 p comm state
+            target_real="$(readlink -f "$WORK/run/Legion.AppImage" 2>/dev/null || printf '%s' "$WORK/run/Legion.AppImage")"
+            for p in /proc/[0-9]*; do
+              [ -r "$p/comm" ] && [ -r "$p/stat" ] && [ -r "$p/environ" ] || continue
+              comm="$(cat "$p/comm" 2>/dev/null || true)"
+              [ "$comm" = "legion-app" ] || continue
+              state="$(awk '{ sub(/^[^)]*\) /, ""); print $1 }' "$p/stat" 2>/dev/null || true)"
+              [ "$state" = "Z" ] && continue
+              if tr '\0' '\n' < "$p/environ" 2>/dev/null | grep -Fqx "APPIMAGE=$target_real"; then
+                count=$((count + 1))
+              fi
+            done
+            echo "$count"
+          }
+          stop_app_instances() {
+            local target_real sig p pid comm state
+            target_real="$(readlink -f "$WORK/run/Legion.AppImage" 2>/dev/null || printf '%s' "$WORK/run/Legion.AppImage")"
+            for sig in TERM KILL; do
+              for p in /proc/[0-9]*; do
+                pid="${p#/proc/}"
+                [ -r "$p/comm" ] && [ -r "$p/stat" ] && [ -r "$p/environ" ] || continue
+                comm="$(cat "$p/comm" 2>/dev/null || true)"
+                [ "$comm" = "legion-app" ] || continue
+                state="$(awk '{ sub(/^[^)]*\) /, ""); print $1 }' "$p/stat" 2>/dev/null || true)"
+                [ "$state" = "Z" ] && continue
+                if tr '\0' '\n' < "$p/environ" 2>/dev/null | grep -Fqx "APPIMAGE=$target_real"; then
+                  kill "-$sig" "$pid" 2>/dev/null || true
+                fi
+              done
+              pkill "-$sig" -f "$WORK/run/Legion.AppImage" 2>/dev/null || true
+              for _ in $(seq 1 20); do
+                if [ "$(count_app_instances)" -eq 0 ]; then
+                  return 0
+                fi
+                sleep 0.25
+              done
+            done
+          }
           kill_pg() {
             local pg="$1"
             [ -n "$pg" ] || return 0
@@ -594,7 +645,7 @@ jobs:
             if ! command -v dbus-send >/dev/null 2>&1 || [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
               return 0
             fi
-            for _ in $(seq 1 20); do
+            for _ in $(seq 1 40); do
               local reply
               reply="$(dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply \
                 /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:com.x1f4r.legion.SingleInstance 2>/dev/null || true)"
@@ -604,11 +655,92 @@ jobs:
               esac
             done
           }
+          wait_for_download() {
+            local phase="$1" timeout="$2" downloaded=0 i has_cur=0 has_dl=0 has_part=0 has_prefs=0
+            for i in $(seq 1 "$timeout"); do
+              if [ $((i % 10)) -eq 0 ]; then
+                {
+                  echo "=== ${phase} run1 t=${i}s ==="
+                  cat "$APP_DATA/last-state.json" 2>/dev/null || echo "(no last-state.json)"
+                } >> "$DIAG/poll-trace.log"
+              fi
+              if [ -f "$APP_DATA/current-build.json" ] && grep -q "\"sequence\": $SEQ1" "$APP_DATA/current-build.json" \
+                 && [ -f "$DL_FILE" ] && [ ! -f "$DL_FILE.part" ] \
+                 && [ -f "$APP_DATA/prefs.json" ] && grep -q "\"sequence\": $SEQ2" "$APP_DATA/prefs.json"; then
+                downloaded=1
+                break
+              fi
+              sleep 1
+            done
+            kill_pg "$PID1"
+            PID1=""
+            stop_app_instances
+            wait_dbus_free
+            if [ "$downloaded" -ne 1 ]; then
+              [ -f "$APP_DATA/current-build.json" ] && grep -q "\"sequence\": $SEQ1" "$APP_DATA/current-build.json" && has_cur=1
+              [ -f "$DL_FILE" ] && has_dl=1
+              [ -f "$DL_FILE.part" ] && has_part=1
+              [ -f "$APP_DATA/prefs.json" ] && grep -q "\"sequence\": $SEQ2" "$APP_DATA/prefs.json" && has_prefs=1
+              fail "$phase download did not complete within ${timeout}s (current_seq1=$has_cur dl_file=$has_dl dl_part=$has_part prefs_seq2=$has_prefs)"
+            fi
+          }
+          verify_updated() {
+            local phase="$1" timeout="$2" updated=0 i
+            local has_marker=0 has_cur2=0 backup_gone=0 lock_gone=0 instances=0 rollback_files=""
+            for i in $(seq 1 "$timeout"); do
+              if [ $((i % 10)) -eq 0 ]; then
+                {
+                  echo "=== ${phase} run2 t=${i}s ==="
+                  cat "$APP_DATA/last-state.json" 2>/dev/null || echo "(no last-state.json)"
+                  cat "$APP_DATA/supervisor.log" 2>/dev/null || echo "(no supervisor.log)"
+                  [ -f "$APP_DATA/new-start.log" ] && cat "$APP_DATA/new-start.log" || true
+                } >> "$DIAG/poll-trace.log"
+              fi
+              if [ -f "$APP_DATA/started-$SEQ2.ok" ] \
+                 && [ -f "$APP_DATA/current-build.json" ] \
+                 && grep -q "\"sequence\": $SEQ2" "$APP_DATA/current-build.json" \
+                 && [ ! -e "$WORK/run/.Legion.AppImage.prev" ] \
+                 && [ ! -e "$APP_DATA/update.lock" ]; then
+                updated=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$updated" -ne 1 ]; then
+              [ -f "$APP_DATA/started-$SEQ2.ok" ] && has_marker=1
+              [ -f "$APP_DATA/current-build.json" ] && grep -q "\"sequence\": $SEQ2" "$APP_DATA/current-build.json" && has_cur2=1
+              [ ! -e "$WORK/run/.Legion.AppImage.prev" ] && backup_gone=1
+              [ ! -e "$APP_DATA/update.lock" ] && lock_gone=1
+              instances="$(count_app_instances)"
+              fail "$phase update did not complete within ${timeout}s (started_marker=$has_marker current_seq2=$has_cur2 backup_gone=$backup_gone lock_gone=$lock_gone running_instances=$instances)"
+            fi
+            instances="$(count_app_instances)"
+            if [ "$instances" -ne 1 ]; then
+              for _ in $(seq 1 10); do
+                sleep 0.5
+                instances="$(count_app_instances)"
+                if [ "$instances" -eq 1 ]; then break; fi
+              done
+            fi
+            [ "$instances" -eq 1 ] || fail "$phase expected exactly 1 running legion-app instance after update, found $instances"
+            [ ! -e "$WORK/run/.Legion.AppImage.prev" ] || fail "$phase backup AppImage still present after update"
+            [ ! -e "$APP_DATA/update.lock" ] || fail "$phase update.lock still present after update"
+            rollback_files="$(find "$APP_DATA" -maxdepth 1 -name 'rollback-*.json' -print 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+            [ -z "$rollback_files" ] || fail "$phase produced unexpected rollback file(s): $rollback_files"
+            cat "$APP_DATA/current-build.json" || true
+            kill_pg "$PID2"
+            PID2=""
+            stop_app_instances
+            wait_dbus_free
+          }
           cleanup_inner() {
             kill_pg "$PID1"
             kill_pg "$PID2"
+            stop_app_instances
           }
           trap cleanup_inner EXIT
+
+          DL_FILE="$APP_DATA/downloads/preview-$SEQ2/Legion-linux-x86_64.AppImage"
 
           # Launch 1: start seq1 in its own process group and wait for verified download + persisted prefs.
           PATH="$WORK/bin:$PATH" \
@@ -618,28 +750,7 @@ jobs:
           WEBKIT_DISABLE_COMPOSITING_MODE=1 \
             setsid "$WORK/run/Legion.AppImage" >"$DIAG/run1.log" 2>&1 &
           PID1=$!
-
-          DL_FILE="$APP_DATA/downloads/preview-$SEQ2/Legion-linux-x86_64.AppImage"
-          DOWNLOADED=0
-          for i in $(seq 1 90); do
-            if [ $((i % 10)) -eq 0 ]; then
-              {
-                echo "=== run1 t=${i}s ==="
-                cat "$APP_DATA/last-state.json" 2>/dev/null || echo "(no last-state.json)"
-              } >> "$DIAG/poll-trace.log"
-            fi
-            if [ -f "$APP_DATA/current-build.json" ] && grep -q "\"sequence\": $SEQ1" "$APP_DATA/current-build.json" \
-               && [ -f "$DL_FILE" ] && [ ! -f "$DL_FILE.part" ] \
-               && [ -f "$APP_DATA/prefs.json" ] && grep -q "\"sequence\": $SEQ2" "$APP_DATA/prefs.json"; then
-              DOWNLOADED=1
-              break
-            fi
-            sleep 1
-          done
-          kill_pg "$PID1"
-          PID1=""
-          wait_dbus_free
-          [ "$DOWNLOADED" -eq 1 ]
+          wait_for_download "Phase 1" 120
 
           # Launch 2: next-start auto-install replaces Legion.AppImage atomically and relaunches seq2.
           PATH="$WORK/bin:$PATH" \
@@ -649,32 +760,7 @@ jobs:
           WEBKIT_DISABLE_COMPOSITING_MODE=1 \
             setsid "$WORK/run/Legion.AppImage" >"$DIAG/run2.log" 2>&1 &
           PID2=$!
-
-          UPDATED=0
-          for i in $(seq 1 90); do
-            if [ $((i % 10)) -eq 0 ]; then
-              {
-                echo "=== run2 t=${i}s ==="
-                cat "$APP_DATA/last-state.json" 2>/dev/null || echo "(no last-state.json)"
-                cat "$APP_DATA/supervisor.log" 2>/dev/null || echo "(no supervisor.log)"
-                [ -f "$APP_DATA/new-start.log" ] && cat "$APP_DATA/new-start.log" || true
-              } >> "$DIAG/poll-trace.log"
-            fi
-            if [ -f "$APP_DATA/started-$SEQ2.ok" ] \
-               && [ -f "$APP_DATA/current-build.json" ] \
-               && grep -q "\"sequence\": $SEQ2" "$APP_DATA/current-build.json" \
-               && [ ! -e "$WORK/run/.Legion.AppImage.prev" ]; then
-              UPDATED=1
-              break
-            fi
-            sleep 1
-          done
-          kill_pg "$PID2"
-          PID2=""
-          wait_dbus_free
-          cat "$APP_DATA/current-build.json" || true
-          [ "$UPDATED" -eq 1 ]
-          [ ! -e "$APP_DATA/update.lock" ]
+          verify_updated "Phase 1" 120
 
           # Phase 2: Explicitly verify that starting a second instance while an update is in
           # progress exits cleanly (code 0), stages at most one copy, and does not break the swap.
@@ -690,21 +776,7 @@ jobs:
           WEBKIT_DISABLE_COMPOSITING_MODE=1 \
             setsid "$WORK/run/Legion.AppImage" >"$DIAG/phase2-run1.log" 2>&1 &
           PID1=$!
-
-          DOWNLOADED=0
-          for i in $(seq 1 90); do
-            if [ -f "$APP_DATA/current-build.json" ] && grep -q "\"sequence\": $SEQ1" "$APP_DATA/current-build.json" \
-               && [ -f "$DL_FILE" ] && [ ! -f "$DL_FILE.part" ] \
-               && [ -f "$APP_DATA/prefs.json" ] && grep -q "\"sequence\": $SEQ2" "$APP_DATA/prefs.json"; then
-              DOWNLOADED=1
-              break
-            fi
-            sleep 1
-          done
-          kill_pg "$PID1"
-          PID1=""
-          wait_dbus_free
-          [ "$DOWNLOADED" -eq 1 ]
+          wait_for_download "Phase 2" 120
 
           PATH="$WORK/bin:$PATH" \
           LEGION_HOME="$WORK/node" \
@@ -717,7 +789,7 @@ jobs:
           SAW_LOCK=0
           SECOND_RC=-1
           MAX_STAGED=0
-          for _ in $(seq 1 300); do
+          for _ in $(seq 1 600); do
             if [ -f "$APP_DATA/update.lock" ]; then
               SAW_LOCK=1
               staged_now="$(find "$WORK/run" -maxdepth 1 -name '.Legion.AppImage.new-*' 2>/dev/null | wc -l | tr -d '[:space:]')"
@@ -737,8 +809,7 @@ jobs:
               done
               if kill -0 "$SECOND_PID" 2>/dev/null; then
                 kill -9 "$SECOND_PID" 2>/dev/null || true
-                echo "ERROR: second instance hung during active update" >&2
-                exit 1
+                fail "Phase 2 concurrent second instance hung for >30s during active update"
               fi
               set +e
               wait "$SECOND_PID"
@@ -754,27 +825,11 @@ jobs:
             sleep 0.1
           done
           echo "Phase 2 lock_seen=$SAW_LOCK second_rc=$SECOND_RC max_staged=$MAX_STAGED"
-          [ "$SAW_LOCK" -eq 1 ]
-          [ "$SECOND_RC" -eq 0 ]
-          [ "$MAX_STAGED" -le 1 ]
+          [ "$SAW_LOCK" -eq 1 ] || fail "Phase 2 never observed update.lock before update finished"
+          [ "$SECOND_RC" -eq 0 ] || fail "Phase 2 concurrent second instance exited with code $SECOND_RC (expected 0)"
+          [ "$MAX_STAGED" -le 1 ] || fail "Phase 2 staged $MAX_STAGED AppImages simultaneously (expected <= 1)"
 
-          UPDATED2=0
-          for i in $(seq 1 90); do
-            if [ -f "$APP_DATA/started-$SEQ2.ok" ] \
-               && [ -f "$APP_DATA/current-build.json" ] \
-               && grep -q "\"sequence\": $SEQ2" "$APP_DATA/current-build.json" \
-               && [ ! -e "$WORK/run/.Legion.AppImage.prev" ] \
-               && [ ! -e "$APP_DATA/update.lock" ]; then
-              UPDATED2=1
-              break
-            fi
-            sleep 1
-          done
-          kill_pg "$PID2"
-          PID2=""
-          wait_dbus_free
-          [ "$UPDATED2" -eq 1 ]
-          ! ls "$APP_DATA"/rollback-*.json >/dev/null 2>&1
+          verify_updated "Phase 2" 120
           INNER
           chmod +x "$WORK/run-appimage-test.sh"
           WORK="$WORK" DIAG="$DIAG" APP_DATA="$APP_DATA" SEQ1="$SEQ1" SEQ2="$SEQ2" \
@@ -1306,15 +1361,43 @@ jobs:
 
           PID1=""
           PID2=""
+          FAIL_REASON=""
+          EXEC_PATH=""
+          fail() {
+            FAIL_REASON="$*"
+            echo "FAIL (macOS self-update): $FAIL_REASON" >&2
+            exit 1
+          }
+          count_app_instances() {
+            [ -n "$EXEC_PATH" ] || { echo 0; return 0; }
+            ps -A -w -w -o stat=,args= | awk -v exe="$EXEC_PATH" '
+              $1 !~ /Z/ {
+                line = $0
+                sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/, "", line)
+                if (line == exe || index(line, exe " ") == 1) c++
+              }
+              END { print c + 0 }
+            '
+          }
+          stop_app_instances() {
+            local sig
+            [ -n "$PID1" ] && { kill "$PID1" 2>/dev/null || true; wait "$PID1" 2>/dev/null || true; PID1=""; }
+            [ -n "$PID2" ] && { kill "$PID2" 2>/dev/null || true; wait "$PID2" 2>/dev/null || true; PID2=""; }
+            for sig in TERM KILL; do
+              pkill "-$sig" -f "$WORK/run/Legion.app" 2>/dev/null || true
+              for _ in $(seq 1 20); do
+                if [ "$(count_app_instances)" -eq 0 ]; then
+                  return 0
+                fi
+                sleep 0.25
+              done
+            done
+          }
           dump_diag() {
             local rc=$?
             set +e
-            [ -n "$PID1" ] && kill "$PID1" 2>/dev/null || true
-            [ -n "$PID2" ] && kill "$PID2" 2>/dev/null || true
-            pkill -f "$WORK/run/Legion.app" 2>/dev/null || true
-            rm -rf apps/legion-app/src-tauri/target/release/bundle
             {
-              echo "=== macOS self-update diagnostics (exit=$rc) ==="
+              echo "=== macOS self-update diagnostics (exit=$rc, reason=${FAIL_REASON:-none}) ==="
               echo "--- ps aux ---"
               ps aux
               echo "--- $APP_DATA tree ---"
@@ -1322,6 +1405,10 @@ jobs:
               echo "--- $WORK/run tree ---"
               ls -la "$WORK/run" 2>/dev/null || true
             } > "$DIAG/summary.txt"
+            [ -n "$PID1" ] && kill "$PID1" 2>/dev/null || true
+            [ -n "$PID2" ] && kill "$PID2" 2>/dev/null || true
+            pkill -f "$WORK/run/Legion.app" 2>/dev/null || true
+            rm -rf apps/legion-app/src-tauri/target/release/bundle
             for f in prefs.json floor.json current-build.json last-state.json supervisor.log supervisor-script.sh.txt new-start.log rollback-ps.txt update.lock; do
               [ -f "$APP_DATA/$f" ] && cp "$APP_DATA/$f" "$DIAG/$f"
             done
@@ -1329,6 +1416,9 @@ jobs:
               [ -f "$f" ] && cp "$f" "$DIAG/$(basename "$f")"
             done
             if [ "$rc" -ne 0 ]; then
+              if [ -z "$FAIL_REASON" ]; then
+                echo "FAIL (macOS self-update): unexpected command failure (exit=$rc)" >&2
+              fi
               for f in "$DIAG"/*; do
                 [ -f "$f" ] || continue
                 echo "===== DIAG $(basename "$f") ====="
@@ -1396,62 +1486,90 @@ jobs:
 
           EXEC_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$WORK/run/Legion.app/Contents/Info.plist")"
           EXEC_PATH="$WORK/run/Legion.app/Contents/MacOS/$EXEC_NAME"
+          DL_FILE="$APP_DATA/downloads/preview-$SEQ2/Legion-macos-aarch64.app.tar.gz"
+
+          wait_for_download() {
+            local phase="$1" timeout="$2" downloaded=0 i has_cur=0 has_dl=0 has_part=0 has_prefs=0
+            for i in $(seq 1 "$timeout"); do
+              if [ $((i % 10)) -eq 0 ]; then
+                {
+                  echo "=== ${phase} run1 t=${i}s ==="
+                  cat "$APP_DATA/last-state.json" 2>/dev/null || echo "(no last-state.json)"
+                } >> "$DIAG/poll-trace.log"
+              fi
+              if [ -f "$APP_DATA/current-build.json" ] && grep -q "\"sequence\": $SEQ1" "$APP_DATA/current-build.json" \
+                 && [ -f "$DL_FILE" ] && [ ! -f "$DL_FILE.part" ] \
+                 && [ -f "$APP_DATA/prefs.json" ] && grep -q "\"sequence\": $SEQ2" "$APP_DATA/prefs.json"; then
+                downloaded=1
+                break
+              fi
+              sleep 1
+            done
+            stop_app_instances
+            if [ "$downloaded" -ne 1 ]; then
+              [ -f "$APP_DATA/current-build.json" ] && grep -q "\"sequence\": $SEQ1" "$APP_DATA/current-build.json" && has_cur=1
+              [ -f "$DL_FILE" ] && has_dl=1
+              [ -f "$DL_FILE.part" ] && has_part=1
+              [ -f "$APP_DATA/prefs.json" ] && grep -q "\"sequence\": $SEQ2" "$APP_DATA/prefs.json" && has_prefs=1
+              fail "$phase download did not complete within ${timeout}s (current_seq1=$has_cur dl_file=$has_dl dl_part=$has_part prefs_seq2=$has_prefs)"
+            fi
+          }
+
+          verify_updated() {
+            local phase="$1" timeout="$2" updated=0 i
+            local has_marker=0 has_cur2=0 backup_gone=0 lock_gone=0 instances=0 rollback_files=""
+            for i in $(seq 1 "$timeout"); do
+              if [ $((i % 10)) -eq 0 ]; then
+                {
+                  echo "=== ${phase} run2 t=${i}s ==="
+                  cat "$APP_DATA/last-state.json" 2>/dev/null || echo "(no last-state.json)"
+                  cat "$APP_DATA/supervisor.log" 2>/dev/null || echo "(no supervisor.log)"
+                  [ -f "$APP_DATA/new-start.log" ] && cat "$APP_DATA/new-start.log" || true
+                } >> "$DIAG/poll-trace.log"
+              fi
+              if [ -f "$APP_DATA/started-$SEQ2.ok" ] \
+                 && [ -f "$APP_DATA/current-build.json" ] \
+                 && grep -q "\"sequence\": $SEQ2" "$APP_DATA/current-build.json" \
+                 && [ ! -e "$WORK/run/.Legion.app.prev" ] \
+                 && [ ! -e "$APP_DATA/update.lock" ]; then
+                updated=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$updated" -ne 1 ]; then
+              [ -f "$APP_DATA/started-$SEQ2.ok" ] && has_marker=1
+              [ -f "$APP_DATA/current-build.json" ] && grep -q "\"sequence\": $SEQ2" "$APP_DATA/current-build.json" && has_cur2=1
+              [ ! -e "$WORK/run/.Legion.app.prev" ] && backup_gone=1
+              [ ! -e "$APP_DATA/update.lock" ] && lock_gone=1
+              instances="$(count_app_instances)"
+              fail "$phase update did not complete within ${timeout}s (started_marker=$has_marker current_seq2=$has_cur2 backup_gone=$backup_gone lock_gone=$lock_gone running_instances=$instances)"
+            fi
+            instances="$(count_app_instances)"
+            if [ "$instances" -ne 1 ]; then
+              for _ in $(seq 1 10); do
+                sleep 0.5
+                instances="$(count_app_instances)"
+                if [ "$instances" -eq 1 ]; then break; fi
+              done
+            fi
+            [ "$instances" -eq 1 ] || fail "$phase expected exactly 1 running instance of $EXEC_PATH after update, found $instances"
+            [ ! -e "$WORK/run/.Legion.app.prev" ] || fail "$phase backup bundle .Legion.app.prev still present after update"
+            [ ! -e "$APP_DATA/update.lock" ] || fail "$phase update.lock still present after update"
+            rollback_files="$(find "$APP_DATA" -maxdepth 1 -name 'rollback-*.json' -print 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+            [ -z "$rollback_files" ] || fail "$phase produced unexpected rollback file(s): $rollback_files"
+            cat "$APP_DATA/current-build.json" || true
+            stop_app_instances
+          }
 
           PATH="$WORK/bin:$PATH" LEGION_HOME="$WORK/node" "$EXEC_PATH" >"$DIAG/run1.log" 2>&1 &
           PID1=$!
-
-          DL_FILE="$APP_DATA/downloads/preview-$SEQ2/Legion-macos-aarch64.app.tar.gz"
-          DOWNLOADED=0
-          for i in $(seq 1 60); do
-            if [ $((i % 10)) -eq 0 ]; then
-              {
-                echo "=== run1 t=${i}s ==="
-                cat "$APP_DATA/last-state.json" 2>/dev/null || echo "(no last-state.json)"
-              } >> "$DIAG/poll-trace.log"
-            fi
-            if [ -f "$APP_DATA/current-build.json" ] && grep -q "\"sequence\": $SEQ1" "$APP_DATA/current-build.json" \
-               && [ -f "$DL_FILE" ] && [ ! -f "$DL_FILE.part" ] \
-               && [ -f "$APP_DATA/prefs.json" ] && grep -q "\"sequence\": $SEQ2" "$APP_DATA/prefs.json"; then
-              DOWNLOADED=1
-              break
-            fi
-            sleep 1
-          done
-          kill "$PID1" 2>/dev/null || true
-          wait "$PID1" 2>/dev/null || true
-          PID1=""
-          [ "$DOWNLOADED" -eq 1 ]
+          wait_for_download "Phase 1" 120
 
           # Second launch triggers immediate next-start auto-install and atomic bundle swap.
           PATH="$WORK/bin:$PATH" LEGION_HOME="$WORK/node" "$EXEC_PATH" >"$DIAG/run2.log" 2>&1 &
           PID2=$!
-
-          UPDATED=0
-          for i in $(seq 1 90); do
-            if [ $((i % 10)) -eq 0 ]; then
-              {
-                echo "=== run2 t=${i}s ==="
-                cat "$APP_DATA/last-state.json" 2>/dev/null || echo "(no last-state.json)"
-                cat "$APP_DATA/supervisor.log" 2>/dev/null || echo "(no supervisor.log)"
-                [ -f "$APP_DATA/new-start.log" ] && cat "$APP_DATA/new-start.log" || true
-              } >> "$DIAG/poll-trace.log"
-            fi
-            if [ -f "$APP_DATA/started-$SEQ2.ok" ] \
-               && [ -f "$APP_DATA/current-build.json" ] \
-               && grep -q "\"sequence\": $SEQ2" "$APP_DATA/current-build.json" \
-               && [ ! -e "$WORK/run/.Legion.app.prev" ]; then
-              UPDATED=1
-              break
-            fi
-            sleep 1
-          done
-          pkill -f "$WORK/run/Legion.app" 2>/dev/null || true
-          kill "$PID2" 2>/dev/null || true
-          wait "$PID2" 2>/dev/null || true
-          PID2=""
-          cat "$APP_DATA/current-build.json" || true
-          [ "$UPDATED" -eq 1 ]
-          [ ! -e "$APP_DATA/update.lock" ]
+          verify_updated "Phase 1" 120
 
           # Phase 2: Explicitly verify that starting a second instance while an update is in
           # progress exits cleanly (code 0), stages at most one copy, and does not break the swap.
@@ -1461,22 +1579,7 @@ jobs:
 
           PATH="$WORK/bin:$PATH" LEGION_HOME="$WORK/node" "$EXEC_PATH" >"$DIAG/phase2-run1.log" 2>&1 &
           PID1=$!
-          DOWNLOADED=0
-          for i in $(seq 1 60); do
-            if [ -f "$APP_DATA/current-build.json" ] && grep -q "\"sequence\": $SEQ1" "$APP_DATA/current-build.json" \
-               && [ -f "$DL_FILE" ] && [ ! -f "$DL_FILE.part" ] \
-               && [ -f "$APP_DATA/prefs.json" ] && grep -q "\"sequence\": $SEQ2" "$APP_DATA/prefs.json"; then
-              DOWNLOADED=1
-              break
-            fi
-            sleep 1
-          done
-          kill "$PID1" 2>/dev/null || true
-          wait "$PID1" 2>/dev/null || true
-          pkill -f "$WORK/run/Legion.app" 2>/dev/null || true
-          sleep 0.5
-          PID1=""
-          [ "$DOWNLOADED" -eq 1 ]
+          wait_for_download "Phase 2" 120
 
           PATH="$WORK/bin:$PATH" LEGION_HOME="$WORK/node" "$EXEC_PATH" >"$DIAG/phase2-run2a.log" 2>&1 &
           PID2=$!
@@ -1484,7 +1587,7 @@ jobs:
           SAW_LOCK=0
           SECOND_RC=-1
           MAX_STAGED=0
-          for _ in $(seq 1 300); do
+          for _ in $(seq 1 600); do
             if [ -f "$APP_DATA/update.lock" ]; then
               SAW_LOCK=1
               staged_now="$(find "$WORK/run" -maxdepth 1 -name '.Legion.app.new-*' 2>/dev/null | wc -l | tr -d '[:space:]')"
@@ -1499,8 +1602,7 @@ jobs:
               done
               if kill -0 "$SECOND_PID" 2>/dev/null; then
                 kill -9 "$SECOND_PID" 2>/dev/null || true
-                echo "ERROR: second macOS instance hung during active update" >&2
-                exit 1
+                fail "Phase 2 concurrent second macOS instance hung for >30s during active update"
               fi
               set +e
               wait "$SECOND_PID"
@@ -1516,27 +1618,11 @@ jobs:
             sleep 0.1
           done
           echo "Phase 2 macOS lock_seen=$SAW_LOCK second_rc=$SECOND_RC max_staged=$MAX_STAGED"
-          [ "$SAW_LOCK" -eq 1 ]
-          [ "$SECOND_RC" -eq 0 ]
-          [ "$MAX_STAGED" -le 1 ]
+          [ "$SAW_LOCK" -eq 1 ] || fail "Phase 2 never observed update.lock before update finished"
+          [ "$SECOND_RC" -eq 0 ] || fail "Phase 2 concurrent second macOS instance exited with code $SECOND_RC (expected 0)"
+          [ "$MAX_STAGED" -le 1 ] || fail "Phase 2 staged $MAX_STAGED bundles simultaneously (expected <= 1)"
 
-          UPDATED2=0
-          for i in $(seq 1 90); do
-            if [ -f "$APP_DATA/started-$SEQ2.ok" ] \
-               && [ -f "$APP_DATA/current-build.json" ] \
-               && grep -q "\"sequence\": $SEQ2" "$APP_DATA/current-build.json" \
-               && [ ! -e "$WORK/run/.Legion.app.prev" ] \
-               && [ ! -e "$APP_DATA/update.lock" ]; then
-              UPDATED2=1
-              break
-            fi
-            sleep 1
-          done
-          pkill -f "$WORK/run/Legion.app" 2>/dev/null || true
-          kill "$PID2" 2>/dev/null || true
-          PID2=""
-          [ "$UPDATED2" -eq 1 ]
-          ! ls "$APP_DATA"/rollback-*.json >/dev/null 2>&1
+          verify_updated "Phase 2" 120
       - name: Upload macOS self-update diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1786,10 +1872,11 @@ jobs:
           $installDir = Join-Path $work 'install'
           $pollTrace = Join-Path $diag 'poll-trace.log'
           $failed = $false
+          $failReason = ''
 
-          function Dump-Diagnostics([bool]$printToConsole) {
+          function Dump-Diagnostics([bool]$printToConsole, [string]$reason) {
             $summaryLines = New-Object System.Collections.Generic.List[string]
-            $summaryLines.Add("=== Windows self-update diagnostics ===")
+            $summaryLines.Add("=== Windows self-update diagnostics (reason=$(if ($reason) { $reason } else { 'none' })) ===")
             $summaryLines.Add("--- Processes ---")
             Get-Process | Sort-Object ProcessName | ForEach-Object {
               $pPath = ''
@@ -1905,70 +1992,122 @@ jobs:
             if (-not $exe) { throw 'Installed seq1 Legion executable not found.' }
 
             $env:PATH = "$(Join-Path $work 'bin');$env:PATH"
-            $proc1 = Start-Process -FilePath $exe.FullName -RedirectStandardOutput (Join-Path $diag 'run1-stdout.log') -RedirectStandardError (Join-Path $diag 'run1-stderr.log') -PassThru
             $currentJson = Join-Path $appUpdates 'current-build.json'
             $prefsJson = Join-Path $appUpdates 'prefs.json'
             $lastStateJson = Join-Path $appUpdates 'last-state.json'
             $supLog = Join-Path $appUpdates 'supervisor.log'
             $newStartLog = Join-Path $appUpdates 'new-start.log'
+            $updateLock = Join-Path $appUpdates 'update.lock'
+            $startedMarker = Join-Path $appUpdates "started-$seq2.ok"
+            $backupDir = Join-Path $appUpdates "backup-$seq1"
             $dlFile = Join-Path $appUpdates "downloads\preview-$seq2\Legion-windows-x86_64-setup.exe"
-            $downloaded = $false
-            for ($i = 1; $i -le 60; $i++) {
-              if (($i % 10) -eq 0) {
-                Add-Content -LiteralPath $pollTrace -Value "=== run1 t=${i}s ==="
-                if (Test-Path -LiteralPath $lastStateJson) {
-                  Add-Content -LiteralPath $pollTrace -Value (Get-Content -LiteralPath $lastStateJson -Raw)
+
+            function Get-AppInstances([string]$exePath) {
+              @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+                $p = $null
+                try { $p = $_.Path } catch {}
+                $p -and [string]::Equals($p, $exePath, [System.StringComparison]::OrdinalIgnoreCase)
+              })
+            }
+
+            function Stop-AppInstances([string]$exePath) {
+              Get-Process -ErrorAction SilentlyContinue | Where-Object {
+                $p = $null
+                try { $p = $_.Path } catch {}
+                $p -and $p.StartsWith($installDir, [System.StringComparison]::OrdinalIgnoreCase)
+              } | Stop-Process -Force -ErrorAction SilentlyContinue
+              for ($w = 0; $w -lt 40; $w++) {
+                if (@(Get-AppInstances $exePath).Count -eq 0) { break }
+                Start-Sleep -Milliseconds 250
+              }
+            }
+
+            function Wait-ForDownload([string]$phase, [int]$timeoutSecs, $launchProc, [string]$exePath) {
+              $downloaded = $false
+              for ($i = 1; $i -le $timeoutSecs; $i++) {
+                if (($i % 10) -eq 0) {
+                  Add-Content -LiteralPath $pollTrace -Value "=== $phase run1 t=${i}s ==="
+                  if (Test-Path -LiteralPath $lastStateJson) {
+                    Add-Content -LiteralPath $pollTrace -Value (Get-Content -LiteralPath $lastStateJson -Raw)
+                  }
+                }
+                if ((Test-Path -LiteralPath $currentJson) -and ((Get-Content -LiteralPath $currentJson -Raw) -match "`"sequence`":\s*$seq1") -and (Test-Path -LiteralPath $dlFile) -and -not (Test-Path -LiteralPath "$dlFile.part") -and (Test-Path -LiteralPath $prefsJson) -and ((Get-Content -LiteralPath $prefsJson -Raw) -match "`"sequence`":\s*$seq2")) {
+                  $downloaded = $true
+                  break
+                }
+                Start-Sleep -Seconds 1
+              }
+              if ($launchProc -and -not $launchProc.HasExited) {
+                Stop-Process -Id $launchProc.Id -Force -ErrorAction SilentlyContinue
+                try { $launchProc.WaitForExit(5000) | Out-Null } catch {}
+              }
+              Stop-AppInstances $exePath
+              if (-not $downloaded) {
+                $hasCur = (Test-Path -LiteralPath $currentJson) -and ((Get-Content -LiteralPath $currentJson -Raw) -match "`"sequence`":\s*$seq1")
+                $hasDl = Test-Path -LiteralPath $dlFile
+                $hasPart = Test-Path -LiteralPath "$dlFile.part"
+                $hasPrefs = (Test-Path -LiteralPath $prefsJson) -and ((Get-Content -LiteralPath $prefsJson -Raw) -match "`"sequence`":\s*$seq2")
+                throw "$phase download did not complete within ${timeoutSecs}s (current_seq1=$hasCur dl_file=$hasDl dl_part=$hasPart prefs_seq2=$hasPrefs)"
+              }
+            }
+
+            function Verify-Updated([string]$phase, [int]$timeoutSecs, [string]$exePath) {
+              $updated = $false
+              for ($i = 1; $i -le $timeoutSecs; $i++) {
+                if (($i % 10) -eq 0) {
+                  Add-Content -LiteralPath $pollTrace -Value "=== $phase run2 t=${i}s ==="
+                  if (Test-Path -LiteralPath $lastStateJson) {
+                    Add-Content -LiteralPath $pollTrace -Value (Get-Content -LiteralPath $lastStateJson -Raw)
+                  }
+                  if (Test-Path -LiteralPath $supLog) {
+                    Add-Content -LiteralPath $pollTrace -Value (Get-Content -LiteralPath $supLog -Raw)
+                  }
+                  if (Test-Path -LiteralPath $newStartLog) {
+                    Add-Content -LiteralPath $pollTrace -Value (Get-Content -LiteralPath $newStartLog -Raw)
+                  }
+                }
+                if ((Test-Path -LiteralPath $startedMarker) -and (Test-Path -LiteralPath $currentJson) -and ((Get-Content -LiteralPath $currentJson -Raw) -match "`"sequence`":\s*$seq2") -and -not (Test-Path -LiteralPath $backupDir) -and -not (Test-Path -LiteralPath $updateLock)) {
+                  $updated = $true
+                  break
+                }
+                Start-Sleep -Seconds 1
+              }
+              if (-not $updated) {
+                $hasMarker = Test-Path -LiteralPath $startedMarker
+                $hasCur2 = (Test-Path -LiteralPath $currentJson) -and ((Get-Content -LiteralPath $currentJson -Raw) -match "`"sequence`":\s*$seq2")
+                $backupGone = -not (Test-Path -LiteralPath $backupDir)
+                $lockGone = -not (Test-Path -LiteralPath $updateLock)
+                $instCount = @(Get-AppInstances $exePath).Count
+                throw "$phase update did not complete within ${timeoutSecs}s (started_marker=$hasMarker current_seq2=$hasCur2 backup_gone=$backupGone lock_gone=$lockGone running_instances=$instCount)"
+              }
+              $instCount = @(Get-AppInstances $exePath).Count
+              if ($instCount -ne 1) {
+                for ($s = 0; $s -lt 10; $s++) {
+                  Start-Sleep -Milliseconds 500
+                  $instCount = @(Get-AppInstances $exePath).Count
+                  if ($instCount -eq 1) { break }
                 }
               }
-              if ((Test-Path -LiteralPath $currentJson) -and ((Get-Content -LiteralPath $currentJson -Raw) -match "`"sequence`":\s*$seq1") -and (Test-Path -LiteralPath $dlFile) -and -not (Test-Path -LiteralPath "$dlFile.part") -and (Test-Path -LiteralPath $prefsJson) -and ((Get-Content -LiteralPath $prefsJson -Raw) -match "`"sequence`":\s*$seq2")) {
-                $downloaded = $true
-                break
-              }
-              Start-Sleep -Seconds 1
+              if ($instCount -ne 1) { throw "$phase expected exactly 1 running instance of $exePath after update, found $instCount" }
+              if (Test-Path -LiteralPath $backupDir) { throw "$phase backup directory still exists after update: $backupDir" }
+              if (Test-Path -LiteralPath $updateLock) { throw "$phase update.lock still exists after update" }
+              $rollbacks = @(Get-ChildItem -LiteralPath $appUpdates -Filter 'rollback-*.json' -File -ErrorAction SilentlyContinue)
+              if ($rollbacks.Count -ne 0) { throw "$phase produced unexpected rollback file(s): $($rollbacks.Name -join ', ')" }
+              if (Test-Path -LiteralPath $currentJson) { Get-Content -LiteralPath $currentJson }
             }
-            if (-not $proc1.HasExited) {
-              Stop-Process -Id $proc1.Id -Force -ErrorAction SilentlyContinue
-              try { $proc1.WaitForExit(5000) | Out-Null } catch {}
-            }
-            Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($installDir, [System.StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Milliseconds 500
-            if (-not $downloaded) { throw 'Timed out waiting for Windows seq1 to download verified seq2.' }
+
+            $proc1 = Start-Process -FilePath $exe.FullName -RedirectStandardOutput (Join-Path $diag 'run1-stdout.log') -RedirectStandardError (Join-Path $diag 'run1-stderr.log') -PassThru
+            Wait-ForDownload 'Phase 1' 120 $proc1 $exe.FullName
 
             # Second launch triggers immediate next-start auto-install via silent NSIS upgrade.
             Start-Process -FilePath $exe.FullName -RedirectStandardOutput (Join-Path $diag 'run2-stdout.log') -RedirectStandardError (Join-Path $diag 'run2-stderr.log') | Out-Null
-            $startedMarker = Join-Path $appUpdates "started-$seq2.ok"
-            $backupDir = Join-Path $appUpdates "backup-$seq1"
-            $updated = $false
-            for ($i = 1; $i -le 120; $i++) {
-              if (($i % 10) -eq 0) {
-                Add-Content -LiteralPath $pollTrace -Value "=== run2 t=${i}s ==="
-                if (Test-Path -LiteralPath $lastStateJson) {
-                  Add-Content -LiteralPath $pollTrace -Value (Get-Content -LiteralPath $lastStateJson -Raw)
-                }
-                if (Test-Path -LiteralPath $supLog) {
-                  Add-Content -LiteralPath $pollTrace -Value (Get-Content -LiteralPath $supLog -Raw)
-                }
-                if (Test-Path -LiteralPath $newStartLog) {
-                  Add-Content -LiteralPath $pollTrace -Value (Get-Content -LiteralPath $newStartLog -Raw)
-                }
-              }
-              if ((Test-Path -LiteralPath $startedMarker) -and (Test-Path -LiteralPath $currentJson) -and ((Get-Content -LiteralPath $currentJson -Raw) -match "`"sequence`":\s*$seq2") -and -not (Test-Path -LiteralPath $backupDir)) {
-                $updated = $true
-                break
-              }
-              Start-Sleep -Seconds 1
-            }
-            if (Test-Path -LiteralPath $currentJson) { Get-Content -LiteralPath $currentJson }
-            if (-not $updated) { throw 'Timed out waiting for Windows NSIS self-update to complete at seq2.' }
-            $updateLock = Join-Path $appUpdates 'update.lock'
-            if (Test-Path -LiteralPath $updateLock) { throw 'Expected update.lock to be cleaned after Windows self-update.' }
+            Verify-Updated 'Phase 1' 120 $exe.FullName
 
             # Phase 2: Explicitly verify that starting a second instance while an update is in
             # progress exits cleanly (code 0), stages at most one installer, and does not break the
             # NSIS upgrade.
             Write-Host "=== Phase 2: concurrent second start during Windows NSIS update ==="
-            Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($installDir, [System.StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Milliseconds 500
+            Stop-AppInstances $exe.FullName
             Remove-Item -LiteralPath $appUpdates -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
             New-Item -ItemType Directory -Path $installDir -Force | Out-Null
@@ -1979,21 +2118,7 @@ jobs:
             if (-not $exe) { throw 'Phase 2 installed seq1 Legion executable not found.' }
 
             $p2Proc1 = Start-Process -FilePath $exe.FullName -RedirectStandardOutput (Join-Path $diag 'phase2-run1-stdout.log') -RedirectStandardError (Join-Path $diag 'phase2-run1-stderr.log') -PassThru
-            $downloaded2 = $false
-            for ($i = 1; $i -le 60; $i++) {
-              if ((Test-Path -LiteralPath $currentJson) -and ((Get-Content -LiteralPath $currentJson -Raw) -match "`"sequence`":\s*$seq1") -and (Test-Path -LiteralPath $dlFile) -and -not (Test-Path -LiteralPath "$dlFile.part") -and (Test-Path -LiteralPath $prefsJson) -and ((Get-Content -LiteralPath $prefsJson -Raw) -match "`"sequence`":\s*$seq2")) {
-                $downloaded2 = $true
-                break
-              }
-              Start-Sleep -Seconds 1
-            }
-            if (-not $p2Proc1.HasExited) {
-              Stop-Process -Id $p2Proc1.Id -Force -ErrorAction SilentlyContinue
-              try { $p2Proc1.WaitForExit(5000) | Out-Null } catch {}
-            }
-            Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($installDir, [System.StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Milliseconds 500
-            if (-not $downloaded2) { throw 'Phase 2 timed out waiting for Windows seq1 to download verified seq2.' }
+            Wait-ForDownload 'Phase 2' 120 $p2Proc1 $exe.FullName
 
             Start-Process -FilePath $exe.FullName -RedirectStandardOutput (Join-Path $diag 'phase2-run2a-stdout.log') -RedirectStandardError (Join-Path $diag 'phase2-run2a-stderr.log') | Out-Null
             $sawLock = $false
@@ -2027,23 +2152,19 @@ jobs:
             if ($secondExit -ne 0) { throw "Phase 2 second Windows instance exited with code $secondExit (expected 0)." }
             if ($maxStaged -gt 1) { throw "Phase 2 staged $maxStaged installers (expected <= 1)." }
 
-            $updated2 = $false
-            for ($i = 1; $i -le 120; $i++) {
-              if ((Test-Path -LiteralPath $startedMarker) -and (Test-Path -LiteralPath $currentJson) -and ((Get-Content -LiteralPath $currentJson -Raw) -match "`"sequence`":\s*$seq2") -and -not (Test-Path -LiteralPath $backupDir) -and -not (Test-Path -LiteralPath $updateLock)) {
-                $updated2 = $true
-                break
-              }
-              Start-Sleep -Seconds 1
-            }
-            if (-not $updated2) { throw 'Phase 2 timed out waiting for Windows NSIS self-update to complete at seq2 after concurrent start.' }
-            $rollbacks = @(Get-ChildItem -LiteralPath $appUpdates -Filter 'rollback-*.json' -File -ErrorAction SilentlyContinue)
-            if ($rollbacks.Count -ne 0) { throw "Phase 2 produced unexpected rollback files: $($rollbacks.Name -join ', ')" }
+            Verify-Updated 'Phase 2' 120 $exe.FullName
           } catch {
             $failed = $true
+            $failReason = $_.Exception.Message
+            Write-Host "FAIL (Windows self-update): $failReason"
             throw
           } finally {
-            Dump-Diagnostics $failed
-            Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($installDir, [System.StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force -ErrorAction SilentlyContinue
+            Dump-Diagnostics $failed $failReason
+            Get-Process -ErrorAction SilentlyContinue | Where-Object {
+              $p = $null
+              try { $p = $_.Path } catch {}
+              $p -and $p.StartsWith($installDir, [System.StringComparison]::OrdinalIgnoreCase)
+            } | Stop-Process -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath 'apps\legion-app\src-tauri\target\release\bundle' -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item Env:LEGION_PREVIEW_UPDATE_KEY -ErrorAction SilentlyContinue
           }
