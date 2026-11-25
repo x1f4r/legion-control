@@ -133,7 +133,13 @@ impl Ran {
 fn after_protocol(output: &[u8]) -> &[u8] {
     let end = output.iter().position(|b| *b == b'\n').expect("a line");
     let opening: Value = serde_json::from_slice(&output[..end]).unwrap();
-    assert_eq!(opening, json!({"protocol": STREAM_PROTOCOL}));
+    assert_eq!(opening["protocol"], json!(STREAM_PROTOCOL));
+    assert!(
+        opening["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|c| c == "stream.relay")),
+        "stream opening should advertise stream.relay: {opening}"
+    );
     &output[end + 1..]
 }
 

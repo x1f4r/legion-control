@@ -65,11 +65,19 @@ use serde_json::{Value, json};
 /// The version of this exchange: a header names it, and a node refuses one it does not speak.
 pub const STREAM_PROTOCOL: u32 = 1;
 
+/// Stream capability advertised in the opening greeting when this node supports `op: "relay"`.
+pub const CAP_STREAM_RELAY: &str = "stream.relay";
+
+/// Stream capabilities advertised in the opening greeting line before any header is read.
+pub const STREAM_CAPABILITIES: [&str; 1] = [CAP_STREAM_RELAY];
+
 /// How often an operation at work on something long says so, where a reply line is awaited.
 pub const HEARTBEAT: Duration = Duration::from_secs(10);
 
 /// The operations this node knows, as `unsupported` names them.
-const OPS: [&str; 7] = ["manifest", "stat", "get", "put", "pack", "unpack", "delete"];
+const OPS: [&str; 8] = [
+    "manifest", "stat", "get", "put", "pack", "unpack", "delete", "relay",
+];
 
 /// The longest header read. A header carries the names a `pack` or `delete` acts on, which a
 /// transfer sends in batches well below this; anything longer is a client gone wrong.
@@ -77,7 +85,7 @@ pub const LONGEST_HEADER: usize = 64 * 1024 * 1024;
 
 /// How much output is gathered before it is written: a file's bytes go out in large writes, and
 /// a listing's lines are not written one by one.
-const OUTPUT_BUFFER: usize = 64 * 1024;
+pub(crate) const OUTPUT_BUFFER: usize = 64 * 1024;
 
 /// How much of the input an operation reads past what it took before it stops: the padding a tar
 /// writer adds after an archive is a few blocks, and a sender that goes on past this has its pipe
@@ -85,7 +93,14 @@ const OUTPUT_BUFFER: usize = 64 * 1024;
 const MOST_TRAILING: u64 = 1024 * 1024;
 
 /// How many chunks of input wait for an operation that reads it on its own thread.
-const QUEUED_CHUNKS: usize = 4;
+pub(crate) const QUEUED_CHUNKS: usize = 4;
+
+fn greeting() -> Value {
+    json!({
+        "protocol": STREAM_PROTOCOL,
+        "capabilities": STREAM_CAPABILITIES,
+    })
+}
 
 /// The node a stream is served for: where its files are, and the name its errors and audit lines
 /// carry.
@@ -108,15 +123,20 @@ impl Host {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// The node's directory layout.
+    pub(crate) fn paths(&self) -> &Paths {
+        &self.paths
+    }
 }
 
 /// The header: what to do, and optionally whom to do it as.
 #[derive(Debug, Deserialize)]
-struct Header {
+pub(crate) struct Header {
     #[serde(rename = "as", default)]
-    as_principal: Option<String>,
+    pub(crate) as_principal: Option<String>,
     #[serde(flatten)]
-    op: Op,
+    pub(crate) op: Op,
 }
 
 /// One operation, as its header names it.
@@ -174,10 +194,18 @@ pub(crate) enum Op {
         root: String,
         names: Vec<String>,
     },
+    /// Relays an inner stream operation header (`request`) to another fleet machine (`on`),
+    /// authorising the caller on this node and forwarding the resolved principal to the target.
+    Relay {
+        on: String,
+        request: Value,
+        #[serde(default)]
+        hops: u32,
+    },
 }
 
 impl Op {
-    fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         match self {
             Op::Manifest { .. } => "manifest",
             Op::Stat { .. } => "stat",
@@ -186,11 +214,12 @@ impl Op {
             Op::Pack { .. } => "pack",
             Op::Unpack { .. } => "unpack",
             Op::Delete { .. } => "delete",
+            Op::Relay { .. } => "relay",
         }
     }
 
     /// The file tool whose permission the operation needs: what it amounts to on this node.
-    fn authorised_as(&self) -> (&'static str, Effect) {
+    pub(crate) fn authorised_as(&self) -> (&'static str, Effect) {
         op_tool(self.name()).unwrap_or(("fs.write", Effect::Write))
     }
 }
@@ -349,6 +378,11 @@ pub struct StreamServeOptions {
     /// Optional shutdown signal (such as SIGTERM/SIGINT) that flushes pending audit records and
     /// ends a `keep_open` session cleanly.
     pub shutdown: Option<CancellationToken>,
+    /// Optional fleet session pool reused when serving `op: "relay"` requests. When absent,
+    /// relayed requests construct a short-lived fleet handle over `host.paths()`.
+    pub fleet: Option<crate::Fleet>,
+    /// Optional Tokio runtime handle used when relaying streams from a blocking thread.
+    pub runtime: Option<tokio::runtime::Handle>,
 }
 
 impl Default for StreamServeOptions {
@@ -359,6 +393,8 @@ impl Default for StreamServeOptions {
             recheck_bytes: GET_RECHECK_BYTES,
             recheck_interval: GET_RECHECK_INTERVAL,
             shutdown: None,
+            fleet: None,
+            runtime: None,
         }
     }
 }
@@ -393,8 +429,7 @@ pub fn serve_with_door<R: Read, W: Write>(
     let started = Instant::now();
     let mut input = BufReader::new(input);
     let mut output = BufWriter::with_capacity(OUTPUT_BUFFER, output);
-    let _ =
-        line(&mut output, &json!({ "protocol": STREAM_PROTOCOL })).and_then(|()| output.flush());
+    let _ = line(&mut output, &greeting()).and_then(|()| output.flush());
     let (header, recorded) = match read_header(&mut input) {
         Ok(read) => read,
         Err(error) => {
@@ -403,6 +438,85 @@ pub fn serve_with_door<R: Read, W: Write>(
             return Err(error);
         }
     };
+    if let Op::Relay { on, request, hops } = header.op {
+        if on == host.name {
+            let (inner_op, _) =
+                match crate::stream_relay::validate_relay_header(host, &on, &request) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        let _ = reply_error(&mut output, &error);
+                        record(
+                            host,
+                            pinned.map(str::to_owned),
+                            door,
+                            device,
+                            "stream.relay",
+                            recorded,
+                            started,
+                            &Err(error.clone()),
+                        );
+                        return Err(error);
+                    }
+                };
+            let local_header = Header {
+                as_principal: header.as_principal,
+                op: inner_op,
+            };
+            if matches!(
+                local_header.op,
+                Op::Get {
+                    keep_open: true,
+                    ..
+                }
+            ) {
+                return serve_keep_open_gets_with_source(
+                    host,
+                    pinned,
+                    door,
+                    device,
+                    &options,
+                    local_header,
+                    recorded,
+                    output,
+                    |_| {
+                        let next = match read_next_header(&mut input) {
+                            Ok(Some(pair)) => NextHeader::Header(pair),
+                            Ok(None) => NextHeader::Eof,
+                            Err(err) => NextHeader::Error(err),
+                        };
+                        crate::stream_relay::unwrap_local_relay_next(host, next)
+                    },
+                );
+            }
+            return serve_single_op(
+                host,
+                pinned,
+                door,
+                device,
+                &options,
+                local_header,
+                recorded,
+                started,
+                &mut input,
+                &mut output,
+            );
+        }
+        return crate::stream_relay::serve_relay_remote_scoped(
+            host,
+            pinned,
+            door,
+            device,
+            &options,
+            header.as_principal,
+            on,
+            request,
+            hops,
+            recorded,
+            started,
+            &mut input,
+            output,
+        );
+    }
     if matches!(
         header.op,
         Op::Get {
@@ -457,8 +571,7 @@ pub fn serve_with_options<R: Read + Send + 'static, W: Write>(
     let mut output = BufWriter::with_capacity(OUTPUT_BUFFER, output);
     // Said before anything else, refusals included, so a reader can tell this node's replies
     // from those of one too old to hold to what it asks.
-    let _ =
-        line(&mut output, &json!({ "protocol": STREAM_PROTOCOL })).and_then(|()| output.flush());
+    let _ = line(&mut output, &greeting()).and_then(|()| output.flush());
     let (header, recorded) = match read_header(&mut input) {
         Ok(read) => read,
         Err(error) => {
@@ -467,6 +580,92 @@ pub fn serve_with_options<R: Read + Send + 'static, W: Write>(
             return Err(error);
         }
     };
+    if let Op::Relay { on, request, hops } = header.op {
+        if on == host.name {
+            let (inner_op, _) =
+                match crate::stream_relay::validate_relay_header(host, &on, &request) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        let _ = reply_error(&mut output, &error);
+                        record(
+                            host,
+                            pinned.map(str::to_owned),
+                            door,
+                            device,
+                            "stream.relay",
+                            recorded,
+                            started,
+                            &Err(error.clone()),
+                        );
+                        return Err(error);
+                    }
+                };
+            let local_header = Header {
+                as_principal: header.as_principal,
+                op: inner_op,
+            };
+            if matches!(
+                local_header.op,
+                Op::Get {
+                    keep_open: true,
+                    ..
+                }
+            ) {
+                let (tx, rx) = mpsc::sync_channel::<Result<Option<(Header, Value)>, ErrorBody>>(1);
+                std::thread::spawn(move || {
+                    loop {
+                        let next = read_next_header(&mut input);
+                        let stop = matches!(next, Ok(None) | Err(_));
+                        if tx.send(next).is_err() || stop {
+                            break;
+                        }
+                    }
+                });
+                return serve_keep_open_gets_with_source(
+                    host,
+                    pinned,
+                    door,
+                    device,
+                    &options,
+                    local_header,
+                    recorded,
+                    output,
+                    |bucket| {
+                        let raw =
+                            poll_next_header_channel(host, door, device, &options, bucket, &rx);
+                        crate::stream_relay::unwrap_local_relay_next(host, raw)
+                    },
+                );
+            }
+            return serve_single_op(
+                host,
+                pinned,
+                door,
+                device,
+                &options,
+                local_header,
+                recorded,
+                started,
+                &mut input,
+                &mut output,
+            );
+        }
+        return crate::stream_relay::serve_relay_remote_spawned(
+            host,
+            pinned,
+            door,
+            device,
+            &options,
+            header.as_principal,
+            on,
+            request,
+            hops,
+            recorded,
+            started,
+            input,
+            output,
+        );
+    }
     if matches!(
         header.op,
         Op::Get {
@@ -496,49 +695,7 @@ pub fn serve_with_options<R: Read + Send + 'static, W: Write>(
             header,
             recorded,
             output,
-            |bucket| {
-                let idle_since = Instant::now();
-                loop {
-                    if options
-                        .shutdown
-                        .as_ref()
-                        .is_some_and(CancellationToken::is_cancelled)
-                    {
-                        return NextHeader::IdleExit;
-                    }
-                    if let Some(pending) = bucket.as_ref()
-                        && pending.started.elapsed() >= options.audit_coalesce_window
-                        && let Some(finished) = bucket.take()
-                    {
-                        finished.flush(host, door, device);
-                    }
-                    let elapsed_idle = idle_since.elapsed();
-                    if elapsed_idle >= options.keep_open_idle_timeout {
-                        return NextHeader::IdleExit;
-                    }
-                    let until_idle = options.keep_open_idle_timeout.saturating_sub(elapsed_idle);
-                    let until_flush = bucket
-                        .as_ref()
-                        .map(|b| {
-                            options
-                                .audit_coalesce_window
-                                .saturating_sub(b.started.elapsed())
-                        })
-                        .unwrap_or(until_idle);
-                    let mut wait = until_idle.min(until_flush);
-                    if options.shutdown.is_some() {
-                        wait = wait.min(Duration::from_millis(50));
-                    }
-                    match rx.recv_timeout(wait) {
-                        Ok(Ok(Some(pair))) => return NextHeader::Header(pair),
-                        Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => {
-                            return NextHeader::Eof;
-                        }
-                        Ok(Err(err)) => return NextHeader::Error(err),
-                        Err(RecvTimeoutError::Timeout) => {}
-                    }
-                }
-            },
+            |bucket| poll_next_header_channel(host, door, device, &options, bucket, &rx),
         );
     }
     serve_single_op(
@@ -553,6 +710,57 @@ pub fn serve_with_options<R: Read + Send + 'static, W: Write>(
         &mut input,
         &mut output,
     )
+}
+
+fn poll_next_header_channel(
+    host: &Host,
+    door: Door,
+    device: Option<&str>,
+    options: &StreamServeOptions,
+    bucket: &mut Option<GetAuditBucket>,
+    rx: &Receiver<Result<Option<(Header, Value)>, ErrorBody>>,
+) -> NextHeader {
+    let idle_since = Instant::now();
+    loop {
+        if options
+            .shutdown
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return NextHeader::IdleExit;
+        }
+        if let Some(pending) = bucket.as_ref()
+            && pending.started.elapsed() >= options.audit_coalesce_window
+            && let Some(finished) = bucket.take()
+        {
+            finished.flush(host, door, device);
+        }
+        let elapsed_idle = idle_since.elapsed();
+        if elapsed_idle >= options.keep_open_idle_timeout {
+            return NextHeader::IdleExit;
+        }
+        let until_idle = options.keep_open_idle_timeout.saturating_sub(elapsed_idle);
+        let until_flush = bucket
+            .as_ref()
+            .map(|b| {
+                options
+                    .audit_coalesce_window
+                    .saturating_sub(b.started.elapsed())
+            })
+            .unwrap_or(until_idle);
+        let mut wait = until_idle.min(until_flush);
+        if options.shutdown.is_some() {
+            wait = wait.min(Duration::from_millis(50));
+        }
+        match rx.recv_timeout(wait) {
+            Ok(Ok(Some(pair))) => return NextHeader::Header(pair),
+            Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => {
+                return NextHeader::Eof;
+            }
+            Ok(Err(err)) => return NextHeader::Error(err),
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -624,31 +832,33 @@ const GET_RECHECK_BYTES: u64 = 2 * 1024 * 1024;
 /// Time interval between mid-stream policy/path re-checks during a `get`.
 const GET_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
 
-enum NextHeader {
+pub(crate) enum NextHeader {
     Header((Header, Value)),
     Eof,
     IdleExit,
     Error(ErrorBody),
 }
 
-struct GetAuditBucket {
-    principal: String,
-    path: String,
-    requests: u64,
-    bytes: u64,
-    started: Instant,
+pub(crate) struct GetAuditBucket {
+    pub(crate) target: String,
+    pub(crate) principal: String,
+    pub(crate) path: String,
+    pub(crate) requests: u64,
+    pub(crate) bytes: u64,
+    pub(crate) started: Instant,
 }
 
 impl GetAuditBucket {
-    fn flush(self, host: &Host, door: Door, device: Option<&str>) {
+    pub(crate) fn flush(self, host: &Host, door: Door, device: Option<&str>) {
         let args = json!({
             "op": "get",
             "path": self.path,
             "requests": self.requests,
             "bytes_served": self.bytes,
         });
-        record(
+        record_for_target(
             host,
+            &self.target,
             Some(self.principal),
             door,
             device,
@@ -805,6 +1015,7 @@ fn serve_keep_open_gets_with_source<W: Write>(
                         prev.flush(host, door, device);
                     }
                     bucket = Some(GetAuditBucket {
+                        target: host.name.clone(),
                         principal,
                         path,
                         requests: 1,
@@ -865,16 +1076,22 @@ fn serve_keep_open_gets_with_source<W: Write>(
 }
 
 fn machine(error: ErrorBody, host: &Host) -> ErrorBody {
+    machine_or(error, &host.name)
+}
+
+pub(crate) fn machine_or(error: ErrorBody, fallback: &str) -> ErrorBody {
     if error.machine.is_some() {
         error
     } else {
-        error.with_machine(host.name.clone())
+        error.with_machine(fallback.to_owned())
     }
 }
 
 /// Reads and parses a subsequent header line on a persistent stream, returning `Ok(None)` on clean
 /// EOF.
-fn read_next_header<R: BufRead>(input: &mut R) -> Result<Option<(Header, Value)>, ErrorBody> {
+pub(crate) fn read_next_header<R: BufRead>(
+    input: &mut R,
+) -> Result<Option<(Header, Value)>, ErrorBody> {
     let mut line = Vec::new();
     let read = input
         .by_ref()
@@ -968,17 +1185,20 @@ fn parse_header_bytes(line: &[u8]) -> Result<(Header, Value), ErrorBody> {
             ErrorCode::InvalidArgs,
             format!("The stream's header does not name an operation it can do: {error}."),
         )
-        .with_hint("op is one of manifest, stat, get, put, pack, unpack and delete.")
+        .with_hint("op is one of manifest, stat, get, put, pack, unpack, delete and relay.")
     })?;
     let mut recorded = value;
     if let Value::Object(map) = &mut recorded {
         map.remove("as");
+        if let Some(Value::Object(req)) = map.get_mut("request") {
+            req.remove("as");
+        }
     }
     Ok((header, recorded))
 }
 
 /// What a node answers a header it cannot serve: what it speaks instead.
-fn unsupported(message: String) -> ErrorBody {
+pub(crate) fn unsupported(message: String) -> ErrorBody {
     ErrorBody::new(ErrorCode::Unsupported, message)
         .with_hint(
             "Update legion on whichever machine is older, so both speak the same stream protocol.",
@@ -1027,13 +1247,30 @@ fn record(
     started: Instant,
     result: &Result<(), ErrorBody>,
 ) {
+    record_for_target(
+        host, &host.name, principal, door, device, tool, args, started, result,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_for_target(
+    host: &Host,
+    target: &str,
+    principal: Option<String>,
+    door: Door,
+    device: Option<&str>,
+    tool: &str,
+    args: Value,
+    started: Instant,
+    result: &Result<(), ErrorBody>,
+) {
     let entry = AuditEntry {
         time: audit::now(),
         principal,
         door,
         device: device.map(str::to_owned),
         tool: tool.to_owned(),
-        target: host.name.clone(),
+        target: target.to_owned(),
         outcome: match result {
             Ok(()) => Outcome::Ok,
             Err(error) => Outcome::Error(error.code),
@@ -1106,10 +1343,14 @@ fn run<R: BufRead, W: Write>(
         Op::Pack { root, names } => pack(grant, &root, &names, output),
         Op::Unpack { root, entries } => unpack(grant, &root, &entries, input, output),
         Op::Delete { root, names } => delete(grant, &root, &names, output),
+        Op::Relay { .. } => Err(Failure::Reply(ErrorBody::new(
+            ErrorCode::Internal,
+            "Relay operations are dispatched before local execution.",
+        ))),
     }
 }
 
-fn line<W: Write, T: Serialize>(output: &mut W, value: &T) -> io::Result<()> {
+pub(crate) fn line<W: Write, T: Serialize>(output: &mut W, value: &T) -> io::Result<()> {
     serde_json::to_writer(&mut *output, value).map_err(io::Error::other)?;
     output.write_all(b"\n")
 }
@@ -1120,12 +1361,12 @@ fn reply<W: Write, T: Serialize>(output: &mut W, value: &T) -> Result<(), Failur
         .map_err(|error| Failure::Raw(gone(&error)))
 }
 
-fn reply_error<W: Write>(output: &mut W, error: &ErrorBody) -> io::Result<()> {
+pub(crate) fn reply_error<W: Write>(output: &mut W, error: &ErrorBody) -> io::Result<()> {
     line(output, &json!({ "error": error }))?;
     output.flush()
 }
 
-fn gone(error: &io::Error) -> ErrorBody {
+pub(crate) fn gone(error: &io::Error) -> ErrorBody {
     ErrorBody::new(
         ErrorCode::Failed,
         format!("The other end of the stream went away: {error}."),

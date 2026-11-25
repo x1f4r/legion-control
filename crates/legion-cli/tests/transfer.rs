@@ -397,7 +397,7 @@ fn twice(header: Value, mut command: Command) -> ExitCode {
 fn first_reply(stdout: &[u8]) -> Value {
     let mut lines = stdout.split(|b| *b == b'\n');
     let opening: Value = serde_json::from_slice(lines.next().unwrap()).unwrap();
-    assert_eq!(opening, json!({"protocol": 1}));
+    assert_eq!(opening["protocol"], json!(1));
     serde_json::from_slice(lines.next().unwrap()).unwrap()
 }
 

@@ -61,5 +61,11 @@ harness = false
 name = "setup"
 harness = false
 
+# Three-node relayed `legion stream` test bed (device -> tower -> studio, plus old-relay and
+# mid-transfer disconnect helpers).
+[[test]]
+name = "stream_relay"
+harness = false
+
 [lints]
 workspace = true
