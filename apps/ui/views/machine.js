@@ -273,7 +273,6 @@ function OverviewTab({
   technical,
   wide,
   wakePending,
-  onWake,
   onEnsureAwake,
   onStopJob,
   onUpdateMachineSys,
@@ -370,8 +369,6 @@ function OverviewTab({
                   onClick=${() => {
                     if (onEnsureAwake) {
                       onEnsureAwake(machine, { kind: 'wake', immediate: true, forgettable: true });
-                    } else if (onWake) {
-                      onWake(machine);
                     }
                   }}
                 >
@@ -1345,6 +1342,7 @@ function PowerTab({
   allowedSet,
   technical,
   wakePending,
+  onEnsureAwake,
   onWakeSent,
   onRequestConfirm,
   onRefreshFleet,
@@ -1453,8 +1451,13 @@ function PowerTab({
                     type="button"
                     class="btn small primary"
                     disabled=${!canWake || busy}
-                    onClick=${() =>
-                      runAction('power.wake', { machine: machine.name }, undefined, true)}
+                    onClick=${() => {
+                      if (onEnsureAwake) {
+                        onEnsureAwake(machine, { kind: 'wake', immediate: true, forgettable: true });
+                      } else {
+                        runAction('power.wake', { machine: machine.name }, undefined, true);
+                      }
+                    }}
                   >
                     Wake
                   </button>
@@ -1639,7 +1642,6 @@ export function MachineDetail({
   deviceNoun,
   thumbCache,
   wakePending,
-  onWakeMachine,
   onEnsureAwake,
   onWakeSent,
   onRequestConfirm,
@@ -1731,7 +1733,6 @@ export function MachineDetail({
               technical=${technical}
               wide=${wide}
               wakePending=${wakePending}
-              onWake=${onWakeMachine || (() => selectTab('power'))}
               onEnsureAwake=${onEnsureAwake}
               onStopJob=${handleStopJob}
               onUpdateMachineSys=${onUpdateMachineSys}
@@ -1783,7 +1784,7 @@ export function MachineDetail({
                     settings=${settings}
                     deviceNoun=${deviceNoun}
                     thumbCache=${thumbCache}
-                    onWakeMachine=${onWakeMachine}
+                    onEnsureAwake=${onEnsureAwake}
                   />
                 `
               : effectiveTab === 'activity'
@@ -1824,6 +1825,7 @@ export function MachineDetail({
                           allowedSet=${allowedSet}
                           technical=${technical}
                           wakePending=${wakePending}
+                          onEnsureAwake=${onEnsureAwake}
                           onWakeSent=${onWakeSent}
                           onRequestConfirm=${onRequestConfirm}
                           onRefreshFleet=${onRefreshFleet}

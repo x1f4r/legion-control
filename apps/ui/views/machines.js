@@ -61,7 +61,7 @@ function OnlineMachineCard({ machine, selected, showMetrics }) {
   `;
 }
 
-function OfflineMachineRow({ machine, selected, canWake, wakePending, onWake, onEnsureAwake }) {
+function OfflineMachineRow({ machine, selected, canWake, wakePending, onEnsureAwake }) {
   const isAsking = machine.status === 'asking' || machine.asking;
   const cls = [
     'machine',
@@ -103,8 +103,6 @@ function OfflineMachineRow({ machine, selected, canWake, wakePending, onWake, on
                 e.stopPropagation();
                 if (onEnsureAwake) {
                   onEnsureAwake(machine, { kind: 'wake', immediate: true, forgettable: true });
-                } else if (onWake) {
-                  onWake(machine);
                 }
               }}
             >
@@ -135,7 +133,6 @@ export function MachinesView({
   deviceNoun,
   thumbCache,
   wakePendingSet,
-  onWakeMachine,
   onEnsureAwake,
   onWakeSent,
   onRequestConfirm,
@@ -242,7 +239,6 @@ export function MachinesView({
                           machine=${m}
                           selected=${wide && m.name === selectedName}
                           canWake=${false}
-                          onWake=${onWakeMachine}
                         />
                       `,
                     )}
@@ -262,7 +258,6 @@ export function MachinesView({
                           selected=${wide && m.name === selectedName}
                           canWake=${canWake}
                           wakePending=${Boolean(wakePendingSet?.has(m.name))}
-                          onWake=${onWakeMachine}
                           onEnsureAwake=${onEnsureAwake}
                         />
                       `,
@@ -294,7 +289,6 @@ export function MachinesView({
                   deviceNoun=${deviceNoun}
                   thumbCache=${thumbCache}
                   wakePending=${Boolean(wakePendingSet?.has(selectedMachine.name))}
-                  onWakeMachine=${onWakeMachine}
                   onEnsureAwake=${onEnsureAwake}
                   onWakeSent=${onWakeSent}
                   onRequestConfirm=${onRequestConfirm}
@@ -325,7 +319,6 @@ export function MachinesView({
         deviceNoun=${deviceNoun}
         thumbCache=${thumbCache}
         wakePending=${Boolean(wakePendingSet?.has(selectedMachine.name))}
-        onWakeMachine=${onWakeMachine}
         onEnsureAwake=${onEnsureAwake}
         onWakeSent=${onWakeSent}
         onRequestConfirm=${onRequestConfirm}

@@ -42,7 +42,6 @@ import {
   ROOT_SECTIONS,
   routeHref,
 } from './lib/route.js';
-import { describePowerConfirm } from './lib/schema.js';
 import {
   applySettingsToRoot,
   detectDeviceNoun,
@@ -1347,34 +1346,6 @@ function App() {
     [wakeController],
   );
 
-  const onWakeMachine = useCallback(
-    (machine) => {
-      const args = { machine: machine.name };
-      const copy = describePowerConfirm('power.wake', machine.name, args);
-      const wakeRunner =
-        (snapshotRef.current?.machines || []).find((m) => m.reachable)?.name || nodeInfo?.node;
-      openConfirm({
-        title: copy.title,
-        summary: copy.summary,
-        targetName: machine.name,
-        args,
-        tool: 'power.wake',
-        effect: 'power',
-        confirmLabel: copy.confirmLabel,
-        canDryRun: true,
-        async onDryRun() {
-          return link.call('power.wake', { machine: machine.name, dry_run: true }, { on: wakeRunner });
-        },
-        async onConfirm() {
-          await link.call('power.wake', { machine: machine.name }, { on: wakeRunner });
-          markWakeSent(machine.name);
-          refreshFleet(nodeInfo, { forceOffline: true });
-        },
-      });
-    },
-    [link, openConfirm, markWakeSent, refreshFleet, nodeInfo],
-  );
-
   const filesActions = useMemo(
     () => ({
       pushHref(href) {
@@ -2300,7 +2271,6 @@ function App() {
                           deviceNoun=${deviceNoun}
                           thumbCache=${thumbCache}
                           wakePendingSet=${wakePendingSet}
-                          onWakeMachine=${onWakeMachine}
                           onEnsureAwake=${ensureAwakeMachine}
                           onWakeSent=${markWakeSent}
                           onRequestConfirm=${openConfirm}
@@ -2338,7 +2308,7 @@ function App() {
                             filesActions=${filesActions}
                             wakePendingSet=${wakePendingSet}
                             onRefreshFleet=${(opts) => refreshFleet(nodeInfo, opts)}
-                            onWakeMachine=${onWakeMachine}
+                            onEnsureAwake=${ensureAwakeMachine}
                             onRequestConfirm=${openConfirm}
                             onToast=${showToast}
                           />
