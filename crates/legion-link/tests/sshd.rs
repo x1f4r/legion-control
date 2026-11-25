@@ -521,6 +521,43 @@ async fn real_sshd_session_and_security_checks() {
             assert_eq!(bytes, &expected[off..off + 32_768]);
         }
 
+        // Twenty streams held open at once on a single SSH connection (far above the 8 active
+        // channel cap and sshd's MaxSessions = 10): unread streams park after ~2s to release their
+        // channel slots so the rest can open and active readers + RPC keep flowing, and every
+        // parked stream resumes cleanly with exact bytes.
+        let mut twenty = Vec::with_capacity(20);
+        for i in 0..20usize {
+            let off = (i * 65_536) as u64;
+            let len = 512 * 1024u64; // > initial 256 KiB window so reopening is exercised
+            let mut s = tokio::time::timeout(
+                Duration::from_secs(12),
+                link.open_content(&env.node, sample_file, off, Some(len)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("20-stream open #{i} timed out"))
+            .unwrap();
+            // Read only a small prefix on the first 4 streams; leave the rest completely unread.
+            let mut prefix = Vec::new();
+            if i < 4 {
+                prefix.resize(64 * 1024, 0);
+                s.read_exact(&mut prefix).await.unwrap();
+                assert_eq!(prefix, &expected[off as usize..off as usize + prefix.len()]);
+            }
+            twenty.push((off as usize, len as usize, prefix, s));
+        }
+        let hello_with_20 = tokio::time::timeout(Duration::from_secs(3), link.hello(&env.node))
+            .await
+            .expect("hello stalled with 20 open streams")
+            .unwrap();
+        assert_eq!(hello_with_20["node"], json!(env.node));
+        for (i, (off, len, mut buf, mut stream)) in twenty.into_iter().enumerate() {
+            tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("resuming stream #{i} of 20 timed out"))
+                .unwrap();
+            assert_eq!(buf, &expected[off..off + len], "stream #{i} byte mismatch");
+        }
+
         // Error cases: offset past EOF and unknown machine.
         let bad_off = link
             .open_content(&env.node, sample_file, expected.len() as u64 + 1, Some(10))
@@ -673,4 +710,86 @@ async fn real_sshd_session_and_security_checks() {
 
         pair_link.close().await;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires LEGION_LINK_SSHD... and LEGION_LINK_LONG_PAUSE=1 (sleeps 130s)"]
+async fn real_sshd_paused_stream_resumes_after_130s() {
+    if env::var("LEGION_LINK_LONG_PAUSE").ok().as_deref() != Some("1") {
+        eprintln!("skipping 130s pause test (set LEGION_LINK_LONG_PAUSE=1 to run)");
+        return;
+    }
+    let Some(env) = env_target() else {
+        panic!(
+            "Set LEGION_LINK_SSHD, LEGION_LINK_USER, LEGION_LINK_HOST_KEY, LEGION_LINK_KEY_FILE."
+        );
+    };
+    let sample_file = env
+        .sample_file
+        .as_deref()
+        .expect("LEGION_LINK_SAMPLE_FILE required");
+    let expected = fs::read(sample_file).unwrap();
+    assert!(expected.len() >= 4 * 1024 * 1024);
+
+    let target = SshTarget {
+        hosts: vec![env.host.clone()],
+        port: env.port,
+        user: env.user.clone(),
+        host_keys: vec![env.ed25519_host_key.clone()],
+    };
+    let link = Link::new(LinkConfig {
+        device_key: Some(env.key.to_openssh().unwrap()),
+        nodes: vec![NodeLink::ssh(&env.node, target, Some("phone".to_owned()))],
+        ..LinkConfig::default()
+    });
+
+    // Open three streams and advance them to three distinct positions before pausing 130 seconds
+    // (past remote `legion stream`'s 120s idle timeout):
+    //   1. Unread at offset 0.
+    //   2. Mid-window after reading 400 KiB.
+    //   3. Mid-file after reading 2 MiB.
+    let s_start = link
+        .open_content(&env.node, sample_file, 0, None)
+        .await
+        .unwrap();
+    let mut s_mid = link
+        .open_content(&env.node, sample_file, 0, None)
+        .await
+        .unwrap();
+    let mut mid_buf = vec![0u8; 400 * 1024];
+    s_mid.read_exact(&mut mid_buf).await.unwrap();
+    assert_eq!(mid_buf, &expected[..mid_buf.len()]);
+
+    let mut s_late = link
+        .open_content(&env.node, sample_file, 0, None)
+        .await
+        .unwrap();
+    let mut late_buf = vec![0u8; 2 * 1024 * 1024];
+    s_late.read_exact(&mut late_buf).await.unwrap();
+    assert_eq!(late_buf, &expected[..late_buf.len()]);
+
+    eprintln!("Pausing 3 streams for 130s (past remote 120s idle timeout)...");
+    tokio::time::sleep(Duration::from_secs(130)).await;
+
+    for (label, mut stream, mut got) in [
+        ("start (0 B)", s_start, Vec::with_capacity(expected.len())),
+        ("mid-window (400 KiB)", s_mid, mid_buf),
+        ("mid-file (2 MiB)", s_late, late_buf),
+    ] {
+        let t0 = std::time::Instant::now();
+        let mut rest = Vec::with_capacity(expected.len() - got.len());
+        tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut rest))
+            .await
+            .unwrap_or_else(|_| panic!("{label} timed out after 130s pause"))
+            .unwrap();
+        let elapsed = t0.elapsed();
+        got.extend_from_slice(&rest);
+        assert_eq!(got, expected, "{label} byte mismatch after 130s pause");
+        eprintln!(
+            "resumed {label} cleanly in {:.1} ms",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+
+    link.close().await;
 }

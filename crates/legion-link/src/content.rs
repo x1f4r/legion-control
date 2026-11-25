@@ -17,7 +17,8 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,7 @@ use legion_proto::{ErrorBody, ErrorCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
+use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::stderr::StderrTail;
@@ -45,10 +47,38 @@ const STREAM_BUF_BYTES: usize = 256 * 1024;
 /// If the reader takes longer than this before starting to drain a window, shrink the adaptive
 /// window size back toward `initial_bytes` to avoid over-buffering a paused consumer.
 const ADAPTIVE_STALL_THRESHOLD: Duration = Duration::from_millis(500);
-/// Initial backoff when retrying a refused channel on a fallback continuation window.
+/// Initial backoff when retrying a refused channel on a fallback continuation window or reopen.
 const CHANNEL_REFUSED_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
 /// Maximum backoff between retries after a channel refusal.
 const CHANNEL_REFUSED_MAX_BACKOFF: Duration = Duration::from_millis(500);
+/// Reader inactivity duration after which a `keep_open` stream parks its channel and frees its
+/// SSH slot while retaining already-buffered payload bytes.
+pub(crate) const DEFAULT_IDLE_PARK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum wait for forward progress from a live remote channel while the reader is actively
+/// polling (never armed while a stream is paused or parked).
+pub(crate) const DEFAULT_WINDOW_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum consecutive `{"busy": true}` lines tolerated before failing the stream.
+pub(crate) const DEFAULT_MAX_BUSY_LINES: usize = 32;
+/// Maximum consecutive unparked channel reopens without delivering payload bytes.
+const MAX_CONSECUTIVE_REOPENS: usize = 3;
+
+/// Internal tuning knobs for [`ContentStream`] parking, progress timeouts, and busy-line bounds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ContentStreamOptions {
+    pub idle_park_timeout: Duration,
+    pub progress_timeout: Duration,
+    pub max_busy_lines: usize,
+}
+
+impl Default for ContentStreamOptions {
+    fn default() -> Self {
+        Self {
+            idle_park_timeout: DEFAULT_IDLE_PARK_TIMEOUT,
+            progress_timeout: DEFAULT_WINDOW_PROGRESS_TIMEOUT,
+            max_busy_lines: DEFAULT_MAX_BUSY_LINES,
+        }
+    }
+}
 
 /// Type-erased async reader for a raw `legion stream` pipe.
 pub type BoxStreamRead = Box<dyn AsyncRead + Unpin + Send>;
@@ -81,10 +111,13 @@ pub struct RawStream {
     pub writer: BoxStreamWrite,
     /// Optional bounded stderr collector for diagnostics.
     pub stderr: Option<Arc<StderrTail>>,
-    /// Cancellation token that immediately closes this stream channel or child process when
+    /// Cancellation token that immediately aborts this stream channel or child process when
     /// cancelled.
     pub cancel: CancellationToken,
-    /// Optional RAII lifecycle guard dropped when the stream finishes or is dropped.
+    /// Optional park token that closes the underlying channel and releases its concurrency slot
+    /// while leaving already-buffered payload bytes readable until EOF.
+    pub park: Option<CancellationToken>,
+    /// Optional RAII lifecycle guard dropped when the stream parks, finishes, or is dropped.
     pub guard: Option<Box<dyn Send + Sync>>,
 }
 
@@ -121,6 +154,7 @@ struct OpenedChannel {
     reader: BufReader<BoxStreamRead>,
     writer: BoxStreamWrite,
     channel_cancel: CancellationToken,
+    park_cancel: Option<CancellationToken>,
     guard: Option<Box<dyn Send + Sync>>,
 }
 
@@ -175,6 +209,97 @@ struct PendingWindow {
     length: u64,
 }
 
+struct ReopenedKeepOpen {
+    opened: OpenedChannel,
+    validated: ValidatedGet,
+    cursor_offset: u64,
+}
+
+type ReopenFuture = Pin<Box<dyn Future<Output = Result<ReopenedKeepOpen, io::Error>> + Send>>;
+
+struct ParkActivity {
+    started: Instant,
+    last_poll_ms: AtomicU64,
+    waiting_for_remote: AtomicBool,
+    parked: AtomicBool,
+    watchdog_cancel: CancellationToken,
+    guard: Mutex<Option<Box<dyn Send + Sync>>>,
+}
+
+impl ParkActivity {
+    fn start(
+        park_cancel: Option<CancellationToken>,
+        guard: Option<Box<dyn Send + Sync>>,
+        idle_park_timeout: Duration,
+    ) -> Arc<Self> {
+        let activity = Arc::new(Self {
+            started: Instant::now(),
+            last_poll_ms: AtomicU64::new(0),
+            waiting_for_remote: AtomicBool::new(false),
+            parked: AtomicBool::new(false),
+            watchdog_cancel: CancellationToken::new(),
+            guard: Mutex::new(guard),
+        });
+        if let Some(park_token) = park_cancel
+            && !idle_park_timeout.is_zero()
+        {
+            let weak = Arc::downgrade(&activity);
+            let cancel = activity.watchdog_cancel.clone();
+            let threshold_ms = u64::try_from(idle_park_timeout.as_millis()).unwrap_or(u64::MAX);
+            let tick = (idle_park_timeout / 4)
+                .clamp(Duration::from_millis(15), Duration::from_millis(250));
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => break,
+                        () = tokio::time::sleep(tick) => {
+                            let Some(act) = weak.upgrade() else {
+                                break;
+                            };
+                            if act.waiting_for_remote.load(Ordering::Acquire) {
+                                continue;
+                            }
+                            let now_ms = u64::try_from(act.started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX);
+                            let last_ms = act.last_poll_ms.load(Ordering::Acquire);
+                            if now_ms.saturating_sub(last_ms) >= threshold_ms {
+                                act.parked.store(true, Ordering::Release);
+                                park_token.cancel();
+                                let _ = act
+                                    .guard
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .take();
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        activity
+    }
+
+    fn touch_ms(&self) {
+        let now_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_poll_ms.store(now_ms, Ordering::Release);
+    }
+
+    fn set_waiting(&self, waiting: bool) {
+        self.waiting_for_remote.store(waiting, Ordering::Release);
+    }
+
+    fn is_parked(&self) -> bool {
+        self.parked.load(Ordering::Acquire)
+    }
+
+    fn stop_and_release(&self) {
+        self.watchdog_cancel.cancel();
+        let _ = self.guard.lock().unwrap_or_else(|p| p.into_inner()).take();
+    }
+}
+
 enum KeepOpenPhase {
     Data {
         remaining: u64,
@@ -187,6 +312,7 @@ enum KeepOpenPhase {
         expected: PendingWindow,
         line: Vec<u8>,
     },
+    Reopening(ReopenFuture),
     ClosingEof,
     Finished,
 }
@@ -203,25 +329,144 @@ struct KeepOpenState {
     logical_end: u64,
     policy: WindowPolicy,
     current_window_bytes: u64,
+    opener: Option<Arc<dyn StreamOpener>>,
+    timeout: Duration,
+    options: ContentStreamOptions,
     machine: String,
     path: String,
     as_principal: Option<String>,
     expected_size: u64,
     expected_mtime: ContentTime,
     expected_file_id: Option<u64>,
+    stream_cancel: CancellationToken,
     channel_cancel: CancellationToken,
-    _guard: Option<Box<dyn Send + Sync>>,
+    activity: Arc<ParkActivity>,
+    consecutive_reopens: usize,
+    progress_deadline: Option<Pin<Box<Sleep>>>,
+    busy_count: usize,
 }
 
 impl Drop for KeepOpenState {
     fn drop(&mut self) {
-        if !matches!(self.phase, KeepOpenPhase::Finished) {
+        let was_parked = self.activity.is_parked();
+        self.activity.stop_and_release();
+        if !matches!(self.phase, KeepOpenPhase::Finished) && !was_parked {
             self.channel_cancel.cancel();
         }
     }
 }
 
+fn is_reopenable_io_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::WriteZero
+    )
+}
+
+fn poll_progress_deadline(
+    deadline: &mut Option<Pin<Box<Sleep>>>,
+    timeout: Duration,
+    machine: &str,
+    cx: &mut Context<'_>,
+) -> Result<(), io::Error> {
+    if timeout.is_zero() {
+        return Ok(());
+    }
+    let sleep = deadline.get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
+    if sleep.as_mut().poll(cx).is_ready() {
+        *deadline = None;
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "timed out waiting for content stream progress from {machine} after {}s",
+                timeout.as_secs_f64()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl KeepOpenState {
+    fn fail_stream(&mut self, total_remaining: &mut u64) {
+        *total_remaining = 0;
+        self.phase = KeepOpenPhase::Finished;
+        self.progress_deadline = None;
+        let was_parked = self.activity.is_parked();
+        self.activity.stop_and_release();
+        if !was_parked {
+            self.channel_cancel.cancel();
+        }
+    }
+
+    fn begin_reopen(
+        &mut self,
+        total_remaining: u64,
+        fallback_err: io::Error,
+    ) -> Result<(), io::Error> {
+        if self.stream_cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "content stream was cancelled",
+            ));
+        }
+        let Some(opener) = self.opener.clone() else {
+            return Err(fallback_err);
+        };
+        let was_parked = self.activity.is_parked();
+        if !was_parked {
+            if self.consecutive_reopens >= MAX_CONSECUTIVE_REOPENS {
+                return Err(fallback_err);
+            }
+            self.consecutive_reopens += 1;
+        }
+        self.activity.stop_and_release();
+        if !was_parked {
+            self.channel_cancel.cancel();
+        }
+        self.writer = None;
+        self.pending_write.clear();
+        self.pending_write_pos = 0;
+        self.need_flush = false;
+        self.in_flight = None;
+        self.progress_deadline = None;
+        self.busy_count = 0;
+
+        let cursor_offset = self.logical_end.saturating_sub(total_remaining);
+        let want = total_remaining.min(self.policy.initial_bytes);
+        let machine = self.machine.clone();
+        let path = self.path.clone();
+        let as_principal = self.as_principal.clone();
+        let timeout = self.timeout;
+        let max_busy_lines = self.options.max_busy_lines;
+        let expected_size = self.expected_size;
+        let expected_mtime = self.expected_mtime;
+        let expected_file_id = self.expected_file_id;
+        let cancel = self.stream_cancel.child_token();
+
+        self.phase = KeepOpenPhase::Reopening(Box::pin(async move {
+            reopen_keep_open_channel(
+                opener,
+                machine,
+                path,
+                cursor_offset,
+                want,
+                as_principal,
+                timeout,
+                max_busy_lines,
+                expected_size,
+                expected_mtime,
+                expected_file_id,
+                cancel,
+            )
+            .await
+        }));
+        Ok(())
+    }
+
     fn drive_pending_write(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         let Some(writer) = self.writer.as_mut() else {
             self.pending_write.clear();
@@ -261,7 +506,11 @@ impl KeepOpenState {
     }
 
     fn enqueue_next_window(&mut self, elapsed: Duration) {
-        if self.in_flight.is_some() || self.next_request_offset >= self.logical_end {
+        if self.in_flight.is_some()
+            || self.next_request_offset >= self.logical_end
+            || self.writer.is_none()
+            || self.activity.is_parked()
+        {
             return;
         }
         let next_size = if elapsed < ADAPTIVE_STALL_THRESHOLD {
@@ -300,6 +549,9 @@ struct PerChunkState {
     active: Option<ActiveChunk>,
     next_chunk: Option<NextChunkFuture>,
     continuation: Option<ChunkContinuation>,
+    machine: String,
+    progress_timeout: Duration,
+    progress_deadline: Option<Pin<Box<Sleep>>>,
 }
 
 enum StreamMode {
@@ -321,7 +573,6 @@ pub struct ContentStream {
     mtime: ContentTime,
     file_id: Option<u64>,
     cancel: CancellationToken,
-    _flight: Option<Box<dyn Send + Sync>>,
 }
 
 impl ContentStream {
@@ -359,10 +610,6 @@ impl ContentStream {
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
-
-    pub(crate) fn attach_flight(&mut self, guard: Box<dyn Send + Sync>) {
-        self._flight = Some(guard);
-    }
 }
 
 impl Drop for ContentStream {
@@ -396,15 +643,9 @@ impl AsyncRead for ContentStream {
 
         match &mut this.mode {
             StreamMode::KeepOpen(state) => poll_keep_open(state, &mut this.remaining, cx, buf),
-            StreamMode::PerChunk(state) => poll_per_chunk(
-                &mut state.active,
-                &mut state.next_chunk,
-                &mut state.continuation,
-                &mut this.remaining,
-                &this.cancel,
-                cx,
-                buf,
-            ),
+            StreamMode::PerChunk(state) => {
+                poll_per_chunk(state, &mut this.remaining, &this.cancel, cx, buf)
+            }
         }
     }
 }
@@ -415,40 +656,124 @@ fn poll_keep_open(
     cx: &mut Context<'_>,
     buf: &mut ReadBuf<'_>,
 ) -> Poll<io::Result<()>> {
+    state.activity.touch_ms();
+    state.activity.set_waiting(false);
+
     loop {
-        if let Err(err) = state.drive_pending_write(cx) {
-            *total_remaining = 0;
-            state.phase = KeepOpenPhase::Finished;
-            state.channel_cancel.cancel();
-            return Poll::Ready(Err(err));
+        if let KeepOpenPhase::Reopening(fut) = &mut state.phase {
+            match fut.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => {
+                    state.fail_stream(total_remaining);
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Ready(Ok(reopened)) => {
+                    let active_cancel = reopened.opened.channel_cancel.clone();
+                    let master = state.stream_cancel.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            biased;
+                            () = master.cancelled() => active_cancel.cancel(),
+                            () = active_cancel.cancelled() => {}
+                        }
+                    });
+                    state.reader = reopened.opened.reader;
+                    state.writer = Some(reopened.opened.writer);
+                    state.channel_cancel = reopened.opened.channel_cancel;
+                    state.activity = ParkActivity::start(
+                        reopened.opened.park_cancel,
+                        reopened.opened.guard,
+                        state.options.idle_park_timeout,
+                    );
+                    state.activity.touch_ms();
+                    state.next_request_offset = reopened
+                        .cursor_offset
+                        .saturating_add(reopened.validated.length);
+                    state.current_window_bytes = state.policy.initial_bytes;
+                    state.busy_count = 0;
+                    state.progress_deadline = None;
+                    state.phase = KeepOpenPhase::Data {
+                        remaining: reopened.validated.length,
+                        started: Instant::now(),
+                    };
+                    continue;
+                }
+            }
+        }
+
+        if !state.activity.is_parked()
+            && state.writer.is_some()
+            && let Err(err) = state.drive_pending_write(cx)
+        {
+            if is_reopenable_io_error(&err) && *total_remaining > 0 {
+                // Drop writer so any already-buffered bytes drain first, or reopen immediately if
+                // we have no buffered data phase left.
+                state.writer = None;
+                state.pending_write.clear();
+                state.pending_write_pos = 0;
+                state.need_flush = false;
+                state.in_flight = None;
+            } else {
+                state.fail_stream(total_remaining);
+                return Poll::Ready(Err(err));
+            }
         }
 
         match &mut state.phase {
             KeepOpenPhase::Finished => return Poll::Ready(Ok(())),
+            KeepOpenPhase::Reopening(_) => continue,
             KeepOpenPhase::Data { remaining, started } => {
                 if *remaining == 0 {
+                    if *total_remaining == 0 && state.activity.is_parked() {
+                        state.phase = KeepOpenPhase::Finished;
+                        state.activity.stop_and_release();
+                        return Poll::Ready(Ok(()));
+                    }
                     state.phase = KeepOpenPhase::DoneTrailer {
                         line: Vec::with_capacity(32),
                     };
                     continue;
                 }
                 match Pin::new(&mut state.reader).poll_fill_buf(cx) {
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        if let Err(err) = poll_progress_deadline(
+                            &mut state.progress_deadline,
+                            state.options.progress_timeout,
+                            &state.machine,
+                            cx,
+                        ) {
+                            state.fail_stream(total_remaining);
+                            return Poll::Ready(Err(err));
+                        }
+                        state.activity.set_waiting(true);
+                        return Poll::Pending;
+                    }
                     Poll::Ready(Err(err)) => {
-                        *total_remaining = 0;
-                        state.phase = KeepOpenPhase::Finished;
-                        state.channel_cancel.cancel();
-                        return Poll::Ready(Err(err));
+                        if is_reopenable_io_error(&err)
+                            && *total_remaining > 0
+                            && state.begin_reopen(*total_remaining, err).is_ok()
+                        {
+                            continue;
+                        }
+                        state.fail_stream(total_remaining);
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "content stream ended unexpectedly",
+                        )));
                     }
                     Poll::Ready(Ok([])) => {
                         let missing = *total_remaining;
-                        *total_remaining = 0;
-                        state.phase = KeepOpenPhase::Finished;
-                        state.channel_cancel.cancel();
-                        return Poll::Ready(Err(io::Error::new(
+                        let fallback = io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             format!("content stream ended with {missing} bytes remaining"),
-                        )));
+                        );
+                        match state.begin_reopen(missing, fallback) {
+                            Ok(()) => continue,
+                            Err(err) => {
+                                state.fail_stream(total_remaining);
+                                return Poll::Ready(Err(err));
+                            }
+                        }
                     }
                     Poll::Ready(Ok(avail)) => {
                         let max_read = usize::try_from(*remaining)
@@ -460,18 +785,29 @@ fn poll_keep_open(
                         *remaining -= take as u64;
                         *total_remaining -= take as u64;
                         let elapsed = started.elapsed();
+                        state.progress_deadline = None;
+                        state.consecutive_reopens = 0;
+                        state.activity.touch_ms();
 
                         // Pipeline at most one read-ahead window once the caller starts reading
                         // this window, keeping unread buffering strictly bounded.
-                        if state.in_flight.is_none()
+                        if !state.activity.is_parked()
+                            && state.writer.is_some()
+                            && state.in_flight.is_none()
                             && state.next_request_offset < state.logical_end
                         {
                             state.enqueue_next_window(elapsed);
                             if let Err(err) = state.drive_pending_write(cx) {
-                                *total_remaining = 0;
-                                state.phase = KeepOpenPhase::Finished;
-                                state.channel_cancel.cancel();
-                                return Poll::Ready(Err(err));
+                                if is_reopenable_io_error(&err) {
+                                    state.writer = None;
+                                    state.pending_write.clear();
+                                    state.pending_write_pos = 0;
+                                    state.need_flush = false;
+                                    state.in_flight = None;
+                                } else {
+                                    state.fail_stream(total_remaining);
+                                    return Poll::Ready(Err(err));
+                                }
                             }
                         }
                         return Poll::Ready(Ok(()));
@@ -480,29 +816,63 @@ fn poll_keep_open(
             }
             KeepOpenPhase::DoneTrailer { line } => {
                 match Pin::new(&mut state.reader).poll_fill_buf(cx) {
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        if let Err(err) = poll_progress_deadline(
+                            &mut state.progress_deadline,
+                            state.options.progress_timeout,
+                            &state.machine,
+                            cx,
+                        ) {
+                            state.fail_stream(total_remaining);
+                            return Poll::Ready(Err(err));
+                        }
+                        state.activity.set_waiting(true);
+                        return Poll::Pending;
+                    }
                     Poll::Ready(Err(err)) => {
-                        *total_remaining = 0;
-                        state.phase = KeepOpenPhase::Finished;
-                        state.channel_cancel.cancel();
+                        if is_reopenable_io_error(&err) && *total_remaining > 0 {
+                            match state.begin_reopen(*total_remaining, err) {
+                                Ok(()) => continue,
+                                Err(e) => {
+                                    state.fail_stream(total_remaining);
+                                    return Poll::Ready(Err(e));
+                                }
+                            }
+                        }
+                        state.fail_stream(total_remaining);
                         return Poll::Ready(Err(err));
                     }
                     Poll::Ready(Ok([])) => {
-                        *total_remaining = 0;
-                        state.phase = KeepOpenPhase::Finished;
-                        state.channel_cancel.cancel();
+                        if *total_remaining > 0 {
+                            let fallback = io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "content stream closed before done frame",
+                            );
+                            match state.begin_reopen(*total_remaining, fallback) {
+                                Ok(()) => continue,
+                                Err(err) => {
+                                    state.fail_stream(total_remaining);
+                                    return Poll::Ready(Err(err));
+                                }
+                            }
+                        }
+                        if state.activity.is_parked() {
+                            state.phase = KeepOpenPhase::Finished;
+                            state.activity.stop_and_release();
+                            return Poll::Ready(Ok(()));
+                        }
+                        state.fail_stream(total_remaining);
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "content stream closed before done frame",
                         )));
                     }
                     Poll::Ready(Ok(avail)) => {
+                        state.progress_deadline = None;
                         if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
                             let take = pos + 1;
                             if line.len() + take > MAX_DONE_LINE {
-                                *total_remaining = 0;
-                                state.phase = KeepOpenPhase::Finished;
-                                state.channel_cancel.cancel();
+                                state.fail_stream(total_remaining);
                                 return Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     "remote sent extra bytes past announced window length",
@@ -511,15 +881,18 @@ fn poll_keep_open(
                             line.extend_from_slice(&avail[..take]);
                             Pin::new(&mut state.reader).consume(take);
                             if !is_done_frame(line) {
-                                *total_remaining = 0;
-                                state.phase = KeepOpenPhase::Finished;
-                                state.channel_cancel.cancel();
+                                state.fail_stream(total_remaining);
                                 return Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     "remote sent an invalid done frame",
                                 )));
                             }
                             if *total_remaining == 0 {
+                                if state.activity.is_parked() {
+                                    state.phase = KeepOpenPhase::Finished;
+                                    state.activity.stop_and_release();
+                                    return Poll::Ready(Ok(()));
+                                }
                                 // Drop stdin cleanly so the remote `legion stream` flushes its
                                 // coalesced audit entry and exits with EOF.
                                 state.writer = None;
@@ -527,23 +900,42 @@ fn poll_keep_open(
                                 continue;
                             }
                             if state.in_flight.is_none() {
+                                if state.activity.is_parked() || state.writer.is_none() {
+                                    let fallback = io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "content stream channel closed before next window",
+                                    );
+                                    match state.begin_reopen(*total_remaining, fallback) {
+                                        Ok(()) => continue,
+                                        Err(err) => {
+                                            state.fail_stream(total_remaining);
+                                            return Poll::Ready(Err(err));
+                                        }
+                                    }
+                                }
                                 state.enqueue_next_window(Duration::ZERO);
                                 if let Err(err) = state.drive_pending_write(cx) {
-                                    *total_remaining = 0;
-                                    state.phase = KeepOpenPhase::Finished;
-                                    state.channel_cancel.cancel();
+                                    if is_reopenable_io_error(&err) {
+                                        match state.begin_reopen(*total_remaining, err) {
+                                            Ok(()) => continue,
+                                            Err(e) => {
+                                                state.fail_stream(total_remaining);
+                                                return Poll::Ready(Err(e));
+                                            }
+                                        }
+                                    }
+                                    state.fail_stream(total_remaining);
                                     return Poll::Ready(Err(err));
                                 }
                             }
                             let Some(expected) = state.in_flight.take() else {
-                                *total_remaining = 0;
-                                state.phase = KeepOpenPhase::Finished;
-                                state.channel_cancel.cancel();
+                                state.fail_stream(total_remaining);
                                 return Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::UnexpectedEof,
                                     "content stream ended before delivering all bytes",
                                 )));
                             };
+                            state.busy_count = 0;
                             state.phase = KeepOpenPhase::NextReady {
                                 expected,
                                 line: Vec::with_capacity(128),
@@ -552,9 +944,7 @@ fn poll_keep_open(
                         }
                         let n = avail.len();
                         if line.len() + n > MAX_DONE_LINE {
-                            *total_remaining = 0;
-                            state.phase = KeepOpenPhase::Finished;
-                            state.channel_cancel.cancel();
+                            state.fail_stream(total_remaining);
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "remote sent more bytes than announced",
@@ -568,29 +958,50 @@ fn poll_keep_open(
             KeepOpenPhase::NextReady { expected, line } => {
                 let expected = *expected;
                 match Pin::new(&mut state.reader).poll_fill_buf(cx) {
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        if let Err(err) = poll_progress_deadline(
+                            &mut state.progress_deadline,
+                            state.options.progress_timeout,
+                            &state.machine,
+                            cx,
+                        ) {
+                            state.fail_stream(total_remaining);
+                            return Poll::Ready(Err(err));
+                        }
+                        state.activity.set_waiting(true);
+                        return Poll::Pending;
+                    }
                     Poll::Ready(Err(err)) => {
-                        *total_remaining = 0;
-                        state.phase = KeepOpenPhase::Finished;
-                        state.channel_cancel.cancel();
+                        if is_reopenable_io_error(&err) && *total_remaining > 0 {
+                            match state.begin_reopen(*total_remaining, err) {
+                                Ok(()) => continue,
+                                Err(e) => {
+                                    state.fail_stream(total_remaining);
+                                    return Poll::Ready(Err(e));
+                                }
+                            }
+                        }
+                        state.fail_stream(total_remaining);
                         return Poll::Ready(Err(err));
                     }
                     Poll::Ready(Ok([])) => {
-                        *total_remaining = 0;
-                        state.phase = KeepOpenPhase::Finished;
-                        state.channel_cancel.cancel();
-                        return Poll::Ready(Err(io::Error::new(
+                        let fallback = io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "content stream closed before answering next window",
-                        )));
+                        );
+                        match state.begin_reopen(*total_remaining, fallback) {
+                            Ok(()) => continue,
+                            Err(err) => {
+                                state.fail_stream(total_remaining);
+                                return Poll::Ready(Err(err));
+                            }
+                        }
                     }
                     Poll::Ready(Ok(avail)) => {
                         if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
                             let take = pos + 1;
                             if line.len() + take > MAX_REPLY_LINE {
-                                *total_remaining = 0;
-                                state.phase = KeepOpenPhase::Finished;
-                                state.channel_cancel.cancel();
+                                state.fail_stream(total_remaining);
                                 return Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     "remote sent an oversized stream reply line",
@@ -601,25 +1012,31 @@ fn poll_keep_open(
 
                             let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(line)
                             else {
-                                *total_remaining = 0;
-                                state.phase = KeepOpenPhase::Finished;
-                                state.channel_cancel.cancel();
+                                state.fail_stream(total_remaining);
                                 return Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     "remote answered stream get with non-JSON output",
                                 )));
                             };
                             if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
+                                state.busy_count += 1;
+                                if state.busy_count > state.options.max_busy_lines {
+                                    let machine = state.machine.clone();
+                                    state.fail_stream(total_remaining);
+                                    return Poll::Ready(Err(io::Error::other(format!(
+                                        "{machine} sent too many consecutive busy responses while streaming"
+                                    ))));
+                                }
                                 line.clear();
                                 continue;
                             }
+                            state.busy_count = 0;
+                            state.progress_deadline = None;
                             if let Some(error_val) = fields.get("error")
                                 && let Ok(body) =
                                     serde_json::from_value::<ErrorBody>(error_val.clone())
                             {
-                                *total_remaining = 0;
-                                state.phase = KeepOpenPhase::Finished;
-                                state.channel_cancel.cancel();
+                                state.fail_stream(total_remaining);
                                 let kind = match body.code {
                                     ErrorCode::Denied => io::ErrorKind::PermissionDenied,
                                     ErrorCode::NotFound => io::ErrorKind::NotFound,
@@ -632,9 +1049,7 @@ fn poll_keep_open(
                             let Ok(ready) =
                                 serde_json::from_value::<GetReadyReply>(Value::Object(fields))
                             else {
-                                *total_remaining = 0;
-                                state.phase = KeepOpenPhase::Finished;
-                                state.channel_cancel.cancel();
+                                state.fail_stream(total_remaining);
                                 return Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     "remote answered stream get with an unexpected line",
@@ -648,9 +1063,7 @@ fn poll_keep_open(
                             ) {
                                 Ok(v) => v,
                                 Err(err) => {
-                                    *total_remaining = 0;
-                                    state.phase = KeepOpenPhase::Finished;
-                                    state.channel_cancel.cancel();
+                                    state.fail_stream(total_remaining);
                                     return Poll::Ready(Err(io::Error::new(
                                         io::ErrorKind::InvalidData,
                                         err.message,
@@ -661,9 +1074,7 @@ fn poll_keep_open(
                                 || validated.mtime != state.expected_mtime
                                 || validated.file_id != state.expected_file_id
                             {
-                                *total_remaining = 0;
-                                state.phase = KeepOpenPhase::Finished;
-                                state.channel_cancel.cancel();
+                                state.fail_stream(total_remaining);
                                 return Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     "file changed on remote node while streaming",
@@ -677,9 +1088,7 @@ fn poll_keep_open(
                         }
                         let n = avail.len();
                         if line.len() + n > MAX_REPLY_LINE {
-                            *total_remaining = 0;
-                            state.phase = KeepOpenPhase::Finished;
-                            state.channel_cancel.cancel();
+                            state.fail_stream(total_remaining);
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "remote sent an oversized stream reply line",
@@ -691,21 +1100,34 @@ fn poll_keep_open(
                 }
             }
             KeepOpenPhase::ClosingEof => match Pin::new(&mut state.reader).poll_fill_buf(cx) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    if let Err(err) = poll_progress_deadline(
+                        &mut state.progress_deadline,
+                        state.options.progress_timeout,
+                        &state.machine,
+                        cx,
+                    ) {
+                        state.fail_stream(total_remaining);
+                        return Poll::Ready(Err(err));
+                    }
+                    state.activity.set_waiting(true);
+                    return Poll::Pending;
+                }
                 Poll::Ready(Err(err)) => {
-                    state.phase = KeepOpenPhase::Finished;
+                    state.fail_stream(total_remaining);
                     return Poll::Ready(Err(err));
                 }
                 Poll::Ready(Ok(extra)) if !extra.is_empty() => {
-                    state.phase = KeepOpenPhase::Finished;
-                    state.channel_cancel.cancel();
+                    state.fail_stream(total_remaining);
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "remote sent more bytes than announced",
                     )));
                 }
                 Poll::Ready(Ok(_)) => {
+                    state.progress_deadline = None;
                     state.phase = KeepOpenPhase::Finished;
+                    state.activity.stop_and_release();
                     return Poll::Ready(Ok(()));
                 }
             },
@@ -714,25 +1136,40 @@ fn poll_keep_open(
 }
 
 fn poll_per_chunk(
-    active_slot: &mut Option<ActiveChunk>,
-    next_chunk: &mut Option<NextChunkFuture>,
-    continuation: &mut Option<ChunkContinuation>,
+    state: &mut PerChunkState,
     total_remaining: &mut u64,
     cancel: &CancellationToken,
     cx: &mut Context<'_>,
     buf: &mut ReadBuf<'_>,
 ) -> Poll<io::Result<()>> {
+    let active_slot = &mut state.active;
+    let next_chunk = &mut state.next_chunk;
+    let continuation = &mut state.continuation;
+    let machine = &state.machine;
+    let progress_timeout = state.progress_timeout;
+    let progress_deadline = &mut state.progress_deadline;
     loop {
         if let Some(active) = active_slot.as_mut() {
             if active.chunk_remaining > 0 {
                 match Pin::new(&mut active.reader).poll_fill_buf(cx) {
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        if let Err(err) =
+                            poll_progress_deadline(progress_deadline, progress_timeout, machine, cx)
+                        {
+                            *total_remaining = 0;
+                            *active_slot = None;
+                            return Poll::Ready(Err(err));
+                        }
+                        return Poll::Pending;
+                    }
                     Poll::Ready(Err(err)) => {
+                        *progress_deadline = None;
                         *total_remaining = 0;
                         *active_slot = None;
                         return Poll::Ready(Err(err));
                     }
                     Poll::Ready(Ok([])) => {
+                        *progress_deadline = None;
                         let missing = *total_remaining;
                         *total_remaining = 0;
                         *active_slot = None;
@@ -742,6 +1179,7 @@ fn poll_per_chunk(
                         )));
                     }
                     Poll::Ready(Ok(avail)) => {
+                        *progress_deadline = None;
                         let max_read = usize::try_from(active.chunk_remaining)
                             .unwrap_or(usize::MAX)
                             .min(buf.remaining());
@@ -755,13 +1193,24 @@ fn poll_per_chunk(
                 }
             } else if !active.checked_eof {
                 match Pin::new(&mut active.reader).poll_fill_buf(cx) {
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        if let Err(err) =
+                            poll_progress_deadline(progress_deadline, progress_timeout, machine, cx)
+                        {
+                            *total_remaining = 0;
+                            *active_slot = None;
+                            return Poll::Ready(Err(err));
+                        }
+                        return Poll::Pending;
+                    }
                     Poll::Ready(Err(err)) => {
+                        *progress_deadline = None;
                         *total_remaining = 0;
                         *active_slot = None;
                         return Poll::Ready(Err(err));
                     }
                     Poll::Ready(Ok(extra)) if !extra.is_empty() => {
+                        *progress_deadline = None;
                         active.chunk_cancel.cancel();
                         *total_remaining = 0;
                         *active_slot = None;
@@ -771,6 +1220,7 @@ fn poll_per_chunk(
                         )));
                     }
                     Poll::Ready(Ok(_)) => {
+                        *progress_deadline = None;
                         active.checked_eof = true;
                         *active_slot = None;
                         if *total_remaining == 0 {
@@ -990,6 +1440,34 @@ pub(crate) async fn handshake_get(
     timeout: Duration,
     cancel: CancellationToken,
 ) -> Result<ContentStream, ErrorBody> {
+    handshake_get_with_options(
+        stream,
+        opener,
+        machine,
+        path,
+        offset,
+        length,
+        as_principal,
+        timeout,
+        cancel,
+        ContentStreamOptions::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handshake_get_with_options(
+    stream: RawStream,
+    opener: Option<Arc<dyn StreamOpener>>,
+    machine: &str,
+    path: &str,
+    offset: u64,
+    length: Option<u64>,
+    as_principal: Option<&str>,
+    timeout: Duration,
+    cancel: CancellationToken,
+    options: ContentStreamOptions,
+) -> Result<ContentStream, ErrorBody> {
     let policy = opener
         .as_ref()
         .and_then(|o| o.window_policy())
@@ -1009,6 +1487,7 @@ pub(crate) async fn handshake_get(
         as_principal,
         request_keep_open,
         timeout,
+        options.max_busy_lines,
         cancel,
     )
     .await?;
@@ -1033,6 +1512,8 @@ pub(crate) async fn handshake_get(
     {
         let logical_end = validated.offset.saturating_add(total_length);
         let next_request_offset = validated.offset.saturating_add(validated.length);
+        let activity =
+            ParkActivity::start(opened.park_cancel, opened.guard, options.idle_park_timeout);
         StreamMode::KeepOpen(Box::new(KeepOpenState {
             reader: opened.reader,
             writer: Some(opened.writer),
@@ -1048,14 +1529,21 @@ pub(crate) async fn handshake_get(
             logical_end,
             policy,
             current_window_bytes: policy.initial_bytes,
+            opener,
+            timeout,
+            options,
             machine: machine.to_owned(),
             path: path.to_owned(),
             as_principal: as_principal.map(str::to_owned),
             expected_size: validated.size,
             expected_mtime: validated.mtime,
             expected_file_id: validated.file_id,
+            stream_cancel: stream_cancel.clone(),
             channel_cancel: opened.channel_cancel,
-            _guard: opened.guard,
+            activity,
+            consecutive_reopens: 0,
+            progress_deadline: None,
+            busy_count: 0,
         }))
     } else {
         let chunk = ActiveChunk::from_opened(opened, validated.length);
@@ -1078,6 +1566,9 @@ pub(crate) async fn handshake_get(
             active: Some(chunk),
             next_chunk: None,
             continuation,
+            machine: machine.to_owned(),
+            progress_timeout: options.progress_timeout,
+            progress_deadline: None,
         }))
     };
 
@@ -1090,7 +1581,99 @@ pub(crate) async fn handshake_get(
         mtime: validated.mtime,
         file_id: validated.file_id,
         cancel: stream_cancel,
-        _flight: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reopen_keep_open_channel(
+    opener: Arc<dyn StreamOpener>,
+    machine: String,
+    path: String,
+    cursor_offset: u64,
+    length: u64,
+    as_principal: Option<String>,
+    timeout: Duration,
+    max_busy_lines: usize,
+    expected_size: u64,
+    expected_mtime: ContentTime,
+    expected_file_id: Option<u64>,
+    cancel: CancellationToken,
+) -> Result<ReopenedKeepOpen, io::Error> {
+    let deadline = Instant::now() + timeout;
+    let mut backoff = CHANNEL_REFUSED_INITIAL_BACKOFF;
+    let raw = loop {
+        match opener.open_stream(cancel.clone()).await {
+            Ok(raw) => break raw,
+            Err(StreamOpenError::ChannelRefused(body)) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::other(body.message));
+                }
+                let delay = backoff.min(remaining);
+                backoff = backoff.saturating_mul(2).min(CHANNEL_REFUSED_MAX_BACKOFF);
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "content stream was cancelled",
+                        ));
+                    }
+                    () = tokio::time::sleep(delay) => {}
+                }
+            }
+            Err(StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body)) => {
+                let kind = match body.code {
+                    ErrorCode::Denied => io::ErrorKind::PermissionDenied,
+                    ErrorCode::NotFound => io::ErrorKind::NotFound,
+                    ErrorCode::Timeout => io::ErrorKind::TimedOut,
+                    ErrorCode::Cancelled => io::ErrorKind::Interrupted,
+                    _ => io::ErrorKind::Other,
+                };
+                return Err(io::Error::new(kind, body.message));
+            }
+        }
+    };
+
+    let (opened, validated) = open_one_chunk(
+        raw,
+        &machine,
+        &path,
+        cursor_offset,
+        Some(length),
+        as_principal.as_deref(),
+        true,
+        timeout,
+        max_busy_lines,
+        cancel,
+    )
+    .await
+    .map_err(|err| {
+        let kind = match err.code {
+            ErrorCode::Denied => io::ErrorKind::PermissionDenied,
+            ErrorCode::NotFound => io::ErrorKind::NotFound,
+            ErrorCode::Timeout => io::ErrorKind::TimedOut,
+            ErrorCode::Cancelled => io::ErrorKind::Interrupted,
+            _ => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, err.message)
+    })?;
+
+    if validated.size != expected_size
+        || validated.mtime != expected_mtime
+        || validated.file_id != expected_file_id
+    {
+        opened.channel_cancel.cancel();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file changed on remote node while streaming",
+        ));
+    }
+
+    Ok(ReopenedKeepOpen {
+        opened,
+        validated,
+        cursor_offset,
     })
 }
 
@@ -1145,6 +1728,7 @@ async fn open_continuation_chunk(
         as_principal.as_deref(),
         false,
         timeout,
+        DEFAULT_MAX_BUSY_LINES,
         cancel,
     )
     .await
@@ -1172,6 +1756,7 @@ async fn open_one_chunk(
     as_principal: Option<&str>,
     keep_open: bool,
     timeout: Duration,
+    max_busy_lines: usize,
     cancel: CancellationToken,
 ) -> Result<(OpenedChannel, ValidatedGet), ErrorBody> {
     let RawStream {
@@ -1179,6 +1764,7 @@ async fn open_one_chunk(
         mut writer,
         stderr,
         cancel: chunk_cancel,
+        park: park_cancel,
         guard,
     } = stream;
 
@@ -1194,7 +1780,7 @@ async fn open_one_chunk(
             .flush()
             .await
             .map_err(|err| stream_io_error(machine, "flushing stream header", &err, &stderr))?;
-        read_get_ready(&mut buf_reader, machine, &stderr).await
+        read_get_ready(&mut buf_reader, machine, &stderr, max_busy_lines).await
     };
 
     let ready = tokio::select! {
@@ -1247,6 +1833,7 @@ async fn open_one_chunk(
             reader: buf_reader,
             writer,
             channel_cancel: chunk_cancel,
+            park_cancel,
             guard,
         },
         validated,
@@ -1257,10 +1844,12 @@ async fn read_get_ready<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     machine: &str,
     stderr: &Option<Arc<StderrTail>>,
+    max_busy_lines: usize,
 ) -> Result<GetReadyReply, ErrorBody> {
     let mut greeted = false;
     let mut noise_lines = 0usize;
     let mut noise_bytes = 0usize;
+    let mut busy_lines = 0usize;
     let mut line = Vec::new();
 
     loop {
@@ -1300,6 +1889,17 @@ async fn read_get_ready<R: AsyncRead + Unpin>(
                     continue;
                 }
             } else if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
+                busy_lines += 1;
+                if busy_lines > max_busy_lines {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Busy,
+                        format!(
+                            "{machine} sent too many consecutive busy responses while opening content stream."
+                        ),
+                    )
+                    .with_hint("Retry once the remote node is less busy.")
+                    .with_machine(machine));
+                }
                 continue;
             } else {
                 if let Some(error_val) = fields.get("error")
@@ -1574,6 +2174,7 @@ mod tests {
                     writer: Box::new(client_out),
                     stderr: None,
                     cancel: stream_cancel,
+                    park: None,
                     guard: None,
                 })
             })
@@ -1943,6 +2544,7 @@ mod tests {
                         writer: Box::new(client_out),
                         stderr: None,
                         cancel: stream_cancel,
+                        park: None,
                         guard: None,
                     })
                 })
@@ -2059,6 +2661,7 @@ mod tests {
                         writer: Box::new(client_out),
                         stderr: None,
                         cancel: CancellationToken::new(),
+                        park: None,
                         guard: None,
                     })
                 })
@@ -2082,5 +2685,460 @@ mod tests {
         assert_eq!(out, payload);
         // 3 windows (16 KiB + 16 KiB + 8 KiB) + 2 refused retries = 5 attempts.
         assert_eq!(attempts.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn keep_open_parks_idle_channel_frees_slot_reopens_and_detects_change() {
+        struct ParkSlotGuard(Arc<AtomicUsize>);
+        impl Drop for ParkSlotGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        struct ParkableOpener {
+            payload: Arc<Vec<u8>>,
+            mtime_secs: Arc<std::sync::atomic::AtomicI64>,
+            active_slots: Arc<AtomicUsize>,
+            opened: Arc<AtomicUsize>,
+        }
+
+        impl StreamOpener for ParkableOpener {
+            fn window_policy(&self) -> Option<WindowPolicy> {
+                Some(WindowPolicy {
+                    initial_bytes: 16 * 1024,
+                    max_bytes: 32 * 1024,
+                })
+            }
+
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let payload = Arc::clone(&self.payload);
+                let mtime_secs = Arc::clone(&self.mtime_secs);
+                let active_slots = Arc::clone(&self.active_slots);
+                let opened = Arc::clone(&self.opened);
+                Box::pin(async move {
+                    opened.fetch_add(1, Ordering::SeqCst);
+                    active_slots.fetch_add(1, Ordering::SeqCst);
+                    let guard = Box::new(ParkSlotGuard(Arc::clone(&active_slots)));
+
+                    let (client_in, mut server_out) = tokio::io::duplex(128 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let channel_cancel = CancellationToken::new();
+                    let park_cancel = CancellationToken::new();
+                    let rx_cancel = channel_cancel.clone();
+                    let rx_park = park_cancel.clone();
+
+                    tokio::spawn(async move {
+                        let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            let n = tokio::select! {
+                                biased;
+                                () = rx_cancel.cancelled() => break,
+                                () = rx_park.cancelled() => break,
+                                res = reader.read_line(&mut line) => res.unwrap_or(0),
+                            };
+                            if n == 0 {
+                                break;
+                            }
+                            let req: Value = serde_json::from_str(&line).unwrap();
+                            let offset = req["offset"].as_u64().unwrap() as usize;
+                            let len = req["length"].as_u64().unwrap() as usize;
+                            let actual = len.min(payload.len() - offset);
+                            let ready = json!({
+                                "size": payload.len(),
+                                "offset": offset,
+                                "length": actual,
+                                "mtime": { "secs": mtime_secs.load(Ordering::SeqCst), "nanos": 0u32 },
+                                "file_id": 77u64,
+                                "keep_open": true,
+                            });
+                            if server_out
+                                .write_all(format!("{ready}\n").as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if server_out
+                                .write_all(&payload[offset..offset + actual])
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if server_out.write_all(b"{\"done\":true}\n").await.is_err() {
+                                break;
+                            }
+                            let _ = server_out.flush().await;
+                        }
+                        let _ = server_out.shutdown().await;
+                    });
+
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: channel_cancel,
+                        park: Some(park_cancel),
+                        guard: Some(guard),
+                    })
+                })
+            }
+        }
+
+        let payload: Vec<u8> = (0..96 * 1024usize).map(|i| (i % 239) as u8).collect();
+        let mtime_secs = Arc::new(std::sync::atomic::AtomicI64::new(1_700_000_123));
+        let active_slots = Arc::new(AtomicUsize::new(0));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opener: Arc<dyn StreamOpener> = Arc::new(ParkableOpener {
+            payload: Arc::new(payload.clone()),
+            mtime_secs: Arc::clone(&mtime_secs),
+            active_slots: Arc::clone(&active_slots),
+            opened: Arc::clone(&opened),
+        });
+
+        let opts = ContentStreamOptions {
+            idle_park_timeout: Duration::from_millis(60),
+            progress_timeout: Duration::from_millis(120),
+            max_busy_lines: 4,
+        };
+        let raw = opener.open_stream(CancellationToken::new()).await.unwrap();
+        let mut stream = handshake_get_with_options(
+            raw,
+            Some(Arc::clone(&opener)),
+            "tower",
+            "/movie.webm",
+            0,
+            None,
+            None,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+            opts,
+        )
+        .await
+        .unwrap();
+        assert_eq!(active_slots.load(Ordering::SeqCst), 1);
+
+        // Read 4 KiB, then pause for 200ms (> idle_park_timeout 60ms AND > progress_timeout 120ms):
+        // the channel must park, free its slot, keep buffered bytes, and NEVER fire progress timeout.
+        let mut head = [0u8; 4096];
+        stream.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head[..], &payload[..4096]);
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        assert_eq!(
+            active_slots.load(Ordering::SeqCst),
+            0,
+            "idle parked stream must release its channel slot"
+        );
+
+        // Resume: buffered bytes drain first, then the stream transparently reopens at exact offset.
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).await.unwrap();
+        let mut full = head.to_vec();
+        full.extend_from_slice(&rest);
+        assert_eq!(full, payload);
+        assert!(
+            opened.load(Ordering::SeqCst) >= 2,
+            "expected transparent reopen after parking"
+        );
+        assert_eq!(active_slots.load(Ordering::SeqCst), 0);
+
+        // Now verify file-changed detection on reopen: open, park, mutate mtime, resume -> error.
+        let raw2 = opener.open_stream(CancellationToken::new()).await.unwrap();
+        let mut stream2 = handshake_get_with_options(
+            raw2,
+            Some(Arc::clone(&opener)),
+            "tower",
+            "/movie.webm",
+            0,
+            None,
+            None,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+            opts,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        assert_eq!(active_slots.load(Ordering::SeqCst), 0);
+        mtime_secs.store(1_700_000_999, Ordering::SeqCst);
+
+        let mut sink = Vec::new();
+        let err = stream2.read_to_end(&mut sink).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("file changed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn keep_open_reopens_transparently_after_remote_idle_close() {
+        struct OneWindowThenCloseOpener {
+            payload: Arc<Vec<u8>>,
+            opened: Arc<AtomicUsize>,
+        }
+
+        impl StreamOpener for OneWindowThenCloseOpener {
+            fn window_policy(&self) -> Option<WindowPolicy> {
+                Some(WindowPolicy {
+                    initial_bytes: 16 * 1024,
+                    max_bytes: 16 * 1024,
+                })
+            }
+
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let payload = Arc::clone(&self.payload);
+                let opened = Arc::clone(&self.opened);
+                Box::pin(async move {
+                    opened.fetch_add(1, Ordering::SeqCst);
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    tokio::spawn(async move {
+                        let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let offset = req["offset"].as_u64().unwrap() as usize;
+                        let len = req["length"].as_u64().unwrap() as usize;
+                        let actual = len.min(payload.len() - offset);
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": actual,
+                            "mtime": { "secs": 1_700_000_123i64, "nanos": 0u32 },
+                            "file_id": 88u64,
+                            "keep_open": true,
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        let _ = server_out
+                            .write_all(&payload[offset..offset + actual])
+                            .await;
+                        let _ = server_out.write_all(b"{\"done\":true}\n").await;
+                        // Simulate remote idle-timeout exit right after one window.
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: CancellationToken::new(),
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        let payload: Vec<u8> = (0..48 * 1024usize).map(|i| (i % 197) as u8).collect();
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opener: Arc<dyn StreamOpener> = Arc::new(OneWindowThenCloseOpener {
+            payload: Arc::new(payload.clone()),
+            opened: Arc::clone(&opened),
+        });
+        let raw = opener.open_stream(CancellationToken::new()).await.unwrap();
+        let mut stream = handshake_get_with_options(
+            raw,
+            Some(opener),
+            "tower",
+            "/clip.webm",
+            0,
+            None,
+            None,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+            ContentStreamOptions {
+                idle_park_timeout: Duration::from_secs(60),
+                progress_timeout: Duration::from_secs(5),
+                max_busy_lines: 4,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, payload);
+        assert_eq!(opened.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn progress_timeout_and_busy_line_cap_stop_misbehaving_remote() {
+        let opts = ContentStreamOptions {
+            idle_park_timeout: Duration::from_secs(60),
+            progress_timeout: Duration::from_millis(100),
+            max_busy_lines: 3,
+        };
+
+        // 1. Mid-window stall triggers progress timeout.
+        {
+            let (client_in, mut server_out) = tokio::io::duplex(32 * 1024);
+            let (server_in, client_out) = tokio::io::duplex(8 * 1024);
+            tokio::spawn(async move {
+                let mut r = BufReader::new(server_in);
+                let mut line = String::new();
+                let _ = r.read_line(&mut line).await;
+                let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                let _ = server_out
+                    .write_all(b"{\"size\":1024,\"offset\":0,\"length\":1024,\"mtime\":{\"secs\":10,\"nanos\":0},\"keep_open\":true}\n")
+                    .await;
+                let _ = server_out.write_all(&[0xAA; 128]).await;
+                let _ = server_out.flush().await;
+                // Stall forever without sending remaining bytes.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+            let raw = RawStream {
+                reader: Box::new(client_in),
+                writer: Box::new(client_out),
+                stderr: None,
+                cancel: CancellationToken::new(),
+                park: None,
+                guard: None,
+            };
+            let mut stream = handshake_get_with_options(
+                raw,
+                None,
+                "tower",
+                "/stall.bin",
+                0,
+                None,
+                None,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+                opts,
+            )
+            .await
+            .unwrap();
+            let mut out = Vec::new();
+            let err = stream.read_to_end(&mut out).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+            assert_eq!(out.len(), 128);
+        }
+
+        // 2. Infinite {"busy": true} on initial handshake fails with ErrorCode::Busy.
+        {
+            let (client_in, mut server_out) = tokio::io::duplex(32 * 1024);
+            let (server_in, client_out) = tokio::io::duplex(8 * 1024);
+            tokio::spawn(async move {
+                let mut r = BufReader::new(server_in);
+                let mut line = String::new();
+                let _ = r.read_line(&mut line).await;
+                let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                for _ in 0..10 {
+                    if server_out.write_all(b"{\"busy\":true}\n").await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let raw = RawStream {
+                reader: Box::new(client_in),
+                writer: Box::new(client_out),
+                stderr: None,
+                cancel: CancellationToken::new(),
+                park: None,
+                guard: None,
+            };
+            let err = handshake_get_with_options(
+                raw,
+                None,
+                "tower",
+                "/busy.bin",
+                0,
+                None,
+                None,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+                opts,
+            )
+            .await
+            .err()
+            .expect("expected busy cap error");
+            assert_eq!(err.code, ErrorCode::Busy, "{err}");
+        }
+
+        // 3. Infinite {"busy": true} on a subsequent keep_open window fails cleanly.
+        {
+            struct StaticPolicyOpener;
+            impl StreamOpener for StaticPolicyOpener {
+                fn window_policy(&self) -> Option<WindowPolicy> {
+                    Some(WindowPolicy {
+                        initial_bytes: 128,
+                        max_bytes: 128,
+                    })
+                }
+                fn open_stream(
+                    &self,
+                    _cancel: CancellationToken,
+                ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+                {
+                    Box::pin(async {
+                        Err(StreamOpenError::Failed(ErrorBody::new(
+                            ErrorCode::Failed,
+                            "unused",
+                        )))
+                    })
+                }
+            }
+
+            let (client_in, mut server_out) = tokio::io::duplex(32 * 1024);
+            let (server_in, client_out) = tokio::io::duplex(8 * 1024);
+            tokio::spawn(async move {
+                let mut r = BufReader::new(server_in);
+                let mut line = String::new();
+                let _ = r.read_line(&mut line).await;
+                let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                let _ = server_out
+                    .write_all(b"{\"size\":256,\"offset\":0,\"length\":128,\"mtime\":{\"secs\":10,\"nanos\":0},\"keep_open\":true}\n")
+                    .await;
+                let _ = server_out.write_all(&[0xBB; 128]).await;
+                let _ = server_out.write_all(b"{\"done\":true}\n").await;
+                line.clear();
+                let _ = r.read_line(&mut line).await;
+                for _ in 0..10 {
+                    if server_out.write_all(b"{\"busy\":true}\n").await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let raw = RawStream {
+                reader: Box::new(client_in),
+                writer: Box::new(client_out),
+                stderr: None,
+                cancel: CancellationToken::new(),
+                park: None,
+                guard: None,
+            };
+            let mut stream = handshake_get_with_options(
+                raw,
+                Some(Arc::new(StaticPolicyOpener)),
+                "tower",
+                "/busy2.bin",
+                0,
+                None,
+                None,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+                opts,
+            )
+            .await
+            .unwrap();
+            let mut out = Vec::new();
+            let err = stream.read_to_end(&mut out).await.unwrap_err();
+            assert!(
+                err.to_string().contains("too many consecutive busy"),
+                "{err}"
+            );
+        }
     }
 }

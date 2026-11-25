@@ -2169,7 +2169,7 @@ impl Link {
 
         let live = self.get_or_open(machine, cancel.clone()).await?;
         let flight = live.acquire_flight();
-        let (raw, opener, live, flight) =
+        let (mut raw, opener, live, flight) =
             match self.open_stream_on(&live, machine, cancel.clone()).await {
                 Ok((raw, opener)) => (raw, opener, live, flight),
                 Err(StreamOpenError::DeadSession(_)) => {
@@ -2195,9 +2195,21 @@ impl Link {
                 }
             };
 
-        let mut stream = handshake_get(
+        // Attach the in-flight session guard to the raw channel's lifecycle guard rather than to
+        // `ContentStream` itself so parking an idle stream releases both its SSH channel slot and
+        // its session flight pin; reopening acquires a fresh session if the old one closed.
+        let prev_guard = raw.guard.take();
+        raw.guard = Some(Box::new((prev_guard, flight)));
+
+        let reopener: Arc<dyn crate::content::StreamOpener> = Arc::new(LinkStreamOpener {
+            link: self.clone(),
+            machine: machine.to_owned(),
+            window_policy: opener.window_policy(),
+        });
+
+        handshake_get(
             raw,
-            Some(opener),
+            Some(reopener),
             machine,
             path,
             offset,
@@ -2206,9 +2218,7 @@ impl Link {
             self.inner.options.ssh_timeouts.handshake,
             cancel,
         )
-        .await?;
-        stream.attach_flight(Box::new(flight));
-        Ok(stream)
+        .await
     }
 
     async fn open_stream_on(
@@ -2236,7 +2246,74 @@ impl Link {
         let raw = opener.open_stream(cancel).await?;
         Ok((raw, opener))
     }
+}
 
+/// Session-backed [`crate::content::StreamOpener`] used by [`ContentStream`] when reopening a
+/// parked or idle-closed channel, transparently acquiring the current (or freshly reconnected)
+/// session for `machine`.
+struct LinkStreamOpener {
+    link: Link,
+    machine: String,
+    window_policy: Option<crate::content::WindowPolicy>,
+}
+
+impl crate::content::StreamOpener for LinkStreamOpener {
+    fn window_policy(&self) -> Option<crate::content::WindowPolicy> {
+        self.window_policy
+    }
+
+    fn open_stream(
+        &self,
+        cancel: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::content::RawStream, StreamOpenError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let live = self
+                .link
+                .get_or_open(&self.machine, cancel.clone())
+                .await
+                .map_err(StreamOpenError::Failed)?;
+            let flight = live.acquire_flight();
+            let (mut raw, flight) = match self
+                .link
+                .open_stream_on(&live, &self.machine, cancel.clone())
+                .await
+            {
+                Ok((raw, _)) => (raw, flight),
+                Err(StreamOpenError::DeadSession(_)) => {
+                    drop(flight);
+                    self.link.invalidate_if_same(&self.machine, &live.session);
+                    let fresh = self
+                        .link
+                        .get_or_open(&self.machine, cancel.clone())
+                        .await
+                        .map_err(StreamOpenError::Failed)?;
+                    let flight2 = fresh.acquire_flight();
+                    let (raw, _) = self
+                        .link
+                        .open_stream_on(&fresh, &self.machine, cancel)
+                        .await
+                        .map_err(|err| match err {
+                            StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body) => {
+                                self.link.invalidate_if_same(&self.machine, &fresh.session);
+                                StreamOpenError::Failed(body.with_machine(&self.machine))
+                            }
+                            StreamOpenError::ChannelRefused(body) => {
+                                StreamOpenError::ChannelRefused(body.with_machine(&self.machine))
+                            }
+                        })?;
+                    (raw, flight2)
+                }
+                Err(err) => return Err(err),
+            };
+            let prev_guard = raw.guard.take();
+            raw.guard = Some(Box::new((prev_guard, flight)));
+            Ok(raw)
+        })
+    }
+}
+
+impl Link {
     /// Calls `tool` on `node` with JSON `arguments` and optional `on` (passed through untouched to
     /// the node for forwarding or fan-out), streaming live events as JSON objects to `events`.
     pub async fn call(

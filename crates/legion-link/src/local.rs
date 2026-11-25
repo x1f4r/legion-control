@@ -238,6 +238,7 @@ impl StreamOpener for LocalStreamOpener {
                 writer: Box::new(stdin),
                 stderr: Some(stderr),
                 cancel: stream_cancel.clone(),
+                park: None,
                 guard: Some(Box::new(LocalStreamGuard {
                     cancel: stream_cancel,
                 })),
