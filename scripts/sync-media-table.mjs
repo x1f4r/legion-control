@@ -3,8 +3,8 @@
 // in `crates/legion-core/src/media.rs` (`MEDIA_TABLE`).
 //
 // Usage:
-//   node scripts/sync-media-table.mjs          # regenerate mirrors in place
-//   node scripts/sync-media-table.mjs --check  # exit non-zero if any mirror differs
+//   node scripts/sync-media-table.mjs [root]          # regenerate mirrors in place
+//   node scripts/sync-media-table.mjs --check [root]  # exit non-zero if any mirror differs
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -12,16 +12,26 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
-const CHECK_ONLY = process.argv.includes('--check');
 
-const CORE_PATH = path.join(REPO_ROOT, 'crates/legion-core/src/media.rs');
-const CONTENT_PATH = path.join(REPO_ROOT, 'crates/legion-content/src/media.rs');
-const POLICY_PATH = path.join(REPO_ROOT, 'apps/legion-app/src-tauri/src/transfers/file_policy.rs');
-const KOTLIN_PATH = path.join(
-  REPO_ROOT,
-  'apps/legion-app/src-tauri/gen/android/app/src/main/java/com/x1f4r/legion/TransferPathPolicy.kt',
-);
-const UI_FILES_PATH = path.join(REPO_ROOT, 'apps/ui/lib/files.js');
+export const MIRROR_REL_PATHS = Object.freeze({
+  core: 'crates/legion-core/src/media.rs',
+  content: 'crates/legion-content/src/media.rs',
+  policy: 'apps/legion-app/src-tauri/src/transfers/file_policy.rs',
+  kotlin: 'apps/legion-app/src-tauri/gen/android/app/src/main/java/com/x1f4r/legion/TransferPathPolicy.kt',
+  uiFiles: 'apps/ui/lib/files.js',
+});
+
+function normalizeNewlines(text) {
+  return text.replace(/\r\n/g, '\n');
+}
+
+function detectEol(text) {
+  return text.includes('\r\n') ? '\r\n' : '\n';
+}
+
+function applyEol(lfText, eol) {
+  return eol === '\r\n' ? lfText.replace(/\n/g, '\r\n') : lfText;
+}
 
 function extractBetween(text, beginMarker, endMarker, label) {
   const start = text.indexOf(beginMarker);
@@ -41,8 +51,8 @@ function replaceBetween(text, beginMarker, endMarker, replacement, label) {
   return `${text.slice(0, afterStart + 1)}${replacement}\n${text.slice(endLineStart + 1)}`;
 }
 
-function parseCoreTable(src) {
-  const block = extractBetween(src, '// BEGIN_MEDIA_TABLE', '// END_MEDIA_TABLE', CORE_PATH);
+function parseCoreTable(src, label) {
+  const block = extractBetween(normalizeNewlines(src), '// BEGIN_MEDIA_TABLE', '// END_MEDIA_TABLE', label);
   const entries = [];
   const re =
     /entry\(\s*"([^"]+)",\s*Category::([A-Za-z]+),\s*"([^"]+)",\s*ContentServe::([A-Za-z]+)(?:\("([^"]+)"\))?,\s*(None|Some\("([^"]+)"\)),\s*(None|Some\("([^"]+)"\)),\s*ViewerMode::([A-Za-z]+)\s*,?\s*\)/g;
@@ -141,94 +151,128 @@ function formatJsTable(entries) {
   return lines.join('\n');
 }
 
-const coreSrc = fs.readFileSync(CORE_PATH, 'utf8');
-const entries = parseCoreTable(coreSrc);
+export function syncMediaTables({ repoRoot = REPO_ROOT, checkOnly = false } = {}) {
+  const corePath = path.join(repoRoot, MIRROR_REL_PATHS.core);
+  const contentPath = path.join(repoRoot, MIRROR_REL_PATHS.content);
+  const policyPath = path.join(repoRoot, MIRROR_REL_PATHS.policy);
+  const kotlinPath = path.join(repoRoot, MIRROR_REL_PATHS.kotlin);
+  const uiFilesPath = path.join(repoRoot, MIRROR_REL_PATHS.uiFiles);
 
-const targets = [
-  {
-    path: CONTENT_PATH,
-    transform: (src) =>
-      replaceBetween(
-        src,
-        '// BEGIN_CONTENT_MEDIA_TABLE',
-        '// END_CONTENT_MEDIA_TABLE',
-        formatContentTable(entries),
-        CONTENT_PATH,
-      ),
-  },
-  {
-    path: POLICY_PATH,
-    transform: (src) => {
-      let next = replaceBetween(
-        src,
-        '// BEGIN_ALLOWED_OPEN_MIME_BY_EXT',
-        '// END_ALLOWED_OPEN_MIME_BY_EXT',
-        formatRustPairsConst('ALLOWED_OPEN_MIME_BY_EXT', entries, (e) => e.openMime),
-        POLICY_PATH,
-      );
-      next = replaceBetween(
-        next,
-        '// BEGIN_NON_OPEN_DOWNLOAD_MIME_BY_EXT',
-        '// END_NON_OPEN_DOWNLOAD_MIME_BY_EXT',
-        formatRustPairsConst('NON_OPEN_DOWNLOAD_MIME_BY_EXT', entries, (e) => e.downloadMime),
-        POLICY_PATH,
-      );
-      return next;
-    },
-  },
-  {
-    path: KOTLIN_PATH,
-    transform: (src) => {
-      let next = replaceBetween(
-        src,
-        '// BEGIN_ALLOWED_OPEN_MIME_BY_EXT',
-        '// END_ALLOWED_OPEN_MIME_BY_EXT',
-        formatKotlinMap('ALLOWED_OPEN_MIME_BY_EXT', entries, (e) => e.openMime),
-        KOTLIN_PATH,
-      );
-      next = replaceBetween(
-        next,
-        '// BEGIN_NON_OPEN_DOWNLOAD_MIME_BY_EXT',
-        '// END_NON_OPEN_DOWNLOAD_MIME_BY_EXT',
-        formatKotlinMap('NON_OPEN_DOWNLOAD_MIME_BY_EXT', entries, (e) => e.downloadMime),
-        KOTLIN_PATH,
-      );
-      return next;
-    },
-  },
-  {
-    path: UI_FILES_PATH,
-    transform: (src) =>
-      replaceBetween(
-        src,
-        '// BEGIN_MEDIA_TABLE',
-        '// END_MEDIA_TABLE',
-        formatJsTable(entries),
-        UI_FILES_PATH,
-      ),
-  },
-];
+  const coreSrc = normalizeNewlines(fs.readFileSync(corePath, 'utf8'));
+  const entries = parseCoreTable(coreSrc, corePath);
 
-let drifted = [];
-for (const target of targets) {
-  const before = fs.readFileSync(target.path, 'utf8');
-  const after = target.transform(before);
-  if (before !== after) {
-    if (CHECK_ONLY) {
-      drifted.push(path.relative(REPO_ROOT, target.path));
-    } else {
-      fs.writeFileSync(target.path, after);
-      console.log(`Updated ${path.relative(REPO_ROOT, target.path)} (${entries.length} canonical types)`);
+  const targets = [
+    {
+      path: contentPath,
+      transform: (src) =>
+        replaceBetween(
+          src,
+          '// BEGIN_CONTENT_MEDIA_TABLE',
+          '// END_CONTENT_MEDIA_TABLE',
+          formatContentTable(entries),
+          contentPath,
+        ),
+    },
+    {
+      path: policyPath,
+      transform: (src) => {
+        let next = replaceBetween(
+          src,
+          '// BEGIN_ALLOWED_OPEN_MIME_BY_EXT',
+          '// END_ALLOWED_OPEN_MIME_BY_EXT',
+          formatRustPairsConst('ALLOWED_OPEN_MIME_BY_EXT', entries, (e) => e.openMime),
+          policyPath,
+        );
+        next = replaceBetween(
+          next,
+          '// BEGIN_NON_OPEN_DOWNLOAD_MIME_BY_EXT',
+          '// END_NON_OPEN_DOWNLOAD_MIME_BY_EXT',
+          formatRustPairsConst('NON_OPEN_DOWNLOAD_MIME_BY_EXT', entries, (e) => e.downloadMime),
+          policyPath,
+        );
+        return next;
+      },
+    },
+    {
+      path: kotlinPath,
+      transform: (src) => {
+        let next = replaceBetween(
+          src,
+          '// BEGIN_ALLOWED_OPEN_MIME_BY_EXT',
+          '// END_ALLOWED_OPEN_MIME_BY_EXT',
+          formatKotlinMap('ALLOWED_OPEN_MIME_BY_EXT', entries, (e) => e.openMime),
+          kotlinPath,
+        );
+        next = replaceBetween(
+          next,
+          '// BEGIN_NON_OPEN_DOWNLOAD_MIME_BY_EXT',
+          '// END_NON_OPEN_DOWNLOAD_MIME_BY_EXT',
+          formatKotlinMap('NON_OPEN_DOWNLOAD_MIME_BY_EXT', entries, (e) => e.downloadMime),
+          kotlinPath,
+        );
+        return next;
+      },
+    },
+    {
+      path: uiFilesPath,
+      transform: (src) =>
+        replaceBetween(
+          src,
+          '// BEGIN_MEDIA_TABLE',
+          '// END_MEDIA_TABLE',
+          formatJsTable(entries),
+          uiFilesPath,
+        ),
+    },
+  ];
+
+  const drifted = [];
+  const updated = [];
+  for (const target of targets) {
+    const rawBefore = fs.readFileSync(target.path, 'utf8');
+    const eol = detectEol(rawBefore);
+    const beforeLf = normalizeNewlines(rawBefore);
+    const afterLf = target.transform(beforeLf);
+    if (beforeLf !== afterLf) {
+      const rel = path.relative(repoRoot, target.path);
+      if (checkOnly) {
+        drifted.push(rel);
+      } else {
+        fs.writeFileSync(target.path, applyEol(afterLf, eol));
+        updated.push(rel);
+      }
     }
   }
+
+  return { entriesCount: entries.length, drifted, updated };
 }
 
-if (CHECK_ONLY && drifted.length > 0) {
-  console.error(
-    `Media table mirror(s) drifted from crates/legion-core/src/media.rs:\n  - ${drifted.join('\n  - ')}\nRun: node scripts/sync-media-table.mjs`,
-  );
-  process.exit(1);
-}
-if (CHECK_ONLY) {
-  console.log(`All 4 media table mirrors match crates/legion-core/src/media.rs (${entries.length} types).`);
+const real = (file) => {
+  try {
+    return fs.realpathSync(file);
+  } catch {
+    return path.resolve(file);
+  }
+};
+
+if (process.argv[1] && real(process.argv[1]) === real(fileURLToPath(import.meta.url))) {
+  const args = process.argv.slice(2);
+  const checkOnly = args.includes('--check');
+  const positional = args.filter((arg) => arg !== '--check');
+  const repoRoot = positional[0] ? path.resolve(positional[0]) : REPO_ROOT;
+
+  const { entriesCount, drifted, updated } = syncMediaTables({ repoRoot, checkOnly });
+  if (checkOnly) {
+    if (drifted.length > 0) {
+      console.error(
+        `Media table mirror(s) drifted from crates/legion-core/src/media.rs:\n  - ${drifted.join('\n  - ')}\nRun: node scripts/sync-media-table.mjs`,
+      );
+      process.exit(1);
+    }
+    console.log(`All 4 media table mirrors match crates/legion-core/src/media.rs (${entriesCount} types).`);
+  } else {
+    for (const rel of updated) {
+      console.log(`Updated ${rel} (${entriesCount} canonical types)`);
+    }
+  }
 }

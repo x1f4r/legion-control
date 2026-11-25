@@ -1379,7 +1379,8 @@ mod tests {
         let kt_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("gen/android/app/src/main/java/com/x1f4r/legion/TransferPathPolicy.kt");
         let kt_src = fs::read_to_string(&kt_path)
-            .expect("TransferPathPolicy.kt must exist beside Rust crate");
+            .expect("TransferPathPolicy.kt must exist beside Rust crate")
+            .replace("\r\n", "\n");
 
         let extract_block = |begin: &str, end: &str| -> String {
             let start_idx = kt_src
