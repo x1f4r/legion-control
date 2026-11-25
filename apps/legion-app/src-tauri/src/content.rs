@@ -46,7 +46,7 @@ use legion_link::{ContentRoutePolicy, Route};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::{AppError, Backend, ErrorCode, NodeRouteIdentity};
@@ -342,12 +342,15 @@ impl Drop for LoopbackConnGuard {
 
 struct ActiveStreamGuard {
     active_streams: Arc<AtomicUsize>,
+    active_streams_notify: Arc<Notify>,
     activity: Arc<Mutex<ActivityState>>,
 }
 
 impl Drop for ActiveStreamGuard {
     fn drop(&mut self) {
-        self.active_streams.fetch_sub(1, Ordering::AcqRel);
+        if self.active_streams.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.active_streams_notify.notify_waiters();
+        }
         self.activity
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -670,6 +673,7 @@ pub struct AppContentServer {
     listener_lock: AsyncMutex<()>,
     listener: Mutex<Option<ListenerHandle>>,
     active_streams: Arc<AtomicUsize>,
+    active_streams_notify: Arc<Notify>,
     activity: Arc<Mutex<ActivityState>>,
     request_log: Mutex<VecDeque<ContentRequestLog>>,
     ticket_statuses: Mutex<VecDeque<TicketStatusEntry>>,
@@ -757,6 +761,7 @@ impl AppContentServer {
             listener_lock: AsyncMutex::new(()),
             listener: Mutex::new(None),
             active_streams: Arc::new(AtomicUsize::new(0)),
+            active_streams_notify: Arc::new(Notify::new()),
             activity: Arc::new(Mutex::new(ActivityState {
                 last_activity: Instant::now(),
             })),
@@ -1076,6 +1081,26 @@ impl AppContentServer {
     /// Returns the number of content response streams currently being served.
     pub fn active_streams(&self) -> usize {
         self.active_streams.load(Ordering::Acquire)
+    }
+
+    /// Waits up to `timeout` for every active content response stream to finish and release its
+    /// underlying direct or relayed [`legion_link::ContentStream`]. Returns `true` when zero
+    /// streams remain active.
+    pub async fn wait_for_active_streams_stopped(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.active_streams_notify.notified();
+            if self.active_streams.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                return self.active_streams.load(Ordering::Acquire) == 0;
+            };
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return self.active_streams.load(Ordering::Acquire) == 0;
+            }
+        }
     }
 
     /// Revokes every issued content ticket (used on store repair and app exit).
@@ -1620,6 +1645,7 @@ impl AppContentServer {
         self.active_streams.fetch_add(1, Ordering::AcqRel);
         let active_guard = ActiveStreamGuard {
             active_streams: Arc::clone(&self.active_streams),
+            active_streams_notify: Arc::clone(&self.active_streams_notify),
             activity: Arc::clone(&self.activity),
         };
         let hooks = StreamHooks {
