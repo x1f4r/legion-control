@@ -42,9 +42,10 @@ pub use path::{resolve_relative_path, validate_relative_path};
 pub use plan::{Plan, PlanConflict, PlanOptions, PlanTotals};
 pub use platform::{is_legion_internal_name, is_sweepable_temp_name};
 pub use rename::{
-    FsNameBehavior, PendingRenameIntent, PendingRenameRecovery, SameEntryDecision,
-    case_insensitive, case_insensitive_in_dir, classify_same_entry, decide_pending_rename_recovery,
-    directory_contains_exact_name, move_no_replace_raw, names_fold_equivalent, pending_renames_dir,
-    probe_dir_name_behavior, recover_pending_renames, rename_intent_key, unicode_normalizing,
+    FsNameBehavior, PendingRenameIntent, PendingRenameRecovery, RenameRecoveryScope,
+    SameEntryDecision, case_insensitive, case_insensitive_in_dir, classify_same_entry,
+    decide_pending_rename_recovery, directory_contains_exact_name, move_no_replace_raw,
+    names_fold_equivalent, pending_renames_dir, probe_dir_name_behavior, recover_pending_renames,
+    recover_pending_renames_checked, rename_intent_key, unicode_normalizing,
     unicode_normalizing_in_dir, unlink_held_lock, visible_rename_temp_name,
 };

@@ -419,23 +419,48 @@ fn normalize_scope_path(path: &Path) -> String {
     normalized
 }
 
-fn paths_overlap_scope(scope: &Path, parent: &Path) -> bool {
-    if let (Ok(s_id), Ok(p_id)) = (file_identity(scope), file_identity(parent))
-        && s_id.same_file(&p_id)
+/// Directory scope restricting which pending two-step rename intents [`recover_pending_renames`]
+/// may touch.
+///
+/// Neither variant ever matches ancestor directories above the target path, so an operation on a
+/// subfolder can never touch or probe a parent directory outside its scope.
+#[derive(Clone, Copy, Debug)]
+pub enum RenameRecoveryScope<'a> {
+    /// Recover ONLY intents whose `parent` directory is this exact directory.
+    ExactDir(&'a Path),
+    /// Recover intents whose `parent` directory is this directory or a subdirectory inside it.
+    WithinDir(&'a Path),
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if let (Ok(a_id), Ok(b_id)) = (file_identity(a), file_identity(b))
+        && a_id.same_file(&b_id)
     {
         return true;
     }
-    let s = normalize_scope_path(&fs::canonicalize(scope).unwrap_or_else(|_| scope.to_path_buf()));
-    let p =
-        normalize_scope_path(&fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()));
-    let is_prefix = |ancestor: &str, child: &str| {
-        ancestor == child
-            || ancestor == "/"
-            || child
-                .strip_prefix(ancestor)
-                .is_some_and(|rest| rest.starts_with('/'))
-    };
-    is_prefix(&s, &p) || is_prefix(&p, &s)
+    let a_norm = normalize_scope_path(&fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf()));
+    let b_norm = normalize_scope_path(&fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf()));
+    a_norm == b_norm
+}
+
+fn parent_matches_scope(scope: RenameRecoveryScope<'_>, parent: &Path) -> bool {
+    match scope {
+        RenameRecoveryScope::ExactDir(dir) => same_dir(dir, parent),
+        RenameRecoveryScope::WithinDir(dir) => {
+            if same_dir(dir, parent) {
+                return true;
+            }
+            let s =
+                normalize_scope_path(&fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+            let p = normalize_scope_path(
+                &fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()),
+            );
+            s == p
+                || s == "/"
+                || p.strip_prefix(&s)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }
+    }
 }
 
 /// Renames `src` to `dst` without replacing an existing entry when the kernel supports it.
@@ -467,11 +492,22 @@ pub fn unlink_held_lock(lock_path: &Path, lock_file: fs::File) {
 }
 
 /// Completes or reverses any interrupted two-step case/normalization renames whose intent records
-/// remain under `<state_dir>/xfer/renames/`, and removes their finished or orphaned `.lock` files.
+/// remain under `<state_dir>/xfer/renames/` matching `scope`, and removes their finished or
+/// orphaned `.lock` files.
+pub fn recover_pending_renames(state_dir: &Path, scope: Option<RenameRecoveryScope<'_>>) {
+    recover_pending_renames_checked(state_dir, scope, |_, _| true);
+}
+
+/// Like [`recover_pending_renames`], but additionally checks `can_write(parent, intent)` before
+/// reading, probing, renaming, or clearing any intent in `parent`.
 ///
 /// Decides purely from `read_dir(&parent)`'s exact entry names (compared byte for byte) so case
 /// folding or path canonicalisation can never confuse `from_name`, `to_name`, and `temp_name`.
-pub fn recover_pending_renames(state_dir: &Path, scope_dir: Option<&Path>) {
+pub fn recover_pending_renames_checked(
+    state_dir: &Path,
+    scope: Option<RenameRecoveryScope<'_>>,
+    can_write: impl Fn(&Path, &PendingRenameIntent) -> bool,
+) {
     let dir = pending_renames_dir(state_dir);
     let Ok(entries) = fs::read_dir(&dir) else {
         return;
@@ -504,9 +540,12 @@ pub fn recover_pending_renames(state_dir: &Path, scope_dir: Option<&Path>) {
             continue;
         };
         let parent = PathBuf::from(&intent.parent);
-        if let Some(scope) = scope_dir
-            && !paths_overlap_scope(scope, &parent)
+        if let Some(scope) = scope
+            && !parent_matches_scope(scope, &parent)
         {
+            continue;
+        }
+        if !can_write(&parent, &intent) {
             continue;
         }
         let dir_entries: Vec<OsString> = match fs::read_dir(&parent) {

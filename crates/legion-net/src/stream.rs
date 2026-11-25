@@ -65,10 +65,11 @@ use legion_tools::xfer::{error as xfer_error, manifest, resolve_root};
 pub use legion_xfer::recover_pending_renames;
 use legion_xfer::{
     CaseCollision, Entry, EntryKind, Hash, IfExists, ManifestOptions, PlacedFileMeta, PutSession,
-    RenamedEntry, SkippedEntry, Timestamp, case_insensitive, case_insensitive_in_dir,
-    directory_contains_exact_name, move_no_replace_raw, pending_renames_dir,
-    probe_dir_name_behavior, rename_intent_key, resolve_relative_path, unicode_normalizing,
-    unicode_normalizing_in_dir, visible_rename_temp_name,
+    RenameRecoveryScope, RenamedEntry, SkippedEntry, Timestamp, case_insensitive,
+    case_insensitive_in_dir, directory_contains_exact_name, move_no_replace_raw,
+    pending_renames_dir, probe_dir_name_behavior, recover_pending_renames_checked,
+    rename_intent_key, resolve_relative_path, unicode_normalizing, unicode_normalizing_in_dir,
+    visible_rename_temp_name,
 };
 pub(crate) use legion_xfer::{
     FsNameBehavior, PendingRenameIntent, SameEntryDecision, classify_same_entry,
@@ -1319,6 +1320,33 @@ fn gone(error: &io::Error) -> ErrorBody {
     )
 }
 
+fn write_grant_for(host: &Host, principal: &str) -> Option<Grant> {
+    ConfigStore::new(host.paths.config_dir())
+        .get::<Policy>()
+        .ok()
+        .and_then(|policy| {
+            policy
+                .authorize_name(principal, "fs.write", Some(Effect::Write), &host.paths)
+                .ok()
+        })
+}
+
+fn can_write_rename_intent(grant: &Grant, parent: &Path, intent: &PendingRenameIntent) -> bool {
+    grant.check_path(parent, Access::Write).is_ok()
+        && legion_tools::fs::check_not_protected_tree(grant, parent).is_ok()
+        && [
+            intent.from_name.as_str(),
+            intent.temp_name.as_str(),
+            intent.to_name.as_str(),
+        ]
+        .iter()
+        .all(|name| {
+            let entry = parent.join(name);
+            grant.check_path(&entry, Access::Write).is_ok()
+                && legion_tools::fs::check_not_protected_tree(grant, &entry).is_ok()
+        })
+}
+
 fn list<W: Write>(
     host: &Host,
     grant: &Grant,
@@ -1329,8 +1357,13 @@ fn list<W: Write>(
 ) -> Result<(), Failure> {
     let root = resolve_root(grant, root, Access::Read)?;
     let state_dir = host.paths.state_dir();
-    recover_pending_renames(state_dir, Some(&root));
-    legion_xfer::sweep_abandoned_temps(state_dir, legion_xfer::PROBE_SWEEP_AGE);
+    if let Some(wg) = write_grant_for(host, grant.principal()) {
+        recover_pending_renames_checked(
+            state_dir,
+            Some(RenameRecoveryScope::WithinDir(&root)),
+            |parent, intent| can_write_rename_intent(&wg, parent, intent),
+        );
+    }
     let options = ManifestOptions { checksum, exclude };
     let listing = busy(output, || manifest(grant, &host.paths, &root, &options))??;
     write_listing(output, listing.entries, listing.skipped)
@@ -1385,9 +1418,20 @@ fn stat<W: Write>(
     // source size and hash. Sidecar metadata/locks live in the node's state directory.
     let given = grant.check_path(path, Access::Read)?;
     let state_dir = host.paths.state_dir();
-    recover_pending_renames(state_dir, given.parent());
-    legion_xfer::sweep_abandoned_temps(state_dir, legion_xfer::PROBE_SWEEP_AGE);
-    legion_xfer::reclaim_stale_claim(state_dir, &given);
+    if let Some(wg) = write_grant_for(host, grant.principal()) {
+        if let Some(parent) = given.parent() {
+            recover_pending_renames_checked(
+                state_dir,
+                Some(RenameRecoveryScope::ExactDir(parent)),
+                |p, intent| can_write_rename_intent(&wg, p, intent),
+            );
+        }
+        if wg.check_path(&given, Access::Write).is_ok()
+            && legion_tools::fs::check_not_protected_tree(&wg, &given).is_ok()
+        {
+            legion_xfer::reclaim_stale_claim(state_dir, &given);
+        }
+    }
     let is_symlink = fs::symlink_metadata(&given).is_ok_and(|meta| meta.file_type().is_symlink());
     let expected_hash = if_hash.and_then(|s| s.parse::<Hash>().ok());
     let partial = || {
@@ -1566,7 +1610,13 @@ fn put<R: Read + Send + 'static, W: Write>(
     legion_tools::fs::check_not_protected_tree(grant, &target)?;
     grant.check_create(&target, CreateKind::File, true)?;
     let state_dir = host.paths.state_dir().to_path_buf();
-    recover_pending_renames(&state_dir, target.parent());
+    if let Some(parent) = target.parent() {
+        recover_pending_renames_checked(
+            &state_dir,
+            Some(RenameRecoveryScope::ExactDir(parent)),
+            |p, intent| can_write_rename_intent(grant, p, intent),
+        );
+    }
     legion_xfer::reclaim_stale_claim(&state_dir, &target);
     // Only the resumable `.legion-part` file sits beside the target; lock and metadata sidecars
     // live under the node's state directory.
@@ -1791,7 +1841,11 @@ fn unpack<R: Read + Send + 'static, W: Write>(
 ) -> Result<(), Failure> {
     let root = resolve_root(grant, root, Access::Write)?;
     let state_dir = host.paths.state_dir().to_path_buf();
-    recover_pending_renames(&state_dir, Some(&root));
+    recover_pending_renames_checked(
+        &state_dir,
+        Some(RenameRecoveryScope::WithinDir(&root)),
+        |p, intent| can_write_rename_intent(grant, p, intent),
+    );
     if fs::symlink_metadata(&root).is_err() {
         grant.check_create(&root, CreateKind::Dir, true)?;
     }
@@ -2564,7 +2618,13 @@ fn rename_same_file<W: Write>(
     // checks as `fs.move`.
     let (from_checked, to_checked) = legion_tools::fs::check_move_paths(grant, from, to)?;
     let state_dir = host.paths.state_dir();
-    recover_pending_renames(state_dir, from_checked.parent());
+    if let Some(parent) = from_checked.parent() {
+        recover_pending_renames_checked(
+            state_dir,
+            Some(RenameRecoveryScope::ExactDir(parent)),
+            |p, intent| can_write_rename_intent(grant, p, intent),
+        );
+    }
 
     let (Some(from_parent), Some(to_parent)) = (from_checked.parent(), to_checked.parent()) else {
         return Err(Failure::Reply(ErrorBody::new(
@@ -3836,7 +3896,7 @@ mod tests {
         // Case 1: Only temp present (crash between step 1 and step 2) -> completes `temp -> to`.
         fs::write(work_dir.join(&temp_name), b"important").unwrap();
         let intent_path = write_intent("Report.txt", &temp_name, "report.txt");
-        recover_pending_renames(&state_dir, Some(&work_dir));
+        recover_pending_renames(&state_dir, Some(RenameRecoveryScope::ExactDir(&work_dir)));
         assert!(!has_exact_entry(&temp_name));
         assert!(has_exact_entry("report.txt"));
         assert!(!has_exact_entry("Report.txt"));
@@ -3850,7 +3910,7 @@ mod tests {
         fs::write(work_dir.join("OnlyOrig.txt"), b"orig-only").unwrap();
         let temp_orig = visible_rename_temp_name(OsStr::new("OnlyOrig.txt"), 42, 10);
         let intent_orig = write_intent("OnlyOrig.txt", &temp_orig, "onlyorig.txt");
-        recover_pending_renames(&state_dir, Some(&work_dir));
+        recover_pending_renames(&state_dir, Some(RenameRecoveryScope::ExactDir(&work_dir)));
         assert!(has_exact_entry("OnlyOrig.txt"));
         assert!(!has_exact_entry(&temp_orig));
         assert!(!intent_orig.exists());
@@ -3859,7 +3919,7 @@ mod tests {
         fs::write(work_dir.join("onlyfinal.txt"), b"final-only").unwrap();
         let temp_final = visible_rename_temp_name(OsStr::new("OnlyFinal.txt"), 42, 11);
         let intent_final = write_intent("OnlyFinal.txt", &temp_final, "onlyfinal.txt");
-        recover_pending_renames(&state_dir, Some(&work_dir));
+        recover_pending_renames(&state_dir, Some(RenameRecoveryScope::ExactDir(&work_dir)));
         assert!(has_exact_entry("onlyfinal.txt"));
         assert!(!has_exact_entry(&temp_final));
         assert!(!intent_final.exists());
@@ -3870,7 +3930,7 @@ mod tests {
         fs::write(work_dir.join("notes.txt"), b"occupant").unwrap();
         let intent_path2 = write_intent("Notes.txt", &temp_name2, "notes.txt");
 
-        recover_pending_renames(&state_dir, Some(&work_dir));
+        recover_pending_renames(&state_dir, Some(RenameRecoveryScope::ExactDir(&work_dir)));
         if host_fs.case_insensitive {
             // On NTFS / case-insensitive APFS, `notes.txt` occupies `Notes.txt`'s folded slot, so
             // recovery MUST preserve both visible `temp_name2` and `notes.txt` without overwriting!
@@ -3882,7 +3942,7 @@ mod tests {
 
             // Once the conflicting occupant is moved away, recovery completes cleanly to `notes.txt`.
             fs::remove_file(work_dir.join("notes.txt")).unwrap();
-            recover_pending_renames(&state_dir, Some(&work_dir));
+            recover_pending_renames(&state_dir, Some(RenameRecoveryScope::ExactDir(&work_dir)));
             assert!(!has_exact_entry(&temp_name2));
             assert!(has_exact_entry("notes.txt"));
             assert_eq!(fs::read(work_dir.join("notes.txt")).unwrap(), b"original");
@@ -3903,7 +3963,7 @@ mod tests {
         fs::write(work_dir.join("Draft.txt"), b"recreated").unwrap();
         let intent_path3 = write_intent("Draft.txt", &temp_name3, "draft.txt");
 
-        recover_pending_renames(&state_dir, Some(&work_dir));
+        recover_pending_renames(&state_dir, Some(RenameRecoveryScope::ExactDir(&work_dir)));
         if host_fs.case_insensitive {
             assert!(has_exact_entry(&temp_name3));
             assert!(has_exact_entry("Draft.txt"));

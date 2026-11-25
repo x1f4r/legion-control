@@ -245,6 +245,152 @@ async fn list_recovers_interrupted_two_step_rename_and_cleans_up_intent_and_lock
     );
 }
 
+#[tokio::test]
+async fn list_never_recovers_outside_exact_dir_or_without_write_permission() {
+    let f = Fixture::new();
+    let sub = f.work.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("inside.txt"), "hello").unwrap();
+
+    let state_dir = f.dir.path().join("state");
+    let renames_dir = legion_xfer::pending_renames_dir(&state_dir);
+    std::fs::create_dir_all(&renames_dir).unwrap();
+
+    // Policy:
+    // - `sub_reader`: ONLY `fs.list` on `~/projects/sub/**` (no write permission anywhere, no access to `~`).
+    // - `sub_writer`: `fs.list` + `fs.write` on `~/projects/sub/**` ONLY (still no access to `~`).
+    // - `home_reader`: ONLY `fs.list` on `~/projects/**` (read-only inside the affected folder itself).
+    f.write_config(
+        "policy.toml",
+        r#"
+[roles.sub_reader_role]
+allow = ["fs.list"]
+paths = ["~/projects/sub/**"]
+
+[roles.sub_writer_role]
+allow = ["fs.list", "fs.write"]
+paths = ["~/projects/sub/**"]
+
+[roles.home_reader_role]
+allow = ["fs.list"]
+paths = ["~/projects/**"]
+
+[principals.sub_reader]
+role = "sub_reader_role"
+
+[principals.sub_writer]
+role = "sub_writer_role"
+
+[principals.home_reader]
+role = "home_reader_role"
+"#,
+    );
+
+    // 1. Seed a pending interrupted rename in `~` (an ancestor above `~/projects/sub`).
+    let home_temp = legion_xfer::visible_rename_temp_name(std::ffi::OsStr::new("Note.txt"), 88, 1);
+    std::fs::write(f.home.join(&home_temp), "home-body").unwrap();
+    let home_key = legion_xfer::rename_intent_key(&f.home, &home_temp);
+    let home_intent_path = renames_dir.join(format!("{home_key}.json"));
+    let home_intent = legion_xfer::PendingRenameIntent {
+        parent: f.home.to_string_lossy().into_owned(),
+        from_name: "Note.txt".to_owned(),
+        temp_name: home_temp.clone(),
+        to_name: "note.txt".to_owned(),
+    };
+    std::fs::write(&home_intent_path, serde_json::to_vec(&home_intent).unwrap()).unwrap();
+
+    // Principal allowed only `fs.list` on `~/projects/sub/**` lists `~/projects/sub`.
+    let listed_sub = f
+        .call_as("sub_reader", "fs.list", json!({"path": "~/projects/sub"}))
+        .await
+        .unwrap();
+    assert_eq!(listed_sub["entries"][0]["name"], json!("inside.txt"));
+    assert!(
+        f.home.join(&home_temp).exists(),
+        "sub_reader listing ~/projects/sub must NOT touch pending rename in ~"
+    );
+    assert!(!f.home.join("note.txt").exists());
+    assert!(home_intent_path.exists());
+
+    // Even a writer restricted to `~/projects/sub/**` listing `~/projects/sub` must NOT touch `~`.
+    let _ = f
+        .call_as("sub_writer", "fs.list", json!({"path": "~/projects/sub"}))
+        .await
+        .unwrap();
+    assert!(
+        f.home.join(&home_temp).exists(),
+        "sub_writer listing ~/projects/sub must NOT touch pending rename in ancestor ~"
+    );
+    assert!(!f.home.join("note.txt").exists());
+    assert!(home_intent_path.exists());
+
+    // Even the owner listing `~/projects/sub` (a child of `~`) must NOT touch `~` because
+    // `fs.list` recovery is restricted to the EXACT listed directory.
+    let _ = f
+        .call("fs.list", json!({"path": "~/projects/sub"}))
+        .await
+        .unwrap();
+    assert!(
+        f.home.join(&home_temp).exists(),
+        "listing ~/projects/sub must NOT touch pending rename in ancestor ~"
+    );
+    assert!(!f.home.join("note.txt").exists());
+    assert!(home_intent_path.exists());
+
+    // 2. Seed a pending interrupted rename inside `~/projects` itself, and list `~/projects` as a
+    //    read-only caller (`home_reader` with `fs.list` only). Nothing may change!
+    let proj_temp = legion_xfer::visible_rename_temp_name(std::ffi::OsStr::new("Plan.txt"), 88, 2);
+    std::fs::write(f.work.join(&proj_temp), "plan-body").unwrap();
+    let proj_key = legion_xfer::rename_intent_key(&f.work, &proj_temp);
+    let proj_intent_path = renames_dir.join(format!("{proj_key}.json"));
+    let proj_intent = legion_xfer::PendingRenameIntent {
+        parent: f.work.to_string_lossy().into_owned(),
+        from_name: "Plan.txt".to_owned(),
+        temp_name: proj_temp.clone(),
+        to_name: "plan.txt".to_owned(),
+    };
+    std::fs::write(&proj_intent_path, serde_json::to_vec(&proj_intent).unwrap()).unwrap();
+
+    let listed_ro = f
+        .call_as("home_reader", "fs.list", json!({"path": "~/projects"}))
+        .await
+        .unwrap();
+    let ro_names: Vec<&str> = listed_ro["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        ro_names.contains(&proj_temp.as_str()),
+        "read-only fs.list must return the directory unchanged: {ro_names:?}"
+    );
+    assert!(f.work.join(&proj_temp).exists());
+    assert!(!f.work.join("plan.txt").exists());
+    assert!(proj_intent_path.exists());
+
+    // Finally, when the owner (who HAS `fs.write` in `~/projects`) lists `~/projects`, ONLY the
+    // pending rename in `~/projects` is recovered; the one in `~` STILL remains untouched.
+    let listed_owner = f
+        .call("fs.list", json!({"path": "~/projects"}))
+        .await
+        .unwrap();
+    let owner_names: Vec<&str> = listed_owner["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert!(owner_names.contains(&"plan.txt"), "{owner_names:?}");
+    assert!(!f.work.join(&proj_temp).exists());
+    assert!(!proj_intent_path.exists());
+    assert!(
+        f.home.join(&home_temp).exists(),
+        "listing ~/projects must still leave pending rename in ancestor ~ untouched"
+    );
+    assert!(home_intent_path.exists());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn list_and_stat_report_symlinks_without_following_and_include_unix_mode() {
