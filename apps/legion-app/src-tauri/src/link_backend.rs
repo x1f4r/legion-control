@@ -22,8 +22,8 @@ use crate::backend::{
     AppError, AppState, Backend, BoxFuture, CallId, CallRequest, CancelResult,
     ConflictingIdentityInfo, ContentTarget, DisagreementEntryView, DisagreementView, ErrorCode,
     IdentityChangedInfo, LearnRejectionView, LearnResult, LearnedDirectIdentity, MachineRouteView,
-    Needs, NodeLink, PairPendingPeer, PairSummary, RepairInfo, RepairResult, TransferCapabilities,
-    UnpairResult,
+    Needs, NodeLink, NodeRouteIdentity, PairPendingPeer, PairSummary, RepairInfo, RepairResult,
+    TransferCapabilities, UnpairResult,
 };
 use crate::commands::default_device_name;
 use crate::store::{AppStore, AppStoreData, StoredNodeMeta};
@@ -1102,13 +1102,28 @@ impl Backend for LinkBackend {
                 None => guard.set_fresh_epoch(&entry.node),
             };
             let learned_identity = if entry.origin == NodeOrigin::Learned {
-                let from_paired_introducer = entry.learned_from.as_deref().is_some_and(|intro| {
+                let paired_introducer = entry.learned_from.as_deref().and_then(|intro| {
                     guard
                         .data
                         .link
                         .node(intro)
-                        .is_some_and(|n| n.origin == NodeOrigin::Paired)
+                        .filter(|n| n.origin == NodeOrigin::Paired)
+                        .cloned()
                 });
+                let from_paired_introducer = paired_introducer.is_some();
+                let introducer_holder = paired_introducer.as_ref().and_then(|intro| {
+                    guard
+                        .pairing_epochs
+                        .get(&intro.node)
+                        .copied()
+                        .map(|ep| format_pairing_holder(&intro.node, ep))
+                });
+                let introducer_host_keys = paired_introducer
+                    .as_ref()
+                    .and_then(|intro| intro.target.as_ref())
+                    .map(|t| canonical_host_keys(&t.host_keys))
+                    .unwrap_or_default();
+                let learned_from = paired_introducer.map(|intro| intro.node);
                 let host_keys = entry
                     .target
                     .as_ref()
@@ -1122,6 +1137,9 @@ impl Backend for LinkBackend {
                     .map(|learned_fleet_epoch| LearnedDirectIdentity {
                         learned_fleet_epoch,
                         from_paired_introducer,
+                        learned_from,
+                        introducer_holder,
+                        introducer_host_keys,
                         host_keys,
                     })
             } else {
@@ -1192,6 +1210,47 @@ impl Backend for LinkBackend {
             return any_configured && guard.fleet_pairing_epoch == epoch;
         }
         false
+    }
+
+    fn node_route_identity(&self, node: &str) -> Option<NodeRouteIdentity> {
+        let trimmed = node.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.store_error.is_some() {
+            return None;
+        }
+        if let Some(entry) = guard.data.link.node(trimmed) {
+            let epoch = guard.pairing_epochs.get(&entry.node).copied()?;
+            let host_keys = entry
+                .target
+                .as_ref()
+                .map(|t| canonical_host_keys(&t.host_keys))
+                .unwrap_or_default();
+            return Some(NodeRouteIdentity {
+                node: entry.node.clone(),
+                is_paired: entry.origin == NodeOrigin::Paired,
+                holder: format_pairing_holder(&entry.node, epoch),
+                host_keys,
+            });
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if guard.local_program.is_some()
+            && (trimmed == LOCAL_NODE_ID || guard.attached_local_node.as_deref() == Some(trimmed))
+        {
+            let epoch = guard.pairing_epochs.get(LOCAL_NODE_ID).copied()?;
+            return Some(NodeRouteIdentity {
+                node: LOCAL_NODE_ID.to_owned(),
+                is_paired: true,
+                holder: format_pairing_holder(LOCAL_NODE_ID, epoch),
+                host_keys: Vec::new(),
+            });
+        }
+        None
     }
 }
 

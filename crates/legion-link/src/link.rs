@@ -721,6 +721,23 @@ impl Drop for ActiveCallGuard {
     }
 }
 
+/// Restricts which route(s) [`Link::open_content_with_policy`] may use to reach a target machine.
+///
+/// Used by ticketed content servers to bind a ticket strictly to the paired relay (or upgraded
+/// direct entry) that minted it so a reopen never silently crosses into another paired fleet.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ContentRoutePolicy {
+    /// Normal routing: direct entry first when configured, falling back across all relay candidates.
+    #[default]
+    Any,
+    /// Direct entry only; never fall back to any relay.
+    DirectOnly,
+    /// Relay strictly through the named configured node; never try a direct entry or another relay.
+    RelayOnly(String),
+    /// Direct entry first, with relay fallback restricted strictly to the single named relay.
+    DirectOrRelay(String),
+}
+
 impl Link {
     /// Creates a new [`Link`] from `config` using default [`LinkOptions`].
     pub fn new(config: LinkConfig) -> Self {
@@ -2330,11 +2347,34 @@ impl Link {
         length: Option<u64>,
         cancel: CancellationToken,
     ) -> Result<ContentStream, ErrorBody> {
+        self.open_content_with_policy(
+            machine,
+            path,
+            offset,
+            length,
+            ContentRoutePolicy::Any,
+            cancel,
+        )
+        .await
+    }
+
+    /// Like [`Link::open_content_with_cancel`], enforcing `route_policy` so the open never falls
+    /// back outside the permitted direct entry or single pinned relay.
+    pub async fn open_content_with_policy(
+        &self,
+        machine: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+        route_policy: ContentRoutePolicy,
+        cancel: CancellationToken,
+    ) -> Result<ContentStream, ErrorBody> {
         self.open_content_inner(
             machine,
             path,
             offset,
             length,
+            route_policy,
             cancel,
             Some(Arc::clone(&self.inner.parked_streams)),
         )
@@ -2354,16 +2394,26 @@ impl Link {
         length: Option<u64>,
         cancel: CancellationToken,
     ) -> Result<ContentStream, ErrorBody> {
-        self.open_content_inner(machine, path, offset, length, cancel, None)
-            .await
+        self.open_content_inner(
+            machine,
+            path,
+            offset,
+            length,
+            ContentRoutePolicy::Any,
+            cancel,
+            None,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn open_content_inner(
         &self,
         machine: &str,
         path: &str,
         offset: u64,
         length: Option<u64>,
+        route_policy: ContentRoutePolicy,
         cancel: CancellationToken,
         park_pool: Option<Arc<ParkedStreamPool>>,
     ) -> Result<ContentStream, ErrorBody> {
@@ -2384,8 +2434,18 @@ impl Link {
             .node(machine)
             .cloned();
 
+        let allow_direct = !matches!(route_policy, ContentRoutePolicy::RelayOnly(_));
+        let allow_relay = !matches!(route_policy, ContentRoutePolicy::DirectOnly);
+        let pinned_relay: Option<&str> = match &route_policy {
+            ContentRoutePolicy::RelayOnly(relay) | ContentRoutePolicy::DirectOrRelay(relay) => {
+                Some(relay.as_str())
+            }
+            ContentRoutePolicy::Any | ContentRoutePolicy::DirectOnly => None,
+        };
+
         // A local-only desktop pipe (e.g. `local`) cannot be relayed through remote SSH peers.
-        if let Some(ref e) = entry
+        if allow_direct
+            && let Some(ref e) = entry
             && e.local_program.is_some()
             && e.target.is_none()
         {
@@ -2405,7 +2465,7 @@ impl Link {
         let mut direct_err: Option<ErrorBody> = None;
         let mut learned_auth_err: Option<ErrorBody> = None;
 
-        if entry.is_some() && !in_unsynced_backoff {
+        if allow_direct && entry.is_some() && !in_unsynced_backoff {
             match self
                 .open_content_direct(
                     machine,
@@ -2423,6 +2483,9 @@ impl Link {
                     return Ok(stream);
                 }
                 Err(err) => {
+                    if !allow_relay {
+                        return Err(err);
+                    }
                     if !is_unsent(&err) {
                         return Err(err);
                     }
@@ -2442,7 +2505,46 @@ impl Link {
             }
         }
 
-        let relays = self.relay_candidates(machine, entry_learned_from.as_deref());
+        if !allow_relay {
+            if entry.is_none() {
+                return Err(ErrorBody::new(
+                    ErrorCode::Unreachable,
+                    format!("Can't reach {machine} right now."),
+                )
+                .with_machine(machine));
+            }
+            if in_unsynced_backoff {
+                match self
+                    .open_content_direct(machine, path, offset, length, cancel, park_pool)
+                    .await
+                {
+                    Ok(stream) => {
+                        self.clear_unsynced(machine);
+                        self.record_route(machine, MachineRouteStatus::Direct);
+                        return Ok(stream);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        let relays: Vec<String> = match pinned_relay {
+            Some(relay) => {
+                let configured = self
+                    .inner
+                    .config
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .node(relay)
+                    .is_some();
+                if configured && relay != machine {
+                    vec![relay.to_owned()]
+                } else {
+                    Vec::new()
+                }
+            }
+            None => self.relay_candidates(machine, entry_learned_from.as_deref()),
+        };
         let mut last_relay_err: Option<ErrorBody> = None;
         let mut relay_auth_err: Option<ErrorBody> = None;
         let mut old_relay_err: Option<ErrorBody> = None;
@@ -2513,7 +2615,7 @@ impl Link {
             }
         }
 
-        if in_unsynced_backoff {
+        if allow_direct && in_unsynced_backoff {
             match self
                 .open_content_direct(machine, path, offset, length, cancel, park_pool)
                 .await
@@ -2531,6 +2633,21 @@ impl Link {
                     }
                 }
             }
+        }
+
+        if let Some(relay) = pinned_relay
+            && direct_err.is_none()
+            && last_relay_err.is_none()
+            && relay_auth_err.is_none()
+            && old_relay_err.is_none()
+            && learned_auth_err.is_none()
+            && unknown_machine_err.is_none()
+        {
+            return Err(ErrorBody::new(
+                ErrorCode::Unreachable,
+                format!("Can't reach {relay} right now."),
+            )
+            .with_machine(relay));
         }
 
         Err(self.resolve_stream_fallback_error(
@@ -8654,5 +8771,311 @@ mod tests {
             );
             link_put.close().await;
         }
+    }
+
+    #[tokio::test]
+    async fn open_content_with_policy_pins_relay_and_direct_routes() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let tower_down = Arc::new(AtomicBool::new(false));
+        let other_hits = Arc::new(AtomicUsize::new(0));
+        let studio_down = Arc::new(AtomicBool::new(false));
+
+        struct TaggedRelayStreamOpener {
+            peer: String,
+            payload: Vec<u8>,
+            hits: Option<Arc<AtomicUsize>>,
+        }
+
+        impl crate::content::StreamOpener for TaggedRelayStreamOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<crate::content::RawStream, StreamOpenError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                let peer = self.peer.clone();
+                let payload = self.payload.clone();
+                let hits = self.hits.clone();
+                Box::pin(async move {
+                    if let Some(h) = hits {
+                        h.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    tokio::spawn(async move {
+                        let greeting = json!({
+                            "protocol": 1,
+                            "capabilities": [CAP_STREAM_RELAY],
+                        });
+                        let _ = server_out
+                            .write_all(format!("{greeting}\n").as_bytes())
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let inner = if req["op"] == "relay" {
+                            &req["request"]
+                        } else {
+                            &req
+                        };
+                        let offset = inner["offset"].as_u64().unwrap_or(0) as usize;
+                        let len = inner
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize)
+                            .unwrap_or(payload.len().saturating_sub(offset))
+                            .min(payload.len().saturating_sub(offset));
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": len,
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": if peer == "other-hub" { 2u64 } else { 1u64 },
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        let _ = server_out.write_all(&payload[offset..offset + len]).await;
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(crate::content::RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: CancellationToken::new(),
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        struct PolicyTransport(Arc<dyn crate::content::StreamOpener>);
+        impl crate::session::TransportHandle for PolicyTransport {
+            fn collect_exit_info(
+                &mut self,
+                _: Duration,
+            ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
+                Box::pin(async { (Some(0), String::new()) })
+            }
+            fn close(self: Box<Self>, _: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+            fn stream_opener(&self) -> Option<Arc<dyn crate::content::StreamOpener>> {
+                Some(Arc::clone(&self.0))
+            }
+        }
+
+        let opener: SessionOpener = {
+            let tower_down = Arc::clone(&tower_down);
+            let other_hits = Arc::clone(&other_hits);
+            let studio_down = Arc::clone(&studio_down);
+            Arc::new(move |entry, _, cancel| {
+                let tower_down = Arc::clone(&tower_down);
+                let other_hits = Arc::clone(&other_hits);
+                let studio_down = Arc::clone(&studio_down);
+                Box::pin(async move {
+                    if entry.node == "tower" && tower_down.load(Ordering::SeqCst) {
+                        return Err(ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            "Can't reach tower right now.",
+                        )
+                        .with_machine("tower"));
+                    }
+                    if entry.node == "studio" && studio_down.load(Ordering::SeqCst) {
+                        return Err(ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            "Can't reach studio right now.",
+                        )
+                        .with_machine("studio"));
+                    }
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let node_name = entry.node.clone();
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_proto::Request = serde_json::from_str(&line).unwrap();
+                            let reply = legion_proto::Response::ok(
+                                req.id,
+                                serde_json::to_value(legion_proto::HelloResult {
+                                    node: node_name.clone(),
+                                    version: legion_proto::VERSION.to_owned(),
+                                    build: None,
+                                    protocol: legion_proto::PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    let (payload, hits) = match entry.node.as_str() {
+                        "tower" => (b"studio-via-tower".to_vec(), None),
+                        "other-hub" => (b"studio-via-other".to_vec(), Some(other_hits)),
+                        _ => (b"studio-direct-ok".to_vec(), None),
+                    };
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(PolicyTransport(Arc::new(TaggedRelayStreamOpener {
+                            peer: entry.node.clone(),
+                            payload,
+                            hits,
+                        }))),
+                        &entry.node,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|e| e.into_error())
+                })
+            })
+        };
+
+        let link = Link::with_opener(
+            LinkConfig {
+                nodes: vec![
+                    NodeLink::ssh(
+                        "tower",
+                        SshTarget {
+                            hosts: vec!["192.0.2.1".to_owned()],
+                            port: 22,
+                            user: "me".to_owned(),
+                            host_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITowerPinKey000000000000000000000000000000000".to_owned()],
+                        },
+                        Some("device:pixel".to_owned()),
+                    ),
+                    NodeLink::ssh(
+                        "other-hub",
+                        SshTarget {
+                            hosts: vec!["192.0.2.2".to_owned()],
+                            port: 22,
+                            user: "me".to_owned(),
+                            host_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherPinKey000000000000000000000000000000000".to_owned()],
+                        },
+                        Some("device:pixel".to_owned()),
+                    ),
+                ],
+                ..LinkConfig::default()
+            },
+            LinkOptions::default(),
+            opener,
+        );
+
+        // 1. RelayOnly("tower") reads via tower.
+        let mut s1 = link
+            .open_content_with_policy(
+                "studio",
+                "/home/me/f.bin",
+                0,
+                None,
+                ContentRoutePolicy::RelayOnly("tower".to_owned()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            s1.route(),
+            &Route::Relay {
+                via: "tower".to_owned()
+            }
+        );
+        let mut buf = Vec::new();
+        s1.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"studio-via-tower");
+        assert_eq!(other_hits.load(Ordering::SeqCst), 0);
+
+        // 2. When tower goes down, RelayOnly("tower") fails with Unreachable and NEVER falls back
+        //    to `other-hub`.
+        tower_down.store(true, Ordering::SeqCst);
+        link.close().await;
+        let err = link
+            .open_content_with_policy(
+                "studio",
+                "/home/me/f.bin",
+                0,
+                None,
+                ContentRoutePolicy::RelayOnly("tower".to_owned()),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code, ErrorCode::Unreachable, "{err:?}");
+        assert_eq!(err.machine.as_deref(), Some("tower"));
+        assert_eq!(
+            other_hits.load(Ordering::SeqCst),
+            0,
+            "pinned relay must never fall back to another paired machine"
+        );
+
+        // 3. DirectOnly never falls back to `other-hub` when direct `studio` is unreachable.
+        let mut learned = NodeLink::ssh(
+            "studio",
+            SshTarget {
+                hosts: vec!["192.0.2.3".to_owned()],
+                port: 22,
+                user: "me".to_owned(),
+                host_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIStudioPinKey00000000000000000000000000000000".to_owned()],
+            },
+            Some("device:pixel".to_owned()),
+        );
+        learned.origin = NodeOrigin::Learned;
+        learned.learned_from = Some("tower".to_owned());
+        link.upsert_node(learned);
+
+        studio_down.store(true, Ordering::SeqCst);
+        let err = link
+            .open_content_with_policy(
+                "studio",
+                "/home/me/f.bin",
+                0,
+                None,
+                ContentRoutePolicy::DirectOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code, ErrorCode::Unreachable, "{err:?}");
+        assert_eq!(err.machine.as_deref(), Some("studio"));
+        assert_eq!(other_hits.load(Ordering::SeqCst), 0);
+
+        // 4. DirectOrRelay("tower") when both studio and tower are down also never touches other-hub.
+        let err = link
+            .open_content_with_policy(
+                "studio",
+                "/home/me/f.bin",
+                0,
+                None,
+                ContentRoutePolicy::DirectOrRelay("tower".to_owned()),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code, ErrorCode::Unreachable, "{err:?}");
+        assert_eq!(other_hits.load(Ordering::SeqCst), 0);
+
+        link.close().await;
     }
 }

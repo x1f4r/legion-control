@@ -427,14 +427,34 @@ impl TransferCapabilities {
     }
 }
 
-/// Identity metadata for a learned direct entry, used to bind a `fleet:<epoch>` content ticket
-/// at most once to the exact learned machine identity that upgraded it.
+/// Cryptographic identity and pairing holder of a configured node (`Paired`, `Learned`, or desktop
+/// local pipe), used to pin a relayed content ticket to the exact relay machine that minted it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeRouteIdentity {
+    /// Configured node name (e.g. `"tower"`).
+    pub node: String,
+    /// True when this node is directly paired (or the local desktop pipe).
+    pub is_paired: bool,
+    /// Pairing epoch holder (`pairing:<node>:<epoch>`).
+    pub holder: String,
+    /// Canonical sorted SSH host keys (`<type> <base64>`), empty for local desktop pipes.
+    pub host_keys: Vec<String>,
+}
+
+/// Identity metadata for a learned direct entry, used to bind a relayed content ticket at most
+/// once to the exact learned machine identity introduced by the same paired relay that minted it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LearnedDirectIdentity {
     /// Fleet pairing epoch during which this learned entry was added.
     pub learned_fleet_epoch: u64,
     /// True when `learned_from` names a currently directly paired introducer.
     pub from_paired_introducer: bool,
+    /// Configured node name of the paired introducer that reported this entry (e.g. `"tower"`).
+    pub learned_from: Option<String>,
+    /// Pairing epoch holder of that introducer (`pairing:<introducer>:<epoch>`), when paired.
+    pub introducer_holder: Option<String>,
+    /// Canonical sorted SSH host keys of that introducer, when paired.
+    pub introducer_host_keys: Vec<String>,
     /// Canonical sorted set of pinned SSH host keys (`<type> <base64>`).
     pub host_keys: Vec<String>,
 }
@@ -603,6 +623,12 @@ pub trait Backend: Send + Sync {
     /// Fast synchronous check that a content ticket's pairing holder is still active.
     fn is_pairing_holder_live(&self, _holder: &str) -> bool {
         false
+    }
+
+    /// Returns the live configured identity (pairing holder and pinned SSH host keys) of a
+    /// configured relay/direct node, if present.
+    fn node_route_identity(&self, _node: &str) -> Option<NodeRouteIdentity> {
+        None
     }
 }
 
