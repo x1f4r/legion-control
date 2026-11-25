@@ -143,6 +143,9 @@ fn helper(args: &[String]) -> ExitCode {
             cmd.arg(sub)
                 .env("LEGION_HOME", legion_home)
                 .env("HOME", user_home)
+                .env("USERPROFILE", user_home)
+                .env_remove("XDG_CONFIG_HOME")
+                .env_remove("XDG_STATE_HOME")
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
@@ -169,6 +172,9 @@ fn helper(args: &[String]) -> ExitCode {
             cmd.arg(sub)
                 .env("LEGION_HOME", legion_home)
                 .env("HOME", user_home)
+                .env("USERPROFILE", user_home)
+                .env_remove("XDG_CONFIG_HOME")
+                .env_remove("XDG_STATE_HOME")
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
@@ -490,7 +496,10 @@ fn spawn_stream_with_timeout(
         cmd.arg("--as").arg(p);
     }
     cmd.env("LEGION_HOME", legion_home_of(node_home))
-        .env("HOME", node_home.home());
+        .env("HOME", node_home.home())
+        .env("USERPROFILE", node_home.home())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME");
     if let Some(ms) = relay_timeout_ms {
         cmd.env("LEGION_TEST_RELAY_TIMEOUT_MS", ms.to_string());
     }
@@ -2138,7 +2147,7 @@ fn relayed_put_if_exists_fail_refuses_existing_file_and_preserves_fields() {
         "existing file on studio must remain untouched after if_exists=fail refusal"
     );
     assert!(
-        !studio.home().join(".existing.txt.legion-part").exists(),
+        !studio.home().join("existing.txt.legion-part").exists(),
         "refused put must not leave a partial file"
     );
 
@@ -2248,6 +2257,7 @@ fn configure_gate_device(home: &Home, node_name: &str, pairing_id: &str, role_ru
         .args(["device.list"])
         .env("LEGION_HOME", legion_home_of(home))
         .env("HOME", home.home())
+        .env("USERPROFILE", home.home())
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_STATE_HOME")
         .output()
@@ -2480,7 +2490,7 @@ fn run_revoked_put_case(
     let _ = writer.join();
 
     let dest_exists = studio.home().join("revoked-put.bin").exists();
-    let part_exists = studio.home().join(".revoked-put.bin.legion-part").exists();
+    let part_exists = studio.home().join("revoked-put.bin.legion-part").exists();
     (reply, dest_exists, part_exists, elapsed)
 }
 
