@@ -4506,24 +4506,38 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 .filter(|c| c.acked_local_incarnation == meta.incarnation)
                 .map_or(0, |c| c.acked_local_seq);
             let seq_gap = meta.local_seq.saturating_sub(peer_acked_seq);
-            let emitted_outgoing = if seq_gap == 0
-                || (meta.local_clock == 0
-                    && meta.members.len() <= 2
-                    && cursor_opt.is_some_and(|c| c.incarnation != 0 && c.seq > 0))
-            {
+            let emitted_outgoing = if seq_gap == 0 {
                 0
-            } else if cursor_opt.is_none_or(|c| c.incarnation == 0) || seq_gap > 4096 {
+            } else if cursor_opt.is_none_or(|c| c.incarnation == 0) {
                 seq_gap
             } else {
                 let peer_inc = cursor_opt.map_or(0, |c| c.incarnation);
-                let page =
-                    self.store
-                        .records_since(member, meta.incarnation, peer_acked_seq, 4096)?;
                 let peer_vkey = crate::version::VersionKey::new(member.clone(), peer_inc);
-                page.records
-                    .iter()
-                    .filter(|r| !(r.modified_by == *member && r.version.get(&peer_vkey) > 0))
-                    .count() as u64
+                let mut count = 0u64;
+                let mut scan_seq = peer_acked_seq;
+                loop {
+                    let page = self.store.records_since(
+                        member,
+                        meta.incarnation,
+                        scan_seq,
+                        MAX_PAGE_RECORDS,
+                    )?;
+                    if page.records.is_empty() {
+                        break;
+                    }
+                    let mut last_seq = scan_seq;
+                    for r in &page.records {
+                        last_seq = last_seq.max(r.seq);
+                        if !(r.modified_by == *member && r.version.get(&peer_vkey) > 0) {
+                            count = count.saturating_add(1);
+                        }
+                    }
+                    if !page.has_more || last_seq <= scan_seq {
+                        break;
+                    }
+                    scan_seq = last_seq;
+                }
+                count
             };
             let pending_outgoing = emitted_outgoing.saturating_add(pending_del_count);
             let pending_outgoing_since = if pending_outgoing == 0 {

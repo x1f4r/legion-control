@@ -6151,17 +6151,45 @@ fn run_index_wipe_and_explicit_rebuild_seed(root_seed: u64, seed: u64, record_tr
     ));
 
     // Explicit rebuild-from-disk recovers cleanly and preserves `secret.pdf` deletion!
+    // Also place an unsynced file on A before rebuild so we verify status never falsely reports
+    // UpToDate after A pulls from B while B still lacks A's unsynced file (`review5::s7`).
+    let unsynced_body = format!("only-on-a-{seed}").into_bytes();
+    let unsynced_h = hash_bytes(&unsynced_body);
+    reopened
+        .fs()
+        .user_write_file("only_on_a.txt", unsynced_body, unsynced_h, now_a);
     reopened.rebuild_from_disk(now_a).unwrap();
     assert!(!reopened.is_index_damaged());
     world.members[a].engine = reopened;
 
-    // B reconnects -> `secret.pdf` must NOT resurrect on A and MUST be deleted on B!
+    // B reconnects: let A pull from B first -> A still holds `only_on_a.txt` that B has not
+    // pulled yet, so A MUST report WaitingForMember (NEVER UpToDate)!
     world.members[b].group = 0;
+    {
+        let (left, right) = world.members.split_at_mut(b);
+        left[a]
+            .engine
+            .pull_from_peer(
+                &SimPeer::new(&right[0].engine, &left[a].id, &right[0].id, PeerFault::None),
+                Timestamp::new(now_a.secs + 1, 0),
+            )
+            .unwrap();
+        let st_a = left[a].engine.status().unwrap();
+        assert!(
+            matches!(st_a.state, MemberState::WaitingForMember { .. }),
+            "seed={root_seed}: rebuilt member holding unsynced file must report WaitingForMember, got {:?}",
+            st_a.state
+        );
+    }
     world.sync_connected_groups_to_quiescence();
     for m in &world.members {
         if m.active {
             assert_eq!(m.engine.fs().live_file_hash("secret.pdf"), None);
             assert_eq!(m.engine.fs().live_file_hash("keep.txt"), Some(keep_h));
+            assert_eq!(
+                m.engine.fs().live_file_hash("only_on_a.txt"),
+                Some(unsynced_h)
+            );
         }
     }
     world.check_invariants(true);
@@ -7390,7 +7418,7 @@ fn run_asymmetric_membership_views_seed(root_seed: u64, seed: u64, _record_trace
             }
         };
 
-    match rng.range(3) {
+    match rng.range(4) {
         0 => {
             // Subcase 0: `pi` added on `nas` (and optionally `laptop`), unknown to `tower`;
             // concurrent edit + deletion + optional dropped page when `tower` finally learns `pi`.
@@ -7617,7 +7645,7 @@ fn run_asymmetric_membership_views_seed(root_seed: u64, seed: u64, _record_trace
                 assert_eq!(e.status().unwrap().state, MemberState::UpToDate);
             }
         }
-        _ => {
+        2 => {
             // Subcase 2: `p2b`-style relay edit + concurrent deletion + laptop removal +
             // dropped page on rejoin, randomized order!
             let three = ["tower", "nas", "laptop"];
@@ -7691,6 +7719,63 @@ fn run_asymmetric_membership_views_seed(root_seed: u64, seed: u64, _record_trace
                 assert_eq!(e.status().unwrap().state, MemberState::UpToDate);
             }
         }
+        3 => {
+            // Subcase 3 (`review5::s5b`): relay with `local_clock == 0` pulls a file from a third
+            // member, removes that third member (leaving 2 members), and pulls from the remaining
+            // peer: status MUST report `WaitingForMember`, NEVER `UpToDate`, until the peer pulls!
+            let three = ["tower", "pi", "laptop"];
+            let mut tower = mk("tower", &three, &mut rng);
+            let mut pi = mk("pi", &three, &mut rng);
+            let mut laptop = mk("laptop", &three, &mut rng);
+
+            let p_body = format!("p-{seed}").into_bytes();
+            pi.fs()
+                .user_write_file("p.txt", p_body.clone(), hash_bytes(&p_body), t0);
+            pi.scan(t0).unwrap();
+            sync_slice(
+                &mut [&mut tower, &mut pi, &mut laptop],
+                t0.secs + 1,
+                &mut rng,
+            );
+
+            let lap_body = format!("relayed-{seed}").into_bytes();
+            let lap_h = hash_bytes(&lap_body);
+            let t1 = Timestamp::new(t0.secs + 20, 0);
+            laptop.fs().user_write_file("doc.txt", lap_body, lap_h, t1);
+            laptop.scan(t1).unwrap();
+            tower
+                .pull_from_peer(
+                    &SimPeer::new(&laptop, "tower", "laptop", PeerFault::None),
+                    t1,
+                )
+                .unwrap();
+            drop(laptop);
+            tower.remove_member("laptop").unwrap();
+            pi.remove_member("laptop").unwrap();
+            tower
+                .pull_from_peer(
+                    &SimPeer::new(&pi, "tower", "pi", PeerFault::None),
+                    Timestamp::new(t0.secs + 25, 0),
+                )
+                .unwrap();
+            assert_eq!(tower.meta().unwrap().local_clock, 0);
+            assert_eq!(tower.meta().unwrap().members.len(), 2);
+            assert_eq!(pi.fs().live_file_hash("doc.txt"), None);
+            assert_eq!(
+                tower.status().unwrap().state,
+                MemberState::WaitingForMember {
+                    members: vec!["pi".to_string()],
+                },
+                "seed={root_seed}: 2-member relay with local_clock=0 must report WaitingForMember, not UpToDate"
+            );
+
+            // Once pi pulls from tower (and tower hears pi's ack), both converge to UpToDate.
+            sync_slice(&mut [&mut tower, &mut pi], t0.secs + 30, &mut rng);
+            assert_eq!(pi.fs().live_file_hash("doc.txt"), Some(lap_h));
+            assert_eq!(tower.status().unwrap().state, MemberState::UpToDate);
+            assert_eq!(pi.status().unwrap().state, MemberState::UpToDate);
+        }
+        _ => unreachable!(),
     }
 }
 
