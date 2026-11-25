@@ -296,6 +296,7 @@ function App() {
   const mainRef = useRef(null);
   const refreshAbortRef = useRef(null);
   const refreshInFlightRef = useRef(false);
+  const resumingRef = useRef(false);
   const screenRefreshRef = useRef(null);
   const swipeRef = useRef(null);
   const touchSwipeRef = useRef(null);
@@ -1014,7 +1015,8 @@ function App() {
     if (
       commandDraftRef.current.running ||
       activeCallsRef.current > 0 ||
-      activeTransfersCountRef.current > 0
+      activeTransfersCountRef.current > 0 ||
+      resumingRef.current
     ) {
       promptConfirm();
       return null;
@@ -1293,6 +1295,7 @@ function App() {
                 isRunningCommand: Boolean(commandDraftRef.current.running),
                 activeCalls: activeCallsRef.current + activeTransfersCountRef.current,
                 isPairingOpen: Boolean(pairingOpenRef.current),
+                isResuming: resumingRef.current,
               })
             ) {
               startupAutoInstallRanRef.current = true;
@@ -1355,6 +1358,9 @@ function App() {
     const resumeController = createForegroundResumeController({
       invalidateSessions:
         typeof link.invalidateSessions === 'function' ? () => link.invalidateSessions() : null,
+      onResumingChange: (active) => {
+        resumingRef.current = active;
+      },
       onBackground: () => {
         if (
           typeof link.maybeAutoInstall === 'function' &&
@@ -1371,6 +1377,7 @@ function App() {
             isRunningCommand: Boolean(commandDraftRef.current.running),
             activeCalls: activeCallsRef.current + activeTransfersCountRef.current,
             isPairingOpen: Boolean(pairingOpenRef.current),
+            isResuming: resumingRef.current,
           })
         ) {
           link.maybeAutoInstall('background').catch(() => {});
@@ -1428,11 +1435,12 @@ function App() {
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       if (timer !== null) window.clearInterval(timer);
+      resumingRef.current = false;
       unsubNativeResume();
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [link, capsStore, linkState?.ready, nodeInfo, refreshFleet, settings.refreshSeconds]);
+  }, [link, capsStore, linkState?.ready, nodeInfo, refreshFleet, settings.refreshSeconds, checkUpdatesQuietly]);
 
   const openConfirm = useCallback((req) => {
     if (!sheetHistoryRef.current) {

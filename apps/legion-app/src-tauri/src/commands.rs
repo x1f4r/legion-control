@@ -223,15 +223,17 @@ pub async fn repair_store(
 pub async fn invalidate_sessions(
     backend: State<'_, SharedBackend>,
     content: State<'_, SharedContentServer>,
+    updater: State<'_, SharedUpdater>,
 ) -> Result<(), AppError> {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
+        let _resume_guard = updater.0.track_external_operation();
         content.0.on_app_resumed();
         backend.0.invalidate_sessions().await
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        let _ = (backend, content);
+        let _ = (backend, content, updater);
         Ok(())
     }
 }
