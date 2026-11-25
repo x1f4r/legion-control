@@ -27,8 +27,8 @@ pub(crate) const HEADER_PEEK_BYTES: usize = 128 * 1024;
 const MAX_HEADER_PEEK_BYTES: usize = 512 * 1024;
 /// Maximum WebP chunks scanned inside an extended (`VP8X`) or animated (`ANMF`) container.
 const MAX_WEBP_CHUNKS: usize = 64;
-/// Fixed allocator overhead covering decoder tables and small resize buffers (4 MiB).
-const BASE_DECODE_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
+/// Fixed allocator overhead covering decoder tables and small resize buffers (2 MiB).
+const BASE_DECODE_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
 /// Maximum JPEG marker segments scanned before SOS so crafted files cannot spin CPU.
 const MAX_JPEG_MARKERS: usize = 1024;
 /// Maximum TIFF IFD entries scanned in EXIF IFD0/IFD1 or MPF index IFD.
@@ -226,9 +226,10 @@ pub(crate) struct HeaderPeek {
 /// Estimates peak heap allocation in bytes for decoding an image of `width x height` pixels with
 /// `subtype` and compressed input size `source_bytes`.
 ///
-/// Accounts for `2 * source_bytes` because `image::ImageReader::into_decoder` reads the compressed
-/// stream from `Cursor<Vec<u8>>` into the underlying codec's input buffer before dropping the
-/// caller's vector.
+/// Accounts for `max(2 * source_bytes, decode_bytes + source_bytes)`: `image::ImageReader` may
+/// copy the compressed input into a codec buffer before dropping the caller's `Vec` (briefly
+/// holding `2 * source_bytes`), after which only one compressed copy and the decoded pixel buffers
+/// (`decode_bytes + source_bytes`) are live simultaneously.
 pub(crate) fn estimate_peak_bytes(
     width: u32,
     height: u32,
@@ -237,8 +238,13 @@ pub(crate) fn estimate_peak_bytes(
 ) -> u64 {
     let pixels = u64::from(width).saturating_mul(u64::from(height));
     let decode_bytes = pixels.saturating_mul(subtype.bpp_x10()).saturating_add(9) / 10;
+    let src = source_bytes as u64;
+    // During `into_decoder()`, `Vec::read_to_end` grows geometrically (rounding up to a power of
+    // two, up to +4 MiB on 63 MiB padded files) while the caller's `Vec` is still live.
+    let copy_peak = src.saturating_mul(2).saturating_add(4 * 1024 * 1024);
     decode_bytes
-        .saturating_add((source_bytes as u64).saturating_mul(2))
+        .saturating_add(src)
+        .max(copy_peak)
         .saturating_add(BASE_DECODE_OVERHEAD_BYTES)
 }
 

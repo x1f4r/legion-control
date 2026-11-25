@@ -67,10 +67,11 @@ symbolic links, and special files keep their existing `kind` and omit `category`
   an exact cross-OS live-heap cap via a capped global allocator, backed by OS limits (`RLIMIT_AS`
   with virtual-address headroom on Linux, `RLIMIT_DATA` on other non-macOS Unix, suspended-create
   Job Object limits on Windows), a 10 ms RSS watchdog on every platform (including macOS), and a
-  10 s wall-clock kill timeout. Each worker reserves its exact resident limit (`heap_cap + 12 MiB`)
+  10 s wall-clock kill timeout. Each worker reserves its exact resident limit (`heap_cap + 9 MiB`)
   from the shared in-flight budget of `min(512 MiB, effective RAM / 8)` (honoring cgroup v2/v1 and
-  Windows Job Object limits, floored at 256 MiB) across at most 8 concurrent decodes round-robin per
-  principal with anti-starvation aging, plus a 10 s wait timeout returning retryable `busy`. Only
+  Windows Job Object limits, floored at 256 MiB) across up to 16 concurrent decodes (scaled to CPU
+  cores, bounded by the shared byte budget) round-robin per principal with anti-starvation aging,
+  plus a 10 s wait timeout returning retryable `busy`. Only
   memory kills decided by this node's own limits are cached as bad-file entries in `thumb-cache/`
   (expiring after 7 days); external kills (`SIGKILL`/`SIGTERM`) and crashes return a transient
   per-path error without poisoning the cache, and timeouts are never cached permanently as bad

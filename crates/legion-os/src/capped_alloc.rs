@@ -191,3 +191,86 @@ unsafe impl GlobalAlloc for CappedAlloc {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accounts_alloc_zeroed_realloc_and_over_aligned_layouts_without_drift() {
+        // Test CappedAlloc directly through the GlobalAlloc trait without arming the test
+        // harness's own global allocator.
+        let alloc = CappedAlloc::new();
+        set_memory_cap(4 * 1024 * 1024);
+
+        // 1. alloc + dealloc
+        let l1 = Layout::from_size_align(1024, 8).unwrap();
+        let p1 = unsafe { alloc.alloc(l1) };
+        assert!(!p1.is_null());
+        assert_eq!(live_bytes(), 1024);
+        unsafe { alloc.dealloc(p1, l1) };
+        assert_eq!(live_bytes(), 0);
+
+        // 2. alloc_zeroed + over-aligned (align = 4096)
+        let l2 = Layout::from_size_align(4096, 4096).unwrap();
+        let p2 = unsafe { alloc.alloc_zeroed(l2) };
+        assert!(!p2.is_null());
+        assert_eq!((p2 as usize) % 4096, 0);
+        assert_eq!(live_bytes(), 4096);
+        let slice = unsafe { std::slice::from_raw_parts(p2, 4096) };
+        assert!(slice.iter().all(|&b| b == 0));
+
+        // 3. realloc grow + shrink (preserving over-alignment = 64)
+        let l3 = Layout::from_size_align(256, 64).unwrap();
+        let p3 = unsafe { alloc.alloc(l3) };
+        assert!(!p3.is_null());
+        assert_eq!((p3 as usize) % 64, 0);
+        assert_eq!(live_bytes(), 4096 + 256);
+
+        let p3_big = unsafe { alloc.realloc(p3, l3, 8192) };
+        assert!(!p3_big.is_null());
+        assert_eq!((p3_big as usize) % 64, 0);
+        assert_eq!(live_bytes(), 4096 + 8192);
+        let l3_big = Layout::from_size_align(8192, 64).unwrap();
+
+        let p3_small = unsafe { alloc.realloc(p3_big, l3_big, 512) };
+        assert!(!p3_small.is_null());
+        assert_eq!(live_bytes(), 4096 + 512);
+        let l3_small = Layout::from_size_align(512, 64).unwrap();
+
+        unsafe {
+            alloc.dealloc(p3_small, l3_small);
+            alloc.dealloc(p2, l2);
+        }
+        assert_eq!(live_bytes(), 0);
+
+        // 4. 10,000 sequential alloc/realloc/dealloc cycles must leave zero counter drift.
+        for i in 1..=10_000usize {
+            let sz = (i % 4096) + 16;
+            let align = if i % 8 == 0 { 64 } else { 8 };
+            let layout = Layout::from_size_align(sz, align).unwrap();
+            let ptr = unsafe {
+                if i % 3 == 0 {
+                    alloc.alloc_zeroed(layout)
+                } else {
+                    alloc.alloc(layout)
+                }
+            };
+            assert!(!ptr.is_null());
+            let grown = sz + 128;
+            let ptr2 = unsafe { alloc.realloc(ptr, layout, grown) };
+            assert!(!ptr2.is_null());
+            let layout2 = Layout::from_size_align(grown, align).unwrap();
+            let shrunk = (sz / 2).max(8);
+            let ptr3 = unsafe { alloc.realloc(ptr2, layout2, shrunk) };
+            assert!(!ptr3.is_null());
+            let layout3 = Layout::from_size_align(shrunk, align).unwrap();
+            unsafe { alloc.dealloc(ptr3, layout3) };
+        }
+        assert_eq!(live_bytes(), 0);
+        assert!(peak_bytes() >= 4096 + 8192);
+
+        // Disarm back to 0 so sibling unit tests in the same process run unlimited.
+        set_memory_cap(0);
+    }
+}

@@ -103,11 +103,11 @@ node.
   load) backed by an OS limit (`RLIMIT_AS` with virtual-address headroom on Linux, `RLIMIT_DATA` on
   other non-macOS Unix, suspended-create Job Object memory limit on Windows), a 10 ms RSS watchdog
   on every platform (including macOS), and a 10 s wall-clock kill timeout. Each worker's in-flight
-  reservation equals its resident limit (`heap_cap + 12 MiB`), so the sum of live worker limits
+  reservation equals its resident limit (`heap_cap + 9 MiB`), so the sum of live worker limits
   never exceeds the shared budget of `min(512 MiB, effective RAM / 8)` (floored at 256 MiB,
   honoring Linux cgroup v2/v1 and Windows Job Object memory limits), scheduled round-robin by
-  principal with anti-starvation aging across at most 8 concurrent decodes and a 10 s bounded wait
-  (returning retryable `busy`). Only memory kills decided by this node's own limits (allocator cap,
+  principal with anti-starvation aging across up to 16 concurrent decodes (scaled to CPU cores,
+  bounded by the shared byte budget) and a 10 s bounded wait (returning retryable `busy`). Only memory kills decided by this node's own limits (allocator cap,
   RSS watchdog, or allocator OOM under the OS limit) are recorded as negative bad-file entries in
   `thumb-cache/` keyed to that file identity, and those entries expire after 7 days so the file is
   retried once after expiry; external signals (`SIGKILL`, `SIGTERM`) and crashes return a transient

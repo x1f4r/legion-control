@@ -14,8 +14,8 @@
 //! - **Per-format estimated decode memory cap (256 MiB)**: rather than a blanket pixel cap that
 //!   would reject 48–61 MP baseline phone/camera JPEGs, [`thumb_probe`](super::thumb_probe) reads
 //!   the format and encoding subtype from the header before decoding and multiplies pixels by a
-//!   counting-allocator-measured bytes-per-pixel factor (plus compressed source bytes and 4 MiB
-//!   overhead). Images whose estimated peak fits within **256 MiB** are decoded directly (e.g.,
+//!   counting-allocator-measured bytes-per-pixel factor (plus `max(2 * source_bytes + 4 MiB,
+//!   decode + source_bytes)` and 2 MiB overhead). Images whose estimated peak fits within **256 MiB** are decoded directly (e.g.,
 //!   50 MP baseline 4:2:0 JPEG peaks around ~145 MiB + source size; 25 MP progressive 4:4:4 JPEG
 //!   peaks around ~215 MiB).
 //! - **Exact cross-OS worker heap cap + matching in-flight budget**: each `__thumb-worker` arms
@@ -23,7 +23,7 @@
 //!   exits immediately with [`CAP_EXCEEDED_EXIT_CODE`](legion_os::capped_alloc::CAP_EXCEEDED_EXIT_CODE)
 //!   on overshoot, backed by OS limits (`RLIMIT_AS` with headroom on Linux, `RLIMIT_DATA` on other
 //!   non-macOS Unix, suspended-create Job Object limits on Windows) and a 10 ms RSS watchdog. Each
-//!   worker reserves its exact resident limit (`heap_cap + 12 MiB`) from the shared in-flight byte
+//!   worker reserves its exact resident limit (`heap_cap + 9 MiB`) from the shared in-flight byte
 //!   pool so the sum of live workers' limits never exceeds `min(512 MiB, effective_ram / 8)`.
 //! - **Embedded EXIF/MPF preview fallback**: when a JPEG exceeds the 256 MiB decode cap (such as a
 //!   200 MP photo or a 36+ MP progressive 4:4:4 JPEG), `fs.thumb` extracts an embedded MPF APP2
@@ -121,11 +121,13 @@ const DEFAULT_THUMB_SIZE: u32 = 256;
 const MAX_THUMB_SIZE: u32 = 512;
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_IN_FLIGHT_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_IN_FLIGHT_IMAGES: usize = 8;
+const MIN_IN_FLIGHT_IMAGES: usize = 8;
+const MAX_IN_FLIGHT_IMAGES_CAP: usize = 16;
 const MAX_IN_FLIGHT_VIDEOS: usize = 2;
-/// Fixed non-heap RSS allowance for a `__thumb-worker` process (binary, libc, stack). Included in
-/// each worker's reservation so `sum(live worker resident limits) <= in_flight_budget`.
-const WORKER_FIXED_OVERHEAD_BYTES: u64 = 12 * 1024 * 1024;
+/// Fixed non-heap RSS allowance for a `__thumb-worker` process (binary, libc, stack — measured
+/// 5.2–5.7 MiB on Linux x86_64 release builds). Included in each worker's reservation so
+/// `sum(live worker resident limits) <= in_flight_budget`.
+const WORKER_FIXED_OVERHEAD_BYTES: u64 = 9 * 1024 * 1024;
 const MIN_IMAGE_HEAP_CAP_BYTES: u64 = 12 * 1024 * 1024;
 const MAX_IMAGE_HEAP_CAP_BYTES: u64 = MAX_IMAGE_DECODE_BYTES - WORKER_FIXED_OVERHEAD_BYTES;
 const IMAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -288,10 +290,18 @@ fn video_tier_limits(tier: VideoTier) -> (u64, u64, u64) {
     }
 }
 
+fn max_in_flight_images() -> usize {
+    std::thread::available_parallelism().map_or(MIN_IN_FLIGHT_IMAGES, |n| {
+        n.get()
+            .clamp(MIN_IN_FLIGHT_IMAGES, MAX_IN_FLIGHT_IMAGES_CAP)
+    })
+}
+
 fn image_pool() -> Arc<FairPool> {
     Arc::clone(
-        IMAGE_POOL
-            .get_or_init(|| FairPool::new(machine_in_flight_image_budget(), MAX_IN_FLIGHT_IMAGES)),
+        IMAGE_POOL.get_or_init(|| {
+            FairPool::new(machine_in_flight_image_budget(), max_in_flight_images())
+        }),
     )
 }
 
@@ -1115,7 +1125,8 @@ pub(crate) fn select_decode_source(
 ) -> Result<(Vec<u8>, ImageProfile, Option<Orientation>), ErrorBody> {
     let (profile, jpeg_meta) = probe_image_profile(path, &bytes)?;
     if profile.fits_cap() {
-        return Ok((bytes, profile, None));
+        let orientation = jpeg_meta.map(|meta| meta.orientation);
+        return Ok((bytes, profile, orientation));
     }
 
     // Over the 256 MiB decode cap: attempt embedded MPF preview / EXIF IFD1 thumbnail fallback.
@@ -1397,16 +1408,18 @@ pub(crate) fn decode_and_render_image_checked(
 
 /// Resizes `img` for a square `target_size x target_size` thumbnail.
 ///
-/// For >=2x downscales, uses `DynamicImage::thumbnail` / `imageops::thumbnail` integer box
-/// averaging, which allocates only the tiny output buffer (eliminating `FilterType::Triangle`'s
-/// 8–25 MiB filter weight scratch on large photos) and runs >2x faster. Smaller downscales and
-/// `Cover` upscales use `FilterType::Triangle`.
+/// For >=2x downscales on 8-bit `Rgb8`/`Rgba8`/`Luma8` images, uses a cache-friendly row-major
+/// integer box downscaler directly on the raw pixel slice (zero extra scratch buffers, ~3x faster
+/// than `imageops::thumbnail` on 12–50 MP photos). Other 16-bit/LumaA8 >=2x downscales use
+/// `DynamicImage::thumbnail`, and smaller downscales or `Cover` upscales use `FilterType::Triangle`.
 fn resize_for_thumb(img: &DynamicImage, target_size: u32, fit: ThumbFit) -> DynamicImage {
     let (w, h) = (img.width(), img.height());
     match fit {
         ThumbFit::Contain => {
             if w >= target_size.saturating_mul(2) && h >= target_size.saturating_mul(2) {
-                img.thumbnail(target_size, target_size)
+                let (dw, dh) = contain_dimensions(w, h, target_size, target_size);
+                fast_box_thumbnail(img, 0, 0, w, h, dw, dh)
+                    .unwrap_or_else(|| img.thumbnail(target_size, target_size))
             } else if w > target_size || h > target_size {
                 img.resize(target_size, target_size, FilterType::Triangle)
             } else {
@@ -1418,12 +1431,189 @@ fn resize_for_thumb(img: &DynamicImage, target_size: u32, fit: ThumbFit) -> Dyna
             if side >= target_size.saturating_mul(2) {
                 let x = (w - side) / 2;
                 let y = (h - side) / 2;
-                thumbnail_crop_square(img, x, y, side, target_size)
+                fast_box_thumbnail(img, x, y, side, side, target_size, target_size)
+                    .unwrap_or_else(|| thumbnail_crop_square(img, x, y, side, target_size))
             } else {
                 img.resize_to_fill(target_size, target_size, FilterType::Triangle)
             }
         }
     }
+}
+
+fn contain_dimensions(width: u32, height: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    let wratio = f64::from(max_w) / f64::from(width);
+    let hratio = f64::from(max_h) / f64::from(height);
+    let ratio = f64::min(wratio, hratio);
+    let nw = ((f64::from(width) * ratio).round() as u32).max(1);
+    let nh = ((f64::from(height) * ratio).round() as u32).max(1);
+    (nw, nh)
+}
+
+fn fast_box_thumbnail(
+    img: &DynamicImage,
+    crop_x: u32,
+    crop_y: u32,
+    crop_w: u32,
+    crop_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Option<DynamicImage> {
+    match img {
+        DynamicImage::ImageRgb8(buf) => {
+            let raw = box_downscale_8bit::<3>(
+                buf.as_raw(),
+                buf.width() as usize,
+                crop_x as usize,
+                crop_y as usize,
+                crop_w as usize,
+                crop_h as usize,
+                dst_w as usize,
+                dst_h as usize,
+            );
+            image::RgbImage::from_raw(dst_w, dst_h, raw).map(DynamicImage::ImageRgb8)
+        }
+        DynamicImage::ImageRgba8(buf) => {
+            let raw = box_downscale_8bit::<4>(
+                buf.as_raw(),
+                buf.width() as usize,
+                crop_x as usize,
+                crop_y as usize,
+                crop_w as usize,
+                crop_h as usize,
+                dst_w as usize,
+                dst_h as usize,
+            );
+            image::RgbaImage::from_raw(dst_w, dst_h, raw).map(DynamicImage::ImageRgba8)
+        }
+        DynamicImage::ImageLuma8(buf) => {
+            let raw = box_downscale_8bit::<1>(
+                buf.as_raw(),
+                buf.width() as usize,
+                crop_x as usize,
+                crop_y as usize,
+                crop_w as usize,
+                crop_h as usize,
+                dst_w as usize,
+                dst_h as usize,
+            );
+            image::GrayImage::from_raw(dst_w, dst_h, raw).map(DynamicImage::ImageLuma8)
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn box_downscale_8bit<const C: usize>(
+    src: &[u8],
+    src_w: usize,
+    crop_x: usize,
+    crop_y: usize,
+    crop_w: usize,
+    crop_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<u8> {
+    let row_stride = src_w * C;
+    let mut out = vec![0u8; dst_w * dst_h * C];
+
+    let mut x_bounds = Vec::with_capacity(dst_w);
+    let mut max_x_span = 1usize;
+    for ox in 0..dst_w {
+        let x0 = crop_x + ox * crop_w / dst_w;
+        let x1 = (crop_x + (ox + 1) * crop_w / dst_w)
+            .max(x0 + 1)
+            .min(crop_x + crop_w);
+        let span = x1 - x0;
+        max_x_span = max_x_span.max(span);
+        x_bounds.push((x0 * C, x1 * C, span));
+    }
+
+    let max_y_span = crop_h.div_ceil(dst_h).max(1);
+    let use_u32 = max_x_span
+        .checked_mul(max_y_span)
+        .is_some_and(|px| px <= 16_000_000);
+
+    if use_u32 {
+        let mut col_sums = vec![[0u32; C]; dst_w];
+        for oy in 0..dst_h {
+            let y0 = crop_y + oy * crop_h / dst_h;
+            let y1 = (crop_y + (oy + 1) * crop_h / dst_h)
+                .max(y0 + 1)
+                .min(crop_y + crop_h);
+            let y_count = (y1 - y0) as u32;
+            col_sums.fill([0u32; C]);
+
+            for y in y0..y1 {
+                let row = &src[y * row_stride..(y + 1) * row_stride];
+                for (acc, &(bx0, bx1, _)) in col_sums.iter_mut().zip(x_bounds.iter()) {
+                    let mut local = [0u32; C];
+                    for px in row[bx0..bx1].as_chunks::<C>().0 {
+                        for ch in 0..C {
+                            local[ch] += u32::from(px[ch]);
+                        }
+                    }
+                    for ch in 0..C {
+                        acc[ch] += local[ch];
+                    }
+                }
+            }
+
+            let out_row = &mut out[oy * dst_w * C..(oy + 1) * dst_w * C];
+            for (dst_px, (acc, &(_, _, x_span))) in out_row
+                .as_chunks_mut::<C>()
+                .0
+                .iter_mut()
+                .zip(col_sums.iter().zip(x_bounds.iter()))
+            {
+                let count = (x_span as u32) * y_count;
+                let half = count / 2;
+                for ch in 0..C {
+                    dst_px[ch] = ((acc[ch] + half) / count) as u8;
+                }
+            }
+        }
+    } else {
+        let mut col_sums = vec![[0u64; C]; dst_w];
+        for oy in 0..dst_h {
+            let y0 = crop_y + oy * crop_h / dst_h;
+            let y1 = (crop_y + (oy + 1) * crop_h / dst_h)
+                .max(y0 + 1)
+                .min(crop_y + crop_h);
+            let y_count = (y1 - y0) as u64;
+            col_sums.fill([0u64; C]);
+
+            for y in y0..y1 {
+                let row = &src[y * row_stride..(y + 1) * row_stride];
+                for (acc, &(bx0, bx1, _)) in col_sums.iter_mut().zip(x_bounds.iter()) {
+                    let mut local = [0u64; C];
+                    for px in row[bx0..bx1].as_chunks::<C>().0 {
+                        for ch in 0..C {
+                            local[ch] += u64::from(px[ch]);
+                        }
+                    }
+                    for ch in 0..C {
+                        acc[ch] += local[ch];
+                    }
+                }
+            }
+
+            let out_row = &mut out[oy * dst_w * C..(oy + 1) * dst_w * C];
+            for (dst_px, (acc, &(_, _, x_span))) in out_row
+                .as_chunks_mut::<C>()
+                .0
+                .iter_mut()
+                .zip(col_sums.iter().zip(x_bounds.iter()))
+            {
+                let count = (x_span as u64) * y_count;
+                let half = count / 2;
+                for ch in 0..C {
+                    dst_px[ch] = ((acc[ch] + half) / count) as u8;
+                }
+            }
+        }
+    }
+
+    out
 }
 
 fn thumbnail_crop_square(
@@ -2349,6 +2539,47 @@ mod tests {
         assert_eq!(results[2].error.as_ref().unwrap().code, ErrorCode::Internal);
         assert_eq!(results[3].path, "/d.jpg");
         assert!(results[3].ok.is_some());
+    }
+
+    #[test]
+    fn fast_box_downscale_matches_contain_and_cover_dimensions_and_colors() {
+        // 800x600 RGB8 with distinct colored quadrants: red TL, green TR, blue BL, white BR.
+        let mut rgb = image::RgbImage::new(800, 600);
+        for (x, y, px) in rgb.enumerate_pixels_mut() {
+            *px = match (x < 400, y < 300) {
+                (true, true) => image::Rgb([240, 20, 20]),
+                (false, true) => image::Rgb([20, 220, 40]),
+                (true, false) => image::Rgb([30, 50, 230]),
+                (false, false) => image::Rgb([230, 230, 230]),
+            };
+        }
+        let dyn_rgb = DynamicImage::ImageRgb8(rgb);
+
+        let contain = resize_for_thumb(&dyn_rgb, 200, ThumbFit::Contain);
+        assert_eq!((contain.width(), contain.height()), (200, 150));
+        let c_rgb = contain.to_rgb8();
+        assert_eq!(c_rgb.get_pixel(20, 20).0, [240, 20, 20]);
+        assert_eq!(c_rgb.get_pixel(180, 20).0, [20, 220, 40]);
+        assert_eq!(c_rgb.get_pixel(20, 130).0, [30, 50, 230]);
+        assert_eq!(c_rgb.get_pixel(180, 130).0, [230, 230, 230]);
+
+        let cover = resize_for_thumb(&dyn_rgb, 150, ThumbFit::Cover);
+        assert_eq!((cover.width(), cover.height()), (150, 150));
+        let v_rgb = cover.to_rgb8();
+        assert_eq!(v_rgb.get_pixel(20, 20).0, [240, 20, 20]);
+        assert_eq!(v_rgb.get_pixel(130, 130).0, [230, 230, 230]);
+
+        // RGBA8 transparency preservation
+        let rgba = image::RgbaImage::from_pixel(400, 400, image::Rgba([10, 200, 100, 128]));
+        let out_rgba = resize_for_thumb(&DynamicImage::ImageRgba8(rgba), 100, ThumbFit::Contain);
+        assert_eq!((out_rgba.width(), out_rgba.height()), (100, 100));
+        assert_eq!(out_rgba.to_rgba8().get_pixel(50, 50).0, [10, 200, 100, 128]);
+
+        // Luma8
+        let gray = image::GrayImage::from_pixel(600, 300, image::Luma([177]));
+        let out_gray = resize_for_thumb(&DynamicImage::ImageLuma8(gray), 150, ThumbFit::Contain);
+        assert_eq!((out_gray.width(), out_gray.height()), (150, 75));
+        assert_eq!(out_gray.to_luma8().get_pixel(10, 10).0, [177]);
     }
 
     fn crc32_ieee(bytes: &[u8]) -> u32 {
