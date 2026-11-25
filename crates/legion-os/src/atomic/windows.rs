@@ -103,4 +103,41 @@ pub(super) async fn rename_exclusive_async(
     .map_err(classify_windows_exclusive_error)
 }
 
+pub(super) fn exchange_files(_a: &Path, _b: &Path) -> Result<()> {
+    Err(OsError::Unsupported {
+        detail: "use replace_with_backup on Windows".to_string(),
+    })
+}
+
+pub(super) fn replace_with_backup(staged: &Path, target: &Path, backup: &Path) -> Result<()> {
+    retry_sync_with_backoff(
+        || win_proc::replace_file_with_backup(target, staged, backup),
+        is_retryable_windows_replace_error,
+        WINDOWS_REPLACE_TIMEOUT,
+        WINDOWS_INITIAL_BACKOFF,
+        WINDOWS_MAX_BACKOFF,
+    )
+    .map_err(|err| {
+        if matches!(err.raw_os_error(), Some(1 | 50)) || err.kind() == io::ErrorKind::Unsupported {
+            OsError::Unsupported {
+                detail: format!("ReplaceFileW unsupported for {}: {err}", target.display()),
+            }
+        } else {
+            OsError::from_io(
+                format!(
+                    "cannot replace {} with {} (backup {})",
+                    target.display(),
+                    staged.display(),
+                    backup.display()
+                ),
+                err,
+            )
+        }
+    })
+}
+
+pub(super) fn file_change_id(path: &Path, _meta: &Metadata) -> Option<u64> {
+    win_proc::ntfs_file_change_id(path)
+}
+
 pub(super) fn sync_parent_dir(_parent: &Path) {}

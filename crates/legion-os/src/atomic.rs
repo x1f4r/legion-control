@@ -263,6 +263,60 @@ pub async fn replace_file_async(from: impl AsRef<Path>, to: impl AsRef<Path>) ->
     replace_file_async_impl(from.as_ref(), to.as_ref()).await
 }
 
+/// Atomically rename `from` to `to`, refusing to replace an existing entry at `to`.
+///
+/// Uses the kernel's exclusive rename (`renameat2(RENAME_NOREPLACE)` on Linux,
+/// `renamex_np(RENAME_EXCL)` on macOS, `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on
+/// Windows), falling back to `hard_link` + unlink only when the filesystem reports that
+/// exclusive rename is unsupported. Returns [`OsError::AlreadyExists`] if `to` already exists
+/// and [`OsError::Unsupported`] if neither atomic primitive is supported.
+pub fn rename_no_replace(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
+    let from = from.as_ref();
+    let to = to.as_ref();
+    commit_exclusive_with_ops(
+        || rename_exclusive_impl(from, to),
+        || fs::hard_link(from, to),
+        || {
+            let _ = fs::remove_file(from);
+        },
+        from,
+        to,
+    )
+}
+
+/// Atomically exchange two existing filesystem entries `a` and `b`.
+///
+/// Uses `renameat2(RENAME_EXCHANGE)` on Linux and `renamex_np(RENAME_SWAP)` on macOS. Returns
+/// [`OsError::Unsupported`] on filesystems or operating systems without atomic swap support so
+/// callers can fall back to [`replace_with_backup`] or claim-then-rename.
+pub fn exchange_files(a: impl AsRef<Path>, b: impl AsRef<Path>) -> Result<()> {
+    exchange_files_impl(a.as_ref(), b.as_ref())
+}
+
+/// Atomically replace existing `target` with `staged`, moving the previous contents of `target`
+/// to `backup` in one OS operation.
+///
+/// Uses `ReplaceFileW` on Windows (retrying transient sharing violations) and returns
+/// [`OsError::Unsupported`] on Unix where callers use [`exchange_files`] or claim-then-rename.
+pub fn replace_with_backup(
+    staged: impl AsRef<Path>,
+    target: impl AsRef<Path>,
+    backup: impl AsRef<Path>,
+) -> Result<()> {
+    replace_with_backup_impl(staged.as_ref(), target.as_ref(), backup.as_ref())
+}
+
+/// Returns a local filesystem change fingerprint for `path` / `meta` to detect same-size,
+/// same-mtime overwrites or renames without re-hashing unchanged files.
+///
+/// On Unix, hashes `(dev, ino, ctime, ctime_nsec)`. On Windows, queries NTFS `FileBasicInfo`
+/// (`ChangeTime`) and `FileIdInfo` (`VolumeSerialNumber`, `FileId`) via
+/// `GetFileInformationByHandleEx` (falling back to `GetFileInformationByHandle` on volumes without
+/// 128-bit file IDs).
+pub fn file_change_id(path: impl AsRef<Path>, meta: &Metadata) -> Option<u64> {
+    file_change_id_impl(path.as_ref(), meta)
+}
+
 /// RAII guard that unlinks the temporary sibling file unless [`TempFileGuard::disarm`] is called.
 struct TempFileGuard {
     path: PathBuf,
@@ -505,6 +559,40 @@ async fn rename_exclusive_async_impl(
     to: &Path,
 ) -> std::result::Result<(), ExclusiveRenameError> {
     rename_exclusive_impl(from, to)
+}
+
+#[cfg(any(unix, windows))]
+fn exchange_files_impl(a: &Path, b: &Path) -> Result<()> {
+    platform::exchange_files(a, b)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn exchange_files_impl(_a: &Path, _b: &Path) -> Result<()> {
+    Err(OsError::Unsupported {
+        detail: "atomic file exchange is not supported on this platform".to_string(),
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn replace_with_backup_impl(staged: &Path, target: &Path, backup: &Path) -> Result<()> {
+    platform::replace_with_backup(staged, target, backup)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_with_backup_impl(_staged: &Path, _target: &Path, _backup: &Path) -> Result<()> {
+    Err(OsError::Unsupported {
+        detail: "replace_with_backup is not supported on this platform".to_string(),
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn file_change_id_impl(path: &Path, meta: &Metadata) -> Option<u64> {
+    platform::file_change_id(path, meta)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_change_id_impl(_path: &Path, _meta: &Metadata) -> Option<u64> {
+    None
 }
 
 fn create_sibling_temp(

@@ -28,8 +28,12 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, MOVE_FILE_FLAGS, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL,
+    FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo,
+    FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, MOVE_FILE_FLAGS,
+    MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW,
+    SYNCHRONIZE,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
@@ -545,6 +549,107 @@ pub(crate) fn move_file_no_replace(from: &Path, to: &Path) -> std::io::Result<()
         Ok(()) => Ok(()),
         Err(_) => Err(std::io::Error::last_os_error()),
     }
+}
+
+/// Atomically replaces existing `target` with `replacement`, moving the previous contents of
+/// `target` to `backup` via `ReplaceFileW`.
+pub(crate) fn replace_file_with_backup(
+    target: &Path,
+    replacement: &Path,
+    backup: &Path,
+) -> std::io::Result<()> {
+    let target_wide = to_wide_null(target.as_os_str());
+    let replacement_wide = to_wide_null(replacement.as_os_str());
+    let backup_wide = to_wide_null(backup.as_os_str());
+    // SAFETY: All three pointers reference valid NUL-terminated UTF-16 buffers alive for the call.
+    match unsafe {
+        ReplaceFileW(
+            PCWSTR::from_raw(target_wide.as_ptr()),
+            PCWSTR::from_raw(replacement_wide.as_ptr()),
+            PCWSTR::from_raw(backup_wide.as_ptr()),
+            REPLACEFILE_IGNORE_MERGE_ERRORS,
+            None,
+            None,
+        )
+    } {
+        Ok(()) => Ok(()),
+        Err(_) => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// Queries NTFS change time (`FileBasicInfo`) and 128-bit file ID (`FileIdInfo`), falling back
+/// to `GetFileInformationByHandle` on volumes without `FileIdInfo`, and folds them into a 64-bit
+/// FNV-1a fingerprint.
+pub(crate) fn ntfs_file_change_id(path: &Path) -> Option<u64> {
+    let path_wide = to_wide_null(path.as_os_str());
+    // SAFETY: `path_wide` is a valid NUL-terminated UTF-16 path; handle is wrapped in OwnedHandle.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(path_wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .ok()?;
+    let owned = OwnedHandle(handle);
+
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: `basic` is a properly sized out-buffer for `FileBasicInfo`.
+    let got_basic = unsafe {
+        GetFileInformationByHandleEx(
+            owned.0,
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast::<c_void>(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    }
+    .is_ok();
+    if got_basic {
+        mix(&basic.ChangeTime.to_le_bytes());
+        mix(&basic.LastWriteTime.to_le_bytes());
+    }
+
+    let mut file_id = FILE_ID_INFO::default();
+    // SAFETY: `file_id` is a properly sized out-buffer for `FileIdInfo`.
+    let got_id = unsafe {
+        GetFileInformationByHandleEx(
+            owned.0,
+            FileIdInfo,
+            (&mut file_id as *mut FILE_ID_INFO).cast::<c_void>(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .is_ok();
+    if got_id {
+        mix(&file_id.VolumeSerialNumber.to_le_bytes());
+        mix(&file_id.FileId.Identifier);
+        return Some(h);
+    }
+
+    let mut by_handle = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `by_handle` is a properly sized out-buffer for `GetFileInformationByHandle`.
+    if unsafe { GetFileInformationByHandle(owned.0, &mut by_handle) }.is_ok() {
+        mix(&by_handle.dwVolumeSerialNumber.to_le_bytes());
+        mix(&by_handle.nFileIndexHigh.to_le_bytes());
+        mix(&by_handle.nFileIndexLow.to_le_bytes());
+        mix(&by_handle.ftLastWriteTime.dwHighDateTime.to_le_bytes());
+        mix(&by_handle.ftLastWriteTime.dwLowDateTime.to_le_bytes());
+        return Some(h);
+    }
+
+    got_basic.then_some(h)
 }
 
 fn open_non_inheritable_nul(access: u32) -> Result<OwnedHandle> {
