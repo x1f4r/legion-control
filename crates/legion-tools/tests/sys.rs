@@ -157,13 +157,38 @@ async fn procs_finds_this_process_and_respects_its_limits() {
     }
 }
 
-/// The start time sys.procs reports for a helper child, found by the test binary's name, which
-/// its command line holds.
-async fn start_time_of(fixture: &Fixture, pid: u32) -> String {
-    let exe = std::env::current_exe().unwrap();
-    let name = exe.file_stem().unwrap().to_string_lossy().into_owned();
+/// Kills and reaps a spawned child process on drop so test failures never leave orphan processes.
+struct ChildGuard(std::process::Child);
+
+impl ChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self(child)
+    }
+
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0.wait()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The start time `sys.procs` reports for `pid`, narrowed by a name or command substring so the
+/// result fits well inside `limit: 500` even on busy hosts.
+async fn start_time_of_matching(fixture: &Fixture, pid: u32, filter: &str) -> String {
     let procs = fixture
-        .call("sys.procs", json!({"filter": name, "limit": 500}))
+        .call("sys.procs", json!({"filter": filter, "limit": 500}))
         .await
         .unwrap();
     let listed = procs["procs"]
@@ -173,6 +198,14 @@ async fn start_time_of(fixture: &Fixture, pid: u32) -> String {
         .find(|proc| proc["pid"] == json!(pid))
         .unwrap_or_else(|| panic!("process {pid} is not among {procs:#}"));
     listed["start_time"].as_str().unwrap().to_owned()
+}
+
+/// The start time `sys.procs` reports for a helper child, found by the test binary's name, which
+/// its command line holds.
+async fn start_time_of(fixture: &Fixture, pid: u32) -> String {
+    let exe = std::env::current_exe().unwrap();
+    let name = exe.file_stem().unwrap().to_string_lossy().into_owned();
+    start_time_of_matching(fixture, pid, &name).await
 }
 
 async fn kill_stops_a_child_and_only_that_child() {
@@ -470,15 +503,15 @@ async fn kill_targets_reports_per_target_outcomes() {
     let fixture = Fixture::new();
 
     // 1. A normal child that exits cleanly on SIGTERM.
-    let mut normal = spawn_helper("sleep", &["60"]);
+    let mut normal = ChildGuard::new(spawn_helper("sleep", &["60"]));
     // 2. A child that exits immediately (so it is `gone`).
-    let mut exited = spawn_helper("args", &["done"]);
+    let mut exited = ChildGuard::new(spawn_helper("args", &["done"]));
     exited.wait().unwrap();
     // 3. A child whose start_time we intentionally mismatch (`reused`).
-    let mut reused_child = spawn_helper("sleep", &["60"]);
+    let reused_child = ChildGuard::new(spawn_helper("sleep", &["60"]));
     // 4. On Unix, a stubborn child that ignores SIGTERM until `force: true`.
     #[cfg(unix)]
-    let mut stubborn = spawn_helper("stubborn", &[]);
+    let mut stubborn = ChildGuard::new(spawn_helper("stubborn", &[]));
 
     wait_for(Duration::from_secs(30), || {
         let base_ok = alive(normal.id()) && alive(reused_child.id());
@@ -572,7 +605,7 @@ async fn kill_targets_reports_per_target_outcomes() {
             "$f.Add_Shown({ $t.Start(); Set-Content -Path $env:LEGION_WIN_READY -Value 'ready' }); ",
             "[System.Windows.Forms.Application]::Run($f)"
         );
-        if let Ok(mut win_child) = std::process::Command::new("powershell.exe")
+        match std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", ps_script])
             .env("LEGION_WIN_READY", &ready_file)
             .stdin(std::process::Stdio::null())
@@ -580,32 +613,49 @@ async fn kill_targets_reports_per_target_outcomes() {
             .stderr(std::process::Stdio::null())
             .spawn()
         {
-            let shown = wait_for(Duration::from_secs(15), || {
-                ready_file.exists().then_some(())
-            })
-            .await;
-            if shown.is_some() && alive(win_child.id()) {
-                let win_start = start_time_of(&fixture, win_child.id()).await;
-                let closed = fixture
-                    .call(
-                        "sys.kill",
-                        json!({
-                            "targets": [{"pid": win_child.id(), "start_time": win_start}],
-                            "force": false
-                        }),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    closed["results"][0]["status"],
-                    json!("stopped"),
-                    "windowed process must close gracefully on WM_CLOSE: {closed:#}"
-                );
-                assert!(gone(win_child.id()).await);
-            } else {
-                let _ = win_child.kill();
+            Ok(child) => {
+                let mut win_child = ChildGuard::new(child);
+                let shown = wait_for(Duration::from_secs(15), || {
+                    if ready_file.exists() {
+                        Some(true)
+                    } else if !alive(win_child.id()) {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                })
+                .await;
+                if shown == Some(true) && alive(win_child.id()) {
+                    let win_start =
+                        start_time_of_matching(&fixture, win_child.id(), "powershell").await;
+                    let closed = fixture
+                        .call(
+                            "sys.kill",
+                            json!({
+                                "targets": [{"pid": win_child.id(), "start_time": win_start}],
+                                "force": false
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        closed["results"][0]["status"],
+                        json!("stopped"),
+                        "windowed process must close gracefully on WM_CLOSE: {closed:#}"
+                    );
+                    assert!(gone(win_child.id()).await);
+                    let _ = win_child.wait();
+                } else {
+                    eprintln!(
+                        "skipping Windows WM_CLOSE sub-check: runner did not show a Win32 window"
+                    );
+                }
             }
-            let _ = win_child.wait();
+            Err(err) => {
+                eprintln!(
+                    "skipping Windows WM_CLOSE sub-check: failed to start powershell.exe: {err}"
+                );
+            }
         }
     }
     assert_eq!(results[1]["status"], json!("gone"), "{res:#}");
@@ -667,8 +717,7 @@ async fn kill_targets_reports_per_target_outcomes() {
     }
 
     let _ = normal.wait();
-    let _ = reused_child.kill();
-    let _ = reused_child.wait();
+    drop(reused_child);
 }
 
 async fn kill_refuses_thread_ids_of_self_and_child() {
