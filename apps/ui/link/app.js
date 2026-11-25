@@ -235,27 +235,42 @@ export function createAppLink() {
       try {
         for (const item of checks) {
           const ticket = await contentUrl({ machine, path: item.path });
-          // 1) Verify sandbox CSP + nosniff + non-HTML content-type on the content origin.
+          // 1) App CSP restricts connect-src to Tauri IPC only, so fetch() to the content origin
+          // must either fail under CSP or (if ever permitted) return sandbox + frame-ancestors 'none'.
           if (typeof fetch === 'function') {
-            const resp = await fetch(ticket.url);
-            if (!resp.ok) {
-              throw new Error(`IPC isolation ${item.kind} fetch returned ${resp.status}`);
-            }
-            const csp = String(resp.headers.get('content-security-policy') || '').toLowerCase();
-            const nosniff = String(resp.headers.get('x-content-type-options') || '').toLowerCase();
-            const ctype = String(resp.headers.get('content-type') || '').toLowerCase();
-            if (!csp.includes('sandbox') || !csp.includes("frame-ancestors 'none'")) {
-              throw new Error(`Missing sandbox/frame-ancestors CSP on ${item.kind}: ${csp}`);
-            }
-            if (nosniff !== 'nosniff') {
-              throw new Error(`Missing nosniff on ${item.kind}: ${nosniff}`);
-            }
-            if (item.kind === 'html' && ctype.includes('text/html')) {
-              throw new Error(`HTML content must not be served as text/html: ${ctype}`);
+            try {
+              const resp = await fetch(ticket.url);
+              const csp = String(resp.headers.get('content-security-policy') || '').toLowerCase();
+              const nosniff = String(resp.headers.get('x-content-type-options') || '').toLowerCase();
+              const ctype = String(resp.headers.get('content-type') || '').toLowerCase();
+              if (!csp.includes('sandbox') || !csp.includes("frame-ancestors 'none'")) {
+                throw new Error(`Missing sandbox/frame-ancestors CSP on ${item.kind}: ${csp}`);
+              }
+              if (nosniff !== 'nosniff') {
+                throw new Error(`Missing nosniff on ${item.kind}: ${nosniff}`);
+              }
+              if (item.kind === 'html' && ctype.includes('text/html')) {
+                throw new Error(`HTML content must not be served as text/html: ${ctype}`);
+              }
+            } catch (fetchErr) {
+              const msg = String(fetchErr?.message || fetchErr || '');
+              if (msg.startsWith('Missing ') || msg.startsWith('HTML content ')) {
+                throw fetchErr;
+              }
+              // Expected: strict app CSP `connect-src` blocks fetch() to the content origin.
             }
           }
 
-          // 2) Attempt to frame the content URL and ensure neither script nor IPC is reachable.
+          // 2) For SVG, load through <img> (allowed by img-src) and confirm it renders without
+          // executing its embedded <script>.
+          if (item.kind === 'svg') {
+            const svgImg = await loadImage(ticket.url);
+            if (svgImg.width <= 0 || svgImg.height <= 0) {
+              throw new Error('SVG content image did not decode');
+            }
+          }
+
+          // 3) Attempt to frame the content URL and ensure neither script nor IPC is reachable.
           const iframe = document.createElement('iframe');
           iframe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:10px;height:10px;';
           iframe.src = ticket.url;
@@ -271,7 +286,7 @@ export function createAppLink() {
           }
           iframe.remove();
 
-          // 3) Attempt top-level navigation to the content URL; on_navigation must refuse it so
+          // 4) Attempt top-level navigation to the content URL; on_navigation must refuse it so
           // the WebView stays on the bundled app origin.
           try {
             window.location.assign(ticket.url);

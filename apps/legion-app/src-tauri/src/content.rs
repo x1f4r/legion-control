@@ -2001,4 +2001,101 @@ mod tests {
             "peak in-flight buffered memory ({peak}) exceeded budget ({budget_bytes})"
         );
     }
+
+    #[tokio::test]
+    async fn html_and_svg_carry_sandbox_csp_nosniff_and_safe_content_types_on_both_mounts() {
+        let mut files = HashMap::new();
+        files.insert(
+            "/home/me/evil.html".to_owned(),
+            b"<html><script>window.__TAURI__.core.invoke('state')</script></html>".to_vec(),
+        );
+        files.insert(
+            "/home/me/evil.svg".to_owned(),
+            b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>".to_vec(),
+        );
+
+        // 1) Loopback mount (desktop & iOS).
+        let lb_backend = Arc::new(MockContentBackend::new(files.clone()));
+        let lb = Arc::new(AppContentServer::with_config(
+            lb_backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["tauri://localhost".to_owned()],
+        ));
+        let lb_html = lb
+            .mint_url("tower", "/home/me/evil.html", false)
+            .await
+            .unwrap();
+        let lb_svg = lb
+            .mint_url("tower", "/home/me/evil.svg", false)
+            .await
+            .unwrap();
+        let port = lb.loopback_port().unwrap();
+        for (url, expected_ct) in [
+            (&lb_html.url, "content-type: text/plain; charset=utf-8"),
+            (&lb_svg.url, "content-type: image/svg+xml"),
+        ] {
+            let path = url
+                .strip_prefix(&format!("http://127.0.0.1:{port}"))
+                .unwrap();
+            let (status, head, _) = raw_http(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await;
+            assert_eq!(status, 200);
+            let lower = head.to_ascii_lowercase();
+            assert!(lower.contains(expected_ct), "{head}");
+            assert!(lower.contains("x-content-type-options: nosniff"), "{head}");
+            assert!(
+                lower.contains(
+                    "content-security-policy: sandbox; default-src 'none'; frame-ancestors 'none'"
+                ),
+                "{head}"
+            );
+        }
+        lb.shutdown();
+
+        // 2) Custom-scheme mount (Android).
+        let cs_backend = Arc::new(MockContentBackend::new(files));
+        let cs = Arc::new(AppContentServer::with_config(
+            cs_backend,
+            ContentMountMode::CustomScheme,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+        let cs_html = cs
+            .mint_url("tower", "/home/me/evil.html", false)
+            .await
+            .unwrap();
+        let cs_svg = cs
+            .mint_url("tower", "/home/me/evil.svg", false)
+            .await
+            .unwrap();
+        for (url, expected_ct) in [
+            (&cs_html.url, "text/plain; charset=utf-8"),
+            (&cs_svg.url, "image/svg+xml"),
+        ] {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(url)
+                .body(Vec::new())
+                .unwrap();
+            let resp = cs.handle_custom_scheme(req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), expected_ct);
+            assert_eq!(
+                resp.headers().get(X_CONTENT_TYPE_OPTIONS).unwrap(),
+                "nosniff"
+            );
+            assert_eq!(
+                resp.headers().get(CONTENT_SECURITY_POLICY).unwrap(),
+                CONTENT_SANDBOX_CSP
+            );
+        }
+    }
 }
