@@ -1775,10 +1775,22 @@ fn parse_wav<R: Read + Seek>(
         chunks += 1;
         let ch = stream.read_fixed::<8>()?;
         let fourcc = [ch[0], ch[1], ch[2], ch[3]];
-        let chunk_size = u64::from(u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]));
-        if chunk_size > stream.remaining_file() {
-            return Err(stream.malformed("WAV chunk length exceeds file size"));
-        }
+        let declared_size = u64::from(u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]));
+        let remaining = stream.remaining_file();
+        // Streamed and in-progress WAV recordings commonly declare `0xFFFFFFFF` (or more than
+        // currently written bytes) on the final `data` chunk. Clamp payload/trailing chunks to EOF
+        // so earlier metadata and current duration are preserved, while still rejecting truncated
+        // header or tag chunks.
+        let chunk_size = if declared_size > remaining {
+            match &fourcc {
+                b"fmt " | b"ID3 " | b"id3 " | b"LIST" => {
+                    return Err(stream.malformed("WAV chunk length exceeds file size"));
+                }
+                _ => remaining,
+            }
+        } else {
+            declared_size
+        };
         let pad = chunk_size & 1;
         let chunk_start = stream.pos;
         let next_pos = chunk_start
@@ -1921,18 +1933,33 @@ fn parse_aiff<R: Read + Seek>(
         return Err(stream.malformed("not an AIFF FORM file"));
     }
 
+    let mut channels = 0u16;
+    let mut sample_size_bits = 0u16;
     let mut num_sample_frames = 0u32;
     let mut sample_rate = 0.0f64;
+    let mut ssnd_bytes = 0u64;
     let mut chunks = 0usize;
 
     while stream.remaining_file() >= 8 && chunks < MAX_CONTAINER_CHUNKS {
         chunks += 1;
         let ch = stream.read_fixed::<8>()?;
         let fourcc = [ch[0], ch[1], ch[2], ch[3]];
-        let chunk_size = u64::from(u32::from_be_bytes([ch[4], ch[5], ch[6], ch[7]]));
-        if chunk_size > stream.remaining_file() {
-            return Err(stream.malformed("AIFF chunk length exceeds file size"));
-        }
+        let declared_size = u64::from(u32::from_be_bytes([ch[4], ch[5], ch[6], ch[7]]));
+        let remaining = stream.remaining_file();
+        // Streamed and in-progress AIFF recordings commonly declare `0xFFFFFFFF` (or more than
+        // currently written bytes) on the final `SSND` chunk. Clamp payload/trailing chunks to EOF
+        // so earlier metadata and current duration are preserved, while still rejecting truncated
+        // header or tag chunks.
+        let chunk_size = if declared_size > remaining {
+            match &fourcc {
+                b"COMM" | b"ID3 " | b"id3 " => {
+                    return Err(stream.malformed("AIFF chunk length exceeds file size"));
+                }
+                _ => remaining,
+            }
+        } else {
+            declared_size
+        };
         let pad = chunk_size & 1;
         let chunk_start = stream.pos;
         let next_pos = chunk_start
@@ -1945,12 +1972,17 @@ fn parse_aiff<R: Read + Seek>(
             b"COMM" => {
                 if chunk_size >= 18 {
                     let comm = stream.read_fixed::<18>()?;
+                    channels = u16::from_be_bytes([comm[0], comm[1]]);
                     num_sample_frames = u32::from_be_bytes([comm[2], comm[3], comm[4], comm[5]]);
+                    sample_size_bits = u16::from_be_bytes([comm[6], comm[7]]);
                     sample_rate = decode_ieee80_be([
                         comm[8], comm[9], comm[10], comm[11], comm[12], comm[13], comm[14],
                         comm[15], comm[16], comm[17],
                     ]);
                 }
+            }
+            b"SSND" => {
+                ssnd_bytes = chunk_size;
             }
             b"ID3 " | b"id3 " => {
                 let raw = stream.read_tag_bytes(chunk_size)?;
@@ -1962,8 +1994,18 @@ fn parse_aiff<R: Read + Seek>(
         stream.seek_to(next_pos)?;
     }
 
-    if sample_rate.is_finite() && sample_rate > 0.0 && num_sample_frames > 0 {
-        tags.duration_s = normalize_duration(f64::from(num_sample_frames) / sample_rate);
+    if sample_rate.is_finite() && sample_rate > 0.0 {
+        if num_sample_frames > 0 && num_sample_frames != u32::MAX {
+            tags.duration_s = normalize_duration(f64::from(num_sample_frames) / sample_rate);
+        } else if channels > 0 && sample_size_bits > 0 && ssnd_bytes > 8 {
+            let bytes_per_frame =
+                u64::from(channels).saturating_mul(u64::from(sample_size_bits.div_ceil(8)));
+            if let Some(frames) = (ssnd_bytes - 8).checked_div(bytes_per_frame)
+                && frames > 0
+            {
+                tags.duration_s = normalize_duration(frames as f64 / sample_rate);
+            }
+        }
     }
     Ok(())
 }
@@ -3256,6 +3298,90 @@ mod tests {
         assert_eq!(extracted.tags.title.as_deref(), Some("Part One, Part Two"));
         assert_eq!(extracted.tags.artist.as_deref(), Some("Ada, Grace"));
         assert_eq!(extracted.tags.track, Some(3));
+    }
+
+    #[test]
+    fn wav_and_aiff_clamp_oversized_trailing_audio_chunks_for_in_progress_recordings() {
+        // 1. In-progress WAV: RIFF size=0xFFFFFFFF, LIST/INFO title + fmt + data size=0xFFFFFFFF
+        //    with 2 seconds of 8 kHz 16-bit mono PCM (32,000 bytes) written so far.
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        // LIST/INFO chunk before `data`
+        let inam = b"Live WAV take\0";
+        let list_payload_len = 4 + 8 + inam.len(); // "INFO" + "INAM" + len + value (14 is even)
+        wav.extend_from_slice(b"LIST");
+        wav.extend_from_slice(&(list_payload_len as u32).to_le_bytes());
+        wav.extend_from_slice(b"INFO");
+        wav.extend_from_slice(b"INAM");
+        wav.extend_from_slice(&(inam.len() as u32).to_le_bytes());
+        wav.extend_from_slice(inam);
+        // `fmt ` chunk: PCM, 1ch, 8000 Hz, byte_rate=16000, block_align=2, 16-bit
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&16_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        // `data` chunk declaring 0xFFFFFFFF with 32,000 bytes actually present
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        wav.resize(wav.len() + 32_000, 0);
+
+        let mut cur_w = Cursor::new(wav.as_slice());
+        let res_w = parse_audio(
+            &mut cur_w,
+            wav.len() as u64,
+            AudioFormat::Wav,
+            CoverExtractMode::CheckOnly,
+            Path::new("/recording.wav"),
+        )
+        .unwrap();
+        assert_eq!(res_w.tags.title.as_deref(), Some("Live WAV take"));
+        assert!((res_w.tags.duration_s.unwrap() - 2.0).abs() < 0.01);
+
+        // 2. In-progress AIFF: FORM size=0xFFFFFFFF, ID3 title + COMM (num_frames=0xFFFFFFFF,
+        //    1ch 16-bit 44100 Hz) + SSND size=0xFFFFFFFF with 8-byte header + 1 s of PCM (88,200 B).
+        let mut aiff = Vec::new();
+        aiff.extend_from_slice(b"FORM");
+        aiff.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        aiff.extend_from_slice(b"AIFF");
+        // ID3 chunk before SSND
+        let id3_frame = b"TIT2\x00\x00\x00\x0f\x00\x00\x03Live AIFF take";
+        let mut id3 = vec![b'I', b'D', b'3', 4, 0, 0, 0, 0, 0, id3_frame.len() as u8];
+        id3.extend_from_slice(id3_frame);
+        aiff.extend_from_slice(b"ID3 ");
+        aiff.extend_from_slice(&(id3.len() as u32).to_be_bytes());
+        aiff.extend_from_slice(&id3);
+        if !id3.len().is_multiple_of(2) {
+            aiff.push(0);
+        }
+        // COMM chunk: 1ch, num_frames=0xFFFFFFFF, 16-bit, 44100 Hz
+        aiff.extend_from_slice(b"COMM");
+        aiff.extend_from_slice(&18u32.to_be_bytes());
+        aiff.extend_from_slice(&1u16.to_be_bytes());
+        aiff.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        aiff.extend_from_slice(&16u16.to_be_bytes());
+        aiff.extend_from_slice(&[0x40, 0x0E, 0xAC, 0x44, 0, 0, 0, 0, 0, 0]);
+        // SSND chunk declaring 0xFFFFFFFF with 8-byte header + 88,200 bytes (1.0 s)
+        aiff.extend_from_slice(b"SSND");
+        aiff.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        aiff.resize(aiff.len() + 8 + 88_200, 0);
+
+        let mut cur_a = Cursor::new(aiff.as_slice());
+        let res_a = parse_audio(
+            &mut cur_a,
+            aiff.len() as u64,
+            AudioFormat::Aiff,
+            CoverExtractMode::CheckOnly,
+            Path::new("/recording.aiff"),
+        )
+        .unwrap();
+        assert_eq!(res_a.tags.title.as_deref(), Some("Live AIFF take"));
+        assert!((res_a.tags.duration_s.unwrap() - 1.0).abs() < 0.01);
     }
 
     #[test]

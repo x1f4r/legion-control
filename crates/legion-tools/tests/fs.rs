@@ -4745,3 +4745,82 @@ async fn audio_thumb_falls_back_from_corrupt_embedded_and_corrupt_folder_covers_
         "{th_all_bad}"
     );
 }
+
+#[tokio::test]
+async fn tags_reads_in_progress_wav_and_aiff_recordings_with_oversized_data_chunk() {
+    use audio_fixtures as af;
+
+    let f = Fixture::new();
+
+    // Streamed/in-progress WAV: RIFF=0xFFFFFFFF, ID3 title first, fmt, then data=0xFFFFFFFF with
+    // 3 seconds of 8 kHz 16-bit mono audio (48,000 bytes).
+    let mut live_wav = Vec::new();
+    live_wav.extend_from_slice(b"RIFF");
+    live_wav.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    live_wav.extend_from_slice(b"WAVE");
+    let mut id3_frames = Vec::new();
+    id3_frames.extend_from_slice(&af::make_id3v23_text_frame(b"TIT2", 3, "Streamed WAV"));
+    id3_frames.extend_from_slice(&af::make_id3v23_text_frame(b"TPE1", 3, "Someone"));
+    let id3 = af::wrap_id3v23(&id3_frames, false, false);
+    live_wav.extend_from_slice(b"ID3 ");
+    live_wav.extend_from_slice(&(id3.len() as u32).to_le_bytes());
+    live_wav.extend_from_slice(&id3);
+    if !id3.len().is_multiple_of(2) {
+        live_wav.push(0);
+    }
+    live_wav.extend_from_slice(b"fmt ");
+    live_wav.extend_from_slice(&16u32.to_le_bytes());
+    live_wav.extend_from_slice(&1u16.to_le_bytes());
+    live_wav.extend_from_slice(&1u16.to_le_bytes());
+    live_wav.extend_from_slice(&8000u32.to_le_bytes());
+    live_wav.extend_from_slice(&16_000u32.to_le_bytes());
+    live_wav.extend_from_slice(&2u16.to_le_bytes());
+    live_wav.extend_from_slice(&16u16.to_le_bytes());
+    live_wav.extend_from_slice(b"data");
+    live_wav.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    live_wav.resize(live_wav.len() + 48_000, 0);
+    let wav_path = f.work.join("in_progress.wav");
+    std::fs::write(&wav_path, &live_wav).unwrap();
+
+    // Streamed/in-progress AIFF: FORM=0xFFFFFFFF, ID3 title first, COMM, then SSND=0xFFFFFFFF.
+    let mut live_aiff = Vec::new();
+    live_aiff.extend_from_slice(b"FORM");
+    live_aiff.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    live_aiff.extend_from_slice(b"AIFF");
+    let mut aiff_frames = Vec::new();
+    aiff_frames.extend_from_slice(&af::make_id3v23_text_frame(b"TIT2", 3, "Streamed AIFF"));
+    aiff_frames.extend_from_slice(&af::make_id3v23_text_frame(b"TPE1", 3, "Someone"));
+    let aiff_id3 = af::wrap_id3v23(&aiff_frames, false, false);
+    live_aiff.extend_from_slice(b"ID3 ");
+    live_aiff.extend_from_slice(&(aiff_id3.len() as u32).to_be_bytes());
+    live_aiff.extend_from_slice(&aiff_id3);
+    if !aiff_id3.len().is_multiple_of(2) {
+        live_aiff.push(0);
+    }
+    live_aiff.extend_from_slice(b"COMM");
+    live_aiff.extend_from_slice(&18u32.to_be_bytes());
+    live_aiff.extend_from_slice(&1u16.to_be_bytes());
+    live_aiff.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    live_aiff.extend_from_slice(&16u16.to_be_bytes());
+    live_aiff.extend_from_slice(&[0x40, 0x0E, 0xAC, 0x44, 0, 0, 0, 0, 0, 0]);
+    live_aiff.extend_from_slice(b"SSND");
+    live_aiff.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    live_aiff.resize(live_aiff.len() + 8 + 2 * 88_200, 0);
+    let aiff_path = f.work.join("in_progress.aiff");
+    std::fs::write(&aiff_path, &live_aiff).unwrap();
+
+    let res = f
+        .call(
+            "fs.tags",
+            json!({"paths": [f.p(&wav_path), f.p(&aiff_path)]}),
+        )
+        .await
+        .unwrap();
+    let arr = res["results"].as_array().unwrap();
+    assert_eq!(arr[0]["ok"]["title"], json!("Streamed WAV"));
+    assert_eq!(arr[0]["ok"]["artist"], json!("Someone"));
+    assert!((arr[0]["ok"]["duration_s"].as_f64().unwrap() - 3.0).abs() < 0.05);
+    assert_eq!(arr[1]["ok"]["title"], json!("Streamed AIFF"));
+    assert_eq!(arr[1]["ok"]["artist"], json!("Someone"));
+    assert!((arr[1]["ok"]["duration_s"].as_f64().unwrap() - 2.0).abs() < 0.05);
+}
