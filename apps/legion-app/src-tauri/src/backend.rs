@@ -33,6 +33,8 @@ pub enum ErrorCode {
     Exists,
     /// Concurrent modification or duplicate call identifier.
     Conflict,
+    /// The target machine answered under a different node name than its fleet name.
+    NameMismatch,
     /// Permission, authentication, or policy denied the request.
     Denied,
     /// The target node cannot be reached.
@@ -59,6 +61,7 @@ impl From<ProtoErrorCode> for ErrorCode {
             ProtoErrorCode::NotFound => Self::NotFound,
             ProtoErrorCode::Exists => Self::Exists,
             ProtoErrorCode::Conflict => Self::Conflict,
+            ProtoErrorCode::NameMismatch => Self::NameMismatch,
             ProtoErrorCode::Denied => Self::Denied,
             ProtoErrorCode::Unreachable => Self::Unreachable,
             ProtoErrorCode::Timeout => Self::Timeout,

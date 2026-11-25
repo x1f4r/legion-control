@@ -88,6 +88,12 @@ impl Ctx {
         &self.name
     }
 
+    /// Whether this node's name is explicitly set in `node.toml` (`Some(true)`), host-derived
+    /// (`Some(false)`), or unknown because `node.toml` failed to parse (`None`).
+    pub fn node_name_explicit(&self) -> Option<bool> {
+        self.node.name_explicit()
+    }
+
     /// The operating system: `linux`, `macos` or `windows`.
     pub fn os(&self) -> &'static str {
         std::env::consts::OS

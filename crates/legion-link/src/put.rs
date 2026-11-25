@@ -1001,6 +1001,7 @@ mod tests {
                             req.id,
                             serde_json::to_value(HelloResult {
                                 node: hello_node.clone(),
+                                node_explicit: None,
                                 version: VERSION.to_owned(),
                                 build: None,
                                 protocol: PROTOCOL,

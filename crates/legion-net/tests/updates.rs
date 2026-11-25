@@ -142,6 +142,7 @@ fn run_peer_helper(args: &[String]) -> ExitCode {
                         let hello = HelloResult {
                             protocol: PROTOCOL,
                             node: node.name(),
+                            node_explicit: node.name_explicit(),
                             version: VERSION.to_owned(),
                             os: std::env::consts::OS.to_owned(),
                             arch: std::env::consts::ARCH.to_owned(),

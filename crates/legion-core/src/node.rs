@@ -150,6 +150,16 @@ impl Node {
         }
     }
 
+    /// Whether `node.toml` sets `name` explicitly (`Some(true)`), omits `name` / does not exist
+    /// (`Some(false)`), or could not be parsed (`None`, so callers never overwrite a broken file).
+    pub fn name_explicit(&self) -> Option<bool> {
+        self.inner
+            .config
+            .get::<NodeFile>()
+            .ok()
+            .map(|file| file.name.is_some())
+    }
+
     /// Every tool's spec, sorted by name: built-in tools first, then any reloadable sources.
     /// Built-in tools always win if a source offers the same name.
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -225,8 +235,10 @@ impl Node {
                 systems.push(target.clone());
             }
         }
+        let node_explicit = file.as_ref().map(|file| file.name.is_some());
         Ok(HelloResult {
             node: self.name(),
+            node_explicit,
             version: VERSION.to_owned(),
             build: BUILD.map(str::to_owned),
             protocol: PROTOCOL,
@@ -466,6 +478,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = Node::new(Paths::under(dir.path()), Registry::new());
         let bare = node.hello(&hello_params()).unwrap();
+        assert_eq!(bare.node_explicit, Some(false));
         assert_eq!(bare.build.as_deref(), BUILD);
         assert_eq!(bare.system, None);
         assert!(bare.systems.is_empty());
@@ -491,7 +504,21 @@ mod tests {
         )
         .unwrap();
         let named = node.hello(&hello_params()).unwrap();
+        assert_eq!(named.node_explicit, Some(false));
         assert_eq!(named.system.as_deref(), Some("linux"));
         assert_eq!(named.systems, ["linux", "windows"]);
+
+        std::fs::write(
+            dir.path().join("config").join("node.toml"),
+            "name = \"studio\"\n",
+        )
+        .unwrap();
+        let explicit = node.hello(&hello_params()).unwrap();
+        assert_eq!(explicit.node, "studio");
+        assert_eq!(explicit.node_explicit, Some(true));
+
+        std::fs::write(dir.path().join("config").join("node.toml"), "name = 3\n").unwrap();
+        let broken = node.hello(&hello_params()).unwrap();
+        assert_eq!(broken.node_explicit, None);
     }
 }

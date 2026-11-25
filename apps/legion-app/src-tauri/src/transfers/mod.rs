@@ -4550,6 +4550,7 @@ mod tests {
                                     req.id,
                                     serde_json::to_value(HelloResult {
                                         node: "tower".to_owned(),
+                                        node_explicit: None,
                                         version: VERSION.to_owned(),
                                         build: None,
                                         protocol: PROTOCOL,

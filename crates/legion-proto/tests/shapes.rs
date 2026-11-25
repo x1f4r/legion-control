@@ -35,6 +35,7 @@ fn error_codes_are_the_closed_set_the_design_lists() {
             json!("not_found"),
             json!("exists"),
             json!("conflict"),
+            json!("name_mismatch"),
             json!("denied"),
             json!("unreachable"),
             json!("timeout"),
@@ -206,6 +207,7 @@ fn hello() {
     pin(
         HelloResult {
             node: "tower".into(),
+            node_explicit: None,
             version: "0.1.0".into(),
             build: None,
             protocol: 1,
@@ -227,6 +229,7 @@ fn hello() {
     pin(
         HelloResult {
             node: "tower".into(),
+            node_explicit: Some(true),
             version: "0.1.0".into(),
             build: Some("a59ec0d12345".into()),
             protocol: 1,
@@ -238,6 +241,7 @@ fn hello() {
         },
         json!({
             "node": "tower",
+            "node_explicit": true,
             "version": "0.1.0",
             "build": "a59ec0d12345",
             "protocol": 1,
@@ -246,6 +250,29 @@ fn hello() {
             "systems": ["linux", "windows"],
             "system": "linux",
             "boot_id": "0f5b7c1e-2d1a-4c8e-9b3f-5a6d7e8f9012"
+        }),
+    );
+    pin(
+        HelloResult {
+            node: "someones-laptop".into(),
+            node_explicit: Some(false),
+            version: "0.1.0".into(),
+            build: None,
+            protocol: 1,
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            systems: vec![],
+            system: None,
+            boot_id: None,
+        },
+        json!({
+            "node": "someones-laptop",
+            "node_explicit": false,
+            "version": "0.1.0",
+            "protocol": 1,
+            "os": "macos",
+            "arch": "aarch64",
+            "systems": []
         }),
     );
 }

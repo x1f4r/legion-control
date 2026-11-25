@@ -486,6 +486,68 @@ impl NodeFile {
     }
 }
 
+/// Outcome of planning a `name = "<fleet name>"` insertion into `node.toml`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InsertNodeName {
+    /// The file did not exist or had no `name`; write these exact bytes (keeping any prior content
+    /// byte for byte after the inserted `name` line).
+    Write(Vec<u8>),
+    /// The file already explicitly sets `name` to the requested name; nothing to write.
+    AlreadyMatches,
+    /// The file already explicitly sets a different `name`; leave it untouched.
+    ExplicitMismatch(NodeName),
+}
+
+/// Plans inserting `name = "<target>"` into `node.toml` while keeping every existing byte verbatim.
+///
+/// Refuses to modify a file that does not parse as a valid [`NodeFile`] or that already declares a
+/// different explicit `name`.
+pub fn insert_node_name(
+    existing: Option<&[u8]>,
+    path: &Path,
+    target: &NodeName,
+) -> Result<InsertNodeName, ErrorBody> {
+    let Some(bytes) = existing else {
+        let content = format!("name = \"{}\"\n", target.as_str()).into_bytes();
+        parse::<NodeFile>(path, &content)?;
+        return Ok(InsertNodeName::Write(content));
+    };
+
+    let parsed = parse::<NodeFile>(path, bytes)?;
+    if let Some(current) = parsed.name {
+        if current == *target {
+            return Ok(InsertNodeName::AlreadyMatches);
+        }
+        return Ok(InsertNodeName::ExplicitMismatch(current));
+    }
+
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        let line = line_and_column(bytes, error.valid_up_to()).0;
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} is not UTF-8 text (line {line}).", path.display()),
+        )
+    })?;
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let prefix = format!("name = \"{}\"{eol}", target.as_str());
+    let mut updated = Vec::with_capacity(prefix.len() + bytes.len());
+    updated.extend_from_slice(prefix.as_bytes());
+    updated.extend_from_slice(bytes);
+
+    let reparsed = parse::<NodeFile>(path, &updated)?;
+    if reparsed.name.as_ref() != Some(target) {
+        return Err(ErrorBody::new(
+            ErrorCode::Internal,
+            format!(
+                "Inserting name = {:?} into {} did not parse back with that name.",
+                target.as_str(),
+                path.display()
+            ),
+        ));
+    }
+    Ok(InsertNodeName::Write(updated))
+}
+
 /// The longest a node's name may be: what a DNS label may be, so a name can also be a host's.
 const LONGEST_NAME: usize = 63;
 
@@ -949,5 +1011,60 @@ verify = ["check-next-entry", "Other"]
         ] {
             assert!(node(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn insert_node_name_preserves_existing_bytes_and_refuses_explicit_mismatch() {
+        let studio = NodeName::try_from("studio".to_owned()).unwrap();
+        let path = Path::new("node.toml");
+
+        // Missing file creates minimal valid node.toml.
+        let created = insert_node_name(None, path, &studio).unwrap();
+        assert_eq!(
+            created,
+            InsertNodeName::Write(b"name = \"studio\"\n".to_vec())
+        );
+
+        // Existing file without name keeps every byte verbatim after the inserted line.
+        let original =
+            b"# Header comment\n# name = \"commented\"\nsystem = \"linux\"\n\n[svc]\nsudo = true # keep me";
+        let updated = insert_node_name(Some(original), path, &studio).unwrap();
+        let InsertNodeName::Write(written) = updated else {
+            panic!("expected Write, got {updated:?}");
+        };
+        let expected_prefix = b"name = \"studio\"\n";
+        assert!(written.starts_with(expected_prefix));
+        assert_eq!(&written[expected_prefix.len()..], original);
+        let parsed = parse::<NodeFile>(path, &written).unwrap();
+        assert_eq!(parsed.name.as_ref(), Some(&studio));
+        assert!(parsed.svc.sudo);
+
+        // CRLF file uses CRLF for the inserted line and keeps CRLF body byte for byte.
+        let crlf_original = b"[svc]\r\nsudo = true\r\n";
+        let InsertNodeName::Write(crlf_written) =
+            insert_node_name(Some(crlf_original), path, &studio).unwrap()
+        else {
+            panic!("expected Write for CRLF");
+        };
+        assert_eq!(
+            crlf_written,
+            b"name = \"studio\"\r\n[svc]\r\nsudo = true\r\n"
+        );
+
+        // Matching explicit name is a no-op.
+        assert_eq!(
+            insert_node_name(Some(b"name = \"studio\"\n"), path, &studio).unwrap(),
+            InsertNodeName::AlreadyMatches
+        );
+
+        // Different explicit name is refused without modification.
+        let mismatch = insert_node_name(Some(b"name = \"tower\"\n"), path, &studio).unwrap();
+        assert_eq!(
+            mismatch,
+            InsertNodeName::ExplicitMismatch(NodeName::try_from("tower".to_owned()).unwrap())
+        );
+
+        // Unparseable node.toml returns an error rather than overwriting it.
+        assert!(insert_node_name(Some(b"name = 3\n"), path, &studio).is_err());
     }
 }

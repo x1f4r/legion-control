@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// What went wrong, from a set closed on purpose: an agent branches on it, so every door uses the
-/// same thirteen words and a new failure picks the nearest one rather than inventing a fourteenth.
+/// same fourteen words and a new failure picks the nearest one rather than inventing another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -19,6 +19,8 @@ pub enum ErrorCode {
     Exists,
     /// The thing changed since the caller last looked, so the call would overwrite someone.
     Conflict,
+    /// The machine answered under a different node name than its fleet name.
+    NameMismatch,
     /// Policy does not let this principal do this.
     Denied,
     /// The machine the call is for cannot be reached.
@@ -39,12 +41,13 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every code, in the order the design lists them.
-    pub const ALL: [ErrorCode; 13] = [
+    pub const ALL: [ErrorCode; 14] = [
         ErrorCode::InvalidArgs,
         ErrorCode::UnknownTool,
         ErrorCode::NotFound,
         ErrorCode::Exists,
         ErrorCode::Conflict,
+        ErrorCode::NameMismatch,
         ErrorCode::Denied,
         ErrorCode::Unreachable,
         ErrorCode::Timeout,
@@ -63,6 +66,7 @@ impl ErrorCode {
             ErrorCode::NotFound => "not_found",
             ErrorCode::Exists => "exists",
             ErrorCode::Conflict => "conflict",
+            ErrorCode::NameMismatch => "name_mismatch",
             ErrorCode::Denied => "denied",
             ErrorCode::Unreachable => "unreachable",
             ErrorCode::Timeout => "timeout",

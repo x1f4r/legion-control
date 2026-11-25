@@ -28,6 +28,10 @@ pub struct HelloParams {
 pub struct HelloResult {
     /// The node's name.
     pub node: String,
+    /// Whether `node` was set explicitly in `node.toml` (`Some(true)`), derived from the host name
+    /// (`Some(false)`), or unreported by an older node / unparseable `node.toml` (`None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_explicit: Option<bool>,
     /// The version of legion the node runs.
     pub version: String,
     /// The source revision of legion the node runs, when known.

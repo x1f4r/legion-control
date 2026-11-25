@@ -1236,6 +1236,7 @@ mod tests {
             Some(Id::Number(1)),
             serde_json::to_value(HelloResult {
                 node: node.to_owned(),
+                node_explicit: None,
                 version: "0.1.0".to_owned(),
                 build: None,
                 protocol,
