@@ -7048,4 +7048,221 @@ mod tests {
 
         drop(lock1);
     }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn desktop_close_update_waits_for_active_transfer_drain_and_installs_after_queue_empties()
+    {
+        use std::sync::atomic::AtomicBool;
+
+        use crate::link_backend::LinkBackend;
+        use crate::store::AppStore;
+        use crate::transfers::{
+            PickedUploadFile, QueueNotificationSummary, TransferControlAction, TransferManager,
+            TransferPlatform,
+        };
+        use crate::{
+            DesktopCloseOutcome, desktop_close_active_ops, handle_desktop_close_request,
+            try_spawn_close_install_after_drain,
+        };
+
+        struct DrainTestPlatform {
+            hidden_for_drain: AtomicBool,
+            drain_notified: AtomicBool,
+        }
+
+        impl DrainTestPlatform {
+            fn new() -> Self {
+                Self {
+                    hidden_for_drain: AtomicBool::new(false),
+                    drain_notified: AtomicBool::new(false),
+                }
+            }
+        }
+
+        impl TransferPlatform for DrainTestPlatform {
+            fn pick_upload_files(
+                &self,
+            ) -> crate::backend::BoxFuture<'_, Result<Vec<PickedUploadFile>, AppError>>
+            {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+
+            fn finalize_download<'a>(
+                &'a self,
+                _id: &'a str,
+                part_path: &'a Path,
+                _file_name: &'a str,
+                _mime: Option<&'a str>,
+                _open_after_done: bool,
+            ) -> crate::backend::BoxFuture<'a, Result<String, AppError>> {
+                let out = part_path.to_string_lossy().into_owned();
+                Box::pin(async move { Ok(out) })
+            }
+
+            fn open_local_file<'a>(
+                &'a self,
+                _local_path: &'a str,
+                _mime: Option<&'a str>,
+            ) -> crate::backend::BoxFuture<'a, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn on_queue_updated(&self, summary: QueueNotificationSummary) {
+                if summary.active_count == 0 && self.hidden_for_drain.swap(false, Ordering::SeqCst)
+                {
+                    self.drain_notified.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let appimage = dir.path().join("Legion.AppImage");
+        fs::write(&appimage, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let (rel_sk, rel_pk) = keypair(0x95);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250225,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"#!/bin/sh\nexit 0\n",
+                &rel_sk,
+            ),
+        );
+
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage.clone(),
+        });
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let st = mgr
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap();
+        assert_eq!(st.phase, "ready");
+
+        let store = AppStore::in_dir(&data_dir);
+        let backend: Arc<dyn Backend> = Arc::new(LinkBackend::with_local_program(
+            store,
+            Some("/usr/bin/legion".to_owned()),
+        ));
+        let drain_platform = Arc::new(DrainTestPlatform::new());
+        let transfers = TransferManager::load_or_new(
+            &data_dir,
+            Arc::clone(&backend),
+            Arc::clone(&drain_platform) as Arc<dyn TransferPlatform>,
+        );
+
+        // Queue an active device transfer without starting workers so it stays active deterministically.
+        let xfer_id = transfers
+            .enqueue_download(
+                "local".to_owned(),
+                "/tmp/sample.bin".to_owned(),
+                Some("sample.bin".to_owned()),
+                Some(4096),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(transfers.has_active_work());
+
+        // 1. Closing the window while a transfer is active MUST hide for drain and NEVER spawn
+        //    an update supervisor or acquire update.lock.
+        assert_eq!(
+            handle_desktop_close_request(&mgr, backend.as_ref(), &transfers),
+            DesktopCloseOutcome::HideForDrain
+        );
+        assert!(
+            !updates_dir.join(desktop::UPDATE_LOCK_FILENAME).exists(),
+            "active transfer must prevent update.lock acquisition on window close"
+        );
+        assert!(
+            !updates_dir.join("supervisor.log").exists(),
+            "active transfer must prevent supervisor spawn on window close"
+        );
+        assert_eq!(mgr.snapshot().phase, "ready");
+
+        // Defense in depth: passing active transfer count into the native updater gate also
+        // refuses startup and close auto-installs while transfers are active.
+        let active_ops = desktop_close_active_ops(backend.as_ref(), &transfers);
+        assert!(active_ops >= 1);
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("startup", active_ops, true, t0),
+            Err("native_activity_in_flight")
+        );
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("close", active_ops, false, t0),
+            Err("native_activity_in_flight")
+        );
+        assert!(!try_spawn_close_install_after_drain(
+            &mgr,
+            backend.as_ref(),
+            &transfers
+        ));
+
+        // 2. Window is now hidden waiting for the queue to drain. Complete/drain the transfer so
+        //    no active work remains and verify the drain callback fires.
+        drain_platform
+            .hidden_for_drain
+            .store(true, Ordering::SeqCst);
+        transfers
+            .control(&xfer_id, TransferControlAction::Cancel)
+            .await
+            .unwrap();
+        assert!(!transfers.has_active_work());
+        assert!(
+            drain_platform.drain_notified.load(Ordering::SeqCst),
+            "draining the active transfer queue must notify the hidden desktop window"
+        );
+
+        // 3. Now that the queue has drained, the native gate permits close-time update install.
+        let idle_ops = desktop_close_active_ops(backend.as_ref(), &transfers);
+        assert_eq!(idle_ops, 0);
+        assert_eq!(
+            mgr.evaluate_auto_install_gate_at("close", idle_ops, false, t0),
+            Ok(())
+        );
+
+        #[cfg(unix)]
+        {
+            assert!(
+                try_spawn_close_install_after_drain(&mgr, backend.as_ref(), &transfers),
+                "ready update must spawn verify-only close supervisor once hidden transfer queue drains"
+            );
+            assert_eq!(mgr.snapshot().phase, "installing");
+            let lock = desktop::inspect_active_update_lock(&updates_dir)
+                .expect("close supervisor must hold update.lock after drain");
+            assert!(lock.verify_only);
+            assert_eq!(lock.target_sequence, 202611250225);
+            if let Some(sup_pid) = lock.supervisor_pid {
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-TERM", &sup_pid.to_string()])
+                    .status();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
 }

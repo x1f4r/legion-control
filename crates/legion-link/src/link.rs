@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::content::{ContentStream, StreamOpenError, handshake_get};
 use crate::invite::{Enrolled, SshTarget, SshTimeouts};
+use crate::put::{PutRequest, PutStream, handshake_put, validate_blake3_hash};
 use crate::session::{CallError, Session};
 
 /// Default idle duration after which unused sessions are closed (matches `legion serve`).
@@ -2219,6 +2220,78 @@ impl Link {
             cancel,
         )
         .await
+    }
+
+    /// Opens a resumable bulk-pipe upload (`legion stream`'s `put`) to `request.path` on `machine`
+    /// over the session this [`Link`] holds for `machine`.
+    ///
+    /// Follows the same routing and identity rules as [`Link::open_content`]: `machine` must be
+    /// configured on this [`Link`], its pinned host keys and `hello.node` identity are verified,
+    /// and uploads never fall back to another machine.
+    pub async fn open_put(
+        &self,
+        machine: &str,
+        request: PutRequest,
+    ) -> Result<PutStream, ErrorBody> {
+        self.open_put_with_cancel(machine, request, CancellationToken::new())
+            .await
+    }
+
+    /// Like [`Link::open_put`], aborting the open handshake or in-progress upload if `cancel`
+    /// fires.
+    pub async fn open_put_with_cancel(
+        &self,
+        machine: &str,
+        request: PutRequest,
+        cancel: CancellationToken,
+    ) -> Result<PutStream, ErrorBody> {
+        self.ensure_reaper();
+        if request.path.is_empty() {
+            return Err(
+                ErrorBody::new(ErrorCode::InvalidArgs, "Upload path cannot be empty.")
+                    .with_hint("Pass an absolute or `~`-prefixed destination path.")
+                    .with_machine(machine),
+            );
+        }
+        validate_blake3_hash(&request.hash, machine)?;
+
+        let live = self.get_or_open(machine, cancel.clone()).await?;
+        let flight = live.acquire_flight();
+        let (raw, live, flight) = match self.open_stream_on(&live, machine, cancel.clone()).await {
+            Ok((raw, _opener)) => (raw, live, flight),
+            Err(StreamOpenError::DeadSession(_)) => {
+                drop(flight);
+                self.invalidate_if_same(machine, &live.session);
+                let fresh = self.get_or_open(machine, cancel.clone()).await?;
+                let flight2 = fresh.acquire_flight();
+                let (raw, _opener) = self
+                    .open_stream_on(&fresh, machine, cancel.clone())
+                    .await
+                    .map_err(|err| match err {
+                        StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body) => {
+                            self.invalidate_if_same(machine, &fresh.session);
+                            body.with_machine(machine)
+                        }
+                        StreamOpenError::ChannelRefused(body) => body.with_machine(machine),
+                    })?;
+                (raw, fresh, flight2)
+            }
+            Err(StreamOpenError::ChannelRefused(body) | StreamOpenError::Failed(body)) => {
+                return Err(body.with_machine(machine));
+            }
+        };
+
+        let mut stream = handshake_put(
+            raw,
+            machine,
+            &request,
+            live.config_snapshot.principal.as_deref(),
+            self.inner.options.ssh_timeouts.handshake,
+            cancel,
+        )
+        .await?;
+        stream.attach_flight(Box::new(flight));
+        Ok(stream)
     }
 
     async fn open_stream_on(

@@ -1704,7 +1704,9 @@ where
         "no_proxy",
         "all_proxy",
         "LEGION_HOME",
+        #[cfg(debug_assertions)]
         "LEGION_APP_READY_FILE",
+        #[cfg(debug_assertions)]
         "LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS",
     ];
     const FILTERED_PATH_LISTS: &[&str] =
@@ -3224,7 +3226,9 @@ pub const WIN_ALLOWED_VARS: &[&str] = &[
     "NO_PROXY",
     "ALL_PROXY",
     "LEGION_HOME",
+    #[cfg(debug_assertions)]
     "LEGION_APP_READY_FILE",
+    #[cfg(debug_assertions)]
     "LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS",
 ];
 
@@ -3798,6 +3802,21 @@ mod tests {
         assert!(kept.contains_key(OsStr::new("WEBVIEW2_USER_DATA_FOLDER")));
         assert!(!kept.contains_key(OsStr::new("PSModulePath")));
         assert!(!kept.contains_key(OsStr::new("EVIL_VAR")));
+
+        // Release builds must never allow debug-only test switches through the env allow-list.
+        #[cfg(not(debug_assertions))]
+        {
+            assert!(
+                !WIN_ALLOWED_VARS
+                    .iter()
+                    .any(|v| v.eq_ignore_ascii_case("LEGION_APP_READY_FILE"))
+            );
+            assert!(
+                !WIN_ALLOWED_VARS
+                    .iter()
+                    .any(|v| v.eq_ignore_ascii_case("LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS"))
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -4593,7 +4612,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            if ready.exists() && !backup.exists() {
+            if ready.exists() && !backup.exists() && !new_log.exists() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));

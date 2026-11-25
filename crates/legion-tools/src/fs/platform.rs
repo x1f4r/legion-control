@@ -74,6 +74,10 @@ mod imp {
     pub(super) fn path_component_eq(a: &OsStr, b: &OsStr) -> bool {
         a == b
     }
+
+    pub(super) fn ffmpeg_input_arg(path: &Path) -> String {
+        format!("file:{}", path.to_string_lossy())
+    }
 }
 
 #[cfg(windows)]
@@ -168,6 +172,10 @@ mod imp {
     pub(super) fn path_component_eq(a: &OsStr, b: &OsStr) -> bool {
         a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
     }
+
+    pub(super) fn ffmpeg_input_arg(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -236,6 +244,10 @@ mod imp {
     pub(super) fn path_component_eq(a: &OsStr, b: &OsStr) -> bool {
         a == b
     }
+
+    pub(super) fn ffmpeg_input_arg(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
 }
 
 /// Whether the target platform uses Windows path semantics.
@@ -303,4 +315,10 @@ pub(crate) fn same_device(
 ) -> bool {
     let inner = root.as_ref().map(|d| d.0.clone());
     imp::same_device(&inner, child_path, child_meta)
+}
+
+/// Formats an absolute local file path as an `ffmpeg -i` input argument without letting Unix
+/// filenames containing `:` be interpreted as protocol prefixes.
+pub(crate) fn ffmpeg_input_arg(path: &Path) -> String {
+    imp::ffmpeg_input_arg(path)
 }

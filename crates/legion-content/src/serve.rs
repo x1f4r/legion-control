@@ -60,6 +60,20 @@ pub struct ServeOptions {
     pub liveness_check_bytes: u64,
     /// Time interval between in-flight revocation and hard-TTL checks while streaming.
     pub liveness_check_interval: Duration,
+    /// Optional upper bound on bytes answered for a single `Range` request (`206 Partial Content`).
+    ///
+    /// `None` (the default, used by streaming HTTP listeners) answers open-ended and large ranges
+    /// in full with backpressure. `Some(n)` (with `n > 0`) clamps range responses to at most `n`
+    /// bytes per reply so buffered mounts such as a web view's custom URI scheme answer open-ended
+    /// ranges (`bytes=0-`) in bounded pieces.
+    pub max_range_bytes: Option<u64>,
+    /// Optional upper bound on total file size answered for an unranged `GET` request (`200 OK`).
+    ///
+    /// When `Some(n)` (with `n > 0`), the handler probes file metadata (`length = Some(0)`) before
+    /// reading any bytes and returns `413 Payload Too Large` immediately if the file exceeds `n`
+    /// bytes. Buffered mounts use this to prevent large unranged images or downloads from buffering
+    /// unbounded memory.
+    pub max_full_bytes: Option<u64>,
 }
 
 impl Default for ServeOptions {
@@ -68,7 +82,19 @@ impl Default for ServeOptions {
             corp: CorpPolicy::SameOrigin,
             liveness_check_bytes: LIVENESS_CHECK_BYTES,
             liveness_check_interval: LIVENESS_CHECK_INTERVAL,
+            max_range_bytes: None,
+            max_full_bytes: None,
         }
+    }
+}
+
+impl ServeOptions {
+    fn effective_max_range_bytes(self) -> Option<u64> {
+        self.max_range_bytes.filter(|&n| n > 0)
+    }
+
+    fn effective_max_full_bytes(self) -> Option<u64> {
+        self.max_full_bytes.filter(|&n| n > 0)
     }
 }
 
@@ -414,16 +440,19 @@ async fn serve_head<S: ContentSource>(
             options,
             ContentBody::empty(),
         ),
-        RangeDecision::Partial(range) => build_content_response(
-            StatusCode::PARTIAL_CONTENT,
-            ticket,
-            opened.size,
-            Some(range),
-            tag,
-            download,
-            options,
-            ContentBody::empty(),
-        ),
+        RangeDecision::Partial(range) => {
+            let range = clamp_resolved_range(range, options.effective_max_range_bytes());
+            build_content_response(
+                StatusCode::PARTIAL_CONTENT,
+                ticket,
+                opened.size,
+                Some(range),
+                tag,
+                download,
+                options,
+                ContentBody::empty(),
+            )
+        }
         RangeDecision::Unsatisfiable => unsatisfiable(opened.size, tag, options),
     }
 }
@@ -482,6 +511,7 @@ async fn serve_get<S: ContentSource>(
             else {
                 return unsatisfiable(probe.size, tag, options);
             };
+            let resolved = clamp_resolved_range(resolved, options.effective_max_range_bytes());
             let opened = match source
                 .open_range(ticket, resolved.start, Some(resolved.length))
                 .await
@@ -520,6 +550,11 @@ async fn serve_get<S: ContentSource>(
             // Fast path: open the requested range directly in a single round-trip.
             let requested_len =
                 end.and_then(|e| e.checked_sub(start).and_then(|d| d.checked_add(1)));
+            let requested_len = match (requested_len, options.effective_max_range_bytes()) {
+                (Some(n), Some(cap)) => Some(n.min(cap)),
+                (None, Some(cap)) => Some(cap),
+                (other, None) => other,
+            };
             match source.open_range(ticket, start, requested_len).await {
                 Ok(opened) => {
                     if let Err(err) = validate_opened_range(&opened, start, requested_len) {
@@ -592,12 +627,30 @@ async fn open_and_stream_full<S: ContentSource>(
     options: ServeOptions,
     stream_ctx: StreamContext<S>,
 ) -> Response<ContentBody> {
+    if let Some(cap) = options.effective_max_full_bytes() {
+        let probe = match source.open_range(ticket, 0, Some(0)).await {
+            Ok(opened) => opened,
+            Err(err) => return map_open_error(tickets, ticket, err, options),
+        };
+        if let Err(err) = validate_opened_range(&probe, 0, Some(0)) {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err, options);
+        }
+        if probe.size > cap {
+            return payload_too_large(probe.size, cap, options);
+        }
+    }
+
     let opened = match source.open_range(ticket, 0, None).await {
         Ok(opened) => opened,
         Err(err) => return map_open_error(tickets, ticket, err, options),
     };
     if let Err(err) = validate_opened_range(&opened, 0, None) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err, options);
+    }
+    if let Some(cap) = options.effective_max_full_bytes()
+        && opened.size > cap
+    {
+        return payload_too_large(opened.size, cap, options);
     }
     let tag = etag(opened.size, opened.mtime, opened.file_id);
     let body = stream_ctx.into_body(opened.reader, opened.length);
@@ -611,6 +664,34 @@ async fn open_and_stream_full<S: ContentSource>(
         options,
         body,
     )
+}
+
+fn payload_too_large(size: u64, limit: u64, options: ServeOptions) -> Response<ContentBody> {
+    json_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        &ErrorBody::new(
+            ErrorCode::Unsupported,
+            "This file is too large to display inline here.",
+        )
+        .with_hint("Download the file or open it in another app instead.")
+        .with_details(serde_json::json!({
+            "reason": "too_large_for_inline",
+            "size": size,
+            "limit": limit,
+        })),
+        options,
+    )
+}
+
+fn clamp_resolved_range(range: ResolvedRange, max_bytes: Option<u64>) -> ResolvedRange {
+    match max_bytes {
+        Some(cap) if range.length > cap => ResolvedRange {
+            start: range.start,
+            end: range.start + cap - 1,
+            length: cap,
+        },
+        _ => range,
+    }
 }
 
 fn apply_if_range(parsed: ParsedRange, if_range: Option<&str>, current_etag: &str) -> ParsedRange {
@@ -1502,6 +1583,7 @@ mod tests {
             corp: CorpPolicy::SameOrigin,
             liveness_check_bytes: 256 * 1024,
             liveness_check_interval: Duration::from_secs(60),
+            ..ServeOptions::default()
         };
 
         // 1) Token revoked mid-stream -> aborts after the first check interval and revokes holder.
@@ -1591,6 +1673,7 @@ mod tests {
                 corp: CorpPolicy::SameOrigin,
                 liveness_check_bytes: 1024 * 1024,
                 liveness_check_interval: Duration::from_millis(20),
+                ..ServeOptions::default()
             },
             StreamHooks::default(),
         )
@@ -1674,6 +1757,264 @@ mod tests {
             .await;
             assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }
+    }
+
+    #[tokio::test]
+    async fn max_range_bytes_clamps_open_ended_and_large_ranges_into_bounded_pieces() {
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.path().join("clip.webm"), &data).unwrap();
+
+        let source = Arc::new(DiskSource {
+            root: dir.path().to_path_buf(),
+            revoked: Arc::new(AtomicBool::new(false)),
+            denied: Arc::new(AtomicBool::new(false)),
+        });
+        let tickets = Arc::new(TicketTable::new());
+        let issued = tickets
+            .issue(TicketRequest {
+                holder: "h".to_owned(),
+                principal: "p".to_owned(),
+                machine: "tower".to_owned(),
+                path: "clip.webm".to_owned(),
+            })
+            .unwrap();
+        let opts = ServeOptions {
+            corp: CorpPolicy::CrossOrigin,
+            max_range_bytes: Some(2048),
+            ..ServeOptions::default()
+        };
+
+        // Open-ended range `bytes=0-` returns only the first 2048 bytes as 206 Partial Content.
+        let mut h = HeaderMap::new();
+        h.insert(RANGE, HeaderValue::from_static("bytes=0-"));
+        let resp = handle_request(
+            &tickets,
+            &source,
+            &Method::GET,
+            &issued.id,
+            &issued.file_name,
+            None,
+            &h,
+            opts,
+            StreamHooks::default(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get(CONTENT_RANGE).unwrap(),
+            "bytes 0-2047/10000"
+        );
+        assert_eq!(resp.headers().get(CONTENT_LENGTH).unwrap(), "2048");
+        assert_eq!(
+            resp.headers().get(CROSS_ORIGIN_RESOURCE_POLICY).unwrap(),
+            "cross-origin"
+        );
+        let body = collect_body(resp.into_body()).await.unwrap();
+        assert_eq!(body, &data[0..2048]);
+
+        // Open-ended range near the tail returns only the remaining bytes.
+        let mut h_tail = HeaderMap::new();
+        h_tail.insert(RANGE, HeaderValue::from_static("bytes=9000-"));
+        let resp = handle_request(
+            &tickets,
+            &source,
+            &Method::GET,
+            &issued.id,
+            &issued.file_name,
+            None,
+            &h_tail,
+            opts,
+            StreamHooks::default(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get(CONTENT_RANGE).unwrap(),
+            "bytes 9000-9999/10000"
+        );
+        let body = collect_body(resp.into_body()).await.unwrap();
+        assert_eq!(body, &data[9000..10_000]);
+
+        // Bounded range larger than cap clamps to cap.
+        let mut h_big = HeaderMap::new();
+        h_big.insert(RANGE, HeaderValue::from_static("bytes=1000-8999"));
+        let resp = handle_request(
+            &tickets,
+            &source,
+            &Method::GET,
+            &issued.id,
+            &issued.file_name,
+            None,
+            &h_big,
+            opts,
+            StreamHooks::default(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get(CONTENT_RANGE).unwrap(),
+            "bytes 1000-3047/10000"
+        );
+        let body = collect_body(resp.into_body()).await.unwrap();
+        assert_eq!(body, &data[1000..3048]);
+
+        // Suffix range larger than cap clamps to cap from the suffix start.
+        let mut h_suffix = HeaderMap::new();
+        h_suffix.insert(RANGE, HeaderValue::from_static("bytes=-6000"));
+        let resp = handle_request(
+            &tickets,
+            &source,
+            &Method::GET,
+            &issued.id,
+            &issued.file_name,
+            None,
+            &h_suffix,
+            opts,
+            StreamHooks::default(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get(CONTENT_RANGE).unwrap(),
+            "bytes 4000-6047/10000"
+        );
+        let body = collect_body(resp.into_body()).await.unwrap();
+        assert_eq!(body, &data[4000..6048]);
+
+        // HEAD with open-ended range reports the same clamped Content-Range and Content-Length.
+        let resp = handle_request(
+            &tickets,
+            &source,
+            &Method::HEAD,
+            &issued.id,
+            &issued.file_name,
+            None,
+            &h,
+            opts,
+            StreamHooks::default(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get(CONTENT_RANGE).unwrap(),
+            "bytes 0-2047/10000"
+        );
+        assert_eq!(resp.headers().get(CONTENT_LENGTH).unwrap(), "2048");
+
+        // Unranged GET still returns the full file (200 OK) so <img> elements load cleanly.
+        let resp = handle_request(
+            &tickets,
+            &source,
+            &Method::GET,
+            &issued.id,
+            &issued.file_name,
+            None,
+            &HeaderMap::new(),
+            opts,
+            StreamHooks::default(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(CONTENT_LENGTH).unwrap(), "10000");
+        let body = collect_body(resp.into_body()).await.unwrap();
+        assert_eq!(body, data);
+    }
+
+    #[tokio::test]
+    async fn max_full_bytes_rejects_oversize_unranged_get_before_reading_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = vec![0x42u8; 10_000];
+        let path = dir.path().join("huge.png");
+        std::fs::write(&path, &data).unwrap();
+
+        struct CountingSource {
+            inner: DiskSource,
+            non_zero_opens: AtomicUsize,
+        }
+        impl ContentSource for CountingSource {
+            fn open_range<'a>(
+                &'a self,
+                ticket: &'a Ticket,
+                offset: u64,
+                length: Option<u64>,
+            ) -> Pin<Box<dyn Future<Output = Result<OpenedRange, OpenRangeError>> + Send + 'a>>
+            {
+                if length != Some(0) {
+                    self.non_zero_opens.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.open_range(ticket, offset, length)
+            }
+        }
+
+        let tickets = Arc::new(TicketTable::new());
+        let source = Arc::new(CountingSource {
+            inner: DiskSource {
+                root: dir.path().to_path_buf(),
+                revoked: Arc::new(AtomicBool::new(false)),
+                denied: Arc::new(AtomicBool::new(false)),
+            },
+            non_zero_opens: AtomicUsize::new(0),
+        });
+        let issued = tickets
+            .issue(TicketRequest {
+                holder: "tok-1".to_owned(),
+                principal: "phone".to_owned(),
+                machine: "tower".to_owned(),
+                path: "huge.png".to_owned(),
+            })
+            .unwrap();
+
+        let opts = ServeOptions {
+            corp: CorpPolicy::CrossOrigin,
+            max_range_bytes: Some(2048),
+            max_full_bytes: Some(4096),
+            ..ServeOptions::default()
+        };
+
+        // Unranged GET over cap returns 413 immediately without opening a non-zero byte stream.
+        let resp = handle_request(
+            &tickets,
+            &source,
+            &Method::GET,
+            &issued.id,
+            &issued.file_name,
+            None,
+            &HeaderMap::new(),
+            opts,
+            StreamHooks::default(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(source.non_zero_opens.load(Ordering::SeqCst), 0);
+        let body = collect_body(resp.into_body()).await.unwrap();
+        let err: ErrorBody = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert!(err.message.contains("too large"));
+        assert!(err.hint.as_deref().unwrap_or("").contains("Download"));
+        assert_eq!(
+            err.details.as_ref().and_then(|d| d.get("reason")),
+            Some(&serde_json::json!("too_large_for_inline"))
+        );
+
+        // Ranged GET on the exact same file still succeeds in bounded chunks.
+        let mut h = HeaderMap::new();
+        h.insert(RANGE, HeaderValue::from_static("bytes=0-"));
+        let ranged = handle_request(
+            &tickets,
+            &source,
+            &Method::GET,
+            &issued.id,
+            &issued.file_name,
+            None,
+            &h,
+            opts,
+            StreamHooks::default(),
+        )
+        .await;
+        assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(ranged.headers().get(CONTENT_LENGTH).unwrap(), "2048");
+        assert_eq!(source.non_zero_opens.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
