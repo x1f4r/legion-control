@@ -13,6 +13,8 @@ if [[ "$component" == all || "$component" == scripts ]]; then
   node scripts/check-syntax.mjs
   # Refuse invisible, zero-width, bidirectional, or stray byte order mark characters.
   node scripts/check-invisible.mjs
+  # Keep every media-type mirror synchronized with crates/legion-core/src/media.rs.
+  node scripts/sync-media-table.mjs --check
   node --test tests/*.test.mjs
   node --test apps/ui/lib/test/*.test.mjs
   # Last, so a private value found never hides what the tests above would have said. CI runs it
