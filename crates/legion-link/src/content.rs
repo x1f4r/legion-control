@@ -165,6 +165,23 @@ impl ParkedStreamPool {
         }
     }
 
+    /// Moves an existing parked entry to the back of the LRU queue with a fresh monotonic stamp
+    /// under the same lock, so reading from a parked stream's retained read-ahead buffer updates
+    /// its least-recently-used position.
+    fn touch(&self, id: u64) -> Option<u64> {
+        if id == 0 {
+            return None;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let pos = inner.entries.iter().position(|e| e.id == id)?;
+        let mut entry = inner.entries.remove(pos)?;
+        inner.next_id = inner.next_id.wrapping_add(1).max(1);
+        let new_id = inner.next_id;
+        entry.id = new_id;
+        inner.entries.push_back(entry);
+        Some(new_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.inner
@@ -482,6 +499,12 @@ impl ParkActivity {
                                     Arc::clone(&live_channel),
                                 );
                                 act.park_id.store(id, Ordering::Release);
+                                if act.watchdog_cancel.is_cancelled() {
+                                    let stale = act.park_id.swap(0, Ordering::AcqRel);
+                                    if stale != 0 {
+                                        pool.remove(stale);
+                                    }
+                                }
                             }
                             act.parked.store(true, Ordering::Release);
                             let _ = act
@@ -504,6 +527,21 @@ impl ParkActivity {
         self.probe_pending.store(false, Ordering::Release);
         if self.waiting_for_remote.swap(false, Ordering::AcqRel) {
             let _ = self.waker.lock().unwrap_or_else(|p| p.into_inner()).take();
+        }
+    }
+
+    fn touch_parked_lru(&self) {
+        let Some(pool) = &self.park_pool else {
+            return;
+        };
+        let old_id = self.park_id.load(Ordering::Acquire);
+        if old_id == 0 {
+            return;
+        }
+        if let Some(new_id) = pool.touch(old_id) {
+            let _ =
+                self.park_id
+                    .compare_exchange(old_id, new_id, Ordering::AcqRel, Ordering::Acquire);
         }
     }
 
@@ -889,6 +927,14 @@ impl ContentStream {
             StreamMode::PerChunk(state) => state.active.as_ref().map_or(0, |_| STREAM_BUF_BYTES),
         }
     }
+
+    #[cfg(test)]
+    fn park_stamp(&self) -> u64 {
+        match &self.mode {
+            StreamMode::KeepOpen(state) => state.activity.park_id.load(Ordering::Acquire),
+            StreamMode::PerChunk(_) => 0,
+        }
+    }
 }
 
 impl Drop for ContentStream {
@@ -1013,9 +1059,11 @@ fn poll_keep_open(
                         live.parked_head = Vec::new();
                         live.parked_pos = 0;
                     }
+                    drop(live);
                     state.progress_deadline = None;
                     state.consecutive_reopens = 0;
                     state.activity.touch_ms();
+                    state.activity.touch_parked_lru();
                     return Poll::Ready(Ok(()));
                 }
                 drop(live);
@@ -4110,38 +4158,170 @@ mod tests {
                 "300 parked streams (cap 256) retained too much buffer: {total_retained} bytes"
             );
 
-            // Exactly 44 oldest streams were evicted LRU: 0 bytes retained and clean
-            // PermissionDenied error on next read. Streams in strictly earlier batches (0..40)
-            // must all be evicted, and the remaining 4 evicted streams come from the boundary
-            // batch (40..48) whose 8 watchdogs parked concurrently.
-            let mut evicted_indices = Vec::new();
+            // Verify the exact LRU property directly from the pool's monotonic park stamps:
+            // every stream received a distinct non-zero stamp at park time, the 44 evicted
+            // streams are strictly those with the smallest stamps, and no surviving stream has a
+            // smaller stamp than any evicted stream.
+            let mut stamps = std::collections::BTreeSet::new();
+            let mut evicted_stamps = Vec::new();
+            let mut surviving: Vec<(u64, usize)> = Vec::new();
             for (idx, s) in streams.iter_mut().enumerate() {
+                let stamp = s.park_stamp();
+                assert!(
+                    stamp > 0,
+                    "parked stream {idx} must have a non-zero park stamp"
+                );
+                assert!(
+                    stamps.insert(stamp),
+                    "duplicate park stamp {stamp} assigned to stream {idx}"
+                );
                 if s.retained_buffer_bytes() == 0 {
-                    evicted_indices.push(idx);
+                    evicted_stamps.push(stamp);
                     let mut probe = [0u8; 64];
                     let err = s.read(&mut probe).await.unwrap_err();
                     assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+                } else {
+                    surviving.push((stamp, idx));
                 }
             }
-            assert_eq!(evicted_indices.len(), 44);
-            for idx in 0..40 {
-                assert!(
-                    evicted_indices.contains(&idx),
-                    "stream {idx} from an earlier batch must have been evicted LRU"
-                );
-            }
+            let expected_evicted = streams.len() - DEFAULT_MAX_PARKED_STREAMS;
+            assert_eq!(evicted_stamps.len(), expected_evicted);
+            assert_eq!(surviving.len(), DEFAULT_MAX_PARKED_STREAMS);
+            let max_evicted = *evicted_stamps.iter().max().unwrap();
+            let min_surviving = surviving.iter().map(|(stamp, _)| *stamp).min().unwrap();
             assert!(
-                evicted_indices.iter().all(|&idx| idx < 48),
-                "only streams from oldest batches (0..48) may be evicted LRU, got {evicted_indices:?}"
+                max_evicted < min_surviving,
+                "LRU violation: max evicted stamp ({max_evicted}) >= min surviving stamp ({min_surviving})"
             );
 
-            // Surviving streams resume byte-exact.
-            for idx in [48usize, 170, 299] {
+            // Surviving streams (lowest-stamp, middle-stamp, and newest-stamp) resume byte-exact.
+            surviving.sort_unstable_by_key(|(stamp, _)| *stamp);
+            for &(_, idx) in &[
+                surviving[0],
+                surviving[surviving.len() / 2],
+                surviving[surviving.len() - 1],
+            ] {
                 read_exact_pattern(&mut streams[idx], 300 * 1024, (1024 - 300) * 1024).await;
                 let mut eof = [0u8; 8];
                 assert_eq!(streams[idx].read(&mut eof).await.unwrap(), 0);
             }
             drop(streams);
+            assert_eq!(pool.len(), 0);
+        }
+
+        // Scenario 3: Resuming a parked stream updates its LRU position — both when reading from
+        // its retained read-ahead buffer (without reopening yet) and when reopening and parking
+        // again later.
+        {
+            let file_size = 512 * 1024u64;
+            let active_slots = Arc::new(AtomicUsize::new(0));
+            let opener: Arc<dyn StreamOpener> = Arc::new(LargeWindowOpener {
+                file_size,
+                active_slots: Arc::clone(&active_slots),
+            });
+            let open_and_park = |pool: &Arc<ParkedStreamPool>, name: &str| {
+                let opener = Arc::clone(&opener);
+                let active_slots = Arc::clone(&active_slots);
+                let pool = Arc::clone(pool);
+                let path = format!("/{name}.webm");
+                async move {
+                    let raw = opener.open_stream(CancellationToken::new()).await.unwrap();
+                    let mut s = handshake_get_with_options(
+                        raw,
+                        Some(opener),
+                        "tower",
+                        &path,
+                        0,
+                        None,
+                        None,
+                        Duration::from_secs(5),
+                        CancellationToken::new(),
+                        ContentStreamOptions {
+                            idle_park_timeout: Duration::from_millis(50),
+                            progress_timeout: Duration::from_secs(5),
+                            max_busy_lines: 4,
+                            park_pool: Some(pool),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    read_exact_pattern(&mut s, 0, 128 * 1024).await;
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while (active_slots.load(Ordering::SeqCst) != 0 || s.park_stamp() == 0)
+                        && Instant::now() < deadline
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert_eq!(active_slots.load(Ordering::SeqCst), 0);
+                    assert!(s.park_stamp() > 0);
+                    s
+                }
+            };
+
+            // 3a) Partial read from retained parked_head refreshes LRU stamp without reopening.
+            let pool = Arc::new(ParkedStreamPool::new(3));
+            let mut s0 = open_and_park(&pool, "head-0").await;
+            let mut s1 = open_and_park(&pool, "head-1").await;
+            let mut s2 = open_and_park(&pool, "head-2").await;
+            let t0 = s0.park_stamp();
+            let t1 = s1.park_stamp();
+            let t2 = s2.park_stamp();
+            assert!(t0 < t1 && t1 < t2);
+
+            // Read 4 KiB from s0's retained 64 KiB parked_head (does not reopen).
+            read_exact_pattern(&mut s0, 128 * 1024, 4 * 1024).await;
+            let t0_refreshed = s0.park_stamp();
+            assert!(
+                t0_refreshed > t2,
+                "reading from parked_head must refresh LRU stamp ({t0_refreshed} <= {t2})"
+            );
+
+            // Parking s3 must evict s1 (now oldest), keeping s0, s2, and s3 alive.
+            let mut s3 = open_and_park(&pool, "head-3").await;
+            assert_eq!(pool.len(), 3);
+            let mut probe = [0u8; 64];
+            let err = s1.read(&mut probe).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+            read_exact_pattern(&mut s0, 132 * 1024, (512 - 132) * 1024).await;
+            read_exact_pattern(&mut s2, 128 * 1024, (512 - 128) * 1024).await;
+            read_exact_pattern(&mut s3, 128 * 1024, (512 - 128) * 1024).await;
+            drop((s0, s1, s2, s3));
+            assert_eq!(pool.len(), 0);
+
+            // 3b) Reopening past parked_head and parking again receives a newer LRU stamp.
+            let pool = Arc::new(ParkedStreamPool::new(3));
+            let mut r0 = open_and_park(&pool, "reopen-0").await;
+            let mut r1 = open_and_park(&pool, "reopen-1").await;
+            let mut r2 = open_and_park(&pool, "reopen-2").await;
+            let u0 = r0.park_stamp();
+            let u1 = r1.park_stamp();
+            let u2 = r2.park_stamp();
+            assert!(u0 < u1 && u1 < u2);
+
+            // Drain past r0's 64 KiB parked_head so it reopens a channel, then let it park again.
+            read_exact_pattern(&mut r0, 128 * 1024, 128 * 1024).await;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while (active_slots.load(Ordering::SeqCst) != 0 || r0.park_stamp() <= u2)
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(active_slots.load(Ordering::SeqCst), 0);
+            assert!(
+                r0.park_stamp() > u2,
+                "re-parked stream must have a newer LRU stamp ({} <= {u2})",
+                r0.park_stamp()
+            );
+
+            // Parking r3 must evict r1 (now oldest), keeping r0, r2, and r3 alive.
+            let mut r3 = open_and_park(&pool, "reopen-3").await;
+            assert_eq!(pool.len(), 3);
+            let err = r1.read(&mut probe).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+            read_exact_pattern(&mut r0, 256 * 1024, (512 - 256) * 1024).await;
+            read_exact_pattern(&mut r2, 128 * 1024, (512 - 128) * 1024).await;
+            read_exact_pattern(&mut r3, 128 * 1024, (512 - 128) * 1024).await;
+            drop((r0, r1, r2, r3));
             assert_eq!(pool.len(), 0);
         }
     }
