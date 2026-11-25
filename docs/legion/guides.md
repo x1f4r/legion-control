@@ -1030,8 +1030,9 @@ Security and lifecycle guarantees:
   doubling, ~128–147 KiB on macOS, 128 KiB on Windows), and for what the door itself decides (its
   bearer tokens, local principals and paths in `policy.toml`, and ticket lifetime) detecting a
   revocation cancels the connection first (before flushing audit records), stops handing bytes to
-  the socket, discards server buffers, releases any remote pipe, and sends TCP RST
-  (`SO_LINGER(0)`). That guarantees server-side cutoff within 2 seconds even for slow (20 KB/s) or
+  the socket, discards server buffers, releases any remote pipe, and closes the TCP connection
+  (sending TCP RST via `SO_LINGER(0)` on Linux and Windows, or closing cleanly with TCP `FIN` on
+  macOS/BSD to avoid Darwin's RFC 5961 congested-RST hang). That guarantees server-side cutoff within 2 seconds even for slow (20 KB/s) or
   completely stalled readers, zero bytes handed to the socket after cutoff with the connection
   closed, and at most the physical ceiling (`effective SO_SNDBUF + client effective SO_RCVBUF +
   bytes the client reads before cutoff + 64 KiB`, collapsing to `effective SO_SNDBUF + client

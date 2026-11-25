@@ -188,8 +188,9 @@ interface's origin. So content is served from a **content address**: a URL holdi
   to 256 KiB for bookkeeping; macOS sets ~128–147 KiB; Windows sets 128 KiB), and as soon as
   revocation is detected the server cancels the connection first (before flushing audit records to
   disk), hands no further bytes to the socket, discards its own buffered bytes, releases its remote
-  pipe, and resets the TCP connection (`SO_LINGER(0)`) to drop the server's unsent kernel send
-  queue. What this guarantees for what the door itself decides (its bearer tokens, local principals
+  pipe, and closes the TCP connection (sending TCP RST via `SO_LINGER(0)` on Linux and Windows to
+  drop the server's unsent kernel send queue, or closing cleanly with TCP `FIN` on macOS/BSD to
+  avoid Darwin's RFC 5961 congested-RST hang). What this guarantees for what the door itself decides (its bearer tokens, local principals
   and paths, and ticket lifetime):
   1. **Time**: server-side cutoff within 2 seconds of revocation even for slow (e.g. 20 KB/s) or
      completely stalled readers.
