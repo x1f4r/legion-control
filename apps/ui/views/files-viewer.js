@@ -20,7 +20,7 @@ import {
 } from '../lib/files.js';
 import { readTextWrapPreference, writeTextWrapPreference } from '../lib/files-store.js';
 import { formatBytePair, formatBytes, formatRelativeTime } from '../lib/format.js';
-import { createFullscreenController, formatSpeed, PLAYBACK_SPEEDS } from '../lib/player.js';
+import { createFullscreenController, formatSpeed, PLAYBACK_SPEEDS, queueNeighbors } from '../lib/player.js';
 import { CopyButton, Notice, Sheet } from './common.js';
 import { MusicPlayer, VideoPlayer } from './player.js';
 
@@ -390,7 +390,10 @@ export function FilesViewer({
   }
 
   const effectiveChromeHidden =
-    chromeHidden && activeOpen.status === 'idle' && !(viewerNotice && viewerNotice.key === fileKey);
+    category === 'image' &&
+    chromeHidden &&
+    activeOpen.status === 'idle' &&
+    !(viewerNotice && viewerNotice.key === fileKey);
 
   // Register the single viewer-level fullscreen controller for history Back handling.
   useEffect(() => {
@@ -1139,15 +1142,50 @@ export function FilesViewer({
   const useVideoPlayer = category === 'video' && !skipMediaPlayer && !mediaError;
   const useMusicPlayer = category === 'audio' && !skipMediaPlayer && !mediaError;
   const usingCustomPlayer = useVideoPlayer || useMusicPlayer;
+  const isViewerFullscreen = Boolean(
+    fullscreenState.active && (fullscreenState.source === 'button' || fullscreenState.source === 'rotation'),
+  );
+  const mediaQueue = useMemo(
+    () => (category === 'video' || category === 'audio' ? queueNeighbors(siblings, path, category) : null),
+    [siblings, path, category],
+  );
 
-  // Keyboard navigation inside viewer: Escape closes, Left/Right steps through pictures.
+  // Keyboard navigation inside viewer when the custom video/music player isn't mounted (pictures,
+  // text, and unplayable/error screens): Escape exits full screen first then closes, F leaves
+  // full screen, N/P step through video/audio queues so an unplayable file never strands the queue,
+  // and Left/Right step through pictures.
   useEffect(() => {
     if (usingCustomPlayer) return undefined;
     function onKeyDown(e) {
       if (moreOpen || document.querySelector('.scrim')) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const target = e.target;
+      if (
+        target &&
+        typeof target === 'object' &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
       if (e.key === 'Escape') {
         e.preventDefault();
-        handleClose();
+        if (isViewerFullscreen) {
+          fullscreenController.leave();
+        } else {
+          handleClose();
+        }
+      } else if ((e.key === 'f' || e.key === 'F') && isViewerFullscreen) {
+        e.preventDefault();
+        fullscreenController.leave();
+      } else if ((e.key === 'n' || e.key === 'N') && mediaQueue?.next && onNavigateSibling) {
+        e.preventDefault();
+        onNavigateSibling(mediaQueue.next);
+      } else if ((e.key === 'p' || e.key === 'P') && mediaQueue?.prev && onNavigateSibling) {
+        e.preventDefault();
+        onNavigateSibling(mediaQueue.prev);
       } else if (category === 'image' && e.key === 'ArrowRight' && siblingIndex >= 0 && siblingIndex + 1 < pictureSiblings.length) {
         e.preventDefault();
         if (onNavigateSibling) onNavigateSibling(pictureSiblings[siblingIndex + 1]);
@@ -1158,7 +1196,17 @@ export function FilesViewer({
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [usingCustomPlayer, moreOpen, category, siblingIndex, pictureSiblings.length]);
+  }, [
+    usingCustomPlayer,
+    moreOpen,
+    isViewerFullscreen,
+    fullscreenController,
+    mediaQueue,
+    onNavigateSibling,
+    category,
+    siblingIndex,
+    pictureSiblings.length,
+  ]);
 
   // Load BLAKE3 hash when details sheet opens in technical mode.
   useEffect(() => {
@@ -2294,13 +2342,36 @@ export function FilesViewer({
             `
           : html`
               <div class="viewer-top">
-                <button type="button" class="btn icon" aria-label="Close" onClick=${handleClose}>
-                  <${Icon} name="down" />
+                <button
+                  type="button"
+                  class="btn icon"
+                  aria-label=${fullscreenState.active && fullscreenState.source === 'button' ? 'Back' : 'Close'}
+                  onClick=${() => {
+                    if (fullscreenState.active && fullscreenState.source === 'button') {
+                      fullscreenController.leave();
+                    } else {
+                      handleClose();
+                    }
+                  }}
+                >
+                  <${Icon} name=${fullscreenState.active && fullscreenState.source === 'button' ? 'back' : 'down'} />
                 </button>
                 <span class="name">
                   ${name}
                   ${topSub ? html`<small>${topSub}</small>` : null}
                 </span>
+                ${isViewerFullscreen
+                  ? html`
+                      <button
+                        type="button"
+                        class="btn icon"
+                        aria-label="Exit full screen"
+                        onClick=${() => fullscreenController.leave()}
+                      >
+                        <${Icon} name="fullscreen-exit" />
+                      </button>
+                    `
+                  : null}
                 <button
                   type="button"
                   class="btn icon"
@@ -2333,7 +2404,10 @@ export function FilesViewer({
                     : null}
                   ${caps?.hasTransfer || caps?.hasDownload
                     ? html`
-                        <button type="button" onClick=${() => onSendTo && onSendTo([effectiveEntry])}>
+                        <button
+                          type="button"
+                          onClick=${() => runOutsideFullscreen(() => onSendTo && onSendTo([effectiveEntry]))}
+                        >
                           <${Icon} name="send" />Send to
                         </button>
                       `

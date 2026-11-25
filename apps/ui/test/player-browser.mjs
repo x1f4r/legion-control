@@ -1301,3 +1301,76 @@ test('Player: Space play/pause intent pressed while next file loads applies once
     await server.stop();
   }
 });
+
+test('Player: reaching an unplayable file in full screen keeps top bar, exit full screen, and N/P queue keys working', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+    const page = await context.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.grid a.cell[aria-label="Beach.mp4"]').click();
+    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+    await page.locator('.viewer button[aria-label="Full screen"]').click();
+    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor({ timeout: 3000 });
+
+    // Press N in full screen -> lands on unplayable `Concert (H.264).mp4` error fallback screen.
+    await page.keyboard.press('n');
+    await page.locator('.viewer-top .name', { hasText: 'Concert (H.264).mp4' }).waitFor({ timeout: 5000 });
+    await page.locator('.viewer-stage .said').waitFor({ timeout: 5000 });
+
+    // Top bar has Back, name, Exit full screen, and More options (not stranded in full screen!).
+    assert.equal(await page.locator('.viewer-top button[aria-label="Back"]').count(), 1);
+    assert.equal(await page.locator('.viewer-top button[aria-label="Exit full screen"]').count(), 1);
+    assert.equal(await page.locator('.viewer-top button[aria-label="More options"]').count(), 1);
+
+    // P navigates back to Beach.mp4 while staying in full screen (queue not stranded).
+    await page.keyboard.press('p');
+    await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor({ timeout: 5000 });
+    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+    assert.equal(await page.locator('.viewer button[aria-label="Exit full screen"]').count(), 1);
+
+    // Return to unplayable file in full screen and verify Exit full screen button leaves full screen cleanly.
+    await page.keyboard.press('n');
+    await page.locator('.viewer-stage .said').waitFor({ timeout: 5000 });
+    await page.locator('.viewer-top button[aria-label="Exit full screen"]').click();
+    await page.locator('.viewer-top button[aria-label="Close"]').waitFor({ timeout: 3000 });
+    assert.equal(await page.locator('.viewer-top button[aria-label="Exit full screen"]').count(), 0);
+    // Still on the error screen (did not close viewer); Escape now closes viewer cleanly.
+    assert.equal(await page.locator('.viewer-stage .said').count(), 1);
+    await page.keyboard.press('Escape');
+    await page.locator('.viewer').waitFor({ state: 'hidden', timeout: 3000 });
+
+    // Also verify Escape on unplayable file while in full screen exits full screen FIRST before closing.
+    await page.locator('.grid a.cell[aria-label="Beach.mp4"]').click();
+    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+    await page.locator('.viewer button[aria-label="Full screen"]').click();
+    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor({ timeout: 3000 });
+    await page.keyboard.press('n');
+    await page.locator('.viewer-stage .said').waitFor({ timeout: 5000 });
+    await page.keyboard.press('Escape');
+    await page.locator('.viewer-top button[aria-label="Close"]').waitFor({ timeout: 3000 });
+    assert.equal(await page.locator('.viewer').count(), 1);
+
+    assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+    await context.close();
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});
