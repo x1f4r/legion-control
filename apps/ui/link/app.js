@@ -1040,6 +1040,14 @@ export function createAppLink() {
     }
   }
 
+  async function contentStatus(url) {
+    try {
+      return await invoke('content_status', { url: String(url || '') });
+    } catch {
+      return null;
+    }
+  }
+
   async function download(req = {}) {
     const { machine, path, name, size, mime } = req || {};
     try {
@@ -1078,12 +1086,13 @@ export function createAppLink() {
   }
 
   async function openExternally(req = {}) {
-    const { machine, path, name, mime } = req || {};
+    const { machine, path, name, size, mime } = req || {};
     try {
       return await invoke('transfer_open_externally', {
         machine: machine || '',
         path: path || '',
         name: name ?? null,
+        size: typeof size === 'number' && Number.isFinite(size) ? size : null,
         mime: mime ?? null,
       });
     } catch (err) {
@@ -1216,6 +1225,7 @@ export function createAppLink() {
     dismissUpdateNotice,
     maybeAutoInstall,
     contentUrl,
+    contentStatus,
     download,
     transfers,
     transferControl,

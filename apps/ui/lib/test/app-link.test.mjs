@@ -440,9 +440,23 @@ test('createAppLink implements files-contract contentUrl and device transfer que
     assert.equal('files' in uploadCall.payload, false);
     assert.equal(await link.upload({ machine: 'tower', dir: '/cancelled' }), null);
     assert.deepEqual(
-      await link.openExternally({ machine: 'tower', path: '/home/me/doc.pdf', mime: 'application/pdf' }),
+      await link.openExternally({
+        machine: 'tower',
+        path: '/home/me/doc.pdf',
+        size: 4096,
+        mime: 'application/pdf',
+      }),
       { id: 'tr-3', ok: true },
     );
+    const openCall = seen.find((c) => c.command === 'transfer_open_externally');
+    assert.deepEqual(openCall.payload, {
+      machine: 'tower',
+      path: '/home/me/doc.pdf',
+      name: null,
+      size: 4096,
+      mime: 'application/pdf',
+    });
+    assert.equal(typeof link.contentStatus, 'function');
 
     const list = await link.transfers();
     assert.equal(list.length, 1);
