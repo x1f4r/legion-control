@@ -25,9 +25,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Cursor, Read, Write};
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use legion_sync::path::{
     check_fs_compatibility, fs_equivalence_key, is_descendant_of, parse_conflict_copy_path,
@@ -35,14 +35,14 @@ use legion_sync::path::{
 };
 use legion_sync::{
     BinEntry, ConflictChoice, DeletionBrakeConfig, DeletionBrakeDecision,
-    FORCED_ROTATION_COOLDOWN_SECS, FORCED_ROTATION_WEEK_WINDOW_SECS, FetchOptions, FolderConfig,
-    FolderMarker, FolderMeta, FsCapabilities, FsErrorKind, FsMeta, FsWalkEntry, FsWalkResult,
-    HeldBackRecord, INDEX_DAMAGED_PROBLEM_SENTENCE, IgnoreMatcher, InboundDeletionBrakeDecision,
-    IndexRecord, IndexStore, MAX_FORCED_ROTATIONS_PER_WEEK, MAX_VERSION_COUNTER, MemberId,
-    MemberState, MemoryIndexStore, Peer, PeerAckView, PeerCursor, PeerHandshake, PendingOp,
-    ProblemKind, RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION, ScanOptions, StoreBatch,
-    SyncEngine, SyncError, SyncFs, SyncWrite, VersionKey, VersionVector, is_internal_sync_path,
-    validate_sync_path,
+    FORCED_ROTATION_COOLDOWN_SECS, FORCED_ROTATION_WEEK_WINDOW_SECS, FetchClock, FetchOptions,
+    FolderConfig, FolderMarker, FolderMeta, FsCapabilities, FsErrorKind, FsMeta, FsWalkEntry,
+    FsWalkResult, HeldBackRecord, INDEX_DAMAGED_PROBLEM_SENTENCE, IgnoreMatcher,
+    InboundDeletionBrakeDecision, IndexRecord, IndexStore, MAX_FORCED_ROTATIONS_PER_WEEK,
+    MAX_VERSION_COUNTER, MemberId, MemberState, MemoryIndexStore, Peer, PeerAckView, PeerCursor,
+    PeerHandshake, PendingOp, ProblemKind, RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION,
+    ScanOptions, StoreBatch, SyncEngine, SyncError, SyncFs, SyncWrite, VersionKey, VersionVector,
+    is_internal_sync_path, validate_sync_path,
 };
 use legion_xfer::hash::hash_bytes;
 use legion_xfer::{EntryKind, Hash, Timestamp};
@@ -6758,9 +6758,11 @@ fn run_seed_range_parallel(start_seed: u64, count: u64) -> (std::time::Duration,
             run_one_seed(start_seed + offset, false);
         }
     } else {
+        let failed = AtomicBool::new(false);
         std::thread::scope(|scope| {
             let chunk = count.div_ceil(threads as u64);
             let mut handles = Vec::with_capacity(threads);
+            let failed_ref = &failed;
             for t in 0..threads {
                 let s = start_seed + (t as u64) * chunk;
                 let e = (s + chunk).min(start_seed + count);
@@ -6769,7 +6771,17 @@ fn run_seed_range_parallel(start_seed: u64, count: u64) -> (std::time::Duration,
                 }
                 handles.push(scope.spawn(move || {
                     for seed in s..e {
-                        run_one_seed(seed, false);
+                        if failed_ref.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if let Err(payload) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                run_one_seed(seed, false);
+                            }))
+                        {
+                            failed_ref.store(true, Ordering::Relaxed);
+                            std::panic::resume_unwind(payload);
+                        }
                     }
                 }));
             }
@@ -6834,6 +6846,155 @@ fn simulator_all_dedicated_scenarios() {
         run_index_loss_during_hold_seed(s, s ^ 0x5AD1_6BE2, true);
         run_lying_peer_regression_rate_limit_seed(s, s ^ 0x6BE2_7CF3, true);
     }
+}
+
+#[test]
+fn simulator_idle_fetch_timeout_virtual_clock() {
+    struct SimTickReader {
+        data: Vec<u8>,
+        pos: usize,
+        chunk: usize,
+        tick_ms: u64,
+        eof_tick_ms: u64,
+        clock_ms: Arc<AtomicU64>,
+    }
+    impl Read for SimTickReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.data.len() {
+                self.clock_ms.fetch_add(self.eof_tick_ms, Ordering::SeqCst);
+                return Ok(0);
+            }
+            self.clock_ms.fetch_add(self.tick_ms, Ordering::SeqCst);
+            let n = (self.data.len() - self.pos).min(self.chunk).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+    struct SimTimedPeer<'a> {
+        inner: SimPeer<'a>,
+        payload: Vec<u8>,
+        chunk: usize,
+        tick_ms: u64,
+        eof_tick_ms: u64,
+        clock_ms: Arc<AtomicU64>,
+    }
+    impl Peer for SimTimedPeer<'_> {
+        fn member_id(&self) -> &str {
+            self.inner.member_id()
+        }
+        fn handshake(&self, c: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+            self.inner.handshake(c)
+        }
+        fn records_since(
+            &self,
+            a: u64,
+            b: u64,
+            l: usize,
+            c: Option<&AtomicBool>,
+        ) -> legion_sync::Result<RecordsPage> {
+            self.inner.records_since(a, b, l, c)
+        }
+        fn fetch_file(
+            &self,
+            _p: &str,
+            _h: Hash,
+            o: &FetchOptions,
+        ) -> legion_sync::Result<Box<dyn Read + Send>> {
+            Ok(Box::new(SimTickReader {
+                data: self.payload.clone(),
+                pos: (o.offset as usize).min(self.payload.len()),
+                chunk: self.chunk,
+                tick_ms: self.tick_ms,
+                eof_tick_ms: self.eof_tick_ms,
+                clock_ms: Arc::clone(&self.clock_ms),
+            }))
+        }
+    }
+
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let members = ["m0".to_string(), "m1".to_string()];
+    let mut cfg0 = FolderConfig::new("sim", "m0", members.clone());
+    cfg0.initial_incarnation = Some(101);
+    let mut cfg1 = FolderConfig::new("sim", "m1", members);
+    cfg1.initial_incarnation = Some(202);
+    let mut e0 = SyncEngine::open(
+        cfg0,
+        HonestSimFs::new(FsCapabilities::unix(), true),
+        FaultyIndexStore::new(),
+    )
+    .unwrap();
+    let mut e1 = SyncEngine::open(
+        cfg1,
+        HonestSimFs::new(FsCapabilities::unix(), true),
+        FaultyIndexStore::new(),
+    )
+    .unwrap();
+
+    let payload = vec![b'a'; 2_000];
+    e0.fs()
+        .user_write_file("slow.bin", payload.clone(), hash_bytes(&payload), t0);
+    e0.scan(t0).unwrap();
+
+    // 20 chunks * 29,999ms = 599.98s total >> 30s idle limit, each read arrives 1ms inside limit.
+    let clock_ms = Arc::new(AtomicU64::new(0));
+    let vclock = {
+        let c = Arc::clone(&clock_ms);
+        FetchClock::new(move || Duration::from_millis(c.load(Ordering::SeqCst)))
+    };
+    let opts = FetchOptions::at_offset(0, Duration::from_secs(30), None).with_clock(vclock);
+    let ok_peer = SimTimedPeer {
+        inner: SimPeer::new(&e0, "m1", "m0", PeerFault::None),
+        payload: payload.clone(),
+        chunk: 100,
+        tick_ms: 29_999,
+        eof_tick_ms: 1_000,
+        clock_ms: Arc::clone(&clock_ms),
+    };
+    e1.pull_from_peer_with_options(&ok_peer, 100, &opts, Timestamp::new(t0.secs + 1, 0))
+        .unwrap();
+    assert_eq!(
+        e1.fs().hash_live("slow.bin").unwrap(),
+        (hash_bytes(&payload), payload.len() as u64)
+    );
+
+    // Stall on chunk (30,001ms > 30s) aborts cleanly and leaves no tmp file.
+    let payload2 = vec![b'b'; 500];
+    let t1 = Timestamp::new(t0.secs + 10, 0);
+    e0.fs()
+        .user_write_file("slow.bin", payload2.clone(), hash_bytes(&payload2), t1);
+    e0.scan(t1).unwrap();
+    let stalled_peer = SimTimedPeer {
+        inner: SimPeer::new(&e0, "m1", "m0", PeerFault::None),
+        payload: payload2.clone(),
+        chunk: 100,
+        tick_ms: 30_001,
+        eof_tick_ms: 0,
+        clock_ms: Arc::clone(&clock_ms),
+    };
+    let err = e1
+        .pull_from_peer_with_options(&stalled_peer, 100, &opts, Timestamp::new(t0.secs + 11, 0))
+        .unwrap_err();
+    assert!(matches!(err, SyncError::Timeout { .. }), "got {err:?}");
+    assert!(e1.fs().list_tmp().unwrap().is_empty());
+
+    // Stall before EOF (30,001ms > 30s) also aborts cleanly.
+    let stalled_eof = SimTimedPeer {
+        inner: SimPeer::new(&e0, "m1", "m0", PeerFault::None),
+        payload: payload2,
+        chunk: 500,
+        tick_ms: 1_000,
+        eof_tick_ms: 30_001,
+        clock_ms,
+    };
+    let err_eof = e1
+        .pull_from_peer_with_options(&stalled_eof, 100, &opts, Timestamp::new(t0.secs + 12, 0))
+        .unwrap_err();
+    assert!(
+        matches!(err_eof, SyncError::Timeout { .. }),
+        "got {err_eof:?}"
+    );
+    assert!(e1.fs().list_tmp().unwrap().is_empty());
 }
 
 #[test]

@@ -9,13 +9,13 @@
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashSet};
 use std::io::Read;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use legion_xfer::{EntryKind, Hash, Timestamp};
 
 use crate::error::{FsErrorKind, Result, SyncError};
 use crate::model::{
-    BinEntry, BinReason, ConflictChoice, ExpectedLocalSnapshot, FetchOptions,
+    BinEntry, BinReason, ConflictChoice, ExpectedLocalSnapshot, FetchClock, FetchOptions,
     FolderDeletionLogEntry, FolderMeta, IndexRecord, MAX_ANCESTRY_HASHES, MIN_PLAUSIBLE_CLOCK_SECS,
     MemberId, PendingOp, ProblemKind, RestoreStrategy, SyncProblem, encode_deletion_log_entries,
     random_hex_token,
@@ -5592,6 +5592,40 @@ fn fetch_and_verify_to_tmp<F: SyncFs, S: IndexStore>(
     Ok(tmp_name)
 }
 
+enum ProgressClock<'a> {
+    Real(Instant),
+    Virtual {
+        clock: &'a FetchClock,
+        last: Duration,
+    },
+}
+
+impl<'a> ProgressClock<'a> {
+    fn start(clock: Option<&'a FetchClock>) -> Self {
+        match clock {
+            Some(c) => Self::Virtual {
+                clock: c,
+                last: c.now(),
+            },
+            None => Self::Real(Instant::now()),
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        match self {
+            Self::Real(t) => t.elapsed(),
+            Self::Virtual { clock, last } => clock.now().saturating_sub(*last),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Real(t) => *t = Instant::now(),
+            Self::Virtual { clock, last } => *last = clock.now(),
+        }
+    }
+}
+
 fn fetch_and_verify_into_named_tmp_staged<F: SyncFs>(
     fs: &F,
     peer: &dyn Peer,
@@ -5601,7 +5635,7 @@ fn fetch_and_verify_into_named_tmp_staged<F: SyncFs>(
     expected_hash: Hash,
     base_opts: &FetchOptions,
 ) -> Result<Box<dyn SyncWrite>> {
-    let mut last_progress = Instant::now();
+    let mut last_progress = ProgressClock::start(base_opts.clock.as_ref());
     let max_bytes = expected_size.saturating_add(1);
     let mut hasher = blake3::Hasher::new();
     let mut bytes_written: u64 = 0;
@@ -5634,8 +5668,9 @@ fn fetch_and_verify_into_named_tmp_staged<F: SyncFs>(
             });
         }
         let remaining_timeout = base_opts.timeout.saturating_sub(idle);
-        let opts =
+        let mut opts =
             FetchOptions::at_offset(bytes_written, remaining_timeout, base_opts.cancel.clone());
+        opts.clock = base_opts.clock.clone();
 
         let mut reader = match peer.fetch_file(remote_path, expected_hash, &opts) {
             Ok(r) => r,
@@ -5709,7 +5744,7 @@ fn fetch_and_verify_into_named_tmp_staged<F: SyncFs>(
                             detail: format!("stalled for more than {:?}", base_opts.timeout),
                         });
                     }
-                    last_progress = Instant::now();
+                    last_progress.reset();
                     if let Err(err) = writer.write_all(&buf[..n]) {
                         drop(writer);
                         let _ = fs.remove_tmp(tmp_name);

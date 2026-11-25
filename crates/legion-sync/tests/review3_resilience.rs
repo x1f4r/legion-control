@@ -18,11 +18,11 @@ use std::time::Duration;
 use legion_sync::RestoreStrategy;
 use legion_sync::model::MAX_DELETED_HISTORY_PATHS;
 use legion_sync::{
-    DeletionBrakeDecision, FetchOptions, FsCapabilities, FsErrorKind, FsMeta, FsWalkResult,
-    HandshakeHello, IgnoreMatcher, InboundDeletionBrakeDecision, IndexRecord, IndexStore,
-    MAX_HELD_BACK_ENTRIES, MemberState, MemoryIndexStore, Peer, PeerHandshake, ProblemKind, RealFs,
-    RecordsPage, RedbIndexStore, SYNC_PROTOCOL_VERSION, ScanOptions, SyncEngine, SyncError, SyncFs,
-    SyncWrite, VersionKey, VersionVector,
+    DeletionBrakeDecision, FetchClock, FetchOptions, FsCapabilities, FsErrorKind, FsMeta,
+    FsWalkResult, HandshakeHello, IgnoreMatcher, InboundDeletionBrakeDecision, IndexRecord,
+    IndexStore, MAX_HELD_BACK_ENTRIES, MemberState, MemoryIndexStore, Peer, PeerHandshake,
+    ProblemKind, RealFs, RecordsPage, RedbIndexStore, SYNC_PROTOCOL_VERSION, ScanOptions,
+    SyncEngine, SyncError, SyncFs, SyncWrite, VersionKey, VersionVector,
 };
 use legion_xfer::{EntryKind, Hash, Timestamp};
 use safety_common::*;
@@ -2958,6 +2958,69 @@ fn deleted_history_evicts_oldest_first_and_allows_intentional_restore() {
     );
 }
 
+struct VirtualTickReader {
+    data: Vec<u8>,
+    pos: usize,
+    chunk: usize,
+    tick_ms: u64,
+    eof_tick_ms: u64,
+    clock_ms: Arc<AtomicU64>,
+}
+impl Read for VirtualTickReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.data.len() {
+            self.clock_ms.fetch_add(self.eof_tick_ms, Ordering::SeqCst);
+            return Ok(0);
+        }
+        self.clock_ms.fetch_add(self.tick_ms, Ordering::SeqCst);
+        let n = (self.data.len() - self.pos).min(self.chunk).min(buf.len());
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+struct VirtualTimedPeer<'a> {
+    inner: EnginePeer<'a, RealFs, RedbIndexStore>,
+    payload: Vec<u8>,
+    chunk: usize,
+    tick_ms: u64,
+    eof_tick_ms: u64,
+    clock_ms: Arc<AtomicU64>,
+}
+impl Peer for VirtualTimedPeer<'_> {
+    fn member_id(&self) -> &str {
+        self.inner.member_id()
+    }
+    fn handshake(&self, c: &HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+        self.inner.handshake(c)
+    }
+    fn records_since(
+        &self,
+        a: u64,
+        b: u64,
+        l: usize,
+        c: Option<&AtomicBool>,
+    ) -> legion_sync::Result<RecordsPage> {
+        self.inner.records_since(a, b, l, c)
+    }
+    fn fetch_file(
+        &self,
+        _p: &str,
+        _h: Hash,
+        o: &FetchOptions,
+    ) -> legion_sync::Result<Box<dyn Read + Send>> {
+        Ok(Box::new(VirtualTickReader {
+            data: self.payload.clone(),
+            pos: (o.offset as usize).min(self.payload.len()),
+            chunk: self.chunk,
+            tick_ms: self.tick_ms,
+            eof_tick_ms: self.eof_tick_ms,
+            clock_ms: Arc::clone(&self.clock_ms),
+        }))
+    }
+}
+
 struct TrickleReader {
     data: Vec<u8>,
     pos: usize,
@@ -2969,7 +3032,9 @@ impl Read for TrickleReader {
         if self.pos >= self.data.len() {
             return Ok(0);
         }
-        std::thread::sleep(self.delay);
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
         let n = (self.data.len() - self.pos).min(self.chunk).min(buf.len());
         buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
         self.pos += n;
@@ -3014,50 +3079,116 @@ impl Peer for TimedPeer<'_> {
     }
 }
 
-/// Fetch timeout is an IDLE timeout: a stream whose total duration exceeds `timeout` succeeds as
-/// long as each read arrives within `timeout`, while a stalled stream aborts cleanly.
+/// Fetch timeout is an IDLE timeout: verified deterministically on a virtual clock (20 chunks
+/// each just inside a 30s limit = 600s total succeeds; a single chunk or EOF exceeding 30s aborts
+/// cleanly with no leftover tmp), plus a wide-margin real-time smoke test proving `Instant::now()`
+/// is wired when no virtual clock is supplied.
 #[test]
 fn idle_fetch_timeout_allows_slow_progress_and_aborts_stall() {
     let tmp = scratch();
     let t = tmp.path();
     let all = ["tower", "pi"];
-    let payload = vec![b'x'; 800];
+    let payload = vec![b'x'; 2_000];
     fs::create_dir_all(t.join("tower")).unwrap();
     fs::write(t.join("tower/stream.bin"), &payload).unwrap();
     let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     tower.scan(ts(0)).unwrap();
 
-    // 8 chunks * 30ms = 240ms total > 150ms idle timeout, but each chunk arrives in 30ms < 150ms.
-    let slow_ok = TimedPeer {
+    // Part 1 (deterministic virtual clock): 20 chunks * 29,999ms = 599.98s total >> 30s idle
+    // limit, yet every read arrives 1ms inside the limit -> succeeds with zero wall-clock sleep.
+    let clock_ms = Arc::new(AtomicU64::new(0));
+    let vclock = {
+        let c = Arc::clone(&clock_ms);
+        FetchClock::new(move || Duration::from_millis(c.load(Ordering::SeqCst)))
+    };
+    let slow_ok = VirtualTimedPeer {
         inner: EnginePeer::new(&tower, "pi"),
         payload: payload.clone(),
         chunk: 100,
-        delay: Duration::from_millis(30),
+        tick_ms: 29_999,
+        eof_tick_ms: 1_000,
+        clock_ms: Arc::clone(&clock_ms),
     };
-    let opts = FetchOptions::at_offset(0, Duration::from_millis(150), None);
+    let opts = FetchOptions::at_offset(0, Duration::from_secs(30), None).with_clock(vclock.clone());
     pi.pull_from_peer_with_options(&slow_ok, 100, &opts, ts(1))
         .unwrap();
     assert_eq!(fs::read(t.join("pi/stream.bin")).unwrap(), payload);
+    assert!(
+        clock_ms.load(Ordering::SeqCst) >= 599_000,
+        "virtual clock must have crossed well past the 30s idle limit"
+    );
 
-    // Now test a stalled transfer: 250ms per chunk > 80ms idle timeout -> times out!
+    // Part 2 (deterministic virtual clock): a single chunk taking 30,001ms > 30s limit aborts
+    // immediately and cleans `.legion-sync/tmp`.
     let payload2 = vec![b'y'; 400];
     fs::write(t.join("tower/stream.bin"), &payload2).unwrap();
     tower.scan(ts(10)).unwrap();
-    let stalled = TimedPeer {
+    let stalled_chunk = VirtualTimedPeer {
         inner: EnginePeer::new(&tower, "pi"),
-        payload: payload2,
+        payload: payload2.clone(),
         chunk: 100,
-        delay: Duration::from_millis(250),
+        tick_ms: 30_001,
+        eof_tick_ms: 0,
+        clock_ms: Arc::clone(&clock_ms),
     };
-    let stall_opts = FetchOptions::at_offset(0, Duration::from_millis(80), None);
     let err = pi
-        .pull_from_peer_with_options(&stalled, 100, &stall_opts, ts(11))
+        .pull_from_peer_with_options(&stalled_chunk, 100, &opts, ts(11))
         .unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("timed out"),
-        "expected idle timeout error, got: {err}"
+        "expected idle timeout error on stalled chunk, got: {err}"
     );
+    assert!(
+        pi.fs().list_tmp().unwrap().is_empty(),
+        "aborted fetch must clean up tmp files"
+    );
+
+    // Part 3 (deterministic virtual clock): stall right before EOF also aborts.
+    let stalled_eof = VirtualTimedPeer {
+        inner: EnginePeer::new(&tower, "pi"),
+        payload: payload2.clone(),
+        chunk: 400,
+        tick_ms: 1_000,
+        eof_tick_ms: 30_001,
+        clock_ms: Arc::clone(&clock_ms),
+    };
+    let err_eof = pi
+        .pull_from_peer_with_options(&stalled_eof, 100, &opts, ts(12))
+        .unwrap_err();
+    assert!(
+        err_eof.to_string().to_lowercase().contains("timed out"),
+        "expected idle timeout error on stalled EOF, got: {err_eof}"
+    );
+
+    // Part 4 (real wall-clock smoke test with order-of-magnitude separated limits):
+    // stall (250ms sleep vs 20ms limit) must abort; unstalled (0ms sleep vs 10s limit) succeeds
+    // even if a CI runner pauses for seconds.
+    let real_stalled = TimedPeer {
+        inner: EnginePeer::new(&tower, "pi"),
+        payload: payload2.clone(),
+        chunk: 100,
+        delay: Duration::from_millis(250),
+    };
+    let real_stall_opts = FetchOptions::at_offset(0, Duration::from_millis(20), None);
+    let real_err = pi
+        .pull_from_peer_with_options(&real_stalled, 100, &real_stall_opts, ts(13))
+        .unwrap_err();
+    assert!(
+        real_err.to_string().to_lowercase().contains("timed out"),
+        "expected real-time idle timeout error, got: {real_err}"
+    );
+
+    let real_ok = TimedPeer {
+        inner: EnginePeer::new(&tower, "pi"),
+        payload: payload2.clone(),
+        chunk: 100,
+        delay: Duration::ZERO,
+    };
+    let real_ok_opts = FetchOptions::at_offset(0, Duration::from_secs(10), None);
+    pi.pull_from_peer_with_options(&real_ok, 100, &real_ok_opts, ts(14))
+        .unwrap();
+    assert_eq!(fs::read(t.join("pi/stream.bin")).unwrap(), payload2);
 }
 
 struct InflatedVvPeer<'a> {

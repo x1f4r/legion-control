@@ -833,6 +833,33 @@ pub struct PeerHandshake {
     pub unsettled_vv_keys: Vec<VersionKey>,
 }
 
+/// Monotonic elapsed-time clock for [`FetchOptions`] idle-timeout enforcement.
+///
+/// Production callers leave [`FetchOptions::clock`] unset (`None`), which uses real wall time
+/// (`std::time::Instant`). Deterministic tests and the simulator can inject a virtual clock so
+/// idle-timeout rules are verified without sleeping.
+#[derive(Clone)]
+pub struct FetchClock(Arc<dyn Fn() -> Duration + Send + Sync>);
+
+impl FetchClock {
+    /// Creates a monotonic clock backed by a closure returning elapsed time since an arbitrary
+    /// epoch.
+    pub fn new(now: impl Fn() -> Duration + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    /// Reads the current monotonic timestamp from this clock.
+    pub fn now(&self) -> Duration {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for FetchClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FetchClock(..)")
+    }
+}
+
 /// Per-fetch transfer options supporting ranged resume, idle timeouts, and cooperative cancellation.
 #[derive(Debug, Clone)]
 pub struct FetchOptions {
@@ -842,6 +869,8 @@ pub struct FetchOptions {
     pub timeout: Duration,
     /// Optional cancellation flag checked during streaming reads.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Optional monotonic clock override for deterministic idle-timeout checks.
+    pub clock: Option<FetchClock>,
 }
 
 impl Default for FetchOptions {
@@ -850,18 +879,27 @@ impl Default for FetchOptions {
             offset: 0,
             timeout: DEFAULT_FETCH_TIMEOUT,
             cancel: None,
+            clock: None,
         }
     }
 }
 
 impl FetchOptions {
-    /// Creates options starting at `offset` with default timeout and optional cancellation flag.
+    /// Creates options starting at `offset` with `timeout` and optional cancellation flag.
     pub fn at_offset(offset: u64, timeout: Duration, cancel: Option<Arc<AtomicBool>>) -> Self {
         Self {
             offset,
             timeout,
             cancel,
+            clock: None,
         }
+    }
+
+    /// Attaches a deterministic monotonic clock for idle-timeout checks.
+    #[must_use]
+    pub fn with_clock(mut self, clock: FetchClock) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     /// Returns `true` if cancellation has been requested.
