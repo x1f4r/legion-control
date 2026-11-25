@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 use std::io;
 
 use legion_core::{Door, Paths};
-use legion_net::stream::{
-    Host, STREAM_PROTOCOL, StreamServeOptions, serve, serve_with_options,
-};
+use legion_net::stream::{Host, STREAM_PROTOCOL, StreamServeOptions, serve, serve_with_options};
 use legion_proto::ErrorCode;
 use serde_json::{Value, json};
 

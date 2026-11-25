@@ -427,7 +427,16 @@ pub fn serve_with_door<R: Read, W: Write>(
         );
     }
     serve_single_op(
-        host, pinned, door, device, &options, header, recorded, started, &mut input, &mut output,
+        host,
+        pinned,
+        door,
+        device,
+        &options,
+        header,
+        recorded,
+        started,
+        &mut input,
+        &mut output,
     )
 }
 
@@ -533,7 +542,16 @@ pub fn serve_with_options<R: Read + Send + 'static, W: Write>(
         );
     }
     serve_single_op(
-        host, pinned, door, device, &options, header, recorded, started, &mut input, &mut output,
+        host,
+        pinned,
+        door,
+        device,
+        &options,
+        header,
+        recorded,
+        started,
+        &mut input,
+        &mut output,
     )
 }
 

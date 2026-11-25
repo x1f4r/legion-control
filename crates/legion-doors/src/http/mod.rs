@@ -626,8 +626,9 @@ impl AsyncWrite for MonitoredTcpStream {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.get_mut()
-            .monitor_write(cx, |inner, cx| Pin::new(inner).poll_write_vectored(cx, bufs))
+        self.get_mut().monitor_write(cx, |inner, cx| {
+            Pin::new(inner).poll_write_vectored(cx, bufs)
+        })
     }
 
     fn is_write_vectored(&self) -> bool {

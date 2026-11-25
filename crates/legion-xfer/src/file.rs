@@ -196,7 +196,9 @@ impl GetStream {
     {
         let remaining = self.length;
         if remaining == 0 {
-            writer.flush().map_err(|e| StreamCheckedError::Xfer(e.into()))?;
+            writer
+                .flush()
+                .map_err(|e| StreamCheckedError::Xfer(e.into()))?;
             return Ok(0);
         }
         let mut limited = self.file.take(remaining);
@@ -218,7 +220,9 @@ impl GetStream {
                 .map_err(|e| StreamCheckedError::Xfer(e.into()))?;
             written += n as u64;
         }
-        writer.flush().map_err(|e| StreamCheckedError::Xfer(e.into()))?;
+        writer
+            .flush()
+            .map_err(|e| StreamCheckedError::Xfer(e.into()))?;
 
         if written < remaining {
             return Err(StreamCheckedError::Xfer(Error::Conflict {

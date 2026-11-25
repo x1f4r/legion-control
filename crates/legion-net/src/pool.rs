@@ -213,7 +213,10 @@ impl WaiterGuard {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *state.waiters_by_holder.entry(holder.to_owned()).or_insert(0) += 1;
+            *state
+                .waiters_by_holder
+                .entry(holder.to_owned())
+                .or_insert(0) += 1;
         }
         Self {
             pool: Arc::clone(pool),
@@ -486,7 +489,11 @@ impl Fleet {
             return;
         }
         let weak: Weak<PoolInner> = Arc::downgrade(&self.inner);
-        let interval = self.inner.options.idle_reap_interval.max(Duration::from_millis(10));
+        let interval = self
+            .inner
+            .options
+            .idle_reap_interval
+            .max(Duration::from_millis(10));
         let shutdown = self.inner.shutdown.clone();
         tokio::spawn(async move {
             loop {
@@ -2736,9 +2743,7 @@ impl Fleet {
                     return Err(ContentError::Error(
                         ErrorBody::new(
                             ErrorCode::Failed,
-                            format!(
-                                "{machine} failed to finish a zero-length stream get: {err}."
-                            ),
+                            format!("{machine} failed to finish a zero-length stream get: {err}."),
                         )
                         .with_machine(machine),
                     ));

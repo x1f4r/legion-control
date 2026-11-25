@@ -629,9 +629,9 @@ fn poll_keep_open(
                                 };
                                 return Poll::Ready(Err(io::Error::new(kind, body.message)));
                             }
-                            let Ok(ready) = serde_json::from_value::<GetReadyReply>(Value::Object(
-                                fields,
-                            )) else {
+                            let Ok(ready) =
+                                serde_json::from_value::<GetReadyReply>(Value::Object(fields))
+                            else {
                                 *total_remaining = 0;
                                 state.phase = KeepOpenPhase::Finished;
                                 state.channel_cancel.cancel();

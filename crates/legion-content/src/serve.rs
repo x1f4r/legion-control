@@ -1720,7 +1720,9 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            resp.headers().get(RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
             Some("3")
         );
     }
