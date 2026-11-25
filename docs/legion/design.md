@@ -48,14 +48,16 @@ This page is the design the Rust workspace is built to.
                                process identity, atomic files, locks
       legion-xfer/             the transfer engine: hashes, tree listings, plans, tar streams,
                                resumable single files; knows nothing about machines
+      legion-update/           signed update sets: manifest, SHA256SUMS + Ed25519 verification,
+                               trusted release and optional build-time preview keys, sequence floor
       legion-core/             node: registry, context, policy, audit, config, paths
       legion-tools/            the built-in tool families, one module per family
-      legion-net/              reaching other nodes: connectors, sessions, router, transfer
+      legion-net/              reaching other nodes: connectors, sessions, router, transfer, updates
       legion-doors/            MCP (stdio and HTTP) and the JSON HTTP API
       legion-cli/              the `legion` binary: argument parsing and wiring
 
-Dependencies point one way: `proto ← link`, `proto, os, xfer ← core ← tools`, and `link, tools ← net ← doors ← cli`. `legion-os`
-and `legion-xfer` know nothing about tools or policy, and `legion-tools` never knows a call came
+Dependencies point one way: `proto ← link`, `proto ← update`, `proto, os, xfer ← core ← tools`, and `link, tools, update ← net ← doors ← cli`. `legion-os`,
+`legion-xfer` and `legion-update` know nothing about tools or policy, and `legion-tools` never knows a call came
 from another machine; `legion-net` wraps a local registry and adds the tools that only make sense
 across machines.
 
@@ -151,6 +153,7 @@ are RFC 3339 UTC, durations are seconds.
 | `power` | `power.status`, `power.sleep`, `power.restart`, `power.shutdown`, `power.cancel` | busy-gated; `restart` can name the system to land in; `cancel` calls a pending one off |
 | `power` (fleet) | `power.wol`, `power.wake`, `power.switch` | wake a machine through a helper; restart one and confirm which system came back |
 | `fleet` | `fleet.list`, `fleet.ping`, `fleet.add`, `fleet.remove`, `fleet.discover`, `fleet.install`, `fleet.sync` | the machines, reachability, remote install, config sync |
+| `update` (fleet) | `update.list`, `update.read`, `update.publish` | signed update sets stored in `state/updates/` and propagated across the fleet |
 | `config` (fleet) | `config.list`, `config.read`, `config.write` | shared configuration documents (`fleet.toml`, `policy.toml`, `projects.toml`, `tools.d/*.toml`) |
 | `token` | `token.add`, `token.list`, `token.remove` | bearer tokens for `legion serve` (hashes in `tokens.toml`) |
 | `agent` | `agent.list`, `agent.add`, `agent.remove` | register Legion with AI coding agents through their own CLIs |

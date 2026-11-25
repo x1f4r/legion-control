@@ -1408,6 +1408,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1255e7a9f1902190d4c10a75f2f7f495d3d3ce13e9ba26e6c48683a0f4dbed7"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2510,12 +2520,18 @@ name = "legion-app"
 version = "0.1.0"
 dependencies = [
  "android_logger",
+ "base64 0.23.1",
+ "ed25519-dalek",
+ "flate2",
  "gethostname",
  "legion-link",
+ "legion-update",
  "log",
  "rustix",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
+ "tar",
  "tauri",
  "tauri-build",
  "tauri-plugin-barcode-scanner",
@@ -2546,6 +2562,20 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "legion-update"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "ed25519-dalek",
+ "jiff 1.0.3",
+ "legion-proto",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
 ]
 
 [[package]]
@@ -4699,6 +4729,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
+
+[[package]]
 name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6099,6 +6140,16 @@ dependencies = [
  "libc",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "xattr"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "963d6fab92d5504b971dc8bd90ca743c2575e590bc8071ea5bc571598667ae08"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]

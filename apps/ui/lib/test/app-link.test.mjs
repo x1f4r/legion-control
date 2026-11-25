@@ -258,3 +258,71 @@ test('createAppLink state() keeps selected node unreachable with last known role
     }
   }
 });
+
+test('createAppLink wraps native update commands and live update watch channel', async () => {
+  const prevWindow = globalThis.window;
+  const seen = [];
+  let registeredChannel = null;
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          seen.push({ command, payload });
+          if (command === 'update_watch') {
+            registeredChannel = payload.onState;
+            return Promise.resolve();
+          }
+          if (command === 'update_state' || command === 'update_check') {
+            return Promise.resolve({ phase: 'ready', auto_update: true });
+          }
+          if (command === 'update_set_auto') {
+            return Promise.resolve({ phase: 'ready', auto_update: payload.enabled });
+          }
+          return Promise.resolve({ phase: 'up_to_date', auto_update: true });
+        },
+        Channel: class FakeChannel {
+          constructor() {
+            this.onmessage = null;
+          }
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    const observed = [];
+    const unwatch = link.watchUpdates((st) => observed.push(st));
+    assert.ok(registeredChannel);
+    registeredChannel.onmessage({ phase: 'downloading', progress: { downloaded_bytes: 5, total_bytes: 10 } });
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0].phase, 'downloading');
+    unwatch();
+    registeredChannel.onmessage({ phase: 'ready' });
+    assert.equal(observed.length, 1);
+
+    assert.equal((await link.updateState()).phase, 'ready');
+    assert.equal((await link.checkUpdates()).phase, 'ready');
+    assert.equal((await link.setAutoUpdate(false)).auto_update, false);
+    await link.installUpdate();
+    await link.dismissUpdateNotice();
+    await link.maybeAutoInstall();
+    for (const cmd of [
+      'update_watch',
+      'update_state',
+      'update_check',
+      'update_set_auto',
+      'update_install',
+      'update_dismiss_notice',
+      'update_maybe_auto_install',
+    ]) {
+      assert.ok(seen.some((c) => c.command === cmd), `expected ${cmd}`);
+    }
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+});

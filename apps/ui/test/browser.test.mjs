@@ -1089,6 +1089,43 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     assert.equal(lastCall.tool, 'power.restart');
     assert.deepEqual(lastCall.on, ['tower', 'pi', 'studio']);
 
+    // 10. Settings -> About -> Updates in browser door explains the browser stays as new as the server.
+    await p.goto(`${server.url}/?mock=basic#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Updates', { exact: true }).waitFor();
+    await p.getByText('Always up to date').waitFor();
+    await p.getByText(/browser interface is always as new as tower/i).waitFor();
+
+    // 11. Native app mode (`update`): plain mode hides channel/sequence/key, shows Update now & notes;
+    //     Technical details reveals channel, sequence, key fingerprint, and source machine.
+    await p.goto(`${server.url}/?mock=multi,update#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Version 0.2.0 is ready').waitFor();
+    await p.getByRole('button', { name: 'Update now' }).waitFor();
+    await p.getByText('Update automatically').waitFor();
+    await p.getByText('Automatic fleet updates and faster status refresh.').waitFor();
+    const plainAboutText = await p.locator('main.main').innerText();
+    assert.ok(!plainAboutText.includes('SHA256:MockPreviewKey'), 'Key fingerprint must be hidden when Technical details is off');
+    await assertNoToolNames(p, 'about updates plain');
+
+    await p.goto(`${server.url}/?mock=multi,update,tech#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Update details').waitFor();
+    await p.getByText('preview + stable').waitFor();
+    await p.getByText(/SHA256:MockPreviewKey/).waitFor();
+
+    // 12. Linux .deb mode (`update-deb`): never offers Update now, shows exact apt-get command.
+    await p.goto(`${server.url}/?mock=multi,update-deb#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Version 0.2.0 is available').waitFor();
+    await p.getByText(/sudo apt-get install /).waitFor();
+    assert.equal(await p.getByRole('button', { name: 'Update now' }).count(), 0);
+
+    // 13. One-time "Updated to 0.2.0 · What is new" notice on first screen, sheet, and dismiss.
+    await p.goto(`${server.url}/?mock=multi,updated#/machines`, { waitUntil: 'domcontentloaded' });
+    await p.getByText(/Updated to 0\.2\.0/).waitFor();
+    await p.getByRole('button', { name: 'What is new' }).click();
+    await p.locator('.sheet').getByText('What is new in 0.2.0').waitFor();
+    await p.locator('.sheet').getByText('Automatic fleet updates and faster status refresh.').waitFor();
+    await p.locator('.sheet').getByRole('button', { name: 'Done' }).click();
+    await p.getByText(/Updated to 0\.2\.0/).waitFor({ state: 'hidden' });
+
     await ctx.close();
     assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);
     assert.deepEqual(consoleErrors, [], `Console/CSP errors: ${consoleErrors.join('\n')}`);

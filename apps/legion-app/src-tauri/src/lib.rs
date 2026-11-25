@@ -4,6 +4,7 @@ pub mod backend;
 pub mod commands;
 pub mod link_backend;
 pub mod store;
+pub mod updater;
 
 use std::sync::Arc;
 
@@ -13,6 +14,7 @@ use tauri::{Manager, Url, WebviewWindowBuilder};
 use crate::commands::SharedBackend;
 use crate::link_backend::LinkBackend;
 use crate::store::AppStore;
+use crate::updater::{SharedUpdater, UpdateManager};
 
 /// Returns `true` only for the bundled app origin on the current platform.
 ///
@@ -49,6 +51,19 @@ fn android_barcode_scanner_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
         .build()
 }
 
+/// Registers the in-app `AppUpdaterPlugin` Kotlin plugin on Android so `commands::update_install`
+/// can install verified APKs via `PackageInstaller`.
+#[cfg(target_os = "android")]
+fn android_app_updater_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("app-updater")
+        .setup(|app, api| {
+            let handle = api.register_android_plugin("com.x1f4r.legion", "AppUpdaterPlugin")?;
+            app.manage(updater::android::AndroidUpdaterHandle(handle));
+            Ok(())
+        })
+        .build()
+}
+
 /// Starts the Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -72,11 +87,14 @@ pub fn run() {
 
     let builder = builder.setup(|app| {
         let data_dir = app.path().app_data_dir()?;
-        let store = AppStore::in_dir(data_dir);
+        let store = AppStore::in_dir(&data_dir);
         store.prepare_dir()?;
         let backend = LinkBackend::from_store(store.clone());
+        let updater =
+            UpdateManager::for_app(&data_dir, Some(app.package_info().version.to_string()));
         app.manage(store);
         app.manage(SharedBackend(Arc::new(backend)));
+        app.manage(SharedUpdater(Arc::new(updater)));
 
         let window_config = app
             .config()
@@ -96,6 +114,7 @@ pub fn run() {
     #[cfg(target_os = "android")]
     let builder = builder
         .plugin(android_barcode_scanner_plugin())
+        .plugin(android_app_updater_plugin())
         .invoke_handler(tauri::generate_handler![
             commands::state,
             commands::tools,
@@ -112,6 +131,13 @@ pub fn run() {
             commands::device_name,
             commands::ready,
             commands::scan_invite,
+            commands::update_state,
+            commands::update_watch,
+            commands::update_check,
+            commands::update_install,
+            commands::update_set_auto,
+            commands::update_dismiss_notice,
+            commands::update_maybe_auto_install,
         ]);
 
     #[cfg(target_os = "ios")]
@@ -133,6 +159,13 @@ pub fn run() {
             commands::device_name,
             commands::ready,
             commands::scan_invite,
+            commands::update_state,
+            commands::update_watch,
+            commands::update_check,
+            commands::update_install,
+            commands::update_set_auto,
+            commands::update_dismiss_notice,
+            commands::update_maybe_auto_install,
         ]);
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -151,6 +184,13 @@ pub fn run() {
         commands::dismiss_identity_change,
         commands::device_name,
         commands::ready,
+        commands::update_state,
+        commands::update_watch,
+        commands::update_check,
+        commands::update_install,
+        commands::update_set_auto,
+        commands::update_dismiss_notice,
+        commands::update_maybe_auto_install,
     ]);
 
     #[allow(clippy::expect_used)]

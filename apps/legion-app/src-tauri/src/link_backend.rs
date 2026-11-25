@@ -850,6 +850,27 @@ impl Backend for LinkBackend {
             Ok(state)
         })
     }
+
+    fn update_sources(&self) -> Result<Option<(Link, Vec<String>)>, AppError> {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(err) = &guard.store_error {
+            return Err(err.clone());
+        }
+        let mut nodes: Vec<String> = Vec::new();
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if guard.local_program.is_some() && guard.data.link.node(LOCAL_NODE_ID).is_none() {
+            nodes.push(LOCAL_NODE_ID.to_owned());
+        }
+        for entry in &guard.data.link.nodes {
+            if entry.origin == NodeOrigin::Paired && entry.identity_changed.is_none() {
+                nodes.push(entry.node.clone());
+            }
+        }
+        Ok(Some((guard.link.clone(), nodes)))
+    }
 }
 
 fn build_pair_summary(enrolled: &legion_link::Enrolled) -> PairSummary {

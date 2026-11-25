@@ -39,6 +39,12 @@ import {
   readSettings,
   writeSettings,
 } from './lib/settings.js';
+import {
+  IDLE_INSTALL_DELAY_MS,
+  PERIODIC_CHECK_INTERVAL_MS,
+  isSafeForAutoInstall,
+  shouldCheckOnResume,
+} from './lib/updates.js';
 import { createLink } from './link/index.js';
 import { ActionsView } from './views/actions.js';
 import { ActivityView } from './views/activity.js';
@@ -258,9 +264,16 @@ function App() {
   });
   const [pairingOpen, setPairingOpen] = useState(false);
   const [pairNotice, setPairNotice] = useState(null);
+  const [updateState, setUpdateState] = useState(null);
+  const [whatIsNewOpen, setWhatIsNewOpen] = useState(false);
   const [wakeSentAt, setWakeSentAt] = useState({});
   const sheetHistoryRef = useRef(false);
   const learnInFlightRef = useRef(false);
+  const updateCheckInFlightRef = useRef(false);
+  const lastInteractionRef = useRef(Date.now());
+  const startupAutoInstallRanRef = useRef(false);
+  const updateStateRef = useRef(updateState);
+  updateStateRef.current = updateState;
 
   const nodeInfo = linkState?.nodes?.[0] || null;
   const nodeInfoRef = useRef(nodeInfo);
@@ -394,6 +407,59 @@ function App() {
       });
   }, [link, mergeBackendState]);
 
+  const checkUpdatesQuietly = useCallback(async () => {
+    if (typeof link.checkUpdates !== 'function' || updateCheckInFlightRef.current) return;
+    updateCheckInFlightRef.current = true;
+    try {
+      const next = await link.checkUpdates();
+      if (next) setUpdateState(next);
+    } catch {
+      // A check that finds no machine reachable stays quiet.
+    } finally {
+      updateCheckInFlightRef.current = false;
+    }
+  }, [link]);
+
+  const handleCheckUpdates = useCallback(async () => {
+    if (typeof link.checkUpdates !== 'function') return null;
+    updateCheckInFlightRef.current = true;
+    try {
+      const next = await link.checkUpdates();
+      if (next) setUpdateState(next);
+      return next;
+    } finally {
+      updateCheckInFlightRef.current = false;
+    }
+  }, [link]);
+
+  const handleInstallUpdate = useCallback(async () => {
+    if (typeof link.installUpdate !== 'function') return null;
+    const next = await link.installUpdate();
+    if (next) setUpdateState(next);
+    return next;
+  }, [link]);
+
+  const handleSetAutoUpdate = useCallback(
+    async (enabled) => {
+      if (typeof link.setAutoUpdate !== 'function') return null;
+      const next = await link.setAutoUpdate(enabled);
+      if (next) setUpdateState(next);
+      return next;
+    },
+    [link],
+  );
+
+  const handleDismissUpdateNotice = useCallback(async () => {
+    setWhatIsNewOpen(false);
+    if (typeof link.dismissUpdateNotice !== 'function') return;
+    try {
+      const next = await link.dismissUpdateNotice();
+      if (next) setUpdateState(next);
+    } catch {
+      // Ignore dismiss failure; next load will re-read state.
+    }
+  }, [link]);
+
   const refreshFleet = useCallback(
     async (activeNodeInfo, options = {}) => {
       const targetNode = activeNodeInfo || nodeInfoRef.current;
@@ -506,9 +572,93 @@ function App() {
 
       refreshFleet(primary, { initialSnapshot: cachedSnap });
       triggerLearnInBackground();
+      checkUpdatesQuietly();
     },
-    [link, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground],
+    [link, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
   );
+
+  // Subscribe to native updater state and handle startup/periodic/idle update hooks.
+  useEffect(() => {
+    if (typeof link.watchUpdates !== 'function' && typeof link.updateState !== 'function') {
+      return;
+    }
+    let alive = true;
+    const unwatch =
+      typeof link.watchUpdates === 'function'
+        ? link.watchUpdates((st) => {
+            if (alive && st) setUpdateState(st);
+          })
+        : () => {};
+    if (typeof link.updateState === 'function') {
+      link
+        .updateState()
+        .then((st) => {
+          if (!alive || !st) return;
+          setUpdateState(st);
+          if (
+            !startupAutoInstallRanRef.current &&
+            typeof link.maybeAutoInstall === 'function' &&
+            isSafeForAutoInstall({ updateState: st, startup: true })
+          ) {
+            startupAutoInstallRanRef.current = true;
+            link.maybeAutoInstall().catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }
+    return () => {
+      alive = false;
+      unwatch();
+    };
+  }, [link]);
+
+  // Track user interactions and trigger periodic (6h) update checks plus safe idle auto-install.
+  useEffect(() => {
+    if (!linkState?.ready || typeof link.checkUpdates !== 'function') return;
+    const markActive = () => {
+      lastInteractionRef.current = Date.now();
+    };
+    window.addEventListener('pointerdown', markActive, { passive: true });
+    window.addEventListener('keydown', markActive, { passive: true });
+
+    const periodicTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        checkUpdatesQuietly();
+      }
+    }, PERIODIC_CHECK_INTERVAL_MS);
+
+    const idleTimer = window.setInterval(() => {
+      if (typeof link.maybeAutoInstall !== 'function') return;
+      const safe = isSafeForAutoInstall({
+        updateState: updateStateRef.current,
+        hasOpenSheet: Boolean(confirmRequest || whatIsNewOpen),
+        hasCommandDraft: Boolean(commandDraft.cmd?.trim()),
+        isRunningCommand: Boolean(commandDraft.running),
+        isPairingOpen: Boolean(pairingOpen),
+        lastInteractionMs: lastInteractionRef.current,
+        nowMs: Date.now(),
+      });
+      if (safe) {
+        link.maybeAutoInstall().catch(() => {});
+      }
+    }, Math.min(IDLE_INSTALL_DELAY_MS, 10_000));
+
+    return () => {
+      window.removeEventListener('pointerdown', markActive);
+      window.removeEventListener('keydown', markActive);
+      window.clearInterval(periodicTimer);
+      window.clearInterval(idleTimer);
+    };
+  }, [
+    link,
+    linkState?.ready,
+    checkUpdatesQuietly,
+    confirmRequest,
+    whatIsNewOpen,
+    commandDraft.cmd,
+    commandDraft.running,
+    pairingOpen,
+  ]);
 
   useEffect(() => {
     let alive = true;
@@ -566,6 +716,9 @@ function App() {
       } else {
         wasHidden = false;
         refreshFleet(nodeInfo, { background: true });
+      }
+      if (shouldCheckOnResume(updateStateRef.current?.last_checked_at)) {
+        checkUpdatesQuietly();
       }
     };
 
@@ -1217,6 +1370,9 @@ function App() {
                           error=${fleetError}
                           pairNotice=${pairNotice?.screen === 'machines' ? pairNotice.summary : null}
                           onDismissPairNotice=${() => setPairNotice(null)}
+                          updateState=${updateState}
+                          onOpenWhatIsNew=${() => setWhatIsNewOpen(true)}
+                          onDismissUpdateNotice=${handleDismissUpdateNotice}
                           loading=${refreshing}
                           wide=${wide}
                           route=${route}
@@ -1281,6 +1437,11 @@ function App() {
                               settings=${settings}
                               pairNotice=${pairNotice?.screen === 'connections' ? pairNotice.summary : null}
                               onDismissPairNotice=${() => setPairNotice(null)}
+                              updateState=${updateState}
+                              onCheckUpdates=${handleCheckUpdates}
+                              onInstallUpdate=${handleInstallUpdate}
+                              onSetAutoUpdate=${handleSetAutoUpdate}
+                              onDismissUpdateNotice=${handleDismissUpdateNotice}
                               onUpdateSettings=${updateSettings}
                               onRequestConfirm=${openConfirm}
                               onAcceptIdentityChange=${handleAcceptIdentityChange}
@@ -1331,6 +1492,35 @@ function App() {
                 ${renderNav()}
               </div>
             `}
+      ${whatIsNewOpen && updateState?.just_updated
+        ? html`
+            <${Sheet}
+              title=${`What is new in ${updateState.just_updated.version}`}
+              onClose=${() => setWhatIsNewOpen(false)}
+            >
+              <p>${updateState.just_updated.notes}</p>
+              ${settings.technical
+                ? html`
+                    <div class="list spaced">
+                      <dl class="kv">
+                        <dt>channel</dt>
+                        <dd>${updateState.just_updated.channel}</dd>
+                        <dt>build</dt>
+                        <dd>${updateState.just_updated.build}</dd>
+                        <dt>sequence</dt>
+                        <dd>${updateState.just_updated.sequence}</dd>
+                      </dl>
+                    </div>
+                  `
+                : null}
+              <div class="actions">
+                <button type="button" class="btn primary full" onClick=${handleDismissUpdateNotice}>
+                  Done
+                </button>
+              </div>
+            <//>
+          `
+        : null}
       ${confirmRequest
         ? html`
             <${ConfirmSheet}
