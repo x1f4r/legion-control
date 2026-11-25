@@ -114,14 +114,6 @@ impl<S: IndexStore> LocalIndexView for StoreIndexView<'_, S> {
             .live_paths_for_folded(folded_path)
             .unwrap_or_default()
     }
-
-    fn get_deleted_history(&self, path: &str) -> Vec<Hash> {
-        self.store.get_deleted_history(path).unwrap_or_default()
-    }
-
-    fn get_deleted_history_version(&self, path: &str) -> Option<VersionVector> {
-        self.store.get_deleted_history_version(path).ok().flatten()
-    }
 }
 
 enum SafeReplaceResult {
@@ -1364,27 +1356,6 @@ pub fn apply_decision<F: SyncFs, S: IndexStore>(
                 upsert_seq_fingerprints: vec![(seq, chain)],
                 ..StoreBatch::default()
             };
-            if record.deleted && !record.recent_hashes.is_empty() {
-                let mut merged_dh = record.recent_hashes.clone();
-                for h in store.get_deleted_history(&record.path)? {
-                    if merged_dh.len() >= MAX_ANCESTRY_HASHES {
-                        break;
-                    }
-                    if !merged_dh.contains(&h) {
-                        merged_dh.push(h);
-                    }
-                }
-                batch
-                    .upsert_deleted_history
-                    .push((record.path.clone(), merged_dh));
-                let del_vv = store
-                    .get_deleted_history_version(&record.path)?
-                    .unwrap_or_default()
-                    .merge(&record.version);
-                batch
-                    .upsert_deleted_history_versions
-                    .push((record.path.clone(), del_vv));
-            }
             batch.upsert_records.push(record);
             store.apply_batch(batch)?;
             Ok(ApplyOutcome::Applied)
@@ -1466,10 +1437,6 @@ pub fn apply_decision<F: SyncFs, S: IndexStore>(
                 conflict_dismissed: false,
             };
             let chain = meta.advance_chain_fingerprint(seq, revived.head_fingerprint());
-            let encoded = encode_deletion_log_entries(&[FolderDeletionLogEntry::Revived {
-                path: path.clone(),
-            }])?;
-            fs.append_deletion_log(&encoded)?;
             let batch = StoreBatch {
                 folder_meta: Some(meta),
                 upsert_records: vec![revived],
@@ -2169,13 +2136,7 @@ fn flush_group_commit_records<F: SyncFs, S: IndexStore>(
     let mut batch = StoreBatch::default();
     let drained = std::mem::take(placed);
     let mut meta_dirty = !drained.is_empty();
-    let mut del_log_entries = Vec::new();
     for (remote_seq, mut rec) in drained {
-        if store.get_record(&rec.path)?.is_some_and(|p| p.deleted) {
-            del_log_entries.push(FolderDeletionLogEntry::Revived {
-                path: rec.path.clone(),
-            });
-        }
         let seq = meta.next_seq();
         meta.record_change_mark(seq, rec.mtime);
         rec.seq = seq;
@@ -2187,10 +2148,6 @@ fn flush_group_commit_records<F: SyncFs, S: IndexStore>(
             .push((peer_id.to_string(), rec.path.clone()));
         batch.upsert_records.push(rec);
         out.applied_seqs.push(remote_seq);
-    }
-    if !del_log_entries.is_empty() {
-        let encoded = encode_deletion_log_entries(&del_log_entries)?;
-        fs.append_deletion_log(&encoded)?;
     }
     for p in needs_rescan_paths.drain(..) {
         if meta.needs_rescan.insert(p) {
@@ -4048,7 +4005,6 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                     Err(err) => return Err(err),
                 }
                 let mut meta = load_meta_required(store)?;
-                let was_deleted = prev_deleted_or_none.is_some();
                 let mut version = prev_deleted_or_none
                     .as_ref()
                     .map_or_else(VersionVector::new, |p| p.version.clone());
@@ -4077,13 +4033,6 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                     conflict_dismissed: false,
                 };
                 let chain = meta.advance_chain_fingerprint(seq, dir_rec.head_fingerprint());
-                if was_deleted {
-                    let encoded =
-                        encode_deletion_log_entries(&[FolderDeletionLogEntry::Revived {
-                            path: anc.to_string(),
-                        }])?;
-                    fs.append_deletion_log(&encoded)?;
-                }
                 let batch = StoreBatch {
                     folder_meta: Some(meta),
                     upsert_records: vec![dir_rec],
@@ -4559,12 +4508,9 @@ pub fn restore_from_bin<F: SyncFs, S: IndexStore>(
     };
 
     let mut meta = load_meta_required(store)?;
-    let mut version = match existing.as_ref() {
-        Some(p) => p.version.clone(),
-        None => store
-            .get_deleted_history_version(&target_path)?
-            .unwrap_or_default(),
-    };
+    let mut version = existing
+        .as_ref()
+        .map_or_else(VersionVector::new, |p| p.version.clone());
     meta.bump_version(&mut version);
 
     let mut recent_hashes = existing
@@ -6601,35 +6547,10 @@ fn commit_records_and_clear_pending<F: SyncFs, S: IndexStore>(
         }
         if rec.deleted {
             del_log_entries.push(FolderDeletionLogEntry::from_tombstone(&rec));
-        } else if store.get_record(&rec.path)?.is_some_and(|p| p.deleted) {
-            del_log_entries.push(FolderDeletionLogEntry::Revived {
-                path: rec.path.clone(),
-            });
         }
         let seq = meta.next_seq();
         meta.record_change_mark(seq, rec.mtime);
         rec.seq = seq;
-        if rec.deleted && !rec.recent_hashes.is_empty() {
-            let mut merged_dh = rec.recent_hashes.clone();
-            for h in store.get_deleted_history(&rec.path)? {
-                if merged_dh.len() >= MAX_ANCESTRY_HASHES {
-                    break;
-                }
-                if !merged_dh.contains(&h) {
-                    merged_dh.push(h);
-                }
-            }
-            batch
-                .upsert_deleted_history
-                .push((rec.path.clone(), merged_dh));
-            let del_vv = store
-                .get_deleted_history_version(&rec.path)?
-                .unwrap_or_default()
-                .merge(&rec.version);
-            batch
-                .upsert_deleted_history_versions
-                .push((rec.path.clone(), del_vv));
-        }
         rec.conflict_of = derive_conflict_of(&rec, &meta);
         let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
         batch.upsert_seq_fingerprints.push((seq, chain));

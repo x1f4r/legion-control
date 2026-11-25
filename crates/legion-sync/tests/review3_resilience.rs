@@ -16,13 +16,12 @@ use std::time::Duration;
 
 #[cfg(unix)]
 use legion_sync::RestoreStrategy;
-use legion_sync::model::MAX_DELETED_HISTORY_PATHS;
 use legion_sync::{
     DeletionBrakeDecision, FetchClock, FetchOptions, FsCapabilities, FsErrorKind, FsMeta,
     FsWalkResult, HandshakeHello, IgnoreMatcher, InboundDeletionBrakeDecision, IndexRecord,
-    IndexStore, MAX_HELD_BACK_ENTRIES, MemberState, MemoryIndexStore, Peer, PeerHandshake,
-    ProblemKind, RealFs, RecordsPage, RedbIndexStore, SYNC_PROTOCOL_VERSION, ScanOptions,
-    SyncEngine, SyncError, SyncFs, SyncWrite, VersionKey, VersionVector,
+    IndexStore, MAX_HELD_BACK_ENTRIES, MemberState, Peer, PeerHandshake, ProblemKind, RealFs,
+    RecordsPage, RedbIndexStore, SYNC_PROTOCOL_VERSION, ScanOptions, SyncEngine, SyncError, SyncFs,
+    SyncWrite, VersionKey, VersionVector,
 };
 use legion_xfer::{EntryKind, Hash, Timestamp};
 use safety_common::*;
@@ -212,12 +211,13 @@ fn r1_collected_deletion_resurrected_via_non_originator() {
     sync_all(&mut [&mut tower, &mut pi, &mut nas], 11);
     sync_all(&mut [&mut tower, &mut pi, &mut nas], 20);
     for e in [&mut tower, &mut pi, &mut nas] {
-        let _ = e.gc_tombstones().unwrap();
-        assert!(e.store().get_record("tax-2019.pdf").unwrap().is_none());
-        assert_eq!(
-            e.store().get_deleted_history("tax-2019.pdf").unwrap().len(),
-            1
-        );
+        let rec = e
+            .store()
+            .get_record("tax-2019.pdf")
+            .unwrap()
+            .expect("permanent tombstone must remain in index");
+        assert!(rec.deleted);
+        assert_eq!(rec.recent_hashes.len(), 1);
     }
     assert!(!t.join("pi/tax-2019.pdf").exists());
 
@@ -2780,7 +2780,8 @@ fn r17_two_joiners_with_same_old_copy_resurrect() {
                 .store()
                 .get_record("old-tax-return.pdf")
                 .unwrap()
-                .is_none()
+                .is_some_and(|r| r.deleted),
+            "permanent deletion tombstone must stay in tower's index"
         );
         let all4 = ["tower", "pi", "laptop1", "laptop2"];
         for e in [&mut tower, &mut pi] {
@@ -2956,34 +2957,11 @@ fn serving_stat_mismatch_and_hash_mismatch_trigger_rescan() {
     }
 }
 
-/// Deleted history evicts oldest entries first (not lexicographically) when past the cap, and
-/// recreating a deleted file intentionally after tombstone GC succeeds even with identical bytes.
+/// Permanent deletion log compaction merges only ordered versions for the same path (never
+/// dropping knowledge), and recreating a deleted file intentionally succeeds even with identical
+/// bytes.
 #[test]
-fn deleted_history_evicts_oldest_first_and_allows_intentional_restore() {
-    // Part 1: Oldest-first eviction past MAX_DELETED_HISTORY_PATHS.
-    let mut mem = MemoryIndexStore::new();
-    let h = legion_xfer::hash::hash_bytes(b"payload");
-    let mut batch = legion_sync::StoreBatch::default();
-    // Insert paths with reverse-alphabetical names first ("z_oldest") and "a_newest" last.
-    batch
-        .upsert_deleted_history
-        .push(("z_oldest.txt".to_string(), vec![h]));
-    for i in 1..MAX_DELETED_HISTORY_PATHS {
-        batch
-            .upsert_deleted_history
-            .push((format!("m_{i:06}.txt"), vec![h]));
-    }
-    batch
-        .upsert_deleted_history
-        .push(("a_newest.txt".to_string(), vec![h]));
-    mem.apply_batch(batch).unwrap();
-    assert!(
-        mem.get_deleted_history("z_oldest.txt").unwrap().is_empty(),
-        "oldest entry must be evicted first regardless of alphabetical order"
-    );
-    assert_eq!(mem.get_deleted_history("a_newest.txt").unwrap().len(), 1);
-
-    // Part 2: Intentional user restore with the exact same bytes after tombstone GC.
+fn permanent_deletion_log_compacts_ordered_and_allows_intentional_restore() {
     let tmp = scratch();
     let t = tmp.path();
     let all = ["tower", "pi"];
@@ -2997,10 +2975,20 @@ fn deleted_history_evicts_oldest_first_and_allows_intentional_restore() {
     fs::remove_file(t.join("tower/reborn.txt")).unwrap();
     tower.scan(ts(10)).unwrap();
     sync_all(&mut [&mut tower, &mut pi], 11);
-    let _ = tower.gc_tombstones().unwrap();
-    let _ = pi.gc_tombstones().unwrap();
-    assert!(tower.store().get_record("reborn.txt").unwrap().is_none());
-    assert!(pi.store().get_record("reborn.txt").unwrap().is_none());
+    assert!(
+        tower
+            .store()
+            .get_record("reborn.txt")
+            .unwrap()
+            .is_some_and(|r| r.deleted)
+    );
+    assert!(
+        pi.store()
+            .get_record("reborn.txt")
+            .unwrap()
+            .is_some_and(|r| r.deleted)
+    );
+    assert_eq!(tower.compact_deletion_log().unwrap(), 1);
 
     // The person intentionally puts the file back with the exact same bytes.
     fs::write(t.join("tower/reborn.txt"), b"identical content").unwrap();

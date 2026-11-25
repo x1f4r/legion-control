@@ -6,7 +6,7 @@
 
 use std::cmp::Ordering;
 
-use legion_xfer::{EntryKind, Hash};
+use legion_xfer::EntryKind;
 
 use crate::model::{
     BinReason, FolderMeta, IndexRecord, MAX_ANCESTRY_HASHES, MAX_LINK_TARGET_BYTES,
@@ -31,16 +31,6 @@ pub trait LocalIndexView {
 
     /// Returns all live exact paths in the local index matching `folded_path`.
     fn live_paths_for_folded(&self, folded_path: &str) -> Vec<String>;
-
-    /// Returns historically deleted content hashes recorded for `path`.
-    fn get_deleted_history(&self, path: &str) -> Vec<Hash>;
-
-    /// Returns the merged deletion version vector stored alongside `deleted_history` for `path`,
-    /// if any.
-    fn get_deleted_history_version(&self, path: &str) -> Option<VersionVector> {
-        let _ = path;
-        None
-    }
 }
 
 /// Action decided by [`reconcile_record`] for one incoming peer record.
@@ -442,63 +432,7 @@ fn reconcile_without_local(
         };
     }
 
-    // Content-based deletion dominance (after tombstone GC): if a peer presents a live file whose
-    // exact content hash was previously deleted at this path and the peer's version does NOT
-    // strictly dominate the recorded deletion version (i.e. it is NOT an intentional restore or
-    // re-creation made after seeing the deletion), do NOT resurrect the deleted file — regardless
-    // of whether `from_join` or `rejoining_peers` is set (covering two joiners or two restored
-    // members meeting before a member that saw the deletion).
     let _ = peer_is_rejoining;
-    if let Some(remote_hash) = remote.hash {
-        let deleted_hist = local_view.get_deleted_history(clean_path);
-        if deleted_hist.contains(&remote_hash) {
-            let del_vv_opt = local_view.get_deleted_history_version(clean_path);
-            let del_cmp = del_vv_opt
-                .as_ref()
-                .map(|del_vv| del_vv.compare(&remote.version));
-            let remote_dominates_deletion = del_cmp == Some(VersionOrder::Older);
-            let deletion_dominates_remote =
-                matches!(del_cmp, Some(VersionOrder::Newer | VersionOrder::Equal));
-            let is_join_or_stale_backup =
-                remote.from_join || peer_is_rejoining || deletion_dominates_remote;
-            if is_join_or_stale_backup && !remote_dominates_deletion {
-                let mut recent_hashes = Vec::with_capacity(MAX_ANCESTRY_HASHES);
-                recent_hashes.push(remote_hash);
-                for h in deleted_hist {
-                    if recent_hashes.len() >= MAX_ANCESTRY_HASHES {
-                        break;
-                    }
-                    if !recent_hashes.contains(&h) {
-                        recent_hashes.push(h);
-                    }
-                }
-                let version = match del_vv_opt {
-                    Some(del_vv) => del_vv.merge(&remote.version),
-                    None => remote.version.clone(),
-                };
-                let tombstone = IndexRecord {
-                    path: clean_path.to_string(),
-                    kind: remote.kind,
-                    size: 0,
-                    mtime: remote.mtime,
-                    disk_mtime: None,
-                    disk_change_id: None,
-                    mode: None,
-                    hash: None,
-                    link_target: None,
-                    deleted: true,
-                    version,
-                    modified_by: meta.local_member.clone(),
-                    seq: 0,
-                    recent_hashes,
-                    from_join: false,
-                    conflict_of: None,
-                    conflict_dismissed: false,
-                };
-                return ReconcileDecision::KeepAndSupersede { record: tombstone };
-            }
-        }
-    }
 
     if let Some(problem) = check_local_representable(
         local_view,
@@ -749,17 +683,14 @@ fn reconcile_concurrent(
 
     // Rule D (deletion dominance for joining/reinstalling/restored copies): when the live side is
     // a join-origin copy (including two joiners that met each other and preserved `from_join =
-    // true`) and the concurrent tombstone's ancestry or deleted history records that exact content
-    // hash, the deletion wins and moves the stale copy safely to the bin. Genuine post-join
-    // concurrent edits or intentional re-creations (`from_join = false`) still win delete-vs-live.
+    // true`) and the permanent concurrent tombstone records that exact content hash, the deletion
+    // wins and moves the stale copy safely to the bin. Genuine post-join concurrent edits or
+    // intentional re-creations (`from_join = false`) still win delete-vs-live.
     if local.from_join
         && !local.deleted
         && remote.deleted
         && let Some(local_hash) = local.hash
-        && (remote.recent_hashes.contains(&local_hash)
-            || local_view
-                .get_deleted_history(clean_path)
-                .contains(&local_hash))
+        && remote.recent_hashes.contains(&local_hash)
     {
         let mut tombstone = sanitize_remote(remote, clean_path, meta);
         tombstone.version = merged_version;
@@ -776,19 +707,14 @@ fn reconcile_concurrent(
         && local.deleted
         && !remote.deleted
         && let Some(remote_hash) = remote.hash
+        && local.recent_hashes.contains(&remote_hash)
     {
-        let in_history = local.recent_hashes.contains(&remote_hash)
-            || local_view
-                .get_deleted_history(clean_path)
-                .contains(&remote_hash);
-        if in_history {
-            let mut tombstone = local.clone();
-            tombstone.version = merged_version;
-            tombstone.push_ancestry_hash(remote_hash);
-            tombstone.from_join = false;
-            tombstone.conflict_of = None;
-            return ReconcileDecision::KeepAndSupersede { record: tombstone };
-        }
+        let mut tombstone = local.clone();
+        tombstone.version = merged_version;
+        tombstone.push_ancestry_hash(remote_hash);
+        tombstone.from_join = false;
+        tombstone.conflict_of = None;
+        return ReconcileDecision::KeepAndSupersede { record: tombstone };
     }
 
     // Rule D (live vs live when local side is joining/reinstalling/rolled-back): if our

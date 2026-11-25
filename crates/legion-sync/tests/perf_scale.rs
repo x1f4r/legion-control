@@ -274,10 +274,6 @@ impl LocalIndexView for MapView<'_> {
     fn live_paths_for_folded(&self, _folded_path: &str) -> Vec<String> {
         Vec::new()
     }
-
-    fn get_deleted_history(&self, _path: &str) -> Vec<Hash> {
-        Vec::new()
-    }
 }
 
 fn measure_scale<S: IndexStore>(label: &str, count: usize, store: S) {

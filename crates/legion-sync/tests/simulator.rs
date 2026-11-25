@@ -2620,17 +2620,6 @@ impl IndexStore for FaultyIndexStore {
         self.inner.held_back_count()
     }
 
-    fn get_deleted_history(&self, path: &str) -> legion_sync::Result<Vec<Hash>> {
-        self.inner.get_deleted_history(path)
-    }
-
-    fn get_deleted_history_version(
-        &self,
-        path: &str,
-    ) -> legion_sync::Result<Option<VersionVector>> {
-        self.inner.get_deleted_history_version(path)
-    }
-
     fn load_pending_op(&self) -> legion_sync::Result<Option<PendingOp>> {
         self.inner.load_pending_op()
     }
@@ -4741,9 +4730,18 @@ fn run_long_partition_zombie_seed(root_seed: u64, seed: u64, record_trace: bool)
 
     for &i in &active {
         let remaining = world.members[i].engine.store().list_tombstones().unwrap();
-        if !remaining.is_empty() {
+        if remaining.len() < 2 {
             world.fail(format!(
-                "Direct-ack tombstone GC did not reclaim tombstones on {}: {remaining:?}",
+                "Permanent deletion tombstones were unexpectedly dropped on {}: {remaining:?}",
+                world.members[i].id
+            ));
+        }
+        let log_entries = legion_sync::parse_deletion_log(
+            &world.members[i].engine.fs().read_deletion_log().unwrap(),
+        );
+        if !log_entries.contains_key("z1.txt") || !log_entries.contains_key("dir/z3.txt") {
+            world.fail(format!(
+                "Permanent deletion log missing z1.txt or dir/z3.txt on {}: {log_entries:?}",
                 world.members[i].id
             ));
         }
@@ -5084,7 +5082,7 @@ fn run_backup_reinstall_and_join_old_copy_seed(root_seed: u64, seed: u64, record
         assert_eq!(
             m.engine.fs().live_file_hash("gone.txt"),
             None,
-            "gone.txt resurrected on {} (b={b_id}, m_rec={:?}, a_rec={:?}, b_rec={:?}, a_del_hist={:?}, b_del_hist={:?})",
+            "gone.txt resurrected on {} (b={b_id}, m_rec={:?}, a_rec={:?}, b_rec={:?})",
             m.id,
             m.engine.store().get_record("gone.txt").unwrap(),
             world.members[a]
@@ -5096,16 +5094,6 @@ fn run_backup_reinstall_and_join_old_copy_seed(root_seed: u64, seed: u64, record
                 .engine
                 .store()
                 .get_record("gone.txt")
-                .unwrap(),
-            world.members[a]
-                .engine
-                .store()
-                .get_deleted_history("gone.txt")
-                .unwrap(),
-            world.members[b]
-                .engine
-                .store()
-                .get_deleted_history("gone.txt")
                 .unwrap(),
         );
         assert_eq!(
@@ -5253,12 +5241,16 @@ fn run_membership_change_and_readd_seed(root_seed: u64, seed: u64, record_trace:
     world.members[b].group = 0;
     world.sync_connected_groups_to_quiescence();
 
-    // Tombstone for `old_deleted.txt` is now GC'd across all active members!
+    // Permanent tombstone for `old_deleted.txt` stays in every active member's index & deletion log!
     for m in &world.members {
         if m.active {
             assert!(
-                m.engine.store().list_tombstones().unwrap().is_empty(),
-                "tombstone should have GC'd after active members synced"
+                m.engine
+                    .store()
+                    .get_record("old_deleted.txt")
+                    .unwrap()
+                    .is_some_and(|r| r.deleted),
+                "permanent tombstone for old_deleted.txt must stay in index"
             );
         }
     }
@@ -6514,20 +6506,30 @@ fn run_two_joiners_same_old_copy_seed(root_seed: u64, seed: u64, _record_trace: 
             .unwrap();
     }
 
-    // m0 deletes old.pdf; optionally sync + GC tombstones across m0 and m1.
+    // m0 deletes old.pdf; sync across m0 and m1 and verify permanent tombstones stay cached.
     let t1 = Timestamp::new(t0.secs + 10, 0);
     m0.fs().user_remove_recursive("old.pdf");
     m0.scan(t1).unwrap();
-    let do_gc = (seed & 1) == 0;
-    if do_gc {
+    let full_round = (seed & 1) == 0;
+    if full_round {
         for _ in 0..3 {
             m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t1)
                 .unwrap();
             m0.pull_from_peer(&SimPeer::new(&m1, "m0", "m1", PeerFault::None), t1)
                 .unwrap();
         }
-        assert!(m0.store().get_record("old.pdf").unwrap().is_none());
-        assert!(m1.store().get_record("old.pdf").unwrap().is_none());
+        assert!(
+            m0.store()
+                .get_record("old.pdf")
+                .unwrap()
+                .is_some_and(|r| r.deleted)
+        );
+        assert!(
+            m1.store()
+                .get_record("old.pdf")
+                .unwrap()
+                .is_some_and(|r| r.deleted)
+        );
     } else {
         m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t1)
             .unwrap();
@@ -7539,8 +7541,6 @@ fn run_asymmetric_membership_views_seed(root_seed: u64, seed: u64, _record_trace
                 .user_write_file("del_by_offline.txt", active_saved, active_saved_h, t2);
             tower.scan(t2).unwrap();
             sync_slice(&mut [&mut tower, &mut nas], t0.secs + 70, &mut rng);
-            let _ = tower.gc_tombstones();
-            let _ = nas.gc_tombstones();
 
             // Re-add `laptop` on `tower` first, optionally pull in random direction, then add on `nas`!
             tower.add_member("laptop").unwrap();
@@ -7645,8 +7645,6 @@ fn run_asymmetric_membership_views_seed(root_seed: u64, seed: u64, _record_trace
             }
             if rng.chance(1, 2) {
                 sync_slice(&mut [&mut tower, &mut nas], t0.secs + 80, &mut rng);
-                let _ = tower.gc_tombstones();
-                let _ = nas.gc_tombstones();
             }
             tower.add_member("pi").unwrap();
             let t2 = Timestamp::new(t0.secs + 120, 0);
@@ -7784,17 +7782,33 @@ fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trac
     }
     active[1].scan(t1).unwrap();
     sync_vec(&mut active, t1.secs + 1, &mut rng);
-    for e in &mut active {
-        let _ = e.gc_tombstones();
-    }
 
-    // Rebuild the deleter's index 1..=4 times, editing `keep.txt` between rebuilds so the
-    // deleter moves through retired incarnations and active members sync & GC each time!
+    // Rebuild EVERY surviving member's index 1..=4 times by deleting its index store completely
+    // (mirroring `rebuild_redb_from_disk` deleting the `.redb` file on every machine, as a schema
+    // bump does), editing `keep.txt` between rebuilds and syncing each time!
     let rebuilds = 1 + rng.range(4);
     let mut latest_keep_h = keep_h;
     for r in 0..rebuilds {
         let tr = Timestamp::new(t0.secs + 100 + (r as i64) * 40, 0);
-        active[1].rebuild_from_disk(tr).unwrap();
+        for e in &mut active {
+            let meta = e.meta().unwrap();
+            let fs_snap = e.fs().snapshot();
+            let fresh_fs = HonestSimFs::from_snapshot(fs_snap);
+            let mut rcfg = FolderConfig::new(
+                meta.folder_id.clone(),
+                meta.local_member.clone(),
+                meta.members.iter().cloned(),
+            );
+            rcfg.former_members = meta.former_members.clone();
+            let mut rebuilt = SyncEngine::open(rcfg, fresh_fs, FaultyIndexStore::new()).unwrap();
+            assert!(
+                rebuilt.is_index_damaged(),
+                "seed={root_seed}: fresh index beside existing marker & deletion log must stop as damaged before rebuild"
+            );
+            rebuilt.set_deletion_brake(brake_disabled());
+            rebuilt.rebuild_from_disk(tr).unwrap();
+            *e = rebuilt;
+        }
         sync_vec(&mut active, tr.secs + 1, &mut rng);
         let edited = format!("keep-after-rebuild-{r}-{seed}").into_bytes();
         latest_keep_h = hash_bytes(&edited);
@@ -7809,9 +7823,6 @@ fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trac
             .scan(Timestamp::new(tr.secs + 20, 0))
             .unwrap();
         sync_vec(&mut active, tr.secs + 21, &mut rng);
-        for e in &mut active {
-            let _ = e.gc_tombstones();
-        }
     }
 
     // Optional intentional post-deletion re-creation of `recreate.txt` (half with identical old

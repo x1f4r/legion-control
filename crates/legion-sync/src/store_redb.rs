@@ -21,18 +21,14 @@ use std::path::Path;
 use legion_xfer::{EntryKind, Hash};
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
-use crate::codec::{
-    decode_hash_list, decode_record, decode_string_list, encode_hash_list, encode_record,
-    encode_string_list,
-};
+use crate::codec::{decode_record, decode_string_list, encode_record, encode_string_list};
 use crate::error::{INDEX_DAMAGED_PROBLEM_SENTENCE, Result, SyncError};
 use crate::model::{
     BinEntry, DeferredItem, FolderMeta, HeldBackRecord, INDEX_SCHEMA_VERSION, IndexRecord,
-    MAX_DELETED_HISTORY_PATHS, MemberId, PeerCursor, PendingOp, RecordsPage, SyncProblem,
+    MemberId, PeerCursor, PendingOp, RecordsPage, SyncProblem,
 };
 use crate::path::{fold_case, is_descendant_of};
 use crate::traits::{IndexStore, StoreBatch};
-use crate::version::VersionVector;
 
 const RECORDS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("records");
 const BY_SEQ_TABLE: TableDefinition<u64, &str> = TableDefinition::new("by_seq");
@@ -42,13 +38,6 @@ const FOLDED_LIVE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fo
 const PEER_CURSORS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_cursors_v2");
 const BIN_ENTRIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("bin_entries");
 const HELD_BACK_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("held_back_v2");
-const DELETED_HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("deleted_history");
-const DELETED_HISTORY_ORDER_TABLE: TableDefinition<u64, &str> =
-    TableDefinition::new("deleted_history_order");
-const DELETED_HISTORY_SEQ_TABLE: TableDefinition<&str, u64> =
-    TableDefinition::new("deleted_history_seq");
-const DELETED_HISTORY_VV_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("deleted_history_vv");
 const STAGED_TMPS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("staged_tmps");
 const SEQ_FINGERPRINTS_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("seq_fingerprints");
@@ -64,7 +53,6 @@ const META_KEY_SCHEMA: &str = "schema_version";
 const META_KEY_FOLDER: &str = "folder_meta";
 const META_KEY_PENDING_OP: &str = "pending_op";
 const META_KEY_LIVE_FILES: &str = "live_file_count";
-const META_KEY_DH_SEQ: &str = "deleted_history_seq";
 
 /// Durable [`IndexStore`] implementation backed by a single `redb` database file.
 pub struct RedbIndexStore {
@@ -258,16 +246,6 @@ impl RedbIndexStore {
                 let _ = txn.open_table(PEER_CURSORS_TABLE).map_err(table_err)?;
                 let _ = txn.open_table(BIN_ENTRIES_TABLE).map_err(table_err)?;
                 let _ = txn.open_table(HELD_BACK_TABLE).map_err(table_err)?;
-                let _ = txn.open_table(DELETED_HISTORY_TABLE).map_err(table_err)?;
-                let _ = txn
-                    .open_table(DELETED_HISTORY_ORDER_TABLE)
-                    .map_err(table_err)?;
-                let _ = txn
-                    .open_table(DELETED_HISTORY_SEQ_TABLE)
-                    .map_err(table_err)?;
-                let _ = txn
-                    .open_table(DELETED_HISTORY_VV_TABLE)
-                    .map_err(table_err)?;
                 let _ = txn.open_table(STAGED_TMPS_TABLE).map_err(table_err)?;
                 let _ = txn.open_table(SEQ_FINGERPRINTS_TABLE).map_err(table_err)?;
                 let _ = txn.open_table(PROBLEMS_TABLE).map_err(table_err)?;
@@ -779,42 +757,6 @@ impl IndexStore for RedbIndexStore {
         })
     }
 
-    fn get_deleted_history(&self, path: &str) -> Result<Vec<Hash>> {
-        catch_redb(&self.path_label, || {
-            let txn = self
-                .db
-                .begin_read()
-                .map_err(|e| storage_err("begin read", e))?;
-            let table = txn.open_table(DELETED_HISTORY_TABLE).map_err(table_err)?;
-            let Some(guard) = table
-                .get(path)
-                .map_err(|e| storage_err("get deleted_history", e))?
-            else {
-                return Ok(Vec::new());
-            };
-            decode_hash_list(guard.value())
-        })
-    }
-
-    fn get_deleted_history_version(&self, path: &str) -> Result<Option<VersionVector>> {
-        catch_redb(&self.path_label, || {
-            let txn = self
-                .db
-                .begin_read()
-                .map_err(|e| storage_err("begin read", e))?;
-            let Ok(table) = txn.open_table(DELETED_HISTORY_VV_TABLE) else {
-                return Ok(None);
-            };
-            let Some(guard) = table
-                .get(path)
-                .map_err(|e| storage_err("get deleted_history_vv", e))?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(decode_json("deleted_history_vv", guard.value())?))
-        })
-    }
-
     fn load_pending_op(&self) -> Result<Option<PendingOp>> {
         catch_redb(&self.path_label, || {
             let txn = self
@@ -1074,16 +1016,6 @@ impl RedbIndexStore {
             let mut peer_cursors = txn.open_table(PEER_CURSORS_TABLE).map_err(table_err)?;
             let mut bin_entries = txn.open_table(BIN_ENTRIES_TABLE).map_err(table_err)?;
             let mut held_back = txn.open_table(HELD_BACK_TABLE).map_err(table_err)?;
-            let mut deleted_history = txn.open_table(DELETED_HISTORY_TABLE).map_err(table_err)?;
-            let mut deleted_history_order = txn
-                .open_table(DELETED_HISTORY_ORDER_TABLE)
-                .map_err(table_err)?;
-            let mut deleted_history_seq = txn
-                .open_table(DELETED_HISTORY_SEQ_TABLE)
-                .map_err(table_err)?;
-            let mut deleted_history_vv = txn
-                .open_table(DELETED_HISTORY_VV_TABLE)
-                .map_err(table_err)?;
             let mut staged_tmps = txn.open_table(STAGED_TMPS_TABLE).map_err(table_err)?;
             let mut seq_fps = txn.open_table(SEQ_FINGERPRINTS_TABLE).map_err(table_err)?;
             let mut problems = txn.open_table(PROBLEMS_TABLE).map_err(table_err)?;
@@ -1210,136 +1142,6 @@ impl RedbIndexStore {
                 held_back
                     .insert(key.as_str(), encoded.as_slice())
                     .map_err(|e| storage_err("upsert held_back", e))?;
-            }
-
-            let mut dh_seq = match meta_table
-                .get(META_KEY_DH_SEQ)
-                .map_err(|e| storage_err("read deleted_history_seq", e))?
-            {
-                Some(g) => decode_u64_le("deleted_history_seq", g.value())?,
-                None => 0,
-            };
-            let initial_dh_seq = dh_seq;
-
-            for path in &batch.remove_deleted_history {
-                deleted_history
-                    .remove(path.as_str())
-                    .map_err(|e| storage_err("remove deleted_history", e))?;
-                deleted_history_vv
-                    .remove(path.as_str())
-                    .map_err(|e| storage_err("remove deleted_history_vv", e))?;
-                if let Some(old_seq_guard) = deleted_history_seq
-                    .remove(path.as_str())
-                    .map_err(|e| storage_err("remove deleted_history_seq", e))?
-                {
-                    deleted_history_order
-                        .remove(old_seq_guard.value())
-                        .map_err(|e| storage_err("remove deleted_history_order", e))?;
-                }
-            }
-            for (path, hashes) in &batch.upsert_deleted_history {
-                if hashes.is_empty() {
-                    deleted_history
-                        .remove(path.as_str())
-                        .map_err(|e| storage_err("remove empty deleted_history", e))?;
-                    deleted_history_vv
-                        .remove(path.as_str())
-                        .map_err(|e| storage_err("remove empty deleted_history_vv", e))?;
-                    if let Some(old_seq_guard) = deleted_history_seq
-                        .remove(path.as_str())
-                        .map_err(|e| storage_err("remove empty deleted_history_seq", e))?
-                    {
-                        deleted_history_order
-                            .remove(old_seq_guard.value())
-                            .map_err(|e| storage_err("remove empty deleted_history_order", e))?;
-                    }
-                } else {
-                    if let Some(old_seq_guard) = deleted_history_seq
-                        .remove(path.as_str())
-                        .map_err(|e| storage_err("replace deleted_history_seq", e))?
-                    {
-                        deleted_history_order
-                            .remove(old_seq_guard.value())
-                            .map_err(|e| storage_err("replace deleted_history_order", e))?;
-                    } else {
-                        let existing = deleted_history
-                            .get(path.as_str())
-                            .map_err(|e| storage_err("check deleted_history", e))?
-                            .is_some();
-                        if !existing {
-                            let count = deleted_history
-                                .len()
-                                .map_err(|e| storage_err("count deleted_history", e))?;
-                            if count as usize >= MAX_DELETED_HISTORY_PATHS {
-                                let oldest = deleted_history_order
-                                    .iter()
-                                    .map_err(|e| storage_err("iter deleted_history_order", e))?
-                                    .next()
-                                    .transpose()
-                                    .map_err(|e| storage_err("step deleted_history_order", e))?
-                                    .map(|(seq_g, p_g)| {
-                                        (Some(seq_g.value()), p_g.value().to_string())
-                                    })
-                                    .or_else(|| {
-                                        deleted_history
-                                            .iter()
-                                            .ok()
-                                            .and_then(|mut it| it.next())
-                                            .and_then(std::result::Result::ok)
-                                            .map(|(k, _)| (None, k.value().to_string()))
-                                    });
-                                if let Some((evict_seq, evict_path)) = oldest {
-                                    if let Some(s) = evict_seq {
-                                        deleted_history_order.remove(s).map_err(|e| {
-                                            storage_err("evict deleted_history_order", e)
-                                        })?;
-                                    }
-                                    deleted_history_seq
-                                        .remove(evict_path.as_str())
-                                        .map_err(|e| storage_err("evict deleted_history_seq", e))?;
-                                    deleted_history_vv
-                                        .remove(evict_path.as_str())
-                                        .map_err(|e| storage_err("evict deleted_history_vv", e))?;
-                                    deleted_history
-                                        .remove(evict_path.as_str())
-                                        .map_err(|e| storage_err("evict deleted_history", e))?;
-                                }
-                            }
-                        }
-                    }
-                    dh_seq = dh_seq.saturating_add(1);
-                    deleted_history_order
-                        .insert(dh_seq, path.as_str())
-                        .map_err(|e| storage_err("insert deleted_history_order", e))?;
-                    deleted_history_seq
-                        .insert(path.as_str(), dh_seq)
-                        .map_err(|e| storage_err("insert deleted_history_seq", e))?;
-                    let encoded = encode_hash_list(hashes);
-                    deleted_history
-                        .insert(path.as_str(), encoded.as_slice())
-                        .map_err(|e| storage_err("upsert deleted_history", e))?;
-                }
-            }
-            for (path, vv) in &batch.upsert_deleted_history_versions {
-                if vv.is_empty() {
-                    deleted_history_vv
-                        .remove(path.as_str())
-                        .map_err(|e| storage_err("remove empty deleted_history_vv", e))?;
-                } else if deleted_history
-                    .get(path.as_str())
-                    .map_err(|e| storage_err("check deleted_history for vv", e))?
-                    .is_some()
-                {
-                    let encoded = encode_json("deleted_history_vv", vv)?;
-                    deleted_history_vv
-                        .insert(path.as_str(), encoded.as_slice())
-                        .map_err(|e| storage_err("upsert deleted_history_vv", e))?;
-                }
-            }
-            if dh_seq != initial_dh_seq {
-                meta_table
-                    .insert(META_KEY_DH_SEQ, dh_seq.to_le_bytes().as_slice())
-                    .map_err(|e| storage_err("write deleted_history_seq", e))?;
             }
 
             if let Some(ref op_update) = batch.set_pending_op {

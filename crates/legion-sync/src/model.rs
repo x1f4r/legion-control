@@ -21,7 +21,7 @@ pub type MemberId = String;
 /// Current durable index schema version. Opening an index with a higher version is refused
 /// cleanly with [`SyncError::SchemaTooNew`]; opening an index with an older version is refused as
 /// damaged/incompatible ([`SyncError::IndexDamaged`]) so it is rebuilt rather than misread.
-pub const INDEX_SCHEMA_VERSION: u32 = 4;
+pub const INDEX_SCHEMA_VERSION: u32 = 5;
 
 /// Sync wire/trait protocol version advertised in [`PeerHandshake`] and [`HandshakeHello`].
 pub const SYNC_PROTOCOL_VERSION: u32 = 3;
@@ -68,9 +68,6 @@ pub const MAX_PEER_PROBLEMS: usize = 256;
 /// Maximum number of consecutive deferrals for one `(peer, path)` before promoting it to a
 /// visible problem and advancing past it so no single record stalls a peer forever.
 pub const MAX_DEFERRAL_ATTEMPTS: u32 = 8;
-
-/// Maximum number of deleted `(path -> hashes)` history entries retained for join/re-add safety.
-pub const MAX_DELETED_HISTORY_PATHS: usize = 100_000;
 
 /// Minimum plausible wall-clock timestamp (2026-01-01T00:00:00Z). Bin expiry never runs when the
 /// local clock is earlier than this floor or earlier than the newest bin entry.
@@ -1471,9 +1468,18 @@ pub fn encode_deletion_log_entries(entries: &[FolderDeletionLogEntry]) -> Result
 }
 
 /// Replays NDJSON bytes from `.legion-sync/deletions.log`, tolerating an incomplete trailing line
-/// from a crash, and returns the map of currently active deletions.
-pub fn parse_deletion_log(bytes: &[u8]) -> BTreeMap<String, FolderDeletionRecord> {
-    let mut active = BTreeMap::new();
+/// from a crash, and returns the minimal incomparable set of permanent deletions per path.
+///
+/// Compaction semantics:
+/// - Entries for the same path whose versions are ordered (`Newer` / `Equal` / `Older`) are
+///   merged so the dominating version stays and retains the union of deleted content hashes.
+/// - Incomparable (`Concurrent`) deletions for the same path are both kept until a dominating
+///   version supersedes them.
+/// - [`FolderDeletionLogEntry::Revived`] only cancels unsettled `held = true` entries (a file that
+///   returned during the settle window before any deletion was emitted); committed deletions are
+///   never dropped.
+pub fn parse_deletion_log_all(bytes: &[u8]) -> BTreeMap<String, Vec<FolderDeletionRecord>> {
+    let mut per_path: BTreeMap<String, Vec<FolderDeletionRecord>> = BTreeMap::new();
     for line in bytes.split(|&b| b == b'\n') {
         let trimmed = trim_ascii_whitespace(line);
         if trimmed.is_empty() {
@@ -1493,27 +1499,159 @@ pub fn parse_deletion_log(bytes: &[u8]) -> BTreeMap<String, FolderDeletionRecord
                 modified_by,
                 held,
             } => {
-                if crate::path::validate_sync_path(&path).is_ok() {
-                    active.insert(
-                        path.clone(),
-                        FolderDeletionRecord {
-                            path,
-                            kind,
-                            hashes,
-                            version,
-                            mtime,
-                            modified_by,
-                            held,
-                        },
-                    );
+                if crate::path::validate_sync_path(&path).is_err() {
+                    continue;
                 }
+                let incoming = FolderDeletionRecord {
+                    path: path.clone(),
+                    kind,
+                    hashes,
+                    version,
+                    mtime,
+                    modified_by,
+                    held,
+                };
+                merge_deletion_record_into_list(per_path.entry(path).or_default(), incoming);
             }
             FolderDeletionLogEntry::Revived { path } => {
-                active.remove(&path);
+                if let Some(list) = per_path.get_mut(&path) {
+                    // Only cancel unsettled held deletions from the settle window; committed
+                    // deletion knowledge is permanent for the life of the folder.
+                    list.retain(|rec| !rec.held);
+                    if list.is_empty() {
+                        per_path.remove(&path);
+                    }
+                }
             }
         }
     }
-    active
+    per_path
+}
+
+fn absorb_unique_hashes(dst: &mut Vec<Hash>, extra: &[Hash]) {
+    for &h in extra {
+        if !dst.contains(&h) {
+            dst.push(h);
+        }
+    }
+    dst.truncate(MAX_ANCESTRY_HASHES);
+}
+
+/// Inserts `incoming` into `list`, merging only ordered versions (so the dominating version stays
+/// with the union of deleted hashes) and keeping incomparable concurrent versions intact.
+pub fn merge_deletion_record_into_list(
+    list: &mut Vec<FolderDeletionRecord>,
+    mut incoming: FolderDeletionRecord,
+) {
+    use crate::version::VersionOrder;
+
+    if !incoming.held {
+        // Any committed deletion supersedes unsettled held entries for the same path.
+        let mut carried_hashes = Vec::new();
+        list.retain(|existing| {
+            if existing.held {
+                carried_hashes.extend_from_slice(&existing.hashes);
+                false
+            } else {
+                true
+            }
+        });
+        absorb_unique_hashes(&mut incoming.hashes, &carried_hashes);
+    }
+
+    let mut dominated_by_existing = false;
+    let mut absorbed_hashes = Vec::new();
+    list.retain_mut(|existing| {
+        if existing.held != incoming.held {
+            return true;
+        }
+        match incoming.version.compare(&existing.version) {
+            VersionOrder::Newer | VersionOrder::Equal => {
+                absorbed_hashes.extend_from_slice(&existing.hashes);
+                false
+            }
+            VersionOrder::Older => {
+                absorb_unique_hashes(&mut existing.hashes, &incoming.hashes);
+                dominated_by_existing = true;
+                true
+            }
+            VersionOrder::Concurrent => true,
+        }
+    });
+    if !dominated_by_existing {
+        absorb_unique_hashes(&mut incoming.hashes, &absorbed_hashes);
+        list.push(incoming);
+    }
+}
+
+/// Replays NDJSON bytes from `.legion-sync/deletions.log` and returns one merged
+/// [`FolderDeletionRecord`] per path (preferring committed deletions over unsettled held ones).
+pub fn parse_deletion_log(bytes: &[u8]) -> BTreeMap<String, FolderDeletionRecord> {
+    let all = parse_deletion_log_all(bytes);
+    let mut out = BTreeMap::new();
+    for (path, recs) in all {
+        if let Some(merged) = collapse_deletion_records(recs) {
+            out.insert(path, merged);
+        }
+    }
+    out
+}
+
+/// Collapses one path's deletion log entries into a single record for index caching without
+/// dropping any version key or deleted content hash.
+pub fn collapse_deletion_records(recs: Vec<FolderDeletionRecord>) -> Option<FolderDeletionRecord> {
+    let mut committed: Vec<FolderDeletionRecord> = Vec::new();
+    let mut held: Vec<FolderDeletionRecord> = Vec::new();
+    for r in recs {
+        if r.held {
+            held.push(r);
+        } else {
+            committed.push(r);
+        }
+    }
+    let chosen = if !committed.is_empty() {
+        committed
+    } else {
+        held
+    };
+    let mut iter = chosen.into_iter();
+    let mut acc = iter.next()?;
+    for other in iter {
+        acc.version.merge_in_place(&other.version);
+        if other.mtime > acc.mtime
+            || (other.mtime == acc.mtime && other.modified_by < acc.modified_by)
+        {
+            acc.mtime = other.mtime;
+            acc.modified_by = other.modified_by;
+            acc.kind = other.kind;
+        }
+        absorb_unique_hashes(&mut acc.hashes, &other.hashes);
+    }
+    Some(acc)
+}
+
+/// Compacts `.legion-sync/deletions.log` bytes by merging only entries for the same path whose
+/// versions are ordered (the dominating version stays with the union of deleted hashes). Never
+/// drops committed deletion knowledge.
+pub fn compact_deletion_log_bytes(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
+    let all = parse_deletion_log_all(bytes);
+    let mut entries = Vec::new();
+    for recs in all.into_values() {
+        for r in recs {
+            entries.push(FolderDeletionLogEntry::Deleted {
+                path: r.path,
+                kind: r.kind,
+                hashes: r.hashes,
+                version: r.version,
+                mtime: r.mtime,
+                modified_by: r.modified_by,
+                held: r.held,
+            });
+        }
+    }
+    let count = entries.len();
+    let encoded = encode_deletion_log_entries(&entries)?;
+    Ok((encoded, count))
 }
 
 fn trim_ascii_whitespace(mut slice: &[u8]) -> &[u8] {

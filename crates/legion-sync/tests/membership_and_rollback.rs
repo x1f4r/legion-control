@@ -118,13 +118,12 @@ fn m2_skipped_deletion_acknowledged_then_resurrected() {
         .unwrap();
     nas.pull_from_peer(&EnginePeer::new(&tower, "nas"), ts(23))
         .unwrap();
-    let r = tower
+    let _r = tower
         .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(24))
         .unwrap();
-    let r2 = tower
+    let _r2 = tower
         .pull_from_peer(&EnginePeer::new(&nas, "tower"), ts(24))
         .unwrap();
-    println!("tower gc: {} {}", r.tombstones_gc, r2.tombstones_gc);
     let tomb = tower.store().get_record("report.txt").unwrap();
     println!("tower record for report.txt after acks: {tomb:?}");
     println!(

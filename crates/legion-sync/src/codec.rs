@@ -245,33 +245,6 @@ pub fn decode_string_list(bytes: &[u8]) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Encodes a list of BLAKE3 hashes for deleted-file history storage.
-pub fn encode_hash_list(hashes: &[Hash]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + hashes.len() * 32);
-    write_u32(&mut buf, hashes.len());
-    for h in hashes {
-        buf.extend_from_slice(h.as_bytes());
-    }
-    buf
-}
-
-/// Decodes a list of BLAKE3 hashes from deleted-file history storage.
-pub fn decode_hash_list(bytes: &[u8]) -> Result<Vec<Hash>> {
-    let mut cur = Cursor::new(bytes, "deleted history entry");
-    let count = cur.read_u32()? as usize;
-    let mut out = Vec::with_capacity(count.min(32));
-    for _ in 0..count {
-        out.push(Hash::from_bytes(cur.read_array::<32>()?));
-    }
-    if !cur.is_empty() {
-        return Err(SyncError::CorruptData {
-            context: "deleted history entry".to_string(),
-            detail: "trailing bytes in hash list".to_string(),
-        });
-    }
-    Ok(out)
-}
-
 fn write_u32(buf: &mut Vec<u8>, val: usize) {
     let clamped = u32::try_from(val).unwrap_or(u32::MAX);
     buf.extend_from_slice(&clamped.to_le_bytes());

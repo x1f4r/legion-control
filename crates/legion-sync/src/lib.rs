@@ -37,8 +37,11 @@
 //!   brake pauses before recording large-scale deletions; random per-index incarnations detect
 //!   backup restores, reinstalls, and cloned member IDs; short per-path hash ancestry and deleted
 //!   history prevent stale copies from winning or resurrecting deletions on join or re-add.
-//! - **Direct acknowledgements only**: deletion tombstones are discarded only after every other
-//!   current folder member has directly confirmed seeing the local member's `(incarnation, seq)` —
+//! - **Permanent deletion memory**: deletions are appended durably to `.legion-sync/deletions.log`
+//!   before being acknowledged to any peer and stay there for the life of the folder (compaction
+//!   only merges ordered versions for the same path and never drops knowledge). The index's
+//!   tombstones are a cache of that log rebuilt on every rebuild or schema migration.
+//! - **Direct acknowledgements**: peers report only what they have directly pulled and applied —
 //!   third-party hearsay is never accepted.
 //! - **Fixed ignore rules**: `.legion-sync` at any depth (including case-folded and NFKC
 //!   variants), `.DS_Store`, `Thumbs.db`, `desktop.ini`, and Legion in-flight files
@@ -58,11 +61,11 @@
 //!   (`x86_64-pc-windows-gnu` and MSVC).
 //! - **ACID crash safety**: copy-on-write B+trees with dual checksummed superblocks and synced
 //!   transactions guarantee atomic commits across `RECORDS`, `BY_SEQ`, `TOMBSTONES`, `CONFLICTS`,
-//!   `FOLDED_LIVE`, `BIN_ENTRIES`, `HELD_BACK`, `PEER_CURSORS`, `DELETED_HISTORY`, and `META`
+//!   `FOLDED_LIVE`, `BIN_ENTRIES`, `HELD_BACK`, `PEER_CURSORS`, and `META`
 //!   (with an explicit `schema_version` refused cleanly when newer).
 //! - **500,000+ file scale**: compact versioned binary record encoding (`codec`), O(log N + K)
-//!   incremental sequence scans via `BY_SEQ`, O(T) tombstone GC via `TOMBSTONES`, subtree scans
-//!   for file watchers, and per-page group commits keep scans and applies fast.
+//!   incremental sequence scans via `BY_SEQ`, subtree scans for file watchers, and per-page group
+//!   commits keep scans and applies fast.
 
 pub mod apply;
 pub mod codec;
@@ -96,7 +99,9 @@ pub use model::{
     MIN_PLAUSIBLE_CLOCK_SECS, MemberId, MemberState, MemberStatus, PeerAckView, PeerCursor,
     PeerHandshake, PeerRefusalSummary, PendingLocalDeletion, PendingOp, ProblemKind, RecordsPage,
     RestoreStrategy, SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, chain_fingerprint,
-    encode_deletion_log_entries, parse_deletion_log, validate_folder_id, validate_member_id,
+    collapse_deletion_records, compact_deletion_log_bytes, encode_deletion_log_entries,
+    merge_deletion_record_into_list, parse_deletion_log, parse_deletion_log_all,
+    validate_folder_id, validate_member_id,
 };
 pub use path::{
     IgnoreMatcher, ParsedConflictPath, SYNC_BIN_DIR, SYNC_DELETIONS_LOG_FILE, SYNC_MARKER_FILE,

@@ -90,17 +90,7 @@ fn p1_case(rebuild: bool) {
     pi.flush_settled_deletions(ts(100)).unwrap();
     sync_all(&mut [&mut tower, &mut pi], 101);
     sync_all(&mut [&mut tower, &mut pi], 110);
-    for e in [&mut tower, &mut pi] {
-        let _ = e.gc_tombstones().unwrap();
-    }
     assert!(!t.join("tower/tax.pdf").exists());
-    eprintln!(
-        "tower del vv: {:?}",
-        tower
-            .store()
-            .get_deleted_history_version("tax.pdf")
-            .unwrap()
-    );
     eprintln!(
         "tower record: {:?}",
         tower
@@ -119,19 +109,17 @@ fn p1_case(rebuild: bool) {
     }
     for k in 0..6 {
         sync_all(&mut [&mut tower, &mut pi], 300 + 10 * k);
-        for e in [&mut tower, &mut pi] {
-            let _ = e.gc_tombstones();
-        }
     }
-    // Remembered deletion version vector must retain the deleter's key whole.
-    let del_vv = tower
+    // Permanent tombstone must remain in the index with the deleter's key whole.
+    let tomb = tower
         .store()
-        .get_deleted_history_version("tax.pdf")
+        .get_record("tax.pdf")
         .unwrap()
-        .expect("tower must retain deleted-history version for tax.pdf");
+        .expect("tower must retain permanent tombstone for tax.pdf");
+    assert!(tomb.deleted);
     assert!(
-        !del_vv.is_empty(),
-        "remembered deletion version vector must never lose its keys"
+        !tomb.version.is_empty(),
+        "permanent deletion tombstone must never lose its keys"
     );
 
     // New member with the old copy.
@@ -196,9 +184,6 @@ fn p2_case(settle_window: bool, pi_pulls_first: bool) {
     if settle_window {
         for k in 0..4 {
             sync_all(&mut [&mut tower, &mut nas], 20 + 10 * k);
-            for e in [&mut tower, &mut nas] {
-                let _ = e.gc_tombstones();
-            }
         }
     }
     for e in [&mut tower, &mut nas] {
@@ -305,9 +290,6 @@ fn p2b_relay_edit_with_dropped_page() {
         if settle_window {
             for k in 0..4 {
                 sync_all(&mut [&mut tower, &mut nas], 20 + 10 * k);
-                for e in [&mut tower, &mut nas] {
-                    let _ = e.gc_tombstones();
-                }
             }
         }
         for e in [&mut tower, &mut nas] {
@@ -639,9 +621,6 @@ fn p6_unknown_member_and_adoption_skip_phase_two() {
         if settle_window {
             for k in 0..4 {
                 sync_all(&mut [&mut tower, &mut nas], 30 + 10 * k);
-                for e in [&mut tower, &mut nas] {
-                    let _ = e.gc_tombstones();
-                }
             }
         }
         tower.add_member("pi").unwrap();
@@ -709,9 +688,6 @@ fn p6b_same_with_a_deletion() {
         if settle_window {
             for k in 0..4 {
                 sync_all(&mut [&mut tower, &mut nas], 30 + 10 * k);
-                for e in [&mut tower, &mut nas] {
-                    let _ = e.gc_tombstones();
-                }
             }
         }
         tower.add_member("pi").unwrap();

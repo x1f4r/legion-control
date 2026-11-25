@@ -738,8 +738,13 @@ fn probe_b3_hostile_peer_cannot_cause_early_tombstone_gc() {
         stream: None,
         bytes_read: Arc::new(AtomicU64::new(0)),
     };
-    let r = a.pull_from_peer(&peer, now()).unwrap();
-    assert_eq!(r.tombstones_gc, 0);
+    let _r = a.pull_from_peer(&peer, now()).unwrap();
+    assert!(
+        a.store()
+            .get_record("secret-plan.txt")
+            .unwrap()
+            .is_some_and(|rec| rec.deleted)
+    );
 
     pull(&mut a, &c).unwrap();
     pull(&mut c, &a).unwrap();
@@ -1141,8 +1146,14 @@ fn item_d_removed_and_readded_member_does_not_resurrect_gc_deleted_file() {
     fs::remove_file(ma.root.join("gone.txt")).unwrap();
     a.scan(now()).unwrap();
     pull(&mut b, &a).unwrap();
-    pull(&mut a, &b).unwrap(); // `a` gets direct ack from `b` and GCs tombstone!
-    assert!(a.store().list_tombstones().unwrap().is_empty());
+    pull(&mut a, &b).unwrap();
+    assert!(
+        a.store()
+            .get_record("gone.txt")
+            .unwrap()
+            .is_some_and(|r| r.deleted),
+        "permanent deletion tombstone must stay in a's index"
+    );
 
     // Now re-add `c` (which still has `gone.txt` on disk)!
     a.add_member("c").unwrap();

@@ -26,8 +26,9 @@ use crate::model::{
     MAX_FORCED_ROTATIONS_PER_PEER_PER_WEEK, MAX_HELD_BACK_ENTRIES, MAX_PAGE_RECORDS,
     MAX_PEER_PROBLEMS, MAX_VERSION_COUNTER, MemberId, MemberState, MemberStatus, PeerAckView,
     PeerCursor, PeerHandshake, PeerRefusalSummary, ProblemKind, RecordsPage, RestoreStrategy,
-    SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, encode_deletion_log_entries,
-    parse_deletion_log, random_incarnation_id, validate_member_id,
+    SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, collapse_deletion_records,
+    compact_deletion_log_bytes, encode_deletion_log_entries, merge_deletion_record_into_list,
+    parse_deletion_log_all, random_incarnation_id, validate_member_id,
 };
 use crate::path::{
     IgnoreMatcher, is_descendant_of, is_internal_sync_path, path_depth, validate_sync_path,
@@ -73,8 +74,6 @@ pub struct PullReport {
     pub invalid_skipped: usize,
     /// Local rename optimizations performed without downloading file bytes.
     pub local_renames: usize,
-    /// Tombstones garbage-collected using direct acknowledgements only.
-    pub tombstones_gc: usize,
     /// Previously held-back records successfully re-evaluated and applied.
     pub held_back_resolved: usize,
 }
@@ -212,7 +211,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                             let has_live_entries =
                                 !fs.walk(&IgnoreMatcher::default())?.entries.is_empty();
                             let has_del_log =
-                                !parse_deletion_log(&fs.read_deletion_log()?).is_empty();
+                                !parse_deletion_log_all(&fs.read_deletion_log()?).is_empty();
                             if has_live_entries || has_del_log {
                                 index_damaged = true;
                                 folder_problem = Some(index_damaged_problem());
@@ -451,9 +450,9 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             });
         }
 
-        // Preserve every active deletion from `.legion-sync/deletions.log` (and from the store if
+        // Preserve every deletion from `.legion-sync/deletions.log` (and from the store if
         // readable) so rebuilding an index never resurrects deleted files.
-        let mut carried_deletions = parse_deletion_log(&self.fs.read_deletion_log()?);
+        let mut carried_deletions = parse_deletion_log_all(&self.fs.read_deletion_log()?);
         let mut old_incarnation = existing_marker.as_ref().map(|m| m.incarnation);
         let mut all_paths = Vec::new();
         let mut all_peers = Vec::new();
@@ -465,26 +464,27 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 if let Ok(Some(m)) = self.store.load_meta() {
                     old_incarnation = Some(m.incarnation);
                     for pending in m.pending_deletions.values() {
-                        carried_deletions
-                            .entry(pending.old_record.path.clone())
-                            .or_insert_with(|| {
-                                pending_to_deletion_record(pending, &m.local_member)
-                            });
+                        let rec = pending_to_deletion_record(pending, &m.local_member);
+                        merge_deletion_record_into_list(
+                            carried_deletions.entry(rec.path.clone()).or_default(),
+                            rec,
+                        );
                     }
                 }
                 if let Ok(tombs) = self.store.list_tombstones() {
                     for tomb in tombs {
-                        carried_deletions.insert(
-                            tomb.path.clone(),
-                            FolderDeletionRecord {
-                                path: tomb.path,
-                                kind: tomb.kind,
-                                hashes: tomb.recent_hashes,
-                                version: tomb.version,
-                                mtime: tomb.mtime,
-                                modified_by: tomb.modified_by,
-                                held: false,
-                            },
+                        let rec = FolderDeletionRecord {
+                            path: tomb.path.clone(),
+                            kind: tomb.kind,
+                            hashes: tomb.recent_hashes,
+                            version: tomb.version,
+                            mtime: tomb.mtime,
+                            modified_by: tomb.modified_by,
+                            held: false,
+                        };
+                        merge_deletion_record_into_list(
+                            carried_deletions.entry(rec.path.clone()).or_default(),
+                            rec,
                         );
                     }
                 }
@@ -791,7 +791,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         remove_problems,
                         ..StoreBatch::default()
                     };
-                    let mut del_log_entries = Vec::new();
                     let mut reasserted = 0usize;
                     for tomb in &brake.blocked_tombstones {
                         let Some(mut local) = e.store.get_record(&tomb.path)? else {
@@ -809,15 +808,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         local.from_join = false;
                         let chain = meta.advance_chain_fingerprint(seq, local.head_fingerprint());
                         batch.upsert_seq_fingerprints.push((seq, chain));
-                        del_log_entries.push(FolderDeletionLogEntry::Revived {
-                            path: local.path.clone(),
-                        });
                         batch.upsert_records.push(local);
                         reasserted += 1;
-                    }
-                    if !del_log_entries.is_empty() {
-                        let encoded = encode_deletion_log_entries(&del_log_entries)?;
-                        e.fs.append_deletion_log(&encoded)?;
                     }
                     if reasserted > 0 {
                         batch.folder_meta = Some(meta);
@@ -883,14 +875,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
     /// Removes a member from this folder's member list, stops serving it, retains its name in
     /// `former_members` so historical version vectors remain verifiable, leaves all local files
-    /// untouched, and runs tombstone garbage collection.
-    pub fn remove_member(&mut self, member: &str) -> Result<usize> {
+    /// untouched, and prunes metadata acknowledged by all remaining members.
+    pub fn remove_member(&mut self, member: &str) -> Result<()> {
         self.config.members.remove(member);
         self.config.former_members.insert(member.to_string());
         self.guard_mut("remove_member", |e| {
             let mut meta = e.meta()?;
             if !meta.members.remove(member) {
-                return Ok(0);
+                return Ok(());
             }
             meta.former_members.insert(member.to_string());
             meta.rejoining_peers.remove(member);
@@ -934,7 +926,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             };
             e.store.apply_batch(batch)?;
 
-            e.gc_tombstones_inner()
+            e.prune_acknowledged_metadata_inner()
         })
     }
 
@@ -1648,7 +1640,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 }
                 self.active_progress.remove(&peer_id);
                 if ack_advanced || hs_ack_advanced {
-                    report.tombstones_gc += self.gc_tombstones()?;
+                    self.prune_acknowledged_metadata_inner()?;
                 }
                 break;
             }
@@ -2415,7 +2407,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 let clear_rejoin = self.peer_caught_up_for_rejoin(&local_meta, &cursor)?;
                 self.persist_peer_cursor_and_clear_rejoin(&peer_id, cursor, clear_rejoin)?;
                 self.active_progress.remove(&peer_id);
-                report.tombstones_gc += self.gc_tombstones()?;
+                self.prune_acknowledged_metadata_inner()?;
                 break;
             } else {
                 if contiguous_seq > cursor.seq {
@@ -2426,7 +2418,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 }
                 recompute_peer_applied_ack(&peer_id, &mut cursor, &held_now, &defs_now);
                 self.persist_peer_cursor_and_clear_rejoin(&peer_id, cursor, false)?;
-                report.tombstones_gc += self.gc_tombstones()?;
+                self.prune_acknowledged_metadata_inner()?;
                 if held_back_full || any_deferred || !all_done || contiguous_seq == since_seq {
                     self.update_progress(&peer_id, deferred_files, deferred_bytes);
                     break;
@@ -3633,14 +3625,25 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
     }
 
-    /// Garbage-collects tombstones ONLY when every other current member has *directly* reported
-    /// applying our current `(incarnation, seq)` past the tombstone's `seq`, prunes chained
-    /// sequence fingerprints strictly below that floor, and compacts `.legion-sync/deletions.log`.
-    pub fn gc_tombstones(&mut self) -> Result<usize> {
-        self.guard_mut("gc_tombstones", |e| e.gc_tombstones_inner())
+    /// Compacts `.legion-sync/deletions.log` by merging only entries for the same path whose
+    /// versions are ordered (the dominating version stays with the union of deleted hashes). Never
+    /// drops committed deletion knowledge. Returns the number of surviving entries in the log.
+    pub fn compact_deletion_log(&mut self) -> Result<usize> {
+        self.guard_mut("compact_deletion_log", |e| {
+            let raw = e.fs.read_deletion_log()?;
+            if raw.is_empty() {
+                return Ok(0);
+            }
+            let (compacted, count) = compact_deletion_log_bytes(&raw)?;
+            e.fs.compact_deletion_log(&compacted)?;
+            Ok(count)
+        })
     }
 
-    fn gc_tombstones_inner(&mut self) -> Result<usize> {
+    /// Prunes chained sequence fingerprints and change-age marks strictly below the minimum
+    /// directly acknowledged sequence across all other current members. Never removes deletion
+    /// tombstones.
+    fn prune_acknowledged_metadata_inner(&mut self) -> Result<()> {
         let meta = self.meta()?;
         let cursors = self.store.load_peer_cursors()?;
         let other_members: Vec<&MemberId> = meta
@@ -3649,9 +3652,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             .filter(|m| *m != &meta.local_member)
             .collect();
 
-        // Compute the minimum directly acknowledged (applied) seq across every other active member
-        // for our current incarnation. If any member has never directly acknowledged this
-        // incarnation, `min_direct_ack` is 0 and neither tombstones nor fingerprints are pruned.
         let min_direct_ack = if other_members.is_empty() {
             meta.local_seq
         } else {
@@ -3671,42 +3671,17 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         };
 
         if min_direct_ack == 0 {
-            return Ok(0);
+            return Ok(());
         }
 
-        let tombstones = self.store.list_tombstones()?;
-        let mut to_remove = Vec::new();
-        for ts in &tombstones {
-            if ts.seq <= min_direct_ack {
-                to_remove.push(ts.path.clone());
-            }
-        }
-
-        let removed = to_remove.len();
         let mut meta_for_marks = meta;
         let marks_changed = meta_for_marks.prune_change_marks_through(min_direct_ack);
         let batch = StoreBatch {
             folder_meta: marks_changed.then_some(meta_for_marks),
-            remove_records: to_remove,
             prune_seq_fingerprints_below: Some(min_direct_ack),
             ..StoreBatch::default()
         };
-        self.store.apply_batch(batch)?;
-
-        // Item 6(b): compact `.legion-sync/deletions.log` under the exact same forgetting rule
-        // (preserving any active held pending deletions so rebuilds never forget them).
-        if removed > 0 {
-            let remaining = self.store.list_tombstones()?;
-            let fresh_meta = self.meta()?;
-            compact_deletion_log_from_tombstones(
-                &self.fs,
-                &remaining,
-                &fresh_meta.pending_deletions,
-                &fresh_meta.local_member,
-            )?;
-        }
-
-        Ok(removed)
+        self.store.apply_batch(batch)
     }
 
     fn sync_peer_handshake_problems(
@@ -4950,27 +4925,25 @@ fn pending_to_deletion_record(
 fn collect_deletions_for_rotation<F: SyncFs, S: IndexStore>(
     fs: &F,
     store: &S,
-) -> Result<BTreeMap<String, FolderDeletionRecord>> {
-    let mut map = parse_deletion_log(&fs.read_deletion_log()?);
+) -> Result<BTreeMap<String, Vec<FolderDeletionRecord>>> {
+    let mut map = parse_deletion_log_all(&fs.read_deletion_log()?);
     if let Some(meta) = store.load_meta()? {
         for pending in meta.pending_deletions.values() {
-            map.entry(pending.old_record.path.clone())
-                .or_insert_with(|| pending_to_deletion_record(pending, &meta.local_member));
+            let rec = pending_to_deletion_record(pending, &meta.local_member);
+            merge_deletion_record_into_list(map.entry(rec.path.clone()).or_default(), rec);
         }
     }
     for tomb in store.list_tombstones()? {
-        map.insert(
-            tomb.path.clone(),
-            FolderDeletionRecord {
-                path: tomb.path,
-                kind: tomb.kind,
-                hashes: tomb.recent_hashes,
-                version: tomb.version,
-                mtime: tomb.mtime,
-                modified_by: tomb.modified_by,
-                held: false,
-            },
-        );
+        let rec = FolderDeletionRecord {
+            path: tomb.path.clone(),
+            kind: tomb.kind,
+            hashes: tomb.recent_hashes,
+            version: tomb.version,
+            mtime: tomb.mtime,
+            modified_by: tomb.modified_by,
+            held: false,
+        };
+        merge_deletion_record_into_list(map.entry(rec.path.clone()).or_default(), rec);
     }
     Ok(map)
 }
@@ -4978,7 +4951,7 @@ fn collect_deletions_for_rotation<F: SyncFs, S: IndexStore>(
 fn reissue_carried_deletions<F: SyncFs, S: IndexStore>(
     fs: &F,
     store: &mut S,
-    deletions: BTreeMap<String, FolderDeletionRecord>,
+    deletions: BTreeMap<String, Vec<FolderDeletionRecord>>,
 ) -> Result<()> {
     if deletions.is_empty() {
         return Ok(());
@@ -4987,36 +4960,65 @@ fn reissue_carried_deletions<F: SyncFs, S: IndexStore>(
         return Ok(());
     };
     let mut batch = StoreBatch::default();
-    let mut reissued_tombstones = Vec::new();
+    let mut log_entries_to_persist = Vec::new();
+    let mut restored_any = false;
 
-    for (path, rec) in deletions {
+    for (path, recs) in deletions {
+        let Some(rec) = collapse_deletion_records(recs.clone()) else {
+            continue;
+        };
+        // Keep all committed deletion records in `.legion-sync/deletions.log` even if a path was
+        // later recreated live on disk — compaction never drops committed knowledge.
+        let mut persist_recs = recs;
+
         // Never overwrite a path that currently exists live on disk.
-        if fs.stat_live(&path)?.is_some() {
-            continue;
-        }
-        if store.get_record(&path)?.is_some_and(|r| !r.deleted) {
-            continue;
-        }
-        let mut version = rec.version;
-        meta.bump_version(&mut version);
-        let seq = meta.next_seq();
-        meta.record_change_mark(seq, rec.mtime);
-        if !rec.hashes.is_empty() {
-            let mut merged = store.get_deleted_history(&path)?;
-            for &h in &rec.hashes {
-                if !merged.contains(&h) {
-                    merged.push(h);
+        if fs.stat_live(&path)?.is_some() || store.get_record(&path)?.is_some_and(|r| !r.deleted) {
+            for r in persist_recs {
+                if !r.held {
+                    log_entries_to_persist.push(FolderDeletionLogEntry::Deleted {
+                        path: r.path,
+                        kind: r.kind,
+                        hashes: r.hashes,
+                        version: r.version,
+                        mtime: r.mtime,
+                        modified_by: r.modified_by,
+                        held: false,
+                    });
                 }
             }
-            batch.upsert_deleted_history.push((path.clone(), merged));
+            continue;
         }
-        let mut hist_vv = store
-            .get_deleted_history_version(&path)?
-            .unwrap_or_default();
-        hist_vv.merge_in_place(&version);
-        batch
-            .upsert_deleted_history_versions
-            .push((path.clone(), hist_vv));
+
+        let (version, modified_by) = if rec.held {
+            // An unsettled local deletion inside the 30s settle window had the live record's
+            // pre-deletion version; bump once under the new incarnation to turn it into a
+            // committed tombstone.
+            let mut v = rec.version;
+            meta.bump_version(&mut v);
+            let m = meta.local_member.clone();
+            persist_recs = vec![FolderDeletionRecord {
+                path: path.clone(),
+                kind: rec.kind,
+                hashes: rec.hashes.clone(),
+                version: v.clone(),
+                mtime: rec.mtime,
+                modified_by: m.clone(),
+                held: false,
+            }];
+            (v, m)
+        } else {
+            // Committed deletion: restore its exact version vector and author into the index
+            // cache WITHOUT adding the rebuilt incarnation's key!
+            let author = if meta.is_known_member(&rec.modified_by) {
+                rec.modified_by
+            } else {
+                meta.local_member.clone()
+            };
+            (rec.version, author)
+        };
+
+        let seq = meta.next_seq();
+        meta.record_change_mark(seq, rec.mtime);
         let tomb = IndexRecord {
             path,
             kind: rec.kind,
@@ -5029,7 +5031,7 @@ fn reissue_carried_deletions<F: SyncFs, S: IndexStore>(
             link_target: None,
             deleted: true,
             version,
-            modified_by: meta.local_member.clone(),
+            modified_by,
             seq,
             recent_hashes: rec.hashes,
             from_join: false,
@@ -5038,40 +5040,34 @@ fn reissue_carried_deletions<F: SyncFs, S: IndexStore>(
         };
         let chain = meta.advance_chain_fingerprint(seq, tomb.head_fingerprint());
         batch.upsert_seq_fingerprints.push((seq, chain));
-        reissued_tombstones.push(tomb.clone());
         batch.upsert_records.push(tomb);
+        restored_any = true;
+
+        for r in persist_recs {
+            log_entries_to_persist.push(FolderDeletionLogEntry::Deleted {
+                path: r.path,
+                kind: r.kind,
+                hashes: r.hashes,
+                version: r.version,
+                mtime: r.mtime,
+                modified_by: r.modified_by,
+                held: false,
+            });
+        }
     }
 
-    if !reissued_tombstones.is_empty() {
-        let pending = meta.pending_deletions.clone();
-        let local_member = meta.local_member.clone();
+    if !log_entries_to_persist.is_empty() {
+        // Persist durably to `.legion-sync/deletions.log` BEFORE committing the index batch!
+        let encoded = encode_deletion_log_entries(&log_entries_to_persist)?;
+        let (compacted, _) = compact_deletion_log_bytes(&encoded)?;
+        fs.compact_deletion_log(&compacted)?;
+    }
+
+    if restored_any {
         batch.folder_meta = Some(meta);
         store.apply_batch(batch)?;
-        let all_tombstones = store.list_tombstones()?;
-        compact_deletion_log_from_tombstones(fs, &all_tombstones, &pending, &local_member)?;
     }
     Ok(())
-}
-
-fn compact_deletion_log_from_tombstones<F: SyncFs>(
-    fs: &F,
-    tombstones: &[IndexRecord],
-    pending_deletions: &BTreeMap<String, crate::model::PendingLocalDeletion>,
-    local_member: &str,
-) -> Result<()> {
-    let mut entries: Vec<FolderDeletionLogEntry> = tombstones
-        .iter()
-        .filter(|r| r.deleted)
-        .map(FolderDeletionLogEntry::from_tombstone)
-        .collect();
-    for pending in pending_deletions.values() {
-        entries.push(FolderDeletionLogEntry::from_pending_deletion(
-            pending,
-            local_member,
-        ));
-    }
-    let bytes = encode_deletion_log_entries(&entries)?;
-    fs.compact_deletion_log(&bytes)
 }
 
 fn peer_refused_problem(peer_id: &str, summary: &PeerRefusalSummary) -> SyncProblem {

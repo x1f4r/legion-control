@@ -17,7 +17,6 @@ use crate::model::{
     IndexRecord, MemberId, PeerCursor, PeerHandshake, PendingOp, RecordsPage, SyncProblem,
 };
 use crate::path::IgnoreMatcher;
-use crate::version::VersionVector;
 
 /// Filesystem capabilities and naming rules for a sync member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,7 +382,7 @@ pub struct StoreBatch {
     /// Records to insert or replace (updating seq, tombstone, conflict, and case-folding
     /// secondary indexes automatically).
     pub upsert_records: Vec<IndexRecord>,
-    /// Record paths to permanently remove (garbage-collected tombstones).
+    /// Record paths to remove (used when clearing records on rebuild or incarnation rotation).
     pub remove_records: Vec<String>,
     /// Peer cursors to update (`peer -> PeerCursor`).
     pub set_peer_cursors: BTreeMap<MemberId, PeerCursor>,
@@ -399,14 +398,6 @@ pub struct StoreBatch {
     pub remove_held_back: Vec<(MemberId, String)>,
     /// When `true`, clears all held-back entries (used on incarnation rotation).
     pub clear_held_back: bool,
-    /// Deleted-file content hashes to record per path (persisted across tombstone GC so a
-    /// rejoining or re-added member with an old copy never resurrects a deleted file).
-    pub upsert_deleted_history: Vec<(String, Vec<Hash>)>,
-    /// Causal version vectors associated with deleted-history paths so intentional restores or
-    /// re-creations made *after* seeing a deletion can strictly dominate the deleted history.
-    pub upsert_deleted_history_versions: Vec<(String, VersionVector)>,
-    /// Deleted history paths to prune.
-    pub remove_deleted_history: Vec<String>,
     /// Update to the write-ahead crash journal (`Some(Some(op))` sets it; `Some(None)` clears it;
     /// `None` leaves it unchanged).
     pub set_pending_op: Option<Option<PendingOp>>,
@@ -447,9 +438,6 @@ impl StoreBatch {
             && self.upsert_held_back.is_empty()
             && self.remove_held_back.is_empty()
             && !self.clear_held_back
-            && self.upsert_deleted_history.is_empty()
-            && self.upsert_deleted_history_versions.is_empty()
-            && self.remove_deleted_history.is_empty()
             && self.set_pending_op.is_none()
             && self.add_staged_tmps.is_empty()
             && self.remove_staged_tmps.is_empty()
@@ -527,13 +515,6 @@ pub trait IndexStore {
 
     /// Returns the number of currently held-back records.
     fn held_back_count(&self) -> Result<usize>;
-
-    /// Returns the recorded historical deleted content hashes for `path`, if any.
-    fn get_deleted_history(&self, path: &str) -> Result<Vec<Hash>>;
-
-    /// Returns the merged deletion version vector recorded alongside `deleted_history` for `path`,
-    /// if any.
-    fn get_deleted_history_version(&self, path: &str) -> Result<Option<VersionVector>>;
 
     /// Loads the active write-ahead [`PendingOp`], if any.
     fn load_pending_op(&self) -> Result<Option<PendingOp>>;
