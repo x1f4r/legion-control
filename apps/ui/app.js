@@ -37,6 +37,7 @@ import {
   migrateLocalMachineStorage,
   PENDING_LOCAL_MACHINE_NAME,
 } from './lib/local-machine.js';
+import { createForegroundResumeController } from './lib/resume.js';
 import { createThumbCache } from './lib/thumb-cache.js';
 import {
   classifyHorizontalSwipe,
@@ -311,6 +312,7 @@ function App() {
   const mainRef = useRef(null);
   const refreshAbortRef = useRef(null);
   const refreshInFlightRef = useRef(false);
+  const resumingRef = useRef(false);
   const screenRefreshRef = useRef(null);
   const swipeRef = useRef(null);
   const touchSwipeRef = useRef(null);
@@ -1008,7 +1010,8 @@ function App() {
     if (
       commandDraftRef.current.running ||
       activeCallsRef.current > 0 ||
-      activeTransfersCountRef.current > 0
+      activeTransfersCountRef.current > 0 ||
+      resumingRef.current
     ) {
       promptConfirm();
       return null;
@@ -1398,6 +1401,7 @@ function App() {
                 isRunningCommand: Boolean(commandDraftRef.current.running),
                 activeCalls: activeCallsRef.current + activeTransfersCountRef.current,
                 isPairingOpen: Boolean(pairingOpenRef.current),
+                isResuming: resumingRef.current,
               })
             ) {
               startupAutoInstallRanRef.current = true;
@@ -1456,12 +1460,14 @@ function App() {
   // Poll on the user's configured interval while visible and refresh on resume/focus.
   useEffect(() => {
     if (!linkState?.ready || !nodeInfo) return;
-    let wasHidden = document.visibilityState === 'hidden';
-    let resuming = false;
 
-    const onVisibilityChange = async () => {
-      if (document.visibilityState === 'hidden') {
-        wasHidden = true;
+    const resumeController = createForegroundResumeController({
+      invalidateSessions:
+        typeof link.invalidateSessions === 'function' ? () => link.invalidateSessions() : null,
+      onResumingChange: (active) => {
+        resumingRef.current = active;
+      },
+      onBackground: () => {
         if (
           typeof link.maybeAutoInstall === 'function' &&
           isSafeForAutoInstall({
@@ -1477,34 +1483,47 @@ function App() {
             isRunningCommand: Boolean(commandDraftRef.current.running),
             activeCalls: activeCallsRef.current + activeTransfersCountRef.current,
             isPairingOpen: Boolean(pairingOpenRef.current),
+            isResuming: resumingRef.current,
           })
         ) {
           link.maybeAutoInstall('background').catch(() => {});
         }
-        return;
-      }
-      if (document.visibilityState !== 'visible') return;
-      if (wasHidden && typeof link.invalidateSessions === 'function') {
-        wasHidden = false;
-        resuming = true;
-        try {
-          await link.invalidateSessions();
-          capsStore.invalidate();
-        } finally {
-          resuming = false;
+      },
+      onInvalidate: () => {
+        capsStore.invalidate();
+      },
+      onRefresh: () => {
+        refreshFleet(nodeInfo, { background: true });
+      },
+      onCheckUpdates: () => {
+        if (
+          shouldCheckOnResume(updateStateRef.current?.last_checked_at, Date.now(), {
+            phase: updateStateRef.current?.phase,
+          })
+        ) {
+          checkUpdatesQuietly();
         }
-        refreshFleet(nodeInfo, { background: true });
-      } else {
-        wasHidden = false;
-        refreshFleet(nodeInfo, { background: true });
-      }
-      if (shouldCheckOnResume(updateStateRef.current?.last_checked_at, Date.now(), { phase: updateStateRef.current?.phase })) {
-        checkUpdatesQuietly();
-      }
+      },
+    });
+
+    const onVisibilityChange = () => {
+      resumeController.handleVisibilityChange().catch(() => {});
     };
 
+    const unsubNativeResume =
+      typeof link.onAppResume === 'function'
+        ? link.onAppResume(() => {
+            resumeController.handleNativeResume().catch(() => {});
+          })
+        : () => {};
+
     const onFocus = () => {
-      if (document.visibilityState === 'visible' && !wasHidden && !resuming && settings.refreshSeconds > 0) {
+      if (
+        document.visibilityState === 'visible' &&
+        !resumeController.isHidden() &&
+        !resumeController.isResuming() &&
+        settings.refreshSeconds > 0
+      ) {
         refreshFleet(nodeInfo, { background: true });
       }
     };
@@ -1512,7 +1531,7 @@ function App() {
     const timer =
       settings.refreshSeconds > 0
         ? window.setInterval(() => {
-            if (document.visibilityState === 'visible' && !resuming) {
+            if (document.visibilityState === 'visible' && !resumeController.isResuming()) {
               refreshFleet(nodeInfo, { background: true });
             }
           }, settings.refreshSeconds * 1000)
@@ -1522,10 +1541,12 @@ function App() {
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       if (timer !== null) window.clearInterval(timer);
+      resumingRef.current = false;
+      unsubNativeResume();
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [link, capsStore, linkState?.ready, nodeInfo, refreshFleet, settings.refreshSeconds]);
+  }, [link, capsStore, linkState?.ready, nodeInfo, refreshFleet, settings.refreshSeconds, checkUpdatesQuietly]);
 
   const openConfirm = useCallback((req) => {
     if (!sheetHistoryRef.current) {

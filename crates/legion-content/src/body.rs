@@ -4,7 +4,7 @@ use std::any::Any;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,7 @@ enum BodyKind {
         bytes_since_check: u64,
         last_check: Instant,
         bytes_served: Option<Arc<AtomicU64>>,
+        stream_failed: Option<Arc<AtomicBool>>,
         _guards: Vec<Box<dyn Any + Send + Sync>>,
     },
 }
@@ -75,6 +76,15 @@ impl ContentBody {
         }
     }
 
+    /// Returns the buffered bytes when this body is a small fixed payload (such as a JSON error
+    /// response) and `None` for empty or streaming bodies.
+    pub fn fixed_bytes(&self) -> Option<&[u8]> {
+        match &self.kind {
+            BodyKind::Fixed(Some(bytes)) => Some(bytes.as_ref()),
+            _ => None,
+        }
+    }
+
     /// A streaming body that reads exactly `length` bytes from `reader`.
     ///
     /// If `reader` reaches EOF before `length` bytes have been yielded (for example because the
@@ -88,10 +98,12 @@ impl ContentBody {
             LIVENESS_CHECK_BYTES,
             LIVENESS_CHECK_INTERVAL,
             None,
+            None,
             Vec::new(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn stream_with_controls(
         reader: BoxAsyncRead,
         length: u64,
@@ -99,6 +111,7 @@ impl ContentBody {
         check_bytes_interval: u64,
         check_time_interval: Duration,
         bytes_served: Option<Arc<AtomicU64>>,
+        stream_failed: Option<Arc<AtomicBool>>,
         guards: Vec<Box<dyn Any + Send + Sync>>,
     ) -> Self {
         if length == 0 {
@@ -118,6 +131,7 @@ impl ContentBody {
                 bytes_since_check: 0,
                 last_check: Instant::now(),
                 bytes_served,
+                stream_failed,
                 _guards: guards,
             },
         }
@@ -145,6 +159,7 @@ impl Body for ContentBody {
                 bytes_since_check,
                 last_check,
                 bytes_served,
+                stream_failed,
                 ..
             } => {
                 if *remaining == 0 {
@@ -158,6 +173,9 @@ impl Body for ContentBody {
                         Poll::Pending => Poll::Pending,
                         Poll::Ready(Err(err)) => {
                             *eof_verified = true;
+                            if let Some(flag) = stream_failed {
+                                flag.store(true, Ordering::Release);
+                            }
                             Poll::Ready(Some(Err(err)))
                         }
                         Poll::Ready(Ok(avail)) => {
@@ -165,6 +183,9 @@ impl Body for ContentBody {
                             if avail.is_empty() {
                                 Poll::Ready(None)
                             } else {
+                                if let Some(flag) = stream_failed {
+                                    flag.store(true, Ordering::Release);
+                                }
                                 Poll::Ready(Some(Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     "content stream yielded extra bytes past declared length",
@@ -181,6 +202,9 @@ impl Body for ContentBody {
                     if let Err(err) = check() {
                         *remaining = 0;
                         *eof_verified = true;
+                        if let Some(flag) = stream_failed {
+                            flag.store(true, Ordering::Release);
+                        }
                         return Poll::Ready(Some(Err(err)));
                     }
                     *bytes_since_check = 0;
@@ -195,6 +219,9 @@ impl Body for ContentBody {
                     Poll::Ready(Err(err)) => {
                         *remaining = 0;
                         *eof_verified = true;
+                        if let Some(flag) = stream_failed {
+                            flag.store(true, Ordering::Release);
+                        }
                         Poll::Ready(Some(Err(err)))
                     }
                     Poll::Ready(Ok(avail)) => {
@@ -202,6 +229,9 @@ impl Body for ContentBody {
                             let missing = *remaining;
                             *remaining = 0;
                             *eof_verified = true;
+                            if let Some(flag) = stream_failed {
+                                flag.store(true, Ordering::Release);
+                            }
                             return Poll::Ready(Some(Err(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
                                 format!("content stream ended with {missing} bytes remaining"),

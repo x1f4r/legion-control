@@ -41,6 +41,8 @@ function writeToken(token) {
   }
 }
 
+const CAPABILITY_TOOLS = new Set(['meta.version', 'meta.whoami', 'meta.tools']);
+
 export function createHttpLink() {
   let token = readToken();
   let doorSupportsContent = false;
@@ -96,6 +98,43 @@ export function createHttpLink() {
     }
   }
 
+  function clearContentUnsupported(machines) {
+    let changed = false;
+    for (const machine of machines) {
+      const key = machineKey(machine);
+      if (key && unsupportedContentMachines.delete(key)) {
+        changed = true;
+      }
+    }
+    if (changed) notifyContentSupport();
+  }
+
+  function noteCapabilityContact(tool, targetOn, result) {
+    if (!CAPABILITY_TOOLS.has(tool) || !result || typeof result !== 'object') return;
+    if (isFanOut(result)) {
+      const refreshed = [];
+      for (const [name, entry] of Object.entries(result.results || {})) {
+        if (entry && typeof entry === 'object' && entry.ok && !entry.error) {
+          refreshed.push(name);
+          if (typeof entry.ok.node === 'string') refreshed.push(entry.ok.node);
+        }
+      }
+      if (refreshed.length > 0) clearContentUnsupported(refreshed);
+      return;
+    }
+
+    const onKey = machineKey(targetOn);
+    const nodeKey = machineKey(result.node);
+    if (tool === 'meta.whoami' && !onKey && nodeKey) {
+      localNodeName = nodeKey;
+    }
+    const refreshed = [];
+    if (onKey && onKey !== 'all') refreshed.push(onKey);
+    if (nodeKey) refreshed.push(nodeKey);
+    if (!onKey && localNodeName) refreshed.push(localNodeName);
+    if (refreshed.length > 0) clearContentUnsupported(refreshed);
+  }
+
   function supportsContentFor(machine) {
     if (!doorSupportsContent) return false;
     const key = machineKey(machine);
@@ -117,12 +156,21 @@ export function createHttpLink() {
       });
       if (!res.ok) return null;
       const health = await res.json();
-      if (health?.node) localNodeName = String(health.node);
+      const nodeName = machineKey(health?.node);
+      if (nodeName) localNodeName = nodeName;
+      const prev = doorSupportsContent;
       const next = health?.content === true;
-      if (next !== doorSupportsContent) {
-        doorSupportsContent = next;
-        notifyContentSupport();
+      let changed = next !== prev;
+      doorSupportsContent = next;
+      if (next) {
+        if (!prev && unsupportedContentMachines.size > 0) {
+          unsupportedContentMachines.clear();
+          changed = true;
+        } else if (localNodeName && unsupportedContentMachines.delete(localNodeName)) {
+          changed = true;
+        }
       }
+      if (changed) notifyContentSupport();
       return health;
     } catch {
       return null;
@@ -236,7 +284,10 @@ export function createHttpLink() {
       }
 
       if (failure) throw failure;
-      if (settled) return outcome;
+      if (settled) {
+        noteCapabilityContact(tool, on, outcome);
+        return outcome;
+      }
       throw {
         code: 'internal',
         message: 'The server closed the stream without a final result.',
@@ -252,8 +303,14 @@ export function createHttpLink() {
       parsed = null;
     }
 
-    if (res.ok) return parsed;
-    if (isFanOut(parsed)) return parsed;
+    if (res.ok) {
+      noteCapabilityContact(tool, on, parsed);
+      return parsed;
+    }
+    if (isFanOut(parsed)) {
+      noteCapabilityContact(tool, on, parsed);
+      return parsed;
+    }
     throw toError(parsed, res.status);
   }
 
@@ -291,6 +348,7 @@ export function createHttpLink() {
       parsed = null;
     }
     if (!res.ok) throw toError(parsed, res.status);
+    if (localNodeName) clearContentUnsupported([localNodeName]);
     const list = Array.isArray(parsed?.tools) ? parsed.tools : [];
     cachedLocalTools = list;
     return list;
@@ -503,6 +561,18 @@ export function createHttpLink() {
         hint: null,
         machine: machine || null,
       };
+    }
+    {
+      let changed = false;
+      if (!doorSupportsContent) {
+        doorSupportsContent = true;
+        changed = true;
+      }
+      const target = machineKey(machine) || localNodeName;
+      if (target && unsupportedContentMachines.delete(target)) {
+        changed = true;
+      }
+      if (changed) notifyContentSupport();
     }
     if (download) {
       url += url.includes('?') ? '&download=1' : '?download=1';

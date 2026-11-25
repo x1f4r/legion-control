@@ -1,16 +1,19 @@
 package com.x1f4r.legion
 
 import android.app.DownloadManager
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
@@ -22,15 +25,19 @@ import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Process-scoped Android bridge between Rust's transfer queue and Android platform services.
@@ -43,6 +50,8 @@ import java.util.concurrent.atomic.AtomicLong
 object TransferBridge {
   private const val TAG = "legion-transfers"
   private const val MAX_CHUNK_BYTES = 64 * 1024
+
+  private class NoHandlerException(message: String) : IllegalStateException(message)
 
   @Volatile
   private var appContext: Context? = null
@@ -270,6 +279,7 @@ object TransferBridge {
         }
         "saveToDownloads" -> saveToDownloads(context, params)
         "stageOpenExternally" -> stageOpenExternally(context, params)
+        "checkCacheFile" -> checkCacheFile(context, params)
         "deleteSavedDownload" -> deleteSavedDownload(context, params)
         "openTransferFile" -> openTransferFile(context, params)
         "showInFolder" -> showInFolder(context)
@@ -290,9 +300,18 @@ object TransferBridge {
       } else {
         Log.w(TAG, "Bridge method $method failed (${e.javaClass.simpleName})")
       }
+      val errorCode = when (e) {
+        is NoHandlerException -> "no_handler"
+        is SecurityException -> "denied"
+        is FileNotFoundException -> "not_found"
+        else -> null
+      }
       sendRaw(JSONObject().apply {
         put("id", id)
         put("error", e.message ?: "Android transfer operation failed.")
+        if (errorCode != null) {
+          put("errorCode", errorCode)
+        }
       })
     }
   }
@@ -399,6 +418,40 @@ object TransferBridge {
     return JSONObject().put("uri", uri.toString())
   }
 
+  private fun checkCacheFile(context: Context, params: JSONObject): JSONObject {
+    val uriOrPath = params.optString("uriOrPath", "").trim()
+    val expectedSize = params.optLong("expectedSize", -1L)
+    if (uriOrPath.isEmpty()) {
+      return JSONObject().put("exists", false)
+    }
+    val cacheDir = File(context.cacheDir, "open-externally")
+    val candidate = runCatching {
+      if (uriOrPath.startsWith("content://")) {
+        val uri = Uri.parse(uriOrPath)
+        if (uri.authority != "${context.packageName}.fileprovider") {
+          return@runCatching null
+        }
+        val seg = uri.lastPathSegment?.substringAfterLast('/')
+        if (seg.isNullOrBlank()) return@runCatching null
+        TransferPathPolicy.resolveContainedChild(
+          cacheDir,
+          File(cacheDir, seg),
+          requireExistingFile = true,
+        )
+      } else {
+        TransferPathPolicy.resolveContainedChild(
+          cacheDir,
+          File(uriOrPath),
+          requireExistingFile = true,
+        )
+      }
+    }.getOrNull()
+    val exists = candidate != null &&
+      candidate.isFile &&
+      (expectedSize < 0L || candidate.length() == expectedSize)
+    return JSONObject().put("exists", exists)
+  }
+
   private fun deleteSavedDownload(context: Context, params: JSONObject): JSONObject {
     val uriOrPath = params.optString("uriOrPath", "").trim()
     if (uriOrPath.isEmpty()) {
@@ -498,6 +551,19 @@ object TransferBridge {
       setDataAndType(uri, mime)
       addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
+    val handlers = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      context.packageManager.queryIntentActivities(
+        viewIntent,
+        PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DEFAULT_ONLY.toLong()),
+      )
+    } else {
+      @Suppress("DEPRECATION")
+      context.packageManager.queryIntentActivities(viewIntent, PackageManager.MATCH_DEFAULT_ONLY)
+    }.filter { it.activityInfo?.packageName != context.packageName }
+    if (handlers.isEmpty()) {
+      throw NoHandlerException("No app on this phone can open this file type.")
+    }
+
     val chooser = Intent.createChooser(viewIntent, "Open with").apply {
       addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
       clipData = ClipData.newRawUri("", uri)
@@ -505,21 +571,45 @@ object TransferBridge {
 
     val act = currentActivity()
     if (act != null) {
+      val latch = CountDownLatch(1)
+      val launchErr = AtomicReference<Throwable?>(null)
       act.runOnUiThread {
-        runCatching { act.startActivity(chooser) }
-          .onFailure { e ->
-            if (BuildConfig.DEBUG) {
-              Log.w(TAG, "Activity chooser launch failed: ${e.message}")
-            } else {
-              Log.w(TAG, "Activity chooser launch failed")
-            }
-          }
+        try {
+          act.startActivity(chooser)
+        } catch (t: Throwable) {
+          launchErr.set(t)
+        } finally {
+          latch.countDown()
+        }
+      }
+      val completed = latch.await(5L, TimeUnit.SECONDS)
+      val err = launchErr.get()
+      if (err is ActivityNotFoundException) {
+        throw NoHandlerException("No app on this phone can open this file type.")
+      }
+      if (err != null) {
+        if (BuildConfig.DEBUG) {
+          Log.w(TAG, "Activity chooser launch failed: ${err.message}")
+        } else {
+          Log.w(TAG, "Activity chooser launch failed")
+        }
+        throw IllegalStateException(err.message ?: "Could not open the app chooser.", err)
+      }
+      if (!completed) {
+        throw IllegalStateException("Timed out waiting to open the app chooser.")
       }
     } else {
       chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-      context.startActivity(chooser)
+      try {
+        context.startActivity(chooser)
+      } catch (e: ActivityNotFoundException) {
+        throw NoHandlerException("No app on this phone can open this file type.")
+      }
     }
-    return JSONObject().put("ok", true)
+    if (BuildConfig.DEBUG) {
+      Log.i(TAG, "Opened chooser for $displayName (mime=$mime, handlers=${handlers.size})")
+    }
+    return JSONObject().put("ok", true).put("mime", mime)
   }
 
   private fun showInFolder(context: Context): JSONObject {

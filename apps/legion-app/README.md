@@ -20,8 +20,11 @@ an internal `Backend` trait.
   with caller-scoped cancellation. Machine calls always name their target machine; only door-level
   discovery reads may omit `on` and fall back to another directly paired node when a request never
   left this device (`details.sent == false`), caching an expiring in-memory relay preference hint
-  without persisting or changing any machine target. On mobile resume from background, cached
-  sessions are closed before refreshing.
+  without persisting or changing any machine target. On mobile resume from background, Tauri's
+  native `WindowEvent::Resumed` (`tauri://resumed`, plus `tauri://suspended` -> `tauri://focus` on
+  iOS inactive returns) triggers loopback listener probing in Rust and session invalidation +
+  refresh in the interface even when the web view never saw `visibilityState === 'hidden'`, with
+  DOM `visibilitychange` kept as a second trigger.
 - **State safety, revocation, and unpairing:** If `legion-app.json` is damaged or written by a
   newer schema version, the app enters repair mode, refuses writes, and offers an explicit repair
   action that moves the file aside to `legion-app.json.damaged-<timestamp>` without deleting it. If
@@ -120,28 +123,39 @@ fixed log line.
   a second launch focuses the existing main window.
 - **WebView isolation and Content Security Policy:** `tauri.conf.json` enforces `default-src 'none'`,
   restricts scripts, styles and images to `'self'` plus `tauri:` (needed for Apple `WKWebView`
-  custom-scheme assets), opens `img-src` and `media-src` only to `http://127.0.0.1:*` (desktop and
-  iOS) or `http://legion-content.localhost` (`tauri.android.conf.json` on Android), sets
-  `connect-src` to Tauri's IPC endpoints, and adds
-  `form-action 'none'; base-uri 'none'; frame-ancestors 'none'`. `lib.rs` attaches `on_navigation`
-  to allow only the bundled app origin and denies all `on_new_window` requests.
-- **Content addresses (`content_url`) by platform:**
-  - **Linux, macOS, Windows, iOS and iPadOS:** `AppContentServer` mounts `legion-content` lazily on
-    `http://127.0.0.1:<ephemeral-port>` (capped at 32 simultaneous connections, 5-second
-    header-read timeout, exponential accept-error backoff, iOS resume recovery, and stopping 60
-    seconds after no live tickets or active streams remain), validates `Host` and `Origin` through
-    `HostOriginGuard` (`tauri://localhost` on Linux/macOS/iOS; `http://tauri.localhost` and
-    `https://tauri.localhost` on Windows; never `null`), and sets
-    `Cross-Origin-Resource-Policy: cross-origin`.
-  - **Android:** `AndroidManifest.xml` enforces `usesCleartextTraffic="false"`, so Android WebView
-    refuses cleartext `http://127.0.0.1:<port>` media loads. Android mounts the same
-    `legion-content` crate on Tauri's custom URI scheme `legion-content`
-    (`http://legion-content.localhost/v1/content/<ticket>/<name>`), intercepted in-process via
-    `shouldInterceptRequest`, answering open-ended ranges in bounded 2 MiB pieces, rejecting
-    unranged requests over 16 MiB with `413 Payload Too Large` before reading any bytes, and
-    bounding total concurrent buffered memory to 24 MiB.
-  - Tickets expire after 15 minutes idle / 6 hours max, and are revoked immediately on `unpair`,
-    `repair_store`, `accept_identity_change`, and app exit.
+  custom-scheme assets), opens `img-src` and `media-src` only to `http://127.0.0.1:*` across all
+  platforms (including `tauri.android.conf.json` on Android), sets `connect-src` to Tauri's IPC
+  endpoints, and adds `form-action 'none'; base-uri 'none'; frame-ancestors 'none'`. `lib.rs`
+  attaches `on_navigation` to allow only the bundled app origin and denies all `on_new_window`
+  requests.
+- **Content addresses (`content_url`), status (`content_status`), and revocation (`content_revoke`):**
+  - All platforms (Linux, macOS, Windows, iOS/iPadOS, and Android) mount `legion-content` lazily on
+    `http://127.0.0.1:<ephemeral-port>` (deciding liveness from both Legion's own accept-task state
+    and a short loopback proof-of-ownership probe using a per-listener 256-bit secret that is never
+    logged or placed in any URL — run on mobile resume and before minting once the last verified
+    proof is older than 2 seconds, returning generic `404` without the secret, counting as
+    unauthenticated under connection limits, and always binding a fresh OS-chosen port on failure;
+    capped at 32 simultaneous connections with a 5-second header-read timeout, a 2-second header
+    timeout for unauthenticated connections, `Connection: close` on `404` and guard rejections,
+    eviction of the oldest unauthenticated connection before refusing a new one at the cap,
+    exponential accept-error backoff, mobile resume recovery, and stopping 60 seconds after no live
+    tickets or active streams remain), validate `Host` and `Origin` through `HostOriginGuard`
+    (`tauri://localhost` on Linux/macOS/iOS; `http://tauri.localhost` and `https://tauri.localhost`
+    on Windows and Android; never `null`), and set `Cross-Origin-Resource-Policy: cross-origin`.
+  - On Android, `res/xml/network_security_config.xml` denies cleartext traffic globally
+    (`cleartextTrafficPermitted="false"`) and permits cleartext strictly for `127.0.0.1`, so
+    WebView streams and seeks arbitrarily large media with flat memory while keeping cleartext
+    blocked for every other host. Because any Android app can connect to `127.0.0.1` and send any
+    `Host` and `Origin`, `HostOriginGuard` protects against browsers only; against other apps the
+    ticket is the only barrier, which is why it is 256 bits, hashed at rest, scoped to one holder,
+    machine and path, and revoked via `content_revoke(url)` as soon as the viewer closes, switches
+    files, or tears down a media element.
+  - `content_status(url)` exposes redacted per-ticket HTTP status, response `Content-Type`,
+    mid-stream failure state, and ticket liveness (recorded strictly after ticket lookup succeeds)
+    so the viewer distinguishes transport, server, and permission errors from genuine codec
+    failures.
+  - Tickets also expire after 15 minutes idle / 6 hours max, and are revoked immediately on
+    `unpair`, `repair_store`, `accept_identity_change`, and app exit.
 - **Background transfer queue (`transfers/*`) and what survives what:**
   - Shared Rust queue (`concurrency = 2`, 64 KiB streaming buffers, serialized monotonic
     persistence in `<app_data_dir>/transfers/queue.json`, partial resume by byte offset, progress

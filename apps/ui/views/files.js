@@ -2849,22 +2849,18 @@ export function FilesView({
   const startOpenExternally = useCallback(
     (machine, entry) => {
       const targetCaps = machineCapsFor(machine);
-      if (!targetCaps.hasOpenExternally || typeof link?.openExternally !== 'function') return;
-      link
-        .openExternally({
-          machine,
-          path: entry.path,
-          name: entry.name || baseFileName(entry.path),
-          mime: entry.mime,
-        })
-        .then(() => {
-          if (onToast) onToast(`Opening ${entry.name || baseFileName(entry.path)} in another app.`);
-        })
-        .catch((err) => {
-          if (onToast) onToast(plainErrorMessage(err, 'Could not open in another app.', { technical, deviceNoun }));
-        });
+      if (!targetCaps.hasOpenExternally || typeof link?.openExternally !== 'function') {
+        return Promise.resolve(null);
+      }
+      return link.openExternally({
+        machine,
+        path: entry.path,
+        name: entry.name || baseFileName(entry.path),
+        size: entry.size,
+        mime: entry.mime,
+      });
     },
-    [machineCapsFor, link, onToast, technical, deviceNoun],
+    [machineCapsFor, link],
   );
 
   const requestDelete = useCallback(

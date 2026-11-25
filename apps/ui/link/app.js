@@ -5,6 +5,9 @@ import {
   LOCAL_PIPE_CONNECTION,
   PENDING_LOCAL_MACHINE_NAME,
 } from '../lib/local-machine.js';
+import { isFanOut } from '../lib/result.js';
+
+const CAPABILITY_TOOLS = new Set(['meta.version', 'meta.whoami', 'meta.tools']);
 
 function tauriCore() {
   const tauri = typeof window !== 'undefined' ? window.__TAURI__ : null;
@@ -12,6 +15,14 @@ function tauriCore() {
     return null;
   }
   return tauri.core;
+}
+
+function tauriEvent() {
+  const tauri = typeof window !== 'undefined' ? window.__TAURI__ : null;
+  if (!tauri || !tauri.event || typeof tauri.event.listen !== 'function') {
+    return null;
+  }
+  return tauri.event;
 }
 
 function invoke(command, payload) {
@@ -99,11 +110,98 @@ export function createAppLink() {
   const callPrefix = randomCallPrefix();
   let nextCallId = 1;
   let readySent = false;
+  let selectedNode = '';
   const iosPlatform = isIosPlatform();
   const unsupportedContentMachines = new Set();
   const contentSupportListeners = new Set();
   let hasLocalPipe = false;
   let localPipeNode = null;
+  const appResumeListeners = new Set();
+  let nativeResumeUnlistens = null;
+  let nativeResumeReady = null;
+  let nativeResumeToken = null;
+  let sawNativeSuspend = false;
+
+  function notifyAppResume(source) {
+    for (const listener of appResumeListeners) {
+      try {
+        listener({ source });
+      } catch {
+        // Keep notifying remaining listeners.
+      }
+    }
+  }
+
+  function ensureNativeResumeSubscription() {
+    if (nativeResumeReady) return nativeResumeReady;
+    const ev = tauriEvent();
+    if (!ev) return Promise.resolve(false);
+    const token = {};
+    nativeResumeToken = token;
+    const onResumed = () => {
+      sawNativeSuspend = false;
+      notifyAppResume('tauri://resumed');
+    };
+    const onSuspended = () => {
+      sawNativeSuspend = true;
+    };
+    const onFocus = () => {
+      if (!sawNativeSuspend) return;
+      sawNativeSuspend = false;
+      notifyAppResume('tauri://focus');
+    };
+    nativeResumeReady = Promise.all([
+      Promise.resolve(ev.listen('tauri://resumed', onResumed)).catch(() => null),
+      Promise.resolve(ev.listen('tauri://suspended', onSuspended)).catch(() => null),
+      Promise.resolve(ev.listen('tauri://focus', onFocus)).catch(() => null),
+    ]).then((unlistens) => {
+      const active = unlistens.filter((fn) => typeof fn === 'function');
+      if (nativeResumeToken !== token || appResumeListeners.size === 0) {
+        for (const fn of active) {
+          try {
+            const res = fn();
+            if (res && typeof res.catch === 'function') res.catch(() => {});
+          } catch {
+            // Best-effort cleanup.
+          }
+        }
+        return false;
+      }
+      nativeResumeUnlistens = active;
+      return active.length > 0;
+    });
+    return nativeResumeReady;
+  }
+
+  function teardownNativeResumeSubscription() {
+    nativeResumeToken = null;
+    nativeResumeReady = null;
+    sawNativeSuspend = false;
+    const active = nativeResumeUnlistens;
+    nativeResumeUnlistens = null;
+    if (Array.isArray(active)) {
+      for (const fn of active) {
+        try {
+          const res = fn();
+          if (res && typeof res.catch === 'function') res.catch(() => {});
+        } catch {
+          // Best-effort cleanup.
+        }
+      }
+    }
+  }
+
+  function onAppResume(listener) {
+    if (typeof listener !== 'function') return () => {};
+    appResumeListeners.add(listener);
+    ensureNativeResumeSubscription().catch(() => {});
+    return () => {
+      appResumeListeners.delete(listener);
+      if (appResumeListeners.size === 0) {
+        teardownNativeResumeSubscription();
+      }
+    };
+  }
 
   function machineKey(machine) {
     return typeof machine === 'string' ? machine.trim() : '';
@@ -317,6 +415,40 @@ export function createAppLink() {
     }
   }
 
+  function clearContentUnsupported(machines) {
+    let changed = false;
+    for (const machine of machines) {
+      const key = machineKey(machine);
+      if (key && unsupportedContentMachines.delete(key)) {
+        changed = true;
+      }
+    }
+    if (changed) notifyContentSupport();
+  }
+
+  function noteCapabilityContact(tool, targetOn, result) {
+    if (!CAPABILITY_TOOLS.has(tool) || !result || typeof result !== 'object') return;
+    if (isFanOut(result)) {
+      const refreshed = [];
+      for (const [name, entry] of Object.entries(result.results || {})) {
+        if (entry && typeof entry === 'object' && entry.ok && !entry.error) {
+          refreshed.push(displayMachineFor(name));
+          if (typeof entry.ok.node === 'string') refreshed.push(displayMachineFor(entry.ok.node));
+        }
+      }
+      if (refreshed.length > 0) clearContentUnsupported(refreshed);
+      return;
+    }
+
+    const onKey = machineKey(displayMachineFor(targetOn));
+    const nodeKey = machineKey(displayMachineFor(result.node));
+    const refreshed = [];
+    if (onKey && onKey !== 'all') refreshed.push(onKey);
+    if (nodeKey) refreshed.push(nodeKey);
+    if (!onKey && selectedNode) refreshed.push(selectedNode);
+    if (refreshed.length > 0) clearContentUnsupported(refreshed);
+  }
+
   function clearUnsupportedContentMachines() {
     if (unsupportedContentMachines.size > 0) {
       unsupportedContentMachines.clear();
@@ -325,7 +457,7 @@ export function createAppLink() {
   }
 
   function supportsContentFor(machine) {
-    const key = machineKey(machine);
+    const key = machineKey(displayMachineFor(machine));
     return !key || !unsupportedContentMachines.has(key);
   }
 
@@ -492,10 +624,10 @@ export function createAppLink() {
       if (checks.length === 0) return null;
 
       const appOrigin = window.location.origin;
-      let leakedIpc = false;
+      let scriptProbe = null;
       const onMsg = (evt) => {
         if (evt?.data && typeof evt.data === 'object' && evt.data.legionProbe) {
-          leakedIpc = true;
+          scriptProbe = evt.data;
         }
       };
       window.addEventListener('message', onMsg);
@@ -538,20 +670,71 @@ export function createAppLink() {
           }
 
           // 3) Attempt to frame the content URL and ensure neither script nor IPC is reachable.
+          // End the wait as soon as the frame is conclusively cross-origin (SecurityError on
+          // location.href) or fires load/error, capping silent CSP cancellations at 400 ms. When
+          // CSP `default-src 'none'` or WebView2's `on_navigation` blocks navigation before
+          // commit, the iframe can remain on its initial untouched empty `about:blank` document
+          // (which inherits the app origin and receives Tauri's `withGlobalTauri` init script on
+          // WebView2). Only fail if content actually framed into a same-origin document (navigated
+          // away from `about:blank` or populated DOM) or ran script.
           const iframe = document.createElement('iframe');
           iframe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:10px;height:10px;';
-          iframe.src = ticket.url;
-          document.body.appendChild(iframe);
-          await new Promise((r) => window.setTimeout(r, 400));
+          const isIframeCrossOrigin = () => {
+            try {
+              void iframe.contentWindow?.location?.href;
+              return false;
+            } catch {
+              return true;
+            }
+          };
+          await new Promise((resolve) => {
+            let done = false;
+            const finish = (graceMs = 0) => {
+              if (done) return;
+              done = true;
+              window.clearTimeout(capTimer);
+              window.clearInterval(pollTimer);
+              if (graceMs > 0 && !isIframeCrossOrigin()) {
+                window.setTimeout(resolve, graceMs);
+              } else {
+                resolve();
+              }
+            };
+            const capTimer = window.setTimeout(() => finish(0), 400);
+            const pollTimer = window.setInterval(() => {
+              if (scriptProbe || isIframeCrossOrigin()) finish(0);
+            }, 40);
+            iframe.addEventListener('load', () => finish(50), { once: true });
+            iframe.addEventListener('error', () => finish(0), { once: true });
+            iframe.src = ticket.url;
+            document.body.appendChild(iframe);
+          });
+
+          let iframeLeak = null;
           try {
             const win = iframe.contentWindow;
-            if (win && win.__TAURI__) {
-              leakedIpc = true;
+            if (win) {
+              const href = String(win.location?.href || '');
+              const doc = win.document;
+              const rootTag = String(doc?.documentElement?.tagName || '').toLowerCase();
+              const hasDom = Boolean(
+                doc &&
+                  ((doc.head?.childNodes?.length || 0) > 0 ||
+                    (doc.body?.childNodes?.length || 0) > 0 ||
+                    (rootTag && rootTag !== 'html')),
+              );
+              const isUntouchedBlank = href === 'about:blank' && !hasDom;
+              if (!isUntouchedBlank) {
+                iframeLeak = `href=${href || '<empty>'} tauri=${Boolean(win.__TAURI__)} dom=${hasDom}`;
+              }
             }
           } catch {
-            // Cross-origin SecurityError is expected and proves isolation.
+            // Cross-origin SecurityError (opaque sandbox or error page) proves isolation.
           }
           iframe.remove();
+          if (iframeLeak) {
+            throw new Error(`Content ${item.kind} framed into same-origin document (${iframeLeak})`);
+          }
 
           // 4) Attempt top-level navigation to the content URL; on_navigation must refuse it so
           // the WebView stays on the bundled app origin.
@@ -564,8 +747,10 @@ export function createAppLink() {
           if (window.location.origin !== appOrigin) {
             throw new Error(`WebView navigated to content origin for ${item.kind}`);
           }
-          if (leakedIpc) {
-            throw new Error(`Content ${item.kind} reached script or Tauri IPC`);
+          if (scriptProbe) {
+            throw new Error(
+              `Content ${item.kind} executed script (ipc=${Boolean(scriptProbe.ipc)})`,
+            );
           }
         }
         return true;
@@ -574,44 +759,81 @@ export function createAppLink() {
       }
     };
 
-    const waitForAppResume = () =>
-      new Promise((resolve, reject) => {
-        let sawBackground = false;
-        const cleanup = () => {
+    const createAppResumeWaiter = () => {
+      let settled = false;
+      let sawBackground = false;
+      let resolvePromise = null;
+      let rejectPromise = null;
+      let unsubNative = null;
+      let timer = null;
+
+      const cleanup = () => {
+        if (timer !== null) {
           window.clearTimeout(timer);
-          document.removeEventListener('visibilitychange', onVis);
-          window.removeEventListener('pagehide', onBg);
-          window.removeEventListener('blur', onBg);
-          window.removeEventListener('focus', onFg);
-          window.removeEventListener('pageshow', onFg);
-        };
-        const timer = window.setTimeout(() => {
-          cleanup();
-          reject(new Error('Timed out waiting for app suspend/resume cycle'));
-        }, 45000);
-        const onBg = () => {
+          timer = null;
+        }
+        if (typeof unsubNative === 'function') {
+          unsubNative();
+          unsubNative = null;
+        }
+        document.removeEventListener('visibilitychange', onVis);
+        window.removeEventListener('pagehide', onBg);
+        window.removeEventListener('blur', onBg);
+        window.removeEventListener('focus', onFg);
+        window.removeEventListener('pageshow', onFg);
+      };
+
+      const trigger = (source) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolvePromise(source);
+      };
+
+      const onBg = () => {
+        sawBackground = true;
+      };
+      const onFg = () => {
+        if (sawBackground && document.visibilityState !== 'hidden') {
+          trigger('dom-foreground');
+        }
+      };
+      const onVis = () => {
+        if (document.visibilityState === 'hidden') {
           sawBackground = true;
-        };
-        const onFg = () => {
-          if (sawBackground && document.visibilityState !== 'hidden') {
-            cleanup();
-            resolve();
-          }
-        };
-        const onVis = () => {
-          if (document.visibilityState === 'hidden') {
-            sawBackground = true;
-          } else if (sawBackground) {
-            cleanup();
-            resolve();
-          }
-        };
-        document.addEventListener('visibilitychange', onVis);
-        window.addEventListener('pagehide', onBg);
-        window.addEventListener('blur', onBg);
-        window.addEventListener('focus', onFg);
-        window.addEventListener('pageshow', onFg);
+        } else if (sawBackground) {
+          trigger('dom-visibility');
+        }
+      };
+
+      const promise = new Promise((resolve, reject) => {
+        resolvePromise = resolve;
+        rejectPromise = reject;
       });
+
+      // Native mobile lifecycle resume (`tauri://resumed`, or `tauri://suspended` -> `tauri://focus`)
+      // resolves directly even if the web view never saw `visibilityState === 'hidden'`.
+      unsubNative = onAppResume((ev) => {
+        trigger(ev?.source || 'tauri://resumed');
+      });
+      const ready = ensureNativeResumeSubscription().catch(() => false);
+
+      document.addEventListener('visibilitychange', onVis);
+      window.addEventListener('pagehide', onBg);
+      window.addEventListener('blur', onBg);
+      window.addEventListener('focus', onFg);
+      window.addEventListener('pageshow', onFg);
+
+      // Leave room for up to three simulator retry cycles before timing out inside JS.
+      timer = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        rejectPromise(new Error('Timed out waiting for app suspend/resume cycle'));
+      }, 180000);
+
+      return { ready, promise };
+    };
 
     const report = {
       ok: false,
@@ -624,6 +846,7 @@ export function createAppLink() {
       video_origin: '',
       ipc_isolation_ok: null,
       resume_ok: spec.verify_resume ? false : null,
+      resume_trigger: null,
       error: null,
     };
 
@@ -633,7 +856,15 @@ export function createAppLink() {
         const alreadyPaired =
           Array.isArray(current?.nodes) && current.nodes.some((n) => n.node === spec.machine);
         if (!alreadyPaired) {
-          await pair(spec.invite, 'ci-media');
+          try {
+            await pair(spec.invite, 'ci-media');
+          } catch (pairErr) {
+            if (pairErr?.code !== 'timeout') throw pairErr;
+            // On a cold CI simulator runner, the initial SSH handshake can exceed 10s without
+            // consuming the invite; retry pairing once.
+            await new Promise((r) => window.setTimeout(r, 500));
+            await pair(spec.invite, 'ci-media');
+          }
         }
       }
 
@@ -675,12 +906,16 @@ export function createAppLink() {
       report.ok = mediaPass;
 
       if (spec.verify_resume && mediaPass) {
+        // Register both native (`tauri://resumed`) and DOM resume listeners and await Tauri
+        // listener registration before signaling the simulator harness.
+        const resumeWaiter = createAppResumeWaiter();
+        await resumeWaiter.ready;
         // Emit intermediate report so the simulator harness knows initial playback succeeded and
         // can now background and foreground the app.
         await invoke('media_check_report', { report: { ...report, resume_ok: false } }).catch(() => {});
-        await waitForAppResume();
-        // Give native resume hook a beat to probe/rebind the loopback listener if needed.
-        await new Promise((r) => window.setTimeout(r, 400));
+        report.resume_trigger = await resumeWaiter.promise;
+        // Mint immediately on resume: content_url probes and recovers the loopback listener
+        // synchronously under its lock without relying on an arbitrary sleep.
         const [imgAfter, vidAfter] = await Promise.all([
           contentUrl({ machine: spec.machine, path: spec.image_path }),
           contentUrl({ machine: spec.machine, path: spec.video_path }),
@@ -750,7 +985,12 @@ export function createAppLink() {
   async function tools(options = {}) {
     try {
       const wireOn = wireTargetFor(options?.on ?? null);
-      return await invoke('tools', { on: wireOn ?? null });
+      const result = await invoke('tools', { on: wireOn ?? null });
+      const target = machineKey(displayMachineFor(options?.on)) || selectedNode;
+      if (target && target !== 'all') {
+        clearContentUnsupported([target]);
+      }
+      return result;
     } catch (err) {
       throw formatError(err);
     }
@@ -806,7 +1046,9 @@ export function createAppLink() {
         payload.onEvent = channel;
       }
       const res = await invoke('call', payload);
-      return rewriteCallResult(tool, res, calledLocalPipe);
+      const rewritten = rewriteCallResult(tool, res, calledLocalPipe);
+      noteCapabilityContact(tool, displayMachineFor(on), rewritten);
+      return rewritten;
     } catch (err) {
       throw formatError(err);
     } finally {
@@ -818,6 +1060,7 @@ export function createAppLink() {
     try {
       const base = await rawState();
       if (!base?.ready || !Array.isArray(base.nodes) || base.nodes.length === 0) {
+        selectedNode = '';
         return base;
       }
 
@@ -836,6 +1079,7 @@ export function createAppLink() {
       const primaryIsLocalPipe =
         primary.via === LOCAL_PIPE_CONNECTION || rawTargetNode === LOCAL_PIPE_CONNECTION;
       const probeTarget = primaryIsLocalPipe ? LOCAL_PIPE_CONNECTION : rawTargetNode;
+      selectedNode = machineKey(primaryIsLocalPipe ? localDisplayName() : rawTargetNode);
 
       try {
         const [whoami, version] = await Promise.all([
@@ -855,6 +1099,7 @@ export function createAppLink() {
           noteLocalNodeName(whoami.node);
         }
         const resolvedNodeName = primaryIsLocalPipe ? localDisplayName() : rawTargetNode;
+        selectedNode = machineKey(resolvedNodeName);
         const nodeNamePending = primaryIsLocalPipe && !localPipeNode;
         const checkedAt = new Date().toISOString();
         const latestRaw = await rawState().catch(() => base);
@@ -924,6 +1169,7 @@ export function createAppLink() {
         // Selected machine did not answer: keep it selected and mark it unreachable with its
         // last known role ("as of <when>"), never substituting another node's identity.
         const resolvedNodeName = primaryIsLocalPipe ? localDisplayName() : rawTargetNode;
+        selectedNode = machineKey(resolvedNodeName);
         const nodeNamePending = primaryIsLocalPipe && !localPipeNode;
         const cached = isRealMachineName(resolvedNodeName)
           ? readCachedNodeIdentity(resolvedNodeName)
@@ -1061,6 +1307,7 @@ export function createAppLink() {
   async function selectNode(node) {
     try {
       await invoke('select_node', { node: wireTargetFor(node) });
+      selectedNode = machineKey(displayMachineFor(node));
       return await state();
     } catch (err) {
       throw formatError(err);
@@ -1198,7 +1445,11 @@ export function createAppLink() {
         path: path || '',
         download: Boolean(download),
       });
+      clearContentUnsupported([displayMachineFor(machine) || selectedNode]);
       if (signal?.aborted) {
+        if (result?.url) {
+          invoke('content_revoke', { url: String(result.url) }).catch(() => {});
+        }
         throw {
           code: 'cancelled',
           message: 'The content request was cancelled.',
@@ -1221,6 +1472,24 @@ export function createAppLink() {
         }
       }
       throw normalized;
+    }
+  }
+
+  async function contentStatus(url) {
+    try {
+      return await invoke('content_status', { url: String(url || '') });
+    } catch {
+      return null;
+    }
+  }
+
+  async function revokeContentUrl(url) {
+    const raw = String(url || '').trim();
+    if (!raw) return false;
+    try {
+      return Boolean(await invoke('content_revoke', { url: raw }));
+    } catch {
+      return false;
     }
   }
 
@@ -1262,12 +1531,13 @@ export function createAppLink() {
   }
 
   async function openExternally(req = {}) {
-    const { machine, path, name, mime } = req || {};
+    const { machine, path, name, size, mime } = req || {};
     try {
       return await invoke('transfer_open_externally', {
         machine: wireTargetFor(machine) || '',
         path: path || '',
         name: name ?? null,
+        size: typeof size === 'number' && Number.isFinite(size) ? size : null,
         mime: mime ?? null,
       });
     } catch (err) {
@@ -1398,6 +1668,7 @@ export function createAppLink() {
     dismissIdentityChange,
     repairStore,
     invalidateSessions,
+    onAppResume,
     scanInvite,
     updateState,
     watchUpdates,
@@ -1407,6 +1678,8 @@ export function createAppLink() {
     dismissUpdateNotice,
     maybeAutoInstall,
     contentUrl,
+    contentStatus,
+    revokeContentUrl,
     download,
     transfers,
     transferControl,
