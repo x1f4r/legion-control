@@ -2,6 +2,7 @@
 
 import {
   baseFileName,
+  canOpenExternally,
   categoryFromName,
   filterEntries,
   isHiddenName,
@@ -319,6 +320,9 @@ function makeEntry(path, opts = {}) {
     duration_s: opts.duration_s ?? undefined,
     palette: opts.palette || null,
     sampleMedia: opts.sampleMedia || null, // 'video' | 'audio' | 'unplayable' | 'image'
+    thumbFail: Boolean(opts.thumbFail),
+    mockContentStatus: opts.mockContentStatus || null,
+    mockMintError: opts.mockMintError || null,
   };
 }
 
@@ -354,6 +358,8 @@ export function createMockFilesState({
   const isEmpty = flags.has('empty');
   const isSlowUpload = flags.has('slow-upload');
   const isFailUpload = flags.has('fail-upload');
+  const isFormats = flags.has('formats');
+  const isNoHandler = flags.has('no-handler');
 
   const day = 86400;
   const longLogText = makeLongLogText();
@@ -375,6 +381,7 @@ export function createMockFilesState({
           makeEntry('/home/me/notes.txt', { kind: 'file', size: 124, mtime: isoAgo(3600) }),
           makeEntry('/home/me/.profile', { kind: 'file', size: 280, mtime: isoAgo(day * 40) }),
           ...(isLarge ? [makeEntry('/home/me/Archive5000', { kind: 'dir', mtime: isoAgo(day) })] : []),
+          ...(isFormats ? [makeEntry('/home/me/Formats', { kind: 'dir', mtime: isoAgo(day) })] : []),
         ],
       ],
       [
@@ -743,6 +750,98 @@ export function createMockFilesState({
     'studio:/home/me/Projects/notes/ideas.md': '# Ideas\n\nKeep folders in sync without a central hub.\n',
   };
 
+  if (isFormats) {
+    trees.tower.set('/home/me/Formats', [
+      makeEntry('/home/me/Formats/studio-master.flac', {
+        size: 43_000_000,
+        mtime: isoAgo(day),
+        sampleMedia: 'audio',
+      }),
+      makeEntry('/home/me/Formats/iphone-shot.heic', {
+        size: 1_500_000,
+        mtime: isoAgo(day),
+        palette: PALETTES[2],
+        sampleMedia: 'image',
+      }),
+      makeEntry('/home/me/Formats/camera-raw.dng', {
+        size: 12_000_000,
+        mtime: isoAgo(day),
+        thumbFail: true,
+      }),
+      makeEntry('/home/me/Formats/legacy-track.wma', {
+        size: 5_000_000,
+        mtime: isoAgo(day),
+      }),
+      makeEntry('/home/me/Formats/legacy-clip.avi', {
+        size: 20_000_000,
+        mtime: isoAgo(day),
+      }),
+      makeEntry('/home/me/Formats/README', {
+        size: 86,
+        mtime: isoAgo(day),
+      }),
+      makeEntry('/home/me/Formats/installer.apk', {
+        size: 18_000_000,
+        mtime: isoAgo(day),
+      }),
+      makeEntry('/home/me/Formats/diagram.svg', {
+        size: 4_096,
+        mtime: isoAgo(day),
+      }),
+      makeEntry('/home/me/Formats/fail-413.flac', {
+        size: 43_000_000,
+        mtime: isoAgo(day),
+        sampleMedia: 'unplayable',
+        mockContentStatus: {
+          request_count: 1,
+          status: 413,
+          content_type: 'application/json',
+          stream_failed: false,
+          error_code: 'too_large_for_inline',
+          error_message: 'File exceeds inline size cap.',
+          ticket_live: true,
+        },
+      }),
+      makeEntry('/home/me/Formats/fail-502.flac', {
+        size: 43_000_000,
+        mtime: isoAgo(day),
+        sampleMedia: 'unplayable',
+        mockContentStatus: {
+          request_count: 1,
+          status: 502,
+          content_type: 'application/json',
+          stream_failed: false,
+          error_code: 'unreachable',
+          error_message: 'Machine tower dropped the stream.',
+          ticket_live: true,
+        },
+      }),
+      makeEntry('/home/me/Formats/fail-truncated.flac', {
+        size: 43_000_000,
+        mtime: isoAgo(day),
+        sampleMedia: 'unplayable',
+        mockContentStatus: {
+          request_count: 1,
+          status: 206,
+          content_type: 'audio/flac',
+          stream_failed: true,
+          ticket_live: true,
+        },
+      }),
+      makeEntry('/home/me/Formats/no-route.flac', {
+        size: 43_000_000,
+        mtime: isoAgo(day),
+        mockMintError: {
+          code: 'not_found',
+          message: 'Machine tower is not paired on this device.',
+          hint: 'Pair with that machine or refresh learned fleet routes first.',
+        },
+      }),
+    ]);
+    textFiles['tower:/home/me/Formats/README'] =
+      'Formats fixture README\n\nPlain text without an extension.\n';
+  }
+
   let favCounter = 10;
   let favourites = [
     {
@@ -1109,6 +1208,14 @@ export function createMockFilesState({
           t.finished = new Date().toISOString();
           t.hash = 'blake3:9d20a1f8c44e77b2109f3e6a11b2084d';
           t.canOpen = t.direction === 'download';
+          if (t.openExternally && isNoHandler) {
+            t.openError = {
+              code: 'unsupported',
+              reason: 'no_handler',
+              message: 'No app on this phone can open this file type.',
+              hint: 'Download the file to save it in Downloads instead.',
+            };
+          }
         }
       }
 
@@ -1158,6 +1265,9 @@ export function createMockFilesState({
     return cachedUnplayableVideoBlobUrl;
   }
   const thumbAttemptByPath = new Map();
+  const mockStatusByUrl = new Map();
+  const revokedMockUrls = new Set();
+  let mockUrlSeq = 1;
 
   function normalizePath(p) {
     if (!p || p === '~') return '/home/me';
@@ -1818,38 +1928,64 @@ export function createMockFilesState({
           }
           const norm = normalizePath(path);
           const entry = findEntryOnMachine(target, norm);
+          if (entry?.mockMintError) {
+            throw { ...entry.mockMintError, machine: target };
+          }
           const name = entry?.name || baseFileName(norm);
           const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
 
-          // Unplayable video is driven strictly by payload (`sampleMedia === 'unplayable'`), never by extension.
+          // Unplayable video/audio is driven strictly by payload (`sampleMedia === 'unplayable'`), never by extension.
           if (entry?.sampleMedia === 'unplayable') {
+            const url = `${getUnplayableVideoUrl()}#mock-${mockUrlSeq++}`;
+            if (entry.mockContentStatus) {
+              mockStatusByUrl.set(url, { ...entry.mockContentStatus });
+            } else {
+              mockStatusByUrl.set(url, {
+                request_count: 1,
+                status: 206,
+                content_type: mimeFromName(name),
+                stream_failed: false,
+                ticket_live: true,
+              });
+            }
             return {
-              url: getUnplayableVideoUrl(),
+              url,
               expires_in: 900,
             };
           }
           const cat = categoryFromName(name);
           if (cat === 'video') {
-            return { url: getVideoUrl(), expires_in: 900 };
+            return { url: `${getVideoUrl()}#mock-${mockUrlSeq++}`, expires_in: 900 };
           }
           if (cat === 'audio') {
-            return { url: getAudioUrl(), expires_in: 900 };
+            return { url: `${getAudioUrl()}#mock-${mockUrlSeq++}`, expires_in: 900 };
           }
           if (cat === 'image') {
             if (entry) {
               const pal = entry.palette || paletteFor(norm);
+              const url = makeSampleImageDataUrl({ ...pal, w: 720, h: 540 });
+              revokedMockUrls.delete(url);
+              mockStatusByUrl.delete(url);
               return {
-                url: makeSampleImageDataUrl({ ...pal, w: 720, h: 540 }),
+                url,
                 expires_in: 900,
               };
             }
             if (ext === 'svg') {
+              const url =
+                'data:image/svg+xml;charset=utf-8,' +
+                encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" fill="#3b6f7a"/></svg>');
+              revokedMockUrls.delete(url);
+              mockStatusByUrl.delete(url);
               return {
-                url: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" fill="#3b6f7a"/></svg>'),
+                url,
                 expires_in: 900,
               };
             }
-            return { url: `data:image/png;base64,${SAMPLE_PNG_BASE64}`, expires_in: 900 };
+            const url = `data:image/png;base64,${SAMPLE_PNG_BASE64}`;
+            revokedMockUrls.delete(url);
+            mockStatusByUrl.delete(url);
+            return { url, expires_in: 900 };
           }
           if (ext === 'vtt') {
             return {
@@ -1951,9 +2087,116 @@ export function createMockFilesState({
           return { id: ids[0], ids, count: ids.length };
         },
 
-        async openExternally({ machine, path, name }) {
+        async contentStatus(url) {
+          if (revokedMockUrls.has(url)) {
+            return {
+              request_count: 0,
+              status: 404,
+              content_type: null,
+              stream_failed: false,
+              ticket_live: false,
+            };
+          }
+          if (mockStatusByUrl.has(url)) {
+            return { ...mockStatusByUrl.get(url) };
+          }
+          return {
+            request_count: 1,
+            status: 200,
+            content_type: 'application/octet-stream',
+            stream_failed: false,
+            ticket_live: true,
+          };
+        },
+
+        async revokeContentUrl(url) {
+          const key = String(url || '').trim();
+          if (!key) return false;
+          const wasFresh = !revokedMockUrls.has(key);
+          revokedMockUrls.add(key);
+          if (typeof window !== 'undefined') {
+            if (!Array.isArray(window.__LEGION_MOCK_REVOKED_URLS__)) {
+              window.__LEGION_MOCK_REVOKED_URLS__ = [];
+            }
+            window.__LEGION_MOCK_REVOKED_URLS__.push(key);
+          }
+          const existing = mockStatusByUrl.get(key);
+          if (existing) {
+            mockStatusByUrl.set(key, { ...existing, status: 404, ticket_live: false });
+          }
+          return wasFresh;
+        },
+
+        async openExternally({ machine, path, name, size, mime }) {
           const target = machine || activeNodeRef();
-          return { ok: true, machine: target, path: normalizePath(path), name: name || baseFileName(path) };
+          const norm = normalizePath(path);
+          const entry = findEntryOnMachine(target, norm);
+          const fileName = name || baseFileName(norm);
+          if (!canOpenExternally(fileName)) {
+            throw {
+              code: 'denied',
+              message: 'Legion refuses to open this file type directly.',
+              hint: 'Download it first if you want to inspect it.',
+              machine: target,
+            };
+          }
+          const active = deviceTransfers.find(
+            (t) =>
+              t.openExternally &&
+              t.direction === 'download' &&
+              t.machine === target &&
+              t.path === norm &&
+              (t.state === 'queued' || t.state === 'running'),
+          );
+          if (active) {
+            return { id: active.id, ok: true, openedImmediately: false };
+          }
+          const cached = deviceTransfers.find(
+            (t) =>
+              t.openExternally &&
+              t.direction === 'download' &&
+              t.machine === target &&
+              t.path === norm &&
+              t.state === 'done',
+          );
+          if (cached) {
+            if (isNoHandler) {
+              throw {
+                code: 'unsupported',
+                reason: 'no_handler',
+                message: 'No app on this phone can open this file type.',
+                hint: 'Download the file to save it in Downloads instead.',
+                machine: target,
+              };
+            }
+            return { id: cached.id, ok: true, openedImmediately: true };
+          }
+          const id = `dt-${transferSeq++}`;
+          const total = size || entry?.size || 2_400_000;
+          const activeCount = deviceTransfers.filter((t) => t.state === 'running').length;
+          deviceTransfers.unshift({
+            id,
+            direction: 'download',
+            machine: target,
+            path: norm,
+            name: fileName,
+            localPath: `cache/open-externally/${id}-${fileName}`,
+            mime: mime || mimeFromName(fileName),
+            state: activeCount < 2 ? 'running' : 'queued',
+            bytes_done: 0,
+            bytes_total: total,
+            rate: 0,
+            error: null,
+            openError: null,
+            openExternally: true,
+            created: new Date().toISOString(),
+            finished: null,
+            hash: null,
+            canOpen: false,
+          });
+          emitTransfers();
+          ensureTransferPump();
+          return { id, ok: true, openedImmediately: false };
         },
 
         async transfers() {

@@ -707,19 +707,24 @@ jobs:
             return 1
           }
 
-          run_simulator() {
+          run_simulator_once() {
             local kind="$1"
             local udid="$2"
             local dev_name="$3"
+            local attempt="$4"
 
-            echo "=== Running on $kind ($dev_name / $udid) ==="
+            echo "=== Running on $kind ($dev_name / $udid) [attempt $attempt/2] ==="
             xcrun simctl boot "$udid" || true
-            perl -e 'alarm 480; exec @ARGV' xcrun simctl bootstatus "$udid" -b
-            xcrun simctl install "$udid" "$SIM_APP"
+            if ! perl -e 'alarm 480; exec @ARGV' xcrun simctl bootstatus "$udid" -b; then
+              echo "Simulator $kind ($udid) failed to boot on attempt $attempt" >&2
+              xcrun simctl shutdown "$udid" || true
+              return 2
+            fi
+            xcrun simctl install "$udid" "$SIM_APP" || return 1
 
             local data_dir ready_file media_work media_spec media_out stdout_log stderr_log
-            data_dir="$(xcrun simctl get_app_container "$udid" com.x1f4r.legion data)"
-            mkdir -p "$data_dir/tmp"
+            data_dir="$(xcrun simctl get_app_container "$udid" com.x1f4r.legion data)" || return 1
+            mkdir -p "$data_dir/tmp" || return 1
             ready_file="$data_dir/tmp/legion-ready.txt"
             media_work="$RUNNER_TEMP/ios-media-${kind}"
             media_spec="$data_dir/tmp/media-check.json"
@@ -733,20 +738,26 @@ jobs:
               --legion "$LEGION_BIN" \
               --host 127.0.0.1 \
               --verify-resume \
-              --out "$media_out" >/dev/null
-            cp "$media_work/media-check.json" "$media_spec"
+              --out "$media_out" >/dev/null || return 1
+            cp "$media_work/media-check.json" "$media_spec" || return 1
 
-            xcrun simctl ui "$udid" appearance dark
+            xcrun simctl ui "$udid" appearance dark || true
             local launch_out app_pid
             launch_out="$(SIMCTL_CHILD_LEGION_APP_READY_FILE="$ready_file" \
               SIMCTL_CHILD_LEGION_APP_MEDIA_CHECK_FILE="$media_spec" \
               SIMCTL_CHILD_LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS=1 \
-              xcrun simctl launch --stdout="$stdout_log" --stderr="$stderr_log" "$udid" com.x1f4r.legion)"
+              xcrun simctl launch --stdout="$stdout_log" --stderr="$stderr_log" "$udid" com.x1f4r.legion)" || {
+              echo "Failed to launch Legion on $kind simulator (attempt $attempt)" >&2
+              if [ -f "$media_work/sshd.pid" ]; then kill "$(cat "$media_work/sshd.pid")" 2>/dev/null || true; fi
+              xcrun simctl shutdown "$udid" || true
+              return 2
+            }
             echo "$launch_out"
             app_pid="$(printf '%s\n' "$launch_out" | awk '{print $2}')"
 
             local found=0
             local media_ok=0
+            local media_failed=0
             local resume_triggered=0
             local resume_ok=0
             for i in $(seq 1 110); do
@@ -761,21 +772,36 @@ jobs:
               fi
               if [ "$media_ok" -eq 0 ] && [ -f "$media_out" ]; then
                 cat "$media_out"
-                node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); if (!r.ok || r.image_width <= 0 || r.video_width <= 0 || r.ipc_isolation_ok !== true) process.exit(1);' "$media_out"
-                media_ok=1
+                if node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.exit(r.ok && r.image_width > 0 && r.video_width > 0 && r.ipc_isolation_ok === true ? 0 : 1);' "$media_out"; then
+                  media_ok=1
+                else
+                  media_failed=1
+                  break
+                fi
               fi
               if [ "$media_ok" -eq 1 ] && [ "$resume_triggered" -eq 0 ]; then
                 echo "Backgrounding and resuming Legion on $kind to verify loopback survival..."
                 resume_triggered=1
+                local resume_t0 resume_t1
+                resume_t0="$(date +%s)"
                 xcrun simctl launch "$udid" com.apple.Preferences >/dev/null || true
                 sleep 3
                 xcrun simctl launch "$udid" com.x1f4r.legion >/dev/null || true
+                resume_t1="$(date +%s)"
+                echo "$kind background/resume switch completed in $((resume_t1 - resume_t0))s"
               fi
               if [ "$resume_triggered" -eq 1 ] && [ "$resume_ok" -eq 0 ] && [ -f "$media_out" ]; then
-                if node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.exit(r.ok && r.resume_ok === true ? 0 : 1);' "$media_out"; then
+                local resume_status
+                resume_status="$(node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); if (r.ok && r.resume_ok === true) { console.log("pass"); } else if (r.ok === false) { console.log("fail"); } else { console.log("pending"); }' "$media_out")"
+                if [ "$resume_status" = "pass" ]; then
                   echo "$kind post-resume loopback media check passed after ${i}s"
                   cat "$media_out"
                   resume_ok=1
+                elif [ "$resume_status" = "fail" ]; then
+                  echo "$kind post-resume loopback media check reported failure after ${i}s:"
+                  cat "$media_out"
+                  media_failed=1
+                  break
                 fi
               fi
               if [ "$found" -eq 1 ] && [ "$media_ok" -eq 1 ] && [ "$resume_ok" -eq 1 ]; then
@@ -796,6 +822,10 @@ jobs:
             cat "$stderr_log" || true
             if [ "$found" -ne 1 ] || [ "$media_ok" -ne 1 ] || [ "$resume_ok" -ne 1 ]; then
               echo "Failed waiting for $kind ready ($found), media check ($media_ok), resume ($resume_ok)"
+              if [ -f "$media_out" ]; then
+                echo "--- $kind media-result.json ---"
+                cat "$media_out" || true
+              fi
               cat "$media_work/sshd.log" || true
               ls -la "$data_dir/Library/Application Support" || true
               xcrun simctl io "$udid" screenshot "ci-shots/ios/${kind}-timeout.png" || true
@@ -809,14 +839,18 @@ jobs:
               fi
               echo "--- CoreSimulator logs ---"
               xcrun simctl spawn "$udid" log show --last 3m --style compact --predicate 'eventMessage CONTAINS "Legion" OR eventMessage CONTAINS "com.x1f4r.legion"' | tail -n 100 || true
+              xcrun simctl terminate "$udid" com.x1f4r.legion || true
               xcrun simctl shutdown "$udid" || true
-              exit 1
+              if [ "$found" -eq 0 ] && [ "$media_failed" -eq 0 ]; then
+                return 2
+              fi
+              return 1
             fi
 
             # Confirm the app data directory is excluded from iCloud/iTunes backups.
             local app_data_dir="$data_dir/Library/Application Support/com.x1f4r.legion"
-            test -d "$app_data_dir"
-            swift - "$app_data_dir" << 'SWIFT'
+            test -d "$app_data_dir" || return 1
+            swift - "$app_data_dir" << 'SWIFT' || return 1
           import Foundation
           let path = CommandLine.arguments[1]
           let url = URL(fileURLWithPath: path)
@@ -829,14 +863,33 @@ jobs:
           SWIFT
 
             sleep 2
-            shoot "$udid" "ci-shots/ios/${kind}-dark.png"
+            shoot "$udid" "ci-shots/ios/${kind}-dark.png" || return 1
 
-            xcrun simctl ui "$udid" appearance light
+            xcrun simctl ui "$udid" appearance light || true
             sleep 2
-            shoot "$udid" "ci-shots/ios/${kind}-light.png"
+            shoot "$udid" "ci-shots/ios/${kind}-light.png" || return 1
 
             xcrun simctl terminate "$udid" com.x1f4r.legion || true
             xcrun simctl shutdown "$udid" || true
+            return 0
+          }
+
+          run_simulator() {
+            local kind="$1"
+            local udid="$2"
+            local dev_name="$3"
+            local rc=0
+            run_simulator_once "$kind" "$udid" "$dev_name" 1 || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              return 0
+            fi
+            if [ "$rc" -eq 2 ]; then
+              echo "Retrying $kind simulator once after cold-boot/launch stall..." >&2
+              sleep 3
+              run_simulator_once "$kind" "$udid" "$dev_name" 2
+              return $?
+            fi
+            return "$rc"
           }
 
           run_simulator iphone "$IPHONE_UDID" "$IPHONE_NAME"

@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Duration;
 
 use http::header::{
@@ -106,6 +106,8 @@ pub struct StreamHooks {
     pub limiter: Option<ContentLimiter>,
     /// Optional counter incremented as response body bytes are yielded to the HTTP transport.
     pub bytes_served: Option<Arc<AtomicU64>>,
+    /// Optional flag set to `true` if the streaming response body aborts with a mid-stream error.
+    pub stream_failed: Option<Arc<AtomicBool>>,
     /// Optional caller-supplied RAII guard kept alive for as long as a streaming body is active.
     pub active_guard: Option<Box<dyn Any + Send + Sync>>,
 }
@@ -278,6 +280,7 @@ pub async fn handle_request<S: ContentSource>(
         ticket: ticket.clone(),
         options,
         bytes_served: hooks.bytes_served,
+        stream_failed: hooks.stream_failed,
         permit,
         active_guard: hooks.active_guard,
     };
@@ -301,6 +304,7 @@ struct StreamContext<S: ContentSource> {
     ticket: Ticket,
     options: ServeOptions,
     bytes_served: Option<Arc<AtomicU64>>,
+    stream_failed: Option<Arc<AtomicBool>>,
     permit: Option<StreamPermit>,
     active_guard: Option<Box<dyn Any + Send + Sync>>,
 }
@@ -345,6 +349,7 @@ impl<S: ContentSource> StreamContext<S> {
             self.options.liveness_check_bytes,
             self.options.liveness_check_interval,
             self.bytes_served,
+            self.stream_failed,
             guards,
         )
     }
@@ -2066,5 +2071,250 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("3")
         );
+    }
+
+    #[tokio::test]
+    async fn range_edge_cases_huge_past_end_parallel_small_and_duplicate_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..128 * 1024usize)
+            .map(|i| ((i * 37 + 11) % 251) as u8)
+            .collect();
+        std::fs::write(dir.path().join("track.flac"), &data).unwrap();
+
+        let tickets = Arc::new(TicketTable::new());
+        let source = Arc::new(DiskSource {
+            root: dir.path().to_path_buf(),
+            revoked: Arc::new(AtomicBool::new(false)),
+            denied: Arc::new(AtomicBool::new(false)),
+        });
+        let issued = tickets
+            .issue(TicketRequest {
+                holder: "tok-range".to_owned(),
+                principal: "phone".to_owned(),
+                machine: "tower".to_owned(),
+                path: "track.flac".to_owned(),
+            })
+            .unwrap();
+
+        // 1. Open-ended range from mid-file returns remaining bytes with 206.
+        let mut h = HeaderMap::new();
+        h.insert(RANGE, HeaderValue::from_static("bytes=65536-"));
+        let resp = handle_request(
+            &tickets,
+            &source,
+            &Method::GET,
+            &issued.id,
+            &issued.file_name,
+            None,
+            &h,
+            ServeOptions::default(),
+            StreamHooks::default(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), "audio/flac");
+        assert_eq!(
+            resp.headers().get(CONTENT_RANGE).unwrap(),
+            &format!("bytes 65536-{}/{}", data.len() - 1, data.len())
+        );
+        assert_eq!(collect_body(resp.into_body()).await.unwrap(), data[65536..]);
+
+        // 2. Huge end range (10 GiB and >u64::MAX) clamps cleanly to EOF.
+        for huge in [
+            "bytes=1024-10737418240",
+            "bytes=1024-999999999999999999999999",
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert(RANGE, HeaderValue::from_static(huge));
+            let resp = handle_request(
+                &tickets,
+                &source,
+                &Method::GET,
+                &issued.id,
+                &issued.file_name,
+                None,
+                &h,
+                ServeOptions::default(),
+                StreamHooks::default(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT, "{huge}");
+            assert_eq!(
+                resp.headers().get(CONTENT_RANGE).unwrap(),
+                &format!("bytes 1024-{}/{}", data.len() - 1, data.len()),
+                "{huge}"
+            );
+            assert_eq!(collect_body(resp.into_body()).await.unwrap(), data[1024..]);
+        }
+
+        // 3. Past-the-end ranges answer 416 with `Content-Range: bytes */<size>`.
+        for past in [
+            format!("bytes={}-", data.len()),
+            format!("bytes={}-{}", data.len(), data.len() + 4096),
+            format!("bytes={}-{}", data.len() + 1000, data.len() + 2000),
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert(RANGE, HeaderValue::from_str(&past).unwrap());
+            let resp = handle_request(
+                &tickets,
+                &source,
+                &Method::GET,
+                &issued.id,
+                &issued.file_name,
+                None,
+                &h,
+                ServeOptions::default(),
+                StreamHooks::default(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE, "{past}");
+            assert_eq!(
+                resp.headers().get(CONTENT_RANGE).unwrap(),
+                &format!("bytes */{}", data.len()),
+                "{past}"
+            );
+            assert!(collect_body(resp.into_body()).await.unwrap().is_empty());
+        }
+
+        // 4. Many small ranges in parallel (16 concurrent 1 KiB slices).
+        let limiter = ContentLimiter::with_limits(ConcurrencyLimits {
+            max_per_ticket: 32,
+            max_per_holder: 32,
+            max_global: 64,
+            retry_after_secs: 1,
+        });
+        let mut small_handles = Vec::new();
+        for idx in 0..16usize {
+            let start = idx * 4096;
+            let end = start + 1023;
+            let tickets = Arc::clone(&tickets);
+            let source = Arc::clone(&source);
+            let id = issued.id.clone();
+            let name = issued.file_name.clone();
+            let limiter = limiter.clone();
+            let expected = data[start..=end].to_vec();
+            small_handles.push(tokio::spawn(async move {
+                let mut h = HeaderMap::new();
+                h.insert(
+                    RANGE,
+                    HeaderValue::from_str(&format!("bytes={start}-{end}")).unwrap(),
+                );
+                let resp = handle_request(
+                    &tickets,
+                    &source,
+                    &Method::GET,
+                    &id,
+                    &name,
+                    None,
+                    &h,
+                    ServeOptions::default(),
+                    StreamHooks {
+                        limiter: Some(limiter),
+                        ..StreamHooks::default()
+                    },
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+                let body = collect_body(resp.into_body()).await.unwrap();
+                assert_eq!(body, expected);
+            }));
+        }
+        for handle in small_handles {
+            handle.await.unwrap();
+        }
+
+        // 5. Duplicate identical ranges in parallel (8 concurrent identical `bytes=8192-16383`).
+        let mut dup_handles = Vec::new();
+        let expected_dup = data[8192..=16383].to_vec();
+        for _ in 0..8usize {
+            let tickets = Arc::clone(&tickets);
+            let source = Arc::clone(&source);
+            let id = issued.id.clone();
+            let name = issued.file_name.clone();
+            let limiter = limiter.clone();
+            let expected = expected_dup.clone();
+            dup_handles.push(tokio::spawn(async move {
+                let mut h = HeaderMap::new();
+                h.insert(RANGE, HeaderValue::from_static("bytes=8192-16383"));
+                let resp = handle_request(
+                    &tickets,
+                    &source,
+                    &Method::GET,
+                    &id,
+                    &name,
+                    None,
+                    &h,
+                    ServeOptions::default(),
+                    StreamHooks {
+                        limiter: Some(limiter),
+                        ..StreamHooks::default()
+                    },
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+                let body = collect_body(resp.into_body()).await.unwrap();
+                assert_eq!(body, expected);
+            }));
+        }
+        for handle in dup_handles {
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_failed_hook_marks_mid_stream_truncation() {
+        struct TruncatedSource;
+        impl ContentSource for TruncatedSource {
+            fn open_range<'a>(
+                &'a self,
+                _ticket: &'a Ticket,
+                offset: u64,
+                length: Option<u64>,
+            ) -> Pin<Box<dyn Future<Output = Result<OpenedRange, OpenRangeError>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    let declared = length.unwrap_or(1024).min(1024 - offset);
+                    // Only deliver 10 bytes even though 1024 were declared.
+                    let short = std::io::Cursor::new(vec![0xAAu8; 10]);
+                    Ok(OpenedRange {
+                        size: 1024,
+                        offset,
+                        length: declared,
+                        mtime: ContentTime::new(1_700_000_000, 0),
+                        file_id: Some(1),
+                        reader: Box::new(short),
+                    })
+                })
+            }
+        }
+
+        let tickets = Arc::new(TicketTable::new());
+        let issued = tickets
+            .issue(TicketRequest {
+                holder: "h".to_owned(),
+                principal: "p".to_owned(),
+                machine: "tower".to_owned(),
+                path: "/short.flac".to_owned(),
+            })
+            .unwrap();
+        let failed_flag = Arc::new(AtomicBool::new(false));
+        let resp = handle_request(
+            &tickets,
+            &Arc::new(TruncatedSource),
+            &Method::GET,
+            &issued.id,
+            &issued.file_name,
+            None,
+            &HeaderMap::new(),
+            ServeOptions::default(),
+            StreamHooks {
+                stream_failed: Some(Arc::clone(&failed_flag)),
+                ..StreamHooks::default()
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(collect_body(resp.into_body()).await.is_err());
+        assert!(failed_flag.load(Ordering::Acquire));
     }
 }

@@ -33,17 +33,35 @@
  * @property {number} bytes_done - Bytes transferred so far.
  * @property {number} bytes_total - Total file size in bytes.
  * @property {number | null} [rate] - Current transfer speed in bytes/second.
- * @property {{ code?: string, message: string, hint?: string } | string | null} [error] - Reason when failed.
+ * @property {{ code?: string, message: string, hint?: string, reason?: string } | string | null} [error] - Reason when failed.
  * @property {string} created - ISO-8601 creation timestamp.
  * @property {string | null} [finished] - ISO-8601 completion timestamp when terminal.
  * @property {string | null} [hash] - Verified BLAKE3 hash (shown in technical mode).
  * @property {boolean} [canOpen] - Whether tapping the finished row opens the local file.
+ * @property {{ code?: string, message: string, hint?: string, reason?: string } | null} [openError] - Error if opening externally failed after finishing.
+ * @property {boolean} [openExternally] - True when started by "Open in another app" into the cache.
+ *
+ * @typedef {Object} ContentUrlStatus
+ * @property {number} request_count - Number of requests served for this ticket URL.
+ * @property {number | null} [status] - Most recent HTTP status code.
+ * @property {string | null} [content_type] - Most recent response Content-Type header.
+ * @property {boolean} stream_failed - True if any streaming body aborted mid-stream.
+ * @property {string | null} [error_code] - Structured Legion error code from an error body.
+ * @property {string | null} [error_message] - Error message from an error body.
+ * @property {boolean} ticket_live - True while the ticket is live in the table.
  *
  * @typedef {Object} OptionalFileLinkMethods
  *
  * @property {(req: ContentUrlRequest) => Promise<ContentUrlResult>} [contentUrl]
  *   Mint a short-lived read-only ticketed content address for viewing or browser download.
  *   In the HTTP door this calls `POST /v1/content`; in the native app it calls `content_url`.
+ *
+ * @property {(url: string) => Promise<ContentUrlStatus | null>} [contentStatus]
+ *   Inspect the local content server's observed HTTP status and stream health for `url`.
+ *
+ * @property {(url: string) => Promise<boolean>} [revokeContentUrl]
+ *   Immediately revoke a previously minted content URL when the viewer closes, switches files,
+ *   or tears down a media element.
  *
  * @property {(req: { machine: string, path: string, name?: string, size?: number, mime?: string }) => Promise<{ id: string }>} [download]
  *   Enqueue a non-blocking download to this device's Downloads folder and return `{ id }` at once.
@@ -55,9 +73,9 @@
  *   `machine:dir` via the bulk pipe, and return `{ id }` at once. Returns `null` if cancelled.
  *   Hidden in the UI when absent.
  *
- * @property {(req: { machine: string, path: string, name?: string, mime?: string }) => Promise<{ id?: string, ok?: boolean }>} [openExternally]
- *   Hand a remote file to the device's system chooser (downloading to cache on native).
- *   Returns control immediately. Hidden in the UI when absent.
+ * @property {(req: { machine: string, path: string, name?: string, size?: number, mime?: string }) => Promise<{ id?: string, ok?: boolean, openedImmediately?: boolean }>} [openExternally]
+ *   Hand a remote file to the device's system chooser (downloading to cache on native or reusing
+ *   an unchanged cached copy immediately). Hidden in the UI when absent.
  *
  * @property {() => Promise<DeviceTransfer[]>} [transfers]
  *   List queued, running, paused, finished, and failed device-side transfers for Activity.

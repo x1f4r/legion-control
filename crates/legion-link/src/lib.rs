@@ -224,7 +224,8 @@ pub(crate) fn decode_remote_error(
 
 pub use command::{RemoteOs, Subcommand, remote_command, validate_program};
 pub use content::{
-    CAP_STREAM_RELAY, ContentStream, ContentTime, RawStream, StreamOpenError, StreamOpener,
+    CAP_STREAM_RELAY, ContentStream, ContentTime, DEFAULT_MAX_PARKED_STREAMS, RawStream,
+    StreamOpenError, StreamOpener,
 };
 #[cfg(feature = "ssh")]
 pub use invite::enrol;
@@ -235,9 +236,10 @@ pub use invite::{
 #[cfg(feature = "ssh")]
 pub use key::DeviceKey;
 pub use link::{
-    ConflictingIdentityReport, DEFAULT_IDLE_TIMEOUT, DEFAULT_UNSYNCED_BACKOFF, DisagreementReport,
-    LearnDisagreement, LearnRejection, LearnReport, Link, LinkConfig, LinkOptions,
-    MAX_CONFIGURED_NODES, MAX_ENDPOINT_FIELD_LEN, MAX_ENDPOINT_HOST_KEY_LEN,
+    ConflictingIdentityReport, DEFAULT_CHANNEL_REFUSED_RECONNECT_COOLDOWN, DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_UNSYNCED_BACKOFF, DisagreementReport, LearnDisagreement, LearnRejection, LearnReport,
+    Link, LinkConfig, LinkOptions, MAX_CONFIGURED_NODES, MAX_ENDPOINT_FIELD_LEN,
+    MAX_ENDPOINT_HOST_KEY_LEN,
     MAX_ENDPOINT_HOST_KEYS, MAX_ENDPOINT_HOSTS, MachineRouteStatus, NodeLink, NodeOrigin,
     PendingIdentityChange, Route, RoutedValue, SessionOpener, parse_optional_target,
     public_key_fingerprint,

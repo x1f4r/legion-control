@@ -5,28 +5,25 @@
 //! view play and seek straight from the machine without copying files into memory or exposing the
 //! interface origin.
 //!
-//! - **Linux, macOS, iOS/iPadOS, and Windows** mount `legion-content` on a lazy HTTP/1.1 listener
-//!   bound strictly to `127.0.0.1:0` (system-chosen ephemeral port), stopping automatically once
-//!   no live tickets or active streams remain for [`DEFAULT_IDLE_SHUTDOWN`].
-//! - **Android** enforces `android:usesCleartextTraffic="false"` in `AndroidManifest.xml`, which
-//!   causes Android WebView to reject `http://127.0.0.1:<port>` with `ERR_CLEARTEXT_NOT_PERMITTED`.
-//!   Android therefore mounts the same `legion-content` handler on the Tauri custom URI scheme
-//!   `legion-content` (`http://legion-content.localhost/v1/content/<ticket>/<name>`), answering
-//!   open-ended ranges in bounded [`CUSTOM_SCHEME_MAX_RANGE_BYTES`] pieces so `wry` never buffers
-//!   whole videos into memory and no cleartext loopback port is opened on the device.
+//! All platforms (Linux, macOS, iOS/iPadOS, Windows, and Android) mount `legion-content` on a lazy
+//! HTTP/1.1 listener bound strictly to `127.0.0.1:0` (system-chosen ephemeral port), stopping
+//! automatically once no live tickets or active streams remain for [`DEFAULT_IDLE_SHUTDOWN`]. On
+//! Android, `res/xml/network_security_config.xml` denies cleartext traffic everywhere except the
+//! loopback literal `127.0.0.1`, allowing WebView to stream and seek arbitrarily large media with
+//! flat memory while keeping cleartext blocked for every other host.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_EXPOSE_HEADERS, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE,
+    ACCESS_CONTROL_EXPOSE_HEADERS, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE,
     CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, HeaderName, HeaderValue, RANGE, REFERRER_POLICY,
     VARY, X_CONTENT_TYPE_OPTIONS,
 };
@@ -44,7 +41,7 @@ use legion_content::{
 };
 use legion_link::proto::{ErrorBody as ProtoErrorBody, ErrorCode as ProtoErrorCode};
 use serde::{Deserialize, Serialize};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -72,8 +69,12 @@ const CUSTOM_SCHEME_BUDGET_UNIT_BYTES: usize = 64 * 1024;
 /// Maximum simultaneous TCP connections accepted by the loopback content listener.
 pub const MAX_LOOPBACK_CONNECTIONS: usize = 32;
 
-/// Maximum time a loopback client may take to send HTTP request headers (5 seconds).
+/// Maximum time an authenticated loopback client may take to send HTTP request headers (5 seconds).
 pub const LOOPBACK_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum time an unauthenticated loopback connection (one that has not yet presented a valid
+/// ticket) may take to send complete HTTP request headers before being closed (2 seconds).
+pub const LOOPBACK_UNAUTH_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Initial exponential backoff delay after a transient `accept()` error.
 const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(25);
@@ -96,23 +97,16 @@ const CROSS_ORIGIN_RESOURCE_POLICY: HeaderName =
 /// Transport mount used to reach [`AppContentServer`] from the web view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentMountMode {
-    /// Loopback HTTP/1.1 listener on `127.0.0.1:0` (Linux, macOS, iOS/iPadOS, Windows).
+    /// Streaming loopback HTTP/1.1 listener on `127.0.0.1:0` (all platforms).
     Loopback,
-    /// Tauri custom URI scheme `legion-content` answering bounded range pieces (Android).
+    /// Legacy buffered Tauri custom URI scheme `legion-content` (retained for tests).
     CustomScheme,
 }
 
 impl ContentMountMode {
     /// Returns the content transport mount selected for the current target platform.
     pub const fn current_platform() -> Self {
-        #[cfg(target_os = "android")]
-        {
-            Self::CustomScheme
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            Self::Loopback
-        }
+        Self::Loopback
     }
 }
 
@@ -140,6 +134,43 @@ pub struct ContentUrlResult {
     pub expires_in: u64,
 }
 
+/// Diagnostic status of the most recent content request(s) for one ticket URL.
+///
+/// Queried by the interface via `content_status` when an `<img>`, `<video>`, or `<audio>` element
+/// errors so the viewer distinguishes HTTP/transport/size/revocation failures from genuine media
+/// decode failures.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentUrlStatus {
+    /// Number of HTTP requests observed for this ticket URL so far.
+    pub request_count: u32,
+    /// HTTP status code of the most recent request, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Response `Content-Type` header of the most recent request, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// True when any streaming body served for this ticket aborted mid-stream.
+    pub stream_failed: bool,
+    /// Structured Legion error code from an error response body, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Human-readable error message from an error response body, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// True when the ticket referenced by the URL is still live in the ticket table.
+    pub ticket_live: bool,
+}
+
+struct TicketStatusEntry {
+    key_hash: [u8; 32],
+    request_count: u32,
+    status: Option<u16>,
+    content_type: Option<String>,
+    stream_failed: Arc<AtomicBool>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+}
+
 /// Redacted request diagnostic entry (never stores ticket identifiers or credentials).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentRequestLog {
@@ -163,10 +194,111 @@ pub struct SharedContentServer(pub Arc<AppContentServer>);
 struct ListenerHandle {
     port: u16,
     shutdown: CancellationToken,
+    accept_alive: Arc<AtomicBool>,
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl ListenerHandle {
+    fn is_alive(&self) -> bool {
+        !self.shutdown.is_cancelled()
+            && self.accept_alive.load(Ordering::Acquire)
+            && !self.accept_task.is_finished()
+    }
+}
+
+struct AcceptAliveGuard {
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for AcceptAliveGuard {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+    }
 }
 
 struct ActivityState {
     last_activity: Instant,
+}
+
+struct LoopbackConnSlot {
+    id: u64,
+    authenticated: Arc<AtomicBool>,
+    evict: CancellationToken,
+}
+
+/// Bounded registry of active loopback TCP connections.
+///
+/// Tracks whether each connection has presented a valid content ticket so that when the connection
+/// cap is reached, the oldest unauthenticated connection is evicted before refusing a new one.
+struct LoopbackConnTable {
+    max_connections: usize,
+    next_id: u64,
+    active: VecDeque<LoopbackConnSlot>,
+}
+
+impl LoopbackConnTable {
+    fn new(max_connections: usize) -> Self {
+        let cap = max_connections.max(1);
+        Self {
+            max_connections: cap,
+            next_id: 1,
+            active: VecDeque::with_capacity(cap),
+        }
+    }
+
+    fn admit(
+        table: &Arc<Mutex<Self>>,
+    ) -> Option<(LoopbackConnGuard, Arc<AtomicBool>, CancellationToken)> {
+        let mut guard = table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.active.len() >= guard.max_connections {
+            let evict_idx = guard
+                .active
+                .iter()
+                .position(|slot| !slot.authenticated.load(Ordering::Acquire))?;
+            if let Some(evicted) = guard.active.remove(evict_idx) {
+                evicted.evict.cancel();
+            }
+        }
+        let id = guard.next_id;
+        guard.next_id = guard.next_id.wrapping_add(1);
+        let authenticated = Arc::new(AtomicBool::new(false));
+        let evict = CancellationToken::new();
+        guard.active.push_back(LoopbackConnSlot {
+            id,
+            authenticated: Arc::clone(&authenticated),
+            evict: evict.clone(),
+        });
+        Some((
+            LoopbackConnGuard {
+                table: Arc::clone(table),
+                id,
+            },
+            authenticated,
+            evict,
+        ))
+    }
+
+    fn release(&mut self, id: u64) {
+        if let Some(idx) = self.active.iter().position(|slot| slot.id == id) {
+            self.active.remove(idx);
+        }
+    }
+}
+
+struct LoopbackConnGuard {
+    table: Arc<Mutex<LoopbackConnTable>>,
+    id: u64,
+}
+
+impl Drop for LoopbackConnGuard {
+    fn drop(&mut self) {
+        self.table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .release(self.id);
+    }
 }
 
 struct ActiveStreamGuard {
@@ -274,7 +406,7 @@ pub struct AppContentServer {
     allowed_origins: Vec<String>,
     idle_shutdown: Duration,
     header_read_timeout: Duration,
-    loopback_conn_limit: Arc<Semaphore>,
+    loopback_conns: Arc<Mutex<LoopbackConnTable>>,
     custom_scheme_max_full_bytes: u64,
     custom_scheme_memory_budget: Arc<Semaphore>,
     custom_scheme_buffered_bytes: Arc<AtomicUsize>,
@@ -284,6 +416,7 @@ pub struct AppContentServer {
     active_streams: Arc<AtomicUsize>,
     activity: Arc<Mutex<ActivityState>>,
     request_log: Mutex<VecDeque<ContentRequestLog>>,
+    ticket_statuses: Mutex<VecDeque<TicketStatusEntry>>,
 }
 
 impl AppContentServer {
@@ -350,7 +483,7 @@ impl AppContentServer {
             allowed_origins,
             idle_shutdown,
             header_read_timeout,
-            loopback_conn_limit: Arc::new(Semaphore::new(conn_cap)),
+            loopback_conns: Arc::new(Mutex::new(LoopbackConnTable::new(conn_cap))),
             custom_scheme_max_full_bytes,
             custom_scheme_memory_budget: Arc::new(Semaphore::new(budget_units)),
             custom_scheme_buffered_bytes: Arc::new(AtomicUsize::new(0)),
@@ -362,6 +495,7 @@ impl AppContentServer {
                 last_activity: Instant::now(),
             })),
             request_log: Mutex::new(VecDeque::with_capacity(MAX_REQUEST_LOG)),
+            ticket_statuses: Mutex::new(VecDeque::with_capacity(MAX_REQUEST_LOG)),
         }
     }
 
@@ -395,6 +529,104 @@ impl AppContentServer {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+    }
+
+    /// Returns the observed HTTP status, content type, mid-stream failure flag, and ticket
+    /// liveness for `raw_url` without exposing any secret ticket identifier.
+    pub fn content_status_for_url(&self, raw_url: &str) -> ContentUrlStatus {
+        let Some(ticket_id) = extract_ticket_id_from_url(raw_url) else {
+            return ContentUrlStatus::default();
+        };
+        let key_hash = ticket_hash(ticket_id);
+        let ticket_live = self.tickets.is_live(&key_hash);
+        let statuses = self
+            .ticket_statuses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(entry) = statuses.iter().find(|entry| entry.key_hash == key_hash) else {
+            return ContentUrlStatus {
+                ticket_live,
+                ..ContentUrlStatus::default()
+            };
+        };
+        ContentUrlStatus {
+            request_count: entry.request_count,
+            status: entry.status,
+            content_type: entry.content_type.clone(),
+            stream_failed: entry.stream_failed.load(Ordering::Acquire),
+            error_code: entry.error_code.clone(),
+            error_message: entry.error_message.clone(),
+            ticket_live,
+        }
+    }
+
+    fn ensure_ticket_stream_flag(&self, key_hash: [u8; 32]) -> Arc<AtomicBool> {
+        let mut statuses = self
+            .ticket_statuses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = statuses.iter().find(|entry| entry.key_hash == key_hash) {
+            return Arc::clone(&entry.stream_failed);
+        }
+        if statuses.len() >= MAX_REQUEST_LOG {
+            statuses.pop_front();
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        statuses.push_back(TicketStatusEntry {
+            key_hash,
+            request_count: 0,
+            status: None,
+            content_type: None,
+            stream_failed: Arc::clone(&flag),
+            error_code: None,
+            error_message: None,
+        });
+        flag
+    }
+
+    fn record_ticket_status(
+        &self,
+        key_hash: [u8; 32],
+        status: StatusCode,
+        headers: &HeaderMap,
+        error_body: Option<&[u8]>,
+        increment_count: bool,
+    ) {
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let (error_code, error_message) = if status.is_client_error() || status.is_server_error() {
+            parse_proto_error_summary(error_body)
+        } else {
+            (None, None)
+        };
+        let mut statuses = self
+            .ticket_statuses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = statuses.iter_mut().find(|entry| entry.key_hash == key_hash) {
+            if increment_count {
+                entry.request_count = entry.request_count.saturating_add(1);
+            }
+            entry.status = Some(status.as_u16());
+            entry.content_type = content_type;
+            entry.error_code = error_code;
+            entry.error_message = error_message;
+            return;
+        }
+        if statuses.len() >= MAX_REQUEST_LOG {
+            statuses.pop_front();
+        }
+        statuses.push_back(TicketStatusEntry {
+            key_hash,
+            request_count: u32::from(increment_count),
+            status: Some(status.as_u16()),
+            content_type,
+            stream_failed: Arc::new(AtomicBool::new(false)),
+            error_code,
+            error_message,
+        });
     }
 
     /// Probes `path` on `machine` through `Link::open_content(..., 0, Some(0))`, issues a
@@ -454,7 +686,7 @@ impl AppContentServer {
         let suffix = if download { "?download=1" } else { "" };
         let url = match self.mode {
             ContentMountMode::Loopback => {
-                let port = self.ensure_loopback_listener().await?;
+                let port = self.ensure_live_loopback_listener().await?;
                 format!(
                     "http://127.0.0.1:{port}/v1/content/{}/{encoded_name}{suffix}",
                     issued.id
@@ -472,6 +704,25 @@ impl AppContentServer {
             url,
             expires_in: issued.expires_in,
         })
+    }
+
+    /// Revokes the single content ticket identified by `raw_url` immediately (used when the viewer
+    /// closes, switches files, or tears down a media element). Returns `true` if a live ticket was
+    /// removed.
+    pub fn revoke_url(&self, raw_url: &str) -> bool {
+        let Some(ticket_id) = extract_ticket_id_from_url(raw_url) else {
+            return false;
+        };
+        let key_hash = ticket_hash(ticket_id);
+        let removed = self.tickets.revoke(ticket_id);
+        if removed {
+            let mut statuses = self
+                .ticket_statuses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            statuses.retain(|entry| entry.key_hash != key_hash);
+        }
+        removed
     }
 
     /// Revokes every ticket belonging to pairings that are no longer live in [`Backend`].
@@ -511,37 +762,36 @@ impl AppContentServer {
         });
     }
 
-    /// Verifies that an active loopback listener still accepts TCP connections; if the OS
-    /// reclaimed the socket while suspended, tears it down cleanly and rebinds (trying the
-    /// previous port first so existing media URLs continue working when possible).
+    /// Verifies from our own listener state that an active loopback accept loop is still running;
+    /// if it has stopped or been cancelled while live tickets remain, tears down the stale handle
+    /// and binds a fresh OS-chosen port on `127.0.0.1:0` (never probing via TCP connect and never
+    /// reusing the previous port).
     pub async fn probe_or_recover_loopback(self: &Arc<Self>) -> Result<Option<u16>, AppError> {
         if self.mode != ContentMountMode::Loopback {
             return Ok(None);
         }
-        let Some(port) = self.loopback_port() else {
+        let _guard = self.listener_lock.lock().await;
+        let state = {
+            let slot = self
+                .listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.as_ref().map(|h| (h.port, h.is_alive()))
+        };
+        let Some((port, alive)) = state else {
             return Ok(None);
         };
-        let alive = matches!(
-            tokio::time::timeout(
-                Duration::from_millis(500),
-                TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
-            )
-            .await,
-            Ok(Ok(_))
-        );
         if alive {
             return Ok(Some(port));
         }
 
-        // Listener did not answer on localhost: tear down the dead handle and rebind if live
-        // tickets remain.
+        // Accept task is no longer live: tear down the stale handle and bind a fresh OS-chosen
+        // port if live tickets remain.
         self.teardown_listener_if_port(port);
         if self.tickets.is_empty() {
             return Ok(None);
         }
-        let new_port = self
-            .ensure_loopback_listener_prefer_port(Some(port))
-            .await?;
+        let new_port = self.bind_loopback_listener_locked().await?;
         Ok(Some(new_port))
     }
 
@@ -609,16 +859,31 @@ impl AppContentServer {
         };
 
         let response = self
-            .handle_checked_request(&guard, &method, &uri, &headers, options)
+            .handle_checked_request(&guard, &method, &uri, &headers, options, None)
             .await;
-        collect_bounded_response(
+        let ticket_key_hash = parse_content_path(uri.path()).map(|(id, _)| ticket_hash(id));
+        let initial_status = response.status();
+        let collected = collect_bounded_response(
             response,
             max_bytes,
             &self.custom_scheme_memory_budget,
             &self.custom_scheme_buffered_bytes,
             &self.custom_scheme_peak_buffered_bytes,
         )
-        .await
+        .await;
+        if let Some(key_hash) = ticket_key_hash
+            && collected.status() != initial_status
+            && self.tickets.contains_hash(&key_hash)
+        {
+            self.record_ticket_status(
+                key_hash,
+                collected.status(),
+                collected.headers(),
+                Some(collected.body().as_slice()),
+                false,
+            );
+        }
+        collected
     }
 
     fn touch_activity(&self) {
@@ -640,45 +905,45 @@ impl AppContentServer {
         }
     }
 
-    async fn ensure_loopback_listener(self: &Arc<Self>) -> Result<u16, AppError> {
-        self.ensure_loopback_listener_prefer_port(None).await
+    /// Ensures a loopback listener owned by this server is alive before returning a freshly minted
+    /// URL. Decides liveness strictly from Legion's own accept-task state (never via a TCP connect
+    /// to the old port) and always binds a fresh OS-chosen port on recovery.
+    async fn ensure_live_loopback_listener(self: &Arc<Self>) -> Result<u16, AppError> {
+        let _guard = self.listener_lock.lock().await;
+        let state = {
+            let slot = self
+                .listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.as_ref().map(|h| (h.port, h.is_alive()))
+        };
+        if let Some((port, alive)) = state {
+            if alive {
+                return Ok(port);
+            }
+            self.teardown_listener_if_port(port);
+        }
+        self.bind_loopback_listener_locked().await
     }
 
-    async fn ensure_loopback_listener_prefer_port(
-        self: &Arc<Self>,
-        preferred_port: Option<u16>,
-    ) -> Result<u16, AppError> {
-        if let Some(port) = self.loopback_port() {
-            return Ok(port);
-        }
-        let _guard = self.listener_lock.lock().await;
-        if let Some(port) = self.loopback_port() {
+    async fn bind_loopback_listener_locked(self: &Arc<Self>) -> Result<u16, AppError> {
+        if let Some(port) = {
+            let slot = self
+                .listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.as_ref().filter(|h| h.is_alive()).map(|h| h.port)
+        } {
             return Ok(port);
         }
 
-        let tcp = if let Some(prev_port) = preferred_port {
-            let preferred_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, prev_port));
-            match TcpListener::bind(preferred_addr).await {
-                Ok(l) => l,
-                Err(_) => {
-                    let fallback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-                    TcpListener::bind(fallback).await.map_err(|err| {
-                        AppError::new(
-                            ErrorCode::Internal,
-                            format!("Could not bind local content listener on 127.0.0.1: {err}"),
-                        )
-                    })?
-                }
-            }
-        } else {
-            let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-            TcpListener::bind(bind_addr).await.map_err(|err| {
-                AppError::new(
-                    ErrorCode::Internal,
-                    format!("Could not bind local content listener on 127.0.0.1: {err}"),
-                )
-            })?
-        };
+        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        let tcp = TcpListener::bind(bind_addr).await.map_err(|err| {
+            AppError::new(
+                ErrorCode::Internal,
+                format!("Could not bind local content listener on 127.0.0.1: {err}"),
+            )
+        })?;
         let port = tcp
             .local_addr()
             .map_err(|err| {
@@ -690,6 +955,15 @@ impl AppContentServer {
             .port();
 
         let shutdown = CancellationToken::new();
+        let accept_alive = Arc::new(AtomicBool::new(true));
+        let server = Arc::clone(self);
+        let accept_shutdown = shutdown.clone();
+        let accept_flag = Arc::clone(&accept_alive);
+        let accept_task = tokio::spawn(async move {
+            server
+                .run_accept_loop(tcp, port, accept_shutdown, accept_flag)
+                .await;
+        });
         {
             let mut slot = self
                 .listener
@@ -698,15 +972,11 @@ impl AppContentServer {
             *slot = Some(ListenerHandle {
                 port,
                 shutdown: shutdown.clone(),
+                accept_alive,
+                accept_task,
             });
         }
         self.touch_activity();
-
-        let server = Arc::clone(self);
-        let accept_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            server.run_accept_loop(tcp, port, accept_shutdown).await;
-        });
 
         let reaper_server = Arc::clone(self);
         tokio::spawn(async move {
@@ -721,7 +991,11 @@ impl AppContentServer {
         tcp: TcpListener,
         port: u16,
         shutdown: CancellationToken,
+        accept_alive: Arc<AtomicBool>,
     ) {
+        let _alive_guard = AcceptAliveGuard {
+            alive: accept_alive,
+        };
         let guard = Arc::new(HostOriginGuard {
             port,
             allowed_hosts: Vec::new(),
@@ -767,8 +1041,10 @@ impl AppContentServer {
                     continue;
                 }
             };
-            let Ok(conn_permit) = Arc::clone(&self.loopback_conn_limit).try_acquire_owned() else {
-                // Drop excess connections immediately instead of spawning unbounded tasks.
+            let Some((conn_guard_slot, conn_authenticated, conn_evict)) =
+                LoopbackConnTable::admit(&self.loopback_conns)
+            else {
+                // Every active slot is held by an authenticated connection; drop excess immediately.
                 drop(stream);
                 continue;
             };
@@ -776,18 +1052,28 @@ impl AppContentServer {
             let server = Arc::clone(&self);
             let conn_guard = Arc::clone(&guard);
             let conn_shutdown = shutdown.clone();
+            let unauth_timeout = header_read_timeout.min(LOOPBACK_UNAUTH_HEADER_READ_TIMEOUT);
             tokio::spawn(async move {
-                let _permit = conn_permit;
+                let _slot_guard = conn_guard_slot;
                 let io = TokioIo::new(stream);
+                let service_auth = Arc::clone(&conn_authenticated);
                 let service = service_fn(move |req: Request<Incoming>| {
                     let server = Arc::clone(&server);
                     let guard = Arc::clone(&conn_guard);
+                    let auth_flag = Arc::clone(&service_auth);
                     async move {
                         let method = req.method().clone();
                         let uri = req.uri().clone();
                         let headers = req.headers().clone();
                         let resp = server
-                            .handle_checked_request(&guard, &method, &uri, &headers, options)
+                            .handle_checked_request(
+                                &guard,
+                                &method,
+                                &uri,
+                                &headers,
+                                options,
+                                Some(&auth_flag),
+                            )
                             .await;
                         Ok::<Response<ContentBody>, Infallible>(resp)
                     }
@@ -798,12 +1084,30 @@ impl AppContentServer {
                     .header_read_timeout(header_read_timeout)
                     .serve_connection(io, service);
                 tokio::pin!(conn);
-                tokio::select! {
-                    biased;
-                    () = conn_shutdown.cancelled() => {
-                        conn.as_mut().graceful_shutdown();
+                let unauth_deadline = tokio::time::sleep(unauth_timeout);
+                tokio::pin!(unauth_deadline);
+                let mut check_unauth = true;
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = conn_shutdown.cancelled() => {
+                            conn.as_mut().graceful_shutdown();
+                            let _ = conn.await;
+                            break;
+                        }
+                        () = conn_evict.cancelled() => {
+                            // Immediately drop an evicted unauthenticated socket without waiting
+                            // for its peer to finish headers.
+                            break;
+                        }
+                        () = &mut unauth_deadline, if check_unauth => {
+                            check_unauth = false;
+                            if !conn_authenticated.load(Ordering::Acquire) {
+                                break;
+                            }
+                        }
+                        _ = &mut conn => break,
                     }
-                    _ = &mut conn => {}
                 }
             });
         }
@@ -857,12 +1161,15 @@ impl AppContentServer {
         uri: &Uri,
         headers: &HeaderMap,
         options: ServeOptions,
+        conn_authenticated: Option<&AtomicBool>,
     ) -> Response<ContentBody> {
         self.touch_activity();
 
         let cors_origin = match guard.check(headers, uri) {
             Ok(origin) => origin,
-            Err(rejection) => return guard_error_response(rejection, options.corp),
+            Err(rejection) => {
+                return guard_error_response(rejection, options.corp);
+            }
         };
 
         if *method == Method::OPTIONS {
@@ -873,6 +1180,19 @@ impl AppContentServer {
             return not_found_response(options.corp, cors_origin);
         };
 
+        // Only track status, stream-failure state, and connection authentication for requests that
+        // present a real, live ticket. Requests with unknown, expired, or invalid tickets must
+        // never allocate status slots or keep a loopback socket alive past the unauthenticated
+        // header timeout.
+        let valid_ticket = self.tickets.lookup(ticket_id);
+        if valid_ticket.is_some()
+            && let Some(auth) = conn_authenticated
+        {
+            auth.store(true, Ordering::Release);
+        }
+        let key_hash = valid_ticket.as_ref().map(|t| t.key_hash);
+        let stream_failed = key_hash.map(|h| self.ensure_ticket_stream_flag(h));
+
         self.active_streams.fetch_add(1, Ordering::AcqRel);
         let active_guard = ActiveStreamGuard {
             active_streams: Arc::clone(&self.active_streams),
@@ -881,6 +1201,7 @@ impl AppContentServer {
         let hooks = StreamHooks {
             limiter: Some(self.limiter.clone()),
             bytes_served: None,
+            stream_failed,
             active_guard: Some(Box::new(active_guard)),
         };
 
@@ -897,10 +1218,25 @@ impl AppContentServer {
         )
         .await;
 
+        if response.status() == StatusCode::NOT_FOUND {
+            response
+                .headers_mut()
+                .insert(CONNECTION, HeaderValue::from_static("close"));
+        }
+
         if let Some(origin) = cors_origin {
             apply_cors_headers(response.headers_mut(), origin);
         }
 
+        if let Some(key_hash) = key_hash {
+            self.record_ticket_status(
+                key_hash,
+                response.status(),
+                response.headers(),
+                response.body().fixed_bytes(),
+                true,
+            );
+        }
         self.record_request_log(method, file_name, headers, &response);
         response
     }
@@ -982,6 +1318,42 @@ fn parse_content_path(path: &str) -> Option<(&str, &str)> {
     Some((ticket_id, file_name))
 }
 
+fn ticket_hash(ticket_id: &str) -> [u8; 32] {
+    *blake3::hash(ticket_id.as_bytes()).as_bytes()
+}
+
+fn extract_ticket_id_from_url(raw_url: &str) -> Option<&str> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    let path = if let Some(after_scheme) = without_query.split_once("://").map(|(_, rest)| rest) {
+        let slash = after_scheme.find('/')?;
+        &after_scheme[slash..]
+    } else {
+        without_query
+    };
+    parse_content_path(path).map(|(ticket_id, _)| ticket_id)
+}
+
+fn parse_proto_error_summary(raw: Option<&[u8]>) -> (Option<String>, Option<String>) {
+    let Some(bytes) = raw else {
+        return (None, None);
+    };
+    let Ok(err) = serde_json::from_slice::<ProtoErrorBody>(bytes) else {
+        return (None, None);
+    };
+    let code = serde_json::to_value(err.code)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned));
+    (code, Some(err.message))
+}
+
 fn apply_base_security_headers(headers: &mut HeaderMap, corp: CorpPolicy) {
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(
@@ -1056,6 +1428,9 @@ fn guard_error_response(rejection: GuardRejection, corp: CorpPolicy) -> Response
         .headers_mut()
         .insert(CONTENT_LENGTH, HeaderValue::from(len));
     response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
+    response
 }
 
 fn not_found_response(corp: CorpPolicy, cors_origin: Option<HeaderValue>) -> Response<ContentBody> {
@@ -1074,6 +1449,9 @@ fn not_found_response(corp: CorpPolicy, cors_origin: Option<HeaderValue>) -> Res
     response
         .headers_mut()
         .insert(CONTENT_LENGTH, HeaderValue::from(len));
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
     if let Some(origin) = cors_origin {
         apply_cors_headers(response.headers_mut(), origin);
     }
@@ -1212,15 +1590,26 @@ async fn collect_bounded_response(
                     out.extend_from_slice(&data);
                 }
             }
-            Err(_) => {
-                let msg = serde_json::to_vec(&ProtoErrorBody::new(
-                    ProtoErrorCode::Failed,
-                    "Content stream ended before completing.",
-                ))
-                .unwrap_or_default();
+            Err(err) => {
+                let (status, code, message) = if err.kind() == std::io::ErrorKind::PermissionDenied
+                {
+                    (
+                        StatusCode::GONE,
+                        ProtoErrorCode::NotFound,
+                        "Content stream expired or was evicted.",
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        ProtoErrorCode::Failed,
+                        "Content stream ended before completing.",
+                    )
+                };
+                let msg =
+                    serde_json::to_vec(&ProtoErrorBody::new(code, message)).unwrap_or_default();
                 let len = msg.len() as u64;
                 let mut err_resp = Response::new(msg);
-                *err_resp.status_mut() = StatusCode::BAD_GATEWAY;
+                *err_resp.status_mut() = status;
                 apply_base_security_headers(err_resp.headers_mut(), CorpPolicy::CrossOrigin);
                 err_resp
                     .headers_mut()
@@ -1282,68 +1671,141 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    enum MockStreamFault {
+        #[default]
+        None,
+        ErrorOnGet {
+            code: ProtoCode,
+            message: &'static str,
+        },
+        TruncateAfterBytes(usize),
+    }
+
     struct MemoryFilesOpener {
         files: Arc<HashMap<String, Vec<u8>>>,
+        window_policy: Option<legion_link::content::WindowPolicy>,
+        fault: Arc<Mutex<MockStreamFault>>,
     }
 
     impl StreamOpener for MemoryFilesOpener {
+        fn window_policy(&self) -> Option<legion_link::content::WindowPolicy> {
+            self.window_policy
+        }
+
         fn open_stream(
             &self,
             _cancel: CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>> {
             let files = Arc::clone(&self.files);
+            let supports_keep_open = self.window_policy.is_some();
+            let fault = Arc::clone(&self.fault);
             Box::pin(async move {
                 let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
                 let (server_in, client_out) = tokio::io::duplex(64 * 1024);
                 let cancel = CancellationToken::new();
+                let park = CancellationToken::new();
+                let watch_cancel = cancel.clone();
+                let watch_park = park.clone();
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(server_in);
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    let mut sent_protocol = false;
+                    loop {
+                        let mut line = String::new();
+                        let read_res = tokio::select! {
+                            biased;
+                            () = watch_cancel.cancelled() => return,
+                            () = watch_park.cancelled() => return,
+                            res = reader.read_line(&mut line) => res,
+                        };
+                        if read_res.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        if !sent_protocol {
+                            let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                            sent_protocol = true;
+                        }
+                        let path = req["path"].as_str().unwrap_or("");
+                        let Some(payload) = files.get(path) else {
+                            let err = json!({
+                                "error": ErrorBody::new(ProtoCode::NotFound, "file not found")
+                            });
+                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                            return;
+                        };
+                        let offset = req["offset"].as_u64().unwrap_or(0) as usize;
+                        let req_len = req
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize);
+                        let active_fault = fault.lock().unwrap().clone();
+                        if let MockStreamFault::ErrorOnGet { code, message } = active_fault {
+                            let err = json!({ "error": ErrorBody::new(code, message) });
+                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                            return;
+                        }
+                        if offset > payload.len() {
+                            let err = json!({
+                                "error": ErrorBody::new(ProtoCode::Conflict, "offset past end")
+                                    .with_details(json!({"actual": payload.len()}))
+                            });
+                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                            return;
+                        }
+                        let avail = payload.len() - offset;
+                        let len = req_len.map_or(avail, |n| n.min(avail));
+                        let keep_open =
+                            supports_keep_open && req["keep_open"].as_bool() == Some(true);
+                        let mut ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": len,
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": 77u64,
+                        });
+                        if keep_open {
+                            ready["keep_open"] = Value::Bool(true);
+                        }
+                        if server_out
+                            .write_all(format!("{ready}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if let MockStreamFault::TruncateAfterBytes(cut) = active_fault
+                            && len > cut
+                        {
+                            let _ = server_out.write_all(&payload[offset..offset + cut]).await;
+                            let _ = server_out.shutdown().await;
+                            return;
+                        }
+                        let write_ok = tokio::select! {
+                            biased;
+                            () = watch_cancel.cancelled() => false,
+                            () = watch_park.cancelled() => false,
+                            res = server_out.write_all(&payload[offset..offset + len]) => res.is_ok(),
+                        };
+                        if !write_ok {
+                            return;
+                        }
+                        if keep_open {
+                            if server_out.write_all(b"{\"done\":true}\n").await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        let _ = server_out.shutdown().await;
                         return;
                     }
-                    let req: Value = serde_json::from_str(&line).unwrap();
-                    let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
-                    let path = req["path"].as_str().unwrap_or("");
-                    let Some(payload) = files.get(path) else {
-                        let err = json!({
-                            "error": ErrorBody::new(ProtoCode::NotFound, "file not found")
-                        });
-                        let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
-                        return;
-                    };
-                    let offset = req["offset"].as_u64().unwrap_or(0) as usize;
-                    let req_len = req
-                        .get("length")
-                        .and_then(Value::as_u64)
-                        .map(|n| n as usize);
-                    if offset > payload.len() {
-                        let err = json!({
-                            "error": ErrorBody::new(ProtoCode::Conflict, "offset past end")
-                                .with_details(json!({"actual": payload.len()}))
-                        });
-                        let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
-                        return;
-                    }
-                    let avail = payload.len() - offset;
-                    let len = req_len.map_or(avail, |n| n.min(avail));
-                    let ready = json!({
-                        "size": payload.len(),
-                        "offset": offset,
-                        "length": len,
-                        "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
-                        "file_id": 77u64,
-                    });
-                    let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
-                    let _ = server_out.write_all(&payload[offset..offset + len]).await;
-                    let _ = server_out.shutdown().await;
                 });
                 Ok(RawStream {
                     reader: Box::new(client_in),
                     writer: Box::new(client_out),
                     stderr: None,
                     cancel,
-                    park: None,
+                    park: Some(park),
                     guard: None,
                 })
             })
@@ -1354,12 +1816,24 @@ mod tests {
         link: Link,
         live: Arc<AtomicBool>,
         holder: String,
+        fault: Arc<Mutex<MockStreamFault>>,
     }
 
     impl MockContentBackend {
         fn new(files: HashMap<String, Vec<u8>>) -> Self {
+            Self::with_options(files, LinkOptions::default(), None)
+        }
+
+        fn with_options(
+            files: HashMap<String, Vec<u8>>,
+            link_options: LinkOptions,
+            window_policy: Option<legion_link::content::WindowPolicy>,
+        ) -> Self {
+            let fault = Arc::new(Mutex::new(MockStreamFault::None));
             let opener_files = Arc::new(MemoryFilesOpener {
                 files: Arc::new(files),
+                window_policy,
+                fault: Arc::clone(&fault),
             });
             let session_opener: SessionOpener = Arc::new(move |entry, _, cancel| {
                 let opener_files = Arc::clone(&opener_files);
@@ -1425,9 +1899,10 @@ mod tests {
                 ..LinkConfig::default()
             };
             Self {
-                link: Link::with_opener(cfg, LinkOptions::default(), session_opener),
+                link: Link::with_opener(cfg, link_options, session_opener),
                 live: Arc::new(AtomicBool::new(true)),
                 holder: "pairing:tower:1".to_owned(),
+                fault,
             }
         }
     }
@@ -1820,7 +2295,7 @@ mod tests {
             Duration::from_secs(30),
             vec!["tauri://localhost".to_owned()],
             2,
-            Duration::from_millis(200),
+            Duration::from_millis(400),
             CUSTOM_SCHEME_MAX_FULL_BYTES,
             CUSTOM_SCHEME_TOTAL_MEMORY_BUDGET_BYTES,
         ));
@@ -1835,35 +2310,52 @@ mod tests {
             .strip_prefix(&format!("http://127.0.0.1:{port}"))
             .unwrap();
 
-        // Slowloris header-read timeout: send incomplete HTTP headers and verify server closes
-        // promptly after 200ms rather than holding the slot open forever.
-        let mut slow1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        slow1.write_all(b"GET /v1/content/").await.unwrap();
-        let mut slow2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        slow2.write_all(b"GET /v1/content/").await.unwrap();
-        // Give accept loop a moment to register both permits.
-        tokio::time::sleep(Duration::from_millis(40)).await;
-
-        // Third simultaneous connection exceeds the cap of 2 and is closed immediately.
-        let mut overflow = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let mut byte = [0u8; 1];
-        let overflow_read =
-            tokio::time::timeout(Duration::from_millis(120), overflow.read(&mut byte)).await;
-        assert!(
-            matches!(overflow_read, Ok(Ok(0)) | Ok(Err(_))),
-            "excess connection above cap should be dropped immediately, got {overflow_read:?}"
-        );
-
-        // After the 200ms header read timeout expires, slowloris sockets close and normal
-        // requests succeed again.
+        // 1) Slowloris header-read timeout: send incomplete HTTP headers and verify server closes
+        // promptly after the configured timeout rather than holding the slot open forever.
+        let mut slow = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        slow.write_all(b"GET /v1/content/").await.unwrap();
         let mut sink = Vec::new();
         let slow_closed =
-            tokio::time::timeout(Duration::from_secs(2), slow1.read_to_end(&mut sink)).await;
+            tokio::time::timeout(Duration::from_secs(2), slow.read_to_end(&mut sink)).await;
         assert!(
             slow_closed.is_ok(),
             "slowloris socket must time out and close"
         );
-        drop(slow2);
+
+        // 2) Authenticated connection cap: when both slots are held by authenticated keep-alive
+        // sockets, a third simultaneous connection exceeds the cap of 2 and is dropped immediately.
+        let keep_alive_req = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\n"
+        );
+        let mut auth1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        auth1.write_all(keep_alive_req.as_bytes()).await.unwrap();
+        let mut auth2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        auth2.write_all(keep_alive_req.as_bytes()).await.unwrap();
+        // Wait for both responses to finish so both slots are marked authenticated and idle on keep-alive.
+        let mut buf1 = [0u8; 1024];
+        let mut buf2 = [0u8; 1024];
+        let n1 = tokio::time::timeout(Duration::from_millis(300), auth1.read(&mut buf1))
+            .await
+            .unwrap()
+            .unwrap();
+        let n2 = tokio::time::timeout(Duration::from_millis(300), auth2.read(&mut buf2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&buf1[..n1]).contains("200 OK"));
+        assert!(String::from_utf8_lossy(&buf2[..n2]).contains("200 OK"));
+
+        let mut overflow = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut byte = [0u8; 1];
+        let overflow_read =
+            tokio::time::timeout(Duration::from_millis(150), overflow.read(&mut byte)).await;
+        assert!(
+            matches!(overflow_read, Ok(Ok(0)) | Ok(Err(_))),
+            "excess connection above authenticated cap should be dropped immediately, got {overflow_read:?}"
+        );
+        drop(auth1);
+        drop(auth2);
+        tokio::time::sleep(Duration::from_millis(30)).await;
 
         let (status, _, body) = raw_http(
             port,
@@ -2023,20 +2515,97 @@ mod tests {
 
     #[tokio::test]
     async fn html_and_svg_carry_sandbox_csp_nosniff_and_safe_content_types_on_both_mounts() {
+        fn assert_raw_security_headers(head: &str, expected_ct: Option<&str>) {
+            let lower = head.to_ascii_lowercase();
+            assert!(
+                lower.contains("x-content-type-options: nosniff"),
+                "missing nosniff: {head}"
+            );
+            assert!(
+                lower.contains(
+                    "content-security-policy: sandbox; default-src 'none'; frame-ancestors 'none'"
+                ),
+                "missing sandbox CSP: {head}"
+            );
+            assert!(
+                lower.contains("cross-origin-resource-policy: cross-origin"),
+                "missing CORP: {head}"
+            );
+            assert!(
+                lower.contains("cache-control: private, no-store"),
+                "missing private, no-store: {head}"
+            );
+            assert!(
+                !lower.contains("content-type: text/html"),
+                "content response must never emit text/html: {head}"
+            );
+            if let Some(ct) = expected_ct {
+                assert!(
+                    lower.contains(&format!("content-type: {ct}")),
+                    "expected content-type {ct}: {head}"
+                );
+            }
+        }
+
+        fn assert_response_security_headers<B>(resp: &Response<B>, expected_ct: Option<&str>) {
+            assert_eq!(
+                resp.headers()
+                    .get(X_CONTENT_TYPE_OPTIONS)
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff")
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(CONTENT_SECURITY_POLICY)
+                    .and_then(|v| v.to_str().ok()),
+                Some(CONTENT_SANDBOX_CSP)
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(CROSS_ORIGIN_RESOURCE_POLICY)
+                    .and_then(|v| v.to_str().ok()),
+                Some("cross-origin")
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("private, no-store")
+            );
+            let actual_ct = resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_ascii_lowercase);
+            assert!(
+                !actual_ct
+                    .as_deref()
+                    .is_some_and(|ct| ct.contains("text/html")),
+                "content response must never emit text/html: {actual_ct:?}"
+            );
+            if let Some(ct) = expected_ct {
+                assert_eq!(actual_ct.as_deref(), Some(ct));
+            }
+        }
+
+        let html_bytes =
+            b"<html><script>window.__TAURI__.core.invoke('state')</script></html>".to_vec();
+        let mut large_html = Vec::with_capacity(128 * 1024);
+        while large_html.len() < 128 * 1024 {
+            large_html.extend_from_slice(&html_bytes);
+        }
+        large_html.truncate(128 * 1024);
+        let svg_bytes =
+            b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>".to_vec();
         let mut files = HashMap::new();
-        files.insert(
-            "/home/me/evil.html".to_owned(),
-            b"<html><script>window.__TAURI__.core.invoke('state')</script></html>".to_vec(),
-        );
-        files.insert(
-            "/home/me/evil.svg".to_owned(),
-            b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>".to_vec(),
-        );
+        files.insert("/home/me/evil.html".to_owned(), html_bytes.clone());
+        files.insert("/home/me/evil-large.html".to_owned(), large_html.clone());
+        files.insert("/home/me/evil.svg".to_owned(), svg_bytes.clone());
 
         // 1) Loopback mount (desktop & iOS).
         let lb_backend = Arc::new(MockContentBackend::new(files.clone()));
         let lb = Arc::new(AppContentServer::with_config(
-            lb_backend,
+            Arc::clone(&lb_backend) as Arc<dyn Backend>,
             ContentMountMode::Loopback,
             TicketConfig::default(),
             Duration::from_secs(30),
@@ -2051,13 +2620,23 @@ mod tests {
             .await
             .unwrap();
         let port = lb.loopback_port().unwrap();
-        for (url, expected_ct) in [
-            (&lb_html.url, "content-type: text/plain; charset=utf-8"),
-            (&lb_svg.url, "content-type: image/svg+xml"),
+        let lb_html_path = lb_html
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        let lb_svg_path = lb_svg
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+
+        // 200 OK & 206 Partial Content for both HTML and SVG.
+        let mut html_etag = String::new();
+        for (path, expected_ct) in [
+            (lb_html_path.as_str(), "text/plain; charset=utf-8"),
+            (lb_svg_path.as_str(), "image/svg+xml"),
         ] {
-            let path = url
-                .strip_prefix(&format!("http://127.0.0.1:{port}"))
-                .unwrap();
             let (status, head, _) = raw_http(
                 port,
                 &format!(
@@ -2065,27 +2644,218 @@ mod tests {
                 ),
             )
             .await;
-            assert_eq!(status, 200);
-            let lower = head.to_ascii_lowercase();
-            assert!(lower.contains(expected_ct), "{head}");
-            assert!(lower.contains("x-content-type-options: nosniff"), "{head}");
-            assert!(
-                lower.contains(
-                    "content-security-policy: sandbox; default-src 'none'; frame-ancestors 'none'"
+            assert_eq!(status, 200, "{head}");
+            assert_raw_security_headers(&head, Some(expected_ct));
+            if path == lb_html_path {
+                for line in head.lines() {
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("etag")
+                    {
+                        html_etag = v.trim().to_owned();
+                    }
+                }
+            }
+
+            let (status206, head206, _) = raw_http(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=0-7\r\nConnection: close\r\n\r\n"
                 ),
-                "{head}"
-            );
+            )
+            .await;
+            assert_eq!(status206, 206, "{head206}");
+            assert_raw_security_headers(&head206, Some(expected_ct));
         }
+
+        // Conditional If-None-Match: responses are `Cache-Control: private, no-store`, so no
+        // unguarded 304 is returned — returns 200 with full sandbox headers.
+        assert!(!html_etag.is_empty());
+        let (status_cond, head_cond, _) = raw_http(
+            port,
+            &format!(
+                "GET {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nIf-None-Match: {html_etag}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status_cond, 200, "{head_cond}");
+        assert_raw_security_headers(&head_cond, Some("text/plain; charset=utf-8"));
+
+        // 403 Forbidden (bad Origin), 421 Misdirected Request (bad Host), 405 Method Not Allowed.
+        let (status403, head403, _) = raw_http(
+            port,
+            &format!(
+                "GET {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status403, 403, "{head403}");
+        assert_raw_security_headers(&head403, Some("application/json"));
+
+        let (status421, head421, _) = raw_http(
+            port,
+            &format!("GET {lb_html_path} HTTP/1.1\r\nHost: evil.example:{port}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status421, 421, "{head421}");
+        assert_raw_security_headers(&head421, Some("application/json"));
+
+        let (status405, head405, _) = raw_http(
+            port,
+            &format!("POST {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status405, 405, "{head405}");
+        assert_raw_security_headers(&head405, Some("application/json"));
+
+        // 404 Not Found (unknown ticket and unknown route).
+        for bad_path in [
+            "/v1/content/doesnotexist/evil.html",
+            "/not-content/evil.html",
+        ] {
+            let (status404, head404, _) = raw_http(
+                port,
+                &format!(
+                    "GET {bad_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await;
+            assert_eq!(status404, 404, "{head404}");
+            assert_raw_security_headers(&head404, Some("application/json"));
+        }
+
+        // 413 Payload Too Large (via handle_checked_request with max_full_bytes).
+        let lb_guard = HostOriginGuard {
+            port,
+            allowed_hosts: Vec::new(),
+            allowed_origins: vec!["tauri://localhost".to_owned()],
+            allow_same_origin: false,
+        };
+        let mut lb_headers = HeaderMap::new();
+        lb_headers.insert(
+            HOST,
+            HeaderValue::from_str(&format!("127.0.0.1:{port}")).unwrap(),
+        );
+        let resp413 = lb
+            .handle_checked_request(
+                &lb_guard,
+                &Method::GET,
+                &lb_html_path.parse::<Uri>().unwrap(),
+                &lb_headers,
+                ServeOptions {
+                    corp: CorpPolicy::CrossOrigin,
+                    max_full_bytes: Some(8),
+                    ..ServeOptions::default()
+                },
+                None,
+            )
+            .await;
+        assert_eq!(resp413.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_response_security_headers(&resp413, Some("application/json"));
+
+        // 416 Range Not Satisfiable.
+        let (status416, head416, _) = raw_http(
+            port,
+            &format!(
+                "GET {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=99999-\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status416, 416, "{head416}");
+        assert_raw_security_headers(&head416, None);
+
+        // 429 Too Many Requests (saturate holder permits using distinct ticket hashes).
+        let mut held = Vec::new();
+        for idx in 0u8..64 {
+            let mut key_hash = [0xAAu8; 32];
+            key_hash[0] = idx;
+            match lb.limiter.try_acquire(key_hash, "pairing:tower:1") {
+                Ok(permit) => held.push(permit),
+                Err(_) => break,
+            }
+        }
+        let (status429, head429, _) = raw_http(
+            port,
+            &format!(
+                "GET {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        drop(held);
+        assert_eq!(status429, 429, "{head429}");
+        assert_raw_security_headers(&head429, Some("application/json"));
+
+        // 502 Bad Gateway (upstream unreachable) & 503 Service Unavailable (upstream busy).
+        *lb_backend.fault.lock().unwrap() = MockStreamFault::ErrorOnGet {
+            code: ProtoCode::Unreachable,
+            message: "machine unreachable",
+        };
+        let (status502, head502, _) = raw_http(
+            port,
+            &format!(
+                "GET {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status502, 502, "{head502}");
+        assert_raw_security_headers(&head502, Some("application/json"));
+
+        *lb_backend.fault.lock().unwrap() = MockStreamFault::ErrorOnGet {
+            code: ProtoCode::Busy,
+            message: "all stream slots busy",
+        };
+        let (status503, head503, _) = raw_http(
+            port,
+            &format!(
+                "GET {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status503, 503, "{head503}");
+        assert_raw_security_headers(&head503, Some("application/json"));
+
+        // Aborted body mid-stream on loopback: pre-abort headers carry sandbox CSP, nosniff, and
+        // text/plain, and the connection aborts strictly before Content-Length with no error HTML.
+        *lb_backend.fault.lock().unwrap() = MockStreamFault::None;
+        let lb_large_html = lb
+            .mint_url("tower", "/home/me/evil-large.html", false)
+            .await
+            .unwrap();
+        let lb_large_path = lb_large_html
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        *lb_backend.fault.lock().unwrap() = MockStreamFault::TruncateAfterBytes(70 * 1024);
+        let (status_abort, head_abort, body_abort) = raw_http(
+            port,
+            &format!(
+                "GET {lb_large_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        *lb_backend.fault.lock().unwrap() = MockStreamFault::None;
+        assert_eq!(status_abort, 200, "{head_abort}");
+        assert_raw_security_headers(&head_abort, Some("text/plain; charset=utf-8"));
+        assert!(
+            body_abort.len() < large_html.len(),
+            "aborted loopback body must terminate early ({} vs {})",
+            body_abort.len(),
+            large_html.len()
+        );
         lb.shutdown();
 
         // 2) Custom-scheme mount (Android).
         let cs_backend = Arc::new(MockContentBackend::new(files));
-        let cs = Arc::new(AppContentServer::with_config(
-            cs_backend,
+        let cs = Arc::new(AppContentServer::with_limits(
+            Arc::clone(&cs_backend) as Arc<dyn Backend>,
             ContentMountMode::CustomScheme,
             TicketConfig::default(),
             Duration::from_secs(30),
             vec!["http://tauri.localhost".to_owned()],
+            MAX_LOOPBACK_CONNECTIONS,
+            LOOPBACK_HEADER_READ_TIMEOUT,
+            1024,
+            64 * 1024,
         ));
         let cs_html = cs
             .mint_url("tower", "/home/me/evil.html", false)
@@ -2095,6 +2865,9 @@ mod tests {
             .mint_url("tower", "/home/me/evil.svg", false)
             .await
             .unwrap();
+
+        // 200 OK & 206 Partial Content for both HTML and SVG.
+        let mut cs_html_etag = HeaderValue::from_static("");
         for (url, expected_ct) in [
             (&cs_html.url, "text/plain; charset=utf-8"),
             (&cs_svg.url, "image/svg+xml"),
@@ -2106,21 +2879,232 @@ mod tests {
                 .unwrap();
             let resp = cs.handle_custom_scheme(req).await;
             assert_eq!(resp.status(), StatusCode::OK);
-            assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), expected_ct);
-            assert_eq!(
-                resp.headers().get(X_CONTENT_TYPE_OPTIONS).unwrap(),
-                "nosniff"
-            );
-            assert_eq!(
-                resp.headers().get(CONTENT_SECURITY_POLICY).unwrap(),
-                CONTENT_SANDBOX_CSP
-            );
+            assert_response_security_headers(&resp, Some(expected_ct));
+            if url == &cs_html.url {
+                cs_html_etag = resp.headers().get(http::header::ETAG).unwrap().clone();
+            }
+
+            let req206 = Request::builder()
+                .method(Method::GET)
+                .uri(url)
+                .header(RANGE, "bytes=0-7")
+                .body(Vec::new())
+                .unwrap();
+            let resp206 = cs.handle_custom_scheme(req206).await;
+            assert_eq!(resp206.status(), StatusCode::PARTIAL_CONTENT);
+            assert_response_security_headers(&resp206, Some(expected_ct));
+        }
+
+        // Conditional If-None-Match on custom scheme -> 200 OK (no 304, no-store preserved).
+        let req_cond = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .header("if-none-match", cs_html_etag)
+            .body(Vec::new())
+            .unwrap();
+        let resp_cond = cs.handle_custom_scheme(req_cond).await;
+        assert_eq!(resp_cond.status(), StatusCode::OK);
+        assert_response_security_headers(&resp_cond, Some("text/plain; charset=utf-8"));
+
+        // 403, 421, 405, 404 on custom scheme.
+        let req403 = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .header("origin", "https://evil.example")
+            .body(Vec::new())
+            .unwrap();
+        let resp403 = cs.handle_custom_scheme(req403).await;
+        assert_eq!(resp403.status(), StatusCode::FORBIDDEN);
+        assert_response_security_headers(&resp403, Some("application/json"));
+
+        let req421 = Request::builder()
+            .method(Method::GET)
+            .uri("http://evil.example/v1/content/tok/evil.html")
+            .body(Vec::new())
+            .unwrap();
+        let resp421 = cs.handle_custom_scheme(req421).await;
+        assert_eq!(resp421.status(), StatusCode::MISDIRECTED_REQUEST);
+        assert_response_security_headers(&resp421, Some("application/json"));
+
+        let req405 = Request::builder()
+            .method(Method::POST)
+            .uri(&cs_html.url)
+            .body(Vec::new())
+            .unwrap();
+        let resp405 = cs.handle_custom_scheme(req405).await;
+        assert_eq!(resp405.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_response_security_headers(&resp405, Some("application/json"));
+
+        for bad_uri in [
+            "http://legion-content.localhost/v1/content/doesnotexist/evil.html",
+            "http://legion-content.localhost/not-content/evil.html",
+        ] {
+            let req404 = Request::builder()
+                .method(Method::GET)
+                .uri(bad_uri)
+                .body(Vec::new())
+                .unwrap();
+            let resp404 = cs.handle_custom_scheme(req404).await;
+            assert_eq!(resp404.status(), StatusCode::NOT_FOUND);
+            assert_response_security_headers(&resp404, Some("application/json"));
+        }
+
+        // 413 Payload Too Large on custom scheme (max_full_bytes = 8 < html_bytes.len()).
+        let cs_small = Arc::new(AppContentServer::with_limits(
+            Arc::clone(&cs_backend) as Arc<dyn Backend>,
+            ContentMountMode::CustomScheme,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+            MAX_LOOPBACK_CONNECTIONS,
+            LOOPBACK_HEADER_READ_TIMEOUT,
+            8,
+            64 * 1024,
+        ));
+        let cs_small_html = cs_small
+            .mint_url("tower", "/home/me/evil.html", false)
+            .await
+            .unwrap();
+        let req413 = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_small_html.url)
+            .body(Vec::new())
+            .unwrap();
+        let resp413 = cs_small.handle_custom_scheme(req413).await;
+        assert_eq!(resp413.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_response_security_headers(&resp413, Some("application/json"));
+
+        // 416 Range Not Satisfiable on custom scheme.
+        let req416 = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .header(RANGE, "bytes=99999-")
+            .body(Vec::new())
+            .unwrap();
+        let resp416 = cs.handle_custom_scheme(req416).await;
+        assert_eq!(resp416.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_response_security_headers(&resp416, None);
+
+        // 429 Too Many Requests on custom scheme (saturate holder permits).
+        let mut cs_held = Vec::new();
+        for idx in 0u8..64 {
+            let mut key_hash = [0xBBu8; 32];
+            key_hash[0] = idx;
+            match cs.limiter.try_acquire(key_hash, "pairing:tower:1") {
+                Ok(permit) => cs_held.push(permit),
+                Err(_) => break,
+            }
+        }
+        let req429 = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .body(Vec::new())
+            .unwrap();
+        let resp429 = cs.handle_custom_scheme(req429).await;
+        drop(cs_held);
+        assert_eq!(resp429.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_response_security_headers(&resp429, Some("application/json"));
+
+        // 502 Bad Gateway (upstream unreachable) & 503 Service Unavailable (upstream busy).
+        *cs_backend.fault.lock().unwrap() = MockStreamFault::ErrorOnGet {
+            code: ProtoCode::Unreachable,
+            message: "machine unreachable",
+        };
+        let req502 = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .body(Vec::new())
+            .unwrap();
+        let resp502 = cs.handle_custom_scheme(req502).await;
+        assert_eq!(resp502.status(), StatusCode::BAD_GATEWAY);
+        assert_response_security_headers(&resp502, Some("application/json"));
+
+        *cs_backend.fault.lock().unwrap() = MockStreamFault::ErrorOnGet {
+            code: ProtoCode::Busy,
+            message: "all stream slots busy",
+        };
+        let req503 = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .body(Vec::new())
+            .unwrap();
+        let resp503 = cs.handle_custom_scheme(req503).await;
+        assert_eq!(resp503.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_response_security_headers(&resp503, Some("application/json"));
+
+        // Aborted body on custom scheme -> 502 Bad Gateway (EOF/I/O error) and 410 Gone
+        // (PermissionDenied / evicted parked stream), both carrying full security headers.
+        *cs_backend.fault.lock().unwrap() = MockStreamFault::TruncateAfterBytes(10);
+        let req_abort = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .body(Vec::new())
+            .unwrap();
+        let resp_abort = cs.handle_custom_scheme(req_abort).await;
+        *cs_backend.fault.lock().unwrap() = MockStreamFault::None;
+        assert_eq!(resp_abort.status(), StatusCode::BAD_GATEWAY);
+        assert_response_security_headers(&resp_abort, Some("application/json"));
+
+        // 410 Gone on custom scheme when a parked stream is evicted mid-body.
+        struct EvictedReader;
+        impl tokio::io::AsyncRead for EvictedReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Content stream was closed while idle.",
+                )))
+            }
+        }
+        let budget = Arc::new(tokio::sync::Semaphore::new(16));
+        let buffered = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let resp410 = collect_bounded_response(
+            Response::new(ContentBody::stream(Box::new(EvictedReader), 64)),
+            1024,
+            &budget,
+            &buffered,
+            &peak,
+        )
+        .await;
+        assert_eq!(resp410.status(), StatusCode::GONE);
+        assert_response_security_headers(&resp410, Some("application/json"));
+    }
+
+    async fn read_http_head_and_prefix(
+        stream: &mut TcpStream,
+        min_body_bytes: usize,
+    ) -> (u16, String, Vec<u8>) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "unexpected EOF before response headers");
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let body_start = split + 4;
+                if buf.len() - body_start >= min_body_bytes {
+                    let head = String::from_utf8_lossy(&buf[..split]).into_owned();
+                    let status: u16 = head
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    return (status, head, buf[body_start..].to_vec());
+                }
+            }
         }
     }
 
     #[tokio::test]
-    async fn relayed_picture_and_ranged_media_work_on_loopback_and_custom_scheme_then_switch_to_direct()
-     {
+    async fn relayed_picture_and_ranged_media_work_on_loopback_then_switch_to_direct() {
         use std::sync::atomic::AtomicUsize;
 
         let png_bytes = vec![
@@ -2413,13 +3397,17 @@ mod tests {
             live: Arc::clone(&live),
         });
 
-        // 1) Loopback mount (desktop/iOS): picture GET + ranged media read on `studio` via relay `tower`.
+        // 1) Universal loopback mount (desktop, iOS, and Android): picture GET + ranged media
+        // reads on `studio` via relay `tower`, with both desktop and Android origins allowed.
         let lb = Arc::new(AppContentServer::with_config(
             backend.clone(),
             ContentMountMode::Loopback,
             TicketConfig::default(),
             Duration::from_secs(30),
-            vec!["tauri://localhost".to_owned()],
+            vec![
+                "tauri://localhost".to_owned(),
+                "http://tauri.localhost".to_owned(),
+            ],
         ));
         let pic = lb
             .mint_url("studio", "/home/me/photo.png", false)
@@ -2430,14 +3418,14 @@ mod tests {
             .url
             .strip_prefix(&format!("http://127.0.0.1:{lb_port}"))
             .unwrap();
-        let (status, _, body) = raw_http(
+        let (status, head, body) = raw_http(
             lb_port,
             &format!(
-                "GET {pic_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nConnection: close\r\n\r\n"
+                "GET {pic_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nOrigin: http://tauri.localhost\r\nConnection: close\r\n\r\n"
             ),
         )
         .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 200, "{head}");
         assert_eq!(body, png_bytes);
 
         let vid = lb
@@ -2448,92 +3436,1043 @@ mod tests {
             .url
             .strip_prefix(&format!("http://127.0.0.1:{lb_port}"))
             .unwrap();
-        let (rstatus, _, rbody) = raw_http(
+        let (rstatus, rhead, rbody) = raw_http(
             lb_port,
             &format!(
-                "GET {vid_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nRange: bytes=4096-12287\r\nConnection: close\r\n\r\n"
+                "GET {vid_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nOrigin: http://tauri.localhost\r\nRange: bytes=4096-12287\r\nConnection: close\r\n\r\n"
             ),
         )
         .await;
-        assert_eq!(rstatus, 206);
+        assert_eq!(rstatus, 206, "{rhead}");
         assert_eq!(rbody, &media_bytes[4096..=12287]);
 
-        // 2) Custom-scheme mount (Android): picture + ranged media read on `studio` via relay `tower`.
-        let cs = Arc::new(AppContentServer::with_config(
-            backend.clone(),
-            ContentMountMode::CustomScheme,
+        let (rstatus2, rhead2, rbody2) = raw_http(
+            lb_port,
+            &format!(
+                "GET {vid_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nOrigin: http://tauri.localhost\r\nRange: bytes=16384-32767\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(rstatus2, 206, "{rhead2}");
+        assert_eq!(rbody2, &media_bytes[16384..=32767]);
+        assert!(relay_hits.load(Ordering::SeqCst) >= 3);
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+
+        // 2) Learn a direct route to `studio` -> subsequent reads on the active `fleet:` ticket
+        // switch seamlessly to direct without reminting!
+        let learned = link.learn().await.unwrap();
+        assert_eq!(learned.added, vec!["studio".to_owned()]);
+        let relay_before = relay_hits.load(Ordering::SeqCst);
+        let (dstatus, dhead, dbody) = raw_http(
+            lb_port,
+            &format!(
+                "GET {vid_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nOrigin: http://tauri.localhost\r\nRange: bytes=0-1023\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(dstatus, 206, "{dhead}");
+        assert_eq!(dbody, &media_bytes[0..=1023]);
+        assert_eq!(relay_hits.load(Ordering::SeqCst), relay_before);
+        assert!(direct_hits.load(Ordering::SeqCst) >= 1);
+
+        // 3) Unpairing revokes the holder -> relayed ticket is refused with 404 (TicketRevoked).
+        live.store(false, Ordering::SeqCst);
+        let (rev_status, rev_head, _) = raw_http(
+            lb_port,
+            &format!(
+                "GET {pic_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nOrigin: http://tauri.localhost\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(rev_status, 404, "{rev_head}");
+
+        lb.shutdown();
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn evicted_parked_stream_aborts_loopback_cleanly_and_fresh_ticket_recovers() {
+        // Large enough to exceed loopback kernel TCP send/recv buffers so a paused client pauses
+        // hyper body polling and triggers ContentStream's 2-second idle park.
+        let payload: Vec<u8> = (0..(12 * 1024 * 1024))
+            .map(|i| ((i * 29 + 13) % 251) as u8)
+            .collect();
+        let mut files = HashMap::new();
+        files.insert("/home/me/movie.bin".to_owned(), payload.clone());
+
+        let backend = Arc::new(MockContentBackend::with_options(
+            files,
+            LinkOptions {
+                max_parked_streams: 1,
+                ..LinkOptions::default()
+            },
+            Some(legion_link::content::WindowPolicy {
+                initial_bytes: 256 * 1024,
+                max_bytes: 256 * 1024,
+            }),
+        ));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["tauri://localhost".to_owned()],
+        ));
+
+        let t1 = server
+            .mint_url("tower", "/home/me/movie.bin", false)
+            .await
+            .unwrap();
+        let t2 = server
+            .mint_url("tower", "/home/me/movie.bin", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let path1 = t1
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+        let path2 = t2
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+
+        // Start stream 1, read response headers + a small prefix, then pause past the 2s park timer.
+        let mut s1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s1.write_all(
+            format!("GET {path1} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let (status1, head1, mut body1) = read_http_head_and_prefix(&mut s1, 4096).await;
+        assert_eq!(status1, 200, "{head1}");
+        assert!(
+            head1
+                .to_ascii_lowercase()
+                .contains(&format!("content-length: {}", payload.len())),
+            "{head1}"
+        );
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+
+        // Start stream 2, pause past the 2s park timer so it parks and evicts stream 1 from the
+        // cap-1 ParkedStreamPool.
+        let mut s2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s2.write_all(
+            format!("GET {path2} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let (status2, head2, _body2) = read_http_head_and_prefix(&mut s2, 4096).await;
+        assert_eq!(status2, 200, "{head2}");
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+
+        // Resuming stream 1 must abort cleanly strictly before Content-Length rather than hanging
+        // or delivering corrupted bytes.
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            match s1.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body1.extend_from_slice(&chunk[..n]),
+            }
+        }
+        assert!(
+            body1.len() < payload.len(),
+            "evicted parked stream must abort before full Content-Length ({} vs {})",
+            body1.len(),
+            payload.len()
+        );
+        assert_eq!(body1, &payload[..body1.len()]);
+
+        // Minting a fresh ticket (what FilesViewer does on media error) recovers the exact tail.
+        let t3 = server
+            .mint_url("tower", "/home/me/movie.bin", false)
+            .await
+            .unwrap();
+        let path3 = t3
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+        let (status3, head3, rest) = raw_http(
+            port,
+            &format!(
+                "GET {path3} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes={}-\r\nConnection: close\r\n\r\n",
+                body1.len()
+            ),
+        )
+        .await;
+        assert_eq!(status3, 206, "{head3}");
+        body1.extend_from_slice(&rest);
+        assert_eq!(body1.len(), payload.len());
+        assert_eq!(body1, payload);
+
+        drop(s2);
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn custom_scheme_maps_evicted_parked_stream_to_410_gone() {
+        struct FailAfterPrefix {
+            prefix: Option<Vec<u8>>,
+            kind: std::io::ErrorKind,
+        }
+
+        impl tokio::io::AsyncRead for FailAfterPrefix {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if let Some(prefix) = self.prefix.take() {
+                    buf.put_slice(&prefix);
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    self.kind,
+                    "Content stream was closed while idle.",
+                )))
+            }
+        }
+
+        let budget = Arc::new(tokio::sync::Semaphore::new(64));
+        let buffered = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+
+        // 1) Evicted parked stream (PermissionDenied) -> 410 Gone with full security headers.
+        let mut ok_resp = Response::new(ContentBody::stream(
+            Box::new(FailAfterPrefix {
+                prefix: Some(b"partial".to_vec()),
+                kind: std::io::ErrorKind::PermissionDenied,
+            }),
+            1024,
+        ));
+        *ok_resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+        ok_resp
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("1024"));
+        let evicted =
+            collect_bounded_response(ok_resp, 1024 * 1024, &budget, &buffered, &peak).await;
+        assert_eq!(evicted.status(), StatusCode::GONE);
+        assert_eq!(
+            evicted.headers().get(X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            evicted.headers().get(CONTENT_SECURITY_POLICY).unwrap(),
+            CONTENT_SANDBOX_CSP
+        );
+        assert_eq!(
+            evicted.headers().get(CROSS_ORIGIN_RESOURCE_POLICY).unwrap(),
+            "cross-origin"
+        );
+
+        // 2) Non-eviction I/O error (BrokenPipe) -> 502 Bad Gateway.
+        let mut err_resp = Response::new(ContentBody::stream(
+            Box::new(FailAfterPrefix {
+                prefix: Some(b"partial".to_vec()),
+                kind: std::io::ErrorKind::BrokenPipe,
+            }),
+            1024,
+        ));
+        *err_resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+        let broken =
+            collect_bounded_response(err_resp, 1024 * 1024, &budget, &buffered, &peak).await;
+        assert_eq!(broken.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn suspend_drops_loopback_listener_and_evicts_parked_streams_then_resume_recovers_cleanly()
+     {
+        let image_bytes = b"\x89PNG\r\n\x1a\nresume-image-payload".to_vec();
+        // Large enough to exceed loopback TCP buffers so a paused client triggers idle parking.
+        let movie_bytes: Vec<u8> = (0..(12 * 1024 * 1024))
+            .map(|i| ((i * 31 + 7) % 251) as u8)
+            .collect();
+        let mut files = HashMap::new();
+        files.insert("/home/me/photo.png".to_owned(), image_bytes.clone());
+        files.insert("/home/me/movie.bin".to_owned(), movie_bytes.clone());
+
+        let backend = Arc::new(MockContentBackend::with_options(
+            files,
+            LinkOptions {
+                max_parked_streams: 1,
+                ..LinkOptions::default()
+            },
+            Some(legion_link::content::WindowPolicy {
+                initial_bytes: 256 * 1024,
+                max_bytes: 256 * 1024,
+            }),
+        ));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["tauri://localhost".to_owned()],
+        ));
+
+        // 1) Before suspension: mint and open two streams on the cap-1 pool so stream 1 parks
+        // and is evicted when stream 2 parks.
+        let pre1 = server
+            .mint_url("tower", "/home/me/movie.bin", false)
+            .await
+            .unwrap();
+        let pre2 = server
+            .mint_url("tower", "/home/me/movie.bin", false)
+            .await
+            .unwrap();
+        let port_before = server.loopback_port().unwrap();
+        let path1 = pre1
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port_before}"))
+            .unwrap();
+        let path2 = pre2
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port_before}"))
+            .unwrap();
+
+        let mut s1 = TcpStream::connect(("127.0.0.1", port_before))
+            .await
+            .unwrap();
+        s1.write_all(
+            format!(
+                "GET {path1} HTTP/1.1\r\nHost: 127.0.0.1:{port_before}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let (st1, head1, mut body1) = read_http_head_and_prefix(&mut s1, 4096).await;
+        assert_eq!(st1, 200, "{head1}");
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+
+        let mut s2 = TcpStream::connect(("127.0.0.1", port_before))
+            .await
+            .unwrap();
+        s2.write_all(
+            format!(
+                "GET {path2} HTTP/1.1\r\nHost: 127.0.0.1:{port_before}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let (st2, head2, _body2) = read_http_head_and_prefix(&mut s2, 4096).await;
+        assert_eq!(st2, 200, "{head2}");
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+
+        // 2) Simulate OS background suspension reclaiming the listening socket while the stale
+        // ListenerHandle is still recorded in `server.listener`.
+        {
+            let guard = server.listener.lock().unwrap();
+            if let Some(h) = guard.as_ref() {
+                h.shutdown.cancel();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Pre-suspend evicted stream aborts cleanly strictly before Content-Length.
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            match s1.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body1.extend_from_slice(&chunk[..n]),
+            }
+        }
+        assert!(body1.len() < movie_bytes.len());
+        assert_eq!(body1, &movie_bytes[..body1.len()]);
+        drop(s2);
+
+        // 3) Resume: race `probe_or_recover_loopback()` against concurrent `mint_url()` calls
+        // (matching iOS `WindowEvent::Resumed` racing with immediate post-resume UI requests).
+        let (probe_res, img_res, vid_res) = tokio::join!(
+            server.probe_or_recover_loopback(),
+            server.mint_url("tower", "/home/me/photo.png", false),
+            server.mint_url("tower", "/home/me/movie.bin", false),
+        );
+        let recovered_port = probe_res
+            .unwrap()
+            .expect("probe must see or recover a live loopback listener");
+        let img_ticket = img_res.unwrap();
+        let vid_ticket = vid_res.unwrap();
+        assert_eq!(server.loopback_port(), Some(recovered_port));
+
+        let expected_origin = format!("http://127.0.0.1:{recovered_port}");
+        let img_path = img_ticket
+            .url
+            .strip_prefix(&expected_origin)
+            .expect("image URL must point to recovered live port");
+        let vid_path = vid_ticket
+            .url
+            .strip_prefix(&expected_origin)
+            .expect("video URL must point to recovered live port");
+
+        // First requests after resume must succeed byte-exact without error.
+        let (img_status, img_head, img_body) = raw_http(
+            recovered_port,
+            &format!(
+                "GET {img_path} HTTP/1.1\r\nHost: 127.0.0.1:{recovered_port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(img_status, 200, "{img_head}");
+        assert_eq!(img_body, image_bytes);
+
+        let (vid_status, vid_head, vid_tail) = raw_http(
+            recovered_port,
+            &format!(
+                "GET {vid_path} HTTP/1.1\r\nHost: 127.0.0.1:{recovered_port}\r\nRange: bytes={}-\r\nConnection: close\r\n\r\n",
+                body1.len()
+            ),
+        )
+        .await;
+        assert_eq!(vid_status, 206, "{vid_head}");
+        body1.extend_from_slice(&vid_tail);
+        assert_eq!(body1, movie_bytes);
+
+        // 4) Simulate a long suspension where the listener was completely torn down and all
+        // tickets were cleared: the very first post-resume `mint_url` recreates the listener.
+        server.shutdown();
+        assert_eq!(server.loopback_port(), None);
+        let after_long = server
+            .mint_url("tower", "/home/me/photo.png", false)
+            .await
+            .unwrap();
+        let long_port = server
+            .loopback_port()
+            .expect("mint_url must recreate loopback listener after full teardown");
+        let long_path = after_long
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{long_port}"))
+            .unwrap();
+        let (long_status, long_head, long_body) = raw_http(
+            long_port,
+            &format!(
+                "GET {long_path} HTTP/1.1\r\nHost: 127.0.0.1:{long_port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(long_status, 200, "{long_head}");
+        assert_eq!(long_body, image_bytes);
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn current_platform_uses_loopback_everywhere() {
+        assert_eq!(
+            ContentMountMode::current_platform(),
+            ContentMountMode::Loopback
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_handles_range_edge_cases_parallel_small_and_duplicate_ranges() {
+        let payload: Vec<u8> = (0..(2 * 1024 * 1024usize))
+            .map(|i| ((i * 37 + 11) % 251) as u8)
+            .collect();
+        let mut files = HashMap::new();
+        files.insert("/home/me/master.flac".to_owned(), payload.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
             TicketConfig::default(),
             Duration::from_secs(30),
             vec!["http://tauri.localhost".to_owned()],
         ));
-        let cs_pic = cs
-            .mint_url("studio", "/home/me/photo.png", false)
+
+        let t1 = server
+            .mint_url("tower", "/home/me/master.flac", false)
             .await
             .unwrap();
-        let resp_pic = cs
-            .handle_custom_scheme(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(&cs_pic.url)
-                    .body(Vec::new())
-                    .unwrap(),
-            )
-            .await;
-        assert_eq!(resp_pic.status(), StatusCode::OK);
-        assert_eq!(resp_pic.body(), &png_bytes);
-
-        let cs_vid = cs
-            .mint_url("studio", "/home/me/video.mp4", false)
+        let t2 = server
+            .mint_url("tower", "/home/me/master.flac", false)
             .await
             .unwrap();
-        let resp_vid = cs
-            .handle_custom_scheme(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(&cs_vid.url)
-                    .header("range", "bytes=16384-32767")
-                    .body(Vec::new())
-                    .unwrap(),
-            )
-            .await;
-        assert_eq!(resp_vid.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(resp_vid.body(), &media_bytes[16384..=32767]);
-        assert!(relay_hits.load(Ordering::SeqCst) >= 4);
-        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+        let port = server.loopback_port().unwrap();
+        let path1 = t1
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        let path2 = t2
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
 
-        // 3) Learn a direct route to `studio` -> subsequent reads switch to direct!
-        let learned = link.learn().await.unwrap();
-        assert_eq!(learned.added, vec!["studio".to_owned()]);
-        let relay_before = relay_hits.load(Ordering::SeqCst);
-        let resp_direct = cs
-            .handle_custom_scheme(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(&cs_vid.url)
-                    .header("range", "bytes=0-1023")
-                    .body(Vec::new())
-                    .unwrap(),
-            )
-            .await;
-        assert_eq!(resp_direct.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(resp_direct.body(), &media_bytes[0..=1023]);
-        assert_eq!(relay_hits.load(Ordering::SeqCst), relay_before);
-        assert!(direct_hits.load(Ordering::SeqCst) >= 1);
+        // 1) Open-ended range `bytes=0-` streams the full 2 MiB file over loopback.
+        let (st, head, body) = raw_http(
+            port,
+            &format!(
+                "GET {path1} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=0-\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body.len(), payload.len());
+        assert_eq!(body, payload);
 
-        // 4) Unpairing revokes the holder -> relayed ticket is refused with 404 (TicketRevoked).
-        live.store(false, Ordering::SeqCst);
-        let resp_revoked = cs
-            .handle_custom_scheme(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(&cs_pic.url)
-                    .body(Vec::new())
-                    .unwrap(),
-            )
-            .await;
-        assert_eq!(resp_revoked.status(), StatusCode::NOT_FOUND);
+        // 2) Huge range past end (`bytes=1048576-999999999`) clamps cleanly to EOF.
+        let (st, head, body) = raw_http(
+            port,
+            &format!(
+                "GET {path1} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=1048576-999999999\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body, &payload[1048576..]);
 
-        lb.shutdown();
-        link.close().await;
+        // 3) Past-the-end range -> 416 Range Not Satisfiable with `bytes */<size>`.
+        let (st, head, _) = raw_http(
+            port,
+            &format!(
+                "GET {path1} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes={}-\r\nConnection: close\r\n\r\n",
+                payload.len()
+            ),
+        )
+        .await;
+        assert_eq!(st, 416, "{head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("content-range: bytes */{}", payload.len())),
+            "{head}"
+        );
+
+        // 4) 16 small parallel ranges split across two tickets (8 per ticket, within per-ticket
+        // and per-holder caps) all succeed byte-exact.
+        let mut parallel_tasks = Vec::new();
+        for i in 0..16usize {
+            let p = if i < 8 { path1.clone() } else { path2.clone() };
+            let start = i * 65_536;
+            let end = start + 8191;
+            parallel_tasks.push(tokio::spawn(async move {
+                let (s, h, b) = raw_http(
+                    port,
+                    &format!(
+                        "GET {p} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes={start}-{end}\r\nConnection: close\r\n\r\n"
+                    ),
+                )
+                .await;
+                (start, end, s, h, b)
+            }));
+        }
+        for task in parallel_tasks {
+            let (start, end, s, h, b) = task.await.unwrap();
+            assert_eq!(s, 206, "{h}");
+            assert_eq!(b, &payload[start..=end]);
+        }
+
+        // 5) 8 duplicate identical ranges fired simultaneously on the same ticket all return 206
+        // with identical bytes.
+        let mut dup_tasks = Vec::new();
+        for _ in 0..8usize {
+            let p = path1.clone();
+            dup_tasks.push(tokio::spawn(async move {
+                raw_http(
+                    port,
+                    &format!(
+                        "GET {p} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=4096-20479\r\nConnection: close\r\n\r\n"
+                    ),
+                )
+                .await
+            }));
+        }
+        for task in dup_tasks {
+            let (s, h, b) = task.await.unwrap();
+            assert_eq!(s, 206, "{h}");
+            assert_eq!(b, &payload[4096..20480]);
+        }
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn content_status_reports_healthy_media_truncation_http_errors_and_unrequested_urls() {
+        let flac_bytes: Vec<u8> = (0..(128 * 1024)).map(|i| (i % 251) as u8).collect();
+        let mut files = HashMap::new();
+        files.insert("/home/me/track.flac".to_owned(), flac_bytes.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            Arc::clone(&backend) as Arc<dyn Backend>,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        // 1) Freshly minted URL before any request: ticket_live=true, request_count=0.
+        let healthy = server
+            .mint_url("tower", "/home/me/track.flac", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let initial = server.content_status_for_url(&healthy.url);
+        assert!(initial.ticket_live);
+        assert_eq!(initial.request_count, 0);
+        assert_eq!(initial.status, None);
+        assert!(!initial.stream_failed);
+
+        // 2) Healthy 206 audio/flac delivery: status=206, content_type=audio/flac, stream_failed=false.
+        let healthy_path = healthy
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+        let (st, head, body) = raw_http(
+            port,
+            &format!(
+                "GET {healthy_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=0-4095\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body.len(), 4096);
+        let after_ok = server.content_status_for_url(&healthy.url);
+        assert_eq!(after_ok.request_count, 1);
+        assert_eq!(after_ok.status, Some(206));
+        assert_eq!(after_ok.content_type.as_deref(), Some("audio/flac"));
+        assert!(!after_ok.stream_failed);
+        assert!(after_ok.ticket_live);
+
+        // 3) Mid-stream truncation on loopback: status=200 but stream_failed=true so the viewer
+        // knows NOT to blame the device's codec.
+        let truncated = server
+            .mint_url("tower", "/home/me/track.flac", false)
+            .await
+            .unwrap();
+        let truncated_path = truncated
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+        *backend.fault.lock().unwrap() = MockStreamFault::TruncateAfterBytes(70 * 1024);
+        let (st_trunc, _, body_trunc) = raw_http(
+            port,
+            &format!(
+                "GET {truncated_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        *backend.fault.lock().unwrap() = MockStreamFault::None;
+        assert_eq!(st_trunc, 200);
+        assert!(body_trunc.len() < flac_bytes.len());
+        let after_trunc = server.content_status_for_url(&truncated.url);
+        assert_eq!(after_trunc.status, Some(200));
+        assert_eq!(after_trunc.content_type.as_deref(), Some("audio/flac"));
+        assert!(
+            after_trunc.stream_failed,
+            "mid-stream truncation must flip stream_failed=true"
+        );
+
+        // 4) Upstream 502 error records status=502 and structured error code/message.
+        let failing = server
+            .mint_url("tower", "/home/me/track.flac", false)
+            .await
+            .unwrap();
+        let failing_path = failing
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+        *backend.fault.lock().unwrap() = MockStreamFault::ErrorOnGet {
+            code: ProtoCode::Unreachable,
+            message: "machine offline",
+        };
+        let (st_502, _, _) = raw_http(
+            port,
+            &format!(
+                "GET {failing_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        *backend.fault.lock().unwrap() = MockStreamFault::None;
+        assert_eq!(st_502, 502);
+        let after_502 = server.content_status_for_url(&failing.url);
+        assert_eq!(after_502.status, Some(502));
+        assert_eq!(after_502.error_code.as_deref(), Some("unreachable"));
+        assert_eq!(after_502.error_message.as_deref(), Some("machine offline"));
+
+        // 5) Revoking tickets marks ticket_live=false.
+        server.revoke_all();
+        assert!(!server.content_status_for_url(&healthy.url).ticket_live);
+
+        // 6) Malformed URL returns empty default status cleanly.
+        assert_eq!(
+            server.content_status_for_url("not-a-content-url"),
+            ContentUrlStatus::default()
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn loopback_recovery_ignores_port_squatter_and_binds_new_os_port() {
+        let secret = b"private-audio-bytes-never-for-squatter".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/home/me/secret.flac".to_owned(), secret.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let _initial = server
+            .mint_url("tower", "/home/me/secret.flac", false)
+            .await
+            .unwrap();
+        let old_port = server.loopback_port().unwrap();
+
+        // Simulate Legion's listening socket dying while its stale ListenerHandle still names
+        // `old_port`.
+        {
+            let guard = server.listener.lock().unwrap();
+            if let Some(h) = guard.as_ref() {
+                h.shutdown.cancel();
+            }
+        }
+        // Wait until Legion's accept task exits and releases `old_port`.
+        let squatter = {
+            let mut bound = None;
+            for _ in 0..40 {
+                if let Ok(l) = TcpListener::bind(("127.0.0.1", old_port)).await {
+                    bound = Some(l);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            bound.expect("squatter should bind the released old port")
+        };
+
+        let squatter_hits = Arc::new(AtomicUsize::new(0));
+        let squatter_stop = CancellationToken::new();
+        let hits_clone = Arc::clone(&squatter_hits);
+        let stop_clone = squatter_stop.clone();
+        let squatter_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = stop_clone.cancelled() => break,
+                    res = squatter.accept() => {
+                        if let Ok((_sock, _)) = res {
+                            hits_clone.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Minting a new URL must detect from Legion's own state that the old listener is dead,
+        // never probe the squatter port, and bind a fresh OS-chosen port.
+        let fresh = server
+            .mint_url("tower", "/home/me/secret.flac", false)
+            .await
+            .unwrap();
+        let new_port = server.loopback_port().unwrap();
+        assert_ne!(
+            new_port, old_port,
+            "recovery must bind a new OS-chosen port rather than trusting a squatter on {old_port}"
+        );
+        assert!(
+            fresh
+                .url
+                .starts_with(&format!("http://127.0.0.1:{new_port}/v1/content/")),
+            "minted URL must point at new port {new_port}, got {}",
+            fresh.url
+        );
+
+        let path = fresh
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{new_port}"))
+            .unwrap();
+        let (status, head, body) = raw_http(
+            new_port,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{new_port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{head}");
+        assert_eq!(body, secret);
+
+        // Give the squatter task a moment in case anything tried to connect asynchronously.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            squatter_hits.load(Ordering::SeqCst),
+            0,
+            "nothing may connect to a squatter listening on the old port"
+        );
+
+        squatter_stop.cancel();
+        let _ = squatter_task.await;
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn invalid_ticket_requests_cannot_evict_valid_ticket_status() {
+        let flac_bytes: Vec<u8> = (0..(64 * 1024)).map(|i| (i % 251) as u8).collect();
+        let mut files = HashMap::new();
+        files.insert("/home/me/track.flac".to_owned(), flac_bytes);
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let valid = server
+            .mint_url("tower", "/home/me/track.flac", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let valid_path = valid
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+
+        let (st, head, _) = raw_http(
+            port,
+            &format!(
+                "GET {valid_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=0-1023\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(st, 206, "{head}");
+
+        // Flood more than MAX_REQUEST_LOG (64) junk requests — both invalid 43-char ticket IDs
+        // (404) and guard-rejected Origin/Host requests (403/421). None may allocate status slots
+        // or evict the real URL's diagnosis.
+        let mut sample_junk_url = String::new();
+        for i in 0..80usize {
+            let fake_id = format!("junk{i:039}");
+            assert_eq!(fake_id.len(), 43);
+            let fake_path = format!("/v1/content/{fake_id}/track.flac");
+            if i == 0 {
+                sample_junk_url = format!("http://127.0.0.1:{port}{fake_path}");
+            }
+            let req = if i % 3 == 0 {
+                format!(
+                    "GET {fake_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nConnection: close\r\n\r\n"
+                )
+            } else if i % 3 == 1 {
+                format!(
+                    "GET {fake_path} HTTP/1.1\r\nHost: evil.example:{port}\r\nConnection: close\r\n\r\n"
+                )
+            } else {
+                format!(
+                    "GET {fake_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+            };
+            let (junk_st, _, _) = raw_http(port, &req).await;
+            assert!(matches!(junk_st, 403 | 404 | 421), "got {junk_st}");
+        }
+
+        let preserved = server.content_status_for_url(&valid.url);
+        assert_eq!(preserved.request_count, 1);
+        assert_eq!(preserved.status, Some(206));
+        assert_eq!(preserved.content_type.as_deref(), Some("audio/flac"));
+        assert!(!preserved.stream_failed);
+        assert!(preserved.ticket_live);
+
+        assert_eq!(
+            server.content_status_for_url(&sample_junk_url),
+            ContentUrlStatus::default(),
+            "unknown tickets must never populate content_status"
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn loopback_serves_viewer_while_32_partial_header_sockets_are_held() {
+        let payload: Vec<u8> = (0..(64 * 1024)).map(|i| (i % 251) as u8).collect();
+        let mut files = HashMap::new();
+        files.insert("/home/me/track.flac".to_owned(), payload.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let valid = server
+            .mint_url("tower", "/home/me/track.flac", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let valid_path = valid
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+
+        // 1) Guard rejections (403, 421) and 404 responses emit `Connection: close` and actually
+        // close the TCP connection even when the client asks for `Connection: keep-alive`.
+        for (expected_status, req) in [
+            (
+                404u16,
+                format!(
+                    "GET /v1/content/nonexistent/track.flac HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\n"
+                ),
+            ),
+            (
+                404u16,
+                format!(
+                    "GET /other/path HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\n"
+                ),
+            ),
+            (
+                403u16,
+                format!(
+                    "GET {valid_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nConnection: keep-alive\r\n\r\n"
+                ),
+            ),
+            (
+                421u16,
+                format!(
+                    "GET {valid_path} HTTP/1.1\r\nHost: evil.example:{port}\r\nConnection: keep-alive\r\n\r\n"
+                ),
+            ),
+        ] {
+            let (st, head, _) = tokio::time::timeout(Duration::from_secs(2), raw_http(port, &req))
+                .await
+                .expect("server must close 404/guard-rejected keep-alive connections immediately");
+            assert_eq!(st, expected_status, "{head}");
+            assert!(
+                head.to_ascii_lowercase().contains("connection: close"),
+                "expected Connection: close on {expected_status}, got:\n{head}"
+            );
+        }
+
+        // 2) Hold MAX_LOOPBACK_CONNECTIONS (32) partial-header sockets simultaneously open, then
+        // issue a real viewer GET. The listener must evict the oldest unauthenticated socket and
+        // serve the viewer's valid request immediately.
+        let mut holders = Vec::with_capacity(MAX_LOOPBACK_CONNECTIONS);
+        for _ in 0..MAX_LOOPBACK_CONNECTIONS {
+            let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            sock.write_all(b"GET /v1/content/").await.unwrap();
+            holders.push(sock);
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let (viewer_status, viewer_head, viewer_body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            raw_http(
+                port,
+                &format!(
+                    "GET {valid_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                ),
+            ),
+        )
+        .await
+        .expect("viewer GET must succeed immediately even while 32 partial-header sockets are held");
+        assert_eq!(viewer_status, 200, "{viewer_head}");
+        assert_eq!(viewer_body, payload);
+
+        // The oldest unauthenticated socket (holders[0]) was evicted and must see EOF immediately.
+        let mut evicted_buf = [0u8; 16];
+        let evicted_read = tokio::time::timeout(
+            Duration::from_millis(300),
+            holders[0].read(&mut evicted_buf),
+        )
+        .await;
+        assert!(
+            matches!(evicted_read, Ok(Ok(0)) | Ok(Err(_))),
+            "oldest unauthenticated socket should be evicted, got {evicted_read:?}"
+        );
+        drop(holders);
+
+        // 3) Under default limits, an unauthenticated partial-header socket closes after the short
+        // ~2s unauthenticated header timeout (well below the 5s authenticated timeout).
+        let started = Instant::now();
+        let mut idle_unauth = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        idle_unauth.write_all(b"GET /v1/content/").await.unwrap();
+        let mut sink = Vec::new();
+        let closed = tokio::time::timeout(
+            Duration::from_millis(3500),
+            idle_unauth.read_to_end(&mut sink),
+        )
+        .await;
+        assert!(
+            closed.is_ok(),
+            "unauthenticated partial-header socket must time out within ~2s (elapsed={:?})",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(1500),
+            "unauthenticated timeout fired unexpectedly early: {:?}",
+            started.elapsed()
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn revoked_content_url_returns_404_on_replay() {
+        let payload = b"sensitive-audio-track-bytes".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/home/me/voice-note.flac".to_owned(), payload.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let minted = server
+            .mint_url("tower", "/home/me/voice-note.flac", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let path = minted
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+
+        let (status_before, head_before, body_before) = raw_http(
+            port,
+            &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status_before, 200, "{head_before}");
+        assert_eq!(body_before, payload);
+        assert!(server.content_status_for_url(&minted.url).ticket_live);
+
+        // Revoking the URL immediately invalidates the ticket; replaying it returns 404.
+        assert!(server.revoke_url(&minted.url));
+        assert!(!server.revoke_url(&minted.url));
+        assert!(!server.revoke_url("not-a-content-url"));
+        assert!(!server.content_status_for_url(&minted.url).ticket_live);
+
+        let (status_after, head_after, _) = raw_http(
+            port,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status_after, 404, "{head_after}");
+        assert!(
+            head_after
+                .to_ascii_lowercase()
+                .contains("connection: close"),
+            "replayed revoked URL should emit Connection: close:\n{head_after}"
+        );
+
+        server.shutdown();
     }
 }

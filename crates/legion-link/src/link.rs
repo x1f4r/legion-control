@@ -22,8 +22,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::content::{
-    CAP_STREAM_RELAY, CONTENT_STREAM_BUF_BYTES, ContentStream, StreamOpenError, greet_raw_stream,
-    handshake_get, handshake_get_relayed,
+    CAP_STREAM_RELAY, CONTENT_STREAM_BUF_BYTES, ContentStream, ContentStreamOptions,
+    DEFAULT_MAX_PARKED_STREAMS, ParkedStreamPool, StreamOpenError, greet_raw_stream, handshake_get,
+    handshake_get_relayed,
 };
 use crate::invite::{Enrolled, SshTarget, SshTimeouts};
 use crate::put::{
@@ -45,6 +46,10 @@ pub const MAX_CONFIGURED_NODES: usize = 64;
 
 /// Maximum number of candidate hosts accepted per learned machine.
 pub const MAX_ENDPOINT_HOSTS: usize = 8;
+
+/// Minimum interval between forced SSH session reconnects triggered by persistent sshd channel
+/// refusals while local stream permits are free.
+pub const DEFAULT_CHANNEL_REFUSED_RECONNECT_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Maximum number of pinned host keys accepted per learned machine.
 pub const MAX_ENDPOINT_HOST_KEYS: usize = 8;
@@ -547,6 +552,12 @@ pub struct LinkOptions {
     /// Defaults to `false` so a remote node cannot redirect a controller to a local service;
     /// intended only for tests and debug-only loopback harnesses.
     pub allow_loopback_endpoints: bool,
+    /// Maximum number of parked content streams retained on this link before the least recently
+    /// parked stream is closed.
+    pub max_parked_streams: usize,
+    /// Minimum cooldown between session reconnects triggered when sshd keeps refusing new stream
+    /// channels while local stream permits are free.
+    pub channel_refused_reconnect_cooldown: Duration,
 }
 
 impl Default for LinkOptions {
@@ -556,6 +567,8 @@ impl Default for LinkOptions {
             ssh_timeouts: SshTimeouts::default(),
             unsynced_backoff: DEFAULT_UNSYNCED_BACKOFF,
             allow_loopback_endpoints: false,
+            max_parked_streams: DEFAULT_MAX_PARKED_STREAMS,
+            channel_refused_reconnect_cooldown: DEFAULT_CHANNEL_REFUSED_RECONNECT_COOLDOWN,
         }
     }
 }
@@ -596,6 +609,11 @@ struct LinkInner {
     unsynced_until: Mutex<HashMap<String, Instant>>,
     /// Last observed runtime route status per machine.
     routes: Mutex<HashMap<String, MachineRouteStatus>>,
+    /// Per-link LRU pool capping parked content streams.
+    parked_streams: Arc<ParkedStreamPool>,
+    /// Last timestamp per machine when persistent sshd channel refusals with free permits triggered
+    /// a session reconnect (rate-limited to at most once per cooldown window).
+    channel_refused_reconnect_at: Mutex<HashMap<String, Instant>>,
     reaper_started: AtomicBool,
 }
 
@@ -730,6 +748,8 @@ impl Link {
                 active_calls: Mutex::new(HashMap::new()),
                 unsynced_until: Mutex::new(HashMap::new()),
                 routes: Mutex::new(HashMap::new()),
+                parked_streams: Arc::new(ParkedStreamPool::new(options.max_parked_streams)),
+                channel_refused_reconnect_at: Mutex::new(HashMap::new()),
                 reaper_started: AtomicBool::new(false),
             }),
         }
@@ -2309,6 +2329,43 @@ impl Link {
         length: Option<u64>,
         cancel: CancellationToken,
     ) -> Result<ContentStream, ErrorBody> {
+        self.open_content_inner(
+            machine,
+            path,
+            offset,
+            length,
+            cancel,
+            Some(Arc::clone(&self.inner.parked_streams)),
+        )
+        .await
+    }
+
+    /// Like [`Link::open_content_with_cancel`], for background transfer-queue downloads.
+    ///
+    /// The returned stream still parks its SSH channel and trims buffers when idle, and
+    /// transparently reopens on the next read, but it is exempt from the per-link parked-stream
+    /// eviction cap so paused viewer streams cannot evict an in-progress download.
+    pub async fn open_content_for_transfer_with_cancel(
+        &self,
+        machine: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+        cancel: CancellationToken,
+    ) -> Result<ContentStream, ErrorBody> {
+        self.open_content_inner(machine, path, offset, length, cancel, None)
+            .await
+    }
+
+    async fn open_content_inner(
+        &self,
+        machine: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+        cancel: CancellationToken,
+        park_pool: Option<Arc<ParkedStreamPool>>,
+    ) -> Result<ContentStream, ErrorBody> {
         self.ensure_reaper();
         if path.is_empty() {
             return Err(
@@ -2332,7 +2389,7 @@ impl Link {
             && e.target.is_none()
         {
             let stream = self
-                .open_content_direct(machine, path, offset, length, cancel)
+                .open_content_direct(machine, path, offset, length, cancel, park_pool)
                 .await?;
             self.record_route(machine, MachineRouteStatus::Direct);
             return Ok(stream);
@@ -2349,7 +2406,14 @@ impl Link {
 
         if entry.is_some() && !in_unsynced_backoff {
             match self
-                .open_content_direct(machine, path, offset, length, cancel.clone())
+                .open_content_direct(
+                    machine,
+                    path,
+                    offset,
+                    length,
+                    cancel.clone(),
+                    park_pool.clone(),
+                )
                 .await
             {
                 Ok(stream) => {
@@ -2385,7 +2449,15 @@ impl Link {
 
         for relay in relays {
             match self
-                .open_content_via_relay(&relay, machine, path, offset, length, cancel.clone())
+                .open_content_via_relay(
+                    &relay,
+                    machine,
+                    path,
+                    offset,
+                    length,
+                    cancel.clone(),
+                    park_pool.clone(),
+                )
                 .await
             {
                 Ok(stream) => {
@@ -2442,7 +2514,7 @@ impl Link {
 
         if in_unsynced_backoff {
             match self
-                .open_content_direct(machine, path, offset, length, cancel)
+                .open_content_direct(machine, path, offset, length, cancel, park_pool)
                 .await
             {
                 Ok(stream) => {
@@ -2485,6 +2557,7 @@ impl Link {
         offset: u64,
         length: Option<u64>,
         cancel: CancellationToken,
+        park_pool: Option<Arc<ParkedStreamPool>>,
     ) -> Result<ContentStream, ErrorBody> {
         let (mut raw, opener, live, flight) =
             self.open_stream_on_peer(machine, cancel.clone()).await?;
@@ -2516,11 +2589,16 @@ impl Link {
             live.config_snapshot.principal.as_deref(),
             self.inner.options.ssh_timeouts.handshake,
             cancel,
+            ContentStreamOptions {
+                park_pool,
+                ..ContentStreamOptions::default()
+            },
             Some(&record_caps),
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn open_content_via_relay(
         &self,
         relay: &str,
@@ -2529,6 +2607,7 @@ impl Link {
         offset: u64,
         length: Option<u64>,
         cancel: CancellationToken,
+        park_pool: Option<Arc<ParkedStreamPool>>,
     ) -> Result<ContentStream, ErrorBody> {
         if self.stream_supports(relay, CAP_STREAM_RELAY) == Some(false) {
             return Err(relay_too_old_error(relay, machine));
@@ -2569,6 +2648,10 @@ impl Link {
             relay_live.config_snapshot.principal.as_deref(),
             self.inner.options.ssh_timeouts.handshake,
             cancel,
+            ContentStreamOptions {
+                park_pool,
+                ..ContentStreamOptions::default()
+            },
         )
         .await
     }
@@ -2873,40 +2956,114 @@ impl Link {
         ),
         ErrorBody,
     > {
-        let live = self.get_or_open(peer, cancel.clone()).await?;
+        self.open_stream_with_recovery(peer, cancel)
+            .await
+            .map_err(|err| match err {
+                StreamOpenError::DeadSession(body) | StreamOpenError::ChannelRefused(body) => {
+                    mark_not_sent(body.with_machine(peer))
+                }
+                StreamOpenError::Failed(body) => {
+                    let body = body.with_machine(peer);
+                    if matches!(body.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        mark_not_sent(body)
+                    } else {
+                        body
+                    }
+                }
+            })
+    }
+
+    fn try_claim_channel_refused_reconnect(&self, machine: &str) -> bool {
+        let cooldown = self.inner.options.channel_refused_reconnect_cooldown;
+        let now = Instant::now();
+        let mut map = self
+            .inner
+            .channel_refused_reconnect_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(last) = map.get(machine)
+            && now.saturating_duration_since(*last) < cooldown
+        {
+            return false;
+        }
+        map.insert(machine.to_owned(), now);
+        true
+    }
+
+    async fn open_stream_with_recovery(
+        &self,
+        machine: &str,
+        cancel: CancellationToken,
+    ) -> Result<
+        (
+            crate::content::RawStream,
+            Arc<dyn crate::content::StreamOpener>,
+            LiveSession,
+            InFlightGuard,
+        ),
+        StreamOpenError,
+    > {
+        let live = self
+            .get_or_open(machine, cancel.clone())
+            .await
+            .map_err(StreamOpenError::Failed)?;
         let flight = live.acquire_flight();
-        match self.open_stream_on(&live, peer, cancel.clone()).await {
+        match self.open_stream_on(&live, machine, cancel.clone()).await {
             Ok((raw, opener)) => Ok((raw, opener, live, flight)),
             Err(StreamOpenError::DeadSession(_)) => {
                 // The cached session died before any stream bytes were sent; reopen once.
                 drop(flight);
-                self.invalidate_if_same(peer, &live.session);
-                let fresh = self.get_or_open(peer, cancel.clone()).await?;
+                self.invalidate_if_same(machine, &live.session);
+                let fresh = self
+                    .get_or_open(machine, cancel.clone())
+                    .await
+                    .map_err(StreamOpenError::Failed)?;
                 let flight2 = fresh.acquire_flight();
-                let (raw, opener) =
-                    self.open_stream_on(&fresh, peer, cancel)
-                        .await
-                        .map_err(|err| match err {
-                            StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body) => {
-                                self.invalidate_if_same(peer, &fresh.session);
-                                mark_not_sent(body.with_machine(peer))
-                            }
-                            StreamOpenError::ChannelRefused(body) => {
-                                mark_not_sent(body.with_machine(peer))
-                            }
-                        })?;
+                let (raw, opener) = self.open_stream_on(&fresh, machine, cancel).await.map_err(
+                    |err| match err {
+                        StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body) => {
+                            self.invalidate_if_same(machine, &fresh.session);
+                            StreamOpenError::Failed(body.with_machine(machine))
+                        }
+                        StreamOpenError::ChannelRefused(body) => {
+                            StreamOpenError::ChannelRefused(body.with_machine(machine))
+                        }
+                    },
+                )?;
+                Ok((raw, opener, fresh, flight2))
+            }
+            Err(StreamOpenError::ChannelRefused(body))
+                if is_channel_refused_with_free_permits(&body)
+                    && self.try_claim_channel_refused_reconnect(machine) =>
+            {
+                // sshd kept refusing new channels while our own stream permits were free (for
+                // example a misbehaving remote ignored stdin EOF and left zombie sshd sessions
+                // behind): retire the poisoned session, reconnect once, and retry.
+                drop(flight);
+                self.invalidate_if_same(machine, &live.session);
+                let fresh = self
+                    .get_or_open(machine, cancel.clone())
+                    .await
+                    .map_err(StreamOpenError::Failed)?;
+                let flight2 = fresh.acquire_flight();
+                let (raw, opener) = self.open_stream_on(&fresh, machine, cancel).await.map_err(
+                    |err| match err {
+                        StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body) => {
+                            self.invalidate_if_same(machine, &fresh.session);
+                            StreamOpenError::Failed(body.with_machine(machine))
+                        }
+                        StreamOpenError::ChannelRefused(body) => {
+                            StreamOpenError::ChannelRefused(body.with_machine(machine))
+                        }
+                    },
+                )?;
                 Ok((raw, opener, fresh, flight2))
             }
             Err(StreamOpenError::ChannelRefused(body)) => {
-                Err(mark_not_sent(body.with_machine(peer)))
+                Err(StreamOpenError::ChannelRefused(body.with_machine(machine)))
             }
             Err(StreamOpenError::Failed(body)) => {
-                let body = body.with_machine(peer);
-                if matches!(body.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
-                    Err(mark_not_sent(body))
-                } else {
-                    Err(body)
-                }
+                Err(StreamOpenError::Failed(body.with_machine(machine)))
             }
         }
     }
@@ -2938,6 +3095,14 @@ impl Link {
     }
 }
 
+fn is_channel_refused_with_free_permits(body: &ErrorBody) -> bool {
+    body.details
+        .as_ref()
+        .and_then(|d| d.get("permits_free"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 /// Session-backed [`crate::content::StreamOpener`] used by [`ContentStream`] when reopening a
 /// parked or idle-closed channel, transparently acquiring the current (or freshly reconnected)
 /// session for `peer` (either the direct target machine or the relay carrying it).
@@ -2958,44 +3123,10 @@ impl crate::content::StreamOpener for LinkStreamOpener {
     ) -> Pin<Box<dyn Future<Output = Result<crate::content::RawStream, StreamOpenError>> + Send + '_>>
     {
         Box::pin(async move {
-            let live = self
+            let (mut raw, _, _, flight) = self
                 .link
-                .get_or_open(&self.peer, cancel.clone())
-                .await
-                .map_err(StreamOpenError::Failed)?;
-            let flight = live.acquire_flight();
-            let (mut raw, flight) = match self
-                .link
-                .open_stream_on(&live, &self.peer, cancel.clone())
-                .await
-            {
-                Ok((raw, _)) => (raw, flight),
-                Err(StreamOpenError::DeadSession(_)) => {
-                    drop(flight);
-                    self.link.invalidate_if_same(&self.peer, &live.session);
-                    let fresh = self
-                        .link
-                        .get_or_open(&self.peer, cancel.clone())
-                        .await
-                        .map_err(StreamOpenError::Failed)?;
-                    let flight2 = fresh.acquire_flight();
-                    let (raw, _) = self
-                        .link
-                        .open_stream_on(&fresh, &self.peer, cancel)
-                        .await
-                        .map_err(|err| match err {
-                            StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body) => {
-                                self.link.invalidate_if_same(&self.peer, &fresh.session);
-                                StreamOpenError::Failed(body.with_machine(&self.peer))
-                            }
-                            StreamOpenError::ChannelRefused(body) => {
-                                StreamOpenError::ChannelRefused(body.with_machine(&self.peer))
-                            }
-                        })?;
-                    (raw, flight2)
-                }
-                Err(err) => return Err(err),
-            };
+                .open_stream_with_recovery(&self.peer, cancel)
+                .await?;
             let prev_guard = raw.guard.take();
             raw.guard = Some(Box::new((prev_guard, flight)));
             Ok(raw)

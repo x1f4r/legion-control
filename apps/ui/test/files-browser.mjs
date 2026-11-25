@@ -916,6 +916,171 @@ test('Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses
   }
 });
 
+test('Files viewer: honest media errors, in-place Open in another app progress/cancel/no-handler, refused-type gating, machine previews, and extensionless text', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const ctx = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      colorScheme: 'dark',
+    });
+    const page = await ctx.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    await page.goto(`${server.url}/?mock=formats#/files/tower//home/me/Formats`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('header.top h1', { hasText: 'Formats' }).waitFor();
+
+    // 1. Server 413, 502, mid-stream truncation, and unrouted mint errors NEVER claim "can't play".
+    for (const [fileName, expectedText] of [
+      ['fail-413.flac', 'This file is too large to open inline'],
+      ['fail-502.flac', "Couldn't reach this file"],
+      ['fail-truncated.flac', "Couldn't reach this file"],
+      ['no-route.flac', 'Machine tower is not paired on this device.'],
+    ]) {
+      await page.locator('.list a.row', { hasText: fileName }).click();
+      await page.locator('.viewer').getByText(expectedText).first().waitFor({ timeout: 5000 });
+      const text = await page.locator('.viewer').innerText();
+      assert.ok(
+        !/can't play/i.test(text),
+        `${fileName} must NEVER say "can't play": ${text}`,
+      );
+      await page.locator('.viewer-top button[aria-label="Close"]').click();
+      await page.locator('.viewer').waitFor({ state: 'hidden' });
+    }
+
+    // 2. Known-unplayable formats (WMA, AVI) skip the media player and offer Open in another app.
+    await page.locator('.list a.row', { hasText: 'legacy-track.wma' }).click();
+    await page.locator('.viewer').getByText("This phone can't play WMA audio directly").waitFor();
+    assert.equal(await page.locator('.viewer audio').count(), 0);
+    await page.locator('.viewer').getByRole('button', { name: 'Open in another app' }).waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+
+    await page.locator('.list a.row', { hasText: 'legacy-clip.avi' }).click();
+    await page.locator('.viewer').getByText("This phone can't play AVI video directly").waitFor();
+    assert.equal(await page.locator('.viewer video').count(), 0);
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+
+    // 3. HEIC tries machine-made fs.thumb preview with quiet note; DNG with failed thumb falls back cleanly.
+    await page.locator('.list a.row', { hasText: 'iphone-shot.heic' }).click();
+    await page.locator('.viewer img.viewer-img').waitFor();
+    await page.locator('.viewer-preview-note', { hasText: 'Preview. Open in another app for the original.' }).waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+
+    await page.locator('.list a.row', { hasText: 'camera-raw.dng' }).click();
+    await page.locator('.viewer').getByText("Can't show this picture here").waitFor();
+    await page.locator('.viewer').getByRole('button', { name: 'Open in another app' }).waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+
+    // 4. Extensionless README probes fs.read and opens as text; hides Open in...
+    await page.locator('.list a.row', { hasText: 'README' }).click();
+    await page.locator('.viewer pre.viewer-text', { hasText: 'Plain text without an extension.' }).waitFor();
+    assert.equal(await page.locator('.viewer-bar button', { hasText: 'Open in' }).count(), 0);
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+
+    // 5. Refused types (.apk, .svg) NEVER offer "Open in another app" or bottom-bar "Open in...".
+    for (const refused of ['installer.apk', 'diagram.svg']) {
+      await page.locator('.list a.row', { hasText: refused }).click();
+      await page.locator('.viewer').waitFor();
+      assert.equal(
+        await page.locator('.viewer button', { hasText: 'Open in another app' }).count(),
+        0,
+        `${refused} must not offer Open in another app`,
+      );
+      assert.equal(
+        await page.locator('.viewer-bar button', { hasText: 'Open in' }).count(),
+        0,
+        `${refused} must not offer Open in…`,
+      );
+      await page.locator('.viewer-top button[aria-label="Close"]').click();
+    }
+
+    // 6. "Open in another app" shows visible in-place "Getting it ready… X of Y" progress + Cancel,
+    // and closing the viewer immediately revokes the minted content URL.
+    await page.locator('.list a.row', { hasText: 'studio-master.flac' }).click();
+    const flacAudio = page.locator('.viewer audio');
+    await flacAudio.waitFor();
+    const flacUrl = await flacAudio.getAttribute('src');
+    assert.ok(flacUrl, 'expected minted audio content URL');
+    await page.locator('.viewer-bar button', { hasText: 'Open in…' }).click();
+    const banner = page.locator('.viewer-open-banner');
+    await banner.waitFor();
+    await banner.getByText(/Getting it ready…/).waitFor();
+    await banner.getByRole('button', { name: 'Cancel' }).click();
+    await banner.waitFor({ state: 'hidden' });
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+    const revokedAfterClose = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
+    assert.ok(
+      revokedAfterClose.includes(flacUrl),
+      `closing viewer must revoke minted URL ${flacUrl}, saw ${JSON.stringify(revokedAfterClose)}`,
+    );
+
+    // 6b. Moving to another picture in the mounted viewer immediately revokes the previous URL,
+    // and closing revokes the active one.
+    await page.goto(`${server.url}/?mock=formats#/files/tower//home/me/Videos/Holiday`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.grid a.cell[aria-label="IMG_2041.jpg"]').click();
+    const imgEl = page.locator('.viewer img.viewer-img');
+    await imgEl.waitFor();
+    const firstPicUrl = await imgEl.getAttribute('src');
+    assert.ok(firstPicUrl, 'expected first picture URL');
+    await page.keyboard.press('ArrowRight');
+    await page.locator('.viewer-top .name', { hasText: 'IMG_2042.jpg' }).waitFor();
+    await page.waitForFunction(
+      (prev) => {
+        const cur = document.querySelector('.viewer img.viewer-img')?.getAttribute('src');
+        return Boolean(cur && cur !== prev);
+      },
+      firstPicUrl,
+    );
+    const secondPicUrl = await imgEl.getAttribute('src');
+    const revokedAfterSwitch = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
+    assert.ok(
+      revokedAfterSwitch.includes(firstPicUrl),
+      'switching files in viewer must revoke the previous picture URL',
+    );
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+    const revokedAfterSecondClose = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
+    assert.ok(
+      revokedAfterSecondClose.includes(secondPicUrl),
+      'closing viewer after switching files must revoke the second picture URL',
+    );
+
+    // 7. When no app handles the file type (?mock=formats,no-handler), viewer shows an honest
+    // message in place and offers Download instead of silently doing nothing.
+    await page.goto(`${server.url}/?mock=formats,no-handler#/files/tower//home/me/Formats`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.list a.row', { hasText: 'legacy-track.wma' }).click();
+    await page.locator('.viewer').getByRole('button', { name: 'Open in another app' }).click();
+    await page.locator('.viewer').getByText(/Getting it ready…/).waitFor();
+    await page.locator('.viewer').getByText('No app on this phone can open this file type.').waitFor({ timeout: 6000 });
+    await page.locator('.viewer').getByRole('button', { name: 'Download to this phone' }).waitFor();
+
+    await ctx.close();
+
+    assert.deepEqual(pageErrors, [], `Uncaught page errors (formats): ${pageErrors.join('\n')}`);
+    assert.deepEqual(consoleErrors, [], `Console/CSP errors (formats): ${consoleErrors.join('\n')}`);
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});
+
 async function maybeOldShot(page, name) {
   if (!OLD_SHOTS_DIR) return;
   fs.mkdirSync(OLD_SHOTS_DIR, { recursive: true });

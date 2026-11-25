@@ -19,7 +19,7 @@ use crate::backend::{
     AppError, AppState, Backend, CallId, CallRequest, CancelResult, ErrorCode, LearnResult,
     RepairResult, UnpairResult,
 };
-use crate::content::{ContentUrlResult, SharedContentServer};
+use crate::content::{ContentUrlResult, ContentUrlStatus, SharedContentServer};
 #[cfg(all(debug_assertions, feature = "test-upload-paths"))]
 use crate::transfers::UploadFileInput;
 use crate::transfers::{
@@ -213,16 +213,21 @@ pub async fn repair_store(
 }
 
 /// Closes cached sessions on mobile platforms after resuming from background or sleep so the next
-/// refresh opens fresh sockets instead of stalling on half-open TCP connections.
+/// refresh opens fresh sockets instead of stalling on half-open TCP connections, and probes the
+/// loopback content listener in case the OS reclaimed it while backgrounded.
 #[tauri::command]
-pub async fn invalidate_sessions(backend: State<'_, SharedBackend>) -> Result<(), AppError> {
+pub async fn invalidate_sessions(
+    backend: State<'_, SharedBackend>,
+    content: State<'_, SharedContentServer>,
+) -> Result<(), AppError> {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
+        content.0.on_app_resumed();
         backend.0.invalidate_sessions().await
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        let _ = backend;
+        let _ = (backend, content);
         Ok(())
     }
 }
@@ -273,6 +278,21 @@ pub async fn content_url(
         .0
         .mint_url(&machine, &path, download.unwrap_or(false))
         .await
+}
+
+/// Returns the observed HTTP status, content type, mid-stream failure state, and ticket liveness
+/// for a previously minted content URL so the viewer never misreports transport/HTTP errors as
+/// media decode failures.
+#[tauri::command]
+pub fn content_status(content: State<'_, SharedContentServer>, url: String) -> ContentUrlStatus {
+    content.0.content_status_for_url(&url)
+}
+
+/// Immediately revokes a previously minted content URL when the viewer closes, switches files, or
+/// tears down a media element. Returns `true` if a live ticket was removed.
+#[tauri::command]
+pub fn content_revoke(content: State<'_, SharedContentServer>, url: String) -> bool {
+    content.0.revoke_url(&url)
 }
 
 /// Enqueues a non-blocking download from `machine:path` into the device's Downloads folder.
@@ -347,24 +367,25 @@ pub async fn transfer_upload_test_files(
         .await
 }
 
-/// Enqueues a download to the app cache that opens in another app once verified.
+/// Opens `machine:path` in another app: opens an unchanged cached copy immediately when present,
+/// or enqueues a resumable cache download that launches the system chooser once verified.
 #[tauri::command]
 pub async fn transfer_open_externally(
     transfers: State<'_, SharedTransfers>,
     machine: String,
     path: String,
     name: Option<String>,
+    size: Option<u64>,
     mime: Option<String>,
 ) -> Result<OpenExternallyResult, AppError> {
     validate_label_size("Machine name", &machine)?;
     if let Some(ref raw_name) = name {
         validate_label_size("File name", raw_name)?;
     }
-    let id = transfers
+    transfers
         .0
-        .enqueue_download(machine, path, name, None, mime, true)
-        .await?;
-    Ok(OpenExternallyResult { id, ok: true })
+        .open_externally(machine, path, name, size, mime)
+        .await
 }
 
 /// Lists all current and recent device transfers (newest first).
