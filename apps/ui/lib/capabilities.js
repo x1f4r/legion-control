@@ -302,7 +302,9 @@ export function describeMissingFeatures(entry) {
 
   const xferSpec = map.get('fs.transfer');
   if (xferSpec) {
-    const missingXferArgs = ['background', 'move', 'if_exists'].filter((p) => !specHasProp(xferSpec, p));
+    // Moving between places (`move`) is switched off in default builds, so omit it here:
+    // a feature disabled everywhere is not a missing feature of an older machine.
+    const missingXferArgs = ['background', 'if_exists'].filter((p) => !specHasProp(xferSpec, p));
     if (missingXferArgs.length > 0) {
       missing.push(`fs.transfer (${missingXferArgs.join(', ')})`);
     }

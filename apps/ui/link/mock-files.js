@@ -1637,63 +1637,61 @@ export function createMockFilesState({
         if (oldMachine) {
           throw { code: 'unknown_tool', message: 'Unknown tool: fs.thumb', hint: null, machine: machineName };
         }
-        const paths = Array.isArray(args?.paths) ? args.paths.slice(0, 32) : [];
+        const paths = Array.isArray(args?.paths) ? args.paths : [];
+        if (paths.length === 0 || paths.length > 32) {
+          throw {
+            code: 'invalid_args',
+            message: `fs.thumb accepts between 1 and 32 paths per call, and ${paths.length} were given.`,
+            hint: 'Pass a non-empty list of up to 32 file paths.',
+            machine: machineName,
+          };
+        }
         const reqSize = Number.isInteger(args?.size) ? Math.max(96, Math.min(1024, args.size)) : 128;
-        const thumbnails = {};
         const results = [];
         for (const p of paths) {
           const norm = normalizePath(p);
           const entry = findEntryOnMachine(machineName, norm);
           if (!entry || entry.kind !== 'file') {
-            const err = { code: 'not_found', message: 'File not found.' };
-            thumbnails[p] = { error: err };
-            results.push({ path: p, error: err });
+            results.push({ path: p, error: { code: 'not_found', message: 'File not found.' } });
             continue;
           }
           if (entry.thumbFail) {
-            const err = { code: 'unsupported', message: 'Thumbnail decoding failed.' };
-            thumbnails[p] = { error: err };
-            results.push({ path: p, error: err });
+            results.push({ path: p, error: { code: 'unsupported', message: 'Thumbnail decoding failed.' } });
             continue;
           }
           if (isThumbRetry && entry.name === 'IMG_2042.jpg') {
             const tries = thumbAttemptByPath.get(norm) || 0;
             thumbAttemptByPath.set(norm, tries + 1);
             if (tries < 1) {
-              const err = { code: 'busy', message: 'Thumbnail worker busy.', retryable: true };
-              thumbnails[p] = { error: err };
-              results.push({ path: p, error: err });
+              results.push({ path: p, error: { code: 'busy', message: 'Thumbnail worker busy.', retryable: true } });
               continue;
             }
           }
           const cat = categoryFromName(entry.name);
           if (cat === 'audio') {
             if (!entry.tags?.cover) {
-              const err = { code: 'not_found', message: 'No cover image.' };
-              thumbnails[p] = { error: err };
-              results.push({ path: p, error: err });
+              results.push({ path: p, error: { code: 'not_found', message: 'No cover image.' } });
               continue;
             }
           } else if (cat !== 'image' && cat !== 'video' && !entry.palette) {
-            const err = { code: 'unsupported', message: 'No thumbnail for this kind.' };
-            thumbnails[p] = { error: err };
-            results.push({ path: p, error: err });
+            results.push({ path: p, error: { code: 'unsupported', message: 'No thumbnail for this kind.' } });
             continue;
           }
           const pal = entry.palette || paletteFor(norm);
-          const payload = {
-            mime: 'image/svg+xml',
-            content: makeSampleImageBase64({ ...pal, w: reqSize, h: reqSize }),
-            width: reqSize,
-            height: reqSize,
-          };
-          thumbnails[p] = payload;
-          results.push({ path: p, ok: payload });
+          results.push({
+            path: p,
+            ok: {
+              mime: 'image/svg+xml',
+              content: makeSampleImageBase64({ ...pal, w: reqSize, h: reqSize }),
+              width: reqSize,
+              height: reqSize,
+            },
+          });
         }
         if (isSlowCover && paths.some((p) => categoryFromName(p) === 'audio')) {
-          return new Promise((resolve) => setTimeout(() => resolve({ thumbnails, results }), 280));
+          return new Promise((resolve) => setTimeout(() => resolve({ results }), 280));
         }
-        return { thumbnails, results };
+        return { results };
       }
 
       case 'fs.find': {

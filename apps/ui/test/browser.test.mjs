@@ -10,6 +10,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 import { chromium } from 'playwright-core';
 import './files-browser.mjs';
 import './live-refresh-browser.mjs';
@@ -341,6 +342,11 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await page.locator('header.top button[aria-label="Back"]').click();
     await page.locator('a.machine', { hasText: 'tower' }).click();
     await page.getByText('Health').waitFor();
+    assert.equal(
+      await page.locator('.older-note').count(),
+      0,
+      'Current real node must not show an older-Legion note on Machine Overview',
+    );
     await assertNoToolNames(page, 'real phone tower overview');
     await maybeShot(page, 'real-phone-dark-machine-overview');
     await setTheme(page, 'light');
@@ -350,11 +356,39 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     // Horizontal swipe across machine parts: Overview -> Files; opens same Files browser at tower.
     await dispatchSwipe(page, 'main.main', { startX: 300, startY: 360, endX: 100, endY: 362 });
     await page.locator('nav.nav.parts a[aria-current="page"]', { hasText: 'Files' }).waitFor();
+    await page.locator('.list a.row', { hasText: 'docs' }).waitFor();
+    assert.equal(
+      await page.locator('.older-note').count(),
+      0,
+      'Current real node must not show an older-Legion note at Files root',
+    );
     await page.locator('.list a.row', { hasText: 'docs' }).click();
     await page.locator('.list a.row', { hasText: 'hello.txt' }).click();
     await page.locator('.viewer pre.viewer-text').getByText('Hello from Legion real server preview.').waitFor();
     await assertNoToolNames(page, 'real phone tower files');
     await maybeShot(page, 'real-phone-dark-machine-files');
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    // Real node omits move capability on fs.transfer: Send to another machine offers only Copy.
+    await page.locator('.list a.row', { hasText: 'hello.txt' }).click();
+    await page.locator('.viewer').waitFor();
+    await page.locator('.viewer-bar button', { hasText: 'Send to' }).click();
+    const realSendSheet = page.locator('.sheet');
+    await realSendSheet.waitFor();
+    await page.waitForFunction(
+      () => document.activeElement?.classList?.contains('sheet'),
+      null,
+      { timeout: 3000 },
+    );
+    await realSendSheet.getByRole('button', { name: 'Copy to pi' }).waitFor();
+    assert.equal(
+      await realSendSheet.getByRole('button', { name: 'Move', exact: true }).count(),
+      0,
+      'Real node without move capability must offer only Copy when sending to another machine',
+    );
+    await page.keyboard.press('Escape');
+    await realSendSheet.waitFor({ state: 'hidden' });
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
     await page.goto(`${server.url}/#/machines/tower/power`, { waitUntil: 'domcontentloaded' });
@@ -1613,16 +1647,16 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
     });
     await page.getByText('3 are on').waitFor({ timeout: 15_000 });
 
-    const fileEntry = (name) =>
-      page.locator(`a.row:has-text("${name}"), a.cell[aria-label="${name}"]`);
+    const entryLocator = (name) =>
+      page.locator(`a.cell[aria-label="${name}"]`).or(page.locator('a.row', { hasText: name }));
 
     async function openMachineMedia(machine) {
       await page.locator('nav.nav a', { hasText: 'Files' }).click();
       await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
       await page.locator('.list a.row', { hasText: machine }).first().click();
-      await fileEntry('media').waitFor({ timeout: 10_000 });
-      await fileEntry('media').click();
-      await fileEntry('icon.png').waitFor({ timeout: 10_000 });
+      await entryLocator('media').waitFor({ timeout: 10_000 });
+      await entryLocator('media').click();
+      await entryLocator('icon.png').waitFor({ timeout: 10_000 });
     }
 
     async function verifyPictureAndVideo(machine) {
@@ -1630,7 +1664,7 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
       await openMachineMedia(machine);
 
       // Picture opens through real /v1/content and decodes cleanly.
-      await fileEntry('icon.png').click();
+      await entryLocator('icon.png').click();
       const img = page.locator('.viewer img.viewer-img');
       await img.waitFor({ timeout: 10_000 });
       await page.waitForFunction(
@@ -1653,7 +1687,7 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
       await page.locator('.viewer').waitFor({ state: 'hidden' });
 
       // Video opens through real /v1/content, decodes VP8 WebM, and seeks cleanly with 206 ranges.
-      await fileEntry('sample.webm').click();
+      await entryLocator('sample.webm').click();
       const video = page.locator('.viewer video.viewer-video');
       await video.waitFor({ timeout: 10_000 });
       const videoCheck = await video.evaluate(async (el) => {
@@ -1712,19 +1746,38 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
     await verifyPictureAndVideo('tower');
     await verifyPictureAndVideo('pi');
 
-    // 2. Older node (legacy): graceful fallback on first unsupported response, remembered for the
-    //    rest of the session so the second file does not retry POST /v1/content.
+    // 2. Older node (legacy): POST /v1/content fails once (501 unsupported) and is remembered for
+    //    the session; pictures fall back to the machine-made fs.thumb preview without Download,
+    //    while video shows the plain unavailable message without retrying POST /v1/content.
     await openMachineMedia('legacy');
-    await fileEntry('icon.png').click();
-    await page.locator('.viewer .said', { hasText: "Can't show this picture here" }).waitFor({ timeout: 10_000 });
-    await page.locator('.viewer .said', { hasText: "doesn't serve picture previews yet" }).waitFor();
-    assert.equal(await page.locator('.viewer img.viewer-img').count(), 0);
+    await entryLocator('icon.png').click();
+    const legacyImg = page.locator('.viewer img.viewer-img');
+    await legacyImg.waitFor({ timeout: 10_000 });
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector('.viewer img.viewer-img');
+        return Boolean(el && el.complete && el.naturalWidth > 0 && el.naturalHeight > 0);
+      },
+      null,
+      { timeout: 10_000 },
+    );
+    const legacyImgInfo = await legacyImg.evaluate((el) => ({
+      src: el.getAttribute('src') || '',
+      w: el.naturalWidth,
+      h: el.naturalHeight,
+    }));
+    assert.ok(
+      legacyImgInfo.src.startsWith('data:image/'),
+      `legacy: expected data:image/ fs.thumb fallback preview, got ${legacyImgInfo.src.slice(0, 40)}`,
+    );
+    assert.equal(legacyImgInfo.w, 512, 'legacy: expected 512px preview width');
+    assert.equal(legacyImgInfo.h, 512, 'legacy: expected 512px preview height');
     assert.equal(await page.locator('.viewer button', { hasText: 'Download' }).count(), 0);
     assert.equal(contentPostsByMachine.get('legacy') || 0, 1, 'expected exactly one POST /v1/content probe for legacy');
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
-    await fileEntry('sample.webm').click();
+    await entryLocator('sample.webm').click();
     await page.locator('.viewer .said', { hasText: "Video playback isn't available from legacy yet" }).waitFor({ timeout: 10_000 });
     assert.equal(await page.locator('.viewer video.viewer-video').count(), 0);
     assert.equal(
@@ -1737,7 +1790,7 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
 
     // 3. Supported remote machine still opens pictures after legacy was remembered unsupported.
     await openMachineMedia('pi');
-    await fileEntry('icon.png').click();
+    await entryLocator('icon.png').click();
     await page.waitForFunction(
       () => {
         const el = document.querySelector('.viewer img.viewer-img');
@@ -2258,6 +2311,222 @@ test('Files viewer recovers expired and door-restarted video playback, reports h
     );
 
     assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
+    await ctx.close();
+  } finally {
+    await browser.close();
+    await server.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+const PNG_CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) {
+      c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function pngCrc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i += 1) {
+    c = PNG_CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function makePngChunk(type, data) {
+  const typeBuf = Buffer.from(type, 'ascii');
+  const lenBuf = Buffer.alloc(4);
+  lenBuf.writeUInt32BE(data.length, 0);
+  const crcBuf = Buffer.alloc(4);
+  crcBuf.writeUInt32BE(pngCrc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([lenBuf, typeBuf, data, crcBuf]);
+}
+
+function makeSolidPng(width, height, r, g, b) {
+  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // 8-bit depth
+  ihdr[9] = 2; // RGB
+  const stride = 1 + width * 3;
+  const raw = Buffer.alloc(height * stride);
+  for (let y = 0; y < height; y += 1) {
+    const row = y * stride;
+    raw[row] = 0; // filter: None
+    for (let x = 0; x < width; x += 1) {
+      const px = row + 1 + x * 3;
+      raw[px] = r;
+      raw[px + 1] = g;
+      raw[px + 2] = b;
+    }
+  }
+  return Buffer.concat([
+    sig,
+    makePngChunk('IHDR', ihdr),
+    makePngChunk('IDAT', zlib.deflateSync(raw)),
+    makePngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+async function waitForLoadedThumb(locator, label) {
+  const img = locator.locator('img').first();
+  await img.waitFor({ timeout: 10_000 });
+  await img.evaluate(
+    (el) =>
+      new Promise((resolve, reject) => {
+        if (el.complete && el.naturalWidth > 0 && el.naturalHeight > 0) {
+          resolve();
+          return;
+        }
+        const timer = setTimeout(() => reject(new Error('Thumbnail image did not finish loading')), 10_000);
+        el.addEventListener(
+          'load',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+        el.addEventListener(
+          'error',
+          () => {
+            clearTimeout(timer);
+            reject(new Error('Thumbnail image failed to decode'));
+          },
+          { once: true },
+        );
+      }),
+  );
+  const info = await img.evaluate((el) => ({
+    src: el.getAttribute('src') || '',
+    complete: el.complete,
+    width: el.naturalWidth,
+    height: el.naturalHeight,
+  }));
+  assert.ok(info.src.startsWith('data:image/'), `${label}: expected data:image/ thumbnail, got ${info.src.slice(0, 40)}`);
+  assert.equal(info.complete, true, `${label}: expected thumbnail complete`);
+  assert.ok(info.width > 0, `${label}: expected naturalWidth > 0, got ${info.width}`);
+  assert.ok(info.height > 0, `${label}: expected naturalHeight > 0, got ${info.height}`);
+  return info;
+}
+
+test('real legion serve renders real fs.thumb thumbnails in grid, list, pinned strip, and search hits', async () => {
+  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+  const root = makeWorkRoot();
+  const fleet = setupFleet(root);
+
+  const galleryDir = path.join(fleet.towerUser, 'gallery');
+  fs.mkdirSync(galleryDir, { recursive: true });
+  const pictures = [
+    { name: 'crimson-sunset.png', rgb: [210, 45, 60] },
+    { name: 'forest-pine.png', rgb: [34, 139, 68] },
+    { name: 'ocean-wave.png', rgb: [30, 110, 210] },
+  ];
+  for (const pic of pictures) {
+    fs.writeFileSync(path.join(galleryDir, pic.name), makeSolidPng(160, 120, ...pic.rgb));
+  }
+  fs.writeFileSync(path.join(galleryDir, 'notes.txt'), 'Caption notes for gallery.\n');
+
+  const crimsonPath = path.join(galleryDir, 'crimson-sunset.png');
+  runLegion(
+    ['fav.add', 'machine=tower', `path=${crimsonPath}`, 'pinned=true', '--json'],
+    fleet.towerHome,
+    fleet.towerUser,
+  );
+
+  // Confirm the real node returns the `{ results: [{ path, ok }] }` wire shape.
+  const cliThumb = JSON.parse(
+    runLegion(['fs.thumb', `paths=["${crimsonPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`, '--json'], fleet.towerHome, fleet.towerUser),
+  );
+  assert.ok(Array.isArray(cliThumb.results), 'Real node fs.thumb must return a results array');
+  assert.equal(cliThumb.results.length, 1);
+  assert.equal(cliThumb.results[0].path, crimsonPath);
+  assert.ok(cliThumb.results[0].ok?.mime?.startsWith('image/'));
+  assert.ok(cliThumb.results[0].ok?.content?.length > 0);
+  assert.equal(cliThumb.thumbnails, undefined);
+
+  const server = await startServer(fleet.towerHome, fleet.towerUser);
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const ctx = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      colorScheme: 'dark',
+    });
+    const page = await ctx.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    // 1. Connect and open Files home: pinned picture renders a real thumbnail.
+    await page.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, { waitUntil: 'domcontentloaded' });
+    await page.getByText('2 are on').waitFor({ timeout: 15_000 });
+    await page.locator('nav.nav a', { hasText: 'Files' }).click();
+    await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
+
+    const pinnedTile = page.locator('.tiles a.tile', { hasText: 'crimson-sunset.png' });
+    await pinnedTile.waitFor({ timeout: 10_000 });
+    await waitForLoadedThumb(pinnedTile, 'pinned strip crimson-sunset.png');
+
+    // 2. Open tower -> gallery: defaults to grid view and renders real thumbnails for all 3 pictures.
+    await page.locator('a.row[href="#/files/tower/~"]').click();
+    await page.locator('header.top h1', { hasText: 'Home' }).waitFor();
+    await page.locator('.list a.row', { hasText: 'gallery' }).click();
+    await page.locator('header.top h1', { hasText: 'gallery' }).waitFor();
+
+    const gridSrcs = new Set();
+    for (const pic of pictures) {
+      const cell = page.locator(`.grid a.cell[aria-label="${pic.name}"]`);
+      await cell.waitFor({ timeout: 10_000 });
+      const info = await waitForLoadedThumb(cell, `grid ${pic.name}`);
+      gridSrcs.add(info.src);
+    }
+    assert.equal(gridSrcs.size, pictures.length, 'Different-coloured pictures should produce distinct thumbnails');
+
+    // 3. Switch to list view: all 3 pictures render real thumbnails.
+    await page.locator('.dock button[aria-label="Show as list"]').click();
+    for (const pic of pictures) {
+      const row = page.locator('.list a.row', { hasText: pic.name });
+      await row.waitFor({ timeout: 10_000 });
+      await waitForLoadedThumb(row, `list ${pic.name}`);
+    }
+
+    // 4. Clear cached thumbnails and reload Files home so search hits genuinely fetch via fs.thumb.
+    await page.evaluate(() => {
+      for (const k of Object.keys(localStorage)) {
+        if (k.startsWith('legion.thumb.')) localStorage.removeItem(k);
+      }
+    });
+    await page.goto(`${server.url}/#/files`, { waitUntil: 'domcontentloaded' });
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.locator('header.top h1', { hasText: 'Files' }).waitFor({ timeout: 10_000 });
+
+    const searchInput = page.locator('.dock input[aria-label="Search all machines"]');
+    await searchInput.waitFor({ timeout: 10_000 });
+    await searchInput.fill('ocean-wave');
+    await page.locator('header.top h1', { hasText: 'Search' }).waitFor({ timeout: 10_000 });
+    const searchRow = page.locator('.list a.row', { hasText: 'ocean-wave.png' }).first();
+    await searchRow.waitFor({ timeout: 10_000 });
+    await waitForLoadedThumb(searchRow, 'search hit ocean-wave.png');
+
+    assert.deepEqual(consoleErrors, [], `Unexpected console/CSP errors: ${consoleErrors.join('\n')}`);
+    assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
+
     await ctx.close();
   } finally {
     await browser.close();

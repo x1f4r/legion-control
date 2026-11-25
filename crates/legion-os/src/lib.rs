@@ -12,6 +12,7 @@ pub mod detach;
 pub mod display_awake;
 mod error;
 pub mod file_id;
+pub mod fs_kind;
 pub mod hardware;
 pub mod lock;
 pub mod mem_limit;

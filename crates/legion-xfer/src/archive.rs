@@ -6,13 +6,42 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use legion_os::atomic::FileIdentity;
 use serde::{Deserialize, Serialize};
 use tar::{Archive, Builder, EntryType, Header};
 
 use crate::error::{Error, Result, classify_io};
+use crate::file::{
+    IfExists, MAX_RENAME_ATTEMPTS, PlaceOutcome, default_xfer_state_dir, numbered_candidate,
+    place_file_with_state,
+};
+use crate::hash::{Hash, hash_file};
 use crate::manifest::{CaseCollision, EntryKind, SkippedEntry, Timestamp};
 use crate::path::parse_relative_path_bytes;
 use crate::platform;
+
+/// Verified destination metadata captured immediately after an archive file is placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacedFileMeta {
+    /// Filesystem identity `(dev, ino, nlink)` of the placed file, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<FileIdentity>,
+    /// Final byte length of the placed file.
+    pub size: u64,
+    /// Modification timestamp of the placed file, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<Timestamp>,
+}
+
+/// An entry placed under a numbered sibling name because its original path already existed under
+/// [`IfExists::Rename`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RenamedEntry {
+    /// Original relative path from the source tree.
+    pub from: String,
+    /// Actual relative path written at the destination (such as `sub/photo (2).jpg`).
+    pub to: String,
+}
 
 /// Summary returned by [`pack`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,9 +70,19 @@ pub struct UnpackReport {
     /// Entries skipped without failing the unpack (such as symlinks on Windows).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<SkippedEntry>,
+    /// Relative paths skipped because they already existed under [`IfExists::Skip`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_existing: Vec<String>,
+    /// Entries placed under a numbered sibling path under [`IfExists::Rename`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renamed: Vec<RenamedEntry>,
     /// Entries in the archive whose paths differed only in letter case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub case_collisions: Vec<CaseCollision>,
+    /// Verified destination metadata captured immediately after each placed file, keyed by the
+    /// actual destination relative path (including any `IfExists::Rename` suffix).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub placed_meta: BTreeMap<String, PlacedFileMeta>,
 }
 
 /// Writes a tar stream containing the exact relative `names` under `root` into `writer`.
@@ -152,7 +191,17 @@ where
 ///
 /// Convenience wrapper over [`unpack_filtered`] that accepts every valid entry.
 pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
-    unpack_impl(root, reader, false, |_, _| true)
+    let state_dir = default_xfer_state_dir();
+    unpack_impl(
+        &state_dir,
+        root,
+        reader,
+        IfExists::Replace,
+        false,
+        |_, _| true,
+        |_, _| Ok(()),
+        |_| None,
+    )
 }
 
 /// Safely extracts a tar stream from `reader` into `root`, consulting `filter` before writing each
@@ -171,16 +220,125 @@ where
     R: Read,
     F: FnMut(&str, EntryKind) -> bool,
 {
-    unpack_impl(root, reader, true, filter)
+    let state_dir = default_xfer_state_dir();
+    unpack_impl(
+        &state_dir,
+        root,
+        reader,
+        IfExists::Replace,
+        true,
+        filter,
+        |_, _| Ok(()),
+        |_| None,
+    )
 }
 
-fn unpack_impl<R, F>(root: &Path, reader: R, filtered: bool, mut filter: F) -> Result<UnpackReport>
+/// Like [`unpack_filtered`], enforcing `if_exists` atomically on every regular file and symlink
+/// and consulting `check_target` before placing a renamed sibling candidate.
+pub fn unpack_with_options<R, F, C>(
+    root: &Path,
+    reader: R,
+    if_exists: IfExists,
+    filter: F,
+    check_target: C,
+) -> Result<UnpackReport>
 where
     R: Read,
     F: FnMut(&str, EntryKind) -> bool,
+    C: FnMut(&Path, EntryKind) -> Result<()>,
+{
+    let state_dir = default_xfer_state_dir();
+    unpack_impl(
+        &state_dir,
+        root,
+        reader,
+        if_exists,
+        true,
+        filter,
+        check_target,
+        |_| None,
+    )
+}
+
+/// Like [`unpack_with_options`], also re-reading and verifying each regular file's stored bytes on
+/// disk after `sync_all` against `expected_hash` (when `Some`) before placing it into `root`.
+pub fn unpack_with_options_and_hashes<R, F, C, H>(
+    root: &Path,
+    reader: R,
+    if_exists: IfExists,
+    filter: F,
+    check_target: C,
+    expected_hash: H,
+) -> Result<UnpackReport>
+where
+    R: Read,
+    F: FnMut(&str, EntryKind) -> bool,
+    C: FnMut(&Path, EntryKind) -> Result<()>,
+    H: FnMut(&str) -> Option<Hash>,
+{
+    let state_dir = default_xfer_state_dir();
+    unpack_impl(
+        &state_dir,
+        root,
+        reader,
+        if_exists,
+        true,
+        filter,
+        check_target,
+        expected_hash,
+    )
+}
+
+/// Like [`unpack_with_options_and_hashes`], storing claim and partial-cleanup state under
+/// `state_dir` so no sidecars live in user folders.
+pub fn unpack_with_options_hashes_and_state<R, F, C, H>(
+    state_dir: &Path,
+    root: &Path,
+    reader: R,
+    if_exists: IfExists,
+    filter: F,
+    check_target: C,
+    expected_hash: H,
+) -> Result<UnpackReport>
+where
+    R: Read,
+    F: FnMut(&str, EntryKind) -> bool,
+    C: FnMut(&Path, EntryKind) -> Result<()>,
+    H: FnMut(&str) -> Option<Hash>,
+{
+    unpack_impl(
+        state_dir,
+        root,
+        reader,
+        if_exists,
+        true,
+        filter,
+        check_target,
+        expected_hash,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unpack_impl<R, F, C, H>(
+    state_dir: &Path,
+    root: &Path,
+    reader: R,
+    if_exists: IfExists,
+    filtered: bool,
+    mut filter: F,
+    mut check_target: C,
+    mut expected_hash: H,
+) -> Result<UnpackReport>
+where
+    R: Read,
+    F: FnMut(&str, EntryKind) -> bool,
+    C: FnMut(&Path, EntryKind) -> Result<()>,
+    H: FnMut(&str) -> Option<Hash>,
 {
     fs::create_dir_all(root).map_err(|e| classify_io(root, e))?;
     let canonical_root = fs::canonicalize(root).map_err(|e| classify_io(root, e))?;
+    let _ = crate::file::sweep_abandoned_temps(state_dir, crate::file::PROBE_SWEEP_AGE);
+    let _ = crate::file::sweep_stale_state(state_dir, crate::file::STALE_TEMP_AGE);
     let case_insensitive = is_case_insensitive_dir(&canonical_root)?;
 
     let mut archive = Archive::new(reader);
@@ -326,7 +484,8 @@ where
                 report.dirs.push(rel);
             }
             EntryKind::File => {
-                if let Ok(meta) = fs::symlink_metadata(&dest)
+                if if_exists == IfExists::Replace
+                    && let Ok(meta) = fs::symlink_metadata(&dest)
                     && meta.file_type().is_dir()
                 {
                     return Err(Error::Conflict {
@@ -336,7 +495,7 @@ where
                 }
 
                 let expected_size = entry.size();
-                let (mut tmp_file, mut guard) = create_temp_file(&parent)?;
+                let (mut tmp_file, mut guard) = create_temp_file(&parent, state_dir)?;
                 let written = io::copy(&mut entry, &mut tmp_file)?;
                 if written != expected_size {
                     return Err(Error::Io {
@@ -355,6 +514,20 @@ where
                     .map_err(|e| classify_io(guard.path(), e))?;
                 drop(tmp_file);
 
+                // Re-read and verify the stored bytes on disk after `sync_all` whenever the plan
+                // supplied an expected hash (such as moves and checksum transfers), matching the
+                // single-file path so source removal is gated on verified on-disk storage.
+                if let Some(expected) = expected_hash(&rel) {
+                    let actual = hash_file(guard.path())?;
+                    if actual != expected {
+                        return Err(Error::HashMismatch {
+                            path: dest,
+                            expected,
+                            actual,
+                        });
+                    }
+                }
+
                 if let Some(mode) = safe_mode {
                     platform::set_mode(guard.path(), mode)?;
                 }
@@ -363,14 +536,46 @@ where
                         .map_err(|e| classify_io(guard.path(), e))?;
                 }
 
-                platform::replace_file(guard.path(), &dest)?;
-                guard.disarm();
-                remove_stale_part_file(&dest);
-                dirs_to_sync.insert(parent);
+                match place_file_with_state(state_dir, guard.path(), &dest, if_exists, |cand| {
+                    check_target(cand, EntryKind::File)
+                })? {
+                    PlaceOutcome::Placed(chosen) => {
+                        guard.disarm();
+                        remove_stale_part_file(state_dir, &chosen);
+                        dirs_to_sync.insert(parent);
 
-                record_written(&mut written_exact, &mut written_ancestors, &rel);
-                report.files.push(rel);
-                report.bytes += written;
+                        let placed_rel = if chosen != dest
+                            && let Some(chosen_name) =
+                                chosen.file_name().and_then(|name| name.to_str())
+                        {
+                            let chosen_rel = replace_last_segment(&rel, chosen_name);
+                            record_written(&mut written_exact, &mut written_ancestors, &chosen_rel);
+                            report.renamed.push(RenamedEntry {
+                                from: rel.clone(),
+                                to: chosen_rel.clone(),
+                            });
+                            chosen_rel
+                        } else {
+                            record_written(&mut written_exact, &mut written_ancestors, &rel);
+                            rel.clone()
+                        };
+                        let placed_meta = fs::symlink_metadata(&chosen).ok();
+                        report.placed_meta.insert(
+                            placed_rel,
+                            PlacedFileMeta {
+                                file_id: platform::symlink_file_identity(&chosen).ok(),
+                                size: placed_meta.as_ref().map_or(written, fs::Metadata::len),
+                                mtime: placed_meta.as_ref().map(Timestamp::from_metadata),
+                            },
+                        );
+                        report.files.push(rel);
+                        report.bytes += written;
+                    }
+                    PlaceOutcome::Skipped => {
+                        // `guard` drops here and removes the temporary file.
+                        report.skipped_existing.push(rel);
+                    }
+                }
             }
             EntryKind::Symlink => {
                 if written_exact.contains(&rel) || written_ancestors.contains(&rel) {
@@ -401,7 +606,8 @@ where
                     }
                 })?;
 
-                if let Ok(meta) = fs::symlink_metadata(&dest)
+                if if_exists == IfExists::Replace
+                    && let Ok(meta) = fs::symlink_metadata(&dest)
                     && meta.file_type().is_dir()
                 {
                     return Err(Error::Conflict {
@@ -410,18 +616,42 @@ where
                     });
                 }
 
-                if platform::create_symlink_atomic(Path::new(target_str), &dest)? {
-                    remove_stale_part_file(&dest);
-                    dirs_to_sync.insert(parent);
-                    record_written(&mut written_exact, &mut written_ancestors, &rel);
-                    written_symlinks.insert(rel.clone());
-                    written_symlinks.insert(effective_rel);
-                    report.symlinks.push(rel);
-                } else {
-                    report.skipped.push(SkippedEntry {
-                        path: rel,
-                        reason: "symlinks are skipped on Windows".to_string(),
-                    });
+                match place_symlink(Path::new(target_str), &dest, if_exists, |cand| {
+                    check_target(cand, EntryKind::Symlink)
+                })? {
+                    SymlinkPlace::Placed(chosen) => {
+                        remove_stale_part_file(state_dir, &chosen);
+                        dirs_to_sync.insert(parent);
+                        if chosen != dest
+                            && let Some(chosen_name) =
+                                chosen.file_name().and_then(|name| name.to_str())
+                        {
+                            let chosen_rel = replace_last_segment(&rel, chosen_name);
+                            let effective_chosen =
+                                replace_last_segment(&effective_rel, chosen_name);
+                            record_written(&mut written_exact, &mut written_ancestors, &chosen_rel);
+                            written_symlinks.insert(chosen_rel.clone());
+                            written_symlinks.insert(effective_chosen);
+                            report.renamed.push(RenamedEntry {
+                                from: rel.clone(),
+                                to: chosen_rel,
+                            });
+                        } else {
+                            record_written(&mut written_exact, &mut written_ancestors, &rel);
+                            written_symlinks.insert(rel.clone());
+                            written_symlinks.insert(effective_rel);
+                        }
+                        report.symlinks.push(rel);
+                    }
+                    SymlinkPlace::SkippedExisting => {
+                        report.skipped_existing.push(rel);
+                    }
+                    SymlinkPlace::Unsupported => {
+                        report.skipped.push(SkippedEntry {
+                            path: rel,
+                            reason: "symlinks are skipped on Windows".to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -608,13 +838,87 @@ fn parse_pax_mtime(raw: &str) -> Option<SystemTime> {
     }
 }
 
-/// Removes a stale `<name>.legion-part` file beside `dest` when `unpack` replaces `dest`.
-fn remove_stale_part_file(dest: &Path) {
+/// Removes a stale `<name>.legion-part` file beside `dest` and its state-directory metadata when
+/// `unpack` replaces `dest`.
+fn remove_stale_part_file(state_dir: &Path, dest: &Path) {
     if let Ok(partial) = crate::file::part_path(dest)
         && let Ok(meta) = fs::symlink_metadata(&partial)
         && meta.file_type().is_file()
     {
         let _ = fs::remove_file(&partial);
+        let meta_path = crate::file::part_meta_state_path(state_dir, dest);
+        let _ = fs::remove_file(&meta_path);
+    }
+}
+
+fn replace_last_segment(rel: &str, new_name: &str) -> String {
+    match rel.rsplit_once('/') {
+        Some((parent, _)) => format!("{parent}/{new_name}"),
+        None => new_name.to_owned(),
+    }
+}
+
+enum SymlinkPlace {
+    Placed(PathBuf),
+    SkippedExisting,
+    Unsupported,
+}
+
+fn place_symlink<F>(
+    target: &Path,
+    dest: &Path,
+    if_exists: IfExists,
+    mut check_target: F,
+) -> Result<SymlinkPlace>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    match if_exists {
+        IfExists::Replace => {
+            if platform::create_symlink_atomic(target, dest)? {
+                Ok(SymlinkPlace::Placed(dest.to_path_buf()))
+            } else {
+                Ok(SymlinkPlace::Unsupported)
+            }
+        }
+        IfExists::Fail => match platform::create_symlink_no_replace(target, dest) {
+            Ok(true) => Ok(SymlinkPlace::Placed(dest.to_path_buf())),
+            Ok(false) => Ok(SymlinkPlace::Unsupported),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(Error::Exists {
+                path: dest.to_path_buf(),
+                source: Some(err),
+            }),
+            Err(err) => Err(classify_io(dest, err)),
+        },
+        IfExists::Skip => match platform::create_symlink_no_replace(target, dest) {
+            Ok(true) => Ok(SymlinkPlace::Placed(dest.to_path_buf())),
+            Ok(false) => Ok(SymlinkPlace::Unsupported),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                Ok(SymlinkPlace::SkippedExisting)
+            }
+            Err(err) => Err(classify_io(dest, err)),
+        },
+        IfExists::Rename => {
+            for attempt in 1..=MAX_RENAME_ATTEMPTS {
+                let candidate = if attempt == 1 {
+                    dest.to_path_buf()
+                } else {
+                    let cand = numbered_candidate(dest, attempt);
+                    check_target(&cand)?;
+                    cand
+                };
+                match platform::create_symlink_no_replace(target, &candidate) {
+                    Ok(true) => return Ok(SymlinkPlace::Placed(candidate)),
+                    Ok(false) => return Ok(SymlinkPlace::Unsupported),
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => return Err(classify_io(&candidate, err)),
+                }
+            }
+            Err(Error::Exists {
+                path: dest.to_path_buf(),
+                source: None,
+            })
+        }
     }
 }
 
@@ -883,11 +1187,14 @@ fn unique_temp_path(parent: &Path) -> PathBuf {
     parent.join(format!(".legion-unpack-{pid}-{seq}.tmp"))
 }
 
-fn create_temp_file(parent: &Path) -> Result<(File, TempFileGuard)> {
+fn create_temp_file(parent: &Path, state_dir: &Path) -> Result<(File, TempFileGuard)> {
     loop {
         let path = unique_temp_path(parent);
         match platform::create_new_private(&path) {
-            Ok(file) => return Ok((file, TempFileGuard::new(path))),
+            Ok(file) => {
+                let owned = crate::file::register_owned_temp(state_dir, &path, &file);
+                return Ok((file, TempFileGuard::new(path, owned)));
+            }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(classify_io(&path, err)),
         }
@@ -897,11 +1204,15 @@ fn create_temp_file(parent: &Path) -> Result<(File, TempFileGuard)> {
 /// Deletes a temporary unpack file on drop unless disarmed after a successful rename.
 struct TempFileGuard {
     path: Option<PathBuf>,
+    owned: Option<crate::file::OwnedTempGuard>,
 }
 
 impl TempFileGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
+    fn new(path: PathBuf, owned: Option<crate::file::OwnedTempGuard>) -> Self {
+        Self {
+            path: Some(path),
+            owned,
+        }
     }
 
     fn path(&self) -> &Path {
@@ -910,6 +1221,7 @@ impl TempFileGuard {
 
     fn disarm(&mut self) {
         self.path = None;
+        self.owned.take();
     }
 }
 
@@ -918,6 +1230,7 @@ impl Drop for TempFileGuard {
         if let Some(path) = self.path.take() {
             let _ = fs::remove_file(path);
         }
+        self.owned.take();
     }
 }
 
@@ -1581,7 +1894,8 @@ mod tests {
         }
 
         let dst = tempfile::tempdir().unwrap();
-        let (_file, guard) = create_temp_file(dst.path()).unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let (_file, guard) = create_temp_file(dst.path(), state_dir.path()).unwrap();
         let direct_mode = fs::symlink_metadata(guard.path())
             .unwrap()
             .permissions()
@@ -1621,5 +1935,123 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn unpack_with_options_enforces_if_exists_modes() {
+        let src = tempfile::tempdir().unwrap();
+        fs::create_dir_all(src.path().join("sub")).unwrap();
+        fs::write(src.path().join("a.txt"), b"new-a").unwrap();
+        fs::write(src.path().join("sub/b.txt"), b"new-b").unwrap();
+
+        let mut tar_bytes = Vec::new();
+        pack(src.path(), &["a.txt", "sub", "sub/b.txt"], &mut tar_bytes).unwrap();
+
+        // Fail: stops on existing a.txt without overwriting.
+        let dst_fail = tempfile::tempdir().unwrap();
+        fs::write(dst_fail.path().join("a.txt"), b"orig-a").unwrap();
+        let err = unpack_with_options(
+            dst_fail.path(),
+            Cursor::new(&tar_bytes),
+            IfExists::Fail,
+            |_, _| true,
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Exists { .. }), "{err:?}");
+        assert_eq!(fs::read(dst_fail.path().join("a.txt")).unwrap(), b"orig-a");
+
+        // Skip: preserves existing a.txt, writes new sub/b.txt.
+        let dst_skip = tempfile::tempdir().unwrap();
+        fs::write(dst_skip.path().join("a.txt"), b"orig-a").unwrap();
+        let rep = unpack_with_options(
+            dst_skip.path(),
+            Cursor::new(&tar_bytes),
+            IfExists::Skip,
+            |_, _| true,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(rep.skipped_existing, vec!["a.txt"]);
+        assert_eq!(rep.files, vec!["sub/b.txt"]);
+        assert_eq!(fs::read(dst_skip.path().join("a.txt")).unwrap(), b"orig-a");
+        assert_eq!(
+            fs::read(dst_skip.path().join("sub/b.txt")).unwrap(),
+            b"new-b"
+        );
+
+        // Rename: preserves existing a.txt and writes a (2).txt.
+        let dst_rename = tempfile::tempdir().unwrap();
+        fs::write(dst_rename.path().join("a.txt"), b"orig-a").unwrap();
+        let rep = unpack_with_options(
+            dst_rename.path(),
+            Cursor::new(&tar_bytes),
+            IfExists::Rename,
+            |_, _| true,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            rep.renamed,
+            vec![RenamedEntry {
+                from: "a.txt".to_owned(),
+                to: "a (2).txt".to_owned(),
+            }]
+        );
+        assert_eq!(
+            fs::read(dst_rename.path().join("a.txt")).unwrap(),
+            b"orig-a"
+        );
+        assert_eq!(
+            fs::read(dst_rename.path().join("a (2).txt")).unwrap(),
+            b"new-a"
+        );
+        assert_eq!(
+            fs::read(dst_rename.path().join("sub/b.txt")).unwrap(),
+            b"new-b"
+        );
+    }
+
+    #[test]
+    fn unpack_verifies_stored_file_hash_after_sync() {
+        let src = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("data.bin"), b"verified payload").unwrap();
+        let mut tar_bytes = Vec::new();
+        pack(src.path(), &["data.bin"], &mut tar_bytes).unwrap();
+
+        let good_hash = crate::hash::hash_bytes(b"verified payload");
+        let wrong_hash = crate::hash::hash_bytes(b"different bytes");
+
+        // Matching hash places the file cleanly.
+        let dst_ok = tempfile::tempdir().unwrap();
+        let rep = unpack_with_options_and_hashes(
+            dst_ok.path(),
+            Cursor::new(&tar_bytes),
+            IfExists::Replace,
+            |_, _| true,
+            |_, _| Ok(()),
+            |_| Some(good_hash),
+        )
+        .unwrap();
+        assert_eq!(rep.files, vec!["data.bin"]);
+        assert_eq!(
+            fs::read(dst_ok.path().join("data.bin")).unwrap(),
+            b"verified payload"
+        );
+
+        // Mismatched hash refuses before placing and cleans up temp files.
+        let dst_bad = tempfile::tempdir().unwrap();
+        let err = unpack_with_options_and_hashes(
+            dst_bad.path(),
+            Cursor::new(&tar_bytes),
+            IfExists::Replace,
+            |_, _| true,
+            |_, _| Ok(()),
+            |_| Some(wrong_hash),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::HashMismatch { .. }), "{err:?}");
+        assert!(!dst_bad.path().join("data.bin").exists());
+        assert_eq!(fs::read_dir(dst_bad.path()).unwrap().count(), 0);
     }
 }

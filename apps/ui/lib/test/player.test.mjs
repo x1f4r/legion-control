@@ -4,6 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { extractThumbMap } from '../files.js';
 import { canBrowserImmersive, createBrowserImmersive } from '../immersive-browser.js';
 import { createAppLink, detectAppImmersiveCapability } from '../../link/app.js';
 import {
@@ -17,7 +18,6 @@ import {
   createVideoController,
   DOUBLE_TAP_WINDOW_MS,
   extractTagsMap,
-  extractThumbMap,
   formatMusicDisplay,
   formatPlayerTime,
   formatPositionValueText,
@@ -489,7 +489,7 @@ test('time formatting, spoken slider value, speed labels, orientation, and wire 
   assert.equal(clampVolume(1.4), 1);
   assert.equal(clampVolume(-0.2), 0);
 
-  // Supports both node `{ results }` and mock `{ thumbnails }` shapes.
+  // Shared `extractThumbMap` handles node `{ results }` replies cleanly.
   const fromNode = extractThumbMap({
     results: [
       { path: '/a.mp3', ok: { mime: 'image/jpeg', content: 'abc', width: 512, height: 512 } },
@@ -498,11 +498,6 @@ test('time formatting, spoken slider value, speed labels, orientation, and wire 
   });
   assert.equal(fromNode['/a.mp3'].mime, 'image/jpeg');
   assert.equal(fromNode['/b.mp3'].error.code, 'not_found');
-
-  const fromLegacy = extractThumbMap({
-    thumbnails: { '/a.jpg': { mime: 'image/svg+xml', content: 'xyz' } },
-  });
-  assert.equal(fromLegacy['/a.jpg'].mime, 'image/svg+xml');
 
   const tags = extractTagsMap({
     results: [

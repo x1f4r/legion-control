@@ -90,33 +90,7 @@ export function formatMusicDisplay(tags, fileName) {
   return { title, subtitle };
 }
 
-// ── Wire extractors for fs.thumb and fs.tags ─────────────────────────────────────────────────
-
-/**
- * Extracts per-path entries from `fs.thumb`, supporting both the node's `{ results: [{ path, ok | error }] }`
- * wire format and the legacy/mock `{ thumbnails: { [path]: { mime, content } | { error } } }` format.
- */
-export function extractThumbMap(res) {
-  const map = Object.create(null);
-  if (!res || typeof res !== 'object') return map;
-  if (Array.isArray(res.results)) {
-    for (const item of res.results) {
-      if (!item || typeof item.path !== 'string') continue;
-      if (item.ok && typeof item.ok === 'object') {
-        map[item.path] = item.ok;
-      } else if (item.error) {
-        map[item.path] = { error: item.error };
-      }
-    }
-    return map;
-  }
-  if (res.thumbnails && typeof res.thumbnails === 'object') {
-    for (const [p, val] of Object.entries(res.thumbnails)) {
-      map[p] = val;
-    }
-  }
-  return map;
-}
+// ── Wire extractor for fs.tags ───────────────────────────────────────────────────────────────
 
 /**
  * Extracts per-path entries from `fs.tags` (`{ results: [{ path, ok | error }] }`).

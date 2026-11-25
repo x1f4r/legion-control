@@ -621,6 +621,16 @@ impl Policy {
             .with_details(json!({"principal": principal, "role": role, "tool": tool})))
     }
 
+    /// Whether `principal`'s role has a `deny` rule that matches `tool` by name or glob (ignoring
+    /// `effect:*` deny rules).
+    pub fn is_denied_by_name(&self, principal: &str, tool: &str) -> bool {
+        let (_, rules) = self.role_of(principal);
+        rules
+            .deny
+            .iter()
+            .any(|rule| matches!(rule, Rule::Tools(pattern) if glob::matches(pattern, tool)))
+    }
+
     /// Whether `principal` might be allowed to call `tool` once the target reports its effect.
     ///
     /// Returns `false` when `tool` is already denied by name/glob or when no allow rule could
@@ -2281,32 +2291,46 @@ fn resolve(path: &Path) -> Result<Resolved, Unresolved> {
     let mut existing = path.to_path_buf();
     // The parts that do not exist, the last one first.
     let mut missing: Vec<OsString> = Vec::new();
+    let mut vanish_retries = 0u8;
     loop {
         match std::fs::symlink_metadata(&existing) {
             Ok(_) => {
-                return match dunce::canonicalize(&existing) {
+                match dunce::canonicalize(&existing) {
                     Ok(resolved) => {
                         missing.reverse();
-                        Ok(Resolved {
+                        return Ok(Resolved {
                             existing: resolved,
                             missing,
                             link: None,
-                        })
+                        });
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        Err(Unresolved::Unclear(
+                        // A regular file removed or renamed concurrently between
+                        // `symlink_metadata` and `canonicalize` is absent, not a dangling link.
+                        if vanish_retries < 8
+                            && matches!(
+                                std::fs::symlink_metadata(&existing),
+                                Err(ref e) if e.kind() == io::ErrorKind::NotFound
+                            )
+                        {
+                            vanish_retries += 1;
+                            continue;
+                        }
+                        return Err(Unresolved::Unclear(
                             ErrorCode::NotFound,
                             format!(
                                 "{} is a symbolic link that leads nowhere",
                                 existing.display()
                             ),
-                        ))
+                        ));
                     }
-                    Err(error) => Err(Unresolved::Unclear(
-                        ErrorCode::Failed,
-                        format!("{} cannot be resolved ({error})", existing.display()),
-                    )),
-                };
+                    Err(error) => {
+                        return Err(Unresolved::Unclear(
+                            ErrorCode::Failed,
+                            format!("{} cannot be resolved ({error})", existing.display()),
+                        ));
+                    }
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match existing.components().next_back() {

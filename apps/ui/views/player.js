@@ -4,6 +4,7 @@
 
 import { html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
+import { extractThumbMap } from '../lib/files.js';
 import {
   clampVolume,
   classifyPlayerKey,
@@ -11,7 +12,6 @@ import {
   createTurnWatcher,
   createVideoController,
   extractTagsMap,
-  extractThumbMap,
   formatMusicDisplay,
   formatPlayerTime,
   formatPositionValueText,

@@ -216,6 +216,38 @@ planned `entries` (`path`, `kind`, `size`, `hash`, `target`) and refuses anythin
 stream. Every operation is checked against the target machine's `policy.toml` (`fs.read`,
 `fs.write`, or `fs.remove`) and written to its audit log with door `stream`.
 
+### Collisions (`if_exists`) and background transfers
+
+- **`if_exists`** controls what happens when a destination file already exists: `replace`
+  (default), `fail` (refuse with `exists` before overwriting), `skip` (keep the existing file), or
+  `rename` (write `name (2).ext`, counting up atomically at the destination even when two transfers
+  race for the same name). Works for both single files and directory trees.
+- **`move=true`** is not available yet in default builds (refused with `unsupported` before copying
+  anything while moving between places is reworked around OS file-handle locks). Copy the file or
+  folder first, check the copy, and then remove the original.
+- **`background=true`** starts the transfer as a detached job on the node running `fs.transfer` and
+  returns `{job: {id, machine}}` immediately. The job runs strictly under the caller's own
+  principal and grant, survives the caller disconnecting, appears in `job.list` with
+  `kind: "transfer"` and a readable `title` (such as `"Copy Holiday.mp4 to pi"`), reports
+  `progress` (`bytes_done`, `bytes_total`, `files_done`, `files_total`, `current`, `rate`) in
+  `job.status` and as `progress` events, and finishes with the foreground transfer report in
+  `result`. Its owner may cancel it with `job.cancel` without holding `effect:exec` (keeping the
+  partial file so re-running the transfer resumes); nobody else gains anything from that exception.
+
+### Fleet-wide favourites (`fav.*`)
+
+`fav.list` (`effect:read`), `fav.add`, `fav.set`, and `fav.remove` (`effect:write`) manage a
+fleet-wide list of starred and pinned files and folders in `favorites.toml` beside `policy.toml`:
+
+- `fav.add path=~/photos label="Photos" pinned=true` stars a path (defaulting `machine` to this
+  node; any fleet machine may be named) and automatically pushes `favorites.toml` to reachable
+  peers.
+- `fav.set id=<id> label="Family Photos" pinned=false` updates `label` (pass `""` to clear) or
+  `pinned` independently, each with its own `(updated_at, updated_on)` stamp.
+- `fav.remove id=<id>` records a stamped 90-day tombstone and pushes it to reachable peers.
+- `fav.list` filters by optional `machine` or `pinned`, omits entries outside the caller's `paths`,
+  and reports `exists` cheaply when an entry's `machine` is this node.
+
 ### Transfers involving a `via` relay
 
 Because `legion stream` opens a direct pipe to each end, a machine configured with `via = "pi"`
@@ -1294,11 +1326,14 @@ See [`examples/legion/tools.d/`](../../examples/legion/tools.d/) for complete TO
 `fleet.sync` compares, pushes, or pulls shared configuration across machines in `fleet.toml` (all
 requiring `effect:admin`, built on `config.list`, `config.read`, and `config.write`):
 
-- **Shared documents**: `devices.toml`, `fleet.toml`, `policy.toml`, `projects.toml`, and
-  `tools.d/<name>.toml`. Extension files may contain internal dots (matching `ext.define` files
-  such as `tools.d/ops.greet.toml`); on write, the receiver enforces the same rules as `ext.define`
-  — the filename stem must match the `name` field inside the file, duplicate tool names across
-  files are refused, and reserved families are rejected. `devices.toml` obeys the two-writers rule
+- **Shared documents**: `devices.toml`, `favorites.toml`, `fleet.toml`, `policy.toml`,
+  `projects.toml`, and `tools.d/<name>.toml`. Extension files may contain internal dots (matching
+  `ext.define` files such as `tools.d/ops.greet.toml`); on write, the receiver enforces the same
+  rules as `ext.define` — the filename stem must match the `name` field inside the file, duplicate
+  tool names across files are refused, and reserved families are rejected. `favorites.toml` merges
+  commutatively in both directions with per-field timestamps and 90-day tombstones without
+  owner-only restrictions (strictly validated and size-bounded to 256 KiB on receipt). `devices.toml`
+  obeys the two-writers rule
   (push and pull require the `owner` role on both nodes; non-owner `fleet.sync` skips `devices.toml`
   with the reason while syncing the other documents) and merges per field (`name` and `role` carry
   independent stamps, disagreements on immutable identity or provenance fields are flagged as
