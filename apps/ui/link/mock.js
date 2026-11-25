@@ -880,6 +880,8 @@ export function createMockLink(mode = '') {
     machines,
     flags,
     activeNodeRef: () => activeNode,
+    isAuthedRef: () => authed,
+    canReadRef: () => allowedTools.includes('fs.read'),
   });
 
   function resolveOne(target, tool, args, onEvent) {
@@ -973,7 +975,9 @@ export function createMockLink(mode = '') {
             : { machine: 'tower', reachable: true, node: 'tower', system: 'linux', version: '0.1.0', os: 'linux', arch: 'x86_64', latency_ms: 0 },
           { machine: 'pi', reachable: true, node: 'pi', system: 'linux', version: '0.1.0', os: 'linux', arch: 'aarch64', latency_ms: 4 },
           { machine: 'studio', reachable: true, node: 'studio', system: 'macos', version: '0.1.0', os: 'macos', arch: 'aarch64', latency_ms: 11 },
-          { machine: 'laptop', reachable: false, error: machines.laptop.error },
+          machines.laptop.reachable
+            ? { machine: 'laptop', reachable: true, node: 'laptop', system: 'linux', version: '0.1.0', os: 'linux', arch: 'x86_64', latency_ms: 8 }
+            : { machine: 'laptop', reachable: false, error: machines.laptop.error },
           { machine: 'nas', reachable: false, error: machines.nas.error },
         ];
         if (isFirst) {
@@ -1313,14 +1317,35 @@ export function createMockLink(mode = '') {
           detail: had ? 'Cancelled pending power action.' : 'Nothing is pending on this machine.',
         };
       }
-      case 'power.wake':
+      case 'power.wake': {
+        const wakeTarget = args?.machine || 'laptop';
+        if (!args?.dry_run && machines[wakeTarget] && !machines[wakeTarget].reachable) {
+          setTimeout(() => {
+            const targetMachine = machines[wakeTarget];
+            if (!targetMachine || targetMachine.reachable) return;
+            targetMachine.reachable = true;
+            targetMachine.error = null;
+            if (!targetMachine.sys) {
+              targetMachine.sys = {
+                node: wakeTarget,
+                os: { family: 'linux', name: 'Linux', arch: 'x86_64' },
+                uptime_s: 12,
+                load: [0.18, 0.14, 0.1],
+                memory: { total: 32 * 1024 ** 3, used: 6 * 1024 ** 3, available: 26 * 1024 ** 3 },
+                disks: [{ mount: '/', total: 1000 * 1024 ** 3, used: 420 * 1024 ** 3, available: 580 * 1024 ** 3 }],
+                gpus: [],
+              };
+            }
+          }, 450);
+        }
         return {
-          machine: args?.machine || 'laptop',
+          machine: wakeTarget,
           awake: false,
           sent_by: 'pi',
           dry_run: Boolean(args?.dry_run) || undefined,
           would_send: args?.dry_run ? ['255.255.255.255:9'] : undefined,
         };
+      }
       default:
         return { ok: true, tool, args: args || {}, node: name };
     }

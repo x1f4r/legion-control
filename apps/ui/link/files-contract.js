@@ -17,8 +17,7 @@
  *
  * @typedef {Object} ContentUrlResult
  * @property {string} url - Ticketed content address for `<img>`, `<video>`, `<audio>`, or download.
- * @property {number} [expiresIn] - Ticket lifetime in seconds.
- * @property {string} [mime] - Resolved MIME type, if known.
+ * @property {number | null} [expires_in] - Ticket lifetime in seconds.
  *
  * @typedef {'queued' | 'running' | 'paused' | 'done' | 'failed' | 'cancelled'} DeviceTransferState
  *

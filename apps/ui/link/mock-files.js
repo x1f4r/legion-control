@@ -14,8 +14,11 @@ import {
   base64ToBlobUrl,
   makeSampleImageBase64,
   makeSampleImageDataUrl,
-  SAMPLE_AUDIO_MP3_BASE64,
-  SAMPLE_VIDEO_MP4_BASE64,
+  SAMPLE_AUDIO_OGG_BASE64,
+  SAMPLE_PDF_BASE64,
+  SAMPLE_PNG_BASE64,
+  SAMPLE_UNPLAYABLE_VIDEO_BASE64,
+  SAMPLE_VIDEO_WEBM_BASE64,
 } from './mock-media.js';
 
 const isoAgo = (sec) => new Date(Date.now() - sec * 1000).toISOString();
@@ -71,6 +74,20 @@ export const FILES_EXTRA_TOOLS = [
       properties: {
         path: { type: 'string' },
         parents: { type: 'boolean', default: true },
+      },
+    },
+  },
+  {
+    name: 'fs.copy',
+    effect: 'write',
+    description: 'Copy a file or folder on the same machine.',
+    input_schema: {
+      type: 'object',
+      required: ['from', 'to'],
+      properties: {
+        from: { type: 'string' },
+        to: { type: 'string' },
+        overwrite: { type: 'boolean', default: false },
       },
     },
   },
@@ -315,15 +332,19 @@ function makeLongLogText() {
   return `${lines.join('\n')}\n`;
 }
 
-export function createMockFilesState({ machines, flags, activeNodeRef }) {
+export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedRef = () => true, canReadRef = () => true }) {
   const isOld = flags.has('old') || flags.has('legacy');
   const isNoSync = flags.has('nosync') || isOld;
   const isLarge = flags.has('large');
+  const isInexact = flags.has('inexact');
+  const isThumbRetry = flags.has('thumb-retry');
   const isTransfersDemo = flags.has('transfers');
   const isEmpty = flags.has('empty');
 
   const day = 86400;
   const longLogText = makeLongLogText();
+  const LONG_NO_SPACE_NAME =
+    'quarterly_photogrammetry_orthomosaic_calibration_dataset_2026_11_24_camera_rig_north_ridge_sector_04_final_verified_v12.txt';
 
   // Per-machine filesystem directories: Map<dirPath, Entry[]>
   const trees = {
@@ -336,6 +357,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
           makeEntry('/home/me/Documents', { kind: 'dir', mtime: isoAgo(day * 5) }),
           makeEntry('/home/me/projects', { kind: 'dir', mtime: isoAgo(1200) }),
           makeEntry('/home/me/docs', { kind: 'dir', mtime: isoAgo(day) }),
+          makeEntry('/home/me/Private', { kind: 'dir', mtime: isoAgo(day * 14) }),
           makeEntry('/home/me/notes.txt', { kind: 'file', size: 124, mtime: isoAgo(3600) }),
           makeEntry('/home/me/.profile', { kind: 'file', size: 280, mtime: isoAgo(day * 40) }),
           ...(isLarge ? [makeEntry('/home/me/Archive5000', { kind: 'dir', mtime: isoAgo(day) })] : []),
@@ -366,7 +388,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
             palette: PALETTES[1],
             sampleMedia: 'video',
           }),
-          makeEntry('/home/me/Videos/Holiday/Concert.mkv', {
+          makeEntry('/home/me/Videos/Holiday/Concert (H.264).mp4', {
             size: 6_300_000_000,
             mtime: isoAgo(day * 30),
             duration_s: 4210,
@@ -391,7 +413,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
             palette: PALETTES[4],
             sampleMedia: 'image',
           }),
-          makeEntry('/home/me/Videos/Holiday/Voice note.m4a', {
+          makeEntry('/home/me/Videos/Holiday/Voice note.ogg', {
             size: 2_100_000,
             mtime: isoAgo(day * 4),
             duration_s: 48,
@@ -408,6 +430,10 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
           makeEntry('/home/me/Videos/Holiday/photos-backup.zip', {
             size: 412_000_000,
             mtime: isoAgo(day * 8),
+          }),
+          makeEntry(`/home/me/Videos/Holiday/${LONG_NO_SPACE_NAME}`, {
+            size: 4_820,
+            mtime: isoAgo(day * 6),
           }),
           makeEntry('/home/me/Videos/Holiday/.draft.txt', {
             size: 96,
@@ -485,11 +511,14 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
       [
         '/home/me/Documents',
         [
+          makeEntry('/home/me/Documents/Empty', { kind: 'dir', mtime: isoAgo(day * 2) }),
           makeEntry('/home/me/Documents/Passport.pdf', { size: 540_000, mtime: isoAgo(day * 20), palette: { a: '#7a5b3b', b: '#2a1c14', accent: '#f0d8a8', shape: 'doc' } }),
           makeEntry('/home/me/Documents/README.md', { size: 412, mtime: isoAgo(day * 5) }),
+          makeEntry('/home/me/Documents/broken-preview.jpg', { size: 64_000, mtime: isoAgo(day * 4), thumbFail: true }),
           makeEntry('/home/me/Documents/long-log.txt', { size: longLogText.length, mtime: isoAgo(3600) }),
         ],
       ],
+      ['/home/me/Documents/Empty', []],
       [
         '/home/me/projects',
         [
@@ -602,6 +631,17 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
         ],
       ],
     ]),
+    laptop: new Map([
+      [
+        '/home/me',
+        [
+          makeEntry('/home/me/Documents', { kind: 'dir', mtime: isoAgo(day * 2) }),
+          makeEntry('/home/me/Downloads', { kind: 'dir', mtime: isoAgo(day) }),
+        ],
+      ],
+      ['/home/me/Documents', []],
+      ['/home/me/Downloads', []],
+    ]),
   };
 
   if (isLarge) {
@@ -638,6 +678,10 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
     'tower:/home/me/projects/legion/Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n',
     'tower:/home/me/projects/notes/todo.md': '- Finish holiday photo album\n- Sync camera folder\n',
     'tower:/home/me/Videos/Holiday/notes.txt': 'Holiday itinerary\n\nDay 1: Arrival at the coast, sunset walk.\nDay 2: Beach morning, boat trip.\nDay 3: Mountain pass and evening concert.\n',
+    [`tower:/home/me/Videos/Holiday/${LONG_NO_SPACE_NAME}`]:
+      'calibration_run_id=2026_11_24_north_ridge_sector_04_final_verified_v12\n' +
+      'camera_matrix=1420.550000,0.000000,960.000000,0.000000,1420.550000,540.000000,0.000000,0.000000,1.000000\n' +
+      'status=verified_within_0.18px_reprojection_error_across_all_48_ground_control_targets_without_drift\n',
     'tower:/home/me/Videos/Holiday/.draft.txt': 'Hidden draft notes for packing list.\n',
     'tower:/home/me/Documents/README.md': '# Documents\n\nSynced between tower, pi and studio.\n',
     'tower:/home/me/Documents/long-log.txt': longLogText,
@@ -1036,14 +1080,22 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
 
   let cachedVideoBlobUrl = null;
   let cachedAudioBlobUrl = null;
+  let cachedUnplayableVideoBlobUrl = null;
   function getVideoUrl() {
-    if (!cachedVideoBlobUrl) cachedVideoBlobUrl = base64ToBlobUrl(SAMPLE_VIDEO_MP4_BASE64, 'video/mp4');
+    if (!cachedVideoBlobUrl) cachedVideoBlobUrl = base64ToBlobUrl(SAMPLE_VIDEO_WEBM_BASE64, 'video/webm');
     return cachedVideoBlobUrl;
   }
   function getAudioUrl() {
-    if (!cachedAudioBlobUrl) cachedAudioBlobUrl = base64ToBlobUrl(SAMPLE_AUDIO_MP3_BASE64, 'audio/mpeg');
+    if (!cachedAudioBlobUrl) cachedAudioBlobUrl = base64ToBlobUrl(SAMPLE_AUDIO_OGG_BASE64, 'audio/ogg');
     return cachedAudioBlobUrl;
   }
+  function getUnplayableVideoUrl() {
+    if (!cachedUnplayableVideoBlobUrl) {
+      cachedUnplayableVideoBlobUrl = base64ToBlobUrl(SAMPLE_UNPLAYABLE_VIDEO_BASE64, 'video/mp4');
+    }
+    return cachedUnplayableVideoBlobUrl;
+  }
+  const thumbAttemptByPath = new Map();
 
   function normalizePath(p) {
     if (!p || p === '~') return '/home/me';
@@ -1108,6 +1160,14 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
     switch (tool) {
       case 'fs.list': {
         const requested = normalizePath(args?.path || '~');
+        if (requested === '/home/me/Private' || requested.startsWith('/home/me/Private/')) {
+          throw {
+            code: 'denied',
+            message: "You're not allowed to open this folder.",
+            hint: 'Ask the machine owner to grant access in policy.toml.',
+            machine: machineName,
+          };
+        }
         const rawEntries = tree?.get(requested);
         if (!rawEntries) {
           throw { code: 'not_found', message: `${requested} does not exist.`, hint: null, machine: machineName };
@@ -1134,6 +1194,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
         };
         if (!isOld) {
           res.total = total;
+          res.total_exact = !(isInexact && requested === '/home/me/Archive5000');
           res.offset = offset;
         }
         return res;
@@ -1218,6 +1279,18 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
             results[p] = { error: { code: 'not_found', message: 'File not found.' } };
             continue;
           }
+          if (entry.thumbFail) {
+            results[p] = { error: { code: 'unsupported', message: 'Thumbnail decoding failed.' } };
+            continue;
+          }
+          if (isThumbRetry && entry.name === 'IMG_2042.jpg') {
+            const tries = thumbAttemptByPath.get(norm) || 0;
+            thumbAttemptByPath.set(norm, tries + 1);
+            if (tries < 1) {
+              results[p] = { error: { code: 'busy', message: 'Thumbnail worker busy.', retryable: true } };
+              continue;
+            }
+          }
           const cat = categoryFromName(entry.name);
           if (cat !== 'image' && cat !== 'video' && !entry.palette) {
             results[p] = { error: { code: 'unsupported', message: 'No thumbnail for this kind.' } };
@@ -1289,6 +1362,41 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
         list.push(makeEntry(target, { kind: 'dir', mtime: new Date().toISOString() }));
         tree.set(target, []);
         return { path: target, created: true };
+      }
+
+      case 'fs.copy': {
+        const from = normalizePath(args?.from || '');
+        const to = normalizePath(args?.to || '');
+        const fromParent = parentFilePath(from);
+        const toParent = parentFilePath(to);
+        const fromList = tree?.get(fromParent);
+        const toList = tree?.get(toParent);
+        if (!fromList || !toList) {
+          throw { code: 'not_found', message: 'Source or destination folder does not exist.', hint: null, machine: machineName };
+        }
+        const item = fromList.find((e) => e.path === from);
+        if (!item) {
+          throw { code: 'not_found', message: `${from} does not exist.`, hint: null, machine: machineName };
+        }
+        if (toList.some((e) => e.path === to) && !args?.overwrite) {
+          throw { code: 'conflict', message: `${baseFileName(to)} already exists.`, hint: 'Choose a different name.', machine: machineName };
+        }
+        const copied = { ...item, name: baseFileName(to), path: to, mtime: new Date().toISOString() };
+        const existingIdx = toList.findIndex((e) => e.path === to);
+        if (existingIdx >= 0) toList[existingIdx] = copied;
+        else toList.push(copied);
+        if (item.kind === 'dir' && tree.has(from)) {
+          const children = tree.get(from);
+          tree.set(
+            to,
+            children.map((c) => ({ ...c, path: joinFilePath(to, c.name) })),
+          );
+        }
+        const oldKey = `${machineName}:${from}`;
+        if (Object.prototype.hasOwnProperty.call(textFiles, oldKey)) {
+          textFiles[`${machineName}:${to}`] = textFiles[oldKey];
+        }
+        return { from, to };
       }
 
       case 'fs.move': {
@@ -1601,42 +1709,79 @@ export function createMockFilesState({ machines, flags, activeNodeRef }) {
   const optionalLinkMethods = isOld
     ? {}
     : {
-        async contentUrl({ machine, path, signal }) {
+        async contentUrl(options = {}) {
+          const { machine, path, signal } = options || {};
           if (signal?.aborted) {
-            throw { code: 'cancelled', message: 'Loading was stopped.', hint: null, machine };
+            throw { code: 'cancelled', message: 'Loading was stopped.', hint: null, machine: machine || null };
+          }
+          if (!isAuthedRef()) {
+            throw {
+              code: 'denied',
+              message: 'This browser does not have a token yet.',
+              hint: null,
+              machine: null,
+              status: 401,
+            };
+          }
+          if (typeof path !== 'string' || path.trim() === '') {
+            throw { code: 'invalid_args', message: 'Choose a file path first.', hint: null, machine: machine || null };
           }
           const target = machine || activeNodeRef();
+          const m = machines[target];
+          if (!m) {
+            throw { code: 'not_found', message: `There is no machine called ${target} in fleet.toml.`, hint: null, machine: target };
+          }
+          if (!m.reachable) {
+            throw m.error || { code: 'unreachable', message: `${target} is off.`, hint: null, machine: target };
+          }
+          if (!canReadRef()) {
+            throw { code: 'denied', message: 'Not allowed to read files on this machine.', hint: null, machine: target };
+          }
           const norm = normalizePath(path);
           const entry = findEntryOnMachine(target, norm);
-          if (!entry) {
-            throw { code: 'not_found', message: `${norm} does not exist.`, hint: null, machine: target };
-          }
-          const cat = categoryFromName(entry.name);
-          if (entry.sampleMedia === 'unplayable' || entry.name.toLowerCase().endsWith('.mkv')) {
+          const name = entry?.name || baseFileName(norm);
+          const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
+
+          // Unplayable video is driven strictly by payload (`sampleMedia === 'unplayable'`), never by extension.
+          if (entry?.sampleMedia === 'unplayable') {
             return {
-              url: 'data:video/x-matroska;base64,GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQ==',
-              mime: 'video/x-matroska',
-              expiresIn: 900,
+              url: getUnplayableVideoUrl(),
+              expires_in: 900,
             };
           }
+          const cat = categoryFromName(name);
           if (cat === 'video') {
-            return { url: getVideoUrl(), mime: 'video/mp4', expiresIn: 900 };
+            return { url: getVideoUrl(), expires_in: 900 };
           }
           if (cat === 'audio') {
-            return { url: getAudioUrl(), mime: 'audio/mpeg', expiresIn: 900 };
+            return { url: getAudioUrl(), expires_in: 900 };
           }
           if (cat === 'image') {
-            const pal = entry.palette || paletteFor(norm);
-            return {
-              url: makeSampleImageDataUrl({ ...pal, w: 720, h: 540 }),
-              mime: 'image/svg+xml',
-              expiresIn: 900,
-            };
+            if (entry) {
+              const pal = entry.palette || paletteFor(norm);
+              return {
+                url: makeSampleImageDataUrl({ ...pal, w: 720, h: 540 }),
+                expires_in: 900,
+              };
+            }
+            if (ext === 'svg') {
+              return {
+                url: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" fill="#3b6f7a"/></svg>'),
+                expires_in: 900,
+              };
+            }
+            return { url: `data:image/png;base64,${SAMPLE_PNG_BASE64}`, expires_in: 900 };
+          }
+          if (ext === 'pdf') {
+            return { url: `data:application/pdf;base64,${SAMPLE_PDF_BASE64}`, expires_in: 900 };
+          }
+          if (cat === 'text' || ext === 'html' || ext === 'htm') {
+            const text = textFiles[`${target}:${norm}`] || `Mock preview for ${norm}\n`;
+            return { url: `data:text/plain;charset=utf-8,${encodeURIComponent(text)}`, expires_in: 900 };
           }
           return {
-            url: `data:application/octet-stream;base64,TGVnaW9uIG1vY2sgZmlsZQ==`,
-            mime: mimeFromName(entry.name),
-            expiresIn: 900,
+            url: 'data:application/octet-stream;base64,TGVnaW9uIG1vY2sgZmlsZQ==',
+            expires_in: 900,
           };
         },
 

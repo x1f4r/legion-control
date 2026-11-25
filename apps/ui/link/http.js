@@ -292,32 +292,32 @@ export function createHttpLink() {
     writeToken('');
   }
 
-  let contentUnsupported = false;
-
-  /**
-   * Mints a short-lived ticketed content address (`POST /v1/content`) for viewing or download.
-   */
-  async function contentUrl({ machine, path, download = false, signal } = {}) {
-    if (contentUnsupported) {
-      throw {
-        code: 'unsupported',
-        message: 'This machine does not serve file previews yet.',
-        hint: 'Update Legion on this machine to view pictures, video, and audio here.',
-        machine: machine || null,
-      };
-    }
+  async function contentUrl(options = {}) {
+    const { machine, path, download = false, signal } = options || {};
     const current = token || readToken();
     if (!current) {
       throw {
         code: 'denied',
         message: 'This browser does not have a token yet.',
-        hint: null,
-        machine: machine || null,
+        hint: 'Enter a token made with legion token.add.',
+        machine: null,
         status: 401,
       };
     }
+    if (typeof path !== 'string' || path.trim() === '') {
+      throw {
+        code: 'invalid_args',
+        message: 'Choose a file path first.',
+        hint: null,
+        machine: machine || null,
+      };
+    }
+
     const body = { path };
-    if (machine) body.on = machine;
+    if (machine !== undefined && machine !== null && machine !== '') {
+      body.on = machine;
+    }
+
     let res;
     try {
       res = await fetch('/v1/content', {
@@ -332,20 +332,21 @@ export function createHttpLink() {
       });
     } catch (err) {
       if (err && err.name === 'AbortError') {
-        throw { code: 'cancelled', message: 'The request was cancelled.', hint: null, machine: machine || null };
+        throw {
+          code: 'cancelled',
+          message: 'The request was cancelled.',
+          hint: null,
+          machine: machine || null,
+        };
       }
-      throw { code: 'unreachable', message: 'Could not reach the server.', hint: null, machine: machine || null };
-    }
-    if (res.status === 404 || res.status === 405 || res.status === 501) {
-      contentUnsupported = true;
       throw {
-        code: 'unsupported',
-        message: 'This machine does not serve file previews yet.',
-        hint: null,
+        code: 'unreachable',
+        message: 'Could not reach the server.',
+        hint: 'Check that legion serve is running and reachable from this browser.',
         machine: machine || null,
-        status: res.status,
       };
     }
+
     let parsed = null;
     try {
       parsed = await res.json();
@@ -353,14 +354,22 @@ export function createHttpLink() {
       parsed = null;
     }
     if (!res.ok) throw toError(parsed, res.status);
-    let url = parsed?.url || '';
-    if (download && url) {
+
+    let url = typeof parsed?.url === 'string' ? parsed.url : '';
+    if (!url) {
+      throw {
+        code: 'internal',
+        message: 'The server returned no content address.',
+        hint: null,
+        machine: machine || null,
+      };
+    }
+    if (download) {
       url += url.includes('?') ? '&download=1' : '?download=1';
     }
     return {
       url,
-      expiresIn: parsed?.expires_in ?? parsed?.expiresIn ?? 900,
-      mime: parsed?.mime || null,
+      expires_in: typeof parsed.expires_in === 'number' ? parsed.expires_in : null,
     };
   }
 
