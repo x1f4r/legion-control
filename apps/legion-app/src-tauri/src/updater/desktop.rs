@@ -17,8 +17,6 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use legion_update::InstallKind;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2501,16 +2499,6 @@ fn open_supervisor_log_stdio(log_path: Option<&Path>) -> (Stdio, Stdio) {
     }
 }
 
-/// Encodes a PowerShell script as UTF-16LE Base64 for `powershell.exe -EncodedCommand` so
-/// embedded newlines and quotes are never mangled by Windows command-line parsing.
-pub fn encode_powershell_command(script: &str) -> String {
-    let mut utf16le = Vec::with_capacity(script.len() * 2);
-    for unit in script.encode_utf16() {
-        utf16le.extend_from_slice(&unit.to_le_bytes());
-    }
-    BASE64.encode(utf16le)
-}
-
 /// Resolves Windows PowerShell via the full System32 path (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`).
 pub fn windows_system_powershell_path() -> PathBuf {
     let root = std::env::var_os("SystemRoot")
@@ -2524,15 +2512,187 @@ pub fn windows_system_powershell_path() -> PathBuf {
         .join("powershell.exe")
 }
 
+/// Resolves a System32 executable on Windows (`%SystemRoot%\System32\<name>`).
+#[cfg(windows)]
+fn windows_system32_exe(name: &str) -> PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    root.join("System32").join(name)
+}
+
+/// Restricts a Windows file's DACL to owner-only (`*<current-user-SID>:F` plus
+/// `NT AUTHORITY\SYSTEM` `*S-1-5-18:F`) with inheritance disabled via System32 `icacls.exe`.
+#[cfg(windows)]
+fn restrict_windows_file_to_owner(path: &Path) -> Result<(), AppError> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let whoami = windows_system32_exe("whoami.exe");
+    let owner_grant = Command::new(&whoami)
+        .args(["/user", "/fo", "csv", "/nh"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| {
+            let line = String::from_utf8_lossy(&out.stdout);
+            let sid = line
+                .trim()
+                .rsplit(',')
+                .next()?
+                .trim()
+                .trim_matches('"')
+                .trim();
+            if sid.starts_with("S-1-")
+                && sid
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || matches!(b, b'S' | b'-'))
+            {
+                Some(format!("*{sid}:F"))
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            let user = std::env::var("USERNAME").ok()?;
+            let user = user.trim();
+            if user.is_empty() {
+                return None;
+            }
+            if let Ok(domain) = std::env::var("USERDOMAIN")
+                && !domain.trim().is_empty()
+            {
+                Some(format!("{}\\{}:F", domain.trim(), user))
+            } else {
+                Some(format!("{user}:F"))
+            }
+        })
+        .ok_or_else(|| {
+            AppError::new(
+                ErrorCode::Failed,
+                "Could not determine current Windows user for supervisor script permissions.",
+            )
+        })?;
+
+    let icacls = windows_system32_exe("icacls.exe");
+    let out = Command::new(&icacls)
+        .arg(path)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            &owner_grant,
+            "/grant:r",
+            "*S-1-5-18:F",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| {
+            AppError::new(
+                ErrorCode::Failed,
+                format!("Could not run icacls on {}: {err}", path.display()),
+            )
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return Err(AppError::new(
+            ErrorCode::Failed,
+            format!(
+                "Could not restrict permissions on {}: {} {}",
+                path.display(),
+                stdout.trim(),
+                stderr.trim()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Writes [`WINDOWS_NSIS_SUPERVISOR_SCRIPT`] (with a UTF-8 BOM so Windows PowerShell 5.1 always
+/// parses it as UTF-8) to a private owner-only `.ps1` file inside `updates_dir` so `powershell.exe`
+/// runs it with `-File` and a short command line well below Windows's 32,767-character limit.
+pub fn write_windows_supervisor_script(updates_dir: &Path, pid: u32) -> Result<PathBuf, AppError> {
+    ensure_private_dir(updates_dir)?;
+    let final_path = updates_dir.join(format!("supervisor-{pid}.ps1"));
+    let tmp_path = updates_dir.join(format!(".supervisor-{pid}-{}.ps1.tmp", now_unix_u64()));
+    let _ = fs::remove_file(&tmp_path);
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp_path).map_err(|err| {
+        AppError::new(
+            ErrorCode::Failed,
+            format!(
+                "Could not create supervisor script {}: {err}",
+                tmp_path.display()
+            ),
+        )
+    })?;
+    let write_res = file
+        .write_all(&[0xEF, 0xBB, 0xBF])
+        .and_then(|()| file.write_all(WINDOWS_NSIS_SUPERVISOR_SCRIPT.as_bytes()))
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(AppError::new(
+            ErrorCode::Failed,
+            format!(
+                "Could not write supervisor script {}: {err}",
+                tmp_path.display()
+            ),
+        ));
+    }
+
+    #[cfg(windows)]
+    if let Err(err) = restrict_windows_file_to_owner(&tmp_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    for attempt in 0..5u8 {
+        match fs::rename(&tmp_path, &final_path) {
+            Ok(()) => return Ok(final_path),
+            Err(err) if attempt < 4 => {
+                let _ = err;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(AppError::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Could not finalize supervisor script {}: {err}",
+                        final_path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(final_path)
+}
+
 /// Fixed PowerShell supervisor script for Windows NSIS silent upgrade with automatic rollback.
 ///
-/// Passed to `powershell.exe -EncodedCommand` (UTF-16LE Base64) so embedded newlines and quotes
-/// are never mangled by `CreateProcessW` / PowerShell `-Command` parsing. Receives all paths
-/// strictly through environment variables, uses `-LiteralPath` on every filesystem cmdlet, invokes
-/// the NSIS installer directly via `ProcessStartInfo` (`UseShellExecute = $false`) with
+/// Written to an owner-only `.ps1` file in the updates directory and invoked via System32
+/// `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <path>` so the command
+/// line stays short (well under Windows's 32,767-character `CreateProcessW` limit). Receives all
+/// paths strictly through environment variables, uses `-LiteralPath` on every filesystem cmdlet,
+/// invokes the NSIS installer directly via `ProcessStartInfo` (`UseShellExecute = $false`) with
 /// `/S /UPDATE /D=<install_dir>` (`/D=` last and unquoted), writes progress lines to stdout
-/// (redirected by the parent to `supervisor.log`), and restores the previous copy on any installer
-/// or startup failure.
+/// (redirected by the parent to `supervisor.log`), and restores the previous copy transactionally
+/// on any installer or startup failure.
 pub const WINDOWS_NSIS_SUPERVISOR_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $script:supLockStream = $null
@@ -3020,6 +3180,9 @@ try {
   exit 1
 } finally {
   Release-UpdateLocks
+  if ($env:LEGION_SUPERVISOR_SCRIPT -and (Test-Path -LiteralPath $env:LEGION_SUPERVISOR_SCRIPT)) {
+    Remove-Item -LiteralPath $env:LEGION_SUPERVISOR_SCRIPT -Force -ErrorAction SilentlyContinue
+  }
 }
 "#;
 
@@ -3086,9 +3249,9 @@ where
 }
 
 /// Copies-while-hashing the verified NSIS installer into `verified_dir`, backs up the current
-/// Windows installation directory, and spawns the detached System32 PowerShell supervisor via
-/// `-EncodedCommand` with job breakaway (`CREATE_BREAKAWAY_FROM_JOB`, falling back if forbidden)
-/// and a cleaned environment.
+/// Windows installation directory, writes the supervisor script to an owner-only `.ps1` file in
+/// the updates directory, and spawns detached System32 PowerShell via `-File` with job breakaway
+/// (`CREATE_BREAKAWAY_FROM_JOB`, falling back if forbidden) and a cleaned environment.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 pub fn stage_and_spawn_windows_nsis(
@@ -3177,8 +3340,9 @@ pub fn stage_and_spawn_windows_nsis(
         .unwrap_or_else(|| clean_path.clone());
 
     let sanitized_win_env = build_sanitized_windows_env(std::env::vars_os());
-    let encoded_script = encode_powershell_command(WINDOWS_NSIS_SUPERVISOR_SCRIPT);
     let updates_dir = ready_marker_path.parent();
+    let script_dir = updates_dir.unwrap_or(verified_dir);
+    let script_path = write_windows_supervisor_script(script_dir, pid)?;
     let log_path = updates_dir.map(|d| d.join("supervisor.log"));
     let new_start_log_path = updates_dir.map(|d| d.join(NEW_START_LOG_FILENAME));
     let rollback_ps_path = updates_dir.map(|d| d.join(ROLLBACK_PS_FILENAME));
@@ -3207,13 +3371,14 @@ pub fn stage_and_spawn_windows_nsis(
                 "-NonInteractive",
                 "-ExecutionPolicy",
                 "Bypass",
-                "-EncodedCommand",
-                &encoded_script,
+                "-File",
             ])
+            .arg(&script_path)
             .creation_flags(flags)
             .stdin(Stdio::null())
             .stdout(stdout_cfg)
             .stderr(stderr_cfg)
+            .env("LEGION_SUPERVISOR_SCRIPT", &script_path)
             .env("LEGION_OLD_PID", pid.to_string())
             .env("LEGION_INSTALLER", &staged_installer)
             .env("LEGION_INSTALL_DIR", install_dir)
@@ -3268,18 +3433,24 @@ pub fn stage_and_spawn_windows_nsis(
         Err(err)
             if err.kind() == io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(5) =>
         {
-            let child = build_cmd(base_flags).spawn().map_err(|err2| {
-                AppError::new(
-                    ErrorCode::Failed,
-                    format!("Could not start Windows update helper: {err2}"),
-                )
-            })?;
-            Ok(child.id())
+            match build_cmd(base_flags).spawn() {
+                Ok(child) => Ok(child.id()),
+                Err(err2) => {
+                    let _ = fs::remove_file(&script_path);
+                    Err(AppError::new(
+                        ErrorCode::Failed,
+                        format!("Could not start Windows update helper: {err2}"),
+                    ))
+                }
+            }
         }
-        Err(err) => Err(AppError::new(
-            ErrorCode::Failed,
-            format!("Could not start Windows update helper: {err}"),
-        )),
+        Err(err) => {
+            let _ = fs::remove_file(&script_path);
+            Err(AppError::new(
+                ErrorCode::Failed,
+                format!("Could not start Windows update helper: {err}"),
+            ))
+        }
     }
 }
 
@@ -3439,19 +3610,30 @@ mod tests {
         assert!(ps_str.contains("system32"));
         assert!(ps_str.ends_with("powershell.exe"));
 
-        // EncodedCommand round-trips cleanly as UTF-16LE Base64.
-        let encoded = encode_powershell_command(WINDOWS_NSIS_SUPERVISOR_SCRIPT);
-        let decoded_bytes = BASE64.decode(&encoded).unwrap();
-        assert_eq!(decoded_bytes.len() % 2, 0);
-        let units: Vec<u16> = decoded_bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_le_bytes(*c))
-            .collect();
+        // Supervisor script must be written to an owner-only .ps1 file (with UTF-8 BOM for
+        // Windows PowerShell 5.1) so launching via `-File` stays well under Windows's 32,767-char
+        // CreateProcessW command-line limit regardless of script length.
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = write_windows_supervisor_script(dir.path(), 4242).unwrap();
+        assert!(script_path.is_file());
+        let raw_bytes = fs::read(&script_path).unwrap();
+        assert!(
+            raw_bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+            "Windows .ps1 script must carry UTF-8 BOM for PowerShell 5.1"
+        );
         assert_eq!(
-            String::from_utf16(&units).unwrap(),
+            std::str::from_utf8(&raw_bytes[3..]).unwrap(),
             WINDOWS_NSIS_SUPERVISOR_SCRIPT
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&script_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert!(
+            WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("$env:LEGION_SUPERVISOR_SCRIPT"),
+            "Windows supervisor must clean up its own script file in finally"
         );
 
         // NSIS silent update must pass /S /UPDATE /D= with /D= last and unquoted.
@@ -5002,13 +5184,13 @@ mod tests {
         let deferred_marker = updates_dir.join("deferred-2.json");
         let update_lock = updates_dir.join(UPDATE_LOCK_FILENAME);
         let sup_lock = updates_dir.join(UPDATE_SUPERVISOR_LOCK_FILENAME);
-        let encoded = encode_powershell_command(WINDOWS_NSIS_SUPERVISOR_SCRIPT);
         let ps_path = windows_system_powershell_path();
 
         // Part 1: Hold `install\legion-app.exe` open with exclusive share_mode(0). The supervisor
         // MUST retry boundedly, NOT throw an unhandled exception, leave BOTH `legion-app.exe` and
         // `helper.dll` completely intact as v2 (ZERO half-copy), write `new_kept_files_in_use`,
-        // and release its locks.
+        // and release its locks and script file.
+        let script1 = write_windows_supervisor_script(&updates_dir, 1001).unwrap();
         fs::write(&update_lock, "{}").unwrap();
         let held_exe = OpenOptions::new()
             .read(true)
@@ -5023,9 +5205,10 @@ mod tests {
                 "-NonInteractive",
                 "-ExecutionPolicy",
                 "Bypass",
-                "-EncodedCommand",
-                &encoded,
+                "-File",
             ])
+            .arg(&script1)
+            .env("LEGION_SUPERVISOR_SCRIPT", &script1)
             .env("LEGION_OLD_PID", dead_pid.to_string())
             .env("LEGION_INSTALLER", &fake_installer)
             .env("LEGION_INSTALL_DIR", &install_dir)
@@ -5082,11 +5265,16 @@ mod tests {
             !sup_lock.exists(),
             "update-supervisor.lock must be released"
         );
+        assert!(
+            !script1.exists(),
+            "supervisor .ps1 script must be cleaned up"
+        );
 
         // Part 2: With the file lock released, rollback cleanly restores ALL files to v1 and
         // records `restored_previous`.
         fs::copy(sys_root.join("System32").join("where.exe"), &fake_installer).unwrap();
         let _ = fs::remove_file(&rollback_marker);
+        let script2 = write_windows_supervisor_script(&updates_dir, 1002).unwrap();
         fs::write(&update_lock, "{}").unwrap();
 
         let out2 = Command::new(&ps_path)
@@ -5095,9 +5283,10 @@ mod tests {
                 "-NonInteractive",
                 "-ExecutionPolicy",
                 "Bypass",
-                "-EncodedCommand",
-                &encoded,
+                "-File",
             ])
+            .arg(&script2)
+            .env("LEGION_SUPERVISOR_SCRIPT", &script2)
             .env("LEGION_OLD_PID", dead_pid.to_string())
             .env("LEGION_INSTALLER", &fake_installer)
             .env("LEGION_INSTALL_DIR", &install_dir)
@@ -5151,6 +5340,10 @@ mod tests {
         assert!(
             !sup_lock.exists(),
             "update-supervisor.lock must be released"
+        );
+        assert!(
+            !script2.exists(),
+            "supervisor .ps1 script must be cleaned up"
         );
     }
 }

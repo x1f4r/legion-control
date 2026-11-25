@@ -5111,54 +5111,56 @@ mod tests {
             );
         }
 
-        // .deb downloads and copies-while-hashing into private `<updates>/verified/` directory.
-        let dir = tempfile::tempdir().unwrap();
-        let deb_bytes = b"fake-deb-package-bytes";
-        let mut fleet = FakeFleet::new();
-        fleet.add_set(
-            "tower",
-            build_fake_set(
-                Channel::Stable,
-                "0.2.0",
-                202611250210,
-                "legion-app_0.2.0_amd64.deb",
-                Os::Linux,
-                Arch::X86_64,
-                InstallKind::Deb,
-                deb_bytes,
-                &rel_sk,
-            ),
-        );
-        let mgr = UpdateManager::with_config(
-            dir.path().join("updates"),
-            anchors,
-            Os::Linux,
-            Arch::X86_64,
-            PlatformEnv::Desktop(DesktopInstall::LinuxDeb {
-                package: "legion-app".to_owned(),
-            }),
-            "0.1.0".to_owned(),
-            "old".to_owned(),
-            202611250200,
-        );
-        let st = mgr
-            .check_with_client(&fleet, &nodes, false, false)
-            .await
-            .unwrap();
-        assert_eq!(st.phase, "manual", "{st:?}");
-        let cmd = st.manual_command.unwrap();
-        assert!(cmd.starts_with("sudo apt-get install "));
-        assert!(
-            cmd.contains("/verified/legion-app_0.2.0_amd64.deb"),
-            "{cmd}"
-        );
-        assert_eq!(
-            st.manual_sha256.as_deref(),
-            Some(sha256_bytes(deb_bytes).as_str())
-        );
+        // .deb installs exist only on Linux (`sudo apt-get install` with POSIX quoting and Unix
+        // `0700` private directory permissions), so test the live staging path on Unix hosts.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let deb_bytes = b"fake-deb-package-bytes";
+            let mut fleet = FakeFleet::new();
+            fleet.add_set(
+                "tower",
+                build_fake_set(
+                    Channel::Stable,
+                    "0.2.0",
+                    202611250210,
+                    "legion-app_0.2.0_amd64.deb",
+                    Os::Linux,
+                    Arch::X86_64,
+                    InstallKind::Deb,
+                    deb_bytes,
+                    &rel_sk,
+                ),
+            );
+            let mgr = UpdateManager::with_config(
+                dir.path().join("updates"),
+                anchors,
+                Os::Linux,
+                Arch::X86_64,
+                PlatformEnv::Desktop(DesktopInstall::LinuxDeb {
+                    package: "legion-app".to_owned(),
+                }),
+                "0.1.0".to_owned(),
+                "old".to_owned(),
+                202611250200,
+            );
+            let st = mgr
+                .check_with_client(&fleet, &nodes, false, false)
+                .await
+                .unwrap();
+            assert_eq!(st.phase, "manual", "{st:?}");
+            let cmd = st.manual_command.unwrap();
+            assert!(cmd.starts_with("sudo apt-get install "));
+            assert!(
+                cmd.contains("/verified/legion-app_0.2.0_amd64.deb"),
+                "{cmd}"
+            );
+            assert_eq!(
+                st.manual_sha256.as_deref(),
+                Some(sha256_bytes(deb_bytes).as_str())
+            );
             let vdir_mode = fs::metadata(dir.path().join("updates/verified"))
                 .unwrap()
                 .permissions()
