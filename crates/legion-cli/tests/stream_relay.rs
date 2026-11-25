@@ -435,6 +435,7 @@ fn spawn_stream_with_timeout(
         .expect("spawn legion stream")
 }
 
+#[cfg(unix)]
 fn fleet_entry_for_node_with_pid(alias: &str, pid_file: &std::path::Path, target: &Home) -> String {
     let exe = toml_string(&self_exe());
     let flag = toml_string(HELPER_FLAG);
@@ -1410,12 +1411,6 @@ fn wait_pids_gone(pids: &[u32], limit: Duration) -> usize {
 }
 
 fn stuck_target_50mb_get_sigstop_client_gone_and_timeout() {
-    #[cfg(not(unix))]
-    {
-        // SIGSTOP and stdout peer hangup detection are Unix-only.
-        return;
-    }
-
     #[cfg(unix)]
     {
         let tower = node("tower");
@@ -1778,11 +1773,6 @@ fn stuck_target_checksum_stat_sigstop_timeout_client_gone_and_deadline_resets() 
 }
 
 fn relay_shutdown_is_labelled_with_relay_machine() {
-    #[cfg(not(unix))]
-    {
-        return;
-    }
-
     #[cfg(unix)]
     {
         let tower = node("tower");
