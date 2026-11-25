@@ -52,7 +52,9 @@ use axum::middleware::{self, Next};
 use axum::routing::{any, get, post};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
-use legion_content::{ConcurrencyLimits, ContentLimiter, TicketTable};
+use legion_content::{
+    ABSOLUTE_TTL, ConcurrencyLimits, ContentLimiter, SLIDING_TTL, TicketConfig, TicketTable,
+};
 use legion_core::config::NodeFile;
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::tokens::Tokens;
@@ -147,11 +149,14 @@ pub fn listen_address(text: &str) -> Result<SocketAddr, ErrorBody> {
     Ok(address)
 }
 
-/// Concurrency, slow-reader, and audit-coalescing limits for `/v1/content/{ticket}/{name}` streams.
+/// Concurrency, slow-reader, ticket-lifetime, and audit-coalescing limits for
+/// `/v1/content/{ticket}/{name}` streams.
 #[derive(Clone, Copy, Debug)]
 pub struct ContentStreamLimits {
     /// Per-ticket, per-holder, and global concurrent stream caps.
     pub concurrency: ConcurrencyLimits,
+    /// Ticket table lifetimes and per-holder/global ticket caps.
+    pub ticket_config: TicketConfig,
     /// Maximum duration a content stream write may stall without draining any bytes.
     pub write_idle_timeout: Duration,
     /// Window over which minimum sustained write progress is checked while streaming.
@@ -171,6 +176,7 @@ impl Default for ContentStreamLimits {
     fn default() -> Self {
         Self {
             concurrency: ConcurrencyLimits::default(),
+            ticket_config: TicketConfig::default(),
             write_idle_timeout: Duration::from_secs(15),
             min_rate_window: Duration::from_secs(10),
             min_rate_bytes: 40 * 1024,
@@ -178,6 +184,36 @@ impl Default for ContentStreamLimits {
             sweep_interval: SWEEP,
             liveness_check_interval: Duration::from_secs(1),
         }
+    }
+}
+
+impl ContentStreamLimits {
+    /// Shortens content ticket sliding and/or absolute lifetimes (clamped to never exceed the
+    /// production defaults) and tightens the sweep interval to keep pace. Useful for end-to-end
+    /// tests exercising ticket expiry without waiting 15 minutes.
+    pub fn with_shortened_ticket_ttls(
+        mut self,
+        sliding_ttl: Option<Duration>,
+        absolute_ttl: Option<Duration>,
+    ) -> Self {
+        if let Some(ttl) = sliding_ttl
+            && !ttl.is_zero()
+        {
+            self.ticket_config.sliding_ttl = ttl.min(SLIDING_TTL);
+        }
+        if let Some(ttl) = absolute_ttl
+            && !ttl.is_zero()
+        {
+            self.ticket_config.absolute_ttl = ttl.min(ABSOLUTE_TTL);
+        }
+        let shortest = self
+            .ticket_config
+            .sliding_ttl
+            .min(self.ticket_config.absolute_ttl);
+        if shortest < self.sweep_interval {
+            self.sweep_interval = shortest.max(Duration::from_millis(100));
+        }
+        self
     }
 }
 
@@ -306,7 +342,7 @@ impl HttpDoor {
             mcp_compact,
             managers: [managers_full, managers_compact],
             sessions: Sessions::default(),
-            content_tickets: Arc::new(TicketTable::new()),
+            content_tickets: Arc::new(TicketTable::with_config(content_limits.ticket_config)),
             content_limiter: ContentLimiter::with_limits(content_limits.concurrency),
             content_audit: ContentAuditCoalescer::with_window(content_limits.audit_coalesce_window),
             content_liveness_interval: content_limits.liveness_check_interval,
@@ -395,9 +431,9 @@ impl HttpDoor {
                 tokio::select! {
                     biased;
                     () = conn_abort.cancelled() => {
-                        // Drop `connection` immediately so `MonitoredTcpStream::drop` applies
-                        // SO_LINGER(0) (TCP RST) to discard kernel-buffered bytes and drops the
-                        // active content body, buffers, and remote stream pipe at once.
+                        // Drop `connection` immediately so `MonitoredTcpStream::drop` closes the
+                        // TCP socket (SO_LINGER(0) RST on Linux/Windows; clean FIN on macOS/BSD)
+                        // and drops the active content body, buffers, and remote pipe at once.
                     }
                     _ = connection.as_mut() => {}
                     () = closing.cancelled() => {
@@ -529,6 +565,14 @@ struct MonitoredTcpStream {
 
 impl Drop for MonitoredTcpStream {
     fn drop(&mut self) {
+        // On Linux and Windows, SO_LINGER(0) discards unsent bytes in the server's kernel send
+        // buffer with an immediate TCP RST. On macOS/iOS/FreeBSD (Darwin/BSD), closing a
+        // flow-controlled or zero-window socket with SO_LINGER(0) hits the BSD RFC 5961 check
+        // comparing RST sequence numbers against `last_ack_sent` instead of `rcv_nxt`, causing
+        // peers with delayed/stretch ACKs to drop the RST and hang in ESTABLISHED. Falling back
+        // to a normal TCP close (FIN) on Darwin/BSD guarantees reliable EOF delivery while still
+        // stopping all server writes immediately and staying within the bounded SO_SNDBUF ceiling.
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
         if self.abort.is_cancelled() {
             let _ = socket2::SockRef::from(&self.inner).set_linger(Some(Duration::ZERO));
         }
@@ -1690,6 +1734,12 @@ allow = [\"effect:read\"]
         let max_cut_elapsed = Duration::from_millis(2500);
         let post_cut_quiet_window = Duration::from_secs(1);
 
+        let written_at_revoke = socket_bytes.load(Ordering::Acquire);
+        let slow_rcvbuf_at_revoke = socket2::SockRef::from(&slow_conn)
+            .recv_buffer_size()
+            .unwrap();
+        let mut slow_client_rcvbuf = slow_rcvbuf_at_revoke;
+
         node.call(legion_core::Call::new(
             legion_core::Door::Cli,
             "token.remove",
@@ -1698,10 +1748,6 @@ allow = [\"effect:read\"]
         .await
         .unwrap();
         let revoked_at = Instant::now();
-        let written_at_revoke = socket_bytes.load(Ordering::Acquire);
-        let slow_rcvbuf_at_revoke = socket2::SockRef::from(&slow_conn)
-            .recv_buffer_size()
-            .unwrap();
 
         let mut server_cut_at = None;
         let mut client_read_before_cut = 0usize;
@@ -1721,6 +1767,9 @@ allow = [\"effect:read\"]
                     }
                     Ok(Ok(n)) => {
                         client_read_before_cut += n;
+                        if let Ok(sz) = socket2::SockRef::from(&slow_conn).recv_buffer_size() {
+                            slow_client_rcvbuf = slow_client_rcvbuf.max(sz);
+                        }
                         next_read_at = Instant::now() + Duration::from_millis(200);
                     }
                     Err(_) => {}
@@ -1733,12 +1782,10 @@ allow = [\"effect:read\"]
             }
         }
         let server_cut_elapsed = server_cut_at.expect("watcher must cut slow reader within 4s");
-        let cut_observed_at = Instant::now();
-        let written_at_cut = socket_bytes.load(Ordering::Acquire);
         let slow_rcvbuf_at_cut = socket2::SockRef::from(&slow_conn)
             .recv_buffer_size()
             .unwrap();
-        let slow_client_rcvbuf = slow_rcvbuf_at_revoke.max(slow_rcvbuf_at_cut);
+        slow_client_rcvbuf = slow_client_rcvbuf.max(slow_rcvbuf_at_cut);
 
         // 1. Time bound: server stops handing bytes to the socket within 2 s (+ polling/load margin).
         assert!(
@@ -1747,7 +1794,9 @@ allow = [\"effect:read\"]
         );
 
         // 2. Nothing after the cut: connection closes (EOF or reset, never full file) and zero
-        //    further bytes are handed to the socket for a full 1 s after cutoff.
+        //    further bytes are handed to the socket for a full 1 s after close is observed.
+        //    Waiting for EOF/reset first guarantees `MonitoredTcpStream::drop` has completed on the
+        //    server so `written_at_cut` cannot race an in-flight pre-abort `write_op`.
         let mut tail = Vec::new();
         let drain_res =
             tokio::time::timeout(Duration::from_secs(2), slow_conn.read_to_end(&mut tail)).await;
@@ -1756,10 +1805,8 @@ allow = [\"effect:read\"]
             "expected slow reader connection to close (EOF or reset) after cutoff, timed out after draining {} bytes",
             tail.len()
         );
-        let remaining_quiet = post_cut_quiet_window.saturating_sub(cut_observed_at.elapsed());
-        if !remaining_quiet.is_zero() {
-            tokio::time::sleep(remaining_quiet).await;
-        }
+        let written_at_cut = socket_bytes.load(Ordering::Acquire);
+        tokio::time::sleep(post_cut_quiet_window).await;
         let written_after_1s = socket_bytes.load(Ordering::Acquire);
         let bytes_after_cut = written_after_1s.saturating_sub(written_at_cut);
         assert_eq!(
@@ -1815,6 +1862,11 @@ allow = [\"effect:read\"]
             "expected getsockopt(SO_SNDBUF) to be recorded for stalled content stream"
         );
 
+        let stalled_written_at_revoke = socket_bytes.load(Ordering::Acquire);
+        let stalled_rcvbuf_at_revoke = socket2::SockRef::from(&stalled_conn)
+            .recv_buffer_size()
+            .unwrap();
+
         node.call(legion_core::Call::new(
             legion_core::Door::Cli,
             "token.remove",
@@ -1823,10 +1875,6 @@ allow = [\"effect:read\"]
         .await
         .unwrap();
         let stalled_revoked_at = Instant::now();
-        let stalled_written_at_revoke = socket_bytes.load(Ordering::Acquire);
-        let stalled_rcvbuf_at_revoke = socket2::SockRef::from(&stalled_conn)
-            .recv_buffer_size()
-            .unwrap();
 
         let mut stalled_cut_at = None;
         while stalled_revoked_at.elapsed() < Duration::from_secs(4) {
@@ -1838,8 +1886,6 @@ allow = [\"effect:read\"]
         }
         let stalled_cut_elapsed =
             stalled_cut_at.expect("watcher must cut stalled reader within 4s");
-        let stalled_cut_observed_at = Instant::now();
-        let stalled_written_at_cut = socket_bytes.load(Ordering::Acquire);
         let stalled_rcvbuf_at_cut = socket2::SockRef::from(&stalled_conn)
             .recv_buffer_size()
             .unwrap();
@@ -1852,7 +1898,7 @@ allow = [\"effect:read\"]
         );
 
         // 2. Nothing after the cut: connection closes (EOF or reset) and zero further bytes are
-        //    handed to the socket for a full 1 s after cutoff.
+        //    handed to the socket for a full 1 s after close is observed.
         let mut stalled_tail = Vec::new();
         let stalled_drain_res = tokio::time::timeout(
             Duration::from_secs(2),
@@ -1864,11 +1910,8 @@ allow = [\"effect:read\"]
             "expected stalled reader connection to close (EOF or reset) after cutoff, timed out after draining {} bytes",
             stalled_tail.len()
         );
-        let stalled_remaining_quiet =
-            post_cut_quiet_window.saturating_sub(stalled_cut_observed_at.elapsed());
-        if !stalled_remaining_quiet.is_zero() {
-            tokio::time::sleep(stalled_remaining_quiet).await;
-        }
+        let stalled_written_at_cut = socket_bytes.load(Ordering::Acquire);
+        tokio::time::sleep(post_cut_quiet_window).await;
         let stalled_written_after_1s = socket_bytes.load(Ordering::Acquire);
         let stalled_bytes_after_cut =
             stalled_written_after_1s.saturating_sub(stalled_written_at_cut);

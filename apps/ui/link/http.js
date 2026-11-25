@@ -41,11 +41,33 @@ function writeToken(token) {
   }
 }
 
+const CAPABILITY_TOOLS = new Set(['meta.version', 'meta.whoami', 'meta.tools']);
+
 export function createHttpLink() {
   let token = readToken();
   let doorSupportsContent = false;
+  let localNodeName = '';
+  let localNodeBuild = '';
+  let cachedLocalTools = null;
   const unsupportedContentMachines = new Set();
   const contentSupportListeners = new Set();
+
+  // Baseline v1 argument schemas used only when inspecting a remote machine over HTTP whose
+  // build differs from the HTTP door's own node (since GET /v1/tools only serves the local door).
+  const REMOTE_V1_PROPS = {
+    'fs.list': { path: {}, depth: {}, hidden: {}, limit: {} },
+    'fs.read': { path: {}, offset: {}, length: {}, encoding: {} },
+    'fs.find': { path: {}, glob: {}, kind: {}, max_depth: {}, limit: {}, ignore: {}, cross_filesystems: {} },
+    'fs.stat': { path: {} },
+    'fs.hash': { path: {} },
+    'fs.mkdir': { path: {}, parents: {} },
+    'fs.copy': { from: {}, to: {}, overwrite: {}, recursive: {} },
+    'fs.move': { from: {}, to: {}, overwrite: {} },
+    'fs.remove': { path: {}, recursive: {}, dry_run: {} },
+    'fs.transfer': { from: {}, to: {}, delete: {}, checksum: {}, exclude: {}, dry_run: {} },
+    'fs.write': { path: {}, content: {}, encoding: {}, mode: {}, expect_hash: {}, parents: {}, unix_mode: {} },
+    'fs.edit': { path: {}, old: {}, new: {}, all: {}, expect_hash: {} },
+  };
 
   function machineKey(machine) {
     return typeof machine === 'string' ? machine.trim() : '';
@@ -76,6 +98,43 @@ export function createHttpLink() {
     }
   }
 
+  function clearContentUnsupported(machines) {
+    let changed = false;
+    for (const machine of machines) {
+      const key = machineKey(machine);
+      if (key && unsupportedContentMachines.delete(key)) {
+        changed = true;
+      }
+    }
+    if (changed) notifyContentSupport();
+  }
+
+  function noteCapabilityContact(tool, targetOn, result) {
+    if (!CAPABILITY_TOOLS.has(tool) || !result || typeof result !== 'object') return;
+    if (isFanOut(result)) {
+      const refreshed = [];
+      for (const [name, entry] of Object.entries(result.results || {})) {
+        if (entry && typeof entry === 'object' && entry.ok && !entry.error) {
+          refreshed.push(name);
+          if (typeof entry.ok.node === 'string') refreshed.push(entry.ok.node);
+        }
+      }
+      if (refreshed.length > 0) clearContentUnsupported(refreshed);
+      return;
+    }
+
+    const onKey = machineKey(targetOn);
+    const nodeKey = machineKey(result.node);
+    if (tool === 'meta.whoami' && !onKey && nodeKey) {
+      localNodeName = nodeKey;
+    }
+    const refreshed = [];
+    if (onKey && onKey !== 'all') refreshed.push(onKey);
+    if (nodeKey) refreshed.push(nodeKey);
+    if (!onKey && localNodeName) refreshed.push(localNodeName);
+    if (refreshed.length > 0) clearContentUnsupported(refreshed);
+  }
+
   function supportsContentFor(machine) {
     if (!doorSupportsContent) return false;
     const key = machineKey(machine);
@@ -97,11 +156,21 @@ export function createHttpLink() {
       });
       if (!res.ok) return null;
       const health = await res.json();
+      const nodeName = machineKey(health?.node);
+      if (nodeName) localNodeName = nodeName;
+      const prev = doorSupportsContent;
       const next = health?.content === true;
-      if (next !== doorSupportsContent) {
-        doorSupportsContent = next;
-        notifyContentSupport();
+      let changed = next !== prev;
+      doorSupportsContent = next;
+      if (next) {
+        if (!prev && unsupportedContentMachines.size > 0) {
+          unsupportedContentMachines.clear();
+          changed = true;
+        } else if (localNodeName && unsupportedContentMachines.delete(localNodeName)) {
+          changed = true;
+        }
       }
+      if (changed) notifyContentSupport();
       return health;
     } catch {
       return null;
@@ -215,7 +284,10 @@ export function createHttpLink() {
       }
 
       if (failure) throw failure;
-      if (settled) return outcome;
+      if (settled) {
+        noteCapabilityContact(tool, on, outcome);
+        return outcome;
+      }
       throw {
         code: 'internal',
         message: 'The server closed the stream without a final result.',
@@ -231,12 +303,18 @@ export function createHttpLink() {
       parsed = null;
     }
 
-    if (res.ok) return parsed;
-    if (isFanOut(parsed)) return parsed;
+    if (res.ok) {
+      noteCapabilityContact(tool, on, parsed);
+      return parsed;
+    }
+    if (isFanOut(parsed)) {
+      noteCapabilityContact(tool, on, parsed);
+      return parsed;
+    }
     throw toError(parsed, res.status);
   }
 
-  async function tools() {
+  async function fetchLocalTools() {
     const current = token || readToken();
     if (!current) {
       throw {
@@ -270,7 +348,57 @@ export function createHttpLink() {
       parsed = null;
     }
     if (!res.ok) throw toError(parsed, res.status);
-    return Array.isArray(parsed?.tools) ? parsed.tools : [];
+    if (localNodeName) clearContentUnsupported([localNodeName]);
+    const list = Array.isArray(parsed?.tools) ? parsed.tools : [];
+    cachedLocalTools = list;
+    return list;
+  }
+
+  async function tools(options = {}) {
+    const target = typeof options?.on === 'string' ? options.on.trim() : '';
+    if (!target || !localNodeName || target === localNodeName) {
+      return fetchLocalTools();
+    }
+    // Remote machine through the HTTP door: GET /v1/tools only describes the local door node.
+    // Ask the target machine directly via `meta.whoami` and `meta.version` so we never attribute
+    // the local door's newer schemas to an older remote machine.
+    const [whoami, ver, localList] = await Promise.all([
+      call('meta.whoami', {}, { on: target }),
+      call('meta.version', {}, { on: target }).catch(() => null),
+      cachedLocalTools ? Promise.resolve(cachedLocalTools) : fetchLocalTools().catch(() => []),
+    ]);
+    const remoteNames = Array.isArray(whoami?.tools) ? whoami.tools : [];
+    const localMap = new Map((localList || []).map((t) => [t.name, t]));
+    const sameBuild = Boolean(localNodeBuild && ver?.build && ver.build === localNodeBuild);
+
+    const resolved = remoteNames.map((name) => {
+      if (sameBuild && localMap.has(name)) {
+        return localMap.get(name);
+      }
+      const baselineProps = REMOTE_V1_PROPS[name];
+      if (baselineProps) {
+        return {
+          name,
+          effect: localMap.get(name)?.effect || 'read',
+          description: localMap.get(name)?.description || '',
+          input_schema: { type: 'object', properties: { ...baselineProps } },
+        };
+      }
+      if (localMap.has(name)) {
+        // Tool is present on the remote machine and not a known version-extended file tool.
+        return localMap.get(name);
+      }
+      return {
+        name,
+        effect: 'read',
+        description: '',
+        input_schema: { type: 'object', properties: {} },
+      };
+    });
+    if (!sameBuild) {
+      resolved.schemaComplete = false;
+    }
+    return resolved;
   }
 
   async function state() {
@@ -284,13 +412,16 @@ export function createHttpLink() {
         call('meta.whoami', {}),
         call('meta.version', {}).catch(() => null),
       ]);
+      const resolvedNode = whoami.node || health?.node || 'node';
+      localNodeName = resolvedNode;
+      localNodeBuild = version?.build ? String(version.build) : '';
       return {
         ready: true,
         needs: null,
         health,
         nodes: [
           {
-            node: whoami.node || health?.node || 'node',
+            node: resolvedNode,
             principal: whoami.principal,
             role: whoami.role,
             via: 'http',
@@ -341,6 +472,7 @@ export function createHttpLink() {
 
   async function forget() {
     token = '';
+    cachedLocalTools = null;
     writeToken('');
     if (unsupportedContentMachines.size > 0) {
       unsupportedContentMachines.clear();
@@ -429,6 +561,18 @@ export function createHttpLink() {
         hint: null,
         machine: machine || null,
       };
+    }
+    {
+      let changed = false;
+      if (!doorSupportsContent) {
+        doorSupportsContent = true;
+        changed = true;
+      }
+      const target = machineKey(machine) || localNodeName;
+      if (target && unsupportedContentMachines.delete(target)) {
+        changed = true;
+      }
+      if (changed) notifyContentSupport();
     }
     if (download) {
       url += url.includes('?') ? '&download=1' : '?download=1';

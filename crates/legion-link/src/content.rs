@@ -14,12 +14,13 @@
 //! one coalesced remote audit record. Against older nodes without `keep_open`, it falls back to
 //! per-window channels and retries channel refusals with exponential backoff.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use legion_proto::{ErrorBody, ErrorCode};
@@ -61,13 +62,18 @@ pub(crate) const DEFAULT_WINDOW_PROGRESS_TIMEOUT: Duration = Duration::from_secs
 pub(crate) const DEFAULT_MAX_BUSY_LINES: usize = 32;
 /// Maximum consecutive unparked channel reopens without delivering payload bytes.
 const MAX_CONSECUTIVE_REOPENS: usize = 3;
+/// Maximum read-ahead payload bytes retained in memory while a content stream is parked (64 KiB).
+pub(crate) const PARKED_BUFFER_CAP: usize = 64 * 1024;
+/// Default maximum number of parked content streams retained per [`Link`](crate::Link).
+pub const DEFAULT_MAX_PARKED_STREAMS: usize = 256;
 
 /// Internal tuning knobs for [`ContentStream`] parking, progress timeouts, and busy-line bounds.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub(crate) struct ContentStreamOptions {
     pub idle_park_timeout: Duration,
     pub progress_timeout: Duration,
     pub max_busy_lines: usize,
+    pub park_pool: Option<Arc<ParkedStreamPool>>,
 }
 
 impl Default for ContentStreamOptions {
@@ -76,7 +82,179 @@ impl Default for ContentStreamOptions {
             idle_park_timeout: DEFAULT_IDLE_PARK_TIMEOUT,
             progress_timeout: DEFAULT_WINDOW_PROGRESS_TIMEOUT,
             max_busy_lines: DEFAULT_MAX_BUSY_LINES,
+            park_pool: None,
         }
+    }
+}
+
+struct ParkedEntry {
+    id: u64,
+    evicted: Arc<AtomicBool>,
+    live_channel: Arc<Mutex<LiveChannel>>,
+}
+
+#[derive(Default)]
+struct ParkedPoolInner {
+    next_id: u64,
+    /// Ordered from least recently parked (front) to most recently parked (back).
+    entries: VecDeque<ParkedEntry>,
+}
+
+/// Per-[`Link`](crate::Link) LRU cap for parked content streams.
+///
+/// When more than `max_parked` streams park on one link, the least recently parked stream is
+/// closed: its retained read-ahead buffer is freed immediately and its next read fails cleanly
+/// with [`io::ErrorKind::PermissionDenied`] (the same error shape as an expired stream).
+pub(crate) struct ParkedStreamPool {
+    max_parked: usize,
+    inner: Mutex<ParkedPoolInner>,
+}
+
+impl ParkedStreamPool {
+    pub(crate) fn new(max_parked: usize) -> Self {
+        Self {
+            max_parked,
+            inner: Mutex::new(ParkedPoolInner::default()),
+        }
+    }
+
+    fn register(&self, evicted: Arc<AtomicBool>, live_channel: Arc<Mutex<LiveChannel>>) -> u64 {
+        if self.max_parked == 0 {
+            evicted.store(true, Ordering::Release);
+            live_channel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear_all();
+            return 0;
+        }
+        let mut to_evict = Vec::new();
+        let id = {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            inner.next_id = inner.next_id.wrapping_add(1).max(1);
+            let id = inner.next_id;
+            inner.entries.push_back(ParkedEntry {
+                id,
+                evicted,
+                live_channel,
+            });
+            while inner.entries.len() > self.max_parked {
+                if let Some(oldest) = inner.entries.pop_front() {
+                    to_evict.push(oldest);
+                }
+            }
+            id
+        };
+        for oldest in to_evict {
+            oldest.evicted.store(true, Ordering::Release);
+            oldest
+                .live_channel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear_all();
+        }
+        id
+    }
+
+    fn remove(&self, id: u64) {
+        if id == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(pos) = inner.entries.iter().position(|e| e.id == id) {
+            inner.entries.remove(pos);
+        }
+    }
+
+    /// Moves an existing parked entry to the back of the LRU queue with a fresh monotonic stamp
+    /// under the same lock, so reading from a parked stream's retained read-ahead buffer updates
+    /// its least-recently-used position.
+    fn touch(&self, id: u64) -> Option<u64> {
+        if id == 0 {
+            return None;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let pos = inner.entries.iter().position(|e| e.id == id)?;
+        let mut entry = inner.entries.remove(pos)?;
+        inner.next_id = inner.next_id.wrapping_add(1).max(1);
+        let new_id = inner.next_id;
+        entry.id = new_id;
+        inner.entries.push_back(entry);
+        Some(new_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entries
+            .len()
+    }
+}
+
+struct LiveChannel {
+    reader: Option<BufReader<BoxStreamRead>>,
+    writer: Option<BoxStreamWrite>,
+    /// Remaining payload bytes in the current `KeepOpenPhase::Data` window (0 otherwise).
+    data_window_remaining: u64,
+    /// Small read-ahead slice (at most [`PARKED_BUFFER_CAP`] = 64 KiB) retained while parked
+    /// after dropping the full 256 KiB `BufReader`, underlying channel queue, and stdin duplex.
+    parked_head: Vec<u8>,
+    parked_pos: usize,
+}
+
+impl LiveChannel {
+    fn new(
+        reader: BufReader<BoxStreamRead>,
+        writer: BoxStreamWrite,
+        data_window_remaining: u64,
+    ) -> Self {
+        Self {
+            reader: Some(reader),
+            writer: Some(writer),
+            data_window_remaining,
+            parked_head: Vec::new(),
+            parked_pos: 0,
+        }
+    }
+
+    fn trim_on_park(&mut self) {
+        self.writer = None;
+        if let Some(buf_reader) = self.reader.take() {
+            let buffered = buf_reader.buffer();
+            let avail_payload = usize::try_from(self.data_window_remaining).unwrap_or(usize::MAX);
+            let keep = buffered.len().min(avail_payload).min(PARKED_BUFFER_CAP);
+            if keep > 0 {
+                let mut head = Vec::with_capacity(keep);
+                head.extend_from_slice(&buffered[..keep]);
+                self.parked_head = head;
+                self.parked_pos = 0;
+            } else {
+                self.parked_head = Vec::new();
+                self.parked_pos = 0;
+            }
+            drop(buf_reader);
+        }
+        self.data_window_remaining = 0;
+    }
+
+    fn clear_all(&mut self) {
+        self.reader = None;
+        self.writer = None;
+        self.data_window_remaining = 0;
+        self.parked_head = Vec::new();
+        self.parked_pos = 0;
+    }
+
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        let parked = self.parked_head.capacity();
+        let active = if self.reader.is_some() {
+            STREAM_BUF_BYTES
+        } else {
+            0
+        };
+        parked + active
     }
 }
 
@@ -221,8 +399,13 @@ struct ParkActivity {
     started: Instant,
     last_poll_ms: AtomicU64,
     waiting_for_remote: AtomicBool,
+    probe_pending: AtomicBool,
     parked: AtomicBool,
+    evicted: Arc<AtomicBool>,
+    park_id: AtomicU64,
+    park_pool: Option<Arc<ParkedStreamPool>>,
     watchdog_cancel: CancellationToken,
+    waker: Mutex<Option<Waker>>,
     guard: Mutex<Option<Box<dyn Send + Sync>>>,
 }
 
@@ -230,14 +413,22 @@ impl ParkActivity {
     fn start(
         park_cancel: Option<CancellationToken>,
         guard: Option<Box<dyn Send + Sync>>,
+        live_channel: Arc<Mutex<LiveChannel>>,
+        park_pool: Option<Arc<ParkedStreamPool>>,
         idle_park_timeout: Duration,
     ) -> Arc<Self> {
+        let evicted = Arc::new(AtomicBool::new(false));
         let activity = Arc::new(Self {
             started: Instant::now(),
             last_poll_ms: AtomicU64::new(0),
             waiting_for_remote: AtomicBool::new(false),
+            probe_pending: AtomicBool::new(false),
             parked: AtomicBool::new(false),
+            evicted: Arc::clone(&evicted),
+            park_id: AtomicU64::new(0),
+            park_pool: park_pool.clone(),
             watchdog_cancel: CancellationToken::new(),
+            waker: Mutex::new(None),
             guard: Mutex::new(guard),
         });
         if let Some(park_token) = park_cancel
@@ -246,6 +437,10 @@ impl ParkActivity {
             let weak = Arc::downgrade(&activity);
             let cancel = activity.watchdog_cancel.clone();
             let threshold_ms = u64::try_from(idle_park_timeout.as_millis()).unwrap_or(u64::MAX);
+            // Probe half-way through the idle window when a read previously returned Poll::Pending:
+            // an active reader re-polls immediately and advances `last_poll_ms`, whereas a read
+            // future dropped by `timeout(read)` or `select!` never re-polls and parks on schedule.
+            let probe_ms = (threshold_ms / 2).max(1);
             let tick = (idle_park_timeout / 4)
                 .clamp(Duration::from_millis(15), Duration::from_millis(250));
             tokio::spawn(async move {
@@ -257,22 +452,67 @@ impl ParkActivity {
                             let Some(act) = weak.upgrade() else {
                                 break;
                             };
-                            if act.waiting_for_remote.load(Ordering::Acquire) {
-                                continue;
-                            }
                             let now_ms = u64::try_from(act.started.elapsed().as_millis())
                                 .unwrap_or(u64::MAX);
                             let last_ms = act.last_poll_ms.load(Ordering::Acquire);
-                            if now_ms.saturating_sub(last_ms) >= threshold_ms {
-                                act.parked.store(true, Ordering::Release);
-                                park_token.cancel();
-                                let _ = act
-                                    .guard
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .take();
-                                break;
+                            let idle_ms = now_ms.saturating_sub(last_ms);
+                            if act.waiting_for_remote.load(Ordering::Acquire) {
+                                if !act.probe_pending.load(Ordering::Acquire) {
+                                    if idle_ms >= probe_ms {
+                                        act.probe_pending.store(true, Ordering::Release);
+                                        let waker = act
+                                            .waker
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .clone();
+                                        if let Some(waker) = waker {
+                                            waker.wake();
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if idle_ms < threshold_ms {
+                                    continue;
+                                }
+                                act.waiting_for_remote.store(false, Ordering::Release);
+                                act.probe_pending.store(false, Ordering::Release);
+                            } else if idle_ms < threshold_ms {
+                                continue;
                             }
+                            let _ = act
+                                .waker
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .take();
+                            // Signal graceful channel EOF first, then trim the stream's buffers
+                            // down to <= PARKED_BUFFER_CAP (64 KiB), register in the per-link
+                            // LRU parked pool, publish `parked = true`, and release the channel
+                            // concurrency slot guard.
+                            park_token.cancel();
+                            live_channel
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .trim_on_park();
+                            if let Some(pool) = &park_pool {
+                                let id = pool.register(
+                                    Arc::clone(&evicted),
+                                    Arc::clone(&live_channel),
+                                );
+                                act.park_id.store(id, Ordering::Release);
+                                if act.watchdog_cancel.is_cancelled() {
+                                    let stale = act.park_id.swap(0, Ordering::AcqRel);
+                                    if stale != 0 {
+                                        pool.remove(stale);
+                                    }
+                                }
+                            }
+                            act.parked.store(true, Ordering::Release);
+                            let _ = act
+                                .guard
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .take();
+                            break;
                         }
                     }
                 }
@@ -284,18 +524,57 @@ impl ParkActivity {
     fn touch_ms(&self) {
         let now_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_poll_ms.store(now_ms, Ordering::Release);
+        self.probe_pending.store(false, Ordering::Release);
+        if self.waiting_for_remote.swap(false, Ordering::AcqRel) {
+            let _ = self.waker.lock().unwrap_or_else(|p| p.into_inner()).take();
+        }
     }
 
-    fn set_waiting(&self, waiting: bool) {
-        self.waiting_for_remote.store(waiting, Ordering::Release);
+    fn touch_parked_lru(&self) {
+        let Some(pool) = &self.park_pool else {
+            return;
+        };
+        let old_id = self.park_id.load(Ordering::Acquire);
+        if old_id == 0 {
+            return;
+        }
+        if let Some(new_id) = pool.touch(old_id) {
+            let _ =
+                self.park_id
+                    .compare_exchange(old_id, new_id, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
+    fn mark_waiting(&self, waker: &Waker) {
+        let mut slot = self.waker.lock().unwrap_or_else(|p| p.into_inner());
+        match slot.as_mut() {
+            Some(existing) => existing.clone_from(waker),
+            None => *slot = Some(waker.clone()),
+        }
+        drop(slot);
+        self.probe_pending.store(false, Ordering::Release);
+        self.waiting_for_remote.store(true, Ordering::Release);
     }
 
     fn is_parked(&self) -> bool {
         self.parked.load(Ordering::Acquire)
     }
 
+    fn is_evicted(&self) -> bool {
+        self.evicted.load(Ordering::Acquire)
+    }
+
     fn stop_and_release(&self) {
         self.watchdog_cancel.cancel();
+        self.waiting_for_remote.store(false, Ordering::Release);
+        self.probe_pending.store(false, Ordering::Release);
+        let id = self.park_id.swap(0, Ordering::AcqRel);
+        if id != 0
+            && let Some(pool) = &self.park_pool
+        {
+            pool.remove(id);
+        }
+        let _ = self.waker.lock().unwrap_or_else(|p| p.into_inner()).take();
         let _ = self.guard.lock().unwrap_or_else(|p| p.into_inner()).take();
     }
 }
@@ -318,8 +597,7 @@ enum KeepOpenPhase {
 }
 
 struct KeepOpenState {
-    reader: BufReader<BoxStreamRead>,
-    writer: Option<BoxStreamWrite>,
+    live_channel: Arc<Mutex<LiveChannel>>,
     pending_write: Vec<u8>,
     pending_write_pos: usize,
     need_flush: bool,
@@ -350,6 +628,10 @@ impl Drop for KeepOpenState {
     fn drop(&mut self) {
         let was_parked = self.activity.is_parked();
         self.activity.stop_and_release();
+        self.live_channel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear_all();
         if !matches!(self.phase, KeepOpenPhase::Finished) && !was_parked {
             self.channel_cancel.cancel();
         }
@@ -397,6 +679,10 @@ impl KeepOpenState {
         self.progress_deadline = None;
         let was_parked = self.activity.is_parked();
         self.activity.stop_and_release();
+        self.live_channel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear_all();
         if !was_parked {
             self.channel_cancel.cancel();
         }
@@ -427,7 +713,10 @@ impl KeepOpenState {
         if !was_parked {
             self.channel_cancel.cancel();
         }
-        self.writer = None;
+        self.live_channel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear_all();
         self.pending_write.clear();
         self.pending_write_pos = 0;
         self.need_flush = false;
@@ -467,8 +756,24 @@ impl KeepOpenState {
         Ok(())
     }
 
+    fn has_writer(&self) -> bool {
+        self.live_channel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .writer
+            .is_some()
+    }
+
+    fn clear_writer(&self) {
+        self.live_channel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .writer = None;
+    }
+
     fn drive_pending_write(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
-        let Some(writer) = self.writer.as_mut() else {
+        let mut live = self.live_channel.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(writer) = live.writer.as_mut() else {
             self.pending_write.clear();
             self.pending_write_pos = 0;
             self.need_flush = false;
@@ -508,7 +813,7 @@ impl KeepOpenState {
     fn enqueue_next_window(&mut self, elapsed: Duration) {
         if self.in_flight.is_some()
             || self.next_request_offset >= self.logical_end
-            || self.writer.is_none()
+            || !self.has_writer()
             || self.activity.is_parked()
         {
             return;
@@ -610,6 +915,26 @@ impl ContentStream {
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
+
+    #[cfg(test)]
+    fn retained_buffer_bytes(&self) -> usize {
+        match &self.mode {
+            StreamMode::KeepOpen(state) => state
+                .live_channel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retained_bytes(),
+            StreamMode::PerChunk(state) => state.active.as_ref().map_or(0, |_| STREAM_BUF_BYTES),
+        }
+    }
+
+    #[cfg(test)]
+    fn park_stamp(&self) -> u64 {
+        match &self.mode {
+            StreamMode::KeepOpen(state) => state.activity.park_id.load(Ordering::Acquire),
+            StreamMode::PerChunk(_) => 0,
+        }
+    }
 }
 
 impl Drop for ContentStream {
@@ -657,9 +982,16 @@ fn poll_keep_open(
     buf: &mut ReadBuf<'_>,
 ) -> Poll<io::Result<()>> {
     state.activity.touch_ms();
-    state.activity.set_waiting(false);
 
     loop {
+        if state.activity.is_evicted() {
+            state.fail_stream(total_remaining);
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "parked content stream was closed due to parked stream limit",
+            )));
+        }
+
         if let KeepOpenPhase::Reopening(fut) = &mut state.phase {
             match fut.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
@@ -677,12 +1009,20 @@ fn poll_keep_open(
                             () = active_cancel.cancelled() => {}
                         }
                     });
-                    state.reader = reopened.opened.reader;
-                    state.writer = Some(reopened.opened.writer);
+                    {
+                        let mut live = state.live_channel.lock().unwrap_or_else(|p| p.into_inner());
+                        *live = LiveChannel::new(
+                            reopened.opened.reader,
+                            reopened.opened.writer,
+                            reopened.validated.length,
+                        );
+                    }
                     state.channel_cancel = reopened.opened.channel_cancel;
                     state.activity = ParkActivity::start(
                         reopened.opened.park_cancel,
                         reopened.opened.guard,
+                        Arc::clone(&state.live_channel),
+                        state.options.park_pool.clone(),
                         state.options.idle_park_timeout,
                     );
                     state.activity.touch_ms();
@@ -701,14 +1041,59 @@ fn poll_keep_open(
             }
         }
 
+        // If the watchdog parked and trimmed this stream, drain any retained <= 64 KiB read-ahead
+        // first, then transparently reopen at the exact byte offset.
+        {
+            let mut live = state.live_channel.lock().unwrap_or_else(|p| p.into_inner());
+            if live.reader.is_none() {
+                if live.parked_pos < live.parked_head.len() {
+                    let avail = &live.parked_head[live.parked_pos..];
+                    let max_read = usize::try_from(*total_remaining)
+                        .unwrap_or(usize::MAX)
+                        .min(buf.remaining());
+                    let take = avail.len().min(max_read);
+                    buf.put_slice(&avail[..take]);
+                    live.parked_pos += take;
+                    *total_remaining -= take as u64;
+                    if live.parked_pos >= live.parked_head.len() {
+                        live.parked_head = Vec::new();
+                        live.parked_pos = 0;
+                    }
+                    drop(live);
+                    state.progress_deadline = None;
+                    state.consecutive_reopens = 0;
+                    state.activity.touch_ms();
+                    state.activity.touch_parked_lru();
+                    return Poll::Ready(Ok(()));
+                }
+                drop(live);
+                if *total_remaining == 0 {
+                    state.phase = KeepOpenPhase::Finished;
+                    state.activity.stop_and_release();
+                    return Poll::Ready(Ok(()));
+                }
+                let fallback = io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "parked content stream could not reopen",
+                );
+                match state.begin_reopen(*total_remaining, fallback) {
+                    Ok(()) => continue,
+                    Err(err) => {
+                        state.fail_stream(total_remaining);
+                        return Poll::Ready(Err(err));
+                    }
+                }
+            }
+        }
+
         if !state.activity.is_parked()
-            && state.writer.is_some()
+            && state.has_writer()
             && let Err(err) = state.drive_pending_write(cx)
         {
             if is_reopenable_io_error(&err) && *total_remaining > 0 {
                 // Drop writer so any already-buffered bytes drain first, or reopen immediately if
                 // we have no buffered data phase left.
-                state.writer = None;
+                state.clear_writer();
                 state.pending_write.clear();
                 state.pending_write_pos = 0;
                 state.need_flush = false;
@@ -724,6 +1109,11 @@ fn poll_keep_open(
             KeepOpenPhase::Reopening(_) => continue,
             KeepOpenPhase::Data { remaining, started } => {
                 if *remaining == 0 {
+                    state
+                        .live_channel
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .data_window_remaining = 0;
                     if *total_remaining == 0 && state.activity.is_parked() {
                         state.phase = KeepOpenPhase::Finished;
                         state.activity.stop_and_release();
@@ -734,8 +1124,33 @@ fn poll_keep_open(
                     };
                     continue;
                 }
-                match Pin::new(&mut state.reader).poll_fill_buf(cx) {
-                    Poll::Pending => {
+                let data_poll = {
+                    let mut live = state.live_channel.lock().unwrap_or_else(|p| p.into_inner());
+                    live.data_window_remaining = *remaining;
+                    match live.reader.as_mut() {
+                        None => None,
+                        Some(reader) => match Pin::new(&mut *reader).poll_fill_buf(cx) {
+                            Poll::Pending => Some(Poll::Pending),
+                            Poll::Ready(Err(err)) => Some(Poll::Ready(Err(err))),
+                            Poll::Ready(Ok([])) => Some(Poll::Ready(Ok(0usize))),
+                            Poll::Ready(Ok(avail)) => {
+                                let max_read = usize::try_from(*remaining)
+                                    .unwrap_or(usize::MAX)
+                                    .min(buf.remaining());
+                                let take = avail.len().min(max_read);
+                                buf.put_slice(&avail[..take]);
+                                Pin::new(&mut *reader).consume(take);
+                                *remaining -= take as u64;
+                                *total_remaining -= take as u64;
+                                live.data_window_remaining = *remaining;
+                                Some(Poll::Ready(Ok(take)))
+                            }
+                        },
+                    }
+                };
+                match data_poll {
+                    None => continue,
+                    Some(Poll::Pending) => {
                         if let Err(err) = poll_progress_deadline(
                             &mut state.progress_deadline,
                             state.options.progress_timeout,
@@ -745,10 +1160,10 @@ fn poll_keep_open(
                             state.fail_stream(total_remaining);
                             return Poll::Ready(Err(err));
                         }
-                        state.activity.set_waiting(true);
+                        state.activity.mark_waiting(cx.waker());
                         return Poll::Pending;
                     }
-                    Poll::Ready(Err(err)) => {
+                    Some(Poll::Ready(Err(err))) => {
                         if is_reopenable_io_error(&err)
                             && *total_remaining > 0
                             && state.begin_reopen(*total_remaining, err).is_ok()
@@ -761,7 +1176,7 @@ fn poll_keep_open(
                             "content stream ended unexpectedly",
                         )));
                     }
-                    Poll::Ready(Ok([])) => {
+                    Some(Poll::Ready(Ok(0))) => {
                         let missing = *total_remaining;
                         let fallback = io::Error::new(
                             io::ErrorKind::UnexpectedEof,
@@ -775,15 +1190,7 @@ fn poll_keep_open(
                             }
                         }
                     }
-                    Poll::Ready(Ok(avail)) => {
-                        let max_read = usize::try_from(*remaining)
-                            .unwrap_or(usize::MAX)
-                            .min(buf.remaining());
-                        let take = avail.len().min(max_read);
-                        buf.put_slice(&avail[..take]);
-                        Pin::new(&mut state.reader).consume(take);
-                        *remaining -= take as u64;
-                        *total_remaining -= take as u64;
+                    Some(Poll::Ready(Ok(_))) => {
                         let elapsed = started.elapsed();
                         state.progress_deadline = None;
                         state.consecutive_reopens = 0;
@@ -792,14 +1199,14 @@ fn poll_keep_open(
                         // Pipeline at most one read-ahead window once the caller starts reading
                         // this window, keeping unread buffering strictly bounded.
                         if !state.activity.is_parked()
-                            && state.writer.is_some()
+                            && state.has_writer()
                             && state.in_flight.is_none()
                             && state.next_request_offset < state.logical_end
                         {
                             state.enqueue_next_window(elapsed);
                             if let Err(err) = state.drive_pending_write(cx) {
                                 if is_reopenable_io_error(&err) {
-                                    state.writer = None;
+                                    state.clear_writer();
                                     state.pending_write.clear();
                                     state.pending_write_pos = 0;
                                     state.need_flush = false;
@@ -815,8 +1222,52 @@ fn poll_keep_open(
                 }
             }
             KeepOpenPhase::DoneTrailer { line } => {
-                match Pin::new(&mut state.reader).poll_fill_buf(cx) {
-                    Poll::Pending => {
+                enum LinePoll {
+                    Missing,
+                    Pending,
+                    Err(io::Error),
+                    Eof,
+                    LineReady,
+                    Oversized,
+                    More,
+                }
+                let polled = {
+                    let mut live = state.live_channel.lock().unwrap_or_else(|p| p.into_inner());
+                    live.data_window_remaining = 0;
+                    match live.reader.as_mut() {
+                        None => LinePoll::Missing,
+                        Some(reader) => match Pin::new(&mut *reader).poll_fill_buf(cx) {
+                            Poll::Pending => LinePoll::Pending,
+                            Poll::Ready(Err(err)) => LinePoll::Err(err),
+                            Poll::Ready(Ok([])) => LinePoll::Eof,
+                            Poll::Ready(Ok(avail)) => {
+                                if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                                    let take = pos + 1;
+                                    if line.len() + take > MAX_DONE_LINE {
+                                        LinePoll::Oversized
+                                    } else {
+                                        line.extend_from_slice(&avail[..take]);
+                                        Pin::new(&mut *reader).consume(take);
+                                        LinePoll::LineReady
+                                    }
+                                } else {
+                                    let n = avail.len();
+                                    if line.len() + n > MAX_DONE_LINE {
+                                        LinePoll::Oversized
+                                    } else {
+                                        line.extend_from_slice(avail);
+                                        Pin::new(&mut *reader).consume(n);
+                                        LinePoll::More
+                                    }
+                                }
+                            }
+                        },
+                    }
+                };
+                match polled {
+                    LinePoll::Missing => continue,
+                    LinePoll::More => continue,
+                    LinePoll::Pending => {
                         if let Err(err) = poll_progress_deadline(
                             &mut state.progress_deadline,
                             state.options.progress_timeout,
@@ -826,10 +1277,10 @@ fn poll_keep_open(
                             state.fail_stream(total_remaining);
                             return Poll::Ready(Err(err));
                         }
-                        state.activity.set_waiting(true);
+                        state.activity.mark_waiting(cx.waker());
                         return Poll::Pending;
                     }
-                    Poll::Ready(Err(err)) => {
+                    LinePoll::Err(err) => {
                         if is_reopenable_io_error(&err) && *total_remaining > 0 {
                             match state.begin_reopen(*total_remaining, err) {
                                 Ok(()) => continue,
@@ -842,7 +1293,7 @@ fn poll_keep_open(
                         state.fail_stream(total_remaining);
                         return Poll::Ready(Err(err));
                     }
-                    Poll::Ready(Ok([])) => {
+                    LinePoll::Eof => {
                         if *total_remaining > 0 {
                             let fallback = io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
@@ -867,98 +1318,127 @@ fn poll_keep_open(
                             "content stream closed before done frame",
                         )));
                     }
-                    Poll::Ready(Ok(avail)) => {
+                    LinePoll::Oversized => {
+                        state.fail_stream(total_remaining);
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "remote sent extra bytes past announced window length",
+                        )));
+                    }
+                    LinePoll::LineReady => {
                         state.progress_deadline = None;
-                        if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
-                            let take = pos + 1;
-                            if line.len() + take > MAX_DONE_LINE {
-                                state.fail_stream(total_remaining);
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "remote sent extra bytes past announced window length",
-                                )));
-                            }
-                            line.extend_from_slice(&avail[..take]);
-                            Pin::new(&mut state.reader).consume(take);
-                            if !is_done_frame(line) {
-                                state.fail_stream(total_remaining);
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "remote sent an invalid done frame",
-                                )));
-                            }
-                            if *total_remaining == 0 {
-                                if state.activity.is_parked() {
-                                    state.phase = KeepOpenPhase::Finished;
-                                    state.activity.stop_and_release();
-                                    return Poll::Ready(Ok(()));
-                                }
-                                // Drop stdin cleanly so the remote `legion stream` flushes its
-                                // coalesced audit entry and exits with EOF.
-                                state.writer = None;
-                                state.phase = KeepOpenPhase::ClosingEof;
-                                continue;
-                            }
-                            if state.in_flight.is_none() {
-                                if state.activity.is_parked() || state.writer.is_none() {
-                                    let fallback = io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "content stream channel closed before next window",
-                                    );
-                                    match state.begin_reopen(*total_remaining, fallback) {
-                                        Ok(()) => continue,
-                                        Err(err) => {
-                                            state.fail_stream(total_remaining);
-                                            return Poll::Ready(Err(err));
-                                        }
-                                    }
-                                }
-                                state.enqueue_next_window(Duration::ZERO);
-                                if let Err(err) = state.drive_pending_write(cx) {
-                                    if is_reopenable_io_error(&err) {
-                                        match state.begin_reopen(*total_remaining, err) {
-                                            Ok(()) => continue,
-                                            Err(e) => {
-                                                state.fail_stream(total_remaining);
-                                                return Poll::Ready(Err(e));
-                                            }
-                                        }
-                                    }
-                                    state.fail_stream(total_remaining);
-                                    return Poll::Ready(Err(err));
-                                }
-                            }
-                            let Some(expected) = state.in_flight.take() else {
-                                state.fail_stream(total_remaining);
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "content stream ended before delivering all bytes",
-                                )));
-                            };
-                            state.busy_count = 0;
-                            state.phase = KeepOpenPhase::NextReady {
-                                expected,
-                                line: Vec::with_capacity(128),
-                            };
-                            continue;
-                        }
-                        let n = avail.len();
-                        if line.len() + n > MAX_DONE_LINE {
+                        if !is_done_frame(line) {
                             state.fail_stream(total_remaining);
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                "remote sent more bytes than announced",
+                                "remote sent an invalid done frame",
                             )));
                         }
-                        line.extend_from_slice(avail);
-                        Pin::new(&mut state.reader).consume(n);
+                        if *total_remaining == 0 {
+                            if state.activity.is_parked() {
+                                state.phase = KeepOpenPhase::Finished;
+                                state.activity.stop_and_release();
+                                return Poll::Ready(Ok(()));
+                            }
+                            // Drop stdin cleanly so the remote `legion stream` flushes its
+                            // coalesced audit entry and exits with EOF.
+                            state.clear_writer();
+                            state.phase = KeepOpenPhase::ClosingEof;
+                            continue;
+                        }
+                        if state.in_flight.is_none() {
+                            if state.activity.is_parked() || !state.has_writer() {
+                                let fallback = io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "content stream channel closed before next window",
+                                );
+                                match state.begin_reopen(*total_remaining, fallback) {
+                                    Ok(()) => continue,
+                                    Err(err) => {
+                                        state.fail_stream(total_remaining);
+                                        return Poll::Ready(Err(err));
+                                    }
+                                }
+                            }
+                            state.enqueue_next_window(Duration::ZERO);
+                            if let Err(err) = state.drive_pending_write(cx) {
+                                if is_reopenable_io_error(&err) {
+                                    match state.begin_reopen(*total_remaining, err) {
+                                        Ok(()) => continue,
+                                        Err(e) => {
+                                            state.fail_stream(total_remaining);
+                                            return Poll::Ready(Err(e));
+                                        }
+                                    }
+                                }
+                                state.fail_stream(total_remaining);
+                                return Poll::Ready(Err(err));
+                            }
+                        }
+                        let Some(expected) = state.in_flight.take() else {
+                            state.fail_stream(total_remaining);
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "content stream ended before delivering all bytes",
+                            )));
+                        };
+                        state.busy_count = 0;
+                        state.phase = KeepOpenPhase::NextReady {
+                            expected,
+                            line: Vec::with_capacity(128),
+                        };
+                        continue;
                     }
                 }
             }
             KeepOpenPhase::NextReady { expected, line } => {
                 let expected = *expected;
-                match Pin::new(&mut state.reader).poll_fill_buf(cx) {
-                    Poll::Pending => {
+                enum ReadyPoll {
+                    Missing,
+                    Pending,
+                    Err(io::Error),
+                    Eof,
+                    LineReady,
+                    Oversized,
+                    More,
+                }
+                let polled = {
+                    let mut live = state.live_channel.lock().unwrap_or_else(|p| p.into_inner());
+                    live.data_window_remaining = 0;
+                    match live.reader.as_mut() {
+                        None => ReadyPoll::Missing,
+                        Some(reader) => match Pin::new(&mut *reader).poll_fill_buf(cx) {
+                            Poll::Pending => ReadyPoll::Pending,
+                            Poll::Ready(Err(err)) => ReadyPoll::Err(err),
+                            Poll::Ready(Ok([])) => ReadyPoll::Eof,
+                            Poll::Ready(Ok(avail)) => {
+                                if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                                    let take = pos + 1;
+                                    if line.len() + take > MAX_REPLY_LINE {
+                                        ReadyPoll::Oversized
+                                    } else {
+                                        line.extend_from_slice(&avail[..take]);
+                                        Pin::new(&mut *reader).consume(take);
+                                        ReadyPoll::LineReady
+                                    }
+                                } else {
+                                    let n = avail.len();
+                                    if line.len() + n > MAX_REPLY_LINE {
+                                        ReadyPoll::Oversized
+                                    } else {
+                                        line.extend_from_slice(avail);
+                                        Pin::new(&mut *reader).consume(n);
+                                        ReadyPoll::More
+                                    }
+                                }
+                            }
+                        },
+                    }
+                };
+                match polled {
+                    ReadyPoll::Missing => continue,
+                    ReadyPoll::More => continue,
+                    ReadyPoll::Pending => {
                         if let Err(err) = poll_progress_deadline(
                             &mut state.progress_deadline,
                             state.options.progress_timeout,
@@ -968,10 +1448,10 @@ fn poll_keep_open(
                             state.fail_stream(total_remaining);
                             return Poll::Ready(Err(err));
                         }
-                        state.activity.set_waiting(true);
+                        state.activity.mark_waiting(cx.waker());
                         return Poll::Pending;
                     }
-                    Poll::Ready(Err(err)) => {
+                    ReadyPoll::Err(err) => {
                         if is_reopenable_io_error(&err) && *total_remaining > 0 {
                             match state.begin_reopen(*total_remaining, err) {
                                 Ok(()) => continue,
@@ -984,7 +1464,7 @@ fn poll_keep_open(
                         state.fail_stream(total_remaining);
                         return Poll::Ready(Err(err));
                     }
-                    Poll::Ready(Ok([])) => {
+                    ReadyPoll::Eof => {
                         let fallback = io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "content stream closed before answering next window",
@@ -997,140 +1477,156 @@ fn poll_keep_open(
                             }
                         }
                     }
-                    Poll::Ready(Ok(avail)) => {
-                        if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
-                            let take = pos + 1;
-                            if line.len() + take > MAX_REPLY_LINE {
-                                state.fail_stream(total_remaining);
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "remote sent an oversized stream reply line",
-                                )));
-                            }
-                            line.extend_from_slice(&avail[..take]);
-                            Pin::new(&mut state.reader).consume(take);
-
-                            let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(line)
-                            else {
-                                state.fail_stream(total_remaining);
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "remote answered stream get with non-JSON output",
-                                )));
-                            };
-                            if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
-                                state.busy_count += 1;
-                                if state.busy_count > state.options.max_busy_lines {
-                                    let machine = state.machine.clone();
-                                    state.fail_stream(total_remaining);
-                                    return Poll::Ready(Err(io::Error::other(format!(
-                                        "{machine} sent too many consecutive busy responses while streaming"
-                                    ))));
-                                }
-                                line.clear();
-                                continue;
-                            }
-                            state.busy_count = 0;
-                            state.progress_deadline = None;
-                            if let Some(error_val) = fields.get("error")
-                                && let Ok(body) =
-                                    serde_json::from_value::<ErrorBody>(error_val.clone())
-                            {
-                                state.fail_stream(total_remaining);
-                                let kind = match body.code {
-                                    ErrorCode::Denied => io::ErrorKind::PermissionDenied,
-                                    ErrorCode::NotFound => io::ErrorKind::NotFound,
-                                    ErrorCode::Timeout => io::ErrorKind::TimedOut,
-                                    ErrorCode::Cancelled => io::ErrorKind::Interrupted,
-                                    _ => io::ErrorKind::Other,
-                                };
-                                return Poll::Ready(Err(io::Error::new(kind, body.message)));
-                            }
-                            let Ok(ready) =
-                                serde_json::from_value::<GetReadyReply>(Value::Object(fields))
-                            else {
-                                state.fail_stream(total_remaining);
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "remote answered stream get with an unexpected line",
-                                )));
-                            };
-                            let validated = match validate_get_reply(
-                                &state.machine,
-                                expected.offset,
-                                Some(expected.length),
-                                ready,
-                            ) {
-                                Ok(v) => v,
-                                Err(err) => {
-                                    state.fail_stream(total_remaining);
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        err.message,
-                                    )));
-                                }
-                            };
-                            if validated.size != state.expected_size
-                                || validated.mtime != state.expected_mtime
-                                || validated.file_id != state.expected_file_id
-                            {
-                                state.fail_stream(total_remaining);
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "file changed on remote node while streaming",
-                                )));
-                            }
-                            state.phase = KeepOpenPhase::Data {
-                                remaining: validated.length,
-                                started: Instant::now(),
-                            };
-                            continue;
-                        }
-                        let n = avail.len();
-                        if line.len() + n > MAX_REPLY_LINE {
+                    ReadyPoll::Oversized => {
+                        state.fail_stream(total_remaining);
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "remote sent an oversized stream reply line",
+                        )));
+                    }
+                    ReadyPoll::LineReady => {
+                        let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(line)
+                        else {
                             state.fail_stream(total_remaining);
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                "remote sent an oversized stream reply line",
+                                "remote answered stream get with non-JSON output",
+                            )));
+                        };
+                        if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
+                            state.busy_count += 1;
+                            if state.busy_count > state.options.max_busy_lines {
+                                let machine = state.machine.clone();
+                                state.fail_stream(total_remaining);
+                                return Poll::Ready(Err(io::Error::other(format!(
+                                    "{machine} sent too many consecutive busy responses while streaming"
+                                ))));
+                            }
+                            line.clear();
+                            continue;
+                        }
+                        state.busy_count = 0;
+                        state.progress_deadline = None;
+                        if let Some(error_val) = fields.get("error")
+                            && let Ok(body) = serde_json::from_value::<ErrorBody>(error_val.clone())
+                        {
+                            state.fail_stream(total_remaining);
+                            let kind = match body.code {
+                                ErrorCode::Denied => io::ErrorKind::PermissionDenied,
+                                ErrorCode::NotFound => io::ErrorKind::NotFound,
+                                ErrorCode::Timeout => io::ErrorKind::TimedOut,
+                                ErrorCode::Cancelled => io::ErrorKind::Interrupted,
+                                _ => io::ErrorKind::Other,
+                            };
+                            return Poll::Ready(Err(io::Error::new(kind, body.message)));
+                        }
+                        let Ok(ready) =
+                            serde_json::from_value::<GetReadyReply>(Value::Object(fields))
+                        else {
+                            state.fail_stream(total_remaining);
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "remote answered stream get with an unexpected line",
+                            )));
+                        };
+                        let validated = match validate_get_reply(
+                            &state.machine,
+                            expected.offset,
+                            Some(expected.length),
+                            ready,
+                        ) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                state.fail_stream(total_remaining);
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    err.message,
+                                )));
+                            }
+                        };
+                        if validated.size != state.expected_size
+                            || validated.mtime != state.expected_mtime
+                            || validated.file_id != state.expected_file_id
+                        {
+                            state.fail_stream(total_remaining);
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "file changed on remote node while streaming",
                             )));
                         }
-                        line.extend_from_slice(avail);
-                        Pin::new(&mut state.reader).consume(n);
+                        state
+                            .live_channel
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .data_window_remaining = validated.length;
+                        state.phase = KeepOpenPhase::Data {
+                            remaining: validated.length,
+                            started: Instant::now(),
+                        };
+                        continue;
                     }
                 }
             }
-            KeepOpenPhase::ClosingEof => match Pin::new(&mut state.reader).poll_fill_buf(cx) {
-                Poll::Pending => {
-                    if let Err(err) = poll_progress_deadline(
-                        &mut state.progress_deadline,
-                        state.options.progress_timeout,
-                        &state.machine,
-                        cx,
-                    ) {
+            KeepOpenPhase::ClosingEof => {
+                enum ClosePoll {
+                    Missing,
+                    Pending,
+                    Err(io::Error),
+                    Extra,
+                    Done,
+                }
+                let polled = {
+                    let mut live = state.live_channel.lock().unwrap_or_else(|p| p.into_inner());
+                    live.data_window_remaining = 0;
+                    match live.reader.as_mut() {
+                        None => ClosePoll::Missing,
+                        Some(reader) => match Pin::new(&mut *reader).poll_fill_buf(cx) {
+                            Poll::Pending => ClosePoll::Pending,
+                            Poll::Ready(Err(err)) => ClosePoll::Err(err),
+                            Poll::Ready(Ok(extra)) if !extra.is_empty() => ClosePoll::Extra,
+                            Poll::Ready(Ok(_)) => ClosePoll::Done,
+                        },
+                    }
+                };
+                match polled {
+                    ClosePoll::Missing => {
+                        state.progress_deadline = None;
+                        state.phase = KeepOpenPhase::Finished;
+                        state.activity.stop_and_release();
+                        return Poll::Ready(Ok(()));
+                    }
+                    ClosePoll::Pending => {
+                        if let Err(err) = poll_progress_deadline(
+                            &mut state.progress_deadline,
+                            state.options.progress_timeout,
+                            &state.machine,
+                            cx,
+                        ) {
+                            state.fail_stream(total_remaining);
+                            return Poll::Ready(Err(err));
+                        }
+                        state.activity.mark_waiting(cx.waker());
+                        return Poll::Pending;
+                    }
+                    ClosePoll::Err(err) => {
                         state.fail_stream(total_remaining);
                         return Poll::Ready(Err(err));
                     }
-                    state.activity.set_waiting(true);
-                    return Poll::Pending;
+                    ClosePoll::Extra => {
+                        state.fail_stream(total_remaining);
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "remote sent more bytes than announced",
+                        )));
+                    }
+                    ClosePoll::Done => {
+                        state.progress_deadline = None;
+                        state.phase = KeepOpenPhase::Finished;
+                        state.activity.stop_and_release();
+                        return Poll::Ready(Ok(()));
+                    }
                 }
-                Poll::Ready(Err(err)) => {
-                    state.fail_stream(total_remaining);
-                    return Poll::Ready(Err(err));
-                }
-                Poll::Ready(Ok(extra)) if !extra.is_empty() => {
-                    state.fail_stream(total_remaining);
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "remote sent more bytes than announced",
-                    )));
-                }
-                Poll::Ready(Ok(_)) => {
-                    state.progress_deadline = None;
-                    state.phase = KeepOpenPhase::Finished;
-                    state.activity.stop_and_release();
-                    return Poll::Ready(Ok(()));
-                }
-            },
+            }
         }
     }
 }
@@ -1439,6 +1935,7 @@ pub(crate) async fn handshake_get(
     as_principal: Option<&str>,
     timeout: Duration,
     cancel: CancellationToken,
+    options: ContentStreamOptions,
     on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
 ) -> Result<ContentStream, ErrorBody> {
     handshake_get_inner(
@@ -1451,7 +1948,7 @@ pub(crate) async fn handshake_get(
         as_principal,
         timeout,
         cancel,
-        ContentStreamOptions::default(),
+        options,
         on_greeting_capabilities,
     )
     .await
@@ -1546,11 +2043,20 @@ async fn handshake_get_inner(
     {
         let logical_end = validated.offset.saturating_add(total_length);
         let next_request_offset = validated.offset.saturating_add(validated.length);
-        let activity =
-            ParkActivity::start(opened.park_cancel, opened.guard, options.idle_park_timeout);
+        let live_channel = Arc::new(Mutex::new(LiveChannel::new(
+            opened.reader,
+            opened.writer,
+            validated.length,
+        )));
+        let activity = ParkActivity::start(
+            opened.park_cancel,
+            opened.guard,
+            Arc::clone(&live_channel),
+            options.park_pool.clone(),
+            options.idle_park_timeout,
+        );
         StreamMode::KeepOpen(Box::new(KeepOpenState {
-            reader: opened.reader,
-            writer: Some(opened.writer),
+            live_channel,
             pending_write: Vec::new(),
             pending_write_pos: 0,
             need_flush: false,
@@ -2856,6 +3362,7 @@ mod tests {
             idle_park_timeout: Duration::from_millis(60),
             progress_timeout: Duration::from_millis(120),
             max_busy_lines: 4,
+            ..ContentStreamOptions::default()
         };
         let raw = opener.open_stream(CancellationToken::new()).await.unwrap();
         let mut stream = handshake_get_with_options(
@@ -2868,7 +3375,7 @@ mod tests {
             None,
             Duration::from_secs(5),
             CancellationToken::new(),
-            opts,
+            opts.clone(),
         )
         .await
         .unwrap();
@@ -3010,6 +3517,7 @@ mod tests {
                 idle_park_timeout: Duration::from_secs(60),
                 progress_timeout: Duration::from_secs(5),
                 max_busy_lines: 4,
+                ..ContentStreamOptions::default()
             },
         )
         .await
@@ -3027,6 +3535,7 @@ mod tests {
             idle_park_timeout: Duration::from_secs(60),
             progress_timeout: Duration::from_millis(100),
             max_busy_lines: 3,
+            ..ContentStreamOptions::default()
         };
 
         // 1. Mid-window stall triggers progress timeout.
@@ -3064,7 +3573,7 @@ mod tests {
                 None,
                 Duration::from_secs(5),
                 CancellationToken::new(),
-                opts,
+                opts.clone(),
             )
             .await
             .unwrap();
@@ -3107,7 +3616,7 @@ mod tests {
                 None,
                 Duration::from_secs(5),
                 CancellationToken::new(),
-                opts,
+                opts.clone(),
             )
             .await
             .err()
@@ -3188,5 +3697,909 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn abandoned_pending_read_does_not_block_parking() {
+        struct SlotGuard(Arc<AtomicUsize>);
+        impl Drop for SlotGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        struct DelayedBodyOpener {
+            payload: Arc<Vec<u8>>,
+            first_body_delay: Duration,
+            active_slots: Arc<AtomicUsize>,
+            opened: Arc<AtomicUsize>,
+        }
+
+        impl StreamOpener for DelayedBodyOpener {
+            fn window_policy(&self) -> Option<WindowPolicy> {
+                Some(WindowPolicy {
+                    initial_bytes: 16 * 1024,
+                    max_bytes: 16 * 1024,
+                })
+            }
+
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let payload = Arc::clone(&self.payload);
+                let delay = self.first_body_delay;
+                let active_slots = Arc::clone(&self.active_slots);
+                let opened = Arc::clone(&self.opened);
+                Box::pin(async move {
+                    let seq = opened.fetch_add(1, Ordering::SeqCst);
+                    active_slots.fetch_add(1, Ordering::SeqCst);
+                    let guard = Box::new(SlotGuard(Arc::clone(&active_slots)));
+
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let channel_cancel = CancellationToken::new();
+                    let park_cancel = CancellationToken::new();
+                    let rx_cancel = channel_cancel.clone();
+                    let rx_park = park_cancel.clone();
+
+                    tokio::spawn(async move {
+                        let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            let n = tokio::select! {
+                                biased;
+                                () = rx_cancel.cancelled() => break,
+                                () = rx_park.cancelled() => break,
+                                res = reader.read_line(&mut line) => res.unwrap_or(0),
+                            };
+                            if n == 0 {
+                                break;
+                            }
+                            let req: Value = serde_json::from_str(&line).unwrap();
+                            let offset = req["offset"].as_u64().unwrap() as usize;
+                            let len = req["length"].as_u64().unwrap() as usize;
+                            let actual = len.min(payload.len() - offset);
+                            let ready = json!({
+                                "size": payload.len(),
+                                "offset": offset,
+                                "length": actual,
+                                "mtime": { "secs": 1_700_000_555i64, "nanos": 0u32 },
+                                "file_id": 88u64,
+                                "keep_open": true,
+                            });
+                            if server_out
+                                .write_all(format!("{ready}\n").as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            let _ = server_out.flush().await;
+                            // Delay body bytes on the first channel so the caller's read returns
+                            // Poll::Pending and sets `waiting_for_remote`.
+                            if seq == 0 {
+                                tokio::select! {
+                                    biased;
+                                    () = rx_cancel.cancelled() => break,
+                                    () = rx_park.cancelled() => break,
+                                    () = tokio::time::sleep(delay) => {}
+                                }
+                            }
+                            if server_out
+                                .write_all(&payload[offset..offset + actual])
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if server_out.write_all(b"{\"done\":true}\n").await.is_err() {
+                                break;
+                            }
+                            let _ = server_out.flush().await;
+                        }
+                        let _ = server_out.shutdown().await;
+                    });
+
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: channel_cancel,
+                        park: Some(park_cancel),
+                        guard: Some(guard),
+                    })
+                })
+            }
+        }
+
+        let payload: Vec<u8> = (0..32 * 1024usize).map(|i| (i % 241) as u8).collect();
+        let idle_park = Duration::from_millis(80);
+        let opts = ContentStreamOptions {
+            idle_park_timeout: idle_park,
+            progress_timeout: Duration::from_secs(5),
+            max_busy_lines: 4,
+            ..ContentStreamOptions::default()
+        };
+
+        // 1. A read abandoned via `timeout(read)` while pending must NOT block parking.
+        {
+            let active_slots = Arc::new(AtomicUsize::new(0));
+            let opened = Arc::new(AtomicUsize::new(0));
+            let opener: Arc<dyn StreamOpener> = Arc::new(DelayedBodyOpener {
+                payload: Arc::new(payload.clone()),
+                first_body_delay: Duration::from_secs(30),
+                active_slots: Arc::clone(&active_slots),
+                opened: Arc::clone(&opened),
+            });
+            let raw = opener.open_stream(CancellationToken::new()).await.unwrap();
+            let mut stream = handshake_get_with_options(
+                raw,
+                Some(Arc::clone(&opener)),
+                "tower",
+                "/slow.bin",
+                0,
+                None,
+                None,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+                opts.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(active_slots.load(Ordering::SeqCst), 1);
+
+            let mut buf = [0u8; 4096];
+            let timed_out =
+                tokio::time::timeout(Duration::from_millis(25), stream.read(&mut buf)).await;
+            assert!(
+                timed_out.is_err(),
+                "first read should time out while pending"
+            );
+
+            // Stream must park within the normal idle park window (~80 ms + modest scheduler slack).
+            let deadline = Instant::now() + Duration::from_millis(400);
+            while active_slots.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            assert_eq!(
+                active_slots.load(Ordering::SeqCst),
+                0,
+                "abandoned pending read must not block parking"
+            );
+
+            // Resuming after park reopens transparently and yields exact payload.
+            let mut out = Vec::new();
+            stream.read_to_end(&mut out).await.unwrap();
+            assert_eq!(out, payload);
+            assert!(opened.load(Ordering::SeqCst) >= 2);
+        }
+
+        // 2. An actively waiting reader (future NOT dropped) must NOT be prematurely parked while
+        //    waiting for a slow remote (220 ms > idle_park_timeout 80 ms).
+        {
+            let active_slots = Arc::new(AtomicUsize::new(0));
+            let opened = Arc::new(AtomicUsize::new(0));
+            let opener: Arc<dyn StreamOpener> = Arc::new(DelayedBodyOpener {
+                payload: Arc::new(payload.clone()),
+                first_body_delay: Duration::from_millis(220),
+                active_slots: Arc::clone(&active_slots),
+                opened: Arc::clone(&opened),
+            });
+            let raw = opener.open_stream(CancellationToken::new()).await.unwrap();
+            let mut stream = handshake_get_with_options(
+                raw,
+                Some(Arc::clone(&opener)),
+                "tower",
+                "/slow-active.bin",
+                0,
+                None,
+                None,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+                opts,
+            )
+            .await
+            .unwrap();
+
+            let mut out = Vec::new();
+            stream.read_to_end(&mut out).await.unwrap();
+            assert_eq!(out, payload);
+            assert_eq!(
+                opened.load(Ordering::SeqCst),
+                1,
+                "active reader waiting on slow remote must not be prematurely parked"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parked_streams_trim_buffers_cap_lru_and_stay_cheap_at_scale() {
+        fn pattern_byte(offset: u64) -> u8 {
+            ((offset.wrapping_mul(31).wrapping_add(17)) % 251) as u8
+        }
+
+        #[cfg(target_os = "linux")]
+        fn rss_bytes() -> u64 {
+            let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
+                return 0;
+            };
+            let pages: u64 = statm
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            pages.saturating_mul(4096)
+        }
+        #[cfg(not(target_os = "linux"))]
+        fn rss_bytes() -> u64 {
+            0
+        }
+
+        struct SlotGuard(Arc<AtomicUsize>);
+        impl Drop for SlotGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        struct LargeWindowOpener {
+            file_size: u64,
+            active_slots: Arc<AtomicUsize>,
+        }
+
+        impl StreamOpener for LargeWindowOpener {
+            fn window_policy(&self) -> Option<WindowPolicy> {
+                Some(WindowPolicy {
+                    initial_bytes: 256 * 1024,
+                    max_bytes: 4 * 1024 * 1024,
+                })
+            }
+
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let file_size = self.file_size;
+                let active_slots = Arc::clone(&self.active_slots);
+                Box::pin(async move {
+                    active_slots.fetch_add(1, Ordering::SeqCst);
+                    let guard = Box::new(SlotGuard(Arc::clone(&active_slots)));
+                    // Large duplex buffer matching SSH's in-flight window queue.
+                    let (client_in, mut server_out) = tokio::io::duplex(4 * 1024 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                    let channel_cancel = CancellationToken::new();
+                    let park_cancel = CancellationToken::new();
+                    let rx_cancel = channel_cancel.clone();
+                    let rx_park = park_cancel.clone();
+
+                    tokio::spawn(async move {
+                        let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        let mut chunk = vec![0u8; 64 * 1024];
+                        loop {
+                            line.clear();
+                            let n = tokio::select! {
+                                biased;
+                                () = rx_cancel.cancelled() => break,
+                                () = rx_park.cancelled() => break,
+                                res = reader.read_line(&mut line) => res.unwrap_or(0),
+                            };
+                            if n == 0 {
+                                break;
+                            }
+                            let req: Value = serde_json::from_str(&line).unwrap();
+                            let offset = req["offset"].as_u64().unwrap();
+                            let len = req["length"].as_u64().unwrap();
+                            let actual = len.min(file_size.saturating_sub(offset));
+                            let ready = json!({
+                                "size": file_size,
+                                "offset": offset,
+                                "length": actual,
+                                "mtime": { "secs": 1_700_000_777i64, "nanos": 0u32 },
+                                "file_id": 99u64,
+                                "keep_open": true,
+                            });
+                            if server_out
+                                .write_all(format!("{ready}\n").as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            let mut pos = offset;
+                            let end = offset + actual;
+                            let mut broken = false;
+                            while pos < end {
+                                let step = usize::try_from(end - pos).unwrap().min(chunk.len());
+                                for (i, b) in chunk[..step].iter_mut().enumerate() {
+                                    *b = pattern_byte(pos + i as u64);
+                                }
+                                let write_ok = tokio::select! {
+                                    biased;
+                                    () = rx_cancel.cancelled() => false,
+                                    () = rx_park.cancelled() => false,
+                                    res = server_out.write_all(&chunk[..step]) => res.is_ok(),
+                                };
+                                if !write_ok {
+                                    broken = true;
+                                    break;
+                                }
+                                pos += step as u64;
+                            }
+                            if broken {
+                                break;
+                            }
+                            if server_out.write_all(b"{\"done\":true}\n").await.is_err() {
+                                break;
+                            }
+                            let _ = server_out.flush().await;
+                        }
+                        let _ = server_out.shutdown().await;
+                    });
+
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: channel_cancel,
+                        park: Some(park_cancel),
+                        guard: Some(guard),
+                    })
+                })
+            }
+        }
+
+        async fn read_exact_pattern(stream: &mut ContentStream, start: u64, len: usize) {
+            let mut scratch = vec![0u8; 64 * 1024];
+            let mut done = 0usize;
+            while done < len {
+                let want = (len - done).min(scratch.len());
+                let n = stream.read(&mut scratch[..want]).await.unwrap();
+                assert!(n > 0, "unexpected EOF at offset {}", start + done as u64);
+                for (i, &b) in scratch[..n].iter().enumerate() {
+                    let off = start + (done + i) as u64;
+                    assert_eq!(b, pattern_byte(off), "byte mismatch at offset {off}");
+                }
+                done += n;
+            }
+        }
+
+        // Scenario 1: 200 streams parked after reading 6 MiB each (grows window to 4 MiB).
+        {
+            let file_size = 8 * 1024 * 1024u64;
+            let active_slots = Arc::new(AtomicUsize::new(0));
+            let opener: Arc<dyn StreamOpener> = Arc::new(LargeWindowOpener {
+                file_size,
+                active_slots: Arc::clone(&active_slots),
+            });
+            let pool = Arc::new(ParkedStreamPool::new(DEFAULT_MAX_PARKED_STREAMS));
+            let opts = ContentStreamOptions {
+                idle_park_timeout: Duration::from_millis(60),
+                progress_timeout: Duration::from_secs(5),
+                max_busy_lines: 4,
+                park_pool: Some(Arc::clone(&pool)),
+            };
+            let rss_before = rss_bytes();
+            let mut streams = Vec::with_capacity(200);
+            for batch in 0..25 {
+                let mut futs = Vec::with_capacity(8);
+                for j in 0..8 {
+                    let opener = Arc::clone(&opener);
+                    let opts = opts.clone();
+                    let idx = batch * 8 + j;
+                    futs.push(tokio::spawn(async move {
+                        let raw = opener.open_stream(CancellationToken::new()).await.unwrap();
+                        let mut s = handshake_get_with_options(
+                            raw,
+                            Some(opener),
+                            "tower",
+                            &format!("/video-{idx}.webm"),
+                            0,
+                            None,
+                            None,
+                            Duration::from_secs(5),
+                            CancellationToken::new(),
+                            opts,
+                        )
+                        .await
+                        .unwrap();
+                        read_exact_pattern(&mut s, 0, 6 * 1024 * 1024).await;
+                        s
+                    }));
+                }
+                for fut in futs {
+                    streams.push(fut.await.unwrap());
+                }
+                // Wait for this batch of 8 to park before opening the next batch.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while active_slots.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                }
+                assert_eq!(active_slots.load(Ordering::SeqCst), 0);
+            }
+            assert_eq!(pool.len(), 200);
+            let total_retained: usize = streams
+                .iter()
+                .map(ContentStream::retained_buffer_bytes)
+                .sum();
+            let max_one = streams
+                .iter()
+                .map(ContentStream::retained_buffer_bytes)
+                .max()
+                .unwrap_or(0);
+            let rss_after = rss_bytes();
+            eprintln!(
+                "200 parked streams (after 6 MiB each): total_retained={} bytes ({:.2} MiB) max_per_stream={} bytes rss_delta={:.2} MiB",
+                total_retained,
+                total_retained as f64 / (1024.0 * 1024.0),
+                max_one,
+                rss_after.saturating_sub(rss_before) as f64 / (1024.0 * 1024.0),
+            );
+            assert!(
+                max_one <= PARKED_BUFFER_CAP,
+                "each parked stream must retain <= 64 KiB, saw {max_one}"
+            );
+            assert!(
+                total_retained <= 200 * PARKED_BUFFER_CAP,
+                "200 parked streams retained too much buffer: {total_retained} bytes"
+            );
+
+            // Spot-check byte-exact resume across the parked streams.
+            for idx in [0usize, 99, 199] {
+                read_exact_pattern(&mut streams[idx], 6 * 1024 * 1024, 2 * 1024 * 1024).await;
+                let mut eof = [0u8; 8];
+                assert_eq!(streams[idx].read(&mut eof).await.unwrap(), 0);
+            }
+            drop(streams);
+            assert_eq!(pool.len(), 0);
+        }
+
+        // Scenario 2: 300 streams parked after reading 300 KiB each with default 256 cap.
+        {
+            let file_size = 1024 * 1024u64;
+            let active_slots = Arc::new(AtomicUsize::new(0));
+            let opener: Arc<dyn StreamOpener> = Arc::new(LargeWindowOpener {
+                file_size,
+                active_slots: Arc::clone(&active_slots),
+            });
+            let pool = Arc::new(ParkedStreamPool::new(DEFAULT_MAX_PARKED_STREAMS));
+            let opts = ContentStreamOptions {
+                idle_park_timeout: Duration::from_millis(50),
+                progress_timeout: Duration::from_secs(5),
+                max_busy_lines: 4,
+                park_pool: Some(Arc::clone(&pool)),
+            };
+            let rss_before = rss_bytes();
+            let mut streams = Vec::with_capacity(300);
+            for batch in 0..30 {
+                let mut futs = Vec::with_capacity(10);
+                for j in 0..10 {
+                    let opener = Arc::clone(&opener);
+                    let opts = opts.clone();
+                    let idx = batch * 10 + j;
+                    futs.push(tokio::spawn(async move {
+                        let raw = opener.open_stream(CancellationToken::new()).await.unwrap();
+                        let mut s = handshake_get_with_options(
+                            raw,
+                            Some(opener),
+                            "tower",
+                            &format!("/clip-{idx}.webm"),
+                            0,
+                            None,
+                            None,
+                            Duration::from_secs(5),
+                            CancellationToken::new(),
+                            opts,
+                        )
+                        .await
+                        .unwrap();
+                        read_exact_pattern(&mut s, 0, 300 * 1024).await;
+                        s
+                    }));
+                }
+                for fut in futs {
+                    streams.push(fut.await.unwrap());
+                }
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while active_slots.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                }
+                assert_eq!(active_slots.load(Ordering::SeqCst), 0);
+            }
+            assert_eq!(
+                pool.len(),
+                DEFAULT_MAX_PARKED_STREAMS,
+                "parked pool must cap at 256 streams"
+            );
+            let total_retained: usize = streams
+                .iter()
+                .map(ContentStream::retained_buffer_bytes)
+                .sum();
+            let rss_after = rss_bytes();
+            eprintln!(
+                "300 parked streams (after 300 KiB each, cap 256): pool_len={} total_retained={} bytes ({:.2} MiB) rss_delta={:.2} MiB",
+                pool.len(),
+                total_retained,
+                total_retained as f64 / (1024.0 * 1024.0),
+                rss_after.saturating_sub(rss_before) as f64 / (1024.0 * 1024.0),
+            );
+            assert!(
+                total_retained <= DEFAULT_MAX_PARKED_STREAMS * PARKED_BUFFER_CAP,
+                "300 parked streams (cap 256) retained too much buffer: {total_retained} bytes"
+            );
+
+            // Verify the exact LRU property directly from the pool's monotonic park stamps:
+            // every stream received a distinct non-zero stamp at park time, the 44 evicted
+            // streams are strictly those with the smallest stamps, and no surviving stream has a
+            // smaller stamp than any evicted stream.
+            let mut stamps = std::collections::BTreeSet::new();
+            let mut evicted_stamps = Vec::new();
+            let mut surviving: Vec<(u64, usize)> = Vec::new();
+            for (idx, s) in streams.iter_mut().enumerate() {
+                let stamp = s.park_stamp();
+                assert!(
+                    stamp > 0,
+                    "parked stream {idx} must have a non-zero park stamp"
+                );
+                assert!(
+                    stamps.insert(stamp),
+                    "duplicate park stamp {stamp} assigned to stream {idx}"
+                );
+                if s.retained_buffer_bytes() == 0 {
+                    evicted_stamps.push(stamp);
+                    let mut probe = [0u8; 64];
+                    let err = s.read(&mut probe).await.unwrap_err();
+                    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+                } else {
+                    surviving.push((stamp, idx));
+                }
+            }
+            let expected_evicted = streams.len() - DEFAULT_MAX_PARKED_STREAMS;
+            assert_eq!(evicted_stamps.len(), expected_evicted);
+            assert_eq!(surviving.len(), DEFAULT_MAX_PARKED_STREAMS);
+            let max_evicted = *evicted_stamps.iter().max().unwrap();
+            let min_surviving = surviving.iter().map(|(stamp, _)| *stamp).min().unwrap();
+            assert!(
+                max_evicted < min_surviving,
+                "LRU violation: max evicted stamp ({max_evicted}) >= min surviving stamp ({min_surviving})"
+            );
+
+            // Surviving streams (lowest-stamp, middle-stamp, and newest-stamp) resume byte-exact.
+            surviving.sort_unstable_by_key(|(stamp, _)| *stamp);
+            for &(_, idx) in &[
+                surviving[0],
+                surviving[surviving.len() / 2],
+                surviving[surviving.len() - 1],
+            ] {
+                read_exact_pattern(&mut streams[idx], 300 * 1024, (1024 - 300) * 1024).await;
+                let mut eof = [0u8; 8];
+                assert_eq!(streams[idx].read(&mut eof).await.unwrap(), 0);
+            }
+            drop(streams);
+            assert_eq!(pool.len(), 0);
+        }
+
+        // Scenario 3: Resuming a parked stream updates its LRU position — both when reading from
+        // its retained read-ahead buffer (without reopening yet) and when reopening and parking
+        // again later.
+        {
+            let file_size = 512 * 1024u64;
+            let active_slots = Arc::new(AtomicUsize::new(0));
+            let opener: Arc<dyn StreamOpener> = Arc::new(LargeWindowOpener {
+                file_size,
+                active_slots: Arc::clone(&active_slots),
+            });
+            let open_and_park = |pool: &Arc<ParkedStreamPool>, name: &str| {
+                let opener = Arc::clone(&opener);
+                let active_slots = Arc::clone(&active_slots);
+                let pool = Arc::clone(pool);
+                let path = format!("/{name}.webm");
+                async move {
+                    let raw = opener.open_stream(CancellationToken::new()).await.unwrap();
+                    let mut s = handshake_get_with_options(
+                        raw,
+                        Some(opener),
+                        "tower",
+                        &path,
+                        0,
+                        None,
+                        None,
+                        Duration::from_secs(5),
+                        CancellationToken::new(),
+                        ContentStreamOptions {
+                            idle_park_timeout: Duration::from_millis(50),
+                            progress_timeout: Duration::from_secs(5),
+                            max_busy_lines: 4,
+                            park_pool: Some(pool),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    read_exact_pattern(&mut s, 0, 128 * 1024).await;
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while (active_slots.load(Ordering::SeqCst) != 0 || s.park_stamp() == 0)
+                        && Instant::now() < deadline
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert_eq!(active_slots.load(Ordering::SeqCst), 0);
+                    assert!(s.park_stamp() > 0);
+                    s
+                }
+            };
+
+            // 3a) Partial read from retained parked_head refreshes LRU stamp without reopening.
+            let pool = Arc::new(ParkedStreamPool::new(3));
+            let mut s0 = open_and_park(&pool, "head-0").await;
+            let mut s1 = open_and_park(&pool, "head-1").await;
+            let mut s2 = open_and_park(&pool, "head-2").await;
+            let t0 = s0.park_stamp();
+            let t1 = s1.park_stamp();
+            let t2 = s2.park_stamp();
+            assert!(t0 < t1 && t1 < t2);
+
+            // Read 4 KiB from s0's retained 64 KiB parked_head (does not reopen).
+            read_exact_pattern(&mut s0, 128 * 1024, 4 * 1024).await;
+            let t0_refreshed = s0.park_stamp();
+            assert!(
+                t0_refreshed > t2,
+                "reading from parked_head must refresh LRU stamp ({t0_refreshed} <= {t2})"
+            );
+
+            // Parking s3 must evict s1 (now oldest), keeping s0, s2, and s3 alive.
+            let mut s3 = open_and_park(&pool, "head-3").await;
+            assert_eq!(pool.len(), 3);
+            let mut probe = [0u8; 64];
+            let err = s1.read(&mut probe).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+            read_exact_pattern(&mut s0, 132 * 1024, (512 - 132) * 1024).await;
+            read_exact_pattern(&mut s2, 128 * 1024, (512 - 128) * 1024).await;
+            read_exact_pattern(&mut s3, 128 * 1024, (512 - 128) * 1024).await;
+            drop((s0, s1, s2, s3));
+            assert_eq!(pool.len(), 0);
+
+            // 3b) Reopening past parked_head and parking again receives a newer LRU stamp.
+            let pool = Arc::new(ParkedStreamPool::new(3));
+            let mut r0 = open_and_park(&pool, "reopen-0").await;
+            let mut r1 = open_and_park(&pool, "reopen-1").await;
+            let mut r2 = open_and_park(&pool, "reopen-2").await;
+            let u0 = r0.park_stamp();
+            let u1 = r1.park_stamp();
+            let u2 = r2.park_stamp();
+            assert!(u0 < u1 && u1 < u2);
+
+            // Drain past r0's 64 KiB parked_head so it reopens a channel, then let it park again.
+            read_exact_pattern(&mut r0, 128 * 1024, 128 * 1024).await;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while (active_slots.load(Ordering::SeqCst) != 0 || r0.park_stamp() <= u2)
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(active_slots.load(Ordering::SeqCst), 0);
+            assert!(
+                r0.park_stamp() > u2,
+                "re-parked stream must have a newer LRU stamp ({} <= {u2})",
+                r0.park_stamp()
+            );
+
+            // Parking r3 must evict r1 (now oldest), keeping r0, r2, and r3 alive.
+            let mut r3 = open_and_park(&pool, "reopen-3").await;
+            assert_eq!(pool.len(), 3);
+            let err = r1.read(&mut probe).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+            read_exact_pattern(&mut r0, 256 * 1024, (512 - 256) * 1024).await;
+            read_exact_pattern(&mut r2, 128 * 1024, (512 - 128) * 1024).await;
+            read_exact_pattern(&mut r3, 128 * 1024, (512 - 128) * 1024).await;
+            drop((r0, r1, r2, r3));
+            assert_eq!(pool.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_refused_with_free_permits_reconnects_once_per_minute() {
+        struct SessionScopedOpener {
+            session_id: usize,
+            refuse_sessions: Arc<Mutex<Vec<usize>>>,
+            payload: Arc<Vec<u8>>,
+        }
+
+        impl StreamOpener for SessionScopedOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let sid = self.session_id;
+                let refuse = self
+                    .refuse_sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains(&sid);
+                let payload = Arc::clone(&self.payload);
+                Box::pin(async move {
+                    if refuse {
+                        return Err(StreamOpenError::ChannelRefused(
+                            ErrorBody::new(
+                                ErrorCode::Busy,
+                                "The SSH server refused to open another stream channel.",
+                            )
+                            .with_details(json!({
+                                "reason": "channel_open_failure",
+                                "permits_free": true,
+                                "retryable": true,
+                            })),
+                        ));
+                    }
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(8 * 1024);
+                    tokio::spawn(async move {
+                        let mut r = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": 0u64,
+                            "length": payload.len(),
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": 42u64,
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        let _ = server_out.write_all(&payload).await;
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: CancellationToken::new(),
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        let session_opens = Arc::new(AtomicUsize::new(0));
+        let refuse_sessions = Arc::new(Mutex::new(vec![1usize]));
+        let payload = Arc::new(b"fresh-session-content".to_vec());
+
+        let make_link = |cooldown: Duration| {
+            let opens = Arc::clone(&session_opens);
+            let refuses = Arc::clone(&refuse_sessions);
+            let data = Arc::clone(&payload);
+            let mut config = LinkConfig::default();
+            config.upsert_node(NodeLink::local("tower", "/bin/true"));
+            let opener: SessionOpener = Arc::new(move |entry, _key, cancel| {
+                let sid = opens.fetch_add(1, Ordering::SeqCst) + 1;
+                let stream_opener: Arc<dyn StreamOpener> = Arc::new(SessionScopedOpener {
+                    session_id: sid,
+                    refuse_sessions: Arc::clone(&refuses),
+                    payload: Arc::clone(&data),
+                });
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_proto::Request = serde_json::from_str(&line).unwrap();
+                            let reply = Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: "tower".to_owned(),
+                                    version: VERSION.to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(FakeTransport {
+                            opener: stream_opener,
+                        }),
+                        &entry.node,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|err| err.into_error())
+                })
+            });
+            Link::with_opener(
+                config,
+                LinkOptions {
+                    channel_refused_reconnect_cooldown: cooldown,
+                    ..LinkOptions::default()
+                },
+                opener,
+            )
+        };
+
+        // 1. Default 60 s cooldown: session 1 refuses with free permits -> reconnects ONCE to
+        //    session 2 and succeeds; when session 2 also refuses within 60 s, returns Busy without
+        //    opening session 3.
+        let link = make_link(Duration::from_secs(60));
+        let _ = link.hello("tower").await.unwrap();
+        assert_eq!(session_opens.load(Ordering::SeqCst), 1);
+
+        let mut s = link.open_content("tower", "/a.bin", 0, None).await.unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, *payload);
+        assert_eq!(
+            session_opens.load(Ordering::SeqCst),
+            2,
+            "expected one reconnect when sshd refused channels with free permits"
+        );
+
+        // Poison session 2 too: within the 60 s cooldown it must NOT reconnect again.
+        refuse_sessions.lock().unwrap().push(2);
+        let err = link
+            .open_content("tower", "/b.bin", 0, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code, ErrorCode::Busy, "{err}");
+        assert_eq!(
+            session_opens.load(Ordering::SeqCst),
+            2,
+            "reconnect must be rate-limited to once per cooldown window"
+        );
+        // Existing RPC session remains usable.
+        let _ = link.hello("tower").await.unwrap();
+        assert_eq!(session_opens.load(Ordering::SeqCst), 2);
+
+        // 2. With a short cooldown, once the cooldown elapses a new refusal reconnects once more.
+        session_opens.store(0, Ordering::SeqCst);
+        *refuse_sessions.lock().unwrap() = vec![1, 2];
+        let fast_link = make_link(Duration::from_millis(50));
+        let _ = fast_link.hello("tower").await.unwrap();
+        assert_eq!(session_opens.load(Ordering::SeqCst), 1);
+        // Session 1 refuses -> reconnects to session 2, which also refuses -> Busy (session_opens=2).
+        let err1 = fast_link
+            .open_content("tower", "/c.bin", 0, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err1.code, ErrorCode::Busy, "{err1}");
+        assert_eq!(session_opens.load(Ordering::SeqCst), 2);
+        // Wait past cooldown -> session 2 refuses -> reconnects to session 3 -> succeeds!
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        let mut s3 = fast_link
+            .open_content("tower", "/d.bin", 0, None)
+            .await
+            .unwrap();
+        let mut out3 = Vec::new();
+        s3.read_to_end(&mut out3).await.unwrap();
+        assert_eq!(out3, *payload);
+        assert_eq!(session_opens.load(Ordering::SeqCst), 3);
     }
 }

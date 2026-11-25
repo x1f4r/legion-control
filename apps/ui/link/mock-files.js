@@ -2,6 +2,7 @@
 
 import {
   baseFileName,
+  canOpenExternally,
   categoryFromName,
   filterEntries,
   isHiddenName,
@@ -319,6 +320,9 @@ function makeEntry(path, opts = {}) {
     duration_s: opts.duration_s ?? undefined,
     palette: opts.palette || null,
     sampleMedia: opts.sampleMedia || null, // 'video' | 'audio' | 'unplayable' | 'image'
+    thumbFail: Boolean(opts.thumbFail),
+    mockContentStatus: opts.mockContentStatus || null,
+    mockMintError: opts.mockMintError || null,
   };
 }
 
@@ -332,8 +336,20 @@ function makeLongLogText() {
   return `${lines.join('\n')}\n`;
 }
 
-export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedRef = () => true, canReadRef = () => true }) {
+export function createMockFilesState({
+  machines,
+  flags,
+  isMachineOld: isMachineOldProp = null,
+  activeNodeRef,
+  isAuthedRef = () => true,
+  canReadRef = () => true,
+}) {
   const isOld = flags.has('old') || flags.has('legacy');
+  const isMixed = !isOld && (flags.has('mixed') || flags.has('old-peer'));
+  const isMachineOld =
+    typeof isMachineOldProp === 'function'
+      ? isMachineOldProp
+      : (name) => isOld || (isMixed && name === 'studio');
   const isNoSync = flags.has('nosync') || isOld;
   const isLarge = flags.has('large');
   const isInexact = flags.has('inexact');
@@ -342,6 +358,8 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
   const isEmpty = flags.has('empty');
   const isSlowUpload = flags.has('slow-upload');
   const isFailUpload = flags.has('fail-upload');
+  const isFormats = flags.has('formats');
+  const isNoHandler = flags.has('no-handler');
 
   const day = 86400;
   const longLogText = makeLongLogText();
@@ -363,6 +381,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           makeEntry('/home/me/notes.txt', { kind: 'file', size: 124, mtime: isoAgo(3600) }),
           makeEntry('/home/me/.profile', { kind: 'file', size: 280, mtime: isoAgo(day * 40) }),
           ...(isLarge ? [makeEntry('/home/me/Archive5000', { kind: 'dir', mtime: isoAgo(day) })] : []),
+          ...(isFormats ? [makeEntry('/home/me/Formats', { kind: 'dir', mtime: isoAgo(day) })] : []),
         ],
       ],
       [
@@ -601,6 +620,9 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           makeEntry('/home/me/Projects', { kind: 'dir', mtime: isoAgo(day) }),
           makeEntry('/home/me/Documents', { kind: 'dir', mtime: isoAgo(day * 3) }),
           makeEntry('/home/me/Pictures', { kind: 'dir', mtime: isoAgo(day * 2) }),
+          ...(isMixed
+            ? [makeEntry('/home/me/BigFolder', { kind: 'dir', mtime: isoAgo(day * 4) })]
+            : []),
         ],
       ],
       [
@@ -620,11 +642,30 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       ],
       [
         '/home/me/Documents',
-        [makeEntry('/home/me/Documents/design-notes.md', { size: 840, mtime: isoAgo(day * 3) })],
+        [
+          makeEntry('/home/me/Documents/design-notes.md', { size: 840, mtime: isoAgo(day * 3) }),
+          ...(isMixed
+            ? [
+                makeEntry('/home/me/Documents/Report.pdf', { size: 2_400_000, mtime: isoAgo(day * 5) }),
+                makeEntry('/home/me/Documents/avatar.png', { size: 48_000, mtime: isoAgo(day), palette: PALETTES[2], sampleMedia: 'image' }),
+                makeEntry('/home/me/Documents/Poster.jpg', { size: 4_800_000, mtime: isoAgo(day * 6), palette: PALETTES[4], sampleMedia: 'image' }),
+                makeEntry('/home/me/Documents/Clip.mp4', { size: 640_000_000, mtime: isoAgo(day * 2), duration_s: 312, palette: PALETTES[0], sampleMedia: 'video' }),
+                makeEntry('/home/me/Documents/Track.mp3', { size: 6_200_000, mtime: isoAgo(day * 7), sampleMedia: 'audio' }),
+                makeEntry('/home/me/Documents/archive.zip', { size: 18_500_000, mtime: isoAgo(day * 8) }),
+              ]
+            : []),
+        ],
       ],
       [
         '/home/me/Pictures',
-        [makeEntry('/home/me/Pictures/Camera', { kind: 'dir', mtime: isoAgo(day * 2) })],
+        [
+          makeEntry('/home/me/Pictures/Camera', { kind: 'dir', mtime: isoAgo(day * 2) }),
+          ...(isMixed
+            ? [
+                makeEntry('/home/me/Pictures/avatar.png', { size: 48_000, mtime: isoAgo(day), palette: PALETTES[2], sampleMedia: 'image' }),
+              ]
+            : []),
+        ],
       ],
       [
         '/home/me/Pictures/Camera',
@@ -645,6 +686,21 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       ['/home/me/Downloads', []],
     ]),
   };
+
+  if (isMixed) {
+    const big = [];
+    for (let i = 1; i <= 520; i += 1) {
+      const idx = String(i).padStart(3, '0');
+      const ext = i % 4 === 0 ? 'jpg' : i % 4 === 1 ? 'txt' : i % 4 === 2 ? 'pdf' : 'mp4';
+      big.push(
+        makeEntry(`/home/me/BigFolder/file-${idx}.${ext}`, {
+          size: 2048 * ((i % 40) + 1),
+          mtime: isoAgo(day + i * 30),
+        }),
+      );
+    }
+    trees.studio.set('/home/me/BigFolder', big);
+  }
 
   if (isLarge) {
     const big = [];
@@ -694,6 +750,98 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
     'studio:/home/me/Projects/notes/ideas.md': '# Ideas\n\nKeep folders in sync without a central hub.\n',
   };
 
+  if (isFormats) {
+    trees.tower.set('/home/me/Formats', [
+      makeEntry('/home/me/Formats/studio-master.flac', {
+        size: 43_000_000,
+        mtime: isoAgo(day),
+        sampleMedia: 'audio',
+      }),
+      makeEntry('/home/me/Formats/iphone-shot.heic', {
+        size: 1_500_000,
+        mtime: isoAgo(day),
+        palette: PALETTES[2],
+        sampleMedia: 'image',
+      }),
+      makeEntry('/home/me/Formats/camera-raw.dng', {
+        size: 12_000_000,
+        mtime: isoAgo(day),
+        thumbFail: true,
+      }),
+      makeEntry('/home/me/Formats/legacy-track.wma', {
+        size: 5_000_000,
+        mtime: isoAgo(day),
+      }),
+      makeEntry('/home/me/Formats/legacy-clip.avi', {
+        size: 20_000_000,
+        mtime: isoAgo(day),
+      }),
+      makeEntry('/home/me/Formats/README', {
+        size: 86,
+        mtime: isoAgo(day),
+      }),
+      makeEntry('/home/me/Formats/installer.apk', {
+        size: 18_000_000,
+        mtime: isoAgo(day),
+      }),
+      makeEntry('/home/me/Formats/diagram.svg', {
+        size: 4_096,
+        mtime: isoAgo(day),
+      }),
+      makeEntry('/home/me/Formats/fail-413.flac', {
+        size: 43_000_000,
+        mtime: isoAgo(day),
+        sampleMedia: 'unplayable',
+        mockContentStatus: {
+          request_count: 1,
+          status: 413,
+          content_type: 'application/json',
+          stream_failed: false,
+          error_code: 'too_large_for_inline',
+          error_message: 'File exceeds inline size cap.',
+          ticket_live: true,
+        },
+      }),
+      makeEntry('/home/me/Formats/fail-502.flac', {
+        size: 43_000_000,
+        mtime: isoAgo(day),
+        sampleMedia: 'unplayable',
+        mockContentStatus: {
+          request_count: 1,
+          status: 502,
+          content_type: 'application/json',
+          stream_failed: false,
+          error_code: 'unreachable',
+          error_message: 'Machine tower dropped the stream.',
+          ticket_live: true,
+        },
+      }),
+      makeEntry('/home/me/Formats/fail-truncated.flac', {
+        size: 43_000_000,
+        mtime: isoAgo(day),
+        sampleMedia: 'unplayable',
+        mockContentStatus: {
+          request_count: 1,
+          status: 206,
+          content_type: 'audio/flac',
+          stream_failed: true,
+          ticket_live: true,
+        },
+      }),
+      makeEntry('/home/me/Formats/no-route.flac', {
+        size: 43_000_000,
+        mtime: isoAgo(day),
+        mockMintError: {
+          code: 'not_found',
+          message: 'Machine tower is not paired on this device.',
+          hint: 'Pair with that machine or refresh learned fleet routes first.',
+        },
+      }),
+    ]);
+    textFiles['tower:/home/me/Formats/README'] =
+      'Formats fixture README\n\nPlain text without an extension.\n';
+  }
+
   let favCounter = 10;
   let favourites = [
     {
@@ -732,18 +880,22 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       added_at: isoAgo(day * 15),
       added_by: 'phone',
     },
-    {
-      id: 'fav-4',
-      machine: 'studio',
-      path: '/home/me/Projects',
-      kind: 'dir',
-      category: null,
-      label: 'Projects',
-      pinned: true,
-      exists: true,
-      added_at: isoAgo(day * 12),
-      added_by: 'phone',
-    },
+    ...(!isMixed
+      ? [
+          {
+            id: 'fav-4',
+            machine: 'studio',
+            path: '/home/me/Projects',
+            kind: 'dir',
+            category: null,
+            label: 'Projects',
+            pinned: true,
+            exists: true,
+            added_at: isoAgo(day * 12),
+            added_by: 'phone',
+          },
+        ]
+      : []),
     {
       id: 'fav-5',
       machine: 'tower',
@@ -1056,6 +1208,14 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           t.finished = new Date().toISOString();
           t.hash = 'blake3:9d20a1f8c44e77b2109f3e6a11b2084d';
           t.canOpen = t.direction === 'download';
+          if (t.openExternally && isNoHandler) {
+            t.openError = {
+              code: 'unsupported',
+              reason: 'no_handler',
+              message: 'No app on this phone can open this file type.',
+              hint: 'Download the file to save it in Downloads instead.',
+            };
+          }
         }
       }
 
@@ -1105,6 +1265,9 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
     return cachedUnplayableVideoBlobUrl;
   }
   const thumbAttemptByPath = new Map();
+  const mockStatusByUrl = new Map();
+  const revokedMockUrls = new Set();
+  let mockUrlSeq = 1;
 
   function normalizePath(p) {
     if (!p || p === '~') return '/home/me';
@@ -1113,7 +1276,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
     return p.replace(/\/+$/, '') || '/';
   }
 
-  function formatEntry(entry) {
+  function formatEntry(entry, oldMachine = isOld) {
     const out = {
       name: entry.name,
       path: entry.path,
@@ -1122,7 +1285,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       mtime: entry.mtime,
       mode: entry.mode,
     };
-    if (!isOld && entry.kind === 'file') {
+    if (!oldMachine && entry.kind === 'file') {
       out.category = categoryFromName(entry.name);
       out.mime = mimeFromName(entry.name);
       if (entry.duration_s != null) out.duration_s = entry.duration_s;
@@ -1166,6 +1329,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
 
   function handleTool(machineName, tool, args, onEvent) {
     const tree = trees[machineName];
+    const oldMachine = isMachineOld(machineName);
     switch (tool) {
       case 'fs.list': {
         const requested = normalizePath(args?.path || '~');
@@ -1183,25 +1347,25 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
         }
         const includeHidden = args?.hidden !== false;
         let filtered = rawEntries.filter((e) => includeHidden || !isHiddenName(e.name));
-        if (!isOld && Array.isArray(args?.categories) && args.categories.length > 0) {
+        if (!oldMachine && Array.isArray(args?.categories) && args.categories.length > 0) {
           const catSet = new Set(args.categories);
           filtered = filtered.filter((e) => e.kind === 'dir' || catSet.has(categoryFromName(e.name)));
         }
-        const sorted = !isOld
+        const sorted = !oldMachine
           ? sortEntries(filtered, { sort: args?.sort || 'name', order: args?.order || 'asc' })
           : sortEntries(filtered, { sort: 'name', order: 'asc' });
 
         const total = sorted.length;
-        const offset = !isOld && Number.isInteger(args?.offset) && args.offset > 0 ? args.offset : 0;
+        const offset = !oldMachine && Number.isInteger(args?.offset) && args.offset > 0 ? args.offset : 0;
         const limit = Number.isInteger(args?.limit) && args.limit > 0 ? args.limit : 500;
-        const slice = sorted.slice(offset, offset + limit).map(formatEntry);
+        const slice = sorted.slice(offset, offset + limit).map((e) => formatEntry(e, oldMachine));
         const truncated = offset + slice.length < total;
         const res = {
           path: requested,
           entries: slice,
           truncated,
         };
-        if (!isOld) {
+        if (!oldMachine) {
           res.total = total;
           res.total_exact = !(isInexact && requested === '/home/me/Archive5000');
           res.offset = offset;
@@ -1219,14 +1383,18 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
         if (content === undefined) {
           const entry = findEntryOnMachine(machineName, requested);
           if (entry && entry.kind === 'file') {
+            const isSmallPng =
+              categoryFromName(entry.name) === 'image' && entry.size <= 1048576;
+            const b64 = isSmallPng ? SAMPLE_PNG_BASE64 : 'AAECAwQFBgcICQoLDA0ODw==';
+            const eof = entry.size <= (Number.isInteger(args?.length) ? args.length : 1048576);
             return {
               path: requested,
               size: entry.size,
               offset: 0,
-              length: 16,
+              length: isSmallPng ? entry.size : 16,
               encoding: 'base64',
-              content: 'AAECAwQFBgcICQoLDA0ODw==',
-              eof: true,
+              content: b64,
+              eof,
             };
           }
           throw { code: 'not_found', message: `${requested} does not exist.`, hint: null, machine: machineName };
@@ -1252,7 +1420,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           throw { code: 'not_found', message: `${requested} does not exist.`, hint: null, machine: machineName };
         }
         return {
-          ...formatEntry(entry),
+          ...formatEntry(entry, oldMachine),
           readonly: false,
         };
       }
@@ -1276,7 +1444,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       }
 
       case 'fs.thumb': {
-        if (isOld) {
+        if (oldMachine) {
           throw { code: 'unknown_tool', message: 'Unknown tool: fs.thumb', hint: null, machine: machineName };
         }
         const paths = Array.isArray(args?.paths) ? args.paths.slice(0, 32) : [];
@@ -1322,7 +1490,10 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
         const includeHidden = Boolean(args?.hidden);
         let q = args?.name || '';
         if (!q && typeof args?.glob === 'string') {
-          q = args.glob.replace(/[*?]/g, '');
+          // Support both simple `*word*` globs and case-insensitive character-class globs like `*[nN][oO]*`.
+          q = args.glob
+            .replace(/\[([a-zA-Z])[a-zA-Z]\]/g, '$1')
+            .replace(/[*?]/g, '');
         }
         const categories = Array.isArray(args?.categories) ? [...args.categories] : [];
         if (args?.kind === 'dir' && categories.length === 0) {
@@ -1341,10 +1512,11 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           order: args?.order || 'asc',
         });
         const limit = Number.isInteger(args?.limit) && args.limit > 0 ? args.limit : 200;
-        const slice = sorted.slice(0, limit).map(formatEntry);
+        const slice = sorted.slice(0, limit).map((e) => formatEntry(e, oldMachine));
         const payload = {
           path: requested,
           entries: slice,
+          matches: slice,
           truncated: sorted.length > slice.length,
           reason: sorted.length > slice.length ? 'limit' : undefined,
         };
@@ -1505,7 +1677,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           }
         }
 
-        if (!isOld && args?.background && !args?.dry_run) {
+        if (!oldMachine && args?.background && !args?.dry_run) {
           const id = `j-xfer-${transferSeq++}`;
           const job = {
             id,
@@ -1743,43 +1915,77 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           if (!m.reachable) {
             throw m.error || { code: 'unreachable', message: `${target} is off.`, hint: null, machine: target };
           }
-          if (!canReadRef()) {
+          if (!canReadRef(target)) {
             throw { code: 'denied', message: 'Not allowed to read files on this machine.', hint: null, machine: target };
+          }
+          if (isMachineOld(target)) {
+            throw {
+              code: 'unsupported',
+              message: `${target} does not support content streaming yet.`,
+              hint: null,
+              machine: target,
+            };
           }
           const norm = normalizePath(path);
           const entry = findEntryOnMachine(target, norm);
+          if (entry?.mockMintError) {
+            throw { ...entry.mockMintError, machine: target };
+          }
           const name = entry?.name || baseFileName(norm);
           const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
 
-          // Unplayable video is driven strictly by payload (`sampleMedia === 'unplayable'`), never by extension.
+          // Unplayable video/audio is driven strictly by payload (`sampleMedia === 'unplayable'`), never by extension.
           if (entry?.sampleMedia === 'unplayable') {
+            const url = `${getUnplayableVideoUrl()}#mock-${mockUrlSeq++}`;
+            if (entry.mockContentStatus) {
+              mockStatusByUrl.set(url, { ...entry.mockContentStatus });
+            } else {
+              mockStatusByUrl.set(url, {
+                request_count: 1,
+                status: 206,
+                content_type: mimeFromName(name),
+                stream_failed: false,
+                ticket_live: true,
+              });
+            }
             return {
-              url: getUnplayableVideoUrl(),
+              url,
               expires_in: 900,
             };
           }
           const cat = categoryFromName(name);
           if (cat === 'video') {
-            return { url: getVideoUrl(), expires_in: 900 };
+            return { url: `${getVideoUrl()}#mock-${mockUrlSeq++}`, expires_in: 900 };
           }
           if (cat === 'audio') {
-            return { url: getAudioUrl(), expires_in: 900 };
+            return { url: `${getAudioUrl()}#mock-${mockUrlSeq++}`, expires_in: 900 };
           }
           if (cat === 'image') {
             if (entry) {
               const pal = entry.palette || paletteFor(norm);
+              const url = makeSampleImageDataUrl({ ...pal, w: 720, h: 540 });
+              revokedMockUrls.delete(url);
+              mockStatusByUrl.delete(url);
               return {
-                url: makeSampleImageDataUrl({ ...pal, w: 720, h: 540 }),
+                url,
                 expires_in: 900,
               };
             }
             if (ext === 'svg') {
+              const url =
+                'data:image/svg+xml;charset=utf-8,' +
+                encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" fill="#3b6f7a"/></svg>');
+              revokedMockUrls.delete(url);
+              mockStatusByUrl.delete(url);
               return {
-                url: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" fill="#3b6f7a"/></svg>'),
+                url,
                 expires_in: 900,
               };
             }
-            return { url: `data:image/png;base64,${SAMPLE_PNG_BASE64}`, expires_in: 900 };
+            const url = `data:image/png;base64,${SAMPLE_PNG_BASE64}`;
+            revokedMockUrls.delete(url);
+            mockStatusByUrl.delete(url);
+            return { url, expires_in: 900 };
           }
           if (ext === 'vtt') {
             return {
@@ -1881,9 +2087,116 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           return { id: ids[0], ids, count: ids.length };
         },
 
-        async openExternally({ machine, path, name }) {
+        async contentStatus(url) {
+          if (revokedMockUrls.has(url)) {
+            return {
+              request_count: 0,
+              status: 404,
+              content_type: null,
+              stream_failed: false,
+              ticket_live: false,
+            };
+          }
+          if (mockStatusByUrl.has(url)) {
+            return { ...mockStatusByUrl.get(url) };
+          }
+          return {
+            request_count: 1,
+            status: 200,
+            content_type: 'application/octet-stream',
+            stream_failed: false,
+            ticket_live: true,
+          };
+        },
+
+        async revokeContentUrl(url) {
+          const key = String(url || '').trim();
+          if (!key) return false;
+          const wasFresh = !revokedMockUrls.has(key);
+          revokedMockUrls.add(key);
+          if (typeof window !== 'undefined') {
+            if (!Array.isArray(window.__LEGION_MOCK_REVOKED_URLS__)) {
+              window.__LEGION_MOCK_REVOKED_URLS__ = [];
+            }
+            window.__LEGION_MOCK_REVOKED_URLS__.push(key);
+          }
+          const existing = mockStatusByUrl.get(key);
+          if (existing) {
+            mockStatusByUrl.set(key, { ...existing, status: 404, ticket_live: false });
+          }
+          return wasFresh;
+        },
+
+        async openExternally({ machine, path, name, size, mime }) {
           const target = machine || activeNodeRef();
-          return { ok: true, machine: target, path: normalizePath(path), name: name || baseFileName(path) };
+          const norm = normalizePath(path);
+          const entry = findEntryOnMachine(target, norm);
+          const fileName = name || baseFileName(norm);
+          if (!canOpenExternally(fileName)) {
+            throw {
+              code: 'denied',
+              message: 'Legion refuses to open this file type directly.',
+              hint: 'Download it first if you want to inspect it.',
+              machine: target,
+            };
+          }
+          const active = deviceTransfers.find(
+            (t) =>
+              t.openExternally &&
+              t.direction === 'download' &&
+              t.machine === target &&
+              t.path === norm &&
+              (t.state === 'queued' || t.state === 'running'),
+          );
+          if (active) {
+            return { id: active.id, ok: true, openedImmediately: false };
+          }
+          const cached = deviceTransfers.find(
+            (t) =>
+              t.openExternally &&
+              t.direction === 'download' &&
+              t.machine === target &&
+              t.path === norm &&
+              t.state === 'done',
+          );
+          if (cached) {
+            if (isNoHandler) {
+              throw {
+                code: 'unsupported',
+                reason: 'no_handler',
+                message: 'No app on this phone can open this file type.',
+                hint: 'Download the file to save it in Downloads instead.',
+                machine: target,
+              };
+            }
+            return { id: cached.id, ok: true, openedImmediately: true };
+          }
+          const id = `dt-${transferSeq++}`;
+          const total = size || entry?.size || 2_400_000;
+          const activeCount = deviceTransfers.filter((t) => t.state === 'running').length;
+          deviceTransfers.unshift({
+            id,
+            direction: 'download',
+            machine: target,
+            path: norm,
+            name: fileName,
+            localPath: `cache/open-externally/${id}-${fileName}`,
+            mime: mime || mimeFromName(fileName),
+            state: activeCount < 2 ? 'running' : 'queued',
+            bytes_done: 0,
+            bytes_total: total,
+            rate: 0,
+            error: null,
+            openError: null,
+            openExternally: true,
+            created: new Date().toISOString(),
+            finished: null,
+            hash: null,
+            canOpen: false,
+          });
+          emitTransfers();
+          ensureTransferPump();
+          return { id, ok: true, openedImmediately: false };
         },
 
         async transfers() {

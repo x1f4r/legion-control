@@ -221,19 +221,28 @@ on the session the link already has for that machine (a new exec channel on the 
 a child for a local node) and returns the size, modification time, file identity, and an async
 reader. On SSH connections:
 
-- **Slots and fair waiting**: at most 8 active content channels run on one SSH connection (strictly
-  below OpenSSH's default `MaxSessions` of 10, leaving room for RPC). When all 8 slots are actively
-  reading, further opens wait fairly in FIFO order up to the SSH connect timeout before returning a
-  retryable `busy` error; on teardown or parking, `legion-link` sends stdin EOF and holds the permit
-  until `sshd` confirms channel close (`SSH_MSG_CHANNEL_CLOSE`), falling back to a local channel
-  close after 2 seconds if a remote ignores stdin EOF.
-- **Parking and transparent reopening**: a stream holds an SSH channel and slot only while actively
-  read. After ~2 seconds of reader inactivity, `ContentStream` parks its channel — closing the SSH
-  channel and freeing its slot while keeping already-buffered bytes (within a bounded per-channel
-  window cap). On the next read after parking, or after any idle close (remote 120-second idle
-  timeout or SSH session reconnect), it transparently reopens at the exact next byte offset,
-  verifying `(size, mtime, file_id)` (failing cleanly if the file changed on disk) with bounded
-  consecutive retries.
+- **Slots, fair waiting, and bounded SSH reconnect**: at most 8 active content channels run on one
+  SSH connection (strictly below OpenSSH's default `MaxSessions` of 10, leaving room for RPC). When
+  all 8 slots are actively reading, further opens wait fairly in FIFO order up to the SSH connect
+  timeout before returning a retryable `busy` error; on teardown or parking, `legion-link` sends
+  stdin EOF and holds the permit until `sshd` confirms channel close (`SSH_MSG_CHANNEL_CLOSE`),
+  falling back to a local channel close after 2 seconds if a remote ignores stdin EOF. If `sshd`
+  keeps refusing new channels even while `legion-link`'s own permits are free, the link retires the
+  poisoned SSH session, reconnects once, and retries, bounded to at most one such reconnect per
+  minute per machine.
+- **Parking, bounded buffers, per-link cap, and transparent reopening**: a stream holds an SSH
+  channel and slot only while actively read. After ~2 seconds of reader inactivity (including when a
+  pending `read()` future is dropped or timed out before bytes arrive), `ContentStream` parks its
+  channel — closing the SSH channel, releasing its slot, and dropping its read/write buffers and
+  channel queue down to at most 64 KiB of already-promised payload read-ahead. Parked streams are
+  capped per `Link` (256 by default); opening or parking past the cap closes the least recently used
+  parked stream cleanly so its next read fails like an expired stream. Native transfer-queue
+  downloads still park and trim buffers when idle, but are exempt from the parked eviction cap so
+  paused viewers cannot evict an in-progress download. On the next read after
+  parking, or after any idle close (remote 120-second idle timeout or SSH session reconnect), a
+  surviving stream transparently reopens at the exact next byte offset, verifying
+  `(size, mtime, file_id)` (failing cleanly if the file changed on disk) with bounded consecutive
+  retries.
 - **Misbehaving-remote bounds**: active remote reads enforce a 30-second per-window progress
   timeout (armed only while waiting on a live channel, never while parked) and a cap of 32
   consecutive `{"busy": true}` lines.
@@ -258,8 +267,9 @@ interface's origin. So content is served from a **content address**: a URL holdi
   to 256 KiB for bookkeeping; macOS sets ~128–147 KiB; Windows sets 128 KiB), and as soon as
   revocation is detected the server cancels the connection first (before flushing audit records to
   disk), hands no further bytes to the socket, discards its own buffered bytes, releases its remote
-  pipe, and resets the TCP connection (`SO_LINGER(0)`) to drop the server's unsent kernel send
-  queue. What this guarantees for what the door itself decides (its bearer tokens, local principals
+  pipe, and closes the TCP connection (sending TCP RST via `SO_LINGER(0)` on Linux and Windows to
+  drop the server's unsent kernel send queue, or closing cleanly with TCP `FIN` on macOS/BSD to
+  avoid Darwin's RFC 5961 congested-RST hang). What this guarantees for what the door itself decides (its bearer tokens, local principals
   and paths, and ticket lifetime):
   1. **Time**: server-side cutoff within 2 seconds of revocation even for slow (e.g. 20 KB/s) or
      completely stalled readers.
@@ -327,8 +337,10 @@ the `Host`/`Origin` guard, and the headers, over a small trait that opens a byte
 mount it:
 
 - **The HTTP door**: `GET /v1/health` advertises `"content": true` so the web UI enables content
-  addresses once on connect and remembers per-machine `unsupported` replies for the session when
-  browsing an older remote node. `POST /v1/content` (bearer token) with `{on, path}` returns
+  addresses once on connect and remembers per-machine `unsupported` replies only until the next
+  successful contact with that machine reports its capabilities again (reconnect, `/v1/health`,
+  `meta.version`, `meta.whoami`, `meta.tools`, tool list refresh, or a successful content address).
+  `POST /v1/content` (bearer token) with `{on, path}` returns
   `{url, expires_in}`; the URL is `/v1/content/<ticket>/<file name>` on the same origin, with
   `Cross-Origin-Resource-Policy: same-origin` always set (origins listed in `[serve] origins` read
   content via CORS `fetch()` or `crossorigin`, not no-cors embedding). The door reads remote files
@@ -336,25 +348,29 @@ mount it:
   machine, separate from transfer and RPC pipes (which never share permits with content), with
   per-holder fair sharing and a short acquire timeout (`503 Service Unavailable` with `Retry-After`).
 - **The app**: the native side mounts `legion-content` behind `content_url({machine, path,
-  download})`, reading through `Link::open_content`. Linux, macOS, Windows, iOS and iPadOS mount it
-  lazily on a listener bound to `127.0.0.1` on a system-chosen port (capped at 32 simultaneous
-  connections with a 5-second header-read timeout, exponential backoff on accept errors, iOS
-  resume recovery, and stopping 60 seconds after no live tickets or active streams remain),
-  protected by `HostOriginGuard` (loopback host+port and only that platform's bundled page origins,
-  never `null`) and `Cross-Origin-Resource-Policy: cross-origin`. Android keeps
-  `android:usesCleartextTraffic="false"` in its manifest, which causes Chromium WebView to refuse
-  cleartext loopback HTTP; Android therefore mounts the same `legion-content` crate on a Tauri
-  custom URI scheme (`legion-content`, reached as
-  `http://legion-content.localhost/v1/content/<ticket>/<name>` and intercepted in-process via
-  `shouldInterceptRequest`), answering open-ended `Range` requests in bounded 2 MiB pieces,
-  refusing unranged responses over 16 MiB with `413 Payload Too Large` before reading a byte, and
-  capping total concurrent buffered memory at 24 MiB. Tickets are read-only, short-lived, exist
-  only for files opened in the app, and die immediately when their pairing is removed or replaced
-  or when the app quits.
+  download})`, `content_status({url})`, and `content_revoke({url})`, reading through
+  `Link::open_content`. Every platform (Linux, macOS, Windows, iOS/iPadOS, and Android) mounts it
+  lazily on a streaming HTTP/1.1 listener bound strictly to `127.0.0.1:0` on a system-chosen port
+  (deciding liveness strictly from Legion's own accept-task state and always binding a fresh
+  OS-chosen port on recovery; capped at 32 simultaneous connections with a 5-second header-read
+  timeout, a 2-second header timeout for connections that have not yet presented a valid ticket,
+  `Connection: close` on `404` and guard rejections, eviction of the oldest unauthenticated
+  connection before refusing a new one at the cap, status tracking strictly after ticket lookup
+  succeeds, exponential backoff on accept errors, mobile resume recovery, and stopping 60 seconds
+  after no live tickets or active streams remain), protected by `HostOriginGuard` (loopback
+  host+port and only that platform's bundled page origins, never `null`) and
+  `Cross-Origin-Resource-Policy: cross-origin`. On Android, `res/xml/network_security_config.xml`
+  denies cleartext traffic globally while exempting only the loopback literal `127.0.0.1`, allowing
+  WebView to stream and seek arbitrarily large media with flat memory without permitting cleartext
+  to any other host. On Android, any app on the phone can connect to `127.0.0.1` and send any
+  `Host` and `Origin`, so the host and origin guard protects against browsers only; against other
+  apps the ticket is the only barrier, which is why it is 256 bits, hashed at rest, scoped to one
+  holder, machine and path, and revoked when the viewer closes, moves to another file, or tears
+  down a media element (as well as immediately when its pairing is removed or replaced or when the
+  app quits).
 
 The interface's content security policy grows by exactly what this needs: `img-src` and
-`media-src` for `http://127.0.0.1:*` (desktop and iOS) or `http://legion-content.localhost`
-(Android).
+`media-src` for `http://127.0.0.1:*`.
 
 ### To and from the device
 
@@ -439,13 +455,22 @@ nothing without a word, daily actions in reach of the thumb, plain words first, 
   back arrow all do the same thing: close the sheet, then the viewer, then go to the folder this
   one was opened from, and leave Files only from its first screen. Sideways swiping between tabs
   is off inside a folder so it cannot fight the back gesture.
-- **The viewer** covers the screen. Pictures zoom with a pinch or double tap, and swiping
-  sideways goes to the next picture in the folder as it is currently sorted and filtered. Video
-  and audio use the platform's own player with the content address. Text shows the first
-  128 KiB and offers more. Everything else shows what it is and two buttons: Open in another app,
-  Download. The viewer's actions (Download, Send to, Star, More) are at the bottom.
-- **When a video will not play** the viewer says so in a sentence and offers Download and Open in
-  another app. A phone plays what its own decoders play; Legion does not convert video.
+- **The viewer** covers the screen, keying its active address and error state to the current file so
+  switching files while mounted never carries an old address or error onto the next file. Pictures
+  zoom with a pinch or double tap, and swiping sideways goes to the next picture in the folder as it
+  is currently sorted and filtered. Video and audio use the platform's own player with the content
+  address. Text shows the first 128 KiB and offers more. Everything else shows what it is and two
+  buttons: Open in another app, Download. The viewer's actions (Download, Send to, Star, More) are
+  at the bottom.
+- **When media is interrupted or will not play**: on a media error (for example a ticket expiring
+  during a pause or a door restart), the viewer silently requests one fresh content address for the
+  same file, swaps the source, seeks back to where playback stopped, and resumes if it was playing,
+  without showing an error. It tries at most one fresh address per failure (never looping on a
+  second failure within 10 seconds): if the file cannot be reached (machine off, moved, or changed),
+  it says "Couldn't reach this file" with a **Try again** button; only when a fresh address actually
+  answers HTTP 200 and the player still cannot decode it does the viewer say this device cannot play
+  that kind of video or audio (or show that picture) and offer Download and Open in another app. A
+  phone plays what its own decoders play; Legion does not convert video.
 - **Send to** is one sheet: Copy or Move, which machine (off machines are listed and say so, with
   Wake where it exists), which folder there (starting from pinned folders and the last places
   used), then one button that says what will happen ("Copy to pi"). The transfer runs in the

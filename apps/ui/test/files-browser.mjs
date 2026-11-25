@@ -12,6 +12,7 @@ import { chromium } from 'playwright-core';
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const UI_ROOT = path.resolve(TEST_DIR, '..');
 const FILES_SHOTS_DIR = process.env.LEGION_FILES_SHOTS_DIR || '';
+const OLD_SHOTS_DIR = process.env.LEGION_OLD_SHOTS_DIR || '';
 
 // Same strict CSP as the HTTP door plus `media-src 'self' blob: data:` for mock sample video/audio.
 const MOCK_TEST_CSP =
@@ -909,6 +910,510 @@ test('Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses
 
     assert.deepEqual(pageErrors, [], `Uncaught page errors (toast rules): ${pageErrors.join('\n')}`);
     assert.deepEqual(consoleErrors, [], `Console/CSP errors (toast rules): ${consoleErrors.join('\n')}`);
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});
+
+test('Files viewer: honest media errors, in-place Open in another app progress/cancel/no-handler, refused-type gating, machine previews, and extensionless text', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const ctx = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      colorScheme: 'dark',
+    });
+    const page = await ctx.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    await page.goto(`${server.url}/?mock=formats#/files/tower//home/me/Formats`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('header.top h1', { hasText: 'Formats' }).waitFor();
+
+    // 1. Server 413, 502, mid-stream truncation, and unrouted mint errors NEVER claim "can't play".
+    for (const [fileName, expectedText] of [
+      ['fail-413.flac', 'This file is too large to open inline'],
+      ['fail-502.flac', "Couldn't reach this file"],
+      ['fail-truncated.flac', "Couldn't reach this file"],
+      ['no-route.flac', 'Machine tower is not paired on this device.'],
+    ]) {
+      await page.locator('.list a.row', { hasText: fileName }).click();
+      await page.locator('.viewer').getByText(expectedText).first().waitFor({ timeout: 5000 });
+      const text = await page.locator('.viewer').innerText();
+      assert.ok(
+        !/can't play/i.test(text),
+        `${fileName} must NEVER say "can't play": ${text}`,
+      );
+      await page.locator('.viewer-top button[aria-label="Close"]').click();
+      await page.locator('.viewer').waitFor({ state: 'hidden' });
+    }
+
+    // 2. Known-unplayable formats (WMA, AVI) skip the media player and offer Open in another app.
+    await page.locator('.list a.row', { hasText: 'legacy-track.wma' }).click();
+    await page.locator('.viewer').getByText("This phone can't play WMA audio directly").waitFor();
+    assert.equal(await page.locator('.viewer audio').count(), 0);
+    await page.locator('.viewer').getByRole('button', { name: 'Open in another app' }).waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+
+    await page.locator('.list a.row', { hasText: 'legacy-clip.avi' }).click();
+    await page.locator('.viewer').getByText("This phone can't play AVI video directly").waitFor();
+    assert.equal(await page.locator('.viewer video').count(), 0);
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+
+    // 3. HEIC tries machine-made fs.thumb preview with quiet note; DNG with failed thumb falls back cleanly.
+    await page.locator('.list a.row', { hasText: 'iphone-shot.heic' }).click();
+    await page.locator('.viewer img.viewer-img').waitFor();
+    await page.locator('.viewer-preview-note', { hasText: 'Preview. Open in another app for the original.' }).waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+
+    await page.locator('.list a.row', { hasText: 'camera-raw.dng' }).click();
+    await page.locator('.viewer').getByText("Can't show this picture here").waitFor();
+    await page.locator('.viewer').getByRole('button', { name: 'Open in another app' }).waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+
+    // 4. Extensionless README probes fs.read and opens as text; hides Open in...
+    await page.locator('.list a.row', { hasText: 'README' }).click();
+    await page.locator('.viewer pre.viewer-text', { hasText: 'Plain text without an extension.' }).waitFor();
+    assert.equal(await page.locator('.viewer-bar button', { hasText: 'Open in' }).count(), 0);
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+
+    // 5. Refused types (.apk, .svg) NEVER offer "Open in another app" or bottom-bar "Open in...".
+    for (const refused of ['installer.apk', 'diagram.svg']) {
+      await page.locator('.list a.row', { hasText: refused }).click();
+      await page.locator('.viewer').waitFor();
+      assert.equal(
+        await page.locator('.viewer button', { hasText: 'Open in another app' }).count(),
+        0,
+        `${refused} must not offer Open in another app`,
+      );
+      assert.equal(
+        await page.locator('.viewer-bar button', { hasText: 'Open in' }).count(),
+        0,
+        `${refused} must not offer Open in…`,
+      );
+      await page.locator('.viewer-top button[aria-label="Close"]').click();
+    }
+
+    // 6. "Open in another app" shows visible in-place "Getting it ready… X of Y" progress + Cancel,
+    // and closing the viewer immediately revokes the minted content URL.
+    await page.locator('.list a.row', { hasText: 'studio-master.flac' }).click();
+    const flacAudio = page.locator('.viewer audio');
+    await flacAudio.waitFor();
+    const flacUrl = await flacAudio.getAttribute('src');
+    assert.ok(flacUrl, 'expected minted audio content URL');
+    await page.locator('.viewer-bar button', { hasText: 'Open in…' }).click();
+    const banner = page.locator('.viewer-open-banner');
+    await banner.waitFor();
+    await banner.getByText(/Getting it ready…/).waitFor();
+    await banner.getByRole('button', { name: 'Cancel' }).click();
+    await banner.waitFor({ state: 'hidden' });
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+    const revokedAfterClose = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
+    assert.ok(
+      revokedAfterClose.includes(flacUrl),
+      `closing viewer must revoke minted URL ${flacUrl}, saw ${JSON.stringify(revokedAfterClose)}`,
+    );
+
+    // 6b. Moving to another picture in the mounted viewer immediately revokes the previous URL,
+    // and closing revokes the active one.
+    await page.goto(`${server.url}/?mock=formats#/files/tower//home/me/Videos/Holiday`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.grid a.cell[aria-label="IMG_2041.jpg"]').click();
+    const imgEl = page.locator('.viewer img.viewer-img');
+    await imgEl.waitFor();
+    const firstPicUrl = await imgEl.getAttribute('src');
+    assert.ok(firstPicUrl, 'expected first picture URL');
+    await page.keyboard.press('ArrowRight');
+    await page.locator('.viewer-top .name', { hasText: 'IMG_2042.jpg' }).waitFor();
+    await page.waitForFunction(
+      (prev) => {
+        const cur = document.querySelector('.viewer img.viewer-img')?.getAttribute('src');
+        return Boolean(cur && cur !== prev);
+      },
+      firstPicUrl,
+    );
+    const secondPicUrl = await imgEl.getAttribute('src');
+    const revokedAfterSwitch = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
+    assert.ok(
+      revokedAfterSwitch.includes(firstPicUrl),
+      'switching files in viewer must revoke the previous picture URL',
+    );
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+    const revokedAfterSecondClose = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
+    assert.ok(
+      revokedAfterSecondClose.includes(secondPicUrl),
+      'closing viewer after switching files must revoke the second picture URL',
+    );
+
+    // 7. When no app handles the file type (?mock=formats,no-handler), viewer shows an honest
+    // message in place and offers Download instead of silently doing nothing.
+    await page.goto(`${server.url}/?mock=formats,no-handler#/files/tower//home/me/Formats`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.list a.row', { hasText: 'legacy-track.wma' }).click();
+    await page.locator('.viewer').getByRole('button', { name: 'Open in another app' }).click();
+    await page.locator('.viewer').getByText(/Getting it ready…/).waitFor();
+    await page.locator('.viewer').getByText('No app on this phone can open this file type.').waitFor({ timeout: 6000 });
+    await page.locator('.viewer').getByRole('button', { name: 'Download to this phone' }).waitFor();
+
+    await ctx.close();
+
+    assert.deepEqual(pageErrors, [], `Uncaught page errors (formats): ${pageErrors.join('\n')}`);
+    assert.deepEqual(consoleErrors, [], `Console/CSP errors (formats): ${consoleErrors.join('\n')}`);
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});
+
+async function maybeOldShot(page, name) {
+  if (!OLD_SHOTS_DIR) return;
+  fs.mkdirSync(OLD_SHOTS_DIR, { recursive: true });
+  await setTheme(page, 'dark');
+  await page.screenshot({ path: path.join(OLD_SHOTS_DIR, `${name}-dark.png`) });
+  await setTheme(page, 'light');
+  await page.screenshot({ path: path.join(OLD_SHOTS_DIR, `${name}-light.png`) });
+  await setTheme(page, 'dark');
+}
+
+async function assertNoPlainLeaks(page, label) {
+  const text = await page.locator('body').innerText();
+  const toolMatches = [...new Set(text.match(CATALOG_TOOL_RE) || [])];
+  assert.deepEqual(toolMatches, [], `Tool name(s) leaked in plain mode (${label}): ${toolMatches.join(', ')}`);
+  assert.ok(!/legion\s+help\b/i.test(text), `CLI help hint leaked in plain mode (${label}): ${text}`);
+  assert.ok(!text.includes('`'), `Backtick leaked in plain mode (${label}): ${text}`);
+}
+
+async function assertNoProtocolErrors(page, label) {
+  const bad = await page.evaluate(() =>
+    (window.__LEGION_MOCK_ERRORS__ || []).filter(
+      (e) => e.code === 'invalid_args' || e.code === 'unknown_tool',
+    ),
+  );
+  assert.deepEqual(bad, [], `Unexpected invalid_args/unknown_tool errors (${label}): ${JSON.stringify(bad)}`);
+}
+
+test('Old machine (05ba1ef fixture) at 412x915: quiet note, bottom dock in machine > Files, client sort/filter, 500-cap, search, viewer & download', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const ctx = await browser.newContext({
+      viewport: { width: 412, height: 915 },
+      colorScheme: 'dark',
+    });
+    const page = await ctx.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    // 1. Open studio from Machines list -> Overview shows the quiet one-line note once, with no button.
+    await page.goto(`${server.url}/?mock=multi,mixed#/machines`, { waitUntil: 'domcontentloaded' });
+    await page.locator('a.machine', { hasText: 'studio' }).waitFor();
+    await assertNoPlainLeaks(page, 'machines list');
+
+    await page.locator('a.machine', { hasText: 'studio' }).click();
+    await page.locator('header.top h1', { hasText: 'studio' }).waitFor();
+    const overviewNote = page.locator('.older-note');
+    await overviewNote.waitFor();
+    assert.equal(await overviewNote.count(), 1);
+    assert.equal(
+      (await overviewNote.innerText()).trim(),
+      'studio runs an older Legion, so some things are simpler here.',
+    );
+    assert.equal(await overviewNote.locator('button, a').count(), 0, 'Older note must not contain a button');
+    // Overview shows the meters studio actually reports, omits "Using it now" (no sys.procs group),
+    // and produces zero rejected protocol calls.
+    await page.locator('.gauge', { hasText: 'Processor' }).waitFor();
+    await page.locator('.gauge', { hasText: 'Memory' }).waitFor();
+    await page.locator('.gauge', { hasText: 'Storage' }).waitFor();
+    assert.equal(
+      await page.locator('p.label', { hasText: 'Using it now' }).count(),
+      0,
+      'Old machine Overview must omit "Using it now" when sys.procs lacks group',
+    );
+    await page.waitForTimeout(250);
+    await assertNoProtocolErrors(page, 'studio overview');
+    await assertNoPlainLeaks(page, 'studio overview');
+    await maybeOldShot(page, '01-old-machine-overview');
+
+    // 2. Open studio > Files -> search/sort/grid/more live in bottom thumb dock (not at top!).
+    await page.locator('nav.nav.parts a', { hasText: 'Files' }).click();
+    await page.locator('.list a.row', { hasText: 'Documents' }).waitFor();
+    assert.equal(await page.locator('.files-wide-tools').count(), 0, 'Phone machine > Files must not put tools at top');
+    const dock = page.locator('.dock.tools');
+    await dock.waitFor();
+    const layoutBoxes = await page.evaluate(() => {
+      const main = document.querySelector('main.main')?.getBoundingClientRect();
+      const d = document.querySelector('.dock.tools')?.getBoundingClientRect();
+      const nav = document.querySelector('nav.nav')?.getBoundingClientRect();
+      return {
+        mainBottom: main?.bottom || 0,
+        dockTop: d?.top || 0,
+        dockBottom: d?.bottom || 0,
+        navTop: nav?.top || 0,
+        overflow: document.documentElement.scrollWidth - window.innerWidth,
+      };
+    });
+    assert.ok(
+      layoutBoxes.dockTop >= layoutBoxes.mainBottom - 2,
+      `machine > Files dock must sit below main (${JSON.stringify(layoutBoxes)})`,
+    );
+    assert.ok(
+      layoutBoxes.dockBottom <= layoutBoxes.navTop + 2,
+      `machine > Files dock must sit above bottom nav (${JSON.stringify(layoutBoxes)})`,
+    );
+    assert.ok(layoutBoxes.overflow <= 1, `Horizontal overflow on machine > Files: ${layoutBoxes.overflow}px`);
+    assert.equal(await page.locator('.older-note').count(), 1);
+    await assertNoPlainLeaks(page, 'machine > files');
+    await maybeOldShot(page, '02-old-machine-files-dock');
+
+    // 3. Open studio > Documents: kind icons only (no fs.thumb), no stars, and NO repeated older-note in subfolders.
+    await page.locator('.list a.row', { hasText: 'Documents' }).click();
+    await page.locator('header.top h1', { hasText: 'Documents' }).waitFor();
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).waitFor();
+    assert.equal(await page.locator('.older-note').count(), 0, 'Older-note must not repeat inside subfolders');
+    assert.equal(await page.locator('.list img').count(), 0, 'Old machine must not render fetched thumbnails');
+    assert.equal(await page.locator('.list .star').count(), 0, 'Old machine must not show stars');
+    await assertNoPlainLeaks(page, 'old studio Documents');
+    await maybeOldShot(page, '03-old-files-documents');
+
+    // 4. Client-side sort (Largest first) & kind filter (Pictures) work with zero server invalid_args.
+    await page.locator('.dock.tools button[aria-label^="Sort:"]').click();
+    const sortSheet = page.locator('.sheet');
+    await sortSheet.waitFor();
+    await sortSheet.locator('button.row', { hasText: 'Largest first' }).click();
+    await sortSheet.waitFor({ state: 'hidden' });
+
+    const largestTitles = await page.locator('.list a.row .title').allTextContents();
+    assert.equal(largestTitles[0], 'Clip.mp4', 'Largest file sorted first client-side');
+    assert.equal(largestTitles[1], 'archive.zip', 'Second largest file sorted second client-side');
+    assert.ok(
+      largestTitles.indexOf('Poster.jpg') < largestTitles.indexOf('avatar.png'),
+      `Expected Poster.jpg before avatar.png when sorted largest first, got ${JSON.stringify(largestTitles)}`,
+    );
+
+    // Filter by kind: Pictures.
+    await page.locator('.dock.tools button[aria-label^="Sort:"]').click();
+    const filterSheet = page.locator('.sheet');
+    await filterSheet.waitFor();
+    await filterSheet.locator('.chips button', { hasText: 'Pictures' }).click();
+    await filterSheet.waitFor({ state: 'hidden' });
+
+    await page.locator('.folder-filter-bar', { hasText: 'Showing Pictures' }).waitFor();
+    const picTitles = await page.locator('.list a.row .title').allTextContents();
+    assert.deepEqual(picTitles, ['Poster.jpg', 'avatar.png']);
+    await assertNoPlainLeaks(page, 'old studio sorted & filtered');
+    await maybeOldShot(page, '04-old-sorted-filtered');
+
+    // Clear filter.
+    await page.locator('.folder-filter-bar button', { hasText: 'Show all' }).click();
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).waitFor();
+
+    // 5. BigFolder (sibling of Documents under Home) hits old 500-item limit -> quiet truncation line at foot.
+    await page.locator('nav.where a', { hasText: 'Home' }).click();
+    await page.locator('.older-note').waitFor();
+    assert.equal(await page.locator('.older-note').count(), 1, 'Older-note shows once at studio Home root');
+    await page.locator('.list a.row', { hasText: 'BigFolder' }).click();
+    await page.locator('header.top h1', { hasText: 'BigFolder' }).waitFor();
+    assert.equal(await page.locator('.older-note').count(), 0, 'Older-note must not repeat inside BigFolder');
+    const limitNote = page.locator('.folder-limit-note');
+    await limitNote.waitFor();
+    assert.equal(
+      (await limitNote.innerText()).trim(),
+      'Showing the first 500. Update Legion on studio to see everything.',
+    );
+    await assertNoPlainLeaks(page, 'old studio BigFolder 500 limit');
+    await page.goBack();
+    await page.locator('.list a.row', { hasText: 'Documents' }).click();
+    await page.locator('header.top h1', { hasText: 'Documents' }).waitFor();
+
+    // 6. Open small picture inline, text file inline, large picture fallback + download, and video fallback.
+    await page.locator('.list a.row', { hasText: 'avatar.png' }).click();
+    await page.locator('.viewer img.viewer-img').waitFor({ timeout: 5000 });
+    assert.equal(await page.locator('.viewer-bar button', { hasText: 'Star' }).count(), 0);
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).click();
+    await page.locator('.viewer pre.viewer-text', { hasText: 'Design notes' }).waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    await page.locator('.list a.row', { hasText: 'Poster.jpg' }).click();
+    await page.locator('.viewer').getByText("Can't show this picture here").waitFor();
+    await page.locator('.viewer').getByRole('button', { name: 'Download to this phone' }).click();
+    await page.locator('.toast-banner', { hasText: /Downloading Poster\.jpg/ }).waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+    const dismissBtn = page.locator('.toast-banner button[aria-label="Dismiss"]');
+    if (await dismissBtn.count()) await dismissBtn.click();
+
+    await page.locator('.list a.row', { hasText: 'Clip.mp4' }).click();
+    await page.locator('.viewer').getByText("Video playback isn't available from studio yet").waitFor();
+    await page.locator('.viewer').getByRole('button', { name: 'Download to this phone' }).waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    // 7. Search on studio: More filters hidden, name search uses glob + client filter, zero invalid_args.
+    await page.locator('.dock.tools input[type="search"]').fill('design');
+    await page.locator('header.top h1', { hasText: 'Search' }).waitFor();
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).waitFor();
+    assert.equal(
+      await page.locator('.filters button', { hasText: 'More filters' }).count(),
+      0,
+      'More filters must be hidden when searching an older machine without size/date search filters',
+    );
+    await assertNoPlainLeaks(page, 'old studio search');
+    await maybeOldShot(page, '05-old-search');
+
+    // 8. Check Activity, Actions, and Settings with Technical details off for plain-mode cleanliness.
+    await page.goto(`${server.url}/?mock=multi,mixed#/activity`, { waitUntil: 'domcontentloaded' });
+    await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
+    await assertNoPlainLeaks(page, 'activity plain');
+    await page.goto(`${server.url}/?mock=multi,mixed#/actions`, { waitUntil: 'domcontentloaded' });
+    await page.locator('header.top h1', { hasText: 'Actions' }).waitFor();
+    await assertNoPlainLeaks(page, 'actions plain');
+    await page.goto(`${server.url}/?mock=multi,mixed#/settings`, { waitUntil: 'domcontentloaded' });
+    await page.locator('header.top h1', { hasText: 'Settings' }).waitFor();
+    await assertNoPlainLeaks(page, 'settings plain');
+
+    // 9. Turn Technical details ON -> studio Overview note reveals version, build, and missing list.
+    await page.locator('label.row.switch', { hasText: 'Technical details' }).click();
+    await page.goto(`${server.url}/?mock=multi,mixed#/machines/studio`, { waitUntil: 'domcontentloaded' });
+    const techLine = page.locator('.older-note-tech');
+    await techLine.waitFor();
+    const techText = await techLine.innerText();
+    assert.ok(techText.includes('0.1.0'), `Expected version in technical note, got: ${techText}`);
+    assert.ok(techText.includes('05ba1ef2e385'), `Expected build in technical note, got: ${techText}`);
+    assert.ok(techText.includes('fs.thumb'), `Expected missing features in technical note, got: ${techText}`);
+
+    await assertNoProtocolErrors(page, 'old machine full journey');
+    await ctx.close();
+
+    assert.deepEqual(pageErrors, [], `Uncaught page errors (old machine): ${pageErrors.join('\n')}`);
+    assert.deepEqual(consoleErrors, [], `Console/CSP errors (old machine): ${consoleErrors.join('\n')}`);
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});
+
+test('Mixed-version fleet side by side (?mock=multi,mixed): current tower + old studio, cross-machine search, and Send to both ways', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const ctx = await browser.newContext({
+      viewport: { width: 412, height: 915 },
+      colorScheme: 'dark',
+    });
+    const page = await ctx.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    // 1. Current machine (tower) keeps full features (Pinned, thumbnails, stars, no older-note).
+    await page.goto(`${server.url}/?mock=multi,mixed#/files`, { waitUntil: 'domcontentloaded' });
+    await page.getByText('Pinned').waitFor();
+    await page.locator('a.row[href="#/files/tower/~"]').click();
+    await page.locator('.list a.row', { hasText: 'Videos' }).click();
+    await page.locator('.list a.row', { hasText: 'Holiday' }).click();
+    await page.locator('.grid a.cell img').first().waitFor({ timeout: 5000 });
+    assert.equal(await page.locator('.older-note').count(), 0, 'Current machine tower must not show older-note');
+
+    // 2. Old machine (studio) in the exact same session degrades cleanly with zero invalid_args.
+    await page.goto(`${server.url}/?mock=multi,mixed#/files/studio/~`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.list a.row', { hasText: 'Documents' }).waitFor();
+    assert.equal(await page.locator('.older-note').count(), 1, 'Older-note shows once at studio Home root');
+    await page.locator('.list a.row', { hasText: 'Documents' }).click();
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).waitFor();
+    assert.equal(await page.locator('.older-note').count(), 0, 'Older-note stays hidden inside subfolders');
+    assert.equal(await page.locator('.list img').count(), 0);
+    assert.equal(await page.locator('.list .star').count(), 0);
+
+    // 3. Cross-machine search finds matches on both current and old machines with zero invalid_args.
+    await page.goto(`${server.url}/?mock=multi,mixed#/files`, { waitUntil: 'domcontentloaded' });
+    await page.locator('.dock input[aria-label="Search all machines"]').fill('notes');
+    await page.locator('header.top h1', { hasText: 'Search' }).waitFor();
+    await page.locator('.list a.row', { hasText: 'notes.txt' }).first().waitFor();
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).first().waitFor();
+    await assertNoPlainLeaks(page, 'mixed fleet cross-machine search');
+
+    // 4. Send to from current machine (tower) -> old machine (studio).
+    await page.goto(`${server.url}/?mock=multi,mixed#/files/tower//home/me/Documents`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
+    await dispatchSwipe(page, '.swipe-row:has-text("README.md")', {
+      startX: 310,
+      startY: 220,
+      endX: 140,
+      endY: 222,
+    });
+    await page.locator('.swipe-row:has-text("README.md") .swipe-action', { hasText: 'Send to' }).click();
+    const toOldSheet = page.locator('.sheet');
+    await toOldSheet.waitFor();
+    await toOldSheet.locator('button[role="radio"]', { hasText: 'studio' }).click();
+    await toOldSheet.getByRole('button', { name: 'Copy to studio' }).click();
+    await toOldSheet.waitFor({ state: 'hidden' });
+    await page.locator('.toast-banner', { hasText: /Copying README\.md to studio/ }).waitFor();
+
+    // 5. Send to from old machine (studio) -> current machine (tower).
+    await page.goto(`${server.url}/?mock=multi,mixed#/files/studio//home/me/Documents`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).waitFor();
+    await dispatchSwipe(page, '.swipe-row:has-text("design-notes.md")', {
+      startX: 310,
+      startY: 220,
+      endX: 140,
+      endY: 222,
+    });
+    await page.locator('.swipe-row:has-text("design-notes.md") .swipe-action', { hasText: 'Send to' }).click();
+    const fromOldSheet = page.locator('.sheet');
+    await fromOldSheet.waitFor();
+    await fromOldSheet.locator('button[role="radio"]', { hasText: 'tower' }).click();
+    await fromOldSheet.getByRole('button', { name: 'Copy to tower' }).click();
+    await fromOldSheet.waitFor({ state: 'hidden' });
+    await page.locator('.toast-banner', { hasText: /Copying design-notes\.md to tower/ }).waitFor();
+
+    await assertNoProtocolErrors(page, 'mixed-version fleet side-by-side');
+    await ctx.close();
+
+    assert.deepEqual(pageErrors, [], `Uncaught page errors (mixed fleet): ${pageErrors.join('\n')}`);
+    assert.deepEqual(consoleErrors, [], `Console/CSP errors (mixed fleet): ${consoleErrors.join('\n')}`);
   } finally {
     await browser.close();
     await server.stop();

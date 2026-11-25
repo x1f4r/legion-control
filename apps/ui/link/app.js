@@ -1,5 +1,9 @@
 // Native app link: calls the Tauri 2 shell through window.__TAURI__.core.invoke and Channel.
 
+import { isFanOut } from '../lib/result.js';
+
+const CAPABILITY_TOOLS = new Set(['meta.version', 'meta.whoami', 'meta.tools']);
+
 function tauriCore() {
   const tauri = typeof window !== 'undefined' ? window.__TAURI__ : null;
   if (!tauri || !tauri.core || typeof tauri.core.invoke !== 'function') {
@@ -93,6 +97,7 @@ export function createAppLink() {
   const callPrefix = randomCallPrefix();
   let nextCallId = 1;
   let readySent = false;
+  let selectedNode = '';
   const iosPlatform = isIosPlatform();
   const unsupportedContentMachines = new Set();
   const contentSupportListeners = new Set();
@@ -118,6 +123,40 @@ export function createAppLink() {
       unsupportedContentMachines.add(key);
       notifyContentSupport();
     }
+  }
+
+  function clearContentUnsupported(machines) {
+    let changed = false;
+    for (const machine of machines) {
+      const key = machineKey(machine);
+      if (key && unsupportedContentMachines.delete(key)) {
+        changed = true;
+      }
+    }
+    if (changed) notifyContentSupport();
+  }
+
+  function noteCapabilityContact(tool, targetOn, result) {
+    if (!CAPABILITY_TOOLS.has(tool) || !result || typeof result !== 'object') return;
+    if (isFanOut(result)) {
+      const refreshed = [];
+      for (const [name, entry] of Object.entries(result.results || {})) {
+        if (entry && typeof entry === 'object' && entry.ok && !entry.error) {
+          refreshed.push(name);
+          if (typeof entry.ok.node === 'string') refreshed.push(entry.ok.node);
+        }
+      }
+      if (refreshed.length > 0) clearContentUnsupported(refreshed);
+      return;
+    }
+
+    const onKey = machineKey(targetOn);
+    const nodeKey = machineKey(result.node);
+    const refreshed = [];
+    if (onKey && onKey !== 'all') refreshed.push(onKey);
+    if (nodeKey) refreshed.push(nodeKey);
+    if (!onKey && selectedNode) refreshed.push(selectedNode);
+    if (refreshed.length > 0) clearContentUnsupported(refreshed);
   }
 
   function clearUnsupportedContentMachines() {
@@ -270,10 +309,10 @@ export function createAppLink() {
       if (checks.length === 0) return null;
 
       const appOrigin = window.location.origin;
-      let leakedIpc = false;
+      let scriptProbe = null;
       const onMsg = (evt) => {
         if (evt?.data && typeof evt.data === 'object' && evt.data.legionProbe) {
-          leakedIpc = true;
+          scriptProbe = evt.data;
         }
       };
       window.addEventListener('message', onMsg);
@@ -316,20 +355,71 @@ export function createAppLink() {
           }
 
           // 3) Attempt to frame the content URL and ensure neither script nor IPC is reachable.
+          // End the wait as soon as the frame is conclusively cross-origin (SecurityError on
+          // location.href) or fires load/error, capping silent CSP cancellations at 400 ms. When
+          // CSP `default-src 'none'` or WebView2's `on_navigation` blocks navigation before
+          // commit, the iframe can remain on its initial untouched empty `about:blank` document
+          // (which inherits the app origin and receives Tauri's `withGlobalTauri` init script on
+          // WebView2). Only fail if content actually framed into a same-origin document (navigated
+          // away from `about:blank` or populated DOM) or ran script.
           const iframe = document.createElement('iframe');
           iframe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:10px;height:10px;';
-          iframe.src = ticket.url;
-          document.body.appendChild(iframe);
-          await new Promise((r) => window.setTimeout(r, 400));
+          const isIframeCrossOrigin = () => {
+            try {
+              void iframe.contentWindow?.location?.href;
+              return false;
+            } catch {
+              return true;
+            }
+          };
+          await new Promise((resolve) => {
+            let done = false;
+            const finish = (graceMs = 0) => {
+              if (done) return;
+              done = true;
+              window.clearTimeout(capTimer);
+              window.clearInterval(pollTimer);
+              if (graceMs > 0 && !isIframeCrossOrigin()) {
+                window.setTimeout(resolve, graceMs);
+              } else {
+                resolve();
+              }
+            };
+            const capTimer = window.setTimeout(() => finish(0), 400);
+            const pollTimer = window.setInterval(() => {
+              if (scriptProbe || isIframeCrossOrigin()) finish(0);
+            }, 40);
+            iframe.addEventListener('load', () => finish(50), { once: true });
+            iframe.addEventListener('error', () => finish(0), { once: true });
+            iframe.src = ticket.url;
+            document.body.appendChild(iframe);
+          });
+
+          let iframeLeak = null;
           try {
             const win = iframe.contentWindow;
-            if (win && win.__TAURI__) {
-              leakedIpc = true;
+            if (win) {
+              const href = String(win.location?.href || '');
+              const doc = win.document;
+              const rootTag = String(doc?.documentElement?.tagName || '').toLowerCase();
+              const hasDom = Boolean(
+                doc &&
+                  ((doc.head?.childNodes?.length || 0) > 0 ||
+                    (doc.body?.childNodes?.length || 0) > 0 ||
+                    (rootTag && rootTag !== 'html')),
+              );
+              const isUntouchedBlank = href === 'about:blank' && !hasDom;
+              if (!isUntouchedBlank) {
+                iframeLeak = `href=${href || '<empty>'} tauri=${Boolean(win.__TAURI__)} dom=${hasDom}`;
+              }
             }
           } catch {
-            // Cross-origin SecurityError is expected and proves isolation.
+            // Cross-origin SecurityError (opaque sandbox or error page) proves isolation.
           }
           iframe.remove();
+          if (iframeLeak) {
+            throw new Error(`Content ${item.kind} framed into same-origin document (${iframeLeak})`);
+          }
 
           // 4) Attempt top-level navigation to the content URL; on_navigation must refuse it so
           // the WebView stays on the bundled app origin.
@@ -342,8 +432,10 @@ export function createAppLink() {
           if (window.location.origin !== appOrigin) {
             throw new Error(`WebView navigated to content origin for ${item.kind}`);
           }
-          if (leakedIpc) {
-            throw new Error(`Content ${item.kind} reached script or Tauri IPC`);
+          if (scriptProbe) {
+            throw new Error(
+              `Content ${item.kind} executed script (ipc=${Boolean(scriptProbe.ipc)})`,
+            );
           }
         }
         return true;
@@ -363,10 +455,12 @@ export function createAppLink() {
           window.removeEventListener('focus', onFg);
           window.removeEventListener('pageshow', onFg);
         };
+        // Cold-launching com.apple.Preferences and switching back on a busy CI simulator runner
+        // can take over two minutes (observed 121s on macos-latest); give the transition 3 minutes.
         const timer = window.setTimeout(() => {
           cleanup();
           reject(new Error('Timed out waiting for app suspend/resume cycle'));
-        }, 45000);
+        }, 180000);
         const onBg = () => {
           sawBackground = true;
         };
@@ -411,7 +505,15 @@ export function createAppLink() {
         const alreadyPaired =
           Array.isArray(current?.nodes) && current.nodes.some((n) => n.node === spec.machine);
         if (!alreadyPaired) {
-          await pair(spec.invite, 'ci-media');
+          try {
+            await pair(spec.invite, 'ci-media');
+          } catch (pairErr) {
+            if (pairErr?.code !== 'timeout') throw pairErr;
+            // On a cold CI simulator runner, the initial SSH handshake can exceed 10s without
+            // consuming the invite; retry pairing once.
+            await new Promise((r) => window.setTimeout(r, 500));
+            await pair(spec.invite, 'ci-media');
+          }
         }
       }
 
@@ -457,8 +559,8 @@ export function createAppLink() {
         // can now background and foreground the app.
         await invoke('media_check_report', { report: { ...report, resume_ok: false } }).catch(() => {});
         await waitForAppResume();
-        // Give native resume hook a beat to probe/rebind the loopback listener if needed.
-        await new Promise((r) => window.setTimeout(r, 400));
+        // Mint immediately on resume: content_url probes and recovers the loopback listener
+        // synchronously under its lock without relying on an arbitrary sleep.
         const [imgAfter, vidAfter] = await Promise.all([
           contentUrl({ machine: spec.machine, path: spec.image_path }),
           contentUrl({ machine: spec.machine, path: spec.video_path }),
@@ -527,7 +629,12 @@ export function createAppLink() {
 
   async function tools(options = {}) {
     try {
-      return await invoke('tools', { on: options?.on ?? null });
+      const result = await invoke('tools', { on: options?.on ?? null });
+      const target = machineKey(options?.on) || selectedNode;
+      if (target && target !== 'all') {
+        clearContentUnsupported([target]);
+      }
+      return result;
     } catch (err) {
       throw normalizeError(err);
     }
@@ -575,7 +682,9 @@ export function createAppLink() {
       if (channel) {
         payload.onEvent = channel;
       }
-      return await invoke('call', payload);
+      const result = await invoke('call', payload);
+      noteCapabilityContact(tool, on, result);
+      return result;
     } catch (err) {
       throw normalizeError(err);
     } finally {
@@ -587,6 +696,7 @@ export function createAppLink() {
     try {
       const base = await rawState();
       if (!base?.ready || !Array.isArray(base.nodes) || base.nodes.length === 0) {
+        selectedNode = '';
         return base;
       }
 
@@ -594,6 +704,7 @@ export function createAppLink() {
 
       const primary = base.nodes[0];
       const targetNode = primary.node;
+      selectedNode = machineKey(targetNode);
 
       try {
         const [whoami, version] = await Promise.all([
@@ -767,6 +878,7 @@ export function createAppLink() {
   async function selectNode(node) {
     try {
       await invoke('select_node', { node });
+      selectedNode = machineKey(node);
       return await state();
     } catch (err) {
       throw normalizeError(err);
@@ -901,7 +1013,11 @@ export function createAppLink() {
         path: path || '',
         download: Boolean(download),
       });
+      clearContentUnsupported([machine || selectedNode]);
       if (signal?.aborted) {
+        if (result?.url) {
+          invoke('content_revoke', { url: String(result.url) }).catch(() => {});
+        }
         throw {
           code: 'cancelled',
           message: 'The content request was cancelled.',
@@ -924,6 +1040,24 @@ export function createAppLink() {
         }
       }
       throw normalized;
+    }
+  }
+
+  async function contentStatus(url) {
+    try {
+      return await invoke('content_status', { url: String(url || '') });
+    } catch {
+      return null;
+    }
+  }
+
+  async function revokeContentUrl(url) {
+    const raw = String(url || '').trim();
+    if (!raw) return false;
+    try {
+      return Boolean(await invoke('content_revoke', { url: raw }));
+    } catch {
+      return false;
     }
   }
 
@@ -965,12 +1099,13 @@ export function createAppLink() {
   }
 
   async function openExternally(req = {}) {
-    const { machine, path, name, mime } = req || {};
+    const { machine, path, name, size, mime } = req || {};
     try {
       return await invoke('transfer_open_externally', {
         machine: machine || '',
         path: path || '',
         name: name ?? null,
+        size: typeof size === 'number' && Number.isFinite(size) ? size : null,
         mime: mime ?? null,
       });
     } catch (err) {
@@ -1103,6 +1238,8 @@ export function createAppLink() {
     dismissUpdateNotice,
     maybeAutoInstall,
     contentUrl,
+    contentStatus,
+    revokeContentUrl,
     download,
     transfers,
     transferControl,

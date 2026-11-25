@@ -340,10 +340,23 @@ impl AndroidTransferPlatform {
                     };
                     if let Some(id) = msg.get("id").and_then(Value::as_u64) {
                         if let Some(err_msg) = msg.get("error").and_then(Value::as_str) {
-                            client.resolve(
-                                id,
-                                Err(AppError::new(ErrorCode::Failed, err_msg.to_owned())),
-                            );
+                            let err = match msg.get("errorCode").and_then(Value::as_str) {
+                                Some("no_handler") => {
+                                    AppError::new(ErrorCode::Unsupported, err_msg.to_owned())
+                                        .with_hint(
+                                            "Download the file to save it in Downloads instead.",
+                                        )
+                                        .with_details(json!({ "reason": "no_handler" }))
+                                }
+                                Some("denied") => {
+                                    AppError::new(ErrorCode::Denied, err_msg.to_owned())
+                                }
+                                Some("not_found") => {
+                                    AppError::new(ErrorCode::NotFound, err_msg.to_owned())
+                                }
+                                _ => AppError::new(ErrorCode::Failed, err_msg.to_owned()),
+                            };
+                            client.resolve(id, Err(err));
                         } else {
                             let result = msg.get("result").cloned().unwrap_or(Value::Null);
                             client.resolve(id, Ok(result));
@@ -772,6 +785,31 @@ impl TransferPlatform for AndroidTransferPlatform {
                     .with_hint("Legion will keep retrying removal."));
             }
             Ok(())
+        })
+    }
+
+    fn cached_file_exists<'a>(
+        &'a self,
+        local_path: &'a str,
+        expected_size: u64,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let Ok(client) = self.wait_for_client().await else {
+                return false;
+            };
+            let Ok(resp) = client
+                .call(
+                    "checkCacheFile",
+                    json!({
+                        "uriOrPath": local_path,
+                        "expectedSize": expected_size,
+                    }),
+                )
+                .await
+            else {
+                return false;
+            };
+            resp.get("exists").and_then(Value::as_bool).unwrap_or(false)
         })
     }
 

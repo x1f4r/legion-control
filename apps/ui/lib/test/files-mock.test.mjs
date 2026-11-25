@@ -130,6 +130,10 @@ test('mock link with old flag cleanly omits new tools and optional link methods'
   const list = await link.call('fs.list', { path: '/home/me/Videos/Holiday' }, { on: 'tower' });
   assert.equal(list.total, undefined);
   assert.equal(list.entries.find((e) => e.name === 'Arrival.mp4').category, undefined);
+  await assert.rejects(
+    () => link.call('fs.list', { path: '/home/me/Videos/Holiday', sort: 'name' }, { on: 'tower' }),
+    (err) => err?.code === 'invalid_args' && /unknown field `sort`/.test(err.message),
+  );
   await assert.rejects(() => link.call('fs.thumb', { paths: ['/home/me/Videos/Holiday/IMG_2041.jpg'] }, { on: 'tower' }));
   await assert.rejects(() => link.call('fav.list', {}, { on: 'tower' }));
 });

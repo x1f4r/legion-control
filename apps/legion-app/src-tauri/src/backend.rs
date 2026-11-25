@@ -109,6 +109,13 @@ impl AppError {
         self
     }
 
+    /// Attaches structured diagnostic details for the caller.
+    #[must_use]
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
     /// Standard error returned when an operation requires a paired node.
     pub fn not_paired() -> Self {
         Self::new(
