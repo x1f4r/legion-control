@@ -394,6 +394,48 @@ impl Node {
         .await;
     }
 
+    /// Appends one call to this node's audit log synchronously (for callers already running inside
+    /// `spawn_blocking`), applying the same redaction and stderr fallback as
+    /// [`Node::record_audit_with_device`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_audit_blocking(
+        &self,
+        target: String,
+        principal: Option<String>,
+        door: Door,
+        device: Option<String>,
+        tool: String,
+        args: &Value,
+        started: Instant,
+        result: &Result<Value, ErrorBody>,
+    ) {
+        let entry = Entry {
+            time: audit::now(),
+            principal,
+            door,
+            device,
+            tool,
+            target,
+            outcome: match result {
+                Ok(_) => Outcome::Ok,
+                Err(error) => Outcome::Error(error.code),
+            },
+            duration: (started.elapsed().as_secs_f64() * 1e6).round() / 1e6,
+            args: audit::redact(args),
+            message: result
+                .as_ref()
+                .err()
+                .map(|error| audit::redact_message(&error.message)),
+        };
+        if let Err(error) = self.inner.audit.append(&entry) {
+            let problem = format!(
+                "legion: the call ran, but it could not be written to the audit log {}: {error}\n",
+                self.inner.audit.path().display()
+            );
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), problem.as_bytes());
+        }
+    }
+
     async fn append_audit_entry(&self, entry: Entry) {
         let log = self.inner.audit.clone();
         let written = tokio::task::spawn_blocking(move || log.append(&entry)).await;

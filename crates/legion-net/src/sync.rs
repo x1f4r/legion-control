@@ -95,7 +95,7 @@ pub(crate) fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add(SyncTool::<ConfigSetNameArgs, ConfigSetNameResult, _>::new(
         "config.set_name",
         Effect::Admin,
-        "Set `name = \"<name>\"` in this node's `node.toml` when `node.toml` does not exist or omits `name`, keeping every other byte in the file unchanged (preserving a UTF-8 BOM and line endings). Never writes through symbolic links (refuses with `conflict`, `details.kind = \"linked_config\"`), never overwrites a different explicit `name` (`conflict`, `details.kind = \"name_mismatch\"`), and refuses `caller` equal to `name` (`conflict`). Validates and prepares both `projects.toml` and `node.toml` before writing (`projects.toml` first, `node.toml` last) under lock, moving matching `[projects.<name>.on]` entries to the new name without overwriting existing entries (reporting moved entries and conflicts) and healing any remaining host-derived project keys if `node.toml` already matches.",
+        "Set `name = \"<name>\"` in this node's `node.toml` when `node.toml` does not exist or omits `name`, keeping every other byte in the file unchanged (preserving a UTF-8 BOM and line endings). When `node.toml` already sets `<name>`, changes nothing. Never writes through symbolic links (refuses with `conflict`, `details.kind = \"linked_config\"`), never overwrites a different explicit `name` (`conflict`, `details.kind = \"name_mismatch\"`), and refuses `caller` equal to `name` (`conflict`). Validates, prepares, and backs up both `projects.toml` and `node.toml` before writing (`projects.toml` first with its own audit entry, `node.toml` last) under lock, moving matching `[projects.<name>.on]` entries to the new name without overwriting existing entries or moving keys whose old name is listed as another machine in this node's own `fleet.toml` (reporting moved entries and conflicts). Atomic replacement requires write permission on the config directory rather than on `node.toml` or `projects.toml` itself, so a read-only regular file in a writable config directory is replaced.",
         fleet.clone(),
         |fleet, ctx, args| Box::pin(config_set_name(fleet, ctx, args)),
     ));
@@ -400,10 +400,7 @@ fn validate_tools_d_toml(
                 continue;
             }
             let other_path = entry.path();
-            if !other_path.is_file() {
-                continue;
-            }
-            let Ok(other_bytes) = std::fs::read(&other_path) else {
+            let Ok(Some(other_bytes)) = read_regular_file(&other_path) else {
                 continue;
             };
             if let Ok(other_def) = parse_extension_toml(&other_bytes, is_builtin)
@@ -609,22 +606,13 @@ fn read_local_document(
     doc: &SharedDocument,
 ) -> Result<ConfigReadResult, ErrorBody> {
     let path = doc.config_path(config_dir);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(ConfigReadResult {
-                document: doc.canonical_name(),
-                exists: false,
-                hash: None,
-                content: None,
-            });
-        }
-        Err(error) => {
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", path.display()),
-            ));
-        }
+    let Some(bytes) = read_regular_file(&path)? else {
+        return Ok(ConfigReadResult {
+            document: doc.canonical_name(),
+            exists: false,
+            hash: None,
+            content: None,
+        });
     };
     let content = String::from_utf8(bytes).map_err(|error| {
         ErrorBody::new(
@@ -683,16 +671,7 @@ fn write_local_document_blocking(
     let _held = acquire_lock(&lock_path, "shared configuration")?;
 
     let target = doc.config_path(config_dir);
-    let existing = match std::fs::read(&target) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", target.display()),
-            ));
-        }
-    };
+    let existing = read_regular_file(&target)?;
     let hash_before = existing.as_deref().map(|b| hash_bytes(b).to_string());
 
     match precondition {
@@ -1314,7 +1293,10 @@ struct ConfigSetNameArgs {
 pub(crate) struct ProjectRenameConflict {
     pub(crate) project: String,
     pub(crate) old_path: String,
-    pub(crate) new_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) new_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1344,7 +1326,7 @@ fn linked_config_error(file_name: &str, target: &str, node_path: &Path) -> Error
     };
     ErrorBody::new(
         ErrorCode::Conflict,
-        format!("{file_name} on {target} is a link; Legion does not write through links."),
+        format!("{file_name} on this machine is a link; Legion does not write through links."),
     )
     .with_hint(hint)
     .with_details(json!({
@@ -1388,12 +1370,14 @@ struct PlannedProjectsMigration {
 
 /// Reads, validates, and computes any `projects.toml` key migration completely in memory without
 /// writing anything. Refuses before any write if `projects.toml` is invalid, unreadable, or a
-/// symlink that needs keys moved (or is dangling).
+/// symlink that needs keys moved (or is dangling). Never moves keys under `old_name` when
+/// `old_name_in_fleet` is true (listing them in `conflicts` with a sentence instead).
 fn plan_projects_migration(
     projects_path: &Path,
     node_path: &Path,
     old_name: &str,
     new_name: &str,
+    old_name_in_fleet: bool,
 ) -> Result<Option<PlannedProjectsMigration>, ErrorBody> {
     if old_name == new_name {
         return Ok(None);
@@ -1467,6 +1451,28 @@ fn plan_projects_migration(
             if !on_table.contains_key(old_name) {
                 continue;
             }
+            if old_name_in_fleet {
+                let old_path = parsed
+                    .projects
+                    .get(&proj_name)
+                    .and_then(|p| p.on.get(old_name))
+                    .cloned()
+                    .unwrap_or_default();
+                let new_path = parsed
+                    .projects
+                    .get(&proj_name)
+                    .and_then(|p| p.on.get(new_name))
+                    .cloned();
+                conflicts.push(ProjectRenameConflict {
+                    project: proj_name.clone(),
+                    old_path,
+                    new_path,
+                    reason: Some(format!(
+                        "Left {old_name} in projects.{proj_name}.on untouched because fleet.toml lists {old_name} as another machine."
+                    )),
+                });
+                continue;
+            }
             if on_table.contains_key(new_name) {
                 let old_path = parsed
                     .projects
@@ -1478,12 +1484,12 @@ fn plan_projects_migration(
                     .projects
                     .get(&proj_name)
                     .and_then(|p| p.on.get(new_name))
-                    .cloned()
-                    .unwrap_or_default();
+                    .cloned();
                 conflicts.push(ProjectRenameConflict {
                     project: proj_name,
                     old_path,
                     new_path,
+                    reason: None,
                 });
                 continue;
             }
@@ -1541,11 +1547,38 @@ fn write_sync_backup(state_dir: &Path, filename: &str, bytes: &[u8]) -> Result<S
     Ok(backup_path.display().to_string())
 }
 
+struct SetNameAuditCtx {
+    node: legion_core::Node,
+    principal: String,
+    door: legion_core::Door,
+    device: Option<String>,
+    started: Instant,
+}
+
 fn set_local_node_name_blocking(
     config_dir: &Path,
     state_dir: &Path,
     previous_node: &str,
     target: &NodeName,
+    audit: &SetNameAuditCtx,
+) -> Result<ConfigSetNameResult, ErrorBody> {
+    set_local_node_name_with_writer(
+        config_dir,
+        state_dir,
+        previous_node,
+        target,
+        audit,
+        write_atomically,
+    )
+}
+
+fn set_local_node_name_with_writer(
+    config_dir: &Path,
+    state_dir: &Path,
+    previous_node: &str,
+    target: &NodeName,
+    audit: &SetNameAuditCtx,
+    write_node: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
 ) -> Result<ConfigSetNameResult, ErrorBody> {
     let lock_path = state_dir.join("sync").join("config.lock");
     let _held = acquire_lock(&lock_path, "node configuration")?;
@@ -1567,7 +1600,7 @@ fn set_local_node_name_blocking(
     };
 
     // Phase 1: Inspect, read, validate, and compute both new file contents completely in memory
-    // before writing anything.
+    // before taking backups or writing anything.
     match std::fs::symlink_metadata(&node_path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             return Err(linked_config_error(
@@ -1587,94 +1620,143 @@ fn set_local_node_name_blocking(
     }
 
     let existing_node = read_regular_file(&node_path)?;
-    let (node_write, projects_old_name, reported_previous) = match insert_node_name(
-        existing_node.as_deref(),
-        &node_path,
-        target,
-    )? {
+    let updated_node = match insert_node_name(existing_node.as_deref(), &node_path, target)? {
         InsertNodeName::AlreadyMatches => {
-            // Also heal any project keys still left under the host-derived name (for example
-            // after an interrupted previous rename).
-            let host_name = NodeName::from_host().to_string();
-            (None, host_name, target.as_str().to_owned())
+            return Ok(ConfigSetNameResult {
+                node: target.as_str().to_owned(),
+                previous: target.as_str().to_owned(),
+                changed: false,
+                backup: None,
+                moved: Vec::new(),
+                conflicts: Vec::new(),
+            });
         }
         InsertNodeName::ExplicitMismatch(current) => {
             return Err(ErrorBody::new(
-                    ErrorCode::Conflict,
-                    format!(
-                        "This node is already explicitly named {current} in node.toml, so it was not renamed to {target}."
-                    ),
-                )
-                .with_hint(format!(
-                    "Edit {} to set `name = \"{target}\"`, or rename this machine in fleet.toml to `{current}`.",
-                    node_path.display()
-                ))
-                .with_details(json!({
-                    "kind": "name_mismatch",
-                    "expected": target.as_str(),
-                    "reported": current.as_str(),
-                    "explicit": true,
-                })));
+                ErrorCode::Conflict,
+                format!(
+                    "This node is already explicitly named {current} in node.toml, so it was not renamed to {target}."
+                ),
+            )
+            .with_hint(format!(
+                "Edit {} to set `name = \"{target}\"`, or rename this machine in fleet.toml to `{current}`.",
+                node_path.display()
+            ))
+            .with_details(json!({
+                "kind": "name_mismatch",
+                "expected": target.as_str(),
+                "reported": current.as_str(),
+                "explicit": true,
+            })));
         }
-        InsertNodeName::Write(updated) => (
-            Some(updated),
-            previous_node.to_owned(),
-            previous_node.to_owned(),
-        ),
+        InsertNodeName::Write(updated) => updated,
     };
+
+    // Never move `projects.toml` keys whose old name is listed in this node's own `fleet.toml` as
+    // another machine.
+    let fleet_path = config_dir.join(<FleetFile as legion_core::Document>::FILE);
+    let old_name_in_fleet = previous_node != target.as_str()
+        && match read_regular_file(&fleet_path)? {
+            Some(bytes) => parse::<FleetFile>(&fleet_path, &bytes)
+                .ok()
+                .is_some_and(|fleet_file| fleet_file.machines.contains_key(previous_node)),
+            None => false,
+        };
 
     let planned_projects = plan_projects_migration(
         &projects_path,
         &node_path,
-        &projects_old_name,
+        previous_node,
         target.as_str(),
+        old_name_in_fleet,
     )?;
 
-    // Phase 2: Commit writes in order — `projects.toml` first, `node.toml` last — so a failure
-    // while migrating `projects.toml` never leaves `node.toml` renamed, and a crash between writes
-    // is cleanly healed on retry.
+    // Phase 2: Take all backups BEFORE the first write so a failing backup refuses before anything
+    // changes.
+    let projects_backup = match planned_projects.as_ref() {
+        Some(plan) if plan.updated_bytes.is_some() => Some(write_sync_backup(
+            state_dir,
+            "projects.toml.bak",
+            &plan.original_bytes,
+        )?),
+        _ => None,
+    };
+    let node_backup = match existing_node.as_deref() {
+        Some(old_bytes) => Some(write_sync_backup(state_dir, "node.toml.bak", old_bytes)?),
+        None => None,
+    };
+
+    // Phase 3: Write `projects.toml` first and record its audit entry immediately before touching
+    // `node.toml`.
     let (moved, conflicts) = if let Some(plan) = planned_projects {
         if let Some(updated_proj_bytes) = plan.updated_bytes {
-            write_sync_backup(state_dir, "projects.toml.bak", &plan.original_bytes)?;
             write_atomically(&plan.path, &updated_proj_bytes).map_err(|error| {
                 ErrorBody::new(
                     ErrorCode::Failed,
                     format!("{} cannot be written: {error}.", plan.path.display()),
                 )
             })?;
+            let proj_audit_args = json!({
+                "document": "projects.toml",
+                "previous": previous_node,
+                "node": target.as_str(),
+                "backup": projects_backup,
+                "moved": plan.moved,
+                "conflicts": plan.conflicts,
+            });
+            audit.node.record_audit_blocking(
+                previous_node.to_owned(),
+                Some(audit.principal.clone()),
+                audit.door,
+                audit.device.clone(),
+                "config.set_name.projects_migrated".to_owned(),
+                &proj_audit_args,
+                audit.started,
+                &Ok(json!({})),
+            );
         }
         (plan.moved, plan.conflicts)
     } else {
         (Vec::new(), Vec::new())
     };
 
-    let (node_changed, backup) = if let Some(updated_node) = node_write {
-        let backup = match existing_node.as_deref() {
-            Some(old_bytes) => Some(write_sync_backup(state_dir, "node.toml.bak", old_bytes)?),
-            None => None,
-        };
-        std::fs::create_dir_all(config_dir).map_err(|error| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be created: {error}.", config_dir.display()),
-            )
-        })?;
-        write_atomically(&node_path, &updated_node).map_err(|error| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be written: {error}.", node_path.display()),
-            )
-        })?;
-        (true, backup)
-    } else {
-        (false, None)
-    };
+    // Phase 4: Write `node.toml` last and record `config.set_name.applied` immediately.
+    std::fs::create_dir_all(config_dir).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} cannot be created: {error}.", config_dir.display()),
+        )
+    })?;
+    write_node(&node_path, &updated_node).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} cannot be written: {error}.", node_path.display()),
+        )
+    })?;
+    let applied_audit_args = json!({
+        "document": "node.toml",
+        "previous": previous_node,
+        "node": target.as_str(),
+        "backup": node_backup,
+        "moved": moved,
+        "conflicts": conflicts,
+    });
+    audit.node.record_audit_blocking(
+        target.as_str().to_owned(),
+        Some(audit.principal.clone()),
+        audit.door,
+        audit.device.clone(),
+        "config.set_name.applied".to_owned(),
+        &applied_audit_args,
+        audit.started,
+        &Ok(json!({})),
+    );
 
     Ok(ConfigSetNameResult {
         node: target.as_str().to_owned(),
-        previous: reported_previous,
-        changed: node_changed || !moved.is_empty(),
-        backup,
+        previous: previous_node.to_owned(),
+        changed: true,
+        backup: node_backup,
         moved,
         conflicts,
     })
@@ -1706,13 +1788,19 @@ async fn config_set_name(
         })));
     }
 
-    let started = Instant::now();
+    let audit = SetNameAuditCtx {
+        node: ctx.node().clone(),
+        principal: ctx.principal().to_owned(),
+        door: ctx.door(),
+        device: ctx.device().map(str::to_owned),
+        started: Instant::now(),
+    };
     let config_dir = ctx.paths().config_dir().to_path_buf();
     let state_dir = ctx.paths().state_dir().to_path_buf();
     let previous = ctx.node_name().to_owned();
     let target_for_task = target.clone();
     let result = tokio::task::spawn_blocking(move || {
-        set_local_node_name_blocking(&config_dir, &state_dir, &previous, &target_for_task)
+        set_local_node_name_blocking(&config_dir, &state_dir, &previous, &target_for_task, &audit)
     })
     .await
     .map_err(|error| {
@@ -1723,26 +1811,6 @@ async fn config_set_name(
     })??;
     if result.changed {
         fleet.clear_cached_node(target.as_str());
-        let audit_args = json!({
-            "document": "node.toml",
-            "previous": result.previous,
-            "node": result.node,
-            "backup": result.backup,
-            "moved": result.moved,
-            "conflicts": result.conflicts,
-        });
-        ctx.node()
-            .record_audit_with_device(
-                result.node.clone(),
-                Some(ctx.principal().to_owned()),
-                ctx.door(),
-                ctx.device().map(str::to_owned),
-                "config.set_name.applied".to_owned(),
-                &audit_args,
-                started,
-                &Ok(json!({})),
-            )
-            .await;
     }
     Ok(result)
 }
@@ -2603,18 +2671,30 @@ async fn apply_one_machine_node_name(
                             ),
                         },
                     },
-                    Err(error) if is_linked_config_error(&error) => NodeNameSyncOutcome {
-                        status: NodeNameSyncStatus::Manual,
-                        expected: machine.to_owned(),
-                        reported,
-                        source: NodeNameSource::Host,
-                        backup: None,
-                        other_entries: Vec::new(),
-                        moved: Vec::new(),
-                        conflicts: Vec::new(),
-                        detail: Some(error.message.clone()),
-                        error: Some(error),
-                    },
+                    Err(mut error) if is_linked_config_error(&error) => {
+                        let file_name = error
+                            .details
+                            .as_ref()
+                            .and_then(|d| d.get("file"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("node.toml");
+                        let message = format!(
+                            "{file_name} on {machine} is a link; Legion does not write through links."
+                        );
+                        error.message = message.clone();
+                        NodeNameSyncOutcome {
+                            status: NodeNameSyncStatus::Manual,
+                            expected: machine.to_owned(),
+                            reported,
+                            source: NodeNameSource::Host,
+                            backup: None,
+                            other_entries: Vec::new(),
+                            moved: Vec::new(),
+                            conflicts: Vec::new(),
+                            detail: Some(message),
+                            error: Some(error),
+                        }
+                    }
                     Err(error) if is_name_mismatch_error(&error) => NodeNameSyncOutcome {
                         status: NodeNameSyncStatus::NameMismatch,
                         expected: machine.to_owned(),
@@ -6963,9 +7043,7 @@ removed_on = \"box-a\"
             );
             assert_eq!(
                 err.message,
-                format!(
-                    "node.toml on {target_name} is a link; Legion does not write through links."
-                )
+                "node.toml on this machine is a link; Legion does not write through links."
             );
             assert!(
                 err.hint
@@ -7025,9 +7103,7 @@ removed_on = \"box-a\"
             );
             assert_eq!(
                 err.message,
-                format!(
-                    "projects.toml on {target_name} is a link; Legion does not write through links."
-                )
+                "projects.toml on this machine is a link; Legion does not write through links."
             );
             assert_eq!(
                 std::fs::read(paths.config_file("node.toml")).unwrap(),
@@ -7153,13 +7229,46 @@ removed_on = \"box-a\"
             Some("/old/dup")
         );
 
-        // 6. Finding A: Simulated half-applied crash where `node.toml` already has `name = target`
-        //    but `projects.toml` still has a key under `NodeName::from_host()` heals on retry.
-        let half_applied_projects = format!(
-            "[projects.healed]\r\n[projects.healed.on]\r\n{old_host_name} = \"/work/healed\"\r\n"
+        // Audit recorded `config.set_name.projects_migrated` BEFORE `config.set_name.applied`.
+        let audit_entries: Vec<Value> = std::fs::read_to_string(paths.audit_log())
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let proj_idx = audit_entries
+            .iter()
+            .position(|e| e["tool"] == json!("config.set_name.projects_migrated"))
+            .unwrap_or_else(|| panic!("expected projects_migrated audit: {audit_entries:?}"));
+        let applied_idx = audit_entries
+            .iter()
+            .position(|e| e["tool"] == json!("config.set_name.applied"))
+            .unwrap_or_else(|| panic!("expected applied audit: {audit_entries:?}"));
+        assert!(
+            proj_idx < applied_idx,
+            "projects_migrated must be audited before applied: {audit_entries:?}"
         );
-        std::fs::write(paths.config_file("projects.toml"), &half_applied_projects).unwrap();
-        let heal = node
+        assert_eq!(
+            audit_entries[proj_idx]["args"]["previous"],
+            json!(old_host_name)
+        );
+        assert_eq!(audit_entries[proj_idx]["args"]["node"], json!(target_name));
+        assert_eq!(
+            audit_entries[proj_idx]["args"]["moved"],
+            json!([format!("projects.app.on: {old_host_name} -> {target_name}")])
+        );
+
+        // 6. Item 1: Already-matches path changes NOTHING, even when `fleet.toml` lists another
+        //    machine matching the host name and `projects.toml` has keys under that name.
+        std::fs::write(
+            paths.config_file("fleet.toml"),
+            format!("[machines.{old_host_name}]\nssh = \"other.example\"\n"),
+        )
+        .unwrap();
+        let other_machine_projects = format!(
+            "[projects.app]\n[projects.app.on]\n{old_host_name} = \"/srv/on-other-machine\"\n"
+        );
+        std::fs::write(paths.config_file("projects.toml"), &other_machine_projects).unwrap();
+        let noop = node
             .call(Call::new(
                 Door::Cli,
                 "config.set_name",
@@ -7167,29 +7276,14 @@ removed_on = \"box-a\"
             ))
             .await
             .unwrap();
-        assert_eq!(heal["changed"], json!(true), "{heal}");
+        assert_eq!(noop["changed"], json!(false), "{noop}");
+        assert!(noop.get("moved").is_none(), "{noop}");
+        assert!(noop.get("conflicts").is_none(), "{noop}");
         assert_eq!(
-            heal["moved"],
-            json!([format!(
-                "projects.healed.on: {old_host_name} -> {target_name}"
-            )]),
-            "{heal}"
+            std::fs::read_to_string(paths.config_file("projects.toml")).unwrap(),
+            other_machine_projects,
+            "already-matches must never move another machine's keys"
         );
-        let healed_projects = std::fs::read_to_string(paths.config_file("projects.toml")).unwrap();
-        assert!(
-            !healed_projects.replace("\r\n", "").contains('\n'),
-            "healed projects.toml must keep CRLF: {healed_projects:?}"
-        );
-        let parsed_healed = parse::<ProjectsFile>(
-            &paths.config_file("projects.toml"),
-            healed_projects.as_bytes(),
-        )
-        .unwrap();
-        assert_eq!(
-            parsed_healed.path_on("healed", target_name),
-            Some("/work/healed")
-        );
-        assert_eq!(parsed_healed.path_on("healed", &old_host_name), None);
 
         // 7. Finding B: Symlinked `projects.toml` with NO keys to move still allows renaming
         //    regular `node.toml` without touching `projects.toml`.
@@ -7223,6 +7317,244 @@ removed_on = \"box-a\"
                     .is_symlink()
             );
             assert_eq!(std::fs::read_to_string(&linked_proj2).unwrap(), proj2_body);
+        }
+    }
+
+    #[tokio::test]
+    async fn config_set_name_protects_fleet_keys_completes_half_state_and_audits_partial_writes() {
+        use legion_core::{Call, Door, Node, Paths};
+
+        let host_name = NodeName::from_host().to_string();
+        let target_name = if host_name == "studio" {
+            "studio-peer"
+        } else {
+            "studio"
+        };
+
+        // 1. Item 1: Ordinary rename when `fleet.toml` lists the host-derived old name as another
+        //    machine leaves those project keys untouched, reports them in `conflicts` with a
+        //    sentence, and still writes `name = "<target>"` to `node.toml`.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            std::fs::create_dir_all(paths.state_dir()).unwrap();
+            std::fs::write(
+                paths.config_file("fleet.toml"),
+                format!("[machines.{host_name}]\nssh = \"other.example\"\n"),
+            )
+            .unwrap();
+            let orig_proj =
+                format!("[projects.app]\n[projects.app.on]\n{host_name} = \"/srv/on-other\"\n");
+            std::fs::write(paths.config_file("projects.toml"), &orig_proj).unwrap();
+
+            let fleet = Fleet::new(&paths);
+            let mut reg = Registry::new();
+            register(&mut reg, fleet);
+            let node = Node::new(paths.clone(), reg);
+
+            let res = node
+                .call(Call::new(
+                    Door::Cli,
+                    "config.set_name",
+                    json!({"name": target_name}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res["changed"], json!(true), "{res}");
+            assert!(res.get("moved").is_none(), "{res}");
+            assert_eq!(res["conflicts"][0]["project"], json!("app"), "{res}");
+            assert_eq!(
+                res["conflicts"][0]["old_path"],
+                json!("/srv/on-other"),
+                "{res}"
+            );
+            assert!(
+                res["conflicts"][0]["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("fleet.toml") && r.contains(&host_name)),
+                "{res}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(paths.config_file("projects.toml")).unwrap(),
+                orig_proj
+            );
+            let parsed_node = parse::<NodeFile>(
+                &paths.config_file("node.toml"),
+                &std::fs::read(paths.config_file("node.toml")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                parsed_node.name.as_ref().map(NodeName::as_str),
+                Some(target_name)
+            );
+        }
+
+        // 2. Item 1: Crash half-state ("keys already moved to target, node.toml still unset") is
+        //    cleanly completed by a second ordinary `config.set_name` call.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            std::fs::create_dir_all(paths.state_dir()).unwrap();
+            let moved_proj =
+                format!("[projects.app]\n[projects.app.on]\n{target_name} = \"/work/app\"\n");
+            std::fs::write(paths.config_file("projects.toml"), &moved_proj).unwrap();
+            std::fs::write(paths.config_file("node.toml"), "[svc]\nsudo = false\n").unwrap();
+
+            let fleet = Fleet::new(&paths);
+            let mut reg = Registry::new();
+            register(&mut reg, fleet);
+            let node = Node::new(paths.clone(), reg);
+
+            let res = node
+                .call(Call::new(
+                    Door::Cli,
+                    "config.set_name",
+                    json!({"name": target_name}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res["changed"], json!(true), "{res}");
+            assert!(res.get("moved").is_none(), "{res}");
+            assert_eq!(
+                std::fs::read_to_string(paths.config_file("projects.toml")).unwrap(),
+                moved_proj
+            );
+            let parsed_node = parse::<NodeFile>(
+                &paths.config_file("node.toml"),
+                &std::fs::read(paths.config_file("node.toml")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                parsed_node.name.as_ref().map(NodeName::as_str),
+                Some(target_name)
+            );
+        }
+
+        // 3. Item 2: Failing `node.toml.bak` (made a directory) fails BEFORE writing
+        //    `projects.toml` or `node.toml` and writes no migration or applied audit entry.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            std::fs::create_dir_all(
+                paths
+                    .state_dir()
+                    .join("sync")
+                    .join("backups")
+                    .join("node.toml.bak"),
+            )
+            .unwrap();
+            let orig_node = "[svc]\nsudo = false\n";
+            let orig_proj =
+                format!("[projects.app]\n[projects.app.on]\n{host_name} = \"/work/app\"\n");
+            std::fs::write(paths.config_file("node.toml"), orig_node).unwrap();
+            std::fs::write(paths.config_file("projects.toml"), &orig_proj).unwrap();
+
+            let fleet = Fleet::new(&paths);
+            let mut reg = Registry::new();
+            register(&mut reg, fleet);
+            let node = Node::new(paths.clone(), reg);
+
+            let err = node
+                .call(Call::new(
+                    Door::Cli,
+                    "config.set_name",
+                    json!({"name": target_name}),
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Failed, "{err:?}");
+            assert_eq!(
+                std::fs::read_to_string(paths.config_file("projects.toml")).unwrap(),
+                orig_proj,
+                "failing node.toml.bak must refuse before rewriting projects.toml"
+            );
+            assert_eq!(
+                std::fs::read_to_string(paths.config_file("node.toml")).unwrap(),
+                orig_node
+            );
+            let audit_text = std::fs::read_to_string(paths.audit_log()).unwrap_or_default();
+            assert!(
+                !audit_text.contains("config.set_name.projects_migrated")
+                    && !audit_text.contains("config.set_name.applied"),
+                "no write audit may be recorded when backups fail before writes: {audit_text}"
+            );
+        }
+
+        // 4. Item 2: If `projects.toml` succeeds and `node.toml` write fails afterward, an audit
+        //    entry ALREADY records what moved in `projects.toml` (and no `.applied` entry exists).
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            std::fs::create_dir_all(paths.state_dir()).unwrap();
+            let orig_node = "[svc]\nsudo = false\n";
+            let orig_proj =
+                format!("[projects.app]\n[projects.app.on]\n{host_name} = \"/work/app\"\n");
+            std::fs::write(paths.config_file("node.toml"), orig_node).unwrap();
+            std::fs::write(paths.config_file("projects.toml"), &orig_proj).unwrap();
+
+            let fleet = Fleet::new(&paths);
+            let mut reg = Registry::new();
+            register(&mut reg, fleet);
+            let node = Node::new(paths.clone(), reg);
+            let audit = SetNameAuditCtx {
+                node: node.clone(),
+                principal: "owner".to_owned(),
+                door: Door::Cli,
+                device: None,
+                started: Instant::now(),
+            };
+            let target = NodeName::try_from(target_name.to_owned()).unwrap();
+            let err = set_local_node_name_with_writer(
+                paths.config_dir(),
+                paths.state_dir(),
+                &host_name,
+                &target,
+                &audit,
+                |_path, _bytes| Err(io::Error::other("simulated disk failure on node.toml")),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Failed, "{err:?}");
+
+            // `projects.toml` was written and audited; `node.toml` stayed untouched.
+            let parsed_proj = parse::<ProjectsFile>(
+                &paths.config_file("projects.toml"),
+                &std::fs::read(paths.config_file("projects.toml")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(parsed_proj.path_on("app", target_name), Some("/work/app"));
+            assert_eq!(
+                std::fs::read_to_string(paths.config_file("node.toml")).unwrap(),
+                orig_node
+            );
+            let audit_entries: Vec<Value> = std::fs::read_to_string(paths.audit_log())
+                .unwrap()
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            let migrated = audit_entries
+                .iter()
+                .find(|e| e["tool"] == json!("config.set_name.projects_migrated"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected projects_migrated audit after partial write: {audit_entries:?}"
+                    )
+                });
+            assert_eq!(migrated["args"]["previous"], json!(host_name));
+            assert_eq!(migrated["args"]["node"], json!(target_name));
+            assert_eq!(
+                migrated["args"]["moved"],
+                json!([format!("projects.app.on: {host_name} -> {target_name}")])
+            );
+            assert!(
+                !audit_entries
+                    .iter()
+                    .any(|e| e["tool"] == json!("config.set_name.applied")),
+                "applied audit must not be recorded when node.toml write fails: {audit_entries:?}"
+            );
         }
     }
 }

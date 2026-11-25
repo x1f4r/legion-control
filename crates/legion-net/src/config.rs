@@ -2,7 +2,6 @@
 //! `toml_edit` so comments and unrelated entries survive tool edits.
 
 use std::collections::{BTreeMap, HashSet};
-use std::io;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -579,17 +578,16 @@ fn not_found_in_file(name: &str, known: &[String]) -> ErrorBody {
 }
 
 fn load_editable(path: &Path) -> Result<DocumentMut, ErrorBody> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(DocumentMut::new()),
-        Err(err) => {
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {err}.", path.display()),
-            )
-            .with_hint("Make fleet.toml readable by the account legion runs as."));
-        }
+    let Some(bytes) = legion_core::config::read_regular_file(path)? else {
+        return Ok(DocumentMut::new());
     };
+    let text = String::from_utf8(bytes).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} is not valid UTF-8 text: {err}.", path.display()),
+        )
+        .with_hint("Ensure fleet.toml is valid UTF-8 TOML.")
+    })?;
     // Refuse to edit a file that does not already parse as a valid FleetFile.
     parse::<FleetFile>(path, text.as_bytes())?;
     text.parse::<DocumentMut>().map_err(|err| {

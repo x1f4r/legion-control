@@ -76,6 +76,12 @@ pub struct Version {
 }
 
 async fn version(ctx: &Ctx, _args: NoArgs) -> Result<Version, ToolError> {
+    // Reject non-regular or unreadable `node.toml` (such as a FIFO) instead of silently falling
+    // back to the host name.
+    legion_core::config::read_regular_file(
+        &ctx.paths()
+            .config_file(<legion_core::config::NodeFile as legion_core::Document>::FILE),
+    )?;
     let exe = legion_core::current_exe().ok();
     let node_id = ctx
         .grant()

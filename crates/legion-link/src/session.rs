@@ -1276,13 +1276,10 @@ pub(crate) async fn read_line<R: AsyncBufRead + Unpin>(
     longest: usize,
 ) -> io::Result<Line> {
     line.clear();
-    let mut too_long = false;
     loop {
         let available = input.fill_buf().await?;
         if available.is_empty() {
-            return Ok(if too_long {
-                Line::TooLong
-            } else if line.is_empty() {
+            return Ok(if line.is_empty() {
                 Line::End
             } else {
                 Line::Read
@@ -1292,19 +1289,20 @@ pub(crate) async fn read_line<R: AsyncBufRead + Unpin>(
             Some(end) => (&available[..end], true),
             None => (available, false),
         };
-        if !too_long && line.len() + chunk.len() <= longest {
-            line.extend_from_slice(chunk);
-        } else {
-            too_long = true;
+        if line.len() + chunk.len() > longest {
             line.clear();
+            let used = chunk.len() + usize::from(found_end);
+            input.consume(used);
+            return Ok(Line::TooLong);
         }
+        line.extend_from_slice(chunk);
         let used = chunk.len() + usize::from(found_end);
         input.consume(used);
         if found_end {
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
-            return Ok(if too_long { Line::TooLong } else { Line::Read });
+            return Ok(Line::Read);
         }
     }
 }
@@ -2214,6 +2212,105 @@ mod tests {
         );
         assert_eq!(err.machine.as_deref(), Some("tower"));
         assert!(!session.is_alive(), "oversized reply must end the session");
+
+        session.close().await;
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn oversized_reply_without_newline_ends_session_immediately() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_r, client_w) = tokio::io::split(client_io);
+        let (server_r, mut server_w) = tokio::io::split(server_io);
+
+        let server_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let req: Request =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let hello = Response::ok(
+                req.id,
+                serde_json::to_value(HelloResult {
+                    node: "tower".into(),
+                    node_explicit: Some(true),
+                    node_id: None,
+                    version: "9.9.0".into(),
+                    build: None,
+                    protocol: PROTOCOL,
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                    systems: Vec::new(),
+                    system: None,
+                    boot_id: None,
+                })
+                .unwrap(),
+            );
+            server_w
+                .write_all(format!("{}\n", serde_json::to_string(&hello).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            server_w.flush().await.unwrap();
+
+            let _call: Request =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            // Stream bytes past LONGEST_LINE with NO newline and keep the stream open until the
+            // client disconnects.
+            let chunk = vec![b'z'; 64 * 1024];
+            let mut written = 0usize;
+            let _ = server_w
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":\"")
+                .await;
+            while written <= LONGEST_LINE + 64 * 1024 {
+                if server_w.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                written += chunk.len();
+            }
+            let _ = server_w.flush().await;
+            // Hold the stream open (never sending `\n` or EOF) until the client closes stdin.
+            let _ = lines.next_line().await;
+        });
+
+        let session = Session::open_io(
+            client_r,
+            client_w,
+            "tower",
+            None,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(3),
+            session.call(
+                CallParams {
+                    tool: "meta.version".into(),
+                    args: json!({}),
+                    as_principal: None,
+                    on: None,
+                    hops: 1,
+                },
+                CancellationToken::new(),
+                EventSink::discard(),
+            ),
+        )
+        .await
+        .expect("unterminated oversized reply must fail immediately instead of stalling")
+        .unwrap_err()
+        .into_error();
+
+        assert_eq!(err.code, ErrorCode::Internal, "{err:?}");
+        assert!(
+            err.message.contains("larger than this version"),
+            "unexpected message: {}",
+            err.message
+        );
+        assert_eq!(err.machine.as_deref(), Some("tower"));
+        assert!(
+            !session.is_alive(),
+            "unterminated oversized reply must end the session"
+        );
 
         session.close().await;
         let _ = server_task.await;

@@ -119,6 +119,10 @@ fn main() -> ExitCode {
             node_id_and_boot_id_visibility_follows_admin_effect,
         ),
         (
+            "fifo_config_documents_fail_fast_without_hanging",
+            fifo_config_documents_fail_fast_without_hanging,
+        ),
+        (
             "pipe_handle_drop_is_non_blocking_and_kills_lingering_child",
             pipe_handle_drop_is_non_blocking_and_kills_lingering_child,
         ),
@@ -3147,6 +3151,298 @@ allow = ["effect:read", "effect:admin"]
         );
     }
 }
+
+#[cfg(unix)]
+fn run_with_timeout(home: &Home, args: &[&str], timeout: Duration) -> (i32, String, String) {
+    let mut child = home
+        .command(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("command {args:?} hung for more than {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    (status.code().unwrap_or(-1), stdout, stderr)
+}
+
+#[cfg(unix)]
+fn make_fifo(path: &Path) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    let _ = fs::remove_file(path);
+    let st = Command::new("mkfifo").arg(path).status().unwrap();
+    assert!(st.success(), "mkfifo {} failed: {st}", path.display());
+}
+
+#[cfg(unix)]
+fn fifo_config_documents_fail_fast_without_hanging() {
+    let limit = Duration::from_secs(4);
+    let peer = Home::new();
+    peer.write_config("node.toml", "name = \"pi\"\n");
+
+    let make_tower = || {
+        let tower = Home::new();
+        tower.write_config("node.toml", "name = \"tower\"\n");
+        tower.write_config(
+            "policy.toml",
+            "[principals.viewer]\nrole = \"observer\"\n[roles.observer]\nallow = [\"effect:read\"]\n",
+        );
+        tower.write_config(
+            "fleet.toml",
+            &format!(
+                "[machines.pi]\ncommand = {}\n",
+                toml_argv(&run_argv(&peer, None))
+            ),
+        );
+        tower
+    };
+
+    // 1. FIFO `node.toml`: `meta.version` MUST return an error (never silently fall back to the
+    //    host name), and a non-owner file tool (`fs.list --as viewer`) must finish without hanging.
+    {
+        let tower = make_tower();
+        make_fifo(&legion_home_of(&tower).join("config").join("node.toml"));
+
+        let (code, stdout, stderr) = run_with_timeout(&tower, &["meta.version"], limit);
+        assert_eq!(
+            code, 1,
+            "FIFO node.toml must error in meta.version: stdout={stdout} stderr={stderr}"
+        );
+        let err: Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(err["code"], json!("failed"), "{err}");
+        assert!(
+            err["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not a regular file")),
+            "{err}"
+        );
+
+        let (fs_code, fs_out, fs_err) =
+            run_with_timeout(&tower, &["fs.list", "path=~", "--as", "viewer"], limit);
+        assert_eq!(
+            fs_code, 0,
+            "non-owner fs.list with FIFO node.toml must not hang: stdout={fs_out} stderr={fs_err}"
+        );
+    }
+
+    // 2. FIFO `policy.toml`: fails fast on any command.
+    {
+        let tower = make_tower();
+        make_fifo(&legion_home_of(&tower).join("config").join("policy.toml"));
+        let (code, stdout, stderr) = run_with_timeout(&tower, &["meta.version"], limit);
+        assert_eq!(
+            code, 1,
+            "FIFO policy.toml must fail: stdout={stdout} stderr={stderr}"
+        );
+        let err: Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(err["code"], json!("failed"), "{err}");
+        assert!(
+            err["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not a regular file")),
+            "{err}"
+        );
+    }
+
+    // 3. FIFO `fleet.toml`: `config.read`, `fleet.add`, `fleet.list` all fail fast.
+    {
+        let tower = make_tower();
+        make_fifo(&legion_home_of(&tower).join("config").join("fleet.toml"));
+        for args in [
+            &["config.read", "document=fleet.toml"][..],
+            &["fleet.add", "name=other", "ssh=other.example"][..],
+            &["fleet.list"][..],
+        ] {
+            let (code, stdout, stderr) = run_with_timeout(&tower, args, limit);
+            assert_eq!(code, 1, "{args:?}: stdout={stdout} stderr={stderr}");
+            let err: Value = serde_json::from_str(stdout.trim()).unwrap();
+            assert_eq!(err["code"], json!("failed"), "{args:?}: {err}");
+            assert!(
+                err["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("not a regular file")),
+                "{args:?}: {err}"
+            );
+        }
+    }
+
+    // 4. FIFO `projects.toml` locally AND on a peer: `config.read`, `proj.list`, `proj.add`,
+    //    `fleet.sync direction=push` (local FIFO), and `fleet.sync direction=status` (peer FIFO).
+    {
+        let tower = make_tower();
+        make_fifo(&legion_home_of(&tower).join("config").join("projects.toml"));
+        for args in [
+            &["config.read", "document=projects.toml"][..],
+            &["proj.list"][..],
+            &["proj.add", "name=demo", "path=~"][..],
+        ] {
+            let (code, stdout, stderr) = run_with_timeout(&tower, args, limit);
+            assert_eq!(code, 1, "{args:?}: stdout={stdout} stderr={stderr}");
+            let err: Value = serde_json::from_str(stdout.trim()).unwrap();
+            assert_eq!(err["code"], json!("failed"), "{args:?}: {err}");
+            assert!(
+                err["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("not a regular file")),
+                "{args:?}: {err}"
+            );
+        }
+
+        let (push_code, push_out, push_err) = run_with_timeout(
+            &tower,
+            &[
+                "fleet.sync",
+                "direction=push",
+                "documents=[\"projects.toml\"]",
+            ],
+            limit,
+        );
+        assert_eq!(push_code, 0, "stdout={push_out} stderr={push_err}");
+        let push_json: Value = serde_json::from_str(push_out.trim()).unwrap();
+        assert_eq!(
+            push_json["results"]["pi"]["projects.toml"]["status"],
+            json!("error"),
+            "{push_json}"
+        );
+        assert!(
+            push_json["results"]["pi"]["projects.toml"]["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not a regular file")),
+            "{push_json}"
+        );
+    }
+    {
+        let tower = make_tower();
+        let peer_proj = legion_home_of(&peer).join("config").join("projects.toml");
+        make_fifo(&peer_proj);
+        let (st_code, st_out, st_err) = run_with_timeout(
+            &tower,
+            &[
+                "fleet.sync",
+                "direction=status",
+                "documents=[\"projects.toml\"]",
+            ],
+            limit,
+        );
+        let _ = fs::remove_file(&peer_proj);
+        assert_eq!(st_code, 0, "stdout={st_out} stderr={st_err}");
+        let st_json: Value = serde_json::from_str(st_out.trim()).unwrap();
+        assert_eq!(
+            st_json["results"]["pi"]["projects.toml"]["status"],
+            json!("error"),
+            "{st_json}"
+        );
+        assert!(
+            st_json["results"]["pi"]["projects.toml"]["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not a regular file")),
+            "{st_json}"
+        );
+    }
+
+    // 5. FIFO `devices.toml`: `config.read` and `device.list` fail fast.
+    {
+        let tower = make_tower();
+        make_fifo(&legion_home_of(&tower).join("config").join("devices.toml"));
+        for args in [
+            &["config.read", "document=devices.toml"][..],
+            &["device.list"][..],
+        ] {
+            let (code, stdout, stderr) = run_with_timeout(&tower, args, limit);
+            assert_eq!(code, 1, "{args:?}: stdout={stdout} stderr={stderr}");
+            let err: Value = serde_json::from_str(stdout.trim()).unwrap();
+            assert_eq!(err["code"], json!("failed"), "{args:?}: {err}");
+            assert!(
+                err["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("not a regular file")),
+                "{args:?}: {err}"
+            );
+        }
+    }
+
+    // 6. FIFO `tokens.toml`: `token.list` and `token.add` fail fast.
+    {
+        let tower = make_tower();
+        make_fifo(&legion_home_of(&tower).join("config").join("tokens.toml"));
+        for args in [
+            &["token.list"][..],
+            &["token.add", "name=t", "principal=viewer"][..],
+        ] {
+            let (code, stdout, stderr) = run_with_timeout(&tower, args, limit);
+            assert_eq!(code, 1, "{args:?}: stdout={stdout} stderr={stderr}");
+            let err: Value = serde_json::from_str(stdout.trim()).unwrap();
+            assert_eq!(err["code"], json!("failed"), "{args:?}: {err}");
+            assert!(
+                err["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("not a regular file")),
+                "{args:?}: {err}"
+            );
+        }
+    }
+
+    // 7. FIFO `tools.d/demo.toml`: `config.read` fails fast and `ext.list` reports it as broken
+    //    without hanging.
+    {
+        let tower = make_tower();
+        make_fifo(
+            &legion_home_of(&tower)
+                .join("config")
+                .join("tools.d")
+                .join("demo.toml"),
+        );
+        let (code, stdout, stderr) = run_with_timeout(
+            &tower,
+            &["config.read", "document=tools.d/demo.toml"],
+            limit,
+        );
+        assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+        let err: Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(err["code"], json!("failed"), "{err}");
+        assert!(
+            err["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not a regular file")),
+            "{err}"
+        );
+
+        let (ext_code, ext_out, ext_err) = run_with_timeout(&tower, &["ext.list"], limit);
+        assert_eq!(ext_code, 0, "stdout={ext_out} stderr={ext_err}");
+        let ext_json: Value = serde_json::from_str(ext_out.trim()).unwrap();
+        assert!(
+            ext_json["broken"]
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|b| b["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("not a regular file")))),
+            "{ext_json}"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn fifo_config_documents_fail_fast_without_hanging() {}
 
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: &str) {

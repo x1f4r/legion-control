@@ -310,12 +310,13 @@ fn build_snapshot(
                     continue;
                 }
                 reads += 1;
-                let bytes = match std::fs::read(&path) {
-                    Ok(bytes) => bytes,
+                let bytes = match legion_core::config::read_regular_file(&path) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => continue,
                     Err(error) => {
                         broken.push(BrokenFile {
                             file: path,
-                            reason: format!("cannot be read: {error}"),
+                            reason: error.message,
                             line: None,
                         });
                         continue;

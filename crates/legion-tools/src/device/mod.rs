@@ -579,15 +579,9 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
                 return Ok(record);
             }
             let policy_path = paths.config_file(Policy::FILE);
-            let live_policy = match std::fs::read(&policy_path) {
-                Ok(bytes) => legion_core::config::parse::<Policy>(&policy_path, &bytes)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Policy::default(),
-                Err(error) => {
-                    return Err(ErrorBody::new(
-                        ErrorCode::Failed,
-                        format!("{} cannot be read: {error}.", policy_path.display()),
-                    ));
-                }
+            let live_policy = match legion_core::config::read_regular_file(&policy_path)? {
+                Some(bytes) => legion_core::config::parse::<Policy>(&policy_path, &bytes)?,
+                None => Policy::default(),
             };
             if live_policy
                 .principals
@@ -1098,16 +1092,7 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
 
         let policy_path = paths.config_file(Policy::FILE);
         let policy_before = if new_role.is_some() {
-            match std::fs::read(&policy_path) {
-                Ok(bytes) => Some(bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(ErrorBody::new(
-                        ErrorCode::Failed,
-                        format!("{} cannot be read: {error}.", policy_path.display()),
-                    ));
-                }
-            }
+            legion_core::config::read_regular_file(&policy_path)?
         } else {
             None
         };
@@ -1256,15 +1241,9 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         if confirm {
             let _ = reconcile_device_principals_locked(&paths, &devices_file)?;
         }
-        let live_policy = match std::fs::read(&policy_path) {
-            Ok(bytes) => legion_core::config::parse::<Policy>(&policy_path, &bytes)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Policy::default(),
-            Err(error) => {
-                return Err(ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!("{} cannot be read: {error}.", policy_path.display()),
-                ));
-            }
+        let live_policy = match legion_core::config::read_regular_file(&policy_path)? {
+            Some(bytes) => legion_core::config::parse::<Policy>(&policy_path, &bytes)?,
+            None => Policy::default(),
         };
         let effective_role_after = if confirm && new_role.is_none() {
             live_policy.role_of(&updated_entry.principal).0
@@ -1955,16 +1934,12 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                 let _ = reconcile_device_principals_locked(&paths, &devices_file)
                     .map_err(after_save)?;
                 let policy_path = paths.config_file(Policy::FILE);
-                let live_policy = match std::fs::read(&policy_path) {
-                    Ok(bytes) => legion_core::config::parse::<Policy>(&policy_path, &bytes)
+                let live_policy = match legion_core::config::read_regular_file(&policy_path)
+                    .map_err(after_save)?
+                {
+                    Some(bytes) => legion_core::config::parse::<Policy>(&policy_path, &bytes)
                         .map_err(after_save)?,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Policy::default(),
-                    Err(error) => {
-                        return Err(after_save(ErrorBody::new(
-                            ErrorCode::Failed,
-                            format!("{} cannot be read: {error}.", policy_path.display()),
-                        )));
-                    }
+                    None => Policy::default(),
                 };
 
                 // 3. Reconcile `authorized_keys` and sweep expired invites.

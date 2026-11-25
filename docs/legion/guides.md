@@ -1316,9 +1316,11 @@ requiring `effect:admin`, built on `config.list`, `config.read`, and `config.wri
   on a cloned machine. For an unambiguous machine that reports a `node_id` and a different
   host-derived name (no explicit `name` in `node.toml`), `direction=push` writes
   `name = "<fleet name>"` one machine at a time via `config.set_name` (keeping all other bytes in
-  `node.toml` verbatim, preserving any UTF-8 BOM and CRLF line endings, migrating matching
-  `[projects.<name>.on]` entries in `projects.toml` before writing `node.toml` without overwriting
-  existing entries, and saving backups) and records the update in `node_names`. If `node.toml` —
+  `node.toml` verbatim, preserving any UTF-8 BOM and CRLF line endings, backing up both files
+  before writing, migrating matching `[projects.<name>.on]` entries in `projects.toml` before
+  writing `node.toml` without overwriting existing entries or moving keys whose old name is listed
+  as another machine in the node's own `fleet.toml`, and recording audit entries for each write)
+  and records the update in `node_names`. If `node.toml` —
   or `projects.toml` when it has keys to move — is a symbolic link, `config.set_name` refuses
   without writing through links (`conflict`, `details.kind = "linked_config"`) and `fleet.sync`
   reports `status: "manual"` with a hint to edit by hand. When a machine has a different explicit

@@ -1029,7 +1029,7 @@ fn is_unreachable_warning(error: Option<&ErrorBody>) -> bool {
 }
 
 fn read_fleet_machine_names(fleet_path: &Path) -> Vec<String> {
-    let Ok(bytes) = std::fs::read(fleet_path) else {
+    let Ok(Some(bytes)) = legion_core::config::read_regular_file(fleet_path) else {
         return Vec::new();
     };
     let Ok(text) = std::str::from_utf8(&bytes) else {
