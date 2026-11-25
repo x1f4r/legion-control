@@ -580,10 +580,13 @@ export function createAppLink() {
       report.ok = mediaPass;
 
       if (spec.verify_resume && mediaPass) {
+        // Register resume listeners before signaling the simulator harness so a fast
+        // background/foreground switch cannot race ahead of listener attachment.
+        const resumePromise = waitForAppResume();
         // Emit intermediate report so the simulator harness knows initial playback succeeded and
         // can now background and foreground the app.
         await invoke('media_check_report', { report: { ...report, resume_ok: false } }).catch(() => {});
-        await waitForAppResume();
+        await resumePromise;
         // Mint immediately on resume: content_url probes and recovers the loopback listener
         // synchronously under its lock without relying on an arbitrary sleep.
         const [imgAfter, vidAfter] = await Promise.all([
