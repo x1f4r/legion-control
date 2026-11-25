@@ -408,7 +408,7 @@ test('live folder refresh updates open folders on upload, background copy, renam
     await firstFileRow.waitFor({ state: 'visible', timeout: 5000 });
     await firstFileRow.click();
     await page.locator('.viewer').waitFor({ state: 'visible', timeout: 5000 });
-    await page.locator('.viewer').getByRole('button', { name: 'More' }).click();
+    await page.locator('.viewer').getByRole('button', { name: 'More options', exact: true }).click();
     await page.locator('.sheet .row', { hasText: 'Rename' }).click();
     await page.locator('.sheet input[type="text"]').fill('long-log-renamed.txt');
     await page.locator('.sheet button[type="submit"]').click();
