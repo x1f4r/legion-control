@@ -909,3 +909,405 @@ pub fn build_hostile_text_mp3() -> Vec<u8> {
     mp3.extend_from_slice(&silent_mp3_frame());
     mp3
 }
+
+/// Builds an MP3 ID3v2.3 file with `count` tiny frames (used to exceed `MAX_ID3_FRAMES`).
+pub fn build_mp3_many_id3_frames(count: usize) -> Vec<u8> {
+    let mut frames = Vec::with_capacity(64 + count * 12);
+    frames.extend_from_slice(&make_id3v23_text_frame(b"TIT2", 3, "Before frame cap"));
+    for _ in 0..count {
+        frames.extend_from_slice(b"TXXX");
+        frames.extend_from_slice(&2u32.to_be_bytes());
+        frames.extend_from_slice(&[0, 0, 3, 0]);
+    }
+    frames.extend_from_slice(&make_id3v23_text_frame(b"TPE1", 3, "After frame cap"));
+    let mut mp3 = wrap_id3v23(&frames, false, false);
+    mp3.extend_from_slice(&silent_mp3_frame());
+    mp3
+}
+
+/// Builds a WAV file with `count` empty `JUNK` chunks (used to exceed `MAX_CONTAINER_CHUNKS`).
+pub fn build_wav_many_chunks(count: usize) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + 24 + count * 8);
+    body.extend_from_slice(b"WAVE");
+    body.extend_from_slice(b"fmt ");
+    body.extend_from_slice(&16u32.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&8000u32.to_le_bytes());
+    body.extend_from_slice(&16_000u32.to_le_bytes());
+    body.extend_from_slice(&2u16.to_le_bytes());
+    body.extend_from_slice(&16u16.to_le_bytes());
+    for _ in 0..count {
+        body.extend_from_slice(b"JUNK");
+        body.extend_from_slice(&0u32.to_le_bytes());
+    }
+    let mut wav = Vec::with_capacity(8 + body.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&body);
+    wav
+}
+
+/// Builds an AIFF file with `count` empty `JUNK` chunks (used to exceed `MAX_CONTAINER_CHUNKS`).
+pub fn build_aiff_many_chunks(count: usize) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + 26 + count * 8);
+    body.extend_from_slice(b"AIFF");
+    body.extend_from_slice(b"COMM");
+    body.extend_from_slice(&18u32.to_be_bytes());
+    body.extend_from_slice(&1u16.to_be_bytes());
+    body.extend_from_slice(&44_100u32.to_be_bytes());
+    body.extend_from_slice(&16u16.to_be_bytes());
+    body.extend_from_slice(&[0x40, 0x0E, 0xAC, 0x44, 0, 0, 0, 0, 0, 0]);
+    for _ in 0..count {
+        body.extend_from_slice(b"JUNK");
+        body.extend_from_slice(&0u32.to_be_bytes());
+    }
+    let mut aiff = Vec::with_capacity(8 + body.len());
+    aiff.extend_from_slice(b"FORM");
+    aiff.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    aiff.extend_from_slice(&body);
+    aiff
+}
+
+/// Builds a FLAC file with `count` zero-length `PADDING` blocks (exceeds `MAX_CONTAINER_CHUNKS`).
+pub fn build_flac_many_blocks(count: usize) -> Vec<u8> {
+    let mut flac = Vec::with_capacity(4 + 38 + count * 4);
+    flac.extend_from_slice(b"fLaC");
+    let mut streaminfo = [0u8; 34];
+    streaminfo[10] = 0x0A;
+    streaminfo[11] = 0xC4;
+    streaminfo[12] = 0x42;
+    streaminfo[13] = 0xF0;
+    streaminfo[14..18].copy_from_slice(&44_100u32.to_be_bytes());
+    flac.extend_from_slice(&[0x00, 0, 0, 34]);
+    flac.extend_from_slice(&streaminfo);
+    for i in 0..count {
+        let header = if i + 1 == count { 0x81 } else { 0x01 };
+        flac.extend_from_slice(&[header, 0, 0, 0]);
+    }
+    flac
+}
+
+/// Builds a FLAC file whose `VORBIS_COMMENT` block contains `count` tiny entries (exceeds
+/// `MAX_VORBIS_COMMENTS`).
+pub fn build_flac_many_vorbis_comments(count: usize) -> Vec<u8> {
+    let mut vc = Vec::with_capacity(32 + count * 7);
+    let vendor = b"legion-test";
+    vc.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    vc.extend_from_slice(vendor);
+    vc.extend_from_slice(&((count + 1) as u32).to_le_bytes());
+    let title = b"TITLE=Many comments";
+    vc.extend_from_slice(&(title.len() as u32).to_le_bytes());
+    vc.extend_from_slice(title);
+    for _ in 0..count {
+        vc.extend_from_slice(&3u32.to_le_bytes());
+        vc.extend_from_slice(b"X=1");
+    }
+
+    let mut flac = Vec::with_capacity(4 + 38 + 4 + vc.len());
+    flac.extend_from_slice(b"fLaC");
+    let mut streaminfo = [0u8; 34];
+    streaminfo[10] = 0x0A;
+    streaminfo[11] = 0xC4;
+    streaminfo[12] = 0x42;
+    streaminfo[13] = 0xF0;
+    streaminfo[14..18].copy_from_slice(&44_100u32.to_be_bytes());
+    flac.extend_from_slice(&[0x00, 0, 0, 34]);
+    flac.extend_from_slice(&streaminfo);
+    let len = vc.len() as u32;
+    flac.extend_from_slice(&[
+        0x84,
+        ((len >> 16) & 0xFF) as u8,
+        ((len >> 8) & 0xFF) as u8,
+        (len & 0xFF) as u8,
+    ]);
+    flac.extend_from_slice(&vc);
+    flac
+}
+
+/// Builds an Ogg file with `count` non-Vorbis/Opus BOS pages (exceeds `MAX_OGG_SCAN_PAGES`).
+pub fn build_ogg_many_scan_pages(count: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(count * 36);
+    for i in 0..count {
+        let mut seq = 0u32;
+        push_ogg_packet_pages(&mut out, 100 + i as u32, &mut seq, 0x02, 0, b"NOTAUDIO");
+    }
+    out
+}
+
+/// Builds an Ogg Opus file whose comment packet spans `count` 255-byte continuation pages
+/// (exceeds `MAX_OGG_COMMENT_PAGES` while staying well under the 16 MiB tag budget).
+pub fn build_ogg_many_comment_pages(count: usize) -> Vec<u8> {
+    let serial = 0x2468_1357u32;
+    let mut seq = 0u32;
+    let mut out = Vec::with_capacity(128 + count * (28 + 255));
+
+    let mut head = b"OpusHead".to_vec();
+    head.push(1);
+    head.push(2);
+    head.extend_from_slice(&312u16.to_le_bytes());
+    head.extend_from_slice(&48_000u32.to_le_bytes());
+    head.extend_from_slice(&0u16.to_le_bytes());
+    head.push(0);
+    push_ogg_packet_pages(&mut out, serial, &mut seq, 0x02, 0, &head);
+
+    let mut chunk = [b'A'; 255];
+    for page_idx in 0..count {
+        if page_idx == 0 {
+            chunk[..8].copy_from_slice(b"OpusTags");
+        } else if page_idx == 1 {
+            chunk[..8].copy_from_slice(b"AAAAAAAA");
+        }
+        let page_flags = if page_idx == 0 { 0x00 } else { 0x01 };
+        out.extend_from_slice(b"OggS");
+        out.push(0);
+        out.push(page_flags);
+        out.extend_from_slice(&u64::MAX.to_le_bytes());
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(&seq.to_le_bytes());
+        seq += 1;
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.push(1);
+        out.push(255); // continues on next page
+        out.extend_from_slice(&chunk);
+    }
+    out
+}
+
+/// Builds an MP4 file with `depth` nested `udta` boxes inside `moov` (exceeds `MAX_MP4_DEPTH`).
+pub fn build_mp4_deep_udta(depth: usize) -> Vec<u8> {
+    let ftyp = mp4_box(b"ftyp", b"M4A \x00\x00\x00\x00M4A isom");
+    let ilst = mp4_box(b"ilst", &mp4_ilst_text(b"\xA9nam", "Deep title"));
+    let mut meta_body = vec![0u8; 4];
+    meta_body.extend_from_slice(&ilst);
+    let mut inner = mp4_box(b"meta", &meta_body);
+    for _ in 0..depth {
+        inner = mp4_box(b"udta", &inner);
+    }
+    let moov = mp4_box(b"moov", &inner);
+    let mut out = Vec::with_capacity(ftyp.len() + moov.len());
+    out.extend_from_slice(&ftyp);
+    out.extend_from_slice(&moov);
+    out
+}
+
+/// Builds an MP4 file with `count` 8-byte `free` boxes (exceeds `MAX_CONTAINER_CHUNKS`).
+pub fn build_mp4_many_boxes(count: usize) -> Vec<u8> {
+    let ftyp = mp4_box(b"ftyp", b"M4A \x00\x00\x00\x00M4A isom");
+    let mut out = Vec::with_capacity(ftyp.len() + count * 8);
+    out.extend_from_slice(&ftyp);
+    for _ in 0..count {
+        out.extend_from_slice(&8u32.to_be_bytes());
+        out.extend_from_slice(b"free");
+    }
+    out
+}
+
+/// Builds an Ogg Opus file with a ~15.9 MiB line-wrapped base64 `METADATA_BLOCK_PICTURE` strictly
+/// within the 16 MiB tag budget.
+pub fn build_opus_15_9mib_wrapped_base64_picture() -> Vec<u8> {
+    let mut padded_png = encode_solid_png(128, 128, [30, 170, 80]);
+    padded_png.resize(11_600_000, 0x00);
+    let flac_pic = build_flac_picture_payload(3, "image/png", "cover", &padded_png);
+    let raw_b64 = BASE64.encode(&flac_pic);
+    let mut wrapped_b64 = Vec::with_capacity(raw_b64.len() + raw_b64.len() / 76 * 2 + 4);
+    for chunk in raw_b64.as_bytes().chunks(76) {
+        wrapped_b64.extend_from_slice(chunk);
+        wrapped_b64.extend_from_slice(b"\r\n");
+    }
+    assert!(
+        wrapped_b64.len() > 15_800_000 && wrapped_b64.len() < 16 * 1024 * 1024 - 1024,
+        "expected ~15.9 MiB line-wrapped base64, got {} bytes",
+        wrapped_b64.len()
+    );
+    build_ogg_opus_raw_comments(
+        &[
+            (b"TITLE", b"Wrapped cover song"),
+            (b"ARTIST", b"Someone"),
+            (b"METADATA_BLOCK_PICTURE", &wrapped_b64),
+        ],
+        5,
+    )
+}
+
+/// Builds an ID3v2.4 MP3 carrying raw `raw_title` bytes in a UTF-8 `TIT2` frame plus `"Someone"`
+/// in `TPE1`.
+pub fn build_mp3_id3v24_raw_title(raw_title: &[u8]) -> Vec<u8> {
+    let mut frames = Vec::with_capacity(raw_title.len() + 64);
+    frames.extend_from_slice(b"TIT2");
+    frames.extend_from_slice(&encode_syncsafe((1 + raw_title.len()) as u32));
+    frames.extend_from_slice(&[0x00, 0x00, 0x03]); // UTF-8
+    frames.extend_from_slice(raw_title);
+    frames.extend_from_slice(b"TPE1");
+    frames.extend_from_slice(&encode_syncsafe(8));
+    frames.extend_from_slice(&[0x00, 0x00, 0x03]);
+    frames.extend_from_slice(b"Someone");
+
+    let mut mp3 = Vec::with_capacity(10 + frames.len() + 417);
+    mp3.extend_from_slice(b"ID3");
+    mp3.extend_from_slice(&[4, 0, 0]);
+    mp3.extend_from_slice(&encode_syncsafe(frames.len() as u32));
+    mp3.extend_from_slice(&frames);
+    mp3.extend_from_slice(&silent_mp3_xing_frame(191));
+    mp3
+}
+
+/// Builds an M4A carrying raw `raw_title` bytes in a UTF-8 `©nam` atom plus `"Someone"` in `©ART`.
+pub fn build_m4a_raw_title(raw_title: &[u8]) -> Vec<u8> {
+    let ftyp = mp4_box(b"ftyp", b"M4A \x00\x00\x00\x00M4A isom");
+    let mut nam_data = Vec::with_capacity(8 + raw_title.len());
+    nam_data.extend_from_slice(&1u32.to_be_bytes());
+    nam_data.extend_from_slice(&0u32.to_be_bytes());
+    nam_data.extend_from_slice(raw_title);
+    let nam = mp4_box(b"\xA9nam", &mp4_box(b"data", &nam_data));
+    let art = mp4_ilst_text(b"\xA9ART", "Someone");
+    let mut ilst_body = Vec::with_capacity(nam.len() + art.len());
+    ilst_body.extend_from_slice(&nam);
+    ilst_body.extend_from_slice(&art);
+    let ilst = mp4_box(b"ilst", &ilst_body);
+    let mut meta_body = vec![0u8; 4];
+    meta_body.extend_from_slice(&ilst);
+    let moov = mp4_box(b"moov", &mp4_box(b"udta", &mp4_box(b"meta", &meta_body)));
+    let mut out = Vec::with_capacity(ftyp.len() + moov.len());
+    out.extend_from_slice(&ftyp);
+    out.extend_from_slice(&moov);
+    out
+}
+
+/// Builds a global-unsynced ID3v2.3 MP3 whose tag body has exact size `tag_bytes`.
+pub fn build_mp3_global_unsync_sized(tag_bytes: usize) -> Vec<u8> {
+    let title = make_id3v23_text_frame(b"TIT2", 3, "Sized unsync song");
+    assert!(tag_bytes > title.len() + 26);
+    let priv_raw_len = tag_bytes - title.len() - 10;
+    // Inject two `0xFF 0x00` unsync pairs so `deunsync_in_place` compacts 2 bytes; declare the
+    // post-deunsync payload length in the PRIV frame header so the de-unsynced tag parses cleanly.
+    let priv_deunsynced_len = priv_raw_len - 2;
+    let mut body = Vec::with_capacity(tag_bytes);
+    body.extend_from_slice(&title);
+    body.extend_from_slice(b"PRIV");
+    body.extend_from_slice(&(priv_deunsynced_len as u32).to_be_bytes());
+    body.extend_from_slice(&[0, 0]);
+    body.resize(tag_bytes, b'Z');
+    let base = title.len() + 10;
+    body[base..base + 6].copy_from_slice(&[0xFF, 0x00, 0xE0, 0xFF, 0x00, 0x00]);
+
+    let mut mp3 = Vec::with_capacity(10 + body.len() + 417);
+    mp3.extend_from_slice(b"ID3");
+    mp3.extend_from_slice(&[3, 0, 0x80]); // global unsync flag
+    mp3.extend_from_slice(&encode_syncsafe(body.len() as u32));
+    mp3.extend_from_slice(&body);
+    mp3.extend_from_slice(&silent_mp3_frame());
+    mp3
+}
+
+/// Builds a FLAC file with `pic_count` `PICTURE` blocks each carrying `each_bytes` of PNG-prefixed
+/// payload (used to reach just below and just above the 16 MiB cumulative tag budget).
+pub fn build_flac_cumulative_pictures(pic_count: usize, each_bytes: usize) -> Vec<u8> {
+    let mut img = encode_solid_png(32, 32, [40, 120, 210]);
+    img.resize(each_bytes.max(img.len()), 0);
+    let pic_payload = build_flac_picture_payload(3, "image/png", "cover", &img);
+    assert!(pic_payload.len() <= 0x00FF_FFFF);
+
+    let mut flac = Vec::with_capacity(4 + 38 + pic_count * (4 + pic_payload.len()));
+    flac.extend_from_slice(b"fLaC");
+    let mut streaminfo = [0u8; 34];
+    streaminfo[10] = 0x0A;
+    streaminfo[11] = 0xC4;
+    streaminfo[12] = 0x42;
+    streaminfo[13] = 0xF0;
+    streaminfo[14..18].copy_from_slice(&44_100u32.to_be_bytes());
+    flac.extend_from_slice(&[0x00, 0, 0, 34]);
+    flac.extend_from_slice(&streaminfo);
+
+    let len = pic_payload.len() as u32;
+    for i in 0..pic_count {
+        let hdr = if i + 1 == pic_count { 0x86 } else { 0x06 };
+        flac.extend_from_slice(&[
+            hdr,
+            ((len >> 16) & 0xFF) as u8,
+            ((len >> 8) & 0xFF) as u8,
+            (len & 0xFF) as u8,
+        ]);
+        flac.extend_from_slice(&pic_payload);
+    }
+    flac
+}
+
+/// Builds an MP4 file with a `covr` atom carrying `cover_bytes` of PNG-prefixed data.
+pub fn build_mp4_sized_covr(cover_bytes: usize) -> Vec<u8> {
+    let mut img = encode_solid_png(32, 32, [210, 80, 40]);
+    img.resize(cover_bytes.max(img.len()), 0);
+    build_mp4(true, Some((14, &img)), 4, false, false)
+}
+
+/// Verifies that a single `fs.tags` batch result item is either a valid cleaned `ok` object or a
+/// clean structured `error` object.
+pub fn assert_clean_tags_item(item: &serde_json::Value) {
+    let has_ok = item.get("ok").is_some();
+    let has_err = item.get("error").is_some();
+    assert!(
+        has_ok ^ has_err,
+        "result item must have exactly one of ok/error: {item}"
+    );
+    if let Some(ok) = item.get("ok") {
+        for field in ["title", "artist", "album", "album_artist"] {
+            if let Some(val) = ok.get(field) {
+                let text = val
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{field} must be string: {ok}"));
+                assert!(!text.is_empty(), "{field} must not be empty: {ok}");
+                assert!(
+                    text.chars().count() <= 512,
+                    "{field} exceeded 512 chars ({}): {ok}",
+                    text.chars().count()
+                );
+                let first = text.chars().next().unwrap();
+                let last = text.chars().next_back().unwrap();
+                assert!(
+                    !first.is_whitespace() && first != '\u{200C}' && first != '\u{200D}',
+                    "{field} has leading edge char {first:?}: {ok}"
+                );
+                assert!(
+                    !last.is_whitespace() && last != '\u{200C}' && last != '\u{200D}',
+                    "{field} has trailing edge char {last:?}: {ok}"
+                );
+                for ch in text.chars() {
+                    let cp = ch as u32;
+                    let stripped = ch.is_control()
+                        || matches!(
+                            ch,
+                            '\u{00AD}'
+                                | '\u{061C}'
+                                | '\u{200B}'
+                                | '\u{200E}'..='\u{200F}'
+                                | '\u{2028}'..='\u{202E}'
+                                | '\u{2066}'..='\u{2069}'
+                                | '\u{FEFF}'
+                                | '\u{FDD0}'..='\u{FDEF}'
+                                | '\u{E0000}'..='\u{E007F}'
+                        )
+                        || (cp & 0xFFFF) >= 0xFFFE;
+                    assert!(
+                        !stripped,
+                        "{field} leaked disallowed character U+{cp:04X}: {ok}"
+                    );
+                }
+            }
+        }
+        if let Some(dur) = ok.get("duration_s") {
+            let d = dur.as_f64().unwrap();
+            assert!(d.is_finite() && d > 0.0, "invalid duration_s: {ok}");
+        }
+        if let Some(year) = ok.get("year") {
+            let y = year.as_u64().unwrap();
+            assert!((1..=9999).contains(&y), "invalid year: {ok}");
+        }
+    } else if let Some(err) = item.get("error") {
+        let code = err["code"].as_str().unwrap_or("");
+        assert_eq!(code, "failed", "unexpected fs.tags error code: {item}");
+        assert!(
+            !err["message"].as_str().unwrap_or("").is_empty(),
+            "empty error message: {item}"
+        );
+    }
+}

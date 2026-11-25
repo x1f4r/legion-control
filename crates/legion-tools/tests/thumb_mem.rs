@@ -923,7 +923,7 @@ async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_boun
     let _guard = MEASURE_LOCK.lock().await;
 
     let cover = af::encode_solid_jpeg(96, 96, [200, 50, 50]);
-    let seeds: Vec<(&str, Vec<u8>)> = vec![
+    let small_seeds: Vec<(&str, Vec<u8>)> = vec![
         (
             "mp3",
             af::build_mp3_id3v23(&[("image/jpeg", 3, &cover)], true, true),
@@ -955,6 +955,27 @@ async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_boun
         ),
     ];
 
+    // Iteration-cap hostile seeds covering every loop bound in audio_tags.rs.
+    let cap_seeds: Vec<(&str, &str, Vec<u8>)> = vec![
+        ("mp3_frames", "mp3", af::build_mp3_many_id3_frames(4160)),
+        ("wav_chunks", "wav", af::build_wav_many_chunks(4160)),
+        ("aiff_chunks", "aiff", af::build_aiff_many_chunks(4160)),
+        ("flac_blocks", "flac", af::build_flac_many_blocks(4160)),
+        (
+            "flac_vorbis",
+            "flac",
+            af::build_flac_many_vorbis_comments(65_664),
+        ),
+        ("ogg_scan", "ogg", af::build_ogg_many_scan_pages(80)),
+        (
+            "opus_comment_pages",
+            "opus",
+            af::build_ogg_many_comment_pages(2080),
+        ),
+        ("mp4_depth", "m4a", af::build_mp4_deep_udta(14)),
+        ("mp4_boxes", "m4a", af::build_mp4_many_boxes(4160)),
+    ];
+
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -972,15 +993,17 @@ async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_boun
     };
 
     let t0 = Instant::now();
+    let live_start = LIVE_BYTES.load(Ordering::SeqCst);
     reset_peak();
 
+    // 1. 2,200 mutated & truncated fixtures across all 11 formats (200 per seed) in 32-path
+    //    batches through `fs.tags`.
     let mut cases = 0usize;
-    for (seed_idx, (ext, base)) in seeds.iter().enumerate() {
-        let mut batch = Vec::new();
-        // Deterministic truncations plus length/bit mutations.
-        for step in 0..16usize {
+    let mut pending_batch: Vec<String> = Vec::with_capacity(32);
+    for (seed_idx, (ext, base)) in small_seeds.iter().enumerate() {
+        for step in 0..200usize {
             let mut mutated = base.clone();
-            match step % 4 {
+            match step % 5 {
                 0 => {
                     let cut = (next_u64() as usize) % (mutated.len().max(1));
                     mutated.truncate(cut);
@@ -1002,7 +1025,7 @@ async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_boun
                         }
                     }
                 }
-                _ => {
+                3 => {
                     let cut = (next_u64() as usize) % mutated.len().clamp(1, 128);
                     mutated.truncate(cut);
                     if mutated.len() >= 8 {
@@ -1010,33 +1033,277 @@ async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_boun
                         mutated[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
                     }
                 }
+                _ => {
+                    // Inject control/BiDi/invisible/tag bytes into payloads.
+                    if mutated.len() > 24 {
+                        let off = 12 + ((next_u64() as usize) % (mutated.len() - 24));
+                        let end = (off + 8).min(mutated.len());
+                        mutated[off..end].copy_from_slice(
+                            &[0xE2, 0x80, 0xAE, 0x00, 0xF3, 0xA0, 0x81, 0x81][..end - off],
+                        );
+                    }
+                }
             }
             let p = home.join(format!("fuzz_{seed_idx}_{step}.{ext}"));
             std::fs::write(&p, &mutated).unwrap();
-            batch.push(p.to_string_lossy().into_owned());
+            pending_batch.push(p.to_string_lossy().into_owned());
             cases += 1;
+
+            if pending_batch.len() == 32 {
+                let res = node
+                    .call(Call::new(
+                        Door::Cli,
+                        "fs.tags",
+                        json!({"paths": pending_batch}),
+                    ))
+                    .await
+                    .unwrap();
+                let arr = res["results"].as_array().unwrap();
+                assert_eq!(arr.len(), 32);
+                for item in arr {
+                    af::assert_clean_tags_item(item);
+                }
+                pending_batch.clear();
+            }
         }
+    }
+    if !pending_batch.is_empty() {
         let res = node
-            .call(Call::new(Door::Cli, "fs.tags", json!({"paths": batch})))
+            .call(Call::new(
+                Door::Cli,
+                "fs.tags",
+                json!({"paths": pending_batch}),
+            ))
             .await
             .unwrap();
-        assert_eq!(res["results"].as_array().unwrap().len(), batch.len());
+        let arr = res["results"].as_array().unwrap();
+        assert_eq!(arr.len(), pending_batch.len());
+        for item in arr {
+            af::assert_clean_tags_item(item);
+        }
+        pending_batch.clear();
+    }
+
+    // 2. Every iteration-cap hostile fixture intact + 24 mutated/truncated variants each (225 cases).
+    for (name, ext, base) in &cap_seeds {
+        let p = home.join(format!("cap_{name}_intact.{ext}"));
+        std::fs::write(&p, base).unwrap();
+        pending_batch.push(p.to_string_lossy().into_owned());
+        cases += 1;
+        for step in 0..24usize {
+            let mut mutated = base.clone();
+            if step.is_multiple_of(3) {
+                let cut = (next_u64() as usize) % mutated.len().max(1);
+                mutated.truncate(cut);
+            } else if !mutated.is_empty() {
+                let window = mutated.len().clamp(1, 256);
+                for _ in 0..4 {
+                    let off = (next_u64() as usize) % window;
+                    mutated[off] ^= (next_u64() & 0xFF) as u8;
+                }
+            }
+            let pm = home.join(format!("cap_{name}_{step}.{ext}"));
+            std::fs::write(&pm, &mutated).unwrap();
+            pending_batch.push(pm.to_string_lossy().into_owned());
+            cases += 1;
+            if pending_batch.len() == 32 {
+                let res = node
+                    .call(Call::new(
+                        Door::Cli,
+                        "fs.tags",
+                        json!({"paths": pending_batch}),
+                    ))
+                    .await
+                    .unwrap();
+                for item in res["results"].as_array().unwrap() {
+                    af::assert_clean_tags_item(item);
+                }
+                pending_batch.clear();
+            }
+        }
+    }
+    if !pending_batch.is_empty() {
+        let res = node
+            .call(Call::new(
+                Door::Cli,
+                "fs.tags",
+                json!({"paths": pending_batch}),
+            ))
+            .await
+            .unwrap();
+        for item in res["results"].as_array().unwrap() {
+            af::assert_clean_tags_item(item);
+        }
+        pending_batch.clear();
+    }
+    let small_and_cap_peak = peak_total_bytes().saturating_sub(live_start);
+
+    // 3. Dedicated 16 MiB budget cases measured individually under CountingAlloc (ensuring every
+    //    single worst-case 15.9 MiB & >16 MiB file stays strictly under the 48 MiB worker cap).
+    let measure_single_tags = |label: &'static str, path: std::path::PathBuf| {
+        let node_ref = &node;
+        async move {
+            let live_before = LIVE_BYTES.load(Ordering::SeqCst);
+            reset_peak();
+            let res = node_ref
+                .call(Call::new(
+                    Door::Cli,
+                    "fs.tags",
+                    json!({"paths": [path.to_string_lossy()]}),
+                ))
+                .await
+                .unwrap();
+            let peak = peak_total_bytes().saturating_sub(live_before);
+            let item = res["results"][0].clone();
+            af::assert_clean_tags_item(&item);
+            eprintln!(
+                "AUDIO_TAGS_MEM {label:<38} | in_proc_peak_heap={:.2} MiB | ok={}",
+                peak as f64 / (1024.0 * 1024.0),
+                item.get("ok").is_some(),
+            );
+            assert!(
+                peak < 44 * 1024 * 1024,
+                "{label} peaked at {:.2} MiB (must stay < 44 MiB / under 48 MiB worker cap)",
+                peak as f64 / (1024.0 * 1024.0)
+            );
+            (item, peak)
+        }
+    };
+
+    // 3a. 15.9 MiB line-wrapped base64 picture in Opus (strictly in budget).
+    let opus_b64_path = home.join("budget_15_9mib_wrapped_b64.opus");
+    {
+        let data = af::build_opus_15_9mib_wrapped_base64_picture();
+        std::fs::write(&opus_b64_path, &data).unwrap();
+    }
+    let (item_b64, _) =
+        measure_single_tags("15.9 MiB wrapped base64 pic (Opus)", opus_b64_path).await;
+    assert_eq!(item_b64["ok"]["cover"], json!(true));
+    cases += 1;
+
+    // 3b. 15.9 MiB invalid UTF-8 (0xFF) in Opus, MP3 ID3v2.4, and M4A (strictly in budget).
+    let invalid_utf8 = vec![0xFFu8; 15_900_000];
+    let opus_inv_path = home.join("budget_15_9mib_invalid_utf8.opus");
+    std::fs::write(
+        &opus_inv_path,
+        af::build_ogg_opus_raw_comments(&[(b"TITLE", &invalid_utf8), (b"ARTIST", b"Someone")], 6),
+    )
+    .unwrap();
+    let mp3_inv_path = home.join("budget_15_9mib_invalid_utf8.mp3");
+    std::fs::write(&mp3_inv_path, af::build_mp3_id3v24_raw_title(&invalid_utf8)).unwrap();
+    let m4a_inv_path = home.join("budget_15_9mib_invalid_utf8.m4a");
+    std::fs::write(&m4a_inv_path, af::build_m4a_raw_title(&invalid_utf8)).unwrap();
+    drop(invalid_utf8);
+
+    for (label, path) in [
+        ("15.9 MiB invalid UTF-8 (Opus)", opus_inv_path),
+        ("15.9 MiB invalid UTF-8 (MP3 v2.4)", mp3_inv_path),
+        ("15.9 MiB invalid UTF-8 (M4A)", m4a_inv_path),
+    ] {
+        let (item, _) = measure_single_tags(label, path).await;
+        assert_eq!(
+            item["ok"]["title"].as_str().unwrap().chars().count(),
+            512,
+            "{label}: {item}"
+        );
+        cases += 1;
+    }
+
+    // 3c. Near-16 MiB global-unsynced ID3v2.3 MP3 (in budget) & over-16 MiB seeds across formats.
+    let mp3_unsync_near = home.join("budget_15_8mib_unsync.mp3");
+    {
+        let data = af::build_mp3_global_unsync_sized(15_800_000);
+        std::fs::write(&mp3_unsync_near, &data).unwrap();
+    }
+    let (item_unsync, _) = measure_single_tags("15.8 MiB global-unsync MP3", mp3_unsync_near).await;
+    assert_eq!(item_unsync["ok"]["title"], json!("Sized unsync song"));
+    cases += 1;
+
+    let over_cases: Vec<(&'static str, std::path::PathBuf)> = vec![
+        ("16.5 MiB global-unsync MP3 (over)", {
+            let p = home.join("budget_16_5mib_over.mp3");
+            let data = af::build_mp3_global_unsync_sized(16 * 1024 * 1024 + 512 * 1024);
+            std::fs::write(&p, &data).unwrap();
+            p
+        }),
+        ("16.4 MiB cumulative FLAC pics (over)", {
+            let p = home.join("budget_16_4mib_over.flac");
+            let data = af::build_flac_cumulative_pictures(4, 4_200_000);
+            std::fs::write(&p, &data).unwrap();
+            p
+        }),
+        ("16.5 MiB MP4 covr (over)", {
+            let p = home.join("budget_16_5mib_over.m4a");
+            let data = af::build_mp4_sized_covr(16 * 1024 * 1024 + 512 * 1024);
+            std::fs::write(&p, &data).unwrap();
+            p
+        }),
+    ];
+    for (label, path) in over_cases {
+        let (item, _) = measure_single_tags(label, path).await;
+        assert_eq!(
+            item["error"]["details"]["reason"],
+            json!("tag_too_large"),
+            "{label}: {item}"
+        );
+        cases += 1;
+    }
+
+    // 3d. Mutate headers of a 16 MiB MP3 in-place 16 times and run through `fs.tags`.
+    {
+        let mut big_mp3 = af::build_mp3_global_unsync_sized(15_800_000);
+        let orig_hdr: [u8; 64] = big_mp3[..64].try_into().unwrap();
+        for step in 0..16usize {
+            big_mp3[..64].copy_from_slice(&orig_hdr);
+            for _ in 0..4 {
+                let off = (next_u64() as usize) % 64;
+                big_mp3[off] = if step.is_multiple_of(2) {
+                    0xFF
+                } else {
+                    (next_u64() & 0xFF) as u8
+                };
+            }
+            let pm = home.join(format!("budget_mut_{step}.mp3"));
+            std::fs::write(&pm, &big_mp3).unwrap();
+            let live_before = LIVE_BYTES.load(Ordering::SeqCst);
+            reset_peak();
+            let res = node
+                .call(Call::new(
+                    Door::Cli,
+                    "fs.tags",
+                    json!({"paths": [pm.to_string_lossy()]}),
+                ))
+                .await
+                .unwrap();
+            let peak = peak_total_bytes().saturating_sub(live_before);
+            af::assert_clean_tags_item(&res["results"][0]);
+            assert!(
+                peak < 44 * 1024 * 1024,
+                "mutated 16 MiB MP3 #{step} peaked at {:.2} MiB",
+                peak as f64 / (1024.0 * 1024.0)
+            );
+            let _ = std::fs::remove_file(&pm);
+            cases += 1;
+        }
     }
 
     let elapsed = t0.elapsed();
-    let peak_delta = peak_delta_bytes();
     eprintln!(
-        "audio property fuzz: {cases} mutated fixtures in {:.1} ms, peak heap delta = {:.2} MiB",
-        elapsed.as_secs_f64() * 1000.0,
-        peak_delta as f64 / (1024.0 * 1024.0)
+        "audio property fuzz: {cases} fixtures (small+cap+16MiB) in {:.2} s, small+cap peak heap = {:.2} MiB",
+        elapsed.as_secs_f64(),
+        small_and_cap_peak as f64 / (1024.0 * 1024.0)
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(10),
+        cases >= 2_400,
+        "expected >= 2,400 property fixtures, ran {cases}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(25),
         "mutated audio property test took too long: {elapsed:?}"
     );
     assert!(
-        peak_delta < 32 * 1024 * 1024,
-        "mutated audio property test exceeded 32 MiB heap delta: {} bytes",
-        peak_delta
+        small_and_cap_peak < 64 * 1024 * 1024,
+        "small+cap property batch exceeded 64 MiB heap delta: {} bytes",
+        small_and_cap_peak
     );
 }

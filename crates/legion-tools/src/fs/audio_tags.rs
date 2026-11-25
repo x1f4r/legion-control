@@ -3441,12 +3441,75 @@ mod tests {
         assert!(bad_pad.read_exact(&mut tmp).is_err());
     }
 
+    fn assert_valid_audio_outcome(res: &Result<ExtractedAudio, ErrorBody>, mode: CoverExtractMode) {
+        match res {
+            Ok(extracted) => {
+                for text in [
+                    &extracted.tags.title,
+                    &extracted.tags.artist,
+                    &extracted.tags.album,
+                    &extracted.tags.album_artist,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    assert!(!text.is_empty(), "parsed text field must not be empty");
+                    assert!(
+                        text.chars().count() <= MAX_TAG_FIELD_CHARS,
+                        "parsed text exceeded {MAX_TAG_FIELD_CHARS} chars"
+                    );
+                    let first = text.chars().next().unwrap();
+                    let last = text.chars().next_back().unwrap();
+                    assert!(!is_edge_trimmed(first), "leading edge char {first:?}");
+                    assert!(!is_edge_trimmed(last), "trailing edge char {last:?}");
+                    for ch in text.chars() {
+                        assert!(
+                            !is_stripped_tag_char(ch) && ch != '\u{2028}' && ch != '\u{2029}',
+                            "disallowed char U+{:04X} survived cleaning",
+                            ch as u32
+                        );
+                    }
+                }
+                if let Some(n) = extracted.tags.track {
+                    assert!(n > 0);
+                }
+                if let Some(n) = extracted.tags.disc {
+                    assert!(n > 0);
+                }
+                if let Some(y) = extracted.tags.year {
+                    assert!((1..=9999).contains(&y));
+                }
+                if let Some(d) = extracted.tags.duration_s {
+                    assert!(d.is_finite() && d > 0.0);
+                }
+                match mode {
+                    CoverExtractMode::CheckOnly => {
+                        assert!(extracted.cover.is_none());
+                    }
+                    CoverExtractMode::ExtractBytes => {
+                        if let Some(ref bytes) = extracted.cover {
+                            assert!(extracted.tags.has_embedded_cover);
+                            assert!(bytes.len() <= MAX_AUDIO_TAG_BYTES);
+                            assert!(is_supported_cover_image(bytes));
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::Failed, "unexpected error: {err:?}");
+                assert!(!err.message.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn property_truncated_and_mutated_inputs_never_panic_or_exceed_bounds() {
-        // Build minimal valid seeds for every supported format and feed every truncation plus
-        // deterministic mutations (including oversized declared lengths) through `parse_audio`.
+        // Build seeds across every supported format, every iteration cap, and the 16 MiB tag
+        // budget boundary, then run > 3,500 truncations and mutations asserting valid Ok or clean
+        // structured Err within a strict time bound.
+        let t0 = std::time::Instant::now();
         let tiny_png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
-        let seeds: Vec<(AudioFormat, Vec<u8>)> = vec![
+        let small_seeds: Vec<(AudioFormat, Vec<u8>)> = vec![
             // MP3 ID3v2.4 + frame + ID3v1
             (AudioFormat::Mp3, {
                 let mut f =
@@ -3532,6 +3595,161 @@ mod tests {
             }),
         ];
 
+        // Iteration-cap hostile seeds covering every loop bound in this module.
+        let cap_seeds: Vec<(AudioFormat, Vec<u8>)> = vec![
+            // > MAX_ID3_FRAMES (4096)
+            (AudioFormat::Mp3, {
+                let count = MAX_ID3_FRAMES + 64;
+                let body_len = (count * 12) as u32;
+                let mut f = Vec::with_capacity(10 + body_len as usize);
+                f.extend_from_slice(b"ID3\x03\x00\x00");
+                f.extend_from_slice(&[
+                    ((body_len >> 21) & 0x7F) as u8,
+                    ((body_len >> 14) & 0x7F) as u8,
+                    ((body_len >> 7) & 0x7F) as u8,
+                    (body_len & 0x7F) as u8,
+                ]);
+                for _ in 0..count {
+                    f.extend_from_slice(b"TXXX\x00\x00\x00\x02\x00\x00\x03\x00");
+                }
+                f
+            }),
+            // > MAX_CONTAINER_CHUNKS (4096) in WAV
+            (AudioFormat::Wav, {
+                let count = MAX_CONTAINER_CHUNKS + 64;
+                let body_len = (4 + count * 8) as u32;
+                let mut f = Vec::with_capacity(8 + body_len as usize);
+                f.extend_from_slice(b"RIFF");
+                f.extend_from_slice(&body_len.to_le_bytes());
+                f.extend_from_slice(b"WAVE");
+                for _ in 0..count {
+                    f.extend_from_slice(b"JUNK\x00\x00\x00\x00");
+                }
+                f
+            }),
+            // > MAX_CONTAINER_CHUNKS (4096) in AIFF
+            (AudioFormat::Aiff, {
+                let count = MAX_CONTAINER_CHUNKS + 64;
+                let body_len = (4 + count * 8) as u32;
+                let mut f = Vec::with_capacity(8 + body_len as usize);
+                f.extend_from_slice(b"FORM");
+                f.extend_from_slice(&body_len.to_be_bytes());
+                f.extend_from_slice(b"AIFF");
+                for _ in 0..count {
+                    f.extend_from_slice(b"JUNK\x00\x00\x00\x00");
+                }
+                f
+            }),
+            // > MAX_CONTAINER_CHUNKS (4096) in FLAC
+            (AudioFormat::Flac, {
+                let count = MAX_CONTAINER_CHUNKS + 64;
+                let mut f = Vec::with_capacity(4 + 38 + count * 4);
+                f.extend_from_slice(b"fLaC\x00\x00\x00\x22");
+                f.extend_from_slice(&[0u8; 34]);
+                for i in 0..count {
+                    let hdr = if i + 1 == count { 0x81 } else { 0x01 };
+                    f.extend_from_slice(&[hdr, 0, 0, 0]);
+                }
+                f
+            }),
+            // > MAX_VORBIS_COMMENTS (65536) in FLAC
+            (AudioFormat::Flac, {
+                let count = (MAX_VORBIS_COMMENTS as usize) + 128;
+                let mut vc = Vec::with_capacity(12 + count * 7);
+                vc.extend_from_slice(&4u32.to_le_bytes());
+                vc.extend_from_slice(b"test");
+                vc.extend_from_slice(&(count as u32).to_le_bytes());
+                for _ in 0..count {
+                    vc.extend_from_slice(&3u32.to_le_bytes());
+                    vc.extend_from_slice(b"A=1");
+                }
+                let mut f = Vec::with_capacity(4 + 38 + 4 + vc.len());
+                f.extend_from_slice(b"fLaC\x00\x00\x00\x22");
+                f.extend_from_slice(&[0u8; 34]);
+                let len = vc.len() as u32;
+                f.extend_from_slice(&[
+                    0x84,
+                    ((len >> 16) & 0xFF) as u8,
+                    ((len >> 8) & 0xFF) as u8,
+                    (len & 0xFF) as u8,
+                ]);
+                f.extend_from_slice(&vc);
+                f
+            }),
+            // > MAX_OGG_SCAN_PAGES (64)
+            (AudioFormat::Ogg, {
+                let count = MAX_OGG_SCAN_PAGES + 16;
+                let mut f = Vec::with_capacity(count * 36);
+                for i in 0..count {
+                    f.extend_from_slice(b"OggS\x00\x02");
+                    f.extend_from_slice(&0u64.to_le_bytes());
+                    f.extend_from_slice(&(100 + i as u32).to_le_bytes());
+                    f.extend_from_slice(&0u32.to_le_bytes());
+                    f.extend_from_slice(&0u32.to_le_bytes());
+                    f.extend_from_slice(&[1, 8]);
+                    f.extend_from_slice(b"NOTAUDIO");
+                }
+                f
+            }),
+            // > MAX_OGG_COMMENT_PAGES (2048)
+            (AudioFormat::Ogg, {
+                let count = MAX_OGG_COMMENT_PAGES + 32;
+                let mut f = Vec::with_capacity(64 + count * (28 + 255));
+                let p0 = b"OpusHead\x01\x02\x38\x01\x80\xBB\x00\x00\x00\x00\x00";
+                f.extend_from_slice(b"OggS\x00\x02");
+                f.extend_from_slice(&0u64.to_le_bytes());
+                f.extend_from_slice(&1u32.to_le_bytes());
+                f.extend_from_slice(&0u32.to_le_bytes());
+                f.extend_from_slice(&0u32.to_le_bytes());
+                f.push(1);
+                f.push(p0.len() as u8);
+                f.extend_from_slice(p0);
+                let mut chunk = [b'B'; 255];
+                for page_idx in 0..count {
+                    if page_idx == 0 {
+                        chunk[..8].copy_from_slice(b"OpusTags");
+                    } else if page_idx == 1 {
+                        chunk[..8].copy_from_slice(b"BBBBBBBB");
+                    }
+                    f.extend_from_slice(b"OggS\x00");
+                    f.push(if page_idx == 0 { 0x00 } else { 0x01 });
+                    f.extend_from_slice(&u64::MAX.to_le_bytes());
+                    f.extend_from_slice(&1u32.to_le_bytes());
+                    f.extend_from_slice(&((page_idx + 1) as u32).to_le_bytes());
+                    f.extend_from_slice(&0u32.to_le_bytes());
+                    f.extend_from_slice(&[1, 255]);
+                    f.extend_from_slice(&chunk);
+                }
+                f
+            }),
+            // > MAX_MP4_DEPTH (8) nested udta boxes
+            (AudioFormat::Mp4, {
+                let mut inner = b"\x00\x00\x00\x08free".to_vec();
+                for _ in 0..(MAX_MP4_DEPTH + 6) {
+                    let mut wrapped = Vec::with_capacity(8 + inner.len());
+                    wrapped.extend_from_slice(&((8 + inner.len()) as u32).to_be_bytes());
+                    wrapped.extend_from_slice(b"udta");
+                    wrapped.extend_from_slice(&inner);
+                    inner = wrapped;
+                }
+                let mut f = b"\x00\x00\x00\x14ftypM4A \x00\x00\x00\x00M4A ".to_vec();
+                f.extend_from_slice(&((8 + inner.len()) as u32).to_be_bytes());
+                f.extend_from_slice(b"moov");
+                f.extend_from_slice(&inner);
+                f
+            }),
+            // > MAX_CONTAINER_CHUNKS (4096) in MP4
+            (AudioFormat::Mp4, {
+                let count = MAX_CONTAINER_CHUNKS + 64;
+                let mut f = Vec::with_capacity(20 + count * 8);
+                f.extend_from_slice(b"\x00\x00\x00\x14ftypM4A \x00\x00\x00\x00M4A ");
+                for _ in 0..count {
+                    f.extend_from_slice(b"\x00\x00\x00\x08free");
+                }
+                f
+            }),
+        ];
+
         // Deterministic xorshift64 PRNG so mutations are reproducible across runs.
         let mut rng = 0x9E37_79B9_7F4A_7C15u64;
         let mut next_u64 = || {
@@ -3542,13 +3760,17 @@ mod tests {
         };
 
         let label = Path::new("/fuzz.bin");
-        for (fmt, seed) in &seeds {
+        let mut cases = 0usize;
+
+        for (fmt, seed) in &small_seeds {
             // 1. Every prefix truncation 0..=seed.len()
             for cut in 0..=seed.len() {
                 let slice = &seed[..cut];
                 for mode in [CoverExtractMode::CheckOnly, CoverExtractMode::ExtractBytes] {
                     let mut cur = Cursor::new(slice);
-                    let _ = parse_audio(&mut cur, slice.len() as u64, *fmt, mode, label);
+                    let res = parse_audio(&mut cur, slice.len() as u64, *fmt, mode, label);
+                    assert_valid_audio_outcome(&res, mode);
+                    cases += 1;
                 }
             }
             // 2. 400 random byte/length mutations per format (including 0xFF/0x7F oversized lengths)
@@ -3564,7 +3786,7 @@ mod tests {
                         0 => buf[idx] = 0xFF,
                         1 => buf[idx] = 0x7F,
                         2 => buf[idx] = 0x00,
-                        3 => buf[idx] ^= (1u8) << (next_u64() % 8),
+                        3 => buf[idx] ^= 1u8 << (next_u64() % 8),
                         _ => {
                             let end = (idx + 4).min(buf.len());
                             for b in &mut buf[idx..end] {
@@ -3575,9 +3797,177 @@ mod tests {
                 }
                 for mode in [CoverExtractMode::CheckOnly, CoverExtractMode::ExtractBytes] {
                     let mut cur = Cursor::new(buf.as_slice());
-                    let _ = parse_audio(&mut cur, buf.len() as u64, *fmt, mode, label);
+                    let res = parse_audio(&mut cur, buf.len() as u64, *fmt, mode, label);
+                    assert_valid_audio_outcome(&res, mode);
+                    cases += 1;
                 }
             }
         }
+
+        // 3. Exercise every iteration-cap seed intact, truncated, and mutated.
+        for (fmt, seed) in &cap_seeds {
+            for mode in [CoverExtractMode::CheckOnly, CoverExtractMode::ExtractBytes] {
+                let mut cur = Cursor::new(seed.as_slice());
+                let res = parse_audio(&mut cur, seed.len() as u64, *fmt, mode, label);
+                assert_valid_audio_outcome(&res, mode);
+                cases += 1;
+            }
+            for step in 0..24usize {
+                let mut buf = seed.clone();
+                if step % 3 == 0 {
+                    let cut = (next_u64() as usize) % buf.len().max(1);
+                    buf.truncate(cut);
+                } else if !buf.is_empty() {
+                    let window = buf.len().clamp(1, 256);
+                    for _ in 0..4 {
+                        let off = (next_u64() as usize) % window;
+                        buf[off] ^= (next_u64() & 0xFF) as u8;
+                    }
+                }
+                let mut cur = Cursor::new(buf.as_slice());
+                let res = parse_audio(
+                    &mut cur,
+                    buf.len() as u64,
+                    *fmt,
+                    CoverExtractMode::CheckOnly,
+                    label,
+                );
+                assert_valid_audio_outcome(&res, CoverExtractMode::CheckOnly);
+                cases += 1;
+            }
+        }
+
+        // 4. Exercise the 16 MiB cumulative tag budget (just under and just over across MP3
+        //    global-unsync, FLAC cumulative PICTURE blocks, and MP4 `covr`) plus header mutations.
+        {
+            // 4a. MP3 global-unsynced tag at 15.8 MiB (Ok) and 16 MiB + 128 B (tag_too_large).
+            let near_len = MAX_AUDIO_TAG_BYTES - 256 * 1024;
+            let mut mp3_near = Vec::with_capacity(10 + near_len);
+            mp3_near.extend_from_slice(b"ID3\x03\x00\x80");
+            let sz = near_len as u32;
+            mp3_near.extend_from_slice(&[
+                ((sz >> 21) & 0x7F) as u8,
+                ((sz >> 14) & 0x7F) as u8,
+                ((sz >> 7) & 0x7F) as u8,
+                (sz & 0x7F) as u8,
+            ]);
+            mp3_near.extend_from_slice(b"TIT2\x00\x00\x00\x0a\x00\x00\x03Near 16M!");
+            mp3_near.extend_from_slice(b"PRIV");
+            mp3_near.extend_from_slice(&((near_len - 30) as u32).to_be_bytes());
+            mp3_near.extend_from_slice(&[0, 0]);
+            mp3_near.resize(10 + near_len, b'A');
+            let mut cur = Cursor::new(mp3_near.as_slice());
+            let ok_near = parse_audio(
+                &mut cur,
+                mp3_near.len() as u64,
+                AudioFormat::Mp3,
+                CoverExtractMode::CheckOnly,
+                label,
+            );
+            assert!(
+                ok_near.is_ok(),
+                "15.75 MiB unsync MP3 should succeed: {ok_near:?}"
+            );
+            assert_valid_audio_outcome(&ok_near, CoverExtractMode::CheckOnly);
+            cases += 1;
+
+            let over_len = MAX_AUDIO_TAG_BYTES + 128;
+            let sz_over = over_len as u32;
+            mp3_near[6..10].copy_from_slice(&[
+                ((sz_over >> 21) & 0x7F) as u8,
+                ((sz_over >> 14) & 0x7F) as u8,
+                ((sz_over >> 7) & 0x7F) as u8,
+                (sz_over & 0x7F) as u8,
+            ]);
+            mp3_near.resize(10 + over_len, b'A');
+            let mut cur_over = Cursor::new(mp3_near.as_slice());
+            let err_over = parse_audio(
+                &mut cur_over,
+                mp3_near.len() as u64,
+                AudioFormat::Mp3,
+                CoverExtractMode::CheckOnly,
+                label,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err_over.details.as_ref().and_then(|d| d.get("reason")),
+                Some(&json!("tag_too_large"))
+            );
+            cases += 1;
+
+            // In-place header mutations on the 16 MiB MP3 buffer (zero extra 16 MiB clones).
+            let orig_hdr: [u8; 64] = mp3_near[..64].try_into().unwrap();
+            for _ in 0..32 {
+                mp3_near[..64].copy_from_slice(&orig_hdr);
+                for _ in 0..4 {
+                    let off = (next_u64() as usize) % 64;
+                    mp3_near[off] = match next_u64() % 3 {
+                        0 => 0xFF,
+                        1 => 0x7F,
+                        _ => (next_u64() & 0xFF) as u8,
+                    };
+                }
+                let mut cur_m = Cursor::new(mp3_near.as_slice());
+                let res_m = parse_audio(
+                    &mut cur_m,
+                    mp3_near.len() as u64,
+                    AudioFormat::Mp3,
+                    CoverExtractMode::CheckOnly,
+                    label,
+                );
+                assert_valid_audio_outcome(&res_m, CoverExtractMode::CheckOnly);
+                cases += 1;
+            }
+            drop(mp3_near);
+
+            // 4b. FLAC cumulative 4 x 4.1 MiB PICTURE blocks (> 16 MiB budget -> tag_too_large).
+            let each_pic = 4_200_000usize;
+            let mut pic_body = Vec::with_capacity(32 + 9 + each_pic);
+            pic_body.extend_from_slice(&3u32.to_be_bytes());
+            pic_body.extend_from_slice(&9u32.to_be_bytes());
+            pic_body.extend_from_slice(b"image/png");
+            pic_body.extend_from_slice(&0u32.to_be_bytes());
+            pic_body.extend_from_slice(&[0u8; 16]);
+            pic_body.extend_from_slice(&(each_pic as u32).to_be_bytes());
+            pic_body.extend_from_slice(tiny_png);
+            pic_body.resize(32 + 9 + each_pic, 0);
+            let mut flac_over = Vec::with_capacity(4 + 38 + 4 * (4 + pic_body.len()));
+            flac_over.extend_from_slice(b"fLaC\x00\x00\x00\x22");
+            flac_over.extend_from_slice(&[0u8; 34]);
+            let plen = pic_body.len() as u32;
+            for i in 0..4 {
+                flac_over.extend_from_slice(&[
+                    if i == 3 { 0x86 } else { 0x06 },
+                    ((plen >> 16) & 0xFF) as u8,
+                    ((plen >> 8) & 0xFF) as u8,
+                    (plen & 0xFF) as u8,
+                ]);
+                flac_over.extend_from_slice(&pic_body);
+            }
+            let mut cur_f = Cursor::new(flac_over.as_slice());
+            let err_f = parse_audio(
+                &mut cur_f,
+                flac_over.len() as u64,
+                AudioFormat::Flac,
+                CoverExtractMode::CheckOnly,
+                label,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err_f.details.as_ref().and_then(|d| d.get("reason")),
+                Some(&json!("tag_too_large"))
+            );
+            cases += 1;
+        }
+
+        let elapsed = t0.elapsed();
+        assert!(
+            cases >= 3_500,
+            "expected >= 3,500 property cases, ran {cases}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "audio parser property suite exceeded 15 s time bound: {elapsed:?} ({cases} cases)"
+        );
     }
 }
