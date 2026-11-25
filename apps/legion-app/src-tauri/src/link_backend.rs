@@ -1075,6 +1075,7 @@ impl Backend for LinkBackend {
                 guard.link.clone()
             };
 
+            #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(unused_mut))]
             let mut report = link.learn().await.map_err(AppError::from)?;
 
             // On desktop, never persist a learned SSH route or surface a learn rejection/disagreement
@@ -1762,7 +1763,9 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
 
     let ready = !nodes.is_empty();
     let needs = if ready { None } else { Some(Needs::Pairing) };
+    #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(unused_mut))]
     let mut disagreements = state.disagreements.clone();
+    #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(unused_mut))]
     let mut learn_rejections = state.learn_rejections.clone();
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
