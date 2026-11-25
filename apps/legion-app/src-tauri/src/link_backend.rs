@@ -119,10 +119,11 @@ struct BackendState {
     data: AppStoreData,
     store_error: Option<AppError>,
     local_program: Option<String>,
-    /// Observed real node name (`hello.node` / `meta.whoami.node`) of the implicit desktop `local`
-    /// pipe so content and transfer requests naming that machine resolve cleanly to `local`.
+    /// Live node identity observed from `meta.whoami` over the implicit desktop `local` pipe.
+    /// Never guessed from disk files and never shadows a paired or learned SSH node of the same
+    /// name.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    local_node_name: Option<String>,
+    attached_local_node: Option<String>,
     active_node: Option<String>,
     /// Expiring route preference for door-level discovery reads when the user's preferred node is
     /// offline. Never changes `active_node` and never acts as a target for machine calls.
@@ -242,19 +243,12 @@ impl LinkBackend {
             None => Link::with_options(link_cfg, link_options),
         };
 
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        let initial_local_node_name = if local_program.is_some() {
-            read_local_node_name_hint()
-        } else {
-            None
-        };
-
         let mut state = BackendState {
             data,
             store_error,
             local_program,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            local_node_name: initial_local_node_name,
+            attached_local_node: None,
             active_node,
             preferred_relay: None,
             last_paired: None,
@@ -371,8 +365,15 @@ impl LinkBackend {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Paired and learned SSH nodes ALWAYS take precedence by identity so a remote node
+            // sharing a name with the local machine can never be silently redirected over the
+            // local pipe.
+            if guard.data.link.node(machine).is_some() {
+                return machine.to_owned();
+            }
             if guard.local_program.is_some()
-                && (machine == LOCAL_NODE_ID || guard.local_node_name.as_deref() == Some(machine))
+                && (machine == LOCAL_NODE_ID
+                    || guard.attached_local_node.as_deref() == Some(machine))
             {
                 return LOCAL_NODE_ID.to_owned();
             }
@@ -461,7 +462,7 @@ impl Backend for LinkBackend {
                             .state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        guard.local_node_name = Some(actual_name.to_owned());
+                        guard.attached_local_node = Some(actual_name.to_owned());
                     }
                     Ok(routed.value)
                 }
@@ -1009,22 +1010,9 @@ impl Backend for LinkBackend {
             return Err(err.clone());
         }
         let link = guard.link.clone();
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if guard.local_program.is_some()
-            && (trimmed == LOCAL_NODE_ID || guard.local_node_name.as_deref() == Some(trimmed))
-        {
-            let epoch = match guard.pairing_epochs.get(LOCAL_NODE_ID).copied() {
-                Some(ep) => ep,
-                None => guard.set_fresh_epoch(LOCAL_NODE_ID),
-            };
-            return Ok(ContentTarget {
-                link,
-                link_node: LOCAL_NODE_ID.to_owned(),
-                machine: trimmed.to_owned(),
-                principal: "local".to_owned(),
-                holder: format_pairing_holder(LOCAL_NODE_ID, epoch),
-            });
-        }
+        // Paired and learned SSH nodes ALWAYS match first so a paired remote machine sharing the
+        // local hostname routes over its authenticated SSH connection with host-key verification
+        // instead of silently redirecting to the local pipe.
         if let Some(entry) = guard.data.link.node(trimmed).cloned() {
             let epoch = match guard.pairing_epochs.get(&entry.node).copied() {
                 Some(ep) => ep,
@@ -1043,6 +1031,22 @@ impl Backend for LinkBackend {
                 machine: entry.node.clone(),
                 principal,
                 holder: format_pairing_holder(&entry.node, epoch),
+            });
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if guard.local_program.is_some()
+            && (trimmed == LOCAL_NODE_ID || guard.attached_local_node.as_deref() == Some(trimmed))
+        {
+            let epoch = match guard.pairing_epochs.get(LOCAL_NODE_ID).copied() {
+                Some(ep) => ep,
+                None => guard.set_fresh_epoch(LOCAL_NODE_ID),
+            };
+            return Ok(ContentTarget {
+                link,
+                link_node: LOCAL_NODE_ID.to_owned(),
+                machine: trimmed.to_owned(),
+                principal: "local".to_owned(),
+                holder: format_pairing_holder(LOCAL_NODE_ID, epoch),
             });
         }
         let any_configured = !guard.data.link.nodes.is_empty() || guard.local_program.is_some();
@@ -1348,45 +1352,6 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
         last_paired: state.last_paired.clone(),
         transfer_capabilities: TransferCapabilities::current_platform(),
     }
-}
-
-/// Reads the local node's configured name from `node.toml` (when present) so persisted desktop
-/// transfers and content requests targeting the local node's real name route over the local pipe
-/// immediately on startup, even before the first `meta.whoami` call or after `learn()`.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn read_local_node_name_hint() -> Option<String> {
-    use std::path::PathBuf;
-
-    let candidate = if let Some(home) = std::env::var_os("LEGION_HOME").filter(|v| !v.is_empty()) {
-        PathBuf::from(home).join("config").join("node.toml")
-    } else if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        PathBuf::from(xdg).join("legion").join("node.toml")
-    } else if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
-        PathBuf::from(appdata).join("legion").join("node.toml")
-    } else {
-        let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
-        PathBuf::from(home)
-            .join(".config")
-            .join("legion")
-            .join("node.toml")
-    };
-    let text = std::fs::read_to_string(candidate).ok()?;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            break;
-        }
-        if let Some(rest) = trimmed.strip_prefix("name") {
-            let rest = rest.trim_start();
-            if let Some(val) = rest.strip_prefix('=') {
-                let unquoted = val.trim().trim_matches('"').trim_matches('\'').trim();
-                if !unquoted.is_empty() {
-                    return Some(unquoted.to_owned());
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Discovers an installed `legion` binary on desktop hosts (absolute `PATH` entries first, then
@@ -2731,5 +2696,50 @@ mod tests {
             summary.not_synced[0].reason.as_deref(),
             Some("live device changes refused")
         );
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn paired_ssh_node_takes_precedence_over_local_pipe_and_never_guesses_from_disk()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let mut initial = AppStoreData::default();
+        initial.link.upsert_node(sample_ssh_node("tower"));
+        store.save(&initial)?;
+
+        let backend = LinkBackend::with_local_program(store, Some("/usr/bin/legion".to_owned()));
+
+        // Even if the attached local node happened to report the same name `"tower"`, calls and
+        // content requests for `"tower"` MUST still route to the paired SSH node `"tower"` with
+        // its own pairing holder, while `"local"` addresses the local pipe.
+        {
+            let mut guard = backend.state.lock().unwrap_or_else(|p| p.into_inner());
+            guard.attached_local_node = Some("tower".to_owned());
+        }
+
+        assert_eq!(backend.resolve_link_node_for_call("tower"), "tower");
+        assert_eq!(backend.resolve_link_node_for_call("local"), "local");
+
+        let ssh_target = backend.content_target("tower")?;
+        assert_eq!(ssh_target.link_node, "tower");
+        assert_eq!(ssh_target.principal, "phone");
+        assert!(ssh_target.holder.starts_with("pairing:tower:"));
+
+        let local_target = backend.content_target("local")?;
+        assert_eq!(local_target.link_node, "local");
+        assert_eq!(local_target.principal, "local");
+        assert!(local_target.holder.starts_with("pairing:local:"));
+
+        // Without a live `meta.whoami` identity proof, an unpaired machine name is never guessed
+        // onto the local pipe.
+        let fresh_dir = tempfile::tempdir()?;
+        let fresh_backend = LinkBackend::with_local_program(
+            AppStore::in_dir(fresh_dir.path()),
+            Some("/usr/bin/legion".to_owned()),
+        );
+        assert!(fresh_backend.content_target("tower").is_err());
+        assert_eq!(fresh_backend.content_target("local")?.link_node, "local");
+        Ok(())
     }
 }

@@ -35,7 +35,7 @@ use http_body::Body as _;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use legion_content::{
     CONTENT_SANDBOX_CSP, ContentBody, ContentLimiter, ContentSource, ContentTime, CorpPolicy,
     GuardRejection, HostOriginGuard, MAX_PATH_BYTES, OpenRangeError, OpenedRange, ServeOptions,
@@ -44,8 +44,8 @@ use legion_content::{
 };
 use legion_link::proto::{ErrorBody as ProtoErrorBody, ErrorCode as ProtoErrorCode};
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::{AppError, Backend, ErrorCode};
@@ -59,8 +59,30 @@ pub const CUSTOM_SCHEME_HOST: &str = "legion-content.localhost";
 /// Maximum byte piece answered for one `Range` request over the buffered custom URI scheme (2 MiB).
 pub const CUSTOM_SCHEME_MAX_RANGE_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Hard upper bound on a single buffered custom-scheme response body (64 MiB, for unranged images).
-pub const MAX_CUSTOM_SCHEME_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum unranged response body served over the buffered custom URI scheme (16 MiB). Larger
+/// unranged requests are rejected with `413 Payload Too Large` before reading a single byte.
+pub const CUSTOM_SCHEME_MAX_FULL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum total in-flight buffered memory across concurrent custom-scheme responses (24 MiB).
+pub const CUSTOM_SCHEME_TOTAL_MEMORY_BUDGET_BYTES: usize = 24 * 1024 * 1024;
+
+/// Accounting unit for the custom-scheme memory budget semaphore (64 KiB).
+const CUSTOM_SCHEME_BUDGET_UNIT_BYTES: usize = 64 * 1024;
+
+/// Maximum simultaneous TCP connections accepted by the loopback content listener.
+pub const MAX_LOOPBACK_CONNECTIONS: usize = 32;
+
+/// Maximum time a loopback client may take to send HTTP request headers (5 seconds).
+pub const LOOPBACK_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Initial exponential backoff delay after a transient `accept()` error.
+const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(25);
+
+/// Maximum exponential backoff delay between `accept()` retries.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_millis(500);
+
+/// Consecutive `accept()` errors before tearing down a dead loopback listener so it can rebind.
+const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 8;
 
 /// Idle duration after all tickets expire or are revoked before the loopback listener shuts down.
 pub const DEFAULT_IDLE_SHUTDOWN: Duration = Duration::from_secs(60);
@@ -233,6 +255,12 @@ pub struct AppContentServer {
     source: Arc<LinkContentSource>,
     allowed_origins: Vec<String>,
     idle_shutdown: Duration,
+    header_read_timeout: Duration,
+    loopback_conn_limit: Arc<Semaphore>,
+    custom_scheme_max_full_bytes: u64,
+    custom_scheme_memory_budget: Arc<Semaphore>,
+    custom_scheme_buffered_bytes: Arc<AtomicUsize>,
+    custom_scheme_peak_buffered_bytes: Arc<AtomicUsize>,
     listener_lock: AsyncMutex<()>,
     listener: Mutex<Option<ListenerHandle>>,
     active_streams: Arc<AtomicUsize>,
@@ -261,9 +289,40 @@ impl AppContentServer {
         idle_shutdown: Duration,
         allowed_origins: Vec<String>,
     ) -> Self {
+        Self::with_limits(
+            backend,
+            mode,
+            ticket_config,
+            idle_shutdown,
+            allowed_origins,
+            MAX_LOOPBACK_CONNECTIONS,
+            LOOPBACK_HEADER_READ_TIMEOUT,
+            CUSTOM_SCHEME_MAX_FULL_BYTES,
+            CUSTOM_SCHEME_TOTAL_MEMORY_BUDGET_BYTES,
+        )
+    }
+
+    /// Creates a content server with explicit connection, header-timeout, and custom-scheme memory
+    /// limits (used with tighter budgets in tests).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_limits(
+        backend: Arc<dyn Backend>,
+        mode: ContentMountMode,
+        ticket_config: TicketConfig,
+        idle_shutdown: Duration,
+        allowed_origins: Vec<String>,
+        max_loopback_connections: usize,
+        header_read_timeout: Duration,
+        custom_scheme_max_full_bytes: u64,
+        custom_scheme_total_memory_budget_bytes: usize,
+    ) -> Self {
         let source = Arc::new(LinkContentSource {
             backend: Arc::clone(&backend),
         });
+        let conn_cap = max_loopback_connections.max(1);
+        let budget_units = custom_scheme_total_memory_budget_bytes
+            .div_ceil(CUSTOM_SCHEME_BUDGET_UNIT_BYTES)
+            .max(1);
         Self {
             backend,
             mode,
@@ -272,6 +331,12 @@ impl AppContentServer {
             source,
             allowed_origins,
             idle_shutdown,
+            header_read_timeout,
+            loopback_conn_limit: Arc::new(Semaphore::new(conn_cap)),
+            custom_scheme_max_full_bytes,
+            custom_scheme_memory_budget: Arc::new(Semaphore::new(budget_units)),
+            custom_scheme_buffered_bytes: Arc::new(AtomicUsize::new(0)),
+            custom_scheme_peak_buffered_bytes: Arc::new(AtomicUsize::new(0)),
             listener_lock: AsyncMutex::new(()),
             listener: Mutex::new(None),
             active_streams: Arc::new(AtomicUsize::new(0)),
@@ -416,8 +481,62 @@ impl AppContentServer {
         }
     }
 
+    /// Probes the loopback listener after an app resume (e.g. iOS foregrounding after background
+    /// suspension) and tears down + rebinds it if the OS reclaimed the listening socket.
+    pub fn on_app_resumed(self: &Arc<Self>) {
+        if self.mode != ContentMountMode::Loopback {
+            return;
+        }
+        let server = Arc::clone(self);
+        crate::transfers::spawn_bg(async move {
+            let _ = server.probe_or_recover_loopback().await;
+        });
+    }
+
+    /// Verifies that an active loopback listener still accepts TCP connections; if the OS
+    /// reclaimed the socket while suspended, tears it down cleanly and rebinds (trying the
+    /// previous port first so existing media URLs continue working when possible).
+    pub async fn probe_or_recover_loopback(self: &Arc<Self>) -> Result<Option<u16>, AppError> {
+        if self.mode != ContentMountMode::Loopback {
+            return Ok(None);
+        }
+        let Some(port) = self.loopback_port() else {
+            return Ok(None);
+        };
+        let alive = matches!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        if alive {
+            return Ok(Some(port));
+        }
+
+        // Listener did not answer on localhost: tear down the dead handle and rebind if live
+        // tickets remain.
+        self.teardown_listener_if_port(port);
+        if self.tickets.is_empty() {
+            return Ok(None);
+        }
+        let new_port = self
+            .ensure_loopback_listener_prefer_port(Some(port))
+            .await?;
+        Ok(Some(new_port))
+    }
+
+    /// Returns the peak concurrent custom-scheme response bytes buffered so far.
+    #[cfg(test)]
+    pub fn peak_custom_scheme_buffered_bytes(&self) -> usize {
+        self.custom_scheme_peak_buffered_bytes
+            .load(Ordering::Acquire)
+    }
+
     /// Handles one Tauri custom URI scheme request (`http://legion-content.localhost/v1/content/...`)
-    /// with bounded range pieces and full [`HostOriginGuard`] + `legion-content` security headers.
+    /// with bounded range pieces, pre-read size capping, global in-flight memory budgeting, and
+    /// full [`HostOriginGuard`] + `legion-content` security headers.
     pub async fn handle_custom_scheme(&self, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
         let method = request.method().clone();
         let uri = request.uri().clone();
@@ -443,10 +562,14 @@ impl AppContentServer {
             }
             _ => None,
         };
+        let max_bytes = usize::try_from(self.custom_scheme_max_full_bytes).unwrap_or(usize::MAX);
         let Some(expected_host) = canonical_host else {
             return collect_bounded_response(
                 guard_error_response(GuardRejection::MisdirectedHost, CorpPolicy::CrossOrigin),
-                MAX_CUSTOM_SCHEME_BODY_BYTES,
+                max_bytes,
+                &self.custom_scheme_memory_budget,
+                &self.custom_scheme_buffered_bytes,
+                &self.custom_scheme_peak_buffered_bytes,
             )
             .await;
         };
@@ -463,13 +586,21 @@ impl AppContentServer {
         let options = ServeOptions {
             corp: CorpPolicy::CrossOrigin,
             max_range_bytes: Some(CUSTOM_SCHEME_MAX_RANGE_BYTES),
+            max_full_bytes: Some(self.custom_scheme_max_full_bytes),
             ..ServeOptions::default()
         };
 
         let response = self
             .handle_checked_request(&guard, &method, &uri, &headers, options)
             .await;
-        collect_bounded_response(response, MAX_CUSTOM_SCHEME_BODY_BYTES).await
+        collect_bounded_response(
+            response,
+            max_bytes,
+            &self.custom_scheme_memory_budget,
+            &self.custom_scheme_buffered_bytes,
+            &self.custom_scheme_peak_buffered_bytes,
+        )
+        .await
     }
 
     fn touch_activity(&self) {
@@ -479,7 +610,26 @@ impl AppContentServer {
             .last_activity = Instant::now();
     }
 
+    fn teardown_listener_if_port(&self, port: u16) {
+        let mut slot = self
+            .listener
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.as_ref().is_some_and(|h| h.port == port)
+            && let Some(handle) = slot.take()
+        {
+            handle.shutdown.cancel();
+        }
+    }
+
     async fn ensure_loopback_listener(self: &Arc<Self>) -> Result<u16, AppError> {
+        self.ensure_loopback_listener_prefer_port(None).await
+    }
+
+    async fn ensure_loopback_listener_prefer_port(
+        self: &Arc<Self>,
+        preferred_port: Option<u16>,
+    ) -> Result<u16, AppError> {
         if let Some(port) = self.loopback_port() {
             return Ok(port);
         }
@@ -488,13 +638,29 @@ impl AppContentServer {
             return Ok(port);
         }
 
-        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-        let tcp = TcpListener::bind(bind_addr).await.map_err(|err| {
-            AppError::new(
-                ErrorCode::Internal,
-                format!("Could not bind local content listener on 127.0.0.1: {err}"),
-            )
-        })?;
+        let tcp = if let Some(prev_port) = preferred_port {
+            let preferred_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, prev_port));
+            match TcpListener::bind(preferred_addr).await {
+                Ok(l) => l,
+                Err(_) => {
+                    let fallback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+                    TcpListener::bind(fallback).await.map_err(|err| {
+                        AppError::new(
+                            ErrorCode::Internal,
+                            format!("Could not bind local content listener on 127.0.0.1: {err}"),
+                        )
+                    })?
+                }
+            }
+        } else {
+            let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+            TcpListener::bind(bind_addr).await.map_err(|err| {
+                AppError::new(
+                    ErrorCode::Internal,
+                    format!("Could not bind local content listener on 127.0.0.1: {err}"),
+                )
+            })?
+        };
         let port = tcp
             .local_addr()
             .map_err(|err| {
@@ -547,8 +713,12 @@ impl AppContentServer {
         let options = ServeOptions {
             corp: CorpPolicy::CrossOrigin,
             max_range_bytes: None,
+            max_full_bytes: None,
             ..ServeOptions::default()
         };
+        let header_read_timeout = self.header_read_timeout;
+        let mut consecutive_errors: u32 = 0;
+        let mut backoff = ACCEPT_BACKOFF_INITIAL;
 
         loop {
             let accepted = tokio::select! {
@@ -556,7 +726,32 @@ impl AppContentServer {
                 () = shutdown.cancelled() => break,
                 res = tcp.accept() => res,
             };
-            let Ok((stream, _peer)) = accepted else {
+            let (stream, _peer) = match accepted {
+                Ok(pair) => {
+                    consecutive_errors = 0;
+                    backoff = ACCEPT_BACKOFF_INITIAL;
+                    pair
+                }
+                Err(err) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    if is_fatal_accept_error(&err)
+                        || consecutive_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS
+                    {
+                        self.teardown_listener_if_port(port);
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => break,
+                        () = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                    continue;
+                }
+            };
+            let Ok(conn_permit) = Arc::clone(&self.loopback_conn_limit).try_acquire_owned() else {
+                // Drop excess connections immediately instead of spawning unbounded tasks.
+                drop(stream);
                 continue;
             };
             let _ = stream.set_nodelay(true);
@@ -564,6 +759,7 @@ impl AppContentServer {
             let conn_guard = Arc::clone(&guard);
             let conn_shutdown = shutdown.clone();
             tokio::spawn(async move {
+                let _permit = conn_permit;
                 let io = TokioIo::new(stream);
                 let service = service_fn(move |req: Request<Incoming>| {
                     let server = Arc::clone(&server);
@@ -580,6 +776,8 @@ impl AppContentServer {
                 });
                 let conn = http1::Builder::new()
                     .keep_alive(true)
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(header_read_timeout)
                     .serve_connection(io, service);
                 tokio::pin!(conn);
                 tokio::select! {
@@ -864,37 +1062,134 @@ fn not_found_response(corp: CorpPolicy, cors_origin: Option<HeaderValue>) -> Res
     response
 }
 
+fn is_fatal_accept_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
+fn payload_too_large_response() -> Response<Vec<u8>> {
+    let msg = serde_json::to_vec(&ProtoErrorBody::new(
+        ProtoErrorCode::Unsupported,
+        "Unranged custom-scheme response exceeds the in-memory size limit.",
+    ))
+    .unwrap_or_default();
+    let len = msg.len() as u64;
+    let mut err_resp = Response::new(msg);
+    *err_resp.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+    apply_base_security_headers(err_resp.headers_mut(), CorpPolicy::CrossOrigin);
+    err_resp
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    err_resp
+        .headers_mut()
+        .insert(CONTENT_LENGTH, HeaderValue::from(len));
+    err_resp
+}
+
+struct MemoryUsageGuard<'a> {
+    current: &'a AtomicUsize,
+    bytes: usize,
+}
+
+impl<'a> MemoryUsageGuard<'a> {
+    fn acquire(current: &'a AtomicUsize, peak: &AtomicUsize, bytes: usize) -> Self {
+        if bytes > 0 {
+            let now = current.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            peak.fetch_max(now, Ordering::AcqRel);
+        }
+        Self { current, bytes }
+    }
+
+    fn grow(&mut self, peak: &AtomicUsize, extra: usize) {
+        if extra > 0 {
+            let now = self.current.fetch_add(extra, Ordering::AcqRel) + extra;
+            peak.fetch_max(now, Ordering::AcqRel);
+            self.bytes = self.bytes.saturating_add(extra);
+        }
+    }
+}
+
+impl Drop for MemoryUsageGuard<'_> {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.current.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
+}
+
 async fn collect_bounded_response(
     response: Response<ContentBody>,
     max_bytes: usize,
+    budget: &Semaphore,
+    current_buffered: &AtomicUsize,
+    peak_buffered: &AtomicUsize,
 ) -> Response<Vec<u8>> {
     let (parts, mut body) = response.into_parts();
-    let mut out = Vec::new();
+    let declared_len = parts
+        .headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+
+    if let Some(len) = declared_len
+        && len > max_bytes
+    {
+        return payload_too_large_response();
+    }
+
+    let initial_units = declared_len
+        .filter(|&len| len > 0)
+        .map(|len| len.div_ceil(CUSTOM_SCHEME_BUDGET_UNIT_BYTES))
+        .unwrap_or(0);
+
+    let mut held_permits = Vec::new();
+    let mut reserved_bytes = 0usize;
+    if initial_units > 0 {
+        let Ok(permits) = budget
+            .acquire_many(u32::try_from(initial_units).unwrap_or(u32::MAX))
+            .await
+        else {
+            return payload_too_large_response();
+        };
+        held_permits.push(permits);
+        reserved_bytes = initial_units.saturating_mul(CUSTOM_SCHEME_BUDGET_UNIT_BYTES);
+    }
+    let mut usage_guard =
+        MemoryUsageGuard::acquire(current_buffered, peak_buffered, declared_len.unwrap_or(0));
+    let mut out = match declared_len {
+        Some(len) if len > 0 => Vec::with_capacity(len),
+        _ => Vec::new(),
+    };
+
     let mut pinned = Pin::new(&mut body);
     while let Some(frame) = std::future::poll_fn(|cx| pinned.as_mut().poll_frame(cx)).await {
         match frame {
             Ok(frame) => {
                 if let Ok(data) = frame.into_data() {
-                    if out.len().saturating_add(data.len()) > max_bytes {
-                        let msg = serde_json::to_vec(&ProtoErrorBody::new(
-                            ProtoErrorCode::Unsupported,
-                            "Unranged custom-scheme response exceeds the in-memory size limit.",
-                        ))
-                        .unwrap_or_default();
-                        let len = msg.len() as u64;
-                        let mut err_resp = Response::new(msg);
-                        *err_resp.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
-                        apply_base_security_headers(
-                            err_resp.headers_mut(),
-                            CorpPolicy::CrossOrigin,
+                    let next_len = out.len().saturating_add(data.len());
+                    if next_len > max_bytes {
+                        return payload_too_large_response();
+                    }
+                    if next_len > reserved_bytes {
+                        let extra_bytes = next_len - reserved_bytes;
+                        let extra_units = extra_bytes.div_ceil(CUSTOM_SCHEME_BUDGET_UNIT_BYTES);
+                        let Ok(permits) = budget
+                            .acquire_many(u32::try_from(extra_units).unwrap_or(u32::MAX))
+                            .await
+                        else {
+                            return payload_too_large_response();
+                        };
+                        held_permits.push(permits);
+                        reserved_bytes = reserved_bytes.saturating_add(
+                            extra_units.saturating_mul(CUSTOM_SCHEME_BUDGET_UNIT_BYTES),
                         );
-                        err_resp
-                            .headers_mut()
-                            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                        err_resp
-                            .headers_mut()
-                            .insert(CONTENT_LENGTH, HeaderValue::from(len));
-                        return err_resp;
+                    }
+                    if declared_len.is_none() {
+                        usage_guard.grow(peak_buffered, data.len());
                     }
                     out.extend_from_slice(&data);
                 }
@@ -919,6 +1214,8 @@ async fn collect_bounded_response(
             }
         }
     }
+    drop(usage_guard);
+    drop(held_permits);
     Response::from_parts(parts, out)
 }
 
@@ -1490,5 +1787,218 @@ mod tests {
                 "uri={bad_uri}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn loopback_enforces_connection_cap_header_timeout_and_recovers_after_death() {
+        let mut files = HashMap::new();
+        files.insert("/home/me/hello.txt".to_owned(), b"hello-loopback".to_vec());
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_limits(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["tauri://localhost".to_owned()],
+            2,
+            Duration::from_millis(200),
+            CUSTOM_SCHEME_MAX_FULL_BYTES,
+            CUSTOM_SCHEME_TOTAL_MEMORY_BUDGET_BYTES,
+        ));
+
+        let minted = server
+            .mint_url("tower", "/home/me/hello.txt", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let path = minted
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+
+        // Slowloris header-read timeout: send incomplete HTTP headers and verify server closes
+        // promptly after 200ms rather than holding the slot open forever.
+        let mut slow1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        slow1.write_all(b"GET /v1/content/").await.unwrap();
+        let mut slow2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        slow2.write_all(b"GET /v1/content/").await.unwrap();
+        // Give accept loop a moment to register both permits.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // Third simultaneous connection exceeds the cap of 2 and is closed immediately.
+        let mut overflow = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut byte = [0u8; 1];
+        let overflow_read =
+            tokio::time::timeout(Duration::from_millis(120), overflow.read(&mut byte)).await;
+        assert!(
+            matches!(overflow_read, Ok(Ok(0)) | Ok(Err(_))),
+            "excess connection above cap should be dropped immediately, got {overflow_read:?}"
+        );
+
+        // After the 200ms header read timeout expires, slowloris sockets close and normal
+        // requests succeed again.
+        let mut sink = Vec::new();
+        let slow_closed =
+            tokio::time::timeout(Duration::from_secs(2), slow1.read_to_end(&mut sink)).await;
+        assert!(
+            slow_closed.is_ok(),
+            "slowloris socket must time out and close"
+        );
+        drop(slow2);
+
+        let (status, _, body) = raw_http(
+            port,
+            &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello-loopback");
+
+        // Simulate OS reclaiming the listening socket during iOS background suspend: cancel the
+        // current listener token while keeping the port recorded, then call
+        // `probe_or_recover_loopback()` and confirm it recovers cleanly.
+        {
+            let guard = server.listener.lock().unwrap();
+            if let Some(h) = guard.as_ref() {
+                h.shutdown.cancel();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let recovered_port = server
+            .probe_or_recover_loopback()
+            .await
+            .unwrap()
+            .expect("listener should recover while live ticket exists");
+        let (status, _, body) = raw_http(
+            recovered_port,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{recovered_port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello-loopback");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn custom_scheme_rejects_oversize_unranged_pre_read_and_bounds_parallel_memory() {
+        let mut files = HashMap::new();
+        // 1.2 MiB file against a tight 1 MiB max_full_bytes cap and 2 MiB total budget.
+        let oversize = vec![0x5Au8; 1_200_000];
+        let chunk_file: Vec<u8> = (0..512 * 1024usize).map(|i| (i % 251) as u8).collect();
+        files.insert("/home/me/huge.png".to_owned(), oversize);
+        files.insert("/home/me/clip.webm".to_owned(), chunk_file.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let budget_bytes = 2 * 1024 * 1024; // 2 MiB budget across 20 parallel 512 KiB requests
+        let server = Arc::new(AppContentServer::with_limits(
+            backend,
+            ContentMountMode::CustomScheme,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+            MAX_LOOPBACK_CONNECTIONS,
+            LOOPBACK_HEADER_READ_TIMEOUT,
+            1024 * 1024, // 1 MiB max_full_bytes
+            budget_bytes,
+        ));
+
+        // 1) Unranged GET for 1.2 MiB file fails immediately with 413 Payload Too Large.
+        let huge = server
+            .mint_url("tower", "/home/me/huge.png", false)
+            .await
+            .unwrap();
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&huge.url)
+            .body(Vec::new())
+            .unwrap();
+        let resp = server.handle_custom_scheme(req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // Ranged GET on the same file still succeeds with 206 Partial Content!
+        let range_req = Request::builder()
+            .method(Method::GET)
+            .uri(&huge.url)
+            .header(RANGE, "bytes=0-1023")
+            .body(Vec::new())
+            .unwrap();
+        let range_resp = server.handle_custom_scheme(range_req).await;
+        assert_eq!(range_resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(range_resp.body().len(), 1024);
+
+        // 2) Fire 12 parallel 512 KiB requests across 4 tickets (6 MiB total, within
+        // ContentLimiter's per-ticket=8 / per-holder=16 caps) against a 2 MiB global memory budget
+        // and verify every single one succeeds with exact bytes while peak buffered memory stays
+        // strictly <= budget.
+        let mut urls = Vec::new();
+        for _ in 0..4 {
+            urls.push(
+                server
+                    .mint_url("tower", "/home/me/clip.webm", false)
+                    .await
+                    .unwrap()
+                    .url,
+            );
+        }
+        let mut tasks = Vec::new();
+        for i in 0..12 {
+            let srv = Arc::clone(&server);
+            let url = urls[i % urls.len()].clone();
+            tasks.push(tokio::spawn(async move {
+                let req = Request::builder()
+                    .method(Method::GET)
+                    .uri(&url)
+                    .header(RANGE, "bytes=0-524287")
+                    .body(Vec::new())
+                    .unwrap();
+                srv.handle_custom_scheme(req).await
+            }));
+        }
+        for t in tasks {
+            let resp = t.await.unwrap();
+            assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(resp.body().len(), chunk_file.len());
+            assert_eq!(resp.body(), &chunk_file);
+        }
+
+        // Also fire a storm of 24 parallel requests across 6 tickets: excess streams cleanly
+        // receive 429 while accepted ones return 206, and peak buffered memory still stays <= budget.
+        let mut storm = Vec::new();
+        for i in 0..24 {
+            let srv = Arc::clone(&server);
+            let url = urls[i % urls.len()].clone();
+            storm.push(tokio::spawn(async move {
+                let req = Request::builder()
+                    .method(Method::GET)
+                    .uri(&url)
+                    .header(RANGE, "bytes=0-524287")
+                    .body(Vec::new())
+                    .unwrap();
+                srv.handle_custom_scheme(req).await
+            }));
+        }
+        let mut ok_count = 0usize;
+        for t in storm {
+            let resp = t.await.unwrap();
+            assert!(
+                matches!(
+                    resp.status(),
+                    StatusCode::PARTIAL_CONTENT | StatusCode::TOO_MANY_REQUESTS
+                ),
+                "unexpected status {}",
+                resp.status()
+            );
+            if resp.status() == StatusCode::PARTIAL_CONTENT {
+                assert_eq!(resp.body(), &chunk_file);
+                ok_count += 1;
+            }
+        }
+        assert!(ok_count >= 1);
+        let peak = server.peak_custom_scheme_buffered_bytes();
+        assert!(
+            peak <= budget_bytes,
+            "peak in-flight buffered memory ({peak}) exceeded budget ({budget_bytes})"
+        );
     }
 }
