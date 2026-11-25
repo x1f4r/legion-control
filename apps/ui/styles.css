@@ -2357,7 +2357,7 @@ button.row:active {
   pointer-events: none;
 }
 
-.player-center-btn {
+.btn.icon.player-center-btn {
   pointer-events: auto;
   width: 54px;
   height: 54px;
@@ -2367,19 +2367,19 @@ button.row:active {
   border-color: rgb(255 255 255 / 0.14);
 }
 
-.player-center-btn svg {
+.btn.icon.player-center-btn svg {
   width: 26px;
   height: 26px;
 }
 
-.player-center-btn.main {
+.btn.icon.player-center-btn.main {
   width: 66px;
   height: 66px;
   background: rgb(0 0 0 / 0.68);
   border-color: rgb(255 255 255 / 0.22);
 }
 
-.player-center-btn.main svg {
+.btn.icon.player-center-btn.main svg {
   width: 30px;
   height: 30px;
 }
@@ -2819,19 +2819,19 @@ button.row:active {
   margin-top: 2px;
 }
 
-.music-ctl-btn {
+.btn.icon.music-ctl-btn {
   width: 52px;
   height: 52px;
   border-radius: 50%;
   color: #fff;
 }
 
-.music-ctl-btn svg {
+.btn.icon.music-ctl-btn svg {
   width: 26px;
   height: 26px;
 }
 
-.music-play-btn {
+.btn.icon.music-play-btn {
   width: 68px;
   height: 68px;
   border-radius: 50%;
@@ -2840,7 +2840,7 @@ button.row:active {
   color: var(--accent-ink);
 }
 
-.music-play-btn svg {
+.btn.icon.music-play-btn svg {
   width: 28px;
   height: 28px;
 }
@@ -2866,7 +2866,8 @@ button.row:active {
   }
 
   .music-cover-wrap {
-    width: min(320px, 38vw, 66dvh);
+    width: min(320px, 34vw, 54dvh);
+    justify-self: center;
   }
 
   .music-headings {

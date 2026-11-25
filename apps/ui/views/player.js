@@ -399,6 +399,7 @@ export function VideoPlayer({
   fullscreenSourceRef.current = fullscreenSource;
   const pushedFsHistoryRef = useRef(false);
   const suppressNextPopRef = useRef(false);
+  const leavingFsUntilRef = useRef(0);
   const activeSeekSeqRef = useRef(0);
   const lastSavedAtRef = useRef(0);
   const resumedAppliedRef = useRef(false);
@@ -550,6 +551,8 @@ export function VideoPlayer({
       const hadPushed = pushedFsHistoryRef.current;
       pushedFsHistoryRef.current = false;
       portraitImmersiveRef.current = false;
+      const wasLandscapeNow = typeof window !== 'undefined' && window.innerWidth > window.innerHeight;
+      leavingFsUntilRef.current = wasLandscapeNow ? Date.now() + 900 : 0;
       setIsFullscreen(false);
       setFullscreenSource(null);
       controller.notifyActivity({ show: true });
@@ -622,23 +625,33 @@ export function VideoPlayer({
   useEffect(() => {
     if (!touchOrientationDevice || typeof link?.immersive !== 'function') return undefined;
 
-    const checkOrientation = () => {
+    let wasLandscape = false;
+    const checkOrientation = (initial = false) => {
       const landscape = window.innerWidth > window.innerHeight;
-      if (landscape && !isFullscreenRef.current) {
+      const turnedToLandscape = initial ? landscape : !wasLandscape && landscape;
+      wasLandscape = landscape;
+      if (!landscape) {
+        leavingFsUntilRef.current = 0;
+      }
+      if (Date.now() < leavingFsUntilRef.current) {
+        return;
+      }
+      if (turnedToLandscape && !isFullscreenRef.current) {
         enterFullscreen('rotation');
       } else if (!landscape && isFullscreenRef.current && fullscreenSourceRef.current === 'rotation') {
         leaveFullscreen();
       }
     };
 
-    checkOrientation();
-    window.addEventListener('resize', checkOrientation);
-    window.addEventListener('orientationchange', checkOrientation);
-    window.screen?.orientation?.addEventListener?.('change', checkOrientation);
+    checkOrientation(true);
+    const onResize = () => checkOrientation(false);
+    window.addEventListener('resize', onResize);
+    window.addEventListener('orientationchange', onResize);
+    window.screen?.orientation?.addEventListener?.('change', onResize);
     return () => {
-      window.removeEventListener('resize', checkOrientation);
-      window.removeEventListener('orientationchange', checkOrientation);
-      window.screen?.orientation?.removeEventListener?.('change', checkOrientation);
+      window.removeEventListener('resize', onResize);
+      window.removeEventListener('orientationchange', onResize);
+      window.screen?.orientation?.removeEventListener?.('change', onResize);
     };
   }, [touchOrientationDevice, link, enterFullscreen, leaveFullscreen]);
 

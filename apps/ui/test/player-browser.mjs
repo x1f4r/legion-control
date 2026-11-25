@@ -323,23 +323,27 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
     const firstVideoUrl = await page.evaluate(() => document.querySelector('.viewer video.viewer-video')?.getAttribute('src') || '');
     assert.ok(firstVideoUrl.length > 0);
     await page.keyboard.press('n');
-    await page.locator('.viewer-top .name', { hasText: 'Beach.mp4' }).waitFor();
-    const afterNextRevoked = await page.evaluate((prev) => ({
-      revokedPrev: Array.isArray(window.__LEGION_MOCK_REVOKED_URLS__) && window.__LEGION_MOCK_REVOKED_URLS__.includes(prev),
-      nextUrl: document.querySelector('.viewer video.viewer-video')?.getAttribute('src') || '',
-    }), firstVideoUrl);
-    assert.equal(afterNextRevoked.revokedPrev, true, 'Switching to next video must revoke previous content URL');
-    assert.notEqual(afterNextRevoked.nextUrl, firstVideoUrl);
+    await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor();
+    await page.waitForFunction(
+      (prev) => {
+        const cur = document.querySelector('.viewer video.viewer-video')?.getAttribute('src') || '';
+        return Boolean(cur && cur !== prev && window.__LEGION_MOCK_REVOKED_URLS__?.includes(prev));
+      },
+      firstVideoUrl,
+      { timeout: 5000 },
+    );
+    const nextVideoUrl = await page.evaluate(() => document.querySelector('.viewer video.viewer-video')?.getAttribute('src') || '');
+    assert.notEqual(nextVideoUrl, firstVideoUrl);
     assert.equal(await page.locator('.viewer button[aria-label="Previous video"]').count(), 1);
     assert.equal(await page.locator('.viewer button[aria-label="Next video"]').count(), 1);
 
     // `Esc` closes the viewer when not in fullscreen and revokes the active video URL.
     await page.keyboard.press('Escape');
     await page.locator('.viewer').waitFor({ state: 'hidden' });
-    assert.equal(
-      await page.evaluate((u) => Array.isArray(window.__LEGION_MOCK_REVOKED_URLS__) && window.__LEGION_MOCK_REVOKED_URLS__.includes(u), afterNextRevoked.nextUrl),
-      true,
-      'Closing viewer must revoke active video content URL',
+    await page.waitForFunction(
+      (u) => Array.isArray(window.__LEGION_MOCK_REVOKED_URLS__) && window.__LEGION_MOCK_REVOKED_URLS__.includes(u),
+      nextVideoUrl,
+      { timeout: 5000 },
     );
 
     // 6b. Resume chip ("Resumed at ... · Start over") appears when a >= 10 min file has a saved position, and Start over resets it.
@@ -517,7 +521,8 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
       null,
       { timeout: 3000 },
     );
-    await page.locator('.sheet button', { hasText: 'Done' }).click();
+    await page.keyboard.press('Escape');
+    await page.locator('.sheet').waitFor({ state: 'hidden' });
 
     // Ending a song auto-advances to the next track (`02 - Rain on Glass.mp3`) and revokes the previous URL.
     const firstSongUrl = await page.evaluate(() => document.querySelector('.viewer audio')?.getAttribute('src') || '');
