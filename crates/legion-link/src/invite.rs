@@ -532,6 +532,12 @@ mod enrol_client {
             == Some(crate::ssh::REASON_AUTH_FAILED)
     }
 
+    fn is_device_principal(principal: &str) -> bool {
+        principal
+            .strip_prefix("device:")
+            .is_some_and(|suffix| !suffix.is_empty())
+    }
+
     fn cancelled_error(node: &str) -> ErrorBody {
         ErrorBody::new(
             ErrorCode::Cancelled,
@@ -656,7 +662,10 @@ mod enrol_client {
                     return Err(cancelled_error(&invite.node));
                 }
                 if is_auth_failed(&err) {
-                    if allow_auth_failed_recovery && let Some(enrolled) = probe().await {
+                    if allow_auth_failed_recovery
+                        && is_device_principal(&invite.principal)
+                        && let Some(enrolled) = probe().await
+                    {
                         return Ok(enrolled);
                     }
                     return Err(err.with_hint(format!(
@@ -1543,7 +1552,44 @@ mod tests {
             "{timeout_err:?}"
         );
 
+        let mut device_invite = sample_invite();
+        device_invite.principal = "device:phone".to_owned();
+        let sample_device_enrolled = || Enrolled {
+            node: device_invite.node.clone(),
+            target: device_invite.target(),
+            principal: device_invite.principal.clone(),
+            role: "operator".to_owned(),
+            device: "phone".to_owned(),
+            fleet: BTreeMap::new(),
+            not_synced_to: Vec::new(),
+            sync_command: None,
+        };
+
         let retry_recovered = enrol_client::enrol_flow(
+            &device_invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ConnectErr(
+                    ErrorBody::new(ErrorCode::Denied, "SSH key auth failed.")
+                        .with_machine("tower")
+                        .with_details(json!({ "reason": crate::ssh::REASON_AUTH_FAILED })),
+                )
+            },
+            || {
+                let expected = sample_device_enrolled();
+                async move { Some(expected) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry_recovered.principal, "device:phone");
+
+        // 2b. Refused single-use key for a shared (non-`device:`) principal must NOT probe or
+        //     recover so another device consuming the invite is never masked.
+        let shared_probes = Arc::new(AtomicUsize::new(0));
+        let shared_probes_c = Arc::clone(&shared_probes);
+        let shared_auth_err = enrol_client::enrol_flow(
             &invite,
             CancellationToken::new(),
             true,
@@ -1556,19 +1602,30 @@ mod tests {
             },
             || {
                 let expected = sample_enrolled();
-                async move { Some(expected) }
+                async move {
+                    shared_probes_c.fetch_add(1, Ordering::SeqCst);
+                    Some(expected)
+                }
             },
         )
         .await
-        .unwrap();
-        assert_eq!(retry_recovered.principal, "phone");
+        .unwrap_err();
+        assert_eq!(shared_auth_err.code, ErrorCode::Denied);
+        assert_eq!(shared_probes.load(Ordering::SeqCst), 0);
+        assert!(
+            shared_auth_err
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("single-use")),
+            "{shared_auth_err:?}"
+        );
 
-        // 3. Already paired under the same principal (`allow_auth_failed_recovery = false`): a
-        //    stale/replayed invite failing auth must NOT falsely recover.
+        // 3. Already paired under the same `device:` principal (`allow_auth_failed_recovery = false`):
+        //    a stale/replayed invite failing auth must NOT falsely recover.
         let blocked_probes = Arc::new(AtomicUsize::new(0));
         let blocked_probes_c = Arc::clone(&blocked_probes);
         let auth_err = enrol_client::enrol_flow(
-            &invite,
+            &device_invite,
             CancellationToken::new(),
             false,
             || async {
@@ -1579,7 +1636,7 @@ mod tests {
                 )
             },
             || {
-                let expected = sample_enrolled();
+                let expected = sample_device_enrolled();
                 async move {
                     blocked_probes_c.fetch_add(1, Ordering::SeqCst);
                     Some(expected)
@@ -1597,9 +1654,10 @@ mod tests {
                 .is_some_and(|h| h.contains("single-use"))
         );
 
-        // 4. Genuine auth failure (probe returns None) returns Denied with expiry hint.
+        // 4. Genuine auth failure on a `device:` invite (probe returns None) returns Denied with
+        //    expiry hint.
         let genuine_err = enrol_client::enrol_flow(
-            &invite,
+            &device_invite,
             CancellationToken::new(),
             true,
             || async {
@@ -1618,7 +1676,7 @@ mod tests {
             genuine_err
                 .hint
                 .as_deref()
-                .is_some_and(|h| h.contains(&invite.expires))
+                .is_some_and(|h| h.contains(&device_invite.expires))
         );
 
         // 5. Explicit user cancellation never runs the recovery probe.

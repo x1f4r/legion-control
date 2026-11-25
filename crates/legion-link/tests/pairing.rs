@@ -777,3 +777,172 @@ async fn real_sshd_late_enrolment_confirmation_and_retry_recover_cleanly() {
     assert_eq!(whoami_b["principal"], json!("device:retry-phone"));
     link_b.close().await;
 }
+
+#[tokio::test]
+async fn real_sshd_refused_single_use_key_recovers_only_for_device_principals() {
+    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
+        eprintln!(
+            "skipping real_sshd_refused_single_use_key_recovers_only_for_device_principals: sshd/ssh-keygen unavailable"
+        );
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        eprintln!(
+            "skipping real_sshd_refused_single_use_key_recovers_only_for_device_principals: built `legion` binary not found"
+        );
+        return;
+    };
+
+    let root = strict_tempdir();
+    let user_home = root.path().join("home");
+    let legion_home = root.path().join("legion");
+    let config_dir = legion_home.join("config");
+    let ssh_dir = user_home.join(".ssh");
+    let auth_keys = ssh_dir.join("authorized_keys");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&ssh_dir).unwrap();
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(&user_home, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700));
+    }
+
+    let Some(sshd) = ThrowawaySshd::start(&auth_keys, &user_home) else {
+        eprintln!("skipping: throwaway sshd unavailable");
+        return;
+    };
+
+    let node_toml = format!(
+        "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+        toml_literal(&auth_keys),
+        toml_literal(&sshd.host_key_pub),
+    );
+    fs::write(config_dir.join("node.toml"), node_toml).unwrap();
+    fs::write(
+        config_dir.join("policy.toml"),
+        "default = \"owner\"\n\n\
+         [roles.operator]\n\
+         allow = [\"effect:read\"]\n\n\
+         [principals.me]\n\
+         role = \"operator\"\n",
+    )
+    .unwrap();
+
+    let port_arg = format!("port={}", sshd.port);
+    let user_arg = format!("user={}", sshd.user);
+
+    // 1. Unique `device:` principal: a half-paired device retrying its own consumed invite
+    //    recovers via its installed key.
+    let dev_invite_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=unique-phone",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let dev_invite_text = dev_invite_res["invite"].as_str().unwrap();
+    let dev_invite = Invite::parse(dev_invite_text).unwrap();
+    assert_eq!(dev_invite.principal, "device:unique-phone");
+
+    let dev_key = DeviceKey::generate().unwrap();
+    enrol(
+        &dev_invite,
+        &dev_key,
+        "unique-phone",
+        SshTimeouts::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let dev_link = Link::new(LinkConfig {
+        device_key: Some(dev_key.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let recovered = dev_link
+        .pair(dev_invite_text, "unique-phone")
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "device: principal recovery failed: {e}\n--- sshd log ---\n{}",
+                sshd.log()
+            )
+        });
+    assert_eq!(recovered.principal, "device:unique-phone");
+    assert!(dev_link.config().node("tower").is_some());
+    dev_link.close().await;
+
+    // 2. Shared principal (`me`): Y already holds `me` on the machine (no local entry yet),
+    //    another device X consumes invite #2 for `me`, and Y calling `pair(invite2)` MUST get
+    //    a plain `Denied` / `auth_failed` refusal instead of masking X's use of invite #2.
+    let shared_inv1_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "principal=me",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let shared_inv1 = Invite::parse(shared_inv1_res["invite"].as_str().unwrap()).unwrap();
+    let key_y = DeviceKey::generate().unwrap();
+    enrol(
+        &shared_inv1,
+        &key_y,
+        "shared-y",
+        SshTimeouts::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let shared_inv2_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "principal=me",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let shared_inv2_text = shared_inv2_res["invite"].as_str().unwrap();
+    let shared_inv2 = Invite::parse(shared_inv2_text).unwrap();
+    let key_x = DeviceKey::generate().unwrap();
+    enrol(
+        &shared_inv2,
+        &key_x,
+        "shared-x",
+        SshTimeouts::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let link_y = Link::new(LinkConfig {
+        device_key: Some(key_y.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let err = link_y.pair(shared_inv2_text, "shared-y").await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Denied, "{err}");
+    assert_eq!(
+        err.details.as_ref().unwrap()["reason"],
+        json!(REASON_AUTH_FAILED)
+    );
+    assert!(
+        link_y.config().node("tower").is_none(),
+        "shared-principal refused key must never save a local node entry"
+    );
+    link_y.close().await;
+}
