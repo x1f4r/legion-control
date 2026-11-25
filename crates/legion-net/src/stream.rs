@@ -197,6 +197,8 @@ pub(crate) enum Op {
         #[serde(default)]
         handshake_only: bool,
         #[serde(default)]
+        hello: Option<Box<legion_sync::HandshakeHello>>,
+        #[serde(default)]
         since_incarnation: u64,
         #[serde(default)]
         since_seq: u64,
@@ -1162,6 +1164,7 @@ fn run<R: BufRead, W: Write>(
             folder,
             caller,
             handshake_only,
+            hello,
             since_incarnation,
             since_seq,
             limit,
@@ -1171,6 +1174,7 @@ fn run<R: BufRead, W: Write>(
             &folder,
             &caller,
             handshake_only,
+            hello.as_deref(),
             since_incarnation,
             since_seq,
             limit,

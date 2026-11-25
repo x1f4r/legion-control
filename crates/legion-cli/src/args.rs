@@ -71,6 +71,12 @@ pub struct SyncRunCommand {
     pub scan_interval_secs: Option<u64>,
     /// `--pull-interval <secs>`: override periodic peer pull interval in seconds.
     pub pull_interval_secs: Option<u64>,
+    /// `--pull-max-pages <n>`: maximum index pages pulled from one peer per session before yielding.
+    pub pull_max_pages: Option<usize>,
+    /// `--pull-max-secs <secs>`: wall-clock time bound per peer pull session before yielding.
+    pub pull_max_secs: Option<u64>,
+    /// `--brake-settle-secs <secs>`: override move-awareness deletion settle period (default 30s).
+    pub brake_settle_secs: Option<u64>,
     /// `--config-sync-interval <secs>`: override periodic `sync.toml` sync interval in seconds.
     pub config_sync_interval_secs: Option<u64>,
     /// `--debounce-ms <ms>`: override watcher debounce window in milliseconds.
@@ -370,6 +376,9 @@ and accepts commands from the sync.* tools over an owner-only local control endp
   --no-watch                  disable OS file watching and rely on periodic full scans only
   --scan-interval SECS        interval between periodic full scans (default 60)
   --pull-interval SECS        interval between periodic peer reconciliation passes (default 15)
+  --pull-max-pages N          max index pages pulled per peer before yielding (default 16)
+  --pull-max-secs SECS        max wall-clock seconds per peer pull session before yielding (default 30)
+  --brake-settle-secs SECS    move-awareness deletion settle period in seconds (default 30)
   --config-sync-interval SECS interval between periodic sync.toml fleet merges (default 60)
   --debounce-ms MS            watcher debounce window in milliseconds (default 80)
   --backoff-ms MS             initial offline-peer retry backoff in milliseconds (default 2000)
@@ -378,8 +387,8 @@ and accepts commands from the sync.* tools over an owner-only local control endp
   --state-dir ST              explicit state directory (requires --config-dir)
 
 Manage sync folders with `legion sync.create`, `sync.add`, `sync.remove`, `sync.delete`,
-`sync.list`, `sync.status`, `sync.now`, `sync.pause`, `sync.resume`, `sync.conflicts`,
-`sync.resolve`, `sync.bin`, and `sync.restore`.";
+`sync.list`, `sync.status`, `sync.now`, `sync.pause`, `sync.resume`, `sync.rebuild`,
+`sync.dismiss`, `sync.conflicts`, `sync.resolve`, `sync.bin`, and `sync.restore`.";
 
 /// Reads the arguments after the program's name.
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageError> {
@@ -575,6 +584,9 @@ fn sync_cmd(rest: &[String]) -> Result<Command, UsageError> {
             no_watch: false,
             scan_interval_secs: None,
             pull_interval_secs: None,
+            pull_max_pages: None,
+            pull_max_secs: None,
+            brake_settle_secs: None,
             config_sync_interval_secs: None,
             debounce_ms: None,
             backoff_ms: None,
@@ -592,6 +604,9 @@ fn sync_cmd(rest: &[String]) -> Result<Command, UsageError> {
         no_watch: false,
         scan_interval_secs: None,
         pull_interval_secs: None,
+        pull_max_pages: None,
+        pull_max_secs: None,
+        brake_settle_secs: None,
         config_sync_interval_secs: None,
         debounce_ms: None,
         backoff_ms: None,
@@ -645,6 +660,26 @@ fn sync_cmd(rest: &[String]) -> Result<Command, UsageError> {
             "--pull-interval" => {
                 let raw = take_value(name)?;
                 cmd.pull_interval_secs = Some(parse_u64(name, &raw)?);
+            }
+            "--pull-max-pages" => {
+                let raw = take_value(name)?;
+                let n = parse_u64(name, &raw)?;
+                cmd.pull_max_pages = Some(usize::try_from(n).map_err(|_| {
+                    UsageError(format!("{name} is out of range: {raw:?}."))
+                })?);
+            }
+            "--pull-max-secs" => {
+                let raw = take_value(name)?;
+                cmd.pull_max_secs = Some(parse_u64(name, &raw)?);
+            }
+            "--brake-settle-secs" => {
+                let raw = take_value(name)?;
+                let n = raw.parse::<u64>().map_err(|_| {
+                    UsageError(format!(
+                        "{name} must be a non-negative integer, not {raw:?}."
+                    ))
+                })?;
+                cmd.brake_settle_secs = Some(n);
             }
             "--config-sync-interval" => {
                 let raw = take_value(name)?;

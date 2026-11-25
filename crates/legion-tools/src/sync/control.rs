@@ -20,8 +20,9 @@ use legion_core::config::write_atomically;
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_os::lock::{FileLock, LockMode};
 use legion_sync::{
-    BinEntry, ConflictChoice, ConflictInfo, DeletionBrakeDecision, FolderStatus, MemberState,
-    PeerHandshake, RecordsPage, RestoreStrategy,
+    BinEntry, ConflictChoice, ConflictInfo, DeletionBrakeDecision, FolderStatus, HandshakeHello,
+    InboundDeletionBrakeDecision, MemberState, PeerHandshake, ProblemKind, RecordsPage,
+    RestoreStrategy,
 };
 use legion_xfer::Hash;
 use serde::{Deserialize, Serialize};
@@ -210,6 +211,20 @@ pub struct RunnerPidInfo {
     pub node: String,
 }
 
+/// Summary of one unapplied or held-back sync item (remote peer record or local scan hold).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldBackSummary {
+    /// Relative path inside the sync folder.
+    pub path: String,
+    /// Peer that sent the unapplied record, or `None` for local items held back during scanning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    /// Machine-readable problem classification.
+    pub kind: ProblemKind,
+    /// Plain-language sentence explaining why the item is held back.
+    pub reason: String,
+}
+
 /// Atomically persisted per-folder status file written by `legion sync run` to
 /// `<state_dir>/sync/status/<hash>.json` so `sync.status` can read status without talking to the
 /// runner.
@@ -223,9 +238,16 @@ pub struct PersistedFolderStatus {
     pub local_path: String,
     /// Whether syncing is paused in `sync.toml`.
     pub paused_by_config: bool,
+    /// `true` when this folder's sync index is damaged/missing and stopped awaiting `sync.rebuild`.
+    #[serde(default)]
+    pub index_damaged: bool,
+    /// Unapplied and held-back items (both remote peer records and local scan holds such as
+    /// escaping symbolic links) with their plain-language reasons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_back: Vec<HeldBackSummary>,
     /// RFC 3339 UTC timestamp when this status snapshot was written.
     pub updated_at: String,
-    /// Full engine status snapshot (five-state machine, per-member status, conflicts, bin, brake).
+    /// Full engine status snapshot (five-state machine, per-member status, conflicts, bin, brakes).
     pub status: FolderStatus,
 }
 
@@ -319,12 +341,38 @@ pub enum ControlRequest {
         /// Folder identifier.
         folder_id: String,
     },
-    /// Resolve a tripped mass-deletion brake on one folder.
+    /// Resolve a tripped outbound mass-deletion brake on one folder.
     ResolveBrake {
         /// Folder identifier.
         folder_id: String,
         /// `confirm_deleted` or `rescan`.
         decision: DeletionBrakeDecision,
+    },
+    /// Resolve a tripped inbound mass-deletion brake for one peer on one folder.
+    ResolveInboundBrake {
+        /// Folder identifier.
+        folder_id: String,
+        /// Peer member whose deletions tripped the inbound brake.
+        peer: String,
+        /// `apply_deletions` or `keep_local_files`.
+        decision: InboundDeletionBrakeDecision,
+    },
+    /// Explicitly rebuild a damaged (or forced) folder index from live files, bin sidecars, and
+    /// `.legion-sync/deletions.log`.
+    RebuildIndex {
+        /// Folder identifier.
+        folder_id: String,
+        /// Allow rebuilding even when the index is currently healthy.
+        force: bool,
+    },
+    /// Dismiss informational durable problems matching `kind` (and optional `peer`).
+    DismissProblem {
+        /// Folder identifier.
+        folder_id: String,
+        /// Informational problem kind to dismiss.
+        kind: ProblemKind,
+        /// Optional peer filter.
+        peer: Option<String>,
     },
     /// List unresolved two-version conflicts on one folder.
     ListConflicts {
@@ -356,12 +404,14 @@ pub enum ControlRequest {
         /// Conflict handling strategy (`fail`, `replace`, `rename`).
         strategy: RestoreStrategyWire,
     },
-    /// Concurrent MVCC read: serve [`PeerHandshake`] to `legion stream`.
+    /// Concurrent MVCC read: serve bidirectional [`PeerHandshake`] to `legion stream`.
     ServeHandshake {
         /// Folder identifier.
         folder_id: String,
         /// Calling fleet member name.
         caller: String,
+        /// Caller's [`HandshakeHello`] carrying incarnation, seq, fingerprint, and pull/ack views.
+        hello: HandshakeHello,
     },
     /// Concurrent MVCC read: serve [`RecordsPage`] to `legion stream`.
     ServeRecordsSince {
@@ -452,6 +502,22 @@ pub enum ControlResponse {
     FetchAllowed {
         /// Indexed file byte length.
         size: u64,
+    },
+    /// Explicit index rebuild completed.
+    Rebuilt {
+        /// Number of live entries indexed from disk.
+        files_indexed: usize,
+        /// Number of bin entries restored from `.legion-sync/bin`.
+        bin_entries: usize,
+        /// Updated persisted folder status.
+        status: Box<PersistedFolderStatus>,
+    },
+    /// Informational durable problems dismissed.
+    Dismissed {
+        /// Number of problem entries cleared.
+        count: usize,
+        /// Updated persisted folder status.
+        status: Box<PersistedFolderStatus>,
     },
     /// Structured error returned by the runner.
     Error {

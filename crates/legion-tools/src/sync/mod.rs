@@ -23,10 +23,10 @@ use legion_core::{
     parse_args,
 };
 use legion_sync::{
-    BinEntry, ConflictChoice, ConflictInfo, DeletionBrake, DeletionBrakeDecision, FolderConfig,
-    FolderMarker, IgnoreMatcher, MemberState, MemberStatus, RealFs, RedbIndexStore,
-    RestoreStrategy, SYNC_MARKER_FILE, SYNC_META_DIR, SyncEngine, SyncError, SyncFs, SyncProblem,
-    check_folders_not_nested, validate_folder_id,
+    BinEntry, ConflictChoice, ConflictInfo, DeletionBrakeDecision, FolderConfig, FolderMarker,
+    FolderStatus, IgnoreMatcher, InboundDeletionBrakeDecision, MemberState, MemberStatus,
+    ProblemKind, RealFs, RedbIndexStore, RestoreStrategy, SYNC_MARKER_FILE, SYNC_META_DIR,
+    SyncEngine, SyncError, SyncFs, SyncProblem, check_folders_not_nested, validate_folder_id,
 };
 use legion_xfer::Timestamp as XferTimestamp;
 use schemars::JsonSchema;
@@ -42,8 +42,9 @@ use self::config::{
 };
 use self::control::{
     CONTROL_IPC_TIMEOUT, CONTROL_SYNC_NOW_TIMEOUT, ControlRequest, ControlResponse,
-    PersistedFolderStatus, RestoreStrategyWire, folder_index_path, is_runner_running,
-    read_folder_status, remove_folder_status, send_control_request, write_folder_status,
+    HeldBackSummary, PersistedFolderStatus, RestoreStrategyWire, folder_index_path,
+    is_runner_running, read_folder_status, remove_folder_status, send_control_request,
+    write_folder_status,
 };
 use self::service::{ServiceAction, reconcile_host_service};
 
@@ -81,7 +82,8 @@ pub trait SyncRemote: Send + Sync + 'static {
 }
 
 /// Registers `sync.toml` and the local `sync.*` tools (`sync.list`, `sync.status`, `sync.now`,
-/// `sync.pause`, `sync.resume`, `sync.conflicts`, `sync.resolve`, `sync.bin`, `sync.restore`).
+/// `sync.pause`, `sync.resume`, `sync.rebuild`, `sync.dismiss`, `sync.conflicts`, `sync.resolve`,
+/// `sync.bin`, `sync.restore`).
 pub fn register(registry: &mut Registry) {
     registry.add_document::<SyncFile>();
 
@@ -94,7 +96,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "sync.status",
         Effect::Read,
-        "Report the current status of one or all sync folders from the runner's atomic status files: per-member state (up_to_date, syncing with files_left and bytes_left, waiting_for_member, paused, or problem with a plain sentence), counts of two-version files and bin entries, and any active mass-deletion brake.",
+        "Report the current status of one or all sync folders from the runner's atomic status files in plain sentences and structured fields: per-member state (up_to_date, syncing with files_left and bytes_left, waiting_for_member, paused, or problem), outbound and per-peer inbound mass-deletion brakes, damaged sync records, unapplied and held-back items with reasons (including held-back symbolic links), unresolved two-version conflicts, and bin counts.",
         sync_status,
     );
     registry.add_fn(
@@ -112,8 +114,20 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "sync.resume",
         Effect::Write,
-        "Resume a paused sync folder. When paused by the mass-deletion brake, pass `brake_decision=\"confirm_deleted\"` to confirm the files were deleted or `brake_decision=\"rescan\"` to rescan with the brake still armed.",
+        "Resume a paused sync folder or answer a tripped deletion brake. For an outbound deletion brake pass `brake_decision=\"confirm_deleted\"` or `\"rescan\"`. For a per-peer inbound deletion brake pass `peer=\"<machine>\"` and `inbound_decision=\"apply_deletions\"` or `\"keep_local_files\"`.",
         sync_resume,
+    );
+    registry.add_fn(
+        "sync.rebuild",
+        Effect::Write,
+        "Explicitly rebuild a damaged sync folder index from live files on disk, `.legion-sync/bin` metadata, and `.legion-sync/deletions.log`. Never runs automatically; refuses on a healthy index unless `force=true`.",
+        sync_rebuild,
+    );
+    registry.add_fn(
+        "sync.dismiss",
+        Effect::Write,
+        "Dismiss informational sync notices (such as `peer_forced_rotation`, `peer_rollback_rate_limited`, `directory_kept_local_files`, or `invalid_peer_record`) without discarding held-back records, brakes, or index damage.",
+        sync_dismiss,
     );
     registry.add_fn(
         "sync.conflicts",
@@ -265,8 +279,11 @@ struct SyncFolderSummary {
     local_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<MemberState>,
+    index_damaged: bool,
     conflicts_count: usize,
     bin_count: usize,
+    inbound_brakes_count: usize,
+    unapplied_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -291,18 +308,57 @@ struct SyncStatusResult {
 }
 
 #[derive(Debug, Serialize)]
+struct OutboundBrakeView {
+    deleted_count: usize,
+    total_live_files: usize,
+    sample_paths: Vec<String>,
+    sentence: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InboundBrakeView {
+    peer: String,
+    deleted_count: usize,
+    total_live_files: usize,
+    sample_paths: Vec<String>,
+    sentence: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DeferredItemView {
+    peer: String,
+    path: String,
+    reason: String,
+    attempts: u32,
+    sentence: String,
+}
+
+#[derive(Debug, Serialize)]
 struct SyncFolderStatusView {
     id: String,
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     local_path: Option<String>,
     paused: bool,
+    index_damaged: bool,
     state: MemberState,
+    summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    notices: Vec<String>,
     members: Vec<SyncMemberStatusView>,
     conflicts_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    conflicts: Vec<ConflictInfo>,
     bin_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pending_brake: Option<DeletionBrake>,
+    pending_brake: Option<OutboundBrakeView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inbound_brakes: Vec<InboundBrakeView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    held_back: Vec<HeldBackSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deferred: Vec<DeferredItemView>,
+    unapplied_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     updated_at: Option<String>,
 }
@@ -313,6 +369,7 @@ struct SyncMemberStatusView {
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
     state: MemberState,
+    sentence: String,
     cursor_seq: u64,
 }
 
@@ -477,15 +534,41 @@ impl From<BrakeDecisionArg> for DeletionBrakeDecision {
     }
 }
 
+/// Answer to a tripped inbound mass-deletion brake for one peer on `sync.resume`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InboundBrakeDecisionArg {
+    /// Allow and apply the peer's blocked deletions (moving displaced local files to the bin).
+    ApplyDeletions,
+    /// Keep this machine's local files and re-assert them as newer than the peer's deletions.
+    KeepLocalFiles,
+}
+
+impl From<InboundBrakeDecisionArg> for InboundDeletionBrakeDecision {
+    fn from(value: InboundBrakeDecisionArg) -> Self {
+        match value {
+            InboundBrakeDecisionArg::ApplyDeletions => InboundDeletionBrakeDecision::ApplyDeletions,
+            InboundBrakeDecisionArg::KeepLocalFiles => InboundDeletionBrakeDecision::KeepLocalFiles,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ResumeArgs {
     /// Identifier of the sync folder to resume.
     id: String,
-    /// Decision required when resuming a folder paused by the mass-deletion brake:
+    /// Decision required when resuming a folder paused by the outbound mass-deletion brake:
     /// `confirm_deleted` or `rescan`.
     #[serde(default)]
     brake_decision: Option<BrakeDecisionArg>,
+    /// Peer machine name when resolving a per-peer inbound mass-deletion brake.
+    #[serde(default)]
+    peer: Option<String>,
+    /// Decision required when resolving an inbound mass-deletion brake for `peer`:
+    /// `apply_deletions` or `keep_local_files`.
+    #[serde(default)]
+    inbound_decision: Option<InboundBrakeDecisionArg>,
 }
 
 #[derive(Debug, Serialize)]
@@ -494,6 +577,79 @@ struct ResumeResult {
     paused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     brake_decision: Option<BrakeDecisionArg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inbound_decision: Option<InboundBrakeDecisionArg>,
+    runner_notified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<MemberState>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RebuildArgs {
+    /// Identifier of the sync folder whose damaged index should be rebuilt from disk.
+    id: String,
+    /// Rebuild even when the folder's index is currently healthy (default false).
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RebuildResult {
+    id: String,
+    rebuilt: bool,
+    files_indexed: usize,
+    bin_entries: usize,
+    runner_notified: bool,
+    state: MemberState,
+}
+
+/// Informational durable notice kind that a person or agent may explicitly dismiss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DismissibleProblemArg {
+    /// Dismiss a notice that this machine started a fresh history after a peer reported rollback.
+    PeerForcedRotation,
+    /// Dismiss a notice that a peer's repeated rollback claims were rate-limited.
+    PeerRollbackRateLimited,
+    /// Dismiss a notice that a deleted directory stayed on disk because it held local files.
+    DirectoryKeptLocalFiles,
+    /// Dismiss a notice that a peer sent a malformed or unauthorized record.
+    InvalidPeerRecord,
+}
+
+impl From<DismissibleProblemArg> for ProblemKind {
+    fn from(value: DismissibleProblemArg) -> Self {
+        match value {
+            DismissibleProblemArg::PeerForcedRotation => ProblemKind::PeerForcedRotation,
+            DismissibleProblemArg::PeerRollbackRateLimited => ProblemKind::PeerRollbackRateLimited,
+            DismissibleProblemArg::DirectoryKeptLocalFiles => ProblemKind::DirectoryKeptLocalFiles,
+            DismissibleProblemArg::InvalidPeerRecord => ProblemKind::InvalidPeerRecord,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DismissArgs {
+    /// Identifier of the sync folder.
+    id: String,
+    /// Informational notice kind to dismiss.
+    kind: DismissibleProblemArg,
+    /// Optional peer machine filter.
+    #[serde(default)]
+    peer: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DismissResult {
+    id: String,
+    kind: DismissibleProblemArg,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer: Option<String>,
+    dismissed: usize,
     runner_notified: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<MemberState>,
@@ -631,14 +787,22 @@ async fn sync_list(ctx: &Ctx, _args: NoArgs) -> Result<SyncListResult, ToolError
             let persisted = read_folder_status(&paths, id)?;
             let local_path = entry.members.get(&here).map(|m| m.path.clone());
             let is_local_member = local_path.is_some();
-            let (state, conflicts_count, bin_count) = match persisted {
-                Some(p) => (
-                    Some(p.status.state),
-                    p.status.conflicts.len(),
-                    p.status.bin.len(),
-                ),
-                None => (None, 0, 0),
-            };
+            let (state, index_damaged, conflicts_count, bin_count, inbound_brakes_count, unapplied_count) =
+                match persisted {
+                    Some(p) => {
+                        let unapplied = p.held_back.len() + p.status.deferred.len();
+                        let damaged = p.index_damaged || status_has_index_damaged(&p.status);
+                        (
+                            Some(p.status.state),
+                            damaged,
+                            p.status.conflicts.len(),
+                            p.status.bin.len(),
+                            p.status.inbound_brakes.len(),
+                            unapplied,
+                        )
+                    }
+                    None => (None, false, 0, 0, 0, 0),
+                };
             folders.push(SyncFolderSummary {
                 id: id.clone(),
                 name: entry.name.clone(),
@@ -656,8 +820,11 @@ async fn sync_list(ctx: &Ctx, _args: NoArgs) -> Result<SyncListResult, ToolError
                 is_local_member,
                 local_path,
                 state,
+                index_damaged,
                 conflicts_count,
                 bin_count,
+                inbound_brakes_count,
+                unapplied_count,
             });
         }
         Ok(SyncListResult {
@@ -702,6 +869,153 @@ async fn sync_status(ctx: &Ctx, args: StatusArgs) -> Result<SyncStatusResult, To
     .map_err(join_error)?
 }
 
+const MAX_STATUS_CONFLICTS_INLINE: usize = 50;
+
+fn status_has_index_damaged(status: &FolderStatus) -> bool {
+    matches!(
+        &status.state,
+        MemberState::Problem { problems, .. }
+            if problems.iter().any(|p| p.kind == ProblemKind::IndexDamaged)
+    )
+}
+
+/// Formats a [`MemberState`] as a single plain-language sentence.
+pub fn member_state_sentence(state: &MemberState) -> String {
+    match state {
+        MemberState::UpToDate => "Up to date.".to_owned(),
+        MemberState::Syncing {
+            files_left,
+            bytes_left,
+        } => {
+            let noun = if *files_left == 1 { "file" } else { "files" };
+            if *bytes_left > 0 {
+                format!("Syncing ({files_left} {noun}, {} left).", format_bytes(*bytes_left))
+            } else if *files_left > 0 {
+                format!("Syncing ({files_left} {noun} left).")
+            } else {
+                "Syncing.".to_owned()
+            }
+        }
+        MemberState::WaitingForMember { members } => {
+            if members.is_empty() {
+                "Waiting for a machine that is off.".to_owned()
+            } else if members.len() == 1 {
+                format!("Waiting for {} (currently off or unreachable).", members[0])
+            } else {
+                format!(
+                    "Waiting for {} (currently off or unreachable).",
+                    members.join(", ")
+                )
+            }
+        }
+        MemberState::Paused => "Paused.".to_owned(),
+        MemberState::Problem { sentence, .. } => sentence.clone(),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Ensures held-back symbolic link messages clearly state that only relative links staying inside
+/// the folder sync.
+pub fn enrich_problem_sentence(prob: &SyncProblem) -> String {
+    if prob.kind == ProblemKind::UnsupportedSymlink
+        && !prob.sentence.to_lowercase().contains("windows")
+        && !prob
+            .sentence
+            .contains("Only relative symbolic links that stay inside the sync folder are synced.")
+    {
+        format!(
+            "{} Only relative symbolic links that stay inside the sync folder are synced.",
+            prob.sentence
+        )
+    } else {
+        prob.sentence.clone()
+    }
+}
+
+/// Collects all unapplied remote held-back records AND local scan-held items (such as escaping
+/// symbolic links, Windows-incompatible names, or unreadable paths) with plain-language reasons.
+pub fn collect_held_back_summaries(
+    engine: &SyncEngine<RealFs, RedbIndexStore>,
+    status: &FolderStatus,
+) -> Vec<HeldBackSummary> {
+    let mut items: Vec<HeldBackSummary> = Vec::new();
+    let mut seen: BTreeSet<(Option<String>, String, ProblemKind)> = BTreeSet::new();
+
+    if let Ok(held) = engine.list_held_back() {
+        for h in held {
+            let key = (
+                Some(h.from_peer.clone()),
+                h.record.path.clone(),
+                h.problem.kind,
+            );
+            if seen.insert(key) {
+                items.push(HeldBackSummary {
+                    path: h.record.path,
+                    peer: Some(h.from_peer),
+                    kind: h.problem.kind,
+                    reason: enrich_problem_sentence(&h.problem),
+                });
+            }
+        }
+    }
+
+    if let MemberState::Problem { ref problems, .. } = status.state {
+        for p in problems {
+            if p.path.is_empty() {
+                continue;
+            }
+            let is_item_hold = matches!(
+                p.kind,
+                ProblemKind::UnsupportedSymlink
+                    | ProblemKind::CaseClash
+                    | ProblemKind::ForbiddenWindowsChar
+                    | ProblemKind::TrailingDotOrSpace
+                    | ProblemKind::ReservedWindowsName
+                    | ProblemKind::SegmentTooLong
+                    | ProblemKind::PathTooLong
+                    | ProblemKind::FilesystemError
+                    | ProblemKind::UnknownMember
+                    | ProblemKind::DeferredLimitExceeded
+            );
+            if !is_item_hold {
+                continue;
+            }
+            let key = (p.peer.clone(), p.path.clone(), p.kind);
+            if seen.insert(key) {
+                items.push(HeldBackSummary {
+                    path: p.path.clone(),
+                    peer: p.peer.clone(),
+                    kind: p.kind,
+                    reason: enrich_problem_sentence(p),
+                });
+            }
+        }
+    }
+
+    items.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.peer.cmp(&b.peer))
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
+    items
+}
+
 fn build_status_view(
     id: &str,
     entry: &SyncFolderEntry,
@@ -712,27 +1026,164 @@ fn build_status_view(
     let local_path = entry.members.get(here).map(|m| m.path.clone());
     match persisted {
         Some(p) => {
+            let index_damaged = p.index_damaged || status_has_index_damaged(&p.status);
+            let mut notices: Vec<String> = Vec::new();
+            if index_damaged {
+                notices.push(format!(
+                    "{} Run `sync.rebuild id={id}` to rebuild the index from disk.",
+                    legion_sync::INDEX_DAMAGED_PROBLEM_SENTENCE
+                ));
+            }
+            let pending_brake = p.status.pending_brake.map(|b| {
+                let sentence = format!(
+                    "Sync paused because {} of {} files disappeared at once. Confirm the deletions (`sync.resume id={id} brake_decision=confirm_deleted`) or rescan (`sync.resume id={id} brake_decision=rescan`).",
+                    b.deleted_count, b.total_live_files
+                );
+                notices.push(sentence.clone());
+                OutboundBrakeView {
+                    deleted_count: b.deleted_count,
+                    total_live_files: b.total_live_files,
+                    sample_paths: b.sample_paths,
+                    sentence,
+                }
+            });
+            let inbound_brakes: Vec<InboundBrakeView> = p
+                .status
+                .inbound_brakes
+                .into_iter()
+                .map(|ib| {
+                    let sentence = format!(
+                        "Paused syncing from '{}' because its changes would delete {} of {} files. Apply the deletions (`sync.resume id={id} peer={} inbound_decision=apply_deletions`) or keep this machine's files (`sync.resume id={id} peer={} inbound_decision=keep_local_files`).",
+                        ib.peer, ib.deleted_count, ib.total_live_files, ib.peer, ib.peer
+                    );
+                    notices.push(sentence.clone());
+                    InboundBrakeView {
+                        peer: ib.peer,
+                        deleted_count: ib.deleted_count,
+                        total_live_files: ib.total_live_files,
+                        sample_paths: ib.sample_paths,
+                        sentence,
+                    }
+                })
+                .collect();
+
+            // Collect held-back items (prefer persisted explicit list, fall back to problems).
+            let mut held_back = p.held_back;
+            if held_back.is_empty()
+                && let MemberState::Problem { ref problems, .. } = p.status.state
+            {
+                for prob in problems {
+                    if !prob.path.is_empty()
+                        && matches!(
+                            prob.kind,
+                            ProblemKind::UnsupportedSymlink
+                                | ProblemKind::CaseClash
+                                | ProblemKind::ForbiddenWindowsChar
+                                | ProblemKind::TrailingDotOrSpace
+                                | ProblemKind::ReservedWindowsName
+                                | ProblemKind::SegmentTooLong
+                                | ProblemKind::PathTooLong
+                                | ProblemKind::FilesystemError
+                                | ProblemKind::UnknownMember
+                                | ProblemKind::DeferredLimitExceeded
+                        )
+                    {
+                        held_back.push(HeldBackSummary {
+                            path: prob.path.clone(),
+                            peer: prob.peer.clone(),
+                            kind: prob.kind,
+                            reason: enrich_problem_sentence(prob),
+                        });
+                    }
+                }
+            }
+            for item in &held_back {
+                notices.push(item.reason.clone());
+            }
+
+            let deferred: Vec<DeferredItemView> = p
+                .status
+                .deferred
+                .into_iter()
+                .map(|d| {
+                    let tries = if d.attempts == 1 { "attempt" } else { "attempts" };
+                    let sentence = format!(
+                        "'{}' from '{}' is deferred after {} {tries}: {}.",
+                        d.path, d.peer, d.attempts, d.reason
+                    );
+                    notices.push(sentence.clone());
+                    DeferredItemView {
+                        peer: d.peer,
+                        path: d.path,
+                        reason: d.reason,
+                        attempts: d.attempts,
+                        sentence,
+                    }
+                })
+                .collect();
+
+            let conflicts_count = p.status.conflicts.len();
+            if conflicts_count == 1 {
+                notices.push(format!(
+                    "1 file has two versions ('{}'); inspect with `sync.conflicts id={id}` and settle with `sync.resolve`.",
+                    p.status.conflicts[0].conflict_path
+                ));
+            } else if conflicts_count > 1 {
+                notices.push(format!(
+                    "{conflicts_count} files have two versions; inspect with `sync.conflicts id={id}` and settle with `sync.resolve`."
+                ));
+            }
+            let mut conflicts = p.status.conflicts;
+            if conflicts.len() > MAX_STATUS_CONFLICTS_INLINE {
+                conflicts.truncate(MAX_STATUS_CONFLICTS_INLINE);
+            }
+
+            let bin_count = p.status.bin.len();
+            if bin_count == 1 {
+                notices.push(format!(
+                    "1 deleted or replaced item is in the folder's bin (inspect with `sync.bin id={id}` or restore with `sync.restore`)."
+                ));
+            } else if bin_count > 1 {
+                notices.push(format!(
+                    "{bin_count} deleted or replaced items are in the folder's bin (inspect with `sync.bin id={id}` or restore with `sync.restore`)."
+                ));
+            }
+
             let members = p
                 .status
                 .members
                 .into_iter()
-                .map(|ms: MemberStatus| SyncMemberStatusView {
-                    path: entry.members.get(&ms.member).map(|m| m.path.clone()),
-                    member: ms.member,
-                    state: ms.state,
-                    cursor_seq: ms.cursor_seq,
+                .map(|ms: MemberStatus| {
+                    let sentence = member_state_sentence(&ms.state);
+                    SyncMemberStatusView {
+                        path: entry.members.get(&ms.member).map(|m| m.path.clone()),
+                        member: ms.member,
+                        state: ms.state,
+                        sentence,
+                        cursor_seq: ms.cursor_seq,
+                    }
                 })
                 .collect();
+            let summary = member_state_sentence(&p.status.state);
+            let unapplied_count = held_back.len() + deferred.len();
             SyncFolderStatusView {
                 id: id.to_owned(),
                 name: entry.name.clone(),
                 local_path: Some(p.local_path),
                 paused: entry.paused || matches!(p.status.state, MemberState::Paused),
+                index_damaged,
                 state: p.status.state,
+                summary,
+                notices,
                 members,
-                conflicts_count: p.status.conflicts.len(),
-                bin_count: p.status.bin.len(),
-                pending_brake: p.status.pending_brake,
+                conflicts_count,
+                conflicts,
+                bin_count,
+                pending_brake,
+                inbound_brakes,
+                held_back,
+                deferred,
+                unapplied_count,
                 updated_at: Some(p.updated_at),
             }
         }
@@ -746,7 +1197,7 @@ fn build_status_view(
                     sentence: "The sync runner is not running on this machine.".to_owned(),
                     problems: vec![SyncProblem {
                         path: String::new(),
-                        kind: legion_sync::ProblemKind::FilesystemError,
+                        kind: ProblemKind::FilesystemError,
                         peer: None,
                         sentence: "The sync runner is not running on this machine.".to_owned(),
                     }],
@@ -757,6 +1208,12 @@ fn build_status_view(
                     bytes_left: 0,
                 }
             };
+            let summary = member_state_sentence(&state);
+            let notices = if matches!(state, MemberState::Problem { .. }) {
+                vec![summary.clone()]
+            } else {
+                Vec::new()
+            };
             let members = entry
                 .members
                 .iter()
@@ -764,6 +1221,7 @@ fn build_status_view(
                     member: m.clone(),
                     path: Some(info.path.clone()),
                     state: state.clone(),
+                    sentence: summary.clone(),
                     cursor_seq: 0,
                 })
                 .collect();
@@ -772,11 +1230,19 @@ fn build_status_view(
                 name: entry.name.clone(),
                 local_path,
                 paused: entry.paused,
+                index_damaged: false,
                 state,
+                summary,
+                notices,
                 members,
                 conflicts_count: 0,
+                conflicts: Vec::new(),
                 bin_count: 0,
                 pending_brake: None,
+                inbound_brakes: Vec::new(),
+                held_back: Vec::new(),
+                deferred: Vec::new(),
+                unapplied_count: 0,
                 updated_at: None,
             }
         }
@@ -1559,14 +2025,123 @@ async fn sync_pause(ctx: &Ctx, args: PauseArgs) -> Result<PauseResult, ToolError
 
 async fn sync_resume(ctx: &Ctx, args: ResumeArgs) -> Result<ResumeResult, ToolError> {
     validate_folder_id(&args.id).map_err(sync_error_to_body)?;
+    if args.brake_decision.is_some() && (args.inbound_decision.is_some() || args.peer.is_some()) {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Pass either `brake_decision` (for an outbound brake) or `peer` + `inbound_decision` (for a per-peer inbound brake), not both.",
+        )
+        .with_hint("Resolve one brake at a time with `legion sync.resume`."));
+    }
+    if args.peer.is_some() && args.inbound_decision.is_none() {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "`peer` requires `inbound_decision=\"apply_deletions\"` or `inbound_decision=\"keep_local_files\"`.",
+        )
+        .with_hint("Specify how to resolve that peer's inbound mass-deletion brake."));
+    }
+    if let Some(ref peer) = args.peer {
+        validate_machine_arg(peer)?;
+    }
 
-    // Check whether a local mass-deletion brake is currently pending on this folder.
+    // Check current persisted folder state (damaged index, outbound brake, inbound brakes).
     let paths_check = ctx.paths().clone();
     let id_check = args.id.clone();
     let persisted = tokio::task::spawn_blocking(move || read_folder_status(&paths_check, &id_check))
         .await
         .map_err(join_error)??;
-    let pending_brake = persisted.and_then(|p| p.status.pending_brake);
+    let index_damaged = persisted
+        .as_ref()
+        .is_some_and(|p| p.index_damaged || status_has_index_damaged(&p.status));
+    let pending_brake = persisted.as_ref().and_then(|p| p.status.pending_brake.clone());
+    let inbound_brakes = persisted
+        .as_ref()
+        .map(|p| p.status.inbound_brakes.clone())
+        .unwrap_or_default();
+
+    if index_damaged {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Sync folder {:?}: {}",
+                args.id,
+                legion_sync::INDEX_DAMAGED_PROBLEM_SENTENCE
+            ),
+        )
+        .with_hint(format!(
+            "Rebuild this folder's sync record explicitly with `legion sync.rebuild id={}`.",
+            args.id
+        )));
+    }
+
+    if args.inbound_decision.is_some() && args.peer.is_none() {
+        let peers: Vec<&str> = inbound_brakes.iter().map(|b| b.peer.as_str()).collect();
+        let hint = if peers.is_empty() {
+            "Pass `peer=\"<machine>\"` alongside `inbound_decision`.".to_owned()
+        } else {
+            format!(
+                "Pass `peer=\"<machine>\"` alongside `inbound_decision` (paused peer(s): {}).",
+                peers.join(", ")
+            )
+        };
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "`inbound_decision` requires `peer` naming which peer's inbound brake to resolve.",
+        )
+        .with_hint(hint));
+    }
+
+    // Resolving a per-peer inbound deletion brake.
+    if let (Some(peer), Some(inbound_decision)) = (args.peer.clone(), args.inbound_decision) {
+        check_caller_may_write_folder(ctx, &args.id).await?;
+        let mut state_after = None;
+        let runner_notified = match send_control_request(
+            ctx.paths(),
+            ControlRequest::ResolveInboundBrake {
+                folder_id: args.id.clone(),
+                peer: peer.clone(),
+                decision: inbound_decision.into(),
+            },
+            CONTROL_SYNC_NOW_TIMEOUT,
+        )
+        .await?
+        {
+            Some(ControlResponse::Error { error }) => return Err(error),
+            Some(ControlResponse::Statuses { folders }) => {
+                state_after = folders.into_iter().next().map(|p| p.status.state);
+                true
+            }
+            Some(_) => true,
+            None => {
+                let paths = ctx.paths().clone();
+                let here = ctx.node_name().to_owned();
+                let id = args.id.clone();
+                let peer_clone = peer.clone();
+                let status = tokio::task::spawn_blocking(move || {
+                    with_offline_engine(&paths, &here, &id, |engine, _entry, _local_path| {
+                        engine.resolve_inbound_deletion_brake(
+                            &peer_clone,
+                            inbound_decision.into(),
+                            now_xfer_timestamp(),
+                        )?;
+                        engine.status()
+                    })
+                })
+                .await
+                .map_err(join_error)??;
+                state_after = Some(status.state);
+                false
+            }
+        };
+        return Ok(ResumeResult {
+            id: args.id,
+            paused: false,
+            brake_decision: None,
+            peer: Some(peer),
+            inbound_decision: Some(inbound_decision),
+            runner_notified,
+            state: state_after,
+        });
+    }
 
     if let Some(ref brake) = pending_brake
         && args.brake_decision.is_none()
@@ -1589,16 +2164,36 @@ async fn sync_resume(ctx: &Ctx, args: ResumeArgs) -> Result<ResumeResult, ToolEr
         })));
     }
 
-    // Ensure folder exists and clear config-level pause flag in sync.toml.
+    if args.brake_decision.is_some() {
+        check_caller_may_write_folder(ctx, &args.id).await?;
+    }
+
+    // Ensure folder exists and check whether it was manually paused vs blocked only by an inbound brake.
     let paths = ctx.paths().clone();
     let here = ctx.node_name().to_owned();
     let folder_id = args.id.clone();
+    let has_inbound = !inbound_brakes.is_empty();
+    let no_outbound_decision = args.brake_decision.is_none();
+    let inbound_peers: Vec<String> = inbound_brakes.iter().map(|b| b.peer.clone()).collect();
     tokio::task::spawn_blocking(move || -> Result<(), ErrorBody> {
         let _lock = lock_sync_config(&paths)?;
         let (mut sync_file, bytes_before) = load_sync_file_raw(&paths)?;
         let Some(folder) = sync_file.folders.get_mut(&folder_id) else {
             return Err(folder_not_found(&folder_id));
         };
+        if !folder.paused && no_outbound_decision && has_inbound {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                format!(
+                    "Sync folder {folder_id:?} has an inbound mass-deletion brake awaiting confirmation for peer(s): {}.",
+                    inbound_peers.join(", ")
+                ),
+            )
+            .with_hint(format!(
+                "Pass `peer=\"{}\"` with `inbound_decision=\"apply_deletions\"` or `inbound_decision=\"keep_local_files\"`.",
+                inbound_peers[0]
+            )));
+        }
         if folder.paused {
             folder.set_paused(false, &here);
             save_sync_file_locked(&paths, &sync_file, bytes_before)?;
@@ -1619,41 +2214,223 @@ async fn sync_resume(ctx: &Ctx, args: ResumeArgs) -> Result<ResumeResult, ToolEr
     };
 
     let mut state_after = None;
-    let runner_notified = match send_control_request(ctx.paths(), request, CONTROL_SYNC_NOW_TIMEOUT).await? {
-        Some(ControlResponse::Error { error }) => return Err(error),
-        Some(ControlResponse::Statuses { folders }) => {
-            state_after = folders.into_iter().next().map(|p| p.status.state);
-            true
-        }
-        Some(_) => true,
-        None => {
-            let paths = ctx.paths().clone();
-            let here = ctx.node_name().to_owned();
-            let id = args.id.clone();
-            let brake_decision = args.brake_decision;
-            let status = tokio::task::spawn_blocking(move || {
-                with_offline_engine(&paths, &here, &id, |engine, _entry, _local_path| {
-                    if let Some(decision) = brake_decision {
-                        engine.resolve_deletion_brake(decision.into(), now_xfer_timestamp())?;
-                    } else {
-                        engine.set_paused(false)?;
-                    }
-                    engine.status()
+    let runner_notified =
+        match send_control_request(ctx.paths(), request, CONTROL_SYNC_NOW_TIMEOUT).await? {
+            Some(ControlResponse::Error { error }) => return Err(error),
+            Some(ControlResponse::Statuses { folders }) => {
+                state_after = folders.into_iter().next().map(|p| p.status.state);
+                true
+            }
+            Some(_) => true,
+            None => {
+                let paths = ctx.paths().clone();
+                let here = ctx.node_name().to_owned();
+                let id = args.id.clone();
+                let brake_decision = args.brake_decision;
+                let status = tokio::task::spawn_blocking(move || {
+                    with_offline_engine(&paths, &here, &id, |engine, _entry, _local_path| {
+                        if let Some(decision) = brake_decision {
+                            engine.resolve_deletion_brake(decision.into(), now_xfer_timestamp())?;
+                        } else {
+                            engine.set_paused(false)?;
+                        }
+                        engine.status()
+                    })
                 })
-            })
-            .await
-            .map_err(join_error)??;
-            state_after = Some(status.state);
-            false
-        }
-    };
+                .await
+                .map_err(join_error)??;
+                state_after = Some(status.state);
+                false
+            }
+        };
 
     Ok(ResumeResult {
         id: args.id,
         paused: false,
         brake_decision: args.brake_decision,
+        peer: None,
+        inbound_decision: None,
         runner_notified,
         state: state_after,
+    })
+}
+
+async fn sync_rebuild(ctx: &Ctx, args: RebuildArgs) -> Result<RebuildResult, ToolError> {
+    validate_folder_id(&args.id).map_err(sync_error_to_body)?;
+    check_caller_may_write_folder(ctx, &args.id).await?;
+
+    if let Some(resp) = send_control_request(
+        ctx.paths(),
+        ControlRequest::RebuildIndex {
+            folder_id: args.id.clone(),
+            force: args.force,
+        },
+        CONTROL_SYNC_NOW_TIMEOUT,
+    )
+    .await?
+    {
+        return match resp {
+            ControlResponse::Rebuilt {
+                files_indexed,
+                bin_entries,
+                status,
+            } => Ok(RebuildResult {
+                id: args.id,
+                rebuilt: true,
+                files_indexed,
+                bin_entries,
+                runner_notified: true,
+                state: status.status.state,
+            }),
+            ControlResponse::Error { error } => Err(error),
+            other => Err(ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Unexpected runner reply to sync.rebuild: {other:?}."),
+            )),
+        };
+    }
+
+    // Offline rebuild when no runner is active.
+    let paths = ctx.paths().clone();
+    let here = ctx.node_name().to_owned();
+    let folder_id = args.id.clone();
+    let force = args.force;
+    let (files_indexed, bin_entries, state) = tokio::task::spawn_blocking(move || {
+        let sync_file = load_sync_file(&paths)?;
+        let Some(entry) = sync_file.folders.get(&folder_id) else {
+            return Err(folder_not_found(&folder_id));
+        };
+        let Some(member) = entry.members.get(&here) else {
+            return Err(ErrorBody::new(
+                ErrorCode::NotFound,
+                format!("This machine ({here}) is not a member of sync folder {folder_id:?}."),
+            ));
+        };
+        let root = expand_member_path(&paths, &member.path);
+        let index_path = folder_index_path(&paths, &folder_id);
+        let mut cfg = FolderConfig::new(&folder_id, &here, entry.members.keys().cloned());
+        cfg.former_members = entry.removed_members.keys().cloned().collect();
+        cfg.ignore = entry.ignore.clone();
+        cfg.bin_retention_secs = u64::from(entry.bin_days).saturating_mul(86_400);
+
+        if !force {
+            let probe_damaged = match RedbIndexStore::open(&index_path) {
+                Err(SyncError::IndexDamaged { .. } | SyncError::CorruptData { .. }) => true,
+                Err(err) => return Err(sync_error_to_body(err)),
+                Ok(store) => {
+                    let probe_fs = RealFs::open(&root).map_err(sync_error_to_body)?;
+                    match SyncEngine::open(cfg.clone(), probe_fs, store) {
+                        Ok(eng) => eng.is_index_damaged(),
+                        Err(SyncError::IndexDamaged { .. } | SyncError::CorruptData { .. }) => true,
+                        Err(err) => return Err(sync_error_to_body(err)),
+                    }
+                }
+            };
+            if !probe_damaged {
+                return Err(ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!("Sync folder {folder_id:?} has a healthy sync record; refusing to rebuild without `force=true`."),
+                )
+                .with_hint("Pass `force=true` only if you intentionally want to rebuild the index from disk."));
+            }
+        }
+
+        let real_fs = RealFs::open(&root).map_err(sync_error_to_body)?;
+        let (engine, report) = SyncEngine::rebuild_redb_from_disk(
+            cfg,
+            real_fs,
+            &index_path,
+            now_xfer_timestamp(),
+        )
+        .map_err(sync_error_to_body)?;
+        let files_indexed = report.created + report.modified + report.unchanged;
+        let status = engine.status().map_err(sync_error_to_body)?;
+        let held_back = collect_held_back_summaries(&engine, &status);
+        let bin_entries = status.bin.len();
+        let state = status.state.clone();
+        let persisted = PersistedFolderStatus {
+            folder_id: folder_id.clone(),
+            folder_name: entry.name.clone(),
+            local_path: root.display().to_string(),
+            paused_by_config: entry.paused,
+            index_damaged: engine.is_index_damaged(),
+            held_back,
+            updated_at: format_stamp_time(Timestamp::now()),
+            status,
+        };
+        write_folder_status(&paths, &persisted)?;
+        Ok::<_, ErrorBody>((files_indexed, bin_entries, state))
+    })
+    .await
+    .map_err(join_error)??;
+
+    Ok(RebuildResult {
+        id: args.id,
+        rebuilt: true,
+        files_indexed,
+        bin_entries,
+        runner_notified: false,
+        state,
+    })
+}
+
+async fn sync_dismiss(ctx: &Ctx, args: DismissArgs) -> Result<DismissResult, ToolError> {
+    validate_folder_id(&args.id).map_err(sync_error_to_body)?;
+    if let Some(ref peer) = args.peer {
+        validate_machine_arg(peer)?;
+    }
+    check_caller_may_write_folder(ctx, &args.id).await?;
+    let problem_kind: ProblemKind = args.kind.into();
+
+    if let Some(resp) = send_control_request(
+        ctx.paths(),
+        ControlRequest::DismissProblem {
+            folder_id: args.id.clone(),
+            kind: problem_kind,
+            peer: args.peer.clone(),
+        },
+        CONTROL_IPC_TIMEOUT,
+    )
+    .await?
+    {
+        return match resp {
+            ControlResponse::Dismissed { count, status } => Ok(DismissResult {
+                id: args.id,
+                kind: args.kind,
+                peer: args.peer,
+                dismissed: count,
+                runner_notified: true,
+                state: Some(status.status.state),
+            }),
+            ControlResponse::Error { error } => Err(error),
+            other => Err(ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Unexpected runner reply to sync.dismiss: {other:?}."),
+            )),
+        };
+    }
+
+    let paths = ctx.paths().clone();
+    let here = ctx.node_name().to_owned();
+    let folder_id = args.id.clone();
+    let peer = args.peer.clone();
+    let (count, state) = tokio::task::spawn_blocking(move || {
+        with_offline_engine(&paths, &here, &folder_id, |engine, _entry, _root| {
+            let count = engine.dismiss_problem(problem_kind, peer.as_deref())?;
+            let status = engine.status()?;
+            Ok((count, status.state))
+        })
+    })
+    .await
+    .map_err(join_error)??;
+
+    Ok(DismissResult {
+        id: args.id,
+        kind: args.kind,
+        peer: args.peer,
+        dismissed: count,
+        runner_notified: false,
+        state: Some(state),
     })
 }
 
@@ -2278,11 +3055,14 @@ where
     let out = op(&mut engine, entry, &root).map_err(sync_error_to_body)?;
 
     if let Ok(status) = engine.status() {
+        let held_back = collect_held_back_summaries(&engine, &status);
         let persisted = PersistedFolderStatus {
             folder_id: folder_id.to_owned(),
             folder_name: entry.name.clone(),
             local_path: root.display().to_string(),
             paused_by_config: entry.paused,
+            index_damaged: engine.is_index_damaged(),
+            held_back,
             updated_at: format_stamp_time(Timestamp::now()),
             status,
         };
@@ -2354,6 +3134,15 @@ pub fn sync_error_to_body(err: SyncError) -> ErrorBody {
             format!("Sync folder {folder_id:?} is unavailable: {sentence}"),
         )
         .with_hint("Check that the folder or drive is mounted and `.legion-sync/marker.json` is intact."),
+        SyncError::IndexDamaged {
+            folder_id,
+            sentence,
+            ..
+        } => ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Sync folder {folder_id:?}: {sentence}"),
+        )
+        .with_hint("Run `legion sync.rebuild` to rebuild this folder's sync record from disk."),
         SyncError::Conflict { path, reason } => ErrorBody::new(
             ErrorCode::Conflict,
             format!("Sync conflict on {path:?}: {reason}."),

@@ -137,7 +137,18 @@ fn normalize_relative(rel: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// Coalesces dirty paths and overflow signals during a debounce window.
+/// Result of coalescing a burst of watcher events for one folder into a single engine scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoalescedScan {
+    /// Scan the entire folder in one pass (queue overflow, root event, or paths spanning multiple
+    /// top-level entries).
+    Full,
+    /// Scan a single path or common directory subtree in one pass.
+    Subtree(String),
+}
+
+/// Coalesces dirty paths and overflow signals during a debounce window so any burst of events for
+/// one folder becomes a single engine scan.
 #[derive(Debug, Default)]
 pub struct DirtyAccumulator {
     full_rescan: bool,
@@ -194,8 +205,36 @@ impl DirtyAccumulator {
         self.full_rescan || !self.paths.is_empty()
     }
 
-    /// Drains the accumulated batch: `None` means full rescan; `Some(roots)` lists minimal
-    /// non-overlapping subtree roots to pass to `SyncEngine::scan_subtree`.
+    /// Drains the accumulated batch into **at most one** scan target:
+    /// - `None` when nothing is dirty;
+    /// - `Some(CoalescedScan::Subtree(root))` when all dirty paths are one path or share a
+    ///   non-empty common directory ancestor;
+    /// - `Some(CoalescedScan::Full)` when overflow occurred or paths span distinct top-level roots.
+    pub fn take_coalesced(&mut self) -> Option<CoalescedScan> {
+        if !self.is_dirty() {
+            return None;
+        }
+        if self.full_rescan {
+            self.full_rescan = false;
+            self.paths.clear();
+            return Some(CoalescedScan::Full);
+        }
+        let all = std::mem::take(&mut self.paths);
+        let first = all.first()?;
+        if all.len() == 1 {
+            return Some(CoalescedScan::Subtree(first.clone()));
+        }
+        let last = all.last()?;
+        let prefix = common_component_prefix(first, last);
+        if prefix.is_empty() {
+            Some(CoalescedScan::Full)
+        } else {
+            Some(CoalescedScan::Subtree(prefix))
+        }
+    }
+
+    /// Drains the accumulated batch as minimal non-overlapping subtree roots (`None` means full
+    /// rescan).
     pub fn take_batch(&mut self) -> Option<Vec<String>> {
         if self.full_rescan {
             self.full_rescan = false;
@@ -220,9 +259,64 @@ impl DirtyAccumulator {
     }
 }
 
+fn common_component_prefix(a: &str, b: &str) -> String {
+    let mut shared = Vec::new();
+    for (ca, cb) in a.split('/').zip(b.split('/')) {
+        if ca == cb {
+            shared.push(ca);
+        } else {
+            break;
+        }
+    }
+    shared.join("/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accumulator_coalesces_bursts_into_one_scan() {
+        let mut acc = DirtyAccumulator::default();
+        assert_eq!(acc.take_coalesced(), None);
+
+        // Single file -> single subtree scan of that file.
+        acc.push(WatchSignal::DirtyPaths(vec!["notes/a.txt".to_owned()]));
+        assert_eq!(
+            acc.take_coalesced(),
+            Some(CoalescedScan::Subtree("notes/a.txt".to_owned()))
+        );
+        assert!(!acc.is_dirty());
+
+        // Burst of 50 events under one directory -> ONE subtree scan of common ancestor "a".
+        for i in 0..50 {
+            acc.push(WatchSignal::DirtyPaths(vec![
+                format!("a/b/file-{i}.txt"),
+                format!("a/c/deep/other-{i}.txt"),
+            ]));
+        }
+        assert_eq!(
+            acc.take_coalesced(),
+            Some(CoalescedScan::Subtree("a".to_owned()))
+        );
+        assert!(!acc.is_dirty());
+
+        // Sibling prefixes that share string prefix but NOT path component ("sub" vs "sub2") -> Full.
+        acc.push(WatchSignal::DirtyPaths(vec![
+            "sub/a.txt".to_owned(),
+            "sub2/b.txt".to_owned(),
+        ]));
+        assert_eq!(acc.take_coalesced(), Some(CoalescedScan::Full));
+
+        // Burst > MAX_DIRTY_PATHS promotes to one Full scan.
+        let burst: Vec<String> = (0..=MAX_DIRTY_PATHS)
+            .map(|i| format!("dir/file-{i}.txt"))
+            .collect();
+        acc.push(WatchSignal::DirtyPaths(burst));
+        assert!(acc.is_dirty());
+        assert_eq!(acc.take_coalesced(), Some(CoalescedScan::Full));
+        assert!(!acc.is_dirty());
+    }
 
     #[test]
     fn accumulator_deduplicates_descendants_and_promotes_bursts() {

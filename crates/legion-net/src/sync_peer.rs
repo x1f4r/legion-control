@@ -16,7 +16,7 @@ use legion_core::CancellationToken;
 use legion_core::config::ConfigStore;
 use legion_proto::{ErrorBody, ErrorCode};
 use legion_sync::{
-    FetchOptions, MAX_PAGE_RECORDS, Peer, PeerHandshake, RecordsPage, SyncError,
+    FetchOptions, HandshakeHello, MAX_PAGE_RECORDS, Peer, PeerHandshake, RecordsPage, SyncError,
 };
 use legion_xfer::Hash;
 use serde_json::{Value, json};
@@ -420,15 +420,14 @@ impl Peer for FleetSyncPeer {
         &self.peer_member
     }
 
-    fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
+    fn handshake(&self, caller: &HandshakeHello) -> legion_sync::Result<PeerHandshake> {
         let mut conn = self.take_or_open(DEFAULT_CONTROL_TIMEOUT)?;
+        let req = SessionRequest::Handshake {
+            hello: caller.clone(),
+        };
         let res = self.runtime.block_on(async {
-            conn.send_json_line(
-                &self.peer_member,
-                &SessionRequest::Handshake,
-                DEFAULT_CONTROL_TIMEOUT,
-            )
-            .await?;
+            conn.send_json_line(&self.peer_member, &req, DEFAULT_CONTROL_TIMEOUT)
+                .await?;
             let line = conn
                 .read_json_line(&self.peer_member, DEFAULT_CONTROL_TIMEOUT, None)
                 .await?;

@@ -25,8 +25,8 @@ use legion_core::policy::{OWNER, Policy};
 use legion_core::{Access, Grant};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_sync::{
-    FolderMarker, IgnoreMatcher, MAX_PAGE_RECORDS, PeerHandshake, RealFs, RecordsPage,
-    RedbIndexStore, SyncFs, check_fetch_file_from_store, is_internal_sync_path,
+    FolderMarker, HandshakeHello, IgnoreMatcher, MAX_PAGE_RECORDS, PeerHandshake, RealFs,
+    RecordsPage, RedbIndexStore, SyncFs, check_fetch_file_from_store, is_internal_sync_path,
     serve_handshake_from_store, serve_records_since_from_store, validate_folder_id,
     validate_member_id, validate_sync_path,
 };
@@ -76,7 +76,9 @@ pub(crate) struct SyncSessionReady {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "req", rename_all = "snake_case")]
 pub(crate) enum SessionRequest {
-    Handshake,
+    Handshake {
+        hello: HandshakeHello,
+    },
     Index {
         since_incarnation: u64,
         since_seq: u64,
@@ -304,11 +306,25 @@ impl IndexBackend {
         Ok(Self::Direct { fs, store })
     }
 
-    fn handshake(&mut self, folder: &VerifiedFolder) -> Result<PeerHandshake, ErrorBody> {
+    fn handshake(
+        &mut self,
+        folder: &VerifiedFolder,
+        hello: &HandshakeHello,
+    ) -> Result<PeerHandshake, ErrorBody> {
+        if hello.folder_id != folder.folder_id || hello.member_id != folder.caller {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "Handshake hello identity ({:?}/{:?}) does not match stream folder {:?}/caller {:?}.",
+                    hello.folder_id, hello.member_id, folder.folder_id, folder.caller
+                ),
+            ));
+        }
         match self {
             Self::Runner(client) => match client.call(ControlRequest::ServeHandshake {
                 folder_id: folder.folder_id.clone(),
                 caller: folder.caller.clone(),
+                hello: hello.clone(),
             })? {
                 ControlResponse::Handshake { handshake } => Ok(handshake),
                 ControlResponse::Error { error } => Err(error),
@@ -318,7 +334,8 @@ impl IndexBackend {
                 )),
             },
             Self::Direct { fs, store } => {
-                serve_handshake_from_store(fs, store, &folder.caller).map_err(sync_error_to_body)
+                serve_handshake_from_store(fs, store, &folder.caller, hello)
+                    .map_err(sync_error_to_body)
             }
         }
     }
@@ -391,8 +408,9 @@ impl IndexBackend {
     }
 }
 
-/// Serves one-shot `sync.index`: returns either `{ handshake }` (when `handshake_only` is true)
-/// or `{ page }` for records after `(since_incarnation, since_seq)`.
+/// Serves one-shot `sync.index`: returns either `{ handshake }` (when `handshake_only` is true,
+/// carrying the caller's bidirectional [`HandshakeHello`]) or `{ page }` for records after
+/// `(since_incarnation, since_seq)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_index<W: Write>(
     host: &Host,
@@ -400,6 +418,7 @@ pub(crate) fn serve_index<W: Write>(
     folder_id: &str,
     caller: &str,
     handshake_only: bool,
+    hello: Option<&HandshakeHello>,
     since_incarnation: u64,
     since_seq: u64,
     limit: usize,
@@ -408,8 +427,14 @@ pub(crate) fn serve_index<W: Write>(
     let folder = VerifiedFolder::open(host, grant, folder_id, caller)?;
     let mut backend = IndexBackend::open(host, &folder)?;
     let reply = if handshake_only {
+        let Some(hello) = hello else {
+            return Err(Failure::Reply(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "sync.index with handshake_only=true requires a `hello` HandshakeHello payload.",
+            )));
+        };
         SyncIndexReply::Handshake {
-            handshake: backend.handshake(&folder)?,
+            handshake: backend.handshake(&folder, hello)?,
         }
     } else {
         SyncIndexReply::Page {
@@ -496,9 +521,9 @@ pub(crate) fn serve_session<R: BufRead, W: Write>(
 
         match req {
             SessionRequest::Close => return Ok(()),
-            SessionRequest::Handshake => match folder
+            SessionRequest::Handshake { hello } => match folder
                 .recheck_marker(host.name())
-                .and_then(|_| backend.handshake(&folder))
+                .and_then(|_| backend.handshake(&folder, &hello))
             {
                 Ok(hs) => write_json_line(output, &SyncIndexReply::Handshake { handshake: hs })?,
                 Err(err) => write_json_line(output, &json!({ "error": err }))?,
@@ -676,7 +701,11 @@ mod tests {
     use std::io::Cursor;
 
     use legion_core::Paths;
-    use legion_sync::{FolderConfig, RealFs, RedbIndexStore, SyncEngine};
+    use legion_proto::{ErrorBody, ErrorCode};
+    use legion_sync::{
+        FolderConfig, HandshakeHello, PeerHandshake, RealFs, RedbIndexStore, SYNC_PROTOCOL_VERSION,
+        SyncEngine,
+    };
     use legion_tools::sync::config::{
         DEFAULT_BIN_DAYS, SyncFile, SyncFolderEntry, SyncMemberEntry, format_stamp_time,
     };
@@ -684,6 +713,19 @@ mod tests {
     use legion_tools::sync::now_xfer_timestamp;
 
     use crate::stream::{Host, STREAM_PROTOCOL, serve};
+
+    fn sample_hello(folder: &str, member: &str) -> HandshakeHello {
+        HandshakeHello {
+            folder_id: folder.to_owned(),
+            member_id: member.to_owned(),
+            incarnation: 42,
+            snapshot_seq: 0,
+            head_fingerprint: None,
+            protocol_version: SYNC_PROTOCOL_VERSION,
+            peer_pulled: None,
+            peer_acked: None,
+        }
+    }
 
     fn setup_host_with_folder(
         policy_toml: Option<&str>,
@@ -779,15 +821,30 @@ mod tests {
     fn serves_member_and_refuses_non_member_internal_paths_bad_marker_and_policy() {
         let (_dir, _paths, host, folder_root, hash) = setup_host_with_folder(None);
 
-        // 1. Authorized member gets handshake, index page, and ranged fetch.
+        // 1. Authorized member gets bidirectional handshake, index page, and ranged fetch.
+        let hello_json = serde_json::to_string(&sample_hello("docs", "beta")).unwrap();
         let hs_req = format!(
-            "{{\"protocol\":{STREAM_PROTOCOL},\"op\":\"sync.index\",\"folder\":\"docs\",\"caller\":\"beta\",\"handshake_only\":true}}\n"
+            "{{\"protocol\":{STREAM_PROTOCOL},\"op\":\"sync.index\",\"folder\":\"docs\",\"caller\":\"beta\",\"handshake_only\":true,\"hello\":{hello_json}}}\n"
         );
         let (res, out) = run_stream(&host, None, &hs_req);
         assert!(res.is_ok(), "handshake failed: {res:?}");
         let lines: Vec<&str> = std::str::from_utf8(&out).unwrap().lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[1].contains("\"handshake\""));
+        let hs_val: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        let hs: PeerHandshake = serde_json::from_value(hs_val["handshake"].clone()).unwrap();
+        assert_eq!(hs.folder_id, "docs");
+        assert_eq!(hs.member_id, "alpha");
+        assert!(hs.incarnation != 0);
+        assert!(hs.snapshot_seq >= 1);
+        assert!(hs.head_fingerprint.is_some());
+        assert!(!hs.caller_regressed);
+
+        // Missing hello payload is refused cleanly.
+        let missing_hello_req = format!(
+            "{{\"protocol\":{STREAM_PROTOCOL},\"op\":\"sync.index\",\"folder\":\"docs\",\"caller\":\"beta\",\"handshake_only\":true}}\n"
+        );
+        let (res, _) = run_stream(&host, None, &missing_hello_req);
+        assert_eq!(res.unwrap_err().code, ErrorCode::InvalidArgs);
 
         let fetch_req = format!(
             "{{\"protocol\":{STREAM_PROTOCOL},\"op\":\"sync.fetch\",\"folder\":\"docs\",\"caller\":\"beta\",\"path\":\"hello.txt\",\"expected_hash\":\"{hash}\",\"offset\":6}}\n"
@@ -798,8 +855,9 @@ mod tests {
         assert!(text.ends_with("world!"), "expected ranged tail, got: {text:?}");
 
         // 2. Non-fleet / non-member caller is refused.
+        let bad_hello = serde_json::to_string(&sample_hello("docs", "stranger")).unwrap();
         let bad_caller = format!(
-            "{{\"protocol\":{STREAM_PROTOCOL},\"op\":\"sync.index\",\"folder\":\"docs\",\"caller\":\"stranger\",\"handshake_only\":true}}\n"
+            "{{\"protocol\":{STREAM_PROTOCOL},\"op\":\"sync.index\",\"folder\":\"docs\",\"caller\":\"stranger\",\"handshake_only\":true,\"hello\":{bad_hello}}}\n"
         );
         let (res, _) = run_stream(&host, None, &bad_caller);
         assert_eq!(res.unwrap_err().code, ErrorCode::Denied);
@@ -836,8 +894,9 @@ allow = [\"fs.read\"]
 paths = [\"/only/elsewhere/**\"]
 ";
         let (_dir, _paths, host, _folder_root, _hash) = setup_host_with_folder(Some(pol));
+        let hello_json = serde_json::to_string(&sample_hello("docs", "beta")).unwrap();
         let hs_req = format!(
-            "{{\"protocol\":{STREAM_PROTOCOL},\"op\":\"sync.index\",\"folder\":\"docs\",\"caller\":\"beta\",\"handshake_only\":true}}\n"
+            "{{\"protocol\":{STREAM_PROTOCOL},\"op\":\"sync.index\",\"folder\":\"docs\",\"caller\":\"beta\",\"handshake_only\":true,\"hello\":{hello_json}}}\n"
         );
         let (res, _) = run_stream(&host, None, &hs_req);
         let err = res.unwrap_err();

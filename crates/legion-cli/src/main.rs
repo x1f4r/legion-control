@@ -280,6 +280,15 @@ async fn run(command: Command) -> ExitCode {
             if let Some(s) = cmd.pull_interval_secs {
                 cfg.pull_interval = Duration::from_secs(s);
             }
+            if let Some(n) = cmd.pull_max_pages {
+                cfg.pull_max_pages = n;
+            }
+            if let Some(s) = cmd.pull_max_secs {
+                cfg.pull_max_duration = Duration::from_secs(s);
+            }
+            if let Some(s) = cmd.brake_settle_secs {
+                cfg.brake_settle_secs = Some(s);
+            }
             if let Some(s) = cmd.config_sync_interval_secs {
                 cfg.config_sync_interval = Duration::from_secs(s);
             }
