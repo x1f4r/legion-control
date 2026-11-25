@@ -19,7 +19,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-changed={}", ui_dir.display());
     println!("cargo:rerun-if-changed={}", root_cargo.display());
+    println!("cargo:rerun-if-env-changed=LEGION_BUILD_SEQUENCE");
+    println!("cargo:rerun-if-env-changed=LEGION_BUILD_REV");
 
+    emit_build_identity();
     check_workspace_version(&root_cargo);
 
     stage_frontend(&ui_dir, &dist_dir).map_err(|err| {
@@ -35,6 +38,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tauri_build::build();
     Ok(())
+}
+
+/// Emits `LEGION_APP_SEQUENCE` and `LEGION_APP_BUILD_ID` for the update rule and About screen.
+fn emit_build_identity() {
+    let seq = match env::var("LEGION_BUILD_SEQUENCE") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                0u64
+            } else {
+                let parsed: u64 = trimmed.parse().unwrap_or_else(|err| {
+                    panic!("LEGION_BUILD_SEQUENCE={trimmed:?} must be a positive integer: {err}")
+                });
+                assert!(
+                    parsed > 0,
+                    "LEGION_BUILD_SEQUENCE must be greater than 0 (got 0)"
+                );
+                parsed
+            }
+        }
+        Err(_) => 0u64,
+    };
+    println!("cargo:rustc-env=LEGION_APP_SEQUENCE={seq}");
+
+    let rev = env::var("LEGION_BUILD_REV")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--short=12", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "dev".to_owned());
+    println!("cargo:rustc-env=LEGION_APP_BUILD_ID={rev}");
 }
 
 /// Ensures the standalone app crate keeps the same version as the root workspace.

@@ -4,6 +4,7 @@
 #
 #   ./apps/legion-app/build-android.sh              build arm64-v8a release APK and sign it
 #   ./apps/legion-app/build-android.sh --emulator   include x86_64 alongside arm64-v8a
+#   ./apps/legion-app/build-android.sh --sequence N set LEGION_BUILD_SEQUENCE (default UTC YYYYMMDDHHMM)
 #   ./apps/legion-app/build-android.sh --clean      clean Gradle build outputs first
 #   ./apps/legion-app/build-android.sh --install    install the signed APK on the connected device
 #
@@ -31,6 +32,7 @@ KEY_VALIDITY_DAYS=9862
 WITH_EMULATOR=0
 DO_CLEAN=0
 DO_INSTALL=0
+BUILD_SEQUENCE="${LEGION_BUILD_SEQUENCE:-}"
 
 die() { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
 say() { printf '%s\n' "$1"; }
@@ -38,6 +40,11 @@ say() { printf '%s\n' "$1"; }
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--emulator) WITH_EMULATOR=1 ;;
+		--sequence)
+			shift
+			[[ $# -gt 0 ]] || die "--sequence requires an integer argument."
+			BUILD_SEQUENCE="$1"
+			;;
 		--clean) DO_CLEAN=1 ;;
 		--install) DO_INSTALL=1 ;;
 		-h|--help)
@@ -48,6 +55,12 @@ while [[ $# -gt 0 ]]; do
 	esac
 	shift
 done
+
+if [ -z "$BUILD_SEQUENCE" ]; then
+	BUILD_SEQUENCE="$(date -u +%Y%m%d%H%M)"
+fi
+[[ "$BUILD_SEQUENCE" =~ ^[1-9][0-9]*$ ]] || die "invalid build sequence: $BUILD_SEQUENCE (must be a positive integer)."
+export LEGION_BUILD_SEQUENCE="$BUILD_SEQUENCE"
 
 # ---------------------------------------------------------------------------
 # Toolchain
@@ -184,6 +197,7 @@ if printf '%s\n' "$BADGING_OUTPUT" | grep -q '^application-debuggable'; then
 	die "release APK has android:debuggable=true ($SIGNED); refusing to ship."
 fi
 CERT_SHA256="$(printf '%s\n' "$VERIFY_OUTPUT" | sed -n 's/^.*certificate SHA-256 digest: //p' | head -n 1)"
+APK_VERSION_CODE="$(printf '%s\n' "$BADGING_OUTPUT" | sed -n "s/^package:.*versionCode='\([^']*\)'.*/\1/p" | head -n 1)"
 SIZE_BYTES="$(wc -c < "$SIGNED" | tr -d '[:space:]')"
 SIZE_HUMAN="$(du -h "$SIGNED" | cut -f1)"
 
@@ -191,6 +205,7 @@ say ""
 printf '%s\n' "$VERIFY_OUTPUT"
 say ""
 say "APK: $SIGNED"
+say "Sequence: $LEGION_BUILD_SEQUENCE (versionCode $APK_VERSION_CODE)"
 say "Size: $SIZE_HUMAN ($SIZE_BYTES bytes)"
 say "SHA-256: $CERT_SHA256"
 
