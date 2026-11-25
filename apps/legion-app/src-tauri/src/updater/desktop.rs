@@ -713,6 +713,14 @@ fn extract_macos_app_tar_with_limit(
     // symlink loops.
     validate_all_symlink_chains(&pending_symlinks)?;
 
+    #[cfg(not(unix))]
+    if !pending_symlinks.is_empty() {
+        return Err(AppError::new(
+            ErrorCode::Unsupported,
+            "macOS app-tar extraction requires a Unix host.",
+        ));
+    }
+    #[cfg(unix)]
     for (clean_rel, link_target) in &pending_symlinks {
         if let Some(parent_rel) = clean_rel.parent()
             && !parent_rel.as_os_str().is_empty()
@@ -729,21 +737,12 @@ fn extract_macos_app_tar_with_limit(
                 ),
             ));
         }
-        #[cfg(unix)]
         std::os::unix::fs::symlink(link_target, &target).map_err(|err| {
             AppError::new(
                 ErrorCode::Failed,
                 format!("Could not create symlink {}: {err}", clean_rel.display()),
             )
         })?;
-        #[cfg(not(unix))]
-        {
-            let _ = link_target;
-            return Err(AppError::new(
-                ErrorCode::Unsupported,
-                "macOS app-tar extraction requires a Unix host.",
-            ));
-        }
     }
 
     // Locate the single top-level real `.app` bundle directory (refusing symlinks).
@@ -1150,6 +1149,7 @@ where
 /// utility (`mv`, `rm`, `ps`, `sleep`) exclusively from fixed system directories, restores the
 /// pre-sanitized `LEGION_RELAUNCH_PATH` only inside the relaunched child, and strips all supervisor
 /// helper variables before `exec`.
+#[cfg(unix)]
 const UNIX_SWAP_SUPERVISOR_SCRIPT: &str = r#"
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin

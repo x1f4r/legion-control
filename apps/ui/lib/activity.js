@@ -1,5 +1,6 @@
 // Plain-language formatting for activity rows, machine status phrases, and role summaries.
 
+import { plainErrorMessage } from './errors.js';
 import {
   busyReasonLabel,
   clampPct,
@@ -589,6 +590,9 @@ export function formatDeviceTransferTitle(transfer, technical = false) {
   if (transfer.state === 'done') {
     return isUp ? `Uploaded ${name}` : `Downloaded ${name}`;
   }
+  if (transfer.state === 'cancelling') {
+    return `Cancelling ${name}`;
+  }
   if (transfer.state === 'queued') {
     return isUp ? `Waiting to upload ${name}` : `Waiting to download ${name}`;
   }
@@ -602,6 +606,12 @@ export function formatDeviceTransferSubtitle(transfer, { deviceNoun = 'phone', t
   if (!transfer) return '';
   const isUp = transfer.direction === 'upload';
   const destLabel = isUp ? `From this ${deviceNoun} to ${transfer.machine}` : `To this ${deviceNoun}`;
+
+  if (transfer.state === 'cancelling') {
+    const fallback = 'Removing partial files…';
+    if (!transfer.error) return fallback;
+    return plainErrorMessage(transfer.error, fallback, { technical, deviceNoun });
+  }
 
   if (transfer.state === 'running' || transfer.state === 'paused' || transfer.state === 'queued') {
     const parts = [transfer.state === 'paused' ? 'Paused' : destLabel];
@@ -620,11 +630,8 @@ export function formatDeviceTransferSubtitle(transfer, { deviceNoun = 'phone', t
   }
 
   if (transfer.state === 'failed') {
-    const msg =
-      typeof transfer.error === 'string'
-        ? transfer.error
-        : transfer.error?.message || 'Stopped before finishing. Tap Resume to continue from where it stopped.';
-    return msg;
+    const fallback = 'Stopped before finishing. Tap Resume to continue from where it stopped.';
+    return plainErrorMessage(transfer.error, fallback, { technical, deviceNoun });
   }
 
   if (transfer.state === 'done') {
@@ -659,6 +666,12 @@ export function friendlyDeviceTransferState(transfer, technical = false) {
   }
   if (st === 'queued') return { label: 'Queued', cls: 'running' };
   if (st === 'paused') return { label: 'Paused', cls: '' };
+  if (st === 'cancelling') {
+    return {
+      label: technical ? 'cancelling' : 'Cancelling',
+      cls: transfer?.error ? 'failed' : '',
+    };
+  }
   if (st === 'done') return { label: technical ? 'done' : 'Finished', cls: 'done' };
   if (st === 'failed') return { label: technical ? 'failed' : 'Stopped', cls: 'failed' };
   if (st === 'cancelled') return { label: technical ? 'cancelled' : 'Stopped', cls: '' };

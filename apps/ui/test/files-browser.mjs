@@ -12,6 +12,7 @@ import { chromium } from 'playwright-core';
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const UI_ROOT = path.resolve(TEST_DIR, '..');
 const FILES_SHOTS_DIR = process.env.LEGION_FILES_SHOTS_DIR || '';
+const OLD_SHOTS_DIR = process.env.LEGION_OLD_SHOTS_DIR || '';
 
 // Same strict CSP as the HTTP door plus `media-src 'self' blob: data:` for mock sample video/audio.
 const MOCK_TEST_CSP =
@@ -653,13 +654,79 @@ test('Files tab degrades cleanly against an old node with none of the new tools 
 });
 
 async function assertToastDoesNotCoverFirstRow(page, label) {
-  const toastBox = await page.locator('.toast-banner').boundingBox();
-  const rowBox = await page.locator('main .list .row').first().boundingBox();
-  assert.ok(toastBox, `${label}: expected visible .toast-banner bounding box`);
-  assert.ok(rowBox, `${label}: expected visible first list row bounding box`);
+  // Measure `.toast-banner` and the first list row synchronously in the same animation frame
+  // across two consecutive settled frames so a torn read across auto-dismissal is impossible,
+  // while still catching any single-frame or persistent overlap.
+  const result = await page.evaluate(
+    () =>
+      new Promise((resolve) => {
+        const readBoxes = () => {
+          const toast = document.querySelector('.toast-banner');
+          const row = document.querySelector('main .list .row');
+          if (!toast || !row) {
+            return { toast: null, row: null };
+          }
+          const t = toast.getBoundingClientRect();
+          const r = row.getBoundingClientRect();
+          if (t.width <= 0 || t.height <= 0 || r.width <= 0 || r.height <= 0) {
+            return { toast: null, row: null };
+          }
+          return {
+            toast: { x: t.x, y: t.y, width: t.width, height: t.height, bottom: t.bottom },
+            row: { x: r.x, y: r.y, width: r.width, height: r.height, bottom: r.bottom },
+          };
+        };
+        const same = (a, b) =>
+          Boolean(a && b) &&
+          Math.abs(a.x - b.x) < 0.01 &&
+          Math.abs(a.y - b.y) < 0.01 &&
+          Math.abs(a.width - b.width) < 0.01 &&
+          Math.abs(a.height - b.height) < 0.01;
+
+        let prev = null;
+        let frames = 0;
+        let overlapFrame = null;
+        const step = () => {
+          frames += 1;
+          const cur = readBoxes();
+          if (!cur.toast || !cur.row) {
+            resolve({
+              settled: false,
+              missing: !cur.toast ? 'toast' : 'row',
+              frames,
+              overlapFrame,
+            });
+            return;
+          }
+          if (!overlapFrame && cur.toast.bottom > cur.row.y + 0.5) {
+            overlapFrame = { frame: frames, toast: cur.toast, row: cur.row };
+          }
+          if (prev && same(prev.toast, cur.toast) && same(prev.row, cur.row)) {
+            resolve({ settled: true, frames, toast: cur.toast, row: cur.row, overlapFrame });
+            return;
+          }
+          prev = cur;
+          if (frames >= 30) {
+            resolve({ settled: false, frames, toast: cur.toast, row: cur.row, overlapFrame });
+            return;
+          }
+          requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+      }),
+  );
+
   assert.ok(
-    toastBox.y + toastBox.height <= rowBox.y + 0.5,
-    `${label}: toast (${toastBox.y}..${toastBox.y + toastBox.height}) must not overlap first row (${rowBox.y}..${rowBox.y + rowBox.height})`,
+    !result.overlapFrame,
+    `${label}: toast overlapped first row on frame ${result.overlapFrame?.frame}: toast (${result.overlapFrame?.toast.y}..${result.overlapFrame?.toast.bottom}) vs first row (${result.overlapFrame?.row.y}..${result.overlapFrame?.row.bottom})`,
+  );
+  assert.ok(
+    result.settled,
+    `${label}: expected two consecutive settled frames with visible .toast-banner and first row (${JSON.stringify(result)})`,
+  );
+  assert.ok(
+    result.toast.bottom <= result.row.y + 0.5,
+    `${label}: toast (${result.toast.y}..${result.toast.bottom}) must not overlap first row (${result.row.y}..${result.row.bottom})`,
   );
 }
 
@@ -708,15 +775,17 @@ test('Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses
     await page.locator('.row', { hasText: /Upload-\d+\.jpg/ }).first().waitFor();
 
     // Download wording (no em-dash) + navigating via bottom nav Activity tab also clears the banner.
+    // Pick Passport.pdf (540 KB, ~1s mock download) rather than 412-byte README.md (which completes
+    // on the first 350ms pump tick) so the toast stays active across the layout check and nav click.
     await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
-    await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
-    await dispatchSwipe(page, '.swipe-row:has-text("README.md")', {
+    await page.locator('.list a.row', { hasText: 'Passport.pdf' }).waitFor();
+    await dispatchSwipe(page, '.swipe-row:has-text("Passport.pdf")', {
       startX: 310,
       startY: 220,
       endX: 140,
       endY: 222,
     });
-    await page.locator('.swipe-row:has-text("README.md") .swipe-action', { hasText: 'Send to' }).click();
+    await page.locator('.swipe-row:has-text("Passport.pdf") .swipe-action', { hasText: 'Send to' }).click();
     const dlSheet = page.locator('.sheet');
     await dlSheet.locator('button[role="radio"]', { hasText: 'This phone' }).click();
     await dlSheet.getByRole('button', { name: /Download to this phone/ }).click();
@@ -726,7 +795,7 @@ test('Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses
     await dlToast.waitFor();
     const dlText = await dlToast.innerText();
     assert.ok(
-      dlText.includes('Downloading README.md. Watch progress in Activity.'),
+      dlText.includes('Downloading Passport.pdf. Watch progress in Activity.'),
       `Unexpected download toast text: ${dlText}`,
     );
     assert.ok(!dlText.includes('—'), `Download toast must not contain an em-dash: ${dlText}`);
@@ -739,6 +808,26 @@ test('Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses
       0,
       'Transfer-started toast must dismiss when switching to Activity via nav',
     );
+
+    // Send-to another machine at phone width also keeps the toast clear of the first row.
+    await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
+    await page.locator('.list a.row', { hasText: 'Passport.pdf' }).waitFor();
+    await dispatchSwipe(page, '.swipe-row:has-text("Passport.pdf")', {
+      startX: 310,
+      startY: 220,
+      endX: 140,
+      endY: 222,
+    });
+    await page.locator('.swipe-row:has-text("Passport.pdf") .swipe-action', { hasText: 'Send to' }).click();
+    const sendSheet = page.locator('.sheet');
+    await sendSheet.locator('button[role="radio"]', { hasText: 'pi' }).click();
+    await sendSheet.getByRole('button', { name: 'Copy to pi' }).click();
+    await sendSheet.waitFor({ state: 'hidden' });
+    const sendToast = page.locator('.toast-banner', {
+      hasText: 'Copying Passport.pdf to pi. Watch progress in Activity.',
+    });
+    await sendToast.waitFor();
+    await assertToastDoesNotCoverFirstRow(page, 'narrow send-to toast');
 
     // Case 2: Started while already on Activity -> no transfer-started toast is shown.
     await page.goto(`${server.url}/?mock=slow-upload#/files/tower//home/me/Documents`, {
@@ -821,6 +910,345 @@ test('Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses
 
     assert.deepEqual(pageErrors, [], `Uncaught page errors (toast rules): ${pageErrors.join('\n')}`);
     assert.deepEqual(consoleErrors, [], `Console/CSP errors (toast rules): ${consoleErrors.join('\n')}`);
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});
+
+async function maybeOldShot(page, name) {
+  if (!OLD_SHOTS_DIR) return;
+  fs.mkdirSync(OLD_SHOTS_DIR, { recursive: true });
+  await setTheme(page, 'dark');
+  await page.screenshot({ path: path.join(OLD_SHOTS_DIR, `${name}-dark.png`) });
+  await setTheme(page, 'light');
+  await page.screenshot({ path: path.join(OLD_SHOTS_DIR, `${name}-light.png`) });
+  await setTheme(page, 'dark');
+}
+
+async function assertNoPlainLeaks(page, label) {
+  const text = await page.locator('body').innerText();
+  const toolMatches = [...new Set(text.match(CATALOG_TOOL_RE) || [])];
+  assert.deepEqual(toolMatches, [], `Tool name(s) leaked in plain mode (${label}): ${toolMatches.join(', ')}`);
+  assert.ok(!/legion\s+help\b/i.test(text), `CLI help hint leaked in plain mode (${label}): ${text}`);
+  assert.ok(!text.includes('`'), `Backtick leaked in plain mode (${label}): ${text}`);
+}
+
+async function assertNoProtocolErrors(page, label) {
+  const bad = await page.evaluate(() =>
+    (window.__LEGION_MOCK_ERRORS__ || []).filter(
+      (e) => e.code === 'invalid_args' || e.code === 'unknown_tool',
+    ),
+  );
+  assert.deepEqual(bad, [], `Unexpected invalid_args/unknown_tool errors (${label}): ${JSON.stringify(bad)}`);
+}
+
+test('Old machine (05ba1ef fixture) at 412x915: quiet note, bottom dock in machine > Files, client sort/filter, 500-cap, search, viewer & download', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const ctx = await browser.newContext({
+      viewport: { width: 412, height: 915 },
+      colorScheme: 'dark',
+    });
+    const page = await ctx.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    // 1. Open studio from Machines list -> Overview shows the quiet one-line note once, with no button.
+    await page.goto(`${server.url}/?mock=multi,mixed#/machines`, { waitUntil: 'domcontentloaded' });
+    await page.locator('a.machine', { hasText: 'studio' }).waitFor();
+    await assertNoPlainLeaks(page, 'machines list');
+
+    await page.locator('a.machine', { hasText: 'studio' }).click();
+    await page.locator('header.top h1', { hasText: 'studio' }).waitFor();
+    const overviewNote = page.locator('.older-note');
+    await overviewNote.waitFor();
+    assert.equal(await overviewNote.count(), 1);
+    assert.equal(
+      (await overviewNote.innerText()).trim(),
+      'studio runs an older Legion, so some things are simpler here.',
+    );
+    assert.equal(await overviewNote.locator('button, a').count(), 0, 'Older note must not contain a button');
+    // Overview shows the meters studio actually reports, omits "Using it now" (no sys.procs group),
+    // and produces zero rejected protocol calls.
+    await page.locator('.gauge', { hasText: 'Processor' }).waitFor();
+    await page.locator('.gauge', { hasText: 'Memory' }).waitFor();
+    await page.locator('.gauge', { hasText: 'Storage' }).waitFor();
+    assert.equal(
+      await page.locator('p.label', { hasText: 'Using it now' }).count(),
+      0,
+      'Old machine Overview must omit "Using it now" when sys.procs lacks group',
+    );
+    await page.waitForTimeout(250);
+    await assertNoProtocolErrors(page, 'studio overview');
+    await assertNoPlainLeaks(page, 'studio overview');
+    await maybeOldShot(page, '01-old-machine-overview');
+
+    // 2. Open studio > Files -> search/sort/grid/more live in bottom thumb dock (not at top!).
+    await page.locator('nav.nav.parts a', { hasText: 'Files' }).click();
+    await page.locator('.list a.row', { hasText: 'Documents' }).waitFor();
+    assert.equal(await page.locator('.files-wide-tools').count(), 0, 'Phone machine > Files must not put tools at top');
+    const dock = page.locator('.dock.tools');
+    await dock.waitFor();
+    const layoutBoxes = await page.evaluate(() => {
+      const main = document.querySelector('main.main')?.getBoundingClientRect();
+      const d = document.querySelector('.dock.tools')?.getBoundingClientRect();
+      const nav = document.querySelector('nav.nav')?.getBoundingClientRect();
+      return {
+        mainBottom: main?.bottom || 0,
+        dockTop: d?.top || 0,
+        dockBottom: d?.bottom || 0,
+        navTop: nav?.top || 0,
+        overflow: document.documentElement.scrollWidth - window.innerWidth,
+      };
+    });
+    assert.ok(
+      layoutBoxes.dockTop >= layoutBoxes.mainBottom - 2,
+      `machine > Files dock must sit below main (${JSON.stringify(layoutBoxes)})`,
+    );
+    assert.ok(
+      layoutBoxes.dockBottom <= layoutBoxes.navTop + 2,
+      `machine > Files dock must sit above bottom nav (${JSON.stringify(layoutBoxes)})`,
+    );
+    assert.ok(layoutBoxes.overflow <= 1, `Horizontal overflow on machine > Files: ${layoutBoxes.overflow}px`);
+    assert.equal(await page.locator('.older-note').count(), 1);
+    await assertNoPlainLeaks(page, 'machine > files');
+    await maybeOldShot(page, '02-old-machine-files-dock');
+
+    // 3. Open studio > Documents: kind icons only (no fs.thumb), no stars, and NO repeated older-note in subfolders.
+    await page.locator('.list a.row', { hasText: 'Documents' }).click();
+    await page.locator('header.top h1', { hasText: 'Documents' }).waitFor();
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).waitFor();
+    assert.equal(await page.locator('.older-note').count(), 0, 'Older-note must not repeat inside subfolders');
+    assert.equal(await page.locator('.list img').count(), 0, 'Old machine must not render fetched thumbnails');
+    assert.equal(await page.locator('.list .star').count(), 0, 'Old machine must not show stars');
+    await assertNoPlainLeaks(page, 'old studio Documents');
+    await maybeOldShot(page, '03-old-files-documents');
+
+    // 4. Client-side sort (Largest first) & kind filter (Pictures) work with zero server invalid_args.
+    await page.locator('.dock.tools button[aria-label^="Sort:"]').click();
+    const sortSheet = page.locator('.sheet');
+    await sortSheet.waitFor();
+    await sortSheet.locator('button.row', { hasText: 'Largest first' }).click();
+    await sortSheet.waitFor({ state: 'hidden' });
+
+    const largestTitles = await page.locator('.list a.row .title').allTextContents();
+    assert.equal(largestTitles[0], 'Clip.mp4', 'Largest file sorted first client-side');
+    assert.equal(largestTitles[1], 'archive.zip', 'Second largest file sorted second client-side');
+    assert.ok(
+      largestTitles.indexOf('Poster.jpg') < largestTitles.indexOf('avatar.png'),
+      `Expected Poster.jpg before avatar.png when sorted largest first, got ${JSON.stringify(largestTitles)}`,
+    );
+
+    // Filter by kind: Pictures.
+    await page.locator('.dock.tools button[aria-label^="Sort:"]').click();
+    const filterSheet = page.locator('.sheet');
+    await filterSheet.waitFor();
+    await filterSheet.locator('.chips button', { hasText: 'Pictures' }).click();
+    await filterSheet.waitFor({ state: 'hidden' });
+
+    await page.locator('.folder-filter-bar', { hasText: 'Showing Pictures' }).waitFor();
+    const picTitles = await page.locator('.list a.row .title').allTextContents();
+    assert.deepEqual(picTitles, ['Poster.jpg', 'avatar.png']);
+    await assertNoPlainLeaks(page, 'old studio sorted & filtered');
+    await maybeOldShot(page, '04-old-sorted-filtered');
+
+    // Clear filter.
+    await page.locator('.folder-filter-bar button', { hasText: 'Show all' }).click();
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).waitFor();
+
+    // 5. BigFolder (sibling of Documents under Home) hits old 500-item limit -> quiet truncation line at foot.
+    await page.locator('nav.where a', { hasText: 'Home' }).click();
+    await page.locator('.older-note').waitFor();
+    assert.equal(await page.locator('.older-note').count(), 1, 'Older-note shows once at studio Home root');
+    await page.locator('.list a.row', { hasText: 'BigFolder' }).click();
+    await page.locator('header.top h1', { hasText: 'BigFolder' }).waitFor();
+    assert.equal(await page.locator('.older-note').count(), 0, 'Older-note must not repeat inside BigFolder');
+    const limitNote = page.locator('.folder-limit-note');
+    await limitNote.waitFor();
+    assert.equal(
+      (await limitNote.innerText()).trim(),
+      'Showing the first 500. Update Legion on studio to see everything.',
+    );
+    await assertNoPlainLeaks(page, 'old studio BigFolder 500 limit');
+    await page.goBack();
+    await page.locator('.list a.row', { hasText: 'Documents' }).click();
+    await page.locator('header.top h1', { hasText: 'Documents' }).waitFor();
+
+    // 6. Open small picture inline, text file inline, large picture fallback + download, and video fallback.
+    await page.locator('.list a.row', { hasText: 'avatar.png' }).click();
+    await page.locator('.viewer img.viewer-img').waitFor({ timeout: 5000 });
+    assert.equal(await page.locator('.viewer-bar button', { hasText: 'Star' }).count(), 0);
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).click();
+    await page.locator('.viewer pre.viewer-text', { hasText: 'Design notes' }).waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    await page.locator('.list a.row', { hasText: 'Poster.jpg' }).click();
+    await page.locator('.viewer').getByText("Can't show this picture here").waitFor();
+    await page.locator('.viewer').getByRole('button', { name: 'Download to this phone' }).click();
+    await page.locator('.toast-banner', { hasText: /Downloading Poster\.jpg/ }).waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+    const dismissBtn = page.locator('.toast-banner button[aria-label="Dismiss"]');
+    if (await dismissBtn.count()) await dismissBtn.click();
+
+    await page.locator('.list a.row', { hasText: 'Clip.mp4' }).click();
+    await page.locator('.viewer').getByText("Video playback isn't available from studio yet").waitFor();
+    await page.locator('.viewer').getByRole('button', { name: 'Download to this phone' }).waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    // 7. Search on studio: More filters hidden, name search uses glob + client filter, zero invalid_args.
+    await page.locator('.dock.tools input[type="search"]').fill('design');
+    await page.locator('header.top h1', { hasText: 'Search' }).waitFor();
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).waitFor();
+    assert.equal(
+      await page.locator('.filters button', { hasText: 'More filters' }).count(),
+      0,
+      'More filters must be hidden when searching an older machine without size/date search filters',
+    );
+    await assertNoPlainLeaks(page, 'old studio search');
+    await maybeOldShot(page, '05-old-search');
+
+    // 8. Check Activity, Actions, and Settings with Technical details off for plain-mode cleanliness.
+    await page.goto(`${server.url}/?mock=multi,mixed#/activity`, { waitUntil: 'domcontentloaded' });
+    await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
+    await assertNoPlainLeaks(page, 'activity plain');
+    await page.goto(`${server.url}/?mock=multi,mixed#/actions`, { waitUntil: 'domcontentloaded' });
+    await page.locator('header.top h1', { hasText: 'Actions' }).waitFor();
+    await assertNoPlainLeaks(page, 'actions plain');
+    await page.goto(`${server.url}/?mock=multi,mixed#/settings`, { waitUntil: 'domcontentloaded' });
+    await page.locator('header.top h1', { hasText: 'Settings' }).waitFor();
+    await assertNoPlainLeaks(page, 'settings plain');
+
+    // 9. Turn Technical details ON -> studio Overview note reveals version, build, and missing list.
+    await page.locator('label.row.switch', { hasText: 'Technical details' }).click();
+    await page.goto(`${server.url}/?mock=multi,mixed#/machines/studio`, { waitUntil: 'domcontentloaded' });
+    const techLine = page.locator('.older-note-tech');
+    await techLine.waitFor();
+    const techText = await techLine.innerText();
+    assert.ok(techText.includes('0.1.0'), `Expected version in technical note, got: ${techText}`);
+    assert.ok(techText.includes('05ba1ef2e385'), `Expected build in technical note, got: ${techText}`);
+    assert.ok(techText.includes('fs.thumb'), `Expected missing features in technical note, got: ${techText}`);
+
+    await assertNoProtocolErrors(page, 'old machine full journey');
+    await ctx.close();
+
+    assert.deepEqual(pageErrors, [], `Uncaught page errors (old machine): ${pageErrors.join('\n')}`);
+    assert.deepEqual(consoleErrors, [], `Console/CSP errors (old machine): ${consoleErrors.join('\n')}`);
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});
+
+test('Mixed-version fleet side by side (?mock=multi,mixed): current tower + old studio, cross-machine search, and Send to both ways', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const ctx = await browser.newContext({
+      viewport: { width: 412, height: 915 },
+      colorScheme: 'dark',
+    });
+    const page = await ctx.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    // 1. Current machine (tower) keeps full features (Pinned, thumbnails, stars, no older-note).
+    await page.goto(`${server.url}/?mock=multi,mixed#/files`, { waitUntil: 'domcontentloaded' });
+    await page.getByText('Pinned').waitFor();
+    await page.locator('a.row[href="#/files/tower/~"]').click();
+    await page.locator('.list a.row', { hasText: 'Videos' }).click();
+    await page.locator('.list a.row', { hasText: 'Holiday' }).click();
+    await page.locator('.grid a.cell img').first().waitFor({ timeout: 5000 });
+    assert.equal(await page.locator('.older-note').count(), 0, 'Current machine tower must not show older-note');
+
+    // 2. Old machine (studio) in the exact same session degrades cleanly with zero invalid_args.
+    await page.goto(`${server.url}/?mock=multi,mixed#/files/studio/~`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.list a.row', { hasText: 'Documents' }).waitFor();
+    assert.equal(await page.locator('.older-note').count(), 1, 'Older-note shows once at studio Home root');
+    await page.locator('.list a.row', { hasText: 'Documents' }).click();
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).waitFor();
+    assert.equal(await page.locator('.older-note').count(), 0, 'Older-note stays hidden inside subfolders');
+    assert.equal(await page.locator('.list img').count(), 0);
+    assert.equal(await page.locator('.list .star').count(), 0);
+
+    // 3. Cross-machine search finds matches on both current and old machines with zero invalid_args.
+    await page.goto(`${server.url}/?mock=multi,mixed#/files`, { waitUntil: 'domcontentloaded' });
+    await page.locator('.dock input[aria-label="Search all machines"]').fill('notes');
+    await page.locator('header.top h1', { hasText: 'Search' }).waitFor();
+    await page.locator('.list a.row', { hasText: 'notes.txt' }).first().waitFor();
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).first().waitFor();
+    await assertNoPlainLeaks(page, 'mixed fleet cross-machine search');
+
+    // 4. Send to from current machine (tower) -> old machine (studio).
+    await page.goto(`${server.url}/?mock=multi,mixed#/files/tower//home/me/Documents`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
+    await dispatchSwipe(page, '.swipe-row:has-text("README.md")', {
+      startX: 310,
+      startY: 220,
+      endX: 140,
+      endY: 222,
+    });
+    await page.locator('.swipe-row:has-text("README.md") .swipe-action', { hasText: 'Send to' }).click();
+    const toOldSheet = page.locator('.sheet');
+    await toOldSheet.waitFor();
+    await toOldSheet.locator('button[role="radio"]', { hasText: 'studio' }).click();
+    await toOldSheet.getByRole('button', { name: 'Copy to studio' }).click();
+    await toOldSheet.waitFor({ state: 'hidden' });
+    await page.locator('.toast-banner', { hasText: /Copying README\.md to studio/ }).waitFor();
+
+    // 5. Send to from old machine (studio) -> current machine (tower).
+    await page.goto(`${server.url}/?mock=multi,mixed#/files/studio//home/me/Documents`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.list a.row', { hasText: 'design-notes.md' }).waitFor();
+    await dispatchSwipe(page, '.swipe-row:has-text("design-notes.md")', {
+      startX: 310,
+      startY: 220,
+      endX: 140,
+      endY: 222,
+    });
+    await page.locator('.swipe-row:has-text("design-notes.md") .swipe-action', { hasText: 'Send to' }).click();
+    const fromOldSheet = page.locator('.sheet');
+    await fromOldSheet.waitFor();
+    await fromOldSheet.locator('button[role="radio"]', { hasText: 'tower' }).click();
+    await fromOldSheet.getByRole('button', { name: 'Copy to tower' }).click();
+    await fromOldSheet.waitFor({ state: 'hidden' });
+    await page.locator('.toast-banner', { hasText: /Copying design-notes\.md to tower/ }).waitFor();
+
+    await assertNoProtocolErrors(page, 'mixed-version fleet side-by-side');
+    await ctx.close();
+
+    assert.deepEqual(pageErrors, [], `Uncaught page errors (mixed fleet): ${pageErrors.join('\n')}`);
+    assert.deepEqual(consoleErrors, [], `Console/CSP errors (mixed fleet): ${consoleErrors.join('\n')}`);
   } finally {
     await browser.close();
     await server.stop();

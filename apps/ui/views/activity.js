@@ -3,6 +3,7 @@
 
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Notice, ProgressBar, SwipeRow } from './common.js';
+import { ScrollContainer } from './scroll-container.js';
 import {
   formatActivityDuration,
   formatActivitySubtitle,
@@ -32,6 +33,8 @@ export function ActivityDetail({
   link,
   allowedSet,
   technical = false,
+  onObserveTransferJobs = null,
+  onRegisterRefresh = null,
   onChanged,
 }) {
   const [status, setStatus] = useState(null);
@@ -39,6 +42,7 @@ export function ActivityDetail({
   const [error, setError] = useState(null);
   const [stopping, setStopping] = useState(false);
   const offsetRef = useRef(0);
+  const pollRef = useRef(null);
   const on = targetFor(machineName, nodeName);
   const canCancel = allowedSet ? allowedSet.has('job.cancel') : true;
 
@@ -59,6 +63,9 @@ export function ActivityDetail({
         ]);
         if (!alive) return;
         setStatus(st);
+        if (onObserveTransferJobs && st) {
+          onObserveTransferJobs([{ ...st, machine: machineName }]);
+        }
         if (logs?.content) {
           setLogText((prev) => prev + logs.content);
         }
@@ -73,12 +80,19 @@ export function ActivityDetail({
       }
     }
 
+    pollRef.current = poll;
     poll();
     return () => {
       alive = false;
+      pollRef.current = null;
       if (timer) window.clearTimeout(timer);
     };
-  }, [machineName, jobId]);
+  }, [machineName, jobId, onObserveTransferJobs]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function') return undefined;
+    return onRegisterRefresh(() => (pollRef.current ? pollRef.current() : Promise.resolve()));
+  }, [onRegisterRefresh, machineName, jobId]);
 
   async function onStop() {
     setStopping(true);
@@ -364,7 +378,10 @@ export function ActivityGroups({
     const out = (jobs || []).map((j) => ({ _kind: 'job', ...j }));
     for (const t of deviceTransfers || []) {
       const mappedState =
-        t.state === 'running' || t.state === 'queued' || t.state === 'paused'
+        t.state === 'running' ||
+        t.state === 'queued' ||
+        t.state === 'paused' ||
+        t.state === 'cancelling'
           ? 'running'
           : t.state === 'done'
             ? 'succeeded'
@@ -445,6 +462,8 @@ export function ActivityView({
   wide,
   deviceNoun = 'phone',
   deviceTransfers = [],
+  onObserveTransferJobs = null,
+  onRegisterRefresh = null,
   onOpenTransfer,
   onRefreshFleet,
 }) {
@@ -490,6 +509,9 @@ export function ActivityView({
           if (ctrl.signal.aborted) return;
           anySucceeded = true;
           const entries = (res?.jobs || []).map((job) => ({ ...job, machine }));
+          if (onObserveTransferJobs && entries.length > 0) {
+            onObserveTransferJobs(entries);
+          }
           setJobsByMachine((prev) => {
             const next = { ...(prev || {}) };
             for (const key of Object.keys(next)) {
@@ -570,6 +592,19 @@ export function ActivityView({
   const hasSelected = Boolean(route.machine && route.jobId);
   const selectedKey = hasSelected ? `${route.machine}:${route.jobId}` : '';
 
+  const refreshActivityList = async () => {
+    await Promise.all([
+      load(targetNames),
+      typeof link?.transfers === 'function' ? link.transfers().catch(() => {}) : Promise.resolve(),
+      onRefreshFleet ? onRefreshFleet() : Promise.resolve(),
+    ]);
+  };
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function' || wide || hasSelected) return undefined;
+    return onRegisterRefresh(refreshActivityList);
+  }, [onRegisterRefresh, wide, hasSelected, targetKey, localNode]);
+
   const listPane = html`
     <section>
       ${error ? html`<${Notice} error=${error} />` : null}
@@ -595,8 +630,10 @@ export function ActivityView({
   if (wide && (hasSelected || !jobs || hasAnyItems)) {
     return html`
       <div class="split">
-        ${listPane}
-        <section>
+        <${ScrollContainer} as="section" onRefresh=${refreshActivityList}>
+          ${listPane}
+        <//>
+        <${ScrollContainer} as="section">
           ${hasSelected
             ? html`
                 <${ActivityDetail}
@@ -606,6 +643,7 @@ export function ActivityView({
                   link=${link}
                   allowedSet=${allowedSet}
                   technical=${technical}
+                  onObserveTransferJobs=${onObserveTransferJobs}
                   onChanged=${() => {
                     load();
                     if (onRefreshFleet) onRefreshFleet();
@@ -613,7 +651,7 @@ export function ActivityView({
                 />
               `
             : html`<div class="empty">Select an item to see its details.</div>`}
-        </section>
+        <//>
       </div>
     `;
   }
@@ -627,6 +665,8 @@ export function ActivityView({
         link=${link}
         allowedSet=${allowedSet}
         technical=${technical}
+        onObserveTransferJobs=${onObserveTransferJobs}
+        onRegisterRefresh=${onRegisterRefresh}
         onChanged=${() => {
           load();
           if (onRefreshFleet) onRefreshFleet();

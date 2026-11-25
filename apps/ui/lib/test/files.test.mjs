@@ -124,8 +124,22 @@ test('detectFileCapabilities cleanly degrades against old nodes and limited role
   assert.equal(oldCaps.hasOpenExternally, false);
   assert.equal(oldCaps.hasUpload, false);
 
+  // Unknown capabilities (empty tool list) assume the least, never the most.
+  const unknownCaps = detectFileCapabilities({
+    tools: [],
+    allowedSet: null,
+    link: { kind: 'http', supportsContent: true, contentUrl: async () => ({ url: '' }), download: async () => ({ id: '1' }) },
+    machine: 'pi',
+  });
+  assert.equal(unknownCaps.known, false);
+  assert.equal(unknownCaps.hasList, false);
+  assert.equal(unknownCaps.hasRead, false);
+  assert.equal(unknownCaps.hasListSort, false);
+  assert.equal(unknownCaps.hasContentUrl, false);
+
   // Per-machine content support via `supportsContentFor(machine)` enables real `legion serve`
-  // even without `fs.thumb`, while disabling only machines remembered as unsupported.
+  // on current-version nodes even without `fs.thumb`, while disabling older nodes and machines
+  // remembered as unsupported.
   const perMachineLink = {
     kind: 'http',
     supportsContent: true,
@@ -133,17 +147,29 @@ test('detectFileCapabilities cleanly degrades against old nodes and limited role
     contentUrl: async () => ({ url: '' }),
     download: async () => ({ id: '1' }),
   };
+  const currentWithoutThumb = [
+    { name: 'fs.list', effect: 'read', input_schema: { properties: { path: {}, depth: {}, hidden: {}, limit: {}, offset: {} } } },
+    { name: 'fs.read', effect: 'read', input_schema: { properties: { path: {} } } },
+  ];
   const liveCaps = detectFileCapabilities({
-    tools: oldTools,
-    allowedSet: new Set(oldTools.map((t) => t.name)),
+    tools: currentWithoutThumb,
+    allowedSet: new Set(currentWithoutThumb.map((t) => t.name)),
     link: perMachineLink,
     machine: 'pi',
   });
   assert.equal(liveCaps.hasContentUrl, true);
   assert.equal(liveCaps.hasDownload, true);
-  const legacyCaps = detectFileCapabilities({
+  const oldNodeCaps = detectFileCapabilities({
     tools: oldTools,
     allowedSet: new Set(oldTools.map((t) => t.name)),
+    link: perMachineLink,
+    machine: 'pi',
+  });
+  assert.equal(oldNodeCaps.hasContentUrl, false);
+  assert.equal(oldNodeCaps.hasDownload, false);
+  const legacyCaps = detectFileCapabilities({
+    tools: currentWithoutThumb,
+    allowedSet: new Set(currentWithoutThumb.map((t) => t.name)),
     link: perMachineLink,
     machine: 'legacy',
   });
