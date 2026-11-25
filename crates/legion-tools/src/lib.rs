@@ -12,6 +12,7 @@ mod caller;
 pub mod device;
 pub mod exec;
 pub mod ext;
+pub mod fav;
 pub mod floor;
 pub mod fs;
 pub mod job;
@@ -39,6 +40,7 @@ pub fn register_all(registry: &mut Registry) {
     sys::register(registry);
     exec::register(registry);
     fs::register(registry);
+    fav::register(registry);
     job::register(registry);
     proj::register(registry);
     svc::register(registry);
