@@ -11,22 +11,38 @@ import android.util.Log
  * Receives commit results from Android's [PackageInstaller] session opened by [AppUpdaterPlugin].
  *
  * When Android requires explicit user confirmation (`STATUS_PENDING_USER_ACTION`), this receiver
- * launches the system confirmation intent; all terminal statuses are forwarded back to
- * [AppUpdaterPlugin] so the Rust updater can update state cleanly.
+ * launches the system confirmation intent ONLY for foreground installs. Background installs
+ * abandon the session silently so leaving Legion never brings an installer dialog or the app back
+ * to the front.
  */
 class UpdateInstallReceiver : BroadcastReceiver() {
   override fun onReceive(context: Context, intent: Intent) {
     val sessionId = intent.getIntExtra(PackageInstaller.EXTRA_SESSION_ID, -1)
     val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)
     val message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE).orEmpty()
+    val background = intent.getBooleanExtra(AppUpdaterPlugin.EXTRA_BACKGROUND, false) ||
+      AppUpdaterPlugin.isBackgroundSession(sessionId)
 
     Log.i(
       TAG,
-      "PackageInstaller callback: session=$sessionId status=$status message=$message",
+      "PackageInstaller callback: session=$sessionId status=$status background=$background message=$message",
     )
 
     when (status) {
       PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+        if (background) {
+          Log.i(TAG, "Abandoning background session $sessionId that requested user confirmation")
+          if (sessionId >= 0) {
+            runCatching { context.packageManager.packageInstaller.abandonSession(sessionId) }
+          }
+          AppUpdaterPlugin.onInstallFinished(
+            sessionId = sessionId,
+            status = "deferred_background",
+            message = "Android requested confirmation while in the background.",
+          )
+          return
+        }
+
         val confirmIntent: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
           intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
         } else {

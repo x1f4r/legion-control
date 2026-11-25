@@ -87,14 +87,35 @@ pub fn run() {
 
     let builder = builder.setup(|app| {
         let data_dir = app.path().app_data_dir()?;
+        #[cfg(target_os = "windows")]
+        let updates_base_dir = app
+            .path()
+            .app_local_data_dir()
+            .unwrap_or_else(|_| data_dir.clone());
+        #[cfg(not(target_os = "windows"))]
+        let updates_base_dir = data_dir.clone();
+
+        let updater = Arc::new(UpdateManager::for_app(
+            &updates_base_dir,
+            Some(app.package_info().version.to_string()),
+        ));
+
+        // When spawned by the desktop swapper during a window-close update, confirm startup
+        // cleanly (writing `started-<seq>.ok`, `current-build.json`, advancing `floor.json`, and
+        // recording the post-update notice) and exit without popping a window open.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if std::env::var_os("LEGION_UPDATE_VERIFY_ONLY").is_some_and(|v| v == "1") {
+            updater.on_app_ready();
+            app.handle().exit(0);
+            return Ok(());
+        }
+
         let store = AppStore::in_dir(&data_dir);
         store.prepare_dir()?;
         let backend = LinkBackend::from_store(store.clone());
-        let updater =
-            UpdateManager::for_app(&data_dir, Some(app.package_info().version.to_string()));
         app.manage(store);
         app.manage(SharedBackend(Arc::new(backend)));
-        app.manage(SharedUpdater(Arc::new(updater)));
+        app.manage(SharedUpdater(Arc::clone(&updater)));
 
         let window_config = app
             .config()
@@ -103,10 +124,22 @@ pub fn run() {
             .first()
             .cloned()
             .ok_or_else(|| std::io::Error::other("missing main window config"))?;
-        WebviewWindowBuilder::from_config(app.handle(), &window_config)?
+        let window = WebviewWindowBuilder::from_config(app.handle(), &window_config)?
             .on_navigation(is_allowed_navigation_url)
             .on_new_window(|_, _| NewWindowResponse::Deny)
             .build()?;
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let close_updater = Arc::clone(&updater);
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    let _ = close_updater.try_spawn_desktop_close_install();
+                }
+            });
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let _ = window;
 
         Ok(())
     });

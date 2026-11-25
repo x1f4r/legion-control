@@ -34,8 +34,8 @@ gethostname = "1.1.0"
 android_logger = "0.15.1"
 log = "0.4.35"
 
-[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
-rustix = { version = "1.1.6", features = ["fs"] }
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", features = ["fs", "process"] }
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "=2.5.3"

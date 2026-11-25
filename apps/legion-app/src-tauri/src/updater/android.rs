@@ -32,13 +32,16 @@ pub struct AndroidCapabilities {
     /// Whether Android 12+ silent self-update preconditions are currently met.
     #[serde(default)]
     pub supports_silent_self_update: bool,
+    /// Whether Android's active network is metered (cellular or metered Wi-Fi).
+    #[serde(default)]
+    pub is_metered: bool,
 }
 
 /// Outcome returned by `AppUpdaterPlugin.installApk`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AndroidInstallOutcome {
-    /// `"installed"`, `"needs_permission"`, `"cancelled"`, or `"failed"`.
+    /// `"installed"`, `"needs_permission"`, `"cancelled"`, `"deferred_background"`, or `"failed"`.
     pub status: String,
     /// Whether Android showed its system confirmation dialog (`STATUS_PENDING_USER_ACTION`).
     #[serde(default)]
@@ -49,7 +52,7 @@ pub struct AndroidInstallOutcome {
 }
 
 #[cfg(target_os = "android")]
-/// Queries Android install-packages capability and installer ownership.
+/// Queries Android install-packages capability, metered network state, and installer ownership.
 pub async fn capabilities(handle: &AndroidUpdaterHandle) -> Result<AndroidCapabilities, AppError> {
     handle
         .0
@@ -83,13 +86,23 @@ pub async fn request_install_permission(
 
 #[cfg(target_os = "android")]
 /// Installs a verified APK located inside the app's private data directory via `PackageInstaller`.
+///
+/// When `background` is `true`, Android sessions that ask for user confirmation are abandoned
+/// silently rather than bringing an installer dialog to the foreground.
 pub async fn install_apk(
     handle: &AndroidUpdaterHandle,
     apk_path: &std::path::Path,
+    background: bool,
 ) -> Result<AndroidInstallOutcome, AppError> {
     handle
         .0
-        .run_mobile_plugin_async("installApk", json!({ "path": apk_path.to_string_lossy() }))
+        .run_mobile_plugin_async(
+            "installApk",
+            json!({
+                "path": apk_path.to_string_lossy(),
+                "background": background,
+            }),
+        )
         .await
         .map_err(|err| {
             AppError::new(
