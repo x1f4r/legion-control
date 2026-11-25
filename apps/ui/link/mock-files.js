@@ -340,6 +340,8 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
   const isThumbRetry = flags.has('thumb-retry');
   const isTransfersDemo = flags.has('transfers');
   const isEmpty = flags.has('empty');
+  const isSlowUpload = flags.has('slow-upload');
+  const isFailUpload = flags.has('fail-upload');
 
   const day = 86400;
   const longLogText = makeLongLogText();
@@ -1041,6 +1043,13 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
         t.bytes_done = Math.min(t.bytes_total, t.bytes_done + step);
         t.rate = step * 3;
         changed = true;
+        if (isFailUpload && t.direction === 'upload' && t.bytes_done >= Math.floor(t.bytes_total * 0.3)) {
+          t.state = 'failed';
+          t.rate = 0;
+          t.finished = new Date().toISOString();
+          t.error = { code: 'unreachable', message: 'Connection dropped.' };
+          continue;
+        }
         if (t.bytes_done >= t.bytes_total) {
           t.state = 'done';
           t.rate = 0;
@@ -1823,6 +1832,9 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
         },
 
         async upload({ machine, dir, files }) {
+          if (isSlowUpload) {
+            await new Promise((resolve) => setTimeout(resolve, 450));
+          }
           const target = machine || activeNodeRef();
           const normDir = normalizePath(dir || '~');
           const picked =
