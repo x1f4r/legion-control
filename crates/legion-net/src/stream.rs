@@ -252,6 +252,11 @@ pub(crate) enum Op {
         /// matches this destination file identity.
         #[serde(default)]
         forbid_file_id: Option<(u64, u64)>,
+        /// Move-lock token acquired via `op: "lock"` on this node. When present, `delete` pins
+        /// this lock for the duration of the request and verifies immediately before unlinking
+        /// each file (after hashing) that this lock is still live and covers the path.
+        #[serde(default)]
+        lock_id: Option<String>,
     },
     /// Create or remove a uniquely named empty marker file in a directory to prove whether two
     /// move endpoints refer to distinct directories (even across fleet aliases or network shares).
@@ -598,7 +603,18 @@ pub(crate) struct LockEntry {
 pub(crate) struct LockReady {
     pub locked: bool,
     #[serde(default)]
+    pub lock_id: String,
+    #[serde(default)]
+    pub lease_ms: u64,
+    #[serde(default)]
     pub entries: Vec<LockEntry>,
+}
+
+/// Reply line written on a `lock` stream for each `"renew\n"` (or when a lease expires unpinned).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) struct LockRenewReply {
+    /// `"held"` while the lock remains live; `"lost"` once expired or dropped.
+    pub status: String,
 }
 
 /// How an operation failed: in time to say so on stdout, or after its raw bytes had started.
@@ -1230,12 +1246,14 @@ fn run<R: Read + Send + 'static, W: Write>(
             expect_hashes,
             expect_root_hash,
             forbid_file_id,
+            lock_id,
         } => {
             legion_xfer::sweep_abandoned_temps(
                 host.paths.state_dir(),
                 legion_xfer::PROBE_SWEEP_AGE,
             );
             delete(
+                host.paths.state_dir(),
                 grant,
                 &root,
                 &names,
@@ -1244,6 +1262,7 @@ fn run<R: Read + Send + 'static, W: Write>(
                 &expect_hashes,
                 expect_root_hash,
                 forbid_file_id,
+                lock_id.as_deref(),
                 output,
             )
         }
@@ -2060,8 +2079,37 @@ fn unaccounted(watch: &Watch, report: &legion_xfer::UnpackReport) -> Option<(Str
     })
 }
 
+#[cfg(debug_assertions)]
+fn maybe_test_delete_hash_delay() {
+    if let Ok(raw) = std::env::var("LEGION_TEST_DELETE_HASH_DELAY_MS")
+        && let Ok(ms) = raw.parse::<u64>()
+        && ms > 0
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn maybe_test_delete_hash_delay() {}
+
+fn move_lock_lost_error() -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Conflict,
+        "The copy finished and the source was kept because the move lock expired or no longer covers this path.",
+    )
+    .with_hint("Run the transfer again to finish the move.")
+}
+
+enum RemoveOutcome {
+    Removed,
+    Absent,
+    Skipped(String),
+    LockLost,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn delete<W: Write>(
+    state_dir: &Path,
     grant: &Grant,
     root: &str,
     names: &[String],
@@ -2070,6 +2118,7 @@ fn delete<W: Write>(
     expect_hashes: &HashMap<String, Hash>,
     expect_root_hash: Option<Hash>,
     forbid_file_id: Option<(u64, u64)>,
+    lock_id: Option<&str>,
     output: &mut W,
 ) -> Result<(), Failure> {
     let checked_root = if remove_root {
@@ -2085,6 +2134,22 @@ fn delete<W: Write>(
     if dry_run {
         return reply(output, &DeleteDone::default());
     }
+    // Pin the move lock FIRST before checking that it is live, closing any race where the lock
+    // could expire between the initial check and pinning.
+    let _lock_pin = if let Some(lid) = lock_id {
+        if !is_valid_lock_id(lid) {
+            return Err(Failure::Reply(move_lock_lost_error()));
+        }
+        let pin = MoveLockPinGuard::acquire(state_dir, lid)
+            .map_err(|err| Failure::Reply(io_error("pin move lock", state_dir, &err)))?;
+        if !verify_move_lock_active(state_dir, lid, grant.principal(), true) {
+            return Err(Failure::Reply(move_lock_lost_error()));
+        }
+        Some(pin)
+    } else {
+        None
+    };
+
     let mut done = DeleteDone::default();
     let mut valid: Vec<(usize, String)> = Vec::with_capacity(names.len());
     for name in names {
@@ -2099,69 +2164,99 @@ fn delete<W: Write>(
     // Deepest first, so a directory's children are gone before it is.
     valid.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     valid.dedup();
-    busy(output, || {
+    let lock_lost = busy(output, || {
         for (_, name) in valid {
             let expected = expect_hashes.get(&name).copied();
-            match remove_one(grant, &checked_root, &name, expected) {
-                Ok(true) => done.removed += 1,
-                Ok(false) => {}
-                Err(reason) => done.skipped.push(SkippedEntry { path: name, reason }),
+            match remove_one(state_dir, grant, &checked_root, &name, expected, lock_id) {
+                RemoveOutcome::Removed => done.removed += 1,
+                RemoveOutcome::Absent => {}
+                RemoveOutcome::Skipped(reason) => done.skipped.push(SkippedEntry { path: name, reason }),
+                RemoveOutcome::LockLost => return true,
             }
         }
         if remove_root {
-            match remove_root_path(grant, &checked_root, expect_root_hash, forbid_file_id) {
-                Ok(true) => done.removed += 1,
-                Ok(false) => {}
-                Err(reason) => done.skipped.push(SkippedEntry {
+            match remove_root_path(
+                state_dir,
+                grant,
+                &checked_root,
+                expect_root_hash,
+                forbid_file_id,
+                lock_id,
+            ) {
+                RemoveOutcome::Removed => done.removed += 1,
+                RemoveOutcome::Absent => {}
+                RemoveOutcome::Skipped(reason) => done.skipped.push(SkippedEntry {
                     path: checked_root.to_string_lossy().into_owned(),
                     reason,
                 }),
+                RemoveOutcome::LockLost => return true,
             }
         }
+        false
     })?;
+    if lock_lost {
+        return Err(Failure::Reply(move_lock_lost_error()));
+    }
     done.skipped.sort();
     reply(output, &done)
 }
 
 /// Removes one name under `root`, never following a symbolic link; says whether there was
-/// anything to remove, or why it was left.
+/// anything to remove, why it was left, or whether the move lock was lost before unlinking.
 fn remove_one(
+    state_dir: &Path,
     grant: &Grant,
     root: &Path,
     name: &str,
     expected_hash: Option<Hash>,
-) -> Result<bool, String> {
+    lock_id: Option<&str>,
+) -> RemoveOutcome {
     let path = match named(grant, root, name, Access::Write) {
         Ok(path) => path,
-        Err(Named::Missing) => return Ok(false),
-        Err(Named::Refused(reason)) => return Err(reason),
+        Err(Named::Missing) => return RemoveOutcome::Absent,
+        Err(Named::Refused(reason)) => return RemoveOutcome::Skipped(reason),
     };
     if let Err(error) = legion_tools::fs::check_not_protected_tree(grant, &path) {
-        return Err(error.message);
+        return RemoveOutcome::Skipped(error.message);
     }
     if path
         .file_name()
         .and_then(OsStr::to_str)
         .is_some_and(legion_xfer::is_legion_internal_name)
     {
-        return Err("it is an internal Legion transfer file".to_owned());
+        return RemoveOutcome::Skipped("it is an internal Legion transfer file".to_owned());
     }
     let meta = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.to_string()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return RemoveOutcome::Absent,
+        Err(error) => return RemoveOutcome::Skipped(error.to_string()),
     };
     let kind = meta.file_type();
     if kind.is_file()
         && let Some(expected) = expected_hash
     {
-        let current = legion_xfer::hash::hash_file(&path).map_err(|error| error.to_string())?;
+        maybe_test_delete_hash_delay();
+        let current = match legion_xfer::hash::hash_file(&path) {
+            Ok(h) => h,
+            Err(error) => return RemoveOutcome::Skipped(error.to_string()),
+        };
         if current != expected {
-            return Err("it changed after it was copied, so the source was kept".to_owned());
+            return RemoveOutcome::Skipped(
+                "it changed after it was copied, so the source was kept".to_owned(),
+            );
         }
     }
+    // Check immediately before unlinking (after hashing!) that the move lock is still live on this
+    // node and covers this exact path.
+    if let Some(lid) = lock_id
+        && !verify_move_lock_covers(state_dir, lid, grant.principal(), &path)
+    {
+        return RemoveOutcome::LockLost;
+    }
     let removed = if kind.is_dir() {
-        grant.check_tree(&path).map_err(|error| error.message)?;
+        if let Err(error) = grant.check_tree(&path) {
+            return RemoveOutcome::Skipped(error.message);
+        }
         fs::remove_dir(&path).map_err(|error| {
             if fs::read_dir(&path).is_ok_and(|mut entries| entries.next().is_some()) {
                 "it is a directory that still holds entries the transfer left alone".to_owned()
@@ -2177,61 +2272,91 @@ fn remove_one(
     } else {
         fs::remove_file(&path).map_err(|error| error.to_string())
     };
-    removed.map(|()| true)
+    match removed {
+        Ok(()) => RemoveOutcome::Removed,
+        Err(reason) => RemoveOutcome::Skipped(reason),
+    }
 }
 
 /// Removes the source root itself (a single file, symlink, or now-empty directory) after checking
-/// its hash when `expected_hash` is given and refusing if its filesystem identity matches
-/// `forbid_file_id`.
+/// its hash when `expected_hash` is given, refusing if its filesystem identity matches
+/// `forbid_file_id`, and verifying the move lock immediately before unlink.
 fn remove_root_path(
+    state_dir: &Path,
     grant: &Grant,
     path: &Path,
     expected_hash: Option<Hash>,
     forbid_file_id: Option<(u64, u64)>,
-) -> Result<bool, String> {
+    lock_id: Option<&str>,
+) -> RemoveOutcome {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.to_string()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return RemoveOutcome::Absent,
+        Err(error) => return RemoveOutcome::Skipped(error.to_string()),
     };
     if let Some((forbid_dev, forbid_ino)) = forbid_file_id
         && let Ok(current_id) = symlink_file_identity(path)
         && current_id.dev == forbid_dev
         && current_id.ino == forbid_ino
     {
-        return Err(
+        return RemoveOutcome::Skipped(
             "source and destination refer to the same file, so the source was kept".to_owned(),
         );
     }
     let kind = meta.file_type();
     if kind.is_file() {
         if let Some(expected) = expected_hash {
-            let current = legion_xfer::hash::hash_file(path).map_err(|error| error.to_string())?;
+            maybe_test_delete_hash_delay();
+            let current = match legion_xfer::hash::hash_file(path) {
+                Ok(h) => h,
+                Err(error) => return RemoveOutcome::Skipped(error.to_string()),
+            };
             if current != expected {
-                return Err("it changed after it was copied, so the source was kept".to_owned());
+                return RemoveOutcome::Skipped(
+                    "it changed after it was copied, so the source was kept".to_owned(),
+                );
             }
         }
-        fs::remove_file(path).map_err(|error| error.to_string())?;
-        Ok(true)
+        if let Some(lid) = lock_id
+            && !verify_move_lock_covers(state_dir, lid, grant.principal(), path)
+        {
+            return RemoveOutcome::LockLost;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => RemoveOutcome::Removed,
+            Err(error) => RemoveOutcome::Skipped(error.to_string()),
+        }
     } else if kind.is_dir() {
-        grant.check_tree(path).map_err(|error| error.message)?;
+        if let Err(error) = grant.check_tree(path) {
+            return RemoveOutcome::Skipped(error.message);
+        }
+        if let Some(lid) = lock_id
+            && !verify_move_lock_covers(state_dir, lid, grant.principal(), path)
+        {
+            return RemoveOutcome::LockLost;
+        }
         match fs::remove_dir(path) {
-            Ok(()) => Ok(true),
+            Ok(()) => RemoveOutcome::Removed,
             Err(error) => {
                 if fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some()) {
-                    Ok(false)
+                    RemoveOutcome::Absent
                 } else {
-                    Err(error.to_string())
+                    RemoveOutcome::Skipped(error.to_string())
                 }
             }
         }
     } else if kind.is_symlink() {
-        fs::remove_file(path)
-            .or_else(|error| fs::remove_dir(path).map_err(|_| error))
-            .map_err(|error| error.to_string())?;
-        Ok(true)
+        if let Some(lid) = lock_id
+            && !verify_move_lock_covers(state_dir, lid, grant.principal(), path)
+        {
+            return RemoveOutcome::LockLost;
+        }
+        match fs::remove_file(path).or_else(|error| fs::remove_dir(path).map_err(|_| error)) {
+            Ok(()) => RemoveOutcome::Removed,
+            Err(error) => RemoveOutcome::Skipped(error.to_string()),
+        }
     } else {
-        Err("only files, directories, and symbolic links can be removed".to_owned())
+        RemoveOutcome::Skipped("only files, directories, and symbolic links can be removed".to_owned())
     }
 }
 
@@ -2765,19 +2890,212 @@ fn rename_same_file<W: Write>(
 /// Default lease for stream `lock` calls before automatic expiry unless renewed (`renew\n`).
 const MOVE_LOCK_DEFAULT_LEASE: Duration = Duration::from_secs(10);
 
-/// Minimum caller-requested lease duration (for tests) and hard cap on total lock hold time.
+/// Minimum and maximum caller-requested lease durations. A live holder that keeps renewing its
+/// pipe never loses its lock (no total-hold cap).
 const MOVE_LOCK_MIN_LEASE: Duration = Duration::from_millis(50);
-const MOVE_LOCK_MAX_HOLD: Duration = Duration::from_secs(60);
+const MOVE_LOCK_MAX_LEASE: Duration = Duration::from_secs(60);
 
 /// Maximum number of concurrent move locks one principal may hold across all streams on a node.
 const MAX_LOCKS_PER_PRINCIPAL: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct MoveLockMeta {
+    #[serde(default)]
+    lock_id: String,
     principal: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     job_id: Option<String>,
     expires_at_ms: u64,
+}
+
+fn default_move_lock_lease() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var("LEGION_TEST_MOVE_LOCK_LEASE_MS")
+        && let Ok(ms) = raw.parse::<u64>()
+    {
+        return Duration::from_millis(ms).clamp(MOVE_LOCK_MIN_LEASE, MOVE_LOCK_MAX_LEASE);
+    }
+    MOVE_LOCK_DEFAULT_LEASE
+}
+
+fn generate_lock_id() -> Result<String, Failure> {
+    let mut raw = [0u8; 16];
+    getrandom::fill(&mut raw).map_err(|err| {
+        Failure::Reply(ErrorBody::new(
+            ErrorCode::Internal,
+            format!("Could not generate move lock id: {err}."),
+        ))
+    })?;
+    let mut hex = String::with_capacity(32);
+    for byte in raw {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    Ok(hex)
+}
+
+fn is_valid_lock_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn move_lock_id_path(state_dir: &Path, lock_id: &str) -> PathBuf {
+    state_dir
+        .join("xfer")
+        .join("move-lock")
+        .join(format!("id-{lock_id}.lock"))
+}
+
+fn move_lock_pins_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("xfer").join("move-lock-pins")
+}
+
+static MOVE_LOCK_PIN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn active_in_process_pins() -> &'static Mutex<HashMap<String, usize>> {
+    static MAP: std::sync::OnceLock<Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Pins a move lock while a destructive operation (`delete`) carrying its `lock_id` executes on
+/// this node, preventing the lock holder from expiring the lock until `delete` finishes.
+struct MoveLockPinGuard {
+    lock_id: String,
+    pin_path: PathBuf,
+    pin_file: Option<fs::File>,
+}
+
+impl MoveLockPinGuard {
+    fn acquire(state_dir: &Path, lock_id: &str) -> io::Result<Self> {
+        let dir = move_lock_pins_dir(state_dir);
+        fs::create_dir_all(&dir)?;
+        let pid = std::process::id();
+        let seq = MOVE_LOCK_PIN_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pin_path = dir.join(format!("{lock_id}.{pid}.{seq}.pin"));
+        let pin_file = legion_xfer::try_lock_state_file(&pin_path)
+            .map_err(|err| io::Error::other(err.to_string()))?
+            .ok_or_else(|| io::Error::other("could not acquire move lock pin file"))?;
+        if let Ok(mut map) = active_in_process_pins().lock() {
+            *map.entry(lock_id.to_owned()).or_insert(0) += 1;
+        }
+        Ok(Self {
+            lock_id: lock_id.to_owned(),
+            pin_path,
+            pin_file: Some(pin_file),
+        })
+    }
+}
+
+impl Drop for MoveLockPinGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = active_in_process_pins().lock()
+            && let Some(count) = map.get_mut(&self.lock_id)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.lock_id);
+            }
+        }
+        if let Some(file) = self.pin_file.take() {
+            legion_xfer::unlink_held_lock(&self.pin_path, file);
+        }
+    }
+}
+
+/// Returns `true` while any live `delete` operation on this node holds a pin for `lock_id`,
+/// sweeping any dead unlocked `.pin` leftovers it encounters.
+fn has_active_move_lock_pin(state_dir: &Path, lock_id: &str) -> bool {
+    if active_in_process_pins()
+        .lock()
+        .is_ok_and(|map| map.get(lock_id).copied().unwrap_or(0) > 0)
+    {
+        return true;
+    }
+    let dir = move_lock_pins_dir(state_dir);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return false;
+    };
+    let prefix = format!("{lock_id}.");
+    let mut found = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(".pin") {
+            continue;
+        }
+        let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&path) else {
+            continue;
+        };
+        match file.try_lock() {
+            Ok(()) => {
+                // Dead leftover from a crashed `delete`: sweep cleanly.
+                legion_xfer::unlink_held_lock(&path, file);
+            }
+            Err(_) => {
+                found = true;
+            }
+        }
+    }
+    found
+}
+
+fn is_lock_file_held(lock_path: &Path) -> bool {
+    let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(lock_path) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            drop(file);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+/// Verifies that `lock_id` is currently held on this node by `principal`. When `check_expiry` is
+/// `true` (on initial entry to `delete`), also requires the recorded lease expiry to lie in the
+/// future so a resumed process cannot sneak past an already-expired lease before the lock thread
+/// observes its deadline.
+fn verify_move_lock_active(
+    state_dir: &Path,
+    lock_id: &str,
+    principal: &str,
+    check_expiry: bool,
+) -> bool {
+    if !is_valid_lock_id(lock_id) {
+        return false;
+    }
+    let id_lock_path = move_lock_id_path(state_dir, lock_id);
+    if !is_lock_file_held(&id_lock_path) {
+        return false;
+    }
+    let Some(meta) = read_lock_meta(&id_lock_path) else {
+        return false;
+    };
+    if meta.lock_id != lock_id || meta.principal != principal {
+        return false;
+    }
+    if check_expiry && meta.expires_at_ms <= now_unix_ms() {
+        return false;
+    }
+    true
+}
+
+/// Verifies immediately before unlinking `path` that `lock_id` is still live on this node, belongs
+/// to `principal`, and actively locks `path`.
+fn verify_move_lock_covers(state_dir: &Path, lock_id: &str, principal: &str, path: &Path) -> bool {
+    if !verify_move_lock_active(state_dir, lock_id, principal, false) {
+        return false;
+    }
+    let target_lock_path = legion_xfer::move_lock_state_path(state_dir, path);
+    if !is_lock_file_held(&target_lock_path) {
+        return false;
+    }
+    let Some(meta) = read_lock_meta(&target_lock_path) else {
+        return false;
+    };
+    meta.lock_id == lock_id && meta.principal == principal
 }
 
 fn now_unix_ms() -> u64 {
@@ -2826,8 +3144,15 @@ impl HeldLockFiles {
         self.files.push((path, file));
     }
 
-    fn update_expiry(&mut self, principal: &str, job_id: Option<&str>, expires_at_ms: u64) {
+    fn update_expiry(
+        &mut self,
+        lock_id: &str,
+        principal: &str,
+        job_id: Option<&str>,
+        expires_at_ms: u64,
+    ) {
         let meta = MoveLockMeta {
+            lock_id: lock_id.to_owned(),
             principal: principal.to_owned(),
             job_id: job_id.map(str::to_owned),
             expires_at_ms,
@@ -2847,14 +3172,132 @@ impl Drop for HeldLockFiles {
     }
 }
 
+/// Clock and wait abstraction for [`hold_locks_loop`] so unit tests drive lease renewal, pinning,
+/// and expiry deterministically without short wall-clock sleeps.
+trait LockClock {
+    fn now(&self) -> Duration;
+    fn wait_cmd(&self, rx: &Receiver<String>, timeout: Duration)
+        -> Result<String, RecvTimeoutError>;
+}
+
+struct RealLockClock {
+    started: Instant,
+}
+
+impl RealLockClock {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl LockClock for RealLockClock {
+    fn now(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    fn wait_cmd(
+        &self,
+        rx: &Receiver<String>,
+        timeout: Duration,
+    ) -> Result<String, RecvTimeoutError> {
+        rx.recv_timeout(timeout)
+    }
+}
+
+/// Holds `locks` on this stream until the caller sends `"release\n"`, closes stdin, or lets the
+/// lease expire without an active `delete` pin. Every `"renew\n"` receives `{"status":"held"}`;
+/// an unpinned lease expiry drops `locks`, replies `{"status":"lost"}`, and returns.
+#[allow(clippy::too_many_arguments)]
+fn hold_locks_loop<W: Write>(
+    clock: &impl LockClock,
+    state_dir: &Path,
+    lock_id: &str,
+    principal: &str,
+    job_id: Option<&str>,
+    lease: Duration,
+    locks: HeldLockFiles,
+    rx: &Receiver<String>,
+    output: &mut W,
+) {
+    let mut locks = Some(locks);
+    let mut lease_deadline = clock.now().saturating_add(lease);
+    let lease_ms = u64::try_from(lease.as_millis()).unwrap_or(10_000);
+    let pin_poll = lease.min(Duration::from_millis(50));
+
+    loop {
+        let now = clock.now();
+        let wait = if now >= lease_deadline {
+            if has_active_move_lock_pin(state_dir, lock_id) {
+                // Pinned by a running `delete`: keep holding and refresh metadata so observers see
+                // the lock stays live until `delete` finishes.
+                lease_deadline = now.saturating_add(pin_poll);
+                if let Some(ref mut held) = locks {
+                    held.update_expiry(
+                        lock_id,
+                        principal,
+                        job_id,
+                        now_unix_ms().saturating_add(lease_ms),
+                    );
+                }
+                pin_poll
+            } else {
+                // Lease expired without any active pin: drop all locks immediately and tell the
+                // caller the lock was lost.
+                locks.take();
+                let _ = reply(
+                    output,
+                    &LockRenewReply {
+                        status: "lost".to_owned(),
+                    },
+                );
+                return;
+            }
+        } else {
+            lease_deadline.saturating_sub(now)
+        };
+
+        match clock.wait_cmd(rx, wait) {
+            Ok(cmd) if cmd == "renew" => {
+                lease_deadline = clock.now().saturating_add(lease);
+                if let Some(ref mut held) = locks {
+                    held.update_expiry(
+                        lock_id,
+                        principal,
+                        job_id,
+                        now_unix_ms().saturating_add(lease_ms),
+                    );
+                }
+                if reply(
+                    output,
+                    &LockRenewReply {
+                        status: "held".to_owned(),
+                    },
+                )
+                .is_err()
+                {
+                    return;
+                }
+            }
+            Ok(_) | Err(RecvTimeoutError::Disconnected) => {
+                // Explicit `"release\n"`, unknown control line, or closed pipe: release cleanly.
+                return;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Loop top re-checks `clock.now() >= lease_deadline` and active pins.
+            }
+        }
+    }
+}
+
 /// Sweeps any unlocked `.lock` files (and orphaned `.meta` files) in `<state_dir>/xfer/move-lock/`
-/// immediately and counts how many currently live locks are held by `principal`.
+/// immediately and counts how many currently live target locks are held by `principal`.
 fn sweep_and_count_principal_locks(state_dir: &Path, principal: &str) -> usize {
     let dir = state_dir.join("xfer").join("move-lock");
     let Ok(entries) = fs::read_dir(&dir) else {
         return 0;
     };
-    let now_ms = now_unix_ms();
     let mut held_by_principal = 0usize;
     let mut meta_candidates = Vec::new();
     for entry in entries.flatten() {
@@ -2877,11 +3320,14 @@ fn sweep_and_count_principal_locks(state_dir: &Path, principal: &str) -> usize {
                 legion_xfer::unlink_held_lock(&path, file);
             }
             Err(_) => {
-                // Actively held by another process: read unlocked sibling `.meta` and count toward
-                // `principal`'s quota if valid.
-                if let Some(meta) = read_lock_meta(&path)
+                // Skip `id-*.lock` registry entries when counting per-target quota.
+                let is_id_entry = path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|n| n.starts_with("id-"));
+                if !is_id_entry
+                    && let Some(meta) = read_lock_meta(&path)
                     && meta.principal == principal
-                    && meta.expires_at_ms > now_ms
                 {
                     held_by_principal += 1;
                 }
@@ -2897,9 +3343,9 @@ fn sweep_and_count_principal_locks(state_dir: &Path, principal: &str) -> usize {
 }
 
 /// Acquires exclusive per-path move locks in `<state_dir>/xfer/move-lock/` in deterministic sorted
-/// path order, enforces a per-principal lock limit, returns live metadata ONLY for paths the
-/// caller may read (`fs.read`), and holds the locks for a short renewable lease that expires
-/// automatically if not renewed or released.
+/// path order, enforces a per-principal lock limit, returns an unguessable `lock_id` plus live
+/// metadata ONLY for paths the caller may read (`fs.read`), and holds the locks for as long as the
+/// pipe stays open and renews (or while pinned by a running `delete`).
 #[allow(clippy::too_many_arguments)]
 fn lock_paths<R: Read + Send + 'static, W: Write>(
     host: &Host,
@@ -2921,8 +3367,8 @@ fn lock_paths<R: Read + Send + 'static, W: Write>(
         )));
     }
     let lease = lease_ms
-        .map(|ms| Duration::from_millis(ms).clamp(MOVE_LOCK_MIN_LEASE, MOVE_LOCK_DEFAULT_LEASE))
-        .unwrap_or(MOVE_LOCK_DEFAULT_LEASE);
+        .map(|ms| Duration::from_millis(ms).clamp(MOVE_LOCK_MIN_LEASE, MOVE_LOCK_MAX_LEASE))
+        .unwrap_or_else(default_move_lock_lease);
     let mut checked_pairs: Vec<(String, PathBuf)> = Vec::with_capacity(paths.len());
     for raw in paths {
         let checked = grant.check_path(raw, Access::Write)?;
@@ -2955,15 +3401,32 @@ fn lock_paths<R: Read + Send + 'static, W: Write>(
         ));
     }
 
-    let initial_expiry_ms =
-        now_unix_ms().saturating_add(u64::try_from(lease.as_millis()).unwrap_or(10_000));
+    let lock_id = generate_lock_id()?;
+    let lease_ms_u64 = u64::try_from(lease.as_millis()).unwrap_or(10_000);
+    let initial_expiry_ms = now_unix_ms().saturating_add(lease_ms_u64);
     let meta = MoveLockMeta {
+        lock_id: lock_id.clone(),
         principal: grant.principal().to_owned(),
         job_id: job_id.map(str::to_owned),
         expires_at_ms: initial_expiry_ms,
     };
 
-    let mut locks = HeldLockFiles::new(lock_targets.len());
+    let mut locks = HeldLockFiles::new(lock_targets.len() + 1);
+    let id_lock_path = move_lock_id_path(state_dir, &lock_id);
+    match legion_xfer::try_lock_state_file(&id_lock_path) {
+        Ok(Some(file)) => {
+            write_lock_meta(&id_lock_path, &meta);
+            locks.push(id_lock_path, file);
+        }
+        Ok(None) => {
+            return Err(Failure::Reply(ErrorBody::new(
+                ErrorCode::Conflict,
+                "Move lock id collided; retry the transfer.",
+            )));
+        }
+        Err(err) => return Err(Failure::Reply(xfer_error(err))),
+    }
+
     for target in &lock_targets {
         let lock_path = legion_xfer::move_lock_state_path(state_dir, target);
         match legion_xfer::try_lock_state_file(&lock_path) {
@@ -3092,12 +3555,12 @@ fn lock_paths<R: Read + Send + 'static, W: Write>(
         output,
         &LockReady {
             locked: true,
+            lock_id: lock_id.clone(),
+            lease_ms: lease_ms_u64,
             entries,
         },
     )?;
 
-    // Hold locks for at most `lease` at a time (renewed by `"renew\n"` lines, up to
-    // `MOVE_LOCK_MAX_HOLD` total), releasing immediately on EOF, `"release\n"`, or lease expiry.
     if let Some(mut reader) = input.take() {
         let (tx, rx) = mpsc::channel::<String>();
         std::thread::spawn(move || {
@@ -3116,37 +3579,19 @@ fn lock_paths<R: Read + Send + 'static, W: Write>(
                 }
             }
         });
-        let started = Instant::now();
-        let hard_deadline = started + MOVE_LOCK_MAX_HOLD;
-        let mut lease_deadline = (started + lease).min(hard_deadline);
-        loop {
-            let now = Instant::now();
-            if now >= lease_deadline {
-                break;
-            }
-            match rx.recv_timeout(lease_deadline.saturating_duration_since(now)) {
-                Ok(cmd) if cmd == "renew" => {
-                    let next = (Instant::now() + lease).min(hard_deadline);
-                    lease_deadline = next;
-                    let rem_ms = u64::try_from(
-                        lease_deadline
-                            .saturating_duration_since(Instant::now())
-                            .as_millis(),
-                    )
-                    .unwrap_or(0);
-                    locks.update_expiry(
-                        grant.principal(),
-                        job_id,
-                        now_unix_ms().saturating_add(rem_ms),
-                    );
-                }
-                Ok(_) | Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {
-                    break;
-                }
-            }
-        }
+        let clock = RealLockClock::new();
+        hold_locks_loop(
+            &clock,
+            state_dir,
+            &lock_id,
+            grant.principal(),
+            job_id,
+            lease,
+            locks,
+            &rx,
+            output,
+        );
     }
-    drop(locks);
     Ok(())
 }
 
@@ -4520,5 +4965,173 @@ mod tests {
         assert!(check.verify().is_err());
         assert!(check.is_denied());
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn move_lock_clock_driven_renewal_pinning_and_expiry_without_sleeps() {
+        use std::collections::VecDeque;
+
+        struct ScriptedClock {
+            now: Mutex<Duration>,
+            steps: Mutex<VecDeque<ClockStep>>,
+        }
+
+        enum ClockStep {
+            Cmd {
+                advance: Duration,
+                cmd: String,
+            },
+            Timeout {
+                advance: Duration,
+                on_timeout: Option<Box<dyn FnOnce() + Send>>,
+            },
+        }
+
+        impl LockClock for ScriptedClock {
+            fn now(&self) -> Duration {
+                *self.now.lock().unwrap()
+            }
+
+            fn wait_cmd(
+                &self,
+                _rx: &Receiver<String>,
+                _timeout: Duration,
+            ) -> Result<String, RecvTimeoutError> {
+                let step = self.steps.lock().unwrap().pop_front();
+                match step {
+                    Some(ClockStep::Cmd { advance, cmd }) => {
+                        *self.now.lock().unwrap() += advance;
+                        Ok(cmd)
+                    }
+                    Some(ClockStep::Timeout {
+                        advance,
+                        on_timeout,
+                    }) => {
+                        *self.now.lock().unwrap() += advance;
+                        if let Some(cb) = on_timeout {
+                            cb();
+                        }
+                        Err(RecvTimeoutError::Timeout)
+                    }
+                    None => Err(RecvTimeoutError::Disconnected),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let target = dir.path().join("sample.bin");
+        fs::write(&target, b"keep").unwrap();
+
+        let lock_id = generate_lock_id().unwrap();
+        let id_lock_path = move_lock_id_path(&state_dir, &lock_id);
+        let target_lock_path = legion_xfer::move_lock_state_path(&state_dir, &target);
+        let lease = Duration::from_secs(10);
+        let meta = MoveLockMeta {
+            lock_id: lock_id.clone(),
+            principal: "owner".to_owned(),
+            job_id: None,
+            expires_at_ms: now_unix_ms().saturating_add(10_000),
+        };
+        let mut held = HeldLockFiles::new(2);
+        let id_file = legion_xfer::try_lock_state_file(&id_lock_path)
+            .unwrap()
+            .unwrap();
+        write_lock_meta(&id_lock_path, &meta);
+        held.push(id_lock_path.clone(), id_file);
+        let target_file = legion_xfer::try_lock_state_file(&target_lock_path)
+            .unwrap()
+            .unwrap();
+        write_lock_meta(&target_lock_path, &meta);
+        held.push(target_lock_path.clone(), target_file);
+
+        let pin_slot: Arc<Mutex<Option<MoveLockPinGuard>>> = Arc::new(Mutex::new(Some(
+            MoveLockPinGuard::acquire(&state_dir, &lock_id).unwrap(),
+        )));
+
+        // 1. Renew 12 times at 8-second intervals (96 s total — well past old 60 s max hold!):
+        //    every renew answers `{"status":"held"}`.
+        // 2. Stop renewing while pinned: advance 35 s (3.5x lease) -> lock stays live!
+        // 3. Drop the pin and advance -> lock expires, releases files, replies `{"status":"lost"}`.
+        let mut steps = VecDeque::new();
+        for _ in 0..12 {
+            steps.push_back(ClockStep::Cmd {
+                advance: Duration::from_secs(8),
+                cmd: "renew".to_owned(),
+            });
+        }
+        let state_check1 = state_dir.clone();
+        let lock_id_check1 = lock_id.clone();
+        let target_check1 = target.clone();
+        steps.push_back(ClockStep::Timeout {
+            advance: Duration::from_secs(15),
+            on_timeout: Some(Box::new(move || {
+                assert!(
+                    verify_move_lock_covers(
+                        &state_check1,
+                        &lock_id_check1,
+                        "owner",
+                        &target_check1
+                    ),
+                    "lock must stay live while pinned even after lease expires"
+                );
+            })),
+        });
+        let pin_to_drop = Arc::clone(&pin_slot);
+        let state_check2 = state_dir.clone();
+        let lock_id_check2 = lock_id.clone();
+        let target_check2 = target.clone();
+        steps.push_back(ClockStep::Timeout {
+            advance: Duration::from_secs(20),
+            on_timeout: Some(Box::new(move || {
+                assert!(
+                    verify_move_lock_covers(
+                        &state_check2,
+                        &lock_id_check2,
+                        "owner",
+                        &target_check2
+                    ),
+                    "lock must STILL stay live after multiple lease intervals while pinned"
+                );
+                pin_to_drop.lock().unwrap().take();
+            })),
+        });
+        steps.push_back(ClockStep::Timeout {
+            advance: Duration::from_secs(1),
+            on_timeout: None,
+        });
+
+        let clock = ScriptedClock {
+            now: Mutex::new(Duration::ZERO),
+            steps: Mutex::new(steps),
+        };
+        let (_tx, rx) = mpsc::channel();
+        let mut out = Vec::new();
+        hold_locks_loop(
+            &clock,
+            &state_dir,
+            &lock_id,
+            "owner",
+            None,
+            lease,
+            held,
+            &rx,
+            &mut out,
+        );
+
+        let lines: Vec<LockRenewReply> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 13, "expected 12 held replies + 1 lost reply");
+        assert!(lines[..12].iter().all(|r| r.status == "held"));
+        assert_eq!(lines[12].status, "lost");
+        assert!(
+            !verify_move_lock_covers(&state_dir, &lock_id, "owner", &target),
+            "lock must be released after unpinned expiry"
+        );
+        assert!(!id_lock_path.exists());
+        assert!(!target_lock_path.exists());
     }
 }

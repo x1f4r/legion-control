@@ -150,6 +150,10 @@ fn main() -> ExitCode {
             "stream_rename_privilege_and_visible_interrupted_recovery",
             stream_rename_privilege_and_visible_interrupted_recovery,
         ),
+        (
+            "move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop",
+            move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -688,6 +692,36 @@ fn helper(args: &[String]) -> ExitCode {
             });
             exit_of(child.wait().unwrap())
         }
+        // Signals `lock_marker` when `lock` runs, and pauses the subsequent `stat` (after lock is
+        // held) by touching `paused_marker` and waiting for `resume_marker`, so tests can
+        // deterministically pause a mover with SIGSTOP after lock acquisition and before `delete`.
+        "pause-after-lock" if subcommand == "stream" => {
+            let lock_marker = Path::new(&extra[0]);
+            let paused_marker = Path::new(&extra[1]);
+            let resume_marker = Path::new(&extra[2]);
+            let mut input = BufReader::new(std::io::stdin());
+            let mut header = Vec::new();
+            input.read_until(b'\n', &mut header).unwrap();
+            let header_val: Value = serde_json::from_slice(&header).unwrap_or(Value::Null);
+            let op = header_val["op"].as_str().unwrap_or("");
+            if op == "lock" {
+                let _ = fs::write(lock_marker, b"locked");
+            } else if op == "stat" && lock_marker.exists() && !paused_marker.exists() {
+                let _ = fs::write(paused_marker, b"paused");
+                let wait_until = Instant::now() + Duration::from_secs(20);
+                while !resume_marker.exists() && Instant::now() < wait_until {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+            }
+            let mut child = command.stdin(Stdio::piped()).spawn().unwrap();
+            let mut child_in = child.stdin.take().unwrap();
+            child_in.write_all(&header).unwrap();
+            child_in.flush().unwrap();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut input, &mut child_in);
+            });
+            exit_of(child.wait().unwrap())
+        }
         // A source that does not keep to the protocol, in the way `extra[0]` names.
         "evil" if subcommand == "stream" => evil(&extra[0], Path::new(home), command),
         "cut"
@@ -699,7 +733,8 @@ fn helper(args: &[String]) -> ExitCode {
         | "network-fs-peer"
         | "unknown-fs-peer"
         | "unconfirmed-probe-peer"
-        | "inconclusive-probe" => exit_of(command.status().unwrap()),
+        | "inconclusive-probe"
+        | "pause-after-lock" => exit_of(command.status().unwrap()),
         other => {
             eprintln!("unknown helper mode {other}");
             ExitCode::from(2)
@@ -5105,4 +5140,285 @@ allow = ["effect:read", "effect:write", "effect:destroy"]
     );
     assert!(!rec_dir.join(temp_name).exists());
     assert!(!intent_path.exists());
+}
+
+fn move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop() {
+    let run_transfer_env = |who: &Home, args_val: Value, envs: &[(&str, &str)]| -> Run {
+        let args_text = args_val.to_string();
+        let mut cmd = Command::new(LEGION_BIN);
+        cmd.args(["fs.transfer", "--args", &args_text, "--json"])
+            .env("LEGION_HOME", legion_home_of(who))
+            .env("HOME", who.home())
+            .env("USERPROFILE", who.home())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        Run {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    };
+
+    // 1. Reproduced data-loss race: F and D start identical; hashing F during `delete` takes
+    //    ~900 ms while the lock lease is 300 ms. Move A (`F -> D`) starts first; at ~450 ms (past
+    //    the lease while A is still hashing!), Move B (`D -> F`) attempts to acquire `[F, D]`.
+    //    Move B MUST receive `conflict` because A's background renewer + `delete` pin hold the
+    //    lock, and at the end exact 1 copy (`D`) exists with full payload (never both deleted!).
+    let laptop = node("laptop");
+    fs::create_dir_all(laptop.home().join("race_f")).unwrap();
+    fs::create_dir_all(laptop.home().join("race_d")).unwrap();
+    let f_path = laptop.home().join("race_f/item.bin");
+    let d_path = laptop.home().join("race_d/item.bin");
+    let payload = b"must-never-lose-both-copies-under-slow-hash";
+    fs::write(&f_path, payload).unwrap();
+    fs::write(&d_path, payload).unwrap();
+
+    let (out_a, out_b) = std::thread::scope(|scope| {
+        let h_a = scope.spawn(|| {
+            run_transfer_env(
+                &laptop,
+                json!({"from": "~/race_f/item.bin", "to": "~/race_d/item.bin", "move": true}),
+                &[
+                    ("LEGION_TEST_MOVE_LOCK_LEASE_MS", "300"),
+                    ("LEGION_TEST_DELETE_HASH_DELAY_MS", "900"),
+                ],
+            )
+        });
+        // Wait until A has actually acquired its move locks, then wait past one full lease (450 ms)
+        // so A is guaranteed mid-hash past the initial 300 ms lease when B arrives!
+        let lock_dir = laptop.state().join("xfer/move-lock");
+        let wait_lock = Instant::now() + Duration::from_secs(10);
+        while !fs::read_dir(&lock_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("lock"))
+        {
+            assert!(Instant::now() < wait_lock, "move A never acquired move lock");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(450));
+        let b_res = run_transfer_env(
+            &laptop,
+            json!({"from": "~/race_d/item.bin", "to": "~/race_f/item.bin", "move": true}),
+            &[("LEGION_TEST_MOVE_LOCK_LEASE_MS", "300")],
+        );
+        (h_a.join().unwrap(), b_res)
+    });
+    let a_ok = ok(&out_a);
+    assert_eq!(a_ok["source_removed"], 1, "{a_ok}");
+    let b_err = refused(&out_b);
+    assert_eq!(b_err["code"], "conflict", "move B must see conflict while A holds pinned lock: {b_err}");
+    assert!(!f_path.exists(), "A removed F cleanly");
+    assert_eq!(
+        fs::read(&d_path).unwrap(),
+        payload,
+        "D MUST survive with full payload!"
+    );
+
+    // 2. Holder stops renewing mid-move; lock expires and sends `{"status":"lost"}`, and a
+    //    subsequent `delete` carrying that expired `lock_id` is refused with `conflict` and
+    //    removes NOTHING.
+    let target2 = laptop.home().join("keep_after_lost_lock.bin");
+    fs::write(&target2, b"keep-me-intact").unwrap();
+    let mut lock_child = Command::new(LEGION_BIN)
+        .arg("stream")
+        .env("LEGION_HOME", legion_home_of(&laptop))
+        .env("HOME", laptop.home())
+        .env("USERPROFILE", laptop.home())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lock_in = lock_child.stdin.take().unwrap();
+    let mut lock_out = BufReader::new(lock_child.stdout.take().unwrap());
+    writeln!(
+        lock_in,
+        "{}",
+        json!({
+            "protocol": 1,
+            "op": "lock",
+            "paths": ["~/keep_after_lost_lock.bin"],
+            "lease_ms": 150,
+        })
+    )
+    .unwrap();
+    lock_in.flush().unwrap();
+    let mut line = String::new();
+    lock_out.read_line(&mut line).unwrap(); // greeting
+    line.clear();
+    lock_out.read_line(&mut line).unwrap(); // LockReady
+    let ready: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(ready["locked"], true, "{ready}");
+    let expired_lock_id = ready["lock_id"].as_str().unwrap().to_owned();
+    // Keep stdin open without renewing; the server MUST expire the lease and emit `{"status":"lost"}`.
+    line.clear();
+    lock_out.read_line(&mut line).unwrap();
+    let lost_msg: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(lost_msg["status"], "lost", "{lost_msg}");
+    drop(lock_in);
+    let _ = lock_child.wait();
+
+    let expired_del = stream_request_raw(
+        &laptop,
+        json!({
+            "op": "delete",
+            "root": "~/keep_after_lost_lock.bin",
+            "names": [],
+            "remove_root": true,
+            "lock_id": expired_lock_id,
+        }),
+    );
+    assert_eq!(
+        expired_del["error"]["code"], "conflict",
+        "delete with expired lock_id must return conflict: {expired_del}"
+    );
+    assert_eq!(
+        fs::read(&target2).unwrap(),
+        b"keep-me-intact",
+        "expired lock_id must remove nothing"
+    );
+
+    // 3. Multi-file batch whose deletion takes several lease durations completes cleanly (proving
+    //    background renewal + pinning + no max hold expiry).
+    let batch_src = laptop.home().join("batch_src");
+    let batch_dst = laptop.home().join("batch_dst");
+    fs::create_dir_all(&batch_src).unwrap();
+    for i in 0..5 {
+        fs::write(batch_src.join(format!("f{i}.txt")), format!("batch-{i}")).unwrap();
+    }
+    let batch_out = ok(&run_transfer_env(
+        &laptop,
+        json!({"from": "~/batch_src", "to": "~/batch_dst", "move": true}),
+        &[
+            ("LEGION_TEST_MOVE_LOCK_LEASE_MS", "300"),
+            ("LEGION_TEST_DELETE_HASH_DELAY_MS", "250"),
+        ],
+    ));
+    assert_eq!(batch_out["files_sent"], 5, "{batch_out}");
+    assert_eq!(batch_out["source_removed"], 6, "{batch_out}"); // 5 files + empty root dir
+    assert!(!batch_src.exists());
+    for i in 0..5 {
+        assert_eq!(
+            fs::read_to_string(batch_dst.join(format!("f{i}.txt"))).unwrap(),
+            format!("batch-{i}")
+        );
+    }
+
+    // 4. SIGSTOP of the mover after acquiring locks for longer than the lease, followed by
+    //    SIGCONT: the move MUST end with `conflict` and source kept, never removing both copies.
+    #[cfg(unix)]
+    {
+        let src_node = node("pi");
+        let dst_node = node("box");
+        let lock_marker = laptop.home().join("sigstop.locked");
+        let paused_marker = laptop.home().join("sigstop.paused");
+        let resume_marker = laptop.home().join("sigstop.resume");
+        fleet(
+            &laptop,
+            &[
+                ("pi", &src_node, "node", vec![]),
+                (
+                    "box",
+                    &dst_node,
+                    "pause-after-lock",
+                    vec![
+                        lock_marker.to_string_lossy().into_owned(),
+                        paused_marker.to_string_lossy().into_owned(),
+                        resume_marker.to_string_lossy().into_owned(),
+                    ],
+                ),
+            ],
+        );
+        let sig_body = b"sigstop-must-keep-source";
+        fs::write(src_node.home().join("stop.bin"), sig_body).unwrap();
+        // Pre-seed destination with the exact same bytes so `verify_candidate_under_locks` issues a
+        // `stat(checksum: true)` to `box` right after locks are acquired (triggering `paused_marker`).
+        fs::write(dst_node.home().join("stop.bin"), sig_body).unwrap();
+
+        let args_text = json!({"from": "pi:~/stop.bin", "to": "box:~/stop.bin", "move": true}).to_string();
+        let child = Command::new(LEGION_BIN)
+            .args(["fs.transfer", "--args", &args_text, "--json"])
+            .env("LEGION_HOME", legion_home_of(&laptop))
+            .env("HOME", laptop.home())
+            .env("USERPROFILE", laptop.home())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .env("LEGION_TEST_MOVE_LOCK_LEASE_MS", "250")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id().to_string();
+
+        // Wait until both locks are acquired and `box` is paused inside `stat` (before `delete`).
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !paused_marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "mover never reached pause-after-lock point"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        // Freeze the mover process with SIGSTOP, then release `box`'s helper gate so only SIGSTOP
+        // holds the mover back while `pi`'s and `box`'s locks expire on their own.
+        assert!(Command::new("kill").args(["-STOP", &pid]).status().unwrap().success());
+        fs::write(&resume_marker, b"go").unwrap();
+
+        // Wait until `pi`'s move-lock directory is completely empty (proving the lock genuinely
+        // expired while the mover was stopped!).
+        let pi_lock_dir = src_node.state().join("xfer/move-lock");
+        let exp_deadline = Instant::now() + Duration::from_secs(10);
+        while fs::read_dir(&pi_lock_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("lock"))
+        {
+            assert!(
+                Instant::now() < exp_deadline,
+                "pi's move lock did not expire while mover was SIGSTOP'd"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Resume the mover with SIGCONT; it MUST detect the lost lock and keep the source!
+        assert!(Command::new("kill").args(["-CONT", &pid]).status().unwrap().success());
+        let out = child.wait_with_output().unwrap();
+        let output = Run {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        };
+        let err = refused(&output);
+        assert_eq!(
+            err["code"], "conflict",
+            "SIGSTOP past lease followed by SIGCONT must fail with conflict: {err}"
+        );
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("source was kept"),
+            "{err}"
+        );
+        assert_eq!(
+            fs::read(src_node.home().join("stop.bin")).unwrap(),
+            sig_body,
+            "source MUST be kept after SIGSTOP past lease"
+        );
+        assert_eq!(
+            fs::read(dst_node.home().join("stop.bin")).unwrap(),
+            sig_body,
+            "destination MUST remain intact"
+        );
+    }
 }

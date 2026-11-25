@@ -1372,8 +1372,12 @@ paths = ["~/projects"]
         "lock files must be removed on release: {remaining_locks:?}"
     );
 
-    // 2. Short lease expires automatically even when the holder never closes stdin, and the lock
-    //    file is removed when it expires so another caller can proceed.
+    // 2. Active lock returns an unguessable `lock_id` + `lease_ms`, answers `"renew\n"` with
+    //    `{"status":"held"}`, shows holder details to unconfined owner (including on Windows via
+    //    unlocked sibling `.meta`), authorizes `delete` ONLY for its covered path while live, and
+    //    refuses `delete` with `Conflict` once released (leaving the file intact).
+    //    Uses a generous 10 s lease so loaded CI runners never flake on wall-clock timing;
+    //    lease expiry without wall-clock sleeps is verified in `stream::tests` via an injected clock.
     let (line_tx, line_rx) = mpsc::channel();
     let (out_tx, out_rx) = mpsc::channel();
     let host = node.host.clone();
@@ -1381,7 +1385,7 @@ paths = ["~/projects"]
         "protocol": STREAM_PROTOCOL,
         "op": "lock",
         "paths": ["~/projects/secret.txt"],
-        "lease_ms": 150,
+        "lease_ms": 10_000,
     })
     .to_string()
     .into_bytes();
@@ -1398,8 +1402,32 @@ paths = ["~/projects"]
             NotifyWriter { tx: out_tx },
         )
     });
-    let ready = wait_ready(&out_rx);
+    let mut gathered = Vec::new();
+    let read_next_json = |buf: &mut Vec<u8>, rx: &mpsc::Receiver<Vec<u8>>, skip_lines: usize| -> Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while buf.iter().filter(|&&b| b == b'\n').count() <= skip_lines {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for stream reply line {}: {:?}",
+                skip_lines + 1,
+                String::from_utf8_lossy(buf)
+            );
+            if let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                buf.extend_from_slice(&chunk);
+            }
+        }
+        let line = String::from_utf8_lossy(buf)
+            .lines()
+            .nth(skip_lines)
+            .unwrap()
+            .to_owned();
+        serde_json::from_str(&line).unwrap()
+    };
+    let ready = read_next_json(&mut gathered, &out_rx, 1);
     assert_eq!(ready["locked"], true, "{ready}");
+    let lock_id = ready["lock_id"].as_str().unwrap().to_owned();
+    assert_eq!(lock_id.len(), 32, "lock_id must be 128-bit hex: {ready}");
+    assert_eq!(ready["lease_ms"], 10_000, "{ready}");
 
     // While held: owner (unconfined) sees the holder principal in the conflict error.
     let owner_conflict = node
@@ -1416,21 +1444,86 @@ paths = ["~/projects"]
         "unconfined owner should see who holds the lock: {owner_conflict:?}"
     );
 
-    // Renew once after 80 ms, then stop renewing -> lock stays held past 150 ms, then expires
-    // automatically without `line_tx` ever sending EOF!
-    std::thread::sleep(std::time::Duration::from_millis(80));
+    // Explicit `"renew\n"` replies `{"status":"held"}` immediately.
     line_tx.send(b"renew\n".to_vec()).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(90));
-    node.run(
-        Some("owner"),
-        &json!({"op": "lock", "paths": ["~/projects/secret.txt"]}),
-        b"",
-    )
-    .refused(ErrorCode::Conflict);
+    let renew_reply = read_next_json(&mut gathered, &out_rx, 2);
+    assert_eq!(renew_reply["status"], "held", "{renew_reply}");
 
-    // Wait for lease to expire by itself (holder exits cleanly on its own).
+    // `delete` carrying a forged `lock_id` or another principal's `lock_id` is refused with
+    // `Conflict` and removes nothing.
+    let forged_delete = node
+        .run(
+            Some("owner"),
+            &json!({
+                "op": "delete",
+                "root": "~/projects/secret.txt",
+                "names": [],
+                "remove_root": true,
+                "lock_id": "00000000000000000000000000000000",
+            }),
+            b"",
+        )
+        .refused(ErrorCode::Conflict);
+    assert!(
+        forged_delete["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("source was kept"),
+        "{forged_delete:?}"
+    );
+    assert!(node.home().join("projects/secret.txt").exists());
+
+    // Even `owner` cannot reuse `confined`'s `lock_id` (principal mismatch -> `Conflict`).
+    let wrong_principal_delete = node
+        .run(
+            Some("owner"),
+            &json!({
+                "op": "delete",
+                "root": "~/projects/secret.txt",
+                "names": [],
+                "remove_root": true,
+                "lock_id": &lock_id,
+            }),
+            b"",
+        )
+        .refused(ErrorCode::Conflict);
+    assert!(
+        wrong_principal_delete["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("source was kept"),
+        "{wrong_principal_delete:?}"
+    );
+    assert!(node.home().join("projects/secret.txt").exists());
+
+    // Release cleanly -> lock files are gone, owner can now lock, and `delete` with the released
+    // `lock_id` is refused with `Conflict` without removing `secret.txt`.
+    line_tx.send(b"release\n".to_vec()).unwrap();
     holder.join().unwrap().unwrap();
     drop(line_tx);
+
+    let after_release_delete = node
+        .run(
+            Some("owner"),
+            &json!({
+                "op": "delete",
+                "root": "~/projects/secret.txt",
+                "names": [],
+                "remove_root": true,
+                "lock_id": &lock_id,
+            }),
+            b"",
+        )
+        .refused(ErrorCode::Conflict);
+    assert!(
+        after_release_delete["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("source was kept"),
+        "{after_release_delete:?}"
+    );
+    assert!(node.home().join("projects/secret.txt").exists());
+
     let after_expiry = node
         .run(
             Some("owner"),
@@ -1442,8 +1535,10 @@ paths = ["~/projects"]
         .0;
     assert_eq!(after_expiry["locked"], true, "{after_expiry}");
 
-    // 3. Busy lock holder visibility: when `owner` holds a lock, a confined role hitting it must
-    //    NOT learn `owner`'s principal name or job id.
+    // 3. Busy lock holder visibility + uncovered-path refusal for same principal: when `owner`
+    //    holds a lock on `secret.txt`, a confined role hitting it must NOT learn `owner`'s
+    //    principal name or job id, AND `owner` cannot delete an uncovered `other.txt` using that
+    //    `lock_id`.
     let (o_tx, o_rx) = mpsc::channel();
     let (oo_tx, oo_rx) = mpsc::channel();
     let host2 = node.host.clone();
@@ -1451,7 +1546,7 @@ paths = ["~/projects"]
         "protocol": STREAM_PROTOCOL,
         "op": "lock",
         "paths": ["~/projects/secret.txt"],
-        "lease_ms": 2000,
+        "lease_ms": 10_000,
     })
     .to_string()
     .into_bytes();
@@ -1468,7 +1563,32 @@ paths = ["~/projects"]
             NotifyWriter { tx: oo_tx },
         )
     });
-    assert_eq!(wait_ready(&oo_rx)["locked"], true);
+    let owner_ready = wait_ready(&oo_rx);
+    assert_eq!(owner_ready["locked"], true);
+    let owner_lock_id = owner_ready["lock_id"].as_str().unwrap().to_owned();
+
+    fs::write(node.home().join("projects/other.txt"), "untouched").unwrap();
+    let uncovered_delete = node
+        .run(
+            Some("owner"),
+            &json!({
+                "op": "delete",
+                "root": "~/projects/other.txt",
+                "names": [],
+                "remove_root": true,
+                "lock_id": &owner_lock_id,
+            }),
+            b"",
+        )
+        .refused(ErrorCode::Conflict);
+    assert!(
+        uncovered_delete["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("source was kept"),
+        "{uncovered_delete:?}"
+    );
+    assert!(node.home().join("projects/other.txt").exists());
 
     let conf_conflict = node
         .run(
@@ -1503,7 +1623,7 @@ paths = ["~/projects"]
         "protocol": STREAM_PROTOCOL,
         "op": "lock",
         "paths": paths_256,
-        "lease_ms": 2000,
+        "lease_ms": 10_000,
     })
     .to_string()
     .into_bytes();

@@ -1053,6 +1053,7 @@ pub fn sweep_stale_state(state_dir: &Path, max_age: Duration) -> usize {
         ("part", max_age),
         ("claims", max_age),
         ("move-lock", short_age),
+        ("move-lock-pins", short_age),
         ("renames", short_age),
     ] {
         let dir = base.join(sub);

@@ -50,9 +50,9 @@ use crate::connector::PipeHandle;
 use crate::pool::Fleet;
 use crate::stream::{
     self, CAP_IF_EXISTS, CAP_LOCK, CAP_MOVE, CAP_PROBE, CAP_RENAME, DeleteDone, FsNameBehavior,
-    GetReady, Host, LockEntry, LockReady, ManifestDone, PackReady, Planned, ProbeConfirm,
-    ProbeFsLocality, ProbeReply, PutDone, PutReady, RenameDone, SameEntryDecision, StatReply,
-    UnpackDone, UnpackReady, classify_same_entry,
+    GetReady, Host, LockEntry, LockReady, LockRenewReply, ManifestDone, PackReady, Planned,
+    ProbeConfirm, ProbeFsLocality, ProbeReply, PutDone, PutReady, RenameDone, SameEntryDecision,
+    StatReply, UnpackDone, UnpackReady, classify_same_entry,
 };
 
 /// How many bytes the relay and the in-process pipes hold at once: memory stays bounded however
@@ -1145,30 +1145,88 @@ enum DirPairProof {
     Inconclusive(String),
 }
 
+struct LockRenewalHandle {
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
 /// Active exclusive move locks held across one or two endpoints in deterministic `(machine, path)`
-/// order, together with the live metadata observed on each path under those locks.
+/// order, renewed asynchronously every `lease / 3` by an independent background task that tracks
+/// whether either lock was lost.
 struct HeldMoveLocks {
-    conns: Vec<Conn>,
+    handles: Vec<LockRenewalHandle>,
+    from_lock_id: String,
     from_entries: HashMap<String, LockEntry>,
     to_entries: HashMap<String, LockEntry>,
-    last_renew: Instant,
+    lost: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HeldMoveLocks {
-    async fn renew_if_needed(&mut self) {
-        if self.last_renew.elapsed() < Duration::from_secs(3) {
-            return;
-        }
-        self.last_renew = Instant::now();
-        for conn in &mut self.conns {
-            let _ = conn.write(b"renew\n").await;
+    fn spawn_renewer(
+        mut conn: Conn,
+        lease_ms: u64,
+        lost: Arc<std::sync::atomic::AtomicBool>,
+    ) -> LockRenewalHandle {
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let effective_lease_ms = if lease_ms == 0 { 10_000 } else { lease_ms };
+        let interval = Duration::from_millis((effective_lease_ms / 3).max(20));
+        let reply_timeout = Duration::from_millis((effective_lease_ms / 2).clamp(200, 5_000));
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut stop_rx => {
+                        let _ = conn.write(b"release\n").await;
+                        conn.close().await;
+                        return;
+                    }
+                    () = tokio::time::sleep(interval) => {
+                        if conn.write(b"renew\n").await.is_err() {
+                            lost.store(true, Ordering::SeqCst);
+                            conn.abort().await;
+                            return;
+                        }
+                        match tokio::time::timeout(reply_timeout, conn.first::<LockRenewReply>()).await {
+                            Ok(Ok(reply)) if reply.status == "held" => {}
+                            _ => {
+                                lost.store(true, Ordering::SeqCst);
+                                conn.abort().await;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        LockRenewalHandle {
+            stop_tx: Some(stop_tx),
+            task,
         }
     }
 
-    async fn release(self) {
-        for mut conn in self.conns.into_iter().rev() {
-            let _ = conn.write(b"release\n").await;
-            conn.close().await;
+    fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+
+    fn from_lock_id(&self) -> Option<&str> {
+        (!self.from_lock_id.is_empty()).then_some(self.from_lock_id.as_str())
+    }
+
+    async fn release(mut self) {
+        for mut handle in self.handles.drain(..).rev() {
+            if let Some(tx) = handle.stop_tx.take() {
+                let _ = tx.send(());
+            }
+            let _ = handle.task.await;
+        }
+    }
+}
+
+impl Drop for HeldMoveLocks {
+    fn drop(&mut self) {
+        for mut handle in self.handles.drain(..).rev() {
+            // Dropping `stop_tx` signals the background renewer to send `"release\n"` and close.
+            handle.stop_tx.take();
         }
     }
 }
@@ -1667,11 +1725,14 @@ impl Transfer<'_> {
                     to_entries.insert(p.clone(), entry);
                 }
             }
+            let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let handle = HeldMoveLocks::spawn_renewer(conn, ready.lease_ms, Arc::clone(&lost));
             return Ok(HeldMoveLocks {
-                conns: vec![conn],
+                handles: vec![handle],
+                from_lock_id: ready.lock_id,
                 from_entries,
                 to_entries,
-                last_renew: Instant::now(),
+                lost,
             });
         }
 
@@ -1729,17 +1790,30 @@ impl Transfer<'_> {
             .into_iter()
             .map(|e| (e.path.clone(), e))
             .collect();
-        let (from_entries, to_entries) = if from_first {
-            (map1, map2)
+        let (from_entries, to_entries, from_lock_id) = if from_first {
+            (map1, map2, ready1.lock_id)
         } else {
-            (map2, map1)
+            (map2, map1, ready2.lock_id)
         };
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle1 = HeldMoveLocks::spawn_renewer(conn1, ready1.lease_ms, Arc::clone(&lost));
+        let handle2 = HeldMoveLocks::spawn_renewer(conn2, ready2.lease_ms, Arc::clone(&lost));
         Ok(HeldMoveLocks {
-            conns: vec![conn1, conn2],
+            handles: vec![handle1, handle2],
+            from_lock_id,
             from_entries,
             to_entries,
-            last_renew: Instant::now(),
+            lost,
         })
+    }
+
+    fn move_lock_lost_error(machine: &str) -> ErrorBody {
+        ErrorBody::new(
+            ErrorCode::Conflict,
+            "The copy finished and the source was kept because the move lock expired or was lost before removal.",
+        )
+        .with_hint("Run the transfer again to finish the move.")
+        .with_machine(machine.to_owned())
     }
 
     /// Wraps a busy-lock `Conflict` during move finalization so the caller is clearly told that the
@@ -1882,7 +1956,7 @@ impl Transfer<'_> {
     ) -> Result<u64, ErrorBody> {
         let from_paths = vec![from.path.clone()];
         let to_paths = vec![actual_to_path.to_owned()];
-        let mut locks = self
+        let locks = self
             .acquire_move_locks(from, &from_paths, to, &to_paths)
             .await
             .map_err(Self::explain_busy_move_lock)?;
@@ -1900,25 +1974,34 @@ impl Transfer<'_> {
         let verified = self
             .verify_candidate_under_locks(to, &cand, &locks.from_entries, &locks.to_entries)
             .await;
-        locks.renew_if_needed().await;
-        let result = match verified {
-            Ok(true) => {
-                let forbid = same_machine_or_dir
-                    .then(|| {
-                        locks
-                            .to_entries
-                            .get(actual_to_path)
-                            .and_then(|e| e.file_id)
-                            .map(|id| (id.dev, id.ino))
-                    })
-                    .flatten();
-                self.remove_source_root(from, Some(expected_hash), forbid, skipped)
+        let result = if locks.is_lost() {
+            Err(Self::move_lock_lost_error(&from.machine))
+        } else {
+            match verified {
+                Ok(true) => {
+                    let forbid = same_machine_or_dir
+                        .then(|| {
+                            locks
+                                .to_entries
+                                .get(actual_to_path)
+                                .and_then(|e| e.file_id)
+                                .map(|id| (id.dev, id.ino))
+                        })
+                        .flatten();
+                    self.remove_source_root(
+                        from,
+                        Some(expected_hash),
+                        forbid,
+                        locks.from_lock_id(),
+                        skipped,
+                    )
                     .await
+                }
+                Ok(false) => Ok(0),
+                Err(reason) => Err(ErrorBody::new(ErrorCode::Conflict, reason)
+                    .with_hint("Run the transfer again once no other move is modifying these paths.")
+                    .with_machine(from.machine.clone())),
             }
-            Ok(false) => Ok(0),
-            Err(reason) => Err(ErrorBody::new(ErrorCode::Conflict, reason)
-                .with_hint("Run the transfer again once no other move is modifying these paths.")
-                .with_machine(from.machine.clone())),
         };
         locks.release().await;
         result
@@ -1939,14 +2022,17 @@ impl Transfer<'_> {
         for chunk in candidates.chunks(MOVE_LOCK_BATCH) {
             let from_paths: Vec<String> = chunk.iter().map(|c| c.from_path.clone()).collect();
             let to_paths: Vec<String> = chunk.iter().map(|c| c.to_path.clone()).collect();
-            let mut locks = self
+            let locks = self
                 .acquire_move_locks(from, &from_paths, to, &to_paths)
                 .await
                 .map_err(Self::explain_busy_move_lock)?;
             let mut to_delete: Vec<String> = Vec::with_capacity(chunk.len());
             let mut hashes: HashMap<String, Hash> = HashMap::new();
             for cand in chunk {
-                locks.renew_if_needed().await;
+                if locks.is_lost() {
+                    locks.release().await;
+                    return Err(Self::move_lock_lost_error(&from.machine));
+                }
                 match self
                     .verify_candidate_under_locks(to, cand, &locks.from_entries, &locks.to_entries)
                     .await
@@ -1967,11 +2053,20 @@ impl Transfer<'_> {
                     }
                 }
             }
-            let delete_res = if to_delete.is_empty() {
+            let delete_res = if locks.is_lost() {
+                Err(Self::move_lock_lost_error(&from.machine))
+            } else if to_delete.is_empty() {
                 Ok(0)
             } else {
-                self.delete_verified(from, &to_delete, &hashes, false, skipped)
-                    .await
+                self.delete_verified(
+                    from,
+                    &to_delete,
+                    &hashes,
+                    false,
+                    locks.from_lock_id(),
+                    skipped,
+                )
+                .await
             };
             locks.release().await;
             let removed = delete_res?;
@@ -2943,7 +3038,14 @@ impl Transfer<'_> {
             if !dirs.is_empty() || remove_root {
                 let mut dir_skipped = Vec::new();
                 report.source_removed += self
-                    .delete_verified(from, &dirs, &HashMap::new(), remove_root, &mut dir_skipped)
+                    .delete_verified(
+                        from,
+                        &dirs,
+                        &HashMap::new(),
+                        remove_root,
+                        None,
+                        &mut dir_skipped,
+                    )
                     .await?;
                 // Leaving a directory that still holds excluded/skipped entries is expected; only
                 // surface unexpected directory errors when nothing was intentionally left behind.
@@ -2977,12 +3079,14 @@ impl Transfer<'_> {
         Ok(removed)
     }
 
-    /// Removes a single source root file (verifying its BLAKE3 hash first) after a move succeeds.
+    /// Removes a single source root file (verifying its BLAKE3 hash and active move lock first)
+    /// after a move succeeds.
     async fn remove_source_root(
         &self,
         from: &End,
         expect_hash: Option<Hash>,
         forbid_file_id: Option<(u64, u64)>,
+        lock_id: Option<&str>,
         skipped: &mut Vec<SkippedEntry>,
     ) -> Result<u64, ErrorBody> {
         let mut header = json!({
@@ -2997,37 +3101,40 @@ impl Transfer<'_> {
         if let Some((dev, ino)) = forbid_file_id {
             header["forbid_file_id"] = json!([dev, ino]);
         }
+        if let Some(lid) = lock_id {
+            header["lock_id"] = json!(lid);
+        }
         let done: DeleteDone = self.request_required(from, header, &[CAP_MOVE]).await?;
         skipped.extend(on(&from.machine, done.skipped));
         Ok(done.removed)
     }
 
-    /// Removes verified source entries under `from`, verifying each regular file's hash still
-    /// matches before unlinking, and optionally removes the source root directory once empty.
+    /// Removes verified source entries under `from`, verifying each regular file's hash and active
+    /// move lock still match immediately before unlinking, and optionally removes the source root
+    /// directory once empty.
     async fn delete_verified(
         &self,
         from: &End,
         names: &[String],
         hashes: &HashMap<String, Hash>,
         remove_root: bool,
+        lock_id: Option<&str>,
         skipped: &mut Vec<SkippedEntry>,
     ) -> Result<u64, ErrorBody> {
         let mut removed = 0;
         let chunks = batches(names);
         if chunks.is_empty() {
             if remove_root {
-                let done: DeleteDone = self
-                    .request_required(
-                        from,
-                        json!({
-                            "op": "delete",
-                            "root": from.path,
-                            "names": [],
-                            "remove_root": true,
-                        }),
-                        &[CAP_MOVE],
-                    )
-                    .await?;
+                let mut header = json!({
+                    "op": "delete",
+                    "root": from.path,
+                    "names": [],
+                    "remove_root": true,
+                });
+                if let Some(lid) = lock_id {
+                    header["lock_id"] = json!(lid);
+                }
+                let done: DeleteDone = self.request_required(from, header, &[CAP_MOVE]).await?;
                 removed += done.removed;
                 skipped.extend(on(&from.machine, done.skipped));
             }
@@ -3047,6 +3154,9 @@ impl Transfer<'_> {
             });
             if !chunk_hashes.is_empty() {
                 header["expect_hashes"] = json!(chunk_hashes);
+            }
+            if let Some(lid) = lock_id {
+                header["lock_id"] = json!(lid);
             }
             let done: DeleteDone = self.request_required(from, header, &[CAP_MOVE]).await?;
             removed += done.removed;
