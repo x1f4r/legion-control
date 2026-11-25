@@ -2248,53 +2248,66 @@ paths = ["~/allowed"]
     assert!(fixture.node.call(orig_cancel).await.is_ok());
 
     // Fail-closed live authorization check with transient in-place save tolerance:
-    // 1. Valid `policy.toml` authorizes `xfer_in`.
+    // 1. Valid `policy.toml` authorizes `xfer_in` (both sync and async paths).
     assert!(legion_tools::job::is_transfer_job_authorized(
         fixture.node.paths(),
         &xfer_in.id
     ));
-    // 2. Transient in-place editor save (half-written for 150 ms, then restored) must NOT cancel.
+    assert!(
+        legion_tools::job::is_transfer_job_authorized_async(fixture.node.paths(), &xfer_in.id)
+            .await
+    );
+    // 2. Transient in-place editor save (half-written on first read, restored before retry) must NOT cancel.
     let policy_path = fixture.node.paths().config_file("policy.toml");
     let saved_policy = fs::read_to_string(&policy_path).unwrap();
     fs::write(&policy_path, &saved_policy[..10]).unwrap();
-    let policy_restore = policy_path.clone();
-    let saved_for_thread = saved_policy.clone();
-    let restorer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(150));
-        fs::write(&policy_restore, saved_for_thread).unwrap();
-    });
+    let mut pauses = Vec::new();
     assert!(
-        legion_tools::job::is_transfer_job_authorized_async(fixture.node.paths(), &xfer_in.id)
-            .await,
+        legion_tools::job::is_transfer_job_authorized_with_pause(
+            fixture.node.paths(),
+            &xfer_in.id,
+            |d| {
+                pauses.push(d);
+                if pauses.len() == 1 {
+                    fs::write(&policy_path, &saved_policy).unwrap();
+                }
+            }
+        ),
         "transient in-place save of unchanged policy.toml must not falsely revoke transfer"
     );
-    restorer.join().unwrap();
-    // 3. Genuinely broken `policy.toml` MUST fail closed promptly (well within a few seconds).
+    assert_eq!(pauses, vec![Duration::from_millis(200)]);
+    // 3. Genuinely broken `policy.toml` fails closed after exactly two confirmation pauses.
     fs::write(&policy_path, "this is = [not valid toml\n").unwrap();
-    let started = std::time::Instant::now();
+    pauses.clear();
     assert!(
-        !legion_tools::job::is_transfer_job_authorized(fixture.node.paths(), &xfer_in.id),
+        !legion_tools::job::is_transfer_job_authorized_with_pause(
+            fixture.node.paths(),
+            &xfer_in.id,
+            |d| pauses.push(d),
+        ),
         "corrupt policy.toml must fail closed"
     );
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "broken policy.toml took too long to reject: {:?}",
-        started.elapsed()
+    assert_eq!(
+        pauses,
+        vec![Duration::from_millis(200), Duration::from_millis(200)]
     );
-    // 4. Genuine right removal MUST fail closed promptly.
+    // 4. Genuine right removal fails closed after exactly two confirmation pauses.
     fs::write(
         &policy_path,
         "default = \"ro\"\n[principals.ro]\nrole = \"ro\"\n[principals.mover]\nrole = \"ro\"\n[roles.ro]\nallow = [\"effect:read\"]\n",
     )
     .unwrap();
-    let started = std::time::Instant::now();
+    pauses.clear();
     assert!(
-        !legion_tools::job::is_transfer_job_authorized(fixture.node.paths(), &dev_xfer.id),
+        !legion_tools::job::is_transfer_job_authorized_with_pause(
+            fixture.node.paths(),
+            &dev_xfer.id,
+            |d| pauses.push(d),
+        ),
         "revoked write right must fail closed"
     );
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "revoked right took too long to reject: {:?}",
-        started.elapsed()
+    assert_eq!(
+        pauses,
+        vec![Duration::from_millis(200), Duration::from_millis(200)]
     );
 }
