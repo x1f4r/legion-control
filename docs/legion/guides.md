@@ -1310,15 +1310,19 @@ requiring `effect:admin`, built on `config.list`, `config.read`, and `config.wri
   peer entries), whereas `direction=pull from=<peer>` imports live devices from that named peer
   without writing back. `meta.doctor` warns if any reachable peer has a different `devices.toml`.
 - **Machine-local (never synced as whole files)**: `node.toml` and `tokens.toml`. However,
-  `fleet.sync` checks each machine's reported node name against its name in `fleet.toml`: when a
-  machine's name differs and is host-derived (no explicit `name` in `node.toml`), `direction=push`
-  writes `name = "<fleet name>"` via `config.set_name` (keeping all other bytes in `node.toml`
-  verbatim and saving a backup) and records the update in `node_names`. When a machine has a
-  different explicit `name` in `node.toml` — or is an older node that does not report whether its
-  name is explicit — `fleet.sync` leaves `node.toml` untouched and reports `name_mismatch` in
-  `node_names`. `fleet.list`, `fleet.ping`, and `meta.doctor` also flag name mismatches (including
-  when a node's own name is absent from a non-empty `fleet.toml`), and forwarded `device.endpoint`
-  and `device.invite` calls refuse mismatched nodes with `name_mismatch`.
+  `fleet.sync` probes every target machine before deciding any renames: if more than one fleet
+  entry reaches the same node, none of them renames it and each reports `status: "ambiguous"` with
+  the other entry names and a hint to remove the stale entry. For an unambiguous machine whose
+  reported name differs and is host-derived (no explicit `name` in `node.toml`), `direction=push`
+  writes `name = "<fleet name>"` one machine at a time via `config.set_name` (keeping all other
+  bytes in `node.toml` verbatim, preserving any UTF-8 BOM or safe symlink, migrating matching
+  `[projects.<name>.on]` entries in `projects.toml` without overwriting existing entries, and
+  saving backups) and records the update in `node_names`. When a machine has a different explicit
+  `name` in `node.toml` — or is an older node that does not report whether its name is explicit —
+  `fleet.sync` leaves `node.toml` untouched and reports `name_mismatch` in `node_names`.
+  `fleet.list`, `fleet.ping`, and `meta.doctor` also flag name mismatches (including when a node's
+  own name is absent from a non-empty `fleet.toml`), and forwarded `device.endpoint` and
+  `device.invite` calls refuse mismatched nodes with `conflict` (`details.kind = "name_mismatch"`).
 
 Inspect differences with `direction=status` (reporting per-document status `same`, `only_here`,
 `only_there`, `changed_here`, `changed_there`, or `both`):

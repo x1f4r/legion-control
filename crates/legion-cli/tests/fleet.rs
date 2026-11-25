@@ -103,6 +103,14 @@ fn main() -> ExitCode {
             fleet_sync_repairs_host_derived_name_and_refuses_explicit_and_older_nodes,
         ),
         (
+            "duplicate_fleet_entries_report_ambiguous_and_relayed_invite_prechecks_older_relay",
+            duplicate_fleet_entries_report_ambiguous_and_relayed_invite_prechecks_older_relay,
+        ),
+        (
+            "fleet_sync_rename_migrates_projects_and_reports_conflicts",
+            fleet_sync_rename_migrates_projects_and_reports_conflicts,
+        ),
+        (
             "pipe_handle_drop_is_non_blocking_and_kills_lingering_child",
             pipe_handle_drop_is_non_blocking_and_kills_lingering_child,
         ),
@@ -586,6 +594,85 @@ fn run_helper(args: &[String]) -> ExitCode {
                 writeln!(stdout, "{reply}").unwrap();
                 stdout.flush().unwrap();
             }
+            ExitCode::SUCCESS
+        }
+        // older-relay <relay_name> <legion_bin> <target_legion_home> <target_user_home> <call_log>
+        // Simulates an older relay binary that forwards `call` requests directly to a target node
+        // without pre-checking `device.invite` node names.
+        "older-relay" => {
+            let relay_name = &rest[0];
+            let legion_bin = &rest[1];
+            let target_legion_home = &rest[2];
+            let target_user_home = &rest[3];
+            let call_log = Path::new(&rest[4]);
+            let mut child =
+                spawn_legion_rpc(legion_bin, target_legion_home, target_user_home, true);
+            let mut child_in = child.stdin.take().unwrap();
+            let mut child_out = BufReader::new(child.stdout.take().unwrap());
+            // Complete hello with child once so subsequent calls run over its RPC session.
+            writeln!(
+                child_in,
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "hello",
+                    "params": {"client": "older-relay", "version": "0.1.0", "protocol": 1}
+                })
+            )
+            .unwrap();
+            child_in.flush().unwrap();
+            let mut hello_buf = String::new();
+            let _ = child_out.read_line(&mut hello_buf);
+
+            let mut stdout = std::io::stdout().lock();
+            for line in BufReader::new(std::io::stdin()).lines() {
+                let Ok(line) = line else { break };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let reply = match req["method"].as_str().unwrap_or_default() {
+                    "hello" => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "node": relay_name,
+                            "version": "0.1.0",
+                            "protocol": 1,
+                            "os": std::env::consts::OS,
+                            "arch": std::env::consts::ARCH,
+                            "systems": []
+                        }
+                    }),
+                    "call" => {
+                        let tool = req["params"]["tool"].as_str().unwrap_or_default();
+                        append_line(call_log, tool);
+                        // Strip `on` and forward directly to the target node without checking names.
+                        let mut fwd_params = req["params"].clone();
+                        if let Some(obj) = fwd_params.as_object_mut() {
+                            obj.remove("on");
+                        }
+                        let fwd_req = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "method": "call",
+                            "params": fwd_params,
+                        });
+                        writeln!(child_in, "{fwd_req}").unwrap();
+                        child_in.flush().unwrap();
+                        let mut resp_line = String::new();
+                        child_out.read_line(&mut resp_line).unwrap();
+                        serde_json::from_str::<Value>(&resp_line)
+                            .unwrap_or_else(|_| json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+                    }
+                    _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                };
+                writeln!(stdout, "{reply}").unwrap();
+                stdout.flush().unwrap();
+            }
+            drop(child_in);
+            let _ = child.wait();
             ExitCode::SUCCESS
         }
         other => {
@@ -2085,11 +2172,12 @@ fn node_name_mismatch_detected_in_ping_list_doctor_and_device_forwards() {
     );
     assert!(listed_by("pi").get("name_mismatch").is_none());
 
-    // 3. Forwarded `device.endpoint` refuses mismatched machines with `name_mismatch`, the exact sentence, and a `fleet.sync` hint.
+    // 3. Forwarded `device.endpoint` refuses mismatched machines with `conflict` (`details.kind == "name_mismatch"`), the exact sentence, and a `fleet.sync` hint.
     let ep_direct = tower.run(&["device.endpoint", "--on", "explicit-box"]);
     assert_eq!(ep_direct.code, 1, "{}", ep_direct.stdout);
     let err = ep_direct.json();
-    assert_eq!(err["code"], json!("name_mismatch"), "{err}");
+    assert_eq!(err["code"], json!("conflict"), "{err}");
+    assert_eq!(err["details"]["kind"], json!("name_mismatch"), "{err}");
     assert_eq!(
         err["message"],
         json!("explicit-box calls itself someones-laptop."),
@@ -2103,11 +2191,16 @@ fn node_name_mismatch_detected_in_ping_list_doctor_and_device_forwards() {
     );
     assert_eq!(err["machine"], json!("explicit-box"), "{err}");
 
-    // Relayed `device.endpoint` also refuses with `name_mismatch`.
+    // Relayed `device.endpoint` also refuses with `conflict` (`details.kind == "name_mismatch"`).
     let ep_relayed = tower.run(&["device.endpoint", "--on", "behind"]);
     assert_eq!(ep_relayed.code, 1, "{}", ep_relayed.stdout);
     let rel_err = ep_relayed.json();
-    assert_eq!(rel_err["code"], json!("name_mismatch"), "{rel_err}");
+    assert_eq!(rel_err["code"], json!("conflict"), "{rel_err}");
+    assert_eq!(
+        rel_err["details"]["kind"],
+        json!("name_mismatch"),
+        "{rel_err}"
+    );
     assert_eq!(
         rel_err["message"],
         json!("behind calls itself someones-laptop."),
@@ -2120,13 +2213,18 @@ fn node_name_mismatch_detected_in_ping_list_doctor_and_device_forwards() {
         "{rel_err}"
     );
 
-    // Fan-out `device.endpoint --on all` keeps tower's own endpoint while returning `name_mismatch` for studio.
+    // Fan-out `device.endpoint --on all` keeps tower's own endpoint while returning conflict/name_mismatch for studio.
     let ep_all = tower.run(&["device.endpoint", "--on", "all"]);
     assert_eq!(ep_all.code, 0, "{}", ep_all.stdout);
     let all_res = &ep_all.json()["results"];
     assert_eq!(all_res["tower"]["ok"]["node"], json!("tower"), "{all_res}");
     assert_eq!(
         all_res[studio_fleet_name]["error"]["code"],
+        json!("conflict"),
+        "{all_res}"
+    );
+    assert_eq!(
+        all_res[studio_fleet_name]["error"]["details"]["kind"],
         json!("name_mismatch"),
         "{all_res}"
     );
@@ -2145,7 +2243,13 @@ fn node_name_mismatch_detected_in_ping_list_doctor_and_device_forwards() {
         studio_fleet_name,
     ]);
     assert_eq!(inv.code, 1, "{}", inv.stdout);
-    assert_eq!(inv.json()["code"], json!("name_mismatch"), "{}", inv.stdout);
+    assert_eq!(inv.json()["code"], json!("conflict"), "{}", inv.stdout);
+    assert_eq!(
+        inv.json()["details"]["kind"],
+        json!("name_mismatch"),
+        "{}",
+        inv.stdout
+    );
     assert!(
         !studio_auth_keys.exists(),
         "refused device.invite must not write authorized_keys on remote"
@@ -2337,6 +2441,11 @@ fn fleet_sync_repairs_host_derived_name_and_refuses_explicit_and_older_nodes() {
     );
     assert_eq!(
         push_names["fixed"]["error"]["code"],
+        json!("conflict"),
+        "{push_names}"
+    );
+    assert_eq!(
+        push_names["fixed"]["error"]["details"]["kind"],
         json!("name_mismatch"),
         "{push_names}"
     );
@@ -2390,7 +2499,8 @@ fn fleet_sync_repairs_host_derived_name_and_refuses_explicit_and_older_nodes() {
 
     let ep_legacy = tower.run(&["device.endpoint", "--on", "legacy"]);
     assert_eq!(ep_legacy.code, 1, "{}", ep_legacy.stdout);
-    assert_eq!(ep_legacy.json()["code"], json!("name_mismatch"));
+    assert_eq!(ep_legacy.json()["code"], json!("conflict"));
+    assert_eq!(ep_legacy.json()["details"]["kind"], json!("name_mismatch"));
     assert_eq!(
         ep_legacy.json()["message"],
         json!("legacy calls itself someones-laptop.")
@@ -2411,7 +2521,11 @@ fn fleet_sync_repairs_host_derived_name_and_refuses_explicit_and_older_nodes() {
     // 5. Direct `config.set_name` refusals: explicit mismatch and non-admin caller.
     let refused_explicit = tower.run(&["config.set_name", "name=fixed", "--on", "fixed"]);
     assert_eq!(refused_explicit.code, 1, "{}", refused_explicit.stdout);
-    assert_eq!(refused_explicit.json()["code"], json!("name_mismatch"));
+    assert_eq!(refused_explicit.json()["code"], json!("conflict"));
+    assert_eq!(
+        refused_explicit.json()["details"]["kind"],
+        json!("name_mismatch")
+    );
     assert_eq!(
         fs::read_to_string(&fixed_node_path).unwrap(),
         original_fixed_node_toml
@@ -2429,6 +2543,201 @@ fn fleet_sync_repairs_host_derived_name_and_refuses_explicit_and_older_nodes() {
     let refused_role = tower.run(&["config.set_name", "name=tower", "--as", "viewer"]);
     assert_eq!(refused_role.code, 1, "{}", refused_role.stdout);
     assert_eq!(refused_role.json()["code"], json!("denied"));
+}
+
+fn duplicate_fleet_entries_report_ambiguous_and_relayed_invite_prechecks_older_relay() {
+    let tower = Home::new();
+    let studio = Home::new();
+    let behind = Home::new();
+
+    let host_derived = legion_core::config::NodeName::from_host().to_string();
+    let studio_name = if host_derived == "studio" {
+        "studio-peer"
+    } else {
+        "studio"
+    };
+    let studio_old = format!("{studio_name}-old");
+
+    let behind_key = write_test_host_key(&behind);
+    let behind_auth_keys = behind.home().join("authorized_keys");
+    let relay_log = tower.home().join("older-relay-calls.log");
+
+    tower.write_config("node.toml", "name = \"tower\"\n");
+    // `studio` has no `node.toml` (host-derived name).
+    // `behind` also has a mismatched name and a configured `authorized_keys` path we verify is never touched.
+    behind.write_config(
+        "node.toml",
+        &format!(
+            "name = \"someones-laptop\"\n[devices]\nauthorized_keys = {}\nhosts = [\"behind.example\"]\nhost_keys = [{}]\nuser = \"me\"\n",
+            serde_json::to_string(&behind_auth_keys.to_string_lossy().as_ref()).unwrap(),
+            serde_json::to_string(&behind_key.to_string_lossy().as_ref()).unwrap(),
+        ),
+    );
+
+    let older_relay_argv = helper_argv(
+        "older-relay",
+        &[
+            "older-relay".to_owned(),
+            LEGION_BIN.to_owned(),
+            legion_home_of(&behind).to_string_lossy().into_owned(),
+            behind.home().to_string_lossy().into_owned(),
+            relay_log.to_string_lossy().into_owned(),
+        ],
+    );
+    tower.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.{studio_name}]\ncommand = {}\n\n[machines.{studio_old}]\ncommand = {}\n\n[machines.older-relay]\ncommand = {}\n\n[machines.behind]\nvia = \"older-relay\"\n",
+            toml_argv(&run_argv(&studio, None)),
+            toml_argv(&run_argv(&studio, None)),
+            toml_argv(&older_relay_argv),
+        ),
+    );
+
+    // 1. Two fleet entries pointing at the same node never race to rename it across repeated syncs.
+    let studio_node_path = legion_home_of(&studio).join("config").join("node.toml");
+    for _ in 0..3 {
+        let sync = tower.run(&[
+            "fleet.sync",
+            "direction=push",
+            &format!("machines=[\"{studio_name}\",\"{studio_old}\"]"),
+        ]);
+        assert_eq!(sync.code, 0, "{}", sync.stdout);
+        let names = &sync.json()["node_names"];
+        assert_eq!(names[studio_name]["status"], json!("ambiguous"), "{names}");
+        assert_eq!(
+            names[studio_name]["other_entries"],
+            json!([studio_old]),
+            "{names}"
+        );
+        assert!(
+            names[studio_name]["error"]["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("Remove the stale entry")),
+            "{names}"
+        );
+        assert_eq!(names[&studio_old]["status"], json!("ambiguous"), "{names}");
+        assert_eq!(
+            names[&studio_old]["other_entries"],
+            json!([studio_name]),
+            "{names}"
+        );
+        assert!(
+            !studio_node_path.exists(),
+            "ambiguous duplicate entries must never rename the node"
+        );
+    }
+
+    // 2. Relayed `device.invite` through an older relay pre-checks `meta.version` and refuses
+    //    before ever sending `device.invite` or writing `authorized_keys`.
+    let inv = tower.run(&[
+        "device.invite",
+        "name=pixel",
+        "role=observer",
+        "--on",
+        "behind",
+    ]);
+    assert_eq!(inv.code, 1, "{}", inv.stdout);
+    assert_eq!(inv.json()["code"], json!("conflict"), "{}", inv.stdout);
+    assert_eq!(
+        inv.json()["details"]["kind"],
+        json!("name_mismatch"),
+        "{}",
+        inv.stdout
+    );
+    assert_eq!(
+        inv.json()["message"],
+        json!("behind calls itself someones-laptop."),
+        "{}",
+        inv.stdout
+    );
+    let forwarded = fs::read_to_string(&relay_log).unwrap_or_default();
+    assert!(
+        forwarded.contains("meta.version"),
+        "expected read-only meta.version pre-check through older relay: {forwarded}"
+    );
+    assert!(
+        !forwarded.contains("device.invite"),
+        "device.invite must never reach older relay when target name mismatches: {forwarded}"
+    );
+    assert!(
+        !behind_auth_keys.exists(),
+        "misnamed target behind older relay must not get an enrol line in authorized_keys"
+    );
+}
+
+fn fleet_sync_rename_migrates_projects_and_reports_conflicts() {
+    let tower = Home::new();
+    let studio = Home::new();
+    let app_dir = studio.home().join("app-repo");
+    fs::create_dir_all(&app_dir).unwrap();
+
+    let host_derived = legion_core::config::NodeName::from_host().to_string();
+    let studio_name = if host_derived == "studio" {
+        "studio-peer"
+    } else {
+        "studio"
+    };
+
+    tower.write_config("node.toml", "name = \"tower\"\n");
+    tower.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.{studio_name}]\ncommand = {}\n",
+            toml_argv(&run_argv(&studio, None)),
+        ),
+    );
+    studio.write_config(
+        "projects.toml",
+        &format!(
+            "[projects.app]\n\
+             [projects.app.on]\n\
+             {host_derived} = {}\n\n\
+             [projects.dup]\n\
+             [projects.dup.on]\n\
+             {host_derived} = \"/old/dup\"\n\
+             {studio_name} = \"/existing/dup\"\n",
+            serde_json::to_string(&app_dir.to_string_lossy().as_ref()).unwrap(),
+        ),
+    );
+
+    let push = tower.run(&["fleet.sync", "direction=push"]);
+    assert_eq!(push.code, 0, "{}", push.stdout);
+    let outcome = &push.json()["node_names"][studio_name];
+    assert_eq!(outcome["status"], json!("set"), "{outcome}");
+    assert_eq!(
+        outcome["moved"],
+        json!([format!("projects.app.on: {host_derived} -> {studio_name}")]),
+        "{outcome}"
+    );
+    assert_eq!(
+        outcome["conflicts"],
+        json!([{
+            "project": "dup",
+            "old_path": "/old/dup",
+            "new_path": "/existing/dup"
+        }]),
+        "{outcome}"
+    );
+
+    // `proj.status` on the renamed node immediately finds `app` under its new fleet name.
+    let proj_status = tower.run(&["proj.status", "project=app", "--on", studio_name]);
+    assert_eq!(proj_status.code, 0, "{}", proj_status.stdout);
+    assert_eq!(
+        proj_status.json()["projects"][0]["name"],
+        json!("app"),
+        "{}",
+        proj_status.stdout
+    );
+    assert_eq!(
+        proj_status.json()["projects"][0]["present"],
+        json!(true),
+        "{}",
+        proj_status.stdout
+    );
+    let proj_list = tower.run(&["proj.list", "--on", studio_name]);
+    assert_eq!(proj_list.code, 0, "{}", proj_list.stdout);
+    assert_eq!(proj_list.json()["node"], json!(studio_name));
 }
 
 #[cfg(unix)]

@@ -227,7 +227,7 @@ accounts.
 | --- | --- |
 | [Getting started](getting-started.md) | Installing on Linux, macOS, and Windows; first run; file locations (`LEGION_HOME`); adding machines, dual-boot systems, and `via` relays; troubleshooting real errors. |
 | [Permissions](permissions.md) | Principals, roles, rules, effects, `paths`, protected secret locations, how each door pins a principal, audit logging and redaction, and worked `policy.toml` recipes. |
-| [AI agents](agents.md) | `legion mcp` (compact and full mode), `legion agents add`, operating rules for agents, the 14 error codes, and adding extension tools safely. |
+| [AI agents](agents.md) | `legion mcp` (compact and full mode), `legion agents add`, operating rules for agents, the 13 error codes, and adding extension tools safely. |
 | [Guides](guides.md) | Task walk-throughs: file transfer, long jobs, projects, services, power and wake, device pairing, the HTTP door, extension tools, configuration sync, and updates. |
 | [Tool reference](tools.md) | Generated reference of every built-in tool, its effect, and its input schema. |
 | [Design](design.md) | Architecture, workspace crates, wire and stream protocols, platform rules, and milestones. |
