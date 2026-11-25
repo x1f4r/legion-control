@@ -17,6 +17,7 @@ use crate::model::{
     IndexRecord, MemberId, PeerCursor, PeerHandshake, PendingOp, RecordsPage, SyncProblem,
 };
 use crate::path::IgnoreMatcher;
+use crate::version::VersionVector;
 
 /// Filesystem capabilities and naming rules for a sync member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +164,19 @@ pub trait SyncFs {
         Ok(())
     }
 
+    /// Returns the free bytes currently available on the filesystem that would hold `live_rel`, or
+    /// `Ok(None)` if the backend cannot query free space.
+    fn available_space_for(&self, _live_rel: &str) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Returns `true` when `live_rel` resides on a different mount/device than `.legion-sync/tmp`
+    /// so staging files must be created beside `live_rel` (under an ignored `.legion-*.tmp` name)
+    /// for atomic placement.
+    fn needs_local_staging(&self, _live_rel: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Walks the entire live tree under the folder root, skipping `.legion-sync` at any depth and
     /// any entry matched by `ignore`.
     fn walk(&self, ignore: &IgnoreMatcher) -> Result<FsWalkResult>;
@@ -304,6 +318,19 @@ pub trait SyncFs {
     /// Copies `.legion-sync/bin/<bin_data_name>` into `.legion-sync/tmp/<tmp_name>` and syncs it.
     fn copy_bin_to_tmp(&self, bin_data_name: &str, tmp_name: &str) -> Result<()>;
 
+    /// Moves `.legion-sync/bin/<bin_data_name>` to `live_rel` without replacing an existing live
+    /// entry (`FsErrorKind::AlreadyExists`), falling back to a synced cross-device copy if the
+    /// live destination sits on a different mount than `.legion-sync/bin`.
+    fn move_bin_to_live_no_replace(&self, bin_data_name: &str, live_rel: &str) -> Result<()> {
+        let tmp_name = format!("promote-{bin_data_name}");
+        self.copy_bin_to_tmp(bin_data_name, &tmp_name)?;
+        if let Err(err) = self.commit_tmp_to_live_no_replace(&tmp_name, live_rel) {
+            let _ = self.remove_tmp(&tmp_name);
+            return Err(err);
+        }
+        self.remove_bin_file(bin_data_name)
+    }
+
     /// Removes `.legion-sync/bin/<bin_name>` if it exists.
     fn remove_bin_file(&self, bin_name: &str) -> Result<()>;
 
@@ -342,6 +369,10 @@ pub trait Peer {
         expected_hash: Hash,
         options: &FetchOptions,
     ) -> Result<Box<dyn Read + Send>>;
+
+    /// Best-effort advisory hint sent when the fetcher verified a different hash or size than the
+    /// peer's index promised, so the peer can force a re-hash of `path` on its next scan.
+    fn report_hash_mismatch(&self, _path: &str) {}
 }
 
 /// Atomic batch of mutations committed in a single [`IndexStore::apply_batch`] transaction.
@@ -371,6 +402,9 @@ pub struct StoreBatch {
     /// Deleted-file content hashes to record per path (persisted across tombstone GC so a
     /// rejoining or re-added member with an old copy never resurrects a deleted file).
     pub upsert_deleted_history: Vec<(String, Vec<Hash>)>,
+    /// Causal version vectors associated with deleted-history paths so intentional restores or
+    /// re-creations made *after* seeing a deletion can strictly dominate the deleted history.
+    pub upsert_deleted_history_versions: Vec<(String, VersionVector)>,
     /// Deleted history paths to prune.
     pub remove_deleted_history: Vec<String>,
     /// Update to the write-ahead crash journal (`Some(Some(op))` sets it; `Some(None)` clears it;
@@ -414,6 +448,7 @@ impl StoreBatch {
             && self.remove_held_back.is_empty()
             && !self.clear_held_back
             && self.upsert_deleted_history.is_empty()
+            && self.upsert_deleted_history_versions.is_empty()
             && self.remove_deleted_history.is_empty()
             && self.set_pending_op.is_none()
             && self.add_staged_tmps.is_empty()
@@ -495,6 +530,14 @@ pub trait IndexStore {
 
     /// Returns the recorded historical deleted content hashes for `path`, if any.
     fn get_deleted_history(&self, path: &str) -> Result<Vec<Hash>>;
+
+    /// Returns the merged deletion version vector recorded alongside `deleted_history` for `path`,
+    /// if any.
+    fn get_deleted_history_version(&self, path: &str) -> Result<Option<VersionVector>>;
+
+    /// Lists all `(path, VersionVector)` entries stored alongside `deleted_history` (used when
+    /// pruning retired incarnations).
+    fn list_deleted_history_versions(&self) -> Result<Vec<(String, VersionVector)>>;
 
     /// Loads the active write-ahead [`PendingOp`], if any.
     fn load_pending_op(&self) -> Result<Option<PendingOp>>;

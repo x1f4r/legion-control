@@ -13,6 +13,7 @@ use crate::model::{
 };
 use crate::path::fold_case;
 use crate::traits::{IndexStore, StoreBatch};
+use crate::version::VersionVector;
 
 /// In-memory [`IndexStore`] mirroring the exact transactional semantics and secondary indexes of
 /// [`crate::RedbIndexStore`].
@@ -30,6 +31,10 @@ pub struct MemoryIndexStore {
     bin_entries: BTreeMap<String, BinEntry>,
     held_back: BTreeMap<(MemberId, String), HeldBackRecord>,
     deleted_history: BTreeMap<String, Vec<Hash>>,
+    deleted_history_vv: BTreeMap<String, VersionVector>,
+    deleted_history_order: BTreeMap<u64, String>,
+    deleted_history_seq: BTreeMap<String, u64>,
+    next_deleted_history_seq: u64,
     pending_op: Option<PendingOp>,
     staged_tmps: BTreeSet<String>,
     seq_fingerprints: BTreeMap<u64, Hash>,
@@ -59,6 +64,10 @@ impl MemoryIndexStore {
             bin_entries: BTreeMap::new(),
             held_back: BTreeMap::new(),
             deleted_history: BTreeMap::new(),
+            deleted_history_vv: BTreeMap::new(),
+            deleted_history_order: BTreeMap::new(),
+            deleted_history_seq: BTreeMap::new(),
+            next_deleted_history_seq: 0,
             pending_op: None,
             staged_tmps: BTreeSet::new(),
             seq_fingerprints: BTreeMap::new(),
@@ -320,6 +329,18 @@ impl IndexStore for MemoryIndexStore {
         Ok(self.deleted_history.get(path).cloned().unwrap_or_default())
     }
 
+    fn get_deleted_history_version(&self, path: &str) -> Result<Option<VersionVector>> {
+        Ok(self.deleted_history_vv.get(path).cloned())
+    }
+
+    fn list_deleted_history_versions(&self) -> Result<Vec<(String, VersionVector)>> {
+        Ok(self
+            .deleted_history_vv
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+
     fn load_pending_op(&self) -> Result<Option<PendingOp>> {
         Ok(self.pending_op.clone())
     }
@@ -395,18 +416,45 @@ impl IndexStore for MemoryIndexStore {
         }
         for path in batch.remove_deleted_history {
             self.deleted_history.remove(&path);
+            self.deleted_history_vv.remove(&path);
+            if let Some(old_seq) = self.deleted_history_seq.remove(&path) {
+                self.deleted_history_order.remove(&old_seq);
+            }
         }
         for (path, hashes) in batch.upsert_deleted_history {
             if hashes.is_empty() {
                 self.deleted_history.remove(&path);
-            } else {
-                if !self.deleted_history.contains_key(&path)
-                    && self.deleted_history.len() >= MAX_DELETED_HISTORY_PATHS
-                    && let Some(first_key) = self.deleted_history.keys().next().cloned()
-                {
-                    self.deleted_history.remove(&first_key);
+                self.deleted_history_vv.remove(&path);
+                if let Some(old_seq) = self.deleted_history_seq.remove(&path) {
+                    self.deleted_history_order.remove(&old_seq);
                 }
+            } else {
+                if let Some(old_seq) = self.deleted_history_seq.remove(&path) {
+                    self.deleted_history_order.remove(&old_seq);
+                } else if self.deleted_history.len() >= MAX_DELETED_HISTORY_PATHS {
+                    let evict = self
+                        .deleted_history_order
+                        .pop_first()
+                        .map(|(_, k)| k)
+                        .or_else(|| self.deleted_history.keys().next().cloned());
+                    if let Some(evict_path) = evict {
+                        self.deleted_history.remove(&evict_path);
+                        self.deleted_history_vv.remove(&evict_path);
+                        self.deleted_history_seq.remove(&evict_path);
+                    }
+                }
+                self.next_deleted_history_seq = self.next_deleted_history_seq.saturating_add(1);
+                let seq = self.next_deleted_history_seq;
+                self.deleted_history_order.insert(seq, path.clone());
+                self.deleted_history_seq.insert(path.clone(), seq);
                 self.deleted_history.insert(path, hashes);
+            }
+        }
+        for (path, vv) in batch.upsert_deleted_history_versions {
+            if vv.is_empty() {
+                self.deleted_history_vv.remove(&path);
+            } else if self.deleted_history.contains_key(&path) {
+                self.deleted_history_vv.insert(path, vv);
             }
         }
         if let Some(op_update) = batch.set_pending_op {

@@ -6,36 +6,40 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use legion_xfer::{EntryKind, Hash, Timestamp};
 
 use crate::apply::{
     ApplyOutcome, RecoveryReport, StoreIndexView, apply_decision, apply_local_rename,
-    apply_new_files_group_commit, expire_bin, recover_pending, resolve_conflict, restore_from_bin,
+    apply_new_files_group_commit, expire_bin, inspect_and_promote_modified_bin_entries,
+    recover_pending, resolve_conflict, restore_from_bin,
 };
 use crate::error::{INDEX_DAMAGED_PROBLEM_SENTENCE, Result, SyncError};
 use crate::model::{
     BinEntry, ConflictChoice, ConflictInfo, DeferredItem, DeletionBrakeConfig,
-    DeletionBrakeDecision, FORCED_ROTATION_COOLDOWN_SECS, FetchOptions, FolderConfig,
-    FolderDeletionLogEntry, FolderDeletionRecord, FolderMarker, FolderMeta, FolderStatus,
-    HandshakeHello, HeldBackRecord, INDEX_SCHEMA_VERSION, InboundDeletionBrake,
-    InboundDeletionBrakeDecision, IndexRecord, MAX_DEFERRAL_ATTEMPTS, MAX_HELD_BACK_ENTRIES,
-    MAX_PAGE_RECORDS, MAX_PEER_PROBLEMS, MemberId, MemberState, MemberStatus, PeerAckView,
-    PeerCursor, PeerHandshake, ProblemKind, RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION,
-    SyncProblem, SyncProgress, encode_deletion_log_entries, parse_deletion_log,
-    random_incarnation_id, validate_member_id,
+    DeletionBrakeDecision, FORCED_ROTATION_COOLDOWN_SECS, FORCED_ROTATION_WEEK_WINDOW_SECS,
+    FetchOptions, FolderConfig, FolderDeletionLogEntry, FolderDeletionRecord, FolderMarker,
+    FolderMeta, FolderStatus, HandshakeHello, HeldBackRecord, INDEX_SCHEMA_VERSION,
+    InboundDeletionBrake, InboundDeletionBrakeDecision, IndexRecord, MAX_DEFERRAL_ATTEMPTS,
+    MAX_FORCED_ROTATIONS_PER_WEEK, MAX_HELD_BACK_ENTRIES, MAX_PAGE_RECORDS, MAX_PEER_PROBLEMS,
+    MAX_PRUNED_INCARNATIONS, MemberId, MemberState, MemberStatus, PeerAckView, PeerCursor,
+    PeerHandshake, PeerRefusalSummary, ProblemKind, RecordsPage, RestoreStrategy,
+    SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, encode_deletion_log_entries,
+    parse_deletion_log, random_incarnation_id, validate_member_id,
 };
 use crate::path::{
     IgnoreMatcher, is_descendant_of, is_internal_sync_path, path_depth, validate_sync_path,
 };
 use crate::reconcile::{LocalIndexView, ReconcileDecision, reconcile_record};
 use crate::scan::{
-    PendingStabilityTracker, ScanOptions, ScanReport,
+    PendingStabilityTracker, ScanOptions, ScanReport, disk_stat_matches_index,
     flush_settled_deletions as scan_flush_settled_deletions, scan_folder, scan_subtree,
 };
 use crate::store_redb::RedbIndexStore;
 use crate::traits::{IndexStore, Peer, StoreBatch, SyncFs};
+use crate::version::VersionKey;
 
 /// Default number of records fetched per incremental page during [`SyncEngine::pull_from_peer`].
 pub const DEFAULT_PAGE_LIMIT: usize = 1024;
@@ -87,9 +91,13 @@ pub struct SyncEngine<F: SyncFs, S: IndexStore> {
     stability: PendingStabilityTracker,
     unreachable_peers: BTreeSet<MemberId>,
     active_progress: BTreeMap<MemberId, SyncProgress>,
+    last_pull_errors: BTreeMap<MemberId, SyncProblem>,
+    peer_refusals_from_serve: Mutex<BTreeMap<MemberId, PeerRefusalSummary>>,
+    serve_rescan_hints: Mutex<BTreeSet<String>>,
     skipped_paths: BTreeSet<String>,
     folder_problem: Option<SyncProblem>,
     index_damaged: bool,
+    may_have_retired_vv_keys: bool,
     last_now: Timestamp,
 }
 
@@ -337,9 +345,13 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             stability: PendingStabilityTracker::new(),
             unreachable_peers: BTreeSet::new(),
             active_progress: BTreeMap::new(),
+            last_pull_errors: BTreeMap::new(),
+            peer_refusals_from_serve: Mutex::new(BTreeMap::new()),
+            serve_rescan_hints: Mutex::new(BTreeSet::new()),
             skipped_paths,
             folder_problem,
             index_damaged,
+            may_have_retired_vv_keys: true,
             last_now: Timestamp::from_system_time(std::time::SystemTime::now()),
         };
         if needs_recover {
@@ -445,6 +457,13 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if let Ok(Some(m)) = self.store.load_meta() {
                     old_incarnation = Some(m.incarnation);
+                    for pending in m.pending_deletions.values() {
+                        carried_deletions
+                            .entry(pending.old_record.path.clone())
+                            .or_insert_with(|| {
+                                pending_to_deletion_record(pending, &m.local_member)
+                            });
+                    }
                 }
                 if let Ok(tombs) = self.store.list_tombstones() {
                     for tomb in tombs {
@@ -457,6 +476,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                                 version: tomb.version,
                                 mtime: tomb.mtime,
                                 modified_by: tomb.modified_by,
+                                held: false,
                             },
                         );
                     }
@@ -548,6 +568,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         self.index_damaged = false;
         self.folder_problem = None;
         self.skipped_paths.clear();
+        self.active_progress.clear();
+        self.last_pull_errors.clear();
+        if let Ok(mut refusals) = self.peer_refusals_from_serve.lock() {
+            refusals.clear();
+        }
+        if let Ok(mut hints) = self.serve_rescan_hints.lock() {
+            hints.clear();
+        }
 
         // Rescue any leftover files in `.legion-sync/tmp` per the core principle.
         recover_pending(&self.fs, &mut self.store)?;
@@ -735,6 +763,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     cursor.allow_inbound_mass_deletion_until_seq = cursor
                         .allow_inbound_mass_deletion_until_seq
                         .max(brake.max_blocked_seq);
+                    e.last_pull_errors.remove(peer_id);
                     let mut batch = StoreBatch {
                         remove_problems,
                         ..StoreBatch::default()
@@ -745,6 +774,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 }
                 InboundDeletionBrakeDecision::KeepLocalFiles => {
                     let mut meta = e.meta()?;
+                    cursor.keep_local_files_until_seq = cursor
+                        .keep_local_files_until_seq
+                        .max(brake.max_blocked_seq);
+                    e.last_pull_errors.remove(peer_id);
                     let mut batch = StoreBatch {
                         remove_problems,
                         ..StoreBatch::default()
@@ -758,7 +791,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         if local.deleted {
                             continue;
                         }
-                        local.version.merge(&tomb.version);
+                        local.version.merge_in_place(&tomb.version);
                         meta.bump_version(&mut local.version);
                         let seq = meta.next_seq();
                         local.seq = seq;
@@ -811,6 +844,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 if was_former && member != meta.local_member {
                     meta.rejoining_peers.insert(member.clone());
                 }
+                e.last_pull_errors.remove(&member);
+                if let Ok(mut refusals) = e.peer_refusals_from_serve.lock() {
+                    refusals.remove(&member);
+                }
                 let remove_problems: Vec<String> = e
                     .store
                     .list_problems()?
@@ -848,8 +885,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             meta.former_members.insert(member.to_string());
             meta.rejoining_peers.remove(member);
             meta.last_forced_rotation_by_peer.remove(member);
+            meta.forced_rotation_history.retain(|(p, _)| p != member);
             e.unreachable_peers.remove(member);
             e.active_progress.remove(member);
+            e.last_pull_errors.remove(member);
+            e.may_have_retired_vv_keys = true;
+            if let Ok(mut refusals) = e.peer_refusals_from_serve.lock() {
+                refusals.remove(member);
+            }
 
             let remove_held_back: Vec<(MemberId, String)> = e
                 .store
@@ -925,6 +968,64 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         })
     }
 
+    /// Records that a peer observed a hash or size mismatch for bytes served from `path` so the
+    /// next scan re-hashes `path` even if its stat metadata appears unchanged.
+    pub fn note_serve_hash_mismatch(&self, path: &str) {
+        if let Ok(clean) = validate_sync_path(path)
+            && !is_internal_sync_path(&clean)
+            && let Ok(mut hints) = self.serve_rescan_hints.lock()
+        {
+            hints.insert(clean);
+        }
+    }
+
+    /// Returns paths currently queued for re-hashing due to serving staleness or fetcher hash
+    /// mismatches.
+    pub fn pending_serve_rescan_hints(&self) -> Vec<String> {
+        self.serve_rescan_hints
+            .lock()
+            .map(|h| h.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Rescans any paths flagged during serving (due to on-disk stat mismatch or a fetcher
+    /// reporting a hash/size mismatch), returning the number of hinted paths processed.
+    pub fn rescan_serve_hints(&mut self, now: Timestamp) -> Result<usize> {
+        self.guard_mut("rescan_serve_hints", |e| {
+            let paths = e.drain_serve_rescan_hints_to_meta()?;
+            let count = paths.len();
+            for path in paths {
+                let _ = e.scan_subtree_inner(&path, now, ScanOptions::default())?;
+            }
+            Ok(count)
+        })
+    }
+
+    fn drain_serve_rescan_hints_to_meta(&mut self) -> Result<Vec<String>> {
+        let hinted: Vec<String> = self
+            .serve_rescan_hints
+            .lock()
+            .map(|mut h| std::mem::take(&mut *h).into_iter().collect())
+            .unwrap_or_default();
+        if hinted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut meta = self.meta()?;
+        let mut changed = false;
+        for path in &hinted {
+            if meta.needs_rescan.insert(path.clone()) {
+                changed = true;
+            }
+        }
+        if changed {
+            self.store.apply_batch(StoreBatch {
+                folder_meta: Some(meta),
+                ..StoreBatch::default()
+            })?;
+        }
+        Ok(hinted)
+    }
+
     fn scan_with_options_inner(
         &mut self,
         now: Timestamp,
@@ -932,6 +1033,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     ) -> Result<ScanReport> {
         self.last_now = now;
         self.verify_folder_marker()?;
+        let _ = self.drain_serve_rescan_hints_to_meta()?;
         let report = scan_folder(
             &self.fs,
             &mut self.store,
@@ -940,6 +1042,12 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             &mut self.stability,
             now,
             options,
+        )?;
+        let _ = inspect_and_promote_modified_bin_entries(
+            &self.fs,
+            &mut self.store,
+            options.verify_checksums,
+            now,
         )?;
         self.skipped_paths = report
             .skipped_errors
@@ -1004,6 +1112,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     ) -> Result<ScanReport> {
         self.last_now = now;
         self.verify_folder_marker()?;
+        let _ = self.drain_serve_rescan_hints_to_meta()?;
         let clean_root = validate_sync_path(rel_root)?;
         let report = scan_subtree(
             &self.fs,
@@ -1014,6 +1123,12 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             &mut self.stability,
             now,
             options,
+        )?;
+        let _ = inspect_and_promote_modified_bin_entries(
+            &self.fs,
+            &mut self.store,
+            options.verify_checksums,
+            now,
         )?;
         self.skipped_paths
             .retain(|p| p != &clean_root && !is_descendant_of(p, &clean_root));
@@ -1077,9 +1192,37 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         fetch_opts: &FetchOptions,
         now: Timestamp,
     ) -> Result<PullReport> {
-        self.guard_mut("pull_from_peer_with_options", |e| {
+        let peer_id = peer.member_id().to_string();
+        let res = self.guard_mut("pull_from_peer_with_options", |e| {
             e.pull_from_peer_with_options_inner(peer, page_limit, fetch_opts, now)
-        })
+        });
+        match &res {
+            Ok(_) => {
+                self.last_pull_errors.remove(&peer_id);
+            }
+            Err(err) => {
+                self.active_progress.remove(&peer_id);
+                if !matches!(
+                    err,
+                    SyncError::Paused { .. }
+                        | SyncError::PeerUnavailable { .. }
+                        | SyncError::Cancelled { .. }
+                        | SyncError::IndexDamaged { .. }
+                        | SyncError::FolderUnavailable { .. }
+                ) {
+                    self.last_pull_errors.insert(
+                        peer_id.clone(),
+                        SyncProblem {
+                            path: String::new(),
+                            kind: ProblemKind::FilesystemError,
+                            peer: Some(peer_id),
+                            sentence: format!("Could not finish syncing: {err}"),
+                        },
+                    );
+                }
+            }
+        }
+        res
     }
 
     fn pull_from_peer_with_options_inner(
@@ -1129,20 +1272,40 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         let mut hs = self.do_handshake(peer, &peer_id, &meta, initial_cursors.get(&peer_id))?;
 
         let existing_for_peer = initial_cursors.get(&peer_id).cloned();
-        let peer_regressed_below_ack = existing_for_peer.as_ref().is_some_and(|c| {
-            c.incarnation == hs.incarnation
-                && c.acked_local_incarnation == meta.incarnation
-                && c.acked_local_seq > 0
-                && (match hs.caller_acked {
-                    Some(v) if v.incarnation == meta.incarnation => v.seq < c.acked_local_seq,
-                    None => true,
-                    _ => false,
-                } || match hs.caller_pulled {
-                    Some(v) if v.incarnation == meta.incarnation => v.seq < c.acked_local_seq,
-                    None => true,
-                    _ => false,
-                })
-        });
+        let peer_expected_rejoin = hs.caller_rejoining
+            && hs.caller_pull_matches != Some(false)
+            && existing_for_peer.as_ref().is_some_and(|c| {
+                c.incarnation == hs.incarnation
+                    && hs.snapshot_seq >= c.seq
+                    && !(hs.snapshot_seq == c.seq
+                        && c.seq > 0
+                        && hs.head_fingerprint.is_some()
+                        && c.head_fingerprint.is_some()
+                        && hs.head_fingerprint != c.head_fingerprint)
+            })
+            && match hs.caller_pulled {
+                Some(ref v) => view_matches_local(&self.store, &meta, v)?,
+                None => true,
+            }
+            && match hs.caller_acked {
+                Some(ref v) => view_matches_local(&self.store, &meta, v)?,
+                None => true,
+            };
+        let peer_regressed_below_ack = !peer_expected_rejoin
+            && existing_for_peer.as_ref().is_some_and(|c| {
+                c.incarnation == hs.incarnation
+                    && c.acked_local_incarnation == meta.incarnation
+                    && c.acked_local_seq > 0
+                    && (match hs.caller_acked {
+                        Some(v) if v.incarnation == meta.incarnation => v.seq < c.acked_local_seq,
+                        None => true,
+                        _ => false,
+                    } || match hs.caller_pulled {
+                        Some(v) if v.incarnation == meta.incarnation => v.seq < c.acked_local_seq,
+                        None => true,
+                        _ => false,
+                    })
+            });
 
         // Item 5: check the peer's statement about US before any page moves!
         let mut own_rolled_back = hs.caller_regressed;
@@ -1189,6 +1352,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             }
         }
 
+        // Clean non-regressed handshake: clear any stale rate-limit problem for this peer and
+        // update whether this peer currently refuses any of our records.
+        self.sync_peer_handshake_problems(&peer_id, hs.refused_from_caller.as_ref())?;
+
         let meta = if meta.join_mode {
             // Complete the initial join scan before pulling from any peer so any pre-existing
             // local files are tagged `from_join = true` and `join_mode` is cleared before
@@ -1201,8 +1368,42 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
         let mut observed_cursor =
             self.observe_peer_incarnation_with(&peer_id, hs.incarnation, initial_cursors)?;
+        let mut cursor_dirty = false;
+
+        // Record which active `(member -> incarnation)` pairs this peer directly knows about so
+        // deterministic VV pruning can verify all members have left retired incarnations.
+        let mut filtered_known = BTreeMap::new();
+        for (m, &inc) in &hs.known_incarnations {
+            if inc != 0 && meta.is_known_member(m) {
+                filtered_known.insert(m.clone(), inc);
+            }
+        }
+        filtered_known.insert(peer_id.clone(), hs.incarnation);
+        if observed_cursor.peer_known_incarnations != filtered_known {
+            observed_cursor.peer_known_incarnations = filtered_known;
+            cursor_dirty = true;
+        }
+
         let mut hs_ack_advanced = false;
-        if let Some(acked_view) = hs.caller_acked
+        if peer_expected_rejoin {
+            let (new_ack_inc, new_ack_seq) = match hs.caller_acked {
+                Some(acked_view)
+                    if acked_view.incarnation == meta.incarnation
+                        && acked_view.seq <= meta.local_seq
+                        && view_matches_local(&self.store, &meta, &acked_view)? =>
+                {
+                    (acked_view.incarnation, acked_view.seq)
+                }
+                _ => (0, 0),
+            };
+            if observed_cursor.acked_local_incarnation != new_ack_inc
+                || observed_cursor.acked_local_seq != new_ack_seq
+            {
+                observed_cursor.acked_local_incarnation = new_ack_inc;
+                observed_cursor.acked_local_seq = new_ack_seq;
+                cursor_dirty = true;
+            }
+        } else if let Some(acked_view) = hs.caller_acked
             && acked_view.incarnation == meta.incarnation
             && acked_view.seq <= meta.local_seq
             && view_matches_local(&self.store, &meta, &acked_view)?
@@ -1223,12 +1424,21 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 observed_cursor.acked_local_seq,
             ) != prev_acked;
             if hs_ack_advanced {
-                self.store.apply_batch(StoreBatch {
-                    set_peer_cursors: BTreeMap::from([(peer_id.clone(), observed_cursor.clone())]),
-                    ..StoreBatch::default()
-                })?;
+                cursor_dirty = true;
             }
         }
+        if cursor_dirty {
+            self.store.apply_batch(StoreBatch {
+                set_peer_cursors: BTreeMap::from([(peer_id.clone(), observed_cursor.clone())]),
+                ..StoreBatch::default()
+            })?;
+        }
+
+        // Adopt retired incarnations deterministically pruned by this peer, then check if any
+        // newly-retired incarnations can now be pruned locally BEFORE incoming pages bump seq!
+        let _ = self.adopt_peer_pruned_incarnations(&peer_id, &hs.pruned_incarnations)?;
+        let _ = self.prune_retired_incarnations_inner()?;
+        let meta = self.meta()?;
 
         let mut cached_cursor = Some(observed_cursor);
         let mut cached_meta: Option<FolderMeta> = if cached_cursor
@@ -1243,6 +1453,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         let limit = page_limit.clamp(1, MAX_PAGE_RECORDS);
         let mut report = PullReport::default();
         let cancel_ref = fetch_opts.cancel.as_deref();
+        let mut newly_held_back_this_pull: BTreeSet<String> = BTreeSet::new();
 
         loop {
             if cancel_ref.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -1389,6 +1600,18 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
             report.records_seen += page.records.len();
 
+            if !self.may_have_retired_vv_keys && !page.records.is_empty() {
+                let own_key = local_meta.version_key();
+                for rec in &page.records {
+                    if rec.version.iter().any(|(k, _)| {
+                        *k != own_key && !(k.member == peer_id && k.incarnation == page.incarnation)
+                    }) {
+                        self.may_have_retired_vv_keys = true;
+                        break;
+                    }
+                }
+            }
+
             if page.records.is_empty() {
                 cursor.incarnation = page.incarnation;
                 if page.snapshot_seq >= cursor.seq {
@@ -1468,7 +1691,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
             // Item 8: matching inbound peer deletion brake! Checked BEFORE mutating disk so a
             // peer's mass deletion pauses that peer without touching local files or advancing its
-            // cursor, letting the person choose ApplyDeletions or KeepLocalFiles.
+            // cursor, letting the person choose ApplyDeletions or KeepLocalFiles once for the full
+            // pending batch.
             if self.deletion_brake.is_enabled() && !delete_records.is_empty() {
                 let window_secs = self.deletion_brake.window_secs as i64;
                 cursor
@@ -1489,7 +1713,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         current_live_files + cursor.inbound_binned_in_window.len();
                 }
 
-                let live_create_hashes: BTreeSet<Hash> = live_non_dir_records
+                let mut live_create_hashes: BTreeSet<Hash> = live_non_dir_records
                     .iter()
                     .filter(|r| !r.deleted && r.kind == EntryKind::File)
                     .filter_map(|r| r.hash)
@@ -1499,7 +1723,9 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 let view = StoreIndexView::new(&self.store);
                 let mut candidate_tombstones: Vec<IndexRecord> = Vec::new();
                 for remote in &delete_records {
-                    if remote.seq <= cursor.allow_inbound_mass_deletion_until_seq {
+                    if remote.seq <= cursor.allow_inbound_mass_deletion_until_seq
+                        || remote.seq <= cursor.keep_local_files_until_seq
+                    {
                         continue;
                     }
                     let Some(local) = view.get_record(&remote.path) else {
@@ -1519,12 +1745,12 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     }
                 }
 
-                let mut distinct_inbound_deletes: BTreeSet<&str> = BTreeSet::new();
+                let mut distinct_inbound_deletes: BTreeSet<String> = BTreeSet::new();
                 for (p, _) in &cursor.inbound_binned_in_window {
-                    distinct_inbound_deletes.insert(p.as_str());
+                    distinct_inbound_deletes.insert(p.clone());
                 }
                 for tomb in &candidate_tombstones {
-                    distinct_inbound_deletes.insert(tomb.path.as_str());
+                    distinct_inbound_deletes.insert(tomb.path.clone());
                 }
                 let inbound_baseline = cursor
                     .inbound_window_start_live_files
@@ -1534,12 +1760,105 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         .deletion_brake
                         .should_trip(distinct_inbound_deletes.len(), inbound_baseline)
                 {
-                    let deleted_count = distinct_inbound_deletes.len();
-                    let max_blocked_seq = candidate_tombstones
+                    // Count ahead read-only through all remaining pending pages of this peer so
+                    // the person sees the full deletion count and confirms ONCE per batch.
+                    let mut max_blocked_seq = candidate_tombstones
                         .iter()
                         .map(|r| r.seq)
                         .max()
                         .unwrap_or(page.snapshot_seq);
+                    if page.has_more {
+                        let mut scan_seq = delete_records
+                            .iter()
+                            .chain(live_dir_records.iter())
+                            .chain(live_non_dir_records.iter())
+                            .map(|r| r.seq)
+                            .max()
+                            .unwrap_or(since_seq);
+                        let mut more = true;
+                        let mut pages_peeked = 0usize;
+                        const MAX_BRAKE_LOOKAHEAD_PAGES: usize = 256;
+                        while more && pages_peeked < MAX_BRAKE_LOOKAHEAD_PAGES {
+                            if cancel_ref.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                                break;
+                            }
+                            pages_peeked += 1;
+                            let Ok(next_page) = peer.records_since(
+                                page_incarnation,
+                                scan_seq,
+                                MAX_PAGE_RECORDS,
+                                cancel_ref,
+                            ) else {
+                                break;
+                            };
+                            if next_page.incarnation != page_incarnation
+                                || next_page.records.is_empty()
+                            {
+                                break;
+                            }
+                            let mut page_max_seq = scan_seq;
+                            for r in &next_page.records {
+                                page_max_seq = page_max_seq.max(r.seq);
+                                if !r.deleted
+                                    && r.kind == EntryKind::File
+                                    && let Some(h) = r.hash
+                                {
+                                    live_create_hashes.insert(h);
+                                }
+                            }
+                            for r in &next_page.records {
+                                if !r.deleted
+                                    || r.seq <= cursor.allow_inbound_mass_deletion_until_seq
+                                    || r.seq <= cursor.keep_local_files_until_seq
+                                {
+                                    continue;
+                                }
+                                let Some(local) = view.get_record(&r.path) else {
+                                    continue;
+                                };
+                                if local.deleted || local.kind != EntryKind::File {
+                                    continue;
+                                }
+                                if local.hash.is_some_and(|h| live_create_hashes.contains(&h)) {
+                                    continue;
+                                }
+                                if matches!(
+                                    reconcile_record(
+                                        &view,
+                                        r,
+                                        &peer_id,
+                                        &cur_meta,
+                                        &caps,
+                                        &self.ignore
+                                    ),
+                                    ReconcileDecision::DeleteToBin { .. }
+                                ) {
+                                    max_blocked_seq = max_blocked_seq.max(r.seq);
+                                    candidate_tombstones.push(r.clone());
+                                }
+                            }
+                            if page_max_seq <= scan_seq {
+                                break;
+                            }
+                            scan_seq = page_max_seq;
+                            more = next_page.has_more;
+                        }
+                        // Re-filter against any live creates discovered on subsequent pages.
+                        candidate_tombstones.retain(|tomb| {
+                            view.get_record(&tomb.path)
+                                .and_then(|l| l.hash)
+                                .is_none_or(|h| !live_create_hashes.contains(&h))
+                        });
+                        distinct_inbound_deletes.clear();
+                        for (p, _) in &cursor.inbound_binned_in_window {
+                            distinct_inbound_deletes.insert(p.clone());
+                        }
+                        for tomb in &candidate_tombstones {
+                            distinct_inbound_deletes.insert(tomb.path.clone());
+                        }
+                    }
+
+                    let deleted_count = distinct_inbound_deletes.len();
                     let sample_paths: Vec<String> = candidate_tombstones
                         .iter()
                         .take(10)
@@ -1547,10 +1866,13 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         .collect();
                     let blocked_paths: Vec<String> = candidate_tombstones
                         .iter()
+                        .take(4096)
                         .map(|r| r.path.clone())
                         .collect();
+                    let blocked_tombstones: Vec<IndexRecord> =
+                        candidate_tombstones.into_iter().take(4096).collect();
                     let sentence = format!(
-                        "Paused syncing from '{peer_id}' because its changes would delete {deleted_count} of {inbound_baseline} files; choose whether to apply the deletions or keep this machine's files."
+                        "Paused syncing from '{peer_id}' because '{peer_id}' wants to remove {deleted_count} of {inbound_baseline} files here; choose whether to apply the deletions or keep this machine's files."
                     );
                     cursor.inbound_brake = Some(InboundDeletionBrake {
                         peer: peer_id.clone(),
@@ -1559,7 +1881,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         max_blocked_seq,
                         sample_paths,
                         blocked_paths,
-                        blocked_tombstones: candidate_tombstones,
+                        blocked_tombstones,
                     });
                     let mut batch = StoreBatch::default();
                     batch.set_peer_cursors.insert(peer_id.clone(), cursor);
@@ -1599,6 +1921,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             let mut deferred_files = 0u64;
             let mut deferred_bytes = 0u64;
 
+            let keep_local_until_seq = cursor.keep_local_files_until_seq;
             for (del_raw, del_tomb, add_raw, add_target) in rename_pairs {
                 let del_seq = del_raw.seq;
                 let add_seq = add_raw.seq;
@@ -1618,18 +1941,22 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         self.clear_deferred(&peer_id, &del_raw.path)?;
                         self.clear_deferred(&peer_id, &add_raw.path)?;
                     }
-                    ApplyOutcome::LocalChangedRetry | ApplyOutcome::Deferred { .. } => {
+                    ApplyOutcome::LocalChangedRetry
+                    | ApplyOutcome::Deferred { .. }
+                    | ApplyOutcome::HoldBackLocal(_) => {
                         let ok1 = self.process_one_remote(
                             peer,
                             &del_raw,
                             page_incarnation,
                             prev_chain_fp_for(del_seq, &chain_fps, &cursor),
+                            keep_local_until_seq,
                             fetch_opts,
                             now,
                             &mut report,
                             &mut page_held_back,
                             &mut existing_held_by_key,
                             &mut known_held_keys,
+                            &mut newly_held_back_this_pull,
                             &mut held_back_full,
                         )?;
                         seq_results.insert(del_seq, ok1);
@@ -1642,12 +1969,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                             &add_raw,
                             page_incarnation,
                             prev_chain_fp_for(add_seq, &chain_fps, &cursor),
+                            keep_local_until_seq,
                             fetch_opts,
                             now,
                             &mut report,
                             &mut page_held_back,
                             &mut existing_held_by_key,
                             &mut known_held_keys,
+                            &mut newly_held_back_this_pull,
                             &mut held_back_full,
                         )?;
                         seq_results.insert(add_seq, ok2);
@@ -1678,6 +2007,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     let remote_seq = remote.seq;
                     let was_live_file = self.deletion_brake.is_enabled()
                         && remote_seq > cursor.allow_inbound_mass_deletion_until_seq
+                        && remote_seq > keep_local_until_seq
                         && self
                             .store
                             .get_record(&remote.path)?
@@ -1687,12 +2017,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         &remote,
                         page_incarnation,
                         prev_chain_fp_for(remote_seq, &chain_fps, &cursor),
+                        keep_local_until_seq,
                         fetch_opts,
                         now,
                         &mut report,
                         &mut page_held_back,
                         &mut existing_held_by_key,
                         &mut known_held_keys,
+                        &mut newly_held_back_this_pull,
                         &mut held_back_full,
                     )?;
                     if was_live_file
@@ -1741,12 +2073,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         &remote,
                         page_incarnation,
                         prev_chain_fp_for(remote_seq, &chain_fps, &cursor),
+                        keep_local_until_seq,
                         fetch_opts,
                         now,
                         &mut report,
                         &mut page_held_back,
                         &mut existing_held_by_key,
                         &mut known_held_keys,
+                        &mut newly_held_back_this_pull,
                         &mut held_back_full,
                     )?;
                     seq_results.insert(remote_seq, completed);
@@ -1878,30 +2212,65 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         })?;
                     }
                 }
-                for (seq, path, reason) in batch_res.deferred {
+                for (seq, path, problem) in batch_res.held_back_local {
                     if let Some(raw) = batch_raw_by_seq.get(&seq) {
-                        let completed = self.record_deferral(
+                        if !self.queue_held_back_bounded(
                             &peer_id,
-                            raw,
+                            raw.for_wire(),
                             page_incarnation,
+                            seq,
                             prev_chain_fp_for(seq, &chain_fps, &cursor),
-                            reason,
-                            &mut report,
+                            problem,
+                            false,
                             &mut page_held_back,
                             &mut existing_held_by_key,
                             &mut known_held_keys,
-                            &mut held_back_full,
-                        )?;
-                        seq_results.insert(seq, completed);
-                        if !completed {
+                        )? {
+                            held_back_full = true;
+                            seq_results.insert(seq, false);
                             any_deferred = true;
                             deferred_files += 1;
+                            break;
                         }
+                        newly_held_back_this_pull.insert(path);
+                        report.held_back += 1;
+                        self.clear_deferred(&peer_id, &raw.path)?;
+                        seq_results.insert(seq, true);
                     } else {
                         seq_results.insert(seq, false);
                         any_deferred = true;
                         deferred_files += 1;
-                        let _ = path;
+                    }
+                }
+                if !held_back_full {
+                    for (seq, path, reason) in batch_res.deferred {
+                        if let Some(raw) = batch_raw_by_seq.get(&seq) {
+                            let completed = self.record_deferral(
+                                &peer_id,
+                                raw,
+                                page_incarnation,
+                                prev_chain_fp_for(seq, &chain_fps, &cursor),
+                                reason,
+                                &mut report,
+                                &mut page_held_back,
+                                &mut existing_held_by_key,
+                                &mut known_held_keys,
+                                &mut held_back_full,
+                            )?;
+                            seq_results.insert(seq, completed);
+                            if !completed {
+                                any_deferred = true;
+                                deferred_files += 1;
+                            }
+                            if held_back_full {
+                                break;
+                            }
+                        } else {
+                            seq_results.insert(seq, false);
+                            any_deferred = true;
+                            deferred_files += 1;
+                            let _ = path;
+                        }
                     }
                 }
                 if !held_back_full {
@@ -1912,12 +2281,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                             &fallback,
                             page_incarnation,
                             prev_chain_fp_for(remote_seq, &chain_fps, &cursor),
+                            keep_local_until_seq,
                             fetch_opts,
                             now,
                             &mut report,
                             &mut page_held_back,
                             &mut existing_held_by_key,
                             &mut known_held_keys,
+                            &mut newly_held_back_this_pull,
                             &mut held_back_full,
                         )?;
                         seq_results.insert(remote_seq, completed);
@@ -1959,12 +2330,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         &remote,
                         page_incarnation,
                         prev_chain_fp_for(remote_seq, &chain_fps, &cursor),
+                        keep_local_until_seq,
                         fetch_opts,
                         now,
                         &mut report,
                         &mut page_held_back,
                         &mut existing_held_by_key,
                         &mut known_held_keys,
+                        &mut newly_held_back_this_pull,
                         &mut held_back_full,
                     )?;
                     seq_results.insert(remote_seq, completed);
@@ -2041,7 +2414,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             }
         }
 
-        report.held_back_resolved += self.retry_held_back_for_peer(peer, fetch_opts, now)?;
+        report.held_back_resolved +=
+            self.retry_held_back_for_peer(peer, fetch_opts, &newly_held_back_this_pull, now)?;
         Ok(report)
     }
 
@@ -2067,6 +2441,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             ),
             None => (None, None),
         };
+        let all_cursors = self.store.load_peer_cursors()?;
         let hello = HandshakeHello {
             folder_id: meta.folder_id.clone(),
             member_id: meta.local_member.clone(),
@@ -2076,6 +2451,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             protocol_version: SYNC_PROTOCOL_VERSION,
             peer_pulled,
             peer_acked,
+            peer_rejoining: meta.rejoining_peers.contains(peer_id),
+            refused_from_peer: self.refusal_summary_for_peer(peer_id)?,
+            pruned_incarnations: meta.pruned_incarnations.iter().cloned().collect(),
+            known_incarnations: local_known_incarnations(meta, &all_cursors),
         };
         let hs = match peer.handshake(&hello) {
             Ok(hs) => {
@@ -2214,12 +2593,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         remote: &IndexRecord,
         peer_incarnation: u64,
         prev_chain_fp: Option<Hash>,
+        keep_local_files_until_seq: u64,
         fetch_opts: &FetchOptions,
         now: Timestamp,
         report: &mut PullReport,
         page_held_back: &mut BTreeMap<(MemberId, String), HeldBackRecord>,
         existing_held_by_key: &mut BTreeMap<(MemberId, String), HeldBackRecord>,
         known_held_keys: &mut BTreeSet<(MemberId, String)>,
+        newly_held_back_this_pull: &mut BTreeSet<String>,
         held_back_full: &mut bool,
     ) -> Result<bool> {
         let caps = self.fs.capabilities();
@@ -2258,10 +2639,29 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
         for _attempt in 0..MAX_LOCAL_CHANGE_RETRIES {
             let cur_meta = self.meta()?;
-            let decision = {
+            let mut decision = {
                 let view = StoreIndexView::new(&self.store);
                 reconcile_record(&view, remote, &peer_id, &cur_meta, &caps, &self.ignore)
             };
+            if remote.seq <= keep_local_files_until_seq
+                && let ReconcileDecision::DeleteToBin {
+                    tombstone,
+                    bin_reason,
+                } = decision
+            {
+                if let Some(mut local) = self.store.get_record(&tombstone.path)?
+                    && !local.deleted
+                {
+                    local.version.merge_in_place(&tombstone.version);
+                    local.from_join = false;
+                    decision = ReconcileDecision::KeepAndSupersede { record: local };
+                } else {
+                    decision = ReconcileDecision::DeleteToBin {
+                        tombstone,
+                        bin_reason,
+                    };
+                }
+            }
 
             match decision {
                 ReconcileDecision::RejectInvalid { path, reason } => {
@@ -2425,6 +2825,27 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                                 held_back_full,
                             );
                         }
+                        ApplyOutcome::HoldBackLocal(problem) => {
+                            if !self.queue_held_back_bounded(
+                                &peer_id,
+                                remote.for_wire(),
+                                peer_incarnation,
+                                remote.seq,
+                                prev_chain_fp,
+                                problem,
+                                false,
+                                page_held_back,
+                                existing_held_by_key,
+                                known_held_keys,
+                            )? {
+                                *held_back_full = true;
+                                return Ok(false);
+                            }
+                            newly_held_back_this_pull.insert(remote.path.clone());
+                            report.held_back += 1;
+                            self.clear_deferred(&peer_id, &remote.path)?;
+                            return Ok(true);
+                        }
                     }
                 }
             }
@@ -2545,9 +2966,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     ) -> Result<bool> {
         let key = (peer_id.to_string(), record.path.clone());
         let already_present = known_held_keys.contains(&key);
-        if !already_present && known_held_keys.len() >= MAX_HELD_BACK_ENTRIES {
-            // Item 4: NEVER drop a held-back record; stop pulling from this peer with a visible
-            // durable problem instead!
+        let peer_held_count = known_held_keys.iter().filter(|(p, _)| p == peer_id).count();
+        if !already_present && peer_held_count >= MAX_HELD_BACK_ENTRIES {
+            // Item 4: per-peer held-back limit; NEVER drop a held-back record, and stop pulling
+            // only from this peer with a visible durable problem naming it!
             self.record_peer_problem(
                 peer_id,
                 SyncProblem {
@@ -2555,7 +2977,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     kind: ProblemKind::HeldBackLimitReached,
                     peer: Some(peer_id.to_string()),
                     sentence: format!(
-                        "Stopped pulling from '{peer_id}' because the unapplied problem list reached its limit of {MAX_HELD_BACK_ENTRIES} entries; resolve existing problems to continue."
+                        "Stopped pulling from '{peer_id}' because the unapplied problem list for '{peer_id}' reached its limit of {MAX_HELD_BACK_ENTRIES} entries; resolve existing problems to continue."
                     ),
                 },
             )?;
@@ -2669,9 +3091,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     let peer_stub = LocalOnlyPeer(&item.from_peer);
                     let fetch_opts = FetchOptions::default();
                     let effective_now = now.max(item.record.mtime);
-                    if let Ok(
-                        outcome @ (ApplyOutcome::Applied | ApplyOutcome::DirKeptLocalFiles(_)),
-                    ) = apply_decision(
+                    match apply_decision(
                         &self.fs,
                         &mut self.store,
                         &peer_stub,
@@ -2680,15 +3100,32 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         &fetch_opts,
                         effective_now,
                     ) {
-                        if let ApplyOutcome::DirKeptLocalFiles(prob) = outcome {
-                            self.store.apply_batch(StoreBatch {
-                                upsert_problems: vec![(dir_kept_problem_key(&prob.path), prob)],
-                                ..StoreBatch::default()
-                            })?;
+                        Ok(
+                            outcome @ (ApplyOutcome::Applied | ApplyOutcome::DirKeptLocalFiles(_)),
+                        ) => {
+                            if let ApplyOutcome::DirKeptLocalFiles(prob) = outcome {
+                                self.store.apply_batch(StoreBatch {
+                                    upsert_problems: vec![(dir_kept_problem_key(&prob.path), prob)],
+                                    ..StoreBatch::default()
+                                })?;
+                            }
+                            self.clear_held_back_if_present(&item.from_peer, &item.record.path)?;
+                            touched_peers.insert(item.from_peer);
+                            resolved += 1;
                         }
-                        self.clear_held_back_if_present(&item.from_peer, &item.record.path)?;
-                        touched_peers.insert(item.from_peer);
-                        resolved += 1;
+                        Err(err)
+                            if err.is_crash()
+                                || matches!(
+                                    err,
+                                    SyncError::Storage { .. }
+                                        | SyncError::IndexDamaged { .. }
+                                        | SyncError::FolderUnavailable { .. }
+                                        | SyncError::Cancelled { .. }
+                                ) =>
+                        {
+                            return Err(err);
+                        }
+                        Ok(_) | Err(_) => {}
                     }
                 }
                 ReconcileDecision::Fetch { .. }
@@ -2709,6 +3146,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         &mut self,
         peer: &dyn Peer,
         fetch_opts: &FetchOptions,
+        skip_paths: &BTreeSet<String>,
         now: Timestamp,
     ) -> Result<usize> {
         if self.store.held_back_count()? == 0 {
@@ -2719,8 +3157,11 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         let mut resolved = 0usize;
         let caps = self.fs.capabilities();
 
-        for item in held {
+        for mut item in held {
             if item.from_peer != peer_id {
+                continue;
+            }
+            if skip_paths.contains(&item.record.path) {
                 continue;
             }
             if self.is_blocked_by_skipped(&item.record.path) {
@@ -2747,9 +3188,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     resolved += 1;
                 }
                 other => {
-                    if let Ok(
-                        outcome @ (ApplyOutcome::Applied | ApplyOutcome::DirKeptLocalFiles(_)),
-                    ) = apply_decision(
+                    match apply_decision(
                         &self.fs,
                         &mut self.store,
                         peer,
@@ -2758,14 +3197,41 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         fetch_opts,
                         now,
                     ) {
-                        if let ApplyOutcome::DirKeptLocalFiles(prob) = outcome {
-                            self.store.apply_batch(StoreBatch {
-                                upsert_problems: vec![(dir_kept_problem_key(&prob.path), prob)],
-                                ..StoreBatch::default()
-                            })?;
+                        Ok(
+                            outcome @ (ApplyOutcome::Applied | ApplyOutcome::DirKeptLocalFiles(_)),
+                        ) => {
+                            if let ApplyOutcome::DirKeptLocalFiles(prob) = outcome {
+                                self.store.apply_batch(StoreBatch {
+                                    upsert_problems: vec![(dir_kept_problem_key(&prob.path), prob)],
+                                    ..StoreBatch::default()
+                                })?;
+                            }
+                            self.clear_held_back_if_present(&peer_id, &item.record.path)?;
+                            resolved += 1;
                         }
-                        self.clear_held_back_if_present(&peer_id, &item.record.path)?;
-                        resolved += 1;
+                        Ok(ApplyOutcome::HoldBackLocal(updated_prob)) => {
+                            if item.problem != updated_prob {
+                                item.problem = updated_prob;
+                                self.store.apply_batch(StoreBatch {
+                                    upsert_held_back: vec![item],
+                                    ..StoreBatch::default()
+                                })?;
+                            }
+                        }
+                        Ok(ApplyOutcome::LocalChangedRetry | ApplyOutcome::Deferred { .. }) => {}
+                        Err(err)
+                            if err.is_crash()
+                                || matches!(
+                                    err,
+                                    SyncError::Storage { .. }
+                                        | SyncError::IndexDamaged { .. }
+                                        | SyncError::FolderUnavailable { .. }
+                                        | SyncError::Cancelled { .. }
+                                ) =>
+                        {
+                            return Err(err);
+                        }
+                        Err(_) => {}
                     }
                 }
             }
@@ -2791,7 +3257,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     batch.set_peer_cursors.insert(peer_id.clone(), c);
                 }
             }
-            if held.len() < MAX_HELD_BACK_ENTRIES {
+            let peer_held = held.iter().filter(|h| h.from_peer == *peer_id).count();
+            if peer_held < MAX_HELD_BACK_ENTRIES {
                 batch.remove_problems.push(peer_problem_key(
                     peer_id,
                     ProblemKind::HeldBackLimitReached,
@@ -2889,9 +3356,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             });
         }
 
-        // Legitimate new incarnation (reinstall or rollback recovery): remember the old
-        // incarnation, reset pull & applied-ack positions to 0, and clear stale unapplied records
-        // from the old incarnation since we will pull the new incarnation from sequence 0.
+        // Legitimate new incarnation (reinstall or rollback recovery): a new incarnation of a peer
+        // is a new peer for every purpose. Retire everything remembered from its previous life at
+        // once, including its acknowledgements of us (so stale acks never count toward tombstone
+        // GC and an honest "no position yet" is never read as a regression).
         let old_inc = cursor.incarnation;
         if !cursor.prior_incarnations.contains(&old_inc) {
             cursor.prior_incarnations.push(old_inc);
@@ -2902,13 +3370,18 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         cursor.incarnation = new_inc;
         cursor.seq = 0;
         cursor.applied_ack_seq = 0;
+        cursor.acked_local_incarnation = 0;
+        cursor.acked_local_seq = 0;
         cursor.head_fingerprint = None;
         cursor.acked_fingerprint = None;
+        cursor.duplicate_detected = false;
         cursor.inbound_window_start = None;
         cursor.inbound_window_start_live_files = 0;
         cursor.inbound_binned_in_window.clear();
         cursor.inbound_brake = None;
         cursor.allow_inbound_mass_deletion_until_seq = 0;
+        cursor.keep_local_files_until_seq = 0;
+        cursor.peer_known_incarnations.clear();
 
         let remove_held_back: Vec<(MemberId, String)> = self
             .store
@@ -2932,6 +3405,9 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 peer_problem_key(peer_id, ProblemKind::DuplicateMemberId, ""),
                 peer_problem_key(peer_id, ProblemKind::HeldBackLimitReached, ""),
                 peer_problem_key(peer_id, ProblemKind::InboundDeletionBrakeTripped, ""),
+                peer_problem_key(peer_id, ProblemKind::PeerRollbackRateLimited, ""),
+                peer_problem_key(peer_id, ProblemKind::PeerRefusedRecords, ""),
+                peer_problem_key(peer_id, ProblemKind::InvalidPeerRecord, ""),
             ],
             ..StoreBatch::default()
         };
@@ -2939,6 +3415,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             .set_peer_cursors
             .insert(peer_id.to_string(), cursor.clone());
         self.store.apply_batch(batch)?;
+        if let Ok(mut refusals) = self.peer_refusals_from_serve.lock() {
+            refusals.remove(peer_id);
+        }
+        self.may_have_retired_vv_keys = true;
         Ok(cursor)
     }
 
@@ -2968,24 +3448,38 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     }
 
     /// Recovers when a peer's handshake or page shows our own index went back in time (backup
-    /// restore or clone): rate-limited to at most once per hour per peer, rotates to a fresh
-    /// incarnation, carries every pending tombstone + `.legion-sync/deletions.log`, runs a join
-    /// scan over disk so post-restore changes meet peers as two versions rather than silently
-    /// replacing them, and reports the forced rotation.
+    /// restore or clone): rate-limited to at most once per day per peer and three times per week
+    /// in total, rotates to a fresh incarnation, carries every pending tombstone + held deletion +
+    /// `.legion-sync/deletions.log`, runs a join scan over disk so post-restore changes meet peers
+    /// as two versions rather than silently replacing them, and reports the forced rotation.
     fn recover_own_rollback(
         &mut self,
         peer_id: &str,
         meta: &FolderMeta,
         now: Timestamp,
     ) -> Result<()> {
-        // Item 9: allow peer-forced rotation at most once an hour per peer and report it.
-        if let Some(&prev_ts) = meta.last_forced_rotation_by_peer.get(peer_id)
-            && now.secs >= prev_ts.secs
-            && (now.secs - prev_ts.secs) < FORCED_ROTATION_COOLDOWN_SECS as i64
-        {
-            let sentence = format!(
-                "Peer '{peer_id}' repeatedly claimed this folder's sync history went back in time; rotation is limited to once per hour."
-            );
+        let recent_history: Vec<(MemberId, Timestamp)> = meta
+            .forced_rotation_history
+            .iter()
+            .filter(|(_, ts)| {
+                now.secs >= ts.secs
+                    && (now.secs - ts.secs) < FORCED_ROTATION_WEEK_WINDOW_SECS as i64
+            })
+            .cloned()
+            .collect();
+        let peer_within_day = recent_history.iter().any(|(p, ts)| {
+            p == peer_id && (now.secs - ts.secs) < FORCED_ROTATION_COOLDOWN_SECS as i64
+        }) || meta.last_forced_rotation_by_peer.get(peer_id).is_some_and(
+            |&prev_ts| {
+                now.secs >= prev_ts.secs
+                    && (now.secs - prev_ts.secs) < FORCED_ROTATION_COOLDOWN_SECS as i64
+            },
+        );
+        let week_limit_reached = recent_history.len() >= MAX_FORCED_ROTATIONS_PER_WEEK;
+
+        if peer_within_day || week_limit_reached {
+            let sentence =
+                format!("{peer_id} keeps reporting that this machine's history went back.");
             self.record_peer_problem(
                 peer_id,
                 SyncProblem {
@@ -3001,7 +3495,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             });
         }
 
-        // Item 6(a) + 6(b): collect EVERY pending tombstone from the store AND `.legion-sync/deletions.log`
+        // Collect EVERY pending tombstone, held deletion, and `.legion-sync/deletions.log` entry
         // before resetting so NO deletion is ever dropped across rotation.
         let carried_deletions = collect_deletions_for_rotation(&self.fs, &self.store)?;
 
@@ -3022,9 +3516,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         new_meta.local_clock = 0;
         new_meta.join_mode = true;
         new_meta.head_fingerprint = None;
+        new_meta.pending_deletions.clear();
         new_meta
             .last_forced_rotation_by_peer
             .insert(peer_id.to_string(), now);
+        new_meta.forced_rotation_history = recent_history;
+        new_meta
+            .forced_rotation_history
+            .push((peer_id.to_string(), now));
 
         let reset_batch = StoreBatch {
             folder_meta: Some(new_meta),
@@ -3158,12 +3657,328 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         };
         self.store.apply_batch(batch)?;
 
-        // Item 6(b): compact `.legion-sync/deletions.log` under the exact same forgetting rule!
+        // Item 6(b): compact `.legion-sync/deletions.log` under the exact same forgetting rule
+        // (preserving any active held pending deletions so rebuilds never forget them).
         if removed > 0 {
             let remaining = self.store.list_tombstones()?;
-            compact_deletion_log_from_tombstones(&self.fs, &remaining)?;
+            let fresh_meta = self.meta()?;
+            compact_deletion_log_from_tombstones(
+                &self.fs,
+                &remaining,
+                &fresh_meta.pending_deletions,
+                &fresh_meta.local_member,
+            )?;
         }
+
+        let _ = self.prune_retired_incarnations_inner()?;
         Ok(removed)
+    }
+
+    fn sync_peer_handshake_problems(
+        &mut self,
+        peer_id: &str,
+        refused_from_caller: Option<&PeerRefusalSummary>,
+    ) -> Result<()> {
+        let existing = self.store.list_problems()?;
+        let rate_key = peer_problem_key(peer_id, ProblemKind::PeerRollbackRateLimited, "");
+        let refused_key = peer_problem_key(peer_id, ProblemKind::PeerRefusedRecords, "");
+        let mut batch = StoreBatch::default();
+
+        if existing.iter().any(|(k, _)| k == &rate_key) {
+            batch.remove_problems.push(rate_key);
+        }
+        match refused_from_caller {
+            Some(summary) => {
+                let prob = peer_refused_problem(peer_id, summary);
+                let unchanged = existing
+                    .iter()
+                    .any(|(k, p)| k == &refused_key && p == &prob);
+                if !unchanged {
+                    batch.upsert_problems.push((refused_key, prob));
+                }
+                if let Ok(mut map) = self.peer_refusals_from_serve.lock() {
+                    map.insert(peer_id.to_string(), summary.clone());
+                }
+            }
+            None => {
+                if existing.iter().any(|(k, _)| k == &refused_key) {
+                    batch.remove_problems.push(refused_key);
+                }
+                if let Ok(mut map) = self.peer_refusals_from_serve.lock() {
+                    map.remove(peer_id);
+                }
+            }
+        }
+        if !batch.is_empty() {
+            self.store.apply_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    fn refusal_summary_for_peer(&self, peer_id: &str) -> Result<Option<PeerRefusalSummary>> {
+        if self.store.held_back_count()? > 0 {
+            let held = self.store.list_held_back()?;
+            let mut count = 0usize;
+            let mut sample_path = String::new();
+            let mut reason = String::new();
+            for h in &held {
+                if h.from_peer == peer_id {
+                    if count == 0 {
+                        sample_path = h.record.path.clone();
+                        reason = h.problem.sentence.clone();
+                    }
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                return Ok(Some(PeerRefusalSummary {
+                    count,
+                    sample_path,
+                    reason,
+                }));
+            }
+        }
+        let problems = self.store.list_problems()?;
+        for (_, p) in problems {
+            if p.peer.as_deref() == Some(peer_id)
+                && matches!(
+                    p.kind,
+                    ProblemKind::InvalidPeerRecord | ProblemKind::HeldBackLimitReached
+                )
+            {
+                return Ok(Some(PeerRefusalSummary {
+                    count: 1,
+                    sample_path: p.path,
+                    reason: p.sentence,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Deterministically prunes retired `(member, incarnation)` keys from stored version vectors
+    /// once every other current member has directly acknowledged applied state past every local
+    /// record mentioning that key and every member has moved past that incarnation.
+    fn prune_retired_incarnations_inner(&mut self) -> Result<usize> {
+        if !self.may_have_retired_vv_keys {
+            return Ok(0);
+        }
+        let mut meta = self.meta()?;
+        if meta.pruned_incarnations.len() >= MAX_PRUNED_INCARNATIONS {
+            return Ok(0);
+        }
+        let cursors = self.store.load_peer_cursors()?;
+        let other_members: Vec<&MemberId> = meta
+            .members
+            .iter()
+            .filter(|m| *m != &meta.local_member)
+            .collect();
+        let min_direct_ack = if other_members.is_empty() {
+            meta.local_seq
+        } else {
+            let mut floor = u64::MAX;
+            for member in &other_members {
+                match cursors.get(*member) {
+                    Some(c) if c.acked_local_incarnation == meta.incarnation => {
+                        floor = floor.min(c.acked_local_seq);
+                    }
+                    _ => {
+                        floor = 0;
+                        break;
+                    }
+                }
+            }
+            floor
+        };
+        if min_direct_ack == 0 {
+            return Ok(0);
+        }
+
+        let own_key = meta.version_key();
+        let mut max_seq_by_key: BTreeMap<VersionKey, u64> = BTreeMap::new();
+        let mut any_non_active = false;
+        self.store.scan_records_in_order(&mut |rec| {
+            for (k, _) in rec.version.iter() {
+                if !meta.pruned_incarnations.contains(k) {
+                    let is_active = *k == own_key
+                        || (meta.members.contains(&k.member)
+                            && cursors
+                                .get(&k.member)
+                                .is_some_and(|c| c.incarnation == k.incarnation));
+                    if !is_active {
+                        any_non_active = true;
+                    }
+                    max_seq_by_key
+                        .entry(k.clone())
+                        .and_modify(|s| *s = (*s).max(rec.seq))
+                        .or_insert(rec.seq);
+                }
+            }
+            Ok(true)
+        })?;
+        if !any_non_active {
+            self.may_have_retired_vv_keys = false;
+            return Ok(0);
+        }
+
+        let mut candidates = BTreeSet::new();
+        for (k, max_seq) in max_seq_by_key {
+            if k == own_key || max_seq > min_direct_ack {
+                continue;
+            }
+            let globally_retired = if !meta.members.contains(&k.member) {
+                true
+            } else if k.member == meta.local_member {
+                // `min_direct_ack > 0` guarantees every active member already acked our current
+                // incarnation and moved past `k`.
+                true
+            } else {
+                let directly_moved = cursors
+                    .get(&k.member)
+                    .is_some_and(|c| c.incarnation != 0 && c.incarnation != k.incarnation);
+                let all_others_moved =
+                    other_members
+                        .iter()
+                        .filter(|m| **m != &k.member)
+                        .all(|other| {
+                            cursors.get(*other).is_some_and(|cy| {
+                                cy.peer_known_incarnations
+                                    .get(&k.member)
+                                    .is_some_and(|&inc| inc != k.incarnation)
+                            })
+                        });
+                directly_moved && all_others_moved
+            };
+            if globally_retired {
+                candidates.insert(k);
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut records = Vec::new();
+        self.store.scan_records_in_order(&mut |rec| {
+            records.push(rec);
+            Ok(true)
+        })?;
+        let mut trial_pruned = meta.pruned_incarnations.clone();
+        let mut newly_pruned = 0usize;
+        for k in candidates {
+            if trial_pruned.len() >= MAX_PRUNED_INCARNATIONS {
+                break;
+            }
+            trial_pruned.insert(k.clone());
+            let all_survive = records
+                .iter()
+                .all(|rec| rec.version.iter().any(|(rk, _)| !trial_pruned.contains(rk)));
+            if all_survive {
+                newly_pruned += 1;
+            } else {
+                trial_pruned.remove(&k);
+            }
+        }
+        if newly_pruned == 0 {
+            return Ok(0);
+        }
+
+        meta.pruned_incarnations = trial_pruned;
+        self.apply_pruned_incarnations(meta, records)?;
+        Ok(newly_pruned)
+    }
+
+    /// Adopts retired `(member, incarnation)` keys already pruned by `peer_id`, validating each
+    /// against our own active incarnation, directly observed peer incarnations, and non-empty
+    /// version-vector survival.
+    fn adopt_peer_pruned_incarnations(
+        &mut self,
+        peer_id: &str,
+        peer_pruned: &[VersionKey],
+    ) -> Result<usize> {
+        if peer_pruned.is_empty() {
+            return Ok(0);
+        }
+        let mut meta = self.meta()?;
+        if meta.pruned_incarnations.len() >= MAX_PRUNED_INCARNATIONS {
+            return Ok(0);
+        }
+        let cursors = self.store.load_peer_cursors()?;
+        let own_key = meta.version_key();
+        let mut candidates = BTreeSet::new();
+        for k in peer_pruned {
+            if k.incarnation == 0
+                || *k == own_key
+                || meta.pruned_incarnations.contains(k)
+                || !meta.is_known_member(&k.member)
+            {
+                continue;
+            }
+            let safe_retired = if !meta.members.contains(&k.member) || k.member == meta.local_member
+            {
+                true
+            } else {
+                cursors
+                    .get(&k.member)
+                    .is_some_and(|c| c.incarnation != 0 && c.incarnation != k.incarnation)
+            };
+            if safe_retired {
+                candidates.insert(k.clone());
+            }
+        }
+        let _ = peer_id;
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut records = Vec::new();
+        self.store.scan_records_in_order(&mut |rec| {
+            records.push(rec);
+            Ok(true)
+        })?;
+
+        let mut trial_pruned = meta.pruned_incarnations.clone();
+        let mut newly_pruned = 0usize;
+        for k in candidates {
+            if trial_pruned.len() >= MAX_PRUNED_INCARNATIONS {
+                break;
+            }
+            trial_pruned.insert(k.clone());
+            let all_survive = records
+                .iter()
+                .all(|rec| rec.version.iter().any(|(rk, _)| !trial_pruned.contains(rk)));
+            if all_survive {
+                newly_pruned += 1;
+            } else {
+                trial_pruned.remove(&k);
+            }
+        }
+        if newly_pruned == 0 {
+            return Ok(0);
+        }
+
+        meta.pruned_incarnations = trial_pruned;
+        self.apply_pruned_incarnations(meta, records)?;
+        Ok(newly_pruned)
+    }
+
+    fn apply_pruned_incarnations(
+        &mut self,
+        meta: FolderMeta,
+        records: Vec<IndexRecord>,
+    ) -> Result<()> {
+        let mut batch = StoreBatch::default();
+        for mut rec in records {
+            if rec.version.prune_in_place(&meta.pruned_incarnations) {
+                batch.upsert_records.push(rec);
+            }
+        }
+        for (path, mut vv) in self.store.list_deleted_history_versions()? {
+            if vv.prune_in_place(&meta.pruned_incarnations) {
+                batch.upsert_deleted_history_versions.push((path, vv));
+            }
+        }
+        batch.folder_meta = Some(meta);
+        self.store.apply_batch(batch)
     }
 
     /// Serves this member's bidirectional handshake identity to `caller_member`, checking
@@ -3185,6 +4000,16 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         caller: &HandshakeHello,
     ) -> Result<PeerHandshake> {
         let meta = self.check_serve_allowed(caller_member)?;
+        if let Ok(mut map) = self.peer_refusals_from_serve.lock() {
+            match &caller.refused_from_peer {
+                Some(summary) => {
+                    map.insert(caller_member.to_string(), summary.clone());
+                }
+                None => {
+                    map.remove(caller_member);
+                }
+            }
+        }
         let cursors = self.store.load_peer_cursors()?;
         let caller_cursor = cursors.get(caller_member);
         let (caller_pulled, caller_acked) = match caller_cursor.filter(|c| c.incarnation != 0) {
@@ -3207,7 +4032,17 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             .filter(|c| c.acked_local_incarnation == meta.incarnation)
             .map_or(0, |c| c.acked_local_seq);
         let caller_same_inc = caller_cursor.is_some_and(|c| c.incarnation == caller.incarnation);
-        if caller_same_inc && prev_acked_by_caller > 0 {
+        let caller_expected_rejoin = caller.peer_rejoining
+            && caller_cursor.is_some_and(|c| {
+                c.incarnation == caller.incarnation
+                    && caller.snapshot_seq >= c.seq
+                    && !(caller.snapshot_seq == c.seq
+                        && c.seq > 0
+                        && caller.head_fingerprint.is_some()
+                        && c.head_fingerprint.is_some()
+                        && caller.head_fingerprint != c.head_fingerprint)
+            });
+        if caller_same_inc && prev_acked_by_caller > 0 && !caller_expected_rejoin {
             let ack_regressed = match caller.peer_acked {
                 Some(ref v) if v.incarnation == meta.incarnation => v.seq < prev_acked_by_caller,
                 None => true,
@@ -3219,7 +4054,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
         let caller_pull_matches = match caller.peer_pulled {
             Some(ref view) if view.incarnation == meta.incarnation && view.seq > 0 => {
-                if caller_same_inc && view.seq < prev_acked_by_caller {
+                if caller_same_inc && view.seq < prev_acked_by_caller && !caller_expected_rejoin {
                     caller_regressed = true;
                     None
                 } else if meta.rejoining_peers.contains(caller_member)
@@ -3233,12 +4068,16 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             }
             Some(ref view) => Some(view_matches_local(&self.store, &meta, view)?),
             None => {
-                if caller_same_inc && prev_acked_by_caller > 0 {
+                if caller_same_inc && prev_acked_by_caller > 0 && !caller_expected_rejoin {
                     caller_regressed = true;
                 }
                 None
             }
         };
+        let caller_rejoining = meta.rejoining_peers.contains(caller_member);
+        let refused_from_caller = self.refusal_summary_for_peer(caller_member)?;
+        let pruned_incarnations = meta.pruned_incarnations.iter().cloned().collect();
+        let known_incarnations = local_known_incarnations(&meta, &cursors);
         Ok(PeerHandshake {
             folder_id: meta.folder_id,
             member_id: meta.local_member,
@@ -3250,6 +4089,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             caller_acked,
             caller_pull_matches,
             caller_regressed,
+            caller_rejoining,
+            refused_from_caller,
+            pruned_incarnations,
+            known_incarnations,
         })
     }
 
@@ -3274,7 +4117,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     }
 
     /// Serves a live file's bytes from byte `offset` to `caller_member` after checking membership,
-    /// folder marker integrity, path safety, non-ignored status, and expected hash.
+    /// folder marker integrity, path safety, non-ignored status, on-disk stat freshness, and
+    /// expected hash.
     pub fn serve_fetch_file_range(
         &self,
         caller_member: &str,
@@ -3313,7 +4157,53 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 });
             }
 
+            // Check live stat against index before serving so changed files trigger a rescan
+            // instead of streaming stale bytes.
+            if !disk_stat_matches_index(&e.fs, &clean, Some(&rec))? {
+                e.note_serve_hash_mismatch(&clean);
+                if e.fs.stat_live(&clean)?.is_none() {
+                    return Err(SyncError::NotFound {
+                        what: format!("live file {clean:?}"),
+                    });
+                }
+                return Err(SyncError::Conflict {
+                    path: clean,
+                    reason: "file changed on disk since last scan".to_string(),
+                });
+            }
+
             e.fs.open_live_read_at(&clean, offset)
+        })
+    }
+
+    /// Serves a live file's bytes from `offset`, rescanning `path` immediately if its on-disk size
+    /// or modification time differs from the index before refusing or serving.
+    pub fn serve_fetch_file_range_checked(
+        &mut self,
+        caller_member: &str,
+        path: &str,
+        expected_hash: Hash,
+        offset: u64,
+        now: Timestamp,
+    ) -> Result<Box<dyn Read + Send>> {
+        self.guard_mut("serve_fetch_file_range_checked", |e| {
+            let _meta = e.check_serve_allowed(caller_member)?;
+            let clean = validate_sync_path(path)?;
+            if is_internal_sync_path(&clean) || e.ignore.is_path_or_ancestor_ignored(&clean, false)
+            {
+                return Err(SyncError::Denied {
+                    member: caller_member.to_string(),
+                    reason: format!("'{clean}' is excluded from syncing"),
+                });
+            }
+            if let Some(rec) = e.store.get_record(&clean)?
+                && !rec.deleted
+                && rec.kind == EntryKind::File
+                && !disk_stat_matches_index(&e.fs, &clean, Some(&rec))?
+            {
+                let _ = e.scan_subtree_inner(&clean, now, ScanOptions::default())?;
+            }
+            e.serve_fetch_file_range(caller_member, &clean, expected_hash, offset)
         })
     }
 
@@ -3557,6 +4447,12 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         let conflicts = self.list_conflicts()?;
         let bin = self.list_bin()?;
 
+        let serve_refusals: BTreeMap<MemberId, PeerRefusalSummary> = self
+            .peer_refusals_from_serve
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+
         let mut all_problems: Vec<SyncProblem> = Vec::new();
         if let Some(ref fp) = self.folder_problem {
             all_problems.push(fp.clone());
@@ -3574,6 +4470,25 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
         all_problems.extend(stored_problems.iter().cloned());
         all_problems.extend(held.iter().map(|h| h.problem.clone()));
+        for (member, summary) in &serve_refusals {
+            if meta.members.contains(member)
+                && !all_problems.iter().any(|p| {
+                    p.kind == ProblemKind::PeerRefusedRecords
+                        && p.peer.as_deref() == Some(member.as_str())
+                })
+            {
+                all_problems.push(peer_refused_problem(member, summary));
+            }
+        }
+        for (member, err_prob) in &self.last_pull_errors {
+            if meta.members.contains(member)
+                && !all_problems
+                    .iter()
+                    .any(|p| p.peer.as_deref() == Some(member.as_str()))
+            {
+                all_problems.push(err_prob.clone());
+            }
+        }
         let mut inbound_brakes: Vec<InboundDeletionBrake> = Vec::new();
         for (member, c) in &cursors {
             if c.duplicate_detected
@@ -3600,7 +4515,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         kind: ProblemKind::InboundDeletionBrakeTripped,
                         peer: Some(member.clone()),
                         sentence: format!(
-                            "Paused syncing from '{member}' because its changes would delete {} of {} files; choose whether to apply the deletions or keep this machine's files.",
+                            "Paused syncing from '{member}' because '{member}' wants to remove {} of {} files here; choose whether to apply the deletions or keep this machine's files.",
                             ib.deleted_count, ib.total_live_files
                         ),
                     });
@@ -3616,8 +4531,21 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         });
         all_problems.dedup();
 
-        let total_files_left: u64 = self.active_progress.values().map(|p| p.files_left).sum();
+        let mut total_files_left: u64 = self.active_progress.values().map(|p| p.files_left).sum();
         let total_bytes_left: u64 = self.active_progress.values().map(|p| p.bytes_left).sum();
+        for member in &meta.members {
+            if member == &meta.local_member {
+                continue;
+            }
+            let has_active = self
+                .active_progress
+                .get(member)
+                .is_some_and(|p| p.files_left > 0 || p.bytes_left > 0);
+            if !has_active {
+                let def_count = deferred.iter().filter(|d| d.peer == *member).count() as u64;
+                total_files_left = total_files_left.saturating_add(def_count);
+            }
+        }
         let offline: Vec<MemberId> = self
             .unreachable_peers
             .iter()
@@ -3667,6 +4595,13 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     .filter(|p| p.peer.as_deref() == Some(member.as_str()))
                     .cloned(),
             );
+            if let Some(summary) = serve_refusals.get(member)
+                && !peer_problems
+                    .iter()
+                    .any(|p| p.kind == ProblemKind::PeerRefusedRecords)
+            {
+                peer_problems.push(peer_refused_problem(member, summary));
+            }
             if cursors.get(member).is_some_and(|c| c.duplicate_detected)
                 && !peer_problems
                     .iter()
@@ -3679,6 +4614,11 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     sentence: duplicate_member_sentence(member),
                 });
             }
+            if peer_problems.is_empty()
+                && let Some(err_prob) = self.last_pull_errors.get(member)
+            {
+                peer_problems.push(err_prob.clone());
+            }
             peer_problems.sort_by(|a, b| {
                 a.path
                     .cmp(&b.path)
@@ -3687,6 +4627,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             });
             peer_problems.dedup();
 
+            let peer_deferred_count = deferred.iter().filter(|d| d.peer == *member).count() as u64;
             let peer_state = if !peer_problems.is_empty() {
                 MemberState::Problem {
                     sentence: summarize_problems(&peer_problems),
@@ -3700,6 +4641,11 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 MemberState::Syncing {
                     files_left: prog.files_left,
                     bytes_left: prog.bytes_left,
+                }
+            } else if peer_deferred_count > 0 {
+                MemberState::Syncing {
+                    files_left: peer_deferred_count,
+                    bytes_left: 0,
                 }
             } else if self.unreachable_peers.contains(member) {
                 MemberState::WaitingForMember {
@@ -3886,11 +4832,43 @@ impl Peer for LocalOnlyPeer<'_> {
     }
 }
 
+fn pending_to_deletion_record(
+    pending: &crate::model::PendingLocalDeletion,
+    local_member: &str,
+) -> FolderDeletionRecord {
+    match FolderDeletionLogEntry::from_pending_deletion(pending, local_member) {
+        FolderDeletionLogEntry::Deleted {
+            path,
+            kind,
+            hashes,
+            version,
+            mtime,
+            modified_by,
+            held,
+        } => FolderDeletionRecord {
+            path,
+            kind,
+            hashes,
+            version,
+            mtime,
+            modified_by,
+            held,
+        },
+        FolderDeletionLogEntry::Revived { .. } => unreachable!(),
+    }
+}
+
 fn collect_deletions_for_rotation<F: SyncFs, S: IndexStore>(
     fs: &F,
     store: &S,
 ) -> Result<BTreeMap<String, FolderDeletionRecord>> {
     let mut map = parse_deletion_log(&fs.read_deletion_log()?);
+    if let Some(meta) = store.load_meta()? {
+        for pending in meta.pending_deletions.values() {
+            map.entry(pending.old_record.path.clone())
+                .or_insert_with(|| pending_to_deletion_record(pending, &meta.local_member));
+        }
+    }
     for tomb in store.list_tombstones()? {
         map.insert(
             tomb.path.clone(),
@@ -3901,6 +4879,7 @@ fn collect_deletions_for_rotation<F: SyncFs, S: IndexStore>(
                 version: tomb.version,
                 mtime: tomb.mtime,
                 modified_by: tomb.modified_by,
+                held: false,
             },
         );
     }
@@ -3930,13 +4909,25 @@ fn reissue_carried_deletions<F: SyncFs, S: IndexStore>(
             continue;
         }
         let mut version = rec.version;
+        version.prune_in_place(&meta.pruned_incarnations);
         meta.bump_version(&mut version);
         let seq = meta.next_seq();
         if !rec.hashes.is_empty() {
-            batch
-                .upsert_deleted_history
-                .push((path.clone(), rec.hashes.clone()));
+            let mut merged = store.get_deleted_history(&path)?;
+            for &h in &rec.hashes {
+                if !merged.contains(&h) {
+                    merged.push(h);
+                }
+            }
+            batch.upsert_deleted_history.push((path.clone(), merged));
         }
+        let mut hist_vv = store
+            .get_deleted_history_version(&path)?
+            .unwrap_or_default();
+        hist_vv.merge_in_place(&version);
+        batch
+            .upsert_deleted_history_versions
+            .push((path.clone(), hist_vv));
         let tomb = IndexRecord {
             path,
             kind: rec.kind,
@@ -3963,10 +4954,12 @@ fn reissue_carried_deletions<F: SyncFs, S: IndexStore>(
     }
 
     if !reissued_tombstones.is_empty() {
+        let pending = meta.pending_deletions.clone();
+        let local_member = meta.local_member.clone();
         batch.folder_meta = Some(meta);
         store.apply_batch(batch)?;
         let all_tombstones = store.list_tombstones()?;
-        compact_deletion_log_from_tombstones(fs, &all_tombstones)?;
+        compact_deletion_log_from_tombstones(fs, &all_tombstones, &pending, &local_member)?;
     }
     Ok(())
 }
@@ -3974,14 +4967,56 @@ fn reissue_carried_deletions<F: SyncFs, S: IndexStore>(
 fn compact_deletion_log_from_tombstones<F: SyncFs>(
     fs: &F,
     tombstones: &[IndexRecord],
+    pending_deletions: &BTreeMap<String, crate::model::PendingLocalDeletion>,
+    local_member: &str,
 ) -> Result<()> {
-    let entries: Vec<FolderDeletionLogEntry> = tombstones
+    let mut entries: Vec<FolderDeletionLogEntry> = tombstones
         .iter()
         .filter(|r| r.deleted)
         .map(FolderDeletionLogEntry::from_tombstone)
         .collect();
+    for pending in pending_deletions.values() {
+        entries.push(FolderDeletionLogEntry::from_pending_deletion(
+            pending,
+            local_member,
+        ));
+    }
     let bytes = encode_deletion_log_entries(&entries)?;
     fs.compact_deletion_log(&bytes)
+}
+
+fn local_known_incarnations(
+    meta: &FolderMeta,
+    cursors: &BTreeMap<MemberId, PeerCursor>,
+) -> BTreeMap<MemberId, u64> {
+    let mut map = BTreeMap::new();
+    map.insert(meta.local_member.clone(), meta.incarnation);
+    for (m, c) in cursors {
+        if c.incarnation != 0 && meta.members.contains(m) {
+            map.insert(m.clone(), c.incarnation);
+        }
+    }
+    map
+}
+
+fn peer_refused_problem(peer_id: &str, summary: &PeerRefusalSummary) -> SyncProblem {
+    let sentence = if summary.count <= 1 {
+        format!(
+            "'{peer_id}' could not apply '{}' from this machine: {}",
+            summary.sample_path, summary.reason
+        )
+    } else {
+        format!(
+            "'{peer_id}' could not apply {} items from this machine (for example '{}'): {}",
+            summary.count, summary.sample_path, summary.reason
+        )
+    };
+    SyncProblem {
+        path: summary.sample_path.clone(),
+        kind: ProblemKind::PeerRefusedRecords,
+        peer: Some(peer_id.to_string()),
+        sentence,
+    }
 }
 
 fn choose_fresh_incarnation(explicit: Option<u64>, avoid: Option<u64>) -> Result<u64> {
@@ -4033,6 +5068,7 @@ fn rotate_incarnation_on_marker_mismatch<F: SyncFs, S: IndexStore>(
     meta.local_clock = 0;
     meta.join_mode = true;
     meta.head_fingerprint = None;
+    meta.pending_deletions.clear();
 
     let batch = StoreBatch {
         folder_meta: Some(meta),

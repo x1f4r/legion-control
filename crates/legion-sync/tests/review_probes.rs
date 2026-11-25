@@ -537,6 +537,10 @@ impl Peer for FakePeer {
             caller_acked: None,
             caller_pull_matches: None,
             caller_regressed: false,
+            caller_rejoining: false,
+            refused_from_caller: None,
+            pruned_incarnations: Vec::new(),
+            known_incarnations: BTreeMap::new(),
         })
     }
 
@@ -1765,24 +1769,29 @@ fn item_g_mid_apply_non_crash_error_recovers_immediately() {
     a.scan(now()).unwrap();
     b.fs().fail_once.set(true);
 
-    let err = b
-        .pull_from_peer(&EnginePeer::new(&a, "b"), now())
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        SyncError::Fs {
-            kind: FsErrorKind::NoSpace,
-            ..
-        }
-    ));
+    let rep = b.pull_from_peer(&EnginePeer::new(&a, "b"), now()).unwrap();
+    assert_eq!(
+        rep.held_back, 1,
+        "local ENOSPC placement error sets single record aside as held back"
+    );
+    assert!(
+        matches!(
+            b.status().unwrap().state,
+            MemberState::Problem { ref problems, .. }
+                if problems.iter().any(|p| p.kind == ProblemKind::NoSpace)
+        ),
+        "status must report ProblemKind::NoSpace"
+    );
     // Immediate recovery must have cleared PendingOp and tmp files WITHOUT waiting for restart!
     assert!(b.store().load_pending_op().unwrap().is_none());
     assert!(b.fs().list_tmp().unwrap().is_empty());
     assert_eq!(fs::read(b_root.join("doc.txt")).unwrap(), b"v1");
 
-    // Next pull succeeds cleanly!
-    b.pull_from_peer(&EnginePeer::new(&a, "b"), now()).unwrap();
+    // Next pull retries the held-back record and succeeds cleanly!
+    let rep2 = b.pull_from_peer(&EnginePeer::new(&a, "b"), now()).unwrap();
+    assert_eq!(rep2.held_back_resolved, 1);
     assert_eq!(fs::read(b_root.join("doc.txt")).unwrap(), b"v2");
+    assert_eq!(b.status().unwrap().state, MemberState::UpToDate);
 }
 
 #[test]
@@ -1816,6 +1825,10 @@ fn item_k_ranged_resumable_fetch_and_cancellation() {
                 caller_acked: None,
                 caller_pull_matches: None,
                 caller_regressed: false,
+                caller_rejoining: false,
+                refused_from_caller: None,
+                pruned_incarnations: Vec::new(),
+                known_incarnations: BTreeMap::new(),
             })
         }
 

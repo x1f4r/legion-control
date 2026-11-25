@@ -28,13 +28,21 @@ pub const SYNC_PROTOCOL_VERSION: u32 = 3;
 /// Maximum version vector counter value accepted for any member key (`2^62`).
 pub const MAX_VERSION_COUNTER: u64 = 1u64 << 62;
 
-/// Minimum interval (in seconds) between peer-forced incarnation rotations per peer (1 hour).
-pub const FORCED_ROTATION_COOLDOWN_SECS: u64 = 3_600;
+/// Minimum interval (in seconds) between peer-forced incarnation rotations per peer (1 day).
+pub const FORCED_ROTATION_COOLDOWN_SECS: u64 = 86_400;
+
+/// Rolling window (in seconds) over which total peer-forced incarnation rotations across all peers
+/// are bounded (7 days).
+pub const FORCED_ROTATION_WEEK_WINDOW_SECS: u64 = 7 * 86_400;
+
+/// Maximum number of peer-forced incarnation rotations accepted in total across all peers within
+/// [`FORCED_ROTATION_WEEK_WINDOW_SECS`].
+pub const MAX_FORCED_ROTATIONS_PER_WEEK: usize = 3;
 
 /// Default retention duration for files moved to `.legion-sync/bin` (30 days).
 pub const DEFAULT_BIN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Default fetch timeout when pulling a file from a peer.
+/// Default idle fetch timeout (no bytes received) when pulling a file from a peer.
 pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Maximum number of recent content hashes retained in [`IndexRecord::recent_hashes`].
@@ -44,7 +52,11 @@ pub const MAX_ANCESTRY_HASHES: usize = 16;
 pub const MAX_PAGE_RECORDS: usize = 4_096;
 
 /// Maximum number of distinct incarnations per member accepted in one incoming [`VersionVector`].
-pub const MAX_VV_INCARNATIONS_PER_MEMBER: usize = 8;
+pub const MAX_VV_INCARNATIONS_PER_MEMBER: usize = 64;
+
+/// Maximum number of retired `(member, incarnation)` keys retained in
+/// [`FolderMeta::pruned_incarnations`].
+pub const MAX_PRUNED_INCARNATIONS: usize = 1_024;
 
 /// Maximum byte length of a symbolic link target accepted from a peer.
 pub const MAX_LINK_TARGET_BYTES: usize = 4_096;
@@ -496,9 +508,17 @@ pub struct FolderMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_fingerprint: Option<Hash>,
     /// Last timestamp at which each peer forced an incarnation rotation (rate-limited to at most
-    /// once per hour per peer).
+    /// once per day per peer).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub last_forced_rotation_by_peer: BTreeMap<MemberId, Timestamp>,
+    /// Bounded history of `(peer, timestamp)` peer-forced incarnation rotations within the last
+    /// week (enforcing at most once per day per peer and three times per week in total).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forced_rotation_history: Vec<(MemberId, Timestamp)>,
+    /// Retired `(member, incarnation)` keys that every current member has acknowledged past and
+    /// that are deterministically pruned from all version vectors.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub pruned_incarnations: BTreeSet<VersionKey>,
     /// Directories deleted remotely that were intentionally kept on disk only because they still
     /// hold ignored or held-back local files, persisted across tombstone GC and restarts so scans
     /// never revive them unless synced files are later added inside.
@@ -537,6 +557,8 @@ impl FolderMeta {
             join_mode: true,
             head_fingerprint: None,
             last_forced_rotation_by_peer: BTreeMap::new(),
+            forced_rotation_history: Vec::new(),
+            pruned_incarnations: BTreeSet::new(),
             kept_deleted_dirs: BTreeSet::new(),
             needs_rescan: BTreeSet::new(),
             pending_deletions: BTreeMap::new(),
@@ -679,6 +701,28 @@ pub struct PeerCursor {
     /// Peer sequence number up to which inbound mass deletions were explicitly confirmed.
     #[serde(default)]
     pub allow_inbound_mass_deletion_until_seq: u64,
+    /// Peer sequence number up to which the user chose `KeepLocalFiles` on an inbound mass
+    /// deletion brake, re-asserting local live files across all pending pages of that batch.
+    #[serde(default)]
+    pub keep_local_files_until_seq: u64,
+    /// Active `(member -> incarnation)` pairs this peer reported having directly observed during
+    /// its latest handshake, so healthy members can verify everyone has moved past a retired
+    /// incarnation before originating version-vector pruning.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub peer_known_incarnations: BTreeMap<MemberId, u64>,
+}
+
+/// Compact summary carried in handshakes informing the remote peer that this member could not
+/// accept one or more of its records (so both sides show the problem and neither shows "up to
+/// date" while tombstones remain pinned).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRefusalSummary {
+    /// Number of unapplied held-back records currently refused from that peer.
+    pub count: usize,
+    /// Sample path of one refused record.
+    pub sample_path: String,
+    /// Plain-language reason why the sample record was refused.
+    pub reason: String,
 }
 
 /// Caller-side handshake message sent to a peer before pulling any page.
@@ -703,6 +747,20 @@ pub struct HandshakeHello {
     /// Highest fully-applied position the caller acknowledges to the callee.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_acked: Option<PeerAckView>,
+    /// `true` when the caller intentionally reset its cursor for the callee (because the caller
+    /// removed and re-added the callee), so `peer_pulled == None` is expected rather than a
+    /// rollback.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub peer_rejoining: bool,
+    /// Short summary of records the caller could not accept from the callee, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_from_peer: Option<PeerRefusalSummary>,
+    /// Retired `(member, incarnation)` keys already deterministically pruned by the caller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pruned_incarnations: Vec<VersionKey>,
+    /// Active `(member -> incarnation)` pairs directly observed by the caller.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub known_incarnations: BTreeMap<MemberId, u64>,
 }
 
 /// Handshake summary returned by a peer before pulling records or files.
@@ -736,14 +794,28 @@ pub struct PeerHandshake {
     /// rolled back in time).
     #[serde(default)]
     pub caller_regressed: bool,
+    /// `true` when the callee has `caller` in its `rejoining_peers` list (removed and re-added),
+    /// so `caller_pulled == None` and `caller_acked == None` reflect the fresh re-add rather than
+    /// a rollback.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub caller_rejoining: bool,
+    /// Short summary of records the callee could not accept from the caller, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_from_caller: Option<PeerRefusalSummary>,
+    /// Retired `(member, incarnation)` keys already deterministically pruned by the callee.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pruned_incarnations: Vec<VersionKey>,
+    /// Active `(member -> incarnation)` pairs directly observed by the callee.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub known_incarnations: BTreeMap<MemberId, u64>,
 }
 
-/// Per-fetch transfer options supporting ranged resume, timeouts, and cooperative cancellation.
+/// Per-fetch transfer options supporting ranged resume, idle timeouts, and cooperative cancellation.
 #[derive(Debug, Clone)]
 pub struct FetchOptions {
     /// Byte offset to start or resume reading from (`0` for the start of the file).
     pub offset: u64,
-    /// Maximum wall-clock duration allowed for this transfer.
+    /// Maximum idle duration allowed with no bytes received during this transfer.
     pub timeout: Duration,
     /// Optional cancellation flag checked during streaming reads.
     pub cancel: Option<Arc<AtomicBool>>,
@@ -958,8 +1030,96 @@ pub struct RecordsPage {
     pub head_fingerprint: Option<Hash>,
     /// Chained fingerprints for sequence numbers referenced by this page (`r.seq`, `r.seq - 1`, and
     /// `snapshot_seq`) so receivers can record exact pull and applied-ack fingerprints.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        with = "u64_key_map"
+    )]
     pub chain_fingerprints: BTreeMap<u64, Hash>,
+}
+
+/// Serializes and deserializes `BTreeMap<u64, V>` cleanly across both direct JSON and buffered
+/// `serde` internally-tagged / untagged enums (where buffered JSON hands map keys back as strings).
+mod u64_key_map {
+    use std::collections::BTreeMap;
+    use std::fmt;
+
+    use serde::de::{Deserialize, Deserializer, Error as DeError, MapAccess, Visitor};
+    use serde::ser::{Serialize, SerializeMap, Serializer};
+
+    struct U64Key(u64);
+
+    impl<'de> Deserialize<'de> for U64Key {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct KeyVisitor;
+            impl Visitor<'_> for KeyVisitor {
+                type Value = U64Key;
+
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a u64 integer or decimal u64 string")
+                }
+
+                fn visit_u64<E: DeError>(self, v: u64) -> Result<Self::Value, E> {
+                    Ok(U64Key(v))
+                }
+
+                fn visit_i64<E: DeError>(self, v: i64) -> Result<Self::Value, E> {
+                    u64::try_from(v)
+                        .map(U64Key)
+                        .map_err(|_| E::custom(format!("negative key {v}")))
+                }
+
+                fn visit_str<E: DeError>(self, v: &str) -> Result<Self::Value, E> {
+                    v.parse::<u64>()
+                        .map(U64Key)
+                        .map_err(|err| E::custom(format!("invalid u64 key {v:?}: {err}")))
+                }
+            }
+            deserializer.deserialize_any(KeyVisitor)
+        }
+    }
+
+    pub fn serialize<S: Serializer, V: Serialize>(
+        map: &BTreeMap<u64, V>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let human_readable = serializer.is_human_readable();
+        let mut s = serializer.serialize_map(Some(map.len()))?;
+        if human_readable {
+            for (k, v) in map {
+                s.serialize_entry(&k.to_string(), v)?;
+            }
+        } else {
+            for (k, v) in map {
+                s.serialize_entry(k, v)?;
+            }
+        }
+        s.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>, V: Deserialize<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<u64, V>, D::Error> {
+        struct MapVisitor<V>(std::marker::PhantomData<V>);
+
+        impl<'de, V: Deserialize<'de>> Visitor<'de> for MapVisitor<V> {
+            type Value = BTreeMap<u64, V>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a map keyed by u64 sequence numbers")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+                let mut out = BTreeMap::new();
+                while let Some((U64Key(k), v)) = access.next_entry::<U64Key, V>()? {
+                    out.insert(k, v);
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_map(MapVisitor(std::marker::PhantomData))
+    }
 }
 
 /// Why an entry was moved into `.legion-sync/bin`.
@@ -1008,6 +1168,14 @@ pub struct BinEntry {
     pub by_member: MemberId,
     /// Flat filename inside `.legion-sync/bin/` holding the payload bytes (empty for symlinks).
     pub storage_name: String,
+    /// Disk modification time observed on `.legion-sync/bin/<storage_name>` immediately after
+    /// binning (used to cheaply detect late writes through an already-open handle on scan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binned_mtime: Option<Timestamp>,
+    /// Local change fingerprint observed on `.legion-sync/bin/<storage_name>` immediately after
+    /// binning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binned_change_id: Option<u64>,
 }
 
 /// Policy when restoring a [`BinEntry`] onto a path that currently holds a live entry.
@@ -1065,10 +1233,16 @@ pub enum ProblemKind {
     UnknownMember,
     /// This machine rotated its incarnation because a peer reported a newer or divergent history.
     PeerForcedRotation,
-    /// A peer repeatedly tried to force incarnation rotation faster than once per hour.
+    /// A peer repeatedly tried to force incarnation rotation beyond the rate limit (once a day per
+    /// peer or three times a week in total).
     PeerRollbackRateLimited,
     /// Local sync index file is missing, empty, or damaged; folder is stopped until rebuilt.
     IndexDamaged,
+    /// Local volume does not have enough free space to receive a file.
+    NoSpace,
+    /// A peer reported in its handshake that it could not accept one or more records from this
+    /// machine.
+    PeerRefusedRecords,
 }
 
 /// Human-readable problem reported in [`FolderStatus`].
@@ -1135,7 +1309,7 @@ pub struct DeferredItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum FolderDeletionLogEntry {
-    /// A path was deleted and its tombstone is active.
+    /// A path was deleted and its tombstone (or held deletion inside the settle window) is active.
     Deleted {
         /// Normalized relative path inside the sync folder.
         path: String,
@@ -1144,12 +1318,15 @@ pub enum FolderDeletionLogEntry {
         /// Recent content hashes of the deleted entry.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         hashes: Vec<Hash>,
-        /// Version vector of the deletion tombstone.
+        /// Version vector of the deletion tombstone (or prior record when held).
         version: VersionVector,
         /// Deletion timestamp.
         mtime: Timestamp,
         /// Member that authored the deletion.
         modified_by: MemberId,
+        /// `true` when this deletion was recorded while still held inside the settle period.
+        #[serde(default, skip_serializing_if = "is_false")]
+        held: bool,
     },
     /// A previously deleted path became live again.
     Revived {
@@ -1173,6 +1350,8 @@ pub struct FolderDeletionRecord {
     pub mtime: Timestamp,
     /// Member that authored the deletion.
     pub modified_by: MemberId,
+    /// `true` when this entry came from a deletion held inside the settle period.
+    pub held: bool,
 }
 
 impl FolderDeletionLogEntry {
@@ -1185,6 +1364,26 @@ impl FolderDeletionLogEntry {
             version: rec.version.clone(),
             mtime: rec.mtime,
             modified_by: rec.modified_by.clone(),
+            held: false,
+        }
+    }
+
+    /// Builds a held `Deleted` log entry from a [`PendingLocalDeletion`] inside the settle window.
+    pub fn from_pending_deletion(pd: &PendingLocalDeletion, local_member: &str) -> Self {
+        let mut hashes = pd.old_record.recent_hashes.clone();
+        if let Some(h) = pd.old_record.hash {
+            hashes.retain(|x| *x != h);
+            hashes.insert(0, h);
+            hashes.truncate(MAX_ANCESTRY_HASHES);
+        }
+        Self::Deleted {
+            path: pd.old_record.path.clone(),
+            kind: pd.old_record.kind,
+            hashes,
+            version: pd.old_record.version.clone(),
+            mtime: pd.detected_at,
+            modified_by: local_member.to_string(),
+            held: true,
         }
     }
 }
@@ -1223,6 +1422,7 @@ pub fn parse_deletion_log(bytes: &[u8]) -> BTreeMap<String, FolderDeletionRecord
                 version,
                 mtime,
                 modified_by,
+                held,
             } => {
                 if crate::path::validate_sync_path(&path).is_ok() {
                     active.insert(
@@ -1234,6 +1434,7 @@ pub fn parse_deletion_log(bytes: &[u8]) -> BTreeMap<String, FolderDeletionRecord
                             version,
                             mtime,
                             modified_by,
+                            held,
                         },
                     );
                 }
@@ -1492,4 +1693,50 @@ pub struct SyncProgress {
     pub files_left: u64,
     /// Bytes remaining to transfer.
     pub bytes_left: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_page_chain_fingerprints_roundtrip_inside_tagged_and_untagged_json() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum TaggedEnvelope {
+            Records { page: RecordsPage },
+        }
+
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(untagged)]
+        enum UntaggedEnvelope {
+            Page { page: RecordsPage },
+        }
+
+        let mut fps = BTreeMap::new();
+        fps.insert(1, legion_xfer::hash::hash_bytes(b"seq1"));
+        fps.insert(42, legion_xfer::hash::hash_bytes(b"seq42"));
+        let page = RecordsPage {
+            incarnation: 7,
+            records: Vec::new(),
+            snapshot_seq: 42,
+            has_more: false,
+            caller_acked: Some((3, 10)),
+            caller_acked_fingerprint: Some(legion_xfer::hash::hash_bytes(b"ack")),
+            head_fingerprint: Some(legion_xfer::hash::hash_bytes(b"seq42")),
+            chain_fingerprints: fps,
+        };
+
+        let tagged_json = serde_json::to_string(&TaggedEnvelope::Records { page: page.clone() })
+            .expect("serialize tagged");
+        let tagged_back: TaggedEnvelope =
+            serde_json::from_str(&tagged_json).expect("deserialize tagged");
+        assert_eq!(tagged_back, TaggedEnvelope::Records { page: page.clone() });
+
+        let untagged_json = serde_json::to_string(&UntaggedEnvelope::Page { page: page.clone() })
+            .expect("serialize untagged");
+        let untagged_back: UntaggedEnvelope =
+            serde_json::from_str(&untagged_json).expect("deserialize untagged");
+        assert_eq!(untagged_back, UntaggedEnvelope::Page { page });
+    }
 }

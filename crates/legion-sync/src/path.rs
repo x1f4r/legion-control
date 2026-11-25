@@ -221,6 +221,26 @@ pub fn validate_flat_internal_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validates a staged temporary token, which is either:
+/// - a flat filename inside `.legion-sync/tmp/` (returns `Ok(None)`), or
+/// - a beside-destination relative path `<dir>/.legion-*.tmp` used when `<dir>` sits on a
+///   different filesystem/subvolume from `.legion-sync/tmp/` (returns `Ok(Some(clean_rel))`).
+pub fn validate_staged_tmp_token(token: &str) -> Result<Option<String>> {
+    if !token.contains('/') {
+        validate_flat_internal_name(token)?;
+        return Ok(None);
+    }
+    let clean = validate_sync_path(token)?;
+    let name = basename(&clean);
+    if !is_legion_inflight_name(name) {
+        return Err(SyncError::InvalidPath {
+            path: token.to_string(),
+            reason: "beside-destination staging filename must use Legion's fixed-ignored '.legion-*.tmp' name".to_string(),
+        });
+    }
+    Ok(Some(clean))
+}
+
 /// Returns all strict ancestor directory paths of `rel`, ordered shallowest to deepest.
 ///
 /// For `"a/b/c.txt"`, returns `["a", "a/b"]`. For `"file.txt"`, returns an empty `Vec`.

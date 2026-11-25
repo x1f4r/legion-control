@@ -46,6 +46,10 @@ impl Peer for LyingPeer {
             caller_acked: self.caller_acked,
             caller_pull_matches: Some(true),
             caller_regressed: false,
+            caller_rejoining: false,
+            refused_from_caller: None,
+            pruned_incarnations: Vec::new(),
+            known_incarnations: BTreeMap::new(),
         })
     }
 
@@ -223,10 +227,10 @@ fn forged_own_counter_and_huge_counter_are_refused_unacked_and_durable() {
 }
 
 #[test]
-fn peer_forced_rotation_is_rate_limited_to_once_per_hour_and_reported() {
+fn peer_forced_rotation_is_rate_limited_to_once_per_day_per_peer_and_three_per_week_total() {
     let tmp = scratch();
     let t = tmp.path();
-    let all = ["tower", "evil"];
+    let all = ["tower", "evil1", "evil2", "evil3", "evil4"];
     let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
 
     fs::create_dir_all(t.join("tower")).unwrap();
@@ -234,10 +238,10 @@ fn peer_forced_rotation_is_rate_limited_to_once_per_hour_and_reported() {
     tower.scan(ts(0)).unwrap();
     let inc1 = tower.meta().unwrap().incarnation;
 
-    // First lie: peer claims it pulled seq 999 of `inc1` -> allowed (once per hour), forces rotation,
-    // and reports `PeerForcedRotation`.
+    // First lie from evil1: allowed (once per day per peer), forces rotation, and reports
+    // `PeerForcedRotation`.
     let liar1 = LyingPeer {
-        id: "evil".into(),
+        id: "evil1".into(),
         incarnation: 10,
         snapshot_seq: 0,
         caller_pulled: Some(PeerAckView {
@@ -267,9 +271,9 @@ fn peer_forced_rotation_is_rate_limited_to_once_per_hour_and_reported() {
         other => panic!("expected PeerForcedRotation problem, got {other:?}"),
     }
 
-    // Second lie 10 minutes later (< 1 hour): MUST be refused and rate-limited (no rotation!).
+    // Second lie 2 hours later (< 1 day) from evil1: MUST be refused and rate-limited (no rotation!).
     let liar2 = LyingPeer {
-        id: "evil".into(),
+        id: "evil1".into(),
         incarnation: 10,
         snapshot_seq: 0,
         caller_pulled: Some(PeerAckView {
@@ -281,46 +285,113 @@ fn peer_forced_rotation_is_rate_limited_to_once_per_hour_and_reported() {
         pages: RefCell::new(Vec::new()),
         payloads: BTreeMap::new(),
     };
-    let err = tower.pull_from_peer(&liar2, ts(100 + 600));
+    let err = tower.pull_from_peer(&liar2, ts(100 + 7200));
     assert!(matches!(err, Err(SyncError::Conflict { .. })));
     assert_eq!(
         tower.meta().unwrap().incarnation,
         inc2,
-        "second forced rotation within 1 hour must be refused"
+        "second forced rotation within 1 day must be refused"
     );
     match tower.status().unwrap().state {
         MemberState::Problem { problems, .. } => {
+            let rl = problems
+                .iter()
+                .find(|p| p.kind == ProblemKind::PeerRollbackRateLimited)
+                .expect("rate-limited rotation attempt must be reported");
             assert!(
-                problems
-                    .iter()
-                    .any(|p| p.kind == ProblemKind::PeerRollbackRateLimited),
-                "rate-limited rotation attempt must be reported"
+                rl.sentence
+                    .contains("evil1 keeps reporting that this machine's history went back"),
+                "unexpected rate-limit sentence: {}",
+                rl.sentence
             );
         }
         other => panic!("expected PeerRollbackRateLimited problem, got {other:?}"),
     }
 
-    // After 1 hour has elapsed, a legitimate rotation is allowed again.
-    let liar3 = LyingPeer {
-        id: "evil".into(),
-        incarnation: 10,
+    // Two more distinct peers (evil2, evil3) each rotate once within the same week (total = 3).
+    let liar_e2 = LyingPeer {
+        id: "evil2".into(),
+        incarnation: 20,
         snapshot_seq: 0,
         caller_pulled: Some(PeerAckView {
             incarnation: inc2,
             seq: 999,
-            fingerprint: Some(hash_bytes(b"fake-fp-3")),
+            fingerprint: Some(hash_bytes(b"fake-fp-e2")),
+        }),
+        caller_acked: None,
+        pages: RefCell::new(Vec::new()),
+        payloads: BTreeMap::new(),
+    };
+    tower.pull_from_peer(&liar_e2, ts(200)).unwrap();
+    let inc3 = tower.meta().unwrap().incarnation;
+    assert_ne!(inc3, inc2);
+
+    let liar_e3 = LyingPeer {
+        id: "evil3".into(),
+        incarnation: 30,
+        snapshot_seq: 0,
+        caller_pulled: Some(PeerAckView {
+            incarnation: inc3,
+            seq: 999,
+            fingerprint: Some(hash_bytes(b"fake-fp-e3")),
+        }),
+        caller_acked: None,
+        pages: RefCell::new(Vec::new()),
+        payloads: BTreeMap::new(),
+    };
+    tower.pull_from_peer(&liar_e3, ts(300)).unwrap();
+    let inc4 = tower.meta().unwrap().incarnation;
+    assert_ne!(inc4, inc3);
+
+    // Fourth rotation inside 7 days — even from a fresh peer (evil4) — MUST be blocked by the
+    // 3-per-week total cap!
+    let liar_e4 = LyingPeer {
+        id: "evil4".into(),
+        incarnation: 40,
+        snapshot_seq: 0,
+        caller_pulled: Some(PeerAckView {
+            incarnation: inc4,
+            seq: 999,
+            fingerprint: Some(hash_bytes(b"fake-fp-e4")),
+        }),
+        caller_acked: None,
+        pages: RefCell::new(Vec::new()),
+        payloads: BTreeMap::new(),
+    };
+    assert!(matches!(
+        tower.pull_from_peer(&liar_e4, ts(100 + FORCED_ROTATION_COOLDOWN_SECS as i64 + 1)),
+        Err(SyncError::Conflict { .. })
+    ));
+    assert_eq!(
+        tower.meta().unwrap().incarnation,
+        inc4,
+        "4th peer-forced rotation within 7 days must be refused"
+    );
+
+    // After 7 full days have elapsed, a legitimate rotation is allowed again.
+    let liar_after_week = LyingPeer {
+        id: "evil1".into(),
+        incarnation: 10,
+        snapshot_seq: 0,
+        caller_pulled: Some(PeerAckView {
+            incarnation: inc4,
+            seq: 999,
+            fingerprint: Some(hash_bytes(b"fake-fp-week")),
         }),
         caller_acked: None,
         pages: RefCell::new(Vec::new()),
         payloads: BTreeMap::new(),
     };
     tower
-        .pull_from_peer(&liar3, ts(100 + FORCED_ROTATION_COOLDOWN_SECS as i64 + 1))
+        .pull_from_peer(
+            &liar_after_week,
+            ts(300 + legion_sync::FORCED_ROTATION_WEEK_WINDOW_SECS as i64 + 1),
+        )
         .unwrap();
     assert_ne!(
         tower.meta().unwrap().incarnation,
-        inc2,
-        "rotation should be permitted again after 1 hour"
+        inc4,
+        "rotation should be permitted again after 7 days"
     );
 }
 

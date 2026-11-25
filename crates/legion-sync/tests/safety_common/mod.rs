@@ -71,6 +71,9 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
         self.engine
             .serve_fetch_file_range(&self.caller, path, expected_hash, options.offset)
     }
+    fn report_hash_mismatch(&self, path: &str) {
+        self.engine.note_serve_hash_mismatch(path);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -411,6 +414,17 @@ impl SyncFs for HookFs {
     }
     fn list_bin(&self) -> legion_sync::Result<Vec<String>> {
         self.inner.list_bin()
+    }
+    fn available_space_for(&self, rel_path: &str) -> legion_sync::Result<Option<u64>> {
+        self.inner.available_space_for(rel_path)
+    }
+    fn needs_local_staging(&self, rel_path: &str) -> legion_sync::Result<bool> {
+        self.inner.needs_local_staging(rel_path)
+    }
+    fn move_bin_to_live_no_replace(&self, b: &str, p: &str) -> legion_sync::Result<()> {
+        self.w("move_bin_to_live_no_replace", p, |f| {
+            f.move_bin_to_live_no_replace(b, p)
+        })
     }
 }
 

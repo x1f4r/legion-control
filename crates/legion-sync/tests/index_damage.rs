@@ -301,6 +301,17 @@ impl IndexStore for PanickingStore {
     fn get_deleted_history(&self, path: &str) -> legion_sync::Result<Vec<Hash>> {
         self.inner.get_deleted_history(path)
     }
+    fn get_deleted_history_version(
+        &self,
+        path: &str,
+    ) -> legion_sync::Result<Option<legion_sync::VersionVector>> {
+        self.inner.get_deleted_history_version(path)
+    }
+    fn list_deleted_history_versions(
+        &self,
+    ) -> legion_sync::Result<Vec<(String, legion_sync::VersionVector)>> {
+        self.inner.list_deleted_history_versions()
+    }
     fn load_pending_op(&self) -> legion_sync::Result<Option<PendingOp>> {
         self.inner.load_pending_op()
     }

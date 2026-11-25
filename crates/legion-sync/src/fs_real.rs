@@ -7,18 +7,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use legion_os::atomic::{
-    WriteOptions, exchange_files, file_change_id, rename_no_replace, replace_with_backup,
-    write_atomic,
+    WriteOptions, available_space, exchange_files, file_change_id, rename_no_replace,
+    replace_with_backup, same_device, write_atomic,
 };
 use legion_xfer::hash::hash_reader;
 use legion_xfer::{EntryKind, Hash, Timestamp};
 
-use crate::error::{Result, SyncError};
+use crate::error::{FsErrorKind, Result, SyncError};
 use crate::model::FolderMarker;
 use crate::path::{
     IgnoreMatcher, SYNC_BIN_DIR, SYNC_DELETIONS_LOG_FILE, SYNC_MARKER_FILE, SYNC_META_DIR,
     SYNC_TMP_DIR, ancestors, check_fs_compatibility, is_dot_legion_sync_segment,
-    validate_flat_internal_name, validate_sync_path,
+    validate_flat_internal_name, validate_staged_tmp_token, validate_sync_path,
 };
 use crate::traits::{FsCapabilities, FsMeta, FsWalkEntry, FsWalkResult, SyncFs, SyncWrite};
 
@@ -212,12 +212,104 @@ impl RealFs {
         Ok(current)
     }
 
-    fn resolve_tmp(&self, tmp_name: &str) -> Result<PathBuf> {
-        validate_flat_internal_name(tmp_name)?;
-        let dir = self.tmp_dir();
-        fs::create_dir_all(&dir)
-            .map_err(|err| SyncError::from_io(Some(SYNC_TMP_DIR.to_string()), err))?;
-        Ok(dir.join(tmp_name))
+    fn resolve_tmp(&self, tmp_name: &str, create_parent: bool) -> Result<PathBuf> {
+        match validate_staged_tmp_token(tmp_name)? {
+            None => {
+                let dir = self.tmp_dir();
+                if create_parent {
+                    fs::create_dir_all(&dir)
+                        .map_err(|err| SyncError::from_io(Some(SYNC_TMP_DIR.to_string()), err))?;
+                }
+                Ok(dir.join(tmp_name))
+            }
+            Some(clean_rel) => {
+                if create_parent {
+                    let _ = self.ensure_parent_dirs(&clean_rel)?;
+                } else {
+                    self.ensure_no_symlink_ancestors(&clean_rel)?;
+                }
+                self.resolve_live(&clean_rel, EntryKind::File)
+            }
+        }
+    }
+
+    fn tmp_label(tmp_name: &str) -> String {
+        if tmp_name.contains('/') || tmp_name.starts_with(".legion-") {
+            tmp_name.to_string()
+        } else {
+            format!("{SYNC_TMP_DIR}/{tmp_name}")
+        }
+    }
+
+    fn move_file_no_replace_cross_device_safe(
+        &self,
+        src: &Path,
+        dst: &Path,
+        label: &str,
+    ) -> Result<()> {
+        match rename_no_replace(src, dst) {
+            Ok(()) => {
+                if let Some(parent) = dst.parent() {
+                    sync_dir(parent);
+                }
+                if let Some(parent) = src.parent() {
+                    sync_dir(parent);
+                }
+                Ok(())
+            }
+            Err(os_err) => {
+                let sync_err = SyncError::from_os(Some(label.to_string()), os_err);
+                if !matches!(
+                    sync_err,
+                    SyncError::Fs {
+                        kind: FsErrorKind::CrossDevice,
+                        ..
+                    }
+                ) {
+                    return Err(sync_err);
+                }
+                let dst_parent = dst.parent().ok_or_else(|| SyncError::InvalidPath {
+                    path: label.to_string(),
+                    reason: "destination path has no parent directory".to_string(),
+                })?;
+                let seq = REAL_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+                let stage =
+                    dst_parent.join(format!(".legion-xdev-{}-{seq}.tmp", std::process::id()));
+                let copy_res = (|| -> Result<()> {
+                    let mut reader = File::open(src)
+                        .map_err(|e| SyncError::from_io(Some(label.to_string()), e))?;
+                    let mut writer = create_private_file(&stage)
+                        .map_err(|e| SyncError::from_io(Some(label.to_string()), e))?;
+                    io::copy(&mut reader, &mut writer)
+                        .map_err(|e| SyncError::from_io(Some(label.to_string()), e))?;
+                    writer
+                        .flush()
+                        .map_err(|e| SyncError::from_io(Some(label.to_string()), e))?;
+                    writer
+                        .sync_all()
+                        .map_err(|e| SyncError::from_io(Some(label.to_string()), e))?;
+                    Ok(())
+                })();
+                if let Err(err) = copy_res {
+                    let _ = fs::remove_file(&stage);
+                    return Err(err);
+                }
+                if let Err(os_err) = rename_no_replace(&stage, dst) {
+                    let _ = fs::remove_file(&stage);
+                    return Err(SyncError::from_os(Some(label.to_string()), os_err));
+                }
+                sync_dir(dst_parent);
+                match fs::remove_file(src) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(SyncError::from_io(Some(label.to_string()), e)),
+                }
+                if let Some(parent) = src.parent() {
+                    sync_dir(parent);
+                }
+                Ok(())
+            }
+        }
     }
 
     fn resolve_bin(&self, bin_name: &str) -> Result<PathBuf> {
@@ -373,6 +465,26 @@ impl SyncFs for RealFs {
             });
         }
         Ok(())
+    }
+
+    fn available_space_for(&self, live_rel: &str) -> Result<Option<u64>> {
+        let clean = validate_sync_path(live_rel)?;
+        self.ensure_no_symlink_ancestors(&clean)?;
+        let full = self.resolve_live(&clean, EntryKind::File)?;
+        let probe = full.parent().unwrap_or(&self.root);
+        Ok(available_space(probe).ok())
+    }
+
+    fn needs_local_staging(&self, live_rel: &str) -> Result<bool> {
+        let clean = validate_sync_path(live_rel)?;
+        self.ensure_no_symlink_ancestors(&clean)?;
+        let full = self.resolve_live(&clean, EntryKind::File)?;
+        let probe = full.parent().unwrap_or(&self.root);
+        let tmp_dir = self.tmp_dir();
+        match same_device(&tmp_dir, probe) {
+            Ok(same) => Ok(!same),
+            Err(_) => Ok(false),
+        }
     }
 
     fn walk(&self, ignore: &IgnoreMatcher) -> Result<FsWalkResult> {
@@ -622,30 +734,30 @@ impl SyncFs for RealFs {
     }
 
     fn create_tmp(&self, tmp_name: &str) -> Result<Box<dyn SyncWrite>> {
-        let full = self.resolve_tmp(tmp_name)?;
+        let full = self.resolve_tmp(tmp_name, true)?;
         let file = create_private_file(&full)
-            .map_err(|e| SyncError::from_io(Some(format!("{SYNC_TMP_DIR}/{tmp_name}")), e))?;
+            .map_err(|e| SyncError::from_io(Some(Self::tmp_label(tmp_name)), e))?;
         Ok(Box::new(RealSyncWriter { path: full, file }))
     }
 
     fn open_tmp_append(&self, tmp_name: &str) -> Result<Box<dyn SyncWrite>> {
-        let full = self.resolve_tmp(tmp_name)?;
+        let full = self.resolve_tmp(tmp_name, true)?;
         let file = OpenOptions::new()
             .append(true)
             .create(true)
             .open(&full)
-            .map_err(|e| SyncError::from_io(Some(format!("{SYNC_TMP_DIR}/{tmp_name}")), e))?;
+            .map_err(|e| SyncError::from_io(Some(Self::tmp_label(tmp_name)), e))?;
         Ok(Box::new(RealSyncWriter { path: full, file }))
     }
 
     fn stat_tmp(&self, tmp_name: &str) -> Result<Option<FsMeta>> {
-        let full = self.resolve_tmp(tmp_name)?;
-        stat_path(&full, &format!("{SYNC_TMP_DIR}/{tmp_name}"))
+        let full = self.resolve_tmp(tmp_name, false)?;
+        stat_path(&full, &Self::tmp_label(tmp_name))
     }
 
     fn set_tmp_metadata(&self, tmp_name: &str, mtime: Timestamp, mode: Option<u32>) -> Result<()> {
-        let label = format!("{SYNC_TMP_DIR}/{tmp_name}");
-        let full = self.resolve_tmp(tmp_name)?;
+        let label = Self::tmp_label(tmp_name);
+        let full = self.resolve_tmp(tmp_name, false)?;
         let meta =
             fs::symlink_metadata(&full).map_err(|e| SyncError::from_io(Some(label.clone()), e))?;
         if meta.file_type().is_file() {
@@ -665,21 +777,18 @@ impl SyncFs for RealFs {
     }
 
     fn hash_tmp(&self, tmp_name: &str) -> Result<(Hash, u64)> {
-        let full = self.resolve_tmp(tmp_name)?;
+        let full = self.resolve_tmp(tmp_name, false)?;
         let mut file = File::open(&full)
-            .map_err(|e| SyncError::from_io(Some(format!("{SYNC_TMP_DIR}/{tmp_name}")), e))?;
+            .map_err(|e| SyncError::from_io(Some(Self::tmp_label(tmp_name)), e))?;
         hash_reader(&mut file).map_err(SyncError::from)
     }
 
     fn remove_tmp(&self, tmp_name: &str) -> Result<()> {
-        let full = self.resolve_tmp(tmp_name)?;
+        let full = self.resolve_tmp(tmp_name, false)?;
         match fs::remove_file(&full) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(SyncError::from_io(
-                Some(format!("{SYNC_TMP_DIR}/{tmp_name}")),
-                err,
-            )),
+            Err(err) => Err(SyncError::from_io(Some(Self::tmp_label(tmp_name)), err)),
         }
     }
 
@@ -691,11 +800,15 @@ impl SyncFs for RealFs {
         let clean = validate_sync_path(live_rel)?;
         self.guard_platform_path(&clean, EntryKind::File)?;
         let parent = self.ensure_parent_dirs(&clean)?;
-        let src = self.resolve_tmp(tmp_name)?;
+        let src = self.resolve_tmp(tmp_name, false)?;
         let dst = self.resolve_live(&clean, EntryKind::File)?;
         rename_no_replace(&src, &dst).map_err(|err| SyncError::from_os(Some(clean), err))?;
         sync_dir(&parent);
-        sync_dir(&self.tmp_dir());
+        if let Some(src_parent) = src.parent()
+            && src_parent != parent
+        {
+            sync_dir(src_parent);
+        }
         Ok(())
     }
 
@@ -707,7 +820,7 @@ impl SyncFs for RealFs {
         let clean = validate_sync_path(live_rel)?;
         self.guard_platform_path(&clean, EntryKind::File)?;
         let _parent = self.ensure_parent_dirs(&clean)?;
-        let src = self.resolve_tmp(tmp_name)?;
+        let src = self.resolve_tmp(tmp_name, false)?;
         let dst = self.resolve_live(&clean, EntryKind::File)?;
         rename_no_replace(&src, &dst).map_err(|err| SyncError::from_os(Some(clean), err))?;
         Ok(())
@@ -717,14 +830,18 @@ impl SyncFs for RealFs {
         let clean = validate_sync_path(live_rel)?;
         self.guard_platform_path(&clean, EntryKind::File)?;
         self.ensure_no_symlink_ancestors(&clean)?;
-        let src = self.resolve_tmp(tmp_name)?;
+        let src = self.resolve_tmp(tmp_name, false)?;
         let dst = self.resolve_live(&clean, EntryKind::File)?;
         match exchange_files(&src, &dst) {
             Ok(()) => {
                 if let Some(parent) = dst.parent() {
                     sync_dir(parent);
                 }
-                sync_dir(&self.tmp_dir());
+                if let Some(src_parent) = src.parent()
+                    && dst.parent() != Some(src_parent)
+                {
+                    sync_dir(src_parent);
+                }
                 Ok(true)
             }
             Err(legion_os::OsError::Unsupported { .. }) => Ok(false),
@@ -741,15 +858,19 @@ impl SyncFs for RealFs {
         let clean = validate_sync_path(live_rel)?;
         self.guard_platform_path(&clean, EntryKind::File)?;
         self.ensure_no_symlink_ancestors(&clean)?;
-        let staged = self.resolve_tmp(tmp_name)?;
+        let staged = self.resolve_tmp(tmp_name, false)?;
         let target = self.resolve_live(&clean, EntryKind::File)?;
-        let backup = self.resolve_tmp(backup_tmp)?;
+        let backup = self.resolve_tmp(backup_tmp, true)?;
         match replace_with_backup(&staged, &target, &backup) {
             Ok(()) => {
                 if let Some(parent) = target.parent() {
                     sync_dir(parent);
                 }
-                sync_dir(&self.tmp_dir());
+                if let Some(src_parent) = staged.parent()
+                    && target.parent() != Some(src_parent)
+                {
+                    sync_dir(src_parent);
+                }
                 Ok(true)
             }
             Err(legion_os::OsError::Unsupported { .. }) => Ok(false),
@@ -762,24 +883,27 @@ impl SyncFs for RealFs {
         self.guard_platform_path(&clean, EntryKind::File)?;
         self.ensure_no_symlink_ancestors(&clean)?;
         let src = self.resolve_live(&clean, EntryKind::File)?;
-        let dst = self.resolve_tmp(tmp_name)?;
+        let dst = self.resolve_tmp(tmp_name, true)?;
         rename_no_replace(&src, &dst).map_err(|err| SyncError::from_os(Some(clean), err))?;
-        sync_dir(&self.tmp_dir());
-        if let Some(parent) = src.parent() {
+        if let Some(dst_parent) = dst.parent() {
+            sync_dir(dst_parent);
+        }
+        if let Some(parent) = src.parent()
+            && dst.parent() != Some(parent)
+        {
             sync_dir(parent);
         }
         Ok(())
     }
 
     fn move_tmp_to_bin_no_replace(&self, tmp_name: &str, bin_data_name: &str) -> Result<()> {
-        let src = self.resolve_tmp(tmp_name)?;
+        let src = self.resolve_tmp(tmp_name, false)?;
         let dst = self.resolve_bin(bin_data_name)?;
-        rename_no_replace(&src, &dst).map_err(|err| {
-            SyncError::from_os(Some(format!("{SYNC_BIN_DIR}/{bin_data_name}")), err)
-        })?;
-        sync_dir(&self.bin_dir());
-        sync_dir(&self.tmp_dir());
-        Ok(())
+        self.move_file_no_replace_cross_device_safe(
+            &src,
+            &dst,
+            &format!("{SYNC_BIN_DIR}/{bin_data_name}"),
+        )
     }
 
     fn move_live_to_bin_no_replace(&self, live_rel: &str, bin_data_name: &str) -> Result<()> {
@@ -788,12 +912,7 @@ impl SyncFs for RealFs {
         self.ensure_no_symlink_ancestors(&clean)?;
         let src = self.resolve_live(&clean, EntryKind::File)?;
         let dst = self.resolve_bin(bin_data_name)?;
-        rename_no_replace(&src, &dst).map_err(|err| SyncError::from_os(Some(clean), err))?;
-        sync_dir(&self.bin_dir());
-        if let Some(parent) = src.parent() {
-            sync_dir(parent);
-        }
-        Ok(())
+        self.move_file_no_replace_cross_device_safe(&src, &dst, &clean)
     }
 
     fn write_bin_meta(&self, meta_name: &str, bytes: &[u8]) -> Result<()> {
@@ -829,18 +948,27 @@ impl SyncFs for RealFs {
 
     fn copy_bin_to_tmp(&self, bin_data_name: &str, tmp_name: &str) -> Result<()> {
         let src_path = self.resolve_bin(bin_data_name)?;
-        let dst_path = self.resolve_tmp(tmp_name)?;
+        let dst_path = self.resolve_tmp(tmp_name, true)?;
+        let label = Self::tmp_label(tmp_name);
         let mut src = File::open(&src_path)
             .map_err(|e| SyncError::from_io(Some(format!("{SYNC_BIN_DIR}/{bin_data_name}")), e))?;
         let mut dst = create_private_file(&dst_path)
-            .map_err(|e| SyncError::from_io(Some(format!("{SYNC_TMP_DIR}/{tmp_name}")), e))?;
-        io::copy(&mut src, &mut dst)
-            .map_err(|e| SyncError::from_io(Some(format!("{SYNC_TMP_DIR}/{tmp_name}")), e))?;
+            .map_err(|e| SyncError::from_io(Some(label.clone()), e))?;
+        io::copy(&mut src, &mut dst).map_err(|e| SyncError::from_io(Some(label.clone()), e))?;
         dst.flush()
-            .map_err(|e| SyncError::from_io(Some(format!("{SYNC_TMP_DIR}/{tmp_name}")), e))?;
+            .map_err(|e| SyncError::from_io(Some(label.clone()), e))?;
         dst.sync_all()
-            .map_err(|e| SyncError::from_io(Some(format!("{SYNC_TMP_DIR}/{tmp_name}")), e))?;
+            .map_err(|e| SyncError::from_io(Some(label), e))?;
         Ok(())
+    }
+
+    fn move_bin_to_live_no_replace(&self, bin_data_name: &str, live_rel: &str) -> Result<()> {
+        let clean = validate_sync_path(live_rel)?;
+        self.guard_platform_path(&clean, EntryKind::File)?;
+        let _parent = self.ensure_parent_dirs(&clean)?;
+        let src = self.resolve_bin(bin_data_name)?;
+        let dst = self.resolve_live(&clean, EntryKind::File)?;
+        self.move_file_no_replace_cross_device_safe(&src, &dst, &clean)
     }
 
     fn remove_bin_file(&self, bin_name: &str) -> Result<()> {

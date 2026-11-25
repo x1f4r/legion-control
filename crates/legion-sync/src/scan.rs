@@ -430,12 +430,22 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
     // Any path present on disk in this scan cancels a previously pending local deletion for it.
     let seen_live_paths: BTreeSet<&str> = disk_entries.iter().map(|e| e.path.as_str()).collect();
     let mut brake_meta_dirty = false;
+    let mut held_del_log_entries: Vec<FolderDeletionLogEntry> = Vec::new();
     if !meta.pending_deletions.is_empty() {
-        let before = meta.pending_deletions.len();
-        meta.pending_deletions
-            .retain(|p, _| !seen_live_paths.contains(p.as_str()));
-        if meta.pending_deletions.len() != before {
+        let mut revived_pending = Vec::new();
+        meta.pending_deletions.retain(|p, _| {
+            if seen_live_paths.contains(p.as_str()) {
+                revived_pending.push(p.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if !revived_pending.is_empty() {
             brake_meta_dirty = true;
+            for p in revived_pending {
+                held_del_log_entries.push(FolderDeletionLogEntry::Revived { path: p });
+            }
         }
     }
 
@@ -601,6 +611,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         && brake_config.is_enabled()
         && effective_baseline > brake_config.min_deleted_files;
 
+    let mut newly_held_deletions: Vec<PendingLocalDeletion> = Vec::new();
     let mut deletes: Vec<IndexRecord> = matched_move_deletes;
     if !brake_active {
         // Either the user confirmed the mass deletion, the brake is disabled, or the folder is
@@ -634,10 +645,12 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             if let std::collections::btree_map::Entry::Vacant(e) =
                 meta.pending_deletions.entry(path)
             {
-                e.insert(PendingLocalDeletion {
+                let pd = PendingLocalDeletion {
                     old_record: old,
                     detected_at: now,
-                });
+                };
+                newly_held_deletions.push(pd.clone());
+                e.insert(pd);
                 brake_meta_dirty = true;
             }
         }
@@ -652,10 +665,12 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
                     if let std::collections::btree_map::Entry::Vacant(e) =
                         meta.pending_deletions.entry(path)
                     {
-                        e.insert(PendingLocalDeletion {
+                        let pd = PendingLocalDeletion {
                             old_record: old,
                             detected_at: now,
-                        });
+                        };
+                        newly_held_deletions.push(pd.clone());
+                        e.insert(pd);
                         brake_meta_dirty = true;
                     }
                 } else {
@@ -763,6 +778,17 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         }
     }
 
+    // Record newly held deletions in `.legion-sync/deletions.log` now that we know the brake did
+    // NOT trip, so rebuilding from disk after index damage during the settle window preserves them.
+    for pd in newly_held_deletions {
+        if meta.pending_deletions.contains_key(&pd.old_record.path) {
+            held_del_log_entries.push(FolderDeletionLogEntry::from_pending_deletion(
+                &pd,
+                &meta.local_member,
+            ));
+        }
+    }
+
     let keep_window = !window.emitted_deletions.is_empty()
         || !window.recent_created_hashes.is_empty()
         || !meta.pending_deletions.is_empty();
@@ -777,6 +803,10 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
 
     let finish_join_mode = subtree_root.is_none() && meta.join_mode;
     if deletes.is_empty() && upserts.is_empty() && stat_refreshes.is_empty() {
+        if !held_del_log_entries.is_empty() {
+            let encoded = encode_deletion_log_entries(&held_del_log_entries)?;
+            fs.append_deletion_log(&encoded)?;
+        }
         if finish_join_mode || kept_dirs_changed || brake_meta_dirty {
             if finish_join_mode {
                 meta.join_mode = false;
@@ -813,7 +843,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
     }
 
     let mut meta_dirty = kept_dirs_changed || brake_meta_dirty;
-    let mut del_log_entries: Vec<FolderDeletionLogEntry> = Vec::new();
+    let mut del_log_entries: Vec<FolderDeletionLogEntry> = held_del_log_entries;
 
     for old in deletes {
         let mut version = old.version;
@@ -829,9 +859,25 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         }
 
         if !recent_hashes.is_empty() {
+            let mut merged_dh = recent_hashes.clone();
+            for h in store.get_deleted_history(&old.path)? {
+                if merged_dh.len() >= MAX_ANCESTRY_HASHES {
+                    break;
+                }
+                if !merged_dh.contains(&h) {
+                    merged_dh.push(h);
+                }
+            }
             batch
                 .upsert_deleted_history
-                .push((old.path.clone(), recent_hashes.clone()));
+                .push((old.path.clone(), merged_dh));
+            let mut del_vv = store
+                .get_deleted_history_version(&old.path)?
+                .unwrap_or_default();
+            del_vv = del_vv.merge(&version).pruned(&meta.pruned_incarnations);
+            batch
+                .upsert_deleted_history_versions
+                .push((old.path.clone(), del_vv));
         }
 
         let rec = IndexRecord {
@@ -870,9 +916,13 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
     {
         let was_deleted = prev.as_ref().is_some_and(|p| p.deleted);
         let is_new = prev.as_ref().is_none_or(|p| p.deleted);
-        let mut version = prev
-            .as_ref()
-            .map_or_else(VersionVector::new, |p| p.version.clone());
+        let mut version = match prev.as_ref() {
+            Some(p) => p.version.clone(),
+            None if !join_mode_active => store
+                .get_deleted_history_version(&path)?
+                .unwrap_or_default(),
+            None => VersionVector::new(),
+        };
         meta.bump_version(&mut version);
         let seq = meta.next_seq();
         meta_dirty = true;
@@ -1030,6 +1080,7 @@ pub fn flush_settled_deletions<F: SyncFs, S: IndexStore>(
     }
 
     let mut deletes = Vec::new();
+    let mut revived_paths = Vec::new();
     let mut dirty = false;
     let ready_files: Vec<String> = meta
         .pending_deletions
@@ -1058,6 +1109,8 @@ pub fn flush_settled_deletions<F: SyncFs, S: IndexStore>(
                     window.emitted_deletions.push((p, now));
                 }
                 deletes.push(pd.old_record);
+            } else {
+                revived_paths.push(p);
             }
         }
     }
@@ -1085,6 +1138,8 @@ pub fn flush_settled_deletions<F: SyncFs, S: IndexStore>(
             dirty = true;
             if absent {
                 deletes.push(pd.old_record);
+            } else {
+                revived_paths.push(p);
             }
         }
     }
@@ -1095,6 +1150,14 @@ pub fn flush_settled_deletions<F: SyncFs, S: IndexStore>(
     meta.deletion_window = keep_window.then_some(window);
 
     if deletes.is_empty() {
+        if !revived_paths.is_empty() {
+            let entries: Vec<FolderDeletionLogEntry> = revived_paths
+                .into_iter()
+                .map(|path| FolderDeletionLogEntry::Revived { path })
+                .collect();
+            let encoded = encode_deletion_log_entries(&entries)?;
+            fs.append_deletion_log(&encoded)?;
+        }
         if dirty {
             store.apply_batch(StoreBatch {
                 folder_meta: Some(meta),
@@ -1111,7 +1174,10 @@ pub fn flush_settled_deletions<F: SyncFs, S: IndexStore>(
     });
 
     let mut batch = StoreBatch::default();
-    let mut del_log_entries = Vec::with_capacity(deletes.len());
+    let mut del_log_entries: Vec<FolderDeletionLogEntry> = revived_paths
+        .into_iter()
+        .map(|path| FolderDeletionLogEntry::Revived { path })
+        .collect();
     let count = deletes.len();
     for old in deletes {
         let mut version = old.version;
@@ -1124,9 +1190,25 @@ pub fn flush_settled_deletions<F: SyncFs, S: IndexStore>(
             recent_hashes.truncate(MAX_ANCESTRY_HASHES);
         }
         if !recent_hashes.is_empty() {
+            let mut merged_dh = recent_hashes.clone();
+            for h in store.get_deleted_history(&old.path)? {
+                if merged_dh.len() >= MAX_ANCESTRY_HASHES {
+                    break;
+                }
+                if !merged_dh.contains(&h) {
+                    merged_dh.push(h);
+                }
+            }
             batch
                 .upsert_deleted_history
-                .push((old.path.clone(), recent_hashes.clone()));
+                .push((old.path.clone(), merged_dh));
+            let mut del_vv = store
+                .get_deleted_history_version(&old.path)?
+                .unwrap_or_default();
+            del_vv = del_vv.merge(&version).pruned(&meta.pruned_incarnations);
+            batch
+                .upsert_deleted_history_versions
+                .push((old.path.clone(), del_vv));
         }
         let rec = IndexRecord {
             path: old.path,
@@ -1239,6 +1321,7 @@ pub fn rescan_single_path_with_force<F: SyncFs, S: IndexStore>(
 
             let mut upsert_records = Vec::with_capacity(to_tombstone.len());
             let mut upsert_deleted_history = Vec::new();
+            let mut upsert_deleted_history_versions = Vec::new();
             let mut upsert_seq_fingerprints = Vec::with_capacity(to_tombstone.len());
             let mut del_log_entries = Vec::with_capacity(to_tombstone.len());
             let mut main_record = None;
@@ -1254,7 +1337,21 @@ pub fn rescan_single_path_with_force<F: SyncFs, S: IndexStore>(
                     recent_hashes.truncate(MAX_ANCESTRY_HASHES);
                 }
                 if !recent_hashes.is_empty() {
-                    upsert_deleted_history.push((item.path.clone(), recent_hashes.clone()));
+                    let mut merged_dh = recent_hashes.clone();
+                    for h in store.get_deleted_history(&item.path)? {
+                        if merged_dh.len() >= MAX_ANCESTRY_HASHES {
+                            break;
+                        }
+                        if !merged_dh.contains(&h) {
+                            merged_dh.push(h);
+                        }
+                    }
+                    upsert_deleted_history.push((item.path.clone(), merged_dh));
+                    let mut del_vv = store
+                        .get_deleted_history_version(&item.path)?
+                        .unwrap_or_default();
+                    del_vv = del_vv.merge(&version).pruned(&meta.pruned_incarnations);
+                    upsert_deleted_history_versions.push((item.path.clone(), del_vv));
                 }
                 let rec = IndexRecord {
                     path: item.path,
@@ -1295,6 +1392,7 @@ pub fn rescan_single_path_with_force<F: SyncFs, S: IndexStore>(
                 folder_meta: Some(meta),
                 upsert_records,
                 upsert_deleted_history,
+                upsert_deleted_history_versions,
                 upsert_seq_fingerprints,
                 ..StoreBatch::default()
             };
@@ -1381,9 +1479,12 @@ pub fn rescan_single_path_with_force<F: SyncFs, S: IndexStore>(
             let is_kind_change = prev_opt
                 .as_ref()
                 .is_some_and(|p| !p.deleted && p.kind != disk_meta.kind);
-            let mut version = prev_opt
-                .as_ref()
-                .map_or_else(VersionVector::new, |p| p.version.clone());
+            let mut version = match prev_opt.as_ref() {
+                Some(p) => p.version.clone(),
+                None => store
+                    .get_deleted_history_version(&clean)?
+                    .unwrap_or_default(),
+            };
             meta.bump_version(&mut version);
             let seq = meta.next_seq();
             let mode = disk_meta.mode.or_else(|| {
@@ -1736,6 +1837,27 @@ fn mode_changed(recorded: Option<u32>, disk: Option<u32>) -> bool {
     match (recorded, disk) {
         (_, None) | (None, Some(_)) => false,
         (Some(a), Some(b)) => (a & 0o777) != (b & 0o777),
+    }
+}
+
+/// Fast metadata-only pre-check matching a live path against `expected` without reading file
+/// contents.
+///
+/// Used before atomic replace/delete primitives (`safe_replace_live_file` /
+/// `safe_delete_live_file`) that always hash the displaced file atomically after swap or claim,
+/// keeping displaced-file disk reads bounded to at most 1–2 reads per operation.
+pub fn disk_stat_matches_index<F: SyncFs>(
+    fs: &F,
+    path: &str,
+    expected: Option<&IndexRecord>,
+) -> Result<bool> {
+    let disk_opt = fs.stat_live(path)?;
+    match (expected, disk_opt) {
+        (None, None) => Ok(true),
+        (Some(rec), None) => Ok(rec.deleted),
+        (None, Some(_)) => Ok(false),
+        (Some(rec), Some(_)) if rec.deleted => Ok(false),
+        (Some(rec), Some(disk)) => Ok(is_stat_unchanged(rec, &disk)),
     }
 }
 

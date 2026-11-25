@@ -963,6 +963,10 @@ impl Peer for SyntheticLinuxPeer {
             caller_acked: None,
             caller_pull_matches: None,
             caller_regressed: false,
+            caller_rejoining: false,
+            refused_from_caller: None,
+            pruned_incarnations: Vec::new(),
+            known_incarnations: BTreeMap::new(),
         })
     }
 

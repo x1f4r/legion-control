@@ -6,7 +6,7 @@
 //! with identical semantics always compare equal.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -245,6 +245,67 @@ impl VersionVector {
         }
     }
 
+    /// Compares `self` causally against `other` while ignoring any key in `retired`, without
+    /// allocating temporary copies. Equivalent to
+    /// `self.pruned_for_compare(retired).compare(&other.pruned_for_compare(retired))`.
+    pub fn compare_ignoring(&self, other: &Self, retired: &BTreeSet<VersionKey>) -> VersionOrder {
+        if retired.is_empty() {
+            return self.compare(other);
+        }
+        let mut self_greater = false;
+        let mut other_greater = false;
+
+        let mut it_a = self
+            .counters
+            .iter()
+            .filter(|(k, _)| !retired.contains(*k))
+            .peekable();
+        let mut it_b = other
+            .counters
+            .iter()
+            .filter(|(k, _)| !retired.contains(*k))
+            .peekable();
+
+        while let (Some((ka, va)), Some((kb, vb))) = (it_a.peek(), it_b.peek()) {
+            match ka.cmp(kb) {
+                Ordering::Less => {
+                    self_greater = true;
+                    it_a.next();
+                }
+                Ordering::Greater => {
+                    other_greater = true;
+                    it_b.next();
+                }
+                Ordering::Equal => {
+                    match va.cmp(vb) {
+                        Ordering::Greater => self_greater = true,
+                        Ordering::Less => other_greater = true,
+                        Ordering::Equal => {}
+                    }
+                    it_a.next();
+                    it_b.next();
+                }
+            }
+            if self_greater && other_greater {
+                return VersionOrder::Concurrent;
+            }
+        }
+
+        if it_a.peek().is_some() {
+            self_greater = true;
+        }
+        if it_b.peek().is_some() {
+            other_greater = true;
+        }
+
+        match (self_greater, other_greater) {
+            (false, false) => VersionOrder::Equal,
+            (true, false) => VersionOrder::Newer,
+            (false, true) => VersionOrder::Older,
+            (true, true) => VersionOrder::Concurrent,
+        }
+    }
+
     /// Returns `true` when `self` causally dominates or equals `other`.
     pub fn dominates_or_equal(&self, other: &Self) -> bool {
         matches!(
@@ -271,6 +332,52 @@ impl VersionVector {
                 *entry = val;
             }
         }
+    }
+
+    /// Deterministically removes retired `(member, incarnation)` keys in `retired` from `self`
+    /// while preserving a non-empty vector whenever `self` had at least one unretired key.
+    ///
+    /// When `self` contains at least one key outside `retired`, this is an exact join-semilattice
+    /// homomorphism: `prune(a.merge(b), R) == prune(a, R).merge(prune(b, R))`, and for any
+    /// monotonic growth `R1 ⊆ R2`, `prune(prune(v, R1), R2) == prune(v, R2)`. If *every* key in
+    /// `self` is in `retired`, `self` is left untouched so no record ever collapses to an empty
+    /// version vector.
+    ///
+    /// Returns `true` if any key was removed.
+    pub fn prune_in_place(&mut self, retired: &BTreeSet<VersionKey>) -> bool {
+        if retired.is_empty() || self.counters.is_empty() {
+            return false;
+        }
+        let has_surviving = self.counters.keys().any(|k| !retired.contains(k));
+        if !has_surviving {
+            return false;
+        }
+        let before = self.counters.len();
+        self.counters.retain(|k, _| !retired.contains(k));
+        self.counters.len() != before
+    }
+
+    /// Returns a copy of `self` with retired keys in `retired` deterministically removed while
+    /// keeping a non-empty vector if every key would be removed.
+    pub fn pruned(&self, retired: &BTreeSet<VersionKey>) -> Self {
+        let mut out = self.clone();
+        out.prune_in_place(retired);
+        out
+    }
+
+    /// Pure join-semilattice projection removing every key in `retired` (even if the result is
+    /// empty) for causal comparison.
+    ///
+    /// Because `pruned_for_compare(a.merge(b), P) == pruned_for_compare(a, P).merge(pruned_for_compare(b, P))`
+    /// unconditionally for all vectors `a, b` and retired sets `P`, pruning strictly commutes with
+    /// merging and never flips `Older`/`Newer` into `Concurrent`.
+    pub fn pruned_for_compare(&self, retired: &BTreeSet<VersionKey>) -> Self {
+        if retired.is_empty() || self.counters.is_empty() {
+            return self.clone();
+        }
+        let mut out = self.clone();
+        out.counters.retain(|k, _| !retired.contains(k));
+        out
     }
 }
 
