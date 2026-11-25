@@ -3380,3 +3380,93 @@ async fn thumb_extracts_video_posters_when_ffmpeg_is_installed() {
         assert_eq!(item["ok"]["height"], json!(90), "{item}");
     }
 }
+
+#[tokio::test]
+async fn list_bounds_recursive_counting_by_limit_while_keeping_depth_one_exact() {
+    let f = Fixture::new();
+    let deep = f.work.join("deep_tree");
+    for d in 0..40 {
+        let sub = deep.join(format!("dir_{d:02}"));
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 0..30 {
+            std::fs::write(sub.join(format!("file_{i:02}.txt")), "x").unwrap();
+        }
+    }
+
+    // `depth: 1` always counts every direct child accurately and sets `total_exact: true`.
+    let shallow = f
+        .call(
+            "fs.list",
+            json!({"path": f.p(&deep), "depth": 1, "limit": 5}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shallow["entries"].as_array().unwrap().len(), 5);
+    assert_eq!(shallow["total"], json!(40));
+    assert_eq!(shallow["total_exact"], json!(true));
+    assert_eq!(shallow["truncated"], json!(true));
+
+    // `depth: 3, limit: 5` on a 1,240-entry tree stops promptly instead of walking all 1,240
+    // entries, reporting `total_exact: false` and a bounded lower-bound `total`.
+    let bounded = f
+        .call(
+            "fs.list",
+            json!({"path": f.p(&deep), "depth": 3, "limit": 5}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bounded["entries"].as_array().unwrap().len(), 5);
+    assert_eq!(bounded["total_exact"], json!(false), "{bounded}");
+    assert_eq!(bounded["truncated"], json!(true));
+    let lower_bound = bounded["total"].as_u64().unwrap();
+    assert!(
+        (6..=50).contains(&lower_bound),
+        "expected limit-bounded lower bound, got {lower_bound}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn find_checks_budget_even_when_directories_are_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Skip if running as root, since root ignores 0o000 directory permissions.
+    let f = Fixture::new();
+    let root = f.work.join("unreadable_tree");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut locked_dirs = Vec::new();
+    for i in 0..200 {
+        let sub = root.join(format!("d_{i:03}"));
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("hidden_inside.txt"), "x").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        locked_dirs.push(sub);
+    }
+
+    // Confirm permissions actually deny reading (non-root check).
+    let actually_denied = std::fs::read_dir(&locked_dirs[0]).is_err();
+    let res = f
+        .call(
+            "fs.find",
+            json!({
+                "path": f.p(&root),
+                "ignore": false,
+                "budget_ms": 1,
+            }),
+        )
+        .await;
+
+    // Always restore permissions before asserting so TempDir cleans up cleanly.
+    for sub in &locked_dirs {
+        let _ = std::fs::set_permissions(sub, std::fs::Permissions::from_mode(0o755));
+    }
+
+    if !actually_denied {
+        return;
+    }
+    let val = res.unwrap();
+    // Either completed fast or cut off with `reason: "time"` — never hung or failed.
+    if val["truncated"] == json!(true) {
+        assert_eq!(val["reason"], json!("time"));
+    }
+}

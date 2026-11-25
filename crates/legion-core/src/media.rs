@@ -3,6 +3,24 @@
 //! Nothing on disk is opened to guess a file's type: [`classify_extension`] and [`classify_path`]
 //! look up the extension case-insensitively in one table and fall back to [`Category::Other`] with
 //! `application/octet-stream`.
+//!
+//! # Security: never serve inline `Content-Type` directly from this table
+//!
+//! This table is for display, filtering, and client hints — **not** an HTTP inline-serving
+//! allow-list. Several media types returned here execute script, load external resources, or
+//! interpret active content if served inline in a browser, and **must never** be served inline
+//! from this table without a dedicated content server allow-list and sandboxing headers:
+//!
+//! - `image/svg+xml` (`.svg`)
+//! - `text/html` (`.html`, `.htm`, `.xhtml`)
+//! - `application/xml` (`.xml`, `.xsl`, `.xsd`, `.plist`)
+//! - `text/javascript` (`.js`, `.mjs`, `.cjs`, `.jsx`)
+//! - `text/css` (`.css`, `.scss`, `.sass`, `.less`)
+//! - `application/pdf` (`.pdf`)
+//!
+//! Any content-serving endpoint must apply its own strict allow-list and security headers
+//! (`X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox; default-src 'none'`,
+//! `Content-Disposition: attachment` for non-allow-listed types) rather than echoing `mime`.
 
 use std::fmt;
 use std::path::Path;
@@ -92,7 +110,9 @@ pub fn classify_extension(ext: &str) -> MediaInfo {
         "heic" => (Category::Image, "image/heic"),
         "heif" => (Category::Image, "image/heif"),
         "bmp" | "dib" => (Category::Image, "image/bmp"),
-        "svg" | "svgz" => (Category::Image, "image/svg+xml"),
+        // `.svgz` is gzip-compressed SVG and must not be labelled `image/svg+xml` (which would
+        // mislabel compressed bytes as plain XML); it falls through to `Other`.
+        "svg" => (Category::Image, "image/svg+xml"),
         "tif" | "tiff" => (Category::Image, "image/tiff"),
         "ico" | "cur" => (Category::Image, "image/x-icon"),
         "jxl" => (Category::Image, "image/jxl"),
@@ -125,7 +145,10 @@ pub fn classify_extension(ext: &str) -> MediaInfo {
         "wmv" => (Category::Video, "video/x-ms-wmv"),
         "flv" => (Category::Video, "video/x-flv"),
         "mpg" | "mpeg" | "mpe" => (Category::Video, "video/mpeg"),
-        "m2ts" => (Category::Video, "video/mp2t"),
+        // AVCHD / Blu-ray MPEG transport streams. Plain `.ts` stays mapped to TypeScript below
+        // because classifying `.ts` as video would make `fs.thumb` spawn `ffmpeg` on TypeScript
+        // source trees when browsing code projects.
+        "mts" | "m2ts" => (Category::Video, "video/mp2t"),
         "3gp" => (Category::Video, "video/3gpp"),
         "3g2" => (Category::Video, "video/3gpp2"),
         "ogv" => (Category::Video, "video/ogg"),
@@ -238,7 +261,8 @@ pub fn classify_extension(ext: &str) -> MediaInfo {
         "pl" | "pm" => (Category::Text, "text/x-perl"),
         "lua" => (Category::Text, "text/x-lua"),
         "js" | "mjs" | "cjs" | "jsx" => (Category::Text, "text/javascript"),
-        "ts" | "mts" | "cts" | "tsx" => (Category::Text, "text/typescript"),
+        // `.ts` stays TypeScript (see note under `mts`/`m2ts` above).
+        "ts" | "cts" | "tsx" => (Category::Text, "text/typescript"),
         "sh" | "bash" | "zsh" | "fish" | "ksh" | "csh" => (Category::Text, "text/x-shellscript"),
         "ps1" | "psm1" | "psd1" => (Category::Text, "text/x-powershell"),
         "bat" | "cmd" => (Category::Text, "text/x-bat"),
@@ -321,6 +345,8 @@ mod tests {
             ("web.webm", Category::Video, "video/webm"),
             ("film.mkv", Category::Video, "video/x-matroska"),
             ("old.avi", Category::Video, "video/x-msvideo"),
+            ("cam.mts", Category::Video, "video/mp2t"),
+            ("bluray.M2TS", Category::Video, "video/mp2t"),
             // Audio
             ("song.mp3", Category::Audio, "audio/mpeg"),
             ("track.m4a", Category::Audio, "audio/mp4"),
@@ -400,6 +426,7 @@ mod tests {
             ("README", Category::Other, "application/octet-stream"),
             (".gitignore", Category::Other, "application/octet-stream"),
             ("blob.bin", Category::Other, "application/octet-stream"),
+            ("vector.svgz", Category::Other, "application/octet-stream"),
             (
                 "unknown.xyz123",
                 Category::Other,

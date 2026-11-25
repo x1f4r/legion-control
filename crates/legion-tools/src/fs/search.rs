@@ -42,7 +42,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.add_fn(
         "fs.find",
         Effect::Read,
-        "Find files and directories under a path matching optional name words, glob, kind, category, size, modification time and depth filters within a time budget, with optional sorting and separate hidden and .gitignore controls. With `on: \"all\"`, searches every machine in the fleet concurrently and reports unreachable machines per key.",
+        "Find files and directories under a path matching optional name words, glob, kind, category, size, modification time and depth filters within a time budget, with optional sorting and separate hidden and .gitignore controls. Unsorted searches stream in directory-entry order so huge directories cut off promptly within budget_ms; pass `sort` when deterministic ordering is needed. With `on: \"all\"`, searches every machine in the fleet concurrently and reports unreachable machines per key.",
         find,
     );
     registry.add_fn(
@@ -442,6 +442,7 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
         }
 
         let deadline = Instant::now() + budget;
+        let mut iterations: u64 = 0;
         let mut visited: u64 = 0;
         let mut reason: Option<TruncateReason> = None;
         let skipped_buf = Arc::new(Mutex::new(Vec::new()));
@@ -459,6 +460,9 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
         let mut top_heap: BinaryHeap<SortedCandidate> = BinaryHeap::new();
         let mut overflowed_limit = false;
 
+        // Unsorted walks deliberately stream entries lazily without `sort_by_file_name`, because
+        // buffering and sorting a 200,000-entry directory before yielding entry #1 would blow past
+        // short `budget_ms` limits. Pass `sort` for deterministic ordering.
         let walker = build_walker(
             &root,
             respect_ignore,
@@ -472,7 +476,9 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
         .build();
 
         for item in walker {
-            if visited.is_multiple_of(32) {
+            // Check cancellation and the time budget on EVERY iteration — including entries that
+            // return I/O errors — so a tree full of unreadable directories cannot escape the budget.
+            if iterations.is_multiple_of(32) {
                 if cancel.is_cancelled() {
                     return Err(cancelled_error("fs.find"));
                 }
@@ -481,6 +487,7 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
                     break;
                 }
             }
+            iterations = iterations.saturating_add(1);
             let Ok(entry) = item else {
                 continue;
             };

@@ -3,6 +3,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -22,6 +23,12 @@ use super::{
 const MAX_LIST_DEPTH: u32 = 8;
 const DEFAULT_LIST_LIMIT: u32 = 500;
 const MAX_LIST_LIMIT: u32 = 5000;
+/// Maximum matching entries counted during a multi-level (`depth > 1`) walk before stopping with
+/// `total_exact: false`. Single-directory (`depth == 1`) listings always read and count every
+/// direct child accurately.
+const MAX_RECURSIVE_LIST_COUNT: usize = 10_000;
+/// Wall-clock budget for recursive (`depth > 1`) listing walks so deep trees stay bounded.
+const RECURSIVE_LIST_BUDGET: Duration = Duration::from_secs(2);
 const MAX_READ_LENGTH: u64 = 1024 * 1024;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -29,7 +36,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.add_fn(
         "fs.list",
         Effect::Read,
-        "List entries in a directory up to a bounded depth and count, directories first then ordered by name (natural case-insensitive), modified time, or size, with optional category filtering, paging, and symbolic links reported without following them.",
+        "List entries in a directory up to a bounded depth and count, directories first then ordered by name (natural case-insensitive), modified time, or size, with optional category filtering, paging, total/total_exact counts, staying on one file system for depth > 1, and reporting symbolic links without following them.",
         list,
     );
     registry.add_fn(
@@ -119,6 +126,7 @@ struct ListResult {
     path: String,
     entries: Vec<ListEntry>,
     total: usize,
+    total_exact: bool,
     truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     skipped: Vec<String>,
@@ -163,19 +171,41 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             )
             .with_hint("Use fs.stat or fs.read for a file, or pass its parent directory."));
         }
+        let root_device = platform::device_id(&root, &meta);
         let root_str = path_to_string(&root);
         let reply_bytes = serde_json::to_vec(&ListResult {
             path: root_str.clone(),
             entries: Vec::new(),
             total: usize::MAX,
+            total_exact: false,
             truncated: true,
             skipped: Vec::new(),
         })
-        .map_or(96, |v| v.len());
+        .map_or(112, |v| v.len());
+
+        // For `depth > 1`, bound work proportionally to `offset + limit` (with a hard ceiling and
+        // wall-clock budget) so `fs.list /usr depth=8 limit=1` stops promptly rather than walking
+        // hundreds of thousands of entries just to compute `total`.
+        let page_end = offset.saturating_add(limit);
+        let count_cap = if max_depth > 1 {
+            Some(
+                page_end
+                    .saturating_mul(2)
+                    .max(page_end.saturating_add(1))
+                    .min(MAX_RECURSIVE_LIST_COUNT),
+            )
+        } else {
+            None
+        };
+        let visit_cap = count_cap.map(|c| c.saturating_mul(4).clamp(256, 40_000));
+        let deadline = (max_depth > 1).then(|| Instant::now() + RECURSIVE_LIST_BUDGET);
+
         let mut entries = Vec::new();
         let mut skipped = Vec::new();
         let mut total: usize = 0;
+        let mut visited: usize = 0;
         let mut page_full = false;
+        let mut stopped_early = false;
         let mut state = ListWalk {
             max_depth,
             include_hidden,
@@ -184,6 +214,10 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             sort,
             order,
             categories: categories.as_deref(),
+            root_device,
+            count_cap,
+            visit_cap,
+            deadline,
             reply_bytes,
             own_dirs: &own_dirs,
             cancel: &cancel,
@@ -191,15 +225,19 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             entries: &mut entries,
             skipped: &mut skipped,
             total: &mut total,
+            visited: &mut visited,
             page_full: &mut page_full,
+            stopped_early: &mut stopped_early,
         };
         list_dir(&root, 1, &mut state)?;
         skipped.sort();
-        let truncated = offset.saturating_add(entries.len()) < total;
+        let total_exact = !stopped_early;
+        let truncated = stopped_early || offset.saturating_add(entries.len()) < total;
         Ok(ListResult {
             path: root_str,
             entries,
             total,
+            total_exact,
             truncated,
             skipped,
         })
@@ -215,6 +253,10 @@ struct ListWalk<'a> {
     sort: SortField,
     order: SortOrder,
     categories: Option<&'a [Category]>,
+    root_device: Option<platform::DeviceId>,
+    count_cap: Option<usize>,
+    visit_cap: Option<usize>,
+    deadline: Option<Instant>,
     reply_bytes: usize,
     own_dirs: &'a OwnDirFilter,
     cancel: &'a CancellationToken,
@@ -222,12 +264,37 @@ struct ListWalk<'a> {
     entries: &'a mut Vec<ListEntry>,
     skipped: &'a mut Vec<String>,
     total: &'a mut usize,
+    visited: &'a mut usize,
     page_full: &'a mut bool,
+    stopped_early: &'a mut bool,
+}
+
+impl ListWalk<'_> {
+    fn hit_recursive_budget(&self) -> bool {
+        if let Some(deadline) = self.deadline
+            && self.visited.is_multiple_of(32)
+            && Instant::now() >= deadline
+        {
+            return true;
+        }
+        if *self.page_full {
+            if self.count_cap.is_some_and(|cap| *self.total >= cap) {
+                return true;
+            }
+            if self.visit_cap.is_some_and(|cap| *self.visited >= cap) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolError> {
     if walk.cancel.is_cancelled() {
         return Err(cancelled_error("fs.list"));
+    }
+    if *walk.stopped_early {
+        return Ok(());
     }
     let read_dir = match fs::read_dir(dir) {
         Ok(iter) => iter,
@@ -248,8 +315,13 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
 
     let mut children: Vec<ChildItem> = Vec::new();
     for item in read_dir {
-        if walk.cancel.is_cancelled() {
+        *walk.visited = walk.visited.saturating_add(1);
+        if walk.visited.is_multiple_of(32) && walk.cancel.is_cancelled() {
             return Err(cancelled_error("fs.list"));
+        }
+        if depth > 1 && walk.hit_recursive_budget() {
+            *walk.stopped_early = true;
+            return Ok(());
         }
         let Ok(entry) = item else {
             continue;
@@ -320,6 +392,13 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
         if walk.cancel.is_cancelled() {
             return Err(cancelled_error("fs.list"));
         }
+        if *walk.stopped_early {
+            return Ok(());
+        }
+        if walk.max_depth > 1 && walk.hit_recursive_budget() {
+            *walk.stopped_early = true;
+            return Ok(());
+        }
         let index = *walk.total;
         *walk.total = walk.total.saturating_add(1);
 
@@ -360,8 +439,14 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
             }
         }
 
-        if kind == EntryKind::Dir && depth < walk.max_depth {
+        if kind == EntryKind::Dir
+            && depth < walk.max_depth
+            && platform::same_device(&walk.root_device, &child_path, &meta)
+        {
             list_dir(&child_path, depth + 1, walk)?;
+            if *walk.stopped_early {
+                return Ok(());
+            }
         }
     }
     Ok(())
