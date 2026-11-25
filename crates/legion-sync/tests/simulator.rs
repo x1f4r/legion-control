@@ -34,12 +34,14 @@ use legion_sync::path::{
     validate_flat_internal_name,
 };
 use legion_sync::{
-    BinEntry, ConflictChoice, DeletionBrakeConfig, FetchOptions, FolderConfig, FolderMarker,
-    FolderMeta, FsCapabilities, FsErrorKind, FsMeta, FsWalkEntry, FsWalkResult, HeldBackRecord,
-    IgnoreMatcher, IndexRecord, IndexStore, MemberId, MemberState, MemoryIndexStore, Peer,
-    PeerCursor, PeerHandshake, PendingOp, ProblemKind, RecordsPage, RestoreStrategy,
-    SYNC_PROTOCOL_VERSION, StoreBatch, SyncEngine, SyncError, SyncFs, SyncWrite, VersionKey,
-    VersionVector, is_internal_sync_path, validate_sync_path,
+    BinEntry, ConflictChoice, DeletionBrakeConfig, DeletionBrakeDecision, FetchOptions,
+    FolderConfig, FolderMarker, FolderMeta, FsCapabilities, FsErrorKind, FsMeta, FsWalkEntry,
+    FsWalkResult, HeldBackRecord, INDEX_DAMAGED_PROBLEM_SENTENCE, IgnoreMatcher,
+    InboundDeletionBrakeDecision, IndexRecord, IndexStore, MAX_VERSION_COUNTER, MemberId,
+    MemberState, MemoryIndexStore, Peer, PeerAckView, PeerCursor, PeerHandshake, PendingOp,
+    ProblemKind, RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION, ScanOptions, StoreBatch,
+    SyncEngine, SyncError, SyncFs, SyncWrite, VersionKey, VersionVector, is_internal_sync_path,
+    validate_sync_path,
 };
 use legion_xfer::hash::hash_bytes;
 use legion_xfer::{EntryKind, Hash, Timestamp};
@@ -175,7 +177,7 @@ enum FsFault {
     NonCrash { countdown: usize, kind: FsErrorKind },
 }
 
-/// Human action fired right between two FS steps inside an active apply!
+/// Human action fired right before or after an FS mutation inside an active apply!
 #[derive(Debug, Clone)]
 enum MidApplyOp {
     EditOrCreateFile {
@@ -183,6 +185,17 @@ enum MidApplyOp {
         bytes: Vec<u8>,
         hash: Hash,
         mtime: Timestamp,
+    },
+    /// Same-size, same-mtime overwrite (models `r3` where cached stat metadata looks unchanged).
+    SameSizeInPlaceSave {
+        path: String,
+        bytes: Vec<u8>,
+        hash: Hash,
+    },
+    /// Moves a live file to another path mid-apply (models `r2`).
+    RenameFile {
+        from: String,
+        to: String,
     },
     DeletePath {
         path: String,
@@ -194,11 +207,14 @@ struct MidApplyFired {
     created_hash: Option<Hash>,
     removed_hashes: Vec<Hash>,
     touched_path: String,
+    secondary_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct MidApplyHook {
     countdown: usize,
+    after_op: bool,
+    op_filter: Option<&'static str>,
     op: MidApplyOp,
 }
 
@@ -266,9 +282,9 @@ struct HonestSimFs {
     has_fault: Cell<bool>,
     did_crash: Cell<bool>,
     did_non_crash_fault: Cell<bool>,
-    mid_apply: RefCell<Option<MidApplyHook>>,
+    mid_apply: RefCell<Vec<MidApplyHook>>,
     has_mid_apply: Cell<bool>,
-    mid_apply_fired: RefCell<Option<MidApplyFired>>,
+    mid_apply_fired: RefCell<Vec<MidApplyFired>>,
 }
 
 impl HonestSimFs {
@@ -291,9 +307,9 @@ impl HonestSimFs {
             has_fault: Cell::new(false),
             did_crash: Cell::new(false),
             did_non_crash_fault: Cell::new(false),
-            mid_apply: RefCell::new(None),
+            mid_apply: RefCell::new(Vec::new()),
             has_mid_apply: Cell::new(false),
-            mid_apply_fired: RefCell::new(None),
+            mid_apply_fired: RefCell::new(Vec::new()),
         }
     }
 
@@ -328,9 +344,9 @@ impl HonestSimFs {
             has_fault: Cell::new(false),
             did_crash: Cell::new(false),
             did_non_crash_fault: Cell::new(false),
-            mid_apply: RefCell::new(None),
+            mid_apply: RefCell::new(Vec::new()),
             has_mid_apply: Cell::new(false),
-            mid_apply_fired: RefCell::new(None),
+            mid_apply_fired: RefCell::new(Vec::new()),
         }
     }
 
@@ -370,97 +386,165 @@ impl HonestSimFs {
         self.did_non_crash_fault.get()
     }
 
-    fn arm_mid_apply(&self, countdown: usize, op: MidApplyOp) {
-        *self.mid_apply.borrow_mut() = Some(MidApplyHook { countdown, op });
+    fn arm_mid_apply(
+        &self,
+        countdown: usize,
+        after_op: bool,
+        op_filter: Option<&'static str>,
+        op: MidApplyOp,
+    ) {
+        self.mid_apply.borrow_mut().push(MidApplyHook {
+            countdown,
+            after_op,
+            op_filter,
+            op,
+        });
         self.has_mid_apply.set(true);
-        *self.mid_apply_fired.borrow_mut() = None;
     }
 
-    fn take_mid_apply_fired(&self) -> Option<MidApplyFired> {
-        if !self.has_mid_apply.get() && self.mid_apply_fired.borrow().is_none() {
-            return None;
+    fn take_mid_apply_fired(&self) -> Vec<MidApplyFired> {
+        if !self.has_mid_apply.get() && self.mid_apply_fired.borrow().is_empty() {
+            return Vec::new();
         }
-        *self.mid_apply.borrow_mut() = None;
+        self.mid_apply.borrow_mut().clear();
         self.has_mid_apply.set(false);
-        self.mid_apply_fired.borrow_mut().take()
+        std::mem::take(&mut *self.mid_apply_fired.borrow_mut())
     }
 
-    fn maybe_fire_mid_apply(&self) {
+    fn maybe_fire_mid_apply(&self, op_name: &str, is_after: bool) {
         if !self.has_mid_apply.get() {
             return;
         }
-        let to_run = {
-            let mut guard = self.mid_apply.borrow_mut();
-            match guard.as_mut() {
-                Some(hook) if hook.countdown == 0 => {
-                    self.has_mid_apply.set(false);
-                    guard.take().map(|h| h.op)
-                }
-                Some(hook) => {
-                    hook.countdown -= 1;
-                    None
-                }
-                None => {
-                    self.has_mid_apply.set(false);
-                    None
+        let mut to_run: Vec<MidApplyOp> = Vec::new();
+        {
+            let mut hooks = self.mid_apply.borrow_mut();
+            let mut keep = Vec::with_capacity(hooks.len());
+            for mut hook in hooks.drain(..) {
+                let matches =
+                    hook.after_op == is_after && hook.op_filter.is_none_or(|f| f == op_name);
+                if matches {
+                    if hook.countdown == 0 {
+                        to_run.push(hook.op);
+                    } else {
+                        hook.countdown -= 1;
+                        keep.push(hook);
+                    }
+                } else {
+                    keep.push(hook);
                 }
             }
-        };
-        let Some(op) = to_run else {
-            return;
-        };
-        let fired = match op {
-            MidApplyOp::EditOrCreateFile {
-                path,
-                bytes,
-                hash,
-                mtime,
-            } => {
-                let mut removed = Vec::new();
-                let mut live = self.live.borrow_mut();
-                // Do not corrupt if an ancestor is a non-dir or path is a dir.
-                let blocked = Self::has_ancestor_conflict(&live, &path)
-                    || matches!(live.get(&path), Some(SimNode::Dir { .. }));
-                if blocked {
-                    return;
-                }
-                for anc in legion_sync::path::ancestors(&path) {
-                    live.entry(anc.to_string())
-                        .or_insert(SimNode::Dir { mtime });
-                }
-                if let Some(SimNode::File { hash: old_h, .. }) = live.get(&path) {
-                    removed.push(*old_h);
-                }
-                live.insert(
-                    path.clone(),
-                    SimNode::File {
-                        bytes,
-                        hash,
-                        mtime,
-                        mode: if self.caps.windows_naming {
-                            None
-                        } else {
-                            Some(0o644)
+            *hooks = keep;
+            if hooks.is_empty() {
+                self.has_mid_apply.set(false);
+            }
+        }
+        for op in to_run {
+            let fired = match op {
+                MidApplyOp::EditOrCreateFile {
+                    path,
+                    bytes,
+                    hash,
+                    mtime,
+                } => {
+                    let mut removed = Vec::new();
+                    let mut live = self.live.borrow_mut();
+                    let blocked = Self::has_ancestor_conflict(&live, &path)
+                        || matches!(live.get(&path), Some(SimNode::Dir { .. }));
+                    if blocked {
+                        continue;
+                    }
+                    for anc in legion_sync::path::ancestors(&path) {
+                        live.entry(anc.to_string())
+                            .or_insert(SimNode::Dir { mtime });
+                    }
+                    if let Some(SimNode::File { hash: old_h, .. }) = live.get(&path) {
+                        removed.push(*old_h);
+                    }
+                    live.insert(
+                        path.clone(),
+                        SimNode::File {
+                            bytes,
+                            hash,
+                            mtime,
+                            mode: if self.caps.windows_naming {
+                                None
+                            } else {
+                                Some(0o644)
+                            },
+                            gen_id: self.alloc_gen(),
                         },
-                        gen_id: self.alloc_gen(),
-                    },
-                );
-                MidApplyFired {
-                    created_hash: Some(hash),
-                    removed_hashes: removed,
-                    touched_path: path,
+                    );
+                    MidApplyFired {
+                        created_hash: Some(hash),
+                        removed_hashes: removed,
+                        touched_path: path,
+                        secondary_path: None,
+                    }
                 }
-            }
-            MidApplyOp::DeletePath { path } => {
-                let removed = self.user_remove_recursive(&path);
-                MidApplyFired {
-                    created_hash: None,
-                    removed_hashes: removed,
-                    touched_path: path,
+                MidApplyOp::SameSizeInPlaceSave { path, bytes, hash } => {
+                    let mut removed = Vec::new();
+                    let mut live = self.live.borrow_mut();
+                    let Some(SimNode::File {
+                        bytes: old_b,
+                        hash: old_h,
+                        mtime,
+                        mode,
+                        gen_id,
+                    }) = live.get_mut(&path)
+                    else {
+                        continue;
+                    };
+                    removed.push(*old_h);
+                    // Preserve mtime and size (models coarse-clock same-size save right after
+                    // placement), while bumping `gen_id` (real FS ctime/inode change).
+                    let _ = (*mtime, *mode);
+                    *old_b = bytes;
+                    *old_h = hash;
+                    *gen_id = self.alloc_gen();
+                    MidApplyFired {
+                        created_hash: Some(hash),
+                        removed_hashes: removed,
+                        touched_path: path,
+                        secondary_path: None,
+                    }
                 }
-            }
-        };
-        *self.mid_apply_fired.borrow_mut() = Some(fired);
+                MidApplyOp::RenameFile { from, to } => {
+                    let mut live = self.live.borrow_mut();
+                    let blocked = Self::has_ancestor_conflict(&live, &to)
+                        || matches!(live.get(&to), Some(SimNode::Dir { .. }));
+                    if blocked || !matches!(live.get(&from), Some(SimNode::File { .. })) {
+                        continue;
+                    }
+                    let mut removed = Vec::new();
+                    if let Some(SimNode::File { hash: old_to_h, .. }) = live.get(&to) {
+                        removed.push(*old_to_h);
+                    }
+                    let node = live.remove(&from).unwrap();
+                    for anc in legion_sync::path::ancestors(&to) {
+                        live.entry(anc.to_string()).or_insert(SimNode::Dir {
+                            mtime: Timestamp::new(0, 0),
+                        });
+                    }
+                    live.insert(to.clone(), node);
+                    MidApplyFired {
+                        created_hash: None,
+                        removed_hashes: removed,
+                        touched_path: from,
+                        secondary_path: Some(to),
+                    }
+                }
+                MidApplyOp::DeletePath { path } => {
+                    let removed = self.user_remove_recursive(&path);
+                    MidApplyFired {
+                        created_hash: None,
+                        removed_hashes: removed,
+                        touched_path: path,
+                        secondary_path: None,
+                    }
+                }
+            };
+            self.mid_apply_fired.borrow_mut().push(fired);
+        }
     }
 
     /// Consumes one fault step; returns `(fire_before, fire_after)`.
@@ -523,13 +607,16 @@ impl HonestSimFs {
         f: impl FnOnce() -> legion_sync::Result<T>,
     ) -> legion_sync::Result<T> {
         if allow_mid_apply {
-            self.maybe_fire_mid_apply();
+            self.maybe_fire_mid_apply(op, false);
         }
         let (before, after) = self.tick_fault();
         if let Some(kind) = before {
             return Err(Self::fault_err(op, kind));
         }
         let res = f()?;
+        if allow_mid_apply {
+            self.maybe_fire_mid_apply(op, true);
+        }
         if let Some(kind) = after {
             return Err(Self::fault_err(op, kind));
         }
@@ -1423,21 +1510,21 @@ impl SyncFs for HonestSimFs {
                     detail: "tmp not found".to_string(),
                     kind: FsErrorKind::NotFound,
                 })?;
-            let (mtime, mode, gen_id) = self
-                .tmp_meta
-                .borrow_mut()
-                .remove(tmp_name)
-                .unwrap_or_else(|| {
-                    (
-                        Timestamp::new(0, 0),
-                        if self.caps.windows_naming {
-                            None
-                        } else {
-                            Some(0o644)
-                        },
-                        self.alloc_gen(),
-                    )
-                });
+            let (mtime, mode, gen_id) =
+                self.tmp_meta
+                    .borrow_mut()
+                    .remove(tmp_name)
+                    .unwrap_or_else(|| {
+                        (
+                            Timestamp::new(0, 0),
+                            if self.caps.windows_naming {
+                                None
+                            } else {
+                                Some(0o644)
+                            },
+                            self.alloc_gen(),
+                        )
+                    });
             let hash = hash_bytes(&bytes);
             for anc in legion_sync::path::ancestors(&clean) {
                 if self.resolve_existing_key(&live, anc).is_none() {
@@ -1991,7 +2078,10 @@ impl Peer for SimPeer<'_> {
         self.member_id
     }
 
-    fn handshake(&self, caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+    fn handshake(
+        &self,
+        caller: &legion_sync::HandshakeHello,
+    ) -> legion_sync::Result<PeerHandshake> {
         self.engine.serve_handshake(self.caller, caller)
     }
 
@@ -2700,21 +2790,34 @@ impl SimWorld {
                 self.pick_path()
             };
             let countdown = self.rng.range(4);
-            let op = if self.rng.chance(3, 4) {
-                let (bytes, hash) = self.fresh_bytes();
-                MidApplyOp::EditOrCreateFile {
-                    path: target_path,
-                    bytes,
-                    hash,
-                    mtime: Timestamp::new(now.secs + 1, 0),
+            let after_op = self.rng.chance(1, 2);
+            let op = match self.rng.range(5) {
+                0..=2 => {
+                    let (bytes, hash) = self.fresh_bytes();
+                    MidApplyOp::EditOrCreateFile {
+                        path: target_path,
+                        bytes,
+                        hash,
+                        mtime: Timestamp::new(now.secs + 1, 0),
+                    }
                 }
-            } else {
-                MidApplyOp::DeletePath { path: target_path }
+                3 => {
+                    let to = self.pick_path();
+                    if to != target_path {
+                        MidApplyOp::RenameFile {
+                            from: target_path,
+                            to,
+                        }
+                    } else {
+                        MidApplyOp::DeletePath { path: target_path }
+                    }
+                }
+                _ => MidApplyOp::DeletePath { path: target_path },
             };
             self.members[dst_idx]
                 .engine
                 .fs()
-                .arm_mid_apply(countdown, op);
+                .arm_mid_apply(countdown, after_op, None, op);
         }
 
         if inject_crash {
@@ -2763,8 +2866,8 @@ impl SimWorld {
             )
         };
 
-        // Reconcile any mid-apply human edit into provenance tables BEFORE checking invariants!
-        if let Some(fired) = self.members[dst_idx].engine.fs().take_mid_apply_fired() {
+        // Reconcile any mid-apply human edits into provenance tables BEFORE checking invariants!
+        for fired in self.members[dst_idx].engine.fs().take_mid_apply_fired() {
             for h in fired.removed_hashes {
                 self.note_person_removed(&dst_id, h);
             }
@@ -2773,6 +2876,10 @@ impl SimWorld {
                 self.clear_universally_deleted_for_path(&fired.touched_path);
             }
             self.note_person_touched_path(&dst_id, &fired.touched_path);
+            if let Some(ref sec) = fired.secondary_path {
+                self.note_person_touched_path(&dst_id, sec);
+                self.clear_universally_deleted_for_path(sec);
+            }
             self.log(|| format!("{dst_id} MID_APPLY_HUMAN on {:?}", fired.touched_path));
         }
 
@@ -4237,10 +4344,26 @@ fn run_backup_reinstall_and_join_old_copy_seed(root_seed: u64, seed: u64, record
             "gone.txt resurrected on {} (b={b_id}, m_rec={:?}, a_rec={:?}, b_rec={:?}, a_del_hist={:?}, b_del_hist={:?})",
             m.id,
             m.engine.store().get_record("gone.txt").unwrap(),
-            world.members[a].engine.store().get_record("gone.txt").unwrap(),
-            world.members[b].engine.store().get_record("gone.txt").unwrap(),
-            world.members[a].engine.store().get_deleted_history("gone.txt").unwrap(),
-            world.members[b].engine.store().get_deleted_history("gone.txt").unwrap(),
+            world.members[a]
+                .engine
+                .store()
+                .get_record("gone.txt")
+                .unwrap(),
+            world.members[b]
+                .engine
+                .store()
+                .get_record("gone.txt")
+                .unwrap(),
+            world.members[a]
+                .engine
+                .store()
+                .get_deleted_history("gone.txt")
+                .unwrap(),
+            world.members[b]
+                .engine
+                .store()
+                .get_deleted_history("gone.txt")
+                .unwrap(),
         );
         assert_eq!(
             m.engine.fs().live_file_hash("after_restore.txt"),
@@ -4452,7 +4575,10 @@ fn run_hostile_peer_seed(root_seed: u64, seed: u64, record_trace: bool) {
         fn member_id(&self) -> &str {
             "m1"
         }
-        fn handshake(&self, _caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+        fn handshake(
+            &self,
+            _caller: &legion_sync::HandshakeHello,
+        ) -> legion_sync::Result<PeerHandshake> {
             Ok(PeerHandshake {
                 folder_id: "sim".into(),
                 member_id: "m1".into(),
@@ -4537,13 +4663,15 @@ fn run_hostile_peer_seed(root_seed: u64, seed: u64, record_trace: bool) {
 
     let m0_meta = world.members[0].engine.meta().unwrap();
     let mut forged_own = mk_rec(4, "forged_own.txt", "m1", 4, good_hash);
-    forged_own
-        .version
-        .set(VersionKey::new(&m0_meta.local_member, m0_meta.incarnation), u64::MAX);
+    forged_own.version.set(
+        VersionKey::new(&m0_meta.local_member, m0_meta.incarnation),
+        u64::MAX,
+    );
     let mut huge_cnt = mk_rec(5, "huge_cnt.txt", "m1", 4, good_hash);
-    huge_cnt
-        .version
-        .set(VersionKey::new("m1", 99), legion_sync::MAX_VERSION_COUNTER + 1);
+    huge_cnt.version.set(
+        VersionKey::new("m1", 99),
+        legion_sync::MAX_VERSION_COUNTER + 1,
+    );
     let peer = HostilePeer {
         records: vec![
             mk_rec(1, ".LEGION-SYNC/evil.txt", "m1", 4, good_hash),
@@ -4790,9 +4918,797 @@ fn run_crash_recovery_mid_apply_and_peer_fail_seed(root_seed: u64, seed: u64, re
     world.check_invariants(true);
 }
 
+/// Scenario 9: Swap/claim boundary races (`r1` two saves around exchange, `r2` save then move
+/// around exchange, `r3` same-size/same-mtime save right after exchange, `r5`/`r6` crash after
+/// claim/exchange then new save before restart).
+fn run_swap_boundary_races_seed(root_seed: u64, seed: u64, record_trace: bool) {
+    let mut world = SimWorld::new(
+        root_seed,
+        "swap_boundary_races",
+        seed,
+        false,
+        Vec::new(),
+        record_trace,
+    );
+    // m0 uses atomic exchange (`supports_exchange = true`), m1 uses claim-then-rename (`false`).
+    let a = 0;
+    let b = 1;
+    let target_member = if (seed & 1) == 0 { a } else { b };
+    let source_member = if target_member == a { b } else { a };
+    let displace_op = if target_member == a {
+        "exchange_tmp_with_live"
+    } else {
+        "move_live_to_tmp_no_replace"
+    };
+    let place_op = if target_member == a {
+        "exchange_tmp_with_live"
+    } else {
+        "commit_tmp_to_live_no_replace"
+    };
+
+    // Baseline synced.
+    world.user_create_or_edit_file(source_member, "doc.txt", true);
+    world.user_create_or_edit_file(source_member, "del.txt", true);
+    world.sync_connected_groups_to_quiescence();
+
+    // Case 1 (r1/r2/r3): source updates `doc.txt`; target has concurrent saves/moves right before
+    // and right after the placement syscall!
+    world.global_secs += 30;
+    let src_id = world.members[source_member].id.clone();
+    if let Some(old_h) = world.members[source_member]
+        .engine
+        .fs()
+        .live_file_hash("doc.txt")
+    {
+        world.note_person_removed(&src_id, old_h);
+    }
+    let remote_bytes = b"remote-fixed-16!".to_vec();
+    let remote_hash = hash_bytes(&remote_bytes);
+    let now_src = world.members[source_member].local_time(world.global_secs);
+    world.members[source_member].engine.fs().user_write_file(
+        "doc.txt",
+        remote_bytes.clone(),
+        remote_hash,
+        now_src,
+    );
+    world.note_created(&src_id, remote_hash);
+    world.scan_member(source_member);
+
+    let now_dst = world.members[target_member].local_time(world.global_secs + 1);
+    let (save1_b, save1_h) = world.fresh_bytes();
+    let save2_b = b"newest-fixed-16!".to_vec();
+    let save2_h = hash_bytes(&save2_b);
+
+    let subcase = (seed >> 1) % 3;
+    match subcase {
+        0 => {
+            // r1: save1 right BEFORE swap/claim, save2 right AFTER swap/claim!
+            world.members[target_member].engine.fs().arm_mid_apply(
+                0,
+                false,
+                Some(displace_op),
+                MidApplyOp::EditOrCreateFile {
+                    path: "doc.txt".into(),
+                    bytes: save1_b,
+                    hash: save1_h,
+                    mtime: Timestamp::new(now_dst.secs + 1, 0),
+                },
+            );
+            world.members[target_member].engine.fs().arm_mid_apply(
+                0,
+                true,
+                Some(displace_op),
+                MidApplyOp::EditOrCreateFile {
+                    path: "doc.txt".into(),
+                    bytes: save2_b,
+                    hash: save2_h,
+                    mtime: Timestamp::new(now_dst.secs + 2, 0),
+                },
+            );
+        }
+        1 => {
+            // r2: save1 BEFORE swap/claim, then move `doc.txt` -> `moved.txt` AFTER placement!
+            world.members[target_member].engine.fs().arm_mid_apply(
+                0,
+                false,
+                Some(displace_op),
+                MidApplyOp::EditOrCreateFile {
+                    path: "doc.txt".into(),
+                    bytes: save1_b,
+                    hash: save1_h,
+                    mtime: Timestamp::new(now_dst.secs + 1, 0),
+                },
+            );
+            world.members[target_member].engine.fs().arm_mid_apply(
+                0,
+                true,
+                Some(place_op),
+                MidApplyOp::RenameFile {
+                    from: "doc.txt".into(),
+                    to: "moved.txt".into(),
+                },
+            );
+        }
+        _ => {
+            // r3: same-size, same-mtime save right AFTER placement (`needs_rescan` must catch it!).
+            world.members[target_member].engine.fs().arm_mid_apply(
+                0,
+                true,
+                Some(place_op),
+                MidApplyOp::SameSizeInPlaceSave {
+                    path: "doc.txt".into(),
+                    bytes: save2_b,
+                    hash: save2_h,
+                },
+            );
+        }
+    }
+
+    // Pull without injecting random extra faults so our exact boundary hook fires.
+    world.sync_pair_with_faults(
+        target_member,
+        source_member,
+        false,
+        false,
+        false,
+        false,
+        PeerFault::None,
+    );
+    world.scan_member(target_member);
+
+    if subcase == 2 {
+        // Verify r3: normal scan MUST catch the same-size same-mtime overwrite via `needs_rescan`!
+        let rec = world.members[target_member]
+            .engine
+            .store()
+            .get_record("doc.txt")
+            .unwrap()
+            .unwrap();
+        let disk_h = world.members[target_member]
+            .engine
+            .fs()
+            .live_file_hash("doc.txt");
+        assert_eq!(rec.hash, disk_h, "r3: index/disk mismatch after scan");
+    }
+
+    // Case 2 (r5/r6): delete `del.txt` on source, crash on target right after `move_live_to_tmp_no_replace`,
+    // then person writes a brand-new `del.txt` before recovery runs!
+    world.global_secs += 30;
+    world.user_delete_path(source_member, "del.txt", true);
+    world.members[target_member].engine.fs().arm_crash(0, true);
+    world.sync_pair_with_faults(
+        target_member,
+        source_member,
+        false,
+        false,
+        false,
+        false,
+        PeerFault::None,
+    );
+    let (new_del_b, new_del_h) = world.fresh_bytes();
+    let now_post = world.members[target_member].local_time(world.global_secs + 5);
+    world.members[target_member]
+        .engine
+        .fs()
+        .user_write_file("del.txt", new_del_b, new_del_h, now_post);
+    world.note_created(&world.members[target_member].id.clone(), new_del_h);
+    world.members[target_member].engine.recover().unwrap();
+    world.scan_member(target_member);
+
+    world.sync_connected_groups_to_quiescence();
+    for m in &world.members {
+        if m.active {
+            assert!(
+                m.engine.fs().all_live_hashes().contains(&new_del_h),
+                "post-crash user save at del.txt must survive live on {}",
+                m.id
+            );
+            if subcase == 0 || subcase == 2 {
+                assert!(
+                    m.engine.fs().all_live_hashes().contains(&save2_h),
+                    "newest save around swap must survive live on {}",
+                    m.id
+                );
+            }
+            if subcase == 0 || subcase == 1 {
+                assert!(
+                    m.engine.fs().all_live_hashes().contains(&save1_h)
+                        || m.engine.fs().all_bin_hashes().contains(&save1_h),
+                    "first save before swap must survive on {}",
+                    m.id
+                );
+            }
+        }
+    }
+    world.check_invariants(true);
+}
+
+/// Scenario 10: Late membership arrival (`m1`) and skipped/unapplied deletion never acknowledged
+/// or resurrected (`m2`).
+fn run_late_membership_and_unacked_deletion_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let mut mk = |id: &str, members: &[&str]| {
+        let mut cfg = FolderConfig::new(
+            "sim",
+            id.to_string(),
+            members.iter().map(|s| (*s).to_string()),
+        );
+        cfg.initial_incarnation = Some(rng.next_u64() | 1);
+        let mut e = SyncEngine::open(
+            cfg,
+            HonestSimFs::new(FsCapabilities::unix(), true),
+            FaultyIndexStore::new(),
+        )
+        .unwrap();
+        e.set_deletion_brake(brake_disabled());
+        e
+    };
+
+    // m0 initially does NOT know about m2; m1 and m2 know all three.
+    let mut m0 = mk("m0", &["m0", "m1"]);
+    let mut m1 = mk("m1", &["m0", "m1", "m2"]);
+    let mut m2 = mk("m2", &["m0", "m1", "m2"]);
+
+    // m1 creates `base.txt` and syncs to m0 and m2.
+    let base_b = b"base content".to_vec();
+    let base_h = hash_bytes(&base_b);
+    m1.fs().user_write_file("base.txt", base_b, base_h, t0);
+    m1.scan(t0).unwrap();
+    m0.pull_from_peer(&SimPeer::new(&m1, "m0", "m1", PeerFault::None), t0)
+        .unwrap();
+    m2.pull_from_peer(&SimPeer::new(&m1, "m2", "m1", PeerFault::None), t0)
+        .unwrap();
+
+    // m2 creates `from_m2.txt` AND deletes `base.txt`; m1 pulls from m2.
+    let t1 = Timestamp::new(t0.secs + 10, 0);
+    let m2_b = b"authored by m2".to_vec();
+    let m2_h = hash_bytes(&m2_b);
+    m2.fs().user_write_file("from_m2.txt", m2_b, m2_h, t1);
+    m2.fs().user_remove_recursive("base.txt");
+    m2.scan(t1).unwrap();
+    m1.pull_from_peer(&SimPeer::new(&m2, "m1", "m2", PeerFault::None), t1)
+        .unwrap();
+
+    // m0 pulls from m1 BEFORE learning about m2 -> records mentioning m2 must be held back as
+    // UnknownMember ("not yet") and NOT acknowledged!
+    let t2 = Timestamp::new(t0.secs + 20, 0);
+    let rep = m0
+        .pull_from_peer(&SimPeer::new(&m1, "m0", "m1", PeerFault::None), t2)
+        .unwrap();
+    assert!(rep.held_back >= 2);
+    assert_eq!(rep.invalid_skipped, 0);
+    let m0_c = m0.store().load_peer_cursors().unwrap();
+    assert!(
+        m0_c["m1"].applied_ack_seq < m0_c["m1"].seq,
+        "applied_ack_seq must stay behind held-back records"
+    );
+
+    // m1 pulls from m0 -> m1 must NOT GC `base.txt`'s tombstone because m0 did not ack it!
+    m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t2)
+        .unwrap();
+    assert!(
+        m1.store()
+            .get_record("base.txt")
+            .unwrap()
+            .is_some_and(|r| r.deleted),
+        "m1 must retain base.txt tombstone while m0 holds it back unacked"
+    );
+
+    // Now m0 learns m2! Both `from_m2.txt` and `base.txt` deletion must converge cleanly!
+    let t3 = Timestamp::new(t0.secs + 30, 0);
+    m0.add_member("m2").unwrap();
+    for _ in 0..3 {
+        m0.pull_from_peer(&SimPeer::new(&m1, "m0", "m1", PeerFault::None), t3)
+            .unwrap();
+        m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t3)
+            .unwrap();
+        m2.pull_from_peer(&SimPeer::new(&m1, "m2", "m1", PeerFault::None), t3)
+            .unwrap();
+        m1.pull_from_peer(&SimPeer::new(&m2, "m1", "m2", PeerFault::None), t3)
+            .unwrap();
+    }
+    assert_eq!(m0.fs().live_file_hash("from_m2.txt"), Some(m2_h));
+    assert_eq!(m0.fs().live_file_hash("base.txt"), None);
+    assert_eq!(m1.fs().live_file_hash("base.txt"), None);
+    assert_eq!(m2.fs().live_file_hash("base.txt"), None);
+    assert_eq!(m0.store().held_back_count().unwrap(), 0);
+    let _ = root_seed;
+}
+
+/// Scenario 11: Restored backup making MORE changes than the lost gap (and edit-first-then-new)
+/// must be detected immediately by bidirectional chained-fingerprint handshake without losing a
+/// single post-restore edit (`m3`, `m5`, `m6`, `m7`).
+fn run_backup_restore_more_changes_than_gap_seed(root_seed: u64, seed: u64, record_trace: bool) {
+    let mut world = SimWorld::new(
+        root_seed,
+        "backup_restore_more_changes_than_gap",
+        seed,
+        false,
+        Vec::new(),
+        record_trace,
+    );
+    let a = 0;
+    let b = 1;
+    for i in 0..4 {
+        world.user_create_or_edit_file(b, &format!("f{i}.txt"), true);
+    }
+    world.sync_connected_groups_to_quiescence();
+
+    // Backup B.
+    let b_fs_snap = world.members[b].engine.fs().snapshot();
+    let b_store_snap = world.members[b].engine.store().snapshot();
+    let b_id = world.members[b].id.clone();
+    let b_inc_before = world.members[b].engine.meta().unwrap().incarnation;
+
+    // 3 edits after backup, synced to everyone (small gap of 3).
+    world.global_secs += 60;
+    for i in 0..3 {
+        world.user_create_or_edit_file(b, &format!("f{i}.txt"), true);
+    }
+    world.sync_connected_groups_to_quiescence();
+
+    // Restore B from backup.
+    let post_hashes = world.members[b].engine.fs().all_live_hashes();
+    let backup_hashes: BTreeSet<Hash> = b_fs_snap
+        .live
+        .values()
+        .filter_map(|n| match n {
+            SimNode::File { hash, .. } => Some(*hash),
+            _ => None,
+        })
+        .collect();
+    for h in post_hashes.difference(&backup_hashes) {
+        world.note_person_removed(&b_id, *h);
+    }
+    let all_names: Vec<String> = world.members.iter().map(|m| m.id.clone()).collect();
+    let mut restored = SyncEngine::open(
+        FolderConfig::new("sim", b_id.clone(), all_names),
+        HonestSimFs::from_snapshot(b_fs_snap),
+        FaultyIndexStore::from_inner(b_store_snap),
+    )
+    .unwrap();
+    restored.set_deletion_brake(brake_disabled());
+    world.members[b].engine = restored;
+
+    // Make MORE changes after restore than the gap (8 changes vs gap 3), testing both
+    // edit-first-then-new (m7) and new-first-then-edit (m6)!
+    world.global_secs += 60;
+    let mut must_survive = Vec::new();
+    if (seed & 1) == 0 {
+        for i in 0..3 {
+            world.user_create_or_edit_file(b, &format!("f{i}.txt"), true);
+            must_survive.push(
+                world.members[b]
+                    .engine
+                    .fs()
+                    .live_file_hash(&format!("f{i}.txt"))
+                    .unwrap(),
+            );
+        }
+        for j in 0..5 {
+            let p = format!("new{j}.txt");
+            world.user_create_or_edit_file(b, &p, true);
+            must_survive.push(world.members[b].engine.fs().live_file_hash(&p).unwrap());
+        }
+    } else {
+        for j in 0..5 {
+            let p = format!("new{j}.txt");
+            world.user_create_or_edit_file(b, &p, true);
+            must_survive.push(world.members[b].engine.fs().live_file_hash(&p).unwrap());
+        }
+        for i in 0..3 {
+            world.user_create_or_edit_file(b, &format!("f{i}.txt"), true);
+            must_survive.push(
+                world.members[b]
+                    .engine
+                    .fs()
+                    .live_file_hash(&format!("f{i}.txt"))
+                    .unwrap(),
+            );
+        }
+    }
+
+    // A pulls from B first (must refuse!), then B pulls from A (must rotate incarnation!).
+    {
+        let now_a = world.members[a].local_time(world.global_secs);
+        let (left, right) = world.members.split_at_mut(b);
+        let peer_b = SimPeer::new(&right[0].engine, &left[a].id, &right[0].id, PeerFault::None);
+        assert!(
+            left[a].engine.pull_from_peer(&peer_b, now_a).is_err(),
+            "healthy peer must refuse diverged restored member before rotation"
+        );
+    }
+    {
+        let now_b = world.members[b].local_time(world.global_secs);
+        let (left, right) = world.members.split_at_mut(b);
+        let peer_a = SimPeer::new(&left[a].engine, &right[0].id, &left[a].id, PeerFault::None);
+        right[0].engine.pull_from_peer(&peer_a, now_b).unwrap();
+    }
+    assert_ne!(
+        world.members[b].engine.meta().unwrap().incarnation,
+        b_inc_before
+    );
+    world.sync_connected_groups_to_quiescence();
+    for m in &world.members {
+        if !m.active {
+            continue;
+        }
+        let live = m.engine.fs().all_live_hashes();
+        for h in &must_survive {
+            assert!(
+                live.contains(h),
+                "post-restore change lost on {} (seed={seed})",
+                m.id
+            );
+        }
+    }
+    world.check_invariants(true);
+}
+
+/// Scenario 12: Index wipe while keeping folder + `.legion-sync` stops with `IndexDamaged`,
+/// changes nothing on disk, and explicit `rebuild_from_disk` preserves deletions via
+/// `.legion-sync/deletions.log` (`m4`, `i2`).
+fn run_index_wipe_and_explicit_rebuild_seed(root_seed: u64, seed: u64, record_trace: bool) {
+    let mut world = SimWorld::new(
+        root_seed,
+        "index_wipe_explicit_rebuild",
+        seed,
+        false,
+        Vec::new(),
+        record_trace,
+    );
+    let a = 0;
+    let b = 1;
+    world.user_create_or_edit_file(a, "keep.txt", true);
+    world.user_create_or_edit_file(a, "secret.pdf", true);
+    let keep_h = world.members[a]
+        .engine
+        .fs()
+        .live_file_hash("keep.txt")
+        .unwrap();
+    world.sync_connected_groups_to_quiescence();
+
+    // Partition B off; A deletes `secret.pdf`.
+    world.members[b].group = 1;
+    world.global_secs += 30;
+    world.user_delete_path(a, "secret.pdf", true);
+
+    // Wipe A's index store while keeping A's folder + `.legion-sync` (marker + deletions.log).
+    let a_snap = world.members[a].engine.fs().snapshot();
+    let a_id = world.members[a].id.clone();
+    let all_names: Vec<String> = world.members.iter().map(|m| m.id.clone()).collect();
+    let mut reopened = SyncEngine::open(
+        FolderConfig::new("sim", a_id, all_names),
+        HonestSimFs::from_snapshot(a_snap),
+        FaultyIndexStore::new(),
+    )
+    .unwrap();
+    reopened.set_deletion_brake(brake_disabled());
+    assert!(reopened.is_index_damaged());
+    match reopened.status().unwrap().state {
+        MemberState::Problem { sentence, problems } => {
+            assert_eq!(sentence, INDEX_DAMAGED_PROBLEM_SENTENCE);
+            assert!(problems.iter().any(|p| p.kind == ProblemKind::IndexDamaged));
+        }
+        other => panic!("expected IndexDamaged state, got {other:?}"),
+    }
+    let now_a = world.members[a].local_time(world.global_secs + 10);
+    assert!(matches!(
+        reopened.scan(now_a),
+        Err(SyncError::IndexDamaged { .. })
+    ));
+
+    // Explicit rebuild-from-disk recovers cleanly and preserves `secret.pdf` deletion!
+    reopened.rebuild_from_disk(now_a).unwrap();
+    assert!(!reopened.is_index_damaged());
+    world.members[a].engine = reopened;
+
+    // B reconnects -> `secret.pdf` must NOT resurrect on A and MUST be deleted on B!
+    world.members[b].group = 0;
+    world.sync_connected_groups_to_quiescence();
+    for m in &world.members {
+        if m.active {
+            assert_eq!(m.engine.fs().live_file_hash("secret.pdf"), None);
+            assert_eq!(m.engine.fs().live_file_hash("keep.txt"), Some(keep_h));
+        }
+    }
+    world.check_invariants(true);
+}
+
+/// Scenario 13: Move-aware windowed outbound brake (`b1`, `b2`, `b3`) and matching inbound peer
+/// deletion brake (`b4`: both `KeepLocalFiles` and `ApplyDeletions`).
+fn run_deletion_brake_and_inbound_brake_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    let mut rng = Rng::new(seed);
+    let brake = DeletionBrakeConfig {
+        min_deleted_files: 6,
+        min_deleted_percent: 25,
+        settle_secs: 30,
+        window_secs: 600,
+    };
+    let mut mk = |id: &str| {
+        let mut cfg = FolderConfig::new("sim", id.to_string(), ["m0".into(), "m1".into()]);
+        cfg.initial_incarnation = Some(rng.next_u64() | 1);
+        cfg.deletion_brake = brake;
+        SyncEngine::open(
+            cfg,
+            HonestSimFs::new(FsCapabilities::unix(), true),
+            FaultyIndexStore::new(),
+        )
+        .unwrap()
+    };
+    let mut m0 = mk("m0");
+    let mut m1 = mk("m1");
+    let t0 = Timestamp::new(1_795_608_000, 0);
+
+    // 16 files in d0 (8) and d1 (8).
+    for d in 0..2 {
+        for i in 0..8 {
+            let b = format!("payload-{d}-{i}-{seed}").into_bytes();
+            let h = hash_bytes(&b);
+            m0.fs().user_write_file(&format!("d{d}/f{i}.txt"), b, h, t0);
+        }
+    }
+    m0.scan(t0).unwrap();
+    m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t0)
+        .unwrap();
+
+    // b1: rename d0 -> d0_moved (8 files moved > 6 and 50% > 25%) -> must NOT trip brake!
+    let t1 = Timestamp::new(t0.secs + 5, 0);
+    for i in 0..8 {
+        let old_p = format!("d0/f{i}.txt");
+        let new_p = format!("d0_moved/f{i}.txt");
+        let node = m0.fs().live.borrow_mut().remove(&old_p).unwrap();
+        m0.fs()
+            .live
+            .borrow_mut()
+            .insert("d0_moved".to_string(), SimNode::Dir { mtime: t1 });
+        m0.fs().live.borrow_mut().insert(new_p, node);
+    }
+    m0.fs().live.borrow_mut().remove("d0");
+    let r_move = m0.scan(t1).unwrap();
+    assert!(!r_move.brake_tripped);
+    let p_move = m1
+        .pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t1)
+        .unwrap();
+    assert_eq!(p_move.local_renames, 8);
+
+    // b2: split deletion across two subtree scans -> 0 leaked, brake trips!
+    let t2 = Timestamp::new(t0.secs + 40, 0);
+    for i in 0..4 {
+        m0.fs().user_remove_recursive(&format!("d0_moved/f{i}.txt"));
+    }
+    let r_half1 = m0
+        .scan_subtree("d0_moved", t2, ScanOptions::default())
+        .unwrap();
+    assert!(!r_half1.brake_tripped);
+    assert_eq!(r_half1.deleted, 0);
+    for i in 4..8 {
+        m0.fs().user_remove_recursive(&format!("d0_moved/f{i}.txt"));
+    }
+    let r_half2 = m0
+        .scan_subtree(
+            "d0_moved",
+            Timestamp::new(t2.secs + 5, 0),
+            ScanOptions::default(),
+        )
+        .unwrap();
+    assert!(r_half2.brake_tripped);
+    assert_eq!(r_half2.deleted, 0);
+
+    // Confirm outbound brake on m0 -> m1 must trip inbound peer brake!
+    let t3 = Timestamp::new(t2.secs + 10, 0);
+    m0.resolve_deletion_brake(DeletionBrakeDecision::ConfirmDeleted, t3)
+        .unwrap();
+    assert!(matches!(
+        m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t3),
+        Err(SyncError::Paused { .. })
+    ));
+    assert_eq!(m1.status().unwrap().inbound_brakes.len(), 1);
+
+    if (seed & 1) == 0 {
+        // KeepLocalFiles re-asserts all 8 files back to m0.
+        let kept = m1
+            .resolve_inbound_deletion_brake(
+                "m0",
+                InboundDeletionBrakeDecision::KeepLocalFiles,
+                Timestamp::new(t3.secs + 1, 0),
+            )
+            .unwrap();
+        assert_eq!(kept, 8);
+        m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t3)
+            .unwrap();
+        m0.pull_from_peer(&SimPeer::new(&m1, "m0", "m1", PeerFault::None), t3)
+            .unwrap();
+        assert!(m0.fs().live_file_hash("d0_moved/f0.txt").is_some());
+    } else {
+        // ApplyDeletions deletes all 8 files on m1.
+        m1.resolve_inbound_deletion_brake(
+            "m0",
+            InboundDeletionBrakeDecision::ApplyDeletions,
+            Timestamp::new(t3.secs + 1, 0),
+        )
+        .unwrap();
+        m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t3)
+            .unwrap();
+        assert!(m1.fs().live_file_hash("d0_moved/f0.txt").is_none());
+    }
+    let _ = root_seed;
+}
+
+/// Scenario 14: Lying peer defenses — forged own counter, > 2^62 counter, 1/hour forced-rotation
+/// rate limit, and escaping/absolute symlinks outbound and inbound (Item 9).
+fn run_adversary_counters_rotation_and_symlinks_seed(
+    root_seed: u64,
+    seed: u64,
+    _record_trace: bool,
+) {
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let mut cfg = FolderConfig::new("sim", "m0".to_string(), ["m0".into(), "m1".into()]);
+    cfg.initial_incarnation = Some(rng.next_u64() | 1);
+    let mut m0 = SyncEngine::open(
+        cfg,
+        HonestSimFs::new(FsCapabilities::unix(), true),
+        FaultyIndexStore::new(),
+    )
+    .unwrap();
+    m0.set_deletion_brake(brake_disabled());
+
+    // Outbound escaping symlink must be held back & listed as a problem, never indexed.
+    m0.fs()
+        .create_symlink_live("bad_link", "../../outside")
+        .unwrap();
+    m0.fs().create_symlink_live("good_link", "ok.txt").unwrap();
+    let ok_b = b"ok".to_vec();
+    let ok_h = hash_bytes(&ok_b);
+    m0.fs().user_write_file("ok.txt", ok_b, ok_h, t0);
+    let scan = m0.scan(t0).unwrap();
+    assert_eq!(scan.held_back_problems.len(), 1);
+    assert!(m0.store().get_record("bad_link").unwrap().is_none());
+    assert!(m0.store().get_record("good_link").unwrap().is_some());
+
+    // Lying peer triggers forced rotation twice within 1 hour -> 1st succeeds, 2nd rate-limited!
+    struct ForcedRotPeer {
+        claim_inc: u64,
+        claim_seq: u64,
+        records: Vec<IndexRecord>,
+    }
+    impl Peer for ForcedRotPeer {
+        fn member_id(&self) -> &str {
+            "m1"
+        }
+        fn handshake(
+            &self,
+            _caller: &legion_sync::HandshakeHello,
+        ) -> legion_sync::Result<PeerHandshake> {
+            Ok(PeerHandshake {
+                folder_id: "sim".into(),
+                member_id: "m1".into(),
+                incarnation: 777,
+                snapshot_seq: self.records.len() as u64,
+                head_fingerprint: None,
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                caller_pulled: Some(PeerAckView {
+                    incarnation: self.claim_inc,
+                    seq: self.claim_seq,
+                    fingerprint: Some(hash_bytes(b"forged-fp")),
+                }),
+                caller_acked: None,
+                caller_pull_matches: Some(true),
+                caller_regressed: false,
+            })
+        }
+        fn records_since(
+            &self,
+            _inc: u64,
+            since_seq: u64,
+            _limit: usize,
+            _cancel: Option<&AtomicBool>,
+        ) -> legion_sync::Result<RecordsPage> {
+            let records: Vec<IndexRecord> = self
+                .records
+                .iter()
+                .filter(|r| r.seq > since_seq)
+                .cloned()
+                .collect();
+            Ok(RecordsPage {
+                incarnation: 777,
+                records,
+                snapshot_seq: self.records.len() as u64,
+                has_more: false,
+                caller_acked: None,
+                caller_acked_fingerprint: None,
+                head_fingerprint: None,
+                chain_fingerprints: BTreeMap::new(),
+            })
+        }
+        fn fetch_file(
+            &self,
+            _path: &str,
+            _hash: Hash,
+            _opts: &FetchOptions,
+        ) -> legion_sync::Result<Box<dyn Read + Send>> {
+            Ok(Box::new(Cursor::new(Vec::new())))
+        }
+    }
+
+    let inc0 = m0.meta().unwrap().incarnation;
+    let mut bad_vv = VersionVector::new();
+    bad_vv.bump_above(VersionKey::new("m1", 777), 0);
+    let escaping_sym = IndexRecord {
+        path: "in_escape".into(),
+        kind: EntryKind::Symlink,
+        size: 0,
+        mtime: t0,
+        disk_mtime: None,
+        disk_change_id: None,
+        mode: Some(0o777),
+        hash: None,
+        link_target: Some("../secret".into()),
+        deleted: false,
+        version: bad_vv.clone(),
+        modified_by: "m1".into(),
+        seq: 1,
+        recent_hashes: Vec::new(),
+        from_join: false,
+        conflict_of: None,
+        conflict_dismissed: false,
+    };
+    let mut huge_vv = VersionVector::new();
+    huge_vv.bump_above(VersionKey::new("m1", 777), MAX_VERSION_COUNTER);
+    let huge_rec = IndexRecord {
+        path: "huge.txt".into(),
+        kind: EntryKind::File,
+        size: 1,
+        mtime: t0,
+        disk_mtime: None,
+        disk_change_id: None,
+        mode: Some(0o644),
+        hash: Some(hash_bytes(b"x")),
+        link_target: None,
+        deleted: false,
+        version: huge_vv,
+        modified_by: "m1".into(),
+        seq: 2,
+        recent_hashes: Vec::new(),
+        from_join: false,
+        conflict_of: None,
+        conflict_dismissed: false,
+    };
+
+    let p1 = ForcedRotPeer {
+        claim_inc: inc0,
+        claim_seq: 999,
+        records: vec![escaping_sym, huge_rec],
+    };
+    let r1 = m0
+        .pull_from_peer(&p1, Timestamp::new(t0.secs + 60, 0))
+        .unwrap();
+    let inc1 = m0.meta().unwrap().incarnation;
+    assert_ne!(inc1, inc0, "first rollback claim rotates once");
+    assert_eq!(r1.held_back, 1, "escaping inbound symlink held back");
+    assert_eq!(r1.invalid_skipped, 1, "> 2^62 counter refused");
+    assert!(m0.fs().stat_live("in_escape").unwrap().is_none());
+
+    // Second forced rotation within 1 hour MUST be rate-limited!
+    let p2 = ForcedRotPeer {
+        claim_inc: inc1,
+        claim_seq: 999,
+        records: Vec::new(),
+    };
+    assert!(matches!(
+        m0.pull_from_peer(&p2, Timestamp::new(t0.secs + 120, 0)),
+        Err(SyncError::Conflict { .. })
+    ));
+    assert_eq!(m0.meta().unwrap().incarnation, inc1);
+    let _ = root_seed;
+}
+
 fn run_one_seed(seed: u64, record_trace: bool) {
-    // Every seed runs the dense randomized schedule (all faults, mid-apply human edits, bin
-    // restore, conflict resolution, clock jumps both ways, directory renames, deep trees).
+    // Every seed runs the dense randomized schedule (all faults, mid-apply human edits before &
+    // after swap/claim, bin restore, conflict resolution, clock jumps both ways, directory renames,
+    // deep trees).
     let mut world = SimWorld::new(
         seed,
         "random_schedule",
@@ -4807,7 +5723,7 @@ fn run_one_seed(seed: u64, record_trace: bool) {
     // seeds EACH scenario runs >3,100,000 independent times!
     match seed % 16 {
         0 => run_long_partition_zombie_seed(seed, seed ^ 0x5555_5555, record_trace),
-        1 | 9 => run_conflict_and_delete_vs_edit_seed(seed, seed ^ 0xAAAA_AAAA, record_trace),
+        1 | 15 => run_conflict_and_delete_vs_edit_seed(seed, seed ^ 0xAAAA_AAAA, record_trace),
         2 => run_heterogeneous_and_case_rename_seed(seed, seed ^ 0x3333_3333, record_trace),
         3 => run_backup_reinstall_and_join_old_copy_seed(seed, seed ^ 0x7777_7777, record_trace),
         4 => run_duplicate_member_id_seed(seed, seed ^ 0x9999_9999, record_trace),
@@ -4817,6 +5733,16 @@ fn run_one_seed(seed: u64, record_trace: bool) {
         8 => {
             run_crash_recovery_mid_apply_and_peer_fail_seed(seed, seed ^ 0xEEEE_EEEE, record_trace)
         }
+        9 => run_swap_boundary_races_seed(seed, seed ^ 0x1111_1111, record_trace),
+        10 => run_late_membership_and_unacked_deletion_seed(seed, seed ^ 0x2222_2222, record_trace),
+        11 => run_backup_restore_more_changes_than_gap_seed(seed, seed ^ 0x4444_4444, record_trace),
+        12 => run_index_wipe_and_explicit_rebuild_seed(seed, seed ^ 0x6666_6666, record_trace),
+        13 => run_deletion_brake_and_inbound_brake_seed(seed, seed ^ 0x8888_8888, record_trace),
+        14 => run_adversary_counters_rotation_and_symlinks_seed(
+            seed,
+            seed ^ 0xF0F0_F0F0,
+            record_trace,
+        ),
         _ => {}
     }
 }
@@ -4865,12 +5791,12 @@ fn run_seed_range_parallel(start_seed: u64, count: u64) -> (std::time::Duration,
 /// 5,000,000-seed review run (257640, 859170, 1381582, 1845682, 2777393, 4395930).
 const REGRESSION_SEEDS: &[u64] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 42, 55, 78, 95, 97, 99, 128, 196, 249, 302, 316, 444, 759,
-    951, 1137, 1225, 1326, 1337, 1346, 1435, 1451, 1476, 1532, 1576, 1617, 2026, 11338, 19883,
-    25021, 31444, 35879, 48566, 56498, 60211, 85172, 89687, 90830, 94963, 257640, 338474, 612202,
-    834066, 859170, 1234029, 1276023, 1381582, 1442864, 1631700, 1735939, 1845682, 1905590,
-    2132430, 2242736, 2469631, 2508764, 2770489, 2777393, 2838112, 2972224, 3137180, 3286448,
-    3660488, 3804523, 3954961, 4066064, 4319726, 4377839, 4395930, 4628071, 4717156, 6102439,
-    13635160, 17469556, 18877611, 37147542,
+    951, 1137, 1225, 1326, 1337, 1346, 1435, 1451, 1476, 1532, 1576, 1617, 2026, 2478, 5635, 11338,
+    15197, 19883, 25021, 25180, 27850, 31444, 32580, 35879, 48566, 56498, 60211, 85172, 89687,
+    90830, 94963, 257640, 338474, 612202, 834066, 859170, 1234029, 1276023, 1381582, 1442864,
+    1631700, 1735939, 1845682, 1905590, 2132430, 2242736, 2469631, 2508764, 2770489, 2777393,
+    2838112, 2972224, 3137180, 3286448, 3660488, 3804523, 3954961, 4066064, 4319726, 4377839,
+    4395930, 4628071, 4717156, 6102439, 13635160, 17469556, 18877611, 37147542,
 ];
 
 #[test]
@@ -4892,6 +5818,12 @@ fn simulator_all_dedicated_scenarios() {
         run_hostile_peer_seed(s, s ^ 0xCCCC_CCCC, true);
         run_unreadable_mount_and_ignored_dir_seed(s, s ^ 0xDDDD_DDDD, true);
         run_crash_recovery_mid_apply_and_peer_fail_seed(s, s ^ 0xEEEE_EEEE, true);
+        run_swap_boundary_races_seed(s, s ^ 0x1111_1111, true);
+        run_late_membership_and_unacked_deletion_seed(s, s ^ 0x2222_2222, true);
+        run_backup_restore_more_changes_than_gap_seed(s, s ^ 0x4444_4444, true);
+        run_index_wipe_and_explicit_rebuild_seed(s, s ^ 0x6666_6666, true);
+        run_deletion_brake_and_inbound_brake_seed(s, s ^ 0x8888_8888, true);
+        run_adversary_counters_rotation_and_symlinks_seed(s, s ^ 0xF0F0_F0F0, true);
     }
 }
 
