@@ -11,7 +11,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use legion_proto::{ErrorBody, ErrorCode};
 use serde::Deserialize;
@@ -35,6 +35,13 @@ const STREAM_BUF_BYTES: usize = 16 * 1024;
 /// Minimum idle reply timeout while waiting for `put` verification heartbeats (`legion stream`
 /// emits `{"busy": true}` every 10 seconds while hashing large files).
 const MIN_PUT_FINISH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum number of `{"busy": true}` heartbeats tolerated during the initial `put` handshake.
+const MAX_PUT_READY_BUSY_HEARTBEATS: usize = 16;
+/// Maximum number of `{"busy": true}` heartbeats tolerated while waiting for `put` verification
+/// (`60 * 10s = 10 minutes`), preventing a peer that spams heartbeats from holding a slot forever.
+const MAX_PUT_FINISH_BUSY_HEARTBEATS: usize = 60;
+/// Hard wall-clock cap on waiting for `put` verification regardless of `{"busy": true}` heartbeats.
+const MAX_PUT_FINISH_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Request metadata for uploading a file via [`Link::open_put`](crate::Link::open_put).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -457,6 +464,7 @@ async fn read_put_ready<R: AsyncRead + Unpin>(
     let mut greeted = false;
     let mut noise_lines = 0usize;
     let mut noise_bytes = 0usize;
+    let mut busy_heartbeats = 0usize;
     let mut line = Vec::new();
 
     loop {
@@ -496,6 +504,17 @@ async fn read_put_ready<R: AsyncRead + Unpin>(
                     continue;
                 }
             } else if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
+                busy_heartbeats += 1;
+                if busy_heartbeats > MAX_PUT_READY_BUSY_HEARTBEATS {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Timeout,
+                        format!(
+                            "Timed out waiting for {machine} to start the upload after repeated busy replies."
+                        ),
+                    )
+                    .with_hint("Try again once the machine is no longer busy.")
+                    .with_machine(machine));
+                }
                 continue;
             } else {
                 if let Some(error_val) = fields.get("error")
@@ -546,8 +565,54 @@ async fn read_put_done<R: AsyncRead + Unpin>(
     idle_timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<PutDoneReply, ErrorBody> {
+    read_put_done_with_limits(
+        reader,
+        machine,
+        stderr,
+        idle_timeout,
+        MAX_PUT_FINISH_TOTAL_TIMEOUT,
+        MAX_PUT_FINISH_BUSY_HEARTBEATS,
+        cancel,
+    )
+    .await
+}
+
+async fn read_put_done_with_limits<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    machine: &str,
+    stderr: &Option<Arc<StderrTail>>,
+    idle_timeout: Duration,
+    total_timeout: Duration,
+    max_busy_heartbeats: usize,
+    cancel: &CancellationToken,
+) -> Result<PutDoneReply, ErrorBody> {
+    let started = Instant::now();
+    let mut busy_heartbeats = 0usize;
     let mut line = Vec::new();
     loop {
+        let Some(remaining) = total_timeout.checked_sub(started.elapsed()) else {
+            return Err(ErrorBody::new(
+                ErrorCode::Timeout,
+                format!(
+                    "Timed out waiting for {machine} to finish verifying the upload after {}s.",
+                    total_timeout.as_secs_f64()
+                ),
+            )
+            .with_hint("Retry the upload once the machine is no longer busy.")
+            .with_machine(machine));
+        };
+        if remaining.is_zero() {
+            return Err(ErrorBody::new(
+                ErrorCode::Timeout,
+                format!(
+                    "Timed out waiting for {machine} to finish verifying the upload after {}s.",
+                    total_timeout.as_secs_f64()
+                ),
+            )
+            .with_hint("Retry the upload once the machine is no longer busy.")
+            .with_machine(machine));
+        }
+        let step_timeout = idle_timeout.min(remaining);
         line.clear();
         let read_res = tokio::select! {
             biased;
@@ -559,7 +624,7 @@ async fn read_put_done<R: AsyncRead + Unpin>(
                 .with_machine(machine));
             }
             res = tokio::time::timeout(
-                idle_timeout,
+                step_timeout,
                 read_bounded_line(reader, &mut line, MAX_REPLY_LINE),
             ) => match res {
                 Ok(inner) => inner.map_err(|err| {
@@ -570,7 +635,7 @@ async fn read_put_done<R: AsyncRead + Unpin>(
                         ErrorCode::Timeout,
                         format!(
                             "Timed out waiting for {machine} to verify the upload after {}s of silence.",
-                            idle_timeout.as_secs_f64()
+                            step_timeout.as_secs_f64()
                         ),
                     )
                     .with_machine(machine);
@@ -608,6 +673,17 @@ async fn read_put_done<R: AsyncRead + Unpin>(
             .with_machine(machine));
         };
         if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
+            busy_heartbeats += 1;
+            if busy_heartbeats > max_busy_heartbeats {
+                return Err(ErrorBody::new(
+                    ErrorCode::Timeout,
+                    format!(
+                        "Timed out waiting for {machine} to verify the upload after repeated busy replies."
+                    ),
+                )
+                .with_hint("Retry the upload once the machine is no longer busy.")
+                .with_machine(machine));
+            }
             continue;
         }
         if let Some(error_val) = fields.get("error")
@@ -1135,5 +1211,61 @@ mod tests {
         drop(put2);
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn read_put_done_bounds_endless_busy_heartbeats_by_count_and_total_deadline() {
+        // Endless {"busy":true} stream fails promptly once heartbeat count exceeds limit.
+        let (client, mut server) = tokio::io::duplex(4096);
+        let producer = tokio::spawn(async move {
+            for _ in 0..20 {
+                if server.write_all(b"{\"busy\":true}\n").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut reader = BufReader::new(client);
+        let cancel = CancellationToken::new();
+        let err = read_put_done_with_limits(
+            &mut reader,
+            "tower",
+            &None,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            3,
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Timeout);
+        assert!(err.message.contains("repeated busy replies"));
+        drop(reader);
+        let _ = producer.await;
+
+        // Slow periodic {"busy":true} stream also fails once total deadline expires.
+        let (client2, mut server2) = tokio::io::duplex(4096);
+        let producer2 = tokio::spawn(async move {
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                if server2.write_all(b"{\"busy\":true}\n").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut reader2 = BufReader::new(client2);
+        let err2 = read_put_done_with_limits(
+            &mut reader2,
+            "tower",
+            &None,
+            Duration::from_secs(5),
+            Duration::from_millis(80),
+            100,
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err2.code, ErrorCode::Timeout);
+        drop(reader2);
+        let _ = producer2.await;
     }
 }

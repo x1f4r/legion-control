@@ -67,6 +67,13 @@ pub struct ServeOptions {
     /// bytes per reply so buffered mounts such as a web view's custom URI scheme answer open-ended
     /// ranges (`bytes=0-`) in bounded pieces.
     pub max_range_bytes: Option<u64>,
+    /// Optional upper bound on total file size answered for an unranged `GET` request (`200 OK`).
+    ///
+    /// When `Some(n)` (with `n > 0`), the handler probes file metadata (`length = Some(0)`) before
+    /// reading any bytes and returns `413 Payload Too Large` immediately if the file exceeds `n`
+    /// bytes. Buffered mounts use this to prevent large unranged images or downloads from buffering
+    /// unbounded memory.
+    pub max_full_bytes: Option<u64>,
 }
 
 impl Default for ServeOptions {
@@ -76,6 +83,7 @@ impl Default for ServeOptions {
             liveness_check_bytes: LIVENESS_CHECK_BYTES,
             liveness_check_interval: LIVENESS_CHECK_INTERVAL,
             max_range_bytes: None,
+            max_full_bytes: None,
         }
     }
 }
@@ -83,6 +91,10 @@ impl Default for ServeOptions {
 impl ServeOptions {
     fn effective_max_range_bytes(self) -> Option<u64> {
         self.max_range_bytes.filter(|&n| n > 0)
+    }
+
+    fn effective_max_full_bytes(self) -> Option<u64> {
+        self.max_full_bytes.filter(|&n| n > 0)
     }
 }
 
@@ -607,12 +619,30 @@ async fn open_and_stream_full<S: ContentSource>(
     options: ServeOptions,
     stream_ctx: StreamContext<S>,
 ) -> Response<ContentBody> {
+    if let Some(cap) = options.effective_max_full_bytes() {
+        let probe = match source.open_range(ticket, 0, Some(0)).await {
+            Ok(opened) => opened,
+            Err(err) => return map_open_error(tickets, ticket, err, options),
+        };
+        if let Err(err) = validate_opened_range(&probe, 0, Some(0)) {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err, options);
+        }
+        if probe.size > cap {
+            return payload_too_large(probe.size, cap, options);
+        }
+    }
+
     let opened = match source.open_range(ticket, 0, None).await {
         Ok(opened) => opened,
         Err(err) => return map_open_error(tickets, ticket, err, options),
     };
     if let Err(err) = validate_opened_range(&opened, 0, None) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err, options);
+    }
+    if let Some(cap) = options.effective_max_full_bytes()
+        && opened.size > cap
+    {
+        return payload_too_large(opened.size, cap, options);
     }
     let tag = etag(opened.size, opened.mtime, opened.file_id);
     let body = stream_ctx.into_body(opened.reader, opened.length);
@@ -625,6 +655,23 @@ async fn open_and_stream_full<S: ContentSource>(
         download,
         options,
         body,
+    )
+}
+
+fn payload_too_large(size: u64, limit: u64, options: ServeOptions) -> Response<ContentBody> {
+    json_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        &ErrorBody::new(
+            ErrorCode::Unsupported,
+            "This file is too large to display inline here.",
+        )
+        .with_hint("Download the file or open it in another app instead.")
+        .with_details(serde_json::json!({
+            "reason": "too_large_for_inline",
+            "size": size,
+            "limit": limit,
+        })),
+        options,
     )
 }
 
@@ -1854,5 +1901,101 @@ mod tests {
         assert_eq!(resp.headers().get(CONTENT_LENGTH).unwrap(), "10000");
         let body = collect_body(resp.into_body()).await.unwrap();
         assert_eq!(body, data);
+    }
+
+    #[tokio::test]
+    async fn max_full_bytes_rejects_oversize_unranged_get_before_reading_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = vec![0x42u8; 10_000];
+        let path = dir.path().join("huge.png");
+        std::fs::write(&path, &data).unwrap();
+
+        struct CountingSource {
+            inner: DiskSource,
+            non_zero_opens: AtomicUsize,
+        }
+        impl ContentSource for CountingSource {
+            fn open_range<'a>(
+                &'a self,
+                ticket: &'a Ticket,
+                offset: u64,
+                length: Option<u64>,
+            ) -> Pin<Box<dyn Future<Output = Result<OpenedRange, OpenRangeError>> + Send + 'a>>
+            {
+                if length != Some(0) {
+                    self.non_zero_opens.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.open_range(ticket, offset, length)
+            }
+        }
+
+        let tickets = Arc::new(TicketTable::new());
+        let source = Arc::new(CountingSource {
+            inner: DiskSource {
+                root: dir.path().to_path_buf(),
+                revoked: Arc::new(AtomicBool::new(false)),
+                denied: Arc::new(AtomicBool::new(false)),
+            },
+            non_zero_opens: AtomicUsize::new(0),
+        });
+        let issued = tickets
+            .issue(TicketRequest {
+                holder: "tok-1".to_owned(),
+                principal: "phone".to_owned(),
+                machine: "tower".to_owned(),
+                path: "huge.png".to_owned(),
+            })
+            .unwrap();
+
+        let opts = ServeOptions {
+            corp: CorpPolicy::CrossOrigin,
+            max_range_bytes: Some(2048),
+            max_full_bytes: Some(4096),
+            ..ServeOptions::default()
+        };
+
+        // Unranged GET over cap returns 413 immediately without opening a non-zero byte stream.
+        let resp = handle_request(
+            &tickets,
+            &source,
+            &Method::GET,
+            &issued.id,
+            &issued.file_name,
+            None,
+            &HeaderMap::new(),
+            opts,
+            StreamHooks::default(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(source.non_zero_opens.load(Ordering::SeqCst), 0);
+        let body = collect_body(resp.into_body()).await.unwrap();
+        let err: ErrorBody = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert!(err.message.contains("too large"));
+        assert!(err.hint.as_deref().unwrap_or("").contains("Download"));
+        assert_eq!(
+            err.details.as_ref().and_then(|d| d.get("reason")),
+            Some(&serde_json::json!("too_large_for_inline"))
+        );
+
+        // Ranged GET on the exact same file still succeeds in bounded chunks.
+        let mut h = HeaderMap::new();
+        h.insert(RANGE, HeaderValue::from_static("bytes=0-"));
+        let ranged = handle_request(
+            &tickets,
+            &source,
+            &Method::GET,
+            &issued.id,
+            &issued.file_name,
+            None,
+            &h,
+            opts,
+            StreamHooks::default(),
+        )
+        .await;
+        assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(ranged.headers().get(CONTENT_LENGTH).unwrap(), "2048");
+        assert_eq!(source.non_zero_opens.load(Ordering::SeqCst), 1);
     }
 }
