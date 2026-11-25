@@ -1,5 +1,11 @@
 import { formatBusyReasonLines } from '../lib/format.js';
 import { createMockFilesState, FILES_EXTRA_TOOLS, OLD_FS_FIND_TOOL } from './mock-files.js';
+import {
+  OLD_FIXTURE_BUILD,
+  OLD_FIXTURE_TOOLS,
+  OLD_FIXTURE_VERSION,
+  validateToolArgsAgainstSpec,
+} from './mock-old-tools.js';
 
 // Deterministic mock link (?mock) shaped like real Legion tool results.
 // Mode flags (comma-separated, e.g. ?mock=multi,tech):
@@ -12,7 +18,8 @@ import { createMockFilesState, FILES_EXTRA_TOOLS, OLD_FS_FIND_TOOL } from './moc
 //   enrol     - with fleet, auto-completes the next created invite so post-pairing delivery appears
 //   first     - adds a never-seen machine ("mini") that starts in asking state
 //   tech      - starts with Technical details turned on
-//   old       - configures mock as an older node with none of the new Files tools or content URLs
+//   old       - configures every mock machine as an older node (exact build 05ba1ef2e385 fixture, strict args)
+//   mixed     - mixed-version fleet: tower & pi run current Legion while studio runs build 05ba1ef2e385 (strict args)
 //   nosync    - hides sync.* tools so the Kept in sync section is omitted
 //   large     - adds a 5 000-entry folder (/home/me/Archive5000) for paging tests
 //   transfers - seeds live running machine & device transfers for Activity preview
@@ -582,7 +589,9 @@ export function createMockLink(mode = '') {
   let fleetDevicesByMachine = null;
 
   const isOldNode = flags.has('old') || flags.has('legacy');
+  const isMixed = !isOldNode && (flags.has('mixed') || flags.has('old-peer'));
   const isNoSync = flags.has('nosync') || isOldNode;
+  const isMachineOld = (machineName) => isOldNode || (isMixed && machineName === 'studio');
 
   const baseTools = MOCK_TOOLS.map((t) => {
     if (!isOldNode && t.name === 'fs.list') {
@@ -675,11 +684,19 @@ export function createMockLink(mode = '') {
     : fullBaseTools;
 
   const role = isNone ? 'guest' : isLimited ? 'observer' : 'owner';
-  const allowedTools = isNone
-    ? ['meta.whoami', 'meta.version', 'fleet.list', 'sys.info', 'power.status']
-    : isLimited
-      ? mockToolsList.filter((t) => t.effect === 'read').map((t) => t.name)
-      : mockToolsList.map((t) => t.name);
+  const toolsForMachine = (machineName) =>
+    isMachineOld(machineName) ? OLD_FIXTURE_TOOLS : mockToolsList;
+  const allowedToolsForMachine = (machineName) => {
+    const list = toolsForMachine(machineName);
+    if (isNone) {
+      return ['meta.whoami', 'meta.version', 'fleet.list', 'sys.info', 'power.status'];
+    }
+    if (isLimited) {
+      return list.filter((t) => t.effect === 'read').map((t) => t.name);
+    }
+    return list.map((t) => t.name);
+  };
+  const allowedTools = allowedToolsForMachine(activeNode);
 
   let incomingDevices = [
     {
@@ -938,9 +955,11 @@ export function createMockLink(mode = '') {
   const filesState = createMockFilesState({
     machines,
     flags,
+    isMachineOld,
     activeNodeRef: () => activeNode,
     isAuthedRef: () => authed,
-    canReadRef: () => allowedTools.includes('fs.read') && !isDenyRead,
+    canReadRef: (machineName) =>
+      allowedToolsForMachine(machineName || activeNode).includes('fs.read') && !isDenyRead,
   });
 
   function resolveOne(target, tool, args, onEvent) {
@@ -953,8 +972,28 @@ export function createMockLink(mode = '') {
       throw m.error;
     }
 
-    const spec = mockToolsList.find((t) => t.name === tool);
-    if (spec && !allowedTools.includes(tool)) {
+    const machineTools = toolsForMachine(name);
+    const machineAllowed = allowedToolsForMachine(name);
+    const spec = machineTools.find((t) => t.name === tool);
+    if (isMachineOld(name)) {
+      if (!spec) {
+        throw {
+          code: 'unknown_tool',
+          message: `Unknown tool: ${tool}`,
+          hint: '`legion tools` lists the tools this node offers.',
+          machine: name,
+        };
+      }
+      if (!machineAllowed.includes(tool)) {
+        throw {
+          code: 'denied',
+          message: `Principal "phone" (role "${role}") may not call ${tool}.`,
+          hint: 'Ask the machine owner to grant access in policy.toml.',
+          machine: name,
+        };
+      }
+      validateToolArgsAgainstSpec(name, spec, args);
+    } else if (spec && !machineAllowed.includes(tool)) {
       throw {
         code: 'denied',
         message: `Principal "phone" (role "${role}") may not call ${tool}.`,
@@ -972,8 +1011,8 @@ export function createMockLink(mode = '') {
       case 'meta.version':
         return {
           name: 'legion',
-          version: '0.1.0',
-          build: 'mock00000000',
+          version: isMachineOld(name) ? OLD_FIXTURE_VERSION : isMixed ? '0.2.0' : '0.1.0',
+          build: isMachineOld(name) ? OLD_FIXTURE_BUILD : 'mock00000000',
           protocol: 1,
           node: name,
           os: m.sys.os.family,
@@ -981,9 +1020,9 @@ export function createMockLink(mode = '') {
         };
       case 'meta.update':
         return {
-          current: '0.1.0',
-          latest: '0.1.0',
-          up_to_date: true,
+          current: isMachineOld(name) ? OLD_FIXTURE_VERSION : '0.1.0',
+          latest: '0.2.0',
+          up_to_date: !isMachineOld(name),
           checked: true,
         };
       case 'meta.whoami':
@@ -994,7 +1033,7 @@ export function createMockLink(mode = '') {
           node: name,
           delegate: false,
           paths: null,
-          tools: allowedTools,
+          tools: machineAllowed,
         };
       case 'fleet.list': {
         const answering = isPrimaryOffline && activeNode === 'tower' ? 'pi' : activeNode;
@@ -1031,9 +1070,39 @@ export function createMockLink(mode = '') {
         const all = [
           isPrimaryOffline
             ? { machine: 'tower', reachable: false, error: machines.tower.error }
-            : { machine: 'tower', reachable: true, node: 'tower', system: 'linux', version: '0.1.0', os: 'linux', arch: 'x86_64', latency_ms: 0 },
-          { machine: 'pi', reachable: true, node: 'pi', system: 'linux', version: '0.1.0', os: 'linux', arch: 'aarch64', latency_ms: 4 },
-          { machine: 'studio', reachable: true, node: 'studio', system: 'macos', version: '0.1.0', os: 'macos', arch: 'aarch64', latency_ms: 11 },
+            : {
+                machine: 'tower',
+                reachable: true,
+                node: 'tower',
+                system: 'linux',
+                version: isMachineOld('tower') ? OLD_FIXTURE_VERSION : isMixed ? '0.2.0' : '0.1.0',
+                build: isMachineOld('tower') ? OLD_FIXTURE_BUILD : 'mock00000000',
+                os: 'linux',
+                arch: 'x86_64',
+                latency_ms: 0,
+              },
+          {
+            machine: 'pi',
+            reachable: true,
+            node: 'pi',
+            system: 'linux',
+            version: isMachineOld('pi') ? OLD_FIXTURE_VERSION : isMixed ? '0.2.0' : '0.1.0',
+            build: isMachineOld('pi') ? OLD_FIXTURE_BUILD : 'mock00000000',
+            os: 'linux',
+            arch: 'aarch64',
+            latency_ms: 4,
+          },
+          {
+            machine: 'studio',
+            reachable: true,
+            node: 'studio',
+            system: 'macos',
+            version: isMachineOld('studio') ? OLD_FIXTURE_VERSION : '0.1.0',
+            build: isMachineOld('studio') ? OLD_FIXTURE_BUILD : 'mock00000000',
+            os: 'macos',
+            arch: 'aarch64',
+            latency_ms: 11,
+          },
           machines.laptop.reachable
             ? { machine: 'laptop', reachable: true, node: 'laptop', system: 'linux', version: '0.1.0', os: 'linux', arch: 'x86_64', latency_ms: 8 }
             : { machine: 'laptop', reachable: false, error: machines.laptop.error },
@@ -1444,13 +1513,25 @@ export function createMockLink(mode = '') {
         try {
           results[machine] = { ok: resolveOne(machine, tool, args, onEvent) };
         } catch (err) {
+          if (typeof window !== 'undefined') {
+            const errs = window.__LEGION_MOCK_ERRORS__ || (window.__LEGION_MOCK_ERRORS__ = []);
+            errs.push({ tool, args, on: machine, code: err?.code || 'failed', message: err?.message || '' });
+          }
           results[machine] = { error: err };
         }
       }
       return { results };
     }
     const target = on || (isPrimaryOffline && activeNode === 'tower' ? 'pi' : activeNode);
-    return resolveOne(target, tool, args, onEvent);
+    try {
+      return resolveOne(target, tool, args, onEvent);
+    } catch (err) {
+      if (typeof window !== 'undefined') {
+        const errs = window.__LEGION_MOCK_ERRORS__ || (window.__LEGION_MOCK_ERRORS__ = []);
+        errs.push({ tool, args, on: target, code: err?.code || 'failed', message: err?.message || '' });
+      }
+      throw err;
+    }
   }
 
   async function state() {
@@ -1518,8 +1599,8 @@ export function createMockLink(mode = '') {
           : typeof window !== 'undefined'
             ? window.location.origin
             : `https://${nodeName}.example.ts.net`,
-        version: isOfflinePrimary ? '' : '0.1.0',
-        build: isOfflinePrimary ? null : 'mock00000000',
+        version: isOfflinePrimary ? '' : isMachineOld(activeNode) ? OLD_FIXTURE_VERSION : isMixed ? '0.2.0' : '0.1.0',
+        build: isOfflinePrimary ? null : isMachineOld(activeNode) ? OLD_FIXTURE_BUILD : 'mock00000000',
         protocol: 1,
         whoami,
       };
@@ -1669,7 +1750,7 @@ export function createMockLink(mode = '') {
         }
       );
     }
-    return mockToolsList;
+    return toolsForMachine(target);
   }
 
   async function setToken(t) {
@@ -1963,6 +2044,7 @@ export function createMockLink(mode = '') {
   const baseApi = {
     kind,
     mockFlags: flags,
+    supportsContentFor: (machine) => !isMachineOld(machine || activeNode),
     state,
     tools,
     call,
