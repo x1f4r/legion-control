@@ -1498,17 +1498,17 @@ fn parse_id3v2_body(
         let decode_text = |payload: &[u8]| -> Option<String> {
             if frame_unsync {
                 let prefix = deunsync_prefix(payload, MAX_TEXT_DECODE_BYTES + 1);
-                clean_id3_text_frame(major, &prefix)
+                clean_id3_text_frame(&prefix)
             } else {
-                clean_id3_text_frame(major, payload)
+                clean_id3_text_frame(payload)
             }
         };
         let decode_first_text = |payload: &[u8]| -> Option<String> {
             if frame_unsync {
                 let prefix = deunsync_prefix(payload, MAX_TEXT_DECODE_BYTES + 1);
-                clean_id3_first_text_value(major, &prefix)
+                clean_id3_first_text_value(&prefix)
             } else {
-                clean_id3_first_text_value(major, payload)
+                clean_id3_first_text_value(payload)
             }
         };
 
@@ -1569,10 +1569,11 @@ fn parse_id3v2_body(
     Ok(())
 }
 
-/// Splits an ID3v2.4 text payload (after the encoding byte) into NUL-separated raw segments
+/// Splits an ID3v2 text payload (after the encoding byte) into NUL-separated raw segments
 /// bounded to `MAX_TEXT_DECODE_BYTES`, using 2-byte aligned `0x00 0x00` for UTF-16 encodings and
-/// single `0x00` for Latin-1/UTF-8.
-fn split_id3v24_segments(encoding: u8, data: &[u8]) -> Vec<&[u8]> {
+/// single `0x00` for Latin-1/UTF-8. Applied uniformly to ID3v2.2/2.3/2.4 because many ID3v2.3
+/// taggers also write NUL-separated multi-value frames.
+fn split_id3_text_segments(encoding: u8, data: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     match encoding {
         0 | 3 => {
@@ -1611,18 +1612,15 @@ fn split_id3v24_segments(encoding: u8, data: &[u8]) -> Vec<&[u8]> {
     out
 }
 
-fn clean_id3_text_frame(major: u8, payload: &[u8]) -> Option<String> {
+fn clean_id3_text_frame(payload: &[u8]) -> Option<String> {
     let (&enc, data) = payload.split_first()?;
-    if major < 4 {
-        return clean_id3_string(enc, data);
-    }
-    let segments = split_id3v24_segments(enc, data);
+    let segments = split_id3_text_segments(enc, data);
+    let mut inherited_utf16_le = true;
     let mut joined = String::new();
     let mut joined_chars = 0usize;
     let mut value_count = 0usize;
     for seg in segments {
-        // Each ID3v2.4 NUL-separated value is decoded independently with its own BOM.
-        let Some(cleaned) = clean_id3_string(enc, seg) else {
+        let Some(cleaned) = clean_id3_segment(enc, seg, &mut inherited_utf16_le) else {
             continue;
         };
         if value_count > 0 {
@@ -1644,31 +1642,33 @@ fn clean_id3_text_frame(major: u8, payload: &[u8]) -> Option<String> {
     }
 }
 
-fn clean_id3_first_text_value(major: u8, payload: &[u8]) -> Option<String> {
+fn clean_id3_first_text_value(payload: &[u8]) -> Option<String> {
     let (&enc, data) = payload.split_first()?;
-    if major < 4 {
-        return clean_id3_string(enc, data);
-    }
-    for seg in split_id3v24_segments(enc, data) {
-        if let Some(cleaned) = clean_id3_string(enc, seg) {
+    let mut inherited_utf16_le = true;
+    for seg in split_id3_text_segments(enc, data) {
+        if let Some(cleaned) = clean_id3_segment(enc, seg, &mut inherited_utf16_le) {
             return Some(cleaned);
         }
     }
     None
 }
 
-fn clean_id3_string(encoding: u8, data: &[u8]) -> Option<String> {
+fn clean_id3_segment(encoding: u8, data: &[u8], inherited_utf16_le: &mut bool) -> Option<String> {
     match encoding {
         // ISO-8859-1 (Latin-1)
         0 => clean_latin1_bytes(data),
-        // UTF-16 with BOM
+        // UTF-16 with BOM: honor each segment's own BOM when present, otherwise inherit the
+        // endianness established by an earlier segment (common in ID3v2.3 multi-value frames
+        // that write a single leading BOM).
         1 => {
             let (le, body) = if data.starts_with(&[0xFF, 0xFE]) {
+                *inherited_utf16_le = true;
                 (true, &data[2..])
             } else if data.starts_with(&[0xFE, 0xFF]) {
+                *inherited_utf16_le = false;
                 (false, &data[2..])
             } else {
-                (true, data)
+                (*inherited_utf16_le, data)
             };
             clean_utf16_bytes(body, le)
         }
@@ -3390,22 +3390,25 @@ mod tests {
     }
 
     #[test]
-    fn id3v24_nul_separated_values_join_with_comma_and_per_value_bom() {
+    fn id3v2_nul_separated_values_join_with_comma_across_v23_and_v24() {
         // UTF-8 multi-value with empty/trailing NULs -> joined with ", "
         let utf8_payload = b"\x03First artist\x00\x00Second artist\x00Third artist\x00";
         assert_eq!(
-            clean_id3_text_frame(4, utf8_payload).as_deref(),
+            clean_id3_text_frame(utf8_payload).as_deref(),
             Some("First artist, Second artist, Third artist")
         );
 
-        // Latin-1 multi-value
-        let latin1_payload = b"\x00Alpha\x00Beta";
+        // Latin-1 multi-value & trailing-NUL single value
         assert_eq!(
-            clean_id3_text_frame(4, latin1_payload).as_deref(),
+            clean_id3_text_frame(b"\x00Alpha\x00Beta").as_deref(),
             Some("Alpha, Beta")
         );
+        assert_eq!(
+            clean_id3_text_frame(b"\x00Single\x00").as_deref(),
+            Some("Single")
+        );
 
-        // UTF-16 with BOM: first segment UTF-16LE (FF FE), second segment UTF-16BE (FE FF)
+        // UTF-16 with per-segment BOM: first UTF-16LE (FF FE), second UTF-16BE (FE FF)
         let mut utf16_payload = vec![1u8]; // encoding 1 = UTF-16 with BOM
         utf16_payload.extend_from_slice(&[0xFF, 0xFE]); // LE BOM
         for u in "Ada".encode_utf16() {
@@ -3418,8 +3421,22 @@ mod tests {
         }
         utf16_payload.extend_from_slice(&[0x00, 0x00]); // trailing NUL
         assert_eq!(
-            clean_id3_text_frame(4, &utf16_payload).as_deref(),
+            clean_id3_text_frame(&utf16_payload).as_deref(),
             Some("Ada, Grace")
+        );
+
+        // UTF-16BE with a single leading BOM shared across NUL-separated ID3v2.3 values
+        let mut utf16_be_shared = vec![1u8, 0xFE, 0xFF];
+        for u in "Alpha".encode_utf16() {
+            utf16_be_shared.extend_from_slice(&u.to_be_bytes());
+        }
+        utf16_be_shared.extend_from_slice(&[0x00, 0x00]);
+        for u in "Beta".encode_utf16() {
+            utf16_be_shared.extend_from_slice(&u.to_be_bytes());
+        }
+        assert_eq!(
+            clean_id3_text_frame(&utf16_be_shared).as_deref(),
+            Some("Alpha, Beta")
         );
 
         // Full ID3v2.4 MP3 parse verifying TPE1 multi-value UTF-16 mixed BOM & TRCK first value.
@@ -3465,6 +3482,44 @@ mod tests {
         assert_eq!(extracted.tags.title.as_deref(), Some("Part One, Part Two"));
         assert_eq!(extracted.tags.artist.as_deref(), Some("Ada, Grace"));
         assert_eq!(extracted.tags.track, Some(3));
+
+        // Full ID3v2.3 MP3 parse verifying NUL-separated Latin-1, shared-BOM UTF-16BE, and TRCK.
+        let mut v23_frames = Vec::new();
+        let push_v23 = |out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]| {
+            out.extend_from_slice(id);
+            out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(payload);
+        };
+        push_v23(&mut v23_frames, b"TIT2", b"\x00A\x00B");
+        push_v23(&mut v23_frames, b"TPE1", &utf16_be_shared);
+        push_v23(&mut v23_frames, b"TRCK", b"\x005/12\x006/12");
+        let sz23 = v23_frames.len() as u32;
+        let mut mp3_v23 = vec![
+            b'I',
+            b'D',
+            b'3',
+            3,
+            0,
+            0,
+            ((sz23 >> 21) & 0x7F) as u8,
+            ((sz23 >> 14) & 0x7F) as u8,
+            ((sz23 >> 7) & 0x7F) as u8,
+            (sz23 & 0x7F) as u8,
+        ];
+        mp3_v23.extend_from_slice(&v23_frames);
+        let mut cur23 = Cursor::new(mp3_v23.as_slice());
+        let extracted23 = parse_audio(
+            &mut cur23,
+            mp3_v23.len() as u64,
+            AudioFormat::Mp3,
+            CoverExtractMode::CheckOnly,
+            Path::new("/v23_multi.mp3"),
+        )
+        .unwrap();
+        assert_eq!(extracted23.tags.title.as_deref(), Some("A, B"));
+        assert_eq!(extracted23.tags.artist.as_deref(), Some("Alpha, Beta"));
+        assert_eq!(extracted23.tags.track, Some(5));
     }
 
     #[test]

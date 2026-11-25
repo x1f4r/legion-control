@@ -4805,12 +4805,13 @@ async fn tags_and_audio_thumb_enforce_policy_and_handle_hostile_fixtures() {
         );
     }
 
-    // Hostile text sanitized: control chars removed, trimmed, <= 512 chars, empty artist absent.
+    // Hostile text sanitized: control chars removed, NUL-separated values joined, trimmed, <= 512
+    // chars, empty artist absent.
     let ht = &items[10]["ok"];
     let title = ht["title"].as_str().unwrap();
     assert_eq!(title.chars().count(), 512);
     assert!(!title.chars().any(|c| c.is_control()));
-    assert!(title.starts_with("[31mFirst song"));
+    assert!(title.starts_with("[31mFirst, song"));
     assert!(
         ht.get("artist").is_none(),
         "control-only artist must be absent: {ht}"
