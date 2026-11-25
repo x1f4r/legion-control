@@ -22,6 +22,7 @@ use legion_link::{
     ssh,
 };
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 
 struct TestEnv {
     host: String,
@@ -32,6 +33,8 @@ struct TestEnv {
     mismatch_host: Option<String>,
     auth_keys_path: Option<String>,
     enrol_script: Option<String>,
+    sample_file: Option<String>,
+    legion_bin: Option<String>,
     key: DeviceKey,
     node: String,
 }
@@ -54,6 +57,12 @@ fn env_target() -> Option<TestEnv> {
     let enrol_script = env::var("LEGION_LINK_ENROL_SCRIPT")
         .ok()
         .filter(|s| !s.trim().is_empty());
+    let sample_file = env::var("LEGION_LINK_SAMPLE_FILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let legion_bin = env::var("LEGION_LINK_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     let key_file = env::var("LEGION_LINK_KEY_FILE").ok()?;
     let key_pem = fs::read_to_string(&key_file).unwrap();
     let key = DeviceKey::from_openssh(&key_pem).unwrap();
@@ -67,6 +76,8 @@ fn env_target() -> Option<TestEnv> {
         mismatch_host,
         auth_keys_path,
         enrol_script,
+        sample_file,
+        legion_bin,
         key,
         node,
     })
@@ -333,6 +344,90 @@ async fn real_sshd_session_and_security_checks() {
         info_after.get("os").and_then(|o| o.get("family")).is_some(),
         "{info_after}"
     );
+
+    // 6b. `Link::open_content` over the live SSH session: full read, ranged read, concurrent
+    //     channels on one connection, mid-stream cancellation without harming the parent session,
+    //     and routing/error checks.
+    if let Some(sample_file) = &env.sample_file {
+        let expected = fs::read(sample_file).unwrap();
+        assert!(
+            expected.len() >= 100_000,
+            "sample file should be >= 100 KiB"
+        );
+
+        // Concurrent ranges on the same SSH connection.
+        let mut s1 = link
+            .open_content(&env.node, sample_file, 1024, Some(32_768))
+            .await
+            .unwrap();
+        let mut s2 = link
+            .open_content(&env.node, sample_file, 65_536, Some(16_384))
+            .await
+            .unwrap();
+        let mut s3 = link
+            .open_content(&env.node, sample_file, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(s1.size(), expected.len() as u64);
+        assert_eq!(s1.offset(), 1024);
+        assert_eq!(s1.length(), 32_768);
+        assert!(s1.mtime().secs > 0);
+
+        // Cancel s3 mid-stream after reading 128 bytes.
+        let mut head = [0u8; 128];
+        s3.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head[..], &expected[..128]);
+        s3.cancel();
+        drop(s3);
+
+        // s1 and s2 still finish cleanly on the same SSH connection.
+        let (mut b1, mut b2) = (Vec::new(), Vec::new());
+        let (r1, r2) = tokio::join!(s1.read_to_end(&mut b1), s2.read_to_end(&mut b2));
+        r1.unwrap();
+        r2.unwrap();
+        assert_eq!(b1, &expected[1024..1024 + 32_768]);
+        assert_eq!(b2, &expected[65_536..65_536 + 16_384]);
+
+        // RPC on the same SSH connection keeps working after stream cancellation.
+        let still_alive = link.hello(&env.node).await.unwrap();
+        assert_eq!(still_alive["node"], json!(env.node));
+
+        // Error cases: offset past EOF and unknown machine.
+        let bad_off = link
+            .open_content(&env.node, sample_file, expected.len() as u64 + 1, Some(10))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(bad_off.code, ErrorCode::Conflict);
+
+        let unknown = link
+            .open_content("no-such-machine", sample_file, 0, Some(10))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(unknown.code, ErrorCode::NotFound);
+
+        // Local child pipe (`NodeLink::local`) when both `local` feature and binary are present.
+        #[cfg(feature = "local")]
+        if let Some(legion_bin) = &env.legion_bin {
+            let local_link = Link::new(LinkConfig {
+                nodes: vec![NodeLink::local("local-node", legion_bin)],
+                ..LinkConfig::default()
+            });
+            let mut ls = local_link
+                .open_content("local-node", sample_file, 512, Some(4096))
+                .await
+                .unwrap();
+            assert_eq!(ls.size(), expected.len() as u64);
+            assert_eq!(ls.length(), 4096);
+            let mut lbuf = Vec::new();
+            ls.read_to_end(&mut lbuf).await.unwrap();
+            assert_eq!(lbuf, &expected[512..512 + 4096]);
+            local_link.close().await;
+        }
+        #[cfg(not(feature = "local"))]
+        let _ = &env.legion_bin;
+    }
 
     link.close().await;
 

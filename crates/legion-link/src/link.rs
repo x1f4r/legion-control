@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::content::{ContentStream, StreamOpenError, handshake_get};
 use crate::invite::{Enrolled, SshTarget, SshTimeouts};
 use crate::session::{CallError, Session};
 
@@ -2127,6 +2128,101 @@ impl Link {
             None
         };
         Ok((cancel, guard))
+    }
+
+    /// Opens a streaming byte-range reader for `path` on `machine` via `legion stream`'s `get`
+    /// operation over the session this [`Link`] holds for `machine`.
+    ///
+    /// Follows the same routing and identity rules as calls: `machine` must be configured on this
+    /// [`Link`], its pinned host keys and `hello.node` identity are verified, and the operation
+    /// never falls back to another machine. Multiple content streams may be open concurrently on
+    /// one SSH connection; cancelling or dropping the returned [`ContentStream`] closes its
+    /// channel immediately without affecting the parent session.
+    pub async fn open_content(
+        &self,
+        machine: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<ContentStream, ErrorBody> {
+        self.open_content_with_cancel(machine, path, offset, length, CancellationToken::new())
+            .await
+    }
+
+    /// Like [`Link::open_content`], aborting the open handshake if `cancel` fires.
+    pub async fn open_content_with_cancel(
+        &self,
+        machine: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+        cancel: CancellationToken,
+    ) -> Result<ContentStream, ErrorBody> {
+        self.ensure_reaper();
+        if path.is_empty() {
+            return Err(
+                ErrorBody::new(ErrorCode::InvalidArgs, "Content path cannot be empty.")
+                    .with_hint("Pass an absolute or `~`-prefixed file path.")
+                    .with_machine(machine),
+            );
+        }
+
+        let live = self.get_or_open(machine, cancel.clone()).await?;
+        let flight = live.acquire_flight();
+        let (raw, live, flight) = match self.open_stream_on(&live, machine, cancel.clone()).await {
+            Ok(raw) => (raw, live, flight),
+            Err(StreamOpenError::DeadSession(_)) => {
+                // The cached session died before any stream bytes were sent; reopen once.
+                drop(flight);
+                self.invalidate_if_same(machine, &live.session);
+                let fresh = self.get_or_open(machine, cancel.clone()).await?;
+                let flight2 = fresh.acquire_flight();
+                let raw = self
+                    .open_stream_on(&fresh, machine, cancel.clone())
+                    .await
+                    .map_err(|err| match err {
+                        StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body) => {
+                            self.invalidate_if_same(machine, &fresh.session);
+                            body.with_machine(machine)
+                        }
+                    })?;
+                (raw, fresh, flight2)
+            }
+            Err(StreamOpenError::Failed(body)) => return Err(body.with_machine(machine)),
+        };
+
+        let mut stream = handshake_get(
+            raw,
+            machine,
+            path,
+            offset,
+            length,
+            live.config_snapshot.principal.as_deref(),
+            self.inner.options.ssh_timeouts.handshake,
+            cancel,
+        )
+        .await?;
+        stream.attach_flight(Box::new(flight));
+        Ok(stream)
+    }
+
+    async fn open_stream_on(
+        &self,
+        live: &LiveSession,
+        machine: &str,
+        cancel: CancellationToken,
+    ) -> Result<crate::content::RawStream, StreamOpenError> {
+        let Some(opener) = live.session.stream_opener() else {
+            return Err(StreamOpenError::Failed(
+                ErrorBody::new(
+                    ErrorCode::Unsupported,
+                    format!("The session to {machine} does not support opening content streams."),
+                )
+                .with_hint("Use an SSH or local node transport.")
+                .with_machine(machine),
+            ));
+        };
+        opener.open_stream(cancel).await
     }
 
     /// Calls `tool` on `node` with JSON `arguments` and optional `on` (passed through untouched to

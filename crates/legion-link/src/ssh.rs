@@ -22,6 +22,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::command::{RemoteOs, Subcommand, remote_command};
+use crate::content::{RawStream, StreamOpenError, StreamOpener};
 use crate::invite::SshTarget;
 pub use crate::invite::SshTimeouts;
 use crate::key::DeviceKey;
@@ -62,7 +63,8 @@ impl SshPipe {
 /// Lifecycle handle for an open [`SshPipe`], implementing [`TransportHandle`] so [`Session`]
 /// surfaces remote stderr and exit codes in its errors and disconnects cleanly on close.
 pub struct SshPipeHandle {
-    session: Option<client::Handle<HostKeyHandler>>,
+    session: Option<Arc<client::Handle<HostKeyHandler>>>,
+    connect_timeout: Duration,
     stderr: Arc<StderrTail>,
     exit_code: Arc<Mutex<Option<i32>>>,
     rx_task: Option<JoinHandle<()>>,
@@ -79,6 +81,15 @@ impl SshPipeHandle {
 impl TransportHandle for SshPipeHandle {
     fn stderr_tail(&self) -> Option<Arc<StderrTail>> {
         Some(Arc::clone(&self.stderr))
+    }
+
+    fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+        self.session.as_ref().map(|session| {
+            Arc::new(SshStreamOpener {
+                session: Arc::clone(session),
+                connect_timeout: self.connect_timeout,
+            }) as Arc<dyn StreamOpener>
+        })
     }
 
     fn collect_exit_info(
@@ -703,7 +714,7 @@ async fn connect_one_addr(
             )
         })?;
 
-        Ok(bridge_channel(session, channel))
+        Ok(bridge_channel(session, channel, timeouts.connect))
     };
 
     tokio::select! {
@@ -1091,6 +1102,7 @@ fn build_ssh_config(
 fn bridge_channel(
     session: client::Handle<HostKeyHandler>,
     channel: Channel<client::Msg>,
+    connect_timeout: Duration,
 ) -> SshPipe {
     let (mut read_half, write_half) = channel.split();
     let (stdout_read, stdout_write) = tokio::io::duplex(CHANNEL_BUFFER_BYTES);
@@ -1165,12 +1177,200 @@ fn bridge_channel(
         reader: stdout_read,
         writer: stdin_write,
         handle: SshPipeHandle {
-            session: Some(session),
+            session: Some(Arc::new(session)),
+            connect_timeout,
             stderr,
             exit_code,
             rx_task: Some(rx_task),
             tx_task: Some(tx_task),
         },
+    }
+}
+
+struct SshStreamOpener {
+    session: Arc<client::Handle<HostKeyHandler>>,
+    connect_timeout: Duration,
+}
+
+impl StreamOpener for SshStreamOpener {
+    fn open_stream(
+        &self,
+        cancel: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>> {
+        Box::pin(async move {
+            let command = remote_command(RemoteOs::Unix, Subcommand::Stream, None)
+                .map_err(StreamOpenError::Failed)?;
+            let open_fut = async {
+                let channel = self.session.channel_open_session().await.map_err(|err| {
+                    StreamOpenError::DeadSession(
+                        ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            format!("Could not open an SSH stream channel: {err}."),
+                        )
+                        .with_hint("Check sshd MaxSessions and that the connection is still up.")
+                        .with_details(json!({ "reason": REASON_UNREACHABLE })),
+                    )
+                })?;
+                channel.exec(true, command).await.map_err(|err| {
+                    StreamOpenError::DeadSession(
+                        ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            format!("Could not start `legion stream` on the SSH channel: {err}."),
+                        )
+                        .with_hint(
+                            "Check that the paired key is allowed to run `legion gate` on the node.",
+                        )
+                        .with_details(json!({ "reason": REASON_UNREACHABLE })),
+                    )
+                })?;
+                Ok(bridge_stream_channel(channel))
+            };
+
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(StreamOpenError::Failed(ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    "Opening the SSH stream channel was cancelled.",
+                ))),
+                res = tokio::time::timeout(self.connect_timeout, open_fut) => match res {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(StreamOpenError::DeadSession(
+                        ErrorBody::new(
+                            ErrorCode::Timeout,
+                            format!(
+                                "Timed out opening an SSH stream channel after {}s.",
+                                self.connect_timeout.as_secs_f64()
+                            ),
+                        )
+                        .with_details(json!({ "reason": REASON_TIMEOUT })),
+                    )),
+                },
+            }
+        })
+    }
+}
+
+struct SshStreamGuard {
+    cancel: CancellationToken,
+}
+
+impl Drop for SshStreamGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// Bridges an independent SSH exec channel for `legion stream` with backpressure and immediate
+/// channel close on cancellation or reader drop, leaving the parent SSH connection open.
+fn bridge_stream_channel(channel: Channel<client::Msg>) -> RawStream {
+    let (mut read_half, write_half) = channel.split();
+    let (stdout_read, mut stdout_write) = tokio::io::duplex(CHANNEL_BUFFER_BYTES);
+    let (mut stdin_read, stdin_write) = tokio::io::duplex(CHANNEL_BUFFER_BYTES);
+
+    let stderr = Arc::new(StderrTail::default());
+    let channel_cancel = CancellationToken::new();
+    let rx_finished = CancellationToken::new();
+
+    let rx_stderr = Arc::clone(&stderr);
+    let rx_cancel = channel_cancel.clone();
+    let rx_done = rx_finished.clone();
+    tokio::spawn(async move {
+        let mut stderr_buf = Vec::<u8>::new();
+        loop {
+            let msg = tokio::select! {
+                biased;
+                () = rx_cancel.cancelled() => break,
+                msg = read_half.wait() => msg,
+            };
+            let Some(msg) = msg else {
+                break;
+            };
+            match msg {
+                ChannelMsg::Data { data } => {
+                    let write_res = tokio::select! {
+                        biased;
+                        () = rx_cancel.cancelled() => Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "stream cancelled",
+                        )),
+                        res = stdout_write.write_all(&data) => res,
+                    };
+                    if write_res.is_err() {
+                        rx_cancel.cancel();
+                        break;
+                    }
+                }
+                ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    push_stderr_bytes(&rx_stderr, &mut stderr_buf, &data);
+                }
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        if !stderr_buf.is_empty() {
+            let text = String::from_utf8_lossy(&stderr_buf);
+            rx_stderr.push_line(&text);
+        }
+        let _ = stdout_write.shutdown().await;
+        rx_done.cancel();
+    });
+
+    let tx_cancel = channel_cancel.clone();
+    let tx_rx_done = rx_finished;
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut stdin_open = true;
+        loop {
+            if !stdin_open {
+                tokio::select! {
+                    biased;
+                    () = tx_cancel.cancelled() => {
+                        let _ = write_half.close().await;
+                        break;
+                    }
+                    () = tx_rx_done.cancelled() => {
+                        let _ = write_half.close().await;
+                        break;
+                    }
+                }
+            }
+            tokio::select! {
+                biased;
+                () = tx_cancel.cancelled() => {
+                    let _ = write_half.close().await;
+                    break;
+                }
+                () = tx_rx_done.cancelled() => {
+                    let _ = write_half.close().await;
+                    break;
+                }
+                read = stdin_read.read(&mut buf) => match read {
+                    Ok(0) => {
+                        let _ = write_half.eof().await;
+                        stdin_open = false;
+                    }
+                    Ok(n) => {
+                        if write_half.data(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = write_half.close().await;
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    RawStream {
+        reader: Box::new(stdout_read),
+        writer: Box::new(stdin_write),
+        stderr: Some(stderr),
+        cancel: channel_cancel.clone(),
+        guard: Some(Box::new(SshStreamGuard {
+            cancel: channel_cancel,
+        })),
     }
 }
 

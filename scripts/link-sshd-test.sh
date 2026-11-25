@@ -213,6 +213,14 @@ EOF
 chmod 700 "$WORK/enrol-responder.sh"
 
 echo "1) Running legion-link sshd integration test..."
+SAMPLE_FILE="$WORK/sample-content.bin"
+node -e '
+const fs = require("node:fs");
+const buf = Buffer.alloc(256 * 1024);
+for (let i = 0; i < buf.length; i++) buf[i] = (i * 31 + 7) & 0xff;
+fs.writeFileSync(process.argv[1], buf);
+' "$SAMPLE_FILE"
+
 LEGION_LINK_SSHD="127.0.0.1:$PORT" \
 LEGION_LINK_USER="$USER_NAME" \
 LEGION_LINK_HOST_KEY="$HOST_PUB_ED25519" \
@@ -221,8 +229,10 @@ LEGION_LINK_MISMATCH_HOST="$MISMATCH_HOST" \
 LEGION_LINK_KEY_FILE="$WORK/device_key" \
 LEGION_LINK_AUTH_KEYS="$WORK/authorized_keys" \
 LEGION_LINK_ENROL_SCRIPT="$WORK/enrol-responder.sh" \
+LEGION_LINK_SAMPLE_FILE="$SAMPLE_FILE" \
+LEGION_LINK_BIN="$LEGION_BIN" \
 LEGION_LINK_NODE="tower" \
-  cargo test -p legion-link --features ssh --test sshd -- --ignored --nocapture
+  cargo test -p legion-link --features ssh,local --test sshd -- --ignored --nocapture
 
 echo "2) Running example binary: link tools..."
 TOOLS_OUT="$("$LINK_BIN" tools --config "$WORK/config.json")"
