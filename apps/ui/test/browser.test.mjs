@@ -11,6 +11,7 @@ import readline from 'node:readline';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
+import './files-browser.mjs';
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(TEST_DIR, '..', '..', '..');
@@ -204,7 +205,7 @@ async function dispatchSwipe(page, selector, { startX, startY, endX, endY }) {
 }
 
 const CATALOG_TOOL_RE =
-  /\b(?:power|fs|exec|job|svc|proj|fleet|sys|meta|device|token|config|net|env)\.[a-z_]+\b/g;
+  /\b(?:power|fs|fav|sync|exec|job|svc|proj|fleet|sys|meta|device|token|config|net|env)\.[a-z_]+\b/g;
 
 async function assertNoToolNames(page, label) {
   const text = await page.locator('body').innerText();
@@ -263,7 +264,7 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     assert.equal(await page.locator('header.top .chip').count(), 0);
     assert.equal(await page.locator('button[aria-label="Refresh"]').count(), 0);
     await page.locator('header.top a[aria-label="Settings"]').waitFor();
-    assert.equal(await page.locator('nav.nav a').count(), 3, 'Root bottom bar has 3 places');
+    assert.equal(await page.locator('nav.nav a').count(), 4, 'Root bottom bar has 4 places');
 
     const towerCard = page.locator('a.machine', { hasText: 'tower' });
     await towerCard.waitFor();
@@ -286,13 +287,17 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await dispatchSwipe(page, 'main.main', { startX: 195, startY: 160, endX: 195, endY: 280 });
     await page.getByText('2 are on').waitFor({ timeout: 10_000 });
 
-    // Horizontal swipe across root places: Machines -> Activity -> Actions -> Machines.
+    // Horizontal swipe across root places: Machines -> Files -> Activity -> Actions -> Activity -> Files -> Machines.
+    await dispatchSwipe(page, 'main.main', { startX: 300, startY: 360, endX: 100, endY: 365 });
+    await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
     await dispatchSwipe(page, 'main.main', { startX: 300, startY: 360, endX: 100, endY: 365 });
     await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
     await dispatchSwipe(page, 'main.main', { startX: 300, startY: 360, endX: 100, endY: 365 });
     await page.locator('header.top h1', { hasText: 'Actions' }).waitFor();
     await dispatchSwipe(page, 'main.main', { startX: 100, startY: 360, endX: 300, endY: 365 });
     await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
+    await dispatchSwipe(page, 'main.main', { startX: 100, startY: 360, endX: 300, endY: 365 });
+    await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
     await dispatchSwipe(page, 'main.main', { startX: 100, startY: 360, endX: 300, endY: 365 });
     await page.locator('header.top h1', { hasText: 'Machines' }).waitFor();
 
@@ -332,17 +337,17 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await maybeShot(page, 'real-phone-light-machine-overview');
     await setTheme(page, 'dark');
 
-    // Horizontal swipe across machine parts: Overview -> Files -> Power -> More.
+    // Horizontal swipe across machine parts: Overview -> Files; opens same Files browser at tower.
     await dispatchSwipe(page, 'main.main', { startX: 300, startY: 360, endX: 100, endY: 362 });
     await page.locator('nav.nav.parts a[aria-current="page"]', { hasText: 'Files' }).waitFor();
-    await page.locator('button.row', { hasText: 'docs/' }).click();
-    await page.locator('button.row', { hasText: 'hello.txt' }).click();
-    await page.locator('pre.out').getByText('Hello from Legion real server preview.').waitFor();
+    await page.locator('.list a.row', { hasText: 'docs' }).click();
+    await page.locator('.list a.row', { hasText: 'hello.txt' }).click();
+    await page.locator('.viewer pre.viewer-text').getByText('Hello from Legion real server preview.').waitFor();
     await assertNoToolNames(page, 'real phone tower files');
     await maybeShot(page, 'real-phone-dark-machine-files');
-
-    // Power part: plain dry run shows one plain sentence, no "Dry run commands" or raw commands.
-    await page.locator('nav.nav.parts a', { hasText: 'Power' }).click();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+    await page.goto(`${server.url}/#/machines/tower/power`, { waitUntil: 'domcontentloaded' });
     await page.getByText('Loading power state…').waitFor({ state: 'hidden' });
     await page.getByRole('button', { name: 'Sleep', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Restart', exact: true }).waitFor();
@@ -1145,6 +1150,8 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     const updateRow = p.locator('.update-note');
     await updateRow.waitFor();
     assert.equal(await updateRow.locator('.btn').count(), 0, 'Post-update row must not contain bordered buttons');
+    assert.equal(await p.locator('nav.nav a').count(), 4, 'Root bottom bar has 4 tabs alongside update notice');
+    await maybeShot(p, 'mock-phone-dark-updated');
     await updateRow.locator('.update-note-link').click();
     await p.locator('.sheet').getByText('What is new in 0.2.0').waitFor();
     await p.locator('.sheet').getByText('Automatic fleet updates and faster status refresh.').waitFor();
