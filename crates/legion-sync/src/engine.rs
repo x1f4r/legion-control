@@ -1810,10 +1810,20 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                                 }
                                 anc_keys.push((anc.to_string(), k));
                             }
-                            if local_absent
-                                && !anc_clash
-                                && self.fs.stat_live(&record.path)?.is_none()
-                            {
+                            let disk_absent = match self.fs.stat_live(&record.path) {
+                                Ok(None) => true,
+                                Ok(Some(_)) => false,
+                                Err(SyncError::Fs {
+                                    kind: crate::error::FsErrorKind::Busy,
+                                    ..
+                                }) => false,
+                                Err(SyncError::Fs {
+                                    kind: crate::error::FsErrorKind::PermissionDenied,
+                                    ..
+                                }) if caps.windows_naming => false,
+                                Err(err) => return Err(err),
+                            };
+                            if local_absent && !anc_clash && disk_absent {
                                 record.seq = remote.seq;
                                 batch_raw_by_seq.insert(remote.seq, remote.for_wire());
                                 seen_batch_paths.insert(record.path.clone());

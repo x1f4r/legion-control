@@ -13,9 +13,10 @@ use crate::win_proc;
 use crate::{OsError, Result};
 
 use super::{
-    ExclusiveRenameError, WINDOWS_INITIAL_BACKOFF, WINDOWS_MAX_BACKOFF, WINDOWS_REPLACE_TIMEOUT,
-    WriteOptions, is_retryable_windows_replace_error, retry_async_with_backoff,
-    retry_sync_with_backoff,
+    ExclusiveRenameError, WINDOWS_INITIAL_BACKOFF, WINDOWS_MAX_BACKOFF,
+    WINDOWS_REPLACE_BACKUP_TIMEOUT, WINDOWS_REPLACE_TIMEOUT, WriteOptions,
+    is_retryable_windows_replace_error, is_retryable_windows_replace_with_backup_error,
+    retry_async_with_backoff, retry_sync_with_backoff,
 };
 
 pub(super) fn configure_temp_open(_open: &mut OpenOptions, _restrictive: bool) {}
@@ -112,8 +113,8 @@ pub(super) fn exchange_files(_a: &Path, _b: &Path) -> Result<()> {
 pub(super) fn replace_with_backup(staged: &Path, target: &Path, backup: &Path) -> Result<()> {
     retry_sync_with_backoff(
         || win_proc::replace_file_with_backup(target, staged, backup),
-        is_retryable_windows_replace_error,
-        WINDOWS_REPLACE_TIMEOUT,
+        is_retryable_windows_replace_with_backup_error,
+        WINDOWS_REPLACE_BACKUP_TIMEOUT,
         WINDOWS_INITIAL_BACKOFF,
         WINDOWS_MAX_BACKOFF,
     )

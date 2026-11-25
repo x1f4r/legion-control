@@ -32,8 +32,8 @@ use windows::Win32::Storage::FileSystem::{
     FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo,
     FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, MOVE_FILE_FLAGS,
-    MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW,
-    SYNCHRONIZE,
+    MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, REPLACEFILE_IGNORE_ACL_ERRORS,
+    REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW, SYNCHRONIZE,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
@@ -576,6 +576,15 @@ fn to_wide_null(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
 }
 
+fn win32_error_to_io(err: &windows::core::Error) -> std::io::Error {
+    let raw = err.code().0 as u32;
+    if (raw >> 16) == 0x8007 {
+        std::io::Error::from_raw_os_error((raw & 0xFFFF) as i32)
+    } else {
+        std::io::Error::last_os_error()
+    }
+}
+
 /// Atomically rename `from` to `to` without `MOVEFILE_REPLACE_EXISTING` so Windows fails with
 /// `ERROR_ALREADY_EXISTS` / `ERROR_FILE_EXISTS` if `to` already exists.
 pub(crate) fn move_file_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -591,7 +600,7 @@ pub(crate) fn move_file_no_replace(from: &Path, to: &Path) -> std::io::Result<()
         )
     } {
         Ok(()) => Ok(()),
-        Err(_) => Err(std::io::Error::last_os_error()),
+        Err(err) => Err(win32_error_to_io(&err)),
     }
 }
 
@@ -611,13 +620,13 @@ pub(crate) fn replace_file_with_backup(
             PCWSTR::from_raw(target_wide.as_ptr()),
             PCWSTR::from_raw(replacement_wide.as_ptr()),
             PCWSTR::from_raw(backup_wide.as_ptr()),
-            REPLACEFILE_IGNORE_MERGE_ERRORS,
+            REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS,
             None,
             None,
         )
     } {
         Ok(()) => Ok(()),
-        Err(_) => Err(std::io::Error::last_os_error()),
+        Err(err) => Err(win32_error_to_io(&err)),
     }
 }
 

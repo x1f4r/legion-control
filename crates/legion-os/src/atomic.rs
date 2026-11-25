@@ -28,6 +28,11 @@ mod platform;
 #[allow(dead_code)]
 pub(crate) const WINDOWS_REPLACE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long [`replace_with_backup`] keeps retrying transient Windows sharing violations before
+/// returning the error to the caller for deferral.
+#[allow(dead_code)]
+pub(crate) const WINDOWS_REPLACE_BACKUP_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Initial backoff pause between Windows rename retries.
 #[allow(dead_code)]
 pub(crate) const WINDOWS_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
@@ -710,9 +715,27 @@ fn sync_parent_dir(_parent: &Path) {}
 #[allow(dead_code)]
 pub(crate) fn is_retryable_windows_replace_error(err: &io::Error) -> bool {
     // Win32 codes: ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32),
-    // ERROR_LOCK_VIOLATION (33), ERROR_BUSY (170).
-    err.kind() == io::ErrorKind::PermissionDenied
-        || matches!(err.raw_os_error(), Some(5 | 32 | 33 | 170))
+    // ERROR_LOCK_VIOLATION (33), ERROR_BUSY (170), ERROR_DELETE_PENDING (303).
+    matches!(
+        err.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ResourceBusy
+    ) || matches!(err.raw_os_error(), Some(5 | 32 | 33 | 170 | 303))
+}
+
+/// Return `true` when `err` from `ReplaceFileW` is safe to retry in place without hiding a
+/// partial-failure state.
+///
+/// Retries sharing/access errors and `ERROR_UNABLE_TO_REMOVE_REPLACED` (1175, where Windows
+/// guarantees neither file has moved). Never retries `ERROR_UNABLE_TO_MOVE_REPLACEMENT` (1176)
+/// or `ERROR_UNABLE_TO_MOVE_REPLACEMENT_2` (1177), because on 1177 the target has already been
+/// moved to the backup path and retrying would fail with `ERROR_FILE_NOT_FOUND` and mask the
+/// recovery state.
+#[allow(dead_code)]
+pub(crate) fn is_retryable_windows_replace_with_backup_error(err: &io::Error) -> bool {
+    if matches!(err.raw_os_error(), Some(1176 | 1177)) {
+        return false;
+    }
+    is_retryable_windows_replace_error(err) || err.raw_os_error() == Some(1175)
 }
 
 /// Retry `op` on retryable errors with capped exponential backoff until `timeout` elapses.
@@ -1006,6 +1029,28 @@ mod tests {
         .unwrap_err();
         assert_eq!(attempts, 1);
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn replace_with_backup_retry_predicate_respects_replacefilew_partial_codes() {
+        // Safe pre-move errors retry: sharing (32), lock (33), busy (170), delete-pending (303),
+        // and ERROR_UNABLE_TO_REMOVE_REPLACED (1175).
+        for code in [5, 32, 33, 170, 303, 1175] {
+            let err = io::Error::from_raw_os_error(code);
+            assert!(
+                is_retryable_windows_replace_with_backup_error(&err),
+                "expected Win32 code {code} to be retryable before target moves"
+            );
+        }
+        // Partial-move states MUST NOT retry: ERROR_UNABLE_TO_MOVE_REPLACEMENT (1176) and
+        // ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 (1177) must surface directly for caller recovery.
+        for code in [1176, 1177] {
+            let err = io::Error::from_raw_os_error(code);
+            assert!(
+                !is_retryable_windows_replace_with_backup_error(&err),
+                "Win32 code {code} must not be blindly retried"
+            );
+        }
     }
 
     #[test]

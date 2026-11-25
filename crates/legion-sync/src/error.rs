@@ -24,6 +24,19 @@ pub enum FsErrorKind {
     AlreadyExists,
     /// Directory could not be removed because it still held entries.
     DirectoryNotEmpty,
+    /// Target file or directory is currently in use, locked, or pending deletion in another program
+    /// (for example Windows `ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION` /
+    /// `ERROR_DELETE_PENDING`).
+    Busy,
+    /// Windows `ReplaceFileW` failed with `ERROR_UNABLE_TO_REMOVE_REPLACED` (1175): neither the
+    /// replaced file nor the staged replacement moved.
+    ReplaceUnableToRemoveReplaced,
+    /// Windows `ReplaceFileW` failed with `ERROR_UNABLE_TO_MOVE_REPLACEMENT` (1176): the
+    /// replacement could not be moved into place and Windows attempted to roll back the backup.
+    ReplaceUnableToMoveReplacement,
+    /// Windows `ReplaceFileW` failed with `ERROR_UNABLE_TO_MOVE_REPLACEMENT_2` (1177): the old
+    /// target was moved to the backup path, the replacement stayed staged, and rollback failed.
+    ReplaceUnableToMoveReplacement2,
     /// Storage volume ran out of space or quota.
     NoSpace,
     /// Rename crossed filesystems or mount points (`EXDEV`).
@@ -251,7 +264,11 @@ impl SyncError {
                 FsErrorKind::NotFound => ErrorCode::NotFound,
                 FsErrorKind::PermissionDenied => ErrorCode::Denied,
                 FsErrorKind::AlreadyExists => ErrorCode::Exists,
-                FsErrorKind::DirectoryNotEmpty => ErrorCode::Conflict,
+                FsErrorKind::DirectoryNotEmpty
+                | FsErrorKind::Busy
+                | FsErrorKind::ReplaceUnableToRemoveReplaced
+                | FsErrorKind::ReplaceUnableToMoveReplacement
+                | FsErrorKind::ReplaceUnableToMoveReplacement2 => ErrorCode::Conflict,
                 FsErrorKind::NoSpace
                 | FsErrorKind::CrossDevice
                 | FsErrorKind::Crash
@@ -324,6 +341,13 @@ impl SyncError {
                     "Remove or move remaining files inside the directory and sync again."
                         .to_string(),
                 ),
+                FsErrorKind::Busy
+                | FsErrorKind::ReplaceUnableToRemoveReplaced
+                | FsErrorKind::ReplaceUnableToMoveReplacement
+                | FsErrorKind::ReplaceUnableToMoveReplacement2 => Some(
+                    "Close any program using this file and sync will retry automatically."
+                        .to_string(),
+                ),
                 FsErrorKind::NoSpace => {
                     Some("Free disk space on the sync volume and retry.".to_string())
                 }
@@ -373,8 +397,22 @@ impl SyncError {
     pub fn from_os(path: Option<String>, err: legion_os::OsError) -> Self {
         let kind = match &err {
             legion_os::OsError::NotFound { .. } => FsErrorKind::NotFound,
-            legion_os::OsError::PermissionDenied { .. } => FsErrorKind::PermissionDenied,
+            legion_os::OsError::PermissionDenied {
+                source: Some(source),
+                ..
+            } => {
+                let classified = classify_io_error(source);
+                if matches!(classified, FsErrorKind::Other) {
+                    FsErrorKind::PermissionDenied
+                } else {
+                    classified
+                }
+            }
+            legion_os::OsError::PermissionDenied { source: None, .. } => {
+                FsErrorKind::PermissionDenied
+            }
             legion_os::OsError::AlreadyExists { .. } => FsErrorKind::AlreadyExists,
+            legion_os::OsError::WouldBlock { .. } => FsErrorKind::Busy,
             legion_os::OsError::Io { source, .. } => classify_io_error(source),
             _ => FsErrorKind::Other,
         };
@@ -386,40 +424,61 @@ impl SyncError {
     }
 }
 
+/// Classifies a Win32 error code into its specific [`FsErrorKind`], when one applies.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn classify_windows_error_code(code: i32) -> Option<FsErrorKind> {
+    match code {
+        // ERROR_UNABLE_TO_REMOVE_REPLACED (1175)
+        1175 => Some(FsErrorKind::ReplaceUnableToRemoveReplaced),
+        // ERROR_UNABLE_TO_MOVE_REPLACEMENT (1176)
+        1176 => Some(FsErrorKind::ReplaceUnableToMoveReplacement),
+        // ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 (1177)
+        1177 => Some(FsErrorKind::ReplaceUnableToMoveReplacement2),
+        // ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33),
+        // ERROR_BUSY (170), ERROR_DELETE_PENDING (303)
+        32 | 33 | 170 | 303 => Some(FsErrorKind::Busy),
+        // ERROR_HANDLE_DISK_FULL (39), ERROR_DISK_FULL (112)
+        39 | 112 => Some(FsErrorKind::NoSpace),
+        // ERROR_NOT_SAME_DEVICE (17)
+        17 => Some(FsErrorKind::CrossDevice),
+        // ERROR_FILE_EXISTS (80), ERROR_ALREADY_EXISTS (183)
+        80 | 183 => Some(FsErrorKind::AlreadyExists),
+        _ => None,
+    }
+}
+
 fn classify_io_error(err: &std::io::Error) -> FsErrorKind {
     use std::io::ErrorKind;
+
+    #[cfg(windows)]
+    if let Some(code) = err.raw_os_error()
+        && let Some(kind) = classify_windows_error_code(code)
+    {
+        return kind;
+    }
+
+    #[cfg(unix)]
+    if let Some(code) = err.raw_os_error() {
+        match code {
+            // ENOSPC (28) / EDQUOT (122 on Linux)
+            28 | 122 => return FsErrorKind::NoSpace,
+            // EXDEV (18)
+            18 => return FsErrorKind::CrossDevice,
+            // EBUSY (16) / ETXTBSY (26)
+            16 | 26 => return FsErrorKind::Busy,
+            _ => {}
+        }
+    }
+
     match err.kind() {
         ErrorKind::NotFound => FsErrorKind::NotFound,
         ErrorKind::PermissionDenied => FsErrorKind::PermissionDenied,
         ErrorKind::AlreadyExists => FsErrorKind::AlreadyExists,
         ErrorKind::DirectoryNotEmpty => FsErrorKind::DirectoryNotEmpty,
+        ErrorKind::ResourceBusy => FsErrorKind::Busy,
         ErrorKind::StorageFull => FsErrorKind::NoSpace,
         ErrorKind::CrossesDevices => FsErrorKind::CrossDevice,
-        _ => {
-            #[cfg(unix)]
-            {
-                if matches!(err.raw_os_error(), Some(28 | 122)) {
-                    // ENOSPC (28) / EDQUOT (122 on Linux)
-                    return FsErrorKind::NoSpace;
-                }
-                if err.raw_os_error() == Some(18) {
-                    // EXDEV (18)
-                    return FsErrorKind::CrossDevice;
-                }
-            }
-            #[cfg(windows)]
-            {
-                if matches!(err.raw_os_error(), Some(39 | 112)) {
-                    // ERROR_HANDLE_DISK_FULL (39) / ERROR_DISK_FULL (112)
-                    return FsErrorKind::NoSpace;
-                }
-                if err.raw_os_error() == Some(17) {
-                    // ERROR_NOT_SAME_DEVICE (17)
-                    return FsErrorKind::CrossDevice;
-                }
-            }
-            FsErrorKind::Other
-        }
+        _ => FsErrorKind::Other,
     }
 }
 
@@ -463,5 +522,47 @@ impl From<legion_xfer::Error> for SyncError {
                 kind: FsErrorKind::Other,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_error_codes_classify_replacefilew_and_sharing_distinctly() {
+        assert_eq!(
+            classify_windows_error_code(1175),
+            Some(FsErrorKind::ReplaceUnableToRemoveReplaced)
+        );
+        assert_eq!(
+            classify_windows_error_code(1176),
+            Some(FsErrorKind::ReplaceUnableToMoveReplacement)
+        );
+        assert_eq!(
+            classify_windows_error_code(1177),
+            Some(FsErrorKind::ReplaceUnableToMoveReplacement2)
+        );
+        for busy_code in [32, 33, 170, 303] {
+            assert_eq!(
+                classify_windows_error_code(busy_code),
+                Some(FsErrorKind::Busy),
+                "code {busy_code}"
+            );
+        }
+        assert_eq!(
+            classify_windows_error_code(80),
+            Some(FsErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            classify_windows_error_code(183),
+            Some(FsErrorKind::AlreadyExists)
+        );
+        assert_eq!(classify_windows_error_code(39), Some(FsErrorKind::NoSpace));
+        assert_eq!(classify_windows_error_code(112), Some(FsErrorKind::NoSpace));
+        assert_eq!(
+            classify_windows_error_code(17),
+            Some(FsErrorKind::CrossDevice)
+        );
     }
 }

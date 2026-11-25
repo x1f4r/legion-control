@@ -82,6 +82,7 @@ pub enum When {
 pub enum Act {
     Continue,
     Crash,
+    Err(FsErrorKind),
 }
 
 pub struct Hook {
@@ -92,6 +93,8 @@ pub struct Hook {
     pub fired: bool,
 }
 
+pub type ReplaceBackupHook = Box<dyn FnMut(&RealFs, &str, &str, &str) -> legion_sync::Result<bool>>;
+
 /// `RealFs` wrapper that fires person actions on the real disk at exact operation boundaries.
 pub struct HookFs {
     pub inner: RealFs,
@@ -99,6 +102,10 @@ pub struct HookFs {
     pub counts: RefCell<BTreeMap<&'static str, usize>>,
     pub log: RefCell<Vec<String>>,
     pub no_exchange: bool,
+    pub no_replace_backup: bool,
+    pub simulate_replace_with_backup: bool,
+    pub capabilities_override: Option<FsCapabilities>,
+    pub replace_backup_override: RefCell<Option<ReplaceBackupHook>>,
 }
 
 impl HookFs {
@@ -109,6 +116,10 @@ impl HookFs {
             counts: RefCell::new(BTreeMap::new()),
             log: RefCell::new(Vec::new()),
             no_exchange: false,
+            no_replace_backup: false,
+            simulate_replace_with_backup: false,
+            capabilities_override: None,
+            replace_backup_override: RefCell::new(None),
         }
     }
     pub fn add(
@@ -126,9 +137,19 @@ impl HookFs {
             fired: false,
         });
     }
+    pub fn set_replace_backup_override(
+        &self,
+        f: impl FnMut(&RealFs, &str, &str, &str) -> legion_sync::Result<bool> + 'static,
+    ) {
+        *self.replace_backup_override.borrow_mut() = Some(Box::new(f));
+    }
+    pub fn clear_replace_backup_override(&self) {
+        *self.replace_backup_override.borrow_mut() = None;
+    }
     pub fn clear(&self) {
         self.hooks.borrow_mut().clear();
         self.counts.borrow_mut().clear();
+        *self.replace_backup_override.borrow_mut() = None;
     }
     pub fn all_fired(&self) -> bool {
         self.hooks.borrow().iter().all(|h| h.fired)
@@ -141,12 +162,22 @@ impl HookFs {
                 self.log
                     .borrow_mut()
                     .push(format!("HOOK {op} {when:?} #{n}"));
-                if let Act::Crash = (h.action)() {
-                    return Err(SyncError::Fs {
-                        path: Some(op.to_string()),
-                        detail: "review injected crash".to_string(),
-                        kind: FsErrorKind::Crash,
-                    });
+                match (h.action)() {
+                    Act::Continue => {}
+                    Act::Crash => {
+                        return Err(SyncError::Fs {
+                            path: Some(op.to_string()),
+                            detail: "review injected crash".to_string(),
+                            kind: FsErrorKind::Crash,
+                        });
+                    }
+                    Act::Err(kind) => {
+                        return Err(SyncError::Fs {
+                            path: Some(op.to_string()),
+                            detail: format!("review injected fs error ({kind:?})"),
+                            kind,
+                        });
+                    }
                 }
             }
         }
@@ -172,11 +203,32 @@ impl HookFs {
         }
         r
     }
+    fn w_bool(
+        &self,
+        op: &'static str,
+        arg: &str,
+        f: impl FnOnce(&RealFs) -> legion_sync::Result<bool>,
+    ) -> legion_sync::Result<bool> {
+        let n = {
+            let mut c = self.counts.borrow_mut();
+            let e = c.entry(op).or_insert(0);
+            *e += 1;
+            *e
+        };
+        self.log.borrow_mut().push(format!("{op}({arg}) #{n}"));
+        self.fire(op, When::Before, n)?;
+        let r = f(&self.inner);
+        if matches!(r, Ok(true)) {
+            self.fire(op, When::After, n)?;
+        }
+        r
+    }
 }
 
 impl SyncFs for HookFs {
     fn capabilities(&self) -> FsCapabilities {
-        self.inner.capabilities()
+        self.capabilities_override
+            .unwrap_or_else(|| self.inner.capabilities())
     }
     fn read_marker(&self) -> legion_sync::Result<Option<FolderMarker>> {
         self.w("read_marker", "", |f| f.read_marker())
@@ -304,12 +356,25 @@ impl SyncFs for HookFs {
         if self.no_exchange {
             return Ok(false);
         }
-        self.w("exchange_tmp_with_live", p, |f| {
+        self.w_bool("exchange_tmp_with_live", p, |f| {
             f.exchange_tmp_with_live(t, p)
         })
     }
     fn replace_live_with_tmp_backup(&self, t: &str, p: &str, b: &str) -> legion_sync::Result<bool> {
-        self.inner.replace_live_with_tmp_backup(t, p, b)
+        if self.no_replace_backup {
+            return Ok(false);
+        }
+        self.w_bool("replace_live_with_tmp_backup", p, |f| {
+            if let Some(cb) = self.replace_backup_override.borrow_mut().as_mut() {
+                return cb(f, t, p, b);
+            }
+            if self.simulate_replace_with_backup {
+                f.move_live_to_tmp_no_replace(p, b)?;
+                f.commit_tmp_to_live_no_replace(t, p)?;
+                return Ok(true);
+            }
+            f.replace_live_with_tmp_backup(t, p, b)
+        })
     }
     fn move_live_to_tmp_no_replace(&self, p: &str, t: &str) -> legion_sync::Result<()> {
         self.w("move_live_to_tmp_no_replace", p, |f| {
@@ -392,15 +457,18 @@ pub fn all_bytes(root: &Path) -> Vec<(String, Vec<u8>)> {
             if ft.is_dir() {
                 rec(base, &p, out);
             } else if ft.is_file() {
-                if p.extension().is_some_and(|x| x == "json")
-                    && p.to_string_lossy().contains(".legion-sync/bin")
-                {
+                let norm = p.to_string_lossy().replace('\\', "/");
+                if p.extension().is_some_and(|x| x == "json") && norm.contains(".legion-sync/bin") {
                     continue;
                 }
-                if p.to_string_lossy().ends_with("marker.json") {
+                if norm.ends_with("marker.json") {
                     continue;
                 }
-                let rel = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                let rel = p
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 out.push((rel, fs::read(&p).unwrap_or_default()));
             }
         }
@@ -430,12 +498,11 @@ pub fn where_is(root: &Path, content: &[u8]) -> Vec<String> {
             if ft.is_dir() {
                 rec(base, &p, content, target_len, prefix, out);
             } else if ft.is_file() {
-                if p.extension().is_some_and(|x| x == "json")
-                    && p.to_string_lossy().contains(".legion-sync/bin")
-                {
+                let norm = p.to_string_lossy().replace('\\', "/");
+                if p.extension().is_some_and(|x| x == "json") && norm.contains(".legion-sync/bin") {
                     continue;
                 }
-                if p.to_string_lossy().ends_with("marker.json") {
+                if norm.ends_with("marker.json") {
                     continue;
                 }
                 let Ok(meta) = e.metadata() else { continue };
@@ -454,7 +521,11 @@ pub fn where_is(root: &Path, content: &[u8]) -> Vec<String> {
                     }
                 }
                 if fs::read(&p).is_ok_and(|b| b == content) {
-                    let rel = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                    let rel = p
+                        .strip_prefix(base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
                     out.push(rel);
                 }
             }
