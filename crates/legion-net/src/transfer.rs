@@ -11,7 +11,7 @@
 //! tree is listed at both ends, [`legion_xfer::plan::plan`] decides what differs, and only that is
 //! packed at the source and unpacked at the destination, so a second run sends nothing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -3429,6 +3429,12 @@ struct Conn {
     /// Cancelled by a local in-process stream's auth watchdog if permissions/device are revoked
     /// while the stream is stalled.
     revoke_token: Option<CancellationToken>,
+    /// Complete control lines read from `reader` during a relay (e.g. an early `{"ok": ...}` or
+    /// mid-stream `{"error": ...}`) so [`Self::first`] receives them intact afterward.
+    pending_lines: VecDeque<Vec<u8>>,
+    /// Any incomplete control line already consumed from `reader` while watching for heartbeats or
+    /// errors during a relay, continued seamlessly by [`Self::line`].
+    partial_line: Vec<u8>,
 }
 
 /// How much a listing from another node may hold: entries, bytes in all, and bytes in one line.
@@ -3556,6 +3562,8 @@ impl Conn {
             received: 0,
             opened: tokio::time::Instant::now(),
             revoke_token,
+            pending_lines: VecDeque::new(),
+            partial_line: Vec::new(),
         };
         let mut line = header.to_string().into_bytes();
         line.push(b'\n');
@@ -3693,6 +3701,10 @@ impl Conn {
     /// reply, a byte that cannot be in a line of text ends the read at once: it is data from a
     /// node that speaks another protocol, which may never send a newline.
     async fn line(&mut self) -> Result<Vec<u8>, ErrorBody> {
+        if let Some(line) = self.pending_lines.pop_front() {
+            self.received += line.len();
+            return Ok(line);
+        }
         // A reply is a JSON object however long it is; only other text, a banner, is held to
         // what noise may take before the first reply.
         let (wait, noise) = if self.answered {
@@ -3703,7 +3715,7 @@ impl Conn {
                 MOST_NOISE_BYTES.saturating_sub(self.noise_bytes),
             )
         };
-        let mut line = Vec::new();
+        let mut line = std::mem::take(&mut self.partial_line);
         let binary_is_foreign = !self.answered;
         let read = tokio::time::timeout(
             wait,
@@ -4051,6 +4063,7 @@ fn with_machine(error: ErrorBody, machine: &str) -> ErrorBody {
 }
 
 /// Where a relay broke.
+#[derive(Debug)]
 enum Broken {
     /// This end moved no bytes for [`IDLE_TIMEOUT`]: the source sent none, or the destination
     /// took none.
@@ -4135,15 +4148,70 @@ async fn wait_revoked(token: &Option<CancellationToken>) {
     }
 }
 
-async fn write_to_opt(writer: &mut Option<BoxWrite>, bytes: &[u8]) -> std::io::Result<()> {
+async fn write_once_opt(writer: &mut Option<BoxWrite>, bytes: &[u8]) -> std::io::Result<usize> {
     let Some(w) = writer.as_mut() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "the input was already closed",
         ));
     };
-    w.write_all(bytes).await?;
+    w.write(bytes).await
+}
+
+async fn flush_opt(writer: &mut Option<BoxWrite>) -> std::io::Result<()> {
+    let Some(w) = writer.as_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "the input was already closed",
+        ));
+    };
     w.flush().await
+}
+
+/// Drains whatever control bytes are already buffered in `dest.reader` into `dest.partial_line`
+/// and classifies each complete newline-terminated line:
+/// - `{"busy": true}\n` heartbeats are discarded so the relay keeps watching for later errors.
+/// - `{"error": ...}\n` or malformed/oversized lines are queued on `dest.pending_lines` and stop
+///   the relay immediately with [`Broken::Destination`].
+/// - Any other JSON reply (e.g. an early `{"ok": true, ...}\n`) is queued on `dest.pending_lines`
+///   and sets `*dest_replied_ok = true` so [`Conn::first`] reads it intact once the relay ends.
+fn drain_dest_control(dest: &mut Conn, dest_replied_ok: &mut bool) -> Result<(), Broken> {
+    while !*dest_replied_ok {
+        let avail = dest.reader.buffer();
+        if avail.is_empty() {
+            break;
+        }
+        let (chunk_len, found) = match avail.iter().position(|byte| *byte == b'\n') {
+            Some(end) => (end + 1, true),
+            None => (avail.len(), false),
+        };
+        if dest.partial_line.len() + chunk_len > dest.longest {
+            return Err(Broken::Destination("while it received".to_owned()));
+        }
+        dest.partial_line.extend_from_slice(&avail[..chunk_len]);
+        dest.reader.consume(chunk_len);
+        if !found {
+            break;
+        }
+        let line = std::mem::take(&mut dest.partial_line);
+        match serde_json::from_slice::<Value>(&line) {
+            Ok(Value::Object(ref fields))
+                if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) => {}
+            Ok(Value::Object(ref fields)) if fields.contains_key("error") => {
+                dest.pending_lines.push_back(line);
+                return Err(Broken::Destination("while it received".to_owned()));
+            }
+            Ok(Value::Object(_)) => {
+                dest.pending_lines.push_back(line);
+                *dest_replied_ok = true;
+            }
+            _ => {
+                dest.pending_lines.push_back(line);
+                return Err(Broken::Destination("while it received".to_owned()));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Copies the source's output to the destination's input in fixed chunks, never more than
@@ -4154,6 +4222,22 @@ async fn relay(
     amount: Amount,
     meter: &mut Meter<'_>,
 ) -> Result<(), Broken> {
+    relay_with_timeout(source, dest, amount, meter, IDLE_TIMEOUT).await
+}
+
+/// Cancellation-safe core of [`relay`] with a configurable per-hop stall timeout.
+///
+/// Every `tokio::select!` branch operates on single-step, cancellation-safe futures (`read`,
+/// `write`, `flush`, `fill_buf`), while all partial state (`buf`, `written`, `dest.partial_line`,
+/// `dest.pending_lines`) lives outside `select!`. A heartbeat or early reply arriving on
+/// `dest.reader` mid-chunk can therefore never discard or duplicate bytes already written.
+async fn relay_with_timeout(
+    source: &mut Conn,
+    dest: &mut Conn,
+    amount: Amount,
+    meter: &mut Meter<'_>,
+    idle_timeout: Duration,
+) -> Result<(), Broken> {
     let mut buf = vec![0u8; CHUNK];
     let mut copied = 0u64;
     let limit = match amount {
@@ -4161,9 +4245,12 @@ async fn relay(
     };
     let source_revoke = source.revoke_token.clone();
     let dest_revoke = dest.revoke_token.clone();
-    // Once `dest` sends a non-error reply (e.g. `UnpackDone` right before `source` sends EOF),
-    // stop polling `dest.reader` so we do not mistake a normal early reply for an error.
+    // Once `dest` sends a non-error, non-busy reply (e.g. `UnpackDone` right before `source` sends
+    // EOF), stop polling `dest.reader` so we do not mistake a normal early reply for an error.
     let mut dest_replied_ok = false;
+    // Drain anything already buffered in `dest.reader` before entering the transfer loop.
+    drain_dest_control(dest, &mut dest_replied_ok)?;
+
     loop {
         // An archive is read one byte past its limit, to tell an archive that ends there from one
         // that goes on.
@@ -4175,27 +4262,34 @@ async fn relay(
         if want == 0 {
             break;
         }
-        let read = tokio::select! {
-            res = source.reader.read(&mut buf[..want]) => {
-                res.map_err(|error| Broken::Source(format!("while it sent ({error})")))?
-            }
-            res = dest.reader.fill_buf(), if !dest_replied_ok => {
-                match res {
-                    Ok(avail) if avail.starts_with(b"{\"ok\"") || avail.starts_with(b"{\"busy\"") => {
-                        dest_replied_ok = true;
-                        continue;
+        let read = {
+            let idle = tokio::time::sleep(idle_timeout);
+            tokio::pin!(idle);
+            loop {
+                tokio::select! {
+                    res = source.reader.read(&mut buf[..want]) => match res {
+                        Ok(n) => break n,
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            return Err(Broken::Source(format!("while it sent ({error})")));
+                        }
+                    },
+                    res = dest.reader.fill_buf(), if !dest_replied_ok => match res {
+                        Ok([]) | Err(_) => {
+                            return Err(Broken::Destination("while it received".to_owned()));
+                        }
+                        Ok(_) => drain_dest_control(dest, &mut dest_replied_ok)?,
+                    },
+                    () = wait_revoked(&source_revoke) => {
+                        return Err(Broken::Source("because access was revoked".to_owned()));
                     }
-                    _ => return Err(Broken::Destination("while it received".to_owned())),
+                    () = wait_revoked(&dest_revoke) => {
+                        return Err(Broken::Destination("because access was revoked".to_owned()));
+                    }
+                    () = &mut idle => {
+                        return Err(Broken::Stalled { source: true });
+                    }
                 }
-            }
-            () = wait_revoked(&source_revoke) => {
-                return Err(Broken::Source("because access was revoked".to_owned()));
-            }
-            () = wait_revoked(&dest_revoke) => {
-                return Err(Broken::Destination("because access was revoked".to_owned()));
-            }
-            () = tokio::time::sleep(IDLE_TIMEOUT) => {
-                return Err(Broken::Stalled { source: true });
             }
         };
         if read == 0 {
@@ -4209,28 +4303,80 @@ async fn relay(
         if copied + read as u64 > limit {
             return Err(Broken::Excess(limit));
         }
-        loop {
-            tokio::select! {
-                res = write_to_opt(&mut dest.writer, &buf[..read]) => {
-                    res.map_err(|error| Broken::Destination(format!("while it received ({error})")))?;
-                    break;
-                }
-                res = dest.reader.fill_buf(), if !dest_replied_ok => {
-                    match res {
-                        Ok(avail) if avail.starts_with(b"{\"ok\"") || avail.starts_with(b"{\"busy\"") => {
-                            dest_replied_ok = true;
+
+        // Write `buf[..read]` with an explicit offset owned outside `select!`: each `select!` only
+        // polls a single cancellation-safe `write(&buf[written..read])`, never `write_all`.
+        let mut written = 0usize;
+        {
+            let idle = tokio::time::sleep(idle_timeout);
+            tokio::pin!(idle);
+            while written < read {
+                tokio::select! {
+                    res = write_once_opt(&mut dest.writer, &buf[written..read]) => match res {
+                        Ok(0) => {
+                            return Err(Broken::Destination(
+                                "while it received (write zero)".to_owned(),
+                            ));
                         }
-                        _ => return Err(Broken::Destination("while it received".to_owned())),
+                        Ok(n) => {
+                            written += n;
+                            idle.as_mut()
+                                .reset(tokio::time::Instant::now() + idle_timeout);
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            return Err(Broken::Destination(format!(
+                                "while it received ({error})"
+                            )));
+                        }
+                    },
+                    res = dest.reader.fill_buf(), if !dest_replied_ok => match res {
+                        Ok([]) | Err(_) => {
+                            return Err(Broken::Destination("while it received".to_owned()));
+                        }
+                        Ok(_) => drain_dest_control(dest, &mut dest_replied_ok)?,
+                    },
+                    () = wait_revoked(&source_revoke) => {
+                        return Err(Broken::Source("because access was revoked".to_owned()));
+                    }
+                    () = wait_revoked(&dest_revoke) => {
+                        return Err(Broken::Destination("because access was revoked".to_owned()));
+                    }
+                    () = &mut idle => {
+                        return Err(Broken::Stalled { source: false });
                     }
                 }
-                () = wait_revoked(&source_revoke) => {
-                    return Err(Broken::Source("because access was revoked".to_owned()));
-                }
-                () = wait_revoked(&dest_revoke) => {
-                    return Err(Broken::Destination("because access was revoked".to_owned()));
-                }
-                () = tokio::time::sleep(IDLE_TIMEOUT) => {
-                    return Err(Broken::Stalled { source: false });
+            }
+        }
+        {
+            let idle = tokio::time::sleep(idle_timeout);
+            tokio::pin!(idle);
+            loop {
+                tokio::select! {
+                    res = flush_opt(&mut dest.writer) => match res {
+                        Ok(()) => break,
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            return Err(Broken::Destination(format!(
+                                "while it received ({error})"
+                            )));
+                        }
+                    },
+                    res = dest.reader.fill_buf(), if !dest_replied_ok => match res {
+                        Ok([]) | Err(_) => {
+                            return Err(Broken::Destination("while it received".to_owned()));
+                        }
+                        Ok(_) => drain_dest_control(dest, &mut dest_replied_ok)?,
+                    },
+                    () = wait_revoked(&source_revoke) => {
+                        return Err(Broken::Source("because access was revoked".to_owned()));
+                    }
+                    () = wait_revoked(&dest_revoke) => {
+                        return Err(Broken::Destination("because access was revoked".to_owned()));
+                    }
+                    () = &mut idle => {
+                        return Err(Broken::Stalled { source: false });
+                    }
                 }
             }
         }
@@ -4292,6 +4438,26 @@ struct Meter<'a> {
 }
 
 impl<'a> Meter<'a> {
+    #[cfg(test)]
+    fn quiet(sent: &'a Sent) -> Meter<'a> {
+        let now = Instant::now();
+        Meter {
+            ctx: None,
+            sent,
+            bytes_total: 0,
+            bytes_base: 0,
+            attempt_bytes: 0,
+            files_total: 0,
+            current: None,
+            tar: None,
+            started: now,
+            last: now,
+            last_bytes_done: 0,
+            last_files_done: 0,
+            attempt: 1,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         ctx: &'a Ctx,
@@ -4691,6 +4857,8 @@ mod tests {
             received: 0,
             opened: tokio::time::Instant::now(),
             revoke_token: None,
+            pending_lines: VecDeque::new(),
+            partial_line: Vec::new(),
         };
         (conn, peer_out, peer_in)
     }
@@ -5000,5 +5168,491 @@ mod tests {
         assert_eq!(parent_dir_of("/doc.txt"), "/");
         assert_eq!(parent_dir_of(r"C:\doc.txt"), r"C:\");
         assert_eq!(parent_dir_of(r"C:\Work\doc.txt"), r"C:\Work");
+    }
+
+    #[derive(Clone)]
+    struct Rng64(u64);
+
+    impl Rng64 {
+        fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9e37_79b9_7f4a_7c15)
+        }
+
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn range(&mut self, upper: usize) -> usize {
+            if upper <= 1 {
+                0
+            } else {
+                (self.next() as usize) % upper
+            }
+        }
+    }
+
+    /// Deterministic adversarial `AsyncRead` that yields 1-byte or random short chunks, injects
+    /// `Poll::Pending` wakeups and `Interrupted` errors, and never relies on wall-clock timing.
+    struct AdversarialAsyncRead {
+        data: Vec<u8>,
+        pos: usize,
+        rng: Rng64,
+        single_byte: bool,
+        inject_interrupted: bool,
+        pending_every: usize,
+        polls: usize,
+    }
+
+    impl AsyncRead for AdversarialAsyncRead {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.polls += 1;
+            if self.pending_every > 0 && self.polls.is_multiple_of(self.pending_every) {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            if self.inject_interrupted && self.rng.range(9) == 0 {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "adversarial eintr",
+                )));
+            }
+            let remaining = self.data.len() - self.pos;
+            if remaining == 0 || buf.remaining() == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let max_take = remaining.min(buf.remaining());
+            let take = if self.single_byte {
+                1
+            } else {
+                1 + self.rng.range(max_take.min(4096))
+            };
+            let take = take.min(max_take);
+            buf.put_slice(&self.data[self.pos..self.pos + take]);
+            self.pos += take;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Deterministic adversarial `AsyncWrite` that performs 1-byte or random short writes, injects
+    /// `Poll::Pending` wakeups on write and flush, injects `Interrupted`, and records every byte
+    /// written into a shared buffer for exact byte-for-byte verification.
+    struct AdversarialAsyncWrite {
+        out: Arc<Mutex<Vec<u8>>>,
+        rng: Rng64,
+        single_byte: bool,
+        inject_interrupted: bool,
+        pending_every: usize,
+        polls: usize,
+        on_write_step: Option<Box<dyn FnMut(usize) + Send>>,
+    }
+
+    impl AsyncWrite for AdversarialAsyncWrite {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.polls += 1;
+            if self.pending_every > 0 && self.polls.is_multiple_of(self.pending_every) {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            if self.inject_interrupted && self.rng.range(9) == 0 {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "adversarial eintr",
+                )));
+            }
+            if buf.is_empty() {
+                return std::task::Poll::Ready(Ok(0));
+            }
+            let take = if self.single_byte {
+                1
+            } else {
+                1 + self.rng.range(buf.len().min(4096))
+            };
+            let take = take.min(buf.len());
+            let total = {
+                let mut guard = self.out.lock().unwrap();
+                guard.extend_from_slice(&buf[..take]);
+                guard.len()
+            };
+            if let Some(ref mut cb) = self.on_write_step {
+                cb(total);
+            }
+            std::task::Poll::Ready(Ok(take))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.polls += 1;
+            if self.pending_every > 0 && self.polls.is_multiple_of(self.pending_every) {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            if self.inject_interrupted && self.rng.range(11) == 0 {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "adversarial eintr flush",
+                )));
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn custom_conn(machine: &str, reader: BoxRead, writer: BoxWrite) -> Conn {
+        Conn {
+            machine: machine.to_owned(),
+            reader: BufReader::with_capacity(CHUNK, reader),
+            writer: Some(writer),
+            process: Owned {
+                process: Some(Process::Local(None)),
+                ends: Ends::default(),
+            },
+            answered: true,
+            noise_lines: 0,
+            noise_bytes: 0,
+            greeted: true,
+            capabilities: HashSet::new(),
+            required_caps: Vec::new(),
+            longest: LONGEST_REPLY,
+            received: 0,
+            opened: tokio::time::Instant::now(),
+            revoke_token: None,
+            pending_lines: VecDeque::new(),
+            partial_line: Vec::new(),
+        }
+    }
+
+    fn make_payload(seed: u64, len: usize) -> Vec<u8> {
+        let mut rng = Rng64::new(seed);
+        let mut out = vec![0u8; len];
+        for chunk in out.chunks_mut(8) {
+            let bytes = rng.next().to_le_bytes();
+            let n = chunk.len();
+            chunk.copy_from_slice(&bytes[..n]);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn relay_regression_busy_heartbeat_mid_partial_write_never_duplicates_bytes() {
+        // Reproduces the exact macOS failure deterministically without wall-clock timing:
+        // `dest.writer` accepts a partial prefix of a 64 KiB chunk, then yields `Poll::Pending`
+        // while `dest.reader` delivers `{"busy": true}\n` — cancelling the active write arm of
+        // `tokio::select!`. The relay must resume at `written`, never from offset 0.
+        struct MidChunkStallWriter {
+            out: Arc<Mutex<Vec<u8>>>,
+            busy_tx: Option<tokio::sync::oneshot::Sender<()>>,
+            resume_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+            stalled_once: bool,
+        }
+
+        impl AsyncWrite for MidChunkStallWriter {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                if !self.stalled_once {
+                    let prefix = buf.len().min(17 * 1024);
+                    self.out.lock().unwrap().extend_from_slice(&buf[..prefix]);
+                    self.stalled_once = true;
+                    if let Some(tx) = self.busy_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    return std::task::Poll::Ready(Ok(prefix));
+                }
+                if let Some(rx) = self.resume_rx.as_mut() {
+                    match std::pin::Pin::new(rx).poll(cx) {
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
+                        std::task::Poll::Ready(_) => {
+                            self.resume_rx = None;
+                        }
+                    }
+                }
+                self.out.lock().unwrap().extend_from_slice(buf);
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let payload = make_payload(0xfeed_face, 256 * 1024 + 137);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let (dest_ctrl_in, mut dest_ctrl_out) = tokio::io::duplex(4096);
+        let (_src_sink, src_writer) = tokio::io::duplex(64);
+
+        let ctrl_task = tokio::spawn(async move {
+            busy_rx.await.unwrap();
+            // Deliver three `{"busy": true}\n` heartbeats (one fragmented byte by byte) while
+            // `MidChunkStallWriter` is parked mid-chunk, then release the writer and send `ok`.
+            dest_ctrl_out.write_all(b"{\"busy\":true}\n").await.unwrap();
+            for &b in b"{\"busy\": true}\n" {
+                dest_ctrl_out.write_all(&[b]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            let _ = resume_tx.send(());
+            dest_ctrl_out
+                .write_all(b"{\"ok\":true,\"size\":262281}\n")
+                .await
+                .unwrap();
+            dest_ctrl_out.shutdown().await.unwrap();
+        });
+
+        let mut source = custom_conn(
+            "src",
+            Box::new(std::io::Cursor::new(payload.clone())),
+            Box::new(src_writer),
+        );
+        let mut dest = custom_conn(
+            "dst",
+            Box::new(dest_ctrl_in),
+            Box::new(MidChunkStallWriter {
+                out: Arc::clone(&received),
+                busy_tx: Some(busy_tx),
+                resume_rx: Some(resume_rx),
+                stalled_once: false,
+            }),
+        );
+        let sent = Sent::default();
+        let mut meter = Meter::quiet(&sent);
+        relay(
+            &mut source,
+            &mut dest,
+            Amount::Exactly(payload.len() as u64),
+            &mut meter,
+        )
+        .await
+        .unwrap();
+        ctrl_task.await.unwrap();
+
+        let got = received.lock().unwrap().clone();
+        assert_eq!(got.len(), payload.len());
+        assert_eq!(
+            got, payload,
+            "bytes must match payload byte for byte after mid-chunk busy heartbeats"
+        );
+        let reply: Value = dest.first().await.unwrap();
+        assert_eq!(reply["ok"], Value::Bool(true));
+        assert_eq!(reply["size"], json!(262281));
+    }
+
+    #[tokio::test]
+    async fn relay_is_cancellation_safe_under_adversarial_io_and_heartbeats() {
+        // 64 deterministic seeds exercising 1-byte and random short reads/writes, `Poll::Pending`
+        // wakeups at every await point, `Interrupted` errors, and fragmented `{"busy": true}\n`
+        // plus trailing `{"ok": true}\n` lines across both `Amount::Exactly` and `Amount::AtMost`.
+        for seed in 0u64..64 {
+            let single_byte = seed % 8 == 0;
+            let len = if single_byte {
+                3_000 + (seed as usize) * 37
+            } else {
+                70_000 + (seed as usize) * 1_913
+            };
+            let payload = make_payload(seed + 1, len);
+            let received = Arc::new(Mutex::new(Vec::new()));
+
+            let mut ctrl_bytes = Vec::new();
+            let heartbeats = 2 + (seed as usize % 6);
+            for _ in 0..heartbeats {
+                ctrl_bytes.extend_from_slice(b"{\"busy\":true}\n");
+            }
+            let ok_line = format!("{{\"ok\":true,\"seed\":{seed}}}\n");
+            ctrl_bytes.extend_from_slice(ok_line.as_bytes());
+
+            let source_reader = AdversarialAsyncRead {
+                data: payload.clone(),
+                pos: 0,
+                rng: Rng64::new(seed * 3 + 11),
+                single_byte,
+                inject_interrupted: true,
+                pending_every: 2 + (seed as usize % 3),
+                polls: 0,
+            };
+            let dest_ctrl_reader = AdversarialAsyncRead {
+                data: ctrl_bytes,
+                pos: 0,
+                rng: Rng64::new(seed * 5 + 29),
+                single_byte: true,
+                inject_interrupted: false,
+                pending_every: 2 + (seed as usize % 4),
+                polls: 0,
+            };
+            let dest_writer = AdversarialAsyncWrite {
+                out: Arc::clone(&received),
+                rng: Rng64::new(seed * 7 + 43),
+                single_byte,
+                inject_interrupted: true,
+                pending_every: 2 + (seed as usize % 3),
+                polls: 0,
+                on_write_step: None,
+            };
+            let (_src_sink, src_writer) = tokio::io::duplex(64);
+            let mut source = custom_conn("src", Box::new(source_reader), Box::new(src_writer));
+            let mut dest = custom_conn("dst", Box::new(dest_ctrl_reader), Box::new(dest_writer));
+
+            let sent = Sent::default();
+            let mut meter = Meter::quiet(&sent);
+            let amount = if seed % 2 == 0 {
+                Amount::Exactly(payload.len() as u64)
+            } else {
+                Amount::AtMost(payload.len() as u64 + 1024)
+            };
+            relay(&mut source, &mut dest, amount, &mut meter)
+                .await
+                .unwrap_or_else(|_| panic!("relay failed on seed {seed}"));
+
+            let got = received.lock().unwrap().clone();
+            assert_eq!(got.len(), payload.len(), "length mismatch on seed {seed}");
+            assert_eq!(got, payload, "byte mismatch on seed {seed}");
+
+            let reply: Value = dest.first().await.unwrap();
+            assert_eq!(reply["ok"], Value::Bool(true), "reply on seed {seed}");
+            assert_eq!(reply["seed"], json!(seed), "reply seed on seed {seed}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_detects_destination_error_after_busy_heartbeats_and_detects_stalls() {
+        // 1. Multiple `{"busy": true}\n` heartbeats followed by a mid-stream `{"error": ...}\n`
+        // while `dest.writer` is backpressured must immediately fail with that exact `ErrorBody`.
+        struct NeverReadyWriter;
+        impl AsyncWrite for NeverReadyWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Pending
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let payload = make_payload(77, 128 * 1024);
+        let (dest_ctrl_in, mut dest_ctrl_out) = tokio::io::duplex(4096);
+        let (_src_sink, src_writer) = tokio::io::duplex(64);
+        let mut source = custom_conn(
+            "src",
+            Box::new(std::io::Cursor::new(payload.clone())),
+            Box::new(src_writer),
+        );
+        let mut dest = custom_conn("dst", Box::new(dest_ctrl_in), Box::new(NeverReadyWriter));
+
+        let sender = tokio::spawn(async move {
+            dest_ctrl_out.write_all(b"{\"busy\":true}\n").await.unwrap();
+            dest_ctrl_out
+                .write_all(b"{\"busy\": true}\n")
+                .await
+                .unwrap();
+            let err_line =
+                b"{\"error\":{\"code\":\"denied\",\"message\":\"revoked after heartbeat\"}}\n";
+            for &b in err_line {
+                dest_ctrl_out.write_all(&[b]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let sent = Sent::default();
+        let mut meter = Meter::quiet(&sent);
+        let broken = relay_with_timeout(
+            &mut source,
+            &mut dest,
+            Amount::Exactly(payload.len() as u64),
+            &mut meter,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("mid-stream destination error after busy heartbeats must fail relay");
+        sender.await.unwrap();
+        let explained = broken.explain(source, dest).await;
+        assert_eq!(explained.code, ErrorCode::Denied, "{explained:?}");
+        assert!(
+            explained.message.contains("revoked after heartbeat"),
+            "{explained:?}"
+        );
+
+        // 2. A stalled destination still times out within `idle_timeout` even if `{"busy": true}`
+        // heartbeats keep arriving every second.
+        let (dest_ctrl_in2, mut dest_ctrl_out2) = tokio::io::duplex(4096);
+        let (_src_sink2, src_writer2) = tokio::io::duplex(64);
+        let mut source2 = custom_conn(
+            "src",
+            Box::new(std::io::Cursor::new(payload.clone())),
+            Box::new(src_writer2),
+        );
+        let mut dest2 = custom_conn("dst", Box::new(dest_ctrl_in2), Box::new(NeverReadyWriter));
+        let hb_task = tokio::spawn(async move {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if dest_ctrl_out2
+                    .write_all(b"{\"busy\":true}\n")
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let mut meter2 = Meter::quiet(&sent);
+        let stalled = relay_with_timeout(
+            &mut source2,
+            &mut dest2,
+            Amount::Exactly(payload.len() as u64),
+            &mut meter2,
+            Duration::from_secs(4),
+        )
+        .await
+        .expect_err("stalled writer must time out despite busy heartbeats");
+        assert!(
+            matches!(stalled, Broken::Stalled { source: false }),
+            "expected destination stall"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+        hb_task.abort();
     }
 }

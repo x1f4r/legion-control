@@ -517,6 +517,7 @@ pub(crate) struct LockReady {
 }
 
 /// How an operation failed: in time to say so on stdout, or after its raw bytes had started.
+#[derive(Debug)]
 enum Failure {
     Reply(ErrorBody),
     Raw(ErrorBody),
@@ -581,7 +582,7 @@ pub fn serve_with_cancel<R: Read + Send + 'static, W: Write>(
         &mut output,
         &json!({ "protocol": STREAM_PROTOCOL, "capabilities": STREAM_CAPABILITIES }),
     )
-    .and_then(|()| output.flush());
+    .and_then(|()| flush_retry(&mut output));
     let (header, recorded) = match read_header(&mut reader) {
         Ok(read) => read,
         Err(error) => {
@@ -612,7 +613,7 @@ pub fn serve_with_cancel<R: Read + Send + 'static, W: Write>(
         Err((principal, error)) => (principal, Err(Failure::Reply(error))),
     };
     let result = match result {
-        Ok(()) => output.flush().map_err(|error| {
+        Ok(()) => flush_retry(&mut output).map_err(|error| {
             ErrorBody::new(
                 ErrorCode::Failed,
                 format!("The reader of the stream went away: {error}."),
@@ -963,6 +964,9 @@ impl<W: Write> RecheckingWriter<W> {
 impl<W: Write> Write for RecheckingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.check.maybe_recheck(&mut self.since_check)?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let cap = if self.slow_mode {
             SLOW_WRITE_CHUNK
         } else {
@@ -977,8 +981,14 @@ impl<W: Write> Write for RecheckingWriter<W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.check.maybe_recheck(&mut self.since_check)?;
-        self.inner.flush()
+        loop {
+            self.check.maybe_recheck(&mut self.since_check)?;
+            match self.inner.flush() {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            }
+        }
     }
 }
 
@@ -1153,6 +1163,16 @@ fn run<R: Read + Send + 'static, W: Write>(
     }
 }
 
+fn flush_retry<W: Write>(output: &mut W) -> io::Result<()> {
+    loop {
+        match output.flush() {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn line<W: Write, T: Serialize>(output: &mut W, value: &T) -> io::Result<()> {
     serde_json::to_writer(&mut *output, value).map_err(io::Error::other)?;
     output.write_all(b"\n")
@@ -1160,13 +1180,13 @@ fn line<W: Write, T: Serialize>(output: &mut W, value: &T) -> io::Result<()> {
 
 fn reply<W: Write, T: Serialize>(output: &mut W, value: &T) -> Result<(), Failure> {
     line(output, value)
-        .and_then(|()| output.flush())
+        .and_then(|()| flush_retry(output))
         .map_err(|error| Failure::Raw(gone(&error)))
 }
 
 fn reply_error<W: Write>(output: &mut W, error: &ErrorBody) -> io::Result<()> {
     line(output, &json!({ "error": error }))?;
-    output.flush()
+    flush_retry(output)
 }
 
 fn gone(error: &io::Error) -> ErrorBody {
@@ -1223,7 +1243,7 @@ fn write_listing<W: Write>(
             skipped_total: (kept < total).then_some(total as u64),
         },
     )?;
-    output.flush()
+    flush_retry(output)
 }
 
 fn stat<W: Write>(
@@ -2519,14 +2539,129 @@ fn visible_rename_temp_name(from_name: &OsStr, pid: u32, seq: u64) -> String {
     }
 }
 
+/// Recovery action decided for an interrupted two-step rename from the directory's exact entry
+/// names and the filesystem's case/Unicode folding rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingRenameRecovery {
+    /// Complete step 2 (`temp_name -> to_name`) without replacing anything, then remove the intent
+    /// record.
+    CompleteToFinal,
+    /// Reverse step 1 (`temp_name -> from_name`) without replacing anything (when `to_name` is
+    /// occupied on a filesystem where `from_name` is still a distinct free slot), then remove the
+    /// intent record.
+    ReverseToOriginal,
+    /// `temp_name` is no longer present in the directory (crash before step 1, crash after step 2,
+    /// or user already resolved it): remove the stale intent record and leave directory entries
+    /// untouched.
+    DropStaleIntent,
+    /// Both `temp_name` and a conflicting entry occupying the target/original namespace exist:
+    /// leave the visible `temp_name` and the conflicting entry untouched so no data is ever
+    /// overwritten, and keep the intent record so recovery can finish if the conflict is cleared.
+    KeepBoth,
+}
+
+/// Pure recovery decision from exact directory entry names (raw encoded bytes from `read_dir`),
+/// the intent's `(from_name, temp_name, to_name)`, and the directory's case/Unicode folding rules.
+fn decide_pending_rename_recovery(
+    entries: &[OsString],
+    from_name: &OsStr,
+    temp_name: &OsStr,
+    to_name: &OsStr,
+    fs: FsNameBehavior,
+) -> PendingRenameRecovery {
+    let exact_present = |needle: &OsStr| {
+        let want = needle.as_encoded_bytes();
+        entries.iter().any(|e| e.as_encoded_bytes() == want)
+    };
+    let slot_occupied = |target: &OsStr| {
+        let temp_bytes = temp_name.as_encoded_bytes();
+        entries
+            .iter()
+            .any(|e| e.as_encoded_bytes() != temp_bytes && names_fold_equivalent(e, target, fs))
+    };
+
+    if !exact_present(temp_name) {
+        return PendingRenameRecovery::DropStaleIntent;
+    }
+
+    let has_from = exact_present(from_name);
+    let has_to = exact_present(to_name);
+    let to_slot_busy = has_to || slot_occupied(to_name);
+    let from_slot_busy = has_from || slot_occupied(from_name);
+
+    match (has_from, has_to) {
+        (false, false) => {
+            if !to_slot_busy {
+                PendingRenameRecovery::CompleteToFinal
+            } else if !from_slot_busy {
+                PendingRenameRecovery::ReverseToOriginal
+            } else {
+                PendingRenameRecovery::KeepBoth
+            }
+        }
+        (true, false) => {
+            if !to_slot_busy {
+                PendingRenameRecovery::CompleteToFinal
+            } else {
+                PendingRenameRecovery::KeepBoth
+            }
+        }
+        (false, true) => {
+            if !from_slot_busy {
+                PendingRenameRecovery::ReverseToOriginal
+            } else {
+                PendingRenameRecovery::KeepBoth
+            }
+        }
+        (true, true) => PendingRenameRecovery::KeepBoth,
+    }
+}
+
+fn normalize_scope_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let mut normalized = stripped.replace('\\', "/");
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        if normalized.len() == 3 && normalized.as_bytes()[1] == b':' {
+            break;
+        }
+        normalized.pop();
+    }
+    if cfg!(windows) {
+        normalized.make_ascii_lowercase();
+    }
+    normalized
+}
+
+fn paths_overlap_scope(scope: &Path, parent: &Path) -> bool {
+    if let (Ok(s_id), Ok(p_id)) = (file_identity(scope), file_identity(parent))
+        && s_id.same_file(&p_id)
+    {
+        return true;
+    }
+    let s = normalize_scope_path(&fs::canonicalize(scope).unwrap_or_else(|_| scope.to_path_buf()));
+    let p =
+        normalize_scope_path(&fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()));
+    let is_prefix = |ancestor: &str, child: &str| {
+        ancestor == child
+            || ancestor == "/"
+            || child
+                .strip_prefix(ancestor)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    is_prefix(&s, &p) || is_prefix(&p, &s)
+}
+
 /// Completes or reverses any interrupted two-step case/normalization renames whose intent records
 /// remain under `<state_dir>/xfer/renames/`.
+///
+/// Decides purely from `read_dir(&parent)`'s exact entry names (compared byte for byte) so case
+/// folding or path canonicalisation can never confuse `from_name`, `to_name`, and `temp_name`.
 pub fn recover_pending_renames(state_dir: &Path, scope_dir: Option<&Path>) {
     let dir = pending_renames_dir(state_dir);
     let Ok(entries) = fs::read_dir(&dir) else {
         return;
     };
-    let scope_canon = scope_dir.map(|s| fs::canonicalize(s).unwrap_or_else(|_| s.to_path_buf()));
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(OsStr::to_str) != Some("json") {
@@ -2547,44 +2682,72 @@ pub fn recover_pending_renames(state_dir: &Path, scope_dir: Option<&Path>) {
             continue;
         };
         let parent = PathBuf::from(&intent.parent);
-        if let Some(ref scope) = scope_canon {
-            let parent_canon = fs::canonicalize(&parent).unwrap_or_else(|_| parent.clone());
-            if !parent_canon.starts_with(scope) && !scope.starts_with(&parent_canon) {
+        if let Some(scope) = scope_dir
+            && !paths_overlap_scope(scope, &parent)
+        {
+            continue;
+        }
+        let dir_entries: Vec<OsString> = match fs::read_dir(&parent) {
+            Ok(rd) => rd.filter_map(Result::ok).map(|e| e.file_name()).collect(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let _ = fs::remove_file(&path);
                 continue;
             }
-        }
-        let temp_path = parent.join(&intent.temp_name);
-        let to_path = parent.join(&intent.to_name);
-        let from_path = parent.join(&intent.from_name);
-        if fs::symlink_metadata(&temp_path).is_err() {
-            // Intermediate entry is already gone; clean up the intent record.
-            let _ = fs::remove_file(&path);
-            continue;
-        }
-        // Complete step 2 (`temp -> to`) if `to` does not exist; otherwise reverse (`temp -> from`).
-        let completed = if fs::symlink_metadata(&to_path).is_err() {
-            move_no_replace_raw(&temp_path, &to_path).is_ok()
-                && directory_contains_exact_name(&parent, OsStr::new(&intent.to_name))
-                    .unwrap_or(false)
-        } else {
-            false
+            Err(_) => continue,
         };
-        if completed {
-            #[cfg(unix)]
-            if let Ok(dir_handle) = fs::File::open(&parent) {
-                let _ = dir_handle.sync_all();
+        let from_name = OsStr::new(&intent.from_name);
+        let temp_name = OsStr::new(&intent.temp_name);
+        let to_name = OsStr::new(&intent.to_name);
+        // Only probe directory folding behavior when `temp_name` is actually present so cleaning
+        // up a stale intent never writes a probe file.
+        let has_temp = dir_entries
+            .iter()
+            .any(|e| e.as_encoded_bytes() == temp_name.as_encoded_bytes());
+        let fs_behavior = if has_temp {
+            probe_dir_name_behavior(&parent)
+        } else {
+            FsNameBehavior {
+                case_insensitive: false,
+                unicode_normalizing: false,
             }
-            let _ = fs::remove_file(&path);
-            continue;
-        }
-        if fs::symlink_metadata(&from_path).is_err()
-            && move_no_replace_raw(&temp_path, &from_path).is_ok()
-        {
-            #[cfg(unix)]
-            if let Ok(dir_handle) = fs::File::open(&parent) {
-                let _ = dir_handle.sync_all();
+        };
+        let action = decide_pending_rename_recovery(
+            &dir_entries,
+            from_name,
+            temp_name,
+            to_name,
+            fs_behavior,
+        );
+        let temp_path = parent.join(temp_name);
+        let to_path = parent.join(to_name);
+        let from_path = parent.join(from_name);
+        match action {
+            PendingRenameRecovery::DropStaleIntent => {
+                let _ = fs::remove_file(&path);
             }
-            let _ = fs::remove_file(&path);
+            PendingRenameRecovery::CompleteToFinal => {
+                if move_no_replace_raw(&temp_path, &to_path).is_ok()
+                    && directory_contains_exact_name(&parent, to_name).unwrap_or(false)
+                {
+                    #[cfg(unix)]
+                    if let Ok(dir_handle) = fs::File::open(&parent) {
+                        let _ = dir_handle.sync_all();
+                    }
+                    let _ = fs::remove_file(&path);
+                }
+            }
+            PendingRenameRecovery::ReverseToOriginal => {
+                if move_no_replace_raw(&temp_path, &from_path).is_ok()
+                    && directory_contains_exact_name(&parent, from_name).unwrap_or(false)
+                {
+                    #[cfg(unix)]
+                    if let Ok(dir_handle) = fs::File::open(&parent) {
+                        let _ = dir_handle.sync_all();
+                    }
+                    let _ = fs::remove_file(&path);
+                }
+            }
+            PendingRenameRecovery::KeepBoth => {}
         }
     }
 }
@@ -2983,7 +3146,9 @@ fn feed<R: Read + Send + 'static, W: Write, T: Send>(
                 break;
             }
             let available = match reader.fill_buf() {
-                Ok([]) | Err(_) => break,
+                Ok([]) => break,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
                 Ok(available) => available,
             };
             let take = usize::try_from(left)
@@ -3027,7 +3192,7 @@ fn wait_for<W: Write, T>(finished: &Receiver<T>, output: &mut W) -> Result<T, Fa
             Ok(result) => return Ok(result),
             Err(RecvTimeoutError::Timeout) => {
                 line(output, &json!({"busy": true}))
-                    .and_then(|()| output.flush())
+                    .and_then(|()| flush_retry(output))
                     .map_err(|error| Failure::Raw(gone(&error)))?;
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -3479,11 +3644,207 @@ mod tests {
     }
 
     #[test]
+    fn decide_pending_rename_recovery_covers_every_state_on_sensitive_and_folding_models() {
+        let from = OsStr::new("Notes.txt");
+        let temp = OsStr::new("legion-renaming-42-8-Notes.txt");
+        let to = OsStr::new("notes.txt");
+        let list = |names: &[&str]| -> Vec<OsString> { names.iter().map(OsString::from).collect() };
+
+        for fs_mode in [
+            CASE_SENSITIVE_RAW,
+            CASE_INSENSITIVE_RAW,
+            CASE_SENSITIVE_NORM,
+            CASE_INSENSITIVE_NORM,
+        ] {
+            // 1. Only original spelling present (crash before step 1 or already rolled back).
+            assert_eq!(
+                decide_pending_rename_recovery(&list(&["Notes.txt"]), from, temp, to, fs_mode),
+                PendingRenameRecovery::DropStaleIntent,
+                "only original under {fs_mode:?}"
+            );
+            // 2. Only temporary name present (crash between step 1 and step 2).
+            assert_eq!(
+                decide_pending_rename_recovery(
+                    &list(&["legion-renaming-42-8-Notes.txt"]),
+                    from,
+                    temp,
+                    to,
+                    fs_mode,
+                ),
+                PendingRenameRecovery::CompleteToFinal,
+                "only temp under {fs_mode:?}"
+            );
+            // 3. Only final spelling present (crash after step 2, before deleting intent).
+            assert_eq!(
+                decide_pending_rename_recovery(&list(&["notes.txt"]), from, temp, to, fs_mode),
+                PendingRenameRecovery::DropStaleIntent,
+                "only final under {fs_mode:?}"
+            );
+            // 4. Directory empty (user already removed or moved entry).
+            assert_eq!(
+                decide_pending_rename_recovery(&list(&[]), from, temp, to, fs_mode),
+                PendingRenameRecovery::DropStaleIntent,
+                "empty under {fs_mode:?}"
+            );
+            // 5. All three present -> keep everything untouched.
+            assert_eq!(
+                decide_pending_rename_recovery(
+                    &list(&["Notes.txt", "legion-renaming-42-8-Notes.txt", "notes.txt"]),
+                    from,
+                    temp,
+                    to,
+                    fs_mode,
+                ),
+                PendingRenameRecovery::KeepBoth,
+                "all three under {fs_mode:?}"
+            );
+        }
+
+        // 6. Temporary and original both present:
+        //    - Case-sensitive: `notes.txt` is a distinct free slot -> complete `temp -> to`.
+        //    - Case-insensitive: `Notes.txt` occupies `notes.txt`'s folded slot -> keep both.
+        assert_eq!(
+            decide_pending_rename_recovery(
+                &list(&["legion-renaming-42-8-Notes.txt", "Notes.txt"]),
+                from,
+                temp,
+                to,
+                CASE_SENSITIVE_RAW,
+            ),
+            PendingRenameRecovery::CompleteToFinal
+        );
+        assert_eq!(
+            decide_pending_rename_recovery(
+                &list(&["legion-renaming-42-8-Notes.txt", "Notes.txt"]),
+                from,
+                temp,
+                to,
+                CASE_INSENSITIVE_RAW,
+            ),
+            PendingRenameRecovery::KeepBoth
+        );
+        assert_eq!(
+            decide_pending_rename_recovery(
+                &list(&["legion-renaming-42-8-Notes.txt", "Notes.txt"]),
+                from,
+                temp,
+                to,
+                CASE_INSENSITIVE_NORM,
+            ),
+            PendingRenameRecovery::KeepBoth
+        );
+
+        // 7. Temporary and final both present:
+        //    - Case-sensitive: `Notes.txt` is a distinct free slot -> reverse `temp -> from`.
+        //    - Case-insensitive: `notes.txt` occupies `Notes.txt`'s folded slot -> keep both.
+        assert_eq!(
+            decide_pending_rename_recovery(
+                &list(&["legion-renaming-42-8-Notes.txt", "notes.txt"]),
+                from,
+                temp,
+                to,
+                CASE_SENSITIVE_RAW,
+            ),
+            PendingRenameRecovery::ReverseToOriginal
+        );
+        assert_eq!(
+            decide_pending_rename_recovery(
+                &list(&["legion-renaming-42-8-Notes.txt", "notes.txt"]),
+                from,
+                temp,
+                to,
+                CASE_INSENSITIVE_RAW,
+            ),
+            PendingRenameRecovery::KeepBoth
+        );
+        assert_eq!(
+            decide_pending_rename_recovery(
+                &list(&["legion-renaming-42-8-Notes.txt", "notes.txt"]),
+                from,
+                temp,
+                to,
+                CASE_INSENSITIVE_NORM,
+            ),
+            PendingRenameRecovery::KeepBoth
+        );
+
+        // 8. Temporary and a third case-folded variant (`NOTES.TXT`) present:
+        assert_eq!(
+            decide_pending_rename_recovery(
+                &list(&["legion-renaming-42-8-Notes.txt", "NOTES.TXT"]),
+                from,
+                temp,
+                to,
+                CASE_SENSITIVE_RAW,
+            ),
+            PendingRenameRecovery::CompleteToFinal
+        );
+        assert_eq!(
+            decide_pending_rename_recovery(
+                &list(&["legion-renaming-42-8-Notes.txt", "NOTES.TXT"]),
+                from,
+                temp,
+                to,
+                CASE_INSENSITIVE_RAW,
+            ),
+            PendingRenameRecovery::KeepBoth
+        );
+
+        // 9. Unicode NFC vs NFD normalization folding (`cafe\u{0301}.txt` -> `caf\u{00e9}.txt`):
+        let nfd = OsStr::new("cafe\u{0301}.txt");
+        let nfc = OsStr::new("caf\u{00e9}.txt");
+        let temp_u = OsStr::new("legion-renaming-42-9-cafe\u{0301}.txt");
+        assert_eq!(
+            decide_pending_rename_recovery(
+                &list(&["legion-renaming-42-9-cafe\u{0301}.txt", "caf\u{00e9}.txt"]),
+                nfd,
+                temp_u,
+                nfc,
+                CASE_SENSITIVE_NORM,
+            ),
+            PendingRenameRecovery::KeepBoth
+        );
+        assert_eq!(
+            decide_pending_rename_recovery(
+                &list(&["legion-renaming-42-9-cafe\u{0301}.txt", "caf\u{00e9}.txt"]),
+                nfd,
+                temp_u,
+                nfc,
+                CASE_SENSITIVE_RAW,
+            ),
+            PendingRenameRecovery::ReverseToOriginal
+        );
+    }
+
+    #[test]
     fn visible_rename_temp_is_not_hidden_and_recovery_completes_or_reverses() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
         let work_dir = dir.path().join("work");
         fs::create_dir_all(&work_dir).unwrap();
+        let renames_dir = pending_renames_dir(&state_dir);
+        fs::create_dir_all(&renames_dir).unwrap();
+
+        let has_exact_entry = |name: &str| -> bool {
+            directory_contains_exact_name(&work_dir, OsStr::new(name)).unwrap()
+        };
+        let write_intent = |from_name: &str, temp_name: &str, to_name: &str| -> PathBuf {
+            let key = rename_intent_key(&work_dir, temp_name);
+            let intent_path = renames_dir.join(format!("{key}.json"));
+            let intent = PendingRenameIntent {
+                parent: work_dir.to_string_lossy().into_owned(),
+                from_name: from_name.to_owned(),
+                temp_name: temp_name.to_owned(),
+                to_name: to_name.to_owned(),
+            };
+            write_atomic(
+                &intent_path,
+                &serde_json::to_vec(&intent).unwrap(),
+                WriteOptions::with_mode(0o600),
+            )
+            .unwrap();
+            intent_path
+        };
 
         let temp_name = visible_rename_temp_name(OsStr::new("Report.txt"), 42, 7);
         assert!(
@@ -3495,55 +3856,553 @@ mod tests {
             "intermediate rename name must not be hidden from manifests/listings: {temp_name}"
         );
 
-        // Case 1: Crash between step 1 and step 2 -> recovery completes `temp -> to`.
-        let temp_path = work_dir.join(&temp_name);
-        fs::write(&temp_path, b"important").unwrap();
-        let renames_dir = pending_renames_dir(&state_dir);
-        fs::create_dir_all(&renames_dir).unwrap();
-        let key = rename_intent_key(&work_dir, &temp_name);
-        let intent_path = renames_dir.join(format!("{key}.json"));
-        let intent = PendingRenameIntent {
-            parent: work_dir.to_string_lossy().into_owned(),
-            from_name: "Report.txt".to_owned(),
-            temp_name: temp_name.clone(),
-            to_name: "report.txt".to_owned(),
-        };
-        write_atomic(
-            &intent_path,
-            &serde_json::to_vec(&intent).unwrap(),
-            WriteOptions::with_mode(0o600),
-        )
-        .unwrap();
-
+        // Case 1: Only temp present (crash between step 1 and step 2) -> completes `temp -> to`.
+        fs::write(work_dir.join(&temp_name), b"important").unwrap();
+        let intent_path = write_intent("Report.txt", &temp_name, "report.txt");
         recover_pending_renames(&state_dir, Some(&work_dir));
-        assert!(!temp_path.exists());
+        assert!(!has_exact_entry(&temp_name));
+        assert!(has_exact_entry("report.txt"));
+        assert!(!has_exact_entry("Report.txt"));
         assert_eq!(fs::read(work_dir.join("report.txt")).unwrap(), b"important");
         assert!(!intent_path.exists());
 
-        // Case 2: `to` already occupied by another file -> recovery reverses `temp -> from`.
+        // Probe the host filesystem's actual folding behavior using the real directory.
+        let host_fs = probe_dir_name_behavior(&work_dir);
+
+        // Case 2: Only original spelling present (crash before step 1) -> drops stale intent.
+        fs::write(work_dir.join("OnlyOrig.txt"), b"orig-only").unwrap();
+        let temp_orig = visible_rename_temp_name(OsStr::new("OnlyOrig.txt"), 42, 10);
+        let intent_orig = write_intent("OnlyOrig.txt", &temp_orig, "onlyorig.txt");
+        recover_pending_renames(&state_dir, Some(&work_dir));
+        assert!(has_exact_entry("OnlyOrig.txt"));
+        assert!(!has_exact_entry(&temp_orig));
+        assert!(!intent_orig.exists());
+
+        // Case 3: Only final spelling present (crash after step 2) -> drops stale intent.
+        fs::write(work_dir.join("onlyfinal.txt"), b"final-only").unwrap();
+        let temp_final = visible_rename_temp_name(OsStr::new("OnlyFinal.txt"), 42, 11);
+        let intent_final = write_intent("OnlyFinal.txt", &temp_final, "onlyfinal.txt");
+        recover_pending_renames(&state_dir, Some(&work_dir));
+        assert!(has_exact_entry("onlyfinal.txt"));
+        assert!(!has_exact_entry(&temp_final));
+        assert!(!intent_final.exists());
+
+        // Case 4: Both `temp` and `to` (`notes.txt`) present.
         let temp_name2 = visible_rename_temp_name(OsStr::new("Notes.txt"), 42, 8);
-        let temp_path2 = work_dir.join(&temp_name2);
-        fs::write(&temp_path2, b"original").unwrap();
+        fs::write(work_dir.join(&temp_name2), b"original").unwrap();
         fs::write(work_dir.join("notes.txt"), b"occupant").unwrap();
-        let key2 = rename_intent_key(&work_dir, &temp_name2);
-        let intent_path2 = pending_renames_dir(&state_dir).join(format!("{key2}.json"));
-        let intent2 = PendingRenameIntent {
-            parent: work_dir.to_string_lossy().into_owned(),
-            from_name: "Notes.txt".to_owned(),
-            temp_name: temp_name2,
-            to_name: "notes.txt".to_owned(),
-        };
-        write_atomic(
-            &intent_path2,
-            &serde_json::to_vec(&intent2).unwrap(),
-            WriteOptions::with_mode(0o600),
-        )
-        .unwrap();
+        let intent_path2 = write_intent("Notes.txt", &temp_name2, "notes.txt");
 
         recover_pending_renames(&state_dir, Some(&work_dir));
-        assert!(!temp_path2.exists());
-        assert_eq!(fs::read(work_dir.join("Notes.txt")).unwrap(), b"original");
-        assert_eq!(fs::read(work_dir.join("notes.txt")).unwrap(), b"occupant");
-        assert!(!intent_path2.exists());
+        if host_fs.case_insensitive {
+            // On NTFS / case-insensitive APFS, `notes.txt` occupies `Notes.txt`'s folded slot, so
+            // recovery MUST preserve both visible `temp_name2` and `notes.txt` without overwriting!
+            assert!(has_exact_entry(&temp_name2));
+            assert!(has_exact_entry("notes.txt"));
+            assert_eq!(fs::read(work_dir.join(&temp_name2)).unwrap(), b"original");
+            assert_eq!(fs::read(work_dir.join("notes.txt")).unwrap(), b"occupant");
+            assert!(intent_path2.exists());
+
+            // Once the conflicting occupant is moved away, recovery completes cleanly to `notes.txt`.
+            fs::remove_file(work_dir.join("notes.txt")).unwrap();
+            recover_pending_renames(&state_dir, Some(&work_dir));
+            assert!(!has_exact_entry(&temp_name2));
+            assert!(has_exact_entry("notes.txt"));
+            assert_eq!(fs::read(work_dir.join("notes.txt")).unwrap(), b"original");
+            assert!(!intent_path2.exists());
+        } else {
+            // On a case-sensitive volume, `Notes.txt` is free, so recovery reverses `temp -> from`.
+            assert!(!has_exact_entry(&temp_name2));
+            assert!(has_exact_entry("Notes.txt"));
+            assert!(has_exact_entry("notes.txt"));
+            assert_eq!(fs::read(work_dir.join("Notes.txt")).unwrap(), b"original");
+            assert_eq!(fs::read(work_dir.join("notes.txt")).unwrap(), b"occupant");
+            assert!(!intent_path2.exists());
+        }
+
+        // Case 5: Both `temp` and `from` (`Draft.txt`) present.
+        let temp_name3 = visible_rename_temp_name(OsStr::new("Draft.txt"), 42, 9);
+        fs::write(work_dir.join(&temp_name3), b"in-flight").unwrap();
+        fs::write(work_dir.join("Draft.txt"), b"recreated").unwrap();
+        let intent_path3 = write_intent("Draft.txt", &temp_name3, "draft.txt");
+
+        recover_pending_renames(&state_dir, Some(&work_dir));
+        if host_fs.case_insensitive {
+            assert!(has_exact_entry(&temp_name3));
+            assert!(has_exact_entry("Draft.txt"));
+            assert_eq!(fs::read(work_dir.join(&temp_name3)).unwrap(), b"in-flight");
+            assert_eq!(fs::read(work_dir.join("Draft.txt")).unwrap(), b"recreated");
+            assert!(intent_path3.exists());
+        } else {
+            assert!(!has_exact_entry(&temp_name3));
+            assert!(has_exact_entry("Draft.txt"));
+            assert!(has_exact_entry("draft.txt"));
+            assert_eq!(fs::read(work_dir.join("Draft.txt")).unwrap(), b"recreated");
+            assert_eq!(fs::read(work_dir.join("draft.txt")).unwrap(), b"in-flight");
+            assert!(!intent_path3.exists());
+        }
+    }
+
+    #[derive(Clone)]
+    struct SyncRng(u64);
+
+    impl SyncRng {
+        fn new(seed: u64) -> Self {
+            Self(seed ^ 0xa076_1d64_78bd_642f)
+        }
+
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn range(&mut self, upper: usize) -> usize {
+            if upper <= 1 {
+                0
+            } else {
+                (self.next() as usize) % upper
+            }
+        }
+    }
+
+    /// Deterministic adversarial `std::io::Read` that delivers 1-byte or random short reads,
+    /// injects `ErrorKind::Interrupted`, and optionally triggers time-based re-auth ticks between
+    /// operations by backdating `StreamAuthCheck::last_check`.
+    struct AdversarialSyncRead {
+        data: Vec<u8>,
+        pos: usize,
+        rng: SyncRng,
+        single_byte: bool,
+        inject_interrupted: bool,
+        tick_check: Option<StreamAuthCheck>,
+    }
+
+    impl Read for AdversarialSyncRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(ref check) = self.tick_check
+                && self.rng.range(13) == 0
+                && let Ok(mut last) = check.last_check.lock()
+            {
+                *last = Instant::now() - RECHECK_INTERVAL_TIME - Duration::from_millis(1);
+            }
+            if self.inject_interrupted && self.rng.range(9) == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "adversarial sync read eintr",
+                ));
+            }
+            let remaining = self.data.len() - self.pos;
+            if remaining == 0 || buf.is_empty() {
+                return Ok(0);
+            }
+            let max_take = remaining.min(buf.len());
+            let take = if self.single_byte {
+                1
+            } else {
+                1 + self.rng.range(max_take.min(2048))
+            };
+            let take = take.min(max_take);
+            buf[..take].copy_from_slice(&self.data[self.pos..self.pos + take]);
+            self.pos += take;
+            Ok(take)
+        }
+    }
+
+    /// Deterministic adversarial `std::io::Write` that performs 1-byte or random short writes,
+    /// injects `ErrorKind::Interrupted`, and optionally triggers time-based re-auth ticks between
+    /// writes.
+    struct AdversarialSyncWrite {
+        out: Vec<u8>,
+        rng: SyncRng,
+        single_byte: bool,
+        inject_interrupted: bool,
+        tick_check: Option<StreamAuthCheck>,
+    }
+
+    impl Write for AdversarialSyncWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(ref check) = self.tick_check
+                && self.rng.range(13) == 0
+                && let Ok(mut last) = check.last_check.lock()
+            {
+                *last = Instant::now() - RECHECK_INTERVAL_TIME - Duration::from_millis(1);
+            }
+            if self.inject_interrupted && self.rng.range(9) == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "adversarial sync write eintr",
+                ));
+            }
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let take = if self.single_byte {
+                1
+            } else {
+                1 + self.rng.range(buf.len().min(2048))
+            };
+            let take = take.min(buf.len());
+            self.out.extend_from_slice(&buf[..take]);
+            Ok(take)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.inject_interrupted && self.rng.range(11) == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "adversarial sync flush eintr",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn make_sync_payload(seed: u64, len: usize) -> Vec<u8> {
+        let mut rng = SyncRng::new(seed);
+        let mut out = vec![0u8; len];
+        for chunk in out.chunks_mut(8) {
+            let bytes = rng.next().to_le_bytes();
+            let n = chunk.len();
+            chunk.copy_from_slice(&bytes[..n]);
+        }
+        out
+    }
+
+    #[test]
+    fn adversarial_io_preserves_bytes_across_rechecking_fed_and_all_stream_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let paths = legion_core::Paths::under(dir.path());
+        let config = ConfigStore::new(paths.config_dir());
+        let host = Host::new(paths.clone(), "box".to_owned());
+        let policy = config.get::<Policy>().unwrap();
+        let read_spec = ToolSpec {
+            name: "fs.read".to_owned(),
+            description: String::new(),
+            effect: Effect::Read,
+            input_schema: json!({"type": "object"}),
+        };
+        let write_spec = ToolSpec {
+            name: "fs.write".to_owned(),
+            description: String::new(),
+            effect: Effect::Write,
+            input_schema: json!({"type": "object"}),
+        };
+        let read_grant = policy.authorize("owner", &read_spec, &paths).unwrap();
+        let write_grant = policy.authorize("owner", &write_spec, &paths).unwrap();
+
+        // 1. Direct adversarial tests of `RecheckingReader`, `RecheckingWriter`, and `Fed`
+        // across 32 deterministic seeds with short reads/writes, `Interrupted`, and forced re-auth
+        // timer ticks between operations.
+        for seed in 0u64..32 {
+            let single_byte = seed % 8 == 0;
+            let len = if single_byte {
+                2_000 + (seed as usize) * 29
+            } else {
+                25_000 + (seed as usize) * 997
+            };
+            let payload = make_sync_payload(seed + 100, len);
+            let sample_path = home.join("sample.bin");
+
+            let rcheck = StreamAuthCheck::new(
+                &host,
+                &read_grant,
+                None,
+                "fs.read",
+                Effect::Read,
+                sample_path.clone(),
+                Access::Read,
+                None,
+            );
+            let mut r = RecheckingReader::new(
+                AdversarialSyncRead {
+                    data: payload.clone(),
+                    pos: 0,
+                    rng: SyncRng::new(seed * 3 + 1),
+                    single_byte,
+                    inject_interrupted: true,
+                    tick_check: Some(rcheck.clone()),
+                },
+                rcheck,
+            );
+            let mut read_out = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match r.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => read_out.extend_from_slice(&tmp[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => panic!("RecheckingReader failed on seed {seed}: {e}"),
+                }
+            }
+            assert_eq!(
+                read_out, payload,
+                "RecheckingReader mismatch on seed {seed}"
+            );
+
+            let wcheck = StreamAuthCheck::new(
+                &host,
+                &write_grant,
+                None,
+                "fs.write",
+                Effect::Write,
+                sample_path.clone(),
+                Access::Write,
+                Some(CreateKind::File),
+            );
+            let mut w = RecheckingWriter::new(
+                AdversarialSyncWrite {
+                    out: Vec::new(),
+                    rng: SyncRng::new(seed * 5 + 2),
+                    single_byte,
+                    inject_interrupted: true,
+                    tick_check: Some(wcheck.clone()),
+                },
+                wcheck,
+            );
+            w.write_all(&payload).unwrap();
+            w.flush().unwrap();
+            assert_eq!(
+                w.inner.out, payload,
+                "RecheckingWriter mismatch on seed {seed}"
+            );
+
+            // `feed` + `Fed` with both bounded (`Some(limit)`) and unbounded (`None`) input.
+            let fcheck = StreamAuthCheck::new(
+                &host,
+                &write_grant,
+                None,
+                "fs.write",
+                Effect::Write,
+                sample_path,
+                Access::Write,
+                Some(CreateKind::File),
+            );
+            let mut input_opt = Some(BufReader::with_capacity(
+                if single_byte { 16 } else { 1024 },
+                AdversarialSyncRead {
+                    data: payload.clone(),
+                    pos: 0,
+                    rng: SyncRng::new(seed * 7 + 3),
+                    single_byte,
+                    inject_interrupted: true,
+                    tick_check: Some(fcheck.clone()),
+                },
+            ));
+            let mut out_sink = Vec::new();
+            let limit = if seed % 2 == 0 {
+                Some(payload.len() as u64)
+            } else {
+                None
+            };
+            let fed_bytes = feed(
+                &mut input_opt,
+                limit,
+                &mut out_sink,
+                Some(fcheck),
+                |mut fed| {
+                    let mut got = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match fed.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => got.extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(e) => panic!("Fed::read failed on seed {seed}: {e}"),
+                        }
+                    }
+                    got
+                },
+            )
+            .unwrap();
+            assert_eq!(fed_bytes, payload, "Fed mismatch on seed {seed}");
+        }
+
+        // 2. End-to-end `serve` across `get`, `put`, `pack`, and `unpack` driven through
+        // adversarial short reads/writes and `Interrupted` errors across 16 deterministic seeds.
+        fn split_header_lines(raw: &[u8], count: usize) -> (Vec<Value>, &[u8]) {
+            let mut rest = raw;
+            let mut lines = Vec::with_capacity(count);
+            for _ in 0..count {
+                let nl = rest.iter().position(|&b| b == b'\n').unwrap();
+                let val: Value = serde_json::from_slice(&rest[..nl]).unwrap();
+                lines.push(val);
+                rest = &rest[nl + 1..];
+            }
+            (lines, rest)
+        }
+
+        for seed in 0u64..16 {
+            let single_byte = seed % 4 == 0;
+            let file_len = if single_byte {
+                1_500 + (seed as usize) * 53
+            } else {
+                40_000 + (seed as usize) * 1_319
+            };
+            let payload = make_sync_payload(seed + 500, file_len);
+            let src_file = home.join(format!("src-{seed}.bin"));
+            let dst_file = home.join(format!("dst-{seed}.bin"));
+            fs::write(&src_file, &payload).unwrap();
+            let expected_hash = legion_xfer::hash::hash_file(&src_file).unwrap();
+
+            // `get` through adversarial writer -> verify raw bytes match file byte-for-byte.
+            let get_hdr = format!(
+                "{}\n",
+                json!({
+                    "protocol": STREAM_PROTOCOL,
+                    "op": "get",
+                    "path": src_file.to_string_lossy(),
+                    "offset": 0
+                })
+            );
+            let get_in = AdversarialSyncRead {
+                data: get_hdr.into_bytes(),
+                pos: 0,
+                rng: SyncRng::new(seed * 11 + 1),
+                single_byte,
+                inject_interrupted: true,
+                tick_check: None,
+            };
+            let mut get_out = AdversarialSyncWrite {
+                out: Vec::new(),
+                rng: SyncRng::new(seed * 11 + 2),
+                single_byte,
+                inject_interrupted: true,
+                tick_check: None,
+            };
+            serve(&host, Some("owner"), get_in, &mut get_out).unwrap();
+            let (get_lines, raw_file) = split_header_lines(&get_out.out, 2);
+            assert_eq!(get_lines[1]["size"], json!(file_len));
+            assert_eq!(raw_file, payload.as_slice(), "get mismatch on seed {seed}");
+
+            // `put` receiving those exact bytes through adversarial reader & writer.
+            let mut put_bytes = format!(
+                "{}\n",
+                json!({
+                    "protocol": STREAM_PROTOCOL,
+                    "op": "put",
+                    "path": dst_file.to_string_lossy(),
+                    "size": file_len,
+                    "hash": expected_hash.to_string(),
+                })
+            )
+            .into_bytes();
+            put_bytes.extend_from_slice(raw_file);
+            let put_in = AdversarialSyncRead {
+                data: put_bytes,
+                pos: 0,
+                rng: SyncRng::new(seed * 13 + 3),
+                single_byte,
+                inject_interrupted: true,
+                tick_check: None,
+            };
+            let mut put_out = AdversarialSyncWrite {
+                out: Vec::new(),
+                rng: SyncRng::new(seed * 13 + 4),
+                single_byte,
+                inject_interrupted: true,
+                tick_check: None,
+            };
+            serve(&host, Some("owner"), put_in, &mut put_out).unwrap();
+            let (put_lines, _) = split_header_lines(&put_out.out, 3);
+            assert_eq!(put_lines[2]["ok"], Value::Bool(true), "put on seed {seed}");
+            assert_eq!(
+                fs::read(&dst_file).unwrap(),
+                payload,
+                "put bytes on seed {seed}"
+            );
+
+            // `pack` -> `unpack` on a multi-file directory tree through adversarial reader & writer.
+            let src_tree = home.join(format!("tree-src-{seed}"));
+            let dst_tree = home.join(format!("tree-dst-{seed}"));
+            fs::create_dir_all(src_tree.join("sub")).unwrap();
+            let a_bytes = make_sync_payload(seed + 1000, if single_byte { 777 } else { 9_001 });
+            let b_bytes = make_sync_payload(seed + 2000, if single_byte { 513 } else { 14_333 });
+            fs::write(src_tree.join("a.bin"), &a_bytes).unwrap();
+            fs::write(src_tree.join("sub/b.bin"), &b_bytes).unwrap();
+            let a_hash = legion_xfer::hash::hash_file(&src_tree.join("a.bin")).unwrap();
+            let b_hash = legion_xfer::hash::hash_file(&src_tree.join("sub/b.bin")).unwrap();
+
+            let pack_hdr = format!(
+                "{}\n",
+                json!({
+                    "protocol": STREAM_PROTOCOL,
+                    "op": "pack",
+                    "root": src_tree.to_string_lossy(),
+                    "names": ["sub", "a.bin", "sub/b.bin"],
+                })
+            );
+            let pack_in = AdversarialSyncRead {
+                data: pack_hdr.into_bytes(),
+                pos: 0,
+                rng: SyncRng::new(seed * 17 + 5),
+                single_byte,
+                inject_interrupted: true,
+                tick_check: None,
+            };
+            let mut pack_out = AdversarialSyncWrite {
+                out: Vec::new(),
+                rng: SyncRng::new(seed * 17 + 6),
+                single_byte,
+                inject_interrupted: true,
+                tick_check: None,
+            };
+            serve(&host, Some("owner"), pack_in, &mut pack_out).unwrap();
+            let (pack_lines, tar_bytes) = split_header_lines(&pack_out.out, 2);
+            assert_eq!(pack_lines[1]["ready"], Value::Bool(true));
+
+            let mut unpack_bytes = format!(
+                "{}\n",
+                json!({
+                    "protocol": STREAM_PROTOCOL,
+                    "op": "unpack",
+                    "root": dst_tree.to_string_lossy(),
+                    "entries": [
+                        {"path": "sub", "kind": "dir"},
+                        {"path": "a.bin", "kind": "file", "size": a_bytes.len(), "hash": a_hash.to_string()},
+                        {"path": "sub/b.bin", "kind": "file", "size": b_bytes.len(), "hash": b_hash.to_string()},
+                    ],
+                })
+            )
+            .into_bytes();
+            unpack_bytes.extend_from_slice(tar_bytes);
+            let unpack_in = AdversarialSyncRead {
+                data: unpack_bytes,
+                pos: 0,
+                rng: SyncRng::new(seed * 19 + 7),
+                single_byte,
+                inject_interrupted: true,
+                tick_check: None,
+            };
+            let mut unpack_out = AdversarialSyncWrite {
+                out: Vec::new(),
+                rng: SyncRng::new(seed * 19 + 8),
+                single_byte,
+                inject_interrupted: true,
+                tick_check: None,
+            };
+            serve(&host, Some("owner"), unpack_in, &mut unpack_out).unwrap();
+            let (unpack_lines, _) = split_header_lines(&unpack_out.out, 3);
+            assert_eq!(
+                unpack_lines[2]["ok"],
+                Value::Bool(true),
+                "unpack on seed {seed}"
+            );
+            assert_eq!(
+                fs::read(dst_tree.join("a.bin")).unwrap(),
+                a_bytes,
+                "unpack a.bin mismatch on seed {seed}"
+            );
+            assert_eq!(
+                fs::read(dst_tree.join("sub/b.bin")).unwrap(),
+                b_bytes,
+                "unpack sub/b.bin mismatch on seed {seed}"
+            );
+        }
     }
 }

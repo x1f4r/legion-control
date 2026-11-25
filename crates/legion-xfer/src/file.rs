@@ -659,6 +659,7 @@ impl PutSession {
                     });
                 }
                 Ok(n) => n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => {
                     let _ = file.flush();
                     drop(file);
@@ -1213,16 +1214,24 @@ impl GetStream {
         let mut written = 0u64;
 
         loop {
-            let n = limited
-                .read(&mut buf)
-                .map_err(|e| classify_io(&self.path, e))?;
+            let n = match limited.read(&mut buf) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(classify_io(&self.path, e)),
+            };
             if n == 0 {
                 break;
             }
             writer.write_all(&buf[..n])?;
             written += n as u64;
         }
-        writer.flush()?;
+        loop {
+            match writer.flush() {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
 
         if written < remaining {
             return Err(Error::Conflict {
@@ -1304,6 +1313,7 @@ pub fn put<R: Read>(
                 });
             }
             Ok(n) => n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => {
                 let _ = file.flush();
                 return Err(Error::Io {
