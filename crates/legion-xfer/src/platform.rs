@@ -125,6 +125,20 @@ pub(crate) fn create_symlink_atomic(target: &Path, dest: &Path) -> Result<bool> 
     }
 }
 
+/// Creates a symbolic link on Unix without replacing an existing entry, returning `Ok(true)`.
+///
+/// Fails with [`io::ErrorKind::AlreadyExists`] atomically if `dest` already exists.
+#[cfg(unix)]
+pub(crate) fn create_symlink_no_replace(target: &Path, dest: &Path) -> io::Result<bool> {
+    std::os::unix::fs::symlink(target, dest).map(|()| true)
+}
+
+/// Skips symlink creation on Windows, where creating symlinks normally requires elevation.
+#[cfg(not(unix))]
+pub(crate) fn create_symlink_no_replace(_target: &Path, _dest: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
 /// Skips symlink creation on Windows, where creating symlinks normally requires elevation.
 #[cfg(not(unix))]
 pub(crate) fn create_symlink_atomic(_target: &Path, _dest: &Path) -> Result<bool> {

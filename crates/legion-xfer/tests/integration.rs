@@ -196,6 +196,7 @@ fn full_tree_round_trip_and_idempotent_second_plan() {
         &PlanOptions {
             checksum: true,
             delete: true,
+            ..Default::default()
         },
     );
     assert!(
@@ -227,6 +228,7 @@ fn delete_plan_removes_stale_nested_entries_cleanly() {
         &PlanOptions {
             checksum: false,
             delete: true,
+            ..Default::default()
         },
     );
     assert_eq!(
@@ -252,6 +254,7 @@ fn delete_plan_removes_stale_nested_entries_cleanly() {
         &PlanOptions {
             checksum: true,
             delete: true,
+            ..Default::default()
         },
     );
     assert!(after_plan.delete.is_empty());

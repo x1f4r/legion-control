@@ -1,6 +1,6 @@
 //! Resumable single-file streaming (`get` and `put`) with whole-file verification.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -17,6 +17,34 @@ pub const PART_SUFFIX: &str = ".legion-part";
 /// Fixed copy buffer size so large transfers run in constant memory.
 const STREAM_BUFFER_SIZE: usize = 64 * 1024;
 
+/// Upper bound on numbering attempts for [`IfExists::Rename`] (`name (2).ext`, `name (3).ext`, …).
+pub const MAX_RENAME_ATTEMPTS: u32 = 10_000;
+
+/// Policy when a destination entry already exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IfExists {
+    /// Overwrite the destination entry atomically (default).
+    #[default]
+    Replace,
+    /// Refuse with [`Error::Exists`] without touching the destination.
+    Fail,
+    /// Leave the existing destination entry untouched and skip writing.
+    Skip,
+    /// Write beside the existing entry as `name (2).ext`, counting up atomically.
+    Rename,
+}
+
+/// Result of atomically placing a completed temporary file at a destination path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaceOutcome {
+    /// The file was placed at the returned path (which may differ from the requested path under
+    /// [`IfExists::Rename`]).
+    Placed(PathBuf),
+    /// The destination already existed and [`IfExists::Skip`] left it untouched.
+    Skipped,
+}
+
 /// Summary returned by [`put`] once the full file has been verified and moved into place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PutReport {
@@ -26,6 +54,368 @@ pub struct PutReport {
     pub bytes_written: u64,
     /// Verified whole-file BLAKE3 digest.
     pub hash: Hash,
+}
+
+/// Detailed result returned by [`PutSession::finish`], including the chosen destination path and
+/// whether the file was skipped under [`IfExists::Skip`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutOutcome {
+    /// Byte counts and verified hash of the streamed file.
+    pub report: PutReport,
+    /// Actual destination path written, or `None` when [`Self::skipped`] is `true`.
+    pub path: Option<PathBuf>,
+    /// `true` when the destination appeared concurrently and [`IfExists::Skip`] left it intact.
+    pub skipped: bool,
+}
+
+/// Builds the `n`-th numbered sibling candidate for `target` (`n = 2` produces `name (2).ext`).
+///
+/// A leading dot with no other dot (such as `.bashrc`) is treated as a stem without an extension
+/// so `.bashrc` becomes `.bashrc (2)`.
+pub fn numbered_candidate(target: &Path, n: u32) -> PathBuf {
+    let file_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let candidate_name = numbered_filename(file_name, n);
+    match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(candidate_name),
+        _ => PathBuf::from(candidate_name),
+    }
+}
+
+/// Formats `name` with a ` (n)` suffix before its last extension (when any).
+pub(crate) fn numbered_filename(name: &str, n: u32) -> String {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 && dot + 1 < name.len() => {
+            let (stem, ext) = name.split_at(dot);
+            format!("{stem} ({n}){ext}")
+        }
+        _ => format!("{name} ({n})"),
+    }
+}
+
+/// Atomically places `temp` at `target` according to `if_exists`.
+///
+/// Under [`IfExists::Replace`], `temp` is renamed over `target`. Under [`IfExists::Fail`],
+/// [`IfExists::Skip`], and [`IfExists::Rename`], placement uses [`fs::hard_link`] so two concurrent
+/// transfers racing for the same destination name never overwrite each other; `temp` is unlinked on
+/// successful placement, and left for the caller to clean up on [`PlaceOutcome::Skipped`] or error.
+pub(crate) fn place_file<F>(
+    temp: &Path,
+    target: &Path,
+    if_exists: IfExists,
+    mut check_target: F,
+) -> Result<PlaceOutcome>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    match if_exists {
+        IfExists::Replace => {
+            platform::replace_file(temp, target)?;
+            Ok(PlaceOutcome::Placed(target.to_path_buf()))
+        }
+        IfExists::Fail => match fs::hard_link(temp, target) {
+            Ok(()) => {
+                let _ = fs::remove_file(temp);
+                Ok(PlaceOutcome::Placed(target.to_path_buf()))
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(Error::Exists {
+                path: target.to_path_buf(),
+                source: Some(err),
+            }),
+            Err(err) => Err(classify_io(target, err)),
+        },
+        IfExists::Skip => match fs::hard_link(temp, target) {
+            Ok(()) => {
+                let _ = fs::remove_file(temp);
+                Ok(PlaceOutcome::Placed(target.to_path_buf()))
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(PlaceOutcome::Skipped),
+            Err(err) => Err(classify_io(target, err)),
+        },
+        IfExists::Rename => {
+            for attempt in 1..=MAX_RENAME_ATTEMPTS {
+                let candidate = if attempt == 1 {
+                    target.to_path_buf()
+                } else {
+                    let cand = numbered_candidate(target, attempt);
+                    check_target(&cand)?;
+                    cand
+                };
+                match fs::hard_link(temp, &candidate) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(temp);
+                        return Ok(PlaceOutcome::Placed(candidate));
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => return Err(classify_io(&candidate, err)),
+                }
+            }
+            Err(Error::Exists {
+                path: target.to_path_buf(),
+                source: None,
+            })
+        }
+    }
+}
+
+/// An opened single-file receive session holding an exclusive lock on its partial file so
+/// concurrent transfers to the same target path never corrupt each other's partial data.
+#[derive(Debug)]
+pub struct PutSession {
+    target: PathBuf,
+    partial: PathBuf,
+    file: File,
+    size: u64,
+    offset: u64,
+    if_exists: IfExists,
+    /// `true` when another transfer held the canonical `.legion-part` lock and this session fell
+    /// back to a private unique sibling partial file that should be removed if interrupted.
+    ephemeral: bool,
+}
+
+impl PutSession {
+    /// Prepares to receive a file of `size` bytes at `target` under `if_exists`.
+    ///
+    /// Locks `<name>.legion-part` exclusively when free so a single interrupted transfer resumes
+    /// from its length on disk; if another concurrent transfer holds that lock, opens a unique
+    /// sibling partial file at offset 0 so both transfers race cleanly to commit atomically.
+    pub fn open(target: &Path, size: u64, if_exists: IfExists) -> Result<Self> {
+        if let Ok(meta) = fs::symlink_metadata(target) {
+            if if_exists == IfExists::Fail {
+                return Err(Error::Exists {
+                    path: target.to_path_buf(),
+                    source: None,
+                });
+            }
+            if if_exists == IfExists::Replace && meta.file_type().is_dir() {
+                return Err(Error::Conflict {
+                    path: target.to_path_buf(),
+                    reason: "target path is a directory".to_string(),
+                });
+            }
+        }
+
+        let canonical_partial = part_path(target)?;
+        match try_open_locked_partial(&canonical_partial, size)? {
+            Some((file, offset)) => Ok(Self {
+                target: target.to_path_buf(),
+                partial: canonical_partial,
+                file,
+                size,
+                offset,
+                if_exists,
+                ephemeral: false,
+            }),
+            None => {
+                let (partial, file) = create_unique_partial(target)?;
+                Ok(Self {
+                    target: target.to_path_buf(),
+                    partial,
+                    file,
+                    size,
+                    offset: 0,
+                    if_exists,
+                    ephemeral: true,
+                })
+            }
+        }
+    }
+
+    /// Byte offset the sender should stream from (`0` for a fresh or concurrent transfer, or the
+    /// existing partial file's length when resuming).
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Reads the remaining `size - offset` bytes from `reader`, verifies `expected_hash`, applies
+    /// `mode`, and atomically commits according to `if_exists`.
+    pub fn finish<R, F>(
+        mut self,
+        expected_hash: Hash,
+        mut reader: R,
+        mode: Option<u32>,
+        check_target: F,
+    ) -> Result<PutOutcome>
+    where
+        R: Read,
+        F: FnMut(&Path) -> Result<()>,
+    {
+        let remaining = self.size - self.offset;
+        let mut buf = vec![0u8; STREAM_BUFFER_SIZE];
+        let mut written = 0u64;
+
+        while written < remaining {
+            let to_read = usize::try_from(remaining - written)
+                .unwrap_or(buf.len())
+                .min(buf.len());
+            let n = match reader.read(&mut buf[..to_read]) {
+                Ok(0) => {
+                    let _ = self.file.flush();
+                    drop(self.file);
+                    if self.ephemeral {
+                        let _ = fs::remove_file(&self.partial);
+                    }
+                    return Err(Error::Io {
+                        path: Some(self.partial),
+                        source: io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "stream ended after {} of {} bytes",
+                                self.offset.saturating_add(written),
+                                self.size
+                            ),
+                        ),
+                    });
+                }
+                Ok(n) => n,
+                Err(err) => {
+                    let _ = self.file.flush();
+                    drop(self.file);
+                    if self.ephemeral {
+                        let _ = fs::remove_file(&self.partial);
+                    }
+                    return Err(Error::Io {
+                        path: None,
+                        source: err,
+                    });
+                }
+            };
+            if let Err(err) = self.file.write_all(&buf[..n]) {
+                drop(self.file);
+                if self.ephemeral {
+                    let _ = fs::remove_file(&self.partial);
+                }
+                return Err(classify_io(&self.partial, err));
+            }
+            written += n as u64;
+        }
+
+        self.file
+            .flush()
+            .map_err(|e| classify_io(&self.partial, e))?;
+        self.file
+            .sync_all()
+            .map_err(|e| classify_io(&self.partial, e))?;
+        drop(self.file);
+
+        let actual_hash = hash_file(&self.partial)?;
+        if actual_hash != expected_hash {
+            let _ = fs::remove_file(&self.partial);
+            return Err(Error::HashMismatch {
+                path: self.target,
+                expected: expected_hash,
+                actual: actual_hash,
+            });
+        }
+
+        let final_mode = match mode {
+            Some(m) => m & 0o777,
+            None => fs::symlink_metadata(&self.target)
+                .ok()
+                .filter(|meta| meta.file_type().is_file())
+                .and_then(|meta| platform::entry_mode(&meta))
+                .map(|m| m & 0o777)
+                .unwrap_or(0o644),
+        };
+        platform::set_mode(&self.partial, final_mode)?;
+
+        let outcome = match place_file(&self.partial, &self.target, self.if_exists, check_target) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                if self.ephemeral || matches!(err, Error::Exists { .. }) {
+                    let _ = fs::remove_file(&self.partial);
+                }
+                return Err(err);
+            }
+        };
+
+        let report = PutReport {
+            size: self.size,
+            bytes_written: written,
+            hash: actual_hash,
+        };
+
+        match outcome {
+            PlaceOutcome::Placed(final_path) => {
+                let parent = match final_path.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p,
+                    _ => Path::new("."),
+                };
+                platform::sync_dir(parent)?;
+                Ok(PutOutcome {
+                    report,
+                    path: Some(final_path),
+                    skipped: false,
+                })
+            }
+            PlaceOutcome::Skipped => {
+                let _ = fs::remove_file(&self.partial);
+                Ok(PutOutcome {
+                    report,
+                    path: None,
+                    skipped: true,
+                })
+            }
+        }
+    }
+}
+
+fn try_open_locked_partial(partial: &Path, size: u64) -> Result<Option<(File, u64)>> {
+    let mut file = match platform::create_new_private(partial) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let meta = fs::symlink_metadata(partial).map_err(|e| classify_io(partial, e))?;
+            if !meta.file_type().is_file() {
+                return Err(Error::Conflict {
+                    path: partial.to_path_buf(),
+                    reason: "partial path exists and is not a regular file".to_string(),
+                });
+            }
+            OpenOptions::new()
+                .write(true)
+                .open(partial)
+                .map_err(|e| classify_io(partial, e))?
+        }
+        Err(err) => return Err(classify_io(partial, err)),
+    };
+
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Error(err)) => return Err(classify_io(partial, err)),
+    }
+
+    let meta = file.metadata().map_err(|e| classify_io(partial, e))?;
+    let mut offset = meta.len();
+    if offset > size {
+        file.set_len(0).map_err(|e| classify_io(partial, e))?;
+        offset = 0;
+    }
+    if offset == 0 {
+        platform::set_mode(partial, 0o600)?;
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| classify_io(partial, e))?;
+    Ok(Some((file, offset)))
+}
+
+fn create_unique_partial(target: &Path) -> Result<(PathBuf, File)> {
+    let parent = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let pid = std::process::id();
+    loop {
+        let seq = platform::next_temp_id();
+        let candidate = parent.join(format!(".legion-put-{pid}-{seq}{PART_SUFFIX}"));
+        match platform::create_new_private(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(classify_io(&candidate, err)),
+        }
+    }
 }
 
 /// Computes the sibling partial file path (`<name>.legion-part`) for `target`.
@@ -749,5 +1139,127 @@ mod tests {
         assert!(meta.file_type().is_file());
         assert_eq!(meta.permissions().mode() & 0o777, 0o644);
         assert_eq!(fs::read(&real).unwrap(), b"real");
+    }
+
+    #[test]
+    fn numbered_candidate_formats_extensions_and_dotfiles() {
+        assert_eq!(
+            numbered_candidate(Path::new("/dir/Holiday.mp4"), 2),
+            PathBuf::from("/dir/Holiday (2).mp4")
+        );
+        assert_eq!(
+            numbered_candidate(Path::new("/dir/README"), 3),
+            PathBuf::from("/dir/README (3)")
+        );
+        assert_eq!(
+            numbered_candidate(Path::new("/dir/.bashrc"), 2),
+            PathBuf::from("/dir/.bashrc (2)")
+        );
+        assert_eq!(
+            numbered_candidate(Path::new("/dir/.config.toml"), 2),
+            PathBuf::from("/dir/.config (2).toml")
+        );
+        assert_eq!(
+            numbered_candidate(Path::new("archive.tar.gz"), 4),
+            PathBuf::from("archive.tar (4).gz")
+        );
+    }
+
+    #[test]
+    fn put_session_enforces_if_exists_modes_and_handles_concurrent_race() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("Holiday.mp4");
+        let existing = b"original";
+        fs::write(&dst, existing).unwrap();
+
+        // Fail: refuses immediately without overwriting.
+        let err = PutSession::open(&dst, 3, IfExists::Fail).unwrap_err();
+        assert!(matches!(err, Error::Exists { .. }), "{err:?}");
+        assert_eq!(fs::read(&dst).unwrap(), existing);
+
+        // Skip: leaves existing file untouched.
+        let payload = b"new bytes";
+        let session = PutSession::open(&dst, payload.len() as u64, IfExists::Skip).unwrap();
+        let outcome = session
+            .finish(hash_bytes(payload), Cursor::new(payload), None, |_| Ok(()))
+            .unwrap();
+        assert!(outcome.skipped);
+        assert_eq!(outcome.path, None);
+        assert_eq!(fs::read(&dst).unwrap(), existing);
+
+        // Rename: writes `Holiday (2).mp4`, then `Holiday (3).mp4`.
+        let session = PutSession::open(&dst, payload.len() as u64, IfExists::Rename).unwrap();
+        let outcome = session
+            .finish(hash_bytes(payload), Cursor::new(payload), None, |_| Ok(()))
+            .unwrap();
+        assert!(!outcome.skipped);
+        assert_eq!(outcome.path, Some(dir.path().join("Holiday (2).mp4")));
+        assert_eq!(
+            fs::read(dir.path().join("Holiday (2).mp4")).unwrap(),
+            payload
+        );
+
+        // Race: 4 threads concurrently write to the same target under Rename.
+        let race_dst = dir.path().join("race.bin");
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+        for i in 0u8..4 {
+            let race_dst = race_dst.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let bytes = vec![b'A' + i; 16 * 1024];
+                let hash = hash_bytes(&bytes);
+                barrier.wait();
+                let session =
+                    PutSession::open(&race_dst, bytes.len() as u64, IfExists::Rename).unwrap();
+                let out = session
+                    .finish(hash, Cursor::new(&bytes), None, |_| Ok(()))
+                    .unwrap();
+                (out.path.unwrap(), bytes)
+            }));
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        for handle in handles {
+            let (path, expected_bytes) = handle.join().unwrap();
+            assert_eq!(fs::read(&path).unwrap(), expected_bytes);
+            assert!(
+                paths.insert(path),
+                "two racing transfers claimed the same path"
+            );
+        }
+        assert_eq!(paths.len(), 4);
+        assert!(paths.contains(&dir.path().join("race.bin")));
+        assert!(paths.contains(&dir.path().join("race (2).bin")));
+        assert!(paths.contains(&dir.path().join("race (3).bin")));
+        assert!(paths.contains(&dir.path().join("race (4).bin")));
+
+        // Race under Fail: exactly one wins and the other gets Error::Exists.
+        let fail_dst = dir.path().join("exclusive.bin");
+        let barrier = Arc::new(Barrier::new(2));
+        let mut results = Vec::new();
+        for i in 0u8..2 {
+            let fail_dst = fail_dst.clone();
+            let barrier = Arc::clone(&barrier);
+            results.push(std::thread::spawn(move || {
+                let bytes = vec![b'X' + i; 16 * 1024];
+                let hash = hash_bytes(&bytes);
+                let session =
+                    PutSession::open(&fail_dst, bytes.len() as u64, IfExists::Fail).unwrap();
+                barrier.wait();
+                session.finish(hash, Cursor::new(&bytes), None, |_| Ok(()))
+            }));
+        }
+        let mut ok_count = 0;
+        let mut exists_count = 0;
+        for h in results {
+            match h.join().unwrap() {
+                Ok(_) => ok_count += 1,
+                Err(Error::Exists { .. }) => exists_count += 1,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!((ok_count, exists_count), (1, 1));
     }
 }

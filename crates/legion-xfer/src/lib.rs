@@ -19,9 +19,14 @@ pub mod path;
 pub mod plan;
 mod platform;
 
-pub use archive::{PackReport, UnpackReport, pack, unpack, unpack_filtered};
+pub use archive::{
+    PackReport, RenamedEntry, UnpackReport, pack, unpack, unpack_filtered, unpack_with_options,
+};
 pub use error::{Error, Result};
-pub use file::{GetStream, PART_SUFFIX, PutReport, get, open_get, part_path, put, resume_offset};
+pub use file::{
+    GetStream, IfExists, PART_SUFFIX, PlaceOutcome, PutOutcome, PutReport, PutSession, get,
+    numbered_candidate, open_get, part_path, put, resume_offset,
+};
 pub use hash::{Hash, HashingReader, HashingWriter};
 pub use manifest::{
     CaseCollision, Entry, EntryKind, Manifest, ManifestOptions, SkippedEntry, Timestamp,

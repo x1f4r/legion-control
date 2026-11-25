@@ -725,6 +725,7 @@ impl Transfer<'_> {
             &PlanOptions {
                 checksum: args.checksum,
                 delete: args.delete,
+                ..PlanOptions::default()
             },
         );
         let listed: HashMap<&str, &Entry> = source
