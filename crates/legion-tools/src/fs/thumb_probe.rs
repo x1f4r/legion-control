@@ -27,8 +27,22 @@ pub(crate) const HEADER_PEEK_BYTES: usize = 128 * 1024;
 const MAX_HEADER_PEEK_BYTES: usize = 512 * 1024;
 /// Maximum WebP chunks scanned inside an extended (`VP8X`) or animated (`ANMF`) container.
 const MAX_WEBP_CHUNKS: usize = 64;
-/// Fixed allocator overhead covering decoder tables and small resize buffers (2 MiB).
+/// Fixed allocator overhead covering decoder tables and small resize buffers (2 MiB, sufficient up
+/// to `size = 512`).
 const BASE_DECODE_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
+/// Extra output-buffer headroom added when `target_size > 512` (up to `1024`): at 1024x1024 a
+/// 16-bit RGBA resized buffer is 8 MiB (up from 2 MiB at 512), and a rotated or transparent 1024px
+/// output needs up to ~16 MiB during orientation + PNG encoding.
+pub(crate) const LARGE_THUMB_OUTPUT_OVERHEAD_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Additional peak heap estimate needed for thumbnail target dimensions above 512 px.
+pub(crate) const fn target_output_overhead_bytes(target_size: u32) -> u64 {
+    if target_size > 512 {
+        LARGE_THUMB_OUTPUT_OVERHEAD_BYTES
+    } else {
+        0
+    }
+}
 /// Maximum JPEG marker segments scanned before SOS so crafted files cannot spin CPU.
 const MAX_JPEG_MARKERS: usize = 1024;
 /// Maximum TIFF IFD entries scanned in EXIF IFD0/IFD1 or MPF index IFD.

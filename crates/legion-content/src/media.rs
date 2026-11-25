@@ -68,6 +68,7 @@ const INLINE_CONTENT_TYPES: &[(&str, &str)] = &[
     ("mp3", "audio/mpeg"),
     ("mpga", "audio/mpeg"),
     ("m4a", "audio/mp4"),
+    ("m4b", "audio/mp4"),
     ("mp4a", "audio/mp4"),
     ("alac", "audio/mp4"),
     ("aac", "audio/aac"),

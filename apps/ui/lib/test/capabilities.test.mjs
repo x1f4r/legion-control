@@ -59,7 +59,8 @@ const NEW_TOOLS = [
       },
     },
   },
-  { name: 'fs.thumb', effect: 'read', input_schema: { properties: { paths: {}, size: {}, fit: {} } } },
+  { name: 'fs.tags', effect: 'read', input_schema: { properties: { paths: {} } } },
+  { name: 'fs.thumb', effect: 'read', input_schema: { properties: { paths: {}, size: { maximum: 1024 }, fit: {} } } },
   {
     name: 'fs.transfer',
     effect: 'write',
@@ -399,8 +400,84 @@ test('mixed mock fleet returns current tools for tower and exact 05ba1ef tools w
   const emptyCaps = computeFileCapabilities({ known: false, tools: NEW_TOOLS, link });
   assert.equal(emptyCaps.known, false);
   assert.equal(emptyCaps.hasList, false);
+  assert.equal(emptyCaps.hasTags, false);
+  assert.equal(emptyCaps.hasAudioThumb, false);
+  assert.equal(emptyCaps.thumbMaxSize, 0);
   assert.equal(describeMissingFeatures(store.get('tower')).length, 0);
   assert.ok(describeMissingFeatures(store.get('studio')).length > 0);
+
+  store.dispose();
+});
+
+test('capabilities store exposes hasTags, hasAudioThumb, and thumbMaxSize and treats missing fs.tags silently', async () => {
+  const PRE_TAGS_TOOLS = NEW_TOOLS.filter((t) => t.name !== 'fs.tags').map((t) =>
+    t.name === 'fs.thumb'
+      ? { ...t, input_schema: { properties: { paths: {}, size: { maximum: 512 }, fit: {} } } }
+      : t,
+  );
+  const link = {
+    kind: 'app',
+    async tools({ on }) {
+      if (on === 'current') return NEW_TOOLS;
+      if (on === 'pretags') return PRE_TAGS_TOOLS;
+      return OLD_FIXTURE_TOOLS;
+    },
+    async call(tool, _args, { on }) {
+      if (tool === 'meta.whoami') {
+        const list = on === 'current' ? NEW_TOOLS : on === 'pretags' ? PRE_TAGS_TOOLS : OLD_FIXTURE_TOOLS;
+        return { node: on, principal: 'me', role: 'owner', tools: list.map((t) => t.name) };
+      }
+      if (tool === 'meta.version') {
+        return { version: '0.2.0', build: `b-${on}` };
+      }
+      return {};
+    },
+    contentUrl: async () => ({ url: 'data:text/plain,' }),
+  };
+
+  const store = createCapabilitiesStore(link);
+  await Promise.all([store.ensure('current'), store.ensure('pretags'), store.ensure('legacy')]);
+
+  const currentCaps = store.fileCapabilities('current');
+  assert.equal(currentCaps.hasThumb, true);
+  assert.equal(currentCaps.hasTags, true);
+  assert.equal(currentCaps.hasAudioThumb, true);
+  assert.equal(currentCaps.thumbMaxSize, 1024);
+  assert.deepEqual(store.missingFeatures('current'), []);
+
+  // Pre-tags machine: older silently (no missingFeatures), thumbMaxSize 512, no tags/audio thumbs.
+  const preCaps = store.fileCapabilities('pretags');
+  assert.equal(preCaps.hasThumb, true);
+  assert.equal(preCaps.hasTags, false);
+  assert.equal(preCaps.hasAudioThumb, false);
+  assert.equal(preCaps.thumbMaxSize, 512);
+  assert.deepEqual(store.missingFeatures('pretags'), []);
+
+  // Legacy 05ba1ef machine without fs.thumb reports 0 / false cleanly.
+  const legacyCaps = store.fileCapabilities('legacy');
+  assert.equal(legacyCaps.hasThumb, false);
+  assert.equal(legacyCaps.hasTags, false);
+  assert.equal(legacyCaps.hasAudioThumb, false);
+  assert.equal(legacyCaps.thumbMaxSize, 0);
+
+  // Role with fs.thumb but without fs.tags still advertises audio thumbnails and thumbMaxSize 1024.
+  const limitedCaps = computeFileCapabilities({
+    known: true,
+    tools: NEW_TOOLS,
+    allowedSet: new Set(['fs.list', 'fs.read', 'fs.thumb']),
+  });
+  assert.equal(limitedCaps.hasTags, false);
+  assert.equal(limitedCaps.hasAudioThumb, true);
+  assert.equal(limitedCaps.thumbMaxSize, 1024);
+
+  // Resolving a local placeholder name to the node's own name preserves audio capability flags.
+  store.seed('local', { tools: NEW_TOOLS });
+  assert.equal(store.renameMachine('local', 'tower'), true);
+  assert.equal(store.isKnown('local'), false);
+  const renamedCaps = store.fileCapabilities('tower');
+  assert.equal(renamedCaps.hasTags, true);
+  assert.equal(renamedCaps.hasAudioThumb, true);
+  assert.equal(renamedCaps.thumbMaxSize, 1024);
 
   store.dispose();
 });

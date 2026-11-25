@@ -266,6 +266,7 @@ pub const MEDIA_TABLE: &[MediaEntry] = &[
     entry("mp3", Category::Audio, "audio/mpeg", ContentServe::InlineMedia("audio/mpeg"), Some("audio/mpeg"), None, ViewerMode::Inline),
     entry("mpga", Category::Audio, "audio/mpeg", ContentServe::InlineMedia("audio/mpeg"), Some("audio/mpeg"), None, ViewerMode::Inline),
     entry("m4a", Category::Audio, "audio/mp4", ContentServe::InlineMedia("audio/mp4"), Some("audio/mp4"), None, ViewerMode::Inline),
+    entry("m4b", Category::Audio, "audio/mp4", ContentServe::InlineMedia("audio/mp4"), Some("audio/mp4"), None, ViewerMode::Inline),
     entry("mp4a", Category::Audio, "audio/mp4", ContentServe::InlineMedia("audio/mp4"), Some("audio/mp4"), None, ViewerMode::Inline),
     entry("alac", Category::Audio, "audio/mp4", ContentServe::InlineMedia("audio/mp4"), Some("audio/mp4"), None, ViewerMode::Inline),
     entry("aac", Category::Audio, "audio/aac", ContentServe::InlineMedia("audio/aac"), Some("audio/mp4"), None, ViewerMode::Inline),
@@ -659,6 +660,7 @@ mod tests {
             // Audio
             ("song.mp3", Category::Audio, "audio/mpeg"),
             ("track.m4a", Category::Audio, "audio/mp4"),
+            ("book.m4b", Category::Audio, "audio/mp4"),
             ("stream.aac", Category::Audio, "audio/aac"),
             ("album.FLAC", Category::Audio, "audio/flac"),
             ("voice.ogg", Category::Audio, "audio/ogg"),
@@ -666,6 +668,7 @@ mod tests {
             ("call.opus", Category::Audio, "audio/opus"),
             ("sample.wav", Category::Audio, "audio/wav"),
             ("clip.weba", Category::Audio, "audio/webm"),
+            ("studio.aif", Category::Audio, "audio/aiff"),
             ("studio.aiff", Category::Audio, "audio/aiff"),
             ("legacy.wma", Category::Audio, "audio/x-ms-wma"),
             ("note.amr", Category::Audio, "audio/amr"),
