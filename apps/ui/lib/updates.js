@@ -2,13 +2,29 @@
 
 export const RESUME_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 export const PERIODIC_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+export const ERROR_RETRY_INTERVAL_MS = 5 * 60 * 1000;
 
-/** Returns true when enough time (>= 1 hour) has passed to re-check on foreground resume. */
-export function shouldCheckOnResume(lastCheckedAt, nowMs = Date.now()) {
+/**
+ * Returns true when enough time has passed to re-check on foreground resume (>= 1 hour normally,
+ * or >= 5 minutes when the previous check ended in an error).
+ */
+export function shouldCheckOnResume(lastCheckedAt, nowMs = Date.now(), { phase } = {}) {
   if (!lastCheckedAt) return true;
   const ts = typeof lastCheckedAt === 'number' ? lastCheckedAt : Date.parse(lastCheckedAt);
   if (!Number.isFinite(ts)) return true;
-  return nowMs - ts >= RESUME_CHECK_INTERVAL_MS;
+  const interval = phase === 'error' ? ERROR_RETRY_INTERVAL_MS : RESUME_CHECK_INTERVAL_MS;
+  return nowMs - ts >= interval;
+}
+
+/**
+ * Counts device transfers that represent active work blocking an app update:
+ * `queued`, `running`, and `cancelling` (still stopping workers or deleting leftover files).
+ */
+export function countActiveTransfers(transfers) {
+  if (!Array.isArray(transfers)) return 0;
+  return transfers.filter(
+    (t) => t && (t.state === 'running' || t.state === 'queued' || t.state === 'cancelling'),
+  ).length;
 }
 
 /**
@@ -16,7 +32,8 @@ export function shouldCheckOnResume(lastCheckedAt, nowMs = Date.now()) {
  * anything the person started.
  *
  * Automatic installs only ever run at two moments:
- * - `trigger === 'startup'`: on launch before the person has interacted with the app.
+ * - `trigger === 'startup'`: on launch within the native startup window, before the first full
+ *   screen is shown and before the person has interacted with the app.
  * - `trigger === 'background'`: on Android when the app moves into the background (strictly silent;
  *   desktop window-close updates are triggered natively on `WindowEvent::CloseRequested`).
  */
@@ -28,13 +45,22 @@ export function isSafeForAutoInstall({
   isRunningCommand = false,
   activeCalls = 0,
   isPairingOpen = false,
+  isResuming = false,
   userInteracted = false,
+  firstScreenShown = false,
 } = {}) {
   if (!updateState || !updateState.auto_update) return false;
   if (updateState.phase !== 'ready' || !updateState.can_self_install) return false;
   if ((updateState.current?.sequence || 0) === 0) return false;
   if (updateState.failed_update) return false;
-  if (hasOpenSheet || hasCommandDraft || isRunningCommand || activeCalls > 0 || isPairingOpen) {
+  if (
+    hasOpenSheet ||
+    hasCommandDraft ||
+    isRunningCommand ||
+    activeCalls > 0 ||
+    isPairingOpen ||
+    isResuming
+  ) {
     return false;
   }
   const isAndroid = updateState.current?.os === 'android';
@@ -43,7 +69,7 @@ export function isSafeForAutoInstall({
     return false;
   }
   if (trigger === 'startup') {
-    return !userInteracted;
+    return !userInteracted && !firstScreenShown;
   }
   if (trigger === 'background') {
     return isAndroid;
@@ -189,17 +215,20 @@ export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName 
 
   if (phase === 'ready') {
     const desktopAutoReady = !isAndroid && updateState.auto_update;
+    const readyDetail = updateState.last_error
+      ? updateState.last_error
+      : desktopAutoReady
+        ? avail
+          ? `Version ${avail.version} is downloaded and verified. It will install next time you open or close Legion.`
+          : 'The update is downloaded and verified. It will install next time you open or close Legion.'
+        : androidNote;
     return {
       line: desktopAutoReady
         ? 'Restart to finish'
         : avail
           ? `Version ${avail.version} is ready`
           : 'Update is ready',
-      detail: desktopAutoReady
-        ? avail
-          ? `Version ${avail.version} is downloaded and verified. It will install next time you open or close Legion.`
-          : 'The update is downloaded and verified. It will install next time you open or close Legion.'
-        : androidNote,
+      detail: readyDetail,
       actionLabel: 'Update now',
       canAction: Boolean(updateState.can_self_install),
       showCheck: false,
@@ -249,14 +278,21 @@ export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName 
   }
 
   if (phase === 'error') {
+    const failed = updateState.failed_update || null;
     const actionLabel =
       avail && updateState.can_self_install
-        ? updateState.failed_update
+        ? failed
           ? 'Try again'
           : 'Update now'
         : null;
+    const line =
+      updateState.last_error ||
+      failed?.reason ||
+      (failed
+        ? 'The new version did not start cleanly, so Legion kept the previous copy.'
+        : 'Could not finish the update.');
     return {
-      line: updateState.last_error || 'Could not finish the update.',
+      line,
       detail: avail ? `Version ${avail.version}` : '',
       actionLabel,
       canAction: Boolean(actionLabel),
@@ -334,16 +370,30 @@ export function formatUpdateTechnicalRows(updateState) {
     }
   }
   if (updateState.failed_update) {
+    const f = updateState.failed_update;
+    let suffix = '';
+    if (typeof f.attempts === 'number' && f.attempts > 0) {
+      if (f.skipped) {
+        suffix = ` (${f.attempts} ${f.attempts === 1 ? 'attempt' : 'attempts'}, skipped)`;
+      } else {
+        suffix = ` (attempt ${f.attempts}, will retry once)`;
+      }
+    }
     rows.push({
       key: 'failed',
-      value: `${updateState.failed_update.version} · seq ${updateState.failed_update.sequence}`,
+      value: `${f.version} · seq ${f.sequence}${suffix}`,
     });
   }
   if (Array.isArray(updateState.checked_nodes) && updateState.checked_nodes.length > 0) {
     rows.push({ key: 'checked', value: updateState.checked_nodes.join(', ') });
   }
-  if (updateState.last_error_detail) {
-    rows.push({ key: 'last error', value: updateState.last_error_detail });
+  const errorDetail =
+    updateState.last_error_detail ||
+    updateState.failed_update?.detail ||
+    updateState.rolled_back?.detail ||
+    null;
+  if (errorDetail) {
+    rows.push({ key: 'last error', value: errorDetail });
   }
   return rows;
 }

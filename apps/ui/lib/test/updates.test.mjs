@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  ERROR_RETRY_INTERVAL_MS,
   RESUME_CHECK_INTERVAL_MS,
+  countActiveTransfers,
   describeUpdateSummary,
   formatDownloadPercent,
   formatUpdateTechnicalRows,
@@ -10,13 +12,16 @@ import {
   shouldCheckOnResume,
 } from '../updates.js';
 
-test('shouldCheckOnResume enforces a 1-hour interval', () => {
+test('shouldCheckOnResume enforces a 1-hour interval normally and 5 minutes after an error', () => {
   const now = Date.UTC(2026, 10, 25, 10, 0, 0);
   assert.equal(shouldCheckOnResume(null, now), true);
   assert.equal(shouldCheckOnResume(now - RESUME_CHECK_INTERVAL_MS + 1000, now), false);
   assert.equal(shouldCheckOnResume(now - RESUME_CHECK_INTERVAL_MS, now), true);
   assert.equal(shouldCheckOnResume('2026-11-25T08:30:00Z', now), true);
   assert.equal(shouldCheckOnResume('2026-11-25T09:30:00Z', now), false);
+  // Transient error retries much sooner (5 minutes) instead of waiting 1 hour.
+  assert.equal(shouldCheckOnResume(now - ERROR_RETRY_INTERVAL_MS + 1000, now, { phase: 'error' }), false);
+  assert.equal(shouldCheckOnResume(now - ERROR_RETRY_INTERVAL_MS, now, { phase: 'error' }), true);
 });
 
 test('isSafeForAutoInstall only allows startup before interaction or silent Android backgrounding', () => {
@@ -40,6 +45,16 @@ test('isSafeForAutoInstall only allows startup before interaction or silent Andr
       updateState: readyDesktop,
       trigger: 'startup',
       userInteracted: true,
+    }),
+    false,
+  );
+  // Once the first full screen has shown, startup auto-install must never interrupt the session.
+  assert.equal(
+    isSafeForAutoInstall({
+      updateState: readyDesktop,
+      trigger: 'startup',
+      userInteracted: false,
+      firstScreenShown: true,
     }),
     false,
   );
@@ -81,6 +96,27 @@ test('isSafeForAutoInstall only allows startup before interaction or silent Andr
       updateState: readyDesktop,
       trigger: 'startup',
       activeCalls: 1,
+    }),
+    false,
+  );
+  // Active foreground resume session recovery always blocks auto-install (startup and Android background).
+  assert.equal(
+    isSafeForAutoInstall({
+      updateState: readyDesktop,
+      trigger: 'startup',
+      isResuming: true,
+    }),
+    false,
+  );
+  assert.equal(
+    isSafeForAutoInstall({
+      updateState: {
+        ...readyDesktop,
+        current: { os: 'android', install_kind: 'apk', sequence: 202611250200 },
+        android: { supportsSilentSelfUpdate: true },
+      },
+      trigger: 'background',
+      isResuming: true,
     }),
     false,
   );
@@ -140,6 +176,47 @@ test('isSafeForAutoInstall only allows startup before interaction or silent Andr
       userInteracted: false,
     }),
     true,
+  );
+
+  // Transfers in queued, running, OR cancelling state all count as active work blocking updates
+  // until file removal finishes and the transfer reaches a terminal state.
+  assert.equal(
+    countActiveTransfers([
+      { id: '1', state: 'done' },
+      { id: '2', state: 'failed' },
+      { id: '3', state: 'cancelled' },
+      { id: '4', state: 'paused' },
+    ]),
+    0,
+  );
+  assert.equal(
+    countActiveTransfers([{ id: '1', state: 'cancelling' }]),
+    1,
+  );
+  assert.equal(
+    countActiveTransfers([
+      { id: '1', state: 'queued' },
+      { id: '2', state: 'running' },
+      { id: '3', state: 'cancelling' },
+      { id: '4', state: 'cancelled' },
+    ]),
+    3,
+  );
+  assert.equal(
+    isSafeForAutoInstall({
+      updateState: readyDesktop,
+      trigger: 'startup',
+      activeCalls: countActiveTransfers([{ id: '1', state: 'cancelling' }]),
+    }),
+    false,
+  );
+  assert.equal(
+    isSafeForAutoInstall({
+      updateState: readyAndroidSilent,
+      trigger: 'background',
+      activeCalls: countActiveTransfers([{ id: '1', state: 'cancelling' }]),
+    }),
+    false,
   );
 });
 
@@ -287,4 +364,44 @@ test('formatUpdateTechnicalRows includes channel, build, sequence (including seq
   });
   const seqRow = seqZeroRows.find((r) => r.key === 'sequence');
   assert.equal(seqRow?.value, '0 (updates disabled)');
+
+  // Skipped after two rollbacks surfaces plain message + Try again in summary and attempt count +
+  // captured startup output under Technical details.
+  const skippedState = {
+    phase: 'error',
+    auto_update: true,
+    can_self_install: true,
+    current: { os: 'linux', arch: 'x86_64', install_kind: 'appimage', sequence: 202611250200 },
+    available: { version: '0.2.0', sequence: 202611250205, channel: 'preview', build: 'b2', signer: 'preview', key_fingerprint: 'SHA256:k', source_node: 'tower' },
+    failed_update: {
+      version: '0.2.0',
+      sequence: 202611250205,
+      reason: 'The new version did not start cleanly, so Legion kept the previous copy.',
+      attempts: 2,
+      skipped: true,
+      detail: 'new_pid=42 exited with rc=127: missing libfoo.so',
+    },
+  };
+  const skippedSummary = describeUpdateSummary(skippedState);
+  assert.equal(skippedSummary.line, 'The new version did not start cleanly, so Legion kept the previous copy.');
+  assert.equal(skippedSummary.actionLabel, 'Try again');
+  assert.ok(!skippedSummary.line.includes('libfoo.so'));
+  const skippedRows = Object.fromEntries(formatUpdateTechnicalRows(skippedState).map((r) => [r.key, r.value]));
+  assert.equal(skippedRows.failed, '0.2.0 · seq 202611250205 (2 attempts, skipped)');
+  assert.equal(skippedRows['last error'], 'new_pid=42 exited with rc=127: missing libfoo.so');
+
+  // First rollback (not yet skipped) indicates retry-once status in Technical details.
+  const firstRollbackRows = Object.fromEntries(
+    formatUpdateTechnicalRows({
+      current: { os: 'linux', arch: 'x86_64', install_kind: 'appimage', sequence: 202611250200 },
+      failed_update: {
+        version: '0.2.0',
+        sequence: 202611250205,
+        reason: 'The new version did not start cleanly, so Legion kept the previous copy.',
+        attempts: 1,
+        skipped: false,
+      },
+    }).map((r) => [r.key, r.value]),
+  );
+  assert.equal(firstRollbackRows.failed, '0.2.0 · seq 202611250205 (attempt 1, will retry once)');
 });

@@ -17,6 +17,7 @@
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -- "$HERE/../.." && pwd -P)"
 ANDROID_DIR="$HERE/src-tauri/gen/android"
 
 KEYSTORE="${LEGION_APP_KEYSTORE:-$HOME/.legion-control/legion-app-release.jks}"
@@ -70,6 +71,7 @@ export LEGION_BUILD_SEQUENCE="$BUILD_SEQUENCE"
 command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH."
 cargo tauri --version >/dev/null 2>&1 || die "cargo-tauri is not installed or not on PATH."
 command -v openssl >/dev/null 2>&1 || die "openssl is required to generate the keystore password."
+command -v node >/dev/null 2>&1 || die "node is required to verify the built APK markers."
 
 if [ -z "${JAVA_HOME:-}" ]; then
 	if [ -d "/usr/lib/jvm/java-21-openjdk" ]; then
@@ -151,6 +153,8 @@ if [ "$DO_CLEAN" -eq 1 ]; then
 	( cd "$ANDROID_DIR" && ./gradlew --no-daemon clean )
 fi
 
+rm -rf "$ANDROID_DIR/app/build/outputs/apk"
+
 TARGETS=(--target aarch64)
 OUT_LABEL="arm64"
 if [ "$WITH_EMULATOR" -eq 1 ]; then
@@ -195,6 +199,14 @@ BADGING_OUTPUT="$("$AAPT2" dump badging "$SIGNED")"
 if printf '%s\n' "$BADGING_OUTPUT" | grep -q '^application-debuggable'; then
 	rm -f "$SIGNED"
 	die "release APK has android:debuggable=true ($SIGNED); refusing to ship."
+fi
+CHECK_ARGS=(check-artifact --file "$SIGNED" --kind apk --sequence "$LEGION_BUILD_SEQUENCE")
+if [ -z "${LEGION_PREVIEW_UPDATE_KEY:-}" ]; then
+	CHECK_ARGS+=(--forbid-preview-key)
+fi
+if ! node "$REPO_ROOT/scripts/make-update-set.mjs" "${CHECK_ARGS[@]}"; then
+	rm -f "$SIGNED"
+	die "release APK failed compiled sequence/preview-key verification ($SIGNED); refusing to ship."
 fi
 CERT_SHA256="$(printf '%s\n' "$VERIFY_OUTPUT" | sed -n 's/^.*certificate SHA-256 digest: //p' | head -n 1)"
 APK_VERSION_CODE="$(printf '%s\n' "$BADGING_OUTPUT" | sed -n "s/^package:.*versionCode='\([^']*\)'.*/\1/p" | head -n 1)"

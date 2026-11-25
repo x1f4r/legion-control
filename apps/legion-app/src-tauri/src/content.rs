@@ -769,6 +769,11 @@ impl AppContentServer {
             .retain_holders(|holder| self.backend.is_pairing_holder_live(holder));
     }
 
+    /// Returns the number of content response streams currently being served.
+    pub fn active_streams(&self) -> usize {
+        self.active_streams.load(Ordering::Acquire)
+    }
+
     /// Revokes every issued content ticket (used on store repair and app exit).
     pub fn revoke_all(&self) {
         let _ = self.tickets.retain_holders(|_| false);

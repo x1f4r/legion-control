@@ -7,12 +7,18 @@ export function createForegroundResumeController({
   onInvalidate = null,
   onRefresh = null,
   onCheckUpdates = null,
+  onResumingChange = null,
   dedupeMs = 1500,
   now = () => Date.now(),
 } = {}) {
   let wasHidden = getVisibilityState() === 'hidden';
   let resuming = false;
   let lastInvalidateAt = -Infinity;
+
+  function setResuming(next) {
+    resuming = next;
+    if (typeof onResumingChange === 'function') onResumingChange(next);
+  }
 
   async function runForeground({ forceInvalidate }) {
     if (resuming) return false;
@@ -24,12 +30,12 @@ export function createForegroundResumeController({
       if (recentlyInvalidated) return false;
       if (typeof invalidateSessions === 'function') {
         lastInvalidateAt = currentNow;
-        resuming = true;
+        setResuming(true);
         try {
           await invalidateSessions();
           if (typeof onInvalidate === 'function') onInvalidate();
         } finally {
-          resuming = false;
+          setResuming(false);
         }
       } else {
         lastInvalidateAt = currentNow;
@@ -43,12 +49,12 @@ export function createForegroundResumeController({
       wasHidden = false;
       if (recentlyInvalidated) return false;
       lastInvalidateAt = currentNow;
-      resuming = true;
+      setResuming(true);
       try {
         await invalidateSessions();
         if (typeof onInvalidate === 'function') onInvalidate();
       } finally {
-        resuming = false;
+        setResuming(false);
       }
       if (typeof onRefresh === 'function') onRefresh();
       if (typeof onCheckUpdates === 'function') onCheckUpdates();
@@ -66,7 +72,8 @@ export function createForegroundResumeController({
     const state = getVisibilityState();
     if (state === 'hidden') {
       wasHidden = true;
-      if (typeof onBackground === 'function') onBackground();
+      // Never trigger background auto-install while resume recovery is re-establishing sessions.
+      if (!resuming && typeof onBackground === 'function') onBackground();
       return false;
     }
     if (state !== 'visible') return false;

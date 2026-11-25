@@ -1163,4 +1163,38 @@ test('createForegroundResumeController runs session invalidation on native resum
   assert.equal(capsInvalidated, 2);
   assert.equal(refreshes, 2);
   assert.equal(updateChecks, 2);
+
+  // 4) While resume recovery is mid-flight re-establishing sessions, background auto-install hook
+  // must NOT fire and onResumingChange reflects the active window accurately.
+  clock += 2000;
+  let releaseInvalidate;
+  let bgWhileResuming = 0;
+  const resumingStates = [];
+  const slowCtrl = createForegroundResumeController({
+    getVisibilityState: () => visibility,
+    invalidateSessions: () =>
+      new Promise((resolve) => {
+        releaseInvalidate = resolve;
+      }),
+    onResumingChange: (active) => resumingStates.push(active),
+    onBackground: () => {
+      bgWhileResuming += 1;
+    },
+    dedupeMs: 1500,
+    now: () => clock,
+  });
+
+  const resumePromise = slowCtrl.handleNativeResume();
+  assert.equal(slowCtrl.isResuming(), true);
+  assert.deepEqual(resumingStates, [true]);
+
+  visibility = 'hidden';
+  await slowCtrl.handleVisibilityChange();
+  assert.equal(bgWhileResuming, 0, 'background install hook must be suppressed during active resume recovery');
+  assert.equal(slowCtrl.isHidden(), true);
+
+  releaseInvalidate();
+  await resumePromise;
+  assert.equal(slowCtrl.isResuming(), false);
+  assert.deepEqual(resumingStates, [true, false]);
 });
