@@ -119,14 +119,14 @@ pub const HEARTBEAT: Duration = Duration::from_secs(10);
 pub const DEFAULT_RELAY_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How many streamed bytes pass between live permission and device-revocation re-checks.
-const RECHECK_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const RECHECK_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Maximum wall-clock time between live permission and device-revocation re-checks, so slow or
 /// stalled streams also stop promptly after revocation.
-const RECHECK_INTERVAL_TIME: Duration = Duration::from_secs(2);
+pub(crate) const RECHECK_INTERVAL_TIME: Duration = Duration::from_secs(2);
 
 /// Watchdog polling cadence while waiting on stalled stream I/O.
-const RECHECK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const RECHECK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Monotonic sequence number for unique sibling probe/rename temp names.
 static STREAM_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);

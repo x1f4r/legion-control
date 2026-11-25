@@ -79,6 +79,26 @@ fn main() -> ExitCode {
             "relayed_put_if_exists_fail_refuses_existing_file_and_preserves_fields",
             relayed_put_if_exists_fail_refuses_existing_file_and_preserves_fields,
         ),
+        (
+            "relayed_put_revoked_by_device_deletion_matches_direct",
+            relayed_put_revoked_by_device_deletion_matches_direct,
+        ),
+        (
+            "relayed_put_revoked_by_role_narrowing_matches_direct",
+            relayed_put_revoked_by_role_narrowing_matches_direct,
+        ),
+        (
+            "relayed_unpack_revoked_by_role_narrowing_matches_direct",
+            relayed_unpack_revoked_by_role_narrowing_matches_direct,
+        ),
+        (
+            "relayed_pack_revoked_by_role_narrowing_matches_direct",
+            relayed_pack_revoked_by_role_narrowing_matches_direct,
+        ),
+        (
+            "relayed_stalled_get_revoked_on_relay_stops_both_sides_like_direct",
+            relayed_stalled_get_revoked_on_relay_stops_both_sides_like_direct,
+        ),
     ];
 
     let mut passed = 0usize;
@@ -2197,5 +2217,721 @@ fn relayed_put_if_exists_fail_refuses_existing_file_and_preserves_fields() {
         forwarded["as"],
         json!("device"),
         "relay must replace inner `as` with pinned principal: {forwarded}"
+    );
+}
+
+fn configure_gate_device(home: &Home, node_name: &str, pairing_id: &str, role_rules: &str) {
+    let auth_keys = home.home().join(".ssh/authorized_keys");
+    fs::create_dir_all(auth_keys.parent().unwrap()).unwrap();
+    fs::write(&auth_keys, "").unwrap();
+    home.write_config(
+        "node.toml",
+        &format!(
+            "name = \"{node_name}\"\n[devices]\nauthorized_keys = {}\n",
+            toml_string(&auth_keys.to_string_lossy())
+        ),
+    );
+    home.write_config(
+        "policy.toml",
+        &format!(
+            "default = \"owner\"\n\n[principals.\"device:pixel\"]\nrole = \"device_role\"\ndevice = \"{pairing_id}\"\n\n[roles.device_role]\n{role_rules}\n"
+        ),
+    );
+    home.write_config(
+        "devices.toml",
+        &format!(
+            "version = 1\n\n[devices.{pairing_id}]\nname = \"pixel\"\nprincipal = \"device:pixel\"\nrole = \"device_role\"\npublic_key = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea\"\npaired_at = \"2026-11-01T00:00:00Z\"\npaired_on = \"{node_name}\"\nupdated_at = \"2026-11-01T00:00:00Z\"\nupdated_on = \"{node_name}\"\nname_updated_at = \"2026-11-01T00:00:00Z\"\nname_updated_on = \"{node_name}\"\nrole_updated_at = \"2026-11-01T00:00:00Z\"\nrole_updated_on = \"{node_name}\"\n"
+        ),
+    );
+    // Reconcile authorized_keys from devices.toml so `legion gate` accepts the paired key.
+    let out = Command::new(LEGION_BIN)
+        .args(["device.list"])
+        .env("LEGION_HOME", legion_home_of(home))
+        .env("HOME", home.home())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .expect("run device.list");
+    assert!(
+        out.status.success(),
+        "device.list reconciliation failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn spawn_gate_stream(home: &Home, pairing_id: &str) -> Child {
+    let lh = legion_home_of(home);
+    Command::new(LEGION_BIN)
+        .args([
+            "gate",
+            "--home",
+            lh.to_str().unwrap(),
+            "--as",
+            "device:pixel",
+            "--device",
+            "pixel",
+            "--pairing",
+            pairing_id,
+        ])
+        .env("LEGION_HOME", &lh)
+        .env("HOME", home.home())
+        .env("USERPROFILE", home.home())
+        .env("SSH_ORIGINAL_COMMAND", "legion stream")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn legion gate stream")
+}
+
+fn write_device_role_policy(home: &Home, pairing_id: &str, role_rules: &str) {
+    home.write_config(
+        "policy.toml",
+        &format!(
+            "default = \"owner\"\n\n[principals.\"device:pixel\"]\nrole = \"device_role\"\ndevice = \"{pairing_id}\"\n\n[roles.device_role]\n{role_rules}\n"
+        ),
+    );
+}
+
+fn wait_child_exit_within(child: &mut Child, limit: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child process did not exit within {limit:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+fn wait_pid_dead_within(pid_file: &std::path::Path, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    let pid: u32 = loop {
+        if let Ok(text) = fs::read_to_string(pid_file)
+            && let Ok(p) = text.trim().parse::<u32>()
+        {
+            break p;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pid file {} never populated",
+            pid_file.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    while Instant::now() < deadline {
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !alive {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("downstream process pid {pid} still alive after {limit:?}");
+}
+
+fn make_deterministic_bytes(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| ((i.wrapping_mul(31).wrapping_add(seed as usize)) & 0xff) as u8)
+        .collect()
+}
+
+fn blake3_hex(bytes: &[u8]) -> String {
+    // Ask `legion stream` `stat` with `checksum: true` on a temp home file or compute directly via
+    // a tiny scratch home so this integration test needs no extra dev-dependency.
+    let tmp = node("hasher");
+    write_home_file(&tmp, "payload.bin", bytes);
+    let mut child = spawn_stream(&tmp, None);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let _ = read_greeting(&mut stdout);
+    write_json_line(
+        &mut stdin,
+        &json!({
+            "protocol": 1,
+            "op": "stat",
+            "path": "~/payload.bin",
+            "checksum": true,
+        }),
+    );
+    drop(stdin);
+    let reply = read_json_line(&mut stdout);
+    assert!(child.wait().unwrap().success());
+    reply["hash"].as_str().unwrap().to_owned()
+}
+
+fn pack_entries_from_home(home: &Home, root: &str, names: &[&str]) -> Vec<u8> {
+    let mut child = spawn_stream(home, None);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let _ = read_greeting(&mut stdout);
+    write_json_line(
+        &mut stdin,
+        &json!({
+            "protocol": 1,
+            "op": "pack",
+            "root": root,
+            "names": names,
+        }),
+    );
+    drop(stdin);
+    let ready = read_json_line(&mut stdout);
+    assert_eq!(ready["ready"], json!(true), "pack ready={ready}");
+    let mut archive = Vec::new();
+    stdout.read_to_end(&mut archive).unwrap();
+    assert!(child.wait().unwrap().success());
+    archive
+}
+
+fn run_revoked_put_case(
+    relayed: bool,
+    revoke_action: impl FnOnce(&Home, &str),
+) -> (Value, bool, bool, Duration) {
+    let pairing_id = "11111111222222223333333344444444";
+    let tower = node("tower");
+    let studio = node("studio");
+    configure_gate_device(
+        &tower,
+        "tower",
+        pairing_id,
+        "allow = [\"fs.read\", \"fs.write\"]",
+    );
+    configure_gate_device(
+        &studio,
+        "studio",
+        pairing_id,
+        "allow = [\"fs.read\", \"fs.write\"]",
+    );
+    tower.write_config("fleet.toml", &fleet_entry_for_node("studio", &studio));
+
+    let payload = make_deterministic_bytes(4 * 1024 * 1024, 17);
+    let hash = blake3_hex(&payload);
+
+    let mut child = if relayed {
+        spawn_gate_stream(&tower, pairing_id)
+    } else {
+        spawn_gate_stream(&studio, pairing_id)
+    };
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let _ = read_greeting(&mut stdout);
+
+    let inner = json!({
+        "protocol": 1,
+        "op": "put",
+        "path": "~/revoked-put.bin",
+        "size": payload.len(),
+        "hash": hash,
+    });
+    let header = if relayed {
+        json!({
+            "protocol": 1,
+            "op": "relay",
+            "on": "studio",
+            "request": inner,
+        })
+    } else {
+        inner
+    };
+    write_json_line(&mut stdin, &header);
+    let ready = read_json_line(&mut stdout);
+    assert_eq!(ready["offset"], json!(0), "ready={ready}");
+
+    // Feed 256 KiB so the upload is actively underway, then revoke on the active node (`tower` for
+    // relayed, `studio` for direct) and keep trickling chunks slowly.
+    stdin.write_all(&payload[..256 * 1024]).unwrap();
+    stdin.flush().unwrap();
+
+    let revoked_at = Instant::now();
+    if relayed {
+        revoke_action(&tower, pairing_id);
+    } else {
+        revoke_action(&studio, pairing_id);
+    }
+
+    let mut pos = 256 * 1024;
+    let chunk = 64 * 1024;
+    let writer = std::thread::spawn(move || {
+        while pos < payload.len() {
+            let end = (pos + chunk).min(payload.len());
+            if stdin.write_all(&payload[pos..end]).is_err() || stdin.flush().is_err() {
+                break;
+            }
+            pos = end;
+            std::thread::sleep(Duration::from_millis(120));
+        }
+    });
+
+    let reply = read_json_line(&mut stdout);
+    let elapsed = revoked_at.elapsed();
+    let status = wait_child_exit_within(&mut child, Duration::from_secs(6));
+    assert!(!status.success(), "revoked put must exit non-zero");
+    let _ = writer.join();
+
+    let dest_exists = studio.home().join("revoked-put.bin").exists();
+    let part_exists = studio.home().join(".revoked-put.bin.legion-part").exists();
+    (reply, dest_exists, part_exists, elapsed)
+}
+
+fn relayed_put_revoked_by_device_deletion_matches_direct() {
+    let delete_device = |home: &Home, _pid: &str| {
+        home.write_config("devices.toml", "version = 1\n");
+    };
+    let (direct_reply, direct_dest, direct_part, direct_elapsed) =
+        run_revoked_put_case(false, delete_device);
+    let (relayed_reply, relayed_dest, relayed_part, relayed_elapsed) =
+        run_revoked_put_case(true, delete_device);
+
+    assert_eq!(
+        direct_reply["error"]["code"],
+        json!("denied"),
+        "{direct_reply}"
+    );
+    assert_eq!(
+        relayed_reply["error"]["code"],
+        json!("denied"),
+        "{relayed_reply}"
+    );
+    assert_eq!(
+        relayed_reply["error"]["message"], direct_reply["error"]["message"],
+        "relayed put revocation message must match direct: relayed={relayed_reply} direct={direct_reply}"
+    );
+    assert!(
+        relayed_elapsed < Duration::from_secs(6),
+        "relayed put must stop promptly after device deletion (took {relayed_elapsed:?}, direct={direct_elapsed:?})"
+    );
+    assert!(
+        !direct_dest,
+        "direct revoked put must not commit destination"
+    );
+    assert!(
+        !relayed_dest,
+        "relayed revoked put must not commit destination"
+    );
+    assert_eq!(
+        relayed_part, direct_part,
+        "target disk state after relayed revoked put must match direct"
+    );
+}
+
+fn relayed_put_revoked_by_role_narrowing_matches_direct() {
+    let cut_to_meta = |home: &Home, pid: &str| {
+        write_device_role_policy(home, pid, "allow = [\"meta.*\"]");
+    };
+    let (direct_reply, direct_dest, direct_part, direct_elapsed) =
+        run_revoked_put_case(false, cut_to_meta);
+    let (relayed_reply, relayed_dest, relayed_part, relayed_elapsed) =
+        run_revoked_put_case(true, cut_to_meta);
+
+    assert_eq!(
+        direct_reply["error"]["code"],
+        json!("denied"),
+        "{direct_reply}"
+    );
+    assert_eq!(
+        relayed_reply["error"]["code"],
+        json!("denied"),
+        "{relayed_reply}"
+    );
+    assert_eq!(
+        relayed_reply["error"]["message"], direct_reply["error"]["message"],
+        "relayed put role-cut message must match direct: relayed={relayed_reply} direct={direct_reply}"
+    );
+    assert!(
+        relayed_elapsed < Duration::from_secs(6),
+        "relayed put must stop promptly after role cut (took {relayed_elapsed:?}, direct={direct_elapsed:?})"
+    );
+    assert!(
+        !direct_dest,
+        "direct revoked put must not commit destination"
+    );
+    assert!(
+        !relayed_dest,
+        "relayed revoked put must not commit destination"
+    );
+    assert_eq!(
+        relayed_part, direct_part,
+        "target disk state after relayed revoked put must match direct"
+    );
+}
+
+fn run_revoked_unpack_case(relayed: bool) -> (Value, Vec<String>, Duration) {
+    let pairing_id = "22222222333333334444444455555555";
+    let tower = node("tower");
+    let studio = node("studio");
+    configure_gate_device(
+        &tower,
+        "tower",
+        pairing_id,
+        "allow = [\"fs.read\", \"fs.write\"]",
+    );
+    configure_gate_device(
+        &studio,
+        "studio",
+        pairing_id,
+        "allow = [\"fs.read\", \"fs.write\"]",
+    );
+    tower.write_config("fleet.toml", &fleet_entry_for_node("studio", &studio));
+
+    let src = node("src");
+    let first_bytes = b"first-small-file".to_vec();
+    let second_bytes = make_deterministic_bytes(3 * 1024 * 1024, 41);
+    let third_bytes = b"third-never-sent".to_vec();
+    write_home_file(&src, "bundle/first.txt", &first_bytes);
+    write_home_file(&src, "bundle/second.bin", &second_bytes);
+    write_home_file(&src, "bundle/third.txt", &third_bytes);
+    let archive =
+        pack_entries_from_home(&src, "~/bundle", &["first.txt", "second.bin", "third.txt"]);
+
+    let mut child = if relayed {
+        spawn_gate_stream(&tower, pairing_id)
+    } else {
+        spawn_gate_stream(&studio, pairing_id)
+    };
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let _ = read_greeting(&mut stdout);
+
+    let inner = json!({
+        "protocol": 1,
+        "op": "unpack",
+        "root": "~/unpacked-revoke",
+        "entries": [
+            { "path": "first.txt", "kind": "file", "size": first_bytes.len() },
+            { "path": "second.bin", "kind": "file", "size": second_bytes.len() },
+            { "path": "third.txt", "kind": "file", "size": third_bytes.len() },
+        ],
+    });
+    let header = if relayed {
+        json!({
+            "protocol": 1,
+            "op": "relay",
+            "on": "studio",
+            "request": inner,
+        })
+    } else {
+        inner
+    };
+    write_json_line(&mut stdin, &header);
+    let ready = read_json_line(&mut stdout);
+    assert_eq!(ready["ready"], json!(true), "unpack ready={ready}");
+
+    // Send first 128 KiB (covers `first.txt` plus the start of `second.bin`), then revoke role.
+    stdin.write_all(&archive[..128 * 1024]).unwrap();
+    stdin.flush().unwrap();
+    let revoked_at = Instant::now();
+    if relayed {
+        write_device_role_policy(&tower, pairing_id, "allow = [\"meta.*\"]");
+    } else {
+        write_device_role_policy(&studio, pairing_id, "allow = [\"meta.*\"]");
+    }
+
+    let writer = std::thread::spawn(move || {
+        let mut pos = 128 * 1024;
+        let chunk = 64 * 1024;
+        while pos < archive.len() {
+            let end = (pos + chunk).min(archive.len());
+            if stdin.write_all(&archive[pos..end]).is_err() || stdin.flush().is_err() {
+                break;
+            }
+            pos = end;
+            std::thread::sleep(Duration::from_millis(120));
+        }
+    });
+
+    let reply = read_json_line(&mut stdout);
+    let elapsed = revoked_at.elapsed();
+    let status = wait_child_exit_within(&mut child, Duration::from_secs(6));
+    assert!(!status.success(), "revoked unpack must exit non-zero");
+    let _ = writer.join();
+
+    let mut entries: Vec<String> = fs::read_dir(studio.home().join("unpacked-revoke"))
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort();
+    (reply, entries, elapsed)
+}
+
+fn relayed_unpack_revoked_by_role_narrowing_matches_direct() {
+    let (direct_reply, direct_entries, direct_elapsed) = run_revoked_unpack_case(false);
+    let (relayed_reply, relayed_entries, relayed_elapsed) = run_revoked_unpack_case(true);
+
+    assert_eq!(
+        direct_reply["error"]["code"],
+        json!("denied"),
+        "{direct_reply}"
+    );
+    assert_eq!(
+        relayed_reply["error"]["code"],
+        json!("denied"),
+        "{relayed_reply}"
+    );
+    assert_eq!(
+        relayed_reply["error"]["message"], direct_reply["error"]["message"],
+        "relayed unpack revocation message must match direct: relayed={relayed_reply} direct={direct_reply}"
+    );
+    assert!(
+        relayed_elapsed < Duration::from_secs(6),
+        "relayed unpack must stop promptly after role cut (took {relayed_elapsed:?}, direct={direct_elapsed:?})"
+    );
+    assert!(
+        !relayed_entries
+            .iter()
+            .any(|e| e == "second.bin" || e == "third.txt"),
+        "incomplete or subsequent unpack entries must not be committed: {relayed_entries:?}"
+    );
+    assert_eq!(
+        relayed_entries, direct_entries,
+        "target directory state after relayed revoked unpack must match direct"
+    );
+}
+
+fn relayed_pack_revoked_by_role_narrowing_matches_direct() {
+    let pairing_id = "33333333444444445555555566666666";
+    let tower = node("tower");
+    let studio = node("studio");
+    configure_gate_device(
+        &tower,
+        "tower",
+        pairing_id,
+        "allow = [\"fs.read\", \"fs.write\"]",
+    );
+    configure_gate_device(
+        &studio,
+        "studio",
+        pairing_id,
+        "allow = [\"fs.read\", \"fs.write\"]",
+    );
+    #[cfg(unix)]
+    let pid_file = tower.home().join("pack-target.pid");
+    #[cfg(unix)]
+    tower.write_config(
+        "fleet.toml",
+        &fleet_entry_for_node_with_pid("studio", &pid_file, &studio),
+    );
+    #[cfg(not(unix))]
+    tower.write_config("fleet.toml", &fleet_entry_for_node("studio", &studio));
+
+    let big_bytes = make_deterministic_bytes(16 * 1024 * 1024, 53);
+    write_home_file(&studio, "packsrc/big.bin", &big_bytes);
+
+    // Direct revoked pack while client has stopped reading.
+    let direct_bytes_received = {
+        let mut child = spawn_gate_stream(&studio, pairing_id);
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "pack",
+                "root": "~/packsrc",
+                "names": ["big.bin"],
+            }),
+        );
+        drop(stdin);
+        let ready = read_json_line(&mut stdout);
+        assert_eq!(ready["ready"], json!(true), "direct pack ready={ready}");
+        let mut first_chunk = vec![0u8; 64 * 1024];
+        stdout.read_exact(&mut first_chunk).unwrap();
+        // Stop reading and revoke role on studio.
+        write_device_role_policy(&studio, pairing_id, "allow = [\"meta.*\"]");
+        let status = wait_child_exit_within(&mut child, Duration::from_secs(6));
+        assert!(!status.success(), "direct revoked pack must exit non-zero");
+        let mut rest = Vec::new();
+        let _ = stdout.read_to_end(&mut rest);
+        first_chunk.len() + rest.len()
+    };
+    assert!(
+        direct_bytes_received < big_bytes.len(),
+        "direct revoked pack must stop before sending full archive ({direct_bytes_received})"
+    );
+
+    // Restore studio's role; now revoke ONLY on relay `tower` mid-pack while client stops reading.
+    write_device_role_policy(&studio, pairing_id, "allow = [\"fs.read\", \"fs.write\"]");
+    let relayed_bytes_received = {
+        let mut child = spawn_gate_stream(&tower, pairing_id);
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "request": {
+                    "protocol": 1,
+                    "op": "pack",
+                    "root": "~/packsrc",
+                    "names": ["big.bin"],
+                },
+            }),
+        );
+        drop(stdin);
+        let ready = read_json_line(&mut stdout);
+        assert_eq!(ready["ready"], json!(true), "relayed pack ready={ready}");
+        let mut first_chunk = vec![0u8; 64 * 1024];
+        stdout.read_exact(&mut first_chunk).unwrap();
+
+        let revoked_at = Instant::now();
+        write_device_role_policy(&tower, pairing_id, "allow = [\"meta.*\"]");
+        let status = wait_child_exit_within(&mut child, Duration::from_secs(6));
+        assert!(
+            !status.success(),
+            "relayed revoked pack must exit non-zero within bound (took {:?})",
+            revoked_at.elapsed()
+        );
+        #[cfg(unix)]
+        wait_pid_dead_within(&pid_file, Duration::from_secs(3));
+        let mut rest = Vec::new();
+        let _ = stdout.read_to_end(&mut rest);
+        first_chunk.len() + rest.len()
+    };
+    assert!(
+        relayed_bytes_received < big_bytes.len(),
+        "relayed revoked pack must stop before sending full archive ({relayed_bytes_received})"
+    );
+    assert_eq!(
+        fs::read(studio.home().join("packsrc/big.bin"))
+            .unwrap()
+            .len(),
+        big_bytes.len(),
+        "source file on studio must remain untouched"
+    );
+}
+
+fn relayed_stalled_get_revoked_on_relay_stops_both_sides_like_direct() {
+    let pairing_id = "44444444555555556666666677777777";
+    let tower = node("tower");
+    let studio = node("studio");
+    configure_gate_device(
+        &tower,
+        "tower",
+        pairing_id,
+        "allow = [\"fs.read\", \"fs.write\"]",
+    );
+    configure_gate_device(
+        &studio,
+        "studio",
+        pairing_id,
+        "allow = [\"fs.read\", \"fs.write\"]",
+    );
+    #[cfg(unix)]
+    let pid_file = tower.home().join("get-target.pid");
+    #[cfg(unix)]
+    tower.write_config(
+        "fleet.toml",
+        &fleet_entry_for_node_with_pid("studio", &pid_file, &studio),
+    );
+    #[cfg(not(unix))]
+    tower.write_config("fleet.toml", &fleet_entry_for_node("studio", &studio));
+
+    let big_bytes = make_deterministic_bytes(16 * 1024 * 1024, 73);
+    write_home_file(&studio, "stalled-get.bin", &big_bytes);
+
+    // Direct stalled `get` revoked by role narrowing on `studio`.
+    let direct_received = {
+        let mut child = spawn_gate_stream(&studio, pairing_id);
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "get",
+                "path": "~/stalled-get.bin",
+            }),
+        );
+        drop(stdin);
+        let ready = read_json_line(&mut stdout);
+        assert_eq!(ready["length"], json!(big_bytes.len()));
+        let mut first = vec![0u8; 64 * 1024];
+        stdout.read_exact(&mut first).unwrap();
+
+        // Client stops reading completely; revoke role on studio.
+        write_device_role_policy(&studio, pairing_id, "allow = [\"meta.*\"]");
+        let status = wait_child_exit_within(&mut child, Duration::from_secs(6));
+        assert!(
+            !status.success(),
+            "direct stalled get must exit non-zero on revoke"
+        );
+        let mut rest = Vec::new();
+        let _ = stdout.read_to_end(&mut rest);
+        first.len() + rest.len()
+    };
+    assert!(
+        direct_received < big_bytes.len(),
+        "direct stalled get must truncate on revoke ({direct_received})"
+    );
+
+    // Restore studio role; run relayed stalled `get` and revoke ONLY on relay `tower`.
+    write_device_role_policy(&studio, pairing_id, "allow = [\"fs.read\", \"fs.write\"]");
+    let relayed_received = {
+        let mut child = spawn_gate_stream(&tower, pairing_id);
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "request": {
+                    "protocol": 1,
+                    "op": "get",
+                    "path": "~/stalled-get.bin",
+                },
+            }),
+        );
+        drop(stdin);
+        let ready = read_json_line(&mut stdout);
+        assert_eq!(ready["length"], json!(big_bytes.len()));
+        let mut first = vec![0u8; 64 * 1024];
+        stdout.read_exact(&mut first).unwrap();
+
+        // Client stops reading completely (0 B/s); revoke role on relay `tower`.
+        let revoked_at = Instant::now();
+        write_device_role_policy(&tower, pairing_id, "allow = [\"meta.*\"]");
+        let status = wait_child_exit_within(&mut child, Duration::from_secs(6));
+        assert!(
+            !status.success(),
+            "relayed stalled get must exit non-zero on relay revoke (took {:?})",
+            revoked_at.elapsed()
+        );
+        #[cfg(unix)]
+        wait_pid_dead_within(&pid_file, Duration::from_secs(3));
+        let mut rest = Vec::new();
+        let _ = stdout.read_to_end(&mut rest);
+        first.len() + rest.len()
+    };
+    assert!(
+        relayed_received < big_bytes.len(),
+        "relayed stalled get must truncate on relay revoke ({relayed_received})"
+    );
+    assert_eq!(
+        fs::read(studio.home().join("stalled-get.bin"))
+            .unwrap()
+            .len(),
+        big_bytes.len(),
+        "source file on studio must remain untouched"
     );
 }
