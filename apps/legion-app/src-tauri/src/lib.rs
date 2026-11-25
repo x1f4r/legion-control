@@ -282,12 +282,22 @@ pub fn run() {
         {
             let close_updater = Arc::clone(&updater);
             let close_transfers = Arc::clone(&transfers);
-            window.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { .. } = event
-                    && !close_transfers.has_active_work()
-                {
+            let resize_app = app.handle().clone();
+            let resize_label = window.label().to_owned();
+            window.on_window_event(move |event| match event {
+                tauri::WindowEvent::CloseRequested { .. } if !close_transfers.has_active_work() => {
                     let _ = close_updater.try_spawn_desktop_close_install();
                 }
+                tauri::WindowEvent::Resized(_) => {
+                    if let Some(immersive) = resize_app.try_state::<commands::DesktopImmersiveState>()
+                        && immersive.is_active()
+                        && let Some(win) = resize_app.get_webview_window(&resize_label)
+                        && !win.is_fullscreen().unwrap_or(true)
+                    {
+                        immersive.sync_external_fullscreen(false);
+                    }
+                }
+                _ => {}
             });
         }
         #[cfg(any(target_os = "android", target_os = "ios"))]

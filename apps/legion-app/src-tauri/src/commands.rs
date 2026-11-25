@@ -111,44 +111,72 @@ pub enum ScanInviteResult {
 /// Shared backend state registered with Tauri.
 pub struct SharedBackend(pub Arc<dyn Backend>);
 
-/// Tracks whether the desktop window was already full screen before entering immersive mode so
-/// leaving restores the previous window state.
+/// Tracks whether Legion entered desktop full screen so leaving only undoes what Legion did.
+///
+/// If the window was already full screen when immersive started, entering changes nothing and
+/// leaving changes nothing. If the window leaves full screen by any other hand, immersive follows
+/// and never forces full screen back on.
 #[derive(Default)]
 pub struct DesktopImmersiveState {
-    previous_fullscreen: Mutex<Option<bool>>,
+    inner: Mutex<DesktopImmersiveInner>,
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+struct DesktopImmersiveInner {
+    active: bool,
+    entered_by_legion: bool,
 }
 
 impl DesktopImmersiveState {
-    /// Transitions into immersive mode, recording `currently_fullscreen` only when entering from
-    /// the inactive state. Returns the target full-screen flag (`true`).
+    /// Transitions into immersive mode. Returns `true` only when the window was not already full
+    /// screen and Legion should request full screen on the window.
     pub fn enter(&self, currently_fullscreen: bool) -> bool {
         let mut guard = self
-            .previous_fullscreen
+            .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.is_none() {
-            *guard = Some(currently_fullscreen);
+        if !guard.active {
+            guard.active = true;
+            guard.entered_by_legion = !currently_fullscreen;
         }
-        true
+        !currently_fullscreen
     }
 
-    /// Leaves immersive mode and returns `Some(previous_fullscreen)` if immersive mode was active,
-    /// or `None` when already inactive.
-    pub fn leave(&self) -> Option<bool> {
+    /// Leaves immersive mode. Returns `true` only when Legion was the one that entered full
+    /// screen and should now call `set_fullscreen(false)`. Never requests `set_fullscreen(true)`.
+    pub fn leave(&self) -> bool {
         let mut guard = self
-            .previous_fullscreen
+            .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.take()
+        let should_exit = guard.active && guard.entered_by_legion;
+        guard.active = false;
+        guard.entered_by_legion = false;
+        should_exit
+    }
+
+    /// Reconciles with the window's observed full-screen state after an external window-manager
+    /// transition. Returns `true` if immersive mode was active and just ended externally.
+    pub fn sync_external_fullscreen(&self, window_fullscreen: bool) -> bool {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.active && !window_fullscreen {
+            guard.active = false;
+            guard.entered_by_legion = false;
+            return true;
+        }
+        false
     }
 
     /// Returns whether immersive mode is currently active.
     pub fn is_active(&self) -> bool {
         let guard = self
-            .previous_fullscreen
+            .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.is_some()
+        guard.active
     }
 }
 
@@ -164,20 +192,21 @@ pub struct ImmersiveResult {
 pub use crate::keep_screen_on::DesktopKeepScreenOn;
 
 /// Resets desktop immersive state when the page reloads, crashes, or the window closes/hides.
+/// Only exits full screen if Legion itself entered it.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn reset_desktop_immersive(
     window: Option<&tauri::WebviewWindow>,
     state: &DesktopImmersiveState,
 ) {
-    if let Some(previous) = state.leave()
+    if state.leave()
         && let Some(win) = window
     {
-        let _ = win.set_fullscreen(previous);
+        let _ = win.set_fullscreen(false);
     }
 }
 
-/// Enters or leaves immersive mode on the main desktop window, restoring its pre-immersive
-/// full-screen state when leaving.
+/// Enters or leaves immersive mode on the main desktop window. Legion only undoes what Legion
+/// did: if the window was already full screen, entering and leaving change nothing.
 #[tauri::command]
 pub fn window_set_immersive(
     window: tauri::WebviewWindow,
@@ -188,23 +217,22 @@ pub fn window_set_immersive(
     {
         if on {
             let currently_fullscreen = window.is_fullscreen().unwrap_or(false);
-            let target = state.enter(currently_fullscreen);
-            if !currently_fullscreen {
-                window.set_fullscreen(target).map_err(|err| {
+            if state.enter(currently_fullscreen) {
+                window.set_fullscreen(true).map_err(|err| {
                     AppError::new(
                         ErrorCode::Failed,
                         format!("Could not enter full screen: {err}"),
                     )
                 })?;
             }
-            let fullscreen = window.is_fullscreen().unwrap_or(target);
+            let fullscreen = window.is_fullscreen().unwrap_or(true);
             Ok(ImmersiveResult {
                 active: true,
                 fullscreen,
             })
         } else {
-            if let Some(previous) = state.leave() {
-                window.set_fullscreen(previous).map_err(|err| {
+            if state.leave() {
+                window.set_fullscreen(false).map_err(|err| {
                     AppError::new(
                         ErrorCode::Failed,
                         format!("Could not leave full screen: {err}"),
@@ -1271,24 +1299,40 @@ mod tests {
     }
 
     #[test]
-    fn desktop_immersive_state_restores_previous_fullscreen_state() {
+    fn desktop_immersive_only_undoes_what_legion_did_and_never_forces_fullscreen_back() {
         let state = DesktopImmersiveState::default();
         assert!(!state.is_active());
-        assert_eq!(state.leave(), None);
+        assert!(!state.leave());
 
-        // Normal window -> enter immersive -> leave restores windowed (false).
+        // Normal window -> enter requests fullscreen -> leave exits fullscreen.
         assert!(state.enter(false));
         assert!(state.is_active());
-        // Repeated enter while already active preserves original pre-immersive false.
-        assert!(state.enter(true));
-        assert_eq!(state.leave(), Some(false));
+        // Repeated enter while already active does not overwrite entered_by_legion.
+        assert!(!state.enter(true));
+        assert!(state.leave());
         assert!(!state.is_active());
-        assert_eq!(state.leave(), None);
+        assert!(!state.leave());
 
-        // Window already full screen -> enter immersive -> leave keeps full screen (true).
-        assert!(state.enter(true));
+        // Window already full screen -> entering changes nothing, leaving changes nothing.
+        assert!(!state.enter(true));
         assert!(state.is_active());
-        assert_eq!(state.leave(), Some(true));
+        assert!(!state.leave());
         assert!(!state.is_active());
+
+        // Window already full screen -> user leaves full screen through WM -> controller follows
+        // and never forces full screen back on.
+        assert!(!state.enter(true));
+        assert!(state.is_active());
+        assert!(state.sync_external_fullscreen(false));
+        assert!(!state.is_active());
+        assert!(!state.leave());
+
+        // Windowed -> Legion entered full screen -> user leaves full screen through WM ->
+        // controller follows and leaving afterward changes nothing.
+        assert!(state.enter(false));
+        assert!(state.is_active());
+        assert!(state.sync_external_fullscreen(false));
+        assert!(!state.is_active());
+        assert!(!state.leave());
     }
 }
