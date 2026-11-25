@@ -9816,25 +9816,11 @@ mod tests {
     async fn real_binary_uploads_atomic_if_exists_direct_relayed_and_older_stat_fallback() {
         use std::os::unix::fs::PermissionsExt;
 
-        fn find_workspace_legion_bin() -> Option<PathBuf> {
-            if let Ok(p) = std::env::var("LEGION_BIN") {
-                let pb = PathBuf::from(p);
-                if pb.is_file() {
-                    return Some(pb);
-                }
-            }
-            let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-            for rel in [
-                "../../../target/debug/legion",
-                "../../../target/release/legion",
-            ] {
-                let candidate = manifest.join(rel);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-            None
-        }
+        const TEST_NAME: &str = "transfers::tests::real_binary_uploads_atomic_if_exists_direct_relayed_and_older_stat_fallback";
+
+        let Some(legion_bin) = crate::test_support::real_legion_bin(TEST_NAME) else {
+            return;
+        };
 
         fn write_wrapper(
             path: &Path,
@@ -9947,7 +9933,7 @@ mod tests {
 
         // Part 1: Current `legion` binary — direct AND relayed uploads raced between `fs.stat`
         // and `put` are refused atomically by `"if_exists": "fail"`.
-        if let Some(legion_bin) = find_workspace_legion_bin() {
+        {
             let root = tempfile::tempdir().unwrap();
             let home_a = root.path().join("legion-a");
             let home_b = root.path().join("legion-b");

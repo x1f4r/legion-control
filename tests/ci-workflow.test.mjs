@@ -274,4 +274,82 @@ test('legion-app.yml covers every platform with timeouts, credential-free checko
     /make-update-set\.mjs check-artifact[\s\S]*--kind deb[\s\S]*--forbid-preview-key/,
     'legion-release.yml must verify staged release .deb packages with check-artifact --forbid-preview-key',
   );
+  assert.doesNotMatch(
+    releaseWorkflow,
+    /vars\.|LEGION_PREVIEW_UPDATE_PUBKEY\s*:/,
+    'legion-release.yml must never read repository variables or pass LEGION_PREVIEW_UPDATE_PUBKEY',
+  );
+  const unsetMatches = releaseWorkflow.match(/unset LEGION_PREVIEW_UPDATE_KEY LEGION_PREVIEW_UPDATE_PUBKEY/g) ?? [];
+  assert.equal(
+    unsetMatches.length,
+    3,
+    'legion-release.yml must unset preview key variables in all three release build steps',
+  );
+});
+
+test('legion-app.yml preview desktop builds are workflow_dispatch-only, use vars.LEGION_PREVIEW_UPDATE_PUBKEY, and never leak into ordinary builds', () => {
+  const appWorkflow = read('.github/workflows/legion-app.yml');
+  const appJobs = jobs(appWorkflow);
+
+  // workflow_dispatch defines boolean `preview` (default false) and string `sequence`.
+  const dispatchBlock = /^ {2}workflow_dispatch:\n((?: {4}.*\n)+)/m.exec(appWorkflow)?.[1] ?? '';
+  assert.match(dispatchBlock, / {6}preview:\n(?: {8}.*\n)*? {8}type: boolean\n {8}default: false/);
+  assert.match(dispatchBlock, / {6}sequence:\n(?: {8}.*\n)*? {8}type: string\n {8}default: ''/);
+
+  // Non-desktop jobs never read LEGION_PREVIEW_UPDATE_PUBKEY.
+  for (const id of ['rust-check', 'android', 'ios']) {
+    assert.doesNotMatch(
+      appJobs.get(id).join('\n'),
+      /LEGION_PREVIEW_UPDATE_PUBKEY|build-desktop-preview\.mjs/,
+      `legion-app.yml:${id} must not build desktop preview artifacts`,
+    );
+  }
+
+  // Each desktop job gates both its fast-fail validation and its preview build+upload strictly on
+  // `github.event_name == 'workflow_dispatch' && inputs.preview`, reads the repository variable
+  // (never a secret), and calls the shared build script.
+  const desktopExpectations = [
+    ['linux-desktop', 'linux', 'legion-linux-preview'],
+    ['macos-desktop', 'macos', 'legion-macos-preview'],
+    ['windows-desktop', 'windows', 'legion-windows-preview'],
+  ];
+  for (const [jobId, osName, artifactName] of desktopExpectations) {
+    const body = appJobs.get(jobId).join('\n');
+    const previewGateRe = /if: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.preview \}\}/g;
+    const gateCount = (body.match(previewGateRe) ?? []).length;
+    assert.equal(
+      gateCount,
+      3,
+      `legion-app.yml:${jobId} must gate validate, build, and upload preview steps on workflow_dispatch && inputs.preview`,
+    );
+    assert.match(
+      body,
+      new RegExp(`build-desktop-preview\\.mjs[\\s\\S]*--check-only[\\s\\S]*--os ${osName}`),
+      `legion-app.yml:${jobId} must fast-fail validate preview inputs`,
+    );
+    assert.match(
+      body,
+      new RegExp(`build-desktop-preview\\.mjs[\\s\\S]*--os ${osName}[\\s\\S]*--out ci-preview/${osName}`),
+      `legion-app.yml:${jobId} must run scripts/build-desktop-preview.mjs for ${osName}`,
+    );
+    assert.match(
+      body,
+      new RegExp(`name: ${artifactName}\\n\\s+path: ci-preview/${osName}/\\n\\s+if-no-files-found: error`),
+      `legion-app.yml:${jobId} must upload ${artifactName}`,
+    );
+    assert.match(
+      body,
+      /LEGION_PREVIEW_UPDATE_PUBKEY: \$\{\{ vars\.LEGION_PREVIEW_UPDATE_PUBKEY \}\}/,
+      `legion-app.yml:${jobId} must read vars.LEGION_PREVIEW_UPDATE_PUBKEY`,
+    );
+    // The ordinary `id: build` step must never see LEGION_PREVIEW_UPDATE_PUBKEY or LEGION_PREVIEW_UPDATE_KEY.
+    const ordinaryStart = body.indexOf('- id: build');
+    const ordinaryEnd = body.indexOf('if-no-files-found: error', ordinaryStart);
+    assert.ok(ordinaryStart !== -1 && ordinaryEnd > ordinaryStart, `legion-app.yml:${jobId} missing ordinary build block`);
+    assert.doesNotMatch(
+      body.slice(ordinaryStart, ordinaryEnd),
+      /LEGION_PREVIEW_UPDATE_PUBKEY|LEGION_PREVIEW_UPDATE_KEY/,
+      `legion-app.yml:${jobId} ordinary build must never receive preview key variables`,
+    );
+  }
 });

@@ -5842,43 +5842,8 @@ mod tests {
         use std::path::{Path, PathBuf};
         use std::process::{Child, Command, Stdio};
 
-        fn find_tool(name: &str) -> Option<PathBuf> {
-            let path_var = std::env::var_os("PATH")?;
-            for dir in std::env::split_paths(&path_var) {
-                let candidate = dir.join(name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-            None
-        }
-
-        fn find_sshd() -> Option<PathBuf> {
-            find_tool("sshd").or_else(|| {
-                ["/usr/sbin/sshd", "/sbin/sshd", "/usr/local/sbin/sshd"]
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .find(|p| p.is_file())
-            })
-        }
-
-        fn find_legion_bin() -> Option<PathBuf> {
-            if let Some(explicit) = std::env::var_os("LEGION_BIN") {
-                let p = PathBuf::from(explicit);
-                if p.is_file() {
-                    return Some(p);
-                }
-            }
-            let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-            let repo_root = manifest_dir.parent()?.parent()?.parent()?;
-            for profile in ["debug", "release"] {
-                let candidate = repo_root.join("target").join(profile).join("legion");
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-            None
-        }
+        const TEST_NAME: &str =
+            "content::tests::content_revoke_terminates_active_relayed_stream_on_relay_and_target";
 
         fn is_legion_pid_alive(pid: u32) -> bool {
             let proc_dir = PathBuf::from(format!("/proc/{pid}"));
@@ -5920,14 +5885,9 @@ mod tests {
                 .count()
         }
 
-        let (Some(sshd_bin), Some(keygen_bin)) = (find_sshd(), find_tool("ssh-keygen")) else {
-            eprintln!("skipping 3-node content_revoke test: sshd/ssh-keygen unavailable");
-            return;
-        };
-        let Some(legion_bin) = find_legion_bin() else {
-            eprintln!(
-                "skipping 3-node content_revoke test: built target/debug/legion not found (build workspace first)"
-            );
+        let Some((legion_bin, sshd_bin, keygen_bin)) =
+            crate::test_support::real_legion_bin_with_sshd(TEST_NAME)
+        else {
             return;
         };
         let user_out = Command::new("id")
@@ -5949,8 +5909,7 @@ mod tests {
             }
         }
 
-        let root = tempfile::tempdir().unwrap();
-        let _ = std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700));
+        let root = crate::test_support::strict_tempdir();
         let tower_home = root.path().join("tower-home");
         let studio_home = root.path().join("studio-home");
         let tower_legion = root.path().join("tower-legion");

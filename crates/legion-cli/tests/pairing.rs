@@ -50,12 +50,22 @@ fn read_json_line(reader: &mut BufReader<impl std::io::Read>, what: &str) -> Val
     }
 }
 
+fn require_sshd_or_skip(test_name: &str) -> bool {
+    if TestSshd::available() {
+        return true;
+    }
+    if common::require_real_binary() {
+        panic!(
+            "{test_name}: sshd/ssh/ssh-keygen unavailable (required because LEGION_REQUIRE_REAL_BINARY is enabled)"
+        );
+    }
+    eprintln!("skipping {test_name}: sshd/ssh/ssh-keygen unavailable");
+    false
+}
+
 #[test]
 fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
-    if !TestSshd::available() {
-        eprintln!(
-            "skipping real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry: sshd/ssh/ssh-keygen unavailable"
-        );
+    if !require_sshd_or_skip("real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry") {
         return;
     }
 
@@ -1003,10 +1013,9 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
 
 #[test]
 fn device_invite_refuses_disjoint_keyscan_when_host_key_files_exist_and_falls_back_when_absent() {
-    if !TestSshd::available() {
-        eprintln!(
-            "skipping device_invite_refuses_disjoint_keyscan_when_host_key_files_exist_and_falls_back_when_absent: sshd unavailable"
-        );
+    if !require_sshd_or_skip(
+        "device_invite_refuses_disjoint_keyscan_when_host_key_files_exist_and_falls_back_when_absent",
+    ) {
         return;
     }
     let has_keyscan = std::process::Command::new("ssh-keyscan")
@@ -1017,6 +1026,11 @@ fn device_invite_refuses_disjoint_keyscan_when_host_key_files_exist_and_falls_ba
         .status()
         .is_ok();
     if !has_keyscan {
+        if common::require_real_binary() {
+            panic!(
+                "device_invite_refuses_disjoint_keyscan_when_host_key_files_exist_and_falls_back_when_absent: ssh-keyscan unavailable (required because LEGION_REQUIRE_REAL_BINARY is enabled)"
+            );
+        }
         eprintln!(
             "skipping device_invite_refuses_disjoint_keyscan_when_host_key_files_exist_and_falls_back_when_absent: ssh-keyscan unavailable"
         );
@@ -1162,10 +1176,7 @@ fn device_invite_refuses_disjoint_keyscan_when_host_key_files_exist_and_falls_ba
 
 #[test]
 fn accept_env_cannot_redirect_gate_home_to_crafted_policy() {
-    if !TestSshd::available() {
-        eprintln!(
-            "skipping accept_env_cannot_redirect_gate_home_to_crafted_policy: sshd unavailable"
-        );
+    if !require_sshd_or_skip("accept_env_cannot_redirect_gate_home_to_crafted_policy") {
         return;
     }
 
@@ -1512,10 +1523,9 @@ fn gate_refuses_missing_pinned_home_without_creating_anything() {
 #[cfg(unix)]
 #[test]
 fn real_sshd_control_master_revocation_ends_connection_and_refuses_new_channels() {
-    if !TestSshd::available() {
-        eprintln!(
-            "skipping real_sshd_control_master_revocation_ends_connection_and_refuses_new_channels: sshd unavailable"
-        );
+    if !require_sshd_or_skip(
+        "real_sshd_control_master_revocation_ends_connection_and_refuses_new_channels",
+    ) {
         return;
     }
 
@@ -2179,10 +2189,9 @@ fn device_remove_leaves_running_jobs_alive_and_reports_them() {
 #[cfg(unix)]
 #[test]
 fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() {
-    if !TestSshd::available() {
-        eprintln!(
-            "skipping real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption: sshd unavailable"
-        );
+    if !require_sshd_or_skip(
+        "real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption",
+    ) {
         return;
     }
 
@@ -4363,10 +4372,7 @@ allow = [\"effect:read\"]
 fn real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs() {
     use legion_tools::device::registry::DevicesFile;
 
-    if !TestSshd::available() {
-        eprintln!(
-            "skipping real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs: sshd/ssh/ssh-keygen unavailable"
-        );
+    if !require_sshd_or_skip("real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs") {
         return;
     }
 

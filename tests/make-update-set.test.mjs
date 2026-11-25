@@ -906,3 +906,116 @@ test('main executable must itself carry markers even when a helper has them, and
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('checkShippedArtifact --expect-preview-key accepts the matching fingerprint and refuses none, mismatched keys, and conflicting flags', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-expect-preview-'));
+  try {
+    const seq = 202611250141;
+    const privA = path.join(tmp, 'a.key');
+    const pubA = path.join(tmp, 'a.pub.pem');
+    const privB = path.join(tmp, 'b.key');
+    const pubB = path.join(tmp, 'b.pub.pem');
+    const keyA = createPreviewKey({ privateKeyPath: privA, publicKeyPath: pubA });
+    const keyB = createPreviewKey({ privateKeyPath: privB, publicKeyPath: pubB });
+
+    const binA = path.join(tmp, 'legion-a');
+    const binNone = path.join(tmp, 'legion-none');
+    fs.writeFileSync(binA, compiledPayload(seq, keyA.fingerprint));
+    fs.writeFileSync(binNone, compiledPayload(seq, 'none'));
+
+    const goodLog = path.join(tmp, 'good.log');
+    const releaseLog = path.join(tmp, 'release.log');
+    const wrongLog = path.join(tmp, 'wrong.log');
+    fs.writeFileSync(goodLog, `warning: legion-update: preview update key compiled in (${keyA.fingerprint})\n`);
+    fs.writeFileSync(releaseLog, 'warning: legion-update: release update key only (no preview key)\n');
+    fs.writeFileSync(wrongLog, `warning: legion-update: preview update key compiled in (${keyB.fingerprint})\n`);
+
+    // Accepts matching fingerprint string or PEM path.
+    checkShippedArtifact({
+      filePath: binA,
+      kind: 'binary',
+      sequence: seq,
+      requireExactlyOne: true,
+      expectPreviewKey: keyA.fingerprint,
+      buildLogPath: goodLog,
+    });
+    checkShippedArtifact({
+      filePath: binA,
+      kind: 'binary',
+      sequence: seq,
+      requireExactlyOne: true,
+      expectPreviewKey: pubA,
+    });
+
+    // Refuses release-only (`none`) artifact.
+    assert.throws(
+      () => checkShippedArtifact({
+        filePath: binNone,
+        kind: 'binary',
+        sequence: seq,
+        requireExactlyOne: true,
+        expectPreviewKey: keyA.fingerprint,
+      }),
+      /compiled LEGION_UPDATE_PREVIEW_KEY=none/,
+    );
+
+    // Refuses a different preview key fingerprint.
+    assert.throws(
+      () => checkShippedArtifact({
+        filePath: binA,
+        kind: 'binary',
+        sequence: seq,
+        requireExactlyOne: true,
+        expectPreviewKey: keyB.fingerprint,
+      }),
+      new RegExp(`expected ${keyB.fingerprint.replace(/[+]/g, '\\+')}`),
+    );
+
+    // Refuses release-only or mismatched build logs.
+    assert.throws(
+      () => checkShippedArtifact({
+        filePath: binA,
+        kind: 'binary',
+        sequence: seq,
+        requireExactlyOne: true,
+        expectPreviewKey: keyA.fingerprint,
+        buildLogPath: releaseLog,
+      }),
+      /release update key only/,
+    );
+    assert.throws(
+      () => checkShippedArtifact({
+        filePath: binA,
+        kind: 'binary',
+        sequence: seq,
+        requireExactlyOne: true,
+        expectPreviewKey: keyA.fingerprint,
+        buildLogPath: wrongLog,
+      }),
+      /reports preview key/,
+    );
+
+    // Refuses combining forbidPreviewKey and expectPreviewKey, or passing a private key.
+    assert.throws(
+      () => checkShippedArtifact({
+        filePath: binA,
+        kind: 'binary',
+        sequence: seq,
+        forbidPreviewKey: true,
+        expectPreviewKey: keyA.fingerprint,
+      }),
+      /cannot be combined/,
+    );
+    assert.throws(
+      () => checkShippedArtifact({
+        filePath: binA,
+        kind: 'binary',
+        sequence: seq,
+        expectPreviewKey: privA,
+      }),
+      /Refusing private key/,
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
