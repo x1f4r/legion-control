@@ -367,4 +367,42 @@ class TransferSecurityTest {
       openableCount >= 1000 && blockedCount >= 5000,
     )
   }
+
+  @Test
+  fun cancelCleanupDeletesContainedCacheFilesAndGatesContentUriAuthorities() {
+    // Only MediaStore Downloads (`media`) and our own FileProvider authority may be deleted.
+    assertTrue(TransferPathPolicy.isDeletableSavedDownloadUri("media", "com.x1f4r.legion"))
+    assertTrue(TransferPathPolicy.isDeletableSavedDownloadUri("com.x1f4r.legion.fileprovider", "com.x1f4r.legion"))
+    assertTrue(TransferPathPolicy.isDeletableSavedDownloadUri("com.x1f4r.legion.debug.fileprovider", "com.x1f4r.legion.debug"))
+    assertFalse(TransferPathPolicy.isDeletableSavedDownloadUri("com.android.externalstorage.documents", "com.x1f4r.legion"))
+    assertFalse(TransferPathPolicy.isDeletableSavedDownloadUri("com.other.app.fileprovider", "com.x1f4r.legion"))
+    assertFalse(TransferPathPolicy.isDeletableSavedDownloadUri("", "com.x1f4r.legion"))
+    assertFalse(TransferPathPolicy.isDeletableSavedDownloadUri(null, "com.x1f4r.legion"))
+
+    val root = tempFolder.newFolder("cancel-cleanup")
+    val cacheDir = File(root, "open-externally").apply { mkdirs() }
+    val cached = File(cacheDir, "tr-1-holiday.jpg").apply { writeText("cached-bytes") }
+    assertTrue(TransferPathPolicy.deleteContainedCacheFile(cacheDir, cached))
+    assertFalse(cached.exists())
+    // Second call on missing file is a clean no-op.
+    assertFalse(TransferPathPolicy.deleteContainedCacheFile(cacheDir, cached))
+
+    // Traversal, sibling-prefix, and symlink escapes must throw SecurityException and leave target untouched.
+    val outside = File(root, "secret.txt").apply { writeText("keep") }
+    assertThrows(SecurityException::class.java) {
+      TransferPathPolicy.deleteContainedCacheFile(cacheDir, File(cacheDir, "../secret.txt"))
+    }
+    val siblingDir = File(root, "open-externally2").apply { mkdirs() }
+    val siblingFile = File(siblingDir, "other.jpg").apply { writeText("keep2") }
+    assertThrows(SecurityException::class.java) {
+      TransferPathPolicy.deleteContainedCacheFile(cacheDir, siblingFile)
+    }
+    val link = File(cacheDir, "escape-link.jpg")
+    Files.createSymbolicLink(link.toPath(), outside.toPath())
+    assertThrows(SecurityException::class.java) {
+      TransferPathPolicy.deleteContainedCacheFile(cacheDir, link)
+    }
+    assertTrue(outside.exists())
+    assertTrue(siblingFile.exists())
+  }
 }

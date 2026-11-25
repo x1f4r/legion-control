@@ -246,6 +246,7 @@ object TransferBridge {
         }
         "saveToDownloads" -> saveToDownloads(context, params)
         "stageOpenExternally" -> stageOpenExternally(context, params)
+        "deleteSavedDownload" -> deleteSavedDownload(context, params)
         "openTransferFile" -> openTransferFile(context, params)
         "showInFolder" -> showInFolder(context)
         "openUriRead" -> openUriRead(context, params)
@@ -304,6 +305,17 @@ object TransferBridge {
         }
       } ?: throw IllegalStateException("Could not open MediaStore output stream.")
 
+      if (BuildConfig.DEBUG) {
+        val delayFile = File(context.dataDir, "debug-delay-save-ms")
+        if (delayFile.isFile) {
+          val delayMs = runCatching { delayFile.readText().trim().toLong() }.getOrDefault(0L)
+            .coerceIn(0L, 5000L)
+          if (delayMs > 0L) {
+            Thread.sleep(delayMs)
+          }
+        }
+      }
+
       val publish = ContentValues().apply {
         put(MediaStore.Downloads.IS_PENDING, 0)
       }
@@ -355,6 +367,39 @@ object TransferBridge {
     val authority = "${context.packageName}.fileprovider"
     val uri = FileProvider.getUriForFile(context, authority, destFile)
     return JSONObject().put("uri", uri.toString())
+  }
+
+  private fun deleteSavedDownload(context: Context, params: JSONObject): JSONObject {
+    val uriOrPath = params.optString("uriOrPath", "").trim()
+    if (uriOrPath.isEmpty()) {
+      return JSONObject().put("ok", true).put("deleted", false)
+    }
+
+    var deleted = false
+    if (uriOrPath.startsWith("content://")) {
+      val uri = Uri.parse(uriOrPath)
+      if (!TransferPathPolicy.isDeletableSavedDownloadUri(uri.authority, context.packageName)) {
+        throw SecurityException("Refusing to delete content URI from disallowed authority.")
+      }
+      val rows = runCatching { context.contentResolver.delete(uri, null, null) }.getOrDefault(0)
+      if (rows > 0) {
+        deleted = true
+      }
+      if (uri.authority == "${context.packageName}.fileprovider") {
+        val seg = uri.lastPathSegment?.substringAfterLast('/')
+        if (!seg.isNullOrBlank()) {
+          val cacheDir = File(context.cacheDir, "open-externally")
+          if (runCatching { TransferPathPolicy.deleteContainedCacheFile(cacheDir, File(cacheDir, seg)) }.getOrDefault(false)) {
+            deleted = true
+          }
+        }
+      }
+    } else {
+      val cacheDir = File(context.cacheDir, "open-externally")
+      deleted = TransferPathPolicy.deleteContainedCacheFile(cacheDir, File(uriOrPath))
+    }
+
+    return JSONObject().put("ok", true).put("deleted", deleted)
   }
 
   private fun resolveDisplayNameForUri(context: Context, uri: Uri): String {

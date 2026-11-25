@@ -341,6 +341,25 @@ object TransferPathPolicy {
   }
 
   /**
+   * Returns `true` only for `content://` authorities that Legion itself created for a saved
+   * download (`media` for MediaStore Downloads, or `<packageName>.fileprovider` for our
+   * open-externally cache), preventing arbitrary document URIs from ever being deleted.
+   */
+  fun isDeletableSavedDownloadUri(authority: String?, packageName: String): Boolean {
+    if (authority.isNullOrBlank()) return false
+    return authority == "media" || authority == "$packageName.fileprovider"
+  }
+
+  /**
+   * Deletes `candidate` ONLY if it resolves canonically strictly inside `cacheDir` (refusing
+   * traversal, sibling-prefix tricks, and symlink escapes). Returns `true` if a file was removed.
+   */
+  fun deleteContainedCacheFile(cacheDir: File, candidate: File): Boolean {
+    val resolved = resolveContainedChild(cacheDir, candidate, requireExistingFile = false)
+    return resolved.isFile && resolved.delete()
+  }
+
+  /**
    * Constructs a safe destination file directly inside `cacheDir` and verifies containment.
    */
   fun resolveNewCacheFile(cacheDir: File, transferId: String, fileName: String): File {

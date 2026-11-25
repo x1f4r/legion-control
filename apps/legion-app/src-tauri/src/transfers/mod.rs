@@ -512,6 +512,17 @@ pub trait TransferPlatform: Send + Sync + 'static {
         open_after_done: bool,
     ) -> BoxFuture<'a, Result<String, AppError>>;
 
+    /// Deletes a finalized download destination (local file, open-externally cache copy, or
+    /// Android MediaStore / FileProvider `content://` entry) when a transfer is cancelled or a
+    /// cached copy is replaced by a permanent Downloads save.
+    fn delete_saved_download<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if !local_path.starts_with("content://") {
+                let _ = tokio::fs::remove_file(local_path).await;
+            }
+        })
+    }
+
     /// Opens a finished local file or URI in the system viewer or chooser.
     fn open_local_file<'a>(
         &'a self,
@@ -552,6 +563,12 @@ struct TransferRecord {
     /// Verified BLAKE3 hash recorded alongside `finalized_local_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finalized_hash: Option<String>,
+    /// True when `finalized_local_path` points at the ephemeral `open-externally` cache rather
+    /// than Downloads. If the app restarts and `open_after_done` no longer applies, resuming
+    /// promotes or re-downloads the file into Downloads so a `Done` download never lives only in
+    /// a 24 h pruned cache.
+    #[serde(default)]
+    pub finalized_in_cache: bool,
     /// True once an upload has chosen its collision-free remote path so retries resume it.
     #[serde(default)]
     pub remote_path_resolved: bool,
@@ -1197,6 +1214,7 @@ impl TransferManager {
             open_after_done,
             finalized_local_path: None,
             finalized_hash: None,
+            finalized_in_cache: false,
             remote_path_resolved: false,
             remote_mtime_secs: None,
             remote_mtime_nanos: None,
@@ -1439,6 +1457,7 @@ impl TransferManager {
                     open_after_done: false,
                     finalized_local_path: None,
                     finalized_hash: None,
+                    finalized_in_cache: false,
                     remote_path_resolved: false,
                     remote_mtime_secs: None,
                     remote_mtime_nanos: None,
@@ -1474,6 +1493,7 @@ impl TransferManager {
     ) -> Result<DeviceTransfer, AppError> {
         let mut cancel_token: Option<CancellationToken> = None;
         let mut delete_part = false;
+        let mut delete_saved_path: Option<String> = None;
         let mut release_upload_uri: Option<String> = None;
         let mut pruned = Vec::new();
 
@@ -1508,18 +1528,24 @@ impl TransferManager {
                 }
                 TransferControlAction::Cancel => {
                     if !matches!(current, TransferState::Done | TransferState::Cancelled) {
+                        let is_download =
+                            guard.items[pos].transfer.direction == TransferDirection::Download;
                         guard.items[pos].transfer.state = TransferState::Cancelled;
                         guard.items[pos].transfer.paused_reason = None;
                         guard.items[pos].transfer.rate = None;
                         guard.items[pos].transfer.error = None;
                         guard.items[pos].transfer.finished = Some(now_rfc3339_utc());
                         guard.items[pos].open_after_done = false;
-                        guard.items[pos].finalized_local_path = None;
+                        if is_download {
+                            delete_saved_path = guard.items[pos].finalized_local_path.take();
+                        } else {
+                            guard.items[pos].finalized_local_path = None;
+                        }
                         guard.items[pos].finalized_hash = None;
+                        guard.items[pos].finalized_in_cache = false;
                         cancel_token = guard.running.get(id).map(|w| w.cancel.clone());
-                        delete_part =
-                            guard.items[pos].transfer.direction == TransferDirection::Download;
-                        if guard.items[pos].transfer.direction == TransferDirection::Upload {
+                        delete_part = is_download;
+                        if !is_download {
                             release_upload_uri = guard.items[pos].transfer.local_path.clone();
                         }
                         pruned = prune_terminal_locked(&mut guard.items);
@@ -1544,6 +1570,9 @@ impl TransferManager {
         }
         if delete_part {
             let _ = tokio::fs::remove_file(self.part_path(id)).await;
+        }
+        if let Some(saved) = delete_saved_path {
+            self.platform.delete_saved_download(&saved).await;
         }
         if let Some(uri) = release_upload_uri {
             self.platform.release_upload_source(&uri).await;
@@ -1938,6 +1967,7 @@ impl TransferManager {
                             rec.open_after_done = false;
                             rec.finalized_local_path = None;
                             rec.finalized_hash = None;
+                            rec.finalized_in_cache = false;
                             PostFinalize::Cancelled {
                                 saved_local_path: outcome.local_path,
                                 release_upload_uri: (rec.transfer.direction
@@ -1953,17 +1983,19 @@ impl TransferManager {
                             ) =>
                         {
                             // A pause (or pause -> resume) arrived while the final save / put.finish
-                            // was running. Record the already-finalized output so resume finishes
-                            // idempotently without duplicating files, and honor the pause state
-                            // without opening or firing completion notifications prematurely.
+                            // was running. Record the already-finalized output (and whether it was
+                            // staged in cache) so resume finishes cleanly without duplicating files
+                            // and a subsequent cancel deletes the saved output too.
                             rec.finalized_local_path = outcome.local_path;
                             rec.finalized_hash = Some(outcome.hash);
+                            rec.finalized_in_cache = outcome.finalized_in_cache;
                             rec.transfer.bytes_done = outcome.bytes_total;
                             rec.transfer.bytes_total = outcome.bytes_total;
                             rec.transfer.rate = None;
                             PostFinalize::DeferredUntilResume
                         }
                         Some(rec) => {
+                            let open_after_done = std::mem::take(&mut rec.open_after_done);
                             rec.transfer.state = TransferState::Done;
                             rec.transfer.bytes_done = outcome.bytes_total;
                             rec.transfer.bytes_total = outcome.bytes_total;
@@ -1982,7 +2014,8 @@ impl TransferManager {
                                 rec.transfer.can_open =
                                     self.platform.supports_open_downloads() && allowed_open;
                                 rec.transfer.can_show_in_folder =
-                                    self.platform.supports_show_in_folder();
+                                    self.platform.supports_show_in_folder()
+                                        && !outcome.finalized_in_cache;
                                 rec.transfer.open_blocked_reason =
                                     (!allowed_open).then(|| REFUSED_OPEN_MESSAGE.to_owned());
                             } else {
@@ -1990,9 +2023,9 @@ impl TransferManager {
                                 rec.transfer.can_show_in_folder = false;
                                 rec.transfer.open_blocked_reason = None;
                             }
-                            let open_after_done = std::mem::take(&mut rec.open_after_done);
                             rec.finalized_local_path = None;
                             rec.finalized_hash = None;
+                            rec.finalized_in_cache = false;
                             let done = rec.transfer.clone();
                             let pruned = prune_terminal_locked(&mut guard.items);
                             PostFinalize::Completed {
@@ -2011,10 +2044,8 @@ impl TransferManager {
                     } => {
                         if record.transfer.direction == TransferDirection::Download {
                             let _ = tokio::fs::remove_file(self.part_path(id)).await;
-                            if let Some(saved) = saved_local_path
-                                && !saved.starts_with("content://")
-                            {
-                                let _ = tokio::fs::remove_file(&saved).await;
+                            if let Some(saved) = saved_local_path {
+                                self.platform.delete_saved_download(&saved).await;
                             }
                         }
                         if let Some(uri) = release_upload_uri {
@@ -2095,10 +2126,29 @@ impl TransferManager {
                 self.schedule_notify.notify_one();
             }
             Err(WorkerStop::Interrupted) => {
-                self.finish_worker_slot(id, worker_id);
+                let cleanup_cancelled_download = {
+                    let mut guard = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    clear_own_worker_slot(&mut guard, id, worker_id);
+                    record.transfer.direction == TransferDirection::Download
+                        && guard
+                            .items
+                            .iter()
+                            .find(|r| r.transfer.id == id)
+                            .is_none_or(|r| r.transfer.state == TransferState::Cancelled)
+                };
+                if cleanup_cancelled_download {
+                    let _ = tokio::fs::remove_file(self.part_path(id)).await;
+                }
+                self.persist_locked_snapshot();
+                self.broadcast_state_change();
+                self.schedule_notify.notify_one();
             }
             Err(WorkerStop::Failed(err)) => {
                 let mut delete_part = false;
+                let mut delete_saved_path: Option<String> = None;
                 let mut release_upload_uri: Option<String> = None;
                 let mut pruned = Vec::new();
                 let mut should_mark_failed = false;
@@ -2121,6 +2171,13 @@ impl TransferManager {
                         rec.transfer.error = Some(TransferError::from(&err));
                         rec.open_after_done = false;
                         delete_part = rec.transfer.direction == TransferDirection::Download;
+                        if delete_part {
+                            delete_saved_path = rec.finalized_local_path.take();
+                        } else {
+                            rec.finalized_local_path = None;
+                        }
+                        rec.finalized_hash = None;
+                        rec.finalized_in_cache = false;
                         if rec.transfer.direction == TransferDirection::Upload {
                             release_upload_uri = rec.transfer.local_path.clone();
                         }
@@ -2131,6 +2188,9 @@ impl TransferManager {
                 if should_mark_failed {
                     if delete_part {
                         let _ = tokio::fs::remove_file(self.part_path(id)).await;
+                    }
+                    if let Some(saved) = delete_saved_path {
+                        self.platform.delete_saved_download(&saved).await;
                     }
                     if let Some(uri) = release_upload_uri {
                         self.platform.release_upload_source(&uri).await;
@@ -2167,19 +2227,63 @@ impl TransferManager {
 
         // Idempotent completion: if a previous worker already finalized the verified file while a
         // pause intervened, reuse that saved destination instead of re-downloading or duplicating.
+        // However, if the earlier finalization landed in the ephemeral `open-externally` cache and
+        // `open_after_done` is no longer active (e.g. after an app restart), NEVER report Done
+        // pointing at a 24 h cache: promote the verified file to Downloads or re-download cleanly.
         if let (Some(saved_path), Some(saved_hash)) = (
             initial.finalized_local_path.as_deref(),
             initial.finalized_hash.as_deref(),
         ) {
-            let exists = saved_path.starts_with("content://")
-                || tokio::fs::try_exists(saved_path).await.unwrap_or(false);
-            if exists {
-                let _ = tokio::fs::remove_file(&part_path).await;
-                return Ok(WorkerOutcome {
-                    bytes_total: initial.transfer.bytes_total,
-                    hash: saved_hash.to_owned(),
-                    local_path: Some(saved_path.to_owned()),
-                });
+            if initial.finalized_in_cache && !initial.open_after_done {
+                let device_mime = mime_for_file_name(&initial.transfer.name);
+                if !saved_path.starts_with("content://")
+                    && tokio::fs::try_exists(saved_path).await.unwrap_or(false)
+                    && matches!(
+                        hash_file_blake3(Path::new(saved_path), cancel).await,
+                        Ok(ref actual) if actual == saved_hash
+                    )
+                {
+                    if cancel.is_cancelled() {
+                        return Err(WorkerStop::Interrupted);
+                    }
+                    let downloads_path = self
+                        .platform
+                        .finalize_download(
+                            id,
+                            Path::new(saved_path),
+                            &initial.transfer.name,
+                            Some(device_mime),
+                            false,
+                        )
+                        .await
+                        .map_err(WorkerStop::Failed)?;
+                    // Ensure the old cache copy is gone even if the platform copied instead of moving.
+                    self.platform.delete_saved_download(saved_path).await;
+                    let _ = tokio::fs::remove_file(&part_path).await;
+                    return Ok(WorkerOutcome {
+                        bytes_total: initial.transfer.bytes_total,
+                        hash: saved_hash.to_owned(),
+                        local_path: Some(downloads_path),
+                        finalized_in_cache: false,
+                    });
+                }
+                // Android FileProvider cache URI or missing/pruned cache file: discard the cache
+                // copy and download cleanly into Downloads.
+                self.platform.delete_saved_download(saved_path).await;
+                self.clear_finalized_state(id);
+            } else {
+                let exists = saved_path.starts_with("content://")
+                    || tokio::fs::try_exists(saved_path).await.unwrap_or(false);
+                if exists {
+                    let _ = tokio::fs::remove_file(&part_path).await;
+                    return Ok(WorkerOutcome {
+                        bytes_total: initial.transfer.bytes_total,
+                        hash: saved_hash.to_owned(),
+                        local_path: Some(saved_path.to_owned()),
+                        finalized_in_cache: initial.finalized_in_cache,
+                    });
+                }
+                self.clear_finalized_state(id);
             }
         }
 
@@ -2489,6 +2593,7 @@ impl TransferManager {
             bytes_total: total_size,
             hash: local_hash,
             local_path: Some(final_path),
+            finalized_in_cache: initial.open_after_done,
         })
     }
 
@@ -2671,6 +2776,7 @@ impl TransferManager {
                 bytes_total: initial.transfer.bytes_total,
                 hash: saved_hash.to_owned(),
                 local_path: None,
+                finalized_in_cache: false,
             });
         }
 
@@ -2892,6 +2998,7 @@ impl TransferManager {
                         bytes_total: done.size,
                         hash: done.hash,
                         local_path: None,
+                        finalized_in_cache: false,
                     });
                 }
                 Err(err) => {
@@ -3029,6 +3136,22 @@ impl TransferManager {
             rec.transfer.rate = rate;
         }
     }
+
+    fn clear_finalized_state(&self, id: &str) {
+        {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(rec) = guard.items.iter_mut().find(|r| r.transfer.id == id) {
+                rec.finalized_local_path = None;
+                rec.finalized_hash = None;
+                rec.finalized_in_cache = false;
+                rec.transfer.bytes_done = 0;
+            }
+        }
+        self.persist_locked_snapshot();
+    }
 }
 
 fn clear_own_worker_slot(guard: &mut QueueState, id: &str, worker_id: u64) {
@@ -3045,6 +3168,7 @@ struct WorkerOutcome {
     bytes_total: u64,
     hash: String,
     local_path: Option<String>,
+    finalized_in_cache: bool,
 }
 
 enum WorkerStop {
@@ -3912,16 +4036,21 @@ mod tests {
 
     struct MockPlatform {
         downloads_dir: PathBuf,
+        cache_dir: PathBuf,
         unmetered_wifi: Arc<AtomicBool>,
         opened: OpenedLog,
         shown_in_folder: Arc<Mutex<Vec<String>>>,
         released_uris: Arc<Mutex<Vec<String>>>,
+        deleted_saved: Arc<Mutex<Vec<String>>>,
         completed_notifications: Arc<Mutex<Vec<String>>>,
         picked_files: Arc<Mutex<Vec<PickedUploadFile>>>,
         finalize_calls: Arc<AtomicUsize>,
         finalize_entered: Arc<Notify>,
         finalize_release: Arc<Notify>,
         gate_finalize: Arc<AtomicBool>,
+        return_content_uris: Arc<AtomicBool>,
+        next_content_id: Arc<AtomicU64>,
+        live_content_uris: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         supports_open_externally: bool,
         supports_open_downloads: bool,
         supports_show_in_folder: bool,
@@ -3930,19 +4059,26 @@ mod tests {
     impl MockPlatform {
         fn new(dir: &Path) -> Self {
             let downloads_dir = dir.join("Downloads");
+            let cache_dir = dir.join("cache").join("open-externally");
             fs::create_dir_all(&downloads_dir).unwrap();
+            fs::create_dir_all(&cache_dir).unwrap();
             Self {
                 downloads_dir,
+                cache_dir,
                 unmetered_wifi: Arc::new(AtomicBool::new(true)),
                 opened: Arc::new(Mutex::new(Vec::new())),
                 shown_in_folder: Arc::new(Mutex::new(Vec::new())),
                 released_uris: Arc::new(Mutex::new(Vec::new())),
+                deleted_saved: Arc::new(Mutex::new(Vec::new())),
                 completed_notifications: Arc::new(Mutex::new(Vec::new())),
                 picked_files: Arc::new(Mutex::new(Vec::new())),
                 finalize_calls: Arc::new(AtomicUsize::new(0)),
                 finalize_entered: Arc::new(Notify::new()),
                 finalize_release: Arc::new(Notify::new()),
                 gate_finalize: Arc::new(AtomicBool::new(false)),
+                return_content_uris: Arc::new(AtomicBool::new(false)),
+                next_content_id: Arc::new(AtomicU64::new(1)),
+                live_content_uris: Arc::new(Mutex::new(HashMap::new())),
                 supports_open_externally: true,
                 supports_open_downloads: true,
                 supports_show_in_folder: true,
@@ -3982,22 +4118,70 @@ mod tests {
 
         fn finalize_download<'a>(
             &'a self,
-            _id: &'a str,
+            id: &'a str,
             part_path: &'a Path,
             file_name: &'a str,
             _mime: Option<&'a str>,
-            _open_after_done: bool,
+            open_after_done: bool,
         ) -> BoxFuture<'a, Result<String, AppError>> {
             Box::pin(async move {
                 self.finalize_calls.fetch_add(1, Ordering::SeqCst);
+                if self.return_content_uris.load(Ordering::SeqCst) {
+                    let bytes = tokio::fs::read(part_path).await.map_err(|err| {
+                        AppError::new(ErrorCode::Failed, format!("mock read part: {err}"))
+                    })?;
+                    let safe = sanitize_file_name(file_name);
+                    let uri = if open_after_done {
+                        format!(
+                            "content://com.x1f4r.legion.fileprovider/open_externally/{id}-{safe}"
+                        )
+                    } else {
+                        let seq = self.next_content_id.fetch_add(1, Ordering::SeqCst);
+                        format!("content://media/external/downloads/{seq}")
+                    };
+                    self.live_content_uris
+                        .lock()
+                        .unwrap()
+                        .insert(uri.clone(), bytes);
+                    if self.gate_finalize.load(Ordering::SeqCst) {
+                        self.finalize_entered.notify_waiters();
+                        self.finalize_release.notified().await;
+                    }
+                    let _ = tokio::fs::remove_file(part_path).await;
+                    return Ok(uri);
+                }
                 if self.gate_finalize.load(Ordering::SeqCst) {
                     self.finalize_entered.notify_waiters();
                     self.finalize_release.notified().await;
                 }
+                let dir = if open_after_done {
+                    &self.cache_dir
+                } else {
+                    &self.downloads_dir
+                };
+                let target_name = if open_after_done {
+                    format!("{id}-{}", sanitize_file_name(file_name))
+                } else {
+                    file_name.to_owned()
+                };
                 let dst =
-                    place_file_without_overwrite(part_path, &self.downloads_dir, file_name, false)
+                    place_file_without_overwrite(part_path, dir, &target_name, open_after_done)
                         .await?;
                 Ok(dst.to_string_lossy().into_owned())
+            })
+        }
+
+        fn delete_saved_download<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.deleted_saved
+                    .lock()
+                    .unwrap()
+                    .push(local_path.to_owned());
+                if local_path.starts_with("content://") {
+                    self.live_content_uris.lock().unwrap().remove(local_path);
+                } else {
+                    let _ = tokio::fs::remove_file(local_path).await;
+                }
             })
         }
 
@@ -5152,6 +5336,7 @@ mod tests {
                 open_after_done: false,
                 finalized_local_path: None,
                 finalized_hash: None,
+                finalized_in_cache: false,
                 remote_path_resolved: false,
                 remote_mtime_secs: None,
                 remote_mtime_nanos: None,
@@ -5182,6 +5367,7 @@ mod tests {
                 open_after_done: false,
                 finalized_local_path: None,
                 finalized_hash: None,
+                finalized_in_cache: false,
                 remote_path_resolved: true,
                 remote_mtime_secs: None,
                 remote_mtime_nanos: None,
@@ -5213,6 +5399,7 @@ mod tests {
                     open_after_done: false,
                     finalized_local_path: None,
                     finalized_hash: None,
+                    finalized_in_cache: false,
                     remote_path_resolved: false,
                     remote_mtime_secs: None,
                     remote_mtime_nanos: None,
@@ -5277,6 +5464,7 @@ mod tests {
             open_after_done: false,
             finalized_local_path: None,
             finalized_hash: None,
+            finalized_in_cache: false,
             remote_path_resolved: true,
             remote_mtime_secs: None,
             remote_mtime_nanos: None,
@@ -5323,5 +5511,343 @@ mod tests {
             "stale sequence write must be discarded instead of overwriting newer queue.json"
         );
         mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cancel_after_pause_during_finalize_removes_saved_download_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"payload-saved-before-cancel".to_vec();
+        let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+        remote
+            .lock()
+            .unwrap()
+            .files
+            .insert("/home/me/paused-cancel.jpg".into(), data);
+
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        platform.gate_finalize.store(true, Ordering::SeqCst);
+
+        let mgr = TransferManager::with_options(
+            dir.path(),
+            backend,
+            platform.clone(),
+            2,
+            Duration::from_secs(2),
+        );
+
+        let entered = platform.finalize_entered.notified();
+        let id = mgr
+            .enqueue_download(
+                "tower".into(),
+                "/home/me/paused-cancel.jpg".into(),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        entered.await;
+
+        // Pause while final save is held, then let final save finish -> transfer remains Paused
+        // with the finalized file sitting in Downloads.
+        let paused = mgr
+            .control(&id, TransferControlAction::Pause)
+            .await
+            .unwrap();
+        assert_eq!(paused.state, TransferState::Paused);
+        platform.finalize_release.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let saved_path = platform.downloads_dir.join("paused-cancel.jpg");
+        assert!(
+            saved_path.exists(),
+            "save should have landed before Cancel was requested"
+        );
+
+        // Cancel must remove the already-saved Downloads file AND any .part file.
+        let cancelled = mgr
+            .control(&id, TransferControlAction::Cancel)
+            .await
+            .unwrap();
+        assert_eq!(cancelled.state, TransferState::Cancelled);
+        assert!(
+            !saved_path.exists(),
+            "Cancel must delete saved Downloads file"
+        );
+        assert!(!mgr.part_path(&id).exists());
+        assert!(
+            platform
+                .deleted_saved
+                .lock()
+                .unwrap()
+                .contains(&saved_path.to_string_lossy().into_owned())
+        );
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cancel_during_and_after_finalize_removes_android_content_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"android-mediastore-payload".to_vec();
+        let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+        {
+            let mut st = remote.lock().unwrap();
+            st.files
+                .insert("/home/me/android-during.jpg".into(), data.clone());
+            st.files
+                .insert("/home/me/android-after-pause.jpg".into(), data);
+        }
+
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        platform.gate_finalize.store(true, Ordering::SeqCst);
+        platform.return_content_uris.store(true, Ordering::SeqCst);
+
+        let mgr = TransferManager::with_options(
+            dir.path(),
+            backend,
+            platform.clone(),
+            2,
+            Duration::from_secs(2),
+        );
+
+        // Case A: Cancel while Android MediaStore save is in flight -> content:// URI deleted.
+        let entered1 = platform.finalize_entered.notified();
+        let id1 = mgr
+            .enqueue_download(
+                "tower".into(),
+                "/home/me/android-during.jpg".into(),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        entered1.await;
+
+        let c1 = mgr
+            .control(&id1, TransferControlAction::Cancel)
+            .await
+            .unwrap();
+        assert_eq!(c1.state, TransferState::Cancelled);
+        platform.finalize_release.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert!(
+            platform.live_content_uris.lock().unwrap().is_empty(),
+            "Cancel during Android MediaStore save must delete the content:// entry"
+        );
+        assert!(
+            platform
+                .deleted_saved
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|u| u.starts_with("content://media/external/downloads/"))
+        );
+
+        // Case B: Pause during save -> save finishes -> Cancel -> content:// URI deleted.
+        let entered2 = platform.finalize_entered.notified();
+        let id2 = mgr
+            .enqueue_download(
+                "tower".into(),
+                "/home/me/android-after-pause.jpg".into(),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        entered2.await;
+
+        mgr.control(&id2, TransferControlAction::Pause)
+            .await
+            .unwrap();
+        platform.finalize_release.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(platform.live_content_uris.lock().unwrap().len(), 1);
+
+        let c2 = mgr
+            .control(&id2, TransferControlAction::Cancel)
+            .await
+            .unwrap();
+        assert_eq!(c2.state, TransferState::Cancelled);
+        assert!(
+            platform.live_content_uris.lock().unwrap().is_empty(),
+            "Cancel after Pause-during-save must delete the Android MediaStore content:// entry"
+        );
+        assert!(!mgr.part_path(&id1).exists());
+        assert!(!mgr.part_path(&id2).exists());
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn open_after_done_paused_during_finalize_and_resumed_after_restart_moves_to_downloads_not_cache()
+     {
+        let payload = b"important-photo-must-not-vanish-after-24h".to_vec();
+
+        // Subcase 1: Desktop / local filesystem cache -> promoted to Downloads and cache copy removed.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+            remote
+                .lock()
+                .unwrap()
+                .files
+                .insert("/home/me/holiday.jpg".into(), payload.clone());
+            let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+            let platform = Arc::new(MockPlatform::new(dir.path()));
+            platform.gate_finalize.store(true, Ordering::SeqCst);
+
+            let mgr = TransferManager::with_options(
+                dir.path(),
+                Arc::clone(&backend),
+                platform.clone(),
+                2,
+                Duration::from_secs(2),
+            );
+            let entered = platform.finalize_entered.notified();
+            let id = mgr
+                .enqueue_download(
+                    "tower".into(),
+                    "/home/me/holiday.jpg".into(),
+                    None,
+                    None,
+                    None,
+                    true,
+                )
+                .await
+                .unwrap();
+            entered.await;
+
+            // Pause while staging in cache, then release finalize so cache copy lands on disk.
+            mgr.control(&id, TransferControlAction::Pause)
+                .await
+                .unwrap();
+            platform.finalize_release.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert_eq!(fs::read_dir(&platform.cache_dir).unwrap().count(), 1);
+            assert_eq!(fs::read_dir(&platform.downloads_dir).unwrap().count(), 0);
+
+            // Simulate app restart (open_after_done is session-only and resets to false).
+            mgr.shutdown();
+            platform.gate_finalize.store(false, Ordering::SeqCst);
+
+            let mgr2 = TransferManager::with_options(
+                dir.path(),
+                backend,
+                platform.clone(),
+                2,
+                Duration::from_secs(2),
+            );
+            mgr2.control(&id, TransferControlAction::Resume)
+                .await
+                .unwrap();
+            let done = wait_for_state(&mgr2, &id, |s| s == TransferState::Done).await;
+            let final_path = PathBuf::from(done.local_path.as_deref().unwrap());
+            assert_eq!(
+                final_path.parent(),
+                Some(platform.downloads_dir.as_path()),
+                "Done transfer after restart must live in Downloads, never in cache: {final_path:?}"
+            );
+            assert_eq!(fs::read(&final_path).unwrap(), payload);
+            assert!(done.can_show_in_folder);
+            assert_eq!(
+                fs::read_dir(&platform.cache_dir).unwrap().count(),
+                0,
+                "old open-externally cache copy must be cleaned up"
+            );
+            mgr2.shutdown();
+        }
+
+        // Subcase 2: Android FileProvider content:// cache URI -> cache URI deleted and re-saved to
+        // MediaStore Downloads on resume after restart.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+            remote
+                .lock()
+                .unwrap()
+                .files
+                .insert("/home/me/holiday.jpg".into(), payload.clone());
+            let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+            let platform = Arc::new(MockPlatform::new(dir.path()));
+            platform.gate_finalize.store(true, Ordering::SeqCst);
+            platform.return_content_uris.store(true, Ordering::SeqCst);
+
+            let mgr = TransferManager::with_options(
+                dir.path(),
+                Arc::clone(&backend),
+                platform.clone(),
+                2,
+                Duration::from_secs(2),
+            );
+            let entered = platform.finalize_entered.notified();
+            let id = mgr
+                .enqueue_download(
+                    "tower".into(),
+                    "/home/me/holiday.jpg".into(),
+                    None,
+                    None,
+                    None,
+                    true,
+                )
+                .await
+                .unwrap();
+            entered.await;
+
+            mgr.control(&id, TransferControlAction::Pause)
+                .await
+                .unwrap();
+            platform.finalize_release.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert!(
+                platform
+                    .live_content_uris
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .all(|u| u.contains(".fileprovider/open_externally/"))
+            );
+
+            // Simulate app restart and resume.
+            mgr.shutdown();
+            platform.gate_finalize.store(false, Ordering::SeqCst);
+
+            let mgr2 = TransferManager::with_options(
+                dir.path(),
+                backend,
+                platform.clone(),
+                2,
+                Duration::from_secs(2),
+            );
+            mgr2.control(&id, TransferControlAction::Resume)
+                .await
+                .unwrap();
+            let done = wait_for_state(&mgr2, &id, |s| s == TransferState::Done).await;
+            let final_uri = done.local_path.as_deref().unwrap();
+            assert!(
+                final_uri.starts_with("content://media/external/downloads/"),
+                "Done Android transfer after restart must land in MediaStore Downloads, got {final_uri}"
+            );
+            assert!(done.can_show_in_folder);
+            assert!(
+                platform
+                    .deleted_saved
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|u| u.contains(".fileprovider/open_externally/")),
+                "stale Android FileProvider cache URI must be deleted"
+            );
+            let live = platform.live_content_uris.lock().unwrap();
+            assert_eq!(live.len(), 1);
+            assert_eq!(live.get(final_uri).unwrap(), &payload);
+            mgr2.shutdown();
+        }
     }
 }

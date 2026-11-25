@@ -720,6 +720,20 @@ impl TransferPlatform for AndroidTransferPlatform {
         })
     }
 
+    fn delete_saved_download<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if !local_path.starts_with("content://") {
+                let _ = tokio::fs::remove_file(local_path).await;
+                return;
+            }
+            if let Ok(client) = self.wait_for_client().await {
+                let _ = client
+                    .call("deleteSavedDownload", json!({ "uriOrPath": local_path }))
+                    .await;
+            }
+        })
+    }
+
     fn open_local_file<'a>(
         &'a self,
         local_path: &'a str,
