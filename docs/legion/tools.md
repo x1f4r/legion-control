@@ -1009,15 +1009,15 @@ Stop a background service and read its state back to confirm it is stopped. When
 
 | Tool | Effect | Description |
 | --- | --- | --- |
-| `sys.info` | `read` | Describe this machine: host name, operating system, uptime and boot id, CPU model, core count and current usage, memory and swap, disks, and NVIDIA GPUs. |
-| `sys.kill` | `destroy` | Stop a process: ask it to exit, and force it after a short grace if it has not. |
-| `sys.procs` | `read` | List the processes running on this machine, busiest first, with their id, parent, name, command line, user, CPU usage (percent of one core), memory in bytes and start time. |
+| `sys.info` | `read` | Describe this machine: host name, operating system, uptime and boot id, CPU model, core count, usage and temperature, memory and swap, disks, graphics cards, and battery. |
+| `sys.kill` | `destroy` | Stop one process (`pid`) or up to 64 verified `{pid, start_time}` processes (`targets`). |
+| `sys.procs` | `read` | List the processes running on this machine, busiest first, with their id, parent, name, command line, user, CPU usage (percent of one core), memory and graphics memory in bytes, start time, and whether the process is legion itself or an ancestor. |
 
 ### `sys.info`
 
 Effect: `read`
 
-Describe this machine: host name, operating system, uptime and boot id, CPU model, core count and current usage, memory and swap, disks, and NVIDIA GPUs. Sizes are bytes.
+Describe this machine: host name, operating system, uptime and boot id, CPU model, core count, usage and temperature, memory and swap, disks, graphics cards, and battery. Sizes are bytes.
 
 Takes no arguments.
 
@@ -1025,26 +1025,28 @@ Takes no arguments.
 
 Effect: `destroy`
 
-Stop a process: ask it to exit, and force it after a short grace if it has not. Pass the `start_time` sys.procs reported so a process that has since exited and whose id was reused is never hit. `tree` stops its descendants too; `force` skips asking.
+Stop one process (`pid`) or up to 64 verified `{pid, start_time}` processes (`targets`). With `targets`, without `force` the tool asks them to exit and waits up to five seconds, returning per-target outcomes (`stopped`, `gone`, `reused`, `still_running`, or `refused`). With `pid`, pass `start_time` so a reused id is never hit; `tree` stops descendants too; `force` skips asking.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `pid` | `integer` | yes | - | The process id. Minimum: 0. |
-| `start_time` | `string` | no | - | When the process started, as sys.procs reported it. When given and the process with this id started at another time, the id has been reused and nothing is stopped. |
-| `tree` | `boolean` | no | `false` | Stop the process's descendants as well. |
-| `force` | `boolean` | no | `false` | Stop it at once instead of asking it to exit first. |
+| `pid` | `integer` | no | - | The process id (alternative to `targets`). Minimum: 0. |
+| `start_time` | `string` | no | - | When the process started, as sys.procs reported it (used with `pid`). When given and the process with this id started at another time, the id has been reused and nothing is stopped. |
+| `targets` | `array of object` | no | - | 1 to 64 `{pid, start_time}` pairs to stop together with per-target results (alternative to `pid`). |
+| `tree` | `boolean` | no | `false` | Stop the process's descendants as well (only valid with `pid`). |
+| `force` | `boolean` | no | `false` | Stop at once instead of asking to exit first. |
 
 ### `sys.procs`
 
 Effect: `read`
 
-List the processes running on this machine, busiest first, with their id, parent, name, command line, user, CPU usage (percent of one core), memory in bytes and start time. `filter` keeps those whose name or command line contains it. Command lines are shown with secret-looking values (passwords, tokens, credentials in URLs) replaced by [redacted].
+List the processes running on this machine, busiest first, with their id, parent, name, command line, user, CPU usage (percent of one core), memory and graphics memory in bytes, start time, and whether the process is legion itself or an ancestor. `group` combines processes with the same name and user into one row. `filter` keeps those whose name or command line contains it. Command lines are shown with secret-looking values (passwords, tokens, credentials in URLs) replaced by [redacted].
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `filter` | `string` | no | - | Keep only processes whose name or command line contains this, ignoring case. |
-| `sort` | `string` | no | - | What the busiest are measured by: `cpu` (the default) or `memory`. `cpu`: CPU usage, highest first. `memory`: Memory, largest first. Allowed values: `cpu`, `memory`. |
-| `limit` | `integer` | no | - | How many processes to return, 1 to 500; 30 when absent. Minimum: 0. |
+| `sort` | `string` | no | - | What the busiest are measured by: `cpu` (the default), `memory`, or `gpu_memory`. `cpu`: CPU usage, highest first. `memory`: Memory, largest first. `gpu_memory`: Graphics memory, largest first. Allowed values: `cpu`, `memory`, `gpu_memory`. |
+| `limit` | `integer` | no | - | How many rows to return, 1 to 500; 30 when absent. Minimum: 0. |
+| `group` | `boolean` | no | `false` | Combine processes with the same name and user into one row per program. |
 
 ## token
 
