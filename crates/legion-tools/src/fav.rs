@@ -11,14 +11,11 @@
 //! owner-only restrictions. Every incoming file is strictly validated and size-bounded on receipt,
 //! and `fav.list` omits entries outside the caller's `paths`.
 
-use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap};
-use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use legion_core::config::{Document, parse, write_atomically};
@@ -37,8 +34,11 @@ use crate::device::registry::{FleetPushOutcome, fleet_peer_names};
 /// Schema version of `favorites.toml`.
 pub const FAVORITES_VERSION: u32 = 1;
 
-/// Maximum serialized size of `favorites.toml` accepted from any peer or written locally (1 MiB).
-pub const MAX_FAVORITES_BYTES: usize = 1024 * 1024;
+/// Maximum serialized size of `favorites.toml` accepted from any peer or written locally (4 MiB).
+///
+/// Sized to comfortably hold [`MAX_RECEIVED_LIVE_FAVORITES`] live entries together with
+/// [`MAX_RECEIVED_TOMBSTONES`] compact tombstones so the entry, tombstone, and byte caps agree.
+pub const MAX_FAVORITES_BYTES: usize = 4 * 1024 * 1024;
 
 /// Maximum number of live favourite entries a person may add locally with `fav.add`.
 pub const MAX_LOCAL_LIVE_FAVORITES: usize = 1000;
@@ -47,10 +47,10 @@ pub const MAX_LOCAL_LIVE_FAVORITES: usize = 1000;
 pub const MAX_LIVE_FAVORITES: usize = MAX_LOCAL_LIVE_FAVORITES;
 
 /// Maximum number of live favourite entries accepted when receiving or merging `favorites.toml`.
-pub const MAX_RECEIVED_LIVE_FAVORITES: usize = 4096;
+pub const MAX_RECEIVED_LIVE_FAVORITES: usize = 2000;
 
 /// Maximum number of tombstone records accepted when receiving or merging `favorites.toml`.
-pub const MAX_RECEIVED_TOMBSTONES: usize = 16384;
+pub const MAX_RECEIVED_TOMBSTONES: usize = 4000;
 
 /// Alias for [`MAX_RECEIVED_TOMBSTONES`].
 pub const MAX_REMOVED_FAVORITES: usize = MAX_RECEIVED_TOMBSTONES;
@@ -78,9 +78,6 @@ const FAV_PUSH_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Maximum time to wait for `<state_dir>/sync/favorites.lock`.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Monotonic counter mixed into generated favourite IDs.
-static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Registers `fav.list`, `fav.add`, `fav.set`, `fav.remove` and `favorites.toml`.
 pub fn register(registry: &mut Registry) {
@@ -186,7 +183,10 @@ pub struct FavoriteRecord {
     pub pinned_updated_on: String,
 }
 
-/// Stamped tombstone stored under `[removed.<id>]` in `favorites.toml`.
+/// Compact stamped tombstone stored under `[removed.<id>]` in `favorites.toml`.
+///
+/// Carries only the removal timestamp and writing node (never paths, labels, or embedded entries)
+/// so removed favourites leave no private metadata behind and tombstones stay compact.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FavoriteTombstone {
@@ -194,10 +194,6 @@ pub struct FavoriteTombstone {
     pub removed_at: String,
     /// Node that recorded the removal.
     pub removed_on: String,
-    /// Last-known field registers (`base`, `label`, `pinned`) carried with this removal so merging
-    /// a removal with concurrent field edits across any order stays strictly associative.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub entry: Option<FavoriteRecord>,
 }
 
 impl Document for FavoritesFile {
@@ -237,9 +233,6 @@ impl Document for FavoritesFile {
                 .map_err(|reason| format!("removed {id:?}: removed_at: {reason}"))?;
             validate_node_stamp(&tomb.removed_on)
                 .map_err(|reason| format!("removed {id:?}: removed_on: {reason}"))?;
-            if let Some(ref entry) = tomb.entry {
-                validate_record(id, entry)?;
-            }
         }
         Ok(())
     }
@@ -314,9 +307,6 @@ impl FavoritesFile {
                 let mut t = Table::new();
                 t["removed_at"] = value(tomb.removed_at.as_str());
                 t["removed_on"] = value(tomb.removed_on.as_str());
-                if let Some(ref rec) = tomb.entry {
-                    t.insert("entry", Item::Table(record_to_toml_table(rec)));
-                }
                 removed_table.insert(id, Item::Table(t));
             }
             doc.insert("removed", Item::Table(removed_table));
@@ -344,24 +334,21 @@ pub fn parse_favorites_bytes(path: &Path, bytes: &[u8]) -> Result<FavoritesFile,
     parse::<FavoritesFile>(path, bytes)
 }
 
-/// Merges two `favorites.toml` documents as a pure join-semilattice of independent
-/// last-writer-wins registers with zero trimming during merge.
+/// Merges two `favorites.toml` documents as a pure join-semilattice with compact tombstones and
+/// zero trimming during merge.
 ///
-/// Each favourite `id` is a tuple of independent LWW registers compared by one total order
-/// `(timestamp_nanos, timestamp_rfc3339, writing_node)`:
-/// - **existence** (`present` vs `removed`, breaking exact stamp ties in favour of `removed`): a
-///   removal whose stamp is newer than every edit wins, while an edit whose stamp is newer than a
-///   removal wins like any other write;
-/// - **base** (`added_at`, `added_by`, `machine`, `path`, `kind`);
-/// - **label** (`label_updated_at`, `label_updated_on`, `label`);
-/// - **pinned** (`pinned_updated_at`, `pinned_updated_on`, `pinned`).
+/// Each favourite `id` is ordered first by its **incarnation** `(stamp, is_removed)` (where a live
+/// entry's incarnation stamp is `(added_at, added_by)` and a tombstone's is `(removed_at,
+/// removed_on)`, breaking exact timestamp ties in favour of `removed`):
+/// - A strictly newer incarnation (a removal newer than an add, or a re-add newer than a removal)
+///   replaces the older incarnation completely, so tombstones need not store any entry fields.
+/// - Two live copies of the **same** incarnation merge their `base`, `label`, `pinned`, and
+///   `updated` registers independently by per-field LWW total order, preserving concurrent edits
+///   to different fields made while offline.
 ///
-/// Merging takes the per-register maximum across all four registers (preserving last-known field
-/// registers on tombstones so concurrent edits and removals commute and associate regardless of
-/// merge order). Commutativity, associativity, and idempotence hold by construction for all
-/// inputs. Limits are never enforced by trimming inside merge: creation tools enforce entry caps,
-/// [`prune_expired_tombstones`] drops removals older than 90 days relative to the document's own
-/// newest stamp, and oversized received documents are refused whole.
+/// Because incarnations form a total order and equal-incarnation merges are per-field joins,
+/// commutativity, associativity, and idempotence hold for all inputs without embedding removed
+/// paths or labels in tombstones.
 pub fn merge_favorites(a: &FavoritesFile, b: &FavoritesFile) -> FavoritesFile {
     let mut all_ids = std::collections::BTreeSet::new();
     for id in a
@@ -381,35 +368,21 @@ pub fn merge_favorites(a: &FavoritesFile, b: &FavoritesFile) -> FavoritesFile {
     };
 
     for id in all_ids {
-        let state_a = register_state(a, id);
-        let state_b = register_state(b, id);
+        let state_a = incarnation_state(a, id);
+        let state_b = incarnation_state(b, id);
         let merged = match (state_a, state_b) {
-            (Some(sa), Some(sb)) => merge_register_state(sa, sb),
+            (Some(sa), Some(sb)) => merge_incarnation(sa, sb),
             (Some(sa), None) => sa,
             (None, Some(sb)) => sb,
             (None, None) => continue,
         };
-        if merged.is_removed {
-            let entry = merged.fields.map(|mut rec| {
-                // Normalize `updated_at`/`updated_on` on a tombstone's preserved field record to
-                // the tombstone's own stamp so repeated merges are strictly canonical and
-                // idempotent.
-                rec.updated_at = merged.existence_at.clone();
-                rec.updated_on = merged.existence_on.clone();
-                rec
-            });
-            out.removed.insert(
-                id.to_owned(),
-                FavoriteTombstone {
-                    removed_at: merged.existence_at,
-                    removed_on: merged.existence_on,
-                    entry,
-                },
-            );
-        } else if let Some(mut rec) = merged.fields {
-            rec.updated_at = merged.existence_at;
-            rec.updated_on = merged.existence_on;
-            out.entries.insert(id.to_owned(), rec);
+        match merged {
+            Incarnation::Live(rec) => {
+                out.entries.insert(id.to_owned(), rec);
+            }
+            Incarnation::Removed(tomb) => {
+                out.removed.insert(id.to_owned(), tomb);
+            }
         }
     }
 
@@ -417,52 +390,39 @@ pub fn merge_favorites(a: &FavoritesFile, b: &FavoritesFile) -> FavoritesFile {
 }
 
 #[derive(Clone, Debug)]
-struct RegisterState {
-    existence_at: String,
-    existence_on: String,
-    is_removed: bool,
-    fields: Option<FavoriteRecord>,
+enum Incarnation {
+    Live(FavoriteRecord),
+    Removed(FavoriteTombstone),
 }
 
-fn register_state(file: &FavoritesFile, id: &str) -> Option<RegisterState> {
+fn incarnation_state(file: &FavoritesFile, id: &str) -> Option<Incarnation> {
     if let Some(rec) = file.entries.get(id) {
-        Some(RegisterState {
-            existence_at: rec.updated_at.clone(),
-            existence_on: rec.updated_on.clone(),
-            is_removed: false,
-            fields: Some(rec.clone()),
-        })
+        Some(Incarnation::Live(rec.clone()))
     } else {
-        file.removed.get(id).map(|tomb| RegisterState {
-            existence_at: tomb.removed_at.clone(),
-            existence_on: tomb.removed_on.clone(),
-            is_removed: true,
-            fields: tomb.entry.clone(),
-        })
+        file.removed.get(id).cloned().map(Incarnation::Removed)
     }
 }
 
-fn existence_key(s: &RegisterState) -> ((i128, &str, &str), bool) {
-    (stamp_key(&s.existence_at, &s.existence_on), s.is_removed)
+fn incarnation_key(s: &Incarnation) -> ((i128, &str, &str), bool) {
+    match s {
+        Incarnation::Live(rec) => (stamp_key(&rec.added_at, &rec.added_by), false),
+        Incarnation::Removed(tomb) => (stamp_key(&tomb.removed_at, &tomb.removed_on), true),
+    }
 }
 
-fn merge_register_state(a: RegisterState, b: RegisterState) -> RegisterState {
-    let fields = match (&a.fields, &b.fields) {
-        (Some(fa), Some(fb)) => Some(merge_record_fields(fa, fb)),
-        (Some(fa), None) => Some(fa.clone()),
-        (None, Some(fb)) => Some(fb.clone()),
-        (None, None) => None,
-    };
-    let (existence_at, existence_on, is_removed) = if existence_key(&a) >= existence_key(&b) {
-        (a.existence_at, a.existence_on, a.is_removed)
-    } else {
-        (b.existence_at, b.existence_on, b.is_removed)
-    };
-    RegisterState {
-        existence_at,
-        existence_on,
-        is_removed,
-        fields,
+fn merge_incarnation(a: Incarnation, b: Incarnation) -> Incarnation {
+    match incarnation_key(&a).cmp(&incarnation_key(&b)) {
+        std::cmp::Ordering::Greater => a,
+        std::cmp::Ordering::Less => b,
+        std::cmp::Ordering::Equal => match (a, b) {
+            (Incarnation::Live(ra), Incarnation::Live(rb)) => {
+                Incarnation::Live(merge_record_fields(&ra, &rb))
+            }
+            (Incarnation::Removed(ta), Incarnation::Removed(_)) => Incarnation::Removed(ta),
+            // Impossible because `is_removed` is part of the total key.
+            (Incarnation::Removed(t), Incarnation::Live(_))
+            | (Incarnation::Live(_), Incarnation::Removed(t)) => Incarnation::Removed(t),
+        },
     }
 }
 
@@ -510,13 +470,7 @@ pub fn sanitize_received_favorites(
     }
 
     for (id, tomb) in &incoming.removed {
-        let future_entry = tomb.entry.as_ref().is_some_and(|e| {
-            is_future(&e.added_at)
-                || is_future(&e.updated_at)
-                || is_future(&e.label_updated_at)
-                || is_future(&e.pinned_updated_at)
-        });
-        if is_future(&tomb.removed_at) || future_entry {
+        if is_future(&tomb.removed_at) {
             if warnings.len() < MAX_INDIVIDUAL_FUTURE_WARNINGS {
                 warnings.push(format!(
                     "Skipped favourite removal tombstone {id}: timestamp is more than 24 hours in the future."
@@ -569,9 +523,17 @@ fn merge_record_fields(a: &FavoriteRecord, b: &FavoriteRecord) -> FavoriteRecord
             r.pinned,
         )
     }
+    fn updated_key(r: &FavoriteRecord) -> (i128, &str, &str) {
+        stamp_key(&r.updated_at, &r.updated_on)
+    }
     let base = if base_key(a) >= base_key(b) { a } else { b };
     let label_src = if label_key(a) >= label_key(b) { a } else { b };
     let pinned_src = if pinned_key(a) >= pinned_key(b) { a } else { b };
+    let updated_src = if updated_key(a) >= updated_key(b) {
+        a
+    } else {
+        b
+    };
 
     FavoriteRecord {
         machine: base.machine.clone(),
@@ -581,8 +543,8 @@ fn merge_record_fields(a: &FavoriteRecord, b: &FavoriteRecord) -> FavoriteRecord
         pinned: pinned_src.pinned,
         added_at: base.added_at.clone(),
         added_by: base.added_by.clone(),
-        updated_at: base.updated_at.clone(),
-        updated_on: base.updated_on.clone(),
+        updated_at: updated_src.updated_at.clone(),
+        updated_on: updated_src.updated_on.clone(),
         label_updated_at: label_src.label_updated_at.clone(),
         label_updated_on: label_src.label_updated_on.clone(),
         pinned_updated_at: pinned_src.pinned_updated_at.clone(),
@@ -609,12 +571,6 @@ pub fn newest_document_stamp_nanos(file: &FavoritesFile) -> Option<i128> {
     }
     for tomb in file.removed.values() {
         consider(&tomb.removed_at);
-        if let Some(ref rec) = tomb.entry {
-            consider(&rec.added_at);
-            consider(&rec.updated_at);
-            consider(&rec.label_updated_at);
-            consider(&rec.pinned_updated_at);
-        }
     }
     newest
 }
@@ -1252,12 +1208,17 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
         let floor = build_time_floor();
         prune_expired_tombstones(&mut file);
 
-        // Idempotent add: if `(machine, path)` is already live, update label/pinned stamps in place.
-        let existing_id = file
-            .entries
-            .iter()
-            .find(|(_, rec)| rec.machine == machine && rec.path == stored_path)
-            .map(|(id, _)| id.clone());
+        // Deterministic target-derived id: two offline machines starring the same `(machine, path)`
+        // produce the exact same id and converge to one entry on sync.
+        let derived_id = favorite_id(&machine, &stored_path);
+        let existing_id = if file.entries.contains_key(&derived_id) {
+            Some(derived_id.clone())
+        } else {
+            file.entries
+                .iter()
+                .find(|(_, rec)| rec.machine == machine && rec.path == stored_path)
+                .map(|(id, _)| id.clone())
+        };
 
         let (id, record, existing) = if let Some(existing_id) = existing_id {
             let rec = file.entries.get_mut(&existing_id).ok_or_else(|| {
@@ -1287,8 +1248,11 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
                 )
                 .with_hint("Run `fav.remove` to remove favourites you no longer need."));
             }
-            let id = generate_fav_id(&file);
-            let stamp = format_timestamp(effective_stamp(now, None, floor));
+            let prev_removed_at = file
+                .removed
+                .remove(&derived_id)
+                .map(|tomb| tomb.removed_at);
+            let stamp = format_timestamp(effective_stamp(now, prev_removed_at.as_deref(), floor));
             let record = FavoriteRecord {
                 machine,
                 path: stored_path,
@@ -1304,8 +1268,8 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
                 pinned_updated_at: stamp,
                 pinned_updated_on: node_name,
             };
-            file.entries.insert(id.clone(), record.clone());
-            (id, record, false)
+            file.entries.insert(derived_id.clone(), record.clone());
+            (derived_id, record, false)
         };
 
         file.validate().map_err(|reason| {
@@ -1525,16 +1489,13 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<RemoveResult, ToolError> 
         let floor = build_time_floor();
         prune_expired_tombstones(&mut file);
 
-        if let Some(mut prev) = file.entries.remove(&id) {
+        if let Some(prev) = file.entries.remove(&id) {
             let stamp = format_timestamp(effective_stamp(now, Some(&prev.updated_at), floor));
-            prev.updated_at = stamp.clone();
-            prev.updated_on = node_name.clone();
             file.removed.insert(
                 id,
                 FavoriteTombstone {
                     removed_at: stamp,
                     removed_on: node_name,
-                    entry: Some(prev),
                 },
             );
             let canonical = file.to_toml_string();
@@ -1844,36 +1805,82 @@ pub fn effective_stamp(now: Timestamp, prev: Option<&str>, build_floor: Timestam
     chosen
 }
 
-fn generate_fav_id(file: &FavoritesFile) -> String {
-    for _ in 0..64 {
-        let since_epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        let nanos = u64::try_from(since_epoch.as_nanos()).unwrap_or(u64::MAX);
-        let seq = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u64(nanos);
-        hasher.write_u64(seq);
-        hasher.write_u32(pid);
-        let a = hasher.finish();
-        let b = RandomState::new().build_hasher().finish();
-        let mut material = [0u8; 32];
-        material[0..8].copy_from_slice(&nanos.to_be_bytes());
-        material[8..16].copy_from_slice(&seq.to_be_bytes());
-        material[16..24].copy_from_slice(&a.to_be_bytes());
-        material[24..32].copy_from_slice(&b.to_be_bytes());
-        let digest = blake3::hash(&material);
-        let mut id = String::with_capacity(24);
-        for byte in &digest.as_bytes()[..12] {
-            use std::fmt::Write as _;
-            let _ = write!(id, "{byte:02x}");
-        }
-        if !file.entries.contains_key(&id) && !file.removed.contains_key(&id) {
-            return id;
-        }
+/// Normalizes a favourite path for deterministic ID derivation without altering the verbatim
+/// stored path string.
+///
+/// Strips redundant trailing path separators (preserving roots like `/`, `~`, `C:/`), collapses
+/// repeated separators, and normalizes Windows separators and drive/UNC host case.
+fn normalize_path_for_id(path: &str) -> String {
+    if path == "~" {
+        return "~".to_owned();
     }
-    format!("fav-{}", ID_COUNTER.fetch_add(1, Ordering::Relaxed))
+    if is_windows_unc_path(path) {
+        let rest = path.strip_prefix("\\\\").unwrap_or(path);
+        let mut parts = rest
+            .split(['\\', '/'])
+            .filter(|s| !s.is_empty() && *s != ".");
+        let server = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let share = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let mut out = format!("//{server}/{share}");
+        for seg in parts {
+            out.push('/');
+            out.push_str(&seg.to_ascii_lowercase());
+        }
+        return out;
+    }
+    if is_windows_drive_path(path) {
+        let drive = (path.as_bytes()[0] as char).to_ascii_lowercase();
+        let segs: Vec<String> = path[3..]
+            .split(['\\', '/'])
+            .filter(|s| !s.is_empty() && *s != ".")
+            .map(str::to_ascii_lowercase)
+            .collect();
+        if segs.is_empty() {
+            return format!("{drive}:/");
+        }
+        return format!("{drive}:/{}", segs.join("/"));
+    }
+    if let Some(rest) = path.strip_prefix("~\\").or_else(|| path.strip_prefix("~/")) {
+        let is_win = path.starts_with("~\\");
+        let segs: Vec<&str> = if is_win {
+            rest.split(['\\', '/'])
+                .filter(|s| !s.is_empty() && *s != ".")
+                .collect()
+        } else {
+            rest.split('/')
+                .filter(|s| !s.is_empty() && *s != ".")
+                .collect()
+        };
+        if segs.is_empty() {
+            return "~".to_owned();
+        }
+        return format!("~/{}", segs.join("/"));
+    }
+    if let Some(rest) = path.strip_prefix('/') {
+        let segs: Vec<&str> = rest
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != ".")
+            .collect();
+        if segs.is_empty() {
+            return "/".to_owned();
+        }
+        return format!("/{}", segs.join("/"));
+    }
+    path.to_owned()
+}
+
+/// Derives the deterministic favourite identifier for `(machine, path)` as a shortened BLAKE3 digest
+/// (`fav-<16 hex>`), so two offline machines starring the same target converge to one entry.
+pub fn favorite_id(machine: &str, path: &str) -> String {
+    let normalized = normalize_path_for_id(path);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"legion-fav-v1\0");
+    hasher.update(machine.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(normalized.as_bytes());
+    let digest = hasher.finalize();
+    let hex = digest.to_hex();
+    format!("fav-{}", &hex[..16])
 }
 
 fn validate_id(id: &str) -> Result<(), String> {
@@ -2259,35 +2266,11 @@ mod tests {
                 1 => {
                     let removed_at = random_ts(rng);
                     let removed_on = NODES[rng.gen_range(NODES.len())].to_owned();
-                    let entry = if rng.gen_bool() {
-                        Some(FavoriteRecord {
-                            machine: NODES[rng.gen_range(NODES.len())].to_owned(),
-                            path: format!("/srv/media/{id}.mp4"),
-                            kind: if rng.gen_bool() {
-                                FavoriteKind::File
-                            } else {
-                                FavoriteKind::Dir
-                            },
-                            label: LABELS[rng.gen_range(LABELS.len())].map(str::to_owned),
-                            pinned: rng.gen_bool(),
-                            added_at: random_ts(rng),
-                            added_by: "owner".to_owned(),
-                            updated_at: removed_at.clone(),
-                            updated_on: removed_on.clone(),
-                            label_updated_at: random_ts(rng),
-                            label_updated_on: NODES[rng.gen_range(NODES.len())].to_owned(),
-                            pinned_updated_at: random_ts(rng),
-                            pinned_updated_on: NODES[rng.gen_range(NODES.len())].to_owned(),
-                        })
-                    } else {
-                        None
-                    };
                     file.removed.insert(
                         id.to_owned(),
                         FavoriteTombstone {
                             removed_at,
                             removed_on,
-                            entry,
                         },
                     );
                 }
@@ -2429,7 +2412,6 @@ mod tests {
             FavoriteTombstone {
                 removed_at: format_timestamp(kept_ts),
                 removed_on: "tower".to_owned(),
-                entry: None,
             },
         );
         file.removed.insert(
@@ -2437,7 +2419,6 @@ mod tests {
             FavoriteTombstone {
                 removed_at: format_timestamp(expired_ts),
                 removed_on: "tower".to_owned(),
-                entry: None,
             },
         );
 
@@ -2671,14 +2652,13 @@ paths = [{:?}]
                 sample_record(&format!("b-{i:04}"), "2026-11-01T00:00:01.000Z", "pi"),
             );
         }
-        // Add 2500 tombstones across the two documents (above the old 2000 cap).
+        // Add 2600 compact tombstones across the two documents.
         for i in 0..1300 {
             a.removed.insert(
                 format!("ra-{i:04}"),
                 FavoriteTombstone {
                     removed_at: "2026-11-02T00:00:00.000Z".to_owned(),
                     removed_on: "tower".to_owned(),
-                    entry: None,
                 },
             );
             b.removed.insert(
@@ -2686,7 +2666,6 @@ paths = [{:?}]
                 FavoriteTombstone {
                     removed_at: "2026-11-02T00:00:01.000Z".to_owned(),
                     removed_on: "pi".to_owned(),
-                    entry: None,
                 },
             );
         }
@@ -2709,16 +2688,146 @@ paths = [{:?}]
     }
 
     #[test]
+    fn max_capacity_document_serializes_validates_and_merges_within_byte_limit() {
+        // Construct two documents whose merge hits the exact maximum live entries AND maximum
+        // compact tombstones simultaneously, proving MAX_FAVORITES_BYTES agrees with both caps.
+        let mut a = FavoritesFile::default();
+        let mut b = FavoritesFile::default();
+        let half_live = MAX_RECEIVED_LIVE_FAVORITES / 2;
+        let half_tomb = MAX_RECEIVED_TOMBSTONES / 2;
+        for i in 0..half_live {
+            let path_a = format!("/srv/media/library/collection-{i:04}/item.mp4");
+            let id_a = favorite_id("tower", &path_a);
+            let mut rec_a = sample_record(&id_a, "2026-11-01T00:00:00.000Z", "tower");
+            rec_a.path = path_a;
+            rec_a.label = Some(format!("Tower Item {i:04}"));
+            a.entries.insert(id_a, rec_a);
+
+            let path_b = format!("/srv/media/backup/collection-{i:04}/item.mp4");
+            let id_b = favorite_id("pi", &path_b);
+            let mut rec_b = sample_record(&id_b, "2026-11-01T00:00:01.000Z", "pi");
+            rec_b.path = path_b;
+            rec_b.label = Some(format!("Pi Item {i:04}"));
+            b.entries.insert(id_b, rec_b);
+        }
+        for i in 0..half_tomb {
+            let id_a = favorite_id("tower", &format!("/srv/old/a-{i:04}.txt"));
+            a.removed.insert(
+                id_a,
+                FavoriteTombstone {
+                    removed_at: "2026-11-02T00:00:00.000Z".to_owned(),
+                    removed_on: "tower".to_owned(),
+                },
+            );
+            let id_b = favorite_id("pi", &format!("/srv/old/b-{i:04}.txt"));
+            b.removed.insert(
+                id_b,
+                FavoriteTombstone {
+                    removed_at: "2026-11-02T00:00:01.000Z".to_owned(),
+                    removed_on: "pi".to_owned(),
+                },
+            );
+        }
+        let merged = merge_favorites(&a, &b);
+        assert_eq!(merged.entries.len(), MAX_RECEIVED_LIVE_FAVORITES);
+        assert_eq!(merged.removed.len(), MAX_RECEIVED_TOMBSTONES);
+        merged.validate().unwrap();
+        let encoded = merged.to_toml_string();
+        assert!(
+            encoded.len() <= MAX_FAVORITES_BYTES,
+            "max-capacity document ({} bytes) must fit within MAX_FAVORITES_BYTES ({MAX_FAVORITES_BYTES})",
+            encoded.len()
+        );
+        // Tombstones carry no paths or labels.
+        assert!(!encoded.contains("/srv/old/"));
+        let decoded = parse_favorites_bytes(Path::new("favorites.toml"), encoded.as_bytes())
+            .expect("max-capacity document must parse within MAX_FAVORITES_BYTES");
+        assert_eq!(decoded, merged);
+    }
+
+    #[tokio::test]
+    async fn offline_nodes_starring_same_target_converge_to_single_entry_and_readd_returns_existing()
+     {
+        let tmp_a = tempfile::tempdir().unwrap();
+        let tmp_b = tempfile::tempdir().unwrap();
+        let paths_a = Paths::under(tmp_a.path().join("home"));
+        let paths_b = Paths::under(tmp_b.path().join("home"));
+        for (paths, name) in [(&paths_a, "tower"), (&paths_b, "pi")] {
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            std::fs::write(
+                paths.config_file("node.toml"),
+                format!("name = \"{name}\"\n"),
+            )
+            .unwrap();
+        }
+        let mut reg_a = Registry::new();
+        register(&mut reg_a);
+        let node_a = Node::new(paths_a.clone(), reg_a);
+        let mut reg_b = Registry::new();
+        register(&mut reg_b);
+        let node_b = Node::new(paths_b.clone(), reg_b);
+
+        // Both nodes star the exact same target while completely offline (even with trailing slash
+        // difference on a directory path).
+        let add_a = node_a
+            .call(Call::new(
+                Door::Cli,
+                "fav.add",
+                json!({ "machine": "nas", "path": "/srv/photos/", "label": "Photos A" }),
+            ))
+            .await
+            .unwrap();
+        let add_b = node_b
+            .call(Call::new(
+                Door::Cli,
+                "fav.add",
+                json!({ "machine": "nas", "path": "/srv/photos", "label": "Photos B", "pinned": true }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            add_a["entry"]["id"], add_b["entry"]["id"],
+            "offline nodes starring the same target must derive the exact same id"
+        );
+        assert_eq!(
+            add_a["entry"]["id"],
+            json!(favorite_id("nas", "/srv/photos"))
+        );
+
+        let doc_a = load_favorites(&paths_a).unwrap();
+        let doc_b = load_favorites(&paths_b).unwrap();
+        let merged = merge_favorites(&doc_a, &doc_b);
+        assert_eq!(merged, merge_favorites(&doc_b, &doc_a));
+        assert_eq!(
+            merged.entries.len(),
+            1,
+            "merging offline stars of the same target must converge to a single entry"
+        );
+
+        // Adding the already-starred target again returns the existing entry (`existing: true`).
+        let again = node_a
+            .call(Call::new(
+                Door::Cli,
+                "fav.add",
+                json!({ "machine": "nas", "path": "/srv/photos" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(again["existing"], json!(true));
+        assert_eq!(again["entry"]["id"], add_a["entry"]["id"]);
+    }
+
+    #[test]
     fn oversized_received_document_is_refused_whole_and_never_trimmed() {
         let mut huge = FavoritesFile::default();
-        // Build enough live entries to exceed `MAX_FAVORITES_BYTES` (1 MiB) cleanly.
+        // Build enough live entries with long paths to exceed `MAX_FAVORITES_BYTES` (4 MiB) cleanly.
         let long_label = "x".repeat(MAX_LABEL_CHARS);
-        for i in 0..2_600 {
-            let mut rec =
-                sample_record(&format!("big-{i:05}"), "2026-11-25T00:00:00.000Z", "tower");
-            rec.path = format!("/srv/archive/project-{i:05}/{}", "segment/".repeat(25));
+        for i in 0..1_900 {
+            let id = favorite_id("tower", &format!("/srv/archive/big-{i:05}"));
+            let mut rec = sample_record(&id, "2026-11-25T00:00:00.000Z", "tower");
+            rec.path = format!("/srv/archive/project-{i:05}/{}", "segment/".repeat(260));
             rec.label = Some(long_label.clone());
-            huge.entries.insert(format!("big-{i:05}"), rec);
+            huge.entries.insert(id, rec);
         }
         let encoded = huge.to_toml_string();
         assert!(
@@ -2741,15 +2850,17 @@ paths = [{:?}]
         // edit pin, remove, and merge across 1,000 random trials (plus the exact concurrent
         // remove-at-t=10 vs edit-at-t=20 scenario that previously broke associativity).
         const NODES: [&str; 4] = ["tower", "pi", "nas", "laptop"];
-        const IDS: [&str; 12] = [
-            "f00", "f01", "f02", "f03", "f04", "f05", "f06", "f07", "f08", "f09", "f10", "f11",
-        ];
+        let ids: Vec<String> = (0..12)
+            .map(|i| favorite_id(NODES[i % NODES.len()], &format!("/srv/items/f{i:02}.bin")))
+            .collect();
         const LABELS: [Option<&str>; 4] = [None, Some("Alpha"), Some("Beta"), Some("Gamma")];
         let base_ts: Timestamp = "2026-06-01T00:00:00.000Z".parse().unwrap();
 
-        // 1. Concrete regression: node A edits X at t=20 without seeing node B's removal at t=10,
+        // 1. Concrete regression: node A re-adds X at t=20 after node B's removal at t=10,
         //    merged with node C holding unrelated entries. Both merge orders must match identically
         //    and keep X live (since t=20 > t=10).
+        let x_id = favorite_id("tower", "/srv/files/X.txt");
+        let y_id = favorite_id("nas", "/srv/files/Y.txt");
         let a_live = {
             let mut f = FavoritesFile::default();
             let mut rec = sample_record("X", "2026-11-01T00:00:20.000Z", "tower");
@@ -2757,46 +2868,45 @@ paths = [{:?}]
             rec.label_updated_at = "2026-11-01T00:00:20.000Z".to_owned();
             rec.pinned = true;
             rec.pinned_updated_at = "2026-11-01T00:00:15.000Z".to_owned();
-            f.entries.insert("X".to_owned(), rec);
+            f.entries.insert(x_id.clone(), rec);
             f
         };
         let b_removed = {
             let mut f = FavoritesFile::default();
             f.removed.insert(
-                "X".to_owned(),
+                x_id.clone(),
                 FavoriteTombstone {
                     removed_at: "2026-11-01T00:00:10.000Z".to_owned(),
                     removed_on: "pi".to_owned(),
-                    entry: None,
                 },
             );
             f
         };
         let c_other = {
             let mut f = FavoritesFile::default();
-            f.entries.insert(
-                "Y".to_owned(),
-                sample_record("Y", "2026-11-01T00:00:15.000Z", "nas"),
-            );
+            f.entries
+                .insert(y_id, sample_record("Y", "2026-11-01T00:00:15.000Z", "nas"));
             f
         };
         let left = merge_favorites(&merge_favorites(&a_live, &b_removed), &c_other);
         let right = merge_favorites(&a_live, &merge_favorites(&b_removed, &c_other));
         assert_eq!(left, right);
-        assert!(left.entries.contains_key("X"));
-        assert!(!left.removed.contains_key("X"));
-        assert_eq!(left.entries["X"].label.as_deref(), Some("Edited"));
-        assert!(left.entries["X"].pinned);
+        assert!(left.entries.contains_key(&x_id));
+        assert!(!left.removed.contains_key(&x_id));
+        assert_eq!(left.entries[&x_id].label.as_deref(), Some("Edited"));
+        assert!(left.entries[&x_id].pinned);
 
-        // 2. Concrete associative check when A has an older live edit with a newer pinned flag
-        //    (t_exist=5, t_pin=15), B removes at t=10, and C edits at t=20 (t_pin=1).
+        // 2. Concrete associative check with compact 2-field tombstones: A has an older
+        //    incarnation (`added_at=5, pinned=true@15`), B removes at `t=10` (compact tombstone,
+        //    zero embedded fields), and C re-adds at `t=20` (`pinned=false@1`). Both merge orders
+        //    MUST agree identically (`c_new` wins as the newest incarnation).
         let a_old = {
             let mut f = FavoritesFile::default();
             let mut rec = sample_record("X", "2026-11-01T00:00:05.000Z", "tower");
             rec.pinned = true;
             rec.pinned_updated_at = "2026-11-01T00:00:15.000Z".to_owned();
             rec.pinned_updated_on = "tower".to_owned();
-            f.entries.insert("X".to_owned(), rec);
+            f.entries.insert(x_id.clone(), rec);
             f
         };
         let c_new = {
@@ -2805,13 +2915,13 @@ paths = [{:?}]
             rec.pinned = false;
             rec.pinned_updated_at = "2026-11-01T00:00:01.000Z".to_owned();
             rec.pinned_updated_on = "nas".to_owned();
-            f.entries.insert("X".to_owned(), rec);
+            f.entries.insert(x_id.clone(), rec);
             f
         };
         let assoc_l = merge_favorites(&merge_favorites(&a_old, &b_removed), &c_new);
         let assoc_r = merge_favorites(&a_old, &merge_favorites(&b_removed, &c_new));
         assert_eq!(assoc_l, assoc_r);
-        assert!(assoc_l.entries["X"].pinned);
+        assert!(!assoc_l.entries[&x_id].pinned);
 
         // 3. Random multi-node interleavings of add, edit label, edit pin, remove, and merge
         //    spanning > 120 days so the 90-day document-relative age rule is also exercised.
@@ -2824,7 +2934,7 @@ paths = [{:?}]
                 FavoritesFile::default(),
                 FavoritesFile::default(),
             ];
-            let mut max_edit_nanos: HashMap<&str, i128> = HashMap::new();
+            let mut max_add_nanos: HashMap<&str, i128> = HashMap::new();
             let mut max_remove_nanos: HashMap<&str, i128> = HashMap::new();
 
             // Each trial runs 24 operations across 4 nodes with timestamps spanning 0..140 days.
@@ -2832,7 +2942,7 @@ paths = [{:?}]
             for _step in 0..24 {
                 let node_idx = rng.gen_range(NODES.len());
                 let node = NODES[node_idx];
-                let id = IDS[rng.gen_range(IDS.len())];
+                let id = ids[rng.gen_range(ids.len())].as_str();
                 sec_cursor += i64::try_from(rng.gen_range(14)).unwrap() * 86_400
                     + 1
                     + i64::try_from(rng.gen_range(60)).unwrap();
@@ -2844,17 +2954,17 @@ paths = [{:?}]
 
                 match rng.gen_range(5) {
                     0 => {
-                        // add
+                        // add (new incarnation)
                         let rec = sample_record(id, &ts_str, node);
                         docs[node_idx].removed.remove(id);
                         docs[node_idx].entries.insert(id.to_owned(), rec);
-                        max_edit_nanos
+                        max_add_nanos
                             .entry(id)
                             .and_modify(|m| *m = (*m).max(ts_nanos))
                             .or_insert(ts_nanos);
                     }
                     1 => {
-                        // edit label
+                        // edit label (preserves incarnation `added_at`)
                         if let Some(rec) = docs[node_idx].entries.get_mut(id) {
                             let prev = rec.updated_at.parse::<Timestamp>().unwrap().as_nanosecond();
                             if ts_nanos > prev {
@@ -2863,15 +2973,11 @@ paths = [{:?}]
                                 rec.label_updated_on = node.to_owned();
                                 rec.updated_at = ts_str;
                                 rec.updated_on = node.to_owned();
-                                max_edit_nanos
-                                    .entry(id)
-                                    .and_modify(|m| *m = (*m).max(ts_nanos))
-                                    .or_insert(ts_nanos);
                             }
                         }
                     }
                     2 => {
-                        // edit pinned
+                        // edit pinned (preserves incarnation `added_at`)
                         if let Some(rec) = docs[node_idx].entries.get_mut(id) {
                             let prev = rec.updated_at.parse::<Timestamp>().unwrap().as_nanosecond();
                             if ts_nanos > prev {
@@ -2880,26 +2986,17 @@ paths = [{:?}]
                                 rec.pinned_updated_on = node.to_owned();
                                 rec.updated_at = ts_str;
                                 rec.updated_on = node.to_owned();
-                                max_edit_nanos
-                                    .entry(id)
-                                    .and_modify(|m| *m = (*m).max(ts_nanos))
-                                    .or_insert(ts_nanos);
                             }
                         }
                     }
                     3 => {
-                        // remove
-                        let prev_entry = docs[node_idx].entries.remove(id).map(|mut r| {
-                            r.updated_at = ts_str.clone();
-                            r.updated_on = node.to_owned();
-                            r
-                        });
+                        // remove (compact 2-field tombstone)
+                        docs[node_idx].entries.remove(id);
                         docs[node_idx].removed.insert(
                             id.to_owned(),
                             FavoriteTombstone {
                                 removed_at: ts_str,
                                 removed_on: node.to_owned(),
-                                entry: prev_entry,
                             },
                         );
                         max_remove_nanos
@@ -2944,13 +3041,13 @@ paths = [{:?}]
                 "4-node convergence failed on trial {trial}"
             );
 
-            // Law: any removal strictly newer than every edit of that id is NEVER undone.
+            // Law: any removal strictly newer than every `add` of that id is NEVER undone.
             for (id, &rem_nanos) in &max_remove_nanos {
-                let newest_edit = max_edit_nanos.get(id).copied().unwrap_or(i128::MIN);
-                if rem_nanos > newest_edit {
+                let newest_add = max_add_nanos.get(id).copied().unwrap_or(i128::MIN);
+                if rem_nanos > newest_add {
                     assert!(
                         !all_fwd.entries.contains_key(*id) && all_fwd.removed.contains_key(*id),
-                        "removal newer than every edit was undone for {id} on trial {trial}"
+                        "removal newer than every add was undone for {id} on trial {trial}"
                     );
                 }
             }
@@ -3180,7 +3277,6 @@ target = "unknown_peer"
             FavoriteTombstone {
                 removed_at: valid_ts.to_owned(),
                 removed_on: "pi".to_owned(),
-                entry: None,
             },
         );
         incoming.removed.insert(
@@ -3188,7 +3284,6 @@ target = "unknown_peer"
             FavoriteTombstone {
                 removed_at: future_ts.to_owned(),
                 removed_on: "pi".to_owned(),
-                entry: None,
             },
         );
 
@@ -3245,7 +3340,6 @@ target = "unknown_peer"
                 FavoriteTombstone {
                     removed_at: now_str.clone(),
                     removed_on: "tower".to_owned(),
-                    entry: None,
                 },
             );
         }
@@ -3292,7 +3386,7 @@ target = "unknown_peer"
 
     #[tokio::test]
     async fn rapid_burst_of_favourite_edits_coalesces_pushes() {
-        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::under(tmp.path().join("home"));
