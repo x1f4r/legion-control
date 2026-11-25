@@ -1098,3 +1098,291 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('content URLs isolate HTML and SVG from the interface origin and allow <video> seeking', async () => {
+  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+  const sampleMp4 = path.join(TEST_DIR, 'fixtures', 'sample.mp4');
+  assert.ok(fs.existsSync(sampleMp4), `Sample MP4 fixture not found at ${sampleMp4}`);
+
+  const root = makeWorkRoot();
+  const fleet = setupFleet(root);
+  const docsDir = path.join(fleet.towerUser, 'docs');
+
+  // Craft adversarial HTML and SVG files that try to read localStorage (token), mutate storage,
+  // access window.parent, and postMessage back to the interface origin.
+  fs.writeFileSync(
+    path.join(docsDir, 'xss.html'),
+    [
+      '<!doctype html>',
+      '<html><body><script>',
+      'window.__xss = true;',
+      'try { localStorage.setItem("pwn_html", localStorage.getItem("legion.token") || "ran"); } catch (e) {}',
+      'try { window.parent.postMessage({ pwn: "html", token: localStorage.getItem("legion.token") }, "*"); } catch (e) {}',
+      'try { window.parent.__pwned_html = true; } catch (e) {}',
+      '</script><p>malicious html</p></body></html>',
+    ].join('\n'),
+  );
+  fs.writeFileSync(
+    path.join(docsDir, 'xss.svg'),
+    [
+      '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" onload="window.__xss=true;try{localStorage.setItem(\'pwn_svg\',\'1\')}catch(e){}try{window.parent.__pwned_svg=true}catch(e){}try{window.parent.postMessage({pwn:\'svg\'},\'*\')}catch(e){}">',
+      '<rect width="64" height="64" fill="#16a34a"/>',
+      '<script>window.__xss=true;try{localStorage.setItem("pwn_svg_script",localStorage.getItem("legion.token")||"ran")}catch(e){}try{window.parent.__pwned_svg=true}catch(e){}try{window.parent.postMessage({pwn:"svg-script"},"*")}catch(e){}</script>',
+      '</svg>',
+    ].join('\n'),
+  );
+  fs.copyFileSync(sampleMp4, path.join(docsDir, 'sample.mp4'));
+
+  const server = await startServer(fleet.towerHome, fleet.towerUser);
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+
+  const uiConsoleErrors = [];
+  const uiPageErrors = [];
+
+  try {
+    const ctx = await browser.newContext({
+      viewport: { width: 1100, height: 720 },
+      colorScheme: 'dark',
+    });
+
+    // 1. Connect the real Legion interface page so localStorage holds the live bearer token.
+    const uiPage = await ctx.newPage();
+    uiPage.on('console', (msg) => {
+      if (msg.type() === 'error') uiConsoleErrors.push(msg.text());
+    });
+    uiPage.on('pageerror', (err) => uiPageErrors.push(String(err)));
+
+    await uiPage.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await uiPage.getByText('2 are on').waitFor({ timeout: 15_000 });
+    const storedToken = await uiPage.evaluate(() => localStorage.getItem('legion.token'));
+    assert.equal(storedToken, fleet.token, 'expected live token in interface localStorage');
+
+    // Mint content URLs through the UI's own createHttpLink().contentUrl helper.
+    const urls = await uiPage.evaluate(async () => {
+      const { createHttpLink } = await import('/link/http.js');
+      const link = createHttpLink();
+      const [html, svg, video] = await Promise.all([
+        link.contentUrl({ path: '~/docs/xss.html' }),
+        link.contentUrl({ path: '~/docs/xss.svg' }),
+        link.contentUrl({ path: '~/docs/sample.mp4' }),
+      ]);
+      return { html, svg, video };
+    });
+    assert.match(urls.html.url, /^\/v1\/content\/[^/]+\/xss\.html$/);
+    assert.match(urls.svg.url, /^\/v1\/content\/[^/]+\/xss\.svg$/);
+    assert.match(urls.video.url, /^\/v1\/content\/[^/]+\/sample\.mp4$/);
+
+    // 2. Verify <video> seeking and <img> loading directly on the real Legion UI page
+    //    (proving the UI CSP's `img-src 'self'` and `media-src 'self'` allow them with zero errors).
+    const rangeStatuses = [];
+    uiPage.on('response', (res) => {
+      if (res.url().endsWith('/sample.mp4')) {
+        rangeStatuses.push(res.status());
+      }
+    });
+
+    const mediaResult = await uiPage.evaluate(async ({ videoUrl, svgUrl }) => {
+      const img = document.createElement('img');
+      img.src = svgUrl;
+      document.body.appendChild(img);
+      await new Promise((resolve, reject) => {
+        img.addEventListener('load', resolve, { once: true });
+        img.addEventListener('error', () => reject(new Error('img failed to load')), { once: true });
+      });
+
+      const video = document.createElement('video');
+      video.muted = true;
+      video.preload = 'auto';
+      video.src = videoUrl;
+      document.body.appendChild(video);
+
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('timed out waiting for loadeddata')), 10_000);
+        video.addEventListener(
+          'loadeddata',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+        video.addEventListener(
+          'error',
+          () => {
+            clearTimeout(timer);
+            reject(new Error(`video error code=${video.error?.code}`));
+          },
+          { once: true },
+        );
+      });
+
+      const initialDuration = video.duration;
+      const initialWidth = video.videoWidth;
+      const initialHeight = video.videoHeight;
+
+      const seekDone = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('timed out waiting for seeked')), 10_000);
+        video.addEventListener(
+          'seeked',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+        video.addEventListener(
+          'error',
+          () => {
+            clearTimeout(timer);
+            reject(new Error(`video seek error code=${video.error?.code}`));
+          },
+          { once: true },
+        );
+      });
+      video.currentTime = 1.5;
+      await seekDone;
+
+      return {
+        imgLoaded: img.complete && img.naturalWidth > 0,
+        duration: initialDuration,
+        width: initialWidth,
+        height: initialHeight,
+        currentTime: video.currentTime,
+        hasError: video.error !== null,
+      };
+    }, { videoUrl: urls.video.url, svgUrl: urls.svg.url });
+
+    assert.equal(mediaResult.imgLoaded, true, 'expected SVG <img> to load under UI CSP');
+    assert.ok(mediaResult.duration > 2.0, `expected >2s video duration, got ${mediaResult.duration}`);
+    assert.equal(mediaResult.width, 64);
+    assert.equal(mediaResult.height, 64);
+    assert.ok(
+      mediaResult.currentTime >= 1.2 && mediaResult.currentTime <= 2.0,
+      `expected seeked currentTime near 1.5, got ${mediaResult.currentTime}`,
+    );
+    assert.equal(mediaResult.hasError, false);
+    assert.ok(
+      rangeStatuses.includes(206),
+      `expected at least one 206 Partial Content response for MP4 video, got ${JSON.stringify(rangeStatuses)}`,
+    );
+
+    assert.deepEqual(uiPageErrors, [], `UI page errors during media test: ${uiPageErrors.join('\n')}`);
+    assert.deepEqual(uiConsoleErrors, [], `UI console/CSP errors during media test: ${uiConsoleErrors.join('\n')}`);
+
+    // 3. Top-level navigation to .html and .svg content URLs: neither may run script or reach
+    //    the interface's origin, storage, or token.
+    for (const [kind, relUrl, expectedType] of [
+      ['html', urls.html.url, 'text/plain; charset=utf-8'],
+      ['svg', urls.svg.url, 'image/svg+xml'],
+    ]) {
+      const navPage = await ctx.newPage();
+      const resp = await navPage.goto(`${server.url}${relUrl}`, { waitUntil: 'load' });
+      assert.equal(resp.status(), 200, `${kind} navigation status`);
+      assert.equal(resp.headers()['content-type'], expectedType, `${kind} content-type`);
+      assert.equal(
+        resp.headers()['content-security-policy'],
+        "sandbox; default-src 'none'",
+        `${kind} CSP must sandbox and forbid script`,
+      );
+      assert.equal(resp.headers()['x-content-type-options'], 'nosniff');
+      await navPage.waitForTimeout(150);
+
+      const probe = await navPage.evaluate(() => {
+        let storageBlocked = false;
+        let leakedToken = null;
+        try {
+          leakedToken = localStorage.getItem('legion.token');
+        } catch {
+          storageBlocked = true;
+        }
+        return {
+          origin: window.origin,
+          xssFlag: Boolean(window.__xss),
+          storageBlocked,
+          leakedToken,
+        };
+      });
+      assert.equal(probe.origin, 'null', `${kind} navigation must have opaque sandbox origin`);
+      assert.equal(probe.xssFlag, false, `${kind} navigation must not execute script`);
+      assert.equal(probe.storageBlocked, true, `${kind} navigation must be denied localStorage`);
+      assert.equal(probe.leakedToken, null, `${kind} navigation must never read token`);
+      await navPage.close();
+    }
+
+    // 4. Inside <iframe> on a same-origin host page (sharing the interface's origin and token):
+    //    serve a minimal same-origin host harness via Playwright route interception while letting
+    //    /v1/content/* hit the real `legion serve` server untouched.
+    const hostPage = await ctx.newPage();
+    await hostPage.route(`${server.url}/__test-iframe-host`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/html; charset=utf-8',
+        body: [
+          '<!doctype html><html><body>',
+          '<script>window.__messages = []; window.addEventListener("message", (e) => window.__messages.push(e.data));</script>',
+          `<iframe id="f-html" src="${urls.html.url}"></iframe>`,
+          `<iframe id="f-svg" src="${urls.svg.url}"></iframe>`,
+          '</body></html>',
+        ].join('\n'),
+      });
+    });
+
+    const iframeResponses = new Map();
+    hostPage.on('response', (res) => {
+      if (res.url().includes('/v1/content/')) {
+        iframeResponses.set(new URL(res.url()).pathname, res.status());
+      }
+    });
+
+    await hostPage.goto(`${server.url}/__test-iframe-host`, { waitUntil: 'load' });
+    await hostPage.waitForTimeout(200);
+
+    assert.equal(iframeResponses.get(urls.html.url), 200, 'HTML iframe must actually fetch from legion serve');
+    assert.equal(iframeResponses.get(urls.svg.url), 200, 'SVG iframe must actually fetch from legion serve');
+
+    const iframeCheck = await hostPage.evaluate(() => {
+      const checkIsolated = (id) => {
+        const frame = document.getElementById(id);
+        let domBlocked = false;
+        try {
+          // Reading contentDocument on a sandboxed same-origin URL without allow-same-origin
+          // throws SecurityError or returns null.
+          domBlocked = frame.contentDocument === null;
+        } catch {
+          domBlocked = true;
+        }
+        return domBlocked;
+      };
+      return {
+        htmlIsolated: checkIsolated('f-html'),
+        svgIsolated: checkIsolated('f-svg'),
+        pwnHtmlProp: Boolean(window.__pwned_html),
+        pwnSvgProp: Boolean(window.__pwned_svg),
+        messages: window.__messages,
+        storageKeys: Object.keys(localStorage),
+      };
+    });
+
+    assert.equal(iframeCheck.htmlIsolated, true, 'HTML iframe must be isolated from parent origin');
+    assert.equal(iframeCheck.svgIsolated, true, 'SVG iframe must be isolated from parent origin');
+    assert.equal(iframeCheck.pwnHtmlProp, false, 'HTML iframe must not mutate parent');
+    assert.equal(iframeCheck.pwnSvgProp, false, 'SVG iframe must not mutate parent');
+    assert.deepEqual(iframeCheck.messages, [], 'Sandboxed iframes must not run script or postMessage');
+    assert.ok(!iframeCheck.storageKeys.includes('pwn_html'), 'HTML must not write localStorage');
+    assert.ok(!iframeCheck.storageKeys.includes('pwn_svg'), 'SVG onload must not write localStorage');
+    assert.ok(!iframeCheck.storageKeys.includes('pwn_svg_script'), 'SVG script must not write localStorage');
+
+    await hostPage.close();
+    await ctx.close();
+  } finally {
+    await browser.close();
+    await server.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

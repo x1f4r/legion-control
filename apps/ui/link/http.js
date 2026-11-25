@@ -287,6 +287,87 @@ export function createHttpLink() {
     return nextState;
   }
 
+  async function contentUrl(options = {}) {
+    const { machine, path, download = false, signal } = options || {};
+    const current = token || readToken();
+    if (!current) {
+      throw {
+        code: 'denied',
+        message: 'This browser does not have a token yet.',
+        hint: 'Enter a token made with legion token.add.',
+        machine: null,
+        status: 401,
+      };
+    }
+    if (typeof path !== 'string' || path.trim() === '') {
+      throw {
+        code: 'invalid_args',
+        message: 'Choose a file path first.',
+        hint: null,
+        machine: machine || null,
+      };
+    }
+
+    const body = { path };
+    if (machine !== undefined && machine !== null && machine !== '') {
+      body.on = machine;
+    }
+
+    let res;
+    try {
+      res = await fetch('/v1/content', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${current}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        throw {
+          code: 'cancelled',
+          message: 'The request was cancelled.',
+          hint: null,
+          machine: machine || null,
+        };
+      }
+      throw {
+        code: 'unreachable',
+        message: 'Could not reach the server.',
+        hint: 'Check that legion serve is running and reachable from this browser.',
+        machine: machine || null,
+      };
+    }
+
+    let parsed = null;
+    try {
+      parsed = await res.json();
+    } catch {
+      parsed = null;
+    }
+    if (!res.ok) throw toError(parsed, res.status);
+
+    let url = typeof parsed?.url === 'string' ? parsed.url : '';
+    if (!url) {
+      throw {
+        code: 'internal',
+        message: 'The server returned no content address.',
+        hint: null,
+        machine: machine || null,
+      };
+    }
+    if (download) {
+      url += url.includes('?') ? '&download=1' : '?download=1';
+    }
+    return {
+      url,
+      expires_in: typeof parsed.expires_in === 'number' ? parsed.expires_in : null,
+    };
+  }
+
   async function forget() {
     token = '';
     writeToken('');
@@ -297,6 +378,7 @@ export function createHttpLink() {
     state,
     tools,
     call,
+    contentUrl,
     setToken,
     forget,
   };

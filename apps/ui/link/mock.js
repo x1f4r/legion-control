@@ -1689,12 +1689,124 @@ export function createMockLink(mode = '') {
     return 'legion-invite-1.mock.scanned';
   }
 
+  // Built-in tiny valid media payloads for mock contentUrl().
+  const MOCK_PNG_B64 =
+    'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAADElEQVR4nGNg+M8AAAICAQER5R4LAAAAAElFTkSuQmCC';
+  const MOCK_WAV_B64 =
+    'UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+  const MOCK_MP4_B64 =
+    'AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMqbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAAfQAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAlV0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAAfQAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAABAAAAAQAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAH0AAAAAAABAAAAAAHNbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAABAAAAAIABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABeG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAThzdGJsAAAAuHN0c2QAAAAAAAAAAQAAAKhhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAABAAEABIAAAASAAAAAAAAAABFExhdmM2My4xLjEwMiBsaWJ4MjY0AAAAAAAAAAAAAAAAGP//AAAALmF2Y0MBQsAe/+EAFmdCwB7ZHsBEAAADAAQAAAMAIDxYuSABAAVoy4PLIAAAABBwYXNwAAAAAQAAAAEAAAAUYnRydAAAAAAAAClgAAAAAAAAABhzdHRzAAAAAAAAAAEAAAACAAAQAAAAABRzdHNzAAAAAAAAAAEAAAABAAAAHHN0c2MAAAAAAAAAAQAAAAEAAAACAAAAAQAAABxzdHN6AAAAAAAAAAAAAAACAAACjAAAAAoAAAAUc3RjbwAAAAAAAAABAAADWgAAAGF1ZHRhAAAAWW1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAAAAAAAAAAAAAALGlsc3QAAAAkqXRvbwAAABxkYXRhAAAAAQAAAABMYXZmNjMuMS4xMDIAAAAIZnJlZQAAAp5tZGF0AAACcAYF//9s3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NSByMzIyMiBiMzU2MDVhIC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyNSAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTAgcmVmPTMgZGVibG9jaz0xOjA6MCBhbmFseXNlPTB4MToweDExMSBtZT1oZXggc3VibWU9NyBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVkX3JlZj0xIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MSA4eDhkY3Q9MCBjcW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0tMiB0aHJlYWRzPTEgbG9va2FoZWFkX3RocmVhZHM9MSBzbGljZWRfdGhyZWFkcz0wIG5yPTAgZGVjaW1hdGU9MSBpbnRlcmxhY2VkPTAgYmx1cmF5X2NvbXBhdD0wIGNvbnN0cmFpbmVkX2ludHJhPTAgYmZyYW1lcz0wIHdlaWdodHA9MCBrZXlpbnQ9MjUwIGtleWludF9taW49NCBzY2VuZWN1dD00MCBpbnRyYV9yZWZyZXNoPTAgcmNfbG9va2FoZWFkPTQwIHJjPWNyZiBtYnRyZWU9MSBjcmY9MjMuMCBxY29tcD0wLjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0aW89MS40MCBhcT0xOjEuMDAAgAAAABRliIQEfEYoAAjJxwABD5jgACazgAAAAAZBmjgIeoA=';
+  const MOCK_PDF_B64 =
+    'JVBERi0xLjQKMSAwIG9iago8PC9UeXBlL0NhdGFsb2cvUGFnZXMgMiAwIFI+PgplbmRvYmoKMiAwIG9iago8PC9UeXBlL1BhZ2VzL0tpZHNbMyAwIFJdL0NvdW50IDE+PgplbmRvYmoKMyAwIG9iago8PC9UeXBlL1BhZ2UvUGFyZW50IDIgMCBSL01lZGlhQm94WzAgMCA2NCA2NF0+PgplbmRvYmoKdHJhaWxlcgo8PC9Sb290IDEgMCBSPj4KJSVFT0YK';
+  const MOCK_SVG_TEXT =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#16a34a"/><circle cx="32" cy="32" r="16" fill="#ffffff"/></svg>';
+
+  function mockContentDataUrl(rawPath) {
+    const normalized = rawPath.startsWith('~/') ? `/home/me/${rawPath.slice(2)}` : rawPath;
+    if (Object.prototype.hasOwnProperty.call(fsFiles, normalized)) {
+      return `data:text/plain;charset=utf-8,${encodeURIComponent(fsFiles[normalized])}`;
+    }
+    const base = normalized.split(/[\\/]/).pop() || '';
+    const dot = base.lastIndexOf('.');
+    const ext = dot > 0 ? base.slice(dot + 1).toLowerCase() : '';
+    if (ext === 'svg') {
+      return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(MOCK_SVG_TEXT)}`;
+    }
+    if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp', 'tif', 'tiff', 'ico'].includes(ext)) {
+      return `data:image/png;base64,${MOCK_PNG_B64}`;
+    }
+    if (['mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi'].includes(ext)) {
+      return `data:video/mp4;base64,${MOCK_MP4_B64}`;
+    }
+    if (['wav', 'mp3', 'm4a', 'aac', 'ogg', 'opus', 'flac'].includes(ext)) {
+      return `data:audio/wav;base64,${MOCK_WAV_B64}`;
+    }
+    if (ext === 'pdf') {
+      return `data:application/pdf;base64,${MOCK_PDF_B64}`;
+    }
+    if (
+      [
+        'txt',
+        'md',
+        'markdown',
+        'log',
+        'csv',
+        'tsv',
+        'json',
+        'jsonl',
+        'toml',
+        'yaml',
+        'yml',
+        'xml',
+        'html',
+        'htm',
+        'css',
+        'js',
+        'mjs',
+        'ts',
+        'rs',
+        'py',
+        'sh',
+      ].includes(ext)
+    ) {
+      return `data:text/plain;charset=utf-8,${encodeURIComponent(`Mock content for ${base || normalized}\n`)}`;
+    }
+    return `data:application/octet-stream;base64,${MOCK_WAV_B64}`;
+  }
+
+  async function contentUrl(options = {}) {
+    const { machine, path } = options || {};
+    if (!authed) {
+      throw {
+        code: 'denied',
+        message: 'This device is not connected yet.',
+        hint: null,
+        machine: null,
+        status: 401,
+      };
+    }
+    if (typeof path !== 'string' || path.trim() === '') {
+      throw {
+        code: 'invalid_args',
+        message: 'Choose a file path first.',
+        hint: null,
+        machine: machine || activeNode,
+      };
+    }
+    const name = machine || activeNode;
+    const m = machines[name];
+    if (!m) {
+      throw {
+        code: 'not_found',
+        message: `There is no machine called ${name} in fleet.toml.`,
+        hint: null,
+        machine: activeNode,
+      };
+    }
+    if (!m.reachable) {
+      throw m.error;
+    }
+    if (!allowedTools.includes('fs.read') || isDenyRead) {
+      throw {
+        code: 'denied',
+        message: `Principal "phone" (role "${role}") may not call fs.read.`,
+        hint: 'Ask the machine owner to grant access in policy.toml.',
+        machine: name,
+      };
+    }
+    return {
+      url: mockContentDataUrl(path),
+      expires_in: 900,
+    };
+  }
+
   return {
     kind,
     mockFlags: flags,
     state,
     tools,
     call,
+    contentUrl,
     setToken,
     forget,
     deviceName,
