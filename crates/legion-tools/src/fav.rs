@@ -1755,9 +1755,66 @@ fn not_found_fav(id: &str) -> ErrorBody {
     .with_details(json!({"id": id}))
 }
 
+/// Monotonic clock and sleep abstraction for [`PushCoalescer`] so unit tests can drive burst
+/// coalescing windows deterministically without wall-clock sleeps.
+trait PushClock: Send + Sync + 'static {
+    fn now(&self) -> Duration;
+    fn sleep_until(&self, deadline: Duration) -> legion_core::BoxFuture<'static, ()>;
+}
+
+struct RealPushClock {
+    origin: Instant,
+}
+
+impl RealPushClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl PushClock for RealPushClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    fn sleep_until(&self, deadline: Duration) -> legion_core::BoxFuture<'static, ()> {
+        let target = tokio::time::Instant::from_std(self.origin + deadline);
+        Box::pin(tokio::time::sleep_until(target))
+    }
+}
+
 struct PushCoalescer {
     state: tokio::sync::Mutex<PushState>,
     settled: tokio::sync::Notify,
+    clock: Arc<dyn PushClock>,
+}
+
+impl PushCoalescer {
+    fn with_clock(clock: Arc<dyn PushClock>) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(PushState::default()),
+            settled: tokio::sync::Notify::new(),
+            clock,
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_settled(&self) {
+        loop {
+            let notified = self.settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let guard = self.state.lock().await;
+                if !guard.in_flight && !guard.dirty && !guard.trailing_scheduled {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1765,7 +1822,7 @@ struct PushState {
     in_flight: bool,
     dirty: bool,
     trailing_scheduled: bool,
-    last_completed: Option<Instant>,
+    last_completed: Option<Duration>,
     pending_ctx: Option<PendingPushCtx>,
 }
 
@@ -1777,16 +1834,18 @@ struct PendingPushCtx {
     credential_expires: Option<Timestamp>,
 }
 
-fn coalescer_for(state_dir: &Path) -> Arc<PushCoalescer> {
+fn coalescer_map() -> &'static StdMutex<HashMap<PathBuf, Arc<PushCoalescer>>> {
     static MAP: OnceLock<StdMutex<HashMap<PathBuf, Arc<PushCoalescer>>>> = OnceLock::new();
-    let map = MAP.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
-    Arc::clone(guard.entry(state_dir.to_path_buf()).or_insert_with(|| {
-        Arc::new(PushCoalescer {
-            state: tokio::sync::Mutex::new(PushState::default()),
-            settled: tokio::sync::Notify::new(),
-        })
-    }))
+    MAP.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn coalescer_for(state_dir: &Path) -> Arc<PushCoalescer> {
+    let mut guard = coalescer_map().lock().unwrap_or_else(|p| p.into_inner());
+    Arc::clone(
+        guard
+            .entry(state_dir.to_path_buf())
+            .or_insert_with(|| Arc::new(PushCoalescer::with_clock(Arc::new(RealPushClock::new())))),
+    )
 }
 
 /// Pushes `favorites.toml` to every reachable peer in `fleet.toml` with node authority,
@@ -1828,20 +1887,19 @@ async fn push_favorites_with_interval(
 
     let run_now = {
         let mut guard = coalescer.state.lock().await;
-        let now = Instant::now();
+        let now = coalescer.clock.now();
         let within_cooldown = guard
             .last_completed
-            .is_some_and(|t| now.saturating_duration_since(t) < min_interval);
+            .is_some_and(|t| now.saturating_sub(t) < min_interval);
         if guard.in_flight || within_cooldown {
             guard.dirty = true;
             guard.pending_ctx = Some(pending_ctx);
             if !guard.in_flight && !guard.trailing_scheduled {
                 guard.trailing_scheduled = true;
-                let wait_for = guard
+                let wake_at = guard
                     .last_completed
-                    .map(|t| min_interval.saturating_sub(now.saturating_duration_since(t)))
-                    .unwrap_or(Duration::ZERO);
-                spawn_trailing_push(Arc::clone(&coalescer), wait_for, min_interval);
+                    .map_or(now, |t| t.saturating_add(min_interval));
+                spawn_trailing_push(Arc::clone(&coalescer), wake_at, min_interval);
             }
             false
         } else {
@@ -1858,11 +1916,16 @@ async fn push_favorites_with_interval(
     let outcomes = execute_favorites_push(node, door, device, credential_expires, &peers).await;
 
     let mut guard = coalescer.state.lock().await;
+    let completed_at = coalescer.clock.now();
     guard.in_flight = false;
-    guard.last_completed = Some(Instant::now());
+    guard.last_completed = Some(completed_at);
     if guard.dirty && !guard.trailing_scheduled {
         guard.trailing_scheduled = true;
-        spawn_trailing_push(Arc::clone(&coalescer), min_interval, min_interval);
+        spawn_trailing_push(
+            Arc::clone(&coalescer),
+            completed_at.saturating_add(min_interval),
+            min_interval,
+        );
     } else if !guard.dirty && !guard.trailing_scheduled {
         coalescer.settled.notify_waiters();
     }
@@ -1871,14 +1934,14 @@ async fn push_favorites_with_interval(
 
 fn spawn_trailing_push(
     coalescer: Arc<PushCoalescer>,
-    initial_delay: Duration,
+    initial_deadline: Duration,
     min_interval: Duration,
 ) {
     tokio::spawn(async move {
-        let mut delay = initial_delay;
+        let mut deadline = initial_deadline;
         loop {
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+            if deadline > coalescer.clock.now() {
+                coalescer.clock.sleep_until(deadline).await;
             }
             let maybe_ctx = {
                 let mut guard = coalescer.state.lock().await;
@@ -1911,10 +1974,11 @@ fn spawn_trailing_push(
             }
 
             let mut guard = coalescer.state.lock().await;
+            let completed_at = coalescer.clock.now();
             guard.in_flight = false;
-            guard.last_completed = Some(Instant::now());
+            guard.last_completed = Some(completed_at);
             if guard.dirty {
-                delay = min_interval;
+                deadline = completed_at.saturating_add(min_interval);
             } else {
                 guard.trailing_scheduled = false;
                 coalescer.settled.notify_waiters();
@@ -3602,11 +3666,171 @@ target = "unknown_peer"
         assert_eq!(after.removed.len(), 2101);
     }
 
-    #[tokio::test]
-    async fn rapid_burst_of_favourite_edits_coalesces_pushes() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    struct ManualClockState {
+        now: Duration,
+        waiters: Vec<(Duration, tokio::sync::oneshot::Sender<()>)>,
+    }
 
-        let tmp = tempfile::tempdir().unwrap();
+    struct ManualPushClock {
+        state: StdMutex<ManualClockState>,
+        waiter_added: tokio::sync::Notify,
+    }
+
+    impl ManualPushClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: StdMutex::new(ManualClockState {
+                    now: Duration::ZERO,
+                    waiters: Vec::new(),
+                }),
+                waiter_added: tokio::sync::Notify::new(),
+            })
+        }
+
+        fn advance(&self, delta: Duration) {
+            let ready = {
+                let mut guard = self.state.lock().unwrap();
+                guard.now += delta;
+                let now = guard.now;
+                let mut remaining = Vec::new();
+                let mut ready = Vec::new();
+                for (deadline, tx) in guard.waiters.drain(..) {
+                    if deadline <= now {
+                        ready.push(tx);
+                    } else {
+                        remaining.push((deadline, tx));
+                    }
+                }
+                guard.waiters = remaining;
+                ready
+            };
+            for tx in ready {
+                let _ = tx.send(());
+            }
+        }
+
+        fn pending_waiters(&self) -> usize {
+            self.state.lock().unwrap().waiters.len()
+        }
+
+        async fn wait_for_waiter(&self) {
+            loop {
+                let notified = self.waiter_added.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.pending_waiters() > 0 {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    impl PushClock for ManualPushClock {
+        fn now(&self) -> Duration {
+            self.state.lock().unwrap().now
+        }
+
+        fn sleep_until(&self, deadline: Duration) -> legion_core::BoxFuture<'static, ()> {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            {
+                let mut guard = self.state.lock().unwrap();
+                if deadline <= guard.now {
+                    return Box::pin(async {});
+                }
+                guard.waiters.push((deadline, tx));
+            }
+            self.waiter_added.notify_waiters();
+            Box::pin(async move {
+                let _ = rx.await;
+            })
+        }
+    }
+
+    /// Installs a custom [`PushCoalescer`] for `state_dir` and removes it on drop so repeated
+    /// test loops do not accumulate entries in the process-wide coalescer map.
+    struct TestCoalescerGuard {
+        state_dir: PathBuf,
+        coalescer: Arc<PushCoalescer>,
+    }
+
+    impl TestCoalescerGuard {
+        fn install(state_dir: &Path, clock: Arc<dyn PushClock>) -> Self {
+            let coalescer = Arc::new(PushCoalescer::with_clock(clock));
+            coalescer_map()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(state_dir.to_path_buf(), Arc::clone(&coalescer));
+            Self {
+                state_dir: state_dir.to_path_buf(),
+                coalescer,
+            }
+        }
+    }
+
+    impl Drop for TestCoalescerGuard {
+        fn drop(&mut self) {
+            coalescer_map()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.state_dir);
+        }
+    }
+
+    struct CountingSyncTool {
+        spec: legion_core::proto::ToolSpec,
+        count: Arc<std::sync::atomic::AtomicUsize>,
+        entered: Option<Arc<tokio::sync::Notify>>,
+        gate: Option<Arc<tokio::sync::Notify>>,
+        gate_limit: usize,
+    }
+
+    impl legion_core::Tool for CountingSyncTool {
+        fn spec(&self) -> &legion_core::proto::ToolSpec {
+            &self.spec
+        }
+
+        fn call<'a>(
+            &'a self,
+            _ctx: &'a Ctx,
+            _args: Value,
+        ) -> legion_core::BoxFuture<'a, Result<Value, ToolError>> {
+            use std::sync::atomic::Ordering;
+            let count = Arc::clone(&self.count);
+            let entered = self.entered.clone();
+            let gate = self.gate.clone();
+            let gate_limit = self.gate_limit;
+            Box::pin(async move {
+                let call_no = count.fetch_add(1, Ordering::SeqCst) + 1;
+                if call_no <= gate_limit
+                    && let Some(g) = gate
+                {
+                    let wait = g.notified();
+                    if let Some(e) = entered {
+                        e.notify_one();
+                    }
+                    wait.await;
+                } else if let Some(e) = entered {
+                    e.notify_one();
+                }
+                Ok(json!({
+                    "results": {
+                        "pi": {
+                            "favorites.toml": { "status": "pushed" }
+                        }
+                    }
+                }))
+            })
+        }
+    }
+
+    fn setup_coalesce_node(
+        tmp: &tempfile::TempDir,
+        count: Arc<std::sync::atomic::AtomicUsize>,
+        entered: Option<Arc<tokio::sync::Notify>>,
+        gate: Option<Arc<tokio::sync::Notify>>,
+        gate_limit: usize,
+    ) -> (Paths, Node) {
         let paths = Paths::under(tmp.path().join("home"));
         std::fs::create_dir_all(paths.config_dir()).unwrap();
         std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
@@ -3615,39 +3839,6 @@ target = "unknown_peer"
             "[machines.pi]\nconnector = \"ssh\"\ntarget = \"pi\"\n",
         )
         .unwrap();
-
-        let push_count = Arc::new(AtomicUsize::new(0));
-        let push_count_clone = Arc::clone(&push_count);
-
-        struct CountingSyncTool {
-            spec: legion_core::proto::ToolSpec,
-            count: Arc<AtomicUsize>,
-        }
-
-        impl legion_core::Tool for CountingSyncTool {
-            fn spec(&self) -> &legion_core::proto::ToolSpec {
-                &self.spec
-            }
-
-            fn call<'a>(
-                &'a self,
-                _ctx: &'a Ctx,
-                _args: Value,
-            ) -> legion_core::BoxFuture<'a, Result<Value, ToolError>> {
-                let count = Arc::clone(&self.count);
-                Box::pin(async move {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    Ok(json!({
-                        "results": {
-                            "pi": {
-                                "favorites.toml": { "status": "pushed" }
-                            }
-                        }
-                    }))
-                })
-            }
-        }
-
         let mut registry = Registry::new();
         register(&mut registry);
         registry.add(CountingSyncTool {
@@ -3657,42 +3848,304 @@ target = "unknown_peer"
                 effect: Effect::Admin,
                 input_schema: legion_core::input_schema::<Value>(),
             },
-            count: Arc::clone(&push_count_clone),
+            count,
+            entered,
+            gate,
+            gate_limit,
         });
-
         let node = Node::new(paths.clone(), registry);
-        // Fire 10 rapid fav.add mutations within milliseconds.
-        for i in 0..10 {
-            let burst_path = tmp.path().join("burst").join(format!("file-{i}.txt"));
-            let _ = node
-                .call(Call::new(
+        (paths, node)
+    }
+
+    #[tokio::test]
+    async fn favourite_push_coalescing_with_manual_clock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // 1. Burst inside one window -> exactly 2 pushes (1 immediate + 1 trailing).
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let push_count = Arc::new(AtomicUsize::new(0));
+            let (paths, node) = setup_coalesce_node(&tmp, Arc::clone(&push_count), None, None, 0);
+            let clock = ManualPushClock::new();
+            let guard = TestCoalescerGuard::install(paths.state_dir(), clock.clone());
+
+            for i in 0..10 {
+                if i > 0 {
+                    clock.advance(Duration::from_millis(50));
+                }
+                let p = tmp.path().join("w1").join(format!("file-{i}.txt"));
+                node.call(Call::new(
                     Door::Cli,
                     "fav.add",
-                    json!({ "path": burst_path.to_string_lossy() }),
+                    json!({ "path": p.to_string_lossy() }),
                 ))
                 .await
                 .unwrap();
-        }
-        // Wait for the coalesced trailing push to settle.
-        let coalescer = coalescer_for(paths.state_dir());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            {
-                let guard = coalescer.state.lock().await;
-                if !guard.in_flight && !guard.dirty && !guard.trailing_scheduled {
-                    break;
-                }
             }
-            assert!(Instant::now() < deadline, "trailing push did not settle");
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            // Clock is at 450 ms (< 500 ms window): only the first immediate push has run.
+            clock.wait_for_waiter().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 1);
+
+            // Still 1 ms before window end -> trailing push has not fired yet.
+            clock.advance(Duration::from_millis(49));
+            tokio::task::yield_now().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 1);
+
+            // Crossing 500 ms fires the single coalesced trailing push.
+            clock.advance(Duration::from_millis(1));
+            guard.coalescer.wait_settled().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 2);
+            assert_eq!(clock.pending_waiters(), 0);
+            assert_eq!(load_favorites(&paths).unwrap().entries.len(), 10);
         }
 
-        let pushes = push_count.load(Ordering::SeqCst);
-        assert!(
-            pushes <= 2,
-            "expected burst of 10 fav.add calls to coalesce to <= 2 pushes, got {pushes}"
+        // 2. Burst spanning two cooldown windows -> exactly 3 pushes.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let push_count = Arc::new(AtomicUsize::new(0));
+            let (paths, node) = setup_coalesce_node(&tmp, Arc::clone(&push_count), None, None, 0);
+            let clock = ManualPushClock::new();
+            let guard = TestCoalescerGuard::install(paths.state_dir(), clock.clone());
+
+            // Window 1: edit 0 fires immediately at t=0, edits 1..5 coalesce to t=500ms.
+            for i in 0..5 {
+                if i > 0 {
+                    clock.advance(Duration::from_millis(80));
+                }
+                let p = tmp.path().join("w2").join(format!("a-{i}.txt"));
+                node.call(Call::new(
+                    Door::Cli,
+                    "fav.add",
+                    json!({ "path": p.to_string_lossy() }),
+                ))
+                .await
+                .unwrap();
+            }
+            clock.wait_for_waiter().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 1);
+            clock.advance(Duration::from_millis(180)); // t = 500ms
+            guard.coalescer.wait_settled().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 2);
+
+            // Window 2: edits 5..9 arrive at t=600ms..840ms (within second cooldown [500, 1000)).
+            for i in 5..9 {
+                clock.advance(Duration::from_millis(80));
+                let p = tmp.path().join("w2").join(format!("b-{i}.txt"));
+                node.call(Call::new(
+                    Door::Cli,
+                    "fav.add",
+                    json!({ "path": p.to_string_lossy() }),
+                ))
+                .await
+                .unwrap();
+            }
+            clock.wait_for_waiter().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 2);
+            clock.advance(Duration::from_millis(180)); // t = 1000ms
+            guard.coalescer.wait_settled().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 3);
+            assert_eq!(clock.pending_waiters(), 0);
+            assert_eq!(load_favorites(&paths).unwrap().entries.len(), 9);
+        }
+
+        // 3. Edits arriving while a push is in flight (both initial push and trailing push).
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let push_count = Arc::new(AtomicUsize::new(0));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (paths, node) = setup_coalesce_node(
+                &tmp,
+                Arc::clone(&push_count),
+                Some(Arc::clone(&entered)),
+                Some(Arc::clone(&gate)),
+                2,
+            );
+            let clock = ManualPushClock::new();
+            let guard = TestCoalescerGuard::install(paths.state_dir(), clock.clone());
+
+            // Start edit 0 and hold Push #1 in flight.
+            let node_first = node.clone();
+            let p0 = tmp.path().join("inflight").join("f-0.txt");
+            let first_entered = entered.notified();
+            let first_task = tokio::spawn(async move {
+                node_first
+                    .call(Call::new(
+                        Door::Cli,
+                        "fav.add",
+                        json!({ "path": p0.to_string_lossy() }),
+                    ))
+                    .await
+                    .unwrap()
+            });
+            first_entered.await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 1);
+
+            // Fire edits 1..4 while Push #1 is blocked in flight: they return immediately and
+            // arm no timer until Push #1 completes.
+            for i in 1..4 {
+                let p = tmp.path().join("inflight").join(format!("f-{i}.txt"));
+                let out = node
+                    .call(Call::new(
+                        Door::Cli,
+                        "fav.add",
+                        json!({ "path": p.to_string_lossy() }),
+                    ))
+                    .await
+                    .unwrap();
+                assert!(
+                    out.get("fleet").is_none(),
+                    "coalesced fav.add should omit fleet outcomes: {out}"
+                );
+            }
+            assert_eq!(push_count.load(Ordering::SeqCst), 1);
+            assert_eq!(clock.pending_waiters(), 0);
+
+            // Release Push #1: trailing timer is armed for FAV_PUSH_MIN_INTERVAL (500ms).
+            gate.notify_one();
+            first_task.await.unwrap();
+            clock.wait_for_waiter().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 1);
+
+            clock.advance(Duration::from_millis(499));
+            tokio::task::yield_now().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 1);
+
+            // Crossing 500ms starts Push #2, which also blocks in flight.
+            let second_entered = entered.notified();
+            clock.advance(Duration::from_millis(1));
+            second_entered.await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 2);
+
+            // Edit 4 arrives while trailing Push #2 is in flight.
+            let p4 = tmp.path().join("inflight").join("f-4.txt");
+            node.call(Call::new(
+                Door::Cli,
+                "fav.add",
+                json!({ "path": p4.to_string_lossy() }),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(push_count.load(Ordering::SeqCst), 2);
+
+            // Release Push #2: another 500ms cooldown timer is armed for Push #3.
+            gate.notify_one();
+            clock.wait_for_waiter().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 2);
+            clock.advance(FAV_PUSH_MIN_INTERVAL);
+            guard.coalescer.wait_settled().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 3);
+            assert_eq!(clock.pending_waiters(), 0);
+            assert_eq!(load_favorites(&paths).unwrap().entries.len(), 5);
+        }
+
+        // 4. Quiet period: no spurious pushes while idle, and a later edit pushes immediately.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let push_count = Arc::new(AtomicUsize::new(0));
+            let (paths, node) = setup_coalesce_node(&tmp, Arc::clone(&push_count), None, None, 0);
+            let clock = ManualPushClock::new();
+            let guard = TestCoalescerGuard::install(paths.state_dir(), clock.clone());
+
+            let p0 = tmp.path().join("quiet").join("first.txt");
+            let r0 = node
+                .call(Call::new(
+                    Door::Cli,
+                    "fav.add",
+                    json!({ "path": p0.to_string_lossy() }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r0["fleet"]["pi"]["status"], "synced");
+            guard.coalescer.wait_settled().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 1);
+            assert_eq!(clock.pending_waiters(), 0);
+
+            // Advance well past cooldown during a quiet period -> zero additional pushes.
+            clock.advance(Duration::from_secs(10));
+            tokio::task::yield_now().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 1);
+
+            // Next edit after the quiet period runs immediately with no trailing timer.
+            let p1 = tmp.path().join("quiet").join("second.txt");
+            let r1 = node
+                .call(Call::new(
+                    Door::Cli,
+                    "fav.add",
+                    json!({ "path": p1.to_string_lossy() }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r1["fleet"]["pi"]["status"], "synced");
+            guard.coalescer.wait_settled().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 2);
+            assert_eq!(clock.pending_waiters(), 0);
+            clock.advance(Duration::from_secs(10));
+            tokio::task::yield_now().await;
+            assert_eq!(push_count.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn rapid_burst_of_favourite_edits_coalesces_pushes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Single real-time smoke test exercising `RealPushClock` and `FAV_PUSH_MIN_INTERVAL`
+        // end-to-end. Holding Push #1 in flight via a gate guarantees all 9 follow-up edits
+        // coalesce regardless of host CPU/disk load, and the settle timeout is 30x the 500 ms
+        // coalescing window.
+        let tmp = tempfile::tempdir().unwrap();
+        let push_count = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (paths, node) = setup_coalesce_node(
+            &tmp,
+            Arc::clone(&push_count),
+            Some(Arc::clone(&entered)),
+            Some(Arc::clone(&gate)),
+            1,
         );
-        assert!(pushes >= 1, "at least one push must have occurred");
+        let guard = TestCoalescerGuard::install(paths.state_dir(), Arc::new(RealPushClock::new()));
+
+        let first_entered = entered.notified();
+        let first_node = node.clone();
+        let first_path = tmp.path().join("burst").join("file-0.txt");
+        let first_task = tokio::spawn(async move {
+            first_node
+                .call(Call::new(
+                    Door::Cli,
+                    "fav.add",
+                    json!({ "path": first_path.to_string_lossy() }),
+                ))
+                .await
+                .unwrap()
+        });
+        first_entered.await;
+
+        for i in 1..10 {
+            let burst_path = tmp.path().join("burst").join(format!("file-{i}.txt"));
+            node.call(Call::new(
+                Door::Cli,
+                "fav.add",
+                json!({ "path": burst_path.to_string_lossy() }),
+            ))
+            .await
+            .unwrap();
+        }
+        assert_eq!(push_count.load(Ordering::SeqCst), 1);
+
+        gate.notify_one();
+        first_task.await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(15), guard.coalescer.wait_settled())
+            .await
+            .expect("trailing push did not settle within 15s (30x window)");
+
+        assert_eq!(
+            push_count.load(Ordering::SeqCst),
+            2,
+            "expected gated burst of 10 fav.add calls to coalesce to exactly 2 pushes"
+        );
         assert_eq!(load_favorites(&paths).unwrap().entries.len(), 10);
     }
 
