@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::content::{ContentStream, StreamOpenError, handshake_get};
 use crate::invite::{Enrolled, SshTarget, SshTimeouts};
-use crate::put::{PutRequest, PutStream, handshake_put, validate_blake3_hash};
+use crate::put::{CAP_PUT_NO_REPLACE, PutRequest, PutStream, handshake_put, validate_blake3_hash};
 use crate::session::{CallError, Session};
 
 /// Default idle duration after which unused sessions are closed (matches `legion serve`).
@@ -586,6 +586,7 @@ struct LiveSession {
     config_snapshot: NodeLink,
     last_used: Arc<Mutex<Instant>>,
     in_flight: Arc<AtomicUsize>,
+    stream_capabilities: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl LiveSession {
@@ -594,6 +595,37 @@ impl LiveSession {
             .last_used
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+    }
+
+    fn record_stream_capabilities(&self, caps: Vec<String>) {
+        let mut guard = self
+            .stream_capabilities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.as_mut() {
+            None => {
+                let mut unique = BTreeSet::new();
+                for cap in caps {
+                    unique.insert(cap);
+                }
+                *guard = Some(unique.into_iter().collect());
+            }
+            Some(existing) => {
+                for cap in caps {
+                    if !existing.iter().any(|e| e == &cap) {
+                        existing.push(cap);
+                    }
+                }
+                existing.sort();
+            }
+        }
+    }
+
+    fn stream_capabilities(&self) -> Option<Vec<String>> {
+        self.stream_capabilities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn acquire_flight(&self) -> InFlightGuard {
@@ -2208,6 +2240,11 @@ impl Link {
             window_policy: opener.window_policy(),
         });
 
+        let cap_session = live.clone();
+        let record_caps = move |caps: Vec<String>| {
+            cap_session.record_stream_capabilities(caps);
+        };
+
         handshake_get(
             raw,
             Some(reopener),
@@ -2218,8 +2255,38 @@ impl Link {
             live.config_snapshot.principal.as_deref(),
             self.inner.options.ssh_timeouts.handshake,
             cancel,
+            Some(&record_caps),
         )
         .await
+    }
+
+    /// Returns the stream capabilities observed on the live session to `machine`, or `None` if no
+    /// `legion stream` greeting has been received on the current session yet.
+    pub fn stream_capabilities(&self, machine: &str) -> Option<Vec<String>> {
+        let slot = self
+            .inner
+            .slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(machine)
+            .cloned()?;
+        let guard = slot
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let live = guard.as_ref()?;
+        if !live.session.is_alive() {
+            return None;
+        }
+        live.stream_capabilities()
+    }
+
+    /// Reports whether the live session to `machine` advertised `capability` on `legion stream`:
+    /// `Some(true)` when supported, `Some(false)` when a stream greeting was observed without it
+    /// (an older node), or `None` when no stream has been opened on the active session yet.
+    pub fn stream_supports(&self, machine: &str, capability: &str) -> Option<bool> {
+        self.stream_capabilities(machine)
+            .map(|caps| caps.iter().any(|c| c == capability))
     }
 
     /// Opens a resumable bulk-pipe upload (`legion stream`'s `put`) to `request.path` on `machine`
@@ -2281,6 +2348,11 @@ impl Link {
             }
         };
 
+        let cap_session = live.clone();
+        let record_caps = move |caps: Vec<String>| {
+            cap_session.record_stream_capabilities(caps);
+        };
+
         let mut stream = handshake_put(
             raw,
             machine,
@@ -2288,8 +2360,12 @@ impl Link {
             live.config_snapshot.principal.as_deref(),
             self.inner.options.ssh_timeouts.handshake,
             cancel,
+            Some(&record_caps),
         )
         .await?;
+        if stream.no_replace_confirmed() {
+            live.record_stream_capabilities(vec![CAP_PUT_NO_REPLACE.to_owned()]);
+        }
         stream.attach_flight(Box::new(flight));
         Ok(stream)
     }
@@ -2773,6 +2849,7 @@ impl Link {
             config_snapshot: entry,
             last_used: Arc::new(Mutex::new(Instant::now())),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            stream_capabilities: Arc::new(Mutex::new(None)),
         };
         *slot
             .current

@@ -664,13 +664,79 @@ test('Files tab degrades cleanly against an old node with none of the new tools 
 });
 
 async function assertToastDoesNotCoverFirstRow(page, label) {
-  const toastBox = await page.locator('.toast-banner').boundingBox();
-  const rowBox = await page.locator('main .list .row').first().boundingBox();
-  assert.ok(toastBox, `${label}: expected visible .toast-banner bounding box`);
-  assert.ok(rowBox, `${label}: expected visible first list row bounding box`);
+  // Measure `.toast-banner` and the first list row synchronously in the same animation frame
+  // across two consecutive settled frames so a torn read across auto-dismissal is impossible,
+  // while still catching any single-frame or persistent overlap.
+  const result = await page.evaluate(
+    () =>
+      new Promise((resolve) => {
+        const readBoxes = () => {
+          const toast = document.querySelector('.toast-banner');
+          const row = document.querySelector('main .list .row');
+          if (!toast || !row) {
+            return { toast: null, row: null };
+          }
+          const t = toast.getBoundingClientRect();
+          const r = row.getBoundingClientRect();
+          if (t.width <= 0 || t.height <= 0 || r.width <= 0 || r.height <= 0) {
+            return { toast: null, row: null };
+          }
+          return {
+            toast: { x: t.x, y: t.y, width: t.width, height: t.height, bottom: t.bottom },
+            row: { x: r.x, y: r.y, width: r.width, height: r.height, bottom: r.bottom },
+          };
+        };
+        const same = (a, b) =>
+          Boolean(a && b) &&
+          Math.abs(a.x - b.x) < 0.01 &&
+          Math.abs(a.y - b.y) < 0.01 &&
+          Math.abs(a.width - b.width) < 0.01 &&
+          Math.abs(a.height - b.height) < 0.01;
+
+        let prev = null;
+        let frames = 0;
+        let overlapFrame = null;
+        const step = () => {
+          frames += 1;
+          const cur = readBoxes();
+          if (!cur.toast || !cur.row) {
+            resolve({
+              settled: false,
+              missing: !cur.toast ? 'toast' : 'row',
+              frames,
+              overlapFrame,
+            });
+            return;
+          }
+          if (!overlapFrame && cur.toast.bottom > cur.row.y + 0.5) {
+            overlapFrame = { frame: frames, toast: cur.toast, row: cur.row };
+          }
+          if (prev && same(prev.toast, cur.toast) && same(prev.row, cur.row)) {
+            resolve({ settled: true, frames, toast: cur.toast, row: cur.row, overlapFrame });
+            return;
+          }
+          prev = cur;
+          if (frames >= 30) {
+            resolve({ settled: false, frames, toast: cur.toast, row: cur.row, overlapFrame });
+            return;
+          }
+          requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+      }),
+  );
+
   assert.ok(
-    toastBox.y + toastBox.height <= rowBox.y + 0.5,
-    `${label}: toast (${toastBox.y}..${toastBox.y + toastBox.height}) must not overlap first row (${rowBox.y}..${rowBox.y + rowBox.height})`,
+    !result.overlapFrame,
+    `${label}: toast overlapped first row on frame ${result.overlapFrame?.frame}: toast (${result.overlapFrame?.toast.y}..${result.overlapFrame?.toast.bottom}) vs first row (${result.overlapFrame?.row.y}..${result.overlapFrame?.row.bottom})`,
+  );
+  assert.ok(
+    result.settled,
+    `${label}: expected two consecutive settled frames with visible .toast-banner and first row (${JSON.stringify(result)})`,
+  );
+  assert.ok(
+    result.toast.bottom <= result.row.y + 0.5,
+    `${label}: toast (${result.toast.y}..${result.toast.bottom}) must not overlap first row (${result.row.y}..${result.row.bottom})`,
   );
 }
 
@@ -719,15 +785,17 @@ test('Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses
     await page.locator('.row', { hasText: /Upload-\d+\.jpg/ }).first().waitFor();
 
     // Download wording (no em-dash) + navigating via bottom nav Activity tab also clears the banner.
+    // Pick Passport.pdf (540 KB, ~1s mock download) rather than 412-byte README.md (which completes
+    // on the first 350ms pump tick) so the toast stays active across the layout check and nav click.
     await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
-    await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
-    await dispatchSwipe(page, '.swipe-row:has-text("README.md")', {
+    await page.locator('.list a.row', { hasText: 'Passport.pdf' }).waitFor();
+    await dispatchSwipe(page, '.swipe-row:has-text("Passport.pdf")', {
       startX: 310,
       startY: 220,
       endX: 140,
       endY: 222,
     });
-    await page.locator('.swipe-row:has-text("README.md") .swipe-action', { hasText: 'Send to' }).click();
+    await page.locator('.swipe-row:has-text("Passport.pdf") .swipe-action', { hasText: 'Send to' }).click();
     const dlSheet = page.locator('.sheet');
     await dlSheet.locator('button[role="radio"]', { hasText: 'This phone' }).click();
     await dlSheet.getByRole('button', { name: /Download to this phone/ }).click();
@@ -737,7 +805,7 @@ test('Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses
     await dlToast.waitFor();
     const dlText = await dlToast.innerText();
     assert.ok(
-      dlText.includes('Downloading README.md. Watch progress in Activity.'),
+      dlText.includes('Downloading Passport.pdf. Watch progress in Activity.'),
       `Unexpected download toast text: ${dlText}`,
     );
     assert.ok(!dlText.includes('—'), `Download toast must not contain an em-dash: ${dlText}`);
@@ -750,6 +818,26 @@ test('Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses
       0,
       'Transfer-started toast must dismiss when switching to Activity via nav',
     );
+
+    // Send-to another machine at phone width also keeps the toast clear of the first row.
+    await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
+    await page.locator('.list a.row', { hasText: 'Passport.pdf' }).waitFor();
+    await dispatchSwipe(page, '.swipe-row:has-text("Passport.pdf")', {
+      startX: 310,
+      startY: 220,
+      endX: 140,
+      endY: 222,
+    });
+    await page.locator('.swipe-row:has-text("Passport.pdf") .swipe-action', { hasText: 'Send to' }).click();
+    const sendSheet = page.locator('.sheet');
+    await sendSheet.locator('button[role="radio"]', { hasText: 'pi' }).click();
+    await sendSheet.getByRole('button', { name: 'Copy to pi' }).click();
+    await sendSheet.waitFor({ state: 'hidden' });
+    const sendToast = page.locator('.toast-banner', {
+      hasText: 'Copying Passport.pdf to pi. Watch progress in Activity.',
+    });
+    await sendToast.waitFor();
+    await assertToastDoesNotCoverFirstRow(page, 'narrow send-to toast');
 
     // Case 2: Started while already on Activity -> no transfer-started toast is shown.
     await page.goto(`${server.url}/?mock=slow-upload#/files/tower//home/me/Documents`, {
