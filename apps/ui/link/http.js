@@ -292,6 +292,98 @@ export function createHttpLink() {
     writeToken('');
   }
 
+  let contentUnsupported = false;
+
+  /**
+   * Mints a short-lived ticketed content address (`POST /v1/content`) for viewing or download.
+   */
+  async function contentUrl({ machine, path, download = false, signal } = {}) {
+    if (contentUnsupported) {
+      throw {
+        code: 'unsupported',
+        message: 'This machine does not serve file previews yet.',
+        hint: 'Update Legion on this machine to view pictures, video, and audio here.',
+        machine: machine || null,
+      };
+    }
+    const current = token || readToken();
+    if (!current) {
+      throw {
+        code: 'denied',
+        message: 'This browser does not have a token yet.',
+        hint: null,
+        machine: machine || null,
+        status: 401,
+      };
+    }
+    const body = { path };
+    if (machine) body.on = machine;
+    let res;
+    try {
+      res = await fetch('/v1/content', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${current}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        throw { code: 'cancelled', message: 'The request was cancelled.', hint: null, machine: machine || null };
+      }
+      throw { code: 'unreachable', message: 'Could not reach the server.', hint: null, machine: machine || null };
+    }
+    if (res.status === 404 || res.status === 405 || res.status === 501) {
+      contentUnsupported = true;
+      throw {
+        code: 'unsupported',
+        message: 'This machine does not serve file previews yet.',
+        hint: null,
+        machine: machine || null,
+        status: res.status,
+      };
+    }
+    let parsed = null;
+    try {
+      parsed = await res.json();
+    } catch {
+      parsed = null;
+    }
+    if (!res.ok) throw toError(parsed, res.status);
+    let url = parsed?.url || '';
+    if (download && url) {
+      url += url.includes('?') ? '&download=1' : '?download=1';
+    }
+    return {
+      url,
+      expiresIn: parsed?.expires_in ?? parsed?.expiresIn ?? 900,
+      mime: parsed?.mime || null,
+    };
+  }
+
+  let browserDownloadSeq = 1;
+
+  /**
+   * Non-blocking browser download using a ticketed `?download=1` content address.
+   */
+  async function download({ machine, path, name } = {}) {
+    const id = `browser-dl-${browserDownloadSeq++}`;
+    const res = await contentUrl({ machine, path, download: true });
+    if (res?.url && typeof document !== 'undefined') {
+      const a = document.createElement('a');
+      a.href = res.url;
+      a.download = name || '';
+      a.rel = 'noopener noreferrer';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+    return { id };
+  }
+
   return {
     kind: 'http',
     state,
@@ -299,5 +391,7 @@ export function createHttpLink() {
     call,
     setToken,
     forget,
+    contentUrl,
+    download,
   };
 }

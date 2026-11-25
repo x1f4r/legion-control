@@ -1,16 +1,21 @@
 import { formatBusyReasonLines } from '../lib/format.js';
+import { createMockFilesState, FILES_EXTRA_TOOLS, OLD_FS_FIND_TOOL } from './mock-files.js';
 
 // Deterministic mock link (?mock) shaped like real Legion tool results.
 // Mode flags (comma-separated, e.g. ?mock=multi,tech):
-//   token   - unauthenticated HTTP token start screen
-//   pair    - unauthenticated app pairing start screen
-//   repair  - damaged state file recovery screen
-//   limited - observer role (no exec, write, power, destroy, admin)
-//   multi   - native app mode with two paired nodes (tower, pi)
-//   fleet   - native app mode with learned routes, unsynced peer, relay peer, identity change, and fleet device.invite schema
-//   enrol   - with fleet, auto-completes the next created invite so post-pairing delivery appears
-//   first   - adds a never-seen machine ("mini") that starts in asking state
-//   tech    - starts with Technical details turned on
+//   token     - unauthenticated HTTP token start screen
+//   pair      - unauthenticated app pairing start screen
+//   repair    - damaged state file recovery screen
+//   limited   - observer role (no exec, write, power, destroy, admin)
+//   multi     - native app mode with two paired nodes (tower, pi)
+//   fleet     - native app mode with learned routes, unsynced peer, relay peer, identity change, and fleet device.invite schema
+//   enrol     - with fleet, auto-completes the next created invite so post-pairing delivery appears
+//   first     - adds a never-seen machine ("mini") that starts in asking state
+//   tech      - starts with Technical details turned on
+//   old       - configures mock as an older node with none of the new Files tools or content URLs
+//   nosync    - hides sync.* tools so the Kept in sync section is omitted
+//   large     - adds a 5 000-entry folder (/home/me/Archive5000) for paging tests
+//   transfers - seeds live running machine & device transfers for Activity preview
 
 const isoAgo = (sec) => new Date(Date.now() - sec * 1000).toISOString();
 
@@ -517,9 +522,54 @@ export function createMockLink(mode = '') {
   let deviceListPollCount = 0;
   let fleetDevicesByMachine = null;
 
+  const isOldNode = flags.has('old') || flags.has('legacy');
+  const isNoSync = flags.has('nosync') || isOldNode;
+
+  const baseTools = MOCK_TOOLS.map((t) => {
+    if (!isOldNode && t.name === 'fs.list') {
+      return {
+        ...t,
+        input_schema: {
+          ...t.input_schema,
+          properties: {
+            ...t.input_schema.properties,
+            sort: { type: 'string', enum: ['name', 'modified', 'size'] },
+            order: { type: 'string', enum: ['asc', 'desc'] },
+            categories: { type: 'array', items: { type: 'string' } },
+            offset: { type: 'integer', default: 0, minimum: 0 },
+          },
+        },
+      };
+    }
+    if (!isOldNode && t.name === 'fs.transfer') {
+      return {
+        ...t,
+        input_schema: {
+          ...t.input_schema,
+          properties: {
+            ...t.input_schema.properties,
+            if_exists: { type: 'string', enum: ['fail', 'skip', 'replace', 'rename'] },
+            move: { type: 'boolean', default: false },
+            background: { type: 'boolean', default: false },
+          },
+        },
+      };
+    }
+    return t;
+  });
+
+  const extraFileTools = isOldNode
+    ? [
+        OLD_FS_FIND_TOOL,
+        ...FILES_EXTRA_TOOLS.filter((t) => ['fs.mkdir', 'fs.move', 'fs.stat', 'fs.hash'].includes(t.name)),
+      ]
+    : FILES_EXTRA_TOOLS.filter((t) => !(isNoSync && t.name.startsWith('sync.')));
+
+  const fullBaseTools = [...baseTools, ...extraFileTools];
+
   const mockToolsList = isFleet
     ? [
-        ...MOCK_TOOLS.map((t) =>
+        ...fullBaseTools.map((t) =>
           t.name === 'device.invite'
             ? {
                 ...t,
@@ -563,7 +613,7 @@ export function createMockLink(mode = '') {
             ]
           : []),
       ]
-    : MOCK_TOOLS;
+    : fullBaseTools;
 
   const role = isNone ? 'guest' : isLimited ? 'observer' : 'owner';
   const allowedTools = isNone
@@ -826,31 +876,11 @@ export function createMockLink(mode = '') {
     };
   }
 
-  const fsTree = {
-    '/home/me': [
-      { name: 'projects', path: '/home/me/projects', kind: 'dir', size: 4096, mtime: isoAgo(1200), mode: '0755' },
-      { name: 'docs', path: '/home/me/docs', kind: 'dir', size: 4096, mtime: isoAgo(86400), mode: '0755' },
-      { name: 'notes.txt', path: '/home/me/notes.txt', kind: 'file', size: 124, mtime: isoAgo(3600), mode: '0644' },
-    ],
-    '/home/me/projects': [
-      { name: 'legion', path: '/home/me/projects/legion', kind: 'dir', size: 4096, mtime: isoAgo(600), mode: '0755' },
-      { name: 'notes', path: '/home/me/projects/notes', kind: 'dir', size: 4096, mtime: isoAgo(5400), mode: '0755' },
-    ],
-    '/home/me/projects/legion': [
-      { name: 'README.md', path: '/home/me/projects/legion/README.md', kind: 'file', size: 312, mtime: isoAgo(900), mode: '0644' },
-      { name: 'Cargo.toml', path: '/home/me/projects/legion/Cargo.toml', kind: 'file', size: 184, mtime: isoAgo(900), mode: '0644' },
-    ],
-    '/home/me/docs': [
-      { name: 'hello.txt', path: '/home/me/docs/hello.txt', kind: 'file', size: 38, mtime: isoAgo(86400), mode: '0644' },
-    ],
-  };
-
-  const fsFiles = {
-    '/home/me/notes.txt': 'Tower runs Linux 7.2 with 32 cores and 60 GB RAM.\nPi stays online as the Wake-on-LAN helper for laptop.\n',
-    '/home/me/docs/hello.txt': 'Hello from Legion mock file preview.\n',
-    '/home/me/projects/legion/README.md': '# Legion\n\nOne interface, one protocol, three pipes.\n',
-    '/home/me/projects/legion/Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n',
-  };
+  const filesState = createMockFilesState({
+    machines,
+    flags,
+    activeNodeRef: () => activeNode,
+  });
 
   function resolveOne(target, tool, args, onEvent) {
     const name = target || activeNode;
@@ -870,6 +900,11 @@ export function createMockLink(mode = '') {
         hint: 'Ask the machine owner to grant access in policy.toml.',
         machine: name,
       };
+    }
+
+    if (tool.startsWith('fs.') || tool.startsWith('fav.') || tool.startsWith('sync.')) {
+      const handled = filesState.handleTool(name, tool, args, onEvent);
+      if (handled !== undefined) return handled;
     }
 
     switch (tool) {
@@ -1123,43 +1158,11 @@ export function createMockLink(mode = '') {
           duration_ms: 38,
         };
       }
-      case 'fs.list': {
-        const requested = (args?.path || '~').replace(/^~(?=\/|$)/, '/home/me').replace(/\/+$/, '') || '/home/me';
-        const entries = fsTree[requested];
-        if (!entries) {
-          throw { code: 'not_found', message: `${requested} does not exist.`, hint: null, machine: name };
-        }
-        return { path: requested, entries, truncated: false };
-      }
-      case 'fs.read': {
-        const requested = (args?.path || '').replace(/^~(?=\/|$)/, '/home/me');
-        const content = fsFiles[requested];
-        if (content === undefined) {
-          throw { code: 'not_found', message: `${requested} does not exist.`, hint: null, machine: name };
-        }
-        return {
-          path: requested,
-          size: content.length,
-          offset: 0,
-          length: content.length,
-          encoding: 'utf8',
-          content,
-          eof: true,
-        };
-      }
-      case 'fs.transfer':
-        return {
-          transferred: !args?.dry_run,
-          dry_run: Boolean(args?.dry_run) || undefined,
-          from: args?.from,
-          to: args?.to,
-          bytes: 124,
-        };
       case 'job.list': {
         if (isEmpty) return { jobs: [], truncated: false };
         const jobs = args?.state ? m.jobs.filter((j) => j.state === args.state) : m.jobs;
         return {
-          jobs: jobs.map(({ logs: _logs, ...rest }) => rest),
+          jobs: jobs.map(({ logs: _logs, _mockLive: _live, ...rest }) => rest),
           truncated: false,
         };
       }
@@ -1183,8 +1186,16 @@ export function createMockLink(mode = '') {
         if (!job) throw { code: 'not_found', message: `No job ${args?.id}.`, hint: null, machine: name };
         return {
           id: job.id,
+          kind: job.kind,
           name: job.name,
+          title: job.title,
           cmd: job.command,
+          from: job.from,
+          to: job.to,
+          move: job.move,
+          hash: job.hash,
+          error_summary: job.error_summary,
+          progress: job.progress ? { ...job.progress } : undefined,
           state: job.state,
           created: job.created,
           finished: job.finished,
@@ -1707,5 +1718,6 @@ export function createMockLink(mode = '') {
     repairStore,
     scanInvite,
     initialFleetCache,
+    ...filesState.optionalLinkMethods,
   };
 }
