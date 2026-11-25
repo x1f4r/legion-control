@@ -1433,3 +1433,223 @@ async fn real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat()
     assert_eq!(older_machine_reply.code, ErrorCode::Conflict);
     assert!(older_machine_reply.details.is_none());
 }
+
+#[cfg(unix)]
+fn hold_flock(lock_path: &Path) -> Option<Child> {
+    if find_tool("flock").is_none() {
+        return None;
+    }
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    let child = Command::new("flock")
+        .args(["-o", "-x"])
+        .arg(lock_path)
+        .args(["sleep", "60"])
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let busy = !Command::new("flock")
+            .args(["-n", "-x"])
+            .arg(lock_path)
+            .arg("true")
+            .status()
+            .unwrap()
+            .success();
+        if busy {
+            return Some(child);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("could not acquire lock {}", lock_path.display());
+}
+
+#[cfg(unix)]
+fn wait_lock_busy(lock_path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let busy = !Command::new("flock")
+            .args(["-n", "-x"])
+            .arg(lock_path)
+            .arg("true")
+            .status()
+            .unwrap()
+            .success();
+        if busy {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("lock {} never became held", lock_path.display());
+}
+
+#[cfg(unix)]
+async fn wait_sshd_accepted(sshd: &ThrowawaySshd, target_count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sshd.log().matches("Accepted publickey").count() < target_count {
+        assert!(
+            Instant::now() < deadline,
+            "sshd never accepted connection #{target_count}:\n{}",
+            sshd.log()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_sshd_shared_principal_post_send_not_found_does_not_recover() {
+    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() || find_tool("flock").is_none() {
+        eprintln!(
+            "skipping real_sshd_shared_principal_post_send_not_found_does_not_recover: sshd/ssh-keygen/flock unavailable"
+        );
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        eprintln!("skipping: built `legion` binary not found");
+        return;
+    };
+
+    let root = strict_tempdir();
+    let user_home = root.path().join("home");
+    let legion_home = root.path().join("legion");
+    let config_dir = legion_home.join("config");
+    let ssh_dir = user_home.join(".ssh");
+    let auth_keys = ssh_dir.join("authorized_keys");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&ssh_dir).unwrap();
+    let _ = fs::set_permissions(&user_home, fs::Permissions::from_mode(0o700));
+    let _ = fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700));
+
+    let Some(sshd) = ThrowawaySshd::start(&auth_keys, &user_home) else {
+        return;
+    };
+    fs::write(
+        config_dir.join("node.toml"),
+        format!(
+            "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_keys),
+            toml_literal(&sshd.host_key_pub),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        config_dir.join("policy.toml"),
+        "default = \"owner\"\n\n\
+         [roles.operator]\n\
+         allow = [\"effect:read\"]\n\n\
+         [principals.me]\n\
+         role = \"operator\"\n",
+    )
+    .unwrap();
+
+    let port_arg = format!("port={}", sshd.port);
+    let user_arg = format!("user={}", sshd.user);
+
+    // Key Y is already enrolled under shared principal `me` (and confirmed via a real session).
+    let inv1_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "principal=me",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv1 = Invite::parse(inv1_res["invite"].as_str().unwrap()).unwrap();
+    let key_y = DeviceKey::generate().unwrap();
+    let enrolled_y = enrol(
+        &inv1,
+        &key_y,
+        "phone",
+        SshTimeouts::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let confirm_y = Link::new(LinkConfig {
+        device_key: Some(key_y.to_openssh().unwrap()),
+        nodes: vec![NodeLink::from(enrolled_y)],
+        ..LinkConfig::default()
+    });
+    let _ = confirm_y
+        .call("tower", "meta.whoami", json!({}), None, |_| {})
+        .await
+        .unwrap();
+    confirm_y.close().await;
+
+    // Two holders of a fresh shared-principal invite race deterministically:
+    // 1. Hold `.authorized_keys.legion.lock` so intruder X acquires `config.lock` first and blocks
+    //    before editing `authorized_keys` (leaving the invite key accepted by sshd).
+    // 2. Start victim Y (`link_y.pair`): sshd accepts the invite key, Y sends its enrolment line,
+    //    and blocks on `config.lock` behind X.
+    // 3. Release `.authorized_keys.legion.lock`: X is guaranteed to finish enrolling first and
+    //    consume the invite, so Y reliably receives post-send `ErrorCode::NotFound` and MUST NOT
+    //    probe/recover (which would hide that X consumed the invite).
+    let inv2_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "principal=me",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv2_text = inv2_res["invite"].as_str().unwrap().to_owned();
+    let inv2 = Invite::parse(&inv2_text).unwrap();
+    let auth_lock = ssh_dir.join(".authorized_keys.legion.lock");
+    let config_lock = legion_home.join("state").join("sync").join("config.lock");
+    let Some(mut auth_holder) = hold_flock(&auth_lock) else {
+        return;
+    };
+
+    let key_x = DeviceKey::generate().unwrap();
+    let accepted_before = sshd.log().matches("Accepted publickey").count();
+    let inv_x = inv2.clone();
+    let tx = tokio::spawn(async move {
+        enrol(
+            &inv_x,
+            &key_x,
+            "intruder",
+            SshTimeouts::default(),
+            CancellationToken::new(),
+        )
+        .await
+    });
+    wait_sshd_accepted(&sshd, accepted_before + 1).await;
+    wait_lock_busy(&config_lock);
+
+    let link_y = Link::new(LinkConfig {
+        device_key: Some(key_y.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let ly = link_y.clone();
+    let inv_y = inv2_text.clone();
+    let ty = tokio::spawn(async move { ly.pair(&inv_y, "phone").await });
+    wait_sshd_accepted(&sshd, accepted_before + 2).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let _ = auth_holder.kill();
+    let _ = auth_holder.wait();
+
+    let rx = tx.await.unwrap();
+    let ry = ty.await.unwrap();
+    assert!(rx.is_ok(), "intruder X should win the invite: {rx:?}");
+    let err = ry.expect_err(
+        "intruder consumed the shared-principal invite; post-send NotFound must NOT recover",
+    );
+    assert_eq!(err.code, ErrorCode::NotFound, "{err}");
+    assert!(
+        link_y.config().node("tower").is_none(),
+        "refused shared-principal pairing must not save node"
+    );
+    link_y.close().await;
+}

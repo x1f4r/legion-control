@@ -747,10 +747,12 @@ mod enrol_client {
                         ProbeOutcome::Unreachable => Err(cancelled_uncertain_error(&invite.node)),
                     };
                 }
-                if matches!(
-                    err.code,
-                    ErrorCode::Timeout | ErrorCode::Unreachable | ErrorCode::NotFound
-                ) {
+                let should_recover =
+                    matches!(err.code, ErrorCode::Timeout | ErrorCode::Unreachable)
+                        || (err.code == ErrorCode::NotFound
+                            && allow_auth_failed_recovery
+                            && is_device_principal(&invite.principal));
+                if should_recover {
                     if let ProbeOutcome::Confirmed(enrolled) = probe().await {
                         return Ok(*enrolled);
                     }
@@ -2027,12 +2029,43 @@ mod tests {
         assert_eq!(unsent_err.code, ErrorCode::Unreachable);
         assert_eq!(unsent_probes.load(Ordering::SeqCst), 0);
 
-        // 7. NotFound after request was sent (e.g. a retry that waited behind the first
-        //    enrolment's lock and arrived after the invite was consumed) runs recovery and
-        //    succeeds when the device key is already enrolled.
+        // 7. NotFound after request was sent recovers ONLY for `device:` principals (and when
+        //    `allow_auth_failed_recovery` is true), matching `REASON_AUTH_FAILED` so a shared-
+        //    principal invite consumed by another device is never masked.
         let not_found_probes = Arc::new(AtomicUsize::new(0));
         let not_found_probes_c = Arc::clone(&not_found_probes);
         let not_found_recovered = enrol_client::enrol_flow(
+            &device_invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(
+                        ErrorCode::NotFound,
+                        "This pairing invite is no longer valid or has already been used.",
+                    )
+                    .with_machine("tower"),
+                    request_sent: true,
+                }
+            },
+            || {
+                let expected = sample_device_enrolled();
+                async move {
+                    not_found_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(not_found_recovered.recovered);
+        assert_eq!(not_found_recovered.principal, "device:phone");
+        assert_eq!(not_found_probes.load(Ordering::SeqCst), 1);
+
+        // Shared principal (`phone`) receiving post-send NotFound MUST NOT probe or recover.
+        let shared_nf_probes = Arc::new(AtomicUsize::new(0));
+        let shared_nf_probes_c = Arc::clone(&shared_nf_probes);
+        let shared_nf_err = enrol_client::enrol_flow(
             &invite,
             CancellationToken::new(),
             true,
@@ -2049,21 +2082,52 @@ mod tests {
             || {
                 let expected = sample_enrolled();
                 async move {
-                    not_found_probes_c.fetch_add(1, Ordering::SeqCst);
+                    shared_nf_probes_c.fetch_add(1, Ordering::SeqCst);
                     enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
                 }
             },
         )
         .await
-        .unwrap();
-        assert!(not_found_recovered.recovered);
-        assert_eq!(not_found_probes.load(Ordering::SeqCst), 1);
+        .unwrap_err();
+        assert_eq!(shared_nf_err.code, ErrorCode::NotFound);
+        assert_eq!(shared_nf_probes.load(Ordering::SeqCst), 0);
+
+        // Already paired under the same `device:` principal (`allow_auth_failed_recovery = false`):
+        // post-send NotFound MUST NOT probe or recover.
+        let blocked_nf_probes = Arc::new(AtomicUsize::new(0));
+        let blocked_nf_probes_c = Arc::clone(&blocked_nf_probes);
+        let blocked_nf_err = enrol_client::enrol_flow(
+            &device_invite,
+            CancellationToken::new(),
+            false,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(
+                        ErrorCode::NotFound,
+                        "This pairing invite is no longer valid or has already been used.",
+                    )
+                    .with_machine("tower"),
+                    request_sent: true,
+                }
+            },
+            || {
+                let expected = sample_device_enrolled();
+                async move {
+                    blocked_nf_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(blocked_nf_err.code, ErrorCode::NotFound);
+        assert_eq!(blocked_nf_probes.load(Ordering::SeqCst), 0);
 
         // NotFound before the request left the client does not probe.
         let unsent_nf_probes = Arc::new(AtomicUsize::new(0));
         let unsent_nf_probes_c = Arc::clone(&unsent_nf_probes);
         let unsent_nf_err = enrol_client::enrol_flow(
-            &invite,
+            &device_invite,
             CancellationToken::new(),
             true,
             || async {
@@ -2073,7 +2137,7 @@ mod tests {
                 }
             },
             || {
-                let expected = sample_enrolled();
+                let expected = sample_device_enrolled();
                 async move {
                     unsent_nf_probes_c.fetch_add(1, Ordering::SeqCst);
                     enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
