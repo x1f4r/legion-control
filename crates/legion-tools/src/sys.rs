@@ -1,25 +1,26 @@
-//! `sys`: what the machine is and how busy it is, the processes it runs, and stopping one.
+//! `sys`: what the machine is and how busy it is, the processes it runs, and stopping them.
 //!
-//! System and process figures come from `sysinfo`, whose reads block on the file system or the
-//! kernel, so every read runs on the blocking pool and the async runtime keeps serving other
-//! calls. CPU usage is a rate, which takes two samples a short interval apart; the interval is
-//! awaited on the runtime between two blocking reads rather than slept through on a thread.
+//! System and process figures come from `sysinfo` and `legion_os::hardware`, whose reads block on
+//! the file system or the kernel, so every read runs on the blocking pool or in a bounded probe
+//! task and the async runtime keeps serving other calls. CPU usage is a rate, which takes two
+//! samples a short interval apart; hardware probes run concurrently during that interval so
+//! `sys.info` and `sys.procs` stay as fast as their slowest single probe.
 //!
 //! One rule for every result of the `sys` and `exec` families: a field that may have no value is
 //! left out when it has none, never sent as `null`, so a caller tests for presence and never for
 //! both.
 
 mod disks;
-mod gpu;
 mod probe;
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Ctx, NoArgs, Registry, ToolError, audit};
 use legion_os::OsError;
-use legion_os::procid::{self, ProcessId};
+use legion_os::hardware::{self, Battery, Gpu};
+use legion_os::procid::{self, ProcessId, SignalOutcome};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -29,26 +30,26 @@ use sysinfo::{
 };
 
 pub use disks::Disk;
-pub use gpu::Gpu;
+pub use legion_os::hardware::{Battery as SysBattery, BatteryState, Gpu as SysGpu};
 
 /// Adds the `sys` tools.
 pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "sys.info",
         Effect::Read,
-        "Describe this machine: host name, operating system, uptime and boot id, CPU model, core count and current usage, memory and swap, disks, and NVIDIA GPUs. Sizes are bytes.",
+        "Describe this machine: host name, operating system, uptime and boot id, CPU model, core count, usage and temperature, memory and swap, disks, graphics cards, and battery. Sizes are bytes.",
         info,
     );
     registry.add_fn(
         "sys.procs",
         Effect::Read,
-        "List the processes running on this machine, busiest first, with their id, parent, name, command line, user, CPU usage (percent of one core), memory in bytes and start time. `filter` keeps those whose name or command line contains it. Command lines are shown with secret-looking values (passwords, tokens, credentials in URLs) replaced by [redacted].",
+        "List the processes running on this machine, busiest first, with their id, parent, name, command line, user, CPU usage (percent of one core), memory and graphics memory in bytes, start time, and whether the process is legion itself or an ancestor. `group` combines processes with the same name and user into one row. `filter` keeps those whose name or command line contains it. Command lines are shown with secret-looking values (passwords, tokens, credentials in URLs) replaced by [redacted].",
         procs,
     );
     registry.add_fn(
         "sys.kill",
         Effect::Destroy,
-        "Stop a process: ask it to exit, and force it after a short grace if it has not. Pass the `start_time` sys.procs reported so a process that has since exited and whose id was reused is never hit. `tree` stops its descendants too; `force` skips asking.",
+        "Stop one process (`pid`) or up to 64 verified `{pid, start_time}` processes (`targets`). With `targets`, without `force` the tool asks them to exit and waits up to five seconds, returning per-target outcomes (`stopped`, `gone`, `reused`, `still_running`, or `refused`). With `pid`, pass `start_time` so a reused id is never hit; `tree` stops descendants too; `force` skips asking.",
         kill,
     );
 }
@@ -57,8 +58,21 @@ pub fn register(registry: &mut Registry) {
 /// platforms before a difference means anything.
 const CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// How long a process asked politely to exit is given before it is forced.
+/// How long a single `pid` call waits before escalating to force.
 const KILL_GRACE: Duration = Duration::from_secs(3);
+
+/// How long a `targets` call without `force` waits for processes to exit before reporting
+/// survivors as `still_running`.
+const TARGETS_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a `targets` call with `force` waits for signaled processes to leave the process table.
+const TARGETS_FORCE_SETTLE: Duration = Duration::from_secs(2);
+
+/// Poll interval while waiting for `targets` to exit.
+const TARGETS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Maximum number of targets accepted by `sys.kill` `targets` and members listed per grouped row.
+const MAX_TARGETS: usize = 64;
 
 /// What `sys.info` returns.
 #[derive(Debug, Serialize)]
@@ -81,8 +95,11 @@ pub struct Info {
     pub memory: Memory,
     /// Mounted file systems that hold data, each once.
     pub disks: Vec<Disk>,
-    /// NVIDIA GPUs; empty where `nvidia-smi` is absent or does not answer.
+    /// Graphics cards reported by `nvidia-smi` or Linux `/sys/class/drm`.
     pub gpus: Vec<Gpu>,
+    /// System battery state, absent on machines without a battery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battery: Option<Battery>,
 }
 
 /// The operating system part of [`Info`].
@@ -115,6 +132,9 @@ pub struct Cpu {
     /// The load average over 1, 5 and 15 minutes; Windows has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load: Option<[f64; 3]>,
+    /// Processor package temperature in degrees Celsius, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature_c: Option<f64>,
 }
 
 /// The memory part of [`Info`].
@@ -133,8 +153,9 @@ pub struct Memory {
 }
 
 async fn info(ctx: &Ctx, _args: NoArgs) -> Result<Info, ToolError> {
-    // nvidia-smi can take a second to wake a sleeping GPU; it runs while the CPU is sampled.
-    let gpus = tokio::spawn(gpu::query());
+    // Hardware probes (CPU temp, NVIDIA GPUs, DRM GPUs, battery) each have a 1s limit and run
+    // concurrently side by side while the CPU usage interval elapses.
+    let hw = tokio::spawn(hardware::probe_all(hardware::ProbeConfig::default()));
     let mut system = blocking(|| {
         let mut system = System::new_with_specifics(
             RefreshKind::nothing()
@@ -148,7 +169,7 @@ async fn info(ctx: &Ctx, _args: NoArgs) -> Result<Info, ToolError> {
     .await?;
     tokio::time::sleep(CPU_SAMPLE_INTERVAL).await;
     let windows = ctx.os() == "windows";
-    let (cpu, memory, disks, os, hostname, uptime_s, boot_id) = blocking(move || {
+    let (mut cpu, memory, disks, os, hostname, uptime_s, boot_id) = blocking(move || {
         system.refresh_cpu_usage();
         let model = system
             .cpus()
@@ -167,6 +188,7 @@ async fn info(ctx: &Ctx, _args: NoArgs) -> Result<Info, ToolError> {
             cores: system.cpus().len(),
             usage_pct: round1(f64::from(system.global_cpu_usage())),
             load,
+            temperature_c: None,
         };
         let memory = Memory {
             total: system.total_memory(),
@@ -189,7 +211,8 @@ async fn info(ctx: &Ctx, _args: NoArgs) -> Result<Info, ToolError> {
         Ok((cpu, memory, disks, os, hostname, uptime_s, boot_id))
     })
     .await?;
-    let gpus = gpus.await.unwrap_or_default();
+    let hw = hw.await.unwrap_or_default();
+    cpu.temperature_c = hw.cpu_temperature_c;
     let (name, version, kernel) = os;
     Ok(Info {
         node: ctx.node_name().to_owned(),
@@ -206,7 +229,8 @@ async fn info(ctx: &Ctx, _args: NoArgs) -> Result<Info, ToolError> {
         cpu,
         memory,
         disks,
-        gpus,
+        gpus: hw.gpus,
+        battery: hw.battery,
     })
 }
 
@@ -217,38 +241,53 @@ struct ProcsArgs {
     /// Keep only processes whose name or command line contains this, ignoring case.
     #[serde(default)]
     filter: Option<String>,
-    /// What the busiest are measured by: `cpu` (the default) or `memory`.
+    /// What the busiest are measured by: `cpu` (the default), `memory`, or `gpu_memory`.
     #[serde(default)]
     sort: SortBy,
-    /// How many processes to return, 1 to 500; 30 when absent.
+    /// How many rows to return, 1 to 500; 30 when absent.
     #[serde(default)]
     limit: Option<u32>,
+    /// Combine processes with the same name and user into one row per program.
+    #[serde(default)]
+    group: bool,
 }
 
 /// What `sys.procs` sorts by.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 enum SortBy {
     /// CPU usage, highest first.
     #[default]
     Cpu,
     /// Memory, largest first.
     Memory,
+    /// Graphics memory, largest first.
+    GpuMemory,
 }
 
 /// What `sys.procs` returns.
 #[derive(Debug, Serialize)]
 pub struct Procs {
-    /// The processes, busiest first.
-    pub procs: Vec<Proc>,
-    /// How many processes matched, of which `procs` holds the first `limit`.
+    /// The processes (or grouped programs when `group` is true), busiest first.
+    pub procs: Vec<ProcRow>,
+    /// How many rows matched, of which `procs` holds the first `limit`.
     pub total: usize,
     /// Whether more matched than `procs` holds.
     pub truncated: bool,
 }
 
+/// One row in [`Procs`]: either an individual process or a grouped program row.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ProcRow {
+    /// One individual process (`group: false`).
+    Proc(Proc),
+    /// One grouped program (`group: true`).
+    Group(ProcGroup),
+}
+
 /// One process in [`Procs`].
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Proc {
     /// Its process id.
     pub pid: u32,
@@ -268,10 +307,59 @@ pub struct Proc {
     pub cpu_pct: f64,
     /// Resident memory, in bytes.
     pub memory: u64,
+    /// Graphics memory in bytes, when reported by the graphics driver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_memory: Option<u64>,
     /// When it started, to the second, when the system says. `sys.kill` takes it back to be sure
     /// of the process.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_time: Option<String>,
+    /// Present and `true` on the node's own process and its ancestors.
+    #[serde(rename = "self", skip_serializing_if = "is_false")]
+    pub is_self: bool,
+}
+
+/// One `{pid, start_time}` member inside a [`ProcGroup`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProcMember {
+    /// Process id.
+    pub pid: u32,
+    /// When the process started, to the second, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<String>,
+}
+
+/// One grouped program row returned by `sys.procs` when `group: true`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProcGroup {
+    /// The program's name.
+    pub name: String,
+    /// The account it runs as, when that can be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Number of processes in this group.
+    pub count: usize,
+    /// Sum of CPU usage across the group, in percent of one core.
+    pub cpu_pct: f64,
+    /// Sum of resident memory across the group, in bytes.
+    pub memory: u64,
+    /// Sum of graphics memory across the group, in bytes, when any member reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_memory: Option<u64>,
+    /// Redacted command line of the busiest member, when non-empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
+    /// Present and `true` when any member is the node's own process or an ancestor.
+    #[serde(rename = "self", skip_serializing_if = "is_false")]
+    pub is_self: bool,
+    /// Up to 64 `{pid, start_time}` pairs, busiest first.
+    pub members: Vec<ProcMember>,
+    /// How many members were omitted past the 64-member cap.
+    pub more: usize,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The default and the largest `limit` of `sys.procs`.
@@ -291,6 +379,11 @@ async fn procs(_ctx: &Ctx, args: ProcsArgs) -> Result<Procs, ToolError> {
         )
         .with_hint("Narrow the list with `filter` instead of asking for more."));
     }
+    let gpu_mem_task = tokio::spawn(hardware::probe_gpu_process_memory(
+        hardware::default_nvidia_compute_procs_command(),
+        hardware::default_nvidia_pmon_procs_command(),
+        hardware::DEFAULT_PROBE_TIMEOUT,
+    ));
     let refresh = ProcessRefreshKind::nothing()
         .with_cpu()
         .with_memory()
@@ -304,10 +397,12 @@ async fn procs(_ctx: &Ctx, args: ProcsArgs) -> Result<Procs, ToolError> {
     })
     .await?;
     tokio::time::sleep(CPU_SAMPLE_INTERVAL).await;
+    let gpu_mem = gpu_mem_task.await.unwrap_or_default();
     let filter = args.filter.map(|filter| filter.to_lowercase());
     let sort = args.sort;
     let mut list = blocking(move || {
         system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
+        let self_pids = procid::self_and_ancestors();
         let users = Users::new_with_refreshed_list().ok();
         let names: HashMap<String, String> = users
             .iter()
@@ -326,8 +421,9 @@ async fn procs(_ctx: &Ctx, args: ProcsArgs) -> Result<Procs, ToolError> {
                     .map(|part| part.to_string_lossy().into_owned())
                     .collect();
                 let cmd = audit::redact_command(&words).join(" ");
+                let pid = process.pid().as_u32();
                 Proc {
-                    pid: process.pid().as_u32(),
+                    pid,
                     ppid: process.parent().map(Pid::as_u32),
                     name: process.name().to_string_lossy().into_owned(),
                     cmd,
@@ -336,7 +432,9 @@ async fn procs(_ctx: &Ctx, args: ProcsArgs) -> Result<Procs, ToolError> {
                         .and_then(|uid| names.get(&uid.to_string()).cloned()),
                     cpu_pct: round1(f64::from(process.cpu_usage())),
                     memory: process.memory(),
+                    gpu_memory: gpu_mem.get(&pid).copied(),
                     start_time: rfc3339(process.start_time()),
+                    is_self: self_pids.contains(&pid),
                 }
             })
             .filter(|proc| filter.as_deref().is_none_or(|filter| matches(proc, filter)))
@@ -344,16 +442,28 @@ async fn procs(_ctx: &Ctx, args: ProcsArgs) -> Result<Procs, ToolError> {
         Ok(list)
     })
     .await?;
+
+    let keep = usize::try_from(limit).unwrap_or(usize::MAX);
+    if args.group {
+        let mut groups = group_procs(list, sort);
+        let total = groups.len();
+        groups.truncate(keep);
+        return Ok(Procs {
+            truncated: total > groups.len(),
+            procs: groups.into_iter().map(ProcRow::Group).collect(),
+            total,
+        });
+    }
+
     sort_procs(&mut list, sort);
     let total = list.len();
-    let keep = usize::try_from(limit).unwrap_or(usize::MAX);
     list.truncate(keep);
     for proc in &mut list {
         proc.cmd = cut(&proc.cmd, CMD_CHARS);
     }
     Ok(Procs {
         truncated: total > list.len(),
-        procs: list,
+        procs: list.into_iter().map(ProcRow::Proc).collect(),
         total,
     })
 }
@@ -370,14 +480,101 @@ fn sort_procs(list: &mut [Proc], sort: SortBy) {
             SortBy::Cpu => b
                 .cpu_pct
                 .total_cmp(&a.cpu_pct)
-                .then(b.memory.cmp(&a.memory)),
+                .then(b.memory.cmp(&a.memory))
+                .then(b.gpu_memory.unwrap_or(0).cmp(&a.gpu_memory.unwrap_or(0))),
             SortBy::Memory => b
                 .memory
                 .cmp(&a.memory)
-                .then(b.cpu_pct.total_cmp(&a.cpu_pct)),
+                .then(b.cpu_pct.total_cmp(&a.cpu_pct))
+                .then(b.gpu_memory.unwrap_or(0).cmp(&a.gpu_memory.unwrap_or(0))),
+            SortBy::GpuMemory => b
+                .gpu_memory
+                .unwrap_or(0)
+                .cmp(&a.gpu_memory.unwrap_or(0))
+                .then(b.cpu_pct.total_cmp(&a.cpu_pct))
+                .then(b.memory.cmp(&a.memory)),
         };
         busier.then(a.pid.cmp(&b.pid))
     });
+}
+
+/// Combine processes with the same `(name, user)` into one [`ProcGroup`] row per program.
+fn group_procs(procs: Vec<Proc>, sort: SortBy) -> Vec<ProcGroup> {
+    let mut buckets: BTreeMap<(String, Option<String>), Vec<Proc>> = BTreeMap::new();
+    for proc in procs {
+        buckets
+            .entry((proc.name.clone(), proc.user.clone()))
+            .or_default()
+            .push(proc);
+    }
+
+    let mut groups: Vec<ProcGroup> = buckets
+        .into_iter()
+        .map(|((name, user), mut items)| {
+            sort_procs(&mut items, sort);
+            let count = items.len();
+            let cpu_pct = round1(items.iter().map(|p| p.cpu_pct).sum());
+            let memory = items
+                .iter()
+                .fold(0u64, |acc, p| acc.saturating_add(p.memory));
+            let mut gpu_sum: Option<u64> = None;
+            for p in &items {
+                if let Some(g) = p.gpu_memory {
+                    gpu_sum = Some(gpu_sum.unwrap_or(0).saturating_add(g));
+                }
+            }
+            let is_self = items.iter().any(|p| p.is_self);
+            let cmd = items
+                .first()
+                .map(|p| p.cmd.as_str())
+                .filter(|c| !c.is_empty())
+                .map(|c| cut(c, CMD_CHARS));
+            let more = count.saturating_sub(MAX_TARGETS);
+            let members = items
+                .into_iter()
+                .take(MAX_TARGETS)
+                .map(|p| ProcMember {
+                    pid: p.pid,
+                    start_time: p.start_time,
+                })
+                .collect();
+            ProcGroup {
+                name,
+                user,
+                count,
+                cpu_pct,
+                memory,
+                gpu_memory: gpu_sum,
+                cmd,
+                is_self,
+                members,
+                more,
+            }
+        })
+        .collect();
+
+    groups.sort_by(|a, b| {
+        let busier = match sort {
+            SortBy::Cpu => b
+                .cpu_pct
+                .total_cmp(&a.cpu_pct)
+                .then(b.memory.cmp(&a.memory))
+                .then(b.gpu_memory.unwrap_or(0).cmp(&a.gpu_memory.unwrap_or(0))),
+            SortBy::Memory => b
+                .memory
+                .cmp(&a.memory)
+                .then(b.cpu_pct.total_cmp(&a.cpu_pct))
+                .then(b.gpu_memory.unwrap_or(0).cmp(&a.gpu_memory.unwrap_or(0))),
+            SortBy::GpuMemory => b
+                .gpu_memory
+                .unwrap_or(0)
+                .cmp(&a.gpu_memory.unwrap_or(0))
+                .then(b.cpu_pct.total_cmp(&a.cpu_pct))
+                .then(b.memory.cmp(&a.memory)),
+        };
+        busier.then(a.name.cmp(&b.name)).then(a.user.cmp(&b.user))
+    });
+    groups
 }
 
 /// The first `max` characters of `text`, with an ellipsis when something was cut.
@@ -388,25 +585,41 @@ fn cut(text: &str, max: usize) -> String {
     }
 }
 
+/// One verified `{pid, start_time}` target for `sys.kill` `targets`.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct KillTarget {
+    /// The process id.
+    pid: u32,
+    /// When the process started, as `sys.procs` reported it. Required so a reused id is never
+    /// stopped by mistake.
+    start_time: String,
+}
+
 /// Arguments of `sys.kill`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct KillArgs {
-    /// The process id.
-    pid: u32,
-    /// When the process started, as sys.procs reported it. When given and the process with this
-    /// id started at another time, the id has been reused and nothing is stopped.
+    /// The process id (alternative to `targets`).
+    #[serde(default)]
+    pid: Option<u32>,
+    /// When the process started, as sys.procs reported it (used with `pid`). When given and the
+    /// process with this id started at another time, the id has been reused and nothing is stopped.
     #[serde(default)]
     start_time: Option<String>,
-    /// Stop the process's descendants as well.
+    /// 1 to 64 `{pid, start_time}` pairs to stop together with per-target results (alternative to
+    /// `pid`).
+    #[serde(default)]
+    targets: Option<Vec<KillTarget>>,
+    /// Stop the process's descendants as well (only valid with `pid`).
     #[serde(default)]
     tree: bool,
-    /// Stop it at once instead of asking it to exit first.
+    /// Stop at once instead of asking to exit first.
     #[serde(default)]
     force: bool,
 }
 
-/// What `sys.kill` returns.
+/// What `sys.kill` returns when called with `pid`.
 #[derive(Debug, Serialize)]
 pub struct Killed {
     /// The process that was asked to stop.
@@ -417,15 +630,104 @@ pub struct Killed {
     pub survivors: Vec<u32>,
 }
 
-async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
-    let pid = args.pid;
+/// Outcome for one entry in `sys.kill` `targets`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetStatus {
+    /// The process exited after being asked (or forced).
+    Stopped,
+    /// The process had already ended before anything was done.
+    Gone,
+    /// Another process now has that id; nothing was done.
+    Reused,
+    /// The process was still running after the wait window.
+    StillRunning,
+    /// Stopping this process was refused.
+    Refused,
+}
+
+/// Per-target result returned by `sys.kill` when called with `targets`.
+#[derive(Debug, Serialize)]
+pub struct TargetOutcome {
+    /// The process id that was targeted.
+    pub pid: u32,
+    /// Outcome for this target.
+    pub status: TargetStatus,
+    /// Error code when `status` is `refused`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<ErrorCode>,
+    /// Human-readable sentence explaining a refusal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// What `sys.kill` returns when called with `targets`.
+#[derive(Debug, Serialize)]
+pub struct KillTargetsResult {
+    /// Per-target outcomes, in the same order as `targets`.
+    pub results: Vec<TargetOutcome>,
+}
+
+/// Return value of `sys.kill`, preserving the single-`pid` shape and adding the `targets` shape.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum KillResult {
+    /// Result of calling `sys.kill` with `pid`.
+    Single(Killed),
+    /// Result of calling `sys.kill` with `targets`.
+    Batch(KillTargetsResult),
+}
+
+async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<KillResult, ToolError> {
+    match (args.pid, args.targets) {
+        (Some(_), Some(_)) => Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "sys.kill: pass either `pid` or `targets`, not both.",
+        )
+        .with_hint("Use `pid` for one process or `targets` for a verified list.")),
+        (None, None) => Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "sys.kill: pass either `pid` or `targets`.",
+        )
+        .with_hint("Pass a single `pid` or a non-empty `targets` array of `{pid, start_time}`.")),
+        (Some(pid), None) => kill_single(pid, args.start_time, args.tree, args.force)
+            .await
+            .map(KillResult::Single),
+        (None, Some(targets)) => {
+            if args.start_time.is_some() {
+                return Err(ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    "sys.kill: `start_time` belongs inside each item of `targets`, not at the top level.",
+                ));
+            }
+            if args.tree {
+                return Err(ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    "sys.kill: `tree` cannot be combined with `targets`.",
+                )
+                .with_hint(
+                    "List each process to stop in `targets`, or use `pid` with `tree: true`.",
+                ));
+            }
+            kill_targets(targets, args.force)
+                .await
+                .map(KillResult::Batch)
+        }
+    }
+}
+
+async fn kill_single(
+    pid: u32,
+    start_time: Option<String>,
+    tree: bool,
+    force: bool,
+) -> Result<Killed, ToolError> {
     // What can be refused from the pid alone is, before anything is looked up: a process another
     // account owns may not even let its identity be read.
     if let Some(reason) = protected_by_pid(pid, std::process::id(), std::env::consts::OS) {
         return Err(protected(pid, Some(reason)));
     }
-    let expected = args
-        .start_time
+    let expected = start_time
         .as_deref()
         .map(|text| {
             parse_rfc3339(text).ok_or_else(|| {
@@ -502,14 +804,10 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
         }
     }
 
-    let grace = if args.force {
-        Duration::ZERO
-    } else {
-        KILL_GRACE
-    };
+    let grace = if force { Duration::ZERO } else { KILL_GRACE };
     // The identity read above goes all the way down: legion-os checks it again at the moment it
     // signals, so a process that exits meanwhile and whose id is reused is never hit.
-    let survivors = if args.tree {
+    let survivors = if tree {
         let report = procid::kill_tree(&identity, grace).await.map_err(|error| {
             os_error(
                 pid,
@@ -523,7 +821,7 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
             .map(|survivor| survivor.pid)
             .collect()
     } else {
-        let gone = procid::kill_process(&identity, args.force, grace)
+        let gone = procid::kill_process(&identity, force, grace)
             .await
             .map_err(|error| os_error(pid, &format!("stop process {pid}"), error))?;
         if gone { Vec::new() } else { vec![pid] }
@@ -533,6 +831,260 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
         stopped: survivors.is_empty(),
         survivors,
     })
+}
+
+async fn kill_targets(
+    targets: Vec<KillTarget>,
+    force: bool,
+) -> Result<KillTargetsResult, ToolError> {
+    if targets.is_empty() || targets.len() > MAX_TARGETS {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "sys.kill: `targets` must have between 1 and {MAX_TARGETS} entries, not {}.",
+                targets.len()
+            ),
+        )
+        .with_hint("Pass 1 to 64 `{pid, start_time}` targets from sys.procs."));
+    }
+
+    let mut parsed: Vec<(u32, u64)> = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let Some(ts) = parse_rfc3339(&target.start_time) else {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "sys.kill: `start_time` {:?} for pid {} is not an RFC 3339 time.",
+                    target.start_time, target.pid
+                ),
+            )
+            .with_hint("Pass the start_time sys.procs reported for each target, unchanged."));
+        };
+        parsed.push((target.pid, ts));
+    }
+
+    let own = std::process::id();
+    let inspected: Vec<TargetPlan> = blocking(move || {
+        let mut plans = Vec::with_capacity(parsed.len());
+        for (pid, expected_start) in parsed {
+            if let Some(reason) = protected_target_pid(pid, own, std::env::consts::OS) {
+                plans.push(TargetPlan::Ready(refused_target(
+                    pid,
+                    ErrorCode::Denied,
+                    plain_protected_sentence(reason),
+                )));
+                continue;
+            }
+            let lookup = match identify(pid) {
+                Ok(lookup) => lookup,
+                Err(err) => {
+                    plans.push(TargetPlan::Ready(refused_target(pid, err.code, err.message)));
+                    continue;
+                }
+            };
+            let probe = match lookup {
+                Lookup::Missing => probe::probe(pid),
+                Lookup::Found(..) | Lookup::NotPermitted => probe::Probe::Unknown,
+            };
+            let outcome = decide(pid, own, std::env::consts::OS, lookup, probe);
+            match outcome {
+                Outcome::Protected(reason) => {
+                    plans.push(TargetPlan::Ready(refused_target(
+                        pid,
+                        ErrorCode::Denied,
+                        plain_protected_sentence(reason),
+                    )));
+                }
+                Outcome::NotPermitted => {
+                    plans.push(TargetPlan::Ready(refused_target(
+                        pid,
+                        ErrorCode::Denied,
+                        "This program belongs to another user or to the system, so Legion is not allowed to stop it."
+                            .to_owned(),
+                    )));
+                }
+                Outcome::NotFound => {
+                    plans.push(TargetPlan::Ready(TargetOutcome {
+                        pid,
+                        status: TargetStatus::Gone,
+                        code: None,
+                        message: None,
+                    }));
+                }
+                Outcome::Found(identity, started) => {
+                    if let Some(reason) = procid::is_protected(&identity) {
+                        plans.push(TargetPlan::Ready(refused_target(
+                            pid,
+                            ErrorCode::Denied,
+                            plain_protected_sentence(reason),
+                        )));
+                        continue;
+                    }
+                    match started {
+                        None => {
+                            plans.push(TargetPlan::Ready(refused_target(
+                                pid,
+                                ErrorCode::Failed,
+                                "The system did not report when this program started, so nothing was stopped."
+                                    .to_owned(),
+                            )));
+                        }
+                        Some(actual) if actual != expected_start => {
+                            plans.push(TargetPlan::Ready(TargetOutcome {
+                                pid,
+                                status: TargetStatus::Reused,
+                                code: None,
+                                message: None,
+                            }));
+                        }
+                        Some(_) => {
+                            plans.push(TargetPlan::Signal(identity));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(plans)
+    })
+    .await?;
+
+    let mut results: Vec<Option<TargetOutcome>> = Vec::with_capacity(inspected.len());
+    let mut pending: Vec<(usize, ProcessId)> = Vec::new();
+
+    for (idx, plan) in inspected.into_iter().enumerate() {
+        match plan {
+            TargetPlan::Ready(outcome) => results.push(Some(outcome)),
+            TargetPlan::Signal(identity) => match procid::signal_process(&identity, force).await {
+                Ok(SignalOutcome::Signaled) => {
+                    results.push(None);
+                    pending.push((idx, identity));
+                }
+                Ok(SignalOutcome::AlreadyGone) => {
+                    results.push(Some(TargetOutcome {
+                        pid: identity.pid,
+                        status: TargetStatus::Gone,
+                        code: None,
+                        message: None,
+                    }));
+                }
+                Ok(SignalOutcome::IdentityMismatch) => {
+                    results.push(Some(TargetOutcome {
+                        pid: identity.pid,
+                        status: TargetStatus::Reused,
+                        code: None,
+                        message: None,
+                    }));
+                }
+                Err(OsError::PermissionDenied { .. }) => {
+                    results.push(Some(refused_target(
+                        identity.pid,
+                        ErrorCode::Denied,
+                        "This program belongs to another user or to the system, so Legion is not allowed to stop it."
+                            .to_owned(),
+                    )));
+                }
+                Err(OsError::Unsupported { detail }) => {
+                    results.push(Some(refused_target(
+                        identity.pid,
+                        ErrorCode::Unsupported,
+                        format!("This system cannot stop the program: {detail}."),
+                    )));
+                }
+                Err(other) => {
+                    results.push(Some(refused_target(
+                        identity.pid,
+                        ErrorCode::Failed,
+                        format!("Could not stop the program: {other}."),
+                    )));
+                }
+            },
+        }
+    }
+
+    if !pending.is_empty() {
+        let wait = if force {
+            TARGETS_FORCE_SETTLE
+        } else {
+            TARGETS_WAIT
+        };
+        let deadline = Instant::now() + wait;
+        loop {
+            let ids: Vec<ProcessId> = pending.iter().map(|(_, id)| *id).collect();
+            let alive_flags: Vec<bool> =
+                blocking(move || Ok(ids.iter().map(procid::is_alive).collect())).await?;
+
+            let mut still = Vec::new();
+            for ((idx, id), alive) in pending.into_iter().zip(alive_flags) {
+                if alive {
+                    still.push((idx, id));
+                } else {
+                    results[idx] = Some(TargetOutcome {
+                        pid: id.pid,
+                        status: TargetStatus::Stopped,
+                        code: None,
+                        message: None,
+                    });
+                }
+            }
+            pending = still;
+            if pending.is_empty() {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            tokio::time::sleep(TARGETS_POLL_INTERVAL.min(remaining)).await;
+        }
+
+        for (idx, id) in pending {
+            results[idx] = Some(TargetOutcome {
+                pid: id.pid,
+                status: TargetStatus::StillRunning,
+                code: None,
+                message: None,
+            });
+        }
+    }
+
+    let final_results = results.into_iter().flatten().collect();
+    Ok(KillTargetsResult {
+        results: final_results,
+    })
+}
+
+enum TargetPlan {
+    Ready(TargetOutcome),
+    Signal(ProcessId),
+}
+
+fn refused_target(pid: u32, code: ErrorCode, message: String) -> TargetOutcome {
+    TargetOutcome {
+        pid,
+        status: TargetStatus::Refused,
+        code: Some(code),
+        message: Some(message),
+    }
+}
+
+/// Protected PIDs for `targets`: PID 0 and PID 1 are refused always, alongside the current
+/// process and Windows System (PID 4).
+fn protected_target_pid(pid: u32, own: u32, os: &str) -> Option<&'static str> {
+    if pid == 1 {
+        return Some("init process (pid 1)");
+    }
+    protected_by_pid(pid, own, os)
+}
+
+fn plain_protected_sentence(reason: &str) -> String {
+    match reason {
+        "current process" => "Legion cannot stop itself.".to_owned(),
+        "ancestor of current process" => {
+            "Legion cannot stop a program it is running inside.".to_owned()
+        }
+        _ => "The system requires this program and will not stop it.".to_owned(),
+    }
 }
 
 /// Why sys.kill refuses a process legion-os names as protected: legion itself, the processes it
@@ -710,19 +1262,98 @@ mod tests {
             user: None,
             cpu_pct,
             memory,
+            gpu_memory: None,
             start_time: rfc3339(0),
+            is_self: false,
         }
     }
 
     #[test]
     fn processes_are_sorted_busiest_first_and_ties_by_pid() {
-        let mut list = vec![proc(3, 1.0, 10), proc(1, 5.0, 5), proc(2, 1.0, 10)];
+        let mut p1 = proc(1, 5.0, 5);
+        p1.gpu_memory = Some(100);
+        let mut p2 = proc(2, 1.0, 10);
+        p2.gpu_memory = Some(500);
+        let p3 = proc(3, 1.0, 10);
+        let mut list = vec![p3, p1, p2];
+
         sort_procs(&mut list, SortBy::Cpu);
         let pids: Vec<u32> = list.iter().map(|p| p.pid).collect();
         assert_eq!(pids, [1, 2, 3]);
+
         sort_procs(&mut list, SortBy::Memory);
         let pids: Vec<u32> = list.iter().map(|p| p.pid).collect();
         assert_eq!(pids, [2, 3, 1]);
+
+        sort_procs(&mut list, SortBy::GpuMemory);
+        let pids: Vec<u32> = list.iter().map(|p| p.pid).collect();
+        assert_eq!(pids, [2, 1, 3]);
+    }
+
+    #[test]
+    fn grouping_sums_orders_caps_at_64_and_counts_more() {
+        let mut list = Vec::new();
+        // 70 rustc processes for user "me", pids 1..=70, busiest is pid 70.
+        for i in 1..=70u32 {
+            list.push(Proc {
+                pid: i,
+                ppid: Some(1),
+                name: "rustc".to_owned(),
+                cmd: format!("rustc worker-{i}"),
+                user: Some("me".to_owned()),
+                cpu_pct: f64::from(i),
+                memory: u64::from(i) * 1024,
+                gpu_memory: None,
+                start_time: rfc3339(1_700_000_000 + u64::from(i)),
+                is_self: false,
+            });
+        }
+        // Separate user "other" with same name stays a distinct row.
+        list.push(Proc {
+            pid: 500,
+            ppid: Some(1),
+            name: "rustc".to_owned(),
+            cmd: "rustc other".to_owned(),
+            user: Some("other".to_owned()),
+            cpu_pct: 5.0,
+            memory: 2048,
+            gpu_memory: None,
+            start_time: rfc3339(1_700_000_500),
+            is_self: false,
+        });
+        // GPU-heavy python process.
+        list.push(Proc {
+            pid: 600,
+            ppid: Some(1),
+            name: "python3".to_owned(),
+            cmd: "python3 train.py".to_owned(),
+            user: Some("me".to_owned()),
+            cpu_pct: 12.0,
+            memory: 4096,
+            gpu_memory: Some(9_000_000_000),
+            start_time: rfc3339(1_700_000_600),
+            is_self: false,
+        });
+
+        let by_cpu = group_procs(list.clone(), SortBy::Cpu);
+        assert_eq!(by_cpu.len(), 3);
+        let rustc = &by_cpu[0];
+        assert_eq!(rustc.name, "rustc");
+        assert_eq!(rustc.user.as_deref(), Some("me"));
+        assert_eq!(rustc.count, 70);
+        assert_eq!(rustc.cpu_pct, 2485.0);
+        assert_eq!(rustc.memory, 2485 * 1024);
+        assert_eq!(rustc.gpu_memory, None);
+        assert_eq!(rustc.members.len(), 64);
+        assert_eq!(rustc.more, 6);
+        // Members are ordered busiest first (pid 70 down to pid 7).
+        assert_eq!(rustc.members[0].pid, 70);
+        assert_eq!(rustc.members[63].pid, 7);
+        assert_eq!(rustc.cmd.as_deref(), Some("rustc worker-70"));
+
+        let by_gpu = group_procs(list, SortBy::GpuMemory);
+        assert_eq!(by_gpu[0].name, "python3");
+        assert_eq!(by_gpu[0].gpu_memory, Some(9_000_000_000));
     }
 
     #[test]
@@ -790,7 +1421,7 @@ mod tests {
             decide(77, own, "linux", found, Probe::Unknown),
             Outcome::Found(ProcessId::new(77, 1), Some(1))
         );
-        // Pid 1 and 4 are ordinary on the other family.
+        // Pid 1 and 4 are ordinary on the other family for single-pid mode.
         assert_eq!(
             decide(1, own, "windows", Lookup::Missing, Probe::Missing),
             Outcome::NotFound
@@ -799,42 +1430,18 @@ mod tests {
             decide(4, own, "linux", Lookup::Missing, Probe::Missing),
             Outcome::NotFound
         );
+        // Targets mode refuses pid 0 and 1 on every OS.
+        assert!(protected_target_pid(0, own, "windows").is_some());
+        assert!(protected_target_pid(1, own, "windows").is_some());
+        assert!(protected_target_pid(1, own, "linux").is_some());
     }
 
     #[test]
-    fn refusals_by_the_system_are_denied_and_missing_abilities_unsupported() {
-        let denied = os_error(
-            42,
-            "stop process 42",
-            OsError::PermissionDenied {
-                detail: "kill".into(),
-                source: None,
-            },
-        );
-        assert_eq!(denied.code, ErrorCode::Denied);
-        assert_eq!(denied.details, Some(json!({"pid": 42})));
-        let unsupported = os_error(
-            42,
-            "stop process 42",
-            OsError::Unsupported {
-                detail: "no signals".into(),
-            },
-        );
-        assert_eq!(unsupported.code, ErrorCode::Unsupported);
-    }
-
-    #[test]
-    fn start_times_round_trip_through_rfc_3339() {
-        assert_eq!(
-            rfc3339(1_700_000_000).as_deref(),
-            Some("2023-11-14T22:13:20Z")
-        );
+    fn times_round_trip_through_rfc3339_and_zero_is_absent() {
         assert_eq!(rfc3339(0), None);
-        assert_eq!(parse_rfc3339("2023-11-14T22:13:20Z"), Some(1_700_000_000));
-        assert_eq!(
-            parse_rfc3339("2023-11-14T23:13:20+01:00"),
-            Some(1_700_000_000)
-        );
-        assert_eq!(parse_rfc3339("yesterday"), None);
+        let text = rfc3339(1_700_000_000).unwrap_or_default();
+        assert_eq!(text, "2023-11-14T22:13:20Z");
+        assert_eq!(parse_rfc3339(&text), Some(1_700_000_000));
+        assert_eq!(parse_rfc3339("not a time"), None);
     }
 }

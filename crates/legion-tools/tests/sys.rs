@@ -37,6 +37,12 @@ fn main() -> ExitCode {
         ("a_role_without_the_effect_is_denied", || {
             Box::pin(a_role_without_the_effect_is_denied())
         }),
+        ("procs_marks_self_and_groups_by_program", || {
+            Box::pin(procs_marks_self_and_groups_by_program())
+        }),
+        ("kill_targets_reports_per_target_outcomes", || {
+            Box::pin(kill_targets_reports_per_target_outcomes())
+        }),
     ];
     support::main(tests)
 }
@@ -391,4 +397,184 @@ fn assert_no_nulls(value: &Value) {
         }
         _ => {}
     }
+}
+
+async fn procs_marks_self_and_groups_by_program() {
+    let fixture = Fixture::new();
+    let own = std::process::id();
+    let exe = std::env::current_exe().unwrap();
+    let name = exe.file_stem().unwrap().to_string_lossy().into_owned();
+
+    let listed = fixture
+        .call(
+            "sys.procs",
+            json!({"filter": name, "sort": "gpu_memory", "limit": 500}),
+        )
+        .await
+        .unwrap();
+    assert_no_nulls(&listed);
+    let me = listed["procs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["pid"] == json!(own))
+        .unwrap_or_else(|| panic!("own pid {own} not in {listed:#}"));
+    assert_eq!(me["self"], json!(true), "{me}");
+
+    let mut c1 = spawn_helper("sleep", &["60"]);
+    let mut c2 = spawn_helper("sleep", &["60"]);
+    wait_for(Duration::from_secs(30), || {
+        (alive(c1.id()) && alive(c2.id())).then_some(())
+    })
+    .await
+    .unwrap();
+
+    let grouped = fixture
+        .call(
+            "sys.procs",
+            json!({"filter": name, "group": true, "limit": 100}),
+        )
+        .await
+        .unwrap();
+    assert_no_nulls(&grouped);
+    let rows = grouped["procs"].as_array().unwrap();
+    assert!(!rows.is_empty(), "{grouped:#}");
+    let row = rows
+        .iter()
+        .find(|r| {
+            r["members"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|x| x["pid"] == json!(c1.id())))
+        })
+        .unwrap_or_else(|| panic!("grouped row for helper children not in {grouped:#}"));
+    assert!(row["count"].as_u64().unwrap() >= 3, "{row}");
+    assert_eq!(row["more"], json!(0), "{row}");
+    assert_eq!(row["self"], json!(true), "{row}");
+
+    let _ = c1.kill();
+    let _ = c2.kill();
+    let _ = c1.wait();
+    let _ = c2.wait();
+}
+
+async fn kill_targets_reports_per_target_outcomes() {
+    let fixture = Fixture::new();
+
+    // 1. A normal child that exits cleanly on SIGTERM.
+    let mut normal = spawn_helper("sleep", &["60"]);
+    // 2. A child that exits immediately (so it is `gone`).
+    let mut exited = spawn_helper("args", &["done"]);
+    exited.wait().unwrap();
+    // 3. A child whose start_time we intentionally mismatch (`reused`).
+    let mut reused_child = spawn_helper("sleep", &["60"]);
+    // 4. On Unix, a stubborn child that ignores SIGTERM until `force: true`.
+    #[cfg(unix)]
+    let mut stubborn = spawn_helper("stubborn", &[]);
+
+    wait_for(Duration::from_secs(30), || {
+        let base_ok = alive(normal.id()) && alive(reused_child.id());
+        #[cfg(unix)]
+        let ok = base_ok && alive(stubborn.id());
+        #[cfg(not(unix))]
+        let ok = base_ok;
+        ok.then_some(())
+    })
+    .await
+    .unwrap();
+
+    // Give stubborn child a moment to install its SIGTERM handler before signaling.
+    #[cfg(unix)]
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let normal_start = start_time_of(&fixture, normal.id()).await;
+    #[cfg(unix)]
+    let stubborn_start = start_time_of(&fixture, stubborn.id()).await;
+
+    let own = std::process::id();
+    let parent = parent_of(own);
+    let mut targets = vec![
+        json!({"pid": normal.id(), "start_time": normal_start}),
+        json!({"pid": exited.id(), "start_time": "2020-01-01T00:00:00Z"}),
+        json!({"pid": reused_child.id(), "start_time": "2001-01-01T00:00:00Z"}),
+        json!({"pid": 0, "start_time": "2020-01-01T00:00:00Z"}),
+        json!({"pid": 1, "start_time": "2020-01-01T00:00:00Z"}),
+        json!({"pid": own, "start_time": "2020-01-01T00:00:00Z"}),
+    ];
+    if let Some(ppid) = parent
+        && ppid > 1
+    {
+        targets.push(json!({"pid": ppid, "start_time": "2020-01-01T00:00:00Z"}));
+    }
+    #[cfg(unix)]
+    targets.push(json!({"pid": stubborn.id(), "start_time": stubborn_start}));
+
+    let res = fixture
+        .call("sys.kill", json!({"targets": targets, "force": false}))
+        .await
+        .unwrap();
+    assert_no_nulls(&res);
+    let results = res["results"].as_array().unwrap();
+    assert_eq!(results.len(), targets.len(), "{res:#}");
+    assert_eq!(results[0]["status"], json!("stopped"), "{res:#}");
+    assert_eq!(results[1]["status"], json!("gone"), "{res:#}");
+    assert_eq!(results[2]["status"], json!("reused"), "{res:#}");
+    assert!(alive(reused_child.id()), "reused pid must not be stopped");
+
+    // Refusals: pid 0, pid 1, self, and parent/ancestor.
+    assert_eq!(results[3]["status"], json!("refused"), "{res:#}");
+    assert_eq!(results[3]["code"], json!("denied"), "{res:#}");
+    assert!(results[3]["message"].is_string(), "{res:#}");
+    assert_eq!(results[4]["status"], json!("refused"), "{res:#}");
+    assert_eq!(results[4]["code"], json!("denied"), "{res:#}");
+    assert_eq!(results[5]["status"], json!("refused"), "{res:#}");
+    assert_eq!(results[5]["code"], json!("denied"), "{res:#}");
+    if parent.is_some_and(|p| p > 1) {
+        assert_eq!(results[6]["status"], json!("refused"), "{res:#}");
+        assert_eq!(results[6]["code"], json!("denied"), "{res:#}");
+    }
+
+    #[cfg(unix)]
+    {
+        let last = results.last().unwrap();
+        assert_eq!(last["pid"], json!(stubborn.id()), "{res:#}");
+        assert_eq!(last["status"], json!("still_running"), "{res:#}");
+        assert!(
+            alive(stubborn.id()),
+            "stubborn process should still be alive"
+        );
+
+        // Now force stop the stubborn process.
+        let forced = fixture
+            .call(
+                "sys.kill",
+                json!({
+                    "targets": [{"pid": stubborn.id(), "start_time": stubborn_start}],
+                    "force": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            forced["results"][0]["status"],
+            json!("stopped"),
+            "{forced:#}"
+        );
+        let _ = stubborn.wait();
+        assert!(gone(stubborn.id()).await);
+    }
+
+    // Validation errors.
+    for bad in [
+        json!({}),
+        json!({"targets": []}),
+        json!({"pid": 123, "targets": [{"pid": 123, "start_time": "2020-01-01T00:00:00Z"}]}),
+        json!({"targets": [{"pid": 123, "start_time": "not-a-time"}]}),
+    ] {
+        let err = fixture.call("sys.kill", bad.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{bad}");
+    }
+
+    let _ = normal.wait();
+    let _ = reused_child.kill();
+    let _ = reused_child.wait();
 }
