@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::{CACHE_CONTROL, HeaderValue};
+use axum::http::header::{CACHE_CONTROL, HeaderValue, RETRY_AFTER};
 use axum::http::{Response, StatusCode};
 use legion_content::{
     ContentSource, ContentTime, CorpPolicy, MAX_PATH_BYTES, OpenRangeError, OpenedRange,
@@ -50,7 +50,7 @@ use crate::Authenticated;
 pub(crate) const MAX_CREATE_BODY: usize = 16 * 1024;
 
 /// Coalescing window for successful `content.read` audit lines per ticket.
-const AUDIT_COALESCE_WINDOW: Duration = Duration::from_secs(60);
+pub(crate) const DEFAULT_AUDIT_COALESCE_WINDOW: Duration = Duration::from_secs(60);
 
 /// The JSON body of `POST /v1/content`.
 #[derive(Debug, Deserialize)]
@@ -82,14 +82,27 @@ struct AuditSnapshot {
 }
 
 /// Coalesces successful `content.read` audit records per ticket to at most one entry per ticket
-/// per minute, while flushing remaining deltas when tickets expire, are revoked, or the door
-/// shuts down.
-#[derive(Default)]
+/// per coalescing window, flushing remaining deltas when tickets expire, are evicted, are revoked,
+/// or when the door shuts down.
 pub(crate) struct ContentAuditCoalescer {
+    window: Duration,
     buckets: Mutex<HashMap<[u8; 32], TicketAuditBucket>>,
 }
 
+impl Default for ContentAuditCoalescer {
+    fn default() -> Self {
+        Self::with_window(DEFAULT_AUDIT_COALESCE_WINDOW)
+    }
+}
+
 impl ContentAuditCoalescer {
+    pub(crate) fn with_window(window: Duration) -> Self {
+        Self {
+            window,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// Registers one successful range open for `ticket` and returns the shared byte counter for
     /// the streaming body.
     fn record_open(&self, ticket: &Ticket) -> Arc<AtomicU64> {
@@ -117,7 +130,7 @@ impl ContentAuditCoalescer {
             let now = Instant::now();
             let mut out = Vec::new();
             for bucket in buckets.values_mut() {
-                if now.saturating_duration_since(bucket.last_flushed) < AUDIT_COALESCE_WINDOW {
+                if now.saturating_duration_since(bucket.last_flushed) < self.window {
                     continue;
                 }
                 if let Some(snap) = take_delta(bucket, now) {
@@ -318,6 +331,8 @@ pub(crate) async fn create(State(shared): State<Arc<Shared>>, request: Request) 
 
     let audit_args = json!({ "path": body.path });
 
+    let holder = token_holder(&who);
+
     // Check `fs.read` permission, path confinement (roots, config/state, secrets, symlinks),
     // regular-file type, and remote reachability right now by probing zero bytes.
     let probe_req = ContentRequest {
@@ -326,19 +341,27 @@ pub(crate) async fn create(State(shared): State<Arc<Shared>>, request: Request) 
         offset: 0,
         length: Some(0),
         principal: who.principal.clone(),
+        holder: Some(holder.clone()),
         door: Door::Http,
         audit: false,
         cancel: shared.link.shutdown.child_token(),
     };
     let probe_result = match shared.router.open_content(&shared.node, probe_req).await {
         Ok(_opened) => Ok(()),
-        Err(ContentError::OutOfRange { .. }) => Err(ErrorBody::new(
-            ErrorCode::Internal,
-            "Unexpected out-of-range error while probing file.",
+        Err(ContentError::OutOfRange { .. }) => Err((
+            None,
+            ErrorBody::new(
+                ErrorCode::Internal,
+                "Unexpected out-of-range error while probing file.",
+            ),
         )),
-        Err(ContentError::Error(error)) => Err(error),
+        Err(ContentError::Busy {
+            retry_after_secs,
+            error,
+        }) => Err((Some(retry_after_secs), error)),
+        Err(ContentError::Error(error)) => Err((None, error)),
     };
-    if let Err(error) = probe_result {
+    if let Err((retry_after, error)) = probe_result {
         shared
             .node
             .record_audit(
@@ -351,11 +374,18 @@ pub(crate) async fn create(State(shared): State<Arc<Shared>>, request: Request) 
                 &Err(error.clone()),
             )
             .await;
+        if let Some(secs) = retry_after {
+            let mut response = reply::json(StatusCode::SERVICE_UNAVAILABLE, &error);
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(secs.max(1)));
+            return response;
+        }
         return reply::error(&error);
     }
 
     let issued = match shared.content_tickets.issue(TicketRequest {
-        holder: token_holder(&who),
+        holder,
         principal: who.principal.clone(),
         machine: target_machine.clone(),
         path: body.path,
@@ -382,6 +412,13 @@ pub(crate) async fn create(State(shared): State<Arc<Shared>>, request: Request) 
             return reply::json(status, &error);
         }
     };
+    // Flush any coalesced read bucket whose ticket was evicted by the per-holder LRU cap.
+    shared
+        .content_audit
+        .flush_missing(&shared.node, |hash| {
+            shared.content_tickets.contains_hash(hash)
+        })
+        .await;
 
     shared
         .node
@@ -580,6 +617,7 @@ impl ContentSource for DoorContentSource {
                 offset,
                 length,
                 principal: ticket.principal.clone(),
+                holder: Some(ticket.holder.clone()),
                 door: Door::Http,
                 audit: false,
                 cancel: self.shared.link.shutdown.child_token(),
@@ -606,6 +644,32 @@ impl ContentSource for DoorContentSource {
                     })
                 }
                 Err(ContentError::OutOfRange { size }) => Err(OpenRangeError::OutOfRange { size }),
+                Err(ContentError::Busy {
+                    retry_after_secs,
+                    error,
+                }) => {
+                    let args = json!({
+                        "path": ticket.path,
+                        "offset": offset,
+                        "length": length,
+                    });
+                    self.shared
+                        .node
+                        .record_audit(
+                            ticket.machine.clone(),
+                            Some(ticket.principal.clone()),
+                            Door::Http,
+                            "content.read".to_owned(),
+                            &args,
+                            started,
+                            &Err(error.clone()),
+                        )
+                        .await;
+                    Err(OpenRangeError::Busy {
+                        retry_after_secs,
+                        error: sanitize_holder_error(&error),
+                    })
+                }
                 Err(ContentError::Error(body)) => {
                     // Record denied/failed content reads immediately in the server audit log.
                     let args = json!({

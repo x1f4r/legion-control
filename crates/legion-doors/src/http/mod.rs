@@ -147,7 +147,7 @@ pub fn listen_address(text: &str) -> Result<SocketAddr, ErrorBody> {
     Ok(address)
 }
 
-/// Concurrency and slow-reader protection limits for `/v1/content/{ticket}/{name}` streams.
+/// Concurrency, slow-reader, and audit-coalescing limits for `/v1/content/{ticket}/{name}` streams.
 #[derive(Clone, Copy, Debug)]
 pub struct ContentStreamLimits {
     /// Per-ticket, per-holder, and global concurrent stream caps.
@@ -158,6 +158,10 @@ pub struct ContentStreamLimits {
     pub min_rate_window: Duration,
     /// Minimum bytes written during [`Self::min_rate_window`] (default 40 KiB / 10s = 4 KiB/s).
     pub min_rate_bytes: u64,
+    /// Coalescing window for per-ticket `content.read` audit records (default 60s).
+    pub audit_coalesce_window: Duration,
+    /// Interval between background session/ticket/audit sweeps (default 10s).
+    pub sweep_interval: Duration,
 }
 
 impl Default for ContentStreamLimits {
@@ -167,6 +171,8 @@ impl Default for ContentStreamLimits {
             write_idle_timeout: Duration::from_secs(15),
             min_rate_window: Duration::from_secs(10),
             min_rate_bytes: 40 * 1024,
+            audit_coalesce_window: content::DEFAULT_AUDIT_COALESCE_WINDOW,
+            sweep_interval: SWEEP,
         }
     }
 }
@@ -271,7 +277,7 @@ impl HttpDoor {
             sessions: Sessions::default(),
             content_tickets: Arc::new(TicketTable::new()),
             content_limiter: ContentLimiter::with_limits(content_limits.concurrency),
-            content_audit: ContentAuditCoalescer::default(),
+            content_audit: ContentAuditCoalescer::with_window(content_limits.audit_coalesce_window),
             node: self.node.clone(),
             router: Arc::clone(&self.router),
             port: local.port(),
@@ -291,11 +297,12 @@ impl HttpDoor {
 
         // Ends sessions whose token went or that went idle, even when no request comes to notice.
         let sweeping = Arc::clone(&shared);
+        let sweep_interval = content_limits.sweep_interval;
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = sweeping.link.shutdown.cancelled() => break,
-                    () = tokio::time::sleep(SWEEP) => sweeping.end_stale_sessions().await,
+                    () = tokio::time::sleep(sweep_interval) => sweeping.end_stale_sessions().await,
                 }
             }
         });
@@ -1027,6 +1034,7 @@ mod tests {
                 write_idle_timeout: Duration::from_millis(350),
                 min_rate_window: Duration::from_secs(5),
                 min_rate_bytes: 40 * 1024,
+                ..ContentStreamLimits::default()
             });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

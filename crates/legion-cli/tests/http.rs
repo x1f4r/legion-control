@@ -136,6 +136,10 @@ fn main() -> ExitCode {
             "content_special_names_limits_slow_readers_and_in_flight_revocation",
             content_special_names_limits_slow_readers_and_in_flight_revocation,
         ),
+        (
+            "content_remote_starvation_isolation_and_mid_stream_revocation",
+            content_remote_starvation_isolation_and_mid_stream_revocation,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -3440,6 +3444,207 @@ paths = [\"~/projects/**\"]
     assert!(
         received2 < big_len,
         "expected policy revocation to abort 12 MiB stream early, received {received2}/{big_len}"
+    );
+
+    server.stop();
+}
+
+fn content_remote_starvation_isolation_and_mid_stream_revocation() {
+    let home = Home::new();
+    let pi_home = Home::new();
+
+    let policy = "\
+[principals.holder_a]
+role = \"observer\"
+
+[principals.holder_b]
+role = \"observer\"
+
+[principals.admin]
+role = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+paths = [\"~/projects/**\"]
+";
+    home.write_config("node.toml", "name = \"laptop\"\n");
+    home.write_config("policy.toml", policy);
+    pi_home.write_config("node.toml", "name = \"pi\"\n");
+    pi_home.write_config("policy.toml", policy);
+
+    let test_exe = std::env::current_exe().unwrap();
+    let pi_legion_home = pi_home.state().parent().unwrap().to_path_buf();
+    let pi_cmd = json!([
+        test_exe.to_string_lossy(),
+        HELPER_FLAG,
+        pi_legion_home.to_string_lossy(),
+        pi_home.home().to_string_lossy(),
+        "rpc"
+    ]);
+    home.write_config(
+        "fleet.toml",
+        &format!("[machines.pi]\ncommand = {pi_cmd}\n"),
+    );
+
+    let token_a = make_token(&home, &["tok-a", "holder_a"]);
+    let token_b = make_token(&home, &["tok-b", "holder_b"]);
+    let admin = make_token(&home, &["admin", "admin", "allow_owner=true"]);
+
+    // Large file on `pi` (12 MiB) plus a small transfer fixture.
+    let pi_dir = pi_home.home().join("projects").join("media");
+    std::fs::create_dir_all(&pi_dir).unwrap();
+    let big_len = 12 * 1024 * 1024usize;
+    let big_bytes: Vec<u8> = (0..big_len).map(|i| ((i * 29 + 7) % 251) as u8).collect();
+    let pi_big = pi_dir.join("movie.mp4");
+    std::fs::write(&pi_big, &big_bytes).unwrap();
+    let pi_small = pi_dir.join("note.txt");
+    std::fs::write(&pi_small, b"hello from pi transfer").unwrap();
+
+    let mut server = Server::start(&home);
+
+    // 1. Starvation scenario: holder_a opens 8 stalled GETs of the 12 MiB remote file on `pi`.
+    //    Because remote content reads return their warm pipe to the pool between bounded windows,
+    //    holder_b's POST /v1/content, ranged GET, remote RPC, and fs.transfer all complete fast.
+    let a_url = server
+        .post(
+            "/v1/content",
+            Some(&token_a),
+            &json!({"on": "pi", "path": pi_big.to_string_lossy()}),
+        )
+        .json()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut stalled = Vec::new();
+    for _ in 0..8 {
+        let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        s.set_read_timeout(Some(PATIENCE)).unwrap();
+        write!(
+            s,
+            "GET {a_url} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            server.port
+        )
+        .unwrap();
+        s.flush().unwrap();
+        stalled.push(s);
+    }
+    // Give the 8 stalled readers time to pull initial windows and fill socket buffers.
+    std::thread::sleep(Duration::from_millis(250));
+
+    let t_post = Instant::now();
+    let b_created = server.post(
+        "/v1/content",
+        Some(&token_b),
+        &json!({"on": "pi", "path": pi_big.to_string_lossy()}),
+    );
+    let post_elapsed = t_post.elapsed();
+    assert_eq!(b_created.status, 200, "{}", b_created.text());
+    assert!(
+        post_elapsed < Duration::from_secs(3),
+        "holder_b POST /v1/content starved behind holder_a's 8 stalled reads: {post_elapsed:?}"
+    );
+    let b_url = b_created.json()["url"].as_str().unwrap().to_owned();
+
+    let t_get = Instant::now();
+    let b_range = http(
+        server.port,
+        "GET",
+        &b_url,
+        &[("Range", "bytes=65536-131071".to_owned())],
+        b"",
+    );
+    let get_elapsed = t_get.elapsed();
+    assert_eq!(b_range.status, 206, "{}", b_range.text());
+    assert_eq!(b_range.body, &big_bytes[65_536..131_072]);
+    assert!(
+        get_elapsed < Duration::from_secs(3),
+        "holder_b ranged GET starved behind holder_a's 8 stalled reads: {get_elapsed:?}"
+    );
+
+    // Remote RPC and fs.transfer on `pi` do not share the content pipe pool and succeed promptly.
+    let rpc = server.call(
+        &admin,
+        json!({"tool": "meta.version", "args": {}, "on": "pi"}),
+    );
+    assert_eq!(rpc.status, 200, "{}", rpc.text());
+    let local_copy = home.home().join("projects").join("transferred.txt");
+    let xfer = server.call(
+        &admin,
+        json!({
+            "tool": "fs.transfer",
+            "args": {
+                "from": format!("pi:{}", pi_small.to_string_lossy()),
+                "to": local_copy.to_string_lossy(),
+            }
+        }),
+    );
+    assert_eq!(xfer.status, 200, "{}", xfer.text());
+    assert_eq!(
+        std::fs::read(&local_copy).unwrap(),
+        b"hello from pi transfer"
+    );
+    drop(stalled);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // 2. Mid-stream revocation on the remote machine (`pi`): revoking holder_b's policy on `pi`
+    //    (while `laptop`'s token and policy stay untouched) aborts an in-flight 12 MiB remote
+    //    range download early and denies subsequent reads with 403.
+    let mut rev_stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    rev_stream.set_read_timeout(Some(PATIENCE)).unwrap();
+    write!(
+        rev_stream,
+        "GET {b_url} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        server.port
+    )
+    .unwrap();
+    rev_stream.flush().unwrap();
+    let mut reader = BufReader::new(rev_stream);
+    let (status, _) = read_head(&mut reader);
+    assert_eq!(status, 200);
+    let mut first_chunk = vec![0u8; 512 * 1024];
+    reader.read_exact(&mut first_chunk).unwrap();
+    assert_eq!(first_chunk, &big_bytes[..first_chunk.len()]);
+
+    // Revoke holder_b on `pi` only; `laptop` still allows holder_b.
+    pi_home.write_config(
+        "policy.toml",
+        "\
+[principals.holder_a]
+role = \"observer\"
+
+[principals.holder_b]
+role = \"revoked\"
+
+[principals.admin]
+role = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+paths = [\"~/projects/**\"]
+
+[roles.revoked]
+allow = []
+",
+    );
+
+    let mut rest = Vec::new();
+    let _ = reader.read_to_end(&mut rest);
+    let received = first_chunk.len() + rest.len();
+    assert!(
+        received < big_len,
+        "expected remote policy revocation on pi to abort 12 MiB stream early, received {received}/{big_len}"
+    );
+    assert_eq!(
+        http(
+            server.port,
+            "GET",
+            &b_url,
+            &[("Range", "bytes=0-15".to_owned())],
+            b""
+        )
+        .status,
+        403
     );
 
     server.stop();
