@@ -144,6 +144,17 @@ Drop `--dry-run` to execute it. Common flags:
 7. **Use safety rails.** Pass `expect_hash` to `fs.write` and `fs.edit` to avoid clobbering
    concurrent edits, and call destructive, sync, or power tools with `dry_run: true` first to
    inspect what will happen.
+8. **Wake an off machine and wait for it.** When a call fails with `unreachable` and the machine
+   has Wake-on-LAN configured (`fleet.list`), call `power.wake` with `wait_s` from a node that is
+   on, check `awake: true`, and then continue:
+
+   ```json
+   {"tool": "power.wake", "args": {"machine": "tower", "wait_s": 180}}
+   ```
+
+   `power.wake` sends the wake packet through a helper and polls until the machine answers (or
+   returns `awake: false` after `wait_s` seconds); only retry the original tool once `awake` is
+   `true`.
 
 ## Error codes
 
