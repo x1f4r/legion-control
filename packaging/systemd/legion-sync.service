@@ -1,0 +1,28 @@
+# Legion sync folder runner, systemd user unit.
+#
+# Watches, scans, and reconciles sync folders listed in sync.toml for this machine.
+# Nothing is enabled by default by packages; sync.create / sync.add enables it when
+# the first local sync folder appears, or enable and start it manually with:
+#
+#   systemctl --user enable --now legion-sync.service
+
+[Unit]
+Description=Legion sync folder runner
+Documentation=man:legion(1) https://github.com/x1f4r/legion-control
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/legion sync run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+UMask=0077
+KeyringMode=private
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -40,6 +40,10 @@ pub fn register(registry: &mut Registry, fleet: Fleet) {
     crate::install::register(registry, fleet.clone());
     crate::power::register(registry, fleet.clone());
     crate::sync::register(registry, fleet.clone());
+    legion_tools::sync::register_fleet(
+        registry,
+        std::sync::Arc::new(crate::sync_tools::FleetSyncRemote::new(fleet.clone())),
+    );
     crate::updates::register(registry, fleet.clone());
 
     registry.add(FleetTool::<NoArgs, ListResult, _>::new(

@@ -30,6 +30,7 @@ jiff.workspace = true
 legion-core.workspace = true
 legion-os.workspace = true
 legion-proto.workspace = true
+legion-sync.workspace = true
 legion-update.workspace = true
 legion-xfer.workspace = true
 regex.workspace = true
@@ -40,7 +41,8 @@ serde_json.workspace = true
 sha2.workspace = true
 sysinfo.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "rt", "time", "macros", "sync"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time", "macros", "sync"] }
+toml.workspace = true
 toml_edit.workspace = true
 
 # sys.kill asks a Unix kernel whether a pid exists with signal 0, through nix's safe wrapper.
@@ -48,6 +50,7 @@ toml_edit.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "signal"] }
 
 # These re-execute their own binary as the child processes they need, so they cannot use the

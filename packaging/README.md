@@ -14,6 +14,8 @@ Ubuntu, Arch official repositories, or the AUR.
   `fleet.install` refuse in-place replacement and direct you to `apt` or `pacman`
 - `/usr/lib/systemd/user/legion-serve.service` — optional systemd user unit for `legion serve`
   (loopback only; never enabled or started automatically)
+- `/usr/lib/systemd/user/legion-sync.service` — optional systemd user unit for `legion sync run`
+  (never enabled or started automatically by the package)
 - `/usr/share/man/man1/legion.1.gz` — manual page
 - Licence and documentation files (`/usr/share/doc/legion/` on Debian/Ubuntu,
   `/usr/share/licenses/<pkgname>/LICENSE` on Arch)

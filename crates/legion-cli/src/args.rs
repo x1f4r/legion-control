@@ -56,8 +56,31 @@ pub enum Command {
         /// `--help`: say how, rather than serve.
         help: bool,
     },
+    /// `legion sync run`: run the long-lived sync folder runner for this node.
+    SyncRun(SyncRunCommand),
     /// `legion --version`.
     Version,
+}
+
+/// Options for `legion sync run`.
+#[derive(Debug, PartialEq)]
+pub struct SyncRunCommand {
+    /// `--no-watch`: disable OS file watching and rely only on periodic scans.
+    pub no_watch: bool,
+    /// `--scan-interval <secs>`: override periodic full scan interval in seconds.
+    pub scan_interval_secs: Option<u64>,
+    /// `--pull-interval <secs>`: override periodic peer pull interval in seconds.
+    pub pull_interval_secs: Option<u64>,
+    /// `--config-sync-interval <secs>`: override periodic `sync.toml` sync interval in seconds.
+    pub config_sync_interval_secs: Option<u64>,
+    /// `--debounce-ms <ms>`: override watcher debounce window in milliseconds.
+    pub debounce_ms: Option<u64>,
+    /// `--backoff-ms <ms>`: override initial peer reconnect backoff in milliseconds.
+    pub backoff_ms: Option<u64>,
+    /// Optional explicit `--home` or `--config-dir`/`--state-dir` override.
+    pub home: Option<GateHome>,
+    /// `--help`: print usage for `legion sync run`.
+    pub help: bool,
 }
 
 /// Pinned Legion home passed to `legion gate`.
@@ -202,6 +225,7 @@ Usage:
   legion stream [--as PRINCIPAL]
   legion gate --as PRINCIPAL | --enrol ID
   legion serve [--listen ADDRESS]
+  legion sync run [--no-watch] [--scan-interval SECS] [--pull-interval SECS]
   legion init [--name NAME] [--no-roles] [--dry-run] [--on MACHINE] [--json]
   legion pair [--name NAME] [--role ROLE] [--as PRINCIPAL] [--valid 15m] [--host HOST]... [--port PORT] [--user USER] [--invert] [--json]
   legion agents list | add AGENT --as PRINCIPAL [--full] [--scope SCOPE] [--allow-owner] [--dry-run] | remove AGENT [--scope SCOPE] [--dry-run]
@@ -211,7 +235,7 @@ Usage:
 A value that parses as JSON is JSON (n=3, ok=true, tags=[\"a\"]); anything else is a string.
 --args takes the arguments as one JSON object instead, or reads it from stdin when given -.
 Output is readable on a terminal and JSON otherwise; --json asks for JSON anywhere.
-`legion help cp`, `legion help init`, `legion help pair`, `legion help agents`, `legion help stream` and `legion help gate` describe those commands.";
+`legion help cp`, `legion help init`, `legion help pair`, `legion help agents`, `legion help stream`, `legion help gate` and `legion help sync` describe those commands.";
 
 /// `legion help init`.
 pub const INIT_HELP: &str = "\
@@ -331,6 +355,32 @@ In ~/.ssh/authorized_keys on this machine, one line per key:
 
 Use the full path to legion; restrict turns off port forwarding, a terminal and the rest.";
 
+/// `legion help sync`.
+pub const SYNC_HELP: &str = "\
+Usage:
+  legion sync run [--no-watch] [--scan-interval SECS] [--pull-interval SECS] [--config-sync-interval SECS] [--debounce-ms MS] [--backoff-ms MS] [--home PATH | --config-dir CFG --state-dir ST]
+
+Runs the long-lived sync folder runner for this machine. Only one runner may hold a given Legion
+home at once (enforced by a lock file in the state directory). It opens every sync folder listed
+for this machine in sync.toml, watches for changes (inotify, FSEvents, or ReadDirectoryChangesW),
+pulls incrementally from reachable peers over Legion's existing stream pipe with backoff for
+offline machines, writes atomic per-folder status files, carries sync.toml along across the fleet,
+and accepts commands from the sync.* tools over an owner-only local control endpoint.
+
+  --no-watch                  disable OS file watching and rely on periodic full scans only
+  --scan-interval SECS        interval between periodic full scans (default 60)
+  --pull-interval SECS        interval between periodic peer reconciliation passes (default 15)
+  --config-sync-interval SECS interval between periodic sync.toml fleet merges (default 60)
+  --debounce-ms MS            watcher debounce window in milliseconds (default 80)
+  --backoff-ms MS             initial offline-peer retry backoff in milliseconds (default 2000)
+  --home PATH                 explicit LEGION_HOME root (<PATH>/config and <PATH>/state)
+  --config-dir CFG            explicit configuration directory (requires --state-dir)
+  --state-dir ST              explicit state directory (requires --config-dir)
+
+Manage sync folders with `legion sync.create`, `sync.add`, `sync.remove`, `sync.delete`,
+`sync.list`, `sync.status`, `sync.now`, `sync.pause`, `sync.resume`, `sync.conflicts`,
+`sync.resolve`, `sync.bin`, and `sync.restore`.";
+
 /// Reads the arguments after the program's name.
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageError> {
     let args: Vec<String> = args
@@ -395,6 +445,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
         "pair" => pair(rest),
         "cp" => cp(rest).map(Command::Cp),
         "serve" => serve(rest),
+        "sync" => sync_cmd(rest),
         "init" => init(rest),
         "agents" => agents(rest),
         "token" => token(rest),
@@ -507,8 +558,164 @@ pub fn command_help(name: &str) -> Option<&'static str> {
         "agents" => Some(AGENTS_HELP),
         "stream" => Some(STREAM_HELP),
         "gate" => Some(GATE_HELP),
+        "sync" => Some(SYNC_HELP),
         _ => None,
     }
+}
+
+/// `legion sync run [--no-watch] [--scan-interval SECS] ...`.
+fn sync_cmd(rest: &[String]) -> Result<Command, UsageError> {
+    let Some((sub, tail)) = rest.split_first() else {
+        return Err(UsageError(
+            "sync takes a subcommand (`run`). See `legion help sync`.".to_owned(),
+        ));
+    };
+    if matches!(sub.as_str(), "--help" | "-h") && tail.is_empty() {
+        return Ok(Command::SyncRun(SyncRunCommand {
+            no_watch: false,
+            scan_interval_secs: None,
+            pull_interval_secs: None,
+            config_sync_interval_secs: None,
+            debounce_ms: None,
+            backoff_ms: None,
+            home: None,
+            help: true,
+        }));
+    }
+    if sub != "run" {
+        return Err(UsageError(format!(
+            "sync {sub} is not a command; use `legion sync run` or call a tool such as `legion sync.status`."
+        )));
+    }
+
+    let mut cmd = SyncRunCommand {
+        no_watch: false,
+        scan_interval_secs: None,
+        pull_interval_secs: None,
+        config_sync_interval_secs: None,
+        debounce_ms: None,
+        backoff_ms: None,
+        home: None,
+        help: false,
+    };
+    let mut home_root: Option<PathBuf> = None;
+    let mut config_dir: Option<PathBuf> = None;
+    let mut state_dir: Option<PathBuf> = None;
+
+    let mut words = tail.iter();
+    while let Some(word) = words.next() {
+        if !word.starts_with('-') {
+            return Err(UsageError(format!(
+                "sync run takes no positional arguments, and {word} was given."
+            )));
+        }
+        let (name, inline) = match word.split_once('=') {
+            Some((n, v)) => (n, Some(v.to_owned())),
+            None => (word.as_str(), None),
+        };
+        let mut take_value = |opt: &str| {
+            inline
+                .clone()
+                .or_else(|| words.next().cloned())
+                .ok_or_else(|| UsageError(format!("{opt} needs a value.")))
+        };
+        let parse_u64 = |opt: &str, raw: &str| -> Result<u64, UsageError> {
+            raw.parse::<u64>()
+                .ok()
+                .filter(|v| *v > 0)
+                .ok_or_else(|| UsageError(format!("{opt} must be a positive integer, not {raw:?}.")))
+        };
+        match name {
+            "--help" | "-h" => {
+                if inline.is_some() {
+                    return Err(UsageError(format!("{name} takes no value.")));
+                }
+                cmd.help = true;
+            }
+            "--no-watch" => {
+                if inline.is_some() {
+                    return Err(UsageError("--no-watch takes no value.".to_owned()));
+                }
+                cmd.no_watch = true;
+            }
+            "--scan-interval" => {
+                let raw = take_value(name)?;
+                cmd.scan_interval_secs = Some(parse_u64(name, &raw)?);
+            }
+            "--pull-interval" => {
+                let raw = take_value(name)?;
+                cmd.pull_interval_secs = Some(parse_u64(name, &raw)?);
+            }
+            "--config-sync-interval" => {
+                let raw = take_value(name)?;
+                cmd.config_sync_interval_secs = Some(parse_u64(name, &raw)?);
+            }
+            "--debounce-ms" => {
+                let raw = take_value(name)?;
+                cmd.debounce_ms = Some(parse_u64(name, &raw)?);
+            }
+            "--backoff-ms" => {
+                let raw = take_value(name)?;
+                cmd.backoff_ms = Some(parse_u64(name, &raw)?);
+            }
+            "--home" => {
+                let value = take_value(name)?;
+                let path = PathBuf::from(&value);
+                if value.is_empty() || !path.is_absolute() {
+                    return Err(UsageError(format!(
+                        "--home must be an absolute path, not {value:?}."
+                    )));
+                }
+                if home_root.replace(path).is_some() {
+                    return Err(UsageError("--home is given twice.".to_owned()));
+                }
+            }
+            "--config-dir" => {
+                let value = take_value(name)?;
+                let path = PathBuf::from(&value);
+                if value.is_empty() || !path.is_absolute() {
+                    return Err(UsageError(format!(
+                        "--config-dir must be an absolute path, not {value:?}."
+                    )));
+                }
+                if config_dir.replace(path).is_some() {
+                    return Err(UsageError("--config-dir is given twice.".to_owned()));
+                }
+            }
+            "--state-dir" => {
+                let value = take_value(name)?;
+                let path = PathBuf::from(&value);
+                if value.is_empty() || !path.is_absolute() {
+                    return Err(UsageError(format!(
+                        "--state-dir must be an absolute path, not {value:?}."
+                    )));
+                }
+                if state_dir.replace(path).is_some() {
+                    return Err(UsageError("--state-dir is given twice.".to_owned()));
+                }
+            }
+            _ => return Err(UsageError(format!("{name} is not an option of sync run."))),
+        }
+    }
+    cmd.home = match (home_root, config_dir, state_dir) {
+        (Some(root), None, None) => Some(GateHome::Root(root)),
+        (None, Some(config_dir), Some(state_dir)) => Some(GateHome::Split {
+            config_dir,
+            state_dir,
+        }),
+        (None, None, None) => None,
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return Err(UsageError(
+                "sync run takes --home or --config-dir/--state-dir, not both.".to_owned(),
+            ));
+        }
+        (None, Some(_), None) | (None, None, Some(_)) => {
+            return Err(UsageError(
+                "sync run requires --config-dir and --state-dir to be given together.".to_owned(),
+            ));
+        }
+    };
+    Ok(Command::SyncRun(cmd))
 }
 
 /// `legion gate --as PRINCIPAL [--device NAME --pairing ID] [--account USER] [--home PATH | --config-dir CFG --state-dir ST]`

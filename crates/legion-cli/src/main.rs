@@ -30,7 +30,8 @@ use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
 use crate::args::{
-    ArgsSource, CallCommand, Command, GateCommand, GateHome, USAGE, UsageError, command_help,
+    ArgsSource, CallCommand, Command, GateCommand, GateHome, SYNC_HELP, SyncRunCommand, USAGE,
+    UsageError, command_help,
 };
 
 const FAILED: u8 = 1;
@@ -129,6 +130,20 @@ async fn run(command: Command) -> ExitCode {
                 Ok(paths)
             })
         }
+        Command::SyncRun(SyncRunCommand { help: true, .. }) => {
+            out(&format!("{SYNC_HELP}\n"));
+            return ExitCode::SUCCESS;
+        }
+        Command::SyncRun(SyncRunCommand {
+            home: Some(home), ..
+        }) => match home {
+            GateHome::Root(root) => Paths::from_explicit_home(root),
+            GateHome::Split {
+                config_dir,
+                state_dir,
+            } => Paths::from_explicit_dirs(config_dir, state_dir),
+            GateHome::Default => Paths::from_env(),
+        },
         _ => Paths::from_env(),
     };
     let (node, router) = match paths_result {
@@ -244,6 +259,45 @@ async fn run(command: Command) -> ExitCode {
         Command::Serve { listen, help } => {
             let shutdown = install_shutdown_token();
             serve::run(node, router, listen, help, shutdown).await
+        }
+        Command::SyncRun(cmd) => {
+            let shutdown = install_shutdown_token();
+            let mut cfg = legion_net::sync_runner::RunnerConfig::default();
+            if cmd.no_watch {
+                cfg.watch = false;
+            }
+            if let Some(s) = cmd.scan_interval_secs {
+                cfg.scan_interval = Duration::from_secs(s);
+            }
+            if let Some(s) = cmd.pull_interval_secs {
+                cfg.pull_interval = Duration::from_secs(s);
+            }
+            if let Some(s) = cmd.config_sync_interval_secs {
+                cfg.config_sync_interval = Duration::from_secs(s);
+            }
+            if let Some(ms) = cmd.debounce_ms {
+                cfg.debounce = Duration::from_millis(ms);
+            }
+            if let Some(ms) = cmd.backoff_ms {
+                cfg.backoff_base = Duration::from_millis(ms);
+            }
+            let fleet = Fleet::new(node.paths());
+            let code = match legion_net::sync_runner::run(
+                node.paths().clone(),
+                fleet,
+                cfg,
+                shutdown,
+            )
+            .await
+            {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    err(&render::error(&error));
+                    ExitCode::from(FAILED)
+                }
+            };
+            router.shutdown().await;
+            code
         }
         Command::Help { tool: None, .. } | Command::Version => {
             out(&format!("{USAGE}\n"));

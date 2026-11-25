@@ -16,6 +16,7 @@ conflicts=('legion')
 options=('!strip' '!debug')
 source=(
   "legion-serve.service-${pkgver}::${url}/raw/legion-v${pkgver}/packaging/systemd/legion-serve.service"
+  "legion-sync.service-${pkgver}::${url}/raw/legion-v${pkgver}/packaging/systemd/legion-sync.service"
   "legion.1-${pkgver}::${url}/raw/legion-v${pkgver}/packaging/man/legion.1"
   "LICENSE-${pkgver}::${url}/raw/legion-v${pkgver}/LICENSE"
 )
@@ -25,7 +26,7 @@ source_x86_64=(
 source_aarch64=(
   "legion-${pkgver}-aarch64-unknown-linux-musl::${url}/releases/download/legion-v${pkgver}/legion-${pkgver}-aarch64-unknown-linux-musl"
 )
-sha256sums=('SKIP' 'SKIP' 'SKIP')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
 sha256sums_x86_64=('SKIP')
 sha256sums_aarch64=('SKIP')
 
@@ -33,6 +34,7 @@ package() {
   install -Dm755 "${srcdir}/legion-${pkgver}-${CARCH}-unknown-linux-musl" "${pkgdir}/usr/bin/legion"
   install -Dm644 /dev/stdin "${pkgdir}/usr/lib/legion/managed-by" <<< 'pacman'
   install -Dm644 "${srcdir}/legion-serve.service-${pkgver}" "${pkgdir}/usr/lib/systemd/user/legion-serve.service"
+  install -Dm644 "${srcdir}/legion-sync.service-${pkgver}" "${pkgdir}/usr/lib/systemd/user/legion-sync.service"
   install -d "${pkgdir}/usr/share/man/man1"
   gzip -n -9 -c "${srcdir}/legion.1-${pkgver}" > "${pkgdir}/usr/share/man/man1/legion.1.gz"
   chmod 0644 "${pkgdir}/usr/share/man/man1/legion.1.gz"

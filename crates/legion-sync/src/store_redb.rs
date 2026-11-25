@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::Path;
+use std::sync::Arc;
 
 use legion_xfer::{EntryKind, Hash};
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -49,9 +50,17 @@ const META_KEY_FOLDER: &str = "folder_meta";
 const META_KEY_PENDING_OP: &str = "pending_op";
 const META_KEY_LIVE_FILES: &str = "live_file_count";
 
+/// Default `redb` page cache size (16 MiB) to keep idle runner RSS compact even on large folders.
+const DEFAULT_REDB_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Durable [`IndexStore`] implementation backed by a single `redb` database file.
+///
+/// Cloning shares the underlying [`redb::Database`] handle, enabling lock-free concurrent MVCC
+/// read transactions (e.g. serving peer `records_since` or status queries) while a single writer
+/// updates the index.
+#[derive(Clone)]
 pub struct RedbIndexStore {
-    db: Database,
+    db: Arc<Database>,
     schema_version: u32,
 }
 
@@ -67,10 +76,13 @@ impl RedbIndexStore {
                 .map_err(|err| SyncError::from_io(Some(parent.display().to_string()), err))?;
         }
 
-        let db = Database::create(path).map_err(|err| SyncError::Storage {
-            context: format!("open redb index at {}", path.display()),
-            detail: err.to_string(),
-        })?;
+        let db = Database::builder()
+            .set_cache_size(DEFAULT_REDB_CACHE_BYTES)
+            .create(path)
+            .map_err(|err| SyncError::Storage {
+                context: format!("open redb index at {}", path.display()),
+                detail: err.to_string(),
+            })?;
 
         let txn = db.begin_write().map_err(|err| SyncError::Storage {
             context: "initialize redb tables".to_string(),
@@ -117,7 +129,10 @@ impl RedbIndexStore {
             detail: err.to_string(),
         })?;
 
-        Ok(Self { db, schema_version })
+        Ok(Self {
+            db: Arc::new(db),
+            schema_version,
+        })
     }
 
     /// Stamps `schema_version` directly into `META_TABLE` (intended for tests verifying

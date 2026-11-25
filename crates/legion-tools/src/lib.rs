@@ -21,6 +21,7 @@ pub mod power;
 pub mod proj;
 pub mod roles;
 pub mod svc;
+pub mod sync;
 pub mod sys;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -42,6 +43,7 @@ pub fn register_all(registry: &mut Registry) {
     job::register(registry);
     proj::register(registry);
     svc::register(registry);
+    sync::register(registry);
     xfer::register(registry);
     token::register(registry);
     device::register(registry);

@@ -72,6 +72,7 @@ package() {
   install -Dm755 "${srcdir}/target/release/legion" "${pkgdir}/usr/bin/legion"
   install -Dm644 /dev/stdin "${pkgdir}/usr/lib/legion/managed-by" <<< 'pacman'
   install -Dm644 packaging/systemd/legion-serve.service "${pkgdir}/usr/lib/systemd/user/legion-serve.service"
+  install -Dm644 packaging/systemd/legion-sync.service "${pkgdir}/usr/lib/systemd/user/legion-sync.service"
   install -d "${pkgdir}/usr/share/man/man1"
   gzip -n -9 -c packaging/man/legion.1 > "${pkgdir}/usr/share/man/man1/legion.1.gz"
   chmod 0644 "${pkgdir}/usr/share/man/man1/legion.1.gz"

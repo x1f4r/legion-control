@@ -16,6 +16,7 @@ legion-proto = { path = "crates/legion-proto" }
 legion-link = { path = "crates/legion-link" }
 legion-core = { path = "crates/legion-core" }
 legion-net = { path = "crates/legion-net" }
+legion-sync = { path = "crates/legion-sync" }
 legion-tools = { path = "crates/legion-tools" }
 legion-update = { path = "crates/legion-update" }
 legion-xfer = { path = "crates/legion-xfer" }
@@ -59,6 +60,8 @@ blake3 = "1.8.7"
 getrandom = "0.4.3"
 globset = "0.4.22"
 ignore = "0.4.35"
+# Cross-platform native file watching (inotify on Linux, FSEvents on macOS, ReadDirectoryChangesW on Windows).
+notify = "9.0.0"
 # Pure-Rust QR encoder (no image/svg features) for terminal pairing codes in `legion pair`.
 qrcode = { version = "0.15.0", default-features = false }
 # Pure-Rust ACID copy-on-write B+tree store for the sync folder index (no C toolchain needed).

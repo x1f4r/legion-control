@@ -79,7 +79,11 @@ pub mod traits;
 pub mod version;
 
 pub use apply::{ApplyOutcome, RecoveryReport};
-pub use engine::{DEFAULT_PAGE_LIMIT, FOLDER_MARKER_PROBLEM_SENTENCE, PullReport, SyncEngine};
+pub use engine::{
+    DEFAULT_PAGE_LIMIT, FOLDER_MARKER_PROBLEM_SENTENCE, PullReport, SyncEngine,
+    check_fetch_file_from_store, check_serve_allowed_from_store, serve_handshake_from_store,
+    serve_records_since_from_store,
+};
 pub use error::{FsErrorKind, Result, SyncError};
 pub use fs_real::{RealFs, check_folders_not_nested};
 pub use model::{

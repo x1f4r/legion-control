@@ -16,6 +16,7 @@ legion-core.workspace = true
 legion-doors.workspace = true
 legion-net.workspace = true
 legion-proto.workspace = true
+legion-sync.workspace = true
 legion-tools.workspace = true
 qrcode.workspace = true
 serde.workspace = true
@@ -58,6 +59,12 @@ harness = false
 # Re-executes itself as a cross-platform connector and fake agent CLI for init, agent, sync, and doctor tests.
 [[test]]
 name = "setup"
+harness = false
+
+# End-to-end 3-node loopback sync runner, tools, refusals, conflict resolution, bin restore,
+# mass-deletion brake, and SIGKILL crash-recovery tests.
+[[test]]
+name = "sync"
 harness = false
 
 [lints]

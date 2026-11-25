@@ -265,6 +265,16 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         Ok(())
     }
 
+    /// Updates the folder's bin retention duration in seconds.
+    pub fn set_bin_retention_secs(&mut self, secs: u64) {
+        self.bin_retention_secs = secs;
+    }
+
+    /// Returns `true` when the engine currently has a folder-level marker/availability problem.
+    pub fn has_folder_problem(&self) -> bool {
+        self.folder_problem.is_some()
+    }
+
     /// Updates the folder's mass-deletion brake thresholds.
     pub fn set_deletion_brake(&mut self, config: DeletionBrakeConfig) {
         self.deletion_brake = config;
@@ -2284,4 +2294,110 @@ fn summarize_problems(problems: &[SyncProblem]) -> String {
         problems.len(),
         problems[0].sentence
     )
+}
+
+/// Checks membership and `.legion-sync/marker.json` validity against a read-only [`IndexStore`]
+/// handle (such as a cloned [`crate::RedbIndexStore`] MVCC reader) before serving peer data.
+pub fn check_serve_allowed_from_store<F: SyncFs, S: IndexStore>(
+    fs: &F,
+    store: &S,
+    caller_member: &str,
+) -> Result<FolderMeta> {
+    let meta = store.load_meta()?.ok_or_else(|| SyncError::Storage {
+        context: "load folder metadata".to_string(),
+        detail: "index store is uninitialized".to_string(),
+    })?;
+    if !meta.members.contains(caller_member) {
+        return Err(SyncError::Denied {
+            member: caller_member.to_string(),
+            reason: "caller is not a member of this sync folder".to_string(),
+        });
+    }
+    match fs.read_marker()? {
+        Some(m)
+            if m.folder_id == meta.folder_id
+                && m.member_id == meta.local_member
+                && m.incarnation == meta.incarnation => {}
+        _ => {
+            return Err(SyncError::FolderUnavailable {
+                folder_id: meta.folder_id,
+                sentence: FOLDER_MARKER_PROBLEM_SENTENCE.to_string(),
+            });
+        }
+    }
+    Ok(meta)
+}
+
+/// Serves a [`PeerHandshake`] from a concurrent MVCC [`IndexStore`] read handle without locking
+/// the writer engine.
+pub fn serve_handshake_from_store<F: SyncFs, S: IndexStore>(
+    fs: &F,
+    store: &S,
+    caller_member: &str,
+) -> Result<PeerHandshake> {
+    let meta = check_serve_allowed_from_store(fs, store, caller_member)?;
+    Ok(PeerHandshake {
+        folder_id: meta.folder_id,
+        member_id: meta.local_member,
+        incarnation: meta.incarnation,
+        snapshot_seq: meta.local_seq,
+        protocol_version: SYNC_PROTOCOL_VERSION,
+    })
+}
+
+/// Serves incremental records from a concurrent MVCC [`IndexStore`] read handle without locking
+/// the writer engine.
+pub fn serve_records_since_from_store<F: SyncFs, S: IndexStore>(
+    fs: &F,
+    store: &S,
+    caller_member: &str,
+    since_incarnation: u64,
+    since_seq: u64,
+    limit: usize,
+) -> Result<RecordsPage> {
+    let _meta = check_serve_allowed_from_store(fs, store, caller_member)?;
+    let capped_limit = limit.clamp(1, MAX_PAGE_RECORDS);
+    let mut page = store.records_since(caller_member, since_incarnation, since_seq, capped_limit)?;
+    page.records.retain(|r| !is_internal_sync_path(&r.path));
+    Ok(page)
+}
+
+/// Validates that `caller_member` may fetch live regular file `path` with `expected_hash` from a
+/// concurrent MVCC [`IndexStore`] read handle, returning the indexed byte size on success.
+pub fn check_fetch_file_from_store<F: SyncFs, S: IndexStore>(
+    fs: &F,
+    store: &S,
+    ignore: &IgnoreMatcher,
+    caller_member: &str,
+    path: &str,
+    expected_hash: Hash,
+) -> Result<u64> {
+    let _meta = check_serve_allowed_from_store(fs, store, caller_member)?;
+    let clean = validate_sync_path(path)?;
+    if is_internal_sync_path(&clean) || ignore.is_path_or_ancestor_ignored(&clean, false) {
+        return Err(SyncError::Denied {
+            member: caller_member.to_string(),
+            reason: format!("'{clean}' is excluded from syncing"),
+        });
+    }
+    let Some(rec) = store.get_record(&clean)? else {
+        return Err(SyncError::NotFound {
+            what: format!("file {clean:?}"),
+        });
+    };
+    if rec.deleted || rec.kind != EntryKind::File {
+        return Err(SyncError::NotFound {
+            what: format!("live file {clean:?}"),
+        });
+    }
+    if let Some(indexed_hash) = rec.hash
+        && indexed_hash != expected_hash
+    {
+        return Err(SyncError::HashMismatch {
+            path: clean,
+            expected: expected_hash,
+            actual: indexed_hash,
+        });
+    }
+    Ok(rec.size)
 }

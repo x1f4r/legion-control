@@ -69,7 +69,18 @@ pub const STREAM_PROTOCOL: u32 = 1;
 pub const HEARTBEAT: Duration = Duration::from_secs(10);
 
 /// The operations this node knows, as `unsupported` names them.
-const OPS: [&str; 7] = ["manifest", "stat", "get", "put", "pack", "unpack", "delete"];
+const OPS: [&str; 10] = [
+    "manifest",
+    "stat",
+    "get",
+    "put",
+    "pack",
+    "unpack",
+    "delete",
+    "sync.index",
+    "sync.fetch",
+    "sync.session",
+];
 
 /// The longest header read. A header carries the names a `pack` or `delete` acts on, which a
 /// transfer sends in batches well below this; anything longer is a client gone wrong.
@@ -107,6 +118,11 @@ impl Host {
     /// The node's name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Where this node keeps its configuration and state.
+    pub(crate) fn paths(&self) -> &Paths {
+        &self.paths
     }
 }
 
@@ -170,6 +186,37 @@ pub(crate) enum Op {
         root: String,
         names: Vec<String>,
     },
+    #[serde(rename = "sync.index")]
+    SyncIndex {
+        folder: String,
+        caller: String,
+        #[serde(default)]
+        handshake_only: bool,
+        #[serde(default)]
+        since_incarnation: u64,
+        #[serde(default)]
+        since_seq: u64,
+        #[serde(default = "default_sync_limit")]
+        limit: usize,
+    },
+    #[serde(rename = "sync.fetch")]
+    SyncFetch {
+        folder: String,
+        caller: String,
+        path: String,
+        expected_hash: String,
+        #[serde(default)]
+        offset: u64,
+    },
+    #[serde(rename = "sync.session")]
+    SyncSession {
+        folder: String,
+        caller: String,
+    },
+}
+
+fn default_sync_limit() -> usize {
+    legion_sync::DEFAULT_PAGE_LIMIT
 }
 
 impl Op {
@@ -182,6 +229,9 @@ impl Op {
             Op::Pack { .. } => "pack",
             Op::Unpack { .. } => "unpack",
             Op::Delete { .. } => "delete",
+            Op::SyncIndex { .. } => "sync.index",
+            Op::SyncFetch { .. } => "sync.fetch",
+            Op::SyncSession { .. } => "sync.session",
         }
     }
 
@@ -194,7 +244,9 @@ impl Op {
 /// Maps a stream header's `op` name to the file tool and effect it corresponds to.
 pub(crate) fn op_tool(op: &str) -> Option<(&'static str, Effect)> {
     match op {
-        "manifest" | "stat" | "get" | "pack" => Some(("fs.read", Effect::Read)),
+        "manifest" | "stat" | "get" | "pack" | "sync.index" | "sync.fetch" | "sync.session" => {
+            Some(("fs.read", Effect::Read))
+        }
         "put" | "unpack" => Some(("fs.write", Effect::Write)),
         "delete" => Some(("fs.remove", Effect::Destroy)),
         _ => None,
@@ -310,7 +362,7 @@ pub(crate) struct DeleteDone {
 }
 
 /// How an operation failed: in time to say so on stdout, or after its raw bytes had started.
-enum Failure {
+pub(crate) enum Failure {
     Reply(ErrorBody),
     Raw(ErrorBody),
 }
@@ -589,6 +641,43 @@ fn run<R: BufRead, W: Write>(
         Op::Pack { root, names } => pack(grant, &root, &names, output),
         Op::Unpack { root, entries } => unpack(grant, &root, &entries, input, output),
         Op::Delete { root, names } => delete(grant, &root, &names, output),
+        Op::SyncIndex {
+            folder,
+            caller,
+            handshake_only,
+            since_incarnation,
+            since_seq,
+            limit,
+        } => crate::sync_stream::serve_index(
+            host,
+            grant,
+            &folder,
+            &caller,
+            handshake_only,
+            since_incarnation,
+            since_seq,
+            limit,
+            output,
+        ),
+        Op::SyncFetch {
+            folder,
+            caller,
+            path,
+            expected_hash,
+            offset,
+        } => crate::sync_stream::serve_fetch(
+            host,
+            grant,
+            &folder,
+            &caller,
+            &path,
+            &expected_hash,
+            offset,
+            output,
+        ),
+        Op::SyncSession { folder, caller } => {
+            crate::sync_stream::serve_session(host, grant, &folder, &caller, input, output)
+        }
     }
 }
 

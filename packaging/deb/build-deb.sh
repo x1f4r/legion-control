@@ -58,10 +58,12 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 
 UNIT_SRC="${REPO_ROOT}/packaging/systemd/legion-serve.service"
+SYNC_UNIT_SRC="${REPO_ROOT}/packaging/systemd/legion-sync.service"
 MAN_SRC="${REPO_ROOT}/packaging/man/legion.1"
 LICENSE_SRC="${REPO_ROOT}/LICENSE"
 
 [[ -f "$UNIT_SRC" ]] || die "Missing systemd user unit: $UNIT_SRC"
+[[ -f "$SYNC_UNIT_SRC" ]] || die "Missing systemd user unit: $SYNC_UNIT_SRC"
 [[ -f "$MAN_SRC" ]] || die "Missing man page source: $MAN_SRC"
 [[ -f "$LICENSE_SRC" ]] || die "Missing LICENSE file: $LICENSE_SRC"
 
@@ -87,6 +89,7 @@ printf 'deb\n' > "${STAGE}/usr/lib/${PKG_NAME}/managed-by"
 chmod 0644 "${STAGE}/usr/lib/${PKG_NAME}/managed-by"
 
 install -m 0644 "$UNIT_SRC" "${STAGE}/usr/lib/systemd/user/legion-serve.service"
+install -m 0644 "$SYNC_UNIT_SRC" "${STAGE}/usr/lib/systemd/user/legion-sync.service"
 
 gzip -n -9 -c "$MAN_SRC" > "${STAGE}/usr/share/man/man1/legion.1.gz"
 chmod 0644 "${STAGE}/usr/share/man/man1/legion.1.gz"
