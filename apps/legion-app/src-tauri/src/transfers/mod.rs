@@ -10302,7 +10302,7 @@ mod tests {
             CAP_STREAM_RELAY, Link, LinkConfig, LinkOptions, NodeLink, NodeOrigin, Session,
             SessionOpener, SshTarget,
         };
-        use tokio::net::TcpStream;
+        use tokio::net::TcpSocket;
 
         let dir = tempfile::tempdir().unwrap();
         let tower_key =
@@ -10825,7 +10825,15 @@ mod tests {
             .strip_prefix(&format!("http://127.0.0.1:{lb_port}"))
             .unwrap()
             .to_owned();
-        let mut http_sock = TcpStream::connect(("127.0.0.1", lb_port)).await.unwrap();
+        let http_socket = TcpSocket::new_v4().unwrap();
+        let _ = http_socket.set_recv_buffer_size(16 * 1024);
+        let mut http_sock = http_socket
+            .connect(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::LOCALHOST,
+                lb_port,
+            )))
+            .await
+            .unwrap();
         http_sock
             .write_all(
                 format!(

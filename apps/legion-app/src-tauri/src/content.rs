@@ -5975,12 +5975,25 @@ mod tests {
             let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
         }
 
-        // Write a 16 MiB file on `studio` (larger than loopback TCP + SSH window buffers so a
-        // paused loopback client leaves the relayed stream actively open across all 3 nodes).
-        let file_size = 16 * 1024 * 1024usize;
+        // Write a 32 MiB file on `studio` using a repeating 64 KiB pattern (no 32 MiB RAM copy;
+        // combined with the bounded 16 KiB client SO_RCVBUF and 128 KiB listener SO_SNDBUF, a
+        // paused client leaves the relayed stream actively open across all 3 nodes).
+        let file_size = 32 * 1024 * 1024usize;
+        let pattern_chunk: Vec<u8> = (0..(64 * 1024usize))
+            .map(|i| ((i * 19 + 7) % 251) as u8)
+            .collect();
         let media_path = studio_home.join("media/concert.flac");
-        let media_bytes: Vec<u8> = (0..file_size).map(|i| ((i * 19 + 7) % 251) as u8).collect();
-        std::fs::write(&media_path, &media_bytes).unwrap();
+        {
+            use std::io::Write as _;
+            let mut out = std::io::BufWriter::new(std::fs::File::create(&media_path).unwrap());
+            let mut written = 0usize;
+            while written < file_size {
+                let take = (file_size - written).min(pattern_chunk.len());
+                out.write_all(&pattern_chunk[..take]).unwrap();
+                written += take;
+            }
+            out.flush().unwrap();
+        }
 
         // Wrapper for `studio` (target): records PID of every `legion stream` process before exec.
         let studio_wrapper = root.path().join("studio-exec.sh");
@@ -6237,9 +6250,10 @@ mod tests {
             .strip_prefix(&format!("http://127.0.0.1:{lb_port}"))
             .unwrap();
 
-        // Open a streaming GET and read headers + 64 KiB, then hold the TCP socket open so the
-        // relayed stream stays active across device, relay `tower`, and target `studio`.
-        let mut sock = TcpStream::connect(("127.0.0.1", lb_port)).await.unwrap();
+        // Open a streaming GET with a bounded SO_RCVBUF and read headers + 64 KiB, then hold the
+        // TCP socket open so the relayed stream stays active across device, relay `tower`, and
+        // target `studio` regardless of platform TCP autotuning.
+        let mut sock = connect_bounded_client(lb_port).await;
         sock.write_all(
             format!(
                 "GET {req_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nOrigin: http://tauri.localhost\r\nConnection: close\r\n\r\n"
@@ -6250,7 +6264,13 @@ mod tests {
         .unwrap();
         let (status, head, mut received) = read_http_head_and_prefix(&mut sock, 64 * 1024).await;
         assert_eq!(status, 200, "{head}");
-        assert_eq!(received, &media_bytes[..received.len()]);
+        for (idx, &byte) in received.iter().enumerate() {
+            assert_eq!(
+                byte,
+                pattern_chunk[idx % pattern_chunk.len()],
+                "mismatch at byte {idx}"
+            );
+        }
 
         // Confirm all three nodes have the active relayed stream running before revoke.
         assert_eq!(server.active_streams.load(Ordering::Acquire), 1);
@@ -6303,10 +6323,10 @@ mod tests {
             }
         }
         assert!(
-            received.len() < media_bytes.len(),
-            "revoked relayed stream must abort strictly before full 16 MiB ({} vs {})",
+            received.len() < file_size,
+            "revoked relayed stream must abort strictly before full 32 MiB ({} vs {})",
             received.len(),
-            media_bytes.len()
+            file_size
         );
         drop(sock);
 
@@ -7936,5 +7956,391 @@ mod tests {
         drop(holders);
 
         server.shutdown();
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn local_desktop_pipe_content_ticket_binds_strictly_to_local_direct_route_and_never_relays()
+     {
+        use std::sync::atomic::AtomicUsize;
+
+        let local_bytes: Vec<u8> = (0..16_384usize)
+            .map(|i| ((i * 7 + 3) % 251) as u8)
+            .collect();
+        let tower_bytes: Vec<u8> = (0..16_384usize)
+            .map(|i| ((i * 17 + 11) % 251) as u8)
+            .collect();
+        let local_down = Arc::new(AtomicBool::new(false));
+        let local_hits = Arc::new(AtomicUsize::new(0));
+        let tower_relay_hits = Arc::new(AtomicUsize::new(0));
+        let tower_key = legion_link::DeviceKey::from_seed([73u8; 32])
+            .public_key_line("tower")
+            .unwrap();
+
+        struct LocalOrRelayOpener {
+            is_local: bool,
+            payload: Arc<Vec<u8>>,
+            hits: Arc<AtomicUsize>,
+            down: Arc<AtomicBool>,
+        }
+
+        impl StreamOpener for LocalOrRelayOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let is_local = self.is_local;
+                let payload = Arc::clone(&self.payload);
+                let hits = Arc::clone(&self.hits);
+                let down = Arc::clone(&self.down);
+                Box::pin(async move {
+                    if is_local && down.load(Ordering::SeqCst) {
+                        return Err(StreamOpenError::Failed(
+                            ErrorBody::new(ProtoCode::Unreachable, "local legion pipe down")
+                                .with_details(json!({ "sent": false })),
+                        ));
+                    }
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                    let cancel = CancellationToken::new();
+                    tokio::spawn(async move {
+                        let _ = server_out
+                            .write_all(
+                                format!(
+                                    "{}\n",
+                                    json!({
+                                        "protocol": 1,
+                                        "capabilities": [legion_link::CAP_STREAM_RELAY]
+                                    })
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let inner = if req["op"] == json!("relay") {
+                            &req["request"]
+                        } else {
+                            &req
+                        };
+                        let offset = inner["offset"].as_u64().unwrap_or(0) as usize;
+                        let avail = payload.len().saturating_sub(offset);
+                        let len = inner
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .map_or(avail, |n| (n as usize).min(avail));
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": len,
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": if is_local { 101u64 } else { 202u64 },
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        if len > 0 {
+                            let _ = server_out.write_all(&payload[offset..offset + len]).await;
+                        }
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel,
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        let session_opener: SessionOpener = {
+            let local_payload = Arc::new(local_bytes.clone());
+            let tower_payload = Arc::new(tower_bytes.clone());
+            let local_down = Arc::clone(&local_down);
+            let local_hits = Arc::clone(&local_hits);
+            let tower_relay_hits = Arc::clone(&tower_relay_hits);
+            Arc::new(move |entry, _, cancel| {
+                let is_local = entry.node == "local";
+                let payload = if is_local {
+                    Arc::clone(&local_payload)
+                } else {
+                    Arc::clone(&tower_payload)
+                };
+                let hits = if is_local {
+                    Arc::clone(&local_hits)
+                } else {
+                    Arc::clone(&tower_relay_hits)
+                };
+                let down = Arc::clone(&local_down);
+                Box::pin(async move {
+                    if is_local && down.load(Ordering::SeqCst) {
+                        return Err(ErrorBody::new(
+                            ProtoCode::Unreachable,
+                            "local legion binary unavailable",
+                        )
+                        .with_details(json!({ "sent": false })));
+                    }
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let node_name = entry.node.clone();
+                    let hello_name = if is_local {
+                        "workstation".to_owned()
+                    } else {
+                        node_name.clone()
+                    };
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_link::proto::Request =
+                                serde_json::from_str(&line).unwrap();
+                            let reply = ProtoResp::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: hello_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
+                                    version: VERSION.to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    let opener = Arc::new(LocalOrRelayOpener {
+                        is_local,
+                        payload,
+                        hits,
+                        down,
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(FakeTransport { opener }),
+                        &node_name,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|e| e.into_error())
+                })
+            })
+        };
+
+        let link = Link::with_opener(
+            LinkConfig {
+                device_key: Some("dummy".to_owned()),
+                nodes: vec![
+                    NodeLink::local("local", "/usr/bin/legion"),
+                    NodeLink::ssh(
+                        "tower",
+                        SshTarget {
+                            hosts: vec!["tower.example.net".to_owned()],
+                            port: 22,
+                            user: "me".to_owned(),
+                            host_keys: vec![tower_key.clone()],
+                        },
+                        Some("device:desktop".to_owned()),
+                    ),
+                ],
+                ..LinkConfig::default()
+            },
+            LinkOptions::default(),
+            session_opener,
+        );
+
+        struct DesktopLocalPipeBackend {
+            link: Link,
+            tower_key: String,
+        }
+        impl Backend for DesktopLocalPipeBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                if machine == "local" || machine == "workstation" {
+                    return Ok(ContentTarget {
+                        link: self.link.clone(),
+                        link_node: "local".to_owned(),
+                        machine: machine.to_owned(),
+                        principal: "local".to_owned(),
+                        holder: "pairing:local:1".to_owned(),
+                        learned_identity: None,
+                    });
+                }
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "device:desktop".to_owned(),
+                    holder: "fleet:1".to_owned(),
+                    learned_identity: None,
+                })
+            }
+            fn is_pairing_holder_live(&self, holder: &str) -> bool {
+                matches!(holder, "pairing:local:1" | "pairing:tower:1" | "fleet:1")
+            }
+            fn node_route_identity(&self, node: &str) -> Option<NodeRouteIdentity> {
+                match node {
+                    "local" | "workstation" => Some(NodeRouteIdentity {
+                        node: "local".to_owned(),
+                        is_paired: true,
+                        holder: "pairing:local:1".to_owned(),
+                        host_keys: Vec::new(),
+                    }),
+                    "tower" => Some(NodeRouteIdentity {
+                        node: "tower".to_owned(),
+                        is_paired: true,
+                        holder: "pairing:tower:1".to_owned(),
+                        host_keys: vec![self.tower_key.clone()],
+                    }),
+                    _ => None,
+                }
+            }
+        }
+
+        let server = Arc::new(AppContentServer::with_config(
+            Arc::new(DesktopLocalPipeBackend {
+                link: link.clone(),
+                tower_key,
+            }),
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["tauri://localhost".to_owned()],
+        ));
+
+        // 1) Mint and read via `"local"` (the wire target `apps/ui/link/app.js` sends for this
+        // computer) and via `"workstation"` (the resolved local node name): both bind strictly to
+        // `Route::Direct` over the local pipe and never contact `tower`.
+        for machine in ["local", "workstation"] {
+            let minted = server
+                .mint_url(machine, "/home/me/photo.bin", false)
+                .await
+                .unwrap();
+            let port = server.loopback_port().unwrap();
+            let path = minted
+                .url
+                .strip_prefix(&format!("http://127.0.0.1:{port}"))
+                .unwrap();
+            let (st, head, body) = raw_http(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: tauri://localhost\r\nRange: bytes=0-1023\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await;
+            assert_eq!(st, 206, "machine={machine}: {head}");
+            assert_eq!(body, &local_bytes[0..=1023]);
+            assert_eq!(
+                tower_relay_hits.load(Ordering::SeqCst),
+                0,
+                "local desktop content ticket must never relay through tower"
+            );
+
+            // 2) If the local pipe drops mid-playback, the ticket fails with 502 and NEVER falls
+            // back to relaying through `tower`.
+            local_down.store(true, Ordering::SeqCst);
+            link.close().await;
+            let (st_down, head_down, body_down) = raw_http(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: tauri://localhost\r\nRange: bytes=1024-2047\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await;
+            assert_eq!(st_down, 502, "machine={machine}: {head_down}");
+            assert_ne!(body_down, &tower_bytes[1024..=2047]);
+            assert_eq!(
+                tower_relay_hits.load(Ordering::SeqCst),
+                0,
+                "failing local desktop ticket must never fall back to tower relay"
+            );
+
+            // 3) Even minting a brand-new ticket while the local pipe is unavailable fails
+            // directly without attempting to relay through `tower`.
+            let err = server
+                .mint_url(machine, "/home/me/photo.bin", false)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unreachable);
+            assert_eq!(tower_relay_hits.load(Ordering::SeqCst), 0);
+
+            local_down.store(false, Ordering::SeqCst);
+            link.close().await;
+        }
+        assert!(local_hits.load(Ordering::SeqCst) >= 4);
+
+        server.shutdown();
+        link.close().await;
     }
 }

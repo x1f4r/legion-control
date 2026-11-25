@@ -607,7 +607,11 @@ impl Backend for LinkBackend {
                     "Pass `on: \"<machine>\"` to name the machine whose tool catalogue you want.",
                 ));
             };
-            let routed = link.tools_machine(&machine).await.map_err(AppError::from)?;
+            let resolved = self.resolve_link_node_for_call(&machine);
+            let routed = link
+                .tools_machine(&resolved)
+                .await
+                .map_err(AppError::from)?;
             let tools = routed
                 .value
                 .get("tools")
@@ -659,13 +663,16 @@ impl Backend for LinkBackend {
                         .map_err(AppError::from)?;
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if resolved == LOCAL_NODE_ID
-                        && request.tool == "meta.whoami"
+                        && matches!(
+                            request.tool.as_str(),
+                            "meta.whoami" | "sys.info" | "meta.version"
+                        )
                         && let Some(actual_name) = routed
                             .value
                             .get("node")
                             .and_then(Value::as_str)
                             .map(str::trim)
-                            .filter(|s| !s.is_empty())
+                            .filter(|s| !s.is_empty() && *s != LOCAL_NODE_ID)
                     {
                         let mut guard = self
                             .state
@@ -1068,7 +1075,56 @@ impl Backend for LinkBackend {
                 guard.link.clone()
             };
 
-            let report = link.learn().await.map_err(AppError::from)?;
+            let mut report = link.learn().await.map_err(AppError::from)?;
+
+            // On desktop, never persist a learned SSH route or surface a learn rejection/disagreement
+            // for this computer's own local-pipe machine name unless the user explicitly paired an
+            // SSH node with that name.
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let local_self_name: Option<String> = {
+                let guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if guard.local_program.is_some() {
+                    guard
+                        .attached_local_node
+                        .as_deref()
+                        .filter(|name| {
+                            !guard
+                                .data
+                                .link
+                                .node(name)
+                                .is_some_and(|n| n.origin == NodeOrigin::Paired)
+                        })
+                        .map(str::to_owned)
+                } else {
+                    None
+                }
+            };
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            if let Some(ref local_name) = local_self_name {
+                if link
+                    .config()
+                    .node(local_name)
+                    .is_some_and(|n| n.origin == NodeOrigin::Learned)
+                {
+                    let _ = link.remove_node(local_name).await;
+                }
+                let is_local_self = |m: &str| m == LOCAL_NODE_ID || m == local_name.as_str();
+                report.added.retain(|m| !is_local_self(m));
+                report.updated.retain(|m| !is_local_self(m));
+                report.identity_changed.retain(|m| !is_local_self(m));
+                report.disagreements.retain(|m| !is_local_self(m));
+                report
+                    .disagreement_details
+                    .retain(|d| !is_local_self(&d.machine));
+                report.unreachable.retain(|m| !is_local_self(m));
+                report.rejected.retain(|m| !is_local_self(m));
+                report
+                    .rejected_details
+                    .retain(|r| !is_local_self(&r.machine));
+            }
 
             let state = {
                 let mut guard = self
@@ -1706,6 +1762,28 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
 
     let ready = !nodes.is_empty();
     let needs = if ready { None } else { Some(Needs::Pairing) };
+    let mut disagreements = state.disagreements.clone();
+    let mut learn_rejections = state.learn_rejections.clone();
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if state.local_program.is_some() {
+        let own_local = state
+            .attached_local_node
+            .as_deref()
+            .filter(|name| state.data.link.node(name).is_none());
+        let is_own_local =
+            |name: &str| name == LOCAL_NODE_ID || own_local.is_some_and(|local| local == name);
+        if let Some(local_name) = own_local
+            && routes
+                .get(local_name)
+                .is_some_and(|view| view.kind != "direct")
+        {
+            routes.remove(local_name);
+        }
+        disagreements.retain(|d| !is_own_local(&d.machine));
+        learn_rejections.retain(|r| !is_own_local(&r.machine));
+    }
+
     AppState {
         ready,
         nodes,
@@ -1713,8 +1791,8 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
         repair: None,
         can_scan,
         routes,
-        disagreements: state.disagreements.clone(),
-        learn_rejections: state.learn_rejections.clone(),
+        disagreements,
+        learn_rejections,
         last_paired: state.last_paired.clone(),
         transfer_capabilities: TransferCapabilities::current_platform(),
     }
@@ -3828,6 +3906,213 @@ mod tests {
             after_pair.learned_identity.is_none(),
             "paired entry must never look like a learned upgrade target"
         );
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn desktop_local_pipe_never_learns_ssh_self_route_or_surfaces_self_rejection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use legion_link::proto::{HelloResult, PROTOCOL, Response as ProtoResp, VERSION};
+        use legion_link::{Session, SessionOpener};
+
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let mut initial = AppStoreData::default();
+        initial.link.upsert_node(sample_ssh_node("tower"));
+        store.save(&initial)?;
+
+        let workstation_key = DeviceKey::from_seed([83u8; 32]).public_key_line("workstation")?;
+        let studio_key = DeviceKey::from_seed([84u8; 32]).public_key_line("studio")?;
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let workstation_key = workstation_key.clone();
+            let studio_key = studio_key.clone();
+            Box::pin(async move {
+                let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                let is_local = entry.node == LOCAL_NODE_ID;
+                let hello_node = if is_local {
+                    "workstation".to_owned()
+                } else {
+                    entry.node.clone()
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                    let mut reader = BufReader::new(server_in);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                        let req: legion_link::proto::Request = match serde_json::from_str(&line) {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        };
+                        let reply = if req.method == "hello" {
+                            ProtoResp::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: hello_node.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
+                                    version: VERSION.to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap_or_default(),
+                            )
+                        } else if req.method == "tools" {
+                            ProtoResp::ok(
+                                req.id,
+                                serde_json::json!({
+                                    "tools": [{
+                                        "name": "fs.list",
+                                        "description": "List files",
+                                        "effect": "read",
+                                        "input_schema": { "type": "object" },
+                                    }]
+                                }),
+                            )
+                        } else if req.params["tool"] == "meta.whoami" {
+                            ProtoResp::ok(
+                                req.id,
+                                serde_json::json!({
+                                    "node": "workstation",
+                                    "principal": "local",
+                                    "role": "owner",
+                                }),
+                            )
+                        } else {
+                            // `device.endpoint` reports BOTH `studio` (a valid remote peer) and
+                            // `workstation` (this desktop computer itself — once as an SSH target
+                            // from `tower` and once as a loopback/unlearnable rejection from `local`).
+                            let workstation_entry = if is_local {
+                                serde_json::json!({
+                                    "ok": {
+                                        "node": "workstation",
+                                        "hosts": ["127.0.0.1"],
+                                        "port": 22,
+                                        "user": "me",
+                                        "host_keys": [workstation_key],
+                                    }
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "ok": {
+                                        "node": "workstation",
+                                        "hosts": ["workstation.example.net"],
+                                        "port": 22,
+                                        "user": "me",
+                                        "host_keys": [workstation_key],
+                                    }
+                                })
+                            };
+                            ProtoResp::ok(
+                                req.id,
+                                serde_json::json!({
+                                    "results": {
+                                        "workstation": workstation_entry,
+                                        "studio": {
+                                            "ok": {
+                                                "node": "studio",
+                                                "hosts": ["studio.example.net"],
+                                                "port": 22,
+                                                "user": "me",
+                                                "host_keys": [studio_key],
+                                            }
+                                        }
+                                    }
+                                }),
+                            )
+                        };
+                        if let Ok(encoded) = serde_json::to_string(&reply) {
+                            let _ = server_out
+                                .write_all(format!("{encoded}\n").as_bytes())
+                                .await;
+                        }
+                        line.clear();
+                    }
+                });
+                Session::open_io(
+                    client_in,
+                    client_out,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let backend = LinkBackend::with_opener(store, Some("/usr/bin/legion".to_owned()), opener);
+
+        // Resolving `meta.whoami` over `local` records `attached_local_node = "workstation"`.
+        let who = backend
+            .call(
+                CallRequest {
+                    id: None,
+                    tool: "meta.whoami".to_owned(),
+                    args: serde_json::json!({}),
+                    on: Some(serde_json::json!("local")),
+                },
+                None,
+            )
+            .await?;
+        assert_eq!(who["node"], "workstation");
+
+        // `tools` addressed to `"workstation"` routes over the local pipe directly.
+        let tools = backend
+            .tools(Some(serde_json::json!("workstation")))
+            .await?;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "fs.list");
+
+        // Running `learn()` learns `studio` (the peer) while refusing to persist a learned SSH
+        // shadow or surface a learn rejection/disagreement for `workstation` itself.
+        let learned = backend.learn().await?;
+        assert_eq!(learned.report.added, vec!["studio".to_owned()]);
+        assert!(
+            !learned
+                .report
+                .rejected_details
+                .iter()
+                .any(|r| r.machine == "workstation" || r.machine == "local"),
+            "learn report must not include rejections for this computer: {:?}",
+            learned.report.rejected_details
+        );
+        assert!(
+            !learned
+                .state
+                .nodes
+                .iter()
+                .any(|n| n.node == "workstation" && n.via == "ssh"),
+            "desktop local computer must never gain a learned SSH duplicate: {:?}",
+            learned.state.nodes
+        );
+        assert!(
+            !learned
+                .state
+                .learn_rejections
+                .iter()
+                .any(|r| r.machine == "workstation" || r.machine == "local"),
+            "state must not surface learn_rejections for this computer"
+        );
+        assert!(
+            !learned
+                .state
+                .routes
+                .get("workstation")
+                .is_some_and(|r| r.kind != "direct"),
+            "state must never mark this computer as relayed: {:?}",
+            learned.state.routes
+        );
+        let ct = backend.content_target("workstation")?;
+        assert_eq!(ct.link_node, LOCAL_NODE_ID);
+        assert_eq!(ct.principal, "local");
+        assert!(ct.holder.starts_with("pairing:local:"));
         Ok(())
     }
 }
