@@ -1196,6 +1196,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "toml_edit",
+ "unicode-normalization",
 ]
 
 [[package]]

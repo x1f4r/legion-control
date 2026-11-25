@@ -41,6 +41,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, FileTimes};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -65,6 +66,7 @@ use legion_xfer::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use unicode_normalization::UnicodeNormalization;
 
 /// The version of this exchange: a header names it, and a node refuses one it does not speak.
 pub const STREAM_PROTOCOL: u32 = 1;
@@ -335,6 +337,10 @@ pub(crate) struct StatReply {
     /// Absent when that cannot be told without writing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub case_insensitive: Option<bool>,
+    /// Whether the file system folds canonically equivalent Unicode forms (NFC vs NFD) into one
+    /// entry. Absent when that cannot be told without writing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unicode_normalizing: Option<bool>,
     /// The resolved filesystem path on this node (with `~` and symlinks resolved on existing
     /// ancestors), used to detect moving a file onto itself or a tree into its own subtree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1089,6 +1095,7 @@ fn stat<W: Write>(
                     kind: "missing".to_owned(),
                     partial: partial(),
                     case_insensitive: case_insensitive(&path),
+                    unicode_normalizing: unicode_normalizing(&path),
                     resolved_path,
                     file_id: None,
                     parent_id,
@@ -1105,6 +1112,7 @@ fn stat<W: Write>(
         StatReply {
             kind: "dir".to_owned(),
             case_insensitive: case_insensitive(&path),
+            unicode_normalizing: unicode_normalizing(&path),
             resolved_path,
             file_id: fid,
             parent_id,
@@ -1129,6 +1137,7 @@ fn stat<W: Write>(
             hash: entry.and_then(|entry| entry.hash),
             partial: partial(),
             case_insensitive: case_insensitive(&path),
+            unicode_normalizing: unicode_normalizing(&path),
             resolved_path,
             file_id: fid,
             parent_id,
@@ -1153,14 +1162,95 @@ fn stat<W: Write>(
     reply(output, &answer)
 }
 
+/// How a directory's file system compares entry names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FsNameBehavior {
+    /// Whether names differing only in letter case refer to the same entry (e.g. NTFS, default
+    /// APFS).
+    pub case_insensitive: bool,
+    /// Whether canonically equivalent Unicode forms (NFC vs NFD) refer to the same entry (e.g.
+    /// APFS, HFS+).
+    pub unicode_normalizing: bool,
+}
+
+/// Decision for a move or rename between two paths on the same machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SameEntryDecision {
+    /// Distinct files (or destination absent): proceed as an ordinary transfer or non-replacing
+    /// rename.
+    DistinctEntries,
+    /// Exact same directory entry (same parent directory and byte-identical entry name): no-op,
+    /// must be refused.
+    SameEntryNoOp,
+    /// Same directory entry spelled differently (same parent directory, same underlying file,
+    /// names differ byte-for-byte only by case and/or Unicode normalization under the file
+    /// system's rules, and neither path is a symbolic link): perform a case/normalization rename.
+    CaseOrNormalizationRename,
+    /// Same underlying file through a different directory entry or path (hard link, symlink,
+    /// different parent directory, or case-different hardlink on a case-sensitive file system):
+    /// refuse as moving or renaming onto itself.
+    RefuseSameFileAlias,
+}
+
+/// Pure decision function classifying a same-machine move or rename from parent identities, exact
+/// caller entry names, file-identity equality, symlink status, and file system case/normalization
+/// behavior.
+pub(crate) fn classify_same_entry(
+    src_parent: Option<FileIdentity>,
+    dst_parent: Option<FileIdentity>,
+    src_name: &OsStr,
+    dst_name: &OsStr,
+    same_file: bool,
+    either_symlink: bool,
+    fs: FsNameBehavior,
+) -> SameEntryDecision {
+    let same_parent = src_parent
+        .zip(dst_parent)
+        .is_some_and(|(a, b)| a.same_file(&b));
+    if same_parent && src_name.as_encoded_bytes() == dst_name.as_encoded_bytes() {
+        return SameEntryDecision::SameEntryNoOp;
+    }
+    if !same_file {
+        return SameEntryDecision::DistinctEntries;
+    }
+    if same_parent && !either_symlink && names_fold_equivalent(src_name, dst_name, fs) {
+        return SameEntryDecision::CaseOrNormalizationRename;
+    }
+    SameEntryDecision::RefuseSameFileAlias
+}
+
+/// Whether two entry names fold to the same key under `fs`'s case and Unicode normalization rules.
+pub(crate) fn names_fold_equivalent(a: &OsStr, b: &OsStr, fs: FsNameBehavior) -> bool {
+    if a.as_encoded_bytes() == b.as_encoded_bytes() {
+        return true;
+    }
+    if !fs.case_insensitive && !fs.unicode_normalizing {
+        return false;
+    }
+    let (Some(a), Some(b)) = (a.to_str(), b.to_str()) else {
+        return false;
+    };
+    let fold = |s: &str| -> String {
+        if fs.unicode_normalizing && fs.case_insensitive {
+            let decomposed: String = s.nfd().collect();
+            decomposed.to_lowercase().nfd().collect()
+        } else if fs.unicode_normalizing {
+            s.nfd().collect()
+        } else {
+            s.to_lowercase()
+        }
+    };
+    fold(a) == fold(b)
+}
+
 /// Whether the file system holding `path`, or the nearest directory above it that exists,
 /// ignores letter case, told without writing anything: a name in that directory is looked up again
 /// with the case of its letters flipped, and the two are the same file only where case is ignored.
 ///
 /// Only names inside the directory are on its file system: the directory's own name, and those
 /// above it, are in the directory that holds it, which a mount point's is not. `None` when the
-/// directory holds no name with a letter to flip, which a transfer takes as ignoring case, since
-/// that only holds back names that would collide.
+/// directory holds no suitable name to flip, which a tree transfer takes as ignoring case so
+/// colliding names are still held back.
 fn case_insensitive(path: &Path) -> Option<bool> {
     let dir = path
         .ancestors()
@@ -1184,11 +1274,13 @@ fn case_insensitive(path: &Path) -> Option<bool> {
         };
         let flipped: String = name
             .chars()
-            .map(|c| {
-                if c.is_ascii_lowercase() {
-                    c.to_ascii_uppercase()
+            .flat_map(|c| {
+                if c.is_lowercase() {
+                    c.to_uppercase().collect::<Vec<_>>()
+                } else if c.is_uppercase() {
+                    c.to_lowercase().collect::<Vec<_>>()
                 } else {
-                    c.to_ascii_lowercase()
+                    vec![c]
                 }
             })
             .collect();
@@ -1196,10 +1288,104 @@ fn case_insensitive(path: &Path) -> Option<bool> {
             continue;
         }
         let twin = parent.join(flipped);
-        return Some(
-            fs::symlink_metadata(&twin).is_ok()
-                && same_file::is_same_file(&candidate, &twin).unwrap_or(false),
-        );
+        if fs::symlink_metadata(&twin).is_err() {
+            return Some(false);
+        }
+        // Only trust a positive match on a non-hardlinked entry so two hardlinks with flipped
+        // casing on a case-sensitive filesystem cannot spoof case-insensitivity.
+        if file_identity(&candidate).is_ok_and(|id| id.nlink == 1) {
+            return Some(same_file::is_same_file(&candidate, &twin).unwrap_or(false));
+        }
+    }
+    None
+}
+
+/// Whether the file system holding `path` folds canonically equivalent Unicode forms (NFC vs NFD),
+/// told without writing anything when a decomposable entry already exists in the directory.
+fn unicode_normalizing(path: &Path) -> Option<bool> {
+    let dir = path
+        .ancestors()
+        .find(|dir| fs::metadata(dir).is_ok_and(|meta| meta.is_dir()))?;
+    let inside = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .take(64)
+        .filter_map(Result::ok)
+        .map(|entry| entry.path());
+    for candidate in inside {
+        if fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            continue;
+        }
+        let (Some(parent), Some(name)) = (
+            candidate.parent(),
+            candidate.file_name().and_then(|name| name.to_str()),
+        ) else {
+            continue;
+        };
+        let nfc: String = name.nfc().collect();
+        let nfd: String = name.nfd().collect();
+        if nfc == nfd {
+            continue;
+        }
+        let other = if name == nfc { nfd } else { nfc };
+        let twin = parent.join(other);
+        if fs::symlink_metadata(&twin).is_err() {
+            return Some(false);
+        }
+        if file_identity(&candidate).is_ok_and(|id| id.nlink == 1) {
+            return Some(same_file::is_same_file(&candidate, &twin).unwrap_or(false));
+        }
+    }
+    None
+}
+
+/// Probes `dir`'s exact case-sensitivity and Unicode-normalization behavior, using read-only
+/// inspection first and falling back to an ephemeral unique probe file when `dir` has no suitable
+/// `nlink == 1` entry.
+fn probe_dir_name_behavior(dir: &Path) -> FsNameBehavior {
+    let ci = case_insensitive(dir).unwrap_or_else(|| {
+        probe_dir_pair(
+            dir,
+            |pid, seq| format!(".legion-CaseProbe-{pid}-{seq}.tmp"),
+            |pid, seq| format!(".legion-caseprobe-{pid}-{seq}.tmp"),
+        )
+        .unwrap_or(cfg!(any(windows, target_os = "macos")))
+    });
+    let norm = unicode_normalizing(dir).unwrap_or_else(|| {
+        probe_dir_pair(
+            dir,
+            |pid, seq| format!(".legion-NormProbe-e\u{0301}-{pid}-{seq}.tmp"),
+            |pid, seq| format!(".legion-NormProbe-\u{00e9}-{pid}-{seq}.tmp"),
+        )
+        .unwrap_or(cfg!(target_os = "macos"))
+    });
+    FsNameBehavior {
+        case_insensitive: ci,
+        unicode_normalizing: norm,
+    }
+}
+
+fn probe_dir_pair(
+    dir: &Path,
+    make_a: impl Fn(u32, u64) -> String,
+    make_b: impl Fn(u32, u64) -> String,
+) -> Option<bool> {
+    let pid = std::process::id();
+    for _ in 0..8 {
+        let seq = STREAM_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let a = dir.join(make_a(pid, seq));
+        let b = dir.join(make_b(pid, seq));
+        match fs::OpenOptions::new().write(true).create_new(true).open(&a) {
+            Ok(file) => {
+                drop(file);
+                let folded = fs::symlink_metadata(&b).is_ok()
+                    && same_file::is_same_file(&a, &b).unwrap_or(false);
+                let _ = fs::remove_file(&a);
+                return Some(folded);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
     }
     None
 }
@@ -2007,6 +2193,46 @@ fn probe_read<W: Write>(
     )
 }
 
+/// Extracts the caller's exact final entry name before `canonicalize` can rewrite its case or
+/// Unicode normalization on case-insensitive or normalizing filesystems. Falls back to the checked
+/// path's final component when `raw` does not name an explicit entry (e.g. ends with `.`, `..`, or
+/// `~`).
+fn requested_entry_name(raw: &str, checked: &Path, windows_separators: bool) -> Option<OsString> {
+    let trimmed = if windows_separators {
+        raw.trim_end_matches(['/', '\\'])
+    } else {
+        raw.trim_end_matches('/')
+    };
+    let tail = if windows_separators {
+        trimmed.rsplit(['/', '\\']).next().unwrap_or("")
+    } else {
+        trimmed.rsplit('/').next().unwrap_or("")
+    };
+    let explicit = !tail.is_empty()
+        && tail != "."
+        && tail != ".."
+        && tail != "~"
+        && !(windows_separators && tail.ends_with(':'));
+    if explicit {
+        Some(OsString::from(tail))
+    } else {
+        checked.file_name().map(OsStr::to_os_string)
+    }
+}
+
+/// Lists `dir` and checks whether an entry with the exact byte sequence `expected` is present,
+/// rather than calling `exists()` (which folds case or Unicode normalization on folding volumes).
+fn directory_contains_exact_name(dir: &Path, expected: &OsStr) -> io::Result<bool> {
+    let expected_bytes = expected.as_encoded_bytes();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name().as_encoded_bytes() == expected_bytes {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn rename_same_file<W: Write>(
     host: &Host,
     config: &ConfigStore,
@@ -2024,32 +2250,43 @@ fn rename_same_file<W: Write>(
         Some(Effect::Write),
         &host.paths,
     )?;
-    let from_path = grant.check_path(from, Access::Write)?;
-    let to_path = grant.check_path(to, Access::Write)?;
+    let from_checked = grant.check_path(from, Access::Write)?;
+    let to_checked = grant.check_path(to, Access::Write)?;
 
-    let from_id = symlink_file_identity(&from_path)
-        .map_err(|err| Failure::Reply(io_error("inspect", &from_path, &err)))?;
-    match symlink_file_identity(&to_path) {
-        Ok(to_id) => {
-            if !from_id.same_file(&to_id) {
-                return Err(Failure::Reply(ErrorBody::new(
-                    ErrorCode::Conflict,
-                    format!(
-                        "{} already exists and does not refer to the same entry as {}.",
-                        to_path.display(),
-                        from_path.display()
-                    ),
-                )));
-            }
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(Failure::Reply(io_error("inspect", &to_path, &err))),
-    }
-    let (Some(from_parent), Some(to_parent)) = (from_path.parent(), to_path.parent()) else {
+    let (Some(from_parent), Some(to_parent)) = (from_checked.parent(), to_checked.parent()) else {
         return Err(Failure::Reply(ErrorBody::new(
             ErrorCode::InvalidArgs,
             "Cannot rename a filesystem root.",
         )));
+    };
+    let (Some(from_name), Some(to_name)) = (
+        requested_entry_name(from, &from_checked, cfg!(windows)),
+        requested_entry_name(to, &to_checked, cfg!(windows)),
+    ) else {
+        return Err(Failure::Reply(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Cannot rename a filesystem root.",
+        )));
+    };
+    let from_path = from_parent.join(&from_name);
+    let to_path = to_parent.join(&to_name);
+
+    let from_meta = fs::symlink_metadata(&from_path)
+        .map_err(|err| Failure::Reply(io_error("inspect", &from_path, &err)))?;
+    let from_id = symlink_file_identity(&from_path)
+        .map_err(|err| Failure::Reply(io_error("inspect", &from_path, &err)))?;
+    let (to_exists, same_file, to_is_symlink) = match fs::symlink_metadata(&to_path) {
+        Ok(to_meta) => {
+            let to_id = symlink_file_identity(&to_path)
+                .map_err(|err| Failure::Reply(io_error("inspect", &to_path, &err)))?;
+            (
+                true,
+                from_id.same_file(&to_id),
+                to_meta.file_type().is_symlink(),
+            )
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => (false, false, false),
+        Err(err) => return Err(Failure::Reply(io_error("inspect", &to_path, &err))),
     };
     let from_parent_id = file_identity(from_parent)
         .map_err(|err| Failure::Reply(io_error("inspect", from_parent, &err)))?;
@@ -2061,33 +2298,48 @@ fn rename_same_file<W: Write>(
             "Source and destination are not in the same directory.",
         )));
     }
-    if from_path.file_name() == to_path.file_name() {
-        return Err(Failure::Reply(ErrorBody::new(
-            ErrorCode::InvalidArgs,
-            format!("Cannot rename {} onto itself.", from_path.display()),
-        )));
+
+    let either_symlink = from_meta.file_type().is_symlink() || to_is_symlink;
+    let fs_behavior = probe_dir_name_behavior(from_parent);
+    let decision = classify_same_entry(
+        Some(from_parent_id),
+        Some(to_parent_id),
+        &from_name,
+        &to_name,
+        same_file,
+        either_symlink,
+        fs_behavior,
+    );
+    match decision {
+        SameEntryDecision::SameEntryNoOp => {
+            return Err(Failure::Reply(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("Cannot rename {} onto itself.", from_path.display()),
+            )));
+        }
+        SameEntryDecision::RefuseSameFileAlias => {
+            return Err(Failure::Reply(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "Cannot rename {} onto {} because they are different links to the same entry.",
+                    from_path.display(),
+                    to_path.display()
+                ),
+            )));
+        }
+        SameEntryDecision::DistinctEntries if to_exists => {
+            return Err(Failure::Reply(ErrorBody::new(
+                ErrorCode::Conflict,
+                format!(
+                    "{} already exists and does not refer to the same entry as {}.",
+                    to_path.display(),
+                    from_path.display()
+                ),
+            )));
+        }
+        SameEntryDecision::DistinctEntries | SameEntryDecision::CaseOrNormalizationRename => {}
     }
 
-    // Two-step rename through a unique sibling temporary name so case-only and Unicode
-    // normalization-only renames succeed reliably on case-insensitive filesystems (APFS, HFS+,
-    // NTFS, FAT/exFAT, SMB).
-    let pid = std::process::id();
-    let mut temp_path = None;
-    for _ in 0..32 {
-        let seq = STREAM_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let cand = from_parent.join(format!(".legion-rename-{pid}-{seq}.tmp"));
-        if fs::symlink_metadata(&cand).is_err() {
-            temp_path = Some(cand);
-            break;
-        }
-    }
-    let temp = temp_path.ok_or_else(|| {
-        Failure::Reply(ErrorBody::new(
-            ErrorCode::Failed,
-            "Could not allocate a temporary name for rename.",
-        ))
-    })?;
-    grant.check_path(&temp, Access::Write)?;
     let move_no_replace = |src: &Path, dst: &Path| -> Result<(), Failure> {
         match legion_os::atomic::rename_no_replace(src, dst) {
             Ok(()) => Ok(()),
@@ -2105,14 +2357,55 @@ fn rename_same_file<W: Write>(
             }
         }
     };
-    move_no_replace(&from_path, &temp)?;
-    if let Err(err) = move_no_replace(&temp, &to_path) {
-        let _ = fs::rename(&temp, &from_path);
-        return Err(err);
+
+    if decision == SameEntryDecision::CaseOrNormalizationRename {
+        // Two-step rename through a unique sibling temporary name so case-only and Unicode
+        // normalization-only renames succeed reliably on case-insensitive or normalizing
+        // filesystems (APFS, HFS+, NTFS, FAT/exFAT, SMB) where a direct rename is a no-op or
+        // reports `AlreadyExists`.
+        let pid = std::process::id();
+        let mut temp_path = None;
+        for _ in 0..32 {
+            let seq = STREAM_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let cand = from_parent.join(format!(".legion-rename-{pid}-{seq}.tmp"));
+            if fs::symlink_metadata(&cand).is_err() {
+                temp_path = Some(cand);
+                break;
+            }
+        }
+        let temp = temp_path.ok_or_else(|| {
+            Failure::Reply(ErrorBody::new(
+                ErrorCode::Failed,
+                "Could not allocate a temporary name for rename.",
+            ))
+        })?;
+        grant.check_path(&temp, Access::Write)?;
+        move_no_replace(&from_path, &temp)?;
+        if let Err(err) = move_no_replace(&temp, &to_path) {
+            let _ = fs::rename(&temp, &from_path);
+            return Err(err);
+        }
+    } else {
+        move_no_replace(&from_path, &to_path)?;
     }
+
     #[cfg(unix)]
     if let Ok(dir_handle) = fs::File::open(from_parent) {
         let _ = dir_handle.sync_all();
+    }
+
+    // Verify by listing the directory and comparing entry name bytes (not `exists()`) that the
+    // directory now holds the exact spelling the caller requested.
+    if let Ok(found) = directory_contains_exact_name(from_parent, &to_name)
+        && !found
+    {
+        return Err(Failure::Reply(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "The filesystem did not store the renamed entry with the exact requested name {}.",
+                to_path.display()
+            ),
+        )));
     }
     reply(output, &RenameDone { ok: true })
 }
@@ -2302,4 +2595,326 @@ fn io_error(action: &str, path: &Path, error: &io::Error) -> ErrorBody {
         code,
         format!("Could not {action} {}: {error}.", path.display()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(dev: u64, ino: u64, nlink: u64) -> FileIdentity {
+        FileIdentity { dev, ino, nlink }
+    }
+
+    const CASE_SENSITIVE_RAW: FsNameBehavior = FsNameBehavior {
+        case_insensitive: false,
+        unicode_normalizing: false,
+    };
+    const CASE_INSENSITIVE_RAW: FsNameBehavior = FsNameBehavior {
+        case_insensitive: true,
+        unicode_normalizing: false,
+    };
+    const CASE_SENSITIVE_NORM: FsNameBehavior = FsNameBehavior {
+        case_insensitive: false,
+        unicode_normalizing: true,
+    };
+    const CASE_INSENSITIVE_NORM: FsNameBehavior = FsNameBehavior {
+        case_insensitive: true,
+        unicode_normalizing: true,
+    };
+
+    #[test]
+    fn classify_same_entry_covers_case_normalization_identities_and_aliases() {
+        let dir_a = Some(id(1, 10, 2));
+        let dir_b = Some(id(1, 20, 2));
+
+        // 1. Identical byte-for-byte names in the same parent are always a no-op, under every FS
+        // behavior and whether or not file identity was observed.
+        for fs_mode in [
+            CASE_SENSITIVE_RAW,
+            CASE_INSENSITIVE_RAW,
+            CASE_SENSITIVE_NORM,
+            CASE_INSENSITIVE_NORM,
+        ] {
+            for same_file in [true, false] {
+                for either_symlink in [false, true] {
+                    assert_eq!(
+                        classify_same_entry(
+                            dir_a,
+                            dir_a,
+                            OsStr::new("Report.txt"),
+                            OsStr::new("Report.txt"),
+                            same_file,
+                            either_symlink,
+                            fs_mode,
+                        ),
+                        SameEntryDecision::SameEntryNoOp,
+                        "identical name must be no-op under {fs_mode:?}"
+                    );
+                }
+            }
+        }
+
+        // 2. ASCII case difference (`Report.txt` vs `report.txt`) resolving to the same file in
+        // the same parent:
+        // - case-insensitive (NTFS, default APFS): folding rename
+        // - case-sensitive (Linux ext4, case-sensitive APFS): hardlink alias, refuse
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_a,
+                OsStr::new("Report.txt"),
+                OsStr::new("report.txt"),
+                true,
+                false,
+                CASE_INSENSITIVE_RAW,
+            ),
+            SameEntryDecision::CaseOrNormalizationRename
+        );
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_a,
+                OsStr::new("Report.txt"),
+                OsStr::new("report.txt"),
+                true,
+                false,
+                CASE_INSENSITIVE_NORM,
+            ),
+            SameEntryDecision::CaseOrNormalizationRename
+        );
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_a,
+                OsStr::new("Report.txt"),
+                OsStr::new("report.txt"),
+                true,
+                false,
+                CASE_SENSITIVE_RAW,
+            ),
+            SameEntryDecision::RefuseSameFileAlias
+        );
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_a,
+                OsStr::new("Report.txt"),
+                OsStr::new("report.txt"),
+                true,
+                false,
+                CASE_SENSITIVE_NORM,
+            ),
+            SameEntryDecision::RefuseSameFileAlias
+        );
+
+        // 3. Non-ASCII case difference (`Ärger.txt` vs `ärger.txt`) resolving to the same file:
+        let upper_umlaut = OsStr::new("\u{00c4}rger.txt");
+        let lower_umlaut = OsStr::new("\u{00e4}rger.txt");
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_a,
+                upper_umlaut,
+                lower_umlaut,
+                true,
+                false,
+                CASE_INSENSITIVE_RAW,
+            ),
+            SameEntryDecision::CaseOrNormalizationRename
+        );
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_a,
+                upper_umlaut,
+                lower_umlaut,
+                true,
+                false,
+                CASE_INSENSITIVE_NORM,
+            ),
+            SameEntryDecision::CaseOrNormalizationRename
+        );
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_a,
+                upper_umlaut,
+                lower_umlaut,
+                true,
+                false,
+                CASE_SENSITIVE_RAW,
+            ),
+            SameEntryDecision::RefuseSameFileAlias
+        );
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_a,
+                upper_umlaut,
+                lower_umlaut,
+                true,
+                false,
+                CASE_SENSITIVE_NORM,
+            ),
+            SameEntryDecision::RefuseSameFileAlias
+        );
+
+        // 4. Unicode NFC vs NFD (`caf\u{00e9}.txt` vs `cafe\u{0301}.txt`) resolving to the same
+        // file:
+        // - normalizing (APFS, HFS+, whether case-sensitive or case-insensitive): folding rename
+        // - non-normalizing (Linux ext4, Windows NTFS): hardlink alias, refuse
+        let nfc = OsStr::new("caf\u{00e9}.txt");
+        let nfd = OsStr::new("cafe\u{0301}.txt");
+        assert_eq!(
+            classify_same_entry(dir_a, dir_a, nfd, nfc, true, false, CASE_SENSITIVE_NORM),
+            SameEntryDecision::CaseOrNormalizationRename
+        );
+        assert_eq!(
+            classify_same_entry(dir_a, dir_a, nfd, nfc, true, false, CASE_INSENSITIVE_NORM),
+            SameEntryDecision::CaseOrNormalizationRename
+        );
+        assert_eq!(
+            classify_same_entry(dir_a, dir_a, nfd, nfc, true, false, CASE_SENSITIVE_RAW),
+            SameEntryDecision::RefuseSameFileAlias
+        );
+        assert_eq!(
+            classify_same_entry(dir_a, dir_a, nfd, nfc, true, false, CASE_INSENSITIVE_RAW),
+            SameEntryDecision::RefuseSameFileAlias
+        );
+
+        // 5. Combined non-ASCII case + NFC vs NFD (`Ä` vs `a\u{0308}`): folding rename only when
+        // BOTH case-insensitive AND normalizing.
+        let precomposed_upper = OsStr::new("\u{00c4}.txt");
+        let decomposed_lower = OsStr::new("a\u{0308}.txt");
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_a,
+                precomposed_upper,
+                decomposed_lower,
+                true,
+                false,
+                CASE_INSENSITIVE_NORM,
+            ),
+            SameEntryDecision::CaseOrNormalizationRename
+        );
+        for fs_mode in [
+            CASE_SENSITIVE_RAW,
+            CASE_INSENSITIVE_RAW,
+            CASE_SENSITIVE_NORM,
+        ] {
+            assert_eq!(
+                classify_same_entry(
+                    dir_a,
+                    dir_a,
+                    precomposed_upper,
+                    decomposed_lower,
+                    true,
+                    false,
+                    fs_mode,
+                ),
+                SameEntryDecision::RefuseSameFileAlias,
+                "combined case+norm mismatch must refuse under {fs_mode:?}"
+            );
+        }
+
+        // 6. Different files that merely have case-different names on a case-sensitive filesystem
+        // (e.g. `Report.txt` and `report.txt` are distinct inodes): DistinctEntries.
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_a,
+                OsStr::new("Report.txt"),
+                OsStr::new("report.txt"),
+                false,
+                false,
+                CASE_SENSITIVE_RAW,
+            ),
+            SameEntryDecision::DistinctEntries
+        );
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_a,
+                upper_umlaut,
+                lower_umlaut,
+                false,
+                false,
+                CASE_SENSITIVE_RAW,
+            ),
+            SameEntryDecision::DistinctEntries
+        );
+
+        // 7. Hard links with unrelated names, symlinks, and different-parent aliases are always
+        // refused even on case-insensitive normalizing filesystems.
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_a,
+                OsStr::new("a.txt"),
+                OsStr::new("b.txt"),
+                true,
+                false,
+                CASE_INSENSITIVE_NORM,
+            ),
+            SameEntryDecision::RefuseSameFileAlias
+        );
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_a,
+                OsStr::new("Report.txt"),
+                OsStr::new("report.txt"),
+                true,
+                true,
+                CASE_INSENSITIVE_NORM,
+            ),
+            SameEntryDecision::RefuseSameFileAlias
+        );
+        assert_eq!(
+            classify_same_entry(
+                dir_a,
+                dir_b,
+                OsStr::new("Report.txt"),
+                OsStr::new("report.txt"),
+                true,
+                false,
+                CASE_INSENSITIVE_NORM,
+            ),
+            SameEntryDecision::RefuseSameFileAlias
+        );
+    }
+
+    #[test]
+    fn requested_entry_name_preserves_caller_spelling_across_unix_and_windows() {
+        let checked = Path::new("/home/me/Report.txt");
+        assert_eq!(
+            requested_entry_name("~/report.txt", checked, false),
+            Some(OsString::from("report.txt"))
+        );
+        assert_eq!(
+            requested_entry_name("~/report.txt/", checked, false),
+            Some(OsString::from("report.txt"))
+        );
+        assert_eq!(
+            requested_entry_name(r"C:\Users\me\report.txt", checked, true),
+            Some(OsString::from("report.txt"))
+        );
+        assert_eq!(
+            requested_entry_name("~/report.txt", checked, true),
+            Some(OsString::from("report.txt"))
+        );
+        assert_eq!(
+            requested_entry_name("~/sub/.", checked, false),
+            Some(OsString::from("Report.txt"))
+        );
+        assert_eq!(
+            requested_entry_name("~/sub/..", checked, false),
+            Some(OsString::from("Report.txt"))
+        );
+        assert_eq!(
+            requested_entry_name("~", checked, false),
+            Some(OsString::from("Report.txt"))
+        );
+    }
 }

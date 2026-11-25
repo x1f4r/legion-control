@@ -49,9 +49,9 @@ use crate::config::{FleetFile, validate_machine_name};
 use crate::connector::PipeHandle;
 use crate::pool::Fleet;
 use crate::stream::{
-    self, CAP_IF_EXISTS, CAP_MOVE, CAP_PROBE, CAP_RENAME, DeleteDone, GetReady, Host, ManifestDone,
-    PackReady, Planned, ProbeReply, PutDone, PutReady, RenameDone, StatReply, UnpackDone,
-    UnpackReady,
+    self, CAP_IF_EXISTS, CAP_MOVE, CAP_PROBE, CAP_RENAME, DeleteDone, FsNameBehavior, GetReady,
+    Host, ManifestDone, PackReady, Planned, ProbeReply, PutDone, PutReady, RenameDone,
+    SameEntryDecision, StatReply, UnpackDone, UnpackReady, classify_same_entry,
 };
 
 /// How many bytes the relay and the in-process pipes hold at once: memory stays bounded however
@@ -1290,55 +1290,67 @@ impl Transfer<'_> {
         let mut probed_same_dir = false;
         if args.move_source {
             self.check_move_permission(from).await?;
-            // On one node, check file identity first so case-only or Unicode-normalization-only
-            // renames are performed as atomic renames rather than refused or lost.
-            if from.machine == target.machine
-                && let (Some(src_id), Some(dst_id)) = (source.file_id, there.file_id)
-                && src_id.same_file(&dst_id)
-            {
-                let same_parent = source
-                    .parent_id
-                    .zip(there.parent_id)
+            // On one node, classify same-entry vs folding rename vs alias using parent
+            // identities, exact caller entry names, file identity, and the host filesystem's
+            // case/Unicode-normalization behavior.
+            if from.machine == target.machine {
+                let same_file = source
+                    .file_id
+                    .zip(there.file_id)
                     .is_some_and(|(a, b)| a.same_file(&b));
-                let src_name = file_name(&from.path);
-                let dst_name = file_name(&target.path);
-                let is_folding_rename = !source.is_symlink
-                    && !there.is_symlink
-                    && same_parent
-                    && src_name != dst_name
-                    && (src_id.nlink == 1
-                        || (there.case_insensitive.unwrap_or(false)
-                            && src_name.to_lowercase() == dst_name.to_lowercase()));
-                if is_folding_rename {
-                    if !from_caps.contains(CAP_RENAME) {
-                        return Err(missing_peer_capability(&from.machine, "rename"));
+                let fs_behavior = FsNameBehavior {
+                    case_insensitive: there
+                        .case_insensitive
+                        .or(source.case_insensitive)
+                        .unwrap_or(false),
+                    unicode_normalizing: there
+                        .unicode_normalizing
+                        .or(source.unicode_normalizing)
+                        .unwrap_or(false),
+                };
+                match classify_same_entry(
+                    source.parent_id,
+                    there.parent_id,
+                    OsStr::new(file_name(&from.path)),
+                    OsStr::new(file_name(&target.path)),
+                    same_file,
+                    source.is_symlink || there.is_symlink,
+                    fs_behavior,
+                ) {
+                    SameEntryDecision::CaseOrNormalizationRename => {
+                        if !from_caps.contains(CAP_RENAME) {
+                            return Err(missing_peer_capability(&from.machine, "rename"));
+                        }
+                        if !args.dry_run {
+                            let _: RenameDone = self
+                                .request_required(
+                                    from,
+                                    json!({
+                                        "op": "rename",
+                                        "from": from.path,
+                                        "to": target.path,
+                                    }),
+                                    &[CAP_RENAME],
+                                )
+                                .await?;
+                        }
+                        return Ok(TransferReport {
+                            from: from.named(),
+                            to: target.named(),
+                            kind: "file",
+                            moved: true,
+                            renamed: vec![RenamedEntry {
+                                from: from.path.clone(),
+                                to: target.path.clone(),
+                            }],
+                            ..TransferReport::default()
+                        });
                     }
-                    if !args.dry_run {
-                        let _: RenameDone = self
-                            .request_required(
-                                from,
-                                json!({
-                                    "op": "rename",
-                                    "from": from.path,
-                                    "to": target.path,
-                                }),
-                                &[CAP_RENAME],
-                            )
-                            .await?;
+                    SameEntryDecision::SameEntryNoOp | SameEntryDecision::RefuseSameFileAlias => {
+                        return Err(same_file_move_error(from, &target));
                     }
-                    return Ok(TransferReport {
-                        from: from.named(),
-                        to: target.named(),
-                        kind: "file",
-                        moved: true,
-                        renamed: vec![RenamedEntry {
-                            from: from.path.clone(),
-                            to: target.path.clone(),
-                        }],
-                        ..TransferReport::default()
-                    });
+                    SameEntryDecision::DistinctEntries => {}
                 }
-                return Err(same_file_move_error(from, &target));
             }
             check_not_same_or_subtree(from, &target, source, &there, false)?;
 
@@ -1628,20 +1640,30 @@ impl Transfer<'_> {
         if args.move_source {
             self.check_move_permission(from).await?;
             if from.machine == to.machine {
-                if let (Some(src_id), Some(dst_id)) = (source_stat.file_id, there.file_id)
-                    && src_id.same_file(&dst_id)
-                {
-                    let same_parent = source_stat
-                        .parent_id
-                        .zip(there.parent_id)
-                        .is_some_and(|(a, b)| a.same_file(&b));
-                    let src_name = file_name(&from.path);
-                    let dst_name = file_name(&to.path);
-                    if !source_stat.is_symlink
-                        && !there.is_symlink
-                        && same_parent
-                        && src_name != dst_name
-                    {
+                let same_file = source_stat
+                    .file_id
+                    .zip(there.file_id)
+                    .is_some_and(|(a, b)| a.same_file(&b));
+                let fs_behavior = FsNameBehavior {
+                    case_insensitive: there
+                        .case_insensitive
+                        .or(source_stat.case_insensitive)
+                        .unwrap_or(false),
+                    unicode_normalizing: there
+                        .unicode_normalizing
+                        .or(source_stat.unicode_normalizing)
+                        .unwrap_or(false),
+                };
+                match classify_same_entry(
+                    source_stat.parent_id,
+                    there.parent_id,
+                    OsStr::new(file_name(&from.path)),
+                    OsStr::new(file_name(&to.path)),
+                    same_file,
+                    source_stat.is_symlink || there.is_symlink,
+                    fs_behavior,
+                ) {
+                    SameEntryDecision::CaseOrNormalizationRename => {
                         if !from_caps.contains(CAP_RENAME) {
                             return Err(missing_peer_capability(&from.machine, "rename"));
                         }
@@ -1670,7 +1692,10 @@ impl Transfer<'_> {
                             ..TransferReport::default()
                         });
                     }
-                    return Err(same_file_move_error(from, to));
+                    SameEntryDecision::SameEntryNoOp | SameEntryDecision::RefuseSameFileAlias => {
+                        return Err(same_file_move_error(from, to));
+                    }
+                    SameEntryDecision::DistinctEntries => {}
                 }
                 if let Some(src_id) = source_stat.file_id
                     && there.ancestor_ids.iter().any(|anc| anc.same_file(&src_id))

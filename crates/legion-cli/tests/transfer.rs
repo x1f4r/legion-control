@@ -3266,33 +3266,228 @@ fn move_same_file_aliases_symlinks_hardlinks_and_case_normalization_rename() {
         );
     }
 
-    // 4. Case-only and Unicode-normalization-only two-step atomic rename via `stream` `rename`.
+    // 4. Case-only and Unicode-normalization-only renames via both `fs.transfer` (`move: true`)
+    // and `stream` `rename`, verifying the resulting directory entry's exact spelling by listing
+    // the directory rather than relying on `exists()`.
+    let dir_entry_names = |dir: PathBuf| -> Vec<Vec<u8>> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().as_encoded_bytes().to_vec())
+            .collect()
+    };
+
+    // Probe whether this runner's temp volume is case-insensitive and/or Unicode-normalizing.
+    fs::write(laptop.home().join("FsCaseProbe.tmp"), b"").unwrap();
+    let host_case_insensitive = fs::symlink_metadata(laptop.home().join("fscaseprobe.tmp")).is_ok();
+    let _ = fs::remove_file(laptop.home().join("FsCaseProbe.tmp"));
+
+    fs::write(laptop.home().join("FsNormProbe-e\u{0301}.tmp"), b"").unwrap();
+    let host_unicode_normalizing =
+        fs::symlink_metadata(laptop.home().join("FsNormProbe-\u{00e9}.tmp")).is_ok();
+    let _ = fs::remove_file(laptop.home().join("FsNormProbe-e\u{0301}.tmp"));
+
+    // 4a. ASCII case-only rename via `stream` `rename`: must succeed on every OS and end with the
+    // exact requested spelling `report.txt` (not `Report.txt`).
     fs::write(laptop.home().join("Report.txt"), b"report-contents").unwrap();
     let rename_reply = stream_request(
         &laptop,
         json!({"op": "rename", "from": "~/Report.txt", "to": "~/report.txt"}),
     );
     assert_eq!(rename_reply["ok"], true, "{rename_reply}");
+    let names = dir_entry_names(laptop.home());
+    assert!(
+        names.iter().any(|n| n == b"report.txt"),
+        "expected exact 'report.txt' in dir listing, got {:?}",
+        names
+            .iter()
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !names.iter().any(|n| n == b"Report.txt"),
+        "old spelling 'Report.txt' still present in dir listing"
+    );
     assert_eq!(
         fs::read(laptop.home().join("report.txt")).unwrap(),
         b"report-contents"
     );
 
+    // 4b. ASCII case-only rename via `fs.transfer` (`move: true`): on case-insensitive volumes
+    // (Windows NTFS, default macOS APFS) this takes the atomic folding-rename path (`renamed`
+    // populated); on case-sensitive volumes it moves normally. Either way the directory entry ends
+    // spelled `Report.txt` and `report.txt` is gone.
+    let moved_case = ok(&transfer(
+        &laptop,
+        json!({"from": "~/report.txt", "to": "~/Report.txt", "move": true}),
+        &[],
+    ));
+    assert_eq!(moved_case["moved"], true, "{moved_case}");
+    if host_case_insensitive {
+        assert_eq!(
+            moved_case["renamed"],
+            json!([{"from": "~/report.txt", "to": "~/Report.txt"}]),
+            "case-insensitive host must use folding rename: {moved_case}"
+        );
+    }
+    let names = dir_entry_names(laptop.home());
+    assert!(names.iter().any(|n| n == b"Report.txt"));
+    assert!(!names.iter().any(|n| n == b"report.txt"));
+    assert_eq!(
+        fs::read(laptop.home().join("Report.txt")).unwrap(),
+        b"report-contents"
+    );
+
+    // 4c. Identical byte-for-byte spelling is always refused as renaming/moving onto itself.
+    let self_rename = stream_request_raw(
+        &laptop,
+        json!({"op": "rename", "from": "~/Report.txt", "to": "~/Report.txt"}),
+    );
+    assert_eq!(
+        self_rename["error"]["code"], "invalid_args",
+        "{self_rename}"
+    );
+    let self_move = refused(&transfer(
+        &laptop,
+        json!({"from": "~/Report.txt", "to": "~/Report.txt", "move": true}),
+        &[],
+    ));
+    assert_eq!(self_move["code"], "invalid_args", "{self_move}");
+    assert_eq!(
+        fs::read(laptop.home().join("Report.txt")).unwrap(),
+        b"report-contents"
+    );
+
+    // 4d. Non-ASCII case rename (`Ärger.txt` -> `ärger.txt`) via `fs.transfer` (`move: true`).
+    let upper_umlaut = "\u{00c4}rger.txt";
+    let lower_umlaut = "\u{00e4}rger.txt";
+    fs::write(laptop.home().join(upper_umlaut), b"umlaut-contents").unwrap();
+    let umlaut_moved = ok(&transfer(
+        &laptop,
+        json!({"from": format!("~/{upper_umlaut}"), "to": format!("~/{lower_umlaut}"), "move": true}),
+        &[],
+    ));
+    assert_eq!(umlaut_moved["moved"], true, "{umlaut_moved}");
+    let names = dir_entry_names(laptop.home());
+    assert!(
+        names.iter().any(|n| n == lower_umlaut.as_bytes()),
+        "expected exact '{lower_umlaut}' in dir listing"
+    );
+    assert!(!names.iter().any(|n| n == upper_umlaut.as_bytes()));
+    assert_eq!(
+        fs::read(laptop.home().join(lower_umlaut)).unwrap(),
+        b"umlaut-contents"
+    );
+
+    // 4e. Unicode normalization rename (NFD `cafe\u{0301}.txt` -> NFC `caf\u{00e9}.txt`) via
+    // `fs.transfer` (`move: true`) and back via `stream` `rename`.
     let nfd_name = "cafe\u{0301}.txt";
     let nfc_name = "caf\u{00e9}.txt";
     fs::write(laptop.home().join(nfd_name), b"unicode-contents").unwrap();
-    let unicode_reply = stream_request(
+    let unicode_moved = ok(&transfer(
         &laptop,
-        json!({"op": "rename", "from": format!("~/{nfd_name}"), "to": format!("~/{nfc_name}")}),
+        json!({"from": format!("~/{nfd_name}"), "to": format!("~/{nfc_name}"), "move": true}),
+        &[],
+    ));
+    assert_eq!(unicode_moved["moved"], true, "{unicode_moved}");
+    if host_unicode_normalizing {
+        assert_eq!(
+            unicode_moved["renamed"],
+            json!([{"from": format!("~/{nfd_name}"), "to": format!("~/{nfc_name}")}]),
+            "Unicode-normalizing host must use folding rename: {unicode_moved}"
+        );
+    }
+    let names = dir_entry_names(laptop.home());
+    assert!(
+        names.iter().any(|n| n == nfc_name.as_bytes()),
+        "expected exact NFC '{nfc_name}' in dir listing"
     );
-    assert_eq!(unicode_reply["ok"], true, "{unicode_reply}");
+    assert!(!names.iter().any(|n| n == nfd_name.as_bytes()));
     assert_eq!(
         fs::read(laptop.home().join(nfc_name)).unwrap(),
         b"unicode-contents"
     );
+
+    let unicode_back = stream_request(
+        &laptop,
+        json!({"op": "rename", "from": format!("~/{nfc_name}"), "to": format!("~/{nfd_name}")}),
+    );
+    assert_eq!(unicode_back["ok"], true, "{unicode_back}");
+    let names = dir_entry_names(laptop.home());
+    assert!(names.iter().any(|n| n == nfd_name.as_bytes()));
+    assert!(!names.iter().any(|n| n == nfc_name.as_bytes()));
+
+    // 4f. On case-sensitive volumes (Linux, case-sensitive APFS):
+    // - Two distinct files whose names differ only in case are NOT a folding rename: `stream`
+    //   `rename` refuses with `conflict`, and `fs.transfer` follows `if_exists`.
+    // - Two hardlinks whose names differ only in case are distinct links to the same file, so both
+    //   `fs.transfer` (`move: true`) and `stream` `rename` must refuse with `invalid_args`.
+    if !host_case_insensitive {
+        fs::write(laptop.home().join("CaseA.txt"), b"upper-file").unwrap();
+        fs::write(laptop.home().join("casea.txt"), b"lower-file").unwrap();
+        let conflict_rename = stream_request_raw(
+            &laptop,
+            json!({"op": "rename", "from": "~/CaseA.txt", "to": "~/casea.txt"}),
+        );
+        assert_eq!(
+            conflict_rename["error"]["code"], "conflict",
+            "{conflict_rename}"
+        );
+        let fail_move = refused(&transfer(
+            &laptop,
+            json!({"from": "~/CaseA.txt", "to": "~/casea.txt", "move": true, "if_exists": "fail"}),
+            &[],
+        ));
+        assert_eq!(fail_move["code"], "exists", "{fail_move}");
+        assert_eq!(
+            fs::read(laptop.home().join("CaseA.txt")).unwrap(),
+            b"upper-file"
+        );
+        assert_eq!(
+            fs::read(laptop.home().join("casea.txt")).unwrap(),
+            b"lower-file"
+        );
+
+        let replace_move = ok(&transfer(
+            &laptop,
+            json!({"from": "~/CaseA.txt", "to": "~/casea.txt", "move": true, "if_exists": "replace"}),
+            &[],
+        ));
+        assert_eq!(replace_move["moved"], true, "{replace_move}");
+        assert_eq!(
+            fs::read(laptop.home().join("casea.txt")).unwrap(),
+            b"upper-file"
+        );
+        assert!(!laptop.home().join("CaseA.txt").exists());
+
+        fs::write(laptop.home().join("HardCase.txt"), b"hard-body").unwrap();
+        fs::hard_link(
+            laptop.home().join("HardCase.txt"),
+            laptop.home().join("hardcase.txt"),
+        )
+        .unwrap();
+        let hl_move = refused(&transfer(
+            &laptop,
+            json!({"from": "~/HardCase.txt", "to": "~/hardcase.txt", "move": true}),
+            &[],
+        ));
+        assert_eq!(hl_move["code"], "invalid_args", "{hl_move}");
+        let hl_rename = stream_request_raw(
+            &laptop,
+            json!({"op": "rename", "from": "~/HardCase.txt", "to": "~/hardcase.txt"}),
+        );
+        assert_eq!(hl_rename["error"]["code"], "invalid_args", "{hl_rename}");
+        assert_eq!(
+            fs::read(laptop.home().join("HardCase.txt")).unwrap(),
+            b"hard-body"
+        );
+        assert_eq!(
+            fs::read(laptop.home().join("hardcase.txt")).unwrap(),
+            b"hard-body"
+        );
+    }
 }
 
-fn stream_request(target: &Home, mut header: Value) -> Value {
+fn stream_request_raw(target: &Home, mut header: Value) -> Value {
     if let Some(obj) = header.as_object_mut() {
         obj.entry("protocol").or_insert_with(|| json!(1));
     }
@@ -3313,16 +3508,16 @@ fn stream_request(target: &Home, mut header: Value) -> Value {
         writeln!(stdin, "{header}").unwrap();
     }
     let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "stream failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() >= 2, "expected greeting + reply: {stdout}");
     serde_json::from_str(lines[1]).unwrap()
+}
+
+fn stream_request(target: &Home, header: Value) -> Value {
+    let reply = stream_request_raw(target, header);
+    assert!(reply.get("error").is_none(), "stream failed: {reply}");
+    reply
 }
 
 fn older_v1_peer_copies_work_and_new_features_are_refused() {
