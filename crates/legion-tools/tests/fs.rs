@@ -65,7 +65,7 @@ impl Fixture {
 }
 
 #[test]
-fn all_twelve_fs_tools_are_registered_with_their_effects() {
+fn all_thirteen_fs_tools_are_registered_with_their_effects() {
     let registry = legion_tools::registry();
     let expected = [
         ("fs.copy", Effect::Write),
@@ -79,6 +79,7 @@ fn all_twelve_fs_tools_are_registered_with_their_effects() {
         ("fs.read", Effect::Read),
         ("fs.remove", Effect::Destroy),
         ("fs.stat", Effect::Read),
+        ("fs.thumb", Effect::Read),
         ("fs.write", Effect::Write),
     ];
     for (name, effect) in expected {
@@ -2169,6 +2170,19 @@ async fn non_regular_files_are_refused_before_opening() {
         assert_eq!(err.code, ErrorCode::InvalidArgs, "{tool}: {err}");
     }
 
+    // `fs.thumb` refuses a FIFO with a per-path `invalid_args` immediately without blocking.
+    let thumb_fifo = tokio::time::timeout(
+        Duration::from_secs(2),
+        f.call("fs.thumb", json!({"paths": [f.p(&fifo)]})),
+    )
+    .await
+    .expect("fs.thumb blocked on FIFO")
+    .unwrap();
+    assert_eq!(
+        thumb_fifo["results"][0]["error"]["code"],
+        json!("invalid_args")
+    );
+
     // Grepping a directory containing a FIFO skips it without blocking and still matches regular files.
     let dir_grep = tokio::time::timeout(
         Duration::from_secs(2),
@@ -2845,4 +2859,522 @@ async fn find_large_directory_cuts_off_within_budget() {
         elapsed < Duration::from_secs(2),
         "fs.find took {elapsed:?} for a 40ms budget"
     );
+}
+
+fn make_rgb_image(width: u32, height: u32, color: [u8; 3]) -> image::DynamicImage {
+    image::DynamicImage::ImageRgb8(image::ImageBuffer::from_pixel(
+        width,
+        height,
+        image::Rgb(color),
+    ))
+}
+
+#[tokio::test]
+async fn thumb_decodes_supported_formats_fit_modes_and_validates_args() {
+    use image::codecs::gif::GifEncoder;
+    use image::{Frame, ImageBuffer, ImageFormat, Rgba};
+
+    let f = Fixture::new();
+
+    // Create valid JPEG, opaque PNG, transparent PNG, animated GIF (2 frames), WebP, BMP.
+    let jpg_path = f.work.join("wide.jpg");
+    make_rgb_image(400, 200, [200, 40, 40])
+        .save_with_format(&jpg_path, ImageFormat::Jpeg)
+        .unwrap();
+
+    let png_opaque_path = f.work.join("opaque.png");
+    make_rgb_image(300, 150, [40, 200, 40])
+        .save_with_format(&png_opaque_path, ImageFormat::Png)
+        .unwrap();
+
+    let png_alpha_path = f.work.join("alpha.png");
+    let mut alpha_img =
+        ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(160, 160, Rgba([40, 40, 200, 255]));
+    alpha_img.put_pixel(10, 10, Rgba([40, 40, 200, 0]));
+    image::DynamicImage::ImageRgba8(alpha_img)
+        .save_with_format(&png_alpha_path, ImageFormat::Png)
+        .unwrap();
+
+    let gif_path = f.work.join("anim.gif");
+    {
+        let file = std::fs::File::create(&gif_path).unwrap();
+        let mut enc = GifEncoder::new(file);
+        let frame1 =
+            ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(120, 80, Rgba([220, 20, 20, 255]));
+        let frame2 =
+            ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(120, 80, Rgba([20, 220, 20, 255]));
+        enc.encode_frame(Frame::new(frame1)).unwrap();
+        enc.encode_frame(Frame::new(frame2)).unwrap();
+    }
+
+    let webp_path = f.work.join("pic.webp");
+    make_rgb_image(320, 240, [200, 200, 40])
+        .save_with_format(&webp_path, ImageFormat::WebP)
+        .unwrap();
+
+    let bmp_path = f.work.join("scan.bmp");
+    make_rgb_image(300, 300, [40, 200, 200])
+        .save_with_format(&bmp_path, ImageFormat::Bmp)
+        .unwrap();
+
+    let res = f
+        .call(
+            "fs.thumb",
+            json!({
+                "paths": [
+                    f.p(&jpg_path),
+                    f.p(&png_opaque_path),
+                    f.p(&png_alpha_path),
+                    f.p(&gif_path),
+                    f.p(&webp_path),
+                    f.p(&bmp_path),
+                ],
+                "size": 128,
+                "fit": "contain"
+            }),
+        )
+        .await
+        .unwrap();
+
+    let items = res["results"].as_array().unwrap();
+    assert_eq!(items.len(), 6);
+
+    // JPEG 400x200 -> contain 128 -> 128x64 JPEG.
+    assert_eq!(items[0]["ok"]["mime"], json!("image/jpeg"));
+    assert_eq!(items[0]["ok"]["width"], json!(128));
+    assert_eq!(items[0]["ok"]["height"], json!(64));
+    let decoded0 = BASE64
+        .decode(items[0]["ok"]["content"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(&decoded0[..2], &[0xFF, 0xD8]);
+
+    // Opaque PNG -> JPEG; transparent PNG -> PNG.
+    assert_eq!(items[1]["ok"]["mime"], json!("image/jpeg"));
+    assert_eq!(items[2]["ok"]["mime"], json!("image/png"));
+    let decoded2 = BASE64
+        .decode(items[2]["ok"]["content"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(&decoded2[..4], &[137, 80, 78, 71]);
+
+    // Animated GIF decodes first frame (red, 120x80 not upscaled).
+    assert_eq!(items[3]["ok"]["width"], json!(120));
+    assert_eq!(items[3]["ok"]["height"], json!(80));
+    let gif_bytes = BASE64
+        .decode(items[3]["ok"]["content"].as_str().unwrap())
+        .unwrap();
+    let gif_img = image::load_from_memory(&gif_bytes).unwrap().to_rgb8();
+    let px = gif_img.get_pixel(60, 40);
+    assert!(
+        px.0[0] > 180 && px.0[1] < 80,
+        "expected first (red) GIF frame, got {px:?}"
+    );
+
+    // WebP and BMP both produce valid JPEG thumbnails.
+    assert_eq!(items[4]["ok"]["mime"], json!("image/jpeg"));
+    assert_eq!(items[4]["ok"]["width"], json!(128));
+    assert_eq!(items[4]["ok"]["height"], json!(96));
+    assert_eq!(items[5]["ok"]["mime"], json!("image/jpeg"));
+    assert_eq!(items[5]["ok"]["width"], json!(128));
+    assert_eq!(items[5]["ok"]["height"], json!(128));
+
+    // `fit: "cover"` crops to exact square dimensions.
+    let cover = f
+        .call(
+            "fs.thumb",
+            json!({"paths": [f.p(&jpg_path)], "size": 96, "fit": "cover"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cover["results"][0]["ok"]["width"], json!(96));
+    assert_eq!(cover["results"][0]["ok"]["height"], json!(96));
+
+    // Argument validation rejects out-of-range counts and sizes.
+    let too_many: Vec<String> = (0..33).map(|i| format!("~/projects/p{i}.jpg")).collect();
+    for bad in [
+        json!({"paths": []}),
+        json!({"paths": too_many}),
+        json!({"paths": [f.p(&jpg_path)], "size": 95}),
+        json!({"paths": [f.p(&jpg_path)], "size": 513}),
+    ] {
+        let err = f.call("fs.thumb", bad.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn thumb_handles_hostile_images_without_panicking_or_exhausting_memory() {
+    let f = Fixture::new();
+
+    // 1. Valid image in the same batch must still succeed alongside hostile inputs.
+    let good = f.work.join("good.jpg");
+    make_rgb_image(200, 150, [10, 120, 220])
+        .save_with_format(&good, image::ImageFormat::Jpeg)
+        .unwrap();
+
+    // 2. Truncated JPEG.
+    let mut full_jpg = std::fs::read(&good).unwrap();
+    full_jpg.truncate(full_jpg.len() / 3);
+    let truncated = f.work.join("truncated.jpg");
+    std::fs::write(&truncated, &full_jpg).unwrap();
+
+    // 3. Zero-byte PNG.
+    let empty = f.work.join("empty.png");
+    std::fs::write(&empty, b"").unwrap();
+
+    // 4. Wrong extension: text content named .png, and valid JPEG bytes named .txt.
+    let fake_png = f.work.join("not_an_image.png");
+    std::fs::write(&fake_png, b"just plain text, definitely not a PNG").unwrap();
+    let jpeg_as_txt = f.work.join("actually_jpeg.txt");
+    std::fs::copy(&good, &jpeg_as_txt).unwrap();
+
+    // 5. Decompression bomb: tiny PNG declaring 25000 x 25000 pixels (625 MP > 100 MP).
+    let bomb = f.work.join("bomb.png");
+    {
+        let crc32 = |bytes: &[u8]| -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in bytes {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        };
+        let mut data = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        let mut ihdr = b"IHDR".to_vec();
+        ihdr.extend_from_slice(&25_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&25_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        data.extend_from_slice(&13u32.to_be_bytes());
+        data.extend_from_slice(&ihdr);
+        data.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+        let idat_payload = [
+            0x78u8, 0x01, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01,
+        ];
+        let mut idat = b"IDAT".to_vec();
+        idat.extend_from_slice(&idat_payload);
+        data.extend_from_slice(&(idat_payload.len() as u32).to_be_bytes());
+        data.extend_from_slice(&idat);
+        data.extend_from_slice(&crc32(&idat).to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(b"IEND");
+        data.extend_from_slice(&crc32(b"IEND").to_be_bytes());
+        std::fs::write(&bomb, data).unwrap();
+    }
+
+    // 6. Oversized source (> 64 MiB sparse file).
+    let oversized = f.work.join("huge.png");
+    {
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len(65 * 1024 * 1024).unwrap();
+    }
+
+    // 7. Unsupported image format (.svg) and directory.
+    let svg = f.work.join("icon.svg");
+    std::fs::write(&svg, b"<svg xmlns='http://www.w3.org/2000/svg'/>").unwrap();
+    let dir = f.work.join("subdir");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let res = f
+        .call(
+            "fs.thumb",
+            json!({
+                "paths": [
+                    f.p(&good),
+                    f.p(&truncated),
+                    f.p(&empty),
+                    f.p(&fake_png),
+                    f.p(&jpeg_as_txt),
+                    f.p(&bomb),
+                    f.p(&oversized),
+                    f.p(&svg),
+                    f.p(&dir),
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let items = res["results"].as_array().unwrap();
+    assert_eq!(items.len(), 9);
+    assert!(
+        items[0].get("ok").is_some(),
+        "good image failed: {}",
+        items[0]
+    );
+    assert_eq!(
+        items[1]["error"]["code"],
+        json!("failed"),
+        "truncated: {}",
+        items[1]
+    );
+    assert_eq!(
+        items[2]["error"]["code"],
+        json!("failed"),
+        "empty: {}",
+        items[2]
+    );
+    assert_eq!(
+        items[3]["error"]["code"],
+        json!("failed"),
+        "fake_png: {}",
+        items[3]
+    );
+    assert_eq!(
+        items[4]["error"]["code"],
+        json!("unsupported"),
+        "jpeg_as_txt: {}",
+        items[4]
+    );
+    assert_eq!(
+        items[5]["error"]["code"],
+        json!("failed"),
+        "bomb: {}",
+        items[5]
+    );
+    assert_eq!(
+        items[6]["error"]["code"],
+        json!("failed"),
+        "oversized: {}",
+        items[6]
+    );
+    assert_eq!(
+        items[7]["error"]["code"],
+        json!("unsupported"),
+        "svg: {}",
+        items[7]
+    );
+    assert_eq!(
+        items[8]["error"]["code"],
+        json!("invalid_args"),
+        "dir: {}",
+        items[8]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn thumb_cache_hits_invalidates_is_protected_from_non_admin_and_safe_under_concurrency() {
+    let f = Fixture::new();
+    f.write_config(
+        "policy.toml",
+        r#"
+[principals.viewer]
+role = "viewer"
+
+[principals.no_read]
+role = "no_read"
+
+[principals.jailed]
+role = "jailed"
+
+[roles.viewer]
+allow = ["effect:read", "effect:write", "effect:destroy"]
+
+[roles.no_read]
+allow = ["fs.thumb", "fs.list"]
+deny = ["fs.read"]
+
+[roles.jailed]
+allow = ["effect:read"]
+paths = ["~/projects/**"]
+"#,
+    );
+
+    let pic = f.work.join("cached.png");
+    make_rgb_image(200, 200, [240, 20, 20])
+        .save_with_format(&pic, image::ImageFormat::Png)
+        .unwrap();
+    let outside = f.home.join("private.png");
+    make_rgb_image(150, 150, [20, 240, 20])
+        .save_with_format(&outside, image::ImageFormat::Png)
+        .unwrap();
+
+    // First call populates the cache under state/thumb-cache.
+    let first = f
+        .call("fs.thumb", json!({"paths": [f.p(&pic)], "size": 128}))
+        .await
+        .unwrap();
+    let first_content = first["results"][0]["ok"]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cache_dir = f.dir.path().join("state").join("thumb-cache");
+    let count_thumbs = || {
+        std::fs::read_dir(&cache_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".thumb"))
+            .count()
+    };
+    assert_eq!(count_thumbs(), 1);
+
+    // Second call hits the cache and returns identical content without creating another entry.
+    let second = f
+        .call("fs.thumb", json!({"paths": [f.p(&pic)], "size": 128}))
+        .await
+        .unwrap();
+    assert_eq!(
+        second["results"][0]["ok"]["content"].as_str().unwrap(),
+        first_content
+    );
+    assert_eq!(count_thumbs(), 1);
+
+    // Modifying the file invalidates the cache and returns a fresh thumbnail with different bytes.
+    make_rgb_image(300, 150, [20, 20, 240])
+        .save_with_format(&pic, image::ImageFormat::Png)
+        .unwrap();
+    let updated = f
+        .call("fs.thumb", json!({"paths": [f.p(&pic)], "size": 128}))
+        .await
+        .unwrap();
+    assert_eq!(updated["results"][0]["ok"]["width"], json!(128));
+    assert_eq!(updated["results"][0]["ok"]["height"], json!(64));
+    assert_ne!(
+        updated["results"][0]["ok"]["content"].as_str().unwrap(),
+        first_content
+    );
+    assert_eq!(count_thumbs(), 2);
+
+    // Non-admin role cannot read, list, write, remove or thumbnail anything in the cache directory.
+    let thumb_file = std::fs::read_dir(&cache_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with(".thumb"))
+        .unwrap()
+        .path();
+    for (tool, args) in [
+        ("fs.list", json!({"path": f.p(&cache_dir)})),
+        ("fs.read", json!({"path": f.p(&thumb_file)})),
+        (
+            "fs.write",
+            json!({"path": f.p(&cache_dir.join("injected.thumb")), "content": "x"}),
+        ),
+        ("fs.remove", json!({"path": f.p(&thumb_file)})),
+    ] {
+        let err = f.call_as("viewer", tool, args).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied, "viewer {tool}: {err}");
+    }
+    let thumb_cache_attempt = f
+        .call_as("viewer", "fs.thumb", json!({"paths": [f.p(&thumb_file)]}))
+        .await
+        .unwrap();
+    assert_eq!(
+        thumb_cache_attempt["results"][0]["error"]["code"],
+        json!("denied")
+    );
+
+    // Role denied `fs.read` is denied `fs.thumb` even when `fs.thumb` itself is allowed.
+    let no_read_err = f
+        .call_as("no_read", "fs.thumb", json!({"paths": [f.p(&pic)]}))
+        .await
+        .unwrap_err();
+    assert_eq!(no_read_err.code, ErrorCode::Denied);
+
+    // Owner caches a thumbnail for a file outside `jailed`'s `paths`; `jailed` must still get
+    // `denied` (never a cache hit!), and symlink escapes are refused too.
+    let owner_outside = f
+        .call("fs.thumb", json!({"paths": [f.p(&outside)], "size": 128}))
+        .await
+        .unwrap();
+    assert!(owner_outside["results"][0].get("ok").is_some());
+
+    let jailed_outside = f
+        .call_as(
+            "jailed",
+            "fs.thumb",
+            json!({"paths": [f.p(&outside)], "size": 128}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        jailed_outside["results"][0]["error"]["code"],
+        json!("denied")
+    );
+
+    #[cfg(unix)]
+    {
+        let escape_link = f.work.join("escape_pic.png");
+        std::os::unix::fs::symlink(&outside, &escape_link).unwrap();
+        let jailed_link = f
+            .call_as(
+                "jailed",
+                "fs.thumb",
+                json!({"paths": [f.p(&escape_link)], "size": 128}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(jailed_link["results"][0]["error"]["code"], json!("denied"));
+    }
+
+    // Concurrent `fs.thumb` calls across threads all succeed cleanly.
+    let mut handles = Vec::new();
+    for i in 0..12 {
+        let node = f.node.clone();
+        let path = f.p(&pic);
+        let size = if i % 2 == 0 { 128 } else { 192 };
+        handles.push(tokio::spawn(async move {
+            node.call(Call::new(
+                Door::Cli,
+                "fs.thumb",
+                json!({"paths": [path], "size": size}),
+            ))
+            .await
+        }));
+    }
+    for h in handles {
+        let out = h.await.unwrap().unwrap();
+        assert!(out["results"][0].get("ok").is_some(), "{out}");
+    }
+}
+
+#[tokio::test]
+async fn thumb_extracts_video_posters_when_ffmpeg_is_installed() {
+    // Only run the positive ffmpeg extraction check when `ffmpeg` is present on PATH.
+    let has_ffmpeg = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !has_ffmpeg {
+        return;
+    }
+
+    let f = Fixture::new();
+    let clip = f.work.join("sample.mp4");
+    let short_clip = f.work.join("short.mp4");
+    for (path, duration) in [(&clip, "2"), (&short_clip, "0.2")] {
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc=duration={duration}:size=320x180:rate=10"),
+                "-pix_fmt",
+                "yuv420p",
+                path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "ffmpeg fixture failed for {path:?}");
+    }
+
+    let res = f
+        .call(
+            "fs.thumb",
+            json!({"paths": [f.p(&clip), f.p(&short_clip)], "size": 160, "fit": "contain"}),
+        )
+        .await
+        .unwrap();
+    let items = res["results"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    for item in items {
+        assert_eq!(item["ok"]["mime"], json!("image/jpeg"), "{item}");
+        assert_eq!(item["ok"]["width"], json!(160), "{item}");
+        assert_eq!(item["ok"]["height"], json!(90), "{item}");
+    }
 }

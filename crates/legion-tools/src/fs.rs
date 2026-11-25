@@ -9,6 +9,8 @@ mod manage;
 mod platform;
 mod read;
 mod search;
+mod thumb;
+mod thumb_cache;
 mod write;
 
 use std::cmp::Ordering;
@@ -37,6 +39,7 @@ pub fn register(registry: &mut Registry) {
     write::register(registry);
     manage::register(registry);
     search::register(registry);
+    thumb::register(registry);
 }
 
 /// The kind of a filesystem entry, reported without following symbolic links.

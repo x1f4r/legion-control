@@ -58,6 +58,8 @@ blake3 = "1.8.7"
 getrandom = "0.4.3"
 globset = "0.4.22"
 ignore = "0.4.35"
+# Pure-Rust image decoders/encoders for fs.thumb: only the five supported raster formats, no rayon.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 # Pure-Rust QR encoder (no image/svg features) for terminal pairing codes in `legion pair`.
 qrcode = { version = "0.15.0", default-features = false }
 regex = "1.13.2"
