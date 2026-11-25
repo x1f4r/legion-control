@@ -546,10 +546,11 @@ async fn thumb(ctx: &Ctx, args: ThumbArgs) -> Result<Value, ToolError> {
 
 /// Runs per-path workers across a bounded sliding window ahead of the in-order commit cursor,
 /// encodes each winning thumbnail directly into its final JSON [`Value`] once while freeing raw
-/// bytes immediately, and stops committing once adding the next thumbnail would exceed
-/// `reply_b64_budget`. Every path from the overflowing index onward receives a retryable
-/// `busy` (`details.reason = "reply_budget"`) error in input order, and in-flight work past the
-/// cutoff is cancelled immediately.
+/// bytes immediately, and stops committing once adding another thumbnail would exceed
+/// `reply_b64_budget`. The first successful thumbnail of a call is always admitted regardless of
+/// its size so a single oversized thumbnail can never spin `busy` forever; every path from the
+/// overflowing index onward receives a retryable `busy` (`details.reason = "reply_budget"`) error
+/// in input order, and in-flight work past the cutoff is cancelled immediately.
 async fn run_batch<F, Fut>(
     paths: Vec<String>,
     size: u32,
@@ -583,6 +584,7 @@ where
 
     let mut next_to_spawn = 0usize;
     let mut next_to_commit = 0usize;
+    let mut committed_ok_count = 0usize;
     let mut committed_b64_bytes = 0usize;
     let mut budget_exhausted = false;
 
@@ -649,9 +651,12 @@ where
             match outcome {
                 ThumbOutcome::Ok(thumb) => {
                     let b64_len = base64_encoded_len(thumb.bytes.len());
-                    if committed_b64_bytes.saturating_add(b64_len) <= reply_b64_budget {
+                    if committed_ok_count == 0
+                        || committed_b64_bytes.saturating_add(b64_len) <= reply_b64_budget
+                    {
                         let path = std::mem::take(&mut original_paths[next_to_commit]);
                         let (written_len, val) = thumb_ok_value(path, thumb);
+                        committed_ok_count += 1;
                         committed_b64_bytes = committed_b64_bytes.saturating_add(written_len);
                         results.push(val);
                         next_to_commit += 1;
@@ -3603,6 +3608,79 @@ mod tests {
                 "{item}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn run_batch_always_admits_first_thumbnail_even_above_reply_budget() {
+        // Artificially tiny 64-byte budget while every thumbnail encodes to 400 base64 bytes.
+        // Leading errors stay reported, the first successful thumbnail is ALWAYS admitted so a
+        // batch makes guaranteed progress, and subsequent thumbnails defer with busy/reply_budget.
+        let paths = vec![
+            "/missing.png".to_owned(),
+            "/big0.png".to_owned(),
+            "/big1.png".to_owned(),
+        ];
+        let first = run_batch(
+            paths,
+            512,
+            64,
+            CancellationToken::new(),
+            |path, _cancel| async move {
+                if path == "/missing.png" {
+                    return Ok(ThumbOutcome::Error(ErrorBody::new(
+                        ErrorCode::NotFound,
+                        "missing",
+                    )));
+                }
+                Ok(ThumbOutcome::Ok(CachedThumb {
+                    mime: "image/png",
+                    width: 96,
+                    height: 96,
+                    bytes: vec![0xBB; 300],
+                }))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0]["error"]["code"], json!("not_found"));
+        assert!(
+            first[1].get("ok").is_some(),
+            "first successful thumbnail must be admitted even above budget: {}",
+            first[1]
+        );
+        assert_eq!(first[2]["error"]["code"], json!("busy"), "{}", first[2]);
+        assert_eq!(
+            first[2]["error"]["details"]["reason"],
+            json!("reply_budget"),
+            "{}",
+            first[2]
+        );
+
+        // Re-asking for the remaining oversized path completes cleanly instead of spinning busy.
+        let retry = run_batch(
+            vec!["/big1.png".to_owned()],
+            512,
+            64,
+            CancellationToken::new(),
+            |_path, _cancel| async move {
+                Ok(ThumbOutcome::Ok(CachedThumb {
+                    mime: "image/png",
+                    width: 96,
+                    height: 96,
+                    bytes: vec![0xBB; 300],
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert!(
+            retry[0].get("ok").is_some(),
+            "follow-up single oversized thumbnail must succeed: {}",
+            retry[0]
+        );
     }
 
     #[test]
