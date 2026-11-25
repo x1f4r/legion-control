@@ -335,22 +335,27 @@ async fn serve_stream(
     };
 
     let revoke_abort = CancellationToken::new();
-    let mut stream_options = legion_net::stream::StreamServeOptions {
+    #[cfg(debug_assertions)]
+    let downstream_read_timeout = std::env::var("LEGION_TEST_RELAY_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map_or(
+            legion_net::stream::DEFAULT_RELAY_READ_TIMEOUT,
+            Duration::from_millis,
+        );
+    #[cfg(not(debug_assertions))]
+    let downstream_read_timeout = legion_net::stream::DEFAULT_RELAY_READ_TIMEOUT;
+    let stream_options = legion_net::stream::StreamServeOptions {
         pairing_id,
         abort_on_revoke: Some(revoke_abort.clone()),
         shutdown: Some(shutdown.clone()),
         client_gone: Some(client_gone),
+        downstream_read_timeout,
         fleet: Some(fleet),
         runtime: Some(tokio::runtime::Handle::current()),
         ..legion_net::stream::StreamServeOptions::default()
     };
-    #[cfg(debug_assertions)]
-    if let Ok(raw) = std::env::var("LEGION_TEST_RELAY_TIMEOUT_MS")
-        && let Ok(ms) = raw.trim().parse::<u64>()
-        && ms > 0
-    {
-        stream_options.downstream_read_timeout = Duration::from_millis(ms);
-    }
 
     let mut served = tokio::task::spawn_blocking(move || {
         legion_net::stream::serve_with_options(
