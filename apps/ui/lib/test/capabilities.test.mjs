@@ -69,6 +69,9 @@ const NEW_TOOLS = [
   { name: 'fav.add', effect: 'write', input_schema: { properties: { machine: {}, path: {} } } },
   { name: 'fav.remove', effect: 'write', input_schema: { properties: { id: {} } } },
   { name: 'sync.list', effect: 'read', input_schema: { properties: {} } },
+  { name: 'sys.info', effect: 'read', input_schema: { properties: {} } },
+  { name: 'sys.procs', effect: 'read', input_schema: { properties: { filter: {}, sort: {}, limit: {}, group: {} } } },
+  { name: 'sys.kill', effect: 'destroy', input_schema: { properties: { pid: {}, start_time: {}, targets: {}, tree: {}, force: {} } } },
   { name: 'update.list', effect: 'read', input_schema: { properties: {} } },
 ];
 
@@ -170,6 +173,8 @@ test('capabilities store assumes the least when unknown, deduplicates concurrent
   assert.ok(missing.some((m) => m.includes('fs.list')));
   assert.ok(missing.includes('fs.thumb'));
   assert.ok(missing.includes('fav.*'));
+  assert.ok(missing.includes('sys.procs (group)'));
+  assert.ok(missing.includes('sys.kill (targets)'));
   assert.ok(missing.includes('update.*'));
 
   // Current machine in the same store has full capabilities and no missing features.

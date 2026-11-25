@@ -686,7 +686,7 @@ export function FolderBrowser({
   onStartSelectWith,
   onToggleStar,
   onSendTo,
-  onWakeMachine,
+  onEnsureAwake,
   wakePendingSet = null,
   onRefreshFleet,
   onNewFolder,
@@ -992,14 +992,18 @@ export function FolderBrowser({
               : offlineMachineSub(machineObj || { name: machine })}
           </span>
         </div>
-        ${machineObj?.canWake && canWake && onWakeMachine
+        ${machineObj?.canWake && canWake && onEnsureAwake
           ? html`
               <div class="actions">
                 <button
                   type="button"
                   class="btn primary"
                   disabled=${isWaking}
-                  onClick=${() => onWakeMachine(machineObj)}
+                  onClick=${() =>
+                    onEnsureAwake(machineObj, {
+                      kind: 'files',
+                      label: 'open its files',
+                    })}
                 >
                   ${isWaking ? `Waking ${machine}…` : `Wake ${machine}`}
                 </button>
@@ -2176,7 +2180,7 @@ export function FilesView({
   filesActions,
   wakePendingSet = null,
   onRefreshFleet,
-  onWakeMachine,
+  onEnsureAwake,
   onRequestConfirm,
   onToast,
 }) {
@@ -2594,7 +2598,7 @@ export function FilesView({
           onStartSelectWith=${filesActions.startSelect}
           onToggleStar=${toggleStar}
           onSendTo=${(m, items) => filesActions.openSheet({ kind: 'send', sourceMachine: m, items })}
-          onWakeMachine=${onWakeMachine}
+          onEnsureAwake=${onEnsureAwake}
           wakePendingSet=${wakePendingSet}
           onRefreshFleet=${onRefreshFleet}
           onNewFolder=${(m, p) => filesActions.openSheet({ kind: 'mkdir', machine: m, parentPath: p })}
@@ -2821,7 +2825,7 @@ export function FilesView({
               deviceNoun=${deviceNoun}
               technical=${technical}
               link=${link}
-              onWakeMachine=${onWakeMachine}
+              onEnsureAwake=${onEnsureAwake}
               onRefreshFleet=${onRefreshFleet}
               onLocalDone=${() => setReloadToken((n) => n + 1)}
               onStarted=${(info) => {
@@ -3002,7 +3006,7 @@ export function MachineFilesBrowser({
   wide = false,
   filesState = null,
   filesActions = null,
-  onWakeMachine,
+  onEnsureAwake,
 }) {
   const { caps, entry: capsEntry, missing: missingFeatures } = useMachineCaps(capsStore, machine?.name, {
     fallbackTools: tools,
@@ -3089,7 +3093,7 @@ export function MachineFilesBrowser({
             viewer: { machine: m, path: entry.path },
           });
         }}
-        onWakeMachine=${onWakeMachine}
+        onEnsureAwake=${onEnsureAwake}
         onOpenSearch=${(q, m, p) => {
           window.location.hash = routeHref({
             section: 'files',

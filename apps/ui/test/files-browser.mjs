@@ -324,7 +324,7 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await maybeFilesShot(page, '08-folder-selecting', { alsoLight: true });
 
     await page.locator('.dock .bar4 button', { hasText: 'Send to' }).click();
-    const sendSheet = page.locator('.sheet');
+    const sendSheet = page.locator('.sheet', { hasText: 'Send 2 items' });
     await sendSheet.getByRole('heading', { name: 'Send 2 items' }).waitFor();
     // No amber busy dot in Send to; source machine (`tower`) is last among machines with "Another folder on this machine".
     assert.equal(await sendSheet.locator('.dot.busy').count(), 0, 'Send to must not show amber busy dots');
@@ -337,15 +337,22 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await sendSheet.locator('.title', { hasText: 'Films' }).waitFor();
     await maybeFilesShot(page, '07-sheet-send-to', { alsoLight: true });
 
-    // Wake an off machine (`laptop`) right inside Send to: sheet stays open and laptop becomes selectable!
+    // Wake an off machine (`laptop`) right inside Send to via the shared wake sheet: shows
+    // "Then: send 2 items to laptop", keeps Send to open underneath, and selects laptop once awake.
     await sendSheet.locator('.row', { hasText: 'laptop' }).getByRole('button', { name: 'Wake' }).click();
-    const wakeConfirm = page.locator('.sheet', { hasText: /Wake laptop\?/i });
-    await wakeConfirm.waitFor();
-    await wakeConfirm.getByRole('button', { name: 'Wake', exact: true }).click();
-    await wakeConfirm.waitFor({ state: 'hidden' });
-    // Send to sheet is still open; laptop transitions to selectable radio button once awake!
-    await sendSheet.locator('button[role="radio"]', { hasText: 'laptop' }).waitFor({ timeout: 5000 });
+    const wakePrompt = page.locator('.sheet', { hasText: 'laptop is off.' });
+    await wakePrompt.waitFor();
+    await wakePrompt.getByText('Then: send 2 items to laptop').waitFor();
+    await wakePrompt.getByRole('button', { name: 'Wake it and continue' }).click();
+    const wakingSheet = page.locator('.sheet', { hasText: 'Waking laptop…' });
+    await wakingSheet.waitFor();
+    await wakingSheet.waitFor({ state: 'hidden', timeout: 8000 });
+    // Send to sheet is still open; laptop transitions to a selected radio button once awake!
+    const laptopRadio = sendSheet.locator('button[role="radio"]', { hasText: 'laptop' });
+    await laptopRadio.waitFor({ timeout: 5000 });
+    assert.equal(await laptopRadio.getAttribute('aria-checked'), 'true');
 
+    await sendSheet.locator('button[role="radio"]', { hasText: 'pi' }).click();
     await sendSheet.getByRole('button', { name: 'Copy to pi' }).click();
     await sendSheet.waitFor({ state: 'hidden' });
     // Non-blocking toast confirms transfer started while user remains free to browse (no em-dash).
@@ -918,6 +925,18 @@ test('Old machine (05ba1ef fixture) at 412x915: quiet note, bottom dock in machi
       'studio runs an older Legion, so some things are simpler here.',
     );
     assert.equal(await overviewNote.locator('button, a').count(), 0, 'Older note must not contain a button');
+    // Overview shows the meters studio actually reports, omits "Using it now" (no sys.procs group),
+    // and produces zero rejected protocol calls.
+    await page.locator('.gauge', { hasText: 'Processor' }).waitFor();
+    await page.locator('.gauge', { hasText: 'Memory' }).waitFor();
+    await page.locator('.gauge', { hasText: 'Storage' }).waitFor();
+    assert.equal(
+      await page.locator('p.label', { hasText: 'Using it now' }).count(),
+      0,
+      'Old machine Overview must omit "Using it now" when sys.procs lacks group',
+    );
+    await page.waitForTimeout(250);
+    await assertNoProtocolErrors(page, 'studio overview');
     await assertNoPlainLeaks(page, 'studio overview');
     await maybeOldShot(page, '01-old-machine-overview');
 

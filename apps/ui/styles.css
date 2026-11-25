@@ -979,6 +979,63 @@ button.row:active {
   background: var(--text);
 }
 
+.gauge .meter.warn i,
+.gauge .meter.high i {
+  background: var(--warn);
+}
+
+.gauge .meter.full i {
+  background: var(--bad);
+}
+
+.gauge.warn header span:last-child {
+  color: var(--warn);
+}
+
+.machine-state {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 2px 10px;
+  color: var(--dim);
+  font-size: var(--text-sub);
+}
+
+.stale-values {
+  opacity: 0.55;
+  transition: opacity 0.2s ease;
+}
+
+.attention-word {
+  color: var(--warn);
+  font-size: var(--text-sub);
+  font-weight: 550;
+}
+
+.proc-count {
+  margin-left: 6px;
+  color: var(--dim);
+  font-weight: 450;
+  font-size: var(--text-sub);
+}
+
+.wake-elapsed {
+  font-variant-numeric: tabular-nums;
+  font-size: 16px;
+  color: var(--dim);
+}
+
+.wake-then {
+  color: var(--dim);
+}
+
+.wake-note {
+  margin: 10px 0 0 !important;
+  font-size: var(--text-small);
+  color: var(--dim);
+  text-align: center;
+}
+
 /* ── Tiles (Actions) ────────────────────────────────────────────────────────────────────────── */
 
 .tiles {

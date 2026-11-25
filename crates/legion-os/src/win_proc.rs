@@ -23,8 +23,8 @@ use windows::Win32::Foundation::{
     CloseHandle, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS, DuplicateHandle,
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
     ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME,
-    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, RPC_E_DISCONNECTED, STATUS_BUFFER_TOO_SMALL,
-    STATUS_INFO_LENGTH_MISMATCH, STILL_ACTIVE,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, HWND, LPARAM, RPC_E_DISCONNECTED,
+    STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH, STILL_ACTIVE, WPARAM,
 };
 use windows::Win32::Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{
@@ -49,6 +49,7 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::Memory::{
     MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQueryEx,
 };
+use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, RPC_S_SERVER_UNAVAILABLE};
 use windows::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
 use windows::Win32::System::Threading::{
@@ -69,6 +70,10 @@ use windows::Win32::System::Wmi::{
     WBEM_E_INVALID_OBJECT, WBEM_E_INVALID_OBJECT_PATH, WBEM_E_INVALID_PARAMETER, WBEM_E_NOT_FOUND,
     WBEM_E_SERVER_TOO_BUSY, WBEM_E_SHUTTING_DOWN, WBEM_E_TRANSPORT_FAILURE, WBEM_GENERIC_FLAG_TYPE,
     WbemLocator,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
+    WM_CLOSE,
 };
 use windows::core::{BOOL, BSTR, HRESULT, IUnknown, Interface, PCWSTR, PWSTR};
 
@@ -116,6 +121,45 @@ pub(crate) enum TerminateOutcome {
     IdentityMismatch,
     /// Access was denied when opening or terminating the process.
     AccessDenied,
+}
+
+/// Outcome of an atomic open-verify-graceful-stop attempt (`WM_CLOSE`) against one [`ProcessId`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GracefulStopOutcome {
+    /// A `WM_CLOSE` request was posted to at least one top-level window owned by the target PID.
+    Requested,
+    /// The process owns no top-level windows to ask to close; caller must report `still_running`
+    /// and require `force`.
+    CannotAskGracefully,
+    /// The process no longer exists or has already exited.
+    AlreadyGone,
+    /// A different process with a different creation time now holds the PID.
+    IdentityMismatch,
+    /// Access was denied when opening the process.
+    AccessDenied,
+}
+
+/// Raw fields returned by Win32 `GetSystemPowerStatus`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RawWindowsPowerStatus {
+    pub(crate) ac_line_status: u8,
+    pub(crate) battery_flag: u8,
+    pub(crate) battery_life_percent: u8,
+    pub(crate) battery_life_time: u32,
+}
+
+/// Query Windows AC / battery status through `GetSystemPowerStatus`.
+pub(crate) fn query_system_power_status() -> Option<RawWindowsPowerStatus> {
+    let mut status = SYSTEM_POWER_STATUS::default();
+    // SAFETY: `status` is a plain Win32 output struct owned on the stack; `GetSystemPowerStatus`
+    // writes into it and returns `Ok(())` on success.
+    unsafe { GetSystemPowerStatus(&mut status) }.ok()?;
+    Some(RawWindowsPowerStatus {
+        ac_line_status: status.ACLineStatus,
+        battery_flag: status.BatteryFlag,
+        battery_life_percent: status.BatteryLifePercent,
+        battery_life_time: status.BatteryLifeTime,
+    })
 }
 
 /// An open Win32 process handle paired with its verified identity and parent PID read directly
@@ -2051,6 +2095,93 @@ fn snapshot_exe_name(target_pid: u32) -> Option<String> {
         }
     }
     None
+}
+
+struct CloseWindowsCtx {
+    target_pid: u32,
+    posted: usize,
+}
+
+unsafe extern "system" fn enum_windows_close_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    if lparam.0 == 0 {
+        return BOOL(0);
+    }
+    // SAFETY: `lparam` points to a stack-allocated `CloseWindowsCtx` valid for the entire
+    // synchronous duration of `EnumWindows`.
+    let ctx = unsafe { &mut *(lparam.0 as *mut CloseWindowsCtx) };
+    let mut win_pid = 0u32;
+    // SAFETY: `hwnd` is a top-level window handle passed by `EnumWindows`, and `win_pid` is a
+    // valid stack `u32`.
+    let tid = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut win_pid)) };
+    if tid != 0 && win_pid != 0 && win_pid == ctx.target_pid {
+        // Post `WM_CLOSE` only to visible or unowned top-level windows owned by the exact verified
+        // target PID, asynchronously so a hung window never blocks the caller.
+        // SAFETY: `hwnd` is a valid window handle from `EnumWindows`.
+        let is_visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+        // SAFETY: `hwnd` is a valid window handle from `EnumWindows`.
+        let is_unowned = unsafe { GetWindow(hwnd, GW_OWNER) }.is_err();
+        if (is_visible || is_unowned)
+            && unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok()
+        {
+            ctx.posted += 1;
+        }
+    }
+    BOOL(1)
+}
+
+/// Pin `identity.pid` with an open handle, verify its exact creation time on that handle, and ask
+/// it to exit gracefully by posting `WM_CLOSE` to its top-level windows (and nothing else).
+pub(crate) fn open_verify_request_close(identity: &ProcessId) -> Result<GracefulStopOutcome> {
+    let desired = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+    // SAFETY: `OpenProcess` takes plain integer arguments and the returned handle is immediately
+    // wrapped in `OwnedHandle`, pinning the PID against reuse until drop.
+    let handle = match unsafe { OpenProcess(desired, false, identity.pid) } {
+        Ok(h) => OwnedHandle(h),
+        Err(err) if err.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
+            return Ok(GracefulStopOutcome::AlreadyGone);
+        }
+        Err(err) if err.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+            return Ok(GracefulStopOutcome::AccessDenied);
+        }
+        Err(err) => {
+            return Err(OsError::Platform {
+                detail: format!("OpenProcess failed for pid {}: {err}", identity.pid),
+            });
+        }
+    };
+
+    let (creation, exit_ft) = query_times_raw(handle.0, &format!("pid {}", identity.pid))?;
+    if !is_still_running(handle.0, exit_ft) {
+        return Ok(GracefulStopOutcome::AlreadyGone);
+    }
+    if creation != identity.start_time {
+        return Ok(GracefulStopOutcome::IdentityMismatch);
+    }
+
+    let mut ctx = CloseWindowsCtx {
+        target_pid: identity.pid,
+        posted: 0,
+    };
+    // SAFETY: `enum_windows_close_proc` matches `WNDENUMPROC` and `ctx` remains alive on this
+    // stack frame for the entire synchronous `EnumWindows` call while `handle` pins `target_pid`.
+    let _ = unsafe {
+        EnumWindows(
+            Some(enum_windows_close_proc),
+            LPARAM((&mut ctx as *mut CloseWindowsCtx) as isize),
+        )
+    };
+
+    if ctx.posted > 0 {
+        return Ok(GracefulStopOutcome::Requested);
+    }
+
+    let (_, post_exit_ft) =
+        query_times_raw(handle.0, &format!("pid {}", identity.pid)).unwrap_or((creation, 0));
+    if !is_still_running(handle.0, post_exit_ft) {
+        Ok(GracefulStopOutcome::AlreadyGone)
+    } else {
+        Ok(GracefulStopOutcome::CannotAskGracefully)
+    }
 }
 
 /// Open `identity.pid` with `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, verify its

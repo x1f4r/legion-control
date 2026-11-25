@@ -301,6 +301,16 @@ export function describeMissingFeatures(entry) {
     }
   }
 
+  const procsSpec = map.get('sys.procs');
+  if (procsSpec && !specHasProp(procsSpec, 'group')) {
+    missing.push('sys.procs (group)');
+  }
+
+  const killSpec = map.get('sys.kill');
+  if (killSpec && !specHasProp(killSpec, 'targets')) {
+    missing.push('sys.kill (targets)');
+  }
+
   if (!map.has('update.list')) {
     missing.push('update.*');
   }

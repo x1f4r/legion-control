@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Legion interface: Machine Overview and Wake reference screens</title>
+<link rel="stylesheet" href="../styles.css">
+<style>
+  /* Laying the reference screens out side by side. Nothing in this block ships. */
+  body { padding: 28px; display: flex; flex-wrap: wrap; gap: 28px; align-items: flex-start; background: #000; height: auto; }
+  :root[data-theme="light"] body { background: #d9d6ce; }
+  .frame { position: relative; width: 390px; height: 820px; border-radius: 30px; overflow: hidden; outline: 1px solid #333; }
+  .frame .shell { height: 100%; }
+  .frame .scrim { position: absolute; }
+  figcaption { font: 12px ui-monospace, monospace; color: #888; margin: 0 0 8px 6px; max-width: 380px; }
+  figure { margin: 0; }
+</style>
+
+<svg hidden>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M14.5 5.5 8 12l6.5 6.5"/></symbol>
+  <symbol id="i-overview" viewBox="0 0 24 24"><path d="M4 19V9M10 19V5M16 19v-7M20.5 19h-17"/></symbol>
+  <symbol id="i-files" viewBox="0 0 24 24"><path d="M4 7.5a2 2 0 0 1 2-2h3.5l2 2H18a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 4v7"/><path d="M7.2 6.8a7 7 0 1 0 9.6 0"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><path d="M6 12h.01M12 12h.01M18 12h.01"/></symbol>
+  <symbol id="i-machines" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="6.5" rx="2"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="2"/><path d="M7 7.25h.01M7 16.75h.01"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><path d="M3.5 12h4l2.5-6 4 12 2.5-6h4"/></symbol>
+  <symbol id="i-actions" viewBox="0 0 24 24"><path d="M13 3.5 5.5 13.5H11l-1 7 7.5-10H12z"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><path d="M10.4 5.3 10.5 2.9h3l.1 2.4 2.1.8 1.6-1.6 2.2 2.2-1.6 1.6.8 2.1 2.4.1v3l-2.4.1-.8 2.1 1.6 1.6-2.2 2.2-1.6-1.6-2.1.8-.1 2.4h-3l-.1-2.4-2.1-.8-1.6 1.6-2.2-2.2 1.6-1.6-.8-2.1-2.4-.1v-3l2.4-.1.8-2.1-1.6-1.6 2.2-2.2 1.6 1.6z"/><circle cx="12" cy="12" r="3"/></symbol>
+</svg>
+
+<!-- ─────────────────────────────── 1. Overview busy ─────────────────────────────── -->
+<figure>
+<figcaption>Overview, busy. State line at top, meters only for reported values (amber when attention is needed), Using it now, then Running now.</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top sub">
+    <button class="btn icon back" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <span class="dot busy"></span>
+    <h1>tower<small>Busy · on for 11 hours</small></h1>
+  </header>
+  <main class="main">
+    <p class="label">Health</p>
+    <div class="list">
+      <div class="gauge"><header><span>Processor</span><span>71%</span></header><span class="meter" style="--v:71"><i></i></span></div>
+      <div class="gauge"><header><span>Memory</span><span>29 of 60 GB</span></header><span class="meter" style="--v:48"><i></i></span></div>
+      <div class="gauge"><header><span>Graphics</span><span>69% · 9.1 of 16 GB</span></header><span class="meter" style="--v:69"><i></i></span></div>
+      <div class="gauge"><header><span>Storage</span><span>2.6 TB free</span></header><span class="meter" style="--v:9"><i></i></span></div>
+      <div class="gauge warn"><header><span>Temperature</span><span>89 °C · processor</span></header><span class="meter warn" style="--v:89"><i></i></span></div>
+    </div>
+
+    <p class="label">Using it now</p>
+    <div class="list">
+      <button class="row"><span class="body"><span class="title">rustc<span class="proc-count">× 12</span></span><span class="sub">62% of the processor</span></span><span class="chev">›</span></button>
+      <button class="row"><span class="body"><span class="title">python3</span><span class="sub">9.1 GB of graphics memory</span></span><span class="chev">›</span></button>
+      <button class="row"><span class="body"><span class="title">chromium<span class="proc-count">× 8</span></span><span class="sub">5.4 GB of memory</span></span><span class="chev">›</span></button>
+    </div>
+
+    <p class="label">Running now</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Photo backup</span><span class="sub">Started 4 minutes ago</span></span><span class="state running">Running</span></a>
+    </div>
+  </main>
+  <nav class="nav parts">
+    <a href="#" aria-current="page"><svg><use href="#i-overview"/></svg>Overview</a>
+    <a href="#"><svg><use href="#i-files"/></svg>Files</a>
+    <a href="#"><svg><use href="#i-power"/></svg>Power</a>
+    <a href="#"><svg><use href="#i-more"/></svg>More</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── 2. Overview idle on a laptop with battery ─────────────────────────────── -->
+<figure>
+<figcaption>Overview, idle on a laptop with battery. Battery meter turns amber at 15% or less while not charging. Nothing much is running.</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top sub">
+    <button class="btn icon back" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <span class="dot"></span>
+    <h1>studio<small>Idle · on for 3 days</small></h1>
+  </header>
+  <main class="main">
+    <p class="label">Health</p>
+    <div class="list">
+      <div class="gauge"><header><span>Processor</span><span>12%</span></header><span class="meter" style="--v:12"><i></i></span></div>
+      <div class="gauge"><header><span>Memory</span><span>24 of 128 GB</span></header><span class="meter" style="--v:19"><i></i></span></div>
+      <div class="gauge"><header><span>Storage</span><span>140 GB free</span></header><span class="meter" style="--v:93"><i></i></span></div>
+      <div class="gauge"><header><span>Battery</span><span>84% · 4 h 15 min left</span></header><span class="meter" style="--v:84"><i></i></span></div>
+    </div>
+
+    <p class="label">Using it now</p>
+    <div class="list">
+      <div class="row off"><span class="body"><span class="sub">Nothing much is running.</span></span></div>
+    </div>
+
+    <p class="label">About</p>
+    <div class="list">
+      <dl class="kv plain">
+        <dt>System</dt><dd>macOS 15.4</dd>
+      </dl>
+    </div>
+  </main>
+  <nav class="nav parts">
+    <a href="#" aria-current="page"><svg><use href="#i-overview"/></svg>Overview</a>
+    <a href="#"><svg><use href="#i-files"/></svg>Files</a>
+    <a href="#"><svg><use href="#i-power"/></svg>Power</a>
+    <a href="#"><svg><use href="#i-more"/></svg>More</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── 3. The program sheet ─────────────────────────────── -->
+<figure>
+<figcaption>Program sheet. All figures, since when it runs, and as whom. Plain words; no process ids or signals outside Technical details.</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top sub">
+    <button class="btn icon back" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <span class="dot busy"></span>
+    <h1>tower<small>Busy · on for 11 hours</small></h1>
+  </header>
+  <main class="main">
+    <p class="label">Using it now</p>
+    <div class="list">
+      <button class="row"><span class="body"><span class="title">rustc<span class="proc-count">× 12</span></span><span class="sub">62% of the processor</span></span><span class="chev">›</span></button>
+      <button class="row"><span class="body"><span class="title">python3</span><span class="sub">9.1 GB of graphics memory</span></span><span class="chev">›</span></button>
+    </div>
+  </main>
+  <div class="scrim">
+    <div class="sheet" role="dialog" aria-modal="true">
+      <h2>rustc × 12</h2>
+      <div class="list">
+        <dl class="kv plain">
+          <dt>Processor</dt><dd>62%</dd>
+          <dt>Memory</dt><dd>4.8 GB (8%)</dd>
+          <dt>Running since</dt><dd>14 minutes ago</dd>
+          <dt>Running as</dt><dd>me</dd>
+        </dl>
+      </div>
+      <div class="actions">
+        <button class="btn">Close</button>
+        <button class="btn danger full">Stop</button>
+      </div>
+    </div>
+  </div>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── 4. Sheet after "still running" ─────────────────────────────── -->
+<figure>
+<figcaption>After Stop, when the program did not exit within five seconds: says so and offers Force stop.</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top sub">
+    <button class="btn icon back" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <span class="dot busy"></span>
+    <h1>tower<small>Busy · on for 11 hours</small></h1>
+  </header>
+  <main class="main"></main>
+  <div class="scrim">
+    <div class="sheet" role="dialog" aria-modal="true">
+      <h2>python3</h2>
+      <div class="list">
+        <dl class="kv plain">
+          <dt>Processor</dt><dd>1%</dd>
+          <dt>Memory</dt><dd>3.2 GB (5%)</dd>
+          <dt>Graphics memory</dt><dd>9.1 GB</dd>
+          <dt>Running since</dt><dd>35 minutes ago</dd>
+          <dt>Running as</dt><dd>me</dd>
+        </dl>
+      </div>
+      <div class="notice">
+        <strong>python3 is still running.</strong>
+        <span>It did not stop on its own. You can force it to stop now.</span>
+      </div>
+      <div class="actions">
+        <button class="btn">Close</button>
+        <button class="btn danger full">Force stop</button>
+      </div>
+    </div>
+  </div>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── 5. Machine reporting almost nothing ─────────────────────────────── -->
+<figure>
+<figcaption>A machine that reports almost nothing. No empty meters, no dashes, no placeholder zeros.</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top sub">
+    <button class="btn icon back" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <span class="dot"></span>
+    <h1>pi<small>Idle · on for 41 days</small></h1>
+  </header>
+  <main class="main">
+    <p class="label">Using it now</p>
+    <div class="list">
+      <div class="row off"><span class="body"><span class="sub">Nothing much is running.</span></span></div>
+    </div>
+
+    <p class="label">About</p>
+    <div class="list">
+      <dl class="kv plain">
+        <dt>System</dt><dd>Linux 13</dd>
+      </dl>
+    </div>
+  </main>
+  <nav class="nav parts">
+    <a href="#" aria-current="page"><svg><use href="#i-overview"/></svg>Overview</a>
+    <a href="#"><svg><use href="#i-files"/></svg>Files</a>
+    <a href="#"><svg><use href="#i-power"/></svg>Power</a>
+    <a href="#"><svg><use href="#i-more"/></svg>More</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── 6. Wake sheet: prompt ─────────────────────────────── -->
+<figure>
+<figcaption>Wake sheet (1 of 3): prompt. Shown instead of an error whenever a person starts something on an off wakeable machine.</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top">
+    <h1>Machines<small>3 are on, 2 are off</small></h1>
+    <button class="btn icon" aria-label="Settings"><svg><use href="#i-gear"/></svg></button>
+  </header>
+  <main class="main">
+    <p class="label">Off</p>
+    <div class="list">
+      <div class="machine off"><a class="machine-link" href="#"><span class="dot off"></span><strong>laptop</strong><span>Last on 14 days ago</span></a><button class="btn small">Wake</button></div>
+    </div>
+  </main>
+  <div class="scrim">
+    <div class="sheet" role="dialog" aria-modal="true">
+      <h2>laptop is off.</h2>
+      <p class="wake-then">Then: open laptop</p>
+      <div class="actions">
+        <button class="btn">Not now</button>
+        <button class="btn primary full">Wake it and continue</button>
+      </div>
+    </div>
+  </div>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── 7. Wake sheet: waking ─────────────────────────────── -->
+<figure>
+<figcaption>Wake sheet (2 of 3): waking. Polls fleet.ping every three seconds for up to three minutes with an elapsed clock.</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top">
+    <h1>Machines<small>3 are on, 2 are off</small></h1>
+    <button class="btn icon" aria-label="Settings"><svg><use href="#i-gear"/></svg></button>
+  </header>
+  <main class="main">
+    <p class="label">Off</p>
+    <div class="list">
+      <div class="machine off"><a class="machine-link" href="#"><span class="dot off"></span><strong>laptop</strong><span>Wake sent · waiting for it to answer</span></a></div>
+    </div>
+  </main>
+  <div class="scrim">
+    <div class="sheet" role="dialog" aria-modal="true">
+      <h2>Waking laptop…</h2>
+      <p class="wake-elapsed">0:24</p>
+      <div class="actions">
+        <button class="btn full">Stop waiting</button>
+      </div>
+      <p class="wake-note">The wake signal has already been sent.</p>
+    </div>
+  </div>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── 8. Wake sheet: timeout ─────────────────────────────── -->
+<figure>
+<figcaption>Wake sheet (3 of 3): timeout after three minutes, offering Try again.</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top">
+    <h1>Machines<small>3 are on, 2 are off</small></h1>
+    <button class="btn icon" aria-label="Settings"><svg><use href="#i-gear"/></svg></button>
+  </header>
+  <main class="main">
+    <p class="label">Off</p>
+    <div class="list">
+      <div class="machine off"><a class="machine-link" href="#"><span class="dot off"></span><strong>laptop</strong><span>Last on 14 days ago</span></a><button class="btn small">Wake</button></div>
+    </div>
+  </main>
+  <div class="scrim">
+    <div class="sheet" role="dialog" aria-modal="true">
+      <h2>laptop did not answer</h2>
+      <p>It has been 3 minutes. It may need longer to start, or waking it may not be working.</p>
+      <div class="actions">
+        <button class="btn">Not now</button>
+        <button class="btn primary full">Try again</button>
+      </div>
+    </div>
+  </div>
+</div></div></div>
+</figure>
+</html>

@@ -43,7 +43,7 @@ export function SendToSheet({
   deviceNoun = 'phone',
   technical = false,
   link,
-  onWakeMachine,
+  onEnsureAwake,
   onRefreshFleet,
   onLocalDone,
   onStarted,
@@ -187,10 +187,11 @@ export function SendToSheet({
   const allSizesKnown =
     items.length > 0 && items.every((it) => it && it.kind !== 'dir' && Number.isFinite(it.size));
   const totalBytes = allSizesKnown ? items.reduce((sum, it) => sum + it.size, 0) : 0;
-  const title =
+  const what =
     items.length === 1
-      ? `Send ${items[0].name || baseFileName(items[0].path)}`
-      : `Send ${items.length} items`;
+      ? items[0].name || baseFileName(items[0].path)
+      : `${items.length} items`;
+  const title = `Send ${what}`;
   const subParts = [
     allSizesKnown ? formatBytes(totalBytes) : null,
     `from ${sourceMachine}`,
@@ -245,11 +246,6 @@ export function SendToSheet({
     }
 
     recordRecentDestination(safeStorage(), destMachine, targetDir);
-
-    const what =
-      items.length === 1
-        ? items[0].name || baseFileName(items[0].path)
-        : `${items.length} items`;
 
     // Same-machine Move uses `fs.move` and same-machine Copy uses `fs.copy` — instant, no job.
     if (destMachine === sourceMachine && ((isMove && sourceCaps?.hasMove) || (!isMove && sourceCaps?.hasCopy))) {
@@ -489,13 +485,21 @@ export function SendToSheet({
                         <span class="title">${m.name}</span>
                         <span class="sub">${waking ? 'Waking…' : 'Off · turn it on to send here'}</span>
                       </span>
-                      ${m.canWake && canWake && onWakeMachine
+                      ${m.canWake && canWake && onEnsureAwake
                         ? html`
                             <button
                               type="button"
                               class="btn small"
                               disabled=${waking}
-                              onClick=${() => onWakeMachine(m)}
+                              onClick=${() =>
+                                onEnsureAwake(m, {
+                                  kind: 'transfer',
+                                  label: `send ${what} to ${m.name}`,
+                                  forgettable: true,
+                                  onContinue: () => {
+                                    setDest(m.name);
+                                  },
+                                })}
                             >
                               ${waking ? 'Waking…' : 'Wake'}
                             </button>
