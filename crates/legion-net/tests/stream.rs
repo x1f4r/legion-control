@@ -1267,3 +1267,285 @@ fn stream_lock_is_exclusive_and_returns_conflict_while_held() {
         .0;
     assert_eq!(after["locked"], true, "{after}");
 }
+
+#[test]
+fn stream_lock_lease_expiry_quota_cleanup_metadata_privacy_and_holder_visibility() {
+    use std::sync::mpsc;
+
+    let node = Node::new();
+    fs::write(node.home().join("projects/secret.txt"), b"top-secret").unwrap();
+    node.policy(
+        r#"
+default = "owner"
+
+[principals.confined]
+role = "confined"
+
+[principals.writeonly]
+role = "writeonly"
+
+[roles.confined]
+allow = ["effect:read", "effect:write"]
+paths = ["~/projects"]
+
+[roles.writeonly]
+allow = ["fs.write"]
+paths = ["~/projects"]
+"#,
+    );
+
+    struct FeedLines {
+        header: Cursor<Vec<u8>>,
+        lines: mpsc::Receiver<Vec<u8>>,
+        buf: Cursor<Vec<u8>>,
+    }
+    impl Read for FeedLines {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.header.read(out)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            let n = self.buf.read(out)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            match self.lines.recv() {
+                Ok(next) if !next.is_empty() => {
+                    self.buf = Cursor::new(next);
+                    self.buf.read(out)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    struct NotifyWriter {
+        tx: mpsc::Sender<Vec<u8>>,
+    }
+    impl std::io::Write for NotifyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.tx.send(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let wait_ready = |rx: &mpsc::Receiver<Vec<u8>>| -> Value {
+        let mut gathered = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while gathered.iter().filter(|b| **b == b'\n').count() < 2 {
+            assert!(std::time::Instant::now() < deadline);
+            if let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                gathered.extend_from_slice(&chunk);
+            }
+        }
+        serde_json::from_slice(after_protocol(&gathered)).unwrap()
+    };
+
+    // 1. Write-only role (`writeonly`) acquires a lock cleanly, learns ZERO metadata (`entries: []`),
+    //    and leaves ZERO `.lock` files behind on release.
+    let wo_reply = node
+        .run(
+            Some("writeonly"),
+            &json!({"op": "lock", "paths": ["~/projects/secret.txt", "~/projects/nope.txt"]}),
+            b"",
+        )
+        .ok()
+        .first()
+        .0;
+    assert_eq!(wo_reply["locked"], true, "{wo_reply}");
+    assert_eq!(
+        wo_reply["entries"].as_array().unwrap().len(),
+        0,
+        "write-only role must not receive file existence/size/mtime/inode via lock: {wo_reply}"
+    );
+    let lock_dir = node.dir.path().join("legion/state/xfer/move-lock");
+    let remaining_locks: Vec<_> = fs::read_dir(&lock_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+    assert!(
+        remaining_locks.is_empty(),
+        "lock files must be removed on release: {remaining_locks:?}"
+    );
+
+    // 2. Short lease expires automatically even when the holder never closes stdin, and the lock
+    //    file is removed when it expires so another caller can proceed.
+    let (line_tx, line_rx) = mpsc::channel();
+    let (out_tx, out_rx) = mpsc::channel();
+    let host = node.host.clone();
+    let mut hdr = json!({
+        "protocol": STREAM_PROTOCOL,
+        "op": "lock",
+        "paths": ["~/projects/secret.txt"],
+        "lease_ms": 150,
+    })
+    .to_string()
+    .into_bytes();
+    hdr.push(b'\n');
+    let holder = std::thread::spawn(move || {
+        serve(
+            &host,
+            Some("confined"),
+            FeedLines {
+                header: Cursor::new(hdr),
+                lines: line_rx,
+                buf: Cursor::new(Vec::new()),
+            },
+            NotifyWriter { tx: out_tx },
+        )
+    });
+    let ready = wait_ready(&out_rx);
+    assert_eq!(ready["locked"], true, "{ready}");
+
+    // While held: owner (unconfined) sees the holder principal in the conflict error.
+    let owner_conflict = node
+        .run(
+            Some("owner"),
+            &json!({"op": "lock", "paths": ["~/projects/secret.txt"]}),
+            b"",
+        )
+        .refused(ErrorCode::Conflict);
+    assert!(
+        owner_conflict["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("confined")),
+        "unconfined owner should see who holds the lock: {owner_conflict:?}"
+    );
+
+    // Renew once after 80 ms, then stop renewing -> lock stays held past 150 ms, then expires
+    // automatically without `line_tx` ever sending EOF!
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    line_tx.send(b"renew\n".to_vec()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(90));
+    node.run(
+        Some("owner"),
+        &json!({"op": "lock", "paths": ["~/projects/secret.txt"]}),
+        b"",
+    )
+    .refused(ErrorCode::Conflict);
+
+    // Wait for lease to expire by itself (holder exits cleanly on its own).
+    holder.join().unwrap().unwrap();
+    drop(line_tx);
+    let after_expiry = node
+        .run(
+            Some("owner"),
+            &json!({"op": "lock", "paths": ["~/projects/secret.txt"]}),
+            b"",
+        )
+        .ok()
+        .first()
+        .0;
+    assert_eq!(after_expiry["locked"], true, "{after_expiry}");
+
+    // 3. Busy lock holder visibility: when `owner` holds a lock, a confined role hitting it must
+    //    NOT learn `owner`'s principal name or job id.
+    let (o_tx, o_rx) = mpsc::channel();
+    let (oo_tx, oo_rx) = mpsc::channel();
+    let host2 = node.host.clone();
+    let mut ohdr = json!({
+        "protocol": STREAM_PROTOCOL,
+        "op": "lock",
+        "paths": ["~/projects/secret.txt"],
+        "lease_ms": 2000,
+    })
+    .to_string()
+    .into_bytes();
+    ohdr.push(b'\n');
+    let owner_holder = std::thread::spawn(move || {
+        serve(
+            &host2,
+            Some("owner"),
+            FeedLines {
+                header: Cursor::new(ohdr),
+                lines: o_rx,
+                buf: Cursor::new(Vec::new()),
+            },
+            NotifyWriter { tx: oo_tx },
+        )
+    });
+    assert_eq!(wait_ready(&oo_rx)["locked"], true);
+
+    let conf_conflict = node
+        .run(
+            Some("confined"),
+            &json!({"op": "lock", "paths": ["~/projects/secret.txt"]}),
+            b"",
+        )
+        .refused(ErrorCode::Conflict);
+    assert!(
+        !conf_conflict["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("owner"),
+        "confined role must not see owner holder identity: {conf_conflict:?}"
+    );
+    assert!(
+        conf_conflict.get("details").is_none(),
+        "confined role must not receive holder details: {conf_conflict:?}"
+    );
+    let _ = o_tx.send(b"release\n".to_vec());
+    owner_holder.join().unwrap().unwrap();
+
+    // 4. Per-principal active lock limit (256): holding 256 locks blocks a 257th lock with `busy`,
+    //    and releasing them frees the quota and removes all lock files.
+    let (q_tx, q_rx) = mpsc::channel();
+    let (qo_tx, qo_rx) = mpsc::channel();
+    let host3 = node.host.clone();
+    let paths_256: Vec<String> = (0..256)
+        .map(|i| format!("~/projects/q-{i:03}.txt"))
+        .collect();
+    let mut qhdr = json!({
+        "protocol": STREAM_PROTOCOL,
+        "op": "lock",
+        "paths": paths_256,
+        "lease_ms": 2000,
+    })
+    .to_string()
+    .into_bytes();
+    qhdr.push(b'\n');
+    let quota_holder = std::thread::spawn(move || {
+        serve(
+            &host3,
+            Some("confined"),
+            FeedLines {
+                header: Cursor::new(qhdr),
+                lines: q_rx,
+                buf: Cursor::new(Vec::new()),
+            },
+            NotifyWriter { tx: qo_tx },
+        )
+    });
+    assert_eq!(wait_ready(&qo_rx)["locked"], true);
+
+    let over_quota = node
+        .run(
+            Some("confined"),
+            &json!({"op": "lock", "paths": ["~/projects/q-256.txt"]}),
+            b"",
+        )
+        .refused(ErrorCode::Busy);
+    assert!(
+        over_quota["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("256")),
+        "quota error should state the lock limit: {over_quota:?}"
+    );
+
+    let _ = q_tx.send(b"release\n".to_vec());
+    quota_holder.join().unwrap().unwrap();
+    let remaining_after_256: Vec<_> = fs::read_dir(&lock_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+    assert!(
+        remaining_after_256.is_empty(),
+        "releasing 256 locks must remove all lock files: {}",
+        remaining_after_256.len()
+    );
+}

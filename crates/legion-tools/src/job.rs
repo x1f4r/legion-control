@@ -211,16 +211,21 @@ pub(crate) fn running_job_ids_for_device(
 /// - Path-confined roles see another principal's transfer job only when every path the job names
 ///   lies inside the caller's `paths`, and see another principal's command job only when allowed
 ///   `job.start` or `exec.run`.
-fn can_see_job(ctx: &Ctx, record: &JobRecord) -> bool {
-    let is_own = record.principal == ctx.principal()
-        && match ctx.pairing_id() {
+fn can_grant_see_job(
+    paths: &Paths,
+    grant: &legion_core::Grant,
+    pairing_id: Option<&str>,
+    record: &JobRecord,
+) -> bool {
+    let is_own = record.principal == grant.principal()
+        && match pairing_id {
             Some(pid) => record.pairing_id.as_deref() == Some(pid),
             None => true,
         };
     if is_own {
         return true;
     }
-    if ctx.grant().roots().is_none() {
+    if grant.roots().is_none() {
         return true;
     }
     match record.kind {
@@ -241,32 +246,48 @@ fn can_see_job(ctx: &Ctx, record: &JobRecord) -> bool {
             if !local_paths.is_empty() {
                 local_paths
                     .iter()
-                    .all(|path| ctx.grant().check_path(path, Access::Read).is_ok())
+                    .all(|path| grant.check_path(path, Access::Read).is_ok())
             } else {
                 !record.transfer_paths.is_empty()
                     && record
                         .transfer_paths
                         .iter()
-                        .all(|path| ctx.grant().check_path(path, Access::Read).is_ok())
+                        .all(|path| grant.check_path(path, Access::Read).is_ok())
             }
         }
         JobKind::Exec => {
-            let Ok(policy) = ctx.config().get::<Policy>() else {
+            let config = legion_core::ConfigStore::new(paths.config_dir());
+            let Ok(policy) = config.get::<Policy>() else {
                 return false;
             };
             policy
-                .authorize_name(
-                    ctx.principal(),
-                    "job.start",
-                    Some(Effect::Exec),
-                    ctx.paths(),
-                )
+                .authorize_name(grant.principal(), "job.start", Some(Effect::Exec), paths)
                 .is_ok()
                 || policy
-                    .authorize_name(ctx.principal(), "exec.run", Some(Effect::Exec), ctx.paths())
+                    .authorize_name(grant.principal(), "exec.run", Some(Effect::Exec), paths)
                     .is_ok()
         }
     }
+}
+
+/// Checks whether a principal holding `grant` (and optional `pairing_id`) is allowed to see job
+/// `job_id` on this node. Used by `stream::lock` to decide whether a busy lock may name the job
+/// holding it.
+pub fn can_principal_see_job(
+    paths: &Paths,
+    grant: &legion_core::Grant,
+    pairing_id: Option<&str>,
+    job_id: &str,
+) -> bool {
+    let dir = job_dir(paths.state_dir(), job_id);
+    let Ok(record) = read_job_record(&dir, job_id) else {
+        return false;
+    };
+    can_grant_see_job(paths, grant, pairing_id, &record)
+}
+
+fn can_see_job(ctx: &Ctx, record: &JobRecord) -> bool {
+    can_grant_see_job(ctx.paths(), ctx.grant(), ctx.pairing_id(), record)
 }
 
 /// Loads live `policy.toml` and `devices.toml` from `paths` and returns whether `record` (a

@@ -271,10 +271,17 @@ pub(crate) enum Op {
         to: String,
     },
     /// Acquire exclusive per-path move locks in the node's state directory in sorted path order,
-    /// inspect every locked path, reply with [`LockReady`], and hold the locks until the stream's
-    /// input closes.
+    /// inspect every locked path the caller may read, reply with [`LockReady`], and hold the locks
+    /// for a short renewable lease until released or expired.
     Lock {
         paths: Vec<String>,
+        /// Optional lease duration in milliseconds (clamped to `[50, MOVE_LOCK_DEFAULT_LEASE]`).
+        #[serde(default)]
+        lease_ms: Option<u64>,
+        /// Optional transfer job id owning this lock, disclosed on busy errors only to callers
+        /// allowed to see that job.
+        #[serde(default)]
+        job_id: Option<String>,
     },
 }
 
@@ -1192,7 +1199,20 @@ fn run<R: Read + Send + 'static, W: Write>(
             subdirs,
         } => probe_read(grant, &dir, &marker, &subdirs, output),
         Op::Rename { from, to } => rename_same_file(host, grant, &from, &to, output),
-        Op::Lock { paths } => lock_paths(host, grant, &paths, input, output),
+        Op::Lock {
+            paths,
+            lease_ms,
+            job_id,
+        } => lock_paths(
+            host,
+            grant,
+            pairing_id,
+            &paths,
+            lease_ms,
+            job_id.as_deref(),
+            input,
+            output,
+        ),
     }
 }
 
@@ -3044,25 +3064,152 @@ fn rename_same_file<W: Write>(
     reply(output, &RenameDone { ok: true })
 }
 
+/// Default lease for stream `lock` calls before automatic expiry unless renewed (`renew\n`).
+const MOVE_LOCK_DEFAULT_LEASE: Duration = Duration::from_secs(10);
+
+/// Minimum caller-requested lease duration (for tests) and hard cap on total lock hold time.
+const MOVE_LOCK_MIN_LEASE: Duration = Duration::from_millis(50);
+const MOVE_LOCK_MAX_HOLD: Duration = Duration::from_secs(60);
+
+/// Maximum number of concurrent move locks one principal may hold across all streams on a node.
+const MAX_LOCKS_PER_PRINCIPAL: usize = 256;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MoveLockMeta {
+    principal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    job_id: Option<String>,
+    expires_at_ms: u64,
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn write_lock_meta(file: &mut fs::File, meta: &MoveLockMeta) {
+    use std::io::{Seek, SeekFrom};
+    if let Ok(bytes) = serde_json::to_vec(meta)
+        && file.set_len(0).is_ok()
+        && file.seek(SeekFrom::Start(0)).is_ok()
+    {
+        let _ = file.write_all(&bytes);
+        let _ = file.flush();
+    }
+}
+
+fn read_lock_meta(path: &Path) -> Option<MoveLockMeta> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Drops acquired move locks cleanly by unlinking each `.lock` file while still holding its
+/// exclusive flock, so normal release, lease expiry, or partial-acquisition failure leaves zero
+/// stale lock files behind.
+struct HeldLockFiles {
+    files: Vec<(PathBuf, fs::File)>,
+}
+
+impl HeldLockFiles {
+    fn new(cap: usize) -> Self {
+        Self {
+            files: Vec::with_capacity(cap),
+        }
+    }
+
+    fn push(&mut self, path: PathBuf, file: fs::File) {
+        self.files.push((path, file));
+    }
+
+    fn update_expiry(&mut self, principal: &str, job_id: Option<&str>, expires_at_ms: u64) {
+        let meta = MoveLockMeta {
+            principal: principal.to_owned(),
+            job_id: job_id.map(str::to_owned),
+            expires_at_ms,
+        };
+        for (_, file) in &mut self.files {
+            write_lock_meta(file, &meta);
+        }
+    }
+}
+
+impl Drop for HeldLockFiles {
+    fn drop(&mut self) {
+        for (path, file) in self.files.drain(..).rev() {
+            // Unlink while the exclusive flock is still held; `try_lock_state_file` verifies the
+            // locked inode matches the live path and retries if it raced with this unlink.
+            let _ = fs::remove_file(&path);
+            drop(file);
+        }
+    }
+}
+
+/// Sweeps any unlocked `.lock` files in `<state_dir>/xfer/move-lock/` immediately and counts how
+/// many currently live locks are held by `principal`.
+fn sweep_and_count_principal_locks(state_dir: &Path, principal: &str) -> usize {
+    let dir = state_dir.join("xfer").join("move-lock");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return 0;
+    };
+    let now_ms = now_unix_ms();
+    let mut held_by_principal = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(OsStr::to_str) != Some("lock") {
+            continue;
+        }
+        let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&path) else {
+            continue;
+        };
+        match file.try_lock() {
+            Ok(()) => {
+                // Unlocked leftover (for example after SIGKILL): remove while holding the flock.
+                let _ = fs::remove_file(&path);
+                drop(file);
+            }
+            Err(_) => {
+                // Actively held by another process: count toward `principal`'s quota if valid.
+                if let Some(meta) = read_lock_meta(&path)
+                    && meta.principal == principal
+                    && meta.expires_at_ms > now_ms
+                {
+                    held_by_principal += 1;
+                }
+            }
+        }
+    }
+    held_by_principal
+}
+
 /// Acquires exclusive per-path move locks in `<state_dir>/xfer/move-lock/` in deterministic sorted
-/// path order, returns live metadata for every requested path, and holds the locks until the
-/// stream's input closes (EOF or newline).
-fn lock_paths<R: BufRead, W: Write>(
+/// path order, enforces a per-principal lock limit, returns live metadata ONLY for paths the
+/// caller may read (`fs.read`), and holds the locks for a short renewable lease that expires
+/// automatically if not renewed or released.
+#[allow(clippy::too_many_arguments)]
+fn lock_paths<R: Read + Send + 'static, W: Write>(
     host: &Host,
     grant: &Grant,
+    pairing_id: Option<&str>,
     paths: &[String],
-    input: &mut Option<R>,
+    lease_ms: Option<u64>,
+    job_id: Option<&str>,
+    input: &mut Option<BufReader<R>>,
     output: &mut W,
 ) -> Result<(), Failure> {
-    if paths.is_empty() || paths.len() > 256 {
+    if paths.is_empty() || paths.len() > MAX_LOCKS_PER_PRINCIPAL {
         return Err(Failure::Reply(ErrorBody::new(
             ErrorCode::InvalidArgs,
             format!(
-                "lock requires between 1 and 256 paths, and {} were given.",
+                "lock requires between 1 and {MAX_LOCKS_PER_PRINCIPAL} paths, and {} were given.",
                 paths.len()
             ),
         )));
     }
+    let lease = lease_ms
+        .map(|ms| Duration::from_millis(ms).clamp(MOVE_LOCK_MIN_LEASE, MOVE_LOCK_DEFAULT_LEASE))
+        .unwrap_or(MOVE_LOCK_DEFAULT_LEASE);
     let mut checked_pairs: Vec<(String, PathBuf)> = Vec::with_capacity(paths.len());
     for raw in paths {
         let checked = grant.check_path(raw, Access::Write)?;
@@ -3079,23 +3226,80 @@ fn lock_paths<R: BufRead, W: Write>(
     lock_targets.dedup();
 
     let state_dir = host.paths.state_dir();
-    let mut locks = Vec::with_capacity(lock_targets.len());
+    let held_count = sweep_and_count_principal_locks(state_dir, grant.principal());
+    if held_count + lock_targets.len() > MAX_LOCKS_PER_PRINCIPAL {
+        return Err(Failure::Reply(
+            ErrorBody::new(
+                ErrorCode::Busy,
+                format!(
+                    "{} already holds {held_count} move locks (limit {MAX_LOCKS_PER_PRINCIPAL}).",
+                    grant.principal()
+                ),
+            )
+            .with_hint(
+                "Release existing locks or wait for their lease to expire before acquiring more.",
+            ),
+        ));
+    }
+
+    let initial_expiry_ms =
+        now_unix_ms().saturating_add(u64::try_from(lease.as_millis()).unwrap_or(10_000));
+    let meta = MoveLockMeta {
+        principal: grant.principal().to_owned(),
+        job_id: job_id.map(str::to_owned),
+        expires_at_ms: initial_expiry_ms,
+    };
+
+    let mut locks = HeldLockFiles::new(lock_targets.len());
     for target in &lock_targets {
         let lock_path = legion_xfer::move_lock_state_path(state_dir, target);
         match legion_xfer::try_lock_state_file(&lock_path) {
-            Ok(Some(file)) => locks.push(file),
+            Ok(Some(mut file)) => {
+                write_lock_meta(&mut file, &meta);
+                locks.push(lock_path, file);
+            }
             Ok(None) => {
+                let holder_info = read_lock_meta(&lock_path).and_then(|holder| {
+                    let allowed = match holder.job_id.as_deref() {
+                        Some(jid) => legion_tools::job::can_principal_see_job(
+                            &host.paths,
+                            grant,
+                            pairing_id,
+                            jid,
+                        ),
+                        None => holder.principal == grant.principal() || grant.roots().is_none(),
+                    };
+                    allowed.then_some(holder)
+                });
                 drop(locks);
-                return Err(Failure::Reply(
-                    ErrorBody::new(
+                let mut err = match holder_info {
+                    Some(holder) => {
+                        let who = match holder.job_id.as_deref() {
+                            Some(jid) => format!("job {jid} ({})", holder.principal),
+                            None => holder.principal.clone(),
+                        };
+                        ErrorBody::new(
+                            ErrorCode::Conflict,
+                            format!(
+                                "Another move or transfer ({who}) is currently finalizing {}.",
+                                target.display()
+                            ),
+                        )
+                        .with_details(json!({
+                            "holder": holder.principal,
+                            "job_id": holder.job_id,
+                        }))
+                    }
+                    None => ErrorBody::new(
                         ErrorCode::Conflict,
                         format!(
                             "Another move or transfer is currently finalizing {}.",
                             target.display()
                         ),
-                    )
-                    .with_hint("Run the transfer again in a moment."),
-                ));
+                    ),
+                };
+                err = err.with_hint("Run the transfer again in a moment.");
+                return Err(Failure::Reply(err));
             }
             Err(err) => {
                 drop(locks);
@@ -3104,49 +3308,71 @@ fn lock_paths<R: BufRead, W: Write>(
         }
     }
 
-    let mut entries = Vec::with_capacity(checked_pairs.len());
-    for (raw, checked) in &checked_pairs {
-        let entry = match fs::symlink_metadata(checked) {
-            Ok(meta) => {
-                let ft = meta.file_type();
-                let kind = if ft.is_file() {
-                    "file"
-                } else if ft.is_dir() {
-                    "dir"
-                } else if ft.is_symlink() {
-                    "symlink"
-                } else {
-                    "other"
-                };
-                let link_target = if ft.is_symlink() {
-                    fs::read_link(checked)
-                        .ok()
-                        .map(|t| t.to_string_lossy().into_owned())
-                } else {
-                    None
-                };
-                LockEntry {
-                    path: raw.clone(),
-                    exists: true,
-                    kind: kind.to_owned(),
-                    file_id: symlink_file_identity(checked).ok(),
-                    size: if ft.is_file() { meta.len() } else { 0 },
-                    mtime: meta.modified().ok().map(Timestamp::from_system_time),
-                    link_target,
+    // Only return metadata that the caller could obtain from `stat` with its own `fs.read` rights.
+    // A write-only role receives no existence, kind, size, mtime, or inode details.
+    let read_grant = ConfigStore::new(host.paths.config_dir())
+        .get::<Policy>()
+        .ok()
+        .and_then(|policy| {
+            policy
+                .authorize_name(
+                    grant.principal(),
+                    "fs.read",
+                    Some(Effect::Read),
+                    &host.paths,
+                )
+                .ok()
+        });
+
+    let mut entries = Vec::new();
+    if let Some(ref rg) = read_grant {
+        entries.reserve(checked_pairs.len());
+        for (raw, checked) in &checked_pairs {
+            if rg.check_path(raw, Access::Read).is_err() {
+                continue;
+            }
+            let entry = match fs::symlink_metadata(checked) {
+                Ok(meta) => {
+                    let ft = meta.file_type();
+                    let kind = if ft.is_file() {
+                        "file"
+                    } else if ft.is_dir() {
+                        "dir"
+                    } else if ft.is_symlink() {
+                        "symlink"
+                    } else {
+                        "other"
+                    };
+                    let link_target = if ft.is_symlink() {
+                        fs::read_link(checked)
+                            .ok()
+                            .map(|t| t.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    };
+                    LockEntry {
+                        path: raw.clone(),
+                        exists: true,
+                        kind: kind.to_owned(),
+                        file_id: symlink_file_identity(checked).ok(),
+                        size: if ft.is_file() { meta.len() } else { 0 },
+                        mtime: meta.modified().ok().map(Timestamp::from_system_time),
+                        link_target,
+                    }
                 }
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => LockEntry {
-                path: raw.clone(),
-                exists: false,
-                kind: "missing".to_owned(),
-                ..LockEntry::default()
-            },
-            Err(err) => {
-                drop(locks);
-                return Err(Failure::Reply(io_error("inspect", checked, &err)));
-            }
-        };
-        entries.push(entry);
+                Err(err) if err.kind() == io::ErrorKind::NotFound => LockEntry {
+                    path: raw.clone(),
+                    exists: false,
+                    kind: "missing".to_owned(),
+                    ..LockEntry::default()
+                },
+                Err(err) => {
+                    drop(locks);
+                    return Err(Failure::Reply(io_error("inspect", checked, &err)));
+                }
+            };
+            entries.push(entry);
+        }
     }
 
     reply(
@@ -3157,10 +3383,55 @@ fn lock_paths<R: BufRead, W: Write>(
         },
     )?;
 
-    // Hold all locks until the caller closes its pipe (or sends a release line).
-    if let Some(reader) = input.as_mut() {
-        let mut release = Vec::new();
-        let _ = reader.read_until(b'\n', &mut release);
+    // Hold locks for at most `lease` at a time (renewed by `"renew\n"` lines, up to
+    // `MOVE_LOCK_MAX_HOLD` total), releasing immediately on EOF, `"release\n"`, or lease expiry.
+    if let Some(mut reader) = input.take() {
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut line_buf = Vec::new();
+            loop {
+                line_buf.clear();
+                match reader.read_until(b'\n', &mut line_buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let text = String::from_utf8_lossy(&line_buf).trim().to_owned();
+                        let keep_going = text == "renew";
+                        if tx.send(text).is_err() || !keep_going {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let started = Instant::now();
+        let hard_deadline = started + MOVE_LOCK_MAX_HOLD;
+        let mut lease_deadline = (started + lease).min(hard_deadline);
+        loop {
+            let now = Instant::now();
+            if now >= lease_deadline {
+                break;
+            }
+            match rx.recv_timeout(lease_deadline.saturating_duration_since(now)) {
+                Ok(cmd) if cmd == "renew" => {
+                    let next = (Instant::now() + lease).min(hard_deadline);
+                    lease_deadline = next;
+                    let rem_ms = u64::try_from(
+                        lease_deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis(),
+                    )
+                    .unwrap_or(0);
+                    locks.update_expiry(
+                        grant.principal(),
+                        job_id,
+                        now_unix_ms().saturating_add(rem_ms),
+                    );
+                }
+                Ok(_) | Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+            }
+        }
     }
     drop(locks);
     Ok(())

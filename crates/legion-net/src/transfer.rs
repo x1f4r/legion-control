@@ -1151,11 +1151,23 @@ struct HeldMoveLocks {
     conns: Vec<Conn>,
     from_entries: HashMap<String, LockEntry>,
     to_entries: HashMap<String, LockEntry>,
+    last_renew: Instant,
 }
 
 impl HeldMoveLocks {
+    async fn renew_if_needed(&mut self) {
+        if self.last_renew.elapsed() < Duration::from_secs(3) {
+            return;
+        }
+        self.last_renew = Instant::now();
+        for conn in &mut self.conns {
+            let _ = conn.write(b"renew\n").await;
+        }
+    }
+
     async fn release(self) {
-        for conn in self.conns.into_iter().rev() {
+        for mut conn in self.conns.into_iter().rev() {
+            let _ = conn.write(b"release\n").await;
             conn.close().await;
         }
     }
@@ -1592,6 +1604,7 @@ impl Transfer<'_> {
                 conns: vec![conn],
                 from_entries,
                 to_entries,
+                last_renew: Instant::now(),
             });
         }
 
@@ -1658,7 +1671,31 @@ impl Transfer<'_> {
             conns: vec![conn1, conn2],
             from_entries,
             to_entries,
+            last_renew: Instant::now(),
         })
+    }
+
+    /// Wraps a busy-lock `Conflict` during move finalization so the caller is clearly told that the
+    /// copy finished, the source was kept, and running the transfer again will finish the move.
+    fn explain_busy_move_lock(err: ErrorBody) -> ErrorBody {
+        if err.code != ErrorCode::Conflict {
+            return err;
+        }
+        let mut wrapped = ErrorBody::new(
+            ErrorCode::Conflict,
+            format!(
+                "The copy finished and the source was kept because another move is currently finalizing these paths ({})",
+                err.message
+            ),
+        )
+        .with_hint("Run the transfer again to finish the move.");
+        if let Some(machine) = err.machine {
+            wrapped = wrapped.with_machine(machine);
+        }
+        if let Some(details) = err.details {
+            wrapped = wrapped.with_details(details);
+        }
+        wrapped
     }
 
     /// Re-verifies one candidate's destination copy while holding exclusive locks on both source
@@ -1778,9 +1815,10 @@ impl Transfer<'_> {
     ) -> Result<u64, ErrorBody> {
         let from_paths = vec![from.path.clone()];
         let to_paths = vec![actual_to_path.to_owned()];
-        let locks = self
+        let mut locks = self
             .acquire_move_locks(from, &from_paths, to, &to_paths)
-            .await?;
+            .await
+            .map_err(Self::explain_busy_move_lock)?;
         let cand = MoveRemovalCandidate {
             rel: String::new(),
             from_path: from.path.clone(),
@@ -1795,6 +1833,7 @@ impl Transfer<'_> {
         let verified = self
             .verify_candidate_under_locks(to, &cand, &locks.from_entries, &locks.to_entries)
             .await;
+        locks.renew_if_needed().await;
         let result = match verified {
             Ok(true) => {
                 let forbid = same_machine_or_dir
@@ -1833,12 +1872,14 @@ impl Transfer<'_> {
         for chunk in candidates.chunks(MOVE_LOCK_BATCH) {
             let from_paths: Vec<String> = chunk.iter().map(|c| c.from_path.clone()).collect();
             let to_paths: Vec<String> = chunk.iter().map(|c| c.to_path.clone()).collect();
-            let locks = self
+            let mut locks = self
                 .acquire_move_locks(from, &from_paths, to, &to_paths)
-                .await?;
+                .await
+                .map_err(Self::explain_busy_move_lock)?;
             let mut to_delete: Vec<String> = Vec::with_capacity(chunk.len());
             let mut hashes: HashMap<String, Hash> = HashMap::new();
             for cand in chunk {
+                locks.renew_if_needed().await;
                 match self
                     .verify_candidate_under_locks(to, cand, &locks.from_entries, &locks.to_entries)
                     .await
