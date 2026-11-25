@@ -294,9 +294,182 @@ fn read_mp4_box_header_raw<R: Read + Seek>(
     Some((box_type, payload_start, box_end))
 }
 
-/// Cleans a tag text value per the player contract: removes all control characters, trims
-/// surrounding whitespace, caps at [`MAX_TAG_FIELD_CHARS`] (512) Unicode characters, re-trims, and
-/// returns `None` when empty.
+/// Returns true for characters that must be removed from audio tag text: control characters,
+/// bidirectional overrides/isolates/marks, invisible zero-width/BOM/soft-hyphen characters,
+/// Unicode tag characters (`U+E0000..=U+E007F`), and all 66 Unicode noncharacters.
+pub(crate) fn is_stripped_tag_char(ch: char) -> bool {
+    let cp = ch as u32;
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{00AD}' // soft hyphen
+            | '\u{061C}' // Arabic Letter Mark
+            | '\u{200B}' // Zero Width Space
+            | '\u{200E}'..='\u{200F}' // LRM, RLM
+            | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
+            | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+            | '\u{FEFF}' // BOM / ZWNBSP
+            | '\u{FDD0}'..='\u{FDEF}' // noncharacters
+            | '\u{E0000}'..='\u{E007F}' // Unicode tag characters
+        )
+        || (cp & 0xFFFF) >= 0xFFFE
+}
+
+fn is_joiner(ch: char) -> bool {
+    matches!(ch, '\u{200C}' | '\u{200D}')
+}
+
+fn is_edge_trimmed(ch: char) -> bool {
+    ch.is_whitespace() || is_joiner(ch)
+}
+
+fn is_variation_selector(ch: char) -> bool {
+    matches!(ch, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
+}
+
+/// Covers Unicode combining marks (`Mn`/`Mc`/`Me`) across common scripts plus emoji skin-tone
+/// modifiers so the 512-character truncation boundary steps back to the last complete cluster
+/// without adding a grapheme-table crate dependency.
+fn is_combining_mark(ch: char) -> bool {
+    let cp = ch as u32;
+    matches!(
+        cp,
+        0x0300..=0x036F // Combining Diacritical Marks
+        | 0x0483..=0x0489 // Cyrillic combining marks
+        | 0x0591..=0x05BD
+        | 0x05BF
+        | 0x05C1..=0x05C2
+        | 0x05C4..=0x05C5
+        | 0x05C7 // Hebrew marks
+        | 0x0610..=0x061A
+        | 0x064B..=0x065F
+        | 0x0670
+        | 0x06D6..=0x06DC
+        | 0x06DF..=0x06E4
+        | 0x06E7..=0x06E8
+        | 0x06EA..=0x06ED // Arabic marks
+        | 0x0711
+        | 0x0730..=0x074A // Syriac
+        | 0x07A6..=0x07B0 // Thaana
+        | 0x07EB..=0x07F3
+        | 0x07FD // NKo
+        | 0x0816..=0x0819
+        | 0x081B..=0x0823
+        | 0x0825..=0x0827
+        | 0x0829..=0x082D
+        | 0x0859..=0x085B
+        | 0x0898..=0x089F
+        | 0x08CA..=0x08E1
+        | 0x08E3..=0x0903 // Extended Arabic / Devanagari signs
+        | 0x093A..=0x094F
+        | 0x0951..=0x0957
+        | 0x0962..=0x0963 // Devanagari
+        | 0x0981..=0x0983
+        | 0x09BC
+        | 0x09BE..=0x09CD
+        | 0x09D7
+        | 0x09E2..=0x09E3 // Bengali
+        | 0x0A01..=0x0A03
+        | 0x0A3C
+        | 0x0A3E..=0x0A51
+        | 0x0A70..=0x0A71
+        | 0x0A75 // Gurmukhi
+        | 0x0A81..=0x0A83
+        | 0x0ABC
+        | 0x0ABE..=0x0ACD
+        | 0x0AE2..=0x0AE3
+        | 0x0AFA..=0x0AFF // Gujarati
+        | 0x0B01..=0x0B03
+        | 0x0B3C
+        | 0x0B3E..=0x0B57
+        | 0x0B62..=0x0B63 // Oriya
+        | 0x0B82
+        | 0x0BBE..=0x0BD7 // Tamil
+        | 0x0C00..=0x0C04
+        | 0x0C3C
+        | 0x0C3E..=0x0C56
+        | 0x0C62..=0x0C63 // Telugu
+        | 0x0C81..=0x0C83
+        | 0x0CBC
+        | 0x0CBE..=0x0CD6
+        | 0x0CE2..=0x0CE3 // Kannada
+        | 0x0D00..=0x0D03
+        | 0x0D3B..=0x0D4E
+        | 0x0D57
+        | 0x0D62..=0x0D63 // Malayalam
+        | 0x0D81..=0x0D83
+        | 0x0DCA..=0x0DDF
+        | 0x0DF2..=0x0DF3 // Sinhala
+        | 0x0E31
+        | 0x0E34..=0x0E3A
+        | 0x0E47..=0x0E4E // Thai
+        | 0x0EB1
+        | 0x0EB4..=0x0EBC
+        | 0x0EC8..=0x0ECE // Lao
+        | 0x0F18..=0x0F19
+        | 0x0F35
+        | 0x0F37
+        | 0x0F39
+        | 0x0F3E..=0x0F3F
+        | 0x0F71..=0x0F84
+        | 0x0F86..=0x0F87
+        | 0x0F8D..=0x0FBC
+        | 0x0FC6 // Tibetan
+        | 0x102B..=0x103E
+        | 0x1056..=0x1059
+        | 0x105E..=0x1060
+        | 0x1062..=0x1064
+        | 0x1067..=0x106D
+        | 0x1071..=0x1074
+        | 0x1082..=0x108D
+        | 0x108F
+        | 0x109A..=0x109D // Myanmar
+        | 0x1160..=0x11FF // Hangul Jamo medial/trailing
+        | 0x1712..=0x1715
+        | 0x1732..=0x1734
+        | 0x1752..=0x1753
+        | 0x1772..=0x1773
+        | 0x17B4..=0x17D3
+        | 0x17DD // Khmer & Philippine marks
+        | 0x180B..=0x180D
+        | 0x180F
+        | 0x18A9 // Mongolian
+        | 0x1920..=0x193B
+        | 0x1A17..=0x1A1B
+        | 0x1A55..=0x1A7F
+        | 0x1AB0..=0x1AFF // Combining Diacritical Marks Extended
+        | 0x1B00..=0x1B04
+        | 0x1B34..=0x1B44
+        | 0x1B6B..=0x1B73
+        | 0x1B80..=0x1B82
+        | 0x1BA1..=0x1BAD
+        | 0x1BE6..=0x1BF3
+        | 0x1C24..=0x1C37
+        | 0x1CD0..=0x1CD2
+        | 0x1CD4..=0x1CE8
+        | 0x1CED
+        | 0x1CF4
+        | 0x1CF7..=0x1CF9
+        | 0x1DC0..=0x1DFF // Combining Diacritical Marks Supplement
+        | 0x20D0..=0x20FF // Combining Diacritical Marks for Symbols
+        | 0x302A..=0x302F
+        | 0x3099..=0x309A // CJK / Kana combining marks
+        | 0xA8E0..=0xA8F1
+        | 0xFB1E
+        | 0xFE20..=0xFE2F // Combining Half Marks
+        | 0x1F3FB..=0x1F3FF // Emoji skin-tone modifiers
+    )
+}
+
+fn is_cluster_tail(ch: char) -> bool {
+    is_joiner(ch) || is_variation_selector(ch) || is_combining_mark(ch)
+}
+
+/// Cleans a tag text value per the player contract: maps `U+2028`/`U+2029` to ASCII spaces,
+/// removes control/bidirectional/invisible/tag/noncharacter code points, keeps internal
+/// `U+200C`/`U+200D` while stripping them and whitespace at both edges, caps at
+/// [`MAX_TAG_FIELD_CHARS`] (512) characters stepping back to the last complete cluster on
+/// truncation, and returns `None` when empty.
 #[cfg(test)]
 pub(crate) fn clean_tag_text(raw: &str) -> Option<String> {
     clean_tag_chars(raw.chars())
@@ -306,24 +479,46 @@ fn clean_tag_chars(chars: impl Iterator<Item = char>) -> Option<String> {
     let mut out = String::with_capacity(MAX_TAG_FIELD_CHARS.min(64));
     let mut count = 0usize;
     let mut started = false;
-    for ch in chars {
-        if ch.is_control() {
-            continue;
-        }
+    let mut truncated_next: Option<char> = None;
+
+    for raw_ch in chars {
+        let ch = match raw_ch {
+            '\u{2028}' | '\u{2029}' => ' ',
+            other if is_stripped_tag_char(other) => continue,
+            other => other,
+        };
         if !started {
-            if ch.is_whitespace() {
+            if is_edge_trimmed(ch) {
                 continue;
             }
             started = true;
         }
         if count >= MAX_TAG_FIELD_CHARS {
+            truncated_next = Some(ch);
             break;
         }
         out.push(ch);
         count += 1;
     }
-    let trimmed_end = out.trim_end().len();
-    out.truncate(trimmed_end);
+
+    if let Some(next_ch) = truncated_next {
+        let mut need_step_back =
+            is_cluster_tail(next_ch) || out.chars().next_back().is_some_and(is_cluster_tail);
+        while need_step_back {
+            while out.chars().next_back().is_some_and(is_cluster_tail) {
+                out.pop();
+            }
+            // Drop the base scalar whose cluster was cut off or ended with a tail modifier.
+            out.pop();
+            // If another joiner/modifier now sits at the end (for example a multi-part ZWJ emoji
+            // sequence), keep stepping back to the last complete cluster.
+            need_step_back = out.chars().next_back().is_some_and(is_cluster_tail);
+        }
+    }
+
+    while out.chars().next_back().is_some_and(is_edge_trimmed) {
+        out.pop();
+    }
     (!out.is_empty()).then_some(out)
 }
 
@@ -1246,9 +1441,17 @@ fn parse_id3v2_body(
         let decode_text = |payload: &[u8]| -> Option<String> {
             if frame_unsync {
                 let prefix = deunsync_prefix(payload, MAX_TEXT_DECODE_BYTES + 1);
-                clean_id3_text_frame(&prefix)
+                clean_id3_text_frame(major, &prefix)
             } else {
-                clean_id3_text_frame(payload)
+                clean_id3_text_frame(major, payload)
+            }
+        };
+        let decode_first_text = |payload: &[u8]| -> Option<String> {
+            if frame_unsync {
+                let prefix = deunsync_prefix(payload, MAX_TEXT_DECODE_BYTES + 1);
+                clean_id3_first_text_value(major, &prefix)
+            } else {
+                clean_id3_first_text_value(major, payload)
             }
         };
 
@@ -1275,21 +1478,21 @@ fn parse_id3v2_body(
             }
             b"TRCK" | b"TRK" => {
                 if tags.track.is_none()
-                    && let Some(text) = decode_text(payload)
+                    && let Some(text) = decode_first_text(payload)
                 {
                     tags.track = parse_track_or_disc_cleaned(&text);
                 }
             }
             b"TPOS" | b"TPA" => {
                 if tags.disc.is_none()
-                    && let Some(text) = decode_text(payload)
+                    && let Some(text) = decode_first_text(payload)
                 {
                     tags.disc = parse_track_or_disc_cleaned(&text);
                 }
             }
             b"TDRC" | b"TYER" | b"TYE" => {
                 if tags.year.is_none()
-                    && let Some(text) = decode_text(payload)
+                    && let Some(text) = decode_first_text(payload)
                 {
                     tags.year = parse_year_cleaned(&text);
                 }
@@ -1309,9 +1512,92 @@ fn parse_id3v2_body(
     Ok(())
 }
 
-fn clean_id3_text_frame(payload: &[u8]) -> Option<String> {
+/// Splits an ID3v2.4 text payload (after the encoding byte) into NUL-separated raw segments
+/// bounded to `MAX_TEXT_DECODE_BYTES`, using 2-byte aligned `0x00 0x00` for UTF-16 encodings and
+/// single `0x00` for Latin-1/UTF-8.
+fn split_id3v24_segments(encoding: u8, data: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    match encoding {
+        0 | 3 => {
+            let bounded = if encoding == 3 {
+                bounded_utf8_prefix(data, MAX_TEXT_DECODE_BYTES)
+            } else {
+                &data[..data.len().min(MAX_TEXT_DECODE_BYTES)]
+            };
+            for seg in bounded.split(|&b| b == 0) {
+                if !seg.is_empty() {
+                    out.push(seg);
+                }
+            }
+        }
+        1 | 2 => {
+            let bounded = &data[..data.len().min(MAX_TEXT_DECODE_BYTES) & !1];
+            let mut seg_start = 0usize;
+            let mut i = 0usize;
+            while i + 1 < bounded.len() {
+                if bounded[i] == 0 && bounded[i + 1] == 0 {
+                    if i > seg_start {
+                        out.push(&bounded[seg_start..i]);
+                    }
+                    i += 2;
+                    seg_start = i;
+                } else {
+                    i += 2;
+                }
+            }
+            if seg_start < bounded.len() {
+                out.push(&bounded[seg_start..]);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn clean_id3_text_frame(major: u8, payload: &[u8]) -> Option<String> {
     let (&enc, data) = payload.split_first()?;
-    clean_id3_string(enc, data)
+    if major < 4 {
+        return clean_id3_string(enc, data);
+    }
+    let segments = split_id3v24_segments(enc, data);
+    let mut joined = String::new();
+    let mut joined_chars = 0usize;
+    let mut value_count = 0usize;
+    for seg in segments {
+        // Each ID3v2.4 NUL-separated value is decoded independently with its own BOM.
+        let Some(cleaned) = clean_id3_string(enc, seg) else {
+            continue;
+        };
+        if value_count > 0 {
+            joined.push_str(", ");
+            joined_chars += 2;
+        }
+        joined_chars += cleaned.chars().count();
+        joined.push_str(&cleaned);
+        value_count += 1;
+        // Stop collecting once we already exceed the 512-char field cap with cluster headroom.
+        if joined_chars > MAX_TAG_FIELD_CHARS + 32 {
+            break;
+        }
+    }
+    match value_count {
+        0 => None,
+        1 => Some(joined),
+        _ => clean_tag_chars(joined.chars()),
+    }
+}
+
+fn clean_id3_first_text_value(major: u8, payload: &[u8]) -> Option<String> {
+    let (&enc, data) = payload.split_first()?;
+    if major < 4 {
+        return clean_id3_string(enc, data);
+    }
+    for seg in split_id3v24_segments(enc, data) {
+        if let Some(cleaned) = clean_id3_string(enc, seg) {
+            return Some(cleaned);
+        }
+    }
+    None
 }
 
 fn clean_id3_string(encoding: u8, data: &[u8]) -> Option<String> {
@@ -2823,6 +3109,153 @@ mod tests {
         let mut spaced = "a".repeat(510);
         spaced.push_str("    tail");
         assert_eq!(clean_tag_text(&spaced).unwrap(), "a".repeat(510));
+    }
+
+    #[test]
+    fn clean_tag_text_strips_bidi_invisible_tags_nonchars_maps_separators_and_guards_clusters() {
+        // Every bidirectional control (U+061C, U+200E, U+200F, U+202A..=U+202E, U+2066..=U+2069).
+        let bidi = "A\u{061C}\u{200E}\u{200F}\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}\u{2066}\u{2067}\u{2068}\u{2069}B";
+        assert_eq!(clean_tag_text(bidi).as_deref(), Some("AB"));
+
+        // U+200B (ZWSP), U+FEFF (BOM), U+00AD (soft hyphen).
+        assert_eq!(
+            clean_tag_text("\u{FEFF}Hel\u{00AD}lo\u{200B}World\u{FEFF}").as_deref(),
+            Some("HelloWorld")
+        );
+
+        // Unicode tag characters U+E0000..=U+E007F (smuggled prompt-injection plane).
+        let tagged = "Song\u{E0000}\u{E0001}\u{E0041}\u{E007F}Title";
+        assert_eq!(clean_tag_text(tagged).as_deref(), Some("SongTitle"));
+
+        // Noncharacters: U+FDD0..=U+FDEF and plane-end xxFFFE/xxFFFF.
+        let nonchars =
+            "Track\u{FDD0}\u{FDEF}\u{FFFE}\u{FFFF}\u{1FFFE}\u{1FFFF}\u{10FFFE}\u{10FFFF}One";
+        assert_eq!(clean_tag_text(nonchars).as_deref(), Some("TrackOne"));
+
+        // U+2028 (Line Separator) and U+2029 (Paragraph Separator) become ASCII spaces (trimmed at edges).
+        assert_eq!(
+            clean_tag_text("\u{2028}First\u{2028}line\u{2029}second\u{2029}").as_deref(),
+            Some("First line second")
+        );
+        assert_eq!(clean_tag_text("\u{2028}\u{2029}"), None);
+
+        // U+200C (ZWNJ) and U+200D (ZWJ) are preserved inside text, never at edges.
+        assert_eq!(
+            clean_tag_text("\u{200D}می\u{200C}خواهم\u{200C}").as_deref(),
+            Some("می\u{200C}خواهم")
+        );
+        assert_eq!(
+            clean_tag_text(" \u{200C}\u{200D}👩\u{200D}🚀\u{200D}\u{200C} ").as_deref(),
+            Some("👩\u{200D}🚀")
+        );
+        assert_eq!(clean_tag_text("\u{200C}\u{200D}"), None);
+
+        // Non-truncated combining marks & variation selectors at end are preserved intact.
+        assert_eq!(
+            clean_tag_text("Caf\u{0065}\u{0301}").as_deref(),
+            Some("Caf\u{0065}\u{0301}")
+        );
+        assert_eq!(
+            clean_tag_text("Love ❤\u{FE0F}").as_deref(),
+            Some("Love ❤\u{FE0F}")
+        );
+
+        // 512-char truncation must never end on a joiner, variation selector, or combining mark,
+        // nor split a cluster across index 512:
+        // 1) Combining mark straddling the 512 boundary: 511 'a' + 'e' + U+0301 -> 511 'a'
+        let cut_comb_next = format!("{}e\u{0301}", "a".repeat(511));
+        assert_eq!(clean_tag_text(&cut_comb_next).unwrap(), "a".repeat(511));
+        // 2) Combining mark sitting on index 512 with more chars after -> step back past 'e'
+        let cut_comb_end = format!("{}e\u{0301}z", "a".repeat(510));
+        assert_eq!(clean_tag_text(&cut_comb_end).unwrap(), "a".repeat(510));
+        // 3) Variation selector straddling 512 or landing on 512
+        let cut_vs_next = format!("{}❤\u{FE0F}", "a".repeat(511));
+        assert_eq!(clean_tag_text(&cut_vs_next).unwrap(), "a".repeat(511));
+        let cut_vs_end = format!("{}❤\u{FE0F}z", "a".repeat(510));
+        assert_eq!(clean_tag_text(&cut_vs_end).unwrap(), "a".repeat(510));
+        // 4) ZWJ emoji sequence cut after ZWJ or before ZWJ -> step back over entire joined cluster
+        let cut_zwj_end = format!("{}👩\u{200D}🚀", "a".repeat(510));
+        assert_eq!(clean_tag_text(&cut_zwj_end).unwrap(), "a".repeat(510));
+        let cut_zwj_chain = format!("{}👩\u{200D}👩\u{200D}👧", "a".repeat(509));
+        assert_eq!(clean_tag_text(&cut_zwj_chain).unwrap(), "a".repeat(509));
+    }
+
+    #[test]
+    fn id3v24_nul_separated_values_join_with_comma_and_per_value_bom() {
+        // UTF-8 multi-value with empty/trailing NULs -> joined with ", "
+        let utf8_payload = b"\x03First artist\x00\x00Second artist\x00Third artist\x00";
+        assert_eq!(
+            clean_id3_text_frame(4, utf8_payload).as_deref(),
+            Some("First artist, Second artist, Third artist")
+        );
+
+        // Latin-1 multi-value
+        let latin1_payload = b"\x00Alpha\x00Beta";
+        assert_eq!(
+            clean_id3_text_frame(4, latin1_payload).as_deref(),
+            Some("Alpha, Beta")
+        );
+
+        // UTF-16 with BOM: first segment UTF-16LE (FF FE), second segment UTF-16BE (FE FF)
+        let mut utf16_payload = vec![1u8]; // encoding 1 = UTF-16 with BOM
+        utf16_payload.extend_from_slice(&[0xFF, 0xFE]); // LE BOM
+        for u in "Ada".encode_utf16() {
+            utf16_payload.extend_from_slice(&u.to_le_bytes());
+        }
+        utf16_payload.extend_from_slice(&[0x00, 0x00]); // NUL separator
+        utf16_payload.extend_from_slice(&[0xFE, 0xFF]); // BE BOM
+        for u in "Grace".encode_utf16() {
+            utf16_payload.extend_from_slice(&u.to_be_bytes());
+        }
+        utf16_payload.extend_from_slice(&[0x00, 0x00]); // trailing NUL
+        assert_eq!(
+            clean_id3_text_frame(4, &utf16_payload).as_deref(),
+            Some("Ada, Grace")
+        );
+
+        // Full ID3v2.4 MP3 parse verifying TPE1 multi-value UTF-16 mixed BOM & TRCK first value.
+        let mut frames = Vec::new();
+        let push_v24 = |out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]| {
+            let sz = payload.len() as u32;
+            out.extend_from_slice(id);
+            out.extend_from_slice(&[
+                ((sz >> 21) & 0x7F) as u8,
+                ((sz >> 14) & 0x7F) as u8,
+                ((sz >> 7) & 0x7F) as u8,
+                (sz & 0x7F) as u8,
+            ]);
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(payload);
+        };
+        push_v24(&mut frames, b"TIT2", b"\x03Part One\x00Part Two");
+        push_v24(&mut frames, b"TPE1", &utf16_payload);
+        push_v24(&mut frames, b"TRCK", b"\x033/10\x004/10");
+        let sz = frames.len() as u32;
+        let mut mp3 = vec![
+            b'I',
+            b'D',
+            b'3',
+            4,
+            0,
+            0,
+            ((sz >> 21) & 0x7F) as u8,
+            ((sz >> 14) & 0x7F) as u8,
+            ((sz >> 7) & 0x7F) as u8,
+            (sz & 0x7F) as u8,
+        ];
+        mp3.extend_from_slice(&frames);
+        let mut cur = Cursor::new(mp3.as_slice());
+        let extracted = parse_audio(
+            &mut cur,
+            mp3.len() as u64,
+            AudioFormat::Mp3,
+            CoverExtractMode::CheckOnly,
+            Path::new("/v24_multi.mp3"),
+        )
+        .unwrap();
+        assert_eq!(extracted.tags.title.as_deref(), Some("Part One, Part Two"));
+        assert_eq!(extracted.tags.artist.as_deref(), Some("Ada, Grace"));
+        assert_eq!(extracted.tags.track, Some(3));
     }
 
     #[test]
