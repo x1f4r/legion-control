@@ -134,7 +134,7 @@ fn after_protocol(output: &[u8]) -> &[u8] {
     assert_eq!(opening["protocol"], json!(STREAM_PROTOCOL), "{opening}");
     assert_eq!(
         opening["capabilities"],
-        json!(["if_exists", "move", "probe", "rename"]),
+        json!(["if_exists", "lock", "move", "probe", "rename"]),
         "{opening}"
     );
     &output[end + 1..]
@@ -701,12 +701,15 @@ fn a_partial_file_beside_a_target_is_checked_like_the_target() {
     assert_eq!(fs::read(&outside).unwrap(), b"not yours");
     assert!(!node.home().join("sandbox").exists());
 
-    // Inside the root, a partial file with a matching identity sidecar is resumed.
+    // Inside the root, a partial file with a matching state-dir metadata sidecar is resumed.
     fs::create_dir_all(node.home().join("sandbox")).unwrap();
+    let target_f = node.home().join("sandbox/f.bin");
     fs::write(node.home().join("sandbox/f.bin.legion-part"), b"ab").unwrap();
-    fs::write(
-        node.home().join("sandbox/f.bin.legion-part.meta"),
-        format!("3 {}\n", hash(b"abc")),
+    legion_xfer::write_partial_meta_in_state(
+        &node.dir.path().join("legion/state"),
+        &target_f,
+        3,
+        legion_xfer::hash::hash_bytes(b"abc"),
     )
     .unwrap();
     let ran = node.run(
@@ -1063,18 +1066,204 @@ fn unpack_takes_each_planned_entry_once_as_planned_and_nothing_else() {
 
 #[test]
 fn a_refused_unpack_reads_nothing_of_what_follows() {
+    use std::sync::{Arc, Mutex};
+    struct SharedCursor(Arc<Mutex<Cursor<Vec<u8>>>>);
+    impl Read for SharedCursor {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().read(buf)
+        }
+    }
+
     let node = Node::new();
     node.policy(CONFINED);
     let mut input =
         b"{\"op\":\"unpack\",\"root\":\"~/projects/x\",\"entries\":[],\"protocol\":1}\n".to_vec();
     input.extend(std::iter::repeat_n(0u8, 1 << 20));
-    let mut cursor = Cursor::new(input);
+    let shared = Arc::new(Mutex::new(Cursor::new(input)));
     let mut output = Vec::new();
-    let error = serve(&node.host, Some("reader"), &mut cursor, &mut output).unwrap_err();
+    let error = serve(
+        &node.host,
+        Some("reader"),
+        SharedCursor(Arc::clone(&shared)),
+        &mut output,
+    )
+    .unwrap_err();
     assert_eq!(error.code, ErrorCode::Denied);
     // It answered and returned instead of draining its input; dropping that input is what tells
     // a sender to stop.
     let mut rest = Vec::new();
-    cursor.read_to_end(&mut rest).unwrap();
+    shared.lock().unwrap().read_to_end(&mut rest).unwrap();
     assert!(rest.len() > 900_000, "{}", rest.len());
+}
+
+#[test]
+fn stream_rename_is_limited_to_same_file_case_or_normalization_and_honours_fs_move_protection() {
+    let node = Node::new();
+    node.policy(
+        r#"
+[principals.unrestricted_nonadmin]
+role = "power_user"
+
+[roles.power_user]
+allow = ["effect:read", "effect:write", "effect:destroy"]
+"#,
+    );
+    fs::create_dir_all(node.home().join(".config")).unwrap();
+    fs::write(node.home().join(".config/policy.toml"), b"keep").unwrap();
+    fs::write(node.home().join("projects/a.txt"), b"alpha").unwrap();
+
+    // 1. Non-admin with read+write+destroy CANNOT rename `~/.config` or `~` or Legion's config dir.
+    node.run(
+        Some("unrestricted_nonadmin"),
+        &json!({"op": "rename", "from": "~/.config", "to": "~/.config2"}),
+        b"",
+    )
+    .refused(ErrorCode::Denied);
+    assert!(node.home().join(".config/policy.toml").exists());
+
+    let parent_escape = node
+        .home()
+        .parent()
+        .unwrap()
+        .join("home2")
+        .to_string_lossy()
+        .into_owned();
+    node.run(
+        Some("unrestricted_nonadmin"),
+        &json!({"op": "rename", "from": "~", "to": parent_escape}),
+        b"",
+    )
+    .refused(ErrorCode::Denied);
+    assert!(node.home().exists());
+
+    let cfg_dir = node.config().to_string_lossy().into_owned();
+    let cfg_dir2 = format!("{cfg_dir}2");
+    node.run(
+        Some("unrestricted_nonadmin"),
+        &json!({"op": "rename", "from": cfg_dir, "to": cfg_dir2}),
+        b"",
+    )
+    .refused(ErrorCode::Denied);
+
+    // 2. Arbitrary rename of distinct entries (`a.txt -> b.txt`) is refused with `invalid_args`
+    //    even for owner: stream `rename` is ONLY for same-file case/normalization renames.
+    node.run(
+        None,
+        &json!({"op": "rename", "from": "~/projects/a.txt", "to": "~/projects/b.txt"}),
+        b"",
+    )
+    .refused(ErrorCode::InvalidArgs);
+    assert!(node.home().join("projects/a.txt").exists());
+    assert!(!node.home().join("projects/b.txt").exists());
+
+    // 3. `probe_write remove` never unlinks a non-empty file even if named like a probe marker.
+    let fake_probe = node.home().join("projects/.legion-move-probe-fake.tmp");
+    fs::write(&fake_probe, b"non-empty-user-data").unwrap();
+    node.run(
+        None,
+        &json!({
+            "op": "probe_write",
+            "action": "remove",
+            "dir": "~/projects",
+            "marker": ".legion-move-probe-fake.tmp"
+        }),
+        b"",
+    )
+    .ok();
+    assert_eq!(
+        fs::read(&fake_probe).unwrap(),
+        b"non-empty-user-data",
+        "probe_write remove must never delete non-empty files"
+    );
+}
+
+#[test]
+fn stream_lock_is_exclusive_and_returns_conflict_while_held() {
+    use std::sync::mpsc;
+
+    let node = Node::new();
+    fs::write(node.home().join("projects/x.txt"), b"hello").unwrap();
+
+    struct HoldAfterHeader {
+        header: Cursor<Vec<u8>>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Read for HoldAfterHeader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.header.read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            let _ = self.release.recv();
+            Ok(0)
+        }
+    }
+
+    struct NotifyWriter {
+        tx: mpsc::Sender<Vec<u8>>,
+    }
+    impl std::io::Write for NotifyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.tx.send(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (rel_tx, rel_rx) = mpsc::channel();
+    let (out_tx, out_rx) = mpsc::channel();
+    let host = node.host.clone();
+    let mut header =
+        json!({"protocol": STREAM_PROTOCOL, "op": "lock", "paths": ["~/projects/x.txt"]})
+            .to_string()
+            .into_bytes();
+    header.push(b'\n');
+    let handle = std::thread::spawn(move || {
+        serve(
+            &host,
+            None,
+            HoldAfterHeader {
+                header: Cursor::new(header),
+                release: rel_rx,
+            },
+            NotifyWriter { tx: out_tx },
+        )
+    });
+
+    let mut gathered = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while gathered.iter().filter(|b| **b == b'\n').count() < 2 {
+        assert!(std::time::Instant::now() < deadline);
+        if let Ok(chunk) = out_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            gathered.extend_from_slice(&chunk);
+        }
+    }
+    let reply_bytes = after_protocol(&gathered);
+    let ready: Value = serde_json::from_slice(reply_bytes).unwrap();
+    assert_eq!(ready["locked"], true, "{ready}");
+    assert_eq!(ready["entries"][0]["exists"], true, "{ready}");
+    assert_eq!(ready["entries"][0]["size"], 5, "{ready}");
+
+    node.run(
+        None,
+        &json!({"op": "lock", "paths": ["~/projects/x.txt"]}),
+        b"",
+    )
+    .refused(ErrorCode::Conflict);
+
+    let _ = rel_tx.send(());
+    handle.join().unwrap().unwrap();
+
+    let after = node
+        .run(
+            None,
+            &json!({"op": "lock", "paths": ["~/projects/x.txt"]}),
+            b"",
+        )
+        .ok()
+        .first()
+        .0;
+    assert_eq!(after["locked"], true, "{after}");
 }

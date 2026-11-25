@@ -25,14 +25,14 @@ use legion_core::{
     Access, BoxFuture, Call, CancellationToken, Ctx, Door, EventSink, Node, Paths, Registry, Tool,
     ToolError, input_schema, parse_args,
 };
-use legion_os::atomic::{WriteOptions, write_atomic};
+use legion_os::atomic::{FileIdentity, WriteOptions, write_atomic};
 use legion_os::detach::{DetachOptions, spawn_detached};
 use legion_os::shell::CommandSpec;
 use legion_proto::{Effect, ErrorBody, ErrorCode, EventKind, ToolSpec};
 use legion_tools::job::{self as transfer_job, JobProgress, TransferJobSpec};
 use legion_xfer::{
     CaseCollision, Entry, EntryKind, Hash, IfExists, Manifest, Plan, PlanConflict, PlanOptions,
-    RenamedEntry, SkippedEntry,
+    RenamedEntry, SkippedEntry, Timestamp,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -49,9 +49,10 @@ use crate::config::{FleetFile, validate_machine_name};
 use crate::connector::PipeHandle;
 use crate::pool::Fleet;
 use crate::stream::{
-    self, CAP_IF_EXISTS, CAP_MOVE, CAP_PROBE, CAP_RENAME, DeleteDone, FsNameBehavior, GetReady,
-    Host, ManifestDone, PackReady, Planned, ProbeReply, PutDone, PutReady, RenameDone,
-    SameEntryDecision, StatReply, UnpackDone, UnpackReady, classify_same_entry,
+    self, CAP_IF_EXISTS, CAP_LOCK, CAP_MOVE, CAP_PROBE, CAP_RENAME, DeleteDone, FsNameBehavior,
+    GetReady, Host, LockEntry, LockReady, ManifestDone, PackReady, Planned, ProbeReply, PutDone,
+    PutReady, RenameDone, SameEntryDecision, StatReply, UnpackDone, UnpackReady,
+    classify_same_entry,
 };
 
 /// How many bytes the relay and the in-process pipes hold at once: memory stays bounded however
@@ -175,6 +176,17 @@ pub(crate) enum IfExistsArg {
     Skip,
     /// Write beside the existing entry as `name (2).ext`, counting up atomically at the destination.
     Rename,
+}
+
+impl IfExistsArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            IfExistsArg::Replace => "replace",
+            IfExistsArg::Fail => "fail",
+            IfExistsArg::Skip => "skip",
+            IfExistsArg::Rename => "rename",
+        }
+    }
 }
 
 impl From<IfExistsArg> for IfExists {
@@ -570,6 +582,13 @@ async fn start_background(ctx: &Ctx, mut args: TransferArgs) -> Result<Value, Er
     let config_dir = ctx.paths().config_dir().to_path_buf();
     let home_dir = ctx.paths().home().map(Path::to_path_buf);
 
+    let mut local_paths = Vec::new();
+    if !from.remote {
+        local_paths.push(from.path.clone());
+    }
+    if !to.remote {
+        local_paths.push(to.path.clone());
+    }
     let created = transfer_job::create_transfer_job(
         &state_dir,
         TransferJobSpec {
@@ -578,7 +597,8 @@ async fn start_background(ctx: &Ctx, mut args: TransferArgs) -> Result<Value, Er
             principal: ctx.principal().to_owned(),
             device: ctx.device().map(str::to_owned),
             pairing_id: ctx.pairing_id().map(str::to_owned),
-            transfer_paths: vec![from.path.clone(), to.path.clone()],
+            transfer_paths: local_paths,
+            transfer_has_remote: from.remote || to.remote,
             transfer_local_from: (!from.remote).then(|| from.path.clone()),
             transfer_local_to: (!to.remote).then(|| to.path.clone()),
             transfer_move: args.move_source,
@@ -1112,6 +1132,58 @@ struct Transfer<'a> {
     sent: &'a Sent,
 }
 
+/// Result of probing whether two directories (one on `from`, one on `to`) are distinct.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DirPairProof {
+    /// Marker created in `to_dir` was confirmed absent in `from_dir`.
+    ProvenDistinct,
+    /// Marker created in `to_dir` appeared in `from_dir` (same directory, bind mount,
+    /// symlinked directory, fleet alias, or shared network mount).
+    SameDirectory,
+    /// The probe could not conclude; callers must refuse removal by default and keep both copies.
+    Inconclusive(String),
+}
+
+/// Active exclusive move locks held across one or two endpoints in deterministic `(machine, path)`
+/// order, together with the live metadata observed on each path under those locks.
+struct HeldMoveLocks {
+    conns: Vec<Conn>,
+    from_entries: HashMap<String, LockEntry>,
+    to_entries: HashMap<String, LockEntry>,
+}
+
+impl HeldMoveLocks {
+    async fn release(self) {
+        for conn in self.conns.into_iter().rev() {
+            conn.close().await;
+        }
+    }
+}
+
+/// One candidate file or symlink eligible to be removed from `from` after its destination copy is
+/// re-verified under exclusive locks on both source and destination.
+struct MoveRemovalCandidate {
+    /// Relative path under `from` (empty for single-file root).
+    rel: String,
+    /// Full path on `from`.
+    from_path: String,
+    /// Actual full path placed on `to` (accounting for `if_exists=rename`).
+    to_path: String,
+    kind: EntryKind,
+    expected_hash: Option<Hash>,
+    expected_size: u64,
+    expected_link_target: Option<String>,
+    /// Post-commit `(file_id, size, mtime)` recorded when the file was placed; if missing or
+    /// mismatched under the held locks, the destination is re-hashed before removing the source.
+    recorded_dest: Option<(Option<FileIdentity>, u64, Option<Timestamp>)>,
+    /// Whether `from` and `to` share a machine or directory (requires `src_id != dst_id`).
+    same_machine_or_dir: bool,
+}
+
+/// Maximum number of candidate files locked together in one tree-move verification round (at most
+/// 128 source+destination paths per `lock` call, well under the 256-path cap).
+const MOVE_LOCK_BATCH: usize = 64;
+
 impl Transfer<'_> {
     async fn run(
         &self,
@@ -1183,46 +1255,69 @@ impl Transfer<'_> {
         if if_exists != IfExists::Replace && !to_caps.contains(CAP_IF_EXISTS) {
             return Err(missing_peer_capability(
                 &to.machine,
-                &format!("if_exists={:?}", args.if_exists),
+                &format!("if_exists={}", args.if_exists.as_str()),
             ));
         }
         if args.move_source {
-            if !from_caps.contains(CAP_MOVE) || !from_caps.contains(CAP_PROBE) {
+            if !from_caps.contains(CAP_MOVE)
+                || !from_caps.contains(CAP_PROBE)
+                || !from_caps.contains(CAP_LOCK)
+            {
                 return Err(missing_peer_capability(&from.machine, "move"));
             }
-            if !to_caps.contains(CAP_MOVE) || !to_caps.contains(CAP_PROBE) {
+            if !to_caps.contains(CAP_MOVE)
+                || !to_caps.contains(CAP_PROBE)
+                || !to_caps.contains(CAP_LOCK)
+            {
                 return Err(missing_peer_capability(&to.machine, "move"));
             }
         }
         Ok(())
     }
 
-    /// Creates a uniquely named probe marker in `to_dir` (or its nearest existing ancestor when
-    /// `nearest_ancestor` is `true`) through `to`, checks through `from` whether that marker
-    /// appears in `from_dir` (or any listed `from_subdirs`), and always removes the marker.
-    async fn probe_same_directory(
+    /// Always probes `(from_dir, to_dir)` by creating a unique marker in `to_dir` and checking
+    /// whether it appears in `from_dir`, caching conclusive results for the transfer.
+    ///
+    /// Never treats an error or missing directory as distinct: returns
+    /// [`DirPairProof::Inconclusive`] so callers keep both the copy and the source.
+    async fn prove_dir_pair(
         &self,
         from: &End,
         from_dir: &str,
-        from_subdirs: &[String],
         to: &End,
         to_dir: &str,
-        nearest_ancestor: bool,
-    ) -> Result<bool, ErrorBody> {
-        let created: ProbeReply = self
+        cache: &mut HashMap<(String, String), DirPairProof>,
+    ) -> DirPairProof {
+        let key = (from_dir.to_owned(), to_dir.to_owned());
+        if let Some(cached) = cache.get(&key) {
+            return cached.clone();
+        }
+        let created: ProbeReply = match self
             .request_required(
                 to,
                 json!({
                     "op": "probe_write",
                     "action": "create",
                     "dir": to_dir,
-                    "nearest_ancestor": nearest_ancestor,
+                    "nearest_ancestor": false,
                 }),
                 &[CAP_PROBE],
             )
-            .await?;
+            .await
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                return DirPairProof::Inconclusive(format!(
+                    "could not probe {} on {}: {}",
+                    to_dir, to.machine, err.message
+                ));
+            }
+        };
         let (Some(probe_dir), Some(marker)) = (created.dir, created.marker) else {
-            return Ok(false);
+            return DirPairProof::Inconclusive(format!(
+                "{} on {} could not be probed for directory distinctness",
+                to_dir, to.machine
+            ));
         };
         let check_res: Result<ProbeReply, ErrorBody> = self
             .request_required(
@@ -1231,7 +1326,7 @@ impl Transfer<'_> {
                     "op": "probe_read",
                     "dir": from_dir,
                     "marker": marker,
-                    "subdirs": from_subdirs,
+                    "subdirs": [],
                 }),
                 &[CAP_PROBE],
             )
@@ -1249,7 +1344,422 @@ impl Transfer<'_> {
                 &[CAP_PROBE],
             )
             .await;
-        Ok(check_res?.exists)
+        match check_res {
+            Ok(reply) => {
+                let proof = if reply.exists {
+                    DirPairProof::SameDirectory
+                } else {
+                    DirPairProof::ProvenDistinct
+                };
+                cache.insert(key, proof.clone());
+                proof
+            }
+            Err(err) => DirPairProof::Inconclusive(format!(
+                "could not check directory probe in {} on {}: {}",
+                from_dir, from.machine, err.message
+            )),
+        }
+    }
+
+    /// Up-front tree-move probe checking whether `to_dir` (or its nearest existing ancestor when
+    /// `to_dir` does not exist yet) aliases `from_dir` or any subdirectory of `from_dir`.
+    #[allow(clippy::too_many_arguments)]
+    async fn probe_tree_root_upfront(
+        &self,
+        from: &End,
+        from_dir: &str,
+        from_subdirs: &[String],
+        to: &End,
+        to_dir: &str,
+        to_exists: bool,
+        cache: &mut HashMap<(String, String), DirPairProof>,
+    ) -> Result<bool, ErrorBody> {
+        let created: ProbeReply = match self
+            .request_required(
+                to,
+                json!({
+                    "op": "probe_write",
+                    "action": "create",
+                    "dir": to_dir,
+                    "nearest_ancestor": !to_exists,
+                }),
+                &[CAP_PROBE],
+            )
+            .await
+        {
+            Ok(reply) => reply,
+            Err(_) => return Ok(false),
+        };
+        let (Some(probe_dir), Some(marker)) = (created.dir, created.marker) else {
+            return Ok(false);
+        };
+        let check_res: Result<ProbeReply, ErrorBody> = self
+            .request_required(
+                from,
+                json!({
+                    "op": "probe_read",
+                    "dir": from_dir,
+                    "marker": marker,
+                    "subdirs": from_subdirs,
+                }),
+                &[CAP_PROBE],
+            )
+            .await;
+        let _ = self
+            .request_required::<ProbeReply>(
+                to,
+                json!({
+                    "op": "probe_write",
+                    "action": "remove",
+                    "dir": probe_dir,
+                    "marker": marker,
+                }),
+                &[CAP_PROBE],
+            )
+            .await;
+        match check_res {
+            Ok(reply) => {
+                if !reply.exists && to_exists {
+                    cache.insert(
+                        (from_dir.to_owned(), to_dir.to_owned()),
+                        DirPairProof::ProvenDistinct,
+                    );
+                }
+                Ok(reply.exists)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Acquires exclusive move locks on `from_paths` (on `from`) and `to_paths` (on `to`) in a
+    /// fixed global order by `(machine, path)`. Returns a clean retryable `conflict` when busy.
+    async fn acquire_move_locks(
+        &self,
+        from: &End,
+        from_paths: &[String],
+        to: &End,
+        to_paths: &[String],
+    ) -> Result<HeldMoveLocks, ErrorBody> {
+        if from.machine == to.machine {
+            let mut combined = Vec::with_capacity(from_paths.len() + to_paths.len());
+            let mut seen = HashSet::new();
+            for p in from_paths.iter().chain(to_paths.iter()) {
+                if seen.insert(p.clone()) {
+                    combined.push(p.clone());
+                }
+            }
+            let mut conn = self
+                .open_with_caps(from, json!({"op": "lock", "paths": combined}), &[CAP_LOCK])
+                .await?;
+            let ready: LockReady = match conn.first().await {
+                Ok(ready) => ready,
+                Err(err) => {
+                    conn.abort().await;
+                    return Err(err);
+                }
+            };
+            let mut by_path: HashMap<String, LockEntry> = ready
+                .entries
+                .into_iter()
+                .map(|e| (e.path.clone(), e))
+                .collect();
+            let mut from_entries = HashMap::with_capacity(from_paths.len());
+            let mut to_entries = HashMap::with_capacity(to_paths.len());
+            for p in from_paths {
+                if let Some(entry) = by_path.get(p) {
+                    from_entries.insert(p.clone(), entry.clone());
+                }
+            }
+            for p in to_paths {
+                if let Some(entry) = by_path.remove(p) {
+                    to_entries.insert(p.clone(), entry);
+                }
+            }
+            return Ok(HeldMoveLocks {
+                conns: vec![conn],
+                from_entries,
+                to_entries,
+            });
+        }
+
+        // Different machines: always lock the lexicographically smaller machine first so two
+        // crossing moves (`a -> b` and `b -> a`) acquire locks in the exact same order.
+        let from_first = from.machine < to.machine;
+        let (first_end, first_paths, second_end, second_paths) = if from_first {
+            (from, from_paths, to, to_paths)
+        } else {
+            (to, to_paths, from, from_paths)
+        };
+        let mut conn1 = self
+            .open_with_caps(
+                first_end,
+                json!({"op": "lock", "paths": first_paths}),
+                &[CAP_LOCK],
+            )
+            .await?;
+        let ready1: LockReady = match conn1.first().await {
+            Ok(ready) => ready,
+            Err(err) => {
+                conn1.abort().await;
+                return Err(err);
+            }
+        };
+        let mut conn2 = match self
+            .open_with_caps(
+                second_end,
+                json!({"op": "lock", "paths": second_paths}),
+                &[CAP_LOCK],
+            )
+            .await
+        {
+            Ok(conn) => conn,
+            Err(err) => {
+                conn1.close().await;
+                return Err(err);
+            }
+        };
+        let ready2: LockReady = match conn2.first().await {
+            Ok(ready) => ready,
+            Err(err) => {
+                conn2.abort().await;
+                conn1.close().await;
+                return Err(err);
+            }
+        };
+        let map1: HashMap<String, LockEntry> = ready1
+            .entries
+            .into_iter()
+            .map(|e| (e.path.clone(), e))
+            .collect();
+        let map2: HashMap<String, LockEntry> = ready2
+            .entries
+            .into_iter()
+            .map(|e| (e.path.clone(), e))
+            .collect();
+        let (from_entries, to_entries) = if from_first {
+            (map1, map2)
+        } else {
+            (map2, map1)
+        };
+        Ok(HeldMoveLocks {
+            conns: vec![conn1, conn2],
+            from_entries,
+            to_entries,
+        })
+    }
+
+    /// Re-verifies one candidate's destination copy while holding exclusive locks on both source
+    /// and destination. Returns `Ok(true)` if the source is safe to delete, `Ok(false)` with an
+    /// explanatory reason in `Err(reason)` if the destination disappeared, changed, or aliases the
+    /// source.
+    async fn verify_candidate_under_locks(
+        &self,
+        to: &End,
+        cand: &MoveRemovalCandidate,
+        from_entries: &HashMap<String, LockEntry>,
+        to_entries: &HashMap<String, LockEntry>,
+    ) -> Result<bool, String> {
+        let Some(src_entry) = from_entries.get(&cand.from_path) else {
+            return Err("source metadata was unavailable under lock".to_owned());
+        };
+        if !src_entry.exists {
+            return Ok(false);
+        }
+        let Some(dst_entry) = to_entries.get(&cand.to_path) else {
+            return Err("destination metadata was unavailable under lock".to_owned());
+        };
+        if !dst_entry.exists {
+            return Err(format!(
+                "destination {} on {} disappeared before the source was removed, so the source was kept",
+                cand.to_path, to.machine
+            ));
+        }
+        if cand.same_machine_or_dir {
+            match (src_entry.file_id, dst_entry.file_id) {
+                (Some(src_id), Some(dst_id)) if !src_id.same_file(&dst_id) => {}
+                _ => {
+                    return Err(
+                        "source and destination could not be proven to be distinct files under lock, so the source was kept"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        match cand.kind {
+            EntryKind::Symlink => {
+                if dst_entry.kind != "symlink" || dst_entry.link_target != cand.expected_link_target
+                {
+                    return Err(format!(
+                        "destination symlink {} on {} changed before the source was removed, so the source was kept",
+                        cand.to_path, to.machine
+                    ));
+                }
+                Ok(true)
+            }
+            EntryKind::File => {
+                if dst_entry.kind != "file" || dst_entry.size != cand.expected_size {
+                    return Err(format!(
+                        "destination {} on {} changed before the source was removed, so the source was kept",
+                        cand.to_path, to.machine
+                    ));
+                }
+                let fast_match = cand
+                    .recorded_dest
+                    .is_some_and(|(rec_id, rec_size, rec_mtime)| {
+                        rec_id.is_some()
+                            && rec_mtime.is_some()
+                            && dst_entry.file_id == rec_id
+                            && dst_entry.size == rec_size
+                            && dst_entry.mtime == rec_mtime
+                    });
+                if fast_match {
+                    return Ok(true);
+                }
+                // Metadata was not recorded (e.g. `files_unchanged`) or changed since copy:
+                // re-hash the destination file right now while holding both locks.
+                let mut stat_req = json!({
+                    "op": "stat",
+                    "path": cand.to_path,
+                    "checksum": true,
+                    "if_size": cand.expected_size,
+                });
+                if let Some(h) = cand.expected_hash {
+                    stat_req["if_hash"] = json!(h);
+                }
+                let dst_stat: StatReply = self.request(to, stat_req).await.map_err(|err| {
+                    format!(
+                        "could not re-verify destination {} on {}: {}",
+                        cand.to_path, to.machine, err.message
+                    )
+                })?;
+                if dst_entry.kind != "file"
+                    || dst_stat.kind != "file"
+                    || dst_stat.size != cand.expected_size
+                    || cand.expected_hash.is_none()
+                    || dst_stat.hash != cand.expected_hash
+                {
+                    return Err(format!(
+                        "destination {} on {} no longer matches the source hash, so the source was kept",
+                        cand.to_path, to.machine
+                    ));
+                }
+                Ok(true)
+            }
+            EntryKind::Dir => Ok(false),
+        }
+    }
+
+    /// Acquires exclusive locks on a single-file move's `(from, target)`, re-verifies the
+    /// destination under those locks, removes `from` while holding them, and releases them.
+    #[allow(clippy::too_many_arguments)]
+    async fn lock_verify_and_remove_single_file(
+        &self,
+        from: &End,
+        to: &End,
+        actual_to_path: &str,
+        expected_hash: Hash,
+        expected_size: u64,
+        recorded_dest: Option<(Option<FileIdentity>, u64, Option<Timestamp>)>,
+        same_machine_or_dir: bool,
+        skipped: &mut Vec<SkippedEntry>,
+    ) -> Result<u64, ErrorBody> {
+        let from_paths = vec![from.path.clone()];
+        let to_paths = vec![actual_to_path.to_owned()];
+        let locks = self
+            .acquire_move_locks(from, &from_paths, to, &to_paths)
+            .await?;
+        let cand = MoveRemovalCandidate {
+            rel: String::new(),
+            from_path: from.path.clone(),
+            to_path: actual_to_path.to_owned(),
+            kind: EntryKind::File,
+            expected_hash: Some(expected_hash),
+            expected_size,
+            expected_link_target: None,
+            recorded_dest,
+            same_machine_or_dir,
+        };
+        let verified = self
+            .verify_candidate_under_locks(to, &cand, &locks.from_entries, &locks.to_entries)
+            .await;
+        let result = match verified {
+            Ok(true) => {
+                let forbid = same_machine_or_dir
+                    .then(|| {
+                        locks
+                            .to_entries
+                            .get(actual_to_path)
+                            .and_then(|e| e.file_id)
+                            .map(|id| (id.dev, id.ino))
+                    })
+                    .flatten();
+                self.remove_source_root(from, Some(expected_hash), forbid, skipped)
+                    .await
+            }
+            Ok(false) => Ok(0),
+            Err(reason) => Err(ErrorBody::new(ErrorCode::Conflict, reason)
+                .with_hint("Run the transfer again once no other move is modifying these paths.")
+                .with_machine(from.machine.clone())),
+        };
+        locks.release().await;
+        result
+    }
+
+    /// Acquires exclusive locks on batches of tree-move candidates in fixed `(machine, path)`
+    /// order, re-verifies every destination file under those locks, deletes only the verified
+    /// source files while holding the locks, and returns `(removed_count, any_kept)`.
+    async fn lock_verify_and_delete_tree_candidates(
+        &self,
+        from: &End,
+        to: &End,
+        candidates: &[MoveRemovalCandidate],
+        skipped: &mut Vec<SkippedEntry>,
+    ) -> Result<(u64, bool), ErrorBody> {
+        let mut total_removed = 0u64;
+        let mut any_kept = false;
+        for chunk in candidates.chunks(MOVE_LOCK_BATCH) {
+            let from_paths: Vec<String> = chunk.iter().map(|c| c.from_path.clone()).collect();
+            let to_paths: Vec<String> = chunk.iter().map(|c| c.to_path.clone()).collect();
+            let locks = self
+                .acquire_move_locks(from, &from_paths, to, &to_paths)
+                .await?;
+            let mut to_delete: Vec<String> = Vec::with_capacity(chunk.len());
+            let mut hashes: HashMap<String, Hash> = HashMap::new();
+            for cand in chunk {
+                match self
+                    .verify_candidate_under_locks(to, cand, &locks.from_entries, &locks.to_entries)
+                    .await
+                {
+                    Ok(true) => {
+                        to_delete.push(cand.rel.clone());
+                        if let Some(h) = cand.expected_hash {
+                            hashes.insert(cand.rel.clone(), h);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(reason) => {
+                        any_kept = true;
+                        skipped.push(SkippedEntry {
+                            path: cand.rel.clone(),
+                            reason,
+                        });
+                    }
+                }
+            }
+            let delete_res = if to_delete.is_empty() {
+                Ok(0)
+            } else {
+                self.delete_verified(from, &to_delete, &hashes, false, skipped)
+                    .await
+            };
+            locks.release().await;
+            let removed = delete_res?;
+            if removed < to_delete.len() as u64 {
+                any_kept = true;
+            }
+            total_removed += removed;
+        }
+        Ok((total_removed, any_kept))
     }
 
     async fn file(
@@ -1287,7 +1797,10 @@ impl Transfer<'_> {
                 .await?;
         }
         Self::check_peer_capabilities(from, from_caps, &target, &to_caps, if_exists, args)?;
-        let mut probed_same_dir = false;
+        let mut proof_cache: HashMap<(String, String), DirPairProof> = HashMap::new();
+        let from_parent = parent_dir_of(&from.path);
+        let to_parent = parent_dir_of(&target.path);
+        let mut upfront_proof: Option<DirPairProof> = None;
         if args.move_source {
             self.check_move_permission(from).await?;
             // On one node, classify same-entry vs folding rename vs alias using parent
@@ -1354,30 +1867,24 @@ impl Transfer<'_> {
             }
             check_not_same_or_subtree(from, &target, source, &there, false)?;
 
-            // Across nodes, fleet aliases, or separate mounts (different `dev` or missing
-            // `file_id`), prove distinctness with a directory-pair probe before removing anything.
-            let need_probe = from.machine != target.machine
-                || source.file_id.is_none()
-                || there.file_id.is_some_and(|dst_id| {
-                    source
-                        .file_id
-                        .is_some_and(|src_id| src_id.dev != dst_id.dev)
-                });
-            if need_probe && !args.dry_run {
-                let from_parent = parent_dir_of(&from.path);
-                let to_parent = parent_dir_of(&target.path);
-                probed_same_dir = self
-                    .probe_same_directory(from, &from_parent, &[], &target, &to_parent, false)
-                    .await?;
-                if probed_same_dir && there.kind != "missing" {
+            // Always probe `(from_parent, to_parent)` regardless of machine names, devices, or
+            // mounts so fleet aliases, bind mounts, and shared network folders are caught up front.
+            if !args.dry_run {
+                let proof = self
+                    .prove_dir_pair(from, &from_parent, &target, &to_parent, &mut proof_cache)
+                    .await;
+                if proof == DirPairProof::SameDirectory && there.kind != "missing" {
                     let proven_distinct_same_dev = source
                         .file_id
                         .zip(there.file_id)
                         .is_some_and(|(a, b)| a.dev == b.dev && a.ino != b.ino);
-                    if !proven_distinct_same_dev {
+                    if !proven_distinct_same_dev
+                        && (if_exists != IfExists::Rename || from.machine == target.machine)
+                    {
                         return Err(same_file_move_error(from, &target));
                     }
                 }
+                upfront_proof = Some(proof);
             }
         }
         let mut report = TransferReport {
@@ -1419,13 +1926,53 @@ impl Transfer<'_> {
                             report.source_removed = 1;
                             report.would_remove = Some(vec![from.path.clone()]);
                         } else {
-                            let forbid = (from.machine == target.machine || probed_same_dir)
-                                .then(|| there.file_id.map(|id| (id.dev, id.ino)))
-                                .flatten();
-                            let removed = self
-                                .remove_source_root(from, Some(hash), forbid, &mut report.skipped)
-                                .await?;
-                            report.source_removed = removed;
+                            let dir_proof = match upfront_proof {
+                                Some(DirPairProof::ProvenDistinct) => DirPairProof::ProvenDistinct,
+                                Some(DirPairProof::SameDirectory) => DirPairProof::SameDirectory,
+                                _ => {
+                                    self.prove_dir_pair(
+                                        from,
+                                        &from_parent,
+                                        &target,
+                                        &to_parent,
+                                        &mut proof_cache,
+                                    )
+                                    .await
+                                }
+                            };
+                            match dir_proof {
+                                DirPairProof::Inconclusive(reason) => {
+                                    report.skipped.push(SkippedEntry {
+                                        path: from.path.clone(),
+                                        reason: format!(
+                                            "kept source because {} on {} and {} on {} could not be proven distinct ({reason})",
+                                            from_parent, from.machine, to_parent, target.machine
+                                        ),
+                                    });
+                                }
+                                DirPairProof::SameDirectory if from.machine != target.machine => {
+                                    return Err(same_file_move_error(from, &target));
+                                }
+                                DirPairProof::ProvenDistinct | DirPairProof::SameDirectory => {
+                                    let same_machine_or_dir = from.machine == target.machine
+                                        || dir_proof == DirPairProof::SameDirectory;
+                                    let mut skipped = Vec::new();
+                                    let removed = self
+                                        .lock_verify_and_remove_single_file(
+                                            from,
+                                            &target,
+                                            &target.path,
+                                            hash,
+                                            size,
+                                            None,
+                                            same_machine_or_dir,
+                                            &mut skipped,
+                                        )
+                                        .await?;
+                                    report.source_removed = removed;
+                                    report.skipped = report.list(skipped);
+                                }
+                            }
                         }
                     }
                     return Ok(report);
@@ -1480,34 +2027,65 @@ impl Transfer<'_> {
             report.files_skipped = 1;
             return Ok(report);
         }
-        if let Some(ref actual_path) = done.path
+        let actual_target_path = if let Some(ref actual_path) = done.path
             && if_exists == IfExists::Rename
         {
             let chosen_name = file_name(actual_path);
             let reported_path = replace_path_filename(&target.path, chosen_name);
             report.to = format!("{}:{reported_path}", target.machine);
-        }
+            reported_path
+        } else {
+            target.path.clone()
+        };
         report.files_sent = 1;
         report.bytes_sent = sent;
         report.resumed_from = (resumed > 0).then_some(resumed);
         if args.move_source {
-            // Re-verify post-copy file identity on the same machine (or same directory via alias)
-            // so a source sharing an inode with the placed destination is never removed.
-            if (from.machine == target.machine || probed_same_dir)
-                && let (Some(src_id), Some(dst_id)) = (source.file_id, done.file_id)
-                && src_id.same_file(&dst_id)
-            {
-                return Err(same_file_move_error(from, &target));
+            let actual_to_parent = parent_dir_of(&actual_target_path);
+            let dir_proof = self
+                .prove_dir_pair(
+                    from,
+                    &from_parent,
+                    &target,
+                    &actual_to_parent,
+                    &mut proof_cache,
+                )
+                .await;
+            match dir_proof {
+                DirPairProof::Inconclusive(reason) => {
+                    report.skipped.push(SkippedEntry {
+                        path: from.path.clone(),
+                        reason: format!(
+                            "kept source because {} on {} and {} on {} could not be proven distinct ({reason})",
+                            from_parent, from.machine, actual_to_parent, target.machine
+                        ),
+                    });
+                }
+                DirPairProof::SameDirectory
+                    if file_name(&from.path) == file_name(&actual_target_path) =>
+                {
+                    return Err(same_file_move_error(from, &target));
+                }
+                DirPairProof::ProvenDistinct | DirPairProof::SameDirectory => {
+                    let same_machine_or_dir =
+                        from.machine == target.machine || dir_proof == DirPairProof::SameDirectory;
+                    let mut skipped = Vec::new();
+                    let removed = self
+                        .lock_verify_and_remove_single_file(
+                            from,
+                            &target,
+                            &actual_target_path,
+                            hash,
+                            size,
+                            Some((done.file_id, done.size, done.mtime)),
+                            same_machine_or_dir,
+                            &mut skipped,
+                        )
+                        .await?;
+                    report.source_removed = removed;
+                    report.skipped = report.list(skipped);
+                }
             }
-            let forbid = (from.machine == target.machine || probed_same_dir)
-                .then(|| done.file_id.map(|id| (id.dev, id.ino)))
-                .flatten();
-            let mut skipped = Vec::new();
-            let removed = self
-                .remove_source_root(from, Some(hash), forbid, &mut skipped)
-                .await?;
-            report.source_removed = removed;
-            report.skipped = report.list(skipped);
         }
         Ok(report)
     }
@@ -1734,17 +2312,8 @@ impl Transfer<'_> {
         let source = self
             .manifest(from, effective_checksum, &args.exclude)
             .await?;
-        let need_probe = args.move_source
-            && !args.dry_run
-            && (from.machine != to.machine
-                || source_stat.file_id.is_none()
-                || there.file_id.is_some_and(|dst_id| {
-                    source_stat
-                        .file_id
-                        .is_some_and(|src_id| src_id.dev != dst_id.dev)
-                }));
-        let mut probed_subdirs: HashSet<String> = HashSet::new();
-        if need_probe {
+        let mut proof_cache: HashMap<(String, String), DirPairProof> = HashMap::new();
+        if args.move_source && !args.dry_run {
             let source_subdirs: Vec<String> = source
                 .entries
                 .iter()
@@ -1752,12 +2321,19 @@ impl Transfer<'_> {
                 .map(|e| e.path.clone())
                 .collect();
             let same_or_subtree = self
-                .probe_same_directory(from, &from.path, &source_subdirs, to, &to.path, true)
+                .probe_tree_root_upfront(
+                    from,
+                    &from.path,
+                    &source_subdirs,
+                    to,
+                    &to.path,
+                    !missing,
+                    &mut proof_cache,
+                )
                 .await?;
             if same_or_subtree {
                 return Err(same_file_move_error(from, to));
             }
-            probed_subdirs.insert(String::new());
         }
         let dest = if missing {
             Manifest::default()
@@ -1905,6 +2481,8 @@ impl Transfer<'_> {
             rounds.push(&[]);
         }
         let mut renamed: Vec<RenamedEntry> = Vec::new();
+        let mut unsafe_dirs: HashSet<String> = HashSet::new();
+        let mut any_source_kept = false;
         for names in rounds {
             let budget = archive_budget(names, &listed);
             let done = self
@@ -1926,38 +2504,109 @@ impl Transfer<'_> {
             report.files_sent += done.files;
             report.bytes_sent += done.bytes;
             report.files_skipped += done.files_skipped;
+            let round_renamed: HashMap<String, String> = done
+                .renamed
+                .iter()
+                .map(|r| (r.from.clone(), r.to.clone()))
+                .collect();
             renamed.extend(done.renamed);
             skipped.extend(on(&to.machine, done.skipped));
             if caseless {
                 conflicts.extend(case_conflicts(&done.case_collisions, &to.machine));
             }
-            // Only remove source files/symlinks that this round just verified by hash and placed at
-            // the destination; never remove anything skipped or omitted.
+            // Only remove source files/symlinks after:
+            // 1. Proving their `(from_sub, to_sub)` directory pair distinct (cached per pair);
+            // 2. Re-verifying the destination copy under exclusive locks on both source and dest.
             if args.move_source {
                 let mut verified =
                     Vec::with_capacity(done.verified_files.len() + done.verified_symlinks.len());
                 verified.extend(done.verified_files);
                 verified.extend(done.verified_symlinks);
                 if !verified.is_empty() {
-                    if need_probe {
-                        for rel in &verified {
-                            let sub = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
-                            if !sub.is_empty() && probed_subdirs.insert(sub.to_owned()) {
-                                let from_sub = join(&from.path, sub);
-                                let to_sub = join(&to.path, sub);
-                                if self
-                                    .probe_same_directory(from, &from_sub, &[], to, &to_sub, false)
-                                    .await?
-                                {
-                                    return Err(same_file_move_error(from, to));
+                    let mut safe_candidates: Vec<MoveRemovalCandidate> = Vec::new();
+                    for rel in verified {
+                        let sub = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+                        let from_sub = if sub.is_empty() {
+                            from.path.clone()
+                        } else {
+                            join(&from.path, sub)
+                        };
+                        let to_sub = if sub.is_empty() {
+                            to.path.clone()
+                        } else {
+                            join(&to.path, sub)
+                        };
+                        let proof = self
+                            .prove_dir_pair(from, &from_sub, to, &to_sub, &mut proof_cache)
+                            .await;
+                        match proof {
+                            DirPairProof::ProvenDistinct => {
+                                let Some(entry) = listed.get(rel.as_str()) else {
+                                    continue;
+                                };
+                                let dest_rel = round_renamed.get(&rel).unwrap_or(&rel);
+                                let recorded_dest = done
+                                    .placed_meta
+                                    .get(&rel)
+                                    .map(|m| (m.file_id, m.size, m.mtime));
+                                safe_candidates.push(MoveRemovalCandidate {
+                                    rel: rel.clone(),
+                                    from_path: join(&from.path, &rel),
+                                    to_path: join(&to.path, dest_rel),
+                                    kind: entry.kind,
+                                    expected_hash: entry.hash,
+                                    expected_size: entry.size,
+                                    expected_link_target: entry.link_target.clone(),
+                                    recorded_dest,
+                                    same_machine_or_dir: from.machine == to.machine,
+                                });
+                            }
+                            DirPairProof::SameDirectory => {
+                                any_source_kept = true;
+                                if unsafe_dirs.insert(sub.to_owned()) {
+                                    skipped.push(SkippedEntry {
+                                        path: if sub.is_empty() {
+                                            from.path.clone()
+                                        } else {
+                                            sub.to_owned()
+                                        },
+                                        reason: format!(
+                                            "kept source because {} on {} and {} on {} refer to the same directory",
+                                            from_sub, from.machine, to_sub, to.machine
+                                        ),
+                                    });
+                                }
+                            }
+                            DirPairProof::Inconclusive(reason) => {
+                                any_source_kept = true;
+                                if unsafe_dirs.insert(sub.to_owned()) {
+                                    skipped.push(SkippedEntry {
+                                        path: if sub.is_empty() {
+                                            from.path.clone()
+                                        } else {
+                                            sub.to_owned()
+                                        },
+                                        reason: format!(
+                                            "kept source because {} on {} and {} on {} could not be proven distinct ({reason})",
+                                            from_sub, from.machine, to_sub, to.machine
+                                        ),
+                                    });
                                 }
                             }
                         }
                     }
-                    let hashes = expected_hashes_for(&verified, &listed);
-                    report.source_removed += self
-                        .delete_verified(from, &verified, &hashes, false, &mut skipped)
-                        .await?;
+                    if !safe_candidates.is_empty() {
+                        let (removed, kept) = self
+                            .lock_verify_and_delete_tree_candidates(
+                                from,
+                                to,
+                                &safe_candidates,
+                                &mut skipped,
+                            )
+                            .await?;
+                        report.source_removed += removed;
+                        any_source_kept |= kept;
+                    }
                 }
             }
         }
@@ -1967,38 +2616,109 @@ impl Transfer<'_> {
         report.deleted += self.delete(to, &extras, &mut skipped).await?;
         if args.move_source {
             if !already_verified.is_empty() {
-                if need_probe {
-                    for rel in &already_verified {
-                        let sub = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
-                        if !sub.is_empty() && probed_subdirs.insert(sub.to_owned()) {
-                            let from_sub = join(&from.path, sub);
-                            let to_sub = join(&to.path, sub);
-                            if self
-                                .probe_same_directory(from, &from_sub, &[], to, &to_sub, false)
-                                .await?
-                            {
-                                return Err(same_file_move_error(from, to));
+                let mut safe_candidates: Vec<MoveRemovalCandidate> = Vec::new();
+                for rel in &already_verified {
+                    let sub = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+                    let from_sub = if sub.is_empty() {
+                        from.path.clone()
+                    } else {
+                        join(&from.path, sub)
+                    };
+                    let to_sub = if sub.is_empty() {
+                        to.path.clone()
+                    } else {
+                        join(&to.path, sub)
+                    };
+                    let proof = self
+                        .prove_dir_pair(from, &from_sub, to, &to_sub, &mut proof_cache)
+                        .await;
+                    match proof {
+                        DirPairProof::ProvenDistinct => {
+                            let Some(entry) = listed.get(rel.as_str()) else {
+                                continue;
+                            };
+                            safe_candidates.push(MoveRemovalCandidate {
+                                rel: rel.clone(),
+                                from_path: join(&from.path, rel),
+                                to_path: join(&to.path, rel),
+                                kind: entry.kind,
+                                expected_hash: entry.hash,
+                                expected_size: entry.size,
+                                expected_link_target: entry.link_target.clone(),
+                                recorded_dest: None,
+                                same_machine_or_dir: from.machine == to.machine,
+                            });
+                        }
+                        DirPairProof::SameDirectory => {
+                            any_source_kept = true;
+                            if unsafe_dirs.insert(sub.to_owned()) {
+                                skipped.push(SkippedEntry {
+                                    path: if sub.is_empty() {
+                                        from.path.clone()
+                                    } else {
+                                        sub.to_owned()
+                                    },
+                                    reason: format!(
+                                        "kept source because {} on {} and {} on {} refer to the same directory",
+                                        from_sub, from.machine, to_sub, to.machine
+                                    ),
+                                });
+                            }
+                        }
+                        DirPairProof::Inconclusive(reason) => {
+                            any_source_kept = true;
+                            if unsafe_dirs.insert(sub.to_owned()) {
+                                skipped.push(SkippedEntry {
+                                    path: if sub.is_empty() {
+                                        from.path.clone()
+                                    } else {
+                                        sub.to_owned()
+                                    },
+                                    reason: format!(
+                                        "kept source because {} on {} and {} on {} could not be proven distinct ({reason})",
+                                        from_sub, from.machine, to_sub, to.machine
+                                    ),
+                                });
                             }
                         }
                     }
                 }
-                let hashes = expected_hashes_for(&already_verified, &listed);
-                report.source_removed += self
-                    .delete_verified(from, &already_verified, &hashes, false, &mut skipped)
-                    .await?;
+                if !safe_candidates.is_empty() {
+                    let (removed, kept) = self
+                        .lock_verify_and_delete_tree_candidates(
+                            from,
+                            to,
+                            &safe_candidates,
+                            &mut skipped,
+                        )
+                        .await?;
+                    report.source_removed += removed;
+                    any_source_kept |= kept;
+                }
             }
             // Remove source directories deepest-first only once every verified file has been
-            // removed; any directory still holding excluded, skipped, or conflicted files stays.
+            // removed; any directory that could not be proven distinct (or still holds excluded,
+            // skipped, or conflicted files) stays.
+            let dir_is_unsafe = |dir: &str| {
+                unsafe_dirs.contains("")
+                    || unsafe_dirs.iter().any(|u| {
+                        u == dir
+                            || u.strip_prefix(dir)
+                                .is_some_and(|rest| rest.starts_with('/'))
+                    })
+            };
             let dirs: Vec<String> = source
                 .entries
                 .iter()
-                .filter(|entry| entry.kind == EntryKind::Dir)
+                .filter(|entry| entry.kind == EntryKind::Dir && !dir_is_unsafe(&entry.path))
                 .map(|entry| entry.path.clone())
                 .collect();
             let remove_root = args.exclude.is_empty()
                 && conflicts.is_empty()
                 && report.files_skipped == 0
-                && skipped.is_empty();
+                && skipped.is_empty()
+                && !any_source_kept
+                && unsafe_dirs.is_empty();
             if !dirs.is_empty() || remove_root {
                 let mut dir_skipped = Vec::new();
                 report.source_removed += self
@@ -2442,20 +3162,6 @@ fn normalize_compare_path(path: &str, caseless: bool) -> String {
     s
 }
 
-/// Maps each regular file in `names` to its planned BLAKE3 hash from `listed`.
-fn expected_hashes_for(names: &[String], listed: &HashMap<&str, &Entry>) -> HashMap<String, Hash> {
-    names
-        .iter()
-        .filter_map(|name| {
-            let entry = listed.get(name.as_str())?;
-            (entry.kind == EntryKind::File)
-                .then_some(entry.hash)
-                .flatten()
-                .map(|h| (name.clone(), h))
-        })
-        .collect()
-}
-
 /// Computes the source paths that `dry_run` with `move: true` would remove from the source tree.
 #[allow(clippy::too_many_arguments)]
 fn planned_source_removals(
@@ -2720,6 +3426,9 @@ struct Conn {
     received: usize,
     /// When the pipe was opened, which the first reply's time limit counts from.
     opened: tokio::time::Instant,
+    /// Cancelled by a local in-process stream's auth watchdog if permissions/device are revoked
+    /// while the stream is stalled.
+    revoke_token: Option<CancellationToken>,
 }
 
 /// How much a listing from another node may hold: entries, bytes in all, and bytes in one line.
@@ -2757,7 +3466,12 @@ impl Conn {
         required_caps: &[&str],
     ) -> Result<Conn, ErrorBody> {
         header["protocol"] = json!(stream::STREAM_PROTOCOL);
-        let (reader, writer, process): (BoxRead, BoxWrite, Process) = if end.remote {
+        let (reader, writer, process, revoke_token): (
+            BoxRead,
+            BoxWrite,
+            Process,
+            Option<CancellationToken>,
+        ) = if end.remote {
             let op = header
                 .get("op")
                 .and_then(Value::as_str)
@@ -2788,7 +3502,12 @@ impl Conn {
                 )
                 .await?;
             let (stdin, stdout, handle) = pipe.into_parts();
-            (Box::new(stdout), Box::new(stdin), Process::Remote(handle))
+            (
+                Box::new(stdout),
+                Box::new(stdin),
+                Process::Remote(handle),
+                None,
+            )
         } else {
             let (client_out, server_in) = tokio::io::duplex(CHUNK);
             let (server_out, client_in) = tokio::io::duplex(CHUNK);
@@ -2796,15 +3515,18 @@ impl Conn {
             let principal = ctx.principal().to_owned();
             let device = ctx.device().map(str::to_owned);
             let pairing_id = ctx.pairing_id().map(str::to_owned);
+            let revoke_token = CancellationToken::new();
+            let revoke_for_server = revoke_token.clone();
             let input = SyncIoBridge::new(server_in);
             let output = SyncIoBridge::new(server_out);
             let task = tokio::task::spawn_blocking(move || {
-                stream::serve_with_door(
+                stream::serve_with_cancel(
                     &host,
                     Some(&principal),
                     Door::Stream,
                     device.as_deref(),
                     pairing_id.as_deref(),
+                    Some(revoke_for_server),
                     input,
                     output,
                 )
@@ -2813,6 +3535,7 @@ impl Conn {
                 Box::new(client_in),
                 Box::new(client_out),
                 Process::Local(Some(task)),
+                Some(revoke_token),
             )
         };
         let mut conn = Conn {
@@ -2832,6 +3555,7 @@ impl Conn {
             longest: LONGEST_REPLY,
             received: 0,
             opened: tokio::time::Instant::now(),
+            revoke_token,
         };
         let mut line = header.to_string().into_bytes();
         line.push(b'\n');
@@ -3404,6 +4128,24 @@ enum Amount {
     AtMost(u64),
 }
 
+async fn wait_revoked(token: &Option<CancellationToken>) {
+    match token {
+        Some(t) => t.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn write_to_opt(writer: &mut Option<BoxWrite>, bytes: &[u8]) -> std::io::Result<()> {
+    let Some(w) = writer.as_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "the input was already closed",
+        ));
+    };
+    w.write_all(bytes).await?;
+    w.flush().await
+}
+
 /// Copies the source's output to the destination's input in fixed chunks, never more than
 /// `amount` allows: a source that sends more is stopped before the excess reaches the destination.
 async fn relay(
@@ -3417,6 +4159,11 @@ async fn relay(
     let limit = match amount {
         Amount::Exactly(total) | Amount::AtMost(total) => total,
     };
+    let source_revoke = source.revoke_token.clone();
+    let dest_revoke = dest.revoke_token.clone();
+    // Once `dest` sends a non-error reply (e.g. `UnpackDone` right before `source` sends EOF),
+    // stop polling `dest.reader` so we do not mistake a normal early reply for an error.
+    let mut dest_replied_ok = false;
     loop {
         // An archive is read one byte past its limit, to tell an archive that ends there from one
         // that goes on.
@@ -3428,10 +4175,29 @@ async fn relay(
         if want == 0 {
             break;
         }
-        let read = tokio::time::timeout(IDLE_TIMEOUT, source.reader.read(&mut buf[..want]))
-            .await
-            .map_err(|_| Broken::Stalled { source: true })?
-            .map_err(|error| Broken::Source(format!("while it sent ({error})")))?;
+        let read = tokio::select! {
+            res = source.reader.read(&mut buf[..want]) => {
+                res.map_err(|error| Broken::Source(format!("while it sent ({error})")))?
+            }
+            res = dest.reader.fill_buf(), if !dest_replied_ok => {
+                match res {
+                    Ok(avail) if avail.starts_with(b"{\"ok\"") || avail.starts_with(b"{\"busy\"") => {
+                        dest_replied_ok = true;
+                        continue;
+                    }
+                    _ => return Err(Broken::Destination("while it received".to_owned())),
+                }
+            }
+            () = wait_revoked(&source_revoke) => {
+                return Err(Broken::Source("because access was revoked".to_owned()));
+            }
+            () = wait_revoked(&dest_revoke) => {
+                return Err(Broken::Destination("because access was revoked".to_owned()));
+            }
+            () = tokio::time::sleep(IDLE_TIMEOUT) => {
+                return Err(Broken::Stalled { source: true });
+            }
+        };
         if read == 0 {
             if let Amount::Exactly(_) = amount {
                 return Err(Broken::Source(format!(
@@ -3443,10 +4209,31 @@ async fn relay(
         if copied + read as u64 > limit {
             return Err(Broken::Excess(limit));
         }
-        tokio::time::timeout(IDLE_TIMEOUT, dest.write(&buf[..read]))
-            .await
-            .map_err(|_| Broken::Stalled { source: false })?
-            .map_err(|error| Broken::Destination(format!("while it received ({error})")))?;
+        loop {
+            tokio::select! {
+                res = write_to_opt(&mut dest.writer, &buf[..read]) => {
+                    res.map_err(|error| Broken::Destination(format!("while it received ({error})")))?;
+                    break;
+                }
+                res = dest.reader.fill_buf(), if !dest_replied_ok => {
+                    match res {
+                        Ok(avail) if avail.starts_with(b"{\"ok\"") || avail.starts_with(b"{\"busy\"") => {
+                            dest_replied_ok = true;
+                        }
+                        _ => return Err(Broken::Destination("while it received".to_owned())),
+                    }
+                }
+                () = wait_revoked(&source_revoke) => {
+                    return Err(Broken::Source("because access was revoked".to_owned()));
+                }
+                () = wait_revoked(&dest_revoke) => {
+                    return Err(Broken::Destination("because access was revoked".to_owned()));
+                }
+                () = tokio::time::sleep(IDLE_TIMEOUT) => {
+                    return Err(Broken::Stalled { source: false });
+                }
+            }
+        }
         copied += read as u64;
         meter.add(&buf[..read]);
     }
@@ -3903,6 +4690,7 @@ mod tests {
             longest: LONGEST_REPLY,
             received: 0,
             opened: tokio::time::Instant::now(),
+            revoke_token: None,
         };
         (conn, peer_out, peer_in)
     }

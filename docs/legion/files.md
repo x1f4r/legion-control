@@ -86,13 +86,24 @@ node.
   writes `name (2).ext`).
 - `move`: after the destination is verified by hash (re-read from disk after `sync_all`), remove
   the source. It needs the caller to be allowed `fs.remove` (`effect:destroy`) on the source and is
-  refused before any byte moves otherwise. Source and destination are checked by file identity on
-  one machine and by a directory-pair probe across aliases, mounts, or machines so moving a file or
-  directory onto itself is refused rather than deleting the only copy; case-only or
-  Unicode-normalization-only renames within one directory on one machine are performed as a
-  two-step atomic rename. A tree is verified file by file and a source file is removed only once
-  its copy is verified; an interrupted move (even if the transfer worker is killed mid-flight)
-  leaves every file in at least one place.
+  refused before any byte moves otherwise. Before any source file is removed, each `(source_dir,
+  dest_dir)` directory pair is probed with a unique marker (cached per pair within a transfer) so
+  moving a file, tree, or bind-mounted or symlinked subfolder onto itself is caught regardless of
+  machine names, devices, or mounts; when a probe finds the same directory or cannot conclude,
+  both the copy and the source are kept and the report names which folders could not be told apart.
+  Source removal runs only while holding exclusive per-path locks in the node's state directory on
+  both source and destination taken in a fixed `(machine, path)` order (returning a retryable
+  `conflict` when busy), re-verifying under those locks that the destination still exists, is
+  distinct from the source, and matches its recorded identity, size, and modification time (or
+  re-hashing when they differ). Case-only or Unicode-normalization-only renames within one
+  directory on one machine try a direct rename first and fall back to a recoverable two-step
+  rename through a visible intermediate name (`legion-renaming-*`) recorded under the node's state
+  directory only when direct rename is a no-op; interrupted two-step renames are completed or
+  reversed on the next listing or transfer. Only `<name>.legion-part` lives beside a destination
+  file during a transfer; lock, metadata, claim, and rename recovery sidecars live under the node's
+  state directory. A tree is verified file by file and a source file is removed only once its copy
+  is verified; an interrupted move (even if the transfer worker is killed mid-flight) leaves every
+  file in at least one place.
 - `background`: start the transfer as a job on the node that runs it and return
   `{job: {id, machine}}` at once. The job belongs to the caller's principal (and pairing id when
   started by a paired device), is listed by `job.list` with `kind: "transfer"` and a `title` a
@@ -101,8 +112,9 @@ node.
   offset 0 so `bytes_done` stays honest per attempt) in `job.status`, and survives the caller
   disconnecting. Its owner may cancel it with `job.cancel` without holding `effect:exec`;
   cancelling keeps the partial file, so starting the same transfer again resumes. Removing the
-  paired device or revoking its transfer permissions cancels active background transfers and stops
-  in-flight streams promptly.
+  paired device, revoking its transfer permissions, or leaving `policy.toml` unparsable cancels
+  active background transfers and stops in-flight streams within a few MiB or about two seconds
+  (whichever comes first, even on slow or stalled links).
 
 A controller starts a machine-to-machine transfer on the source machine
 (`on: A`, `from: /path`, `to: "B:/path"`), and on the destination when the source cannot reach

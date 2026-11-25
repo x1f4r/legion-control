@@ -40,13 +40,13 @@
 //! closes its input, so a sender writing to it is never left blocked.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, FileTimes};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -55,14 +55,16 @@ use crate::guard::{Expected, Guarded, Watch};
 use legion_core::audit::{self, AuditLog, Entry as AuditEntry, Outcome};
 use legion_core::config::ConfigStore;
 use legion_core::policy::Policy;
-use legion_core::{Access, CreateKind, Door, Grant, Paths};
-use legion_os::atomic::{FileIdentity, file_identity, symlink_file_identity};
+use legion_core::{Access, CancellationToken, CreateKind, Door, Grant, Paths};
+use legion_os::atomic::{
+    FileIdentity, WriteOptions, file_identity, symlink_file_identity, write_atomic,
+};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::device::registry::DevicesFile;
 use legion_tools::xfer::{error as xfer_error, manifest, resolve_root};
 use legion_xfer::{
-    CaseCollision, Entry, EntryKind, Hash, IfExists, ManifestOptions, PutSession, RenamedEntry,
-    SkippedEntry, Timestamp, resolve_relative_path,
+    CaseCollision, Entry, EntryKind, Hash, IfExists, ManifestOptions, PlacedFileMeta, PutSession,
+    RenamedEntry, SkippedEntry, Timestamp, resolve_relative_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -73,17 +75,20 @@ pub const STREAM_PROTOCOL: u32 = 1;
 
 /// Stream capability: destination honours `if_exists` (`fail`, `skip`, `replace`, `rename`).
 pub const CAP_IF_EXISTS: &str = "if_exists";
+/// Stream capability: node supports `lock` (ordered exclusive move locks in the node's state dir).
+pub const CAP_LOCK: &str = "lock";
 /// Stream capability: node supports safe `move` (`delete` with `dry_run`, `remove_root`,
 /// `expect_hashes`, `expect_root_hash`, `forbid_file_id`, stored-file hash verification in
 /// `unpack`, and `file_id` reporting).
 pub const CAP_MOVE: &str = "move";
 /// Stream capability: node supports `probe_write` / `probe_read` directory distinctness probes.
 pub const CAP_PROBE: &str = "probe";
-/// Stream capability: node supports atomic two-step same-node `rename`.
+/// Stream capability: node supports recoverable same-entry case/normalization `rename`.
 pub const CAP_RENAME: &str = "rename";
 
 /// Capabilities advertised in this node's stream greeting line.
-pub const STREAM_CAPABILITIES: [&str; 4] = [CAP_IF_EXISTS, CAP_MOVE, CAP_PROBE, CAP_RENAME];
+pub const STREAM_CAPABILITIES: [&str; 5] =
+    [CAP_IF_EXISTS, CAP_LOCK, CAP_MOVE, CAP_PROBE, CAP_RENAME];
 
 /// How often an operation at work on something long says so, where a reply line is awaited.
 pub const HEARTBEAT: Duration = Duration::from_secs(10);
@@ -91,11 +96,18 @@ pub const HEARTBEAT: Duration = Duration::from_secs(10);
 /// How many streamed bytes pass between live permission and device-revocation re-checks.
 const RECHECK_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Maximum wall-clock time between live permission and device-revocation re-checks, so slow or
+/// stalled streams also stop promptly after revocation.
+const RECHECK_INTERVAL_TIME: Duration = Duration::from_secs(2);
+
+/// Watchdog polling cadence while waiting on stalled stream I/O.
+const RECHECK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Monotonic sequence number for unique sibling probe/rename temp names.
 static STREAM_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The operations this node knows, as `unsupported` names them.
-const OPS: [&str; 10] = [
+const OPS: [&str; 11] = [
     "manifest",
     "stat",
     "get",
@@ -106,6 +118,7 @@ const OPS: [&str; 10] = [
     "probe_write",
     "probe_read",
     "rename",
+    "lock",
 ];
 
 /// The longest header read. A header carries the names a `pack` or `delete` acts on, which a
@@ -251,12 +264,17 @@ pub(crate) enum Op {
         #[serde(default)]
         subdirs: Vec<String>,
     },
-    /// Atomically rename an entry on this node when `from` and `to` already refer to the exact
-    /// same file or directory in the same parent directory (case-only or Unicode-normalization
-    /// rename), stepping through a unique sibling temporary name when the filesystem needs it.
+    /// Rename an entry on this node ONLY when `from` and `to` already refer to the exact same file
+    /// or directory in the same parent directory (case-only or Unicode-normalization rename).
     Rename {
         from: String,
         to: String,
+    },
+    /// Acquire exclusive per-path move locks in the node's state directory in sorted path order,
+    /// inspect every locked path, reply with [`LockReady`], and hold the locks until the stream's
+    /// input closes.
+    Lock {
+        paths: Vec<String>,
     },
 }
 
@@ -281,6 +299,7 @@ impl Op {
             Op::ProbeWrite { .. } => "probe_write",
             Op::ProbeRead { .. } => "probe_read",
             Op::Rename { .. } => "rename",
+            Op::Lock { .. } => "lock",
         }
     }
 
@@ -294,8 +313,9 @@ impl Op {
 pub(crate) fn op_tool(op: &str) -> Option<(&'static str, Effect)> {
     match op {
         "manifest" | "stat" | "get" | "pack" | "probe_read" => Some(("fs.read", Effect::Read)),
-        "put" | "unpack" | "probe_write" => Some(("fs.write", Effect::Write)),
-        "delete" | "rename" => Some(("fs.remove", Effect::Destroy)),
+        "put" | "unpack" | "probe_write" | "lock" => Some(("fs.write", Effect::Write)),
+        "rename" => Some(("fs.move", Effect::Write)),
+        "delete" => Some(("fs.remove", Effect::Destroy)),
         _ => None,
     }
 }
@@ -399,6 +419,9 @@ pub(crate) struct PutDone {
     /// Filesystem identity `(dev, ino, nlink)` of the placed file after commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_id: Option<FileIdentity>,
+    /// Modification time of the placed file after commit (after `set_times`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<Timestamp>,
 }
 
 /// The line that answers a `pack` before its archive: the names it left out, and why.
@@ -435,6 +458,10 @@ pub(crate) struct UnpackDone {
     /// Symlinks unpacked in this round (by their planned relative path).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified_symlinks: Vec<String>,
+    /// Post-commit metadata of each verified regular file placed in this round, keyed by its
+    /// planned relative path.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub placed_meta: BTreeMap<String, PlacedFileMeta>,
     /// Entries of the archive whose names differ only in letter case.
     #[serde(default)]
     pub case_collisions: Vec<CaseCollision>,
@@ -465,6 +492,30 @@ pub(crate) struct RenameDone {
     pub ok: bool,
 }
 
+/// Live metadata observed for one path while holding its exclusive move lock.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct LockEntry {
+    pub path: String,
+    pub exists: bool,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<FileIdentity>,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<String>,
+}
+
+/// The line that answers a `lock` once all requested paths are locked exclusively.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) struct LockReady {
+    pub locked: bool,
+    #[serde(default)]
+    pub entries: Vec<LockEntry>,
+}
+
 /// How an operation failed: in time to say so on stdout, or after its raw bytes had started.
 enum Failure {
     Reply(ErrorBody),
@@ -484,19 +535,19 @@ impl From<ErrorBody> for Failure {
 /// of a transfer this node runs); a header's `as` is then honoured only when that principal's role
 /// delegates. The error says why the operation failed, for stderr and the exit code; when it could
 /// still be said on `output`, it already has been.
-pub fn serve<R: Read, W: Write>(
+pub fn serve<R: Read + Send + 'static, W: Write>(
     host: &Host,
     pinned: Option<&str>,
     input: R,
     output: W,
 ) -> Result<(), ErrorBody> {
-    serve_with_door(host, pinned, Door::Stream, None, None, input, output)
+    serve_with_cancel(host, pinned, Door::Stream, None, None, None, input, output)
 }
 
 /// Like [`serve`], allowing the caller to specify the audit [`Door`] (for example [`Door::Ssh`]
 /// when served behind `legion gate`), optional paired `device` name, and optional `pairing_id`
 /// (checked live during streaming so revoking a device stops an in-flight transfer promptly).
-pub fn serve_with_door<R: Read, W: Write>(
+pub fn serve_with_door<R: Read + Send + 'static, W: Write>(
     host: &Host,
     pinned: Option<&str>,
     door: Door,
@@ -505,8 +556,24 @@ pub fn serve_with_door<R: Read, W: Write>(
     input: R,
     output: W,
 ) -> Result<(), ErrorBody> {
+    serve_with_cancel(host, pinned, door, device, pairing_id, None, input, output)
+}
+
+/// Like [`serve_with_door`], accepting an optional [`CancellationToken`] that is cancelled by the
+/// mid-stream auth watchdog if policy or device access is revoked while output is stalled.
+#[allow(clippy::too_many_arguments)]
+pub fn serve_with_cancel<R: Read + Send + 'static, W: Write>(
+    host: &Host,
+    pinned: Option<&str>,
+    door: Door,
+    device: Option<&str>,
+    pairing_id: Option<&str>,
+    abort_on_revoke: Option<CancellationToken>,
+    input: R,
+    output: W,
+) -> Result<(), ErrorBody> {
     let started = Instant::now();
-    let mut input = BufReader::new(input);
+    let mut reader = BufReader::new(input);
     let mut output = BufWriter::with_capacity(OUTPUT_BUFFER, output);
     // Said before anything else, refusals included, so a reader can tell this node's replies
     // and advertised capabilities from those of an older node.
@@ -515,7 +582,7 @@ pub fn serve_with_door<R: Read, W: Write>(
         &json!({ "protocol": STREAM_PROTOCOL, "capabilities": STREAM_CAPABILITIES }),
     )
     .and_then(|()| output.flush());
-    let (header, recorded) = match read_header(&mut input) {
+    let (header, recorded) = match read_header(&mut reader) {
         Ok(read) => read,
         Err(error) => {
             let error = error.with_machine(host.name.clone());
@@ -523,6 +590,7 @@ pub fn serve_with_door<R: Read, W: Write>(
             return Err(error);
         }
     };
+    let mut input = Some(reader);
     let tool = format!("stream.{}", header.op.name());
     let config = ConfigStore::new(host.paths.config_dir());
     let (principal, result) = match authorise(host, &config, pinned, pairing_id, &header) {
@@ -532,9 +600,9 @@ pub fn serve_with_door<R: Read, W: Write>(
                 Some(principal),
                 run(
                     host,
-                    &config,
                     &grant,
                     pairing_id,
+                    abort_on_revoke,
                     header.op,
                     &mut input,
                     &mut output,
@@ -713,7 +781,9 @@ fn check_pairing_not_revoked(config: &ConfigStore, pairing_id: &str) -> Result<(
     Ok(())
 }
 
-/// Live permission and device-revocation re-checker run periodically while streaming large files.
+/// Live permission and device-revocation re-checker run periodically while streaming large files
+/// (every [`RECHECK_INTERVAL_BYTES`] or [`RECHECK_INTERVAL_TIME`], whichever comes first, and even
+/// while a stream is stalled).
 #[derive(Clone)]
 struct StreamAuthCheck {
     paths: Paths,
@@ -724,6 +794,7 @@ struct StreamAuthCheck {
     path: PathBuf,
     access: Access,
     create_kind: Option<CreateKind>,
+    last_check: Arc<Mutex<Instant>>,
     denied: Arc<Mutex<Option<ErrorBody>>>,
 }
 
@@ -748,6 +819,7 @@ impl StreamAuthCheck {
             path,
             access,
             create_kind,
+            last_check: Arc::new(Mutex::new(Instant::now())),
             denied: Arc::new(Mutex::new(None)),
         }
     }
@@ -772,6 +844,9 @@ impl StreamAuthCheck {
             }
             Ok(())
         })();
+        if let Ok(mut last) = self.last_check.lock() {
+            *last = Instant::now();
+        }
         match res {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -784,16 +859,94 @@ impl StreamAuthCheck {
         }
     }
 
+    /// Re-verifies authorization whenever either [`RECHECK_INTERVAL_BYTES`] have flowed or
+    /// [`RECHECK_INTERVAL_TIME`] has elapsed since the previous check.
+    fn maybe_recheck(&self, bytes_since: &mut u64) -> io::Result<()> {
+        if self.is_denied() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "permissions or device access were revoked mid-stream",
+            ));
+        }
+        let due_by_time = self
+            .last_check
+            .lock()
+            .map(|last| last.elapsed() >= RECHECK_INTERVAL_TIME)
+            .unwrap_or(true);
+        if *bytes_since >= RECHECK_INTERVAL_BYTES || due_by_time {
+            *bytes_since = 0;
+            self.verify()?;
+        }
+        Ok(())
+    }
+
+    fn is_denied(&self) -> bool {
+        self.denied
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(true)
+    }
+
     fn take_denied(&self) -> Option<ErrorBody> {
         self.denied.lock().ok().and_then(|mut slot| slot.take())
     }
 }
 
-/// Wraps a writer so live policy and pairing status are re-checked every [`RECHECK_INTERVAL_BYTES`].
+/// Background watchdog for outbound (`get`/`pack`) streams so a completely stalled pipe (0 B/s)
+/// still stops within [`RECHECK_INTERVAL_TIME`] when permissions or device access are revoked.
+struct RevokeWatchdog {
+    done: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RevokeWatchdog {
+    fn start(check: StreamAuthCheck, abort: Option<CancellationToken>) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let Some(token) = abort else {
+            return Self { done, handle: None };
+        };
+        let done_bg = Arc::clone(&done);
+        let handle = std::thread::spawn(move || {
+            while !done_bg.load(Ordering::Acquire) {
+                std::thread::sleep(RECHECK_POLL_INTERVAL);
+                if done_bg.load(Ordering::Acquire) {
+                    break;
+                }
+                let mut zero = 0u64;
+                if check.maybe_recheck(&mut zero).is_err() {
+                    token.cancel();
+                    break;
+                }
+            }
+        });
+        Self {
+            done,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for RevokeWatchdog {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Maximum slice written per underlying call when a slow link is detected, so slow transfers
+/// (a few KB/s) never block inside a single 64 KiB write for more than a couple of seconds.
+const SLOW_WRITE_CHUNK: usize = 4 * 1024;
+const SLOW_WRITE_THRESHOLD: Duration = Duration::from_millis(100);
+
+/// Wraps a writer so live policy and pairing status are re-checked every [`RECHECK_INTERVAL_BYTES`]
+/// or [`RECHECK_INTERVAL_TIME`], whichever comes first.
 struct RecheckingWriter<W> {
     inner: W,
     check: StreamAuthCheck,
     since_check: u64,
+    slow_mode: bool,
 }
 
 impl<W: Write> RecheckingWriter<W> {
@@ -802,27 +955,35 @@ impl<W: Write> RecheckingWriter<W> {
             inner,
             check,
             since_check: 0,
+            slow_mode: false,
         }
     }
 }
 
 impl<W: Write> Write for RecheckingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.since_check >= RECHECK_INTERVAL_BYTES {
-            self.check.verify()?;
-            self.since_check = 0;
-        }
-        let n = self.inner.write(buf)?;
+        self.check.maybe_recheck(&mut self.since_check)?;
+        let cap = if self.slow_mode {
+            SLOW_WRITE_CHUNK
+        } else {
+            buf.len()
+        };
+        let slice = &buf[..buf.len().min(cap)];
+        let started = Instant::now();
+        let n = self.inner.write(slice)?;
+        self.slow_mode = started.elapsed() >= SLOW_WRITE_THRESHOLD;
         self.since_check = self.since_check.saturating_add(n as u64);
         Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.check.maybe_recheck(&mut self.since_check)?;
         self.inner.flush()
     }
 }
 
-/// Wraps a reader so live policy and pairing status are re-checked every [`RECHECK_INTERVAL_BYTES`].
+/// Wraps a reader so live policy and pairing status are re-checked every [`RECHECK_INTERVAL_BYTES`]
+/// or [`RECHECK_INTERVAL_TIME`], whichever comes first.
 struct RecheckingReader<R> {
     inner: R,
     check: StreamAuthCheck,
@@ -841,10 +1002,7 @@ impl<R: Read> RecheckingReader<R> {
 
 impl<R: Read> Read for RecheckingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.since_check >= RECHECK_INTERVAL_BYTES {
-            self.check.verify()?;
-            self.since_check = 0;
-        }
+        self.check.maybe_recheck(&mut self.since_check)?;
         let n = self.inner.read(buf)?;
         self.since_check = self.since_check.saturating_add(n as u64);
         Ok(n)
@@ -889,14 +1047,14 @@ fn record(
     }
 }
 
-fn run<R: BufRead, W: Write>(
+fn run<R: Read + Send + 'static, W: Write>(
     host: &Host,
-    config: &ConfigStore,
     grant: &Grant,
     pairing_id: Option<&str>,
+    abort_on_revoke: Option<CancellationToken>,
     op: Op,
-    input: &mut R,
-    output: &mut W,
+    input: &mut Option<BufReader<R>>,
+    output: &mut BufWriter<W>,
 ) -> Result<(), Failure> {
     match op {
         Op::Manifest {
@@ -909,8 +1067,24 @@ fn run<R: BufRead, W: Write>(
             checksum,
             if_size,
             if_hash,
-        } => stat(grant, &path, checksum, if_size, if_hash.as_deref(), output),
-        Op::Get { path, offset } => get(host, grant, pairing_id, &path, offset, output),
+        } => stat(
+            host,
+            grant,
+            &path,
+            checksum,
+            if_size,
+            if_hash.as_deref(),
+            output,
+        ),
+        Op::Get { path, offset } => get(
+            host,
+            grant,
+            pairing_id,
+            abort_on_revoke,
+            &path,
+            offset,
+            output,
+        ),
         Op::Put {
             path,
             size,
@@ -921,7 +1095,15 @@ fn run<R: BufRead, W: Write>(
         } => put(
             host, grant, pairing_id, &path, size, &hash, mode, mtime, if_exists, input, output,
         ),
-        Op::Pack { root, names } => pack(host, grant, pairing_id, &root, &names, output),
+        Op::Pack { root, names } => pack(
+            host,
+            grant,
+            pairing_id,
+            abort_on_revoke,
+            &root,
+            &names,
+            output,
+        ),
         Op::Unpack {
             root,
             entries,
@@ -966,7 +1148,8 @@ fn run<R: BufRead, W: Write>(
             marker,
             subdirs,
         } => probe_read(grant, &dir, &marker, &subdirs, output),
-        Op::Rename { from, to } => rename_same_file(host, config, grant, &from, &to, output),
+        Op::Rename { from, to } => rename_same_file(host, grant, &from, &to, output),
+        Op::Lock { paths } => lock_paths(host, grant, &paths, input, output),
     }
 }
 
@@ -1002,6 +1185,7 @@ fn list<W: Write>(
     output: &mut W,
 ) -> Result<(), Failure> {
     let root = resolve_root(grant, root, Access::Read)?;
+    recover_pending_renames(host.paths.state_dir(), Some(&root));
     let options = ManifestOptions { checksum, exclude };
     let listing = busy(output, || manifest(grant, &host.paths, &root, &options))??;
     write_listing(output, listing.entries, listing.skipped)
@@ -1043,6 +1227,7 @@ fn write_listing<W: Write>(
 }
 
 fn stat<W: Write>(
+    host: &Host,
     grant: &Grant,
     path: &str,
     checksum: bool,
@@ -1052,8 +1237,11 @@ fn stat<W: Write>(
 ) -> Result<(), Failure> {
     // The partial file a `put` to this path would continue sits beside the path as given, a link
     // kept as a link, and is only looked at when it may be read itself and matches the expected
-    // source size and hash.
+    // source size and hash. Sidecar metadata/locks live in the node's state directory.
     let given = grant.check_path(path, Access::Read)?;
+    let state_dir = host.paths.state_dir();
+    recover_pending_renames(state_dir, given.parent());
+    legion_xfer::reclaim_stale_claim(state_dir, &given);
     let is_symlink = fs::symlink_metadata(&given).is_ok_and(|meta| meta.file_type().is_symlink());
     let expected_hash = if_hash.and_then(|s| s.parse::<Hash>().ok());
     let partial = || {
@@ -1061,10 +1249,14 @@ fn stat<W: Write>(
             .ok()
             .filter(|part| grant.check_path(part, Access::Read).is_ok())
             .and_then(|_| match if_size {
-                Some(expected_size) => {
-                    legion_xfer::resume_offset_for(&given, expected_size, expected_hash).ok()
-                }
-                None => legion_xfer::resume_offset(&given).ok(),
+                Some(expected_size) => legion_xfer::resume_offset_for_with_state(
+                    state_dir,
+                    &given,
+                    expected_size,
+                    expected_hash,
+                )
+                .ok(),
+                None => legion_xfer::resume_offset_with_state(state_dir, &given).ok(),
             })
             .filter(|len| *len > 0)
     };
@@ -1394,9 +1586,10 @@ fn get<W: Write>(
     host: &Host,
     grant: &Grant,
     pairing_id: Option<&str>,
+    abort_on_revoke: Option<CancellationToken>,
     path: &str,
     offset: u64,
-    output: &mut W,
+    output: &mut BufWriter<W>,
 ) -> Result<(), Failure> {
     let path = grant.check_path(path, Access::Read)?;
     let source = legion_xfer::open_get(&path, offset).map_err(xfer_error)?;
@@ -1416,7 +1609,10 @@ fn get<W: Write>(
         Access::Read,
         None,
     );
-    let mut guarded = RecheckingWriter::new(&mut *output, check.clone());
+    let _watchdog = RevokeWatchdog::start(check.clone(), abort_on_revoke);
+    // Write raw file bytes directly to the underlying writer (already flushed above) so slow links
+    // never block inside a 64 KiB BufWriter drain before the 2-second re-auth timer fires.
+    let mut guarded = RecheckingWriter::new(output.get_mut(), check.clone());
     if let Err(error) = source.stream_to(&mut guarded) {
         if let Some(denied) = check.take_denied() {
             return Err(Failure::Raw(denied));
@@ -1427,7 +1623,7 @@ fn get<W: Write>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn put<R: BufRead, W: Write>(
+fn put<R: Read + Send + 'static, W: Write>(
     host: &Host,
     grant: &Grant,
     pairing_id: Option<&str>,
@@ -1437,23 +1633,20 @@ fn put<R: BufRead, W: Write>(
     mode: Option<u32>,
     mtime: Option<Timestamp>,
     if_exists: IfExists,
-    input: &mut R,
-    output: &mut W,
+    input: &mut Option<BufReader<R>>,
+    output: &mut BufWriter<W>,
 ) -> Result<(), Failure> {
     let target = grant.check_path(path, Access::Write)?;
+    legion_tools::fs::check_not_protected_tree(grant, &target)?;
     grant.check_create(&target, CreateKind::File, true)?;
-    // The partial file and its metadata/lock sidecars beside the target are created, continued,
-    // truncated and removed, so they are held to what the target is: beside a role's root, they
-    // are outside it.
+    let state_dir = host.paths.state_dir().to_path_buf();
+    recover_pending_renames(&state_dir, target.parent());
+    legion_xfer::reclaim_stale_claim(&state_dir, &target);
+    // Only the resumable `.legion-part` file sits beside the target; lock and metadata sidecars
+    // live under the node's state directory.
     let part = legion_xfer::part_path(&target).map_err(xfer_error)?;
     grant.check_path(&part, Access::Write)?;
     grant.check_create(&part, CreateKind::File, true)?;
-    let part_meta = legion_xfer::part_meta_path(&target).map_err(xfer_error)?;
-    grant.check_path(&part_meta, Access::Write)?;
-    grant.check_create(&part_meta, CreateKind::File, true)?;
-    let part_lock = legion_xfer::part_lock_path(&target).map_err(xfer_error)?;
-    grant.check_path(&part_lock, Access::Write)?;
-    grant.check_create(&part_lock, CreateKind::File, true)?;
     let hash: Hash = hash.parse().map_err(xfer_error)?;
     if let Ok(meta) = fs::symlink_metadata(&target) {
         if if_exists == IfExists::Fail {
@@ -1478,6 +1671,7 @@ fn put<R: BufRead, W: Write>(
                     path: None,
                     skipped: true,
                     file_id: None,
+                    mtime: None,
                 },
             );
         }
@@ -1503,7 +1697,8 @@ fn put<R: BufRead, W: Write>(
     // The sender's offset is only a hint: what is on disk decides, so a sender that lost track
     // of an earlier attempt still continues it rather than starting over, while a concurrent
     // transfer to the same target falls back to its own private partial file.
-    let session = PutSession::open(&target, size, hash, if_exists).map_err(xfer_error)?;
+    let session = PutSession::open_with_state(&state_dir, &target, size, hash, if_exists)
+        .map_err(xfer_error)?;
     let offset = session.offset();
     reply(output, &PutReady { offset })?;
     let grant_for_check = grant.clone();
@@ -1518,45 +1713,63 @@ fn put<R: BufRead, W: Write>(
         Some(CreateKind::File),
     );
     let check_for_feed = check.clone();
-    let outcome = feed(input, Some(size - offset), output, move |fed| {
-        let guarded = RecheckingReader::new(fed, check_for_feed.clone());
-        let mut policy_err: Option<ErrorBody> = None;
-        let res = session.finish(hash, guarded, mode, |candidate| {
-            if let Err(err) = grant_for_check
-                .check_path(candidate, Access::Write)
-                .and_then(|checked| grant_for_check.check_create(&checked, CreateKind::File, true))
-            {
-                policy_err = Some(err);
-                return Err(legion_xfer::Error::PermissionDenied {
-                    path: candidate.to_path_buf(),
-                    source: io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "policy refused renamed target",
-                    ),
-                });
+    let outcome = feed(
+        input,
+        Some(size - offset),
+        output,
+        Some(check.clone()),
+        move |fed| {
+            let guarded = RecheckingReader::new(fed, check_for_feed.clone());
+            let mut policy_err: Option<ErrorBody> = None;
+            let res = session.finish(hash, guarded, mode, |candidate| {
+                if let Err(err) = grant_for_check
+                    .check_path(candidate, Access::Write)
+                    .and_then(|checked| {
+                        legion_tools::fs::check_not_protected_tree(&grant_for_check, &checked)?;
+                        grant_for_check.check_create(&checked, CreateKind::File, true)?;
+                        Ok(())
+                    })
+                {
+                    policy_err = Some(err);
+                    return Err(legion_xfer::Error::PermissionDenied {
+                        path: candidate.to_path_buf(),
+                        source: io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "policy refused renamed target",
+                        ),
+                    });
+                }
+                Ok(())
+            });
+            if let Some(denied) = check_for_feed.take_denied() {
+                return Err(denied);
             }
-            Ok(())
-        });
-        if let Some(denied) = check_for_feed.take_denied() {
-            return Err(denied);
-        }
-        match (res, policy_err) {
-            (Ok(done), _) => Ok(done),
-            (Err(_), Some(err)) => Err(err),
-            (Err(err), None) => Err(xfer_error(err)),
-        }
-    })??;
+            match (res, policy_err) {
+                (Ok(done), _) => Ok(done),
+                (Err(_), Some(err)) => Err(err),
+                (Err(err), None) => Err(xfer_error(err)),
+            }
+        },
+    )??;
     // The file is whole and in place; a time that cannot be set leaves it as it is, and a later
     // listing just sees it as changed.
-    let placed_id = outcome
-        .path
-        .as_deref()
-        .and_then(|final_path| file_identity(final_path).ok());
     if let Some(ref final_path) = outcome.path
         && let Some(time) = mtime.and_then(system_time)
     {
         let _ = fs::set_times(final_path, FileTimes::new().set_modified(time));
     }
+    let (placed_id, placed_mtime) = outcome
+        .path
+        .as_deref()
+        .map(|final_path| {
+            let fid = file_identity(final_path).ok();
+            let mt = fs::symlink_metadata(final_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(Timestamp::from_system_time);
+            (fid, mt)
+        })
+        .unwrap_or((None, None));
     let renamed_path = outcome
         .path
         .filter(|final_path| final_path != &target)
@@ -1570,6 +1783,7 @@ fn put<R: BufRead, W: Write>(
             path: renamed_path,
             skipped: outcome.skipped,
             file_id: placed_id,
+            mtime: placed_mtime,
         },
     )
 }
@@ -1578,9 +1792,10 @@ fn pack<W: Write>(
     host: &Host,
     grant: &Grant,
     pairing_id: Option<&str>,
+    abort_on_revoke: Option<CancellationToken>,
     root: &str,
     names: &[String],
-    output: &mut W,
+    output: &mut BufWriter<W>,
 ) -> Result<(), Failure> {
     let root = resolve_root(grant, root, Access::Read)?;
     if !fs::metadata(&root).is_ok_and(|meta| meta.is_dir()) {
@@ -1626,7 +1841,8 @@ fn pack<W: Write>(
         Access::Read,
         None,
     );
-    let mut guarded = RecheckingWriter::new(&mut *output, check.clone());
+    let _watchdog = RevokeWatchdog::start(check.clone(), abort_on_revoke);
+    let mut guarded = RecheckingWriter::new(output.get_mut(), check.clone());
     if let Err(error) = legion_xfer::pack(&root, &keep, &mut guarded) {
         if let Some(denied) = check.take_denied() {
             return Err(Failure::Raw(denied));
@@ -1637,17 +1853,19 @@ fn pack<W: Write>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn unpack<R: BufRead, W: Write>(
+fn unpack<R: Read + Send + 'static, W: Write>(
     host: &Host,
     grant: &Grant,
     pairing_id: Option<&str>,
     root: &str,
     entries: &[Planned],
     if_exists: IfExists,
-    input: &mut R,
-    output: &mut W,
+    input: &mut Option<BufReader<R>>,
+    output: &mut BufWriter<W>,
 ) -> Result<(), Failure> {
     let root = resolve_root(grant, root, Access::Write)?;
+    let state_dir = host.paths.state_dir().to_path_buf();
+    recover_pending_renames(&state_dir, Some(&root));
     if fs::symlink_metadata(&root).is_err() {
         grant.check_create(&root, CreateKind::Dir, true)?;
     }
@@ -1699,74 +1917,85 @@ fn unpack<R: BufRead, W: Write>(
         None,
     );
     let check_for_feed = check.clone();
-    let (report, mut refused, violation) = feed(input, None, output, |fed| {
-        let rechecked = RecheckingReader::new(fed, check_for_feed.clone());
-        let watch = Rc::new(RefCell::new(Watch::new(plan)));
-        let mut refused: HashMap<String, String> = HashMap::new();
-        let guarded = Guarded::new(rechecked, Rc::clone(&watch));
-        let watch_for_hash = Rc::clone(&watch);
-        let report = legion_xfer::unpack_with_options_and_hashes(
-            &root,
-            guarded,
-            if_exists,
-            |rel, kind| {
-                let mut watch = watch.borrow_mut();
-                // The entry the unpack is about to write must be the one whose header was checked.
-                let checked_entry = watch.current.take();
-                if checked_entry
-                    .is_none_or(|(name, checked_kind)| name != rel || checked_kind != kind)
-                {
-                    let _ =
-                        watch.refuse(rel, "is not the entry whose header was checked".to_owned());
-                    return false;
-                }
-                drop(watch);
-                let create_kind = match kind {
-                    EntryKind::File => CreateKind::File,
-                    EntryKind::Dir => CreateKind::Dir,
-                    EntryKind::Symlink => CreateKind::Symlink,
-                };
-                match checked_create(grant, &root, rel, create_kind) {
-                    Ok(_) => true,
-                    Err(error) => {
-                        refused.insert(rel.to_owned(), error.message);
-                        false
+    let grant_for_unpack = grant.clone();
+    let root_for_unpack = root.clone();
+    let (report, mut refused, violation) =
+        feed(input, None, output, Some(check.clone()), move |fed| {
+            let rechecked = RecheckingReader::new(fed, check_for_feed.clone());
+            let watch = Rc::new(RefCell::new(Watch::new(plan)));
+            let mut refused: HashMap<String, String> = HashMap::new();
+            let guarded = Guarded::new(rechecked, Rc::clone(&watch));
+            let watch_for_hash = Rc::clone(&watch);
+            let report = legion_xfer::unpack_with_options_hashes_and_state(
+                &state_dir,
+                &root_for_unpack,
+                guarded,
+                if_exists,
+                |rel, kind| {
+                    let mut watch = watch.borrow_mut();
+                    // The entry the unpack is about to write must be the one whose header was checked.
+                    let checked_entry = watch.current.take();
+                    if checked_entry
+                        .is_none_or(|(name, checked_kind)| name != rel || checked_kind != kind)
+                    {
+                        let _ = watch
+                            .refuse(rel, "is not the entry whose header was checked".to_owned());
+                        return false;
                     }
-                }
-            },
-            |candidate, kind| {
-                let create_kind = match kind {
-                    EntryKind::File => CreateKind::File,
-                    EntryKind::Dir => CreateKind::Dir,
-                    EntryKind::Symlink => CreateKind::Symlink,
-                };
-                grant
-                    .check_path(candidate, Access::Write)
-                    .and_then(|checked| grant.check_create(&checked, create_kind, true))
-                    .map_err(|_| legion_xfer::Error::PermissionDenied {
-                        path: candidate.to_path_buf(),
-                        source: io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "policy refused renamed target",
-                        ),
-                    })
-            },
-            |rel| {
-                watch_for_hash
-                    .borrow()
-                    .expected(rel)
-                    .and_then(|expected| expected.hash)
-            },
-        );
-        let watch = watch.borrow();
-        let mut violation = watch.refused.clone();
-        if violation.is_none()
-            && let Ok(report) = &report
-        {
-            violation = unaccounted(&watch, report);
-        }
-        (report, refused, violation)
-    })?;
+                    drop(watch);
+                    let create_kind = match kind {
+                        EntryKind::File => CreateKind::File,
+                        EntryKind::Dir => CreateKind::Dir,
+                        EntryKind::Symlink => CreateKind::Symlink,
+                    };
+                    match checked_create(&grant_for_unpack, &root_for_unpack, rel, create_kind) {
+                        Ok(_) => true,
+                        Err(error) => {
+                            refused.insert(rel.to_owned(), error.message);
+                            false
+                        }
+                    }
+                },
+                |candidate, kind| {
+                    let create_kind = match kind {
+                        EntryKind::File => CreateKind::File,
+                        EntryKind::Dir => CreateKind::Dir,
+                        EntryKind::Symlink => CreateKind::Symlink,
+                    };
+                    grant_for_unpack
+                        .check_path(candidate, Access::Write)
+                        .and_then(|checked| {
+                            legion_tools::fs::check_not_protected_tree(
+                                &grant_for_unpack,
+                                &checked,
+                            )?;
+                            grant_for_unpack.check_create(&checked, create_kind, true)?;
+                            Ok(())
+                        })
+                        .map_err(|_| legion_xfer::Error::PermissionDenied {
+                            path: candidate.to_path_buf(),
+                            source: io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "policy refused renamed target",
+                            ),
+                        })
+                },
+                |rel| {
+                    watch_for_hash
+                        .borrow()
+                        .expected(rel)
+                        .and_then(|expected| expected.hash)
+                },
+            );
+            let watch = watch.borrow();
+            let mut violation = watch.refused.clone();
+            if violation.is_none()
+                && let Ok(report) = &report
+            {
+                violation = unaccounted(&watch, report);
+            }
+            (report, refused, violation)
+        })?;
     if let Some(denied) = check.take_denied() {
         return Err(Failure::Reply(denied));
     }
@@ -1809,6 +2038,7 @@ fn unpack<R: BufRead, W: Write>(
             renamed: report.renamed,
             verified_files: report.files,
             verified_symlinks: report.symlinks,
+            placed_meta: report.placed_meta,
             case_collisions: report.case_collisions,
         },
     )
@@ -1864,6 +2094,7 @@ fn delete<W: Write>(
 ) -> Result<(), Failure> {
     let checked_root = if remove_root {
         let checked = grant.check_path(root, Access::Write)?;
+        legion_tools::fs::check_not_protected_tree(grant, &checked)?;
         if fs::symlink_metadata(&checked).is_ok_and(|meta| meta.file_type().is_dir()) {
             grant.check_tree(&checked)?;
         }
@@ -1925,6 +2156,16 @@ fn remove_one(
         Err(Named::Missing) => return Ok(false),
         Err(Named::Refused(reason)) => return Err(reason),
     };
+    if let Err(error) = legion_tools::fs::check_not_protected_tree(grant, &path) {
+        return Err(error.message);
+    }
+    if path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(legion_xfer::is_legion_internal_name)
+    {
+        return Err("it is an internal Legion transfer file".to_owned());
+    }
     let meta = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -2148,6 +2389,7 @@ fn probe_write<W: Write>(
             grant.check_path(&marker_path, Access::Write)?;
             if let Ok(meta) = fs::symlink_metadata(&marker_path)
                 && meta.file_type().is_file()
+                && meta.len() == 0
             {
                 let _ = fs::remove_file(&marker_path);
             }
@@ -2172,11 +2414,13 @@ fn probe_read<W: Write>(
 ) -> Result<(), Failure> {
     validate_probe_marker(marker)?;
     let checked_dir = grant.check_path(dir, Access::Read)?;
-    let mut exists = fs::symlink_metadata(checked_dir.join(marker)).is_ok();
+    let root_marker = grant.check_path(checked_dir.join(marker), Access::Read)?;
+    let mut exists = fs::symlink_metadata(&root_marker).is_ok();
     if !exists {
         for sub in subdirs {
             if let Ok(sub_path) = named(grant, &checked_dir, sub, Access::Read)
-                && fs::symlink_metadata(sub_path.join(marker)).is_ok()
+                && let Ok(sub_marker) = grant.check_path(sub_path.join(marker), Access::Read)
+                && fs::symlink_metadata(&sub_marker).is_ok()
             {
                 exists = true;
                 break;
@@ -2233,25 +2477,220 @@ fn directory_contains_exact_name(dir: &Path, expected: &OsStr) -> io::Result<boo
     Ok(false)
 }
 
+/// Intent record written in `<state_dir>/xfer/renames/<key>.json` before step 1 of a two-step
+/// case/normalization rename so an interrupted rename can always be completed or reversed on the
+/// next transfer or listing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingRenameIntent {
+    parent: String,
+    from_name: String,
+    temp_name: String,
+    to_name: String,
+}
+
+fn pending_renames_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("xfer").join("renames")
+}
+
+fn rename_intent_key(parent: &Path, temp_name: &str) -> String {
+    let mut data =
+        Vec::with_capacity(parent.as_os_str().as_encoded_bytes().len() + 1 + temp_name.len());
+    data.extend_from_slice(parent.as_os_str().as_encoded_bytes());
+    data.push(0);
+    data.extend_from_slice(temp_name.as_bytes());
+    legion_xfer::hash::hash_bytes(&data).to_hex()
+}
+
+/// Builds a **visible** sibling intermediate filename (`legion-renaming-*`, never dot-prefixed and
+/// never filtered by [`legion_xfer::is_legion_internal_name`]) so if a two-step rename is
+/// interrupted mid-flight, the entry remains visible to both people and listings while recovery
+/// waits to run.
+fn visible_rename_temp_name(from_name: &OsStr, pid: u32, seq: u64) -> String {
+    let lossy = from_name.to_string_lossy();
+    let safe: String = lossy
+        .chars()
+        .filter(|c| !matches!(c, '/' | '\\' | '\0'))
+        .take(80)
+        .collect();
+    if safe.is_empty() {
+        format!("legion-renaming-{pid}-{seq}")
+    } else {
+        format!("legion-renaming-{pid}-{seq}-{safe}")
+    }
+}
+
+/// Completes or reverses any interrupted two-step case/normalization renames whose intent records
+/// remain under `<state_dir>/xfer/renames/`.
+pub fn recover_pending_renames(state_dir: &Path, scope_dir: Option<&Path>) {
+    let dir = pending_renames_dir(state_dir);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    let scope_canon = scope_dir.map(|s| fs::canonicalize(s).unwrap_or_else(|_| s.to_path_buf()));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(OsStr::to_str) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let lock_path = dir.join(format!("{stem}.lock"));
+        let Ok(Some(_lock)) = legion_xfer::try_lock_state_file(&lock_path) else {
+            continue;
+        };
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(intent) = serde_json::from_slice::<PendingRenameIntent>(&bytes) else {
+            let _ = fs::remove_file(&path);
+            continue;
+        };
+        let parent = PathBuf::from(&intent.parent);
+        if let Some(ref scope) = scope_canon {
+            let parent_canon = fs::canonicalize(&parent).unwrap_or_else(|_| parent.clone());
+            if !parent_canon.starts_with(scope) && !scope.starts_with(&parent_canon) {
+                continue;
+            }
+        }
+        let temp_path = parent.join(&intent.temp_name);
+        let to_path = parent.join(&intent.to_name);
+        let from_path = parent.join(&intent.from_name);
+        if fs::symlink_metadata(&temp_path).is_err() {
+            // Intermediate entry is already gone; clean up the intent record.
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        // Complete step 2 (`temp -> to`) if `to` does not exist; otherwise reverse (`temp -> from`).
+        let completed = if fs::symlink_metadata(&to_path).is_err() {
+            move_no_replace_raw(&temp_path, &to_path).is_ok()
+                && directory_contains_exact_name(&parent, OsStr::new(&intent.to_name))
+                    .unwrap_or(false)
+        } else {
+            false
+        };
+        if completed {
+            #[cfg(unix)]
+            if let Ok(dir_handle) = fs::File::open(&parent) {
+                let _ = dir_handle.sync_all();
+            }
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        if fs::symlink_metadata(&from_path).is_err()
+            && move_no_replace_raw(&temp_path, &from_path).is_ok()
+        {
+            #[cfg(unix)]
+            if let Ok(dir_handle) = fs::File::open(&parent) {
+                let _ = dir_handle.sync_all();
+            }
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+fn move_no_replace_raw(src: &Path, dst: &Path) -> io::Result<()> {
+    match legion_os::atomic::rename_no_replace(src, dst) {
+        Ok(()) => Ok(()),
+        Err(legion_os::atomic::RenameNoReplaceError::Unsupported) => fs::rename(src, dst),
+        Err(legion_os::atomic::RenameNoReplaceError::AlreadyExists) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination already exists",
+        )),
+        Err(legion_os::atomic::RenameNoReplaceError::Io(err)) => Err(err),
+    }
+}
+
+fn perform_recoverable_two_step_rename(
+    state_dir: &Path,
+    grant: &Grant,
+    from_parent: &Path,
+    from_name: &OsStr,
+    to_name: &OsStr,
+    create_kind: CreateKind,
+) -> Result<(), Failure> {
+    let from_path = from_parent.join(from_name);
+    let to_path = from_parent.join(to_name);
+    let pid = std::process::id();
+    let mut temp_name = None;
+    for _ in 0..32 {
+        let seq = STREAM_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate_name = visible_rename_temp_name(from_name, pid, seq);
+        let candidate_path = from_parent.join(&candidate_name);
+        if fs::symlink_metadata(&candidate_path).is_err() {
+            temp_name = Some(candidate_name);
+            break;
+        }
+    }
+    let temp_name = temp_name.ok_or_else(|| {
+        Failure::Reply(ErrorBody::new(
+            ErrorCode::Failed,
+            "Could not allocate a temporary name for rename.",
+        ))
+    })?;
+    let temp_path = from_parent.join(&temp_name);
+    let temp_checked = grant.check_path(&temp_path, Access::Write)?;
+    grant.check_create(&temp_checked, create_kind, false)?;
+
+    let renames_dir = pending_renames_dir(state_dir);
+    fs::create_dir_all(&renames_dir)
+        .map_err(|err| Failure::Reply(io_error("create", &renames_dir, &err)))?;
+    let key = rename_intent_key(from_parent, &temp_name);
+    let lock_path = renames_dir.join(format!("{key}.lock"));
+    let intent_path = renames_dir.join(format!("{key}.json"));
+    let _intent_lock = legion_xfer::try_lock_state_file(&lock_path)
+        .map_err(xfer_error)?
+        .ok_or_else(|| {
+            Failure::Reply(ErrorBody::new(
+                ErrorCode::Conflict,
+                "Another rename is already in progress for this entry.",
+            ))
+        })?;
+    let intent = PendingRenameIntent {
+        parent: from_parent.to_string_lossy().into_owned(),
+        from_name: from_name.to_string_lossy().into_owned(),
+        temp_name: temp_name.clone(),
+        to_name: to_name.to_string_lossy().into_owned(),
+    };
+    let intent_bytes = serde_json::to_vec(&intent).map_err(|err| {
+        Failure::Reply(ErrorBody::new(
+            ErrorCode::Internal,
+            format!("Could not serialize rename recovery record: {err}."),
+        ))
+    })?;
+    write_atomic(&intent_path, &intent_bytes, WriteOptions::with_mode(0o600)).map_err(|err| {
+        Failure::Reply(ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Could not write rename recovery record: {err}."),
+        ))
+    })?;
+
+    if let Err(err) = move_no_replace_raw(&from_path, &temp_path) {
+        let _ = fs::remove_file(&intent_path);
+        return Err(Failure::Reply(io_error("rename", &temp_path, &err)));
+    }
+    if let Err(err) = move_no_replace_raw(&temp_path, &to_path) {
+        if fs::rename(&temp_path, &from_path).is_ok() {
+            let _ = fs::remove_file(&intent_path);
+        }
+        return Err(Failure::Reply(io_error("rename", &to_path, &err)));
+    }
+    let _ = fs::remove_file(&intent_path);
+    Ok(())
+}
+
 fn rename_same_file<W: Write>(
     host: &Host,
-    config: &ConfigStore,
     grant: &Grant,
     from: &str,
     to: &str,
     output: &mut W,
 ) -> Result<(), Failure> {
-    // `rename` is authorised as `fs.remove`; also require `fs.write` so a role denied writing
-    // cannot rename entries.
-    let policy = config.get::<Policy>()?;
-    policy.authorize_name(
-        grant.principal(),
-        "fs.write",
-        Some(Effect::Write),
-        &host.paths,
-    )?;
-    let from_checked = grant.check_path(from, Access::Write)?;
-    let to_checked = grant.check_path(to, Access::Write)?;
+    // Authorised as `fs.move` and subjected to the exact same path, `paths`, and protected-tree
+    // checks as `fs.move`.
+    let (from_checked, to_checked) = legion_tools::fs::check_move_paths(grant, from, to)?;
+    let state_dir = host.paths.state_dir();
+    recover_pending_renames(state_dir, from_checked.parent());
 
     let (Some(from_parent), Some(to_parent)) = (from_checked.parent(), to_checked.parent()) else {
         return Err(Failure::Reply(ErrorBody::new(
@@ -2273,19 +2712,23 @@ fn rename_same_file<W: Write>(
 
     let from_meta = fs::symlink_metadata(&from_path)
         .map_err(|err| Failure::Reply(io_error("inspect", &from_path, &err)))?;
+    let create_kind = if from_meta.file_type().is_symlink() {
+        CreateKind::Symlink
+    } else if from_meta.is_dir() {
+        CreateKind::Dir
+    } else {
+        CreateKind::File
+    };
+    grant.check_create(&to_checked, create_kind, false)?;
     let from_id = symlink_file_identity(&from_path)
         .map_err(|err| Failure::Reply(io_error("inspect", &from_path, &err)))?;
-    let (to_exists, same_file, to_is_symlink) = match fs::symlink_metadata(&to_path) {
+    let (same_file, to_is_symlink) = match fs::symlink_metadata(&to_path) {
         Ok(to_meta) => {
             let to_id = symlink_file_identity(&to_path)
                 .map_err(|err| Failure::Reply(io_error("inspect", &to_path, &err)))?;
-            (
-                true,
-                from_id.same_file(&to_id),
-                to_meta.file_type().is_symlink(),
-            )
+            (from_id.same_file(&to_id), to_meta.file_type().is_symlink())
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => (false, false, false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => (false, false),
         Err(err) => return Err(Failure::Reply(io_error("inspect", &to_path, &err))),
     };
     let from_parent_id = file_identity(from_parent)
@@ -2310,83 +2753,46 @@ fn rename_same_file<W: Write>(
         either_symlink,
         fs_behavior,
     );
-    match decision {
-        SameEntryDecision::SameEntryNoOp => {
-            return Err(Failure::Reply(ErrorBody::new(
-                ErrorCode::InvalidArgs,
-                format!("Cannot rename {} onto itself.", from_path.display()),
-            )));
-        }
-        SameEntryDecision::RefuseSameFileAlias => {
-            return Err(Failure::Reply(ErrorBody::new(
-                ErrorCode::InvalidArgs,
-                format!(
-                    "Cannot rename {} onto {} because they are different links to the same entry.",
-                    from_path.display(),
-                    to_path.display()
-                ),
-            )));
-        }
-        SameEntryDecision::DistinctEntries if to_exists => {
-            return Err(Failure::Reply(ErrorBody::new(
-                ErrorCode::Conflict,
-                format!(
-                    "{} already exists and does not refer to the same entry as {}.",
-                    to_path.display(),
-                    from_path.display()
-                ),
-            )));
-        }
-        SameEntryDecision::DistinctEntries | SameEntryDecision::CaseOrNormalizationRename => {}
+    // Stream `rename` is strictly limited to same-entry case or Unicode-normalization renames.
+    // Every other rename (including arbitrary moves of distinct files) is refused here so callers
+    // must use `fs.move` or the full transfer path.
+    if decision != SameEntryDecision::CaseOrNormalizationRename {
+        let message = match decision {
+            SameEntryDecision::SameEntryNoOp => {
+                format!("Cannot rename {} onto itself.", from_path.display())
+            }
+            SameEntryDecision::RefuseSameFileAlias => format!(
+                "Cannot rename {} onto {} because they are different links to the same entry.",
+                from_path.display(),
+                to_path.display()
+            ),
+            SameEntryDecision::DistinctEntries => format!(
+                "Stream rename only renames an entry's letter case or Unicode spelling in place; {} and {} are not the same entry.",
+                from_path.display(),
+                to_path.display()
+            ),
+            SameEntryDecision::CaseOrNormalizationRename => unreachable!(),
+        };
+        return Err(Failure::Reply(
+            ErrorBody::new(ErrorCode::InvalidArgs, message)
+                .with_hint("Use fs.move or fs.transfer to move distinct paths."),
+        ));
     }
 
-    let move_no_replace = |src: &Path, dst: &Path| -> Result<(), Failure> {
-        match legion_os::atomic::rename_no_replace(src, dst) {
-            Ok(()) => Ok(()),
-            Err(legion_os::atomic::RenameNoReplaceError::Unsupported) => {
-                fs::rename(src, dst).map_err(|err| Failure::Reply(io_error("rename", dst, &err)))
-            }
-            Err(legion_os::atomic::RenameNoReplaceError::AlreadyExists) => {
-                Err(Failure::Reply(ErrorBody::new(
-                    ErrorCode::Exists,
-                    format!("{} already exists.", dst.display()),
-                )))
-            }
-            Err(legion_os::atomic::RenameNoReplaceError::Io(err)) => {
-                Err(Failure::Reply(io_error("rename", dst, &err)))
-            }
-        }
-    };
-
-    if decision == SameEntryDecision::CaseOrNormalizationRename {
-        // Two-step rename through a unique sibling temporary name so case-only and Unicode
-        // normalization-only renames succeed reliably on case-insensitive or normalizing
-        // filesystems (APFS, HFS+, NTFS, FAT/exFAT, SMB) where a direct rename is a no-op or
-        // reports `AlreadyExists`.
-        let pid = std::process::id();
-        let mut temp_path = None;
-        for _ in 0..32 {
-            let seq = STREAM_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-            let cand = from_parent.join(format!(".legion-rename-{pid}-{seq}.tmp"));
-            if fs::symlink_metadata(&cand).is_err() {
-                temp_path = Some(cand);
-                break;
-            }
-        }
-        let temp = temp_path.ok_or_else(|| {
-            Failure::Reply(ErrorBody::new(
-                ErrorCode::Failed,
-                "Could not allocate a temporary name for rename.",
-            ))
-        })?;
-        grant.check_path(&temp, Access::Write)?;
-        move_no_replace(&from_path, &temp)?;
-        if let Err(err) = move_no_replace(&temp, &to_path) {
-            let _ = fs::rename(&temp, &from_path);
-            return Err(err);
-        }
-    } else {
-        move_no_replace(&from_path, &to_path)?;
+    // Try a direct rename first (succeeds in one kernel operation on modern APFS, NTFS, and most
+    // folding filesystems). Fall back to the recoverable visible two-step route ONLY when the
+    // direct rename leaves the old spelling in place or reports an error leaving `from` intact.
+    let direct_ok = fs::rename(&from_path, &to_path).is_ok()
+        && directory_contains_exact_name(from_parent, &to_name).unwrap_or(false);
+    if !direct_ok {
+        perform_recoverable_two_step_rename(
+            state_dir,
+            grant,
+            from_parent,
+            &from_name,
+            &to_name,
+            create_kind,
+        )?;
     }
 
     #[cfg(unix)]
@@ -2410,6 +2816,128 @@ fn rename_same_file<W: Write>(
     reply(output, &RenameDone { ok: true })
 }
 
+/// Acquires exclusive per-path move locks in `<state_dir>/xfer/move-lock/` in deterministic sorted
+/// path order, returns live metadata for every requested path, and holds the locks until the
+/// stream's input closes (EOF or newline).
+fn lock_paths<R: BufRead, W: Write>(
+    host: &Host,
+    grant: &Grant,
+    paths: &[String],
+    input: &mut Option<R>,
+    output: &mut W,
+) -> Result<(), Failure> {
+    if paths.is_empty() || paths.len() > 256 {
+        return Err(Failure::Reply(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "lock requires between 1 and 256 paths, and {} were given.",
+                paths.len()
+            ),
+        )));
+    }
+    let mut checked_pairs: Vec<(String, PathBuf)> = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let checked = grant.check_path(raw, Access::Write)?;
+        checked_pairs.push((raw.clone(), checked));
+    }
+    // Sort unique lock targets in deterministic byte order before taking any lock so concurrent
+    // moves on this node can never deadlock.
+    let mut lock_targets: Vec<PathBuf> = checked_pairs.iter().map(|(_, p)| p.clone()).collect();
+    lock_targets.sort_by(|a, b| {
+        a.as_os_str()
+            .as_encoded_bytes()
+            .cmp(b.as_os_str().as_encoded_bytes())
+    });
+    lock_targets.dedup();
+
+    let state_dir = host.paths.state_dir();
+    let mut locks = Vec::with_capacity(lock_targets.len());
+    for target in &lock_targets {
+        let lock_path = legion_xfer::move_lock_state_path(state_dir, target);
+        match legion_xfer::try_lock_state_file(&lock_path) {
+            Ok(Some(file)) => locks.push(file),
+            Ok(None) => {
+                drop(locks);
+                return Err(Failure::Reply(
+                    ErrorBody::new(
+                        ErrorCode::Conflict,
+                        format!(
+                            "Another move or transfer is currently finalizing {}.",
+                            target.display()
+                        ),
+                    )
+                    .with_hint("Run the transfer again in a moment."),
+                ));
+            }
+            Err(err) => {
+                drop(locks);
+                return Err(Failure::Reply(xfer_error(err)));
+            }
+        }
+    }
+
+    let mut entries = Vec::with_capacity(checked_pairs.len());
+    for (raw, checked) in &checked_pairs {
+        let entry = match fs::symlink_metadata(checked) {
+            Ok(meta) => {
+                let ft = meta.file_type();
+                let kind = if ft.is_file() {
+                    "file"
+                } else if ft.is_dir() {
+                    "dir"
+                } else if ft.is_symlink() {
+                    "symlink"
+                } else {
+                    "other"
+                };
+                let link_target = if ft.is_symlink() {
+                    fs::read_link(checked)
+                        .ok()
+                        .map(|t| t.to_string_lossy().into_owned())
+                } else {
+                    None
+                };
+                LockEntry {
+                    path: raw.clone(),
+                    exists: true,
+                    kind: kind.to_owned(),
+                    file_id: symlink_file_identity(checked).ok(),
+                    size: if ft.is_file() { meta.len() } else { 0 },
+                    mtime: meta.modified().ok().map(Timestamp::from_system_time),
+                    link_target,
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => LockEntry {
+                path: raw.clone(),
+                exists: false,
+                kind: "missing".to_owned(),
+                ..LockEntry::default()
+            },
+            Err(err) => {
+                drop(locks);
+                return Err(Failure::Reply(io_error("inspect", checked, &err)));
+            }
+        };
+        entries.push(entry);
+    }
+
+    reply(
+        output,
+        &LockReady {
+            locked: true,
+            entries,
+        },
+    )?;
+
+    // Hold all locks until the caller closes its pipe (or sends a release line).
+    if let Some(reader) = input.as_mut() {
+        let mut release = Vec::new();
+        let _ = reader.read_until(b'\n', &mut release);
+    }
+    drop(locks);
+    Ok(())
+}
+
 /// Runs `work` on a thread of its own and says `{"busy": true}` every [`HEARTBEAT`] until it is
 /// done, so a reader waiting for the next line knows the operation is at work, not stuck.
 fn busy<W: Write, T: Send>(output: &mut W, work: impl FnOnce() -> T + Send) -> Result<T, Failure> {
@@ -2422,32 +2950,39 @@ fn busy<W: Write, T: Send>(output: &mut W, work: impl FnOnce() -> T + Send) -> R
     })
 }
 
-/// Like [`busy`], for work that reads the operation's input: this thread passes the input on in
-/// chunks (`limit` bytes at most, or to its end) while the work runs on its own, then says it is
-/// busy until the work is done. The input itself stays on this thread, which a locked standard
-/// input needs. Once the work stops reading, at most [`MOST_TRAILING`] more bytes are read, so a
-/// sender's last write finds a reader and a sender that goes on finds the pipe closed.
-fn feed<R: BufRead, W: Write, T: Send>(
-    input: &mut R,
+/// Like [`busy`], for work that reads the operation's input: a dedicated reader thread passes the
+/// input on in chunks (`limit` bytes at most, or to its end) while the work runs on its own, and
+/// this thread waits for `work` (writing `{"busy": true}` every [`HEARTBEAT`]). Decoupling the
+/// input reader from the scoped worker guarantees that a stalled sender (0 B/s) never blocks
+/// mid-stream revocation: once `work` detects revocation on its 2-second timer and exits, this
+/// function returns immediately so `serve` can write the `denied` reply and close the stream.
+fn feed<R: Read + Send + 'static, W: Write, T: Send>(
+    input: &mut Option<BufReader<R>>,
     limit: Option<u64>,
     output: &mut W,
+    check: Option<StreamAuthCheck>,
     work: impl FnOnce(Fed) -> T + Send,
 ) -> Result<T, Failure> {
-    std::thread::scope(|scope| {
-        let (chunks, fed) = mpsc::sync_channel::<Vec<u8>>(QUEUED_CHUNKS);
-        let (done, finished) = mpsc::channel();
-        scope.spawn(move || {
-            let _ = done.send(work(Fed {
-                chunks: fed,
-                chunk: Vec::new(),
-                at: 0,
-            }));
-        });
+    let Some(mut reader) = input.take() else {
+        return Err(Failure::Reply(ErrorBody::new(
+            ErrorCode::Internal,
+            "The stream input was already consumed.",
+        )));
+    };
+    let (chunks, fed) = mpsc::sync_channel::<Vec<u8>>(QUEUED_CHUNKS);
+    let check_for_reader = check.clone();
+    std::thread::spawn(move || {
         let mut left = limit.unwrap_or(u64::MAX);
         let mut trailing = 0u64;
         let mut taking = true;
         while left > 0 && trailing <= MOST_TRAILING {
-            let available = match input.fill_buf() {
+            if check_for_reader
+                .as_ref()
+                .is_some_and(StreamAuthCheck::is_denied)
+            {
+                break;
+            }
+            let available = match reader.fill_buf() {
                 Ok([]) | Err(_) => break,
                 Ok(available) => available,
             };
@@ -2456,14 +2991,31 @@ fn feed<R: BufRead, W: Write, T: Send>(
                 .min(available.len());
             if taking && chunks.send(available[..take].to_vec()).is_err() {
                 taking = false;
+                if check_for_reader
+                    .as_ref()
+                    .is_some_and(StreamAuthCheck::is_denied)
+                {
+                    break;
+                }
             }
             if !taking {
                 trailing += take as u64;
             }
-            input.consume(take);
+            reader.consume(take);
             left -= take as u64;
         }
         drop(chunks);
+    });
+    std::thread::scope(|scope| {
+        let (done, finished) = mpsc::channel();
+        scope.spawn(move || {
+            let _ = done.send(work(Fed {
+                chunks: fed,
+                chunk: Vec::new(),
+                at: 0,
+                check,
+            }));
+        });
         wait_for(&finished, output)
     })
 }
@@ -2493,17 +3045,24 @@ struct Fed {
     chunks: Receiver<Vec<u8>>,
     chunk: Vec<u8>,
     at: usize,
+    check: Option<StreamAuthCheck>,
 }
 
 impl Read for Fed {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         while self.at == self.chunk.len() {
-            match self.chunks.recv() {
+            match self.chunks.recv_timeout(RECHECK_POLL_INTERVAL) {
                 Ok(chunk) => {
                     self.chunk = chunk;
                     self.at = 0;
                 }
-                Err(_) => return Ok(0),
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(ref check) = self.check {
+                        let mut zero = 0u64;
+                        check.maybe_recheck(&mut zero)?;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => return Ok(0),
             }
         }
         let n = buf.len().min(self.chunk.len() - self.at);
@@ -2581,6 +3140,7 @@ fn checked_create(
 ) -> Result<PathBuf, ErrorBody> {
     let path = resolve_relative_path(root, name).map_err(xfer_error)?;
     let checked = grant.check_path(&path, Access::Write)?;
+    legion_tools::fs::check_not_protected_tree(grant, &checked)?;
     grant.check_create(&checked, kind, true)?;
     Ok(checked)
 }
@@ -2916,5 +3476,74 @@ mod tests {
             requested_entry_name("~", checked, false),
             Some(OsString::from("Report.txt"))
         );
+    }
+
+    #[test]
+    fn visible_rename_temp_is_not_hidden_and_recovery_completes_or_reverses() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+
+        let temp_name = visible_rename_temp_name(OsStr::new("Report.txt"), 42, 7);
+        assert!(
+            !temp_name.starts_with('.'),
+            "intermediate rename name must be visible (not dot-prefixed): {temp_name}"
+        );
+        assert!(
+            !legion_xfer::is_legion_internal_name(&temp_name),
+            "intermediate rename name must not be hidden from manifests/listings: {temp_name}"
+        );
+
+        // Case 1: Crash between step 1 and step 2 -> recovery completes `temp -> to`.
+        let temp_path = work_dir.join(&temp_name);
+        fs::write(&temp_path, b"important").unwrap();
+        let renames_dir = pending_renames_dir(&state_dir);
+        fs::create_dir_all(&renames_dir).unwrap();
+        let key = rename_intent_key(&work_dir, &temp_name);
+        let intent_path = renames_dir.join(format!("{key}.json"));
+        let intent = PendingRenameIntent {
+            parent: work_dir.to_string_lossy().into_owned(),
+            from_name: "Report.txt".to_owned(),
+            temp_name: temp_name.clone(),
+            to_name: "report.txt".to_owned(),
+        };
+        write_atomic(
+            &intent_path,
+            &serde_json::to_vec(&intent).unwrap(),
+            WriteOptions::with_mode(0o600),
+        )
+        .unwrap();
+
+        recover_pending_renames(&state_dir, Some(&work_dir));
+        assert!(!temp_path.exists());
+        assert_eq!(fs::read(work_dir.join("report.txt")).unwrap(), b"important");
+        assert!(!intent_path.exists());
+
+        // Case 2: `to` already occupied by another file -> recovery reverses `temp -> from`.
+        let temp_name2 = visible_rename_temp_name(OsStr::new("Notes.txt"), 42, 8);
+        let temp_path2 = work_dir.join(&temp_name2);
+        fs::write(&temp_path2, b"original").unwrap();
+        fs::write(work_dir.join("notes.txt"), b"occupant").unwrap();
+        let key2 = rename_intent_key(&work_dir, &temp_name2);
+        let intent_path2 = pending_renames_dir(&state_dir).join(format!("{key2}.json"));
+        let intent2 = PendingRenameIntent {
+            parent: work_dir.to_string_lossy().into_owned(),
+            from_name: "Notes.txt".to_owned(),
+            temp_name: temp_name2,
+            to_name: "notes.txt".to_owned(),
+        };
+        write_atomic(
+            &intent_path2,
+            &serde_json::to_vec(&intent2).unwrap(),
+            WriteOptions::with_mode(0o600),
+        )
+        .unwrap();
+
+        recover_pending_renames(&state_dir, Some(&work_dir));
+        assert!(!temp_path2.exists());
+        assert_eq!(fs::read(work_dir.join("Notes.txt")).unwrap(), b"original");
+        assert_eq!(fs::read(work_dir.join("notes.txt")).unwrap(), b"occupant");
+        assert!(!intent_path2.exists());
     }
 }

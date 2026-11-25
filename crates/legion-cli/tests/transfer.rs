@@ -138,6 +138,18 @@ fn main() -> ExitCode {
             "stale_partial_restart_reports_honest_per_attempt_progress",
             stale_partial_restart_reports_honest_per_attempt_progress,
         ),
+        (
+            "move_tree_shared_subfolder_and_inconclusive_probe_keep_source",
+            move_tree_shared_subfolder_and_inconclusive_probe_keep_source,
+        ),
+        (
+            "crossing_moves_same_node_and_two_nodes_never_lose_data",
+            crossing_moves_same_node_and_two_nodes_never_lose_data,
+        ),
+        (
+            "stream_rename_privilege_and_visible_interrupted_recovery",
+            stream_rename_privilege_and_visible_interrupted_recovery,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -232,6 +244,136 @@ fn helper(args: &[String]) -> ExitCode {
                 std::thread::sleep(Duration::from_millis(20));
             }
             drop(child_in);
+            exit_of(child.wait().unwrap())
+        }
+        // Throttles `put` stdin or `get` stdout to ~4 KiB/s (1 KiB every 250ms) so revocation must
+        // trigger via the 2-second time threshold at BOTH ends long before 4 MiB has moved.
+        "very-slow" if subcommand == "stream" => {
+            let mut input = BufReader::new(std::io::stdin());
+            let mut header = Vec::new();
+            input.read_until(b'\n', &mut header).unwrap();
+            let header_val: Value = serde_json::from_slice(&header).unwrap_or(Value::Null);
+            let op = header_val["op"].as_str().unwrap_or("");
+            if op == "get" {
+                let mut child = command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut child_in = child.stdin.take().unwrap();
+                child_in.write_all(&header).unwrap();
+                drop(child_in);
+                let mut child_out = BufReader::new(child.stdout.take().unwrap());
+                let mut stdout = std::io::stdout().lock();
+                // Forward greeting + GetReady JSON lines immediately, then throttle raw file bytes.
+                for _ in 0..2 {
+                    let mut line = Vec::new();
+                    let n = child_out.read_until(b'\n', &mut line).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    stdout.write_all(&line).unwrap();
+                    stdout.flush().unwrap();
+                }
+                let mut buf = [0u8; 1024];
+                while let Ok(read) = child_out.read(&mut buf) {
+                    if let Ok(Some(status)) = child.try_wait()
+                        && !status.success()
+                    {
+                        break;
+                    }
+                    if read == 0 || stdout.write_all(&buf[..read]).is_err() {
+                        break;
+                    }
+                    let _ = stdout.flush();
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                return exit_of(child.wait().unwrap());
+            }
+            let mut child = command.stdin(Stdio::piped()).spawn().unwrap();
+            let mut child_in = child.stdin.take().unwrap();
+            child_in.write_all(&header).unwrap();
+            let _ = child_in.flush();
+            if op == "put" {
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(read) = input.read(&mut buf) {
+                        if read == 0 || child_in.write_all(&buf[..read]).is_err() {
+                            break;
+                        }
+                        let _ = child_in.flush();
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                });
+            } else {
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut input, &mut child_in);
+                });
+            }
+            exit_of(child.wait().unwrap())
+        }
+        // Stalls a `put` stream completely (0 B/s) after forwarding `limit` bytes, keeping stdin
+        // open until the child exits on its own (proving stalled-stream revocation).
+        "stall-put" if subcommand == "stream" => {
+            let marker = Path::new(&extra[0]).to_path_buf();
+            let limit: u64 = extra[1].parse().unwrap();
+            let mut input = BufReader::new(std::io::stdin());
+            let mut header = Vec::new();
+            input.read_until(b'\n', &mut header).unwrap();
+            let header_val: Value = serde_json::from_slice(&header).unwrap_or(Value::Null);
+            let is_put = header_val["op"].as_str() == Some("put");
+            let mut child = command.stdin(Stdio::piped()).spawn().unwrap();
+            let mut child_in = child.stdin.take().unwrap();
+            child_in.write_all(&header).unwrap();
+            let _ = child_in.flush();
+            if is_put {
+                let _ = std::io::copy(&mut (&mut input).take(limit), &mut child_in);
+                let _ = child_in.flush();
+                let _ = fs::write(&marker, b"stalled");
+                // Hold stdin open in a background thread without sending more bytes; exit as soon
+                // as the child terminates (when its 2s auth timer fires!).
+                let _holder = std::thread::spawn(move || {
+                    let _keep_in = child_in;
+                    let _keep_stdin = input;
+                    std::thread::sleep(Duration::from_secs(60));
+                });
+                return exit_of(child.wait().unwrap());
+            }
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut input, &mut child_in);
+            });
+            exit_of(child.wait().unwrap())
+        }
+        // Makes `probe_write` return `{dir: null, marker: null, exists: false}` so directory
+        // distinctness cannot be proven (proving move fails safe and keeps both copies).
+        "inconclusive-probe" if subcommand == "stream" => {
+            let mut input = BufReader::new(std::io::stdin());
+            let mut header = Vec::new();
+            input.read_until(b'\n', &mut header).unwrap();
+            let header_val: Value = serde_json::from_slice(&header).unwrap_or(Value::Null);
+            if header_val["op"].as_str() == Some("probe_write") {
+                let mut stdout = std::io::stdout().lock();
+                writeln!(
+                    stdout,
+                    "{}",
+                    json!({"protocol": 1, "capabilities": ["if_exists", "lock", "move", "probe", "rename"]})
+                )
+                .unwrap();
+                writeln!(
+                    stdout,
+                    "{}",
+                    json!({"dir": null, "marker": null, "exists": false})
+                )
+                .unwrap();
+                stdout.flush().unwrap();
+                return ExitCode::SUCCESS;
+            }
+            let mut child = command.stdin(Stdio::piped()).spawn().unwrap();
+            let mut child_in = child.stdin.take().unwrap();
+            child_in.write_all(&header).unwrap();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut input, &mut child_in);
+            });
             exit_of(child.wait().unwrap())
         }
         // Cuts a specific stream op once (marker file gates it). `op_match`:
@@ -532,7 +674,7 @@ fn first_reply(stdout: &[u8]) -> Value {
     assert_eq!(opening["protocol"], json!(1));
     assert_eq!(
         opening["capabilities"],
-        json!(["if_exists", "move", "probe", "rename"])
+        json!(["if_exists", "lock", "move", "probe", "rename"])
     );
     serde_json::from_slice(lines.next().unwrap()).unwrap()
 }
@@ -3286,31 +3428,42 @@ fn move_same_file_aliases_symlinks_hardlinks_and_case_normalization_rename() {
         fs::symlink_metadata(laptop.home().join("FsNormProbe-\u{00e9}.tmp")).is_ok();
     let _ = fs::remove_file(laptop.home().join("FsNormProbe-e\u{0301}.tmp"));
 
-    // 4a. ASCII case-only rename via `stream` `rename`: must succeed on every OS and end with the
-    // exact requested spelling `report.txt` (not `Report.txt`).
+    // 4a. ASCII case-only rename via `stream` `rename`: strictly limited to same-file
+    // case/normalization renames. On case-insensitive volumes this succeeds and ends with the exact
+    // requested spelling `report.txt`; on case-sensitive volumes `Report.txt` and `report.txt` are
+    // distinct entries so `stream` `rename` refuses with `invalid_args`.
     fs::write(laptop.home().join("Report.txt"), b"report-contents").unwrap();
-    let rename_reply = stream_request(
+    let rename_raw = stream_request_raw(
         &laptop,
         json!({"op": "rename", "from": "~/Report.txt", "to": "~/report.txt"}),
     );
-    assert_eq!(rename_reply["ok"], true, "{rename_reply}");
-    let names = dir_entry_names(laptop.home());
-    assert!(
-        names.iter().any(|n| n == b"report.txt"),
-        "expected exact 'report.txt' in dir listing, got {:?}",
-        names
-            .iter()
-            .map(|n| String::from_utf8_lossy(n).into_owned())
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        !names.iter().any(|n| n == b"Report.txt"),
-        "old spelling 'Report.txt' still present in dir listing"
-    );
-    assert_eq!(
-        fs::read(laptop.home().join("report.txt")).unwrap(),
-        b"report-contents"
-    );
+    if host_case_insensitive {
+        assert_eq!(rename_raw["ok"], true, "{rename_raw}");
+        let names = dir_entry_names(laptop.home());
+        assert!(
+            names.iter().any(|n| n == b"report.txt"),
+            "expected exact 'report.txt' in dir listing"
+        );
+        assert!(
+            !names.iter().any(|n| n == b"Report.txt"),
+            "old spelling 'Report.txt' still present in dir listing"
+        );
+        assert_eq!(
+            fs::read(laptop.home().join("report.txt")).unwrap(),
+            b"report-contents"
+        );
+    } else {
+        assert_eq!(
+            rename_raw["error"]["code"], "invalid_args",
+            "case-sensitive host must refuse distinct stream rename: {rename_raw}"
+        );
+        // Move `Report.txt` -> `report.txt` via `fs.transfer` (`move: true`) for step 4b.
+        ok(&transfer(
+            &laptop,
+            json!({"from": "~/Report.txt", "to": "~/report.txt", "move": true}),
+            &[],
+        ));
+    }
 
     // 4b. ASCII case-only rename via `fs.transfer` (`move: true`): on case-insensitive volumes
     // (Windows NTFS, default macOS APFS) this takes the atomic folding-rename path (`renamed`
@@ -3407,18 +3560,25 @@ fn move_same_file_aliases_symlinks_hardlinks_and_case_normalization_rename() {
         b"unicode-contents"
     );
 
-    let unicode_back = stream_request(
+    let unicode_back = stream_request_raw(
         &laptop,
         json!({"op": "rename", "from": format!("~/{nfc_name}"), "to": format!("~/{nfd_name}")}),
     );
-    assert_eq!(unicode_back["ok"], true, "{unicode_back}");
-    let names = dir_entry_names(laptop.home());
-    assert!(names.iter().any(|n| n == nfd_name.as_bytes()));
-    assert!(!names.iter().any(|n| n == nfc_name.as_bytes()));
+    if host_unicode_normalizing {
+        assert_eq!(unicode_back["ok"], true, "{unicode_back}");
+        let names = dir_entry_names(laptop.home());
+        assert!(names.iter().any(|n| n == nfd_name.as_bytes()));
+        assert!(!names.iter().any(|n| n == nfc_name.as_bytes()));
+    } else {
+        assert_eq!(
+            unicode_back["error"]["code"], "invalid_args",
+            "non-normalizing host must refuse distinct stream rename: {unicode_back}"
+        );
+    }
 
     // 4f. On case-sensitive volumes (Linux, case-sensitive APFS):
     // - Two distinct files whose names differ only in case are NOT a folding rename: `stream`
-    //   `rename` refuses with `conflict`, and `fs.transfer` follows `if_exists`.
+    //   `rename` refuses with `invalid_args`, and `fs.transfer` follows `if_exists`.
     // - Two hardlinks whose names differ only in case are distinct links to the same file, so both
     //   `fs.transfer` (`move: true`) and `stream` `rename` must refuse with `invalid_args`.
     if !host_case_insensitive {
@@ -3429,7 +3589,7 @@ fn move_same_file_aliases_symlinks_hardlinks_and_case_normalization_rename() {
             json!({"op": "rename", "from": "~/CaseA.txt", "to": "~/casea.txt"}),
         );
         assert_eq!(
-            conflict_rename["error"]["code"], "conflict",
+            conflict_rename["error"]["code"], "invalid_args",
             "{conflict_rename}"
         );
         let fail_move = refused(&transfer(
@@ -3578,6 +3738,13 @@ fn older_v1_peer_copies_work_and_new_features_are_refused() {
         assert!(
             err["message"].as_str().unwrap().contains("old_pi"),
             "mode={mode}: {err}"
+        );
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("if_exists={mode}")),
+            "expected lowercase if_exists={mode} in error message: {err}"
         );
         assert_eq!(
             fs::read(old_pi.home().join("plain.txt")).unwrap(),
@@ -3846,30 +4013,55 @@ role_updated_on = "laptop"
     ));
     assert_eq!(st_after_policy["state"], "cancelled", "{st_after_policy}");
 
-    // 4. Mid-stream 4 MiB live policy re-check on a single large file (> 8 MiB) stops `put` on `pi`.
-    let huge = data(9 * 1024 * 1024, 92);
-    fs::write(laptop.home().join("stream_rev.bin"), &huge).unwrap();
+    // 4. Mid-stream 2-second time-based live policy re-check on a VERY slow link (~4 KiB/s, far
+    //    below the 4 MiB byte threshold) stops `put` on `pi` within a few seconds!
+    let pi_slow = node("pi_slow");
+    let pi_stall = node("pi_stall");
+    let stall_marker = laptop.home().join("stall.marker");
+    pi_slow.write_config("policy.toml", device_policy);
+    pi_stall.write_config("policy.toml", device_policy);
+    fleet(
+        &laptop,
+        &[
+            ("pi", &pi, "slow", vec![]),
+            ("pi_slow", &pi_slow, "very-slow", vec![]),
+            (
+                "pi_stall",
+                &pi_stall,
+                "stall-put",
+                vec![
+                    stall_marker.to_string_lossy().into_owned(),
+                    (16 * 1024).to_string(),
+                ],
+            ),
+        ],
+    );
+
+    let slow_body = data(2 * 1024 * 1024, 92);
+    fs::write(laptop.home().join("stream_rev.bin"), &slow_body).unwrap();
     let bg_stream = ok(&transfer(
         &laptop,
         json!({
             "from": "~/stream_rev.bin",
-            "to": "pi:~/stream_rev.bin",
+            "to": "pi_slow:~/stream_rev.bin",
             "background": true
         }),
         &["--as", "stream_rev"],
     ));
     let stream_job_id = bg_stream["job"]["id"].as_str().unwrap().to_owned();
-    let part = pi.home().join("stream_rev.bin.legion-part");
+    let part = pi_slow.home().join("stream_rev.bin.legion-part");
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if fs::metadata(&part).map_or(0, |m| m.len()) >= 256 * 1024 {
+        if fs::metadata(&part).map_or(0, |m| m.len()) >= 2 * 1024 {
             break;
         }
         assert!(Instant::now() < deadline, "stream_rev partial never grew");
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(40));
     }
-    // Revoke `stream_rev`'s write permission on `pi` while the single-file stream is mid-flight!
-    pi.write_config(
+    // Revoke `stream_rev`'s write permission on `pi_slow` while the slow stream (~4 KiB/s) is
+    // mid-flight (nowhere near 4 MiB).
+    let revoked_at = Instant::now();
+    pi_slow.write_config(
         "policy.toml",
         &device_policy.replace(
             "[principals.stream_rev]\nrole = \"mover\"",
@@ -3879,41 +4071,203 @@ role_updated_on = "laptop"
     let stream_done = ok(&call_tool(
         &laptop,
         "job.wait",
-        json!({"id": &stream_job_id, "timeout_s": 25}),
+        json!({"id": &stream_job_id, "timeout_s": 12}),
         &[],
     ));
     assert_eq!(stream_done["state"], "failed", "{stream_done}");
     assert_eq!(stream_done["error"]["code"], "denied", "{stream_done}");
-    assert!(!pi.home().join("stream_rev.bin").exists());
+    assert!(
+        revoked_at.elapsed() < Duration::from_secs(10),
+        "slow-link revocation took too long: {:?}",
+        revoked_at.elapsed()
+    );
+    assert!(
+        fs::metadata(&part).map_or(0, |m| m.len()) < 512 * 1024,
+        "slow-link revocation must fire on the 2s timer long before 4 MiB"
+    );
+    assert!(!pi_slow.home().join("stream_rev.bin").exists());
+
+    // 4b. Mid-stream 2-second time-based live policy re-check on the SENDING (`get`) end at ~4 KiB/s!
+    pi_slow.write_config("policy.toml", device_policy);
+    fs::write(pi_slow.home().join("pull_rev.bin"), &slow_body).unwrap();
+    let bg_pull = ok(&transfer(
+        &laptop,
+        json!({
+            "from": "pi_slow:~/pull_rev.bin",
+            "to": "~/pull_rev.bin",
+            "background": true
+        }),
+        &["--as", "stream_rev"],
+    ));
+    let pull_job_id = bg_pull["job"]["id"].as_str().unwrap().to_owned();
+    let pull_part = laptop.home().join("pull_rev.bin.legion-part");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if fs::metadata(&pull_part).map_or(0, |m| m.len()) >= 2 * 1024 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "pull_rev partial never grew");
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let pull_revoked_at = Instant::now();
+    // Remove `stream_rev` from `pi_slow`'s policy so `get` on `pi_slow` is denied mid-stream!
+    pi_slow.write_config(
+        "policy.toml",
+        &device_policy.replace("[principals.stream_rev]\nrole = \"mover\"", ""),
+    );
+    let pull_done = ok(&call_tool(
+        &laptop,
+        "job.wait",
+        json!({"id": &pull_job_id, "timeout_s": 12}),
+        &[],
+    ));
+    assert_eq!(pull_done["state"], "failed", "{pull_done}");
+    assert!(
+        pull_revoked_at.elapsed() < Duration::from_secs(10),
+        "slow-link get revocation took too long: {:?}",
+        pull_revoked_at.elapsed()
+    );
+    assert!(
+        fs::metadata(&pull_part).map_or(0, |m| m.len()) < 512 * 1024,
+        "slow-link get revocation must fire on the 2s timer long before 4 MiB"
+    );
+    assert!(!laptop.home().join("pull_rev.bin").exists());
+
+    // 5. Completely stalled stream (0 B/s) ALSO stops within a few seconds after revocation!
+    let bg_stall = ok(&transfer(
+        &laptop,
+        json!({
+            "from": "~/stream_rev.bin",
+            "to": "pi_stall:~/stalled.bin",
+            "background": true
+        }),
+        &["--as", "stream_rev"],
+    ));
+    let stall_job_id = bg_stall["job"]["id"].as_str().unwrap().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !stall_marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "stall-put never reached stall point"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let stall_revoked_at = Instant::now();
+    pi_stall.write_config(
+        "policy.toml",
+        &device_policy.replace(
+            "[principals.stream_rev]\nrole = \"mover\"",
+            "[principals.stream_rev]\nrole = \"ro\"",
+        ),
+    );
+    let stall_done = ok(&call_tool(
+        &laptop,
+        "job.wait",
+        json!({"id": &stall_job_id, "timeout_s": 12}),
+        &[],
+    ));
+    assert_eq!(stall_done["state"], "failed", "{stall_done}");
+    assert_eq!(stall_done["error"]["code"], "denied", "{stall_done}");
+    assert!(
+        stall_revoked_at.elapsed() < Duration::from_secs(10),
+        "stalled-stream revocation took too long: {:?}",
+        stall_revoked_at.elapsed()
+    );
+    assert!(!pi_stall.home().join("stalled.bin").exists());
+
+    // 6. Unparsable `policy.toml` fails closed and stops an active background transfer!
+    let bg_corrupt = ok(&transfer(
+        &laptop,
+        json!({
+            "from": "~/phone_big.bin",
+            "to": "pi:~/corrupt_policy.bin",
+            "background": true
+        }),
+        &["--as", "stream_rev"],
+    ));
+    let corrupt_job_id = bg_corrupt["job"]["id"].as_str().unwrap().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let st = ok(&call_tool(
+            &laptop,
+            "job.status",
+            json!({"id": &corrupt_job_id}),
+            &[],
+        ));
+        if st["progress"]["bytes_done"].as_u64().unwrap_or(0) > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "corrupt_policy job never started"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    laptop.write_config("policy.toml", "not valid [ toml ===\n");
+    // Restore valid policy ONLY after verifying the job stopped; inspect status via direct read
+    // or wait for exit file because `job.wait` itself parses policy.toml.
+    let job_dir = laptop.state().join("jobs").join(&corrupt_job_id);
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while !job_dir.join("exit.json").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "transfer job did not fail closed on unparsable policy.toml"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    laptop.write_config("policy.toml", device_policy);
+    let corrupt_done = ok(&call_tool(
+        &laptop,
+        "job.status",
+        json!({"id": &corrupt_job_id}),
+        &[],
+    ));
+    assert!(
+        matches!(corrupt_done["state"].as_str(), Some("cancelled" | "failed")),
+        "corrupt policy.toml must stop the transfer job: {corrupt_done}"
+    );
 }
 
 fn stale_partial_restart_reports_honest_per_attempt_progress() {
     let laptop = node("laptop");
     let pi = node("pi");
-    fleet(&laptop, &[("pi", &pi, "node", vec![])]);
+    let cut_marker = laptop.home().join("restart-cut.marker");
+    fleet(
+        &laptop,
+        &[(
+            "pi",
+            &pi,
+            "cut",
+            vec![
+                cut_marker.to_string_lossy().into_owned(),
+                (64 * 1024).to_string(),
+            ],
+        )],
+    );
 
     let body = data(128 * 1024, 99);
     fs::write(laptop.home().join("restart.bin"), &body).unwrap();
-    // Seed a corrupted `.legion-part` on `pi` WITH a matching `.legion-part.meta` sidecar so
-    // attempt 1 resumes from 64 KiB, detects the hash mismatch on finish, and retries cleanly on
-    // attempt 2 from offset 0.
-    let hashed = ok(&call_tool(
+    // First transfer is cut at 64 KiB so `pi` creates a real `.legion-part` plus its state-dir
+    // metadata sidecar (leaving ZERO `.lock` or `.meta` files in `pi`'s user folder).
+    let _ = refused(&transfer(
         &laptop,
-        "fs.hash",
-        json!({"path": "~/restart.bin"}),
+        json!({"from": "~/restart.bin", "to": "pi:~/restart.bin"}),
         &[],
     ));
-    let expected_hash = hashed["hash"].as_str().unwrap();
-    fs::write(
-        pi.home().join("restart.bin.legion-part"),
-        vec![0xAA; 64 * 1024],
-    )
-    .unwrap();
-    fs::write(
-        pi.home().join("restart.bin.legion-part.meta"),
-        format!("{} {expected_hash}\n", body.len()),
-    )
-    .unwrap();
+    let part = pi.home().join("restart.bin.legion-part");
+    assert!(part.exists(), "expected partial file after cut transfer");
+    assert!(
+        !pi.home().join("restart.bin.legion-part.meta").exists(),
+        "meta sidecar must live in state dir, not user folder"
+    );
+    assert!(
+        !pi.home().join("restart.bin.legion-part.lock").exists(),
+        "lock sidecar must live in state dir, not user folder"
+    );
+    // Corrupt the partial bytes in place so attempt 1 resumes from 64 KiB, detects the hash
+    // mismatch on finish, and retries cleanly on attempt 2 from offset 0.
+    let part_len = fs::metadata(&part).unwrap().len() as usize;
+    fs::write(&part, vec![0xAA; part_len]).unwrap();
 
     let started = ok(&transfer(
         &laptop,
@@ -3939,4 +4293,376 @@ fn stale_partial_restart_reports_honest_per_attempt_progress() {
         "{waited}"
     );
     assert_eq!(fs::read(pi.home().join("restart.bin")).unwrap(), body);
+}
+
+fn move_tree_shared_subfolder_and_inconclusive_probe_keep_source() {
+    let laptop = node("laptop");
+
+    // 1. Real Linux bind-mounted subfolder inside a same-node tree move (`dst/shared` bind-mounted
+    //    to `src/shared` in an unprivileged user+mount namespace): `src` and `dst` are distinct
+    //    roots on the same machine, yet `src/shared` and `dst/shared` are the exact same
+    //    directory. Probing every directory pair MUST detect `SameDirectory` for `shared`, keep
+    //    `shared/vital.txt` intact, still move distinct `other/ok.txt`, and report both folders!
+    #[cfg(target_os = "linux")]
+    {
+        let can_unshare = Command::new("unshare")
+            .args(["-rm", "true"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if can_unshare {
+            let src = laptop.home().join("bind_src");
+            let dst = laptop.home().join("bind_dst");
+            fs::create_dir_all(src.join("shared")).unwrap();
+            fs::create_dir_all(src.join("other")).unwrap();
+            fs::create_dir_all(dst.join("shared")).unwrap();
+            fs::write(src.join("shared/vital.txt"), b"bind-mount-must-survive").unwrap();
+            fs::write(src.join("other/ok.txt"), b"move-me").unwrap();
+
+            let script = r#"
+                set -euo pipefail
+                mount --bind "$1" "$2"
+                "$3" fs.transfer from=~/bind_src to=~/bind_dst move=true --json
+            "#;
+            let out = Command::new("unshare")
+                .args([
+                    "-rm",
+                    "bash",
+                    "-c",
+                    script,
+                    "--",
+                    src.join("shared").to_str().unwrap(),
+                    dst.join("shared").to_str().unwrap(),
+                    LEGION_BIN,
+                ])
+                .env("LEGION_HOME", legion_home_of(&laptop))
+                .env("HOME", laptop.home())
+                .env("USERPROFILE", laptop.home())
+                .env_remove("XDG_CONFIG_HOME")
+                .env_remove("XDG_STATE_HOME")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "bind-mount tree move failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let moved: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(
+                fs::read(src.join("shared/vital.txt")).unwrap(),
+                b"bind-mount-must-survive",
+                "bind-mounted subfolder file MUST survive tree move: {moved}"
+            );
+            assert_eq!(
+                fs::read(dst.join("other/ok.txt")).unwrap(),
+                b"move-me",
+                "distinct subfolder file should be moved: {moved}"
+            );
+            assert!(!src.join("other/ok.txt").exists());
+            let skipped = moved["skipped"].as_array().unwrap();
+            assert!(
+                skipped.iter().any(|entry| {
+                    let reason = entry["reason"].as_str().unwrap_or("");
+                    reason.contains("bind_src/shared") && reason.contains("bind_dst/shared")
+                }),
+                "skipped must name both bind-mounted folders: {moved}"
+            );
+        }
+    }
+
+    // 2. Cross-platform inconclusive probe (probe returns `dir: null, marker: null`):
+    //    NEVER treat unknown as distinct! Both copy and source stay intact and the report names
+    //    the folders that could not be told apart (both single-file and tree moves).
+    let pi_inc = node("pi_inc");
+    fleet(
+        &laptop,
+        &[("pi_inc", &pi_inc, "inconclusive-probe", vec![])],
+    );
+
+    fs::write(laptop.home().join("inc_one.txt"), b"keep-both-single").unwrap();
+    let single_inc = ok(&transfer(
+        &laptop,
+        json!({"from": "~/inc_one.txt", "to": "pi_inc:~/inc_one.txt", "move": true}),
+        &[],
+    ));
+    assert_eq!(
+        single_inc["source_removed"].as_u64().unwrap_or(0),
+        0,
+        "{single_inc}"
+    );
+    assert_eq!(
+        fs::read(laptop.home().join("inc_one.txt")).unwrap(),
+        b"keep-both-single"
+    );
+    assert_eq!(
+        fs::read(pi_inc.home().join("inc_one.txt")).unwrap(),
+        b"keep-both-single"
+    );
+    assert!(
+        single_inc["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("could not be proven distinct")),
+        "expected inconclusive reason in single-file skipped: {single_inc}"
+    );
+
+    let inc_src = laptop.home().join("inc_tree");
+    fs::create_dir_all(inc_src.join("sub")).unwrap();
+    fs::write(inc_src.join("sub/keep.txt"), b"keep-both-tree").unwrap();
+    let tree_inc = ok(&transfer(
+        &laptop,
+        json!({"from": "~/inc_tree", "to": "pi_inc:~/inc_tree", "move": true}),
+        &[],
+    ));
+    assert_eq!(
+        tree_inc["source_removed"].as_u64().unwrap_or(0),
+        0,
+        "{tree_inc}"
+    );
+    assert_eq!(
+        fs::read(inc_src.join("sub/keep.txt")).unwrap(),
+        b"keep-both-tree"
+    );
+    assert_eq!(
+        fs::read(pi_inc.home().join("inc_tree/sub/keep.txt")).unwrap(),
+        b"keep-both-tree"
+    );
+    assert!(
+        tree_inc["skipped"].as_array().unwrap().iter().any(|entry| {
+            let reason = entry["reason"].as_str().unwrap_or("");
+            reason.contains("inc_tree/sub") && reason.contains("could not be proven distinct")
+        }),
+        "skipped must name both folders that could not be told apart: {tree_inc}"
+    );
+
+    // 3. Real OS read-only destination subfolder (Unix): `already_verified` matches the file in
+    //    `dst/ro_sub`, `probe_write` fails with permission denied -> inconclusive -> source kept!
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let src = laptop.home().join("inc_src");
+        let dst = laptop.home().join("inc_dst");
+        fs::create_dir_all(src.join("ro_sub")).unwrap();
+        fs::create_dir_all(dst.join("ro_sub")).unwrap();
+        fs::write(src.join("ro_sub/keep.txt"), b"same-content").unwrap();
+        fs::write(dst.join("ro_sub/keep.txt"), b"same-content").unwrap();
+        fs::set_permissions(dst.join("ro_sub"), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let moved = ok(&transfer(
+            &laptop,
+            json!({"from": "~/inc_src", "to": "~/inc_dst", "move": true}),
+            &[],
+        ));
+        let _ = fs::set_permissions(dst.join("ro_sub"), fs::Permissions::from_mode(0o755));
+
+        assert_eq!(
+            fs::read(src.join("ro_sub/keep.txt")).unwrap(),
+            b"same-content",
+            "inconclusive probe MUST keep source file intact: {moved}"
+        );
+        assert_eq!(
+            fs::read(dst.join("ro_sub/keep.txt")).unwrap(),
+            b"same-content",
+            "destination copy must also stay intact: {moved}"
+        );
+        assert_eq!(moved["source_removed"].as_u64().unwrap_or(0), 0, "{moved}");
+        let skipped = moved["skipped"].as_array().unwrap();
+        assert!(
+            skipped.iter().any(|entry| {
+                let reason = entry["reason"].as_str().unwrap_or("");
+                reason.contains("inc_src/ro_sub") && reason.contains("inc_dst/ro_sub")
+            }),
+            "skipped must name both folders that could not be told apart: {moved}"
+        );
+    }
+}
+
+fn crossing_moves_same_node_and_two_nodes_never_lose_data() {
+    let payload = b"identical-crossing-move-payload-must-survive";
+
+    // 1. Same-node crossing moves: `p/a -> q/a` and `q/a -> p/a` simultaneously for 20 rounds.
+    let laptop = node("laptop");
+    fs::create_dir_all(laptop.home().join("p")).unwrap();
+    fs::create_dir_all(laptop.home().join("q")).unwrap();
+    let p_a = laptop.home().join("p/a.bin");
+    let q_a = laptop.home().join("q/a.bin");
+
+    for round in 0..20 {
+        fs::write(&p_a, payload).unwrap();
+        fs::write(&q_a, payload).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let (r1, r2) = std::thread::scope(|scope| {
+            let h1 = scope.spawn(|| {
+                barrier.wait();
+                transfer(
+                    &laptop,
+                    json!({"from": "~/p/a.bin", "to": "~/q/a.bin", "move": true}),
+                    &[],
+                )
+            });
+            let h2 = scope.spawn(|| {
+                barrier.wait();
+                transfer(
+                    &laptop,
+                    json!({"from": "~/q/a.bin", "to": "~/p/a.bin", "move": true}),
+                    &[],
+                )
+            });
+            (h1.join().unwrap(), h2.join().unwrap())
+        });
+        let p_ok = fs::read(&p_a).ok().as_deref() == Some(payload.as_slice());
+        let q_ok = fs::read(&q_a).ok().as_deref() == Some(payload.as_slice());
+        assert!(
+            p_ok || q_ok,
+            "same-node crossing move round {round} lost BOTH copies! r1={} / {} r2={} / {}",
+            r1.stdout,
+            r1.stderr,
+            r2.stdout,
+            r2.stderr
+        );
+    }
+
+    // 2. Two-node crossing moves: `laptop:~/c/a -> pi:~/c/a` and `pi:~/c/a -> laptop:~/c/a`
+    //    simultaneously for 12 rounds.
+    let pi = node("pi");
+    fleet(&laptop, &[("pi", &pi, "node", vec![])]);
+    fleet(&pi, &[("laptop", &laptop, "node", vec![])]);
+    fs::create_dir_all(laptop.home().join("c")).unwrap();
+    fs::create_dir_all(pi.home().join("c")).unwrap();
+    let la = laptop.home().join("c/a.bin");
+    let pa = pi.home().join("c/a.bin");
+
+    for round in 0..12 {
+        fs::write(&la, payload).unwrap();
+        fs::write(&pa, payload).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let (r1, r2) = std::thread::scope(|scope| {
+            let h1 = scope.spawn(|| {
+                barrier.wait();
+                transfer(
+                    &laptop,
+                    json!({"from": "~/c/a.bin", "to": "pi:~/c/a.bin", "move": true}),
+                    &[],
+                )
+            });
+            let h2 = scope.spawn(|| {
+                barrier.wait();
+                transfer(
+                    &pi,
+                    json!({"from": "~/c/a.bin", "to": "laptop:~/c/a.bin", "move": true}),
+                    &[],
+                )
+            });
+            (h1.join().unwrap(), h2.join().unwrap())
+        });
+        let l_ok = fs::read(&la).ok().as_deref() == Some(payload.as_slice());
+        let p_ok = fs::read(&pa).ok().as_deref() == Some(payload.as_slice());
+        assert!(
+            l_ok || p_ok,
+            "two-node crossing move round {round} lost BOTH copies! r1={} / {} r2={} / {}",
+            r1.stdout,
+            r1.stderr,
+            r2.stdout,
+            r2.stderr
+        );
+    }
+}
+
+fn stream_rename_privilege_and_visible_interrupted_recovery() {
+    let laptop = node("laptop");
+    laptop.write_config(
+        "policy.toml",
+        r#"
+[principals.nonadmin]
+role = "power"
+
+[roles.power]
+allow = ["effect:read", "effect:write", "effect:destroy"]
+"#,
+    );
+    fs::create_dir_all(laptop.home().join(".config")).unwrap();
+    fs::write(laptop.home().join(".config/policy.toml"), b"keep-config").unwrap();
+    fs::write(laptop.home().join("plain.txt"), b"keep-plain").unwrap();
+
+    // 1. Non-admin with read+write+destroy cannot use stream `rename` on `~/.config`, `~`, or
+    //    distinct entries (`plain.txt -> other.txt`).
+    let run_as = |header: Value| -> Value {
+        let mut h = header;
+        h["protocol"] = json!(1);
+        let mut child = Command::new(LEGION_BIN)
+            .args(["stream", "--as", "nonadmin"])
+            .env("LEGION_HOME", legion_home_of(&laptop))
+            .env("HOME", laptop.home())
+            .env("USERPROFILE", laptop.home())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(stdin, "{h}").unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        serde_json::from_str(lines[1]).unwrap()
+    };
+
+    let r_cfg = run_as(json!({"op": "rename", "from": "~/.config", "to": "~/.config2"}));
+    assert_eq!(r_cfg["error"]["code"], "denied", "{r_cfg}");
+    assert!(laptop.home().join(".config/policy.toml").exists());
+
+    let parent_home2 = laptop
+        .home()
+        .parent()
+        .unwrap()
+        .join("home2")
+        .to_string_lossy()
+        .into_owned();
+    let r_home = run_as(json!({"op": "rename", "from": "~", "to": parent_home2}));
+    assert_eq!(r_home["error"]["code"], "denied", "{r_home}");
+
+    let r_distinct = run_as(json!({"op": "rename", "from": "~/plain.txt", "to": "~/other.txt"}));
+    assert_eq!(r_distinct["error"]["code"], "invalid_args", "{r_distinct}");
+    assert!(laptop.home().join("plain.txt").exists());
+    assert!(!laptop.home().join("other.txt").exists());
+
+    // 2. Simulated interrupted two-step rename: visible `legion-renaming-*` file + state-dir
+    //    intent JSON. A subsequent `stream` `manifest` recovers it cleanly to `target.txt` and
+    //    clears the intent record!
+    let rec_dir = laptop.home().join("rec");
+    fs::create_dir_all(&rec_dir).unwrap();
+    let temp_name = "legion-renaming-999-1-Target.txt";
+    fs::write(rec_dir.join(temp_name), b"recovered-body").unwrap();
+    let renames_dir = laptop.state().join("xfer").join("renames");
+    fs::create_dir_all(&renames_dir).unwrap();
+    let intent_path = renames_dir.join("test-intent.json");
+    fs::write(
+        &intent_path,
+        serde_json::to_vec(&json!({
+            "parent": rec_dir.to_string_lossy(),
+            "from_name": "Target.txt",
+            "temp_name": temp_name,
+            "to_name": "target.txt",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Running `stat` on `rec/target.txt` triggers recovery automatically.
+    let st = stream_request(&laptop, json!({"op": "stat", "path": "~/rec/target.txt"}));
+    assert_eq!(st["kind"], "file", "{st}");
+    assert_eq!(
+        fs::read(rec_dir.join("target.txt")).unwrap(),
+        b"recovered-body"
+    );
+    assert!(!rec_dir.join(temp_name).exists());
+    assert!(!intent_path.exists());
 }

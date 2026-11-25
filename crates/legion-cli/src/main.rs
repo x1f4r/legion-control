@@ -296,19 +296,27 @@ async fn serve_stream(
     shutdown: CancellationToken,
 ) -> ExitCode {
     let host = Host::new(node.paths().clone(), node.name());
+    let revoke_abort = CancellationToken::new();
+    let revoke_for_server = revoke_abort.clone();
     let mut served = tokio::task::spawn_blocking(move || {
-        legion_net::stream::serve_with_door(
+        legion_net::stream::serve_with_cancel(
             &host,
             pinned.as_deref(),
             door,
             device.as_deref(),
             pairing_id.as_deref(),
-            io::stdin().lock(),
-            io::stdout().lock(),
+            Some(revoke_for_server),
+            io::stdin(),
+            io::stdout(),
         )
     });
     let outcome = tokio::select! {
         result = &mut served => Some(result),
+        () = revoke_abort.cancelled() => {
+            tokio::time::timeout(Duration::from_millis(200), served)
+                .await
+                .ok()
+        }
         () = shutdown.cancelled() => {
             // Give an operation that is already finishing a short window to audit cleanly
             // without hanging if stdin stays open.
@@ -328,7 +336,11 @@ async fn serve_stream(
             ExitCode::from(FAILED)
         }
         None => {
-            err("legion stream: stopped by signal\n");
+            if revoke_abort.is_cancelled() {
+                err("legion stream: permissions or device access were revoked mid-stream\n");
+            } else {
+                err("legion stream: stopped by signal\n");
+            }
             ExitCode::from(FAILED)
         }
     }
