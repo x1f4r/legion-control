@@ -14,6 +14,7 @@ import { chromium } from 'playwright-core';
 import './files-browser.mjs';
 import './live-refresh-browser.mjs';
 import './machine-browser.mjs';
+import './split-view-browser.mjs';
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(TEST_DIR, '..', '..', '..');
@@ -549,7 +550,7 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await wide.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, {
       waitUntil: 'domcontentloaded',
     });
-    await wide.getByText('2 are on').waitFor({ timeout: 15_000 });
+    await wide.getByText('2 on').waitFor({ timeout: 15_000 });
     assert.ok(!wide.url().includes(fleet.token), `token leaked in URL: ${wide.url()}`);
 
     // Rail has 3 root places + Settings at the foot.
@@ -594,7 +595,7 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
 
       // Default mock: 3 on, 2 off (laptop with "Last on 14 days ago" + Wake, nas with "Off" & no Wake).
       await p.goto(`${server.url}/?mock`, { waitUntil: 'domcontentloaded' });
-      await p.getByText('3 are on, 2 are off').waitFor();
+      await p.getByText(label === 'wide' ? '3 on, 2 off' : '3 are on, 2 are off').waitFor();
       await p.locator('a.machine', { hasText: 'tower' }).getByText('Busy · 2 things running').waitFor();
       await p.locator('a.machine', { hasText: 'studio' }).getByText('Busy · agents').waitFor();
       await p.locator('a.machine', { hasText: 'pi' }).getByText('Idle').waitFor();
@@ -1264,7 +1265,7 @@ test('content URLs isolate HTML and SVG from the interface origin and allow <vid
     await uiPage.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, {
       waitUntil: 'domcontentloaded',
     });
-    await uiPage.getByText('2 are on').waitFor({ timeout: 15_000 });
+    await uiPage.getByText('2 on').waitFor({ timeout: 15_000 });
     const storedToken = await uiPage.evaluate(() => localStorage.getItem('legion.token'));
     assert.equal(storedToken, fleet.token, 'expected live token in interface localStorage');
 
