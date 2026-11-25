@@ -1365,8 +1365,7 @@ pub fn apply_decision<F: SyncFs, S: IndexStore>(
                 let del_vv = store
                     .get_deleted_history_version(&record.path)?
                     .unwrap_or_default()
-                    .merge(&record.version)
-                    .pruned(&meta.pruned_incarnations);
+                    .merge(&record.version);
                 batch
                     .upsert_deleted_history_versions
                     .push((record.path.clone(), del_vv));
@@ -6528,8 +6527,7 @@ fn commit_records_and_clear_pending<F: SyncFs, S: IndexStore>(
             let del_vv = store
                 .get_deleted_history_version(&rec.path)?
                 .unwrap_or_default()
-                .merge(&rec.version)
-                .pruned(&meta.pruned_incarnations);
+                .merge(&rec.version);
             batch
                 .upsert_deleted_history_versions
                 .push((rec.path.clone(), del_vv));

@@ -285,24 +285,6 @@ impl IndexStore for MemoryIndexStore {
         })
     }
 
-    fn visit_version_keys_since(
-        &self,
-        since_seq: u64,
-        visitor: &mut dyn FnMut(&crate::version::VersionKey),
-    ) -> Result<()> {
-        for (_, path) in self
-            .by_seq
-            .range((Bound::Excluded(since_seq), Bound::Unbounded))
-        {
-            if let Some(rec) = self.records.get(path) {
-                for (k, _) in rec.version.iter() {
-                    visitor(k);
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn list_tombstones(&self) -> Result<Vec<IndexRecord>> {
         let mut out = Vec::with_capacity(self.tombstones.len());
         for path in &self.tombstones {
@@ -349,14 +331,6 @@ impl IndexStore for MemoryIndexStore {
 
     fn get_deleted_history_version(&self, path: &str) -> Result<Option<VersionVector>> {
         Ok(self.deleted_history_vv.get(path).cloned())
-    }
-
-    fn list_deleted_history_versions(&self) -> Result<Vec<(String, VersionVector)>> {
-        Ok(self
-            .deleted_history_vv
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect())
     }
 
     fn load_pending_op(&self) -> Result<Option<PendingOp>> {

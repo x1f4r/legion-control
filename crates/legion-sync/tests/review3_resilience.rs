@@ -851,8 +851,8 @@ fn r4_lifetime_incarnations_cut_member_off() {
             .map(|r| r.version.iter().filter(|(k, _)| k.member == "pi").count())
             .unwrap();
         assert!(
-            keys <= 2,
-            "rebuild {n}: expected <= 2 pi keys after VV pruning, got {keys}"
+            keys <= 11 && keys >= n as usize,
+            "rebuild {n}: expected whole version vector keeping all pi keys (between {n} and 11), got {keys}"
         );
         assert_eq!(tower.store().held_back_count().unwrap(), 0);
     }
@@ -3255,107 +3255,65 @@ impl Peer for InflatedVvPeer<'_> {
     }
 }
 
-/// 1) 70 consecutive rebuilds stay bounded past the 64-incarnation cap via deterministic VV
-///    pruning;
-/// 2) When a peer actually presents >64 live incarnations in one VV, the receiver rejects it with
-///    an actionable message mentioning remove & re-add, and the sender learns of the refusal via
-///    handshake (`PeerRefusedRecords`).
+/// 1) Up to 64 incarnations of one member in a record sync cleanly without losing keys;
+/// 2) When a peer presents >64 incarnations of one member in one VV, the receiver refuses only
+///    that record with a truthful actionable message (keep that machine's index / set up the
+///    folder afresh, without falsely claiming remove & re-add clears it), unrelated files continue
+///    syncing, and the sender learns of the refusal via handshake (`PeerRefusedRecords`).
 #[test]
-fn over_64_incarnations_pruning_and_actionable_visibility() {
-    // Part 1: 70 consecutive rebuilds stay healthy via VV pruning.
-    {
-        let tmp = scratch();
-        let t = tmp.path();
-        let all = ["tower", "pi"];
-        fs::create_dir_all(t.join("tower")).unwrap();
-        fs::write(t.join("tower/f.txt"), b"init").unwrap();
-        let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
-        let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
-        tower.scan(ts(0)).unwrap();
-        sync_all(&mut [&mut tower, &mut pi], 1);
+fn over_64_incarnations_refused_with_truthful_guidance() {
+    let tmp = scratch();
+    let t = tmp.path();
+    let all = ["tower", "pi"];
+    fs::create_dir_all(t.join("pi")).unwrap();
+    fs::write(t.join("pi/over.txt"), b"too many incarnations").unwrap();
+    let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
+    let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
+    pi.scan(ts(0)).unwrap();
 
-        for n in 1..=70i64 {
-            drop(pi);
-            fs::remove_file(t.join("pi.redb")).unwrap();
-            let mut p = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
-            p.rebuild_from_disk(ts(100 * n)).unwrap();
-            pi = p;
-            assert!(pull(&mut pi, &tower, 100 * n + 1).is_none());
-            assert!(pull(&mut tower, &pi, 100 * n + 2).is_none());
-            assert!(pull(&mut pi, &tower, 100 * n + 3).is_none());
-            assert!(pull(&mut tower, &pi, 100 * n + 4).is_none());
-            let body = format!("rebuild {n}");
-            fs::write(t.join("pi/f.txt"), &body).unwrap();
-            pi.scan(ts(100 * n + 5)).unwrap();
-            assert!(pull(&mut tower, &pi, 100 * n + 6).is_none());
-            assert!(pull(&mut pi, &tower, 100 * n + 7).is_none());
-            assert_eq!(fs::read_to_string(t.join("tower/f.txt")).unwrap(), body);
+    let bad_peer = InflatedVvPeer {
+        inner: EnginePeer::new(&pi, "tower"),
+        extra_incarnations: 65,
+    };
+    let rep = tower.pull_from_peer(&bad_peer, ts(1)).unwrap();
+    assert_eq!(rep.invalid_skipped, 1);
+    match &tower.status().unwrap().state {
+        MemberState::Problem { problems, .. } => {
+            assert!(
+                problems.iter().any(|p| {
+                    p.kind == ProblemKind::InvalidPeerRecord
+                        && p.sentence.contains("keep that machine's index")
+                        && p.sentence.contains("set up afresh")
+                        && !p.sentence.contains("add it again")
+                }),
+                "expected truthful 64-incarnation guidance on tower, got {problems:?}"
+            );
         }
-        let pi_keys = tower
-            .store()
-            .get_record("f.txt")
-            .unwrap()
-            .unwrap()
-            .version
-            .iter()
-            .filter(|(k, _)| k.member == "pi")
-            .count();
-        assert!(
-            pi_keys <= 2,
-            "expected <= 2 pi keys after 70 rebuilds, got {pi_keys}"
-        );
-        assert_eq!(tower.status().unwrap().state, MemberState::UpToDate);
-        assert_eq!(pi.status().unwrap().state, MemberState::UpToDate);
+        other => panic!("expected InvalidPeerRecord problem on tower, got {other:?}"),
     }
 
-    // Part 2: 65 live non-prunable incarnations rejected with actionable guidance & visible on both
-    // sides.
-    {
-        let tmp = scratch();
-        let t = tmp.path();
-        let all = ["tower", "pi"];
-        fs::create_dir_all(t.join("pi")).unwrap();
-        fs::write(t.join("pi/over.txt"), b"too many incarnations").unwrap();
-        let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
-        let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
-        pi.scan(ts(0)).unwrap();
-
-        let bad_peer = InflatedVvPeer {
-            inner: EnginePeer::new(&pi, "tower"),
-            extra_incarnations: 65,
-        };
-        let rep = tower.pull_from_peer(&bad_peer, ts(1)).unwrap();
-        assert_eq!(rep.invalid_skipped, 1);
-        match &tower.status().unwrap().state {
-            MemberState::Problem { problems, .. } => {
-                assert!(
-                    problems.iter().any(|p| {
-                        p.kind == ProblemKind::InvalidPeerRecord
-                            && p.sentence.contains("remove")
-                            && p.sentence.contains("add it again")
-                    }),
-                    "expected actionable remove/re-add message on tower, got {problems:?}"
-                );
-            }
-            other => panic!("expected InvalidPeerRecord problem on tower, got {other:?}"),
+    // pi pulls from tower and receives the refusal summary in tower's handshake.
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(2))
+        .unwrap();
+    match &pi.status().unwrap().state {
+        MemberState::Problem { problems, .. } => {
+            assert!(
+                problems.iter().any(|p| {
+                    p.kind == ProblemKind::PeerRefusedRecords && p.peer.as_deref() == Some("tower")
+                }),
+                "expected PeerRefusedRecords on pi naming tower, got {problems:?}"
+            );
         }
-
-        // pi pulls from tower and receives the refusal summary in tower's handshake.
-        pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(2))
-            .unwrap();
-        match &pi.status().unwrap().state {
-            MemberState::Problem { problems, .. } => {
-                assert!(
-                    problems.iter().any(|p| {
-                        p.kind == ProblemKind::PeerRefusedRecords
-                            && p.peer.as_deref() == Some("tower")
-                    }),
-                    "expected PeerRefusedRecords on pi naming tower, got {problems:?}"
-                );
-            }
-            other => panic!("expected PeerRefusedRecords problem on pi, got {other:?}"),
-        }
+        other => panic!("expected PeerRefusedRecords problem on pi, got {other:?}"),
     }
+
+    // Unrelated files with <= 64 incarnations still sync cleanly without losing anything.
+    fs::write(t.join("pi/ok.txt"), b"still syncs").unwrap();
+    pi.scan(ts(3)).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(4))
+        .unwrap();
+    assert_eq!(fs::read(t.join("tower/ok.txt")).unwrap(), b"still syncs");
 }
 
 struct ManyOversizedPeer {
@@ -3383,10 +3341,6 @@ impl Peer for ManyOversizedPeer {
             caller_regressed: false,
             caller_rejoining: false,
             refused_from_caller: None,
-            pruned_incarnations: Vec::new(),
-            known_incarnations: BTreeMap::new(),
-            known_members: BTreeSet::new(),
-            unsettled_vv_keys: Vec::new(),
         })
     }
     fn records_since(

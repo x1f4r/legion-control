@@ -965,10 +965,6 @@ impl Peer for SyntheticLinuxPeer {
             caller_regressed: false,
             caller_rejoining: false,
             refused_from_caller: None,
-            pruned_incarnations: Vec::new(),
-            known_incarnations: BTreeMap::new(),
-            known_members: std::collections::BTreeSet::new(),
-            unsettled_vv_keys: Vec::new(),
         })
     }
 

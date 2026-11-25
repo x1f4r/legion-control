@@ -535,10 +535,6 @@ pub trait IndexStore {
     /// if any.
     fn get_deleted_history_version(&self, path: &str) -> Result<Option<VersionVector>>;
 
-    /// Lists all `(path, VersionVector)` entries stored alongside `deleted_history` (used when
-    /// pruning retired incarnations).
-    fn list_deleted_history_versions(&self) -> Result<Vec<(String, VersionVector)>>;
-
     /// Loads the active write-ahead [`PendingOp`], if any.
     fn load_pending_op(&self) -> Result<Option<PendingOp>>;
 
@@ -559,23 +555,6 @@ pub trait IndexStore {
 
     /// Returns the count of currently live regular files in the index (for the deletion brake).
     fn live_file_count(&self) -> Result<u64>;
-
-    /// Visits every [`crate::version::VersionKey`] appearing in records with `seq > since_seq`
-    /// without allocating a wire [`RecordsPage`] or cloning records.
-    fn visit_version_keys_since(
-        &self,
-        since_seq: u64,
-        visitor: &mut dyn FnMut(&crate::version::VersionKey),
-    ) -> Result<()> {
-        self.scan_records_in_order(&mut |rec| {
-            if rec.seq > since_seq {
-                for (k, _) in rec.version.iter() {
-                    visitor(k);
-                }
-            }
-            Ok(true)
-        })
-    }
 
     /// Applies every mutation in `batch` in a single atomic transaction.
     fn apply_batch(&mut self, batch: StoreBatch) -> Result<()>;

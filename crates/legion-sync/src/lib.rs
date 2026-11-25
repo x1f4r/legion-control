@@ -92,12 +92,11 @@ pub use model::{
     FolderStatus, HandshakeHello, HeldBackRecord, INDEX_SCHEMA_VERSION, InboundDeletionBrake,
     InboundDeletionBrakeDecision, IndexRecord, MAX_ANCESTRY_HASHES, MAX_DEFERRAL_ATTEMPTS,
     MAX_FORCED_ROTATIONS_PER_WEEK, MAX_HELD_BACK_ENTRIES, MAX_LINK_TARGET_BYTES, MAX_PAGE_RECORDS,
-    MAX_PEER_PROBLEMS, MAX_PRUNED_INCARNATIONS, MAX_VERSION_COUNTER,
-    MAX_VV_INCARNATIONS_PER_MEMBER, MIN_PLAUSIBLE_CLOCK_SECS, MemberId, MemberState, MemberStatus,
-    PeerAckView, PeerCursor, PeerHandshake, PeerRefusalSummary, PendingLocalDeletion, PendingOp,
-    ProblemKind, RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress,
-    chain_fingerprint, encode_deletion_log_entries, parse_deletion_log, validate_folder_id,
-    validate_member_id,
+    MAX_PEER_PROBLEMS, MAX_VERSION_COUNTER, MAX_VV_INCARNATIONS_PER_MEMBER,
+    MIN_PLAUSIBLE_CLOCK_SECS, MemberId, MemberState, MemberStatus, PeerAckView, PeerCursor,
+    PeerHandshake, PeerRefusalSummary, PendingLocalDeletion, PendingOp, ProblemKind, RecordsPage,
+    RestoreStrategy, SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, chain_fingerprint,
+    encode_deletion_log_entries, parse_deletion_log, validate_folder_id, validate_member_id,
 };
 pub use path::{
     IgnoreMatcher, ParsedConflictPath, SYNC_BIN_DIR, SYNC_DELETIONS_LOG_FILE, SYNC_MARKER_FILE,

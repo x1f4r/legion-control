@@ -4,7 +4,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
 
 use legion_sync::{IndexRecord, VersionKey, VersionOrder, VersionVector, compare_live_winner};
 use legion_xfer::hash::hash_bytes;
@@ -164,36 +163,5 @@ proptest! {
         if ab == Ordering::Less && bc != Ordering::Greater {
             prop_assert_eq!(ac, Ordering::Less);
         }
-    }
-
-    #[test]
-    fn pruning_projection_commutes_with_merge_and_is_monotone(
-        a in version_vector(),
-        b in version_vector(),
-        p1 in prop::collection::btree_set(version_key(), 0..=4),
-        p2 in prop::collection::btree_set(version_key(), 0..=4),
-    ) {
-        // Pure projection pi_P commutes with join-semilattice merge:
-        // pi_P(a U b) == pi_P(a) U pi_P(b).
-        let lhs = a.merge(&b).pruned_for_compare(&p1);
-        let rhs = a.pruned_for_compare(&p1).merge(&b.pruned_for_compare(&p1));
-        prop_assert_eq!(lhs, rhs);
-
-        // Monotonicity: a >= b => pi_P(a) >= pi_P(b).
-        if a.dominates_or_equal(&b) {
-            prop_assert!(a.pruned_for_compare(&p1).dominates_or_equal(&b.pruned_for_compare(&p1)));
-        }
-
-        // Order-independence of applying pruned sets: pi_{P1 U P2} == pi_{P2} o pi_{P1} == pi_{P1} o pi_{P2}.
-        let union: BTreeSet<VersionKey> = p1.union(&p2).cloned().collect();
-        let ab = a.merge(&b);
-        prop_assert_eq!(
-            ab.pruned_for_compare(&union),
-            ab.pruned_for_compare(&p1).pruned_for_compare(&p2)
-        );
-        prop_assert_eq!(
-            ab.pruned_for_compare(&p1).pruned_for_compare(&p2),
-            ab.pruned_for_compare(&p2).pruned_for_compare(&p1)
-        );
     }
 }

@@ -2086,10 +2086,6 @@ impl IndexStore for FaultyIndexStore {
         self.inner.get_deleted_history_version(path)
     }
 
-    fn list_deleted_history_versions(&self) -> legion_sync::Result<Vec<(String, VersionVector)>> {
-        self.inner.list_deleted_history_versions()
-    }
-
     fn load_pending_op(&self) -> legion_sync::Result<Option<PendingOp>> {
         self.inner.load_pending_op()
     }
@@ -2116,14 +2112,6 @@ impl IndexStore for FaultyIndexStore {
 
     fn live_file_count(&self) -> legion_sync::Result<u64> {
         self.inner.live_file_count()
-    }
-
-    fn visit_version_keys_since(
-        &self,
-        since_seq: u64,
-        visitor: &mut dyn FnMut(&VersionKey),
-    ) -> legion_sync::Result<()> {
-        self.inner.visit_version_keys_since(since_seq, visitor)
     }
 
     fn apply_batch(&mut self, batch: StoreBatch) -> legion_sync::Result<()> {
@@ -2528,7 +2516,6 @@ impl SimWorld {
                     m.engine.meta().ok().map(|mt| (
                         mt.incarnation,
                         mt.local_seq,
-                        mt.pruned_incarnations,
                         mt.kept_deleted_dirs
                     )),
                     m.engine.fs().live_tree(&m.ignore),
@@ -4787,10 +4774,6 @@ fn run_hostile_peer_seed(root_seed: u64, seed: u64, record_trace: bool) {
                 caller_regressed: false,
                 caller_rejoining: false,
                 refused_from_caller: None,
-                pruned_incarnations: Vec::new(),
-                known_incarnations: BTreeMap::new(),
-                known_members: BTreeSet::new(),
-                unsettled_vv_keys: Vec::new(),
             })
         }
         fn records_since(
@@ -5800,10 +5783,6 @@ fn run_adversary_counters_rotation_and_symlinks_seed(
                 caller_regressed: false,
                 caller_rejoining: false,
                 refused_from_caller: None,
-                pruned_incarnations: Vec::new(),
-                known_incarnations: BTreeMap::new(),
-                known_members: BTreeSet::new(),
-                unsettled_vv_keys: Vec::new(),
             })
         }
         fn records_since(
@@ -6195,28 +6174,19 @@ fn run_lifetime_rotations_and_vv_pruning_seed(root_seed: u64, seed: u64, _record
                 names[idx]
             );
         }
-        // Deterministic pruning keeps m1's key count bounded on every converged member.
+        // Version vectors are always compared whole and never drop retired incarnation keys.
         let rec0 = es[0].store().get_record("f1.txt").unwrap().unwrap();
+        let rec1 = es[1].store().get_record("f1.txt").unwrap().unwrap();
         let m1_keys = rec0
             .version
             .iter()
             .filter(|(k, _)| k.member == "m1")
             .count();
         assert!(
-            m1_keys <= 2,
-            "seed={root_seed} rot={rot}: expected <= 2 m1 keys after pruning, got {m1_keys}"
+            m1_keys >= rot as usize && m1_keys <= (rot as usize) + 1,
+            "seed={root_seed} rot={rot}: expected whole VV retaining all m1 keys, got {m1_keys}"
         );
-        // Check projection commutativity with merging across members' pruned sets.
-        let p0 = es[0].meta().unwrap().pruned_incarnations;
-        let p1 = es[1].meta().unwrap().pruned_incarnations;
-        let rec1 = es[1].store().get_record("f1.txt").unwrap().unwrap();
-        let union: BTreeSet<VersionKey> = p0.union(&p1).cloned().collect();
-        assert_eq!(
-            rec0.version.merge(&rec1.version).pruned_for_compare(&union),
-            rec0.version
-                .pruned_for_compare(&union)
-                .merge(&rec1.version.pruned_for_compare(&union))
-        );
+        assert_eq!(rec0.version, rec1.version);
     }
 }
 

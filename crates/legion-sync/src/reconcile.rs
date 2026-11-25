@@ -213,8 +213,8 @@ fn validate_incoming_record_detailed(
         }
         if member_inc_count > MAX_VV_INCARNATIONS_PER_MEMBER {
             return Err(RecordValidationError::Invalid(format!(
-                "version vector has more than {MAX_VV_INCARNATIONS_PER_MEMBER} incarnations for member {:?}; remove {:?} from the sync folder and add it again as a fresh member",
-                key.member, key.member
+                "version vector has more than {MAX_VV_INCARNATIONS_PER_MEMBER} incarnations for member {:?}; keep that machine's index instead of rebuilding it, and once this limit is reached the folder has to be set up afresh from one healthy member",
+                key.member
             )));
         }
         if !meta.is_known_member(&key.member) && first_unknown_member.is_none() {
@@ -455,7 +455,7 @@ fn reconcile_without_local(
             let del_vv_opt = local_view.get_deleted_history_version(clean_path);
             let del_cmp = del_vv_opt
                 .as_ref()
-                .map(|del_vv| del_vv.compare_ignoring(&remote.version, &meta.pruned_incarnations));
+                .map(|del_vv| del_vv.compare(&remote.version));
             let remote_dominates_deletion = del_cmp == Some(VersionOrder::Older);
             let deletion_dominates_remote =
                 matches!(del_cmp, Some(VersionOrder::Newer | VersionOrder::Equal));
@@ -472,11 +472,10 @@ fn reconcile_without_local(
                         recent_hashes.push(h);
                     }
                 }
-                let mut version = match del_vv_opt {
+                let version = match del_vv_opt {
                     Some(del_vv) => del_vv.merge(&remote.version),
                     None => remote.version.clone(),
                 };
-                version.prune_in_place(&meta.pruned_incarnations);
                 let tombstone = IndexRecord {
                     path: clean_path.to_string(),
                     kind: remote.kind,
@@ -532,10 +531,7 @@ fn reconcile_with_local(
     meta: &FolderMeta,
     caps: &FsCapabilities,
 ) -> ReconcileDecision {
-    match local
-        .version
-        .compare_ignoring(&remote.version, &meta.pruned_incarnations)
-    {
+    match local.version.compare(&remote.version) {
         VersionOrder::Newer => ReconcileDecision::Keep,
         VersionOrder::Equal => {
             if local.deleted && remote.deleted {
@@ -606,10 +602,7 @@ fn reconcile_remote_newer(
         if local.kind == EntryKind::Dir && local_view.has_live_descendant(clean_path) {
             return ReconcileDecision::ReviveDir {
                 path: clean_path.to_string(),
-                base_version: local
-                    .version
-                    .merge(&remote.version)
-                    .pruned(&meta.pruned_incarnations),
+                base_version: local.version.merge(&remote.version),
             };
         }
 
@@ -634,7 +627,7 @@ fn reconcile_remote_newer(
     // Remote is live and strictly newer.
     if !local.deleted && local.content_equal(remote) {
         let mut updated = local.clone();
-        updated.version = remote.version.pruned(&meta.pruned_incarnations);
+        updated.version = remote.version.clone();
         updated.mtime = remote.mtime;
         updated.modified_by = remote.modified_by.clone();
         if remote.mode.is_some() {
@@ -732,10 +725,7 @@ fn reconcile_concurrent(
     meta: &FolderMeta,
     caps: &FsCapabilities,
 ) -> ReconcileDecision {
-    let merged_version = local
-        .version
-        .merge(&remote.version)
-        .pruned(&meta.pruned_incarnations);
+    let merged_version = local.version.merge(&remote.version);
 
     // Concurrent deletions merge quietly.
     if local.deleted && remote.deleted {
@@ -898,7 +888,7 @@ fn reconcile_concurrent(
         }
         if local.from_join && !remote.from_join {
             let mut adopted = sanitize_remote(remote, clean_path, meta);
-            adopted.version = remote.version.pruned(&meta.pruned_incarnations);
+            adopted.version = remote.version.clone();
             adopted.disk_mtime = local.disk_mtime;
             adopted.disk_change_id = local.disk_change_id;
             adopted.from_join = false;
@@ -1014,7 +1004,6 @@ fn reconcile_concurrent(
 fn sanitize_remote(remote: &IndexRecord, clean_path: &str, meta: &FolderMeta) -> IndexRecord {
     let mut rec = remote.for_wire();
     rec.path = clean_path.to_string();
-    rec.version.prune_in_place(&meta.pruned_incarnations);
     if let Some(canon) = meta.canonical_member_name(&remote.modified_by) {
         rec.modified_by = canon.to_string();
     }
@@ -1051,10 +1040,7 @@ fn build_remote_loses_conflict(
     }
 
     let mut winner = local.clone();
-    winner.version = local
-        .version
-        .merge(&remote.version)
-        .pruned(&meta.pruned_incarnations);
+    winner.version = local.version.merge(&remote.version);
     winner.merge_ancestry_from(remote);
     winner.from_join = false;
 
@@ -1111,10 +1097,7 @@ fn build_local_loses_conflict(
     }
 
     let mut winner = sanitize_remote(remote, clean_path, meta);
-    winner.version = local
-        .version
-        .merge(&remote.version)
-        .pruned(&meta.pruned_incarnations);
+    winner.version = local.version.merge(&remote.version);
     winner.merge_ancestry_from(local);
     winner.from_join = false;
 

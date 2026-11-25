@@ -857,7 +857,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             let mut del_vv = store
                 .get_deleted_history_version(&old.path)?
                 .unwrap_or_default();
-            del_vv = del_vv.merge(&version).pruned(&meta.pruned_incarnations);
+            del_vv = del_vv.merge(&version);
             batch
                 .upsert_deleted_history_versions
                 .push((old.path.clone(), del_vv));
@@ -1188,7 +1188,7 @@ pub fn flush_settled_deletions<F: SyncFs, S: IndexStore>(
             let mut del_vv = store
                 .get_deleted_history_version(&old.path)?
                 .unwrap_or_default();
-            del_vv = del_vv.merge(&version).pruned(&meta.pruned_incarnations);
+            del_vv = del_vv.merge(&version);
             batch
                 .upsert_deleted_history_versions
                 .push((old.path.clone(), del_vv));
@@ -1333,7 +1333,7 @@ pub fn rescan_single_path_with_force<F: SyncFs, S: IndexStore>(
                     let mut del_vv = store
                         .get_deleted_history_version(&item.path)?
                         .unwrap_or_default();
-                    del_vv = del_vv.merge(&version).pruned(&meta.pruned_incarnations);
+                    del_vv = del_vv.merge(&version);
                     upsert_deleted_history_versions.push((item.path.clone(), del_vv));
                 }
                 let rec = IndexRecord {

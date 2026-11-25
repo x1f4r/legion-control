@@ -307,11 +307,6 @@ impl IndexStore for PanickingStore {
     ) -> legion_sync::Result<Option<legion_sync::VersionVector>> {
         self.inner.get_deleted_history_version(path)
     }
-    fn list_deleted_history_versions(
-        &self,
-    ) -> legion_sync::Result<Vec<(String, legion_sync::VersionVector)>> {
-        self.inner.list_deleted_history_versions()
-    }
     fn load_pending_op(&self) -> legion_sync::Result<Option<PendingOp>> {
         self.inner.load_pending_op()
     }
@@ -388,4 +383,50 @@ fn i3_store_panic_is_caught_at_engine_boundary() {
         engine.status().unwrap().state,
         MemberState::UpToDate
     ));
+}
+
+#[test]
+fn i4_old_schema_version_refused_and_rebuilt_cleanly() {
+    let tmp = scratch();
+    let root = tmp.path().join("tower");
+    let db_path = tmp.path().join("tower.redb");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("keep.txt"), b"preserved").unwrap();
+
+    {
+        let mut engine = SyncEngine::open(
+            cfg("tower", &["tower", "pi"]),
+            RealFs::open(&root).unwrap(),
+            RedbIndexStore::open(&db_path).unwrap(),
+        )
+        .unwrap();
+        engine.scan(ts(0)).unwrap();
+        engine
+            .store_mut()
+            .write_schema_version_for_test(legion_sync::INDEX_SCHEMA_VERSION - 1)
+            .unwrap();
+    }
+
+    // Opening the older-schema redb file is refused as IndexDamaged instead of misreading it.
+    match RedbIndexStore::open(&db_path) {
+        Err(SyncError::IndexDamaged { .. }) => {}
+        Err(other) => panic!("expected IndexDamaged for older schema version, got {other:?}"),
+        Ok(_) => panic!("expected IndexDamaged for older schema version, got Ok"),
+    }
+    assert_eq!(fs::read(root.join("keep.txt")).unwrap(), b"preserved");
+
+    // Rebuilding from disk recreates a fresh current-schema index cleanly without losing files.
+    let (engine, report) = SyncEngine::rebuild_redb_from_disk(
+        cfg("tower", &["tower", "pi"]),
+        RealFs::open(&root).unwrap(),
+        &db_path,
+        ts(10),
+    )
+    .unwrap();
+    assert_eq!(report.created, 1);
+    assert_eq!(
+        engine.store().schema_version().unwrap(),
+        legion_sync::INDEX_SCHEMA_VERSION
+    );
+    assert_eq!(fs::read(root.join("keep.txt")).unwrap(), b"preserved");
 }

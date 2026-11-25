@@ -553,15 +553,12 @@ always-on machine) simply makes that happen sooner for everyone.
   held deletions, and `.legion-sync/deletions.log` forward) rather than reusing counters and
   reconciles its disk by the join rule above; peer-forced rotations are rate-limited to at most
   once per day per peer and three times per week in total, after which further claims are ignored
-  and reported as a problem naming the peer. Retired `(member, incarnation)` keys are pruned
-  deterministically from version vectors via two-phase causal stability once every current member
-  agrees the key is retired (removed from membership or replaced by a newer incarnation), has
-  directly acknowledged applied state past every local record mentioning it, and reports no
-  unacknowledged, held-back, or pending records still referencing it (this projection commutes with
-  version-vector merging and preserves convergence), with a safety cap of 64
-  incarnations per member reported durably on both sides (recoverable by removing and re-adding the
-  member). Two live machines using the same member id (alternating incarnations or diverging at the
-  same sequence) are detected and reported as a problem rather than synced.
+  and reported as a problem naming the peer. Version vectors are always compared whole and never
+  drop a key from a record or a remembered deletion; a safety cap of 64 incarnations per member in
+  one record bounds growth, and if reached that member's new records are refused with a durable
+  problem on both sides without affecting unrelated files or losing data. Two live machines using
+  the same member id (alternating incarnations or diverging at the same sequence) are detected and
+  reported as a problem rather than synced.
 - **Direct acknowledgements.** Each member tracks two numbers per peer: its pull position (`seq`)
   and its applied acknowledgement (`applied_ack_seq`), which never advances past the oldest
   unapplied record (whether held back, deferred, invalid, locally unplaceable, or waiting on an
@@ -597,10 +594,10 @@ always-on machine) simply makes that happen sooner for everyone.
   disk: when it trips, the receiver counts ahead through the peer's pending pages to report the
   full batch size and asks once for the whole batch (whether to apply the deletions or keep this
   machine's files across all counted pages; later deletions are judged by the window as usual).
-- **Pulling and safe replacement.** A member handshakes (exchanging pulled/acked positions,
-  retired-incarnation pruning sets, known active peer incarnations, and a bidirectional summary of
-  any records one side could not accept from the other) and asks a peer for the records it has not
-  seen (`sync.index`, by `(incarnation, seq)`), validates and bounds every page and record (invalid
+- **Pulling and safe replacement.** A member handshakes (exchanging pulled/acked positions and a
+  bidirectional summary of any records one side could not accept from the other) and asks a peer for
+  the records it has not seen (`sync.index`, by `(incarnation, seq)`), validates and bounds every
+  page and record (invalid
   or unauthorized records — including a peer forging this member's own counter above its local
   clock or counters above `2^62` — are refused, reported durably, and never acknowledged; conflict
   copy member names come strictly from the folder's member list; conflict status is derived locally
@@ -670,10 +667,12 @@ always-on machine) simply makes that happen sooner for everyone.
   (up to the oldest-first 100,000-path deleted-history bound after tombstone collection); if every
   member loses both or an ancient deletion is evicted from the bounded history, a later member
   carrying an old copy can re-introduce the file. Peer-forced incarnation rotations are rate-limited
-  to at most once per day per peer and three times per week in total so a misbehaving peer cannot
-  trigger unbounded rotations. Retired incarnations are pruned deterministically once acknowledged
-  by all current members; if a record ever still exceeds the 64-incarnation safety cap per member,
-  both sides report a durable problem resolved by removing and re-adding the affected member.
+  per peer so a misbehaving peer cannot trigger unbounded rotations or block another peer's real
+  recovery. A record allows at most 64 incarnations of one member; reaching that limit requires 64
+  rebuilds/reinstalls of the same machine, and if it is ever reached, that member's affected records
+  are refused on both sides without losing data or blocking unrelated files (keep that machine's
+  index instead of rebuilding it; once the limit is reached, the folder has to be set up afresh from
+  one healthy member).
   Because tombstone collection requires direct applied acknowledgements from every current member,
   in topologies where two members never connect directly (for example a strict chain where A and C
   only ever talk through B) their deletion records remain in the index until they meet or a member
@@ -683,15 +682,28 @@ always-on machine) simply makes that happen sooner for everyone.
   file-exchange call, the claim-then-rename fallback briefly leaves the replaced path absent
   between claiming the old file and renaming the new one into place (a concurrent creation in that
   gap is caught by non-replacing rename without data loss).
+- **Why version-vector keys are never dropped.** Dropping a retired `(member, incarnation)` key from
+  causal comparisons is only safe when every machine that could ever reconnect agrees on the exact
+  membership set and has already propagated every edit or deletion carrying that key. Personal
+  machines — some offline for weeks, some added or removed asymmetrically, some restored from
+  backups, or new joiners arriving with pre-deletion copies — cannot provide that global agreement:
+  dropping a deleter's key makes a remembered deletion compare as empty and lets an old copy
+  resurrect, and dropping a removed member's key while an offline relay still holds its edit turns a
+  concurrent conflict into a silent replacement. Therefore `legion-sync` always compares version
+  vectors whole and never drops a key from any record or remembered deletion. If shrinking long-term
+  incarnation history is ever needed in the future, the safe operation is an explicit,
+  person-initiated reset of the folder at a moment when every member is present and identical (not
+  in this round).
 
 The engine is its own crate, `legion-sync`, with the file system and the peer behind traits, so
 it can be driven by a simulator: many members, mixed OS rules (case-insensitive and Unicode
 normalizing), unreadable directories, permission/disk-full/cross-device/commit faults, human edits
 mid-apply, late writes through open handles into binned files, hostile peers and lying regression
-claims, backup restores, reinstalls, lifetimes of rotations with deterministic version-vector
-pruning, duplicate ids, clock jumps, partitions, index loss during the deletion hold, and crashes
-(including during recovery), checking convergence, no silent loss, no zombie resurrection,
-conflict-copy immutability, sequence monotonicity, and no deletions under skipped paths.
+claims, backup restores, reinstalls, repeated rebuilds, asymmetric membership views, duplicate ids,
+clock jumps, partitions, index loss during the deletion hold, and crashes (including power-loss
+unsynced writes/renames and crashes during recovery), checking convergence, no silent loss, no
+zombie resurrection, conflict-copy immutability, sequence monotonicity, and no deletions under
+skipped paths.
 
 ### Status in words
 

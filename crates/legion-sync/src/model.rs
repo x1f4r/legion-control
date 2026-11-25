@@ -19,8 +19,9 @@ pub type FolderId = String;
 pub type MemberId = String;
 
 /// Current durable index schema version. Opening an index with a higher version is refused
-/// cleanly with [`SyncError::SchemaTooNew`].
-pub const INDEX_SCHEMA_VERSION: u32 = 3;
+/// cleanly with [`SyncError::SchemaTooNew`]; opening an index with an older version is refused as
+/// damaged/incompatible ([`SyncError::IndexDamaged`]) so it is rebuilt rather than misread.
+pub const INDEX_SCHEMA_VERSION: u32 = 4;
 
 /// Sync wire/trait protocol version advertised in [`PeerHandshake`] and [`HandshakeHello`].
 pub const SYNC_PROTOCOL_VERSION: u32 = 3;
@@ -53,10 +54,6 @@ pub const MAX_PAGE_RECORDS: usize = 4_096;
 
 /// Maximum number of distinct incarnations per member accepted in one incoming [`VersionVector`].
 pub const MAX_VV_INCARNATIONS_PER_MEMBER: usize = 64;
-
-/// Maximum number of retired `(member, incarnation)` keys retained in
-/// [`FolderMeta::pruned_incarnations`].
-pub const MAX_PRUNED_INCARNATIONS: usize = 1_024;
 
 /// Maximum byte length of a symbolic link target accepted from a peer.
 pub const MAX_LINK_TARGET_BYTES: usize = 4_096;
@@ -515,10 +512,6 @@ pub struct FolderMeta {
     /// week (enforcing at most once per day per peer and three times per week in total).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forced_rotation_history: Vec<(MemberId, Timestamp)>,
-    /// Retired `(member, incarnation)` keys that every current member has acknowledged past and
-    /// that are deterministically pruned from all version vectors.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub pruned_incarnations: BTreeSet<VersionKey>,
     /// Directories deleted remotely that were intentionally kept on disk only because they still
     /// hold ignored or held-back local files, persisted across tombstone GC and restarts so scans
     /// never revive them unless synced files are later added inside.
@@ -558,7 +551,6 @@ impl FolderMeta {
             head_fingerprint: None,
             last_forced_rotation_by_peer: BTreeMap::new(),
             forced_rotation_history: Vec::new(),
-            pruned_incarnations: BTreeSet::new(),
             kept_deleted_dirs: BTreeSet::new(),
             needs_rescan: BTreeSet::new(),
             pending_deletions: BTreeMap::new(),
@@ -705,20 +697,6 @@ pub struct PeerCursor {
     /// deletion brake, re-asserting local live files across all pending pages of that batch.
     #[serde(default)]
     pub keep_local_files_until_seq: u64,
-    /// Active `(member -> incarnation)` pairs this peer reported having directly observed during
-    /// its latest handshake, so healthy members can verify everyone has moved past a retired
-    /// incarnation before originating version-vector pruning.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub peer_known_incarnations: BTreeMap<MemberId, u64>,
-    /// Current folder membership set this peer reported during its latest handshake, used to
-    /// ensure every active member agrees a removed member has left before pruning its keys.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub peer_known_members: BTreeSet<MemberId>,
-    /// Non-active `(member, incarnation)` keys still appearing in this peer's unacknowledged
-    /// records, held-back records, or pending deletions at its latest handshake, preventing any
-    /// peer from pruning a retired key while causal ordering still depends on it in flight.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub peer_unsettled_vv_keys: BTreeSet<VersionKey>,
 }
 
 /// Compact summary carried in handshakes informing the remote peer that this member could not
@@ -764,19 +742,6 @@ pub struct HandshakeHello {
     /// Short summary of records the caller could not accept from the callee, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused_from_peer: Option<PeerRefusalSummary>,
-    /// Retired `(member, incarnation)` keys already deterministically pruned by the caller.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pruned_incarnations: Vec<VersionKey>,
-    /// Active `(member -> incarnation)` pairs directly observed by the caller.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub known_incarnations: BTreeMap<MemberId, u64>,
-    /// Current folder membership set known to the caller.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub known_members: BTreeSet<MemberId>,
-    /// Non-active `(member, incarnation)` keys still appearing in the caller's unacknowledged
-    /// records, held-back records, or pending local deletions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unsettled_vv_keys: Vec<VersionKey>,
 }
 
 /// Handshake summary returned by a peer before pulling records or files.
@@ -818,19 +783,6 @@ pub struct PeerHandshake {
     /// Short summary of records the callee could not accept from the caller, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused_from_caller: Option<PeerRefusalSummary>,
-    /// Retired `(member, incarnation)` keys already deterministically pruned by the callee.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pruned_incarnations: Vec<VersionKey>,
-    /// Active `(member -> incarnation)` pairs directly observed by the callee.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub known_incarnations: BTreeMap<MemberId, u64>,
-    /// Current folder membership set known to the callee.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub known_members: BTreeSet<MemberId>,
-    /// Non-active `(member, incarnation)` keys still appearing in the callee's unacknowledged
-    /// records, held-back records, or pending local deletions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unsettled_vv_keys: Vec<VersionKey>,
 }
 
 /// Monotonic elapsed-time clock for [`FetchOptions`] idle-timeout enforcement.

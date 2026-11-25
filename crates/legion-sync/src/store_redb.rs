@@ -199,6 +199,14 @@ impl RedbIndexStore {
                                 supported: INDEX_SCHEMA_VERSION,
                             });
                         }
+                        if found < INDEX_SCHEMA_VERSION {
+                            return Err(damaged_err(
+                                &path_label,
+                                format!(
+                                    "index schema version {found} is older than supported version {INDEX_SCHEMA_VERSION} and must be rebuilt"
+                                ),
+                            ));
+                        }
                     }
                     if let Some(g) = meta_table
                         .get(META_KEY_FOLDER)
@@ -277,6 +285,14 @@ impl RedbIndexStore {
                             found,
                             supported: INDEX_SCHEMA_VERSION,
                         });
+                    }
+                    Some(found) if found < INDEX_SCHEMA_VERSION => {
+                        return Err(damaged_err(
+                            &path_label,
+                            format!(
+                                "index schema version {found} is older than supported version {INDEX_SCHEMA_VERSION} and must be rebuilt"
+                            ),
+                        ));
                     }
                     Some(found) => found,
                     None => {
@@ -615,37 +631,6 @@ impl IndexStore for RedbIndexStore {
         })
     }
 
-    fn visit_version_keys_since(
-        &self,
-        since_seq: u64,
-        visitor: &mut dyn FnMut(&crate::version::VersionKey),
-    ) -> Result<()> {
-        catch_redb(&self.path_label, || {
-            let txn = self
-                .db
-                .begin_read()
-                .map_err(|e| storage_err("begin read", e))?;
-            let by_seq = txn.open_table(BY_SEQ_TABLE).map_err(table_err)?;
-            let records_table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
-            let range = by_seq
-                .range((Bound::Excluded(since_seq), Bound::Unbounded))
-                .map_err(|e| storage_err("range by_seq", e))?;
-            for item in range {
-                let (_, path_guard) = item.map_err(|e| storage_err("step by_seq", e))?;
-                if let Some(rec_guard) = records_table
-                    .get(path_guard.value())
-                    .map_err(|e| storage_err("lookup record by_seq", e))?
-                {
-                    let rec = decode_record(rec_guard.value())?;
-                    for (k, _) in rec.version.iter() {
-                        visitor(k);
-                    }
-                }
-            }
-            Ok(())
-        })
-    }
-
     fn records_since(
         &self,
         caller_member: &str,
@@ -827,30 +812,6 @@ impl IndexStore for RedbIndexStore {
                 return Ok(None);
             };
             Ok(Some(decode_json("deleted_history_vv", guard.value())?))
-        })
-    }
-
-    fn list_deleted_history_versions(&self) -> Result<Vec<(String, VersionVector)>> {
-        catch_redb(&self.path_label, || {
-            let txn = self
-                .db
-                .begin_read()
-                .map_err(|e| storage_err("begin read", e))?;
-            let Ok(table) = txn.open_table(DELETED_HISTORY_VV_TABLE) else {
-                return Ok(Vec::new());
-            };
-            let iter = table
-                .iter()
-                .map_err(|e| storage_err("iterate deleted_history_vv", e))?;
-            let mut out = Vec::new();
-            for item in iter {
-                let (k, v) = item.map_err(|e| storage_err("step deleted_history_vv", e))?;
-                out.push((
-                    k.value().to_string(),
-                    decode_json("deleted_history_vv", v.value())?,
-                ));
-            }
-            Ok(out)
         })
     }
 

@@ -24,10 +24,10 @@ use crate::model::{
     FolderMeta, FolderStatus, HandshakeHello, HeldBackRecord, INDEX_SCHEMA_VERSION,
     InboundDeletionBrake, InboundDeletionBrakeDecision, IndexRecord, MAX_DEFERRAL_ATTEMPTS,
     MAX_FORCED_ROTATIONS_PER_WEEK, MAX_HELD_BACK_ENTRIES, MAX_PAGE_RECORDS, MAX_PEER_PROBLEMS,
-    MAX_PRUNED_INCARNATIONS, MemberId, MemberState, MemberStatus, PeerAckView, PeerCursor,
-    PeerHandshake, PeerRefusalSummary, ProblemKind, RecordsPage, RestoreStrategy,
-    SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, encode_deletion_log_entries,
-    parse_deletion_log, random_incarnation_id, validate_member_id,
+    MemberId, MemberState, MemberStatus, PeerAckView, PeerCursor, PeerHandshake,
+    PeerRefusalSummary, ProblemKind, RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION,
+    SyncProblem, SyncProgress, encode_deletion_log_entries, parse_deletion_log,
+    random_incarnation_id, validate_member_id,
 };
 use crate::path::{
     IgnoreMatcher, is_descendant_of, is_internal_sync_path, path_depth, validate_sync_path,
@@ -39,7 +39,6 @@ use crate::scan::{
 };
 use crate::store_redb::RedbIndexStore;
 use crate::traits::{IndexStore, Peer, StoreBatch, SyncFs};
-use crate::version::VersionKey;
 
 /// Default number of records fetched per incremental page during [`SyncEngine::pull_from_peer`].
 pub const DEFAULT_PAGE_LIMIT: usize = 1024;
@@ -97,7 +96,6 @@ pub struct SyncEngine<F: SyncFs, S: IndexStore> {
     skipped_paths: BTreeSet<String>,
     folder_problem: Option<SyncProblem>,
     index_damaged: bool,
-    may_have_retired_vv_keys: bool,
     last_now: Timestamp,
 }
 
@@ -172,13 +170,22 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         fs.check_not_nested()?;
         let ignore = IgnoreMatcher::compile(&config.ignore)?;
 
-        let init_attempt =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_> {
+        let init_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<_> {
                 let found_schema = store.schema_version()?;
                 if found_schema > INDEX_SCHEMA_VERSION {
                     return Err(SyncError::SchemaTooNew {
                         found: found_schema,
                         supported: INDEX_SCHEMA_VERSION,
+                    });
+                }
+                if found_schema < INDEX_SCHEMA_VERSION {
+                    return Err(SyncError::IndexDamaged {
+                        folder_id: config.id.clone(),
+                        detail: format!(
+                            "index schema version {found_schema} is older than supported version {INDEX_SCHEMA_VERSION}"
+                        ),
+                        sentence: INDEX_DAMAGED_PROBLEM_SENTENCE.to_string(),
                     });
                 }
 
@@ -324,7 +331,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 };
 
                 Ok((folder_problem, needs_recover, index_damaged, skipped_paths))
-            }));
+            },
+        ));
 
         let (folder_problem, needs_recover, index_damaged, skipped_paths) = match init_attempt {
             Ok(Ok(tuple)) => tuple,
@@ -333,12 +341,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             }
             Ok(Err(err)) => return Err(err),
             Err(_) => (Some(index_damaged_problem()), false, true, BTreeSet::new()),
-        };
-
-        let initial_may_have_retired = if index_damaged {
-            true
-        } else {
-            store.record_count().unwrap_or(1) > 0
         };
 
         let mut engine = Self {
@@ -357,7 +359,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             skipped_paths,
             folder_problem,
             index_damaged,
-            may_have_retired_vv_keys: initial_may_have_retired,
             last_now: Timestamp::from_system_time(std::time::SystemTime::now()),
         };
         if needs_recover {
@@ -535,7 +536,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
 
         let new_inc = choose_fresh_incarnation(None, old_incarnation)?;
-        self.may_have_retired_vv_keys = true;
         self.fs.ensure_internal_dirs()?;
         let marker = FolderMarker::new(
             self.config.id.clone(),
@@ -602,7 +602,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             },
         )?;
         reissue_carried_deletions(&self.fs, &mut self.store, carried_deletions)?;
-        self.may_have_retired_vv_keys = true;
         Ok(report)
     }
 
@@ -897,7 +896,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             e.unreachable_peers.remove(member);
             e.active_progress.remove(member);
             e.last_pull_errors.remove(member);
-            e.may_have_retired_vv_keys = true;
             if let Ok(mut refusals) = e.peer_refusals_from_serve.lock() {
                 refusals.remove(member);
             }
@@ -1378,42 +1376,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             self.observe_peer_incarnation_with(&peer_id, hs.incarnation, initial_cursors)?;
         let mut cursor_dirty = false;
 
-        // Record which active `(member -> incarnation)` pairs, membership set, and unsettled
-        // retired VV keys this peer reported so deterministic VV pruning satisfies 2-phase causal
-        // stability before dropping any retired key.
-        let mut filtered_known = BTreeMap::new();
-        for (m, &inc) in &hs.known_incarnations {
-            if inc != 0 && meta.is_known_member(m) {
-                filtered_known.insert(m.clone(), inc);
-            }
-        }
-        filtered_known.insert(peer_id.clone(), hs.incarnation);
-        if observed_cursor.peer_known_incarnations != filtered_known {
-            observed_cursor.peer_known_incarnations = filtered_known;
-            cursor_dirty = true;
-        }
-        let filtered_members: BTreeSet<MemberId> = hs
-            .known_members
-            .iter()
-            .filter(|m| meta.is_known_member(m))
-            .cloned()
-            .collect();
-        if observed_cursor.peer_known_members != filtered_members {
-            observed_cursor.peer_known_members = filtered_members;
-            cursor_dirty = true;
-        }
-        let filtered_unsettled: BTreeSet<VersionKey> = hs
-            .unsettled_vv_keys
-            .iter()
-            .filter(|k| k.incarnation != 0 && meta.is_known_member(&k.member))
-            .take(MAX_PRUNED_INCARNATIONS)
-            .cloned()
-            .collect();
-        if observed_cursor.peer_unsettled_vv_keys != filtered_unsettled {
-            observed_cursor.peer_unsettled_vv_keys = filtered_unsettled;
-            cursor_dirty = true;
-        }
-
         let mut hs_ack_advanced = false;
         if peer_expected_rejoin {
             let (new_ack_inc, new_ack_seq) = match hs.caller_acked {
@@ -1463,12 +1425,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 ..StoreBatch::default()
             })?;
         }
-
-        // Adopt retired incarnations deterministically pruned by this peer, then check if any
-        // newly-retired incarnations can now be pruned locally BEFORE incoming pages bump seq!
-        let _ = self.adopt_peer_pruned_incarnations(&peer_id, &hs.pruned_incarnations)?;
-        let _ = self.prune_retired_incarnations_inner()?;
-        let meta = self.meta()?;
 
         let mut cached_cursor = Some(observed_cursor);
         let mut cached_meta: Option<FolderMeta> = if cached_cursor
@@ -1629,35 +1585,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             }
 
             report.records_seen += page.records.len();
-
-            if !self.may_have_retired_vv_keys && !page.records.is_empty() {
-                let own_key = local_meta.version_key();
-                let mut cursors_cache: Option<BTreeMap<MemberId, PeerCursor>> = None;
-                'check_retired: for rec in &page.records {
-                    for (k, _) in rec.version.iter() {
-                        if *k == own_key
-                            || (k.member == peer_id && k.incarnation == page.incarnation)
-                        {
-                            continue;
-                        }
-                        if !local_meta.members.contains(&k.member) {
-                            self.may_have_retired_vv_keys = true;
-                            break 'check_retired;
-                        }
-                        if cursors_cache.is_none() {
-                            cursors_cache = Some(self.store.load_peer_cursors()?);
-                        }
-                        if let Some(ref map) = cursors_cache
-                            && !map
-                                .get(&k.member)
-                                .is_some_and(|c| c.incarnation == k.incarnation)
-                        {
-                            self.may_have_retired_vv_keys = true;
-                            break 'check_retired;
-                        }
-                    }
-                }
-            }
 
             if page.records.is_empty() {
                 cursor.incarnation = page.incarnation;
@@ -2489,7 +2416,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             ),
             None => (None, None),
         };
-        let unsettled_vv_keys = self.local_unsettled_retired_vv_keys(meta, all_cursors)?;
         let hello = HandshakeHello {
             folder_id: meta.folder_id.clone(),
             member_id: meta.local_member.clone(),
@@ -2501,10 +2427,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             peer_acked,
             peer_rejoining: meta.rejoining_peers.contains(peer_id),
             refused_from_peer: self.refusal_summary_for_peer(peer_id)?,
-            pruned_incarnations: meta.pruned_incarnations.iter().cloned().collect(),
-            known_incarnations: local_known_incarnations(meta, all_cursors),
-            known_members: meta.members.clone(),
-            unsettled_vv_keys,
         };
         let hs = match peer.handshake(&hello) {
             Ok(hs) => {
@@ -3431,7 +3353,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         cursor.inbound_brake = None;
         cursor.allow_inbound_mass_deletion_until_seq = 0;
         cursor.keep_local_files_until_seq = 0;
-        cursor.peer_known_incarnations.clear();
 
         let remove_held_back: Vec<(MemberId, String)> = self
             .store
@@ -3468,7 +3389,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         if let Ok(mut refusals) = self.peer_refusals_from_serve.lock() {
             refusals.remove(peer_id);
         }
-        self.may_have_retired_vv_keys = true;
         Ok(cursor)
     }
 
@@ -3603,7 +3523,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         )?;
 
         reissue_carried_deletions(&self.fs, &mut self.store, carried_deletions)?;
-        self.may_have_retired_vv_keys = true;
 
         // Report the forced rotation durably (Item 9).
         self.record_peer_problem(
@@ -3721,7 +3640,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             )?;
         }
 
-        let _ = self.prune_retired_incarnations_inner()?;
         Ok(removed)
     }
 
@@ -3805,344 +3723,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             }
         }
         Ok(None)
-    }
-
-    /// Returns every non-active, unpruned `(member, incarnation)` key that still appears in any
-    /// local record with `seq > min_direct_ack` (i.e. not yet directly acknowledged by every
-    /// other current member), in any local held-back peer record, or in any pending local
-    /// deletion.
-    ///
-    /// Runs in `O(1)` on steady-state folders when no retired keys exist and `O(unacked)` via the
-    /// sequence index otherwise.
-    fn local_unsettled_retired_vv_keys(
-        &self,
-        meta: &FolderMeta,
-        cursors: &BTreeMap<MemberId, PeerCursor>,
-    ) -> Result<Vec<VersionKey>> {
-        let held_count = self.store.held_back_count()?;
-        if !self.may_have_retired_vv_keys && held_count == 0 && meta.pending_deletions.is_empty() {
-            return Ok(Vec::new());
-        }
-        let own_key = meta.version_key();
-        let is_non_active = |k: &VersionKey| -> bool {
-            !meta.pruned_incarnations.contains(k)
-                && *k != own_key
-                && !(meta.members.contains(&k.member)
-                    && cursors
-                        .get(&k.member)
-                        .is_some_and(|c| c.incarnation == k.incarnation))
-        };
-
-        let other_members: Vec<&MemberId> = meta
-            .members
-            .iter()
-            .filter(|m| *m != &meta.local_member)
-            .collect();
-        let min_direct_ack = if other_members.is_empty() {
-            meta.local_seq
-        } else {
-            let mut floor = u64::MAX;
-            for member in &other_members {
-                match cursors.get(*member) {
-                    Some(c) if c.acked_local_incarnation == meta.incarnation => {
-                        floor = floor.min(c.acked_local_seq);
-                    }
-                    _ => {
-                        floor = 0;
-                        break;
-                    }
-                }
-            }
-            floor
-        };
-
-        let mut unsettled = BTreeSet::new();
-        if self.may_have_retired_vv_keys && min_direct_ack < meta.local_seq {
-            self.store
-                .visit_version_keys_since(min_direct_ack, &mut |k| {
-                    if is_non_active(k) {
-                        unsettled.insert(k.clone());
-                    }
-                })?;
-        }
-        if held_count > 0 {
-            for hb in self.store.list_held_back()? {
-                for (k, _) in hb.record.version.iter() {
-                    if is_non_active(k) {
-                        unsettled.insert(k.clone());
-                    }
-                }
-            }
-        }
-        for pd in meta.pending_deletions.values() {
-            for (k, _) in pd.old_record.version.iter() {
-                if is_non_active(k) {
-                    unsettled.insert(k.clone());
-                }
-            }
-        }
-        Ok(unsettled.into_iter().collect())
-    }
-
-    /// Deterministically prunes retired `(member, incarnation)` keys from stored version vectors
-    /// once two-phase causal stability holds:
-    /// 1. Every other current member has directly acknowledged applied state past every local
-    ///    record mentioning `k`, and `k` does not appear in local held-back records or pending
-    ///    deletions;
-    /// 2. Every other current member agrees `k` is retired (removed from `known_members` or moved
-    ///    to a newer incarnation) AND reported in its latest handshake that `k` is no longer in
-    ///    its own `unsettled_vv_keys`.
-    fn prune_retired_incarnations_inner(&mut self) -> Result<usize> {
-        if !self.may_have_retired_vv_keys {
-            return Ok(0);
-        }
-        let mut meta = self.meta()?;
-        if meta.pruned_incarnations.len() >= MAX_PRUNED_INCARNATIONS {
-            return Ok(0);
-        }
-        let cursors = self.store.load_peer_cursors()?;
-        let other_members: Vec<&MemberId> = meta
-            .members
-            .iter()
-            .filter(|m| *m != &meta.local_member)
-            .collect();
-        let min_direct_ack = if other_members.is_empty() {
-            meta.local_seq
-        } else {
-            let mut floor = u64::MAX;
-            for member in &other_members {
-                match cursors.get(*member) {
-                    Some(c) if c.acked_local_incarnation == meta.incarnation => {
-                        floor = floor.min(c.acked_local_seq);
-                    }
-                    _ => {
-                        floor = 0;
-                        break;
-                    }
-                }
-            }
-            floor
-        };
-        if min_direct_ack == 0 {
-            return Ok(0);
-        }
-
-        let own_key = meta.version_key();
-        let mut max_seq_by_key: BTreeMap<VersionKey, u64> = BTreeMap::new();
-        let mut any_non_active = false;
-        self.store.scan_records_in_order(&mut |rec| {
-            for (k, _) in rec.version.iter() {
-                if !meta.pruned_incarnations.contains(k) {
-                    let is_active = *k == own_key
-                        || (meta.members.contains(&k.member)
-                            && cursors
-                                .get(&k.member)
-                                .is_some_and(|c| c.incarnation == k.incarnation));
-                    if !is_active {
-                        any_non_active = true;
-                    }
-                    max_seq_by_key
-                        .entry(k.clone())
-                        .and_modify(|s| *s = (*s).max(rec.seq))
-                        .or_insert(rec.seq);
-                }
-            }
-            Ok(true)
-        })?;
-        if !any_non_active {
-            self.may_have_retired_vv_keys = false;
-            return Ok(0);
-        }
-
-        let mut local_blocked_keys = BTreeSet::new();
-        if self.store.held_back_count()? > 0 {
-            for hb in self.store.list_held_back()? {
-                for (k, _) in hb.record.version.iter() {
-                    local_blocked_keys.insert(k.clone());
-                }
-            }
-        }
-        for pd in meta.pending_deletions.values() {
-            for (k, _) in pd.old_record.version.iter() {
-                local_blocked_keys.insert(k.clone());
-            }
-        }
-
-        let mut candidates = BTreeSet::new();
-        for (k, max_seq) in max_seq_by_key {
-            if k == own_key || max_seq > min_direct_ack || local_blocked_keys.contains(&k) {
-                continue;
-            }
-            let all_peers_settled = other_members.iter().all(|other| {
-                cursors.get(*other).is_some_and(|cy| {
-                    !cy.peer_known_members.is_empty() && !cy.peer_unsettled_vv_keys.contains(&k)
-                })
-            });
-            if !all_peers_settled {
-                continue;
-            }
-            let globally_retired = if !meta.members.contains(&k.member) {
-                other_members.iter().all(|other| {
-                    cursors
-                        .get(*other)
-                        .is_some_and(|cy| !cy.peer_known_members.contains(&k.member))
-                })
-            } else if k.member == meta.local_member {
-                // `min_direct_ack > 0` guarantees every active member already acked our current
-                // incarnation and moved past `k`.
-                true
-            } else {
-                let directly_moved = cursors
-                    .get(&k.member)
-                    .is_some_and(|c| c.incarnation != 0 && c.incarnation != k.incarnation);
-                let all_others_moved =
-                    other_members
-                        .iter()
-                        .filter(|m| **m != &k.member)
-                        .all(|other| {
-                            cursors.get(*other).is_some_and(|cy| {
-                                cy.peer_known_incarnations
-                                    .get(&k.member)
-                                    .is_some_and(|&inc| inc != k.incarnation)
-                            })
-                        });
-                directly_moved && all_others_moved
-            };
-            if globally_retired {
-                candidates.insert(k);
-            }
-        }
-        if candidates.is_empty() {
-            return Ok(0);
-        }
-
-        let mut records = Vec::new();
-        self.store.scan_records_in_order(&mut |rec| {
-            records.push(rec);
-            Ok(true)
-        })?;
-        let mut trial_pruned = meta.pruned_incarnations.clone();
-        let mut newly_pruned = 0usize;
-        for k in candidates {
-            if trial_pruned.len() >= MAX_PRUNED_INCARNATIONS {
-                break;
-            }
-            trial_pruned.insert(k.clone());
-            let all_survive = records
-                .iter()
-                .all(|rec| rec.version.iter().any(|(rk, _)| !trial_pruned.contains(rk)));
-            if all_survive {
-                newly_pruned += 1;
-            } else {
-                trial_pruned.remove(&k);
-            }
-        }
-        if newly_pruned == 0 {
-            return Ok(0);
-        }
-
-        meta.pruned_incarnations = trial_pruned;
-        self.apply_pruned_incarnations(meta, records)?;
-        Ok(newly_pruned)
-    }
-
-    /// Adopts retired `(member, incarnation)` keys already pruned by `peer_id`, validating each
-    /// against our own active incarnation, directly observed peer incarnations, local causal
-    /// stability (`local_unsettled_retired_vv_keys`), and non-empty version-vector survival.
-    fn adopt_peer_pruned_incarnations(
-        &mut self,
-        peer_id: &str,
-        peer_pruned: &[VersionKey],
-    ) -> Result<usize> {
-        if peer_pruned.is_empty() {
-            return Ok(0);
-        }
-        let mut meta = self.meta()?;
-        if meta.pruned_incarnations.len() >= MAX_PRUNED_INCARNATIONS {
-            return Ok(0);
-        }
-        let cursors = self.store.load_peer_cursors()?;
-        let local_unsettled: BTreeSet<VersionKey> = self
-            .local_unsettled_retired_vv_keys(&meta, &cursors)?
-            .into_iter()
-            .collect();
-        let own_key = meta.version_key();
-        let mut candidates = BTreeSet::new();
-        for k in peer_pruned {
-            if k.incarnation == 0
-                || *k == own_key
-                || meta.pruned_incarnations.contains(k)
-                || local_unsettled.contains(k)
-                || !meta.is_known_member(&k.member)
-            {
-                continue;
-            }
-            let safe_retired = if !meta.members.contains(&k.member) || k.member == meta.local_member
-            {
-                true
-            } else {
-                cursors
-                    .get(&k.member)
-                    .is_some_and(|c| c.incarnation != 0 && c.incarnation != k.incarnation)
-            };
-            if safe_retired {
-                candidates.insert(k.clone());
-            }
-        }
-        let _ = peer_id;
-        if candidates.is_empty() {
-            return Ok(0);
-        }
-
-        let mut records = Vec::new();
-        self.store.scan_records_in_order(&mut |rec| {
-            records.push(rec);
-            Ok(true)
-        })?;
-
-        let mut trial_pruned = meta.pruned_incarnations.clone();
-        let mut newly_pruned = 0usize;
-        for k in candidates {
-            if trial_pruned.len() >= MAX_PRUNED_INCARNATIONS {
-                break;
-            }
-            trial_pruned.insert(k.clone());
-            let all_survive = records
-                .iter()
-                .all(|rec| rec.version.iter().any(|(rk, _)| !trial_pruned.contains(rk)));
-            if all_survive {
-                newly_pruned += 1;
-            } else {
-                trial_pruned.remove(&k);
-            }
-        }
-        if newly_pruned == 0 {
-            return Ok(0);
-        }
-
-        meta.pruned_incarnations = trial_pruned;
-        self.apply_pruned_incarnations(meta, records)?;
-        Ok(newly_pruned)
-    }
-
-    fn apply_pruned_incarnations(
-        &mut self,
-        meta: FolderMeta,
-        records: Vec<IndexRecord>,
-    ) -> Result<()> {
-        let mut batch = StoreBatch::default();
-        for mut rec in records {
-            if rec.version.prune_in_place(&meta.pruned_incarnations) {
-                batch.upsert_records.push(rec);
-            }
-        }
-        for (path, mut vv) in self.store.list_deleted_history_versions()? {
-            if vv.prune_in_place(&meta.pruned_incarnations) {
-                batch.upsert_deleted_history_versions.push((path, vv));
-            }
-        }
-        batch.folder_meta = Some(meta);
-        self.store.apply_batch(batch)
     }
 
     /// Serves this member's bidirectional handshake identity to `caller_member`, checking
@@ -4240,10 +3820,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         };
         let caller_rejoining = meta.rejoining_peers.contains(caller_member);
         let refused_from_caller = self.refusal_summary_for_peer(caller_member)?;
-        let pruned_incarnations = meta.pruned_incarnations.iter().cloned().collect();
-        let known_incarnations = local_known_incarnations(&meta, &cursors);
-        let unsettled_vv_keys = self.local_unsettled_retired_vv_keys(&meta, &cursors)?;
-        let known_members = meta.members.clone();
         Ok(PeerHandshake {
             folder_id: meta.folder_id,
             member_id: meta.local_member,
@@ -4257,10 +3833,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             caller_regressed,
             caller_rejoining,
             refused_from_caller,
-            pruned_incarnations,
-            known_incarnations,
-            known_members,
-            unsettled_vv_keys,
         })
     }
 
@@ -4461,7 +4033,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         meta,
                         marker.incarnation,
                     )?;
-                    self.may_have_retired_vv_keys = true;
                     self.folder_problem = None;
                     return self.meta();
                 }
@@ -5078,7 +4649,6 @@ fn reissue_carried_deletions<F: SyncFs, S: IndexStore>(
             continue;
         }
         let mut version = rec.version;
-        version.prune_in_place(&meta.pruned_incarnations);
         meta.bump_version(&mut version);
         let seq = meta.next_seq();
         if !rec.hashes.is_empty() {
@@ -5152,20 +4722,6 @@ fn compact_deletion_log_from_tombstones<F: SyncFs>(
     }
     let bytes = encode_deletion_log_entries(&entries)?;
     fs.compact_deletion_log(&bytes)
-}
-
-fn local_known_incarnations(
-    meta: &FolderMeta,
-    cursors: &BTreeMap<MemberId, PeerCursor>,
-) -> BTreeMap<MemberId, u64> {
-    let mut map = BTreeMap::new();
-    map.insert(meta.local_member.clone(), meta.incarnation);
-    for (m, c) in cursors {
-        if c.incarnation != 0 && meta.members.contains(m) {
-            map.insert(m.clone(), c.incarnation);
-        }
-    }
-    map
 }
 
 fn peer_refused_problem(peer_id: &str, summary: &PeerRefusalSummary) -> SyncProblem {
