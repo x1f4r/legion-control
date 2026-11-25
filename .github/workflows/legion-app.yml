@@ -157,9 +157,10 @@ jobs:
           adb shell am start -W -n com.x1f4r.legion.debug/com.x1f4r.legion.MainActivity
           FOUND=0
           for i in $(seq 1 90); do
-            if adb logcat -d -s legion-app:I | grep -q "legion-app: interface ready"; then
+            APP_LOG="$(adb logcat -d -s legion-app:I)"
+            if grep -q "legion-app: interface ready" <<<"$APP_LOG"; then
               echo "Android interface ready after ${i}s"
-              adb logcat -d -s legion-app:I | grep "legion-app: interface ready"
+              grep "legion-app: interface ready" <<<"$APP_LOG"
               FOUND=1
               break
             fi
