@@ -423,6 +423,7 @@ export function VideoPlayer({
   const ctrlPlayingRef = useRef(ctrl.playing);
   ctrlPlayingRef.current = ctrl.playing;
   const wantPlayAfterSwapRef = useRef(false);
+  const wasPlayingBeforeTeardownRef = useRef(false);
   const [pendingPlayIntent, setPendingPlayIntent] = useState(null);
   const pendingPlayIntentRef = useRef(null);
   pendingPlayIntentRef.current = pendingPlayIntent;
@@ -474,8 +475,11 @@ export function VideoPlayer({
         resumeStore.save(prevId, currentTimeRef.current, durationRef.current);
       }
       const carryPlay = Boolean(
-        pendingPlayIntentRef.current != null ? pendingPlayIntentRef.current : ctrlPlayingRef.current,
+        pendingPlayIntentRef.current != null
+          ? pendingPlayIntentRef.current
+          : ctrlPlayingRef.current || wasPlayingBeforeTeardownRef.current,
       );
+      wasPlayingBeforeTeardownRef.current = false;
       wantPlayAfterSwapRef.current = carryPlay;
       pendingPlayIntentRef.current = carryPlay;
       setPendingPlayIntent(carryPlay);
@@ -502,10 +506,12 @@ export function VideoPlayer({
     const v = videoRef.current;
     if (!v) return;
     if (mediaUrl) {
+      wasPlayingBeforeTeardownRef.current = false;
       if (v.getAttribute('src') !== mediaUrl) {
         v.setAttribute('src', mediaUrl);
       }
     } else if (v.hasAttribute('src')) {
+      wasPlayingBeforeTeardownRef.current = Boolean(!v.paused && !v.ended);
       try {
         v.pause();
         v.removeAttribute('src');
@@ -1013,7 +1019,10 @@ export function VideoPlayer({
           setPendingPlayIntent(null);
           if (!recovered) {
             if (wantPlay) {
-              v.play().catch(() => {});
+              controller.setPlaying(true);
+              v.play().catch(() => {
+                controller.setPlaying(false);
+              });
             } else {
               if (!v.paused) {
                 try {
