@@ -74,6 +74,7 @@ fn main() -> ExitCode {
         test_audio_tags_and_covers_through_real_worker_and_benchmarks().await;
         test_reply_budget_real_worker_node_memory_and_completion().await;
         test_in_budget_large_base64_picture_and_invalid_utf8_succeed_under_48mib_cap().await;
+        test_failed_embedded_cover_caches_expiring_bad_entry_while_timeouts_stay_uncached().await;
     });
 
     ExitCode::SUCCESS
@@ -2669,5 +2670,203 @@ async fn test_in_budget_large_base64_picture_and_invalid_utf8_succeed_under_48mi
         th["results"][0].get("ok").is_some(),
         "fs.thumb on 15.9 MiB wrapped base64 picture failed: {}",
         th["results"][0]
+    );
+}
+
+async fn test_failed_embedded_cover_caches_expiring_bad_entry_while_timeouts_stay_uncached() {
+    use audio_fixtures as af;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let paths = Paths::under(dir.path()).with_home(&home);
+    let cache_dir = paths.thumb_cache_dir();
+    let node = Node::new(paths, legion_tools::registry());
+
+    // Build a FLAC whose embedded baseline JPEG header claims 7000x7000 (~156 MiB estimate:
+    // admitted past 112 MiB initial cap -> triggers NeedsCap retry -> truncated scan data fails
+    // decode as Rejected). Previously every listing repeated the ~140 MiB + retry worker pair.
+    let mut lying_jpg = Vec::new();
+    lying_jpg.extend_from_slice(&[0xFF, 0xD8]);
+    lying_jpg.extend_from_slice(&[0xFF, 0xDB, 0x00, 67, 0x00]);
+    lying_jpg.extend_from_slice(&[16u8; 64]);
+    // SOF0 7000x7000 3-component 4:2:0
+    lying_jpg.extend_from_slice(&[0xFF, 0xC0, 0x00, 17, 8]);
+    lying_jpg.extend_from_slice(&7000u16.to_be_bytes());
+    lying_jpg.extend_from_slice(&7000u16.to_be_bytes());
+    lying_jpg.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 0, 3, 0x11, 0]);
+    // Minimal truncated scan causing decode failure
+    lying_jpg.extend_from_slice(&[0xFF, 0xDA, 0x00, 12, 3, 1, 0, 2, 0, 3, 0, 0, 0x3F, 0]);
+    lying_jpg.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+    let bad_flac = home.join("lying_cover.flac");
+    fs::write(
+        &bad_flac,
+        af::build_flac(
+            &[("TITLE", "Lying cover song")],
+            &[(3, "image/jpeg", &lying_jpg)],
+            4,
+        ),
+    )
+    .unwrap();
+
+    // 1. First request at (256, contain): spawns worker(s), fails, and writes an expiring bad entry.
+    legion_tools::fs::reset_peak_worker_rss_for_test();
+    let res1 = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": [bad_flac.to_string_lossy()], "size": 256, "fit": "contain"}),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        res1["results"][0].get("error").is_some(),
+        "lying FLAC cover must fail: {}",
+        res1["results"][0]
+    );
+    assert!(
+        legion_tools::fs::peak_worker_rss_for_test() > 0,
+        "first request should have run the real worker"
+    );
+    let count_cache = || {
+        fs::read_dir(&cache_dir)
+            .map(|it| {
+                it.filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".thumb"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        count_cache(),
+        1,
+        "failed embedded cover must record an expiring bad-file entry"
+    );
+
+    // 2. Second request at the SAME (256, contain): served from bad cache with ZERO worker spawns!
+    legion_tools::fs::reset_peak_worker_rss_for_test();
+    let t0 = Instant::now();
+    let res2 = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": [bad_flac.to_string_lossy()], "size": 256, "fit": "contain"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        legion_tools::fs::peak_worker_rss_for_test(),
+        0,
+        "second request for cached bad embedded cover must not spawn a worker"
+    );
+    assert!(
+        res2["results"][0].get("error").is_some(),
+        "{}",
+        res2["results"][0]
+    );
+    assert!(
+        t0.elapsed() < Duration::from_millis(200),
+        "cached bad embedded cover hit took {:?}",
+        t0.elapsed()
+    );
+
+    // 3. Different (size, fit) is keyed independently (runs worker and creates its own entry).
+    legion_tools::fs::reset_peak_worker_rss_for_test();
+    let _res3 = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": [bad_flac.to_string_lossy()], "size": 128, "fit": "cover"}),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        legion_tools::fs::peak_worker_rss_for_test() > 0,
+        "different (size, fit) must not share (256, contain) bad entry"
+    );
+    assert_eq!(count_cache(), 2);
+
+    // 4. Replacing the FLAC with a valid embedded cover changes identity and immediately succeeds.
+    let valid_jpg = af::encode_solid_jpeg(160, 160, [40, 180, 90]);
+    fs::write(
+        &bad_flac,
+        af::build_flac(
+            &[("TITLE", "Fixed cover song")],
+            &[(3, "image/jpeg", &valid_jpg)],
+            4,
+        ),
+    )
+    .unwrap();
+    let res_fixed = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": [bad_flac.to_string_lossy()], "size": 256, "fit": "contain"}),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        res_fixed["results"][0].get("ok").is_some(),
+        "updated FLAC must bypass stale bad entry: {}",
+        res_fixed["results"][0]
+    );
+
+    // 5. Embedded cover timeouts must NOT be written to the on-disk bad-file cache.
+    let timeout_dir = tempfile::tempdir().unwrap();
+    let timeout_home = timeout_dir.path().join("home");
+    fs::create_dir_all(&timeout_home).unwrap();
+    let timeout_paths = Paths::under(timeout_dir.path()).with_home(&timeout_home);
+    let timeout_cache_dir = timeout_paths.thumb_cache_dir();
+    let timeout_node = Node::new(timeout_paths, legion_tools::registry());
+
+    // 7000x5000 valid RGB PNG (~2 MiB compressed, takes >120 ms to inflate).
+    let (w, h) = (7000u32, 5000u32);
+    let mut raw = vec![0u8; (w * h * 3) as usize];
+    for (i, b) in raw.iter_mut().enumerate().step_by(97) {
+        *b = (i % 251) as u8;
+    }
+    let mut slow_png = Vec::new();
+    PngEncoder::new(&mut slow_png)
+        .write_image(&raw, w, h, ExtendedColorType::Rgb8)
+        .unwrap();
+    let slow_flac = timeout_home.join("slow_cover.flac");
+    fs::write(
+        &slow_flac,
+        af::build_flac(
+            &[("TITLE", "Slow cover")],
+            &[(3, "image/png", &slow_png)],
+            4,
+        ),
+    )
+    .unwrap();
+
+    legion_tools::fs::set_thumb_decode_timeout_for_test(Some(Duration::from_millis(50)));
+    legion_tools::fs::set_thumb_timeout_cpu_busy_for_test(Some(false));
+    let _reset = TimeoutGuard;
+    let res_to = timeout_node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": [slow_flac.to_string_lossy()], "size": 256}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res_to["results"][0]["error"]["code"],
+        json!("timeout"),
+        "expected timeout on slow embedded cover: {}",
+        res_to["results"][0]
+    );
+    let timeout_entries = fs::read_dir(&timeout_cache_dir)
+        .map(|it| {
+            it.filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".thumb"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        timeout_entries, 0,
+        "embedded cover timeout must not write an on-disk bad-file entry"
     );
 }

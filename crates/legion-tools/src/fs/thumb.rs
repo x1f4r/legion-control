@@ -918,6 +918,25 @@ fn prepare_audio_cover_open_once(
     })
 }
 
+async fn record_bad_audio_cover(
+    cache: &ThumbCache,
+    resolved: &Path,
+    file: File,
+    open_stamp: FileStamp,
+    bad_key: String,
+    error: &ErrorBody,
+) {
+    let resolved_check = resolved.to_path_buf();
+    let cache_bad = cache.clone();
+    let err_bad = error.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if verify_post_read_stamp(&resolved_check, &file, open_stamp).is_ok() {
+            cache_bad.put_bad(&bad_key, &err_bad);
+        }
+    })
+    .await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn thumb_audio(
     grant: &Grant,
@@ -1105,19 +1124,22 @@ async fn thumb_audio(
                     continue;
                 }
                 AudioCoverWorkerOutcome::NeedsCap(_) => {
-                    return Ok(ThumbOutcome::Error(
-                        ErrorBody::new(
-                            ErrorCode::Failed,
-                            format!(
-                                "Embedded cover in {} exceeded the allowed thumbnail decode memory budget.",
-                                resolved.display()
-                            ),
-                        )
-                        .with_details(json!({"reason": "too_large"})),
-                    ));
+                    let err = ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!(
+                            "Embedded cover in {} exceeded the allowed thumbnail decode memory budget.",
+                            resolved.display()
+                        ),
+                    )
+                    .with_details(json!({"reason": "too_large"}));
+                    record_bad_audio_cover(cache, &resolved, file, open_stamp, bad_key, &err).await;
+                    return Ok(ThumbOutcome::Error(err));
                 }
-                AudioCoverWorkerOutcome::Rejected(err)
-                | AudioCoverWorkerOutcome::TransientFailure(err) => {
+                AudioCoverWorkerOutcome::Rejected(err) => {
+                    record_bad_audio_cover(cache, &resolved, file, open_stamp, bad_key, &err).await;
+                    return Ok(ThumbOutcome::Error(err));
+                }
+                AudioCoverWorkerOutcome::TransientFailure(err) => {
                     return Ok(ThumbOutcome::Error(err));
                 }
                 AudioCoverWorkerOutcome::TimedOut { error, cpu_busy } => {
@@ -1127,15 +1149,8 @@ async fn thumb_audio(
                     return Ok(ThumbOutcome::Error(error));
                 }
                 AudioCoverWorkerOutcome::MemoryLimitExceeded { error, .. } => {
-                    let resolved_check = resolved.clone();
-                    let cache_bad = cache.clone();
-                    let err_bad = error.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if verify_post_read_stamp(&resolved_check, &file, open_stamp).is_ok() {
-                            cache_bad.put_bad(&bad_key, &err_bad);
-                        }
-                    })
-                    .await;
+                    record_bad_audio_cover(cache, &resolved, file, open_stamp, bad_key, &error)
+                        .await;
                     return Ok(ThumbOutcome::Error(error));
                 }
             }
@@ -1167,6 +1182,7 @@ async fn thumb_audio(
         }
     };
 
+    let handle_check = file.try_clone().ok();
     let abort_flag = Arc::new(AtomicBool::new(false));
     let abort_worker = Arc::clone(&abort_flag);
     let resolved_decode = resolved.clone();
@@ -1253,7 +1269,17 @@ async fn thumb_audio(
             thumb_audio_folder_cover(grant, principal, cache, resolved, size, fit, cancel).await
         }
         Err(err) if err.code == ErrorCode::Cancelled => Err(err),
-        Err(err) => Ok(ThumbOutcome::Error(err)),
+        Err(err) => {
+            if !matches!(
+                err.code,
+                ErrorCode::Timeout | ErrorCode::Busy | ErrorCode::Conflict
+            ) && let Some(check_file) = handle_check
+            {
+                record_bad_audio_cover(cache, &resolved, check_file, open_stamp, bad_key, &err)
+                    .await;
+            }
+            Ok(ThumbOutcome::Error(err))
+        }
     }
 }
 
