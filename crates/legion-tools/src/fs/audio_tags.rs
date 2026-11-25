@@ -465,6 +465,10 @@ fn is_cluster_tail(ch: char) -> bool {
     is_joiner(ch) || is_variation_selector(ch) || is_combining_mark(ch)
 }
 
+fn is_regional_indicator(ch: char) -> bool {
+    matches!(ch, '\u{1F1E6}'..='\u{1F1FF}')
+}
+
 /// Cleans a tag text value per the player contract: maps `U+2028`/`U+2029` to ASCII spaces,
 /// removes control/bidirectional/invisible/tag/noncharacter code points, keeps internal
 /// `U+200C`/`U+200D` while stripping them and whitespace at both edges, caps at
@@ -513,6 +517,17 @@ fn clean_tag_chars(chars: impl Iterator<Item = char>) -> Option<String> {
             // If another joiner/modifier now sits at the end (for example a multi-part ZWJ emoji
             // sequence), keep stepping back to the last complete cluster.
             need_step_back = out.chars().next_back().is_some_and(is_cluster_tail);
+        }
+        // Regional indicator symbols pair up into two-scalar flag emojis (U+1F1E6..=U+1F1FF).
+        // If truncation leaves an odd trailing run of regional indicators, drop the last scalar so
+        // a flag pair is never split in half.
+        let trailing_ri = out
+            .chars()
+            .rev()
+            .take_while(|&ch| is_regional_indicator(ch))
+            .count();
+        if !trailing_ri.is_multiple_of(2) {
+            out.pop();
         }
     }
 
@@ -3220,6 +3235,26 @@ mod tests {
         assert_eq!(clean_tag_text(&cut_zwj_end).unwrap(), "a".repeat(510));
         let cut_zwj_chain = format!("{}👩\u{200D}👩\u{200D}👧", "a".repeat(509));
         assert_eq!(clean_tag_text(&cut_zwj_chain).unwrap(), "a".repeat(509));
+        // 5) Regional indicator flag pair straddling 512 -> drop the lone leading regional indicator
+        let cut_flag_split = format!("{}\u{1F1E9}\u{1F1EA}", "a".repeat(511));
+        assert_eq!(clean_tag_text(&cut_flag_split).unwrap(), "a".repeat(511));
+        // Complete flag pair fitting before 512 stays intact when later chars are truncated
+        let cut_flag_complete = format!("{}\u{1F1E9}\u{1F1EA}z", "a".repeat(510));
+        assert_eq!(
+            clean_tag_text(&cut_flag_complete).unwrap(),
+            format!("{}\u{1F1E9}\u{1F1EA}", "a".repeat(510))
+        );
+        // Second flag straddling 512 keeps the first flag pair intact and drops the lone third RI
+        let cut_two_flags = format!("{}\u{1F1E9}\u{1F1EA}\u{1F1FA}\u{1F1F8}", "a".repeat(509));
+        assert_eq!(
+            clean_tag_text(&cut_two_flags).unwrap(),
+            format!("{}\u{1F1E9}\u{1F1EA}", "a".repeat(509))
+        );
+        // Non-truncated flag remains intact
+        assert_eq!(
+            clean_tag_text("Berlin \u{1F1E9}\u{1F1EA}").as_deref(),
+            Some("Berlin \u{1F1E9}\u{1F1EA}")
+        );
     }
 
     #[test]
