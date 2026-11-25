@@ -103,12 +103,15 @@ In the folder listing a song shows its cover where a picture shows its thumbnail
 
 - **`fs.tags`** (read): `{paths: [1..32]}` returns one entry per path, in order:
   `{path, ok: {title?, artist?, album?, album_artist?, track?, disc?, year?, duration_s?,
-  cover}}` or `{path, error}`. `cover` says whether `fs.thumb` has a picture for it. Fields the
-  file does not carry are absent. A file that is not audio is `unsupported`, per path.
+  cover}}` or `{path, error}`. `cover` is a cheap check that a picture was found (embedded or in
+  the folder), not that it decodes; the caller shows its placeholder if `fs.thumb` then fails.
+  Fields the file does not carry are absent. A file that is not audio is `unsupported`, per path.
 - **`fs.thumb`** accepts audio files: the picture is the embedded cover (the front cover when
-  several, else the first), else a picture in the same folder named `cover`, `folder`, `front`
-  or `album` (jpg, jpeg, png, webp; any case). None: `not_found` for that path. `size` may now
-  be up to 1024, for the player.
+  several, else the first); when none exists or the embedded picture cannot be decoded, `fs.thumb`
+  falls back to a picture in the same folder named `cover`, `folder`, `front` or `album` (jpg,
+  jpeg, png, webp; any case), advancing to the next candidate if a candidate cannot be decoded.
+  Only when no embedded or folder candidate decodes does it return `not_found` for that path.
+  `size` may now be up to 1024, for the player.
 - Read from: ID3v2 and ID3v1 (mp3, also inside wav and aiff), FLAC blocks, Vorbis comments in
   Ogg Vorbis and Opus (including `METADATA_BLOCK_PICTURE`), and MP4 items (m4a, m4b, mp4).
 - These files are untrusted input. Tags and the cover are read inside the same out-of-process

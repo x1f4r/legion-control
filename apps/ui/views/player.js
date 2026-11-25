@@ -1550,7 +1550,7 @@ export function MusicPlayer({
         : link.call(tool, args, { on: machine, signal: ctrl.signal });
 
     const loadCover = async () => {
-      if (!caps?.hasAudioCovers) return;
+      if (!caps?.hasAudioThumb) return;
       const reqSize = Math.min(1024, caps?.thumbMaxSize || 512);
       const cacheKey = thumbCacheKey(machine, path, entry?.mtime || '', reqSize);
       const cached = thumbCache?.get(cacheKey);
@@ -1604,7 +1604,7 @@ export function MusicPlayer({
       alive = false;
       ctrl.abort();
     };
-  }, [machine, path, entry?.mtime, caps?.hasTags, caps?.hasAudioCovers, caps?.thumbMaxSize, capsStore, link, thumbCache]);
+  }, [machine, path, entry?.mtime, caps?.hasTags, caps?.hasAudioThumb, caps?.thumbMaxSize, capsStore, link, thumbCache]);
 
   // Pause in place and clear pending autoplay if the desktop window is hidden/closed.
   useEffect(() => {

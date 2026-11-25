@@ -68,7 +68,13 @@ test('categoryFromName and entryCategory map all design categories case-insensit
   assert.equal(categoryFromName('Arrival.mp4'), 'video');
   assert.equal(categoryFromName('Concert.MKV'), 'video');
   assert.equal(categoryFromName('Voice note.m4a'), 'audio');
+  assert.equal(categoryFromName('Chapter.m4b'), 'audio');
   assert.equal(categoryFromName('track.FLAC'), 'audio');
+  assert.equal(categoryFromName('master.aif'), 'audio');
+  assert.equal(categoryFromName('master.AIFF'), 'audio');
+  assert.equal(mimeFromName('Chapter.m4b'), 'audio/mp4');
+  assert.equal(mimeFromName('master.aif'), 'audio/aiff');
+  assert.equal(mimeFromName('master.AIFF'), 'audio/aiff');
   assert.equal(categoryFromName('Tickets.pdf'), 'document');
   assert.equal(categoryFromName('budget.xlsx'), 'document');
   assert.equal(categoryFromName('notes.txt'), 'text');
@@ -99,7 +105,11 @@ test('categoryFromName and entryCategory map all design categories case-insensit
   assert.equal(entryIconName({ kind: 'file', name: 'a.mp3' }), 'music');
   assert.equal(isThumbEligible({ kind: 'file', name: 'a.jpg' }), true);
   assert.equal(isThumbEligible({ kind: 'file', name: 'a.mp4' }), true);
+  assert.equal(isThumbEligible({ kind: 'file', name: 'song.mp3' }), false);
+  assert.equal(isThumbEligible({ kind: 'file', name: 'song.mp3' }, { allowAudio: true }), true);
+  assert.equal(isThumbEligible({ kind: 'file', name: 'track.flac' }, { allowAudio: true }), true);
   assert.equal(isThumbEligible({ kind: 'file', name: 'a.pdf' }), false);
+  assert.equal(isThumbEligible({ kind: 'file', name: 'a.pdf' }, { allowAudio: true }), false);
   assert.equal(isThumbEligible({ kind: 'dir', name: 'Photos' }), false);
   assert.equal(mimeFromName('Arrival.mp4'), 'video/mp4');
   assert.equal(isHiddenName('.env'), true);
@@ -122,6 +132,9 @@ test('detectFileCapabilities cleanly degrades against old nodes and limited role
   assert.equal(oldCaps.hasListSort, false);
   assert.equal(oldCaps.hasListOffset, false);
   assert.equal(oldCaps.hasThumb, false);
+  assert.equal(oldCaps.hasTags, false);
+  assert.equal(oldCaps.hasAudioThumb, false);
+  assert.equal(oldCaps.thumbMaxSize, 0);
   assert.equal(oldCaps.hasFav, false);
   assert.equal(oldCaps.hasSync, false);
   assert.equal(oldCaps.hasFindEnhanced, false);
@@ -188,7 +201,8 @@ test('detectFileCapabilities cleanly degrades against old nodes and limited role
     { name: 'fs.list', effect: 'read', input_schema: { properties: { path: {}, sort: {}, order: {}, offset: {}, categories: {} } } },
     { name: 'fs.read', effect: 'read', input_schema: { properties: { path: {} } } },
     { name: 'fs.find', effect: 'read', input_schema: { properties: { path: {}, name: {}, categories: {} } } },
-    { name: 'fs.thumb', effect: 'read', input_schema: { properties: { paths: {} } } },
+    { name: 'fs.thumb', effect: 'read', input_schema: { properties: { paths: {}, size: { maximum: 1024 } } } },
+    { name: 'fs.tags', effect: 'read', input_schema: { properties: { paths: {} } } },
     { name: 'fs.mkdir', effect: 'write', input_schema: { properties: { path: {} } } },
     { name: 'fs.move', effect: 'write', input_schema: { properties: { from: {}, to: {} } } },
     { name: 'fs.remove', effect: 'destroy', input_schema: { properties: { path: {} } } },
@@ -213,6 +227,9 @@ test('detectFileCapabilities cleanly degrades against old nodes and limited role
   assert.equal(fullCaps.hasListSort, true);
   assert.equal(fullCaps.hasListOffset, true);
   assert.equal(fullCaps.hasThumb, true);
+  assert.equal(fullCaps.hasTags, true);
+  assert.equal(fullCaps.hasAudioThumb, true);
+  assert.equal(fullCaps.thumbMaxSize, 1024);
   assert.equal(fullCaps.hasFav, true);
   assert.equal(fullCaps.hasFavWrite, true);
   assert.equal(fullCaps.hasSync, true);
@@ -251,6 +268,22 @@ test('detectFileCapabilities cleanly degrades against old nodes and limited role
   assert.equal(obsCaps.hasFavWrite, false);
   assert.equal(obsCaps.hasRemove, false);
   assert.equal(obsCaps.hasTransfer, false);
+  assert.equal(obsCaps.hasTags, false);
+  assert.equal(obsCaps.hasAudioThumb, true);
+
+  // Older node with fs.thumb (size max 512) and without fs.tags lacks tags and audio covers.
+  const preAudioThumbCaps = detectFileCapabilities({
+    tools: [
+      { name: 'fs.list', effect: 'read', input_schema: { properties: { path: {}, offset: {} } } },
+      { name: 'fs.read', effect: 'read', input_schema: { properties: { path: {} } } },
+      { name: 'fs.thumb', effect: 'read', input_schema: { properties: { paths: {}, size: { maximum: 512 } } } },
+    ],
+    allowedSet: new Set(['fs.list', 'fs.read', 'fs.thumb']),
+  });
+  assert.equal(preAudioThumbCaps.hasThumb, true);
+  assert.equal(preAudioThumbCaps.hasTags, false);
+  assert.equal(preAudioThumbCaps.hasAudioThumb, false);
+  assert.equal(preAudioThumbCaps.thumbMaxSize, 512);
 });
 
 test('sortEntries keeps directories first and sorts by name, modified, and size', () => {
@@ -702,7 +735,8 @@ test('createThumbQueue batches at most 32 paths and retries busy errors with exp
   let updates3 = 0;
   const fakeCapsStore = {
     isKnown: () => capsKnown,
-    hasTool: (_m, tool) => capsKnown && tool === 'fs.thumb',
+    hasTool: (_m, tool) => capsKnown && (tool === 'fs.thumb' || tool === 'fs.tags'),
+    fileCapabilities: () => ({ hasThumb: capsKnown, hasAudioThumb: capsKnown }),
     async ensure() {
       ensureAttempts += 1;
       if (ensureAttempts === 1) throw { code: 'unreachable', message: 'Timed out.' };
@@ -741,8 +775,8 @@ test('createThumbQueue batches at most 32 paths and retries busy errors with exp
   assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late.png', '', 128)), null);
 
   // Capabilities arrive later; re-enqueueing fetches both picture and song cover thumbnails.
-  assert.equal(isThumbEligible({ name: 'late-song.flac', kind: 'file' }, { includeAudio: false }), false);
-  assert.equal(isThumbEligible({ name: 'late-song.flac', kind: 'file' }, { includeAudio: true }), true);
+  assert.equal(isThumbEligible({ name: 'late-song.flac', kind: 'file' }, { allowAudio: false }), false);
+  assert.equal(isThumbEligible({ name: 'late-song.flac', kind: 'file' }, { allowAudio: true }), true);
   capsKnown = true;
   q3.enqueue({ path: '/home/me/late.png', mtime: '' });
   q3.enqueue({ path: '/home/me/late-song.flac', mtime: '' });
@@ -752,4 +786,124 @@ test('createThumbQueue batches at most 32 paths and retries busy errors with exp
   assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late.png', '', 128))?.url, 'data:image/png;base64,T0s=');
   assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late-song.flac', '', 128))?.url, 'data:image/png;base64,T0s=');
   q3.dispose();
+
+  // Audio covers go through createThumbQueue on nodes with hasAudioThumb, retry busy covers,
+  // cache not_found cleanly, and are skipped on older nodes without hasAudioThumb while pictures
+  // in the same batch still load.
+  const audioCalls = [];
+  const audioAttempts = new Map();
+  const makeCapsStore = (hasAudioThumb) => ({
+    isKnown: () => true,
+    hasTool: (_m, tool) => tool === 'fs.thumb' || (hasAudioThumb && tool === 'fs.tags'),
+    fileCapabilities: () => ({ hasThumb: true, hasAudioThumb }),
+    async ensure() {
+      return { status: 'known' };
+    },
+    async call(tool, args, opts) {
+      assert.equal(tool, 'fs.thumb');
+      audioCalls.push({ machine: opts.on, paths: [...args.paths] });
+      return {
+        value: {
+          results: args.paths.map((p) => {
+            if (p.endsWith('busy.mp3')) {
+              const tries = audioAttempts.get(p) || 0;
+              audioAttempts.set(p, tries + 1);
+              if (tries === 0) {
+                return { path: p, error: { code: 'busy', message: 'Reply budget exceeded.' } };
+              }
+            }
+            if (p.endsWith('nocover.flac')) {
+              return { path: p, error: { code: 'not_found', message: 'No cover.' } };
+            }
+            return { path: p, ok: { mime: 'image/jpeg', content: 'Q09WRVI=', width: 128, height: 128 } };
+          }),
+        },
+      };
+    },
+  });
+
+  const audioCache = createThumbCache();
+  let audioUpdates = 0;
+  const qAudio = createThumbQueue({
+    machine: 'tower',
+    link: null,
+    capsStore: makeCapsStore(true),
+    thumbCache: audioCache,
+    onUpdate: () => {
+      audioUpdates += 1;
+    },
+    schedule,
+    cancel,
+  });
+  qAudio.enqueue({ path: '/home/me/Music/track.mp3', mtime: '1' });
+  qAudio.enqueue({ path: '/home/me/Music/busy.mp3', mtime: '1' });
+  qAudio.enqueue({ path: '/home/me/Music/nocover.flac', mtime: '1' });
+  await runAllTimers(); // initial batch
+  await runAllTimers(); // retry timer fires -> re-enqueues busy.mp3
+  await runAllTimers(); // retry batch completes
+  assert.equal(audioCalls.length, 2);
+  assert.deepEqual(audioCalls[0].paths, [
+    '/home/me/Music/track.mp3',
+    '/home/me/Music/busy.mp3',
+    '/home/me/Music/nocover.flac',
+  ]);
+  assert.deepEqual(audioCalls[1].paths, ['/home/me/Music/busy.mp3']);
+  assert.equal(audioUpdates, 2);
+  assert.equal(
+    audioCache.get(thumbCacheKey('tower', '/home/me/Music/track.mp3', '1', 128))?.url,
+    'data:image/jpeg;base64,Q09WRVI=',
+  );
+  assert.equal(
+    audioCache.get(thumbCacheKey('tower', '/home/me/Music/busy.mp3', '1', 128))?.url,
+    'data:image/jpeg;base64,Q09WRVI=',
+  );
+  assert.deepEqual(audioCache.get(thumbCacheKey('tower', '/home/me/Music/nocover.flac', '1', 128)), {
+    failed: true,
+  });
+  qAudio.dispose();
+
+  // Pre-audio-thumb machine: skips audio paths even if queued before capabilities arrive, while
+  // still fetching picture thumbnails in the same batch.
+  let oldKnown = false;
+  const oldAudioCalls = [];
+  const oldCapsStore = {
+    isKnown: () => oldKnown,
+    hasTool: (_m, tool) => oldKnown && tool === 'fs.thumb',
+    fileCapabilities: () => ({ hasThumb: oldKnown, hasAudioThumb: false }),
+    async ensure() {
+      oldKnown = true;
+      return { status: 'known' };
+    },
+    async call(tool, args) {
+      assert.equal(tool, 'fs.thumb');
+      oldAudioCalls.push([...args.paths]);
+      return {
+        value: {
+          results: args.paths.map((p) => ({
+            path: p,
+            ok: { mime: 'image/jpeg', content: 'UEhPVE8=', width: 128, height: 128 },
+          })),
+        },
+      };
+    },
+  };
+  const oldCache = createThumbCache();
+  const qOldAudio = createThumbQueue({
+    machine: 'pretags',
+    link: null,
+    capsStore: oldCapsStore,
+    thumbCache: oldCache,
+    schedule,
+    cancel,
+  });
+  qOldAudio.enqueue({ path: '/home/me/Music/track.mp3', mtime: '1' });
+  qOldAudio.enqueue({ path: '/home/me/Photos/pic.jpg', mtime: '1' });
+  await runAllTimers();
+  assert.deepEqual(oldAudioCalls, [['/home/me/Photos/pic.jpg']]);
+  assert.equal(oldCache.get(thumbCacheKey('pretags', '/home/me/Music/track.mp3', '1', 128)), null);
+  assert.equal(
+    oldCache.get(thumbCacheKey('pretags', '/home/me/Photos/pic.jpg', '1', 128))?.url,
+    'data:image/jpeg;base64,UEhPVE8=',
+  );
+  qOldAudio.dispose();
 });

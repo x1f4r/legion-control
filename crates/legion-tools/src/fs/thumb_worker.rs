@@ -20,7 +20,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::OnceLock;
@@ -35,28 +35,37 @@ use legion_os::run::{RunOptions, RunOutput, run};
 use legion_os::shell::CommandSpec;
 use serde_json::json;
 
+use super::audio_tags::{AudioFormat, CoverExtractMode, ParsedAudioTags, parse_audio};
 use super::cancelled_error;
+use super::tags::{audio_format_cli_name, parse_audio_format_cli_name};
 use super::thumb::{ThumbFit, decode_and_render_image_checked, select_decode_source};
 use super::thumb_cache::CachedThumb;
+use super::thumb_probe::target_output_overhead_bytes;
 
 /// Hidden subcommand flag handled before Tokio starts in `legion-cli`.
 pub const THUMB_WORKER_MODE: &str = "__thumb-worker";
 const PROBE_BASELINE_ARG: &str = "--probe-baseline";
+const AUDIO_TAGS_ARG: &str = "--audio-tags";
+const AUDIO_COVER_ARG: &str = "--audio-cover";
 
 const BASELINE_MAGIC: &[u8; 4] = b"LGTB";
 const BASELINE_FRAME_LEN: usize = 12;
 const WORKER_MAGIC: &[u8; 4] = b"LGTW";
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
+const STATUS_TAGS_OK: u8 = 2;
+const STATUS_NO_COVER: u8 = 3;
+const STATUS_NEEDS_CAP: u8 = 4;
 const MIME_JPEG_TAG: u8 = 1;
 const MIME_PNG_TAG: u8 = 2;
-const MAX_WORKER_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_WORKER_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WORKER_ERR_BYTES: usize = 16 * 1024;
+const MAX_WORKER_TAGS_BYTES: usize = 32 * 1024;
 /// Hard upper bounds enforced by the worker itself on its own CLI arguments so invoking
 /// `__thumb-worker` manually with absurd values (such as `4294967295`) cannot trigger huge
 /// allocations before parsing fails.
 const WORKER_MIN_SIZE: u32 = 96;
-const WORKER_MAX_SIZE: u32 = 512;
+const WORKER_MAX_SIZE: u32 = 1024;
 const WORKER_HARD_MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const WORKER_HARD_MAX_HEAP_CAP_BYTES: u64 = 512 * 1024 * 1024;
 /// Minimum backstop margin above `baseline + heap_cap` for allocator bookkeeping, page-size
@@ -99,6 +108,19 @@ static TEST_DECODE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
 static TEST_FORCE_TIMEOUT_CPU_BUSY: AtomicU8 = AtomicU8::new(0);
 static BASELINE_INIT: OnceLock<u64> = OnceLock::new();
 static OBSERVED_BASELINE_BYTES: AtomicU64 = AtomicU64::new(0);
+static PEAK_WORKER_RSS_FOR_TEST: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only helper that resets the high-water worker peak RSS counter.
+#[doc(hidden)]
+pub fn reset_peak_worker_rss_for_test() {
+    PEAK_WORKER_RSS_FOR_TEST.store(0, Ordering::Release);
+}
+
+/// Test-only helper returning the highest worker peak RSS observed since the last reset.
+#[doc(hidden)]
+pub fn peak_worker_rss_for_test() -> u64 {
+    PEAK_WORKER_RSS_FOR_TEST.load(Ordering::Acquire)
+}
 
 /// Returns a per-platform fallback startup RSS estimate used only when out-of-process worker
 /// probing is unavailable (for example, in unit tests without a worker binary).
@@ -296,6 +318,45 @@ pub(crate) enum WorkerOutcome {
     TransientFailure(ErrorBody),
 }
 
+/// Result of running one out-of-process `--audio-tags` worker.
+#[derive(Debug)]
+pub(crate) enum AudioTagsWorkerOutcome {
+    Ok(ParsedAudioTags),
+    Rejected(ErrorBody),
+    MemoryLimitExceeded {
+        error: ErrorBody,
+        #[allow(dead_code)]
+        peak_rss_bytes: u64,
+    },
+    TimedOut {
+        error: ErrorBody,
+        cpu_busy: bool,
+    },
+    TransientFailure(ErrorBody),
+}
+
+/// Result of running one out-of-process `--audio-cover` worker.
+#[derive(Debug)]
+pub(crate) enum AudioCoverWorkerOutcome {
+    Ok(CachedThumb),
+    /// File parsed cleanly with no embedded raster cover; returns its parsed tags so the caller
+    /// can populate the shared tags cache and check for a folder cover.
+    NoEmbeddedCover(ParsedAudioTags),
+    /// Embedded cover header probe requires a larger live-heap cap than the initial reservation.
+    NeedsCap(u64),
+    Rejected(ErrorBody),
+    MemoryLimitExceeded {
+        error: ErrorBody,
+        #[allow(dead_code)]
+        peak_rss_bytes: u64,
+    },
+    TimedOut {
+        error: ErrorBody,
+        cpu_busy: bool,
+    },
+    TransientFailure(ErrorBody),
+}
+
 /// Dispatches the hidden `__thumb-worker` CLI mode if present as the first argument.
 ///
 /// Must be called before Tokio starts in `main()`. Returns `Some(ExitCode)` when handled.
@@ -406,11 +467,207 @@ fn parse_worker_args(args: &[OsString]) -> Result<WorkerArgs, ErrorBody> {
     })
 }
 
+#[derive(Debug)]
+struct AudioTagsWorkerArgs {
+    format: AudioFormat,
+    heap_cap_usize: usize,
+    display_label: String,
+}
+
+fn parse_audio_tags_worker_args(args: &[OsString]) -> Result<AudioTagsWorkerArgs, ErrorBody> {
+    // Expect: <format> <heap_cap_bytes> <display_label>
+    if args.len() < 3 {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Invalid audio tag worker arguments.",
+        ));
+    }
+    let format =
+        parse_audio_format_cli_name(args[0].to_string_lossy().as_ref()).ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Invalid audio worker format argument.",
+            )
+        })?;
+    let heap_cap_bytes = args[1].to_string_lossy().parse::<u64>().map_err(|_| {
+        ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Invalid audio tag worker heap_cap_bytes argument.",
+        )
+    })?;
+    if heap_cap_bytes == 0 || heap_cap_bytes > WORKER_HARD_MAX_HEAP_CAP_BYTES {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Audio tag worker heap_cap_bytes ({heap_cap_bytes}) is out of range."),
+        ));
+    }
+    let heap_cap_usize = usize::try_from(heap_cap_bytes).map_err(|_| {
+        ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Audio tag worker heap_cap_bytes exceeds addressable range.",
+        )
+    })?;
+    Ok(AudioTagsWorkerArgs {
+        format,
+        heap_cap_usize,
+        display_label: args[2].to_string_lossy().into_owned(),
+    })
+}
+
+#[derive(Debug)]
+struct AudioCoverWorkerArgs {
+    format: AudioFormat,
+    size: u32,
+    fit: ThumbFit,
+    heap_cap_bytes: u64,
+    heap_cap_usize: usize,
+    allow_needs_cap: bool,
+    display_label: String,
+}
+
+fn parse_audio_cover_worker_args(args: &[OsString]) -> Result<AudioCoverWorkerArgs, ErrorBody> {
+    // Expect: <format> <size> <fit> <heap_cap_bytes> <allow_needs_cap> <display_label>
+    if args.len() < 6 {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Invalid audio cover worker arguments.",
+        ));
+    }
+    let format =
+        parse_audio_format_cli_name(args[0].to_string_lossy().as_ref()).ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Invalid audio cover format argument.",
+            )
+        })?;
+    let size = args[1].to_string_lossy().parse::<u32>().map_err(|_| {
+        ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Invalid audio cover worker size argument.",
+        )
+    })?;
+    if !(WORKER_MIN_SIZE..=WORKER_MAX_SIZE).contains(&size) {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "Audio cover worker size must be between {WORKER_MIN_SIZE} and {WORKER_MAX_SIZE}, got {size}."
+            ),
+        ));
+    }
+    let fit = match args[2].to_string_lossy().as_ref() {
+        "contain" => ThumbFit::Contain,
+        "cover" => ThumbFit::Cover,
+        _ => {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Invalid audio cover worker fit argument.",
+            ));
+        }
+    };
+    let heap_cap_bytes = args[3].to_string_lossy().parse::<u64>().map_err(|_| {
+        ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Invalid audio cover worker heap_cap_bytes argument.",
+        )
+    })?;
+    if heap_cap_bytes == 0 || heap_cap_bytes > WORKER_HARD_MAX_HEAP_CAP_BYTES {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Audio cover worker heap_cap_bytes ({heap_cap_bytes}) is out of range."),
+        ));
+    }
+    let heap_cap_usize = usize::try_from(heap_cap_bytes).map_err(|_| {
+        ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Audio cover worker heap_cap_bytes exceeds addressable range.",
+        )
+    })?;
+    let allow_needs_cap = match args[4].to_string_lossy().as_ref() {
+        "0" => false,
+        "1" => true,
+        _ => {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Invalid audio cover worker allow_needs_cap argument.",
+            ));
+        }
+    };
+    Ok(AudioCoverWorkerArgs {
+        format,
+        size,
+        fit,
+        heap_cap_bytes,
+        heap_cap_usize,
+        allow_needs_cap,
+        display_label: args[5].to_string_lossy().into_owned(),
+    })
+}
+
+/// Duplicates the already-opened regular file handle inherited on `stdin` into a seekable [`File`]
+/// without using `unsafe` and without opening any path on disk.
+fn open_inherited_stdin_regular_file(label_path: &Path) -> Result<(File, u64), ErrorBody> {
+    let cloned: io::Result<File> = {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd as _;
+            io::stdin().as_fd().try_clone_to_owned().map(File::from)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsHandle as _;
+            io::stdin().as_handle().try_clone_to_owned().map(File::from)
+        }
+    };
+    let mut file = cloned.map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Audio worker could not access inherited file handle for {}: {err}.",
+                label_path.display()
+            ),
+        )
+    })?;
+    let meta = file.metadata().map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Audio worker could not inspect inherited handle for {}: {err}.",
+                label_path.display()
+            ),
+        )
+    })?;
+    if !meta.is_file() {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "Inherited handle for {} is not a regular file.",
+                label_path.display()
+            ),
+        ));
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Audio worker could not seek {}: {err}.",
+                label_path.display()
+            ),
+        )
+    })?;
+    Ok((file, meta.len()))
+}
+
 fn run_worker_main(args: &[OsString]) -> ExitCode {
     if args.first().is_some_and(|a| a == PROBE_BASELINE_ARG) {
         let baseline = process_rss_bytes(std::process::id()).unwrap_or(0);
         let _ = write_baseline_frame(baseline);
         return ExitCode::SUCCESS;
+    }
+    if args.first().is_some_and(|a| a == AUDIO_TAGS_ARG) {
+        return run_audio_tags_worker_main(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == AUDIO_COVER_ARG) {
+        return run_audio_cover_worker_main(&args[1..]);
     }
 
     let parsed = match parse_worker_args(args) {
@@ -506,6 +763,149 @@ fn run_worker_main(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn run_audio_tags_worker_main(args: &[OsString]) -> ExitCode {
+    let parsed = match parse_audio_tags_worker_args(args) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let _ = write_err_frame(&err);
+            return ExitCode::from(2);
+        }
+    };
+    let startup_rss = process_rss_bytes(std::process::id()).unwrap_or(0);
+    let _ = write_baseline_frame(startup_rss);
+
+    capped_alloc::set_memory_cap(parsed.heap_cap_usize);
+
+    let label_path = Path::new(&parsed.display_label);
+    let (mut file, file_len) = match open_inherited_stdin_regular_file(label_path) {
+        Ok(pair) => pair,
+        Err(err) => {
+            let _ = write_err_frame(&err);
+            return ExitCode::SUCCESS;
+        }
+    };
+
+    match parse_audio(
+        &mut file,
+        file_len,
+        parsed.format,
+        CoverExtractMode::CheckOnly,
+        label_path,
+    ) {
+        Ok(extracted) => {
+            if write_tags_frame(STATUS_TAGS_OK, &extracted.tags).is_err() {
+                return ExitCode::from(1);
+            }
+        }
+        Err(err) => {
+            if write_err_frame(&err).is_err() {
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_audio_cover_worker_main(args: &[OsString]) -> ExitCode {
+    let parsed = match parse_audio_cover_worker_args(args) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let _ = write_err_frame(&err);
+            return ExitCode::from(2);
+        }
+    };
+    let startup_rss = process_rss_bytes(std::process::id()).unwrap_or(0);
+    let _ = write_baseline_frame(startup_rss);
+
+    capped_alloc::set_memory_cap(parsed.heap_cap_usize);
+
+    let label_path = Path::new(&parsed.display_label);
+    let (mut file, file_len) = match open_inherited_stdin_regular_file(label_path) {
+        Ok(pair) => pair,
+        Err(err) => {
+            let _ = write_err_frame(&err);
+            return ExitCode::SUCCESS;
+        }
+    };
+
+    let extracted = match parse_audio(
+        &mut file,
+        file_len,
+        parsed.format,
+        CoverExtractMode::ExtractBytes,
+        label_path,
+    ) {
+        Ok(extracted) => extracted,
+        Err(err) => {
+            if write_err_frame(&err).is_err() {
+                return ExitCode::from(1);
+            }
+            return ExitCode::SUCCESS;
+        }
+    };
+    drop(file);
+
+    let Some(cover_bytes) = extracted.cover else {
+        if write_tags_frame(STATUS_NO_COVER, &extracted.tags).is_err() {
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    };
+    drop(extracted.tags);
+
+    let (decode_bytes, profile, override_orientation) =
+        match select_decode_source(label_path, cover_bytes) {
+            Ok(selected) => selected,
+            Err(err) => {
+                if write_err_frame(&err).is_err() {
+                    return ExitCode::from(1);
+                }
+                return ExitCode::SUCCESS;
+            }
+        };
+
+    let needed_cap = heap_cap_from_estimate(
+        profile
+            .estimated_peak_bytes
+            .saturating_add(target_output_overhead_bytes(parsed.size)),
+    );
+    if needed_cap > parsed.heap_cap_bytes {
+        if parsed.allow_needs_cap {
+            if write_needs_cap_frame(needed_cap).is_err() {
+                return ExitCode::from(1);
+            }
+            return ExitCode::SUCCESS;
+        }
+    } else if let Ok(tight) = usize::try_from(needed_cap) {
+        // Tighten CappedAlloc down to the exact cover probe estimate before decoding so a lying
+        // embedded cover is caught at the same tight live-heap cap as a standalone picture.
+        capped_alloc::tighten_memory_cap(tight);
+    }
+
+    let no_abort = AtomicBool::new(false);
+    match decode_and_render_image_checked(
+        label_path,
+        decode_bytes,
+        profile,
+        override_orientation,
+        parsed.size,
+        parsed.fit,
+        &no_abort,
+    ) {
+        Ok(thumb) => {
+            if write_ok_frame(&thumb).is_err() {
+                return ExitCode::from(1);
+            }
+        }
+        Err(err) => {
+            if write_err_frame(&err).is_err() {
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn write_baseline_frame(baseline_rss_bytes: u64) -> io::Result<()> {
     let mut out = io::stdout().lock();
     out.write_all(BASELINE_MAGIC)?;
@@ -560,7 +960,42 @@ fn write_err_frame(err: &ErrorBody) -> io::Result<()> {
     out.flush()
 }
 
-fn parse_worker_frame(raw: &[u8]) -> Option<Result<CachedThumb, ErrorBody>> {
+fn write_tags_frame(status: u8, tags: &ParsedAudioTags) -> io::Result<()> {
+    let payload = serde_json::to_vec(tags)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    if payload.len() > MAX_WORKER_TAGS_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tags frame too large",
+        ));
+    }
+    let len = u32::try_from(payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "tags frame too large"))?;
+    let mut out = io::stdout().lock();
+    out.write_all(WORKER_MAGIC)?;
+    out.write_all(&[status])?;
+    out.write_all(&len.to_le_bytes())?;
+    out.write_all(&payload)?;
+    out.flush()
+}
+
+fn write_needs_cap_frame(needed_cap: u64) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    out.write_all(WORKER_MAGIC)?;
+    out.write_all(&[STATUS_NEEDS_CAP])?;
+    out.write_all(&needed_cap.to_le_bytes())?;
+    out.flush()
+}
+
+enum ParsedWorkerFrame {
+    Thumb(CachedThumb),
+    Err(ErrorBody),
+    Tags(ParsedAudioTags),
+    NoCover(ParsedAudioTags),
+    NeedsCap(u64),
+}
+
+fn parse_worker_frame_any(raw: &[u8]) -> Option<ParsedWorkerFrame> {
     let (_, body) = split_baseline_preamble(raw);
     if body.len() < 5 || &body[..4] != WORKER_MAGIC {
         return None;
@@ -585,7 +1020,7 @@ fn parse_worker_frame(raw: &[u8]) -> Option<Result<CachedThumb, ErrorBody>> {
             if body.len() != end {
                 return None;
             }
-            Some(Ok(CachedThumb {
+            Some(ParsedWorkerFrame::Thumb(CachedThumb {
                 mime,
                 width,
                 height,
@@ -605,8 +1040,45 @@ fn parse_worker_frame(raw: &[u8]) -> Option<Result<CachedThumb, ErrorBody>> {
                 return None;
             }
             let err: ErrorBody = serde_json::from_slice(&body[9..end]).ok()?;
-            Some(Err(err))
+            Some(ParsedWorkerFrame::Err(err))
         }
+        STATUS_TAGS_OK | STATUS_NO_COVER => {
+            if body.len() < 9 {
+                return None;
+            }
+            let len = u32::from_le_bytes(body[5..9].try_into().ok()?) as usize;
+            if len == 0 || len > MAX_WORKER_TAGS_BYTES {
+                return None;
+            }
+            let end = 9usize.checked_add(len)?;
+            if body.len() != end {
+                return None;
+            }
+            let tags: ParsedAudioTags = serde_json::from_slice(&body[9..end]).ok()?;
+            if body[4] == STATUS_TAGS_OK {
+                Some(ParsedWorkerFrame::Tags(tags))
+            } else {
+                Some(ParsedWorkerFrame::NoCover(tags))
+            }
+        }
+        STATUS_NEEDS_CAP => {
+            if body.len() != 13 {
+                return None;
+            }
+            let needed = u64::from_le_bytes(body[5..13].try_into().ok()?);
+            if needed == 0 || needed > WORKER_HARD_MAX_HEAP_CAP_BYTES {
+                return None;
+            }
+            Some(ParsedWorkerFrame::NeedsCap(needed))
+        }
+        _ => None,
+    }
+}
+
+fn parse_worker_frame(raw: &[u8]) -> Option<Result<CachedThumb, ErrorBody>> {
+    match parse_worker_frame_any(raw)? {
+        ParsedWorkerFrame::Thumb(thumb) => Some(Ok(thumb)),
+        ParsedWorkerFrame::Err(err) => Some(Err(err)),
         _ => None,
     }
 }
@@ -694,6 +1166,7 @@ pub(crate) async fn run_thumb_worker(
             ),
         )
     })?;
+    PEAK_WORKER_RSS_FOR_TEST.fetch_max(output.peak_rss_bytes, Ordering::Relaxed);
 
     classify_worker_output(
         display_path,
@@ -703,6 +1176,374 @@ pub(crate) async fn run_thumb_worker(
         baseline_rss_bytes,
         timeout,
     )
+}
+
+/// Runs the out-of-process `__thumb-worker --audio-tags` on the already-opened audio `file`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_audio_tags_worker(
+    display_path: &Path,
+    file: File,
+    format: AudioFormat,
+    heap_cap_bytes: u64,
+    rss_limit_bytes: u64,
+    baseline_rss_bytes: u64,
+    timeout: Duration,
+    cancel: CancellationToken,
+) -> Result<AudioTagsWorkerOutcome, ErrorBody> {
+    let exe = legion_core::current_exe()
+        .or_else(|_| std::env::current_exe())
+        .map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Cannot locate the legion binary to start an audio tag worker: {err}."),
+            )
+        })?;
+    let mut options = RunOptions::new(CommandSpec::Argv {
+        program: exe.into_os_string(),
+        args: vec![
+            OsString::from(THUMB_WORKER_MODE),
+            OsString::from(AUDIO_TAGS_ARG),
+            OsString::from(audio_format_cli_name(format)),
+            OsString::from(heap_cap_bytes.to_string()),
+            display_path.as_os_str().to_os_string(),
+        ],
+    })
+    .env_clear(true)
+    .envs(minimal_system_env())
+    .stdin_file(file)
+    .memory_limit(rss_limit_bytes)
+    .rlimit_as_headroom(WORKER_RLIMIT_AS_HEADROOM)
+    .timeout(timeout)
+    .kill_grace(Duration::ZERO)
+    .capture_limit(MAX_WORKER_TAGS_BYTES + 1024)
+    .raw_stdout(true)
+    .cancel(cancel);
+    options = options.env("MALLOC_ARENA_MAX", "2");
+
+    let output = run(options).await.map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!(
+                "Failed to launch audio tag worker for {}: {err}.",
+                display_path.display()
+            ),
+        )
+    })?;
+    PEAK_WORKER_RSS_FOR_TEST.fetch_max(output.peak_rss_bytes, Ordering::Relaxed);
+
+    classify_audio_tags_output(
+        display_path,
+        &output,
+        heap_cap_bytes,
+        rss_limit_bytes,
+        baseline_rss_bytes,
+        timeout,
+    )
+}
+
+/// Runs the out-of-process `__thumb-worker --audio-cover` on the already-opened audio `file`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_audio_cover_worker(
+    display_path: &Path,
+    file: File,
+    format: AudioFormat,
+    size: u32,
+    fit: ThumbFit,
+    heap_cap_bytes: u64,
+    allow_needs_cap: bool,
+    rss_limit_bytes: u64,
+    baseline_rss_bytes: u64,
+    timeout: Duration,
+    cancel: CancellationToken,
+) -> Result<AudioCoverWorkerOutcome, ErrorBody> {
+    let exe = legion_core::current_exe()
+        .or_else(|_| std::env::current_exe())
+        .map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Cannot locate the legion binary to start an audio cover worker: {err}."),
+            )
+        })?;
+    let fit_str = match fit {
+        ThumbFit::Contain => "contain",
+        ThumbFit::Cover => "cover",
+    };
+    let mut options = RunOptions::new(CommandSpec::Argv {
+        program: exe.into_os_string(),
+        args: vec![
+            OsString::from(THUMB_WORKER_MODE),
+            OsString::from(AUDIO_COVER_ARG),
+            OsString::from(audio_format_cli_name(format)),
+            OsString::from(size.to_string()),
+            OsString::from(fit_str),
+            OsString::from(heap_cap_bytes.to_string()),
+            OsString::from(if allow_needs_cap { "1" } else { "0" }),
+            display_path.as_os_str().to_os_string(),
+        ],
+    })
+    .env_clear(true)
+    .envs(minimal_system_env())
+    .stdin_file(file)
+    .memory_limit(rss_limit_bytes)
+    .rlimit_as_headroom(WORKER_RLIMIT_AS_HEADROOM)
+    .timeout(timeout)
+    .kill_grace(Duration::ZERO)
+    .capture_limit(MAX_WORKER_STDOUT_BYTES)
+    .raw_stdout(true)
+    .cancel(cancel);
+    options = options.env("MALLOC_ARENA_MAX", "2");
+
+    let output = run(options).await.map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!(
+                "Failed to launch audio cover worker for {}: {err}.",
+                display_path.display()
+            ),
+        )
+    })?;
+    PEAK_WORKER_RSS_FOR_TEST.fetch_max(output.peak_rss_bytes, Ordering::Relaxed);
+
+    classify_audio_cover_output(
+        display_path,
+        &output,
+        heap_cap_bytes,
+        rss_limit_bytes,
+        baseline_rss_bytes,
+        timeout,
+    )
+}
+
+enum CommonWorkerStop {
+    TimedOut {
+        error: ErrorBody,
+        cpu_busy: bool,
+    },
+    MemoryLimitExceeded {
+        error: ErrorBody,
+        peak_rss_bytes: u64,
+    },
+    TransientFailure(ErrorBody),
+}
+
+fn classify_common_worker_stop(
+    tool: &'static str,
+    display_path: &Path,
+    output: &RunOutput,
+    heap_cap_bytes: u64,
+    rss_limit_bytes: u64,
+    baseline_rss_bytes: u64,
+    timeout: Duration,
+) -> Result<Option<CommonWorkerStop>, ErrorBody> {
+    if output.cancelled {
+        return Err(cancelled_error(tool));
+    }
+
+    let (worker_baseline_rss, _) = split_baseline_preamble(&output.stdout_bytes);
+    if let Some(observed) = worker_baseline_rss
+        && (MIN_MEASURED_BASELINE_BYTES..=MAX_MEASURED_BASELINE_BYTES).contains(&observed)
+    {
+        OBSERVED_BASELINE_BYTES.fetch_max(observed, Ordering::Relaxed);
+    }
+
+    if output.timed_out {
+        let cpu_busy = match TEST_FORCE_TIMEOUT_CPU_BUSY.load(Ordering::Acquire) {
+            1 => false,
+            2 => true,
+            _ => output
+                .cpu_time
+                .is_some_and(|cpu| cpu.mul_f32(2.0) >= timeout),
+        };
+        let err = ErrorBody::new(
+            ErrorCode::Timeout,
+            format!(
+                "Worker processing {} exceeded the {}-second time limit.",
+                display_path.display(),
+                timeout.as_secs().max(1)
+            ),
+        )
+        .with_hint("The file may be malformed or too expensive to process quickly.");
+        return Ok(Some(CommonWorkerStop::TimedOut {
+            error: err,
+            cpu_busy,
+        }));
+    }
+
+    let platform = platform_label();
+
+    if output.exit_code == Some(CAP_EXCEEDED_EXIT_CODE) {
+        let cap_mib = heap_cap_bytes / (1024 * 1024);
+        let err = ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Processing {} needed more memory than the {cap_mib} MiB worker limit and was stopped.",
+                display_path.display()
+            ),
+        )
+        .with_hint("This file needed more memory than Legion allows for media inspection; open or download the original file instead.")
+        .with_details(json!({
+            "reason": "too_large",
+            "killed_for_memory": true,
+            "enforced_by": "allocator_cap",
+            "platform": platform,
+            "baseline_rss_bytes": baseline_rss_bytes,
+            "worker_baseline_rss_bytes": worker_baseline_rss,
+            "heap_cap_bytes": heap_cap_bytes,
+            "limit_bytes": rss_limit_bytes,
+            "peak_rss_bytes": output.peak_rss_bytes,
+        }));
+        return Ok(Some(CommonWorkerStop::MemoryLimitExceeded {
+            error: err,
+            peak_rss_bytes: output.peak_rss_bytes,
+        }));
+    }
+
+    if output.killed_for_memory {
+        let enforced_by = if output.memory_watchdog_killed {
+            "rss_watchdog"
+        } else {
+            "os_limit"
+        };
+        let _ = writeln!(
+            io::stderr(),
+            "legion: {tool} backstop ({enforced_by}) stopped worker under heap cap for {}: platform={platform} baseline={baseline_rss_bytes}B worker_baseline={worker_baseline_rss:?}B cap={heap_cap_bytes}B limit={rss_limit_bytes}B peak={}B",
+            display_path.display(),
+            output.peak_rss_bytes,
+        );
+        let err = ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Worker for {} hit the {enforced_by} backstop while within its heap cap.",
+                display_path.display()
+            ),
+        )
+        .with_hint("This was not caused by the file exceeding its heap cap; the file was not marked bad. Retry shortly.")
+        .with_details(json!({
+            "reason": "backstop_limit",
+            "transient": true,
+            "enforced_by": enforced_by,
+            "platform": platform,
+            "baseline_rss_bytes": baseline_rss_bytes,
+            "worker_baseline_rss_bytes": worker_baseline_rss,
+            "heap_cap_bytes": heap_cap_bytes,
+            "limit_bytes": rss_limit_bytes,
+            "peak_rss_bytes": output.peak_rss_bytes,
+        }));
+        return Ok(Some(CommonWorkerStop::TransientFailure(err)));
+    }
+
+    Ok(None)
+}
+
+fn unexpected_worker_stop_error(tool: &str, display_path: &Path, output: &RunOutput) -> ErrorBody {
+    let detail = output.stderr.text.trim();
+    let summary = if let Some(sig) = output.signal {
+        format!("terminated by signal {sig}")
+    } else if !detail.is_empty() {
+        detail.lines().next().unwrap_or(detail).trim().to_owned()
+    } else if let Some(code) = output.exit_code {
+        format!("exited with status {code}")
+    } else {
+        "terminated unexpectedly".to_owned()
+    };
+    ErrorBody::new(
+        ErrorCode::Failed,
+        format!(
+            "Media worker for {} stopped unexpectedly ({summary}).",
+            display_path.display()
+        ),
+    )
+    .with_hint(format!(
+        "This failure was not caused by the memory limit; retry {tool}."
+    ))
+}
+
+fn classify_audio_tags_output(
+    display_path: &Path,
+    output: &RunOutput,
+    heap_cap_bytes: u64,
+    rss_limit_bytes: u64,
+    baseline_rss_bytes: u64,
+    timeout: Duration,
+) -> Result<AudioTagsWorkerOutcome, ErrorBody> {
+    if let Some(stop) = classify_common_worker_stop(
+        "fs.tags",
+        display_path,
+        output,
+        heap_cap_bytes,
+        rss_limit_bytes,
+        baseline_rss_bytes,
+        timeout,
+    )? {
+        return Ok(match stop {
+            CommonWorkerStop::TimedOut { error, cpu_busy } => {
+                AudioTagsWorkerOutcome::TimedOut { error, cpu_busy }
+            }
+            CommonWorkerStop::MemoryLimitExceeded {
+                error,
+                peak_rss_bytes,
+            } => AudioTagsWorkerOutcome::MemoryLimitExceeded {
+                error,
+                peak_rss_bytes,
+            },
+            CommonWorkerStop::TransientFailure(err) => {
+                AudioTagsWorkerOutcome::TransientFailure(err)
+            }
+        });
+    }
+    match parse_worker_frame_any(&output.stdout_bytes) {
+        Some(ParsedWorkerFrame::Tags(tags)) => Ok(AudioTagsWorkerOutcome::Ok(tags)),
+        Some(ParsedWorkerFrame::Err(err)) => Ok(AudioTagsWorkerOutcome::Rejected(err)),
+        _ => Ok(AudioTagsWorkerOutcome::TransientFailure(
+            unexpected_worker_stop_error("fs.tags", display_path, output),
+        )),
+    }
+}
+
+fn classify_audio_cover_output(
+    display_path: &Path,
+    output: &RunOutput,
+    heap_cap_bytes: u64,
+    rss_limit_bytes: u64,
+    baseline_rss_bytes: u64,
+    timeout: Duration,
+) -> Result<AudioCoverWorkerOutcome, ErrorBody> {
+    if let Some(stop) = classify_common_worker_stop(
+        "fs.thumb",
+        display_path,
+        output,
+        heap_cap_bytes,
+        rss_limit_bytes,
+        baseline_rss_bytes,
+        timeout,
+    )? {
+        return Ok(match stop {
+            CommonWorkerStop::TimedOut { error, cpu_busy } => {
+                AudioCoverWorkerOutcome::TimedOut { error, cpu_busy }
+            }
+            CommonWorkerStop::MemoryLimitExceeded {
+                error,
+                peak_rss_bytes,
+            } => AudioCoverWorkerOutcome::MemoryLimitExceeded {
+                error,
+                peak_rss_bytes,
+            },
+            CommonWorkerStop::TransientFailure(err) => {
+                AudioCoverWorkerOutcome::TransientFailure(err)
+            }
+        });
+    }
+    match parse_worker_frame_any(&output.stdout_bytes) {
+        Some(ParsedWorkerFrame::Thumb(thumb)) => Ok(AudioCoverWorkerOutcome::Ok(thumb)),
+        Some(ParsedWorkerFrame::NoCover(tags)) => {
+            Ok(AudioCoverWorkerOutcome::NoEmbeddedCover(tags))
+        }
+        Some(ParsedWorkerFrame::NeedsCap(cap)) => Ok(AudioCoverWorkerOutcome::NeedsCap(cap)),
+        Some(ParsedWorkerFrame::Err(err)) => Ok(AudioCoverWorkerOutcome::Rejected(err)),
+        _ => Ok(AudioCoverWorkerOutcome::TransientFailure(
+            unexpected_worker_stop_error("fs.thumb", display_path, output),
+        )),
+    }
 }
 
 fn classify_worker_output(
@@ -1023,5 +1864,85 @@ mod tests {
             }
             other => panic!("allocator cap exit 107 must be MemoryLimitExceeded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn audio_worker_frames_and_cli_args_validate_bounds() {
+        let tags = ParsedAudioTags {
+            title: Some("First song".to_owned()),
+            artist: Some("Someone".to_owned()),
+            album: Some("First album".to_owned()),
+            album_artist: None,
+            track: Some(1),
+            disc: Some(1),
+            year: Some(2025),
+            duration_s: Some(4.5),
+            has_embedded_cover: true,
+        };
+        let payload = serde_json::to_vec(&tags).unwrap();
+
+        let mut tags_raw = Vec::new();
+        tags_raw.extend_from_slice(WORKER_MAGIC);
+        tags_raw.push(STATUS_TAGS_OK);
+        tags_raw.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        tags_raw.extend_from_slice(&payload);
+        match parse_worker_frame_any(&tags_raw) {
+            Some(ParsedWorkerFrame::Tags(got)) => assert_eq!(got, tags),
+            other => panic!("expected Tags frame, got {:?}", other.map(|_| ())),
+        }
+
+        let mut no_cover_raw = Vec::new();
+        no_cover_raw.extend_from_slice(WORKER_MAGIC);
+        no_cover_raw.push(STATUS_NO_COVER);
+        no_cover_raw.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        no_cover_raw.extend_from_slice(&payload);
+        match parse_worker_frame_any(&no_cover_raw) {
+            Some(ParsedWorkerFrame::NoCover(got)) => assert_eq!(got, tags),
+            other => panic!("expected NoCover frame, got {:?}", other.map(|_| ())),
+        }
+
+        let mut cap_raw = Vec::new();
+        cap_raw.extend_from_slice(WORKER_MAGIC);
+        cap_raw.push(STATUS_NEEDS_CAP);
+        cap_raw.extend_from_slice(&(200 * 1024 * 1024u64).to_le_bytes());
+        match parse_worker_frame_any(&cap_raw) {
+            Some(ParsedWorkerFrame::NeedsCap(cap)) => assert_eq!(cap, 200 * 1024 * 1024),
+            other => panic!("expected NeedsCap frame, got {:?}", other.map(|_| ())),
+        }
+
+        // Absurd audio worker CLI arguments must be rejected before allocating.
+        assert_eq!(
+            parse_audio_tags_worker_args(&[
+                OsString::from("bogus"),
+                OsString::from("16777216"),
+                OsString::from("/a.mp3"),
+            ])
+            .unwrap_err()
+            .code,
+            ErrorCode::InvalidArgs
+        );
+        assert_eq!(
+            parse_audio_tags_worker_args(&[
+                OsString::from("mp3"),
+                OsString::from("999999999999"),
+                OsString::from("/a.mp3"),
+            ])
+            .unwrap_err()
+            .code,
+            ErrorCode::InvalidArgs
+        );
+        assert_eq!(
+            parse_audio_cover_worker_args(&[
+                OsString::from("mp3"),
+                OsString::from("1025"),
+                OsString::from("contain"),
+                OsString::from("67108864"),
+                OsString::from("1"),
+                OsString::from("/a.mp3"),
+            ])
+            .unwrap_err()
+            .code,
+            ErrorCode::InvalidArgs
+        );
     }
 }

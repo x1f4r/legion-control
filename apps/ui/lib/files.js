@@ -77,6 +77,7 @@ const MEDIA_TABLE = {
   mp3: ['audio', 'audio/mpeg', 'inline', true],
   mpga: ['audio', 'audio/mpeg', 'inline', true],
   m4a: ['audio', 'audio/mp4', 'inline', true],
+  m4b: ['audio', 'audio/mp4', 'inline', true],
   mp4a: ['audio', 'audio/mp4', 'inline', true],
   alac: ['audio', 'audio/mp4', 'inline', true],
   aac: ['audio', 'audio/aac', 'inline', true],
@@ -439,12 +440,13 @@ export function entryIconName(entry) {
 
 /**
  * Whether an entry can request a server thumbnail (`fs.thumb` supports pictures, video posters,
- * and audio covers on machines advertising `hasAudioCovers`).
+ * and — when `allowAudio` is enabled for a node reporting `hasAudioThumb` — embedded or folder
+ * audio covers).
  */
-export function isThumbEligible(entry, { includeAudio = false } = {}) {
+export function isThumbEligible(entry, { allowAudio = false } = {}) {
   if (!entry || entry.kind === 'dir') return false;
   const cat = entryCategory(entry);
-  return cat === 'image' || cat === 'video' || (includeAudio && cat === 'audio');
+  return cat === 'image' || cat === 'video' || (allowAudio && cat === 'audio');
 }
 
 /**
@@ -734,6 +736,14 @@ export function createThumbQueue({
     return true;
   }
 
+  function machineAllowsAudioThumb() {
+    if (!capsStore) return true;
+    if (typeof capsStore.fileCapabilities === 'function') {
+      return Boolean(capsStore.fileCapabilities(machine)?.hasAudioThumb);
+    }
+    return capsStore.hasTool(machine, 'fs.tags');
+  }
+
   async function flush() {
     flushTimer = null;
     if (!alive || !machine || queue.size === 0) return;
@@ -749,6 +759,7 @@ export function createThumbQueue({
     }
     if (batch.length === 0) return;
 
+    let activeBatch = batch;
     try {
       if (capsStore) {
         if (!capsStore.isKnown(machine)) {
@@ -760,9 +771,21 @@ export function createThumbQueue({
           queue.clear();
           return;
         }
+        if (!machineAllowsAudioThumb()) {
+          const kept = [];
+          for (const item of batch) {
+            if (item.isAudio) inFlight.delete(item.path);
+            else kept.push(item);
+          }
+          for (const [p, queued] of queue.entries()) {
+            if (queued.isAudio) queue.delete(p);
+          }
+          if (kept.length === 0) return;
+          activeBatch = kept;
+        }
       }
 
-      const paths = batch.map((item) => item.path);
+      const paths = activeBatch.map((item) => item.path);
       const res = capsStore
         ? (await capsStore.call('fs.thumb', { paths, size, fit }, { on: machine })).value
         : await link.call('fs.thumb', { paths, size, fit }, { on: machine });
@@ -770,7 +793,7 @@ export function createThumbQueue({
 
       const map = extractThumbMap(res);
       let updated = false;
-      for (const item of batch) {
+      for (const item of activeBatch) {
         inFlight.delete(item.path);
         const key = thumbCacheKey(machine, item.path, item.mtime, size);
         const t = map[item.path];
@@ -789,7 +812,7 @@ export function createThumbQueue({
     } catch (err) {
       if (!alive) return;
       const retryable = isRetryableThumbError(err);
-      for (const item of batch) {
+      for (const item of activeBatch) {
         inFlight.delete(item.path);
         if (retryable && scheduleRetry(item)) continue;
         retryCount.delete(item.path);
@@ -806,7 +829,11 @@ export function createThumbQueue({
   return {
     enqueue(item) {
       if (!alive || !machine || !item?.path) return;
-      if (capsStore && capsStore.isKnown(machine) && !capsStore.hasTool(machine, 'fs.thumb')) return;
+      const isAudio = Boolean(item.isAudio || entryCategory(item) === 'audio');
+      if (capsStore && capsStore.isKnown(machine)) {
+        if (!capsStore.hasTool(machine, 'fs.thumb')) return;
+        if (isAudio && !machineAllowsAudioThumb()) return;
+      }
       const mtime = item.mtime || '';
       const key = thumbCacheKey(machine, item.path, mtime, size);
       if (
@@ -817,7 +844,7 @@ export function createThumbQueue({
       ) {
         return;
       }
-      queue.set(item.path, { path: item.path, mtime });
+      queue.set(item.path, { path: item.path, mtime, isAudio });
       scheduleFlush(debounceMs);
     },
 

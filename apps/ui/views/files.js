@@ -206,7 +206,15 @@ function joinMemberNames(members) {
 
 // ── Batched lazy thumbnail loader hooks ──────────────────────────────────────────────────────
 
-function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, includeAudio = false, thumbCache }) {
+function useBatchedThumbs({
+  machine,
+  entries,
+  link,
+  capsStore = null,
+  enabled,
+  allowAudio = false,
+  thumbCache,
+}) {
   const [, setTick] = useState(0);
   const queueRef = useRef(null);
   const observerRef = useRef(null);
@@ -246,10 +254,14 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, i
 
   const requestPath = useCallback(
     (entry) => {
-      if (!enabled || !machine || !entry || !isThumbEligible(entry, { includeAudio })) return;
-      queueRef.current?.enqueue({ path: entry.path, mtime: entry.mtime || '' });
+      if (!enabled || !machine || !entry || !isThumbEligible(entry, { allowAudio })) return;
+      queueRef.current?.enqueue({
+        path: entry.path,
+        mtime: entry.mtime || '',
+        isAudio: entryCategory(entry) === 'audio',
+      });
     },
-    [enabled, includeAudio, machine],
+    [enabled, machine, allowAudio],
   );
 
   // Immediately enqueue the first visible batch so initial paint fills thumbnails promptly.
@@ -258,12 +270,12 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, i
     let count = 0;
     for (const e of entries) {
       if (count >= 24) break;
-      if (isThumbEligible(e, { includeAudio })) {
+      if (isThumbEligible(e, { allowAudio })) {
         requestPath(e);
         count += 1;
       }
     }
-  }, [enabled, includeAudio, machine, entries, link, capsStore, thumbCache, requestPath]);
+  }, [enabled, machine, entries, allowAudio, link, capsStore, thumbCache, requestPath]);
 
   useEffect(() => {
     if (!enabled || typeof IntersectionObserver === 'undefined') return undefined;
@@ -274,7 +286,7 @@ function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, i
           const p = item.target?.dataset?.thumbPath;
           if (!p) continue;
           const entry = entryMapRef.current.get(p);
-          if (entry && isThumbEligible(entry, { includeAudio })) {
+          if (entry && isThumbEligible(entry, { allowAudio })) {
             requestPath(entry);
             obs.unobserve(item.target);
             observedElsRef.current.delete(item.target);
@@ -419,32 +431,29 @@ export function FilesHome({
   onOpenFile,
   onStartSearch,
 }) {
-  const [capsRev, setCapsRev] = useState(0);
-  useEffect(() => {
-    if (!capsStore) return undefined;
-    return capsStore.subscribe(() => setCapsRev((n) => n + 1));
-  }, [capsStore]);
-
   const pinned = useMemo(() => (favourites || []).filter((f) => f.pinned), [favourites]);
   const hasPinned = Boolean(caps?.hasFav && pinned.length > 0);
   const hasSync = Boolean(caps?.hasSync && syncFolders.length > 0);
   const firstSection = hasPinned ? 'pinned' : hasSync ? 'sync' : 'machines';
   const onlineMachineCount = (machines || []).filter((m) => m.reachable).length;
 
+  const allowPinnedAudio = Boolean(capsStore || caps?.hasAudioThumb);
   const pinnedByMachine = useMemo(() => {
     const map = new Map();
     for (const p of pinned) {
-      const includeAudio = capsStore
-        ? Boolean(capsStore.fileCapabilities(p.machine).hasAudioCovers)
-        : Boolean(caps?.hasAudioCovers);
-      if (!isThumbEligible(p, { includeAudio })) continue;
+      if (!isThumbEligible(p, { allowAudio: allowPinnedAudio })) continue;
       if (!map.has(p.machine)) map.set(p.machine, []);
-      map.get(p.machine).push({ path: p.path, mtime: '' });
+      map.get(p.machine).push({
+        path: p.path,
+        mtime: '',
+        isAudio: entryCategory(p) === 'audio',
+      });
     }
     return map;
-  }, [pinned, capsStore, caps?.hasAudioCovers, capsRev]);
+  }, [pinned, allowPinnedAudio]);
 
-  // Batch-load thumbnails for pinned pictures/videos/audio covers (up to 32 per machine call) with retry backoff.
+  // Batch-load thumbnails for pinned pictures, videos, and audio covers (up to 32 per machine call)
+  // with retry backoff.
   const getPinnedThumbUrl = useMultiMachineThumbs({
     itemsByMachine: pinnedByMachine,
     enabled: Boolean((capsStore || caps?.hasThumb) && pinnedByMachine.size > 0),
@@ -483,10 +492,7 @@ export function FilesHome({
                   item.kind === 'dir'
                     ? routeHref({ section: 'files', view: 'folder', machine: item.machine, path: item.path })
                     : routeHref({ section: 'files', view: 'home', viewer: { machine: item.machine, path: item.path } });
-                const includeAudio = capsStore
-                  ? Boolean(capsStore.fileCapabilities(item.machine).hasAudioCovers)
-                  : Boolean(caps?.hasAudioCovers);
-                const thumbUrl = isThumbEligible(item, { includeAudio })
+                const thumbUrl = isThumbEligible(item, { allowAudio: allowPinnedAudio })
                   ? getPinnedThumbUrl(item.machine, item.path, '')
                   : null;
                 return html`
@@ -1235,7 +1241,7 @@ export function FolderBrowser({
     link,
     capsStore,
     enabled: Boolean(caps?.known && caps?.hasThumb && reachable),
-    includeAudio: Boolean(caps?.hasAudioCovers),
+    allowAudio: Boolean(caps?.hasAudioThumb),
     thumbCache,
   });
 
@@ -1746,29 +1752,26 @@ export function FilesSearchView({
     );
   }, [onRegisterRefresh]);
 
-  const [searchCapsRev, setSearchCapsRev] = useState(0);
-  useEffect(() => {
-    if (!capsStore) return undefined;
-    return capsStore.subscribe(() => setSearchCapsRev((n) => n + 1));
-  }, [capsStore]);
-
-  // Batch-load thumbnails for picture/video/audio search hits (up to 32 per machine call) with retry backoff.
+  // Batch-load thumbnails for picture, video, and audio search hits (up to 32 per machine call)
+  // with retry backoff.
+  const allowSearchAudio = Boolean(capsStore || caps?.hasAudioThumb);
   const searchThumbsByMachine = useMemo(() => {
     const map = new Map();
     for (const [mName, items] of Object.entries(resultsByMachine)) {
       if (!Array.isArray(items) || items.length === 0) continue;
-      const includeAudio = capsStore
-        ? Boolean(capsStore.fileCapabilities(mName).hasAudioCovers)
-        : Boolean(caps?.hasAudioCovers);
       const eligible = [];
       for (const entry of items) {
-        if (!isThumbEligible(entry, { includeAudio })) continue;
-        eligible.push({ path: entry.path, mtime: entry.mtime || '' });
+        if (!isThumbEligible(entry, { allowAudio: allowSearchAudio })) continue;
+        eligible.push({
+          path: entry.path,
+          mtime: entry.mtime || '',
+          isAudio: entryCategory(entry) === 'audio',
+        });
       }
       if (eligible.length > 0) map.set(mName, eligible);
     }
     return map;
-  }, [resultsByMachine, capsStore, caps?.hasAudioCovers, searchCapsRev]);
+  }, [resultsByMachine, allowSearchAudio]);
 
   useMultiMachineThumbs({
     itemsByMachine: searchThumbsByMachine,

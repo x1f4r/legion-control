@@ -5002,12 +5002,12 @@ mod tests {
         )
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if ready.exists() && !backup.exists() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(25));
         }
         assert!(
             ready.exists(),
@@ -5055,10 +5055,22 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn wait_until(timeout: std::time::Duration, desc: &str, mut pred: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if pred() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(pred(), "timed out waiting for {desc} after {timeout:?}");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn unix_swap_supervisor_close_then_reopen_race_does_not_roll_back() {
         use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("Legion.AppImage");
@@ -5066,15 +5078,19 @@ mod tests {
         let backup = dir.path().join(".Legion.AppImage.prev");
         let ready = dir.path().join("started-2.ok");
         let rollback = dir.path().join("rollback-2.json");
+        let sup_log = dir.path().join("supervisor.log");
+        let gate = dir.path().join("handover.gate");
 
         fs::write(&target, "#!/bin/sh\necho v1\n").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
 
         // Simulate a close-then-reopen race where the verify-only launch exits 0 immediately
         // (for instance after handing off to a concurrently reopened instance of the new build)
-        // while the reopened instance finishes painting and writes `started-2.ok` 600ms later.
+        // while the reopened instance finishes painting and writes `started-2.ok` only AFTER the
+        // supervisor has observed the rc=0 exit.
         let v2_handover = format!(
-            "#!/bin/sh\n(sleep 0.6; printf 'ok\\n' > '{}') &\nexit 0\n",
+            "#!/bin/sh\n(while [ ! -f '{}' ]; do sleep 0.05; done; printf 'ok\\n' > '{}') &\nexit 0\n",
+            gate.display(),
             ready.display()
         );
         fs::write(&staged, v2_handover).unwrap();
@@ -5104,26 +5120,39 @@ mod tests {
             update_lock_path: None,
             stage_file_path: None,
             reopen_marker_path: None,
-            log_path: None,
+            log_path: Some(sup_log.clone()),
             new_start_log_path: None,
             rollback_ps_path: None,
             single_instance_dbus_name: None,
             single_instance_socket_path: None,
-            pre_swap_wait_secs: 5,
-            wait_secs: 5,
+            pre_swap_wait_secs: 10,
+            wait_secs: 20,
             exit_grace_secs: 2,
             rollback_retries: 4,
             verify_only: true,
         })
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            if ready.exists() && !backup.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_until(
+            Duration::from_secs(30),
+            "supervisor to observe rc=0 exit before releasing handover",
+            || {
+                fs::read_to_string(&sup_log)
+                    .map(|s| s.contains("exited with rc=0"))
+                    .unwrap_or(false)
+            },
+        );
+        assert!(
+            !rollback.exists(),
+            "rc=0 handover exit must not trigger immediate rollback"
+        );
+        fs::write(&gate, b"go\n").unwrap();
+
+        wait_until(
+            Duration::from_secs(30),
+            "ready marker and backup cleanup after handover",
+            || ready.exists() && !backup.exists(),
+        );
         assert!(ready.exists(), "expected ready marker to be written");
         assert!(
             !rollback.exists(),
@@ -5134,7 +5163,9 @@ mod tests {
             "supervisor should clean up .prev backup once ready marker arrives"
         );
         assert!(
-            fs::read_to_string(&target).unwrap().contains("sleep 0.6"),
+            fs::read_to_string(&target)
+                .unwrap()
+                .contains("handover.gate"),
             "new v2 binary should stay installed rather than rolling back to v1"
         );
     }
@@ -5143,7 +5174,7 @@ mod tests {
     #[test]
     fn unix_swap_supervisor_replaces_and_rolls_back_and_supports_verify_only_on_close() {
         use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("Legion.AppImage");
@@ -5204,13 +5235,11 @@ mod tests {
         })
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            if ready_ok.exists() && !backup.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_until(
+            Duration::from_secs(30),
+            "v2 verify_only ready marker and backup cleanup",
+            || ready_ok.exists() && !backup.exists(),
+        );
         assert!(ready_ok.exists(), "expected v2 verify_only ready marker");
         assert!(!backup.exists(), "expected .prev backup removed");
         assert!(!rollback_ok.exists());
@@ -5249,21 +5278,19 @@ mod tests {
             rollback_ps_path: None,
             single_instance_dbus_name: None,
             single_instance_socket_path: None,
-            pre_swap_wait_secs: 5,
-            wait_secs: 3,
+            pre_swap_wait_secs: 10,
+            wait_secs: 6,
             exit_grace_secs: 1,
             rollback_retries: 4,
             verify_only: false,
         })
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if rollback_bad.exists() && ready_ok.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_until(
+            Duration::from_secs(30),
+            "rollback marker and restored v2 ready marker",
+            || rollback_bad.exists() && ready_ok.exists(),
+        );
         assert!(rollback_bad.exists());
         assert!(ready_ok.exists());
         assert!(fs::read_to_string(&target).unwrap().contains("v2:"));
@@ -5274,7 +5301,7 @@ mod tests {
     #[test]
     fn unix_swap_supervisor_waits_grace_period_on_nonzero_exit_and_captures_capped_log_and_ps() {
         use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("Legion.AppImage");
@@ -5285,17 +5312,19 @@ mod tests {
         let sup_log = dir.path().join("supervisor.log");
         let new_log = dir.path().join(NEW_START_LOG_FILENAME);
         let rollback_ps = dir.path().join(ROLLBACK_PS_FILENAME);
+        let handover_gate = dir.path().join("handover-42.gate");
 
         fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
 
         // 1. Even if the launched PID exits non-zero (rc=42) immediately, the supervisor waits the
-        //    grace period; a handover child writing the ready marker 0.8s later succeeds cleanly
-        //    without rolling back and cleans up new-start.log.
+        //    grace period; a handover child writing the ready marker after the supervisor observes
+        //    rc=42 succeeds cleanly without rolling back and cleans up new-start.log.
         fs::write(
             &staged_handover,
             format!(
-                "#!/bin/sh\necho 'handover starting' >&2\n(sleep 0.8; printf 'ok\\n' > '{}') &\nexit 42\n",
+                "#!/bin/sh\necho 'handover starting' >&2\n(while [ ! -f '{}' ]; do sleep 0.05; done; printf 'ok\\n' > '{}') &\nexit 42\n",
+                handover_gate.display(),
                 ready.display()
             ),
         )
@@ -5331,21 +5360,34 @@ mod tests {
             rollback_ps_path: Some(rollback_ps.clone()),
             single_instance_dbus_name: None,
             single_instance_socket_path: None,
-            pre_swap_wait_secs: 5,
-            wait_secs: 6,
-            exit_grace_secs: 3,
+            pre_swap_wait_secs: 10,
+            wait_secs: 20,
+            exit_grace_secs: 15,
             rollback_retries: 4,
             verify_only: true,
         })
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if ready.exists() && !backup.exists() && !new_log.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_until(
+            Duration::from_secs(30),
+            "supervisor to observe rc=42 and enter grace period",
+            || {
+                fs::read_to_string(&sup_log)
+                    .map(|s| s.contains("exited with rc=42"))
+                    .unwrap_or(false)
+            },
+        );
+        assert!(
+            !rollback.exists(),
+            "non-zero exit must enter grace period before rolling back"
+        );
+        fs::write(&handover_gate, b"go\n").unwrap();
+
+        wait_until(
+            Duration::from_secs(30),
+            "ready marker, backup cleanup, and new-start.log removal",
+            || ready.exists() && !backup.exists() && !new_log.exists(),
+        );
         assert!(
             ready.exists(),
             "handover during non-zero exit grace period must succeed"
@@ -5401,21 +5443,19 @@ mod tests {
             rollback_ps_path: Some(rollback_ps.clone()),
             single_instance_dbus_name: None,
             single_instance_socket_path: None,
-            pre_swap_wait_secs: 5,
-            wait_secs: 6,
+            pre_swap_wait_secs: 10,
+            wait_secs: 10,
             exit_grace_secs: 1,
             rollback_retries: 4,
             verify_only: true,
         })
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if rollback_crash.exists() && rollback_ps.exists() && !backup.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_until(
+            Duration::from_secs(30),
+            "crash rollback marker, rollback-ps.txt, and backup restore",
+            || rollback_crash.exists() && rollback_ps.exists() && !backup.exists(),
+        );
         assert!(
             rollback_crash.exists(),
             "expected rollback marker after crash"
@@ -5445,7 +5485,7 @@ mod tests {
     #[test]
     fn unix_swap_supervisor_waits_for_old_children_and_wrapper_parent_before_swap() {
         use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("Legion.AppImage");
@@ -5453,6 +5493,10 @@ mod tests {
         let backup = dir.path().join(".Legion.AppImage.prev");
         let ready = dir.path().join("started-12.ok");
         let rollback = dir.path().join("rollback-12.json");
+        let sup_log = dir.path().join("supervisor.log");
+        let child_started = dir.path().join("old-child-started.txt");
+        let old_release = dir.path().join("old-proc-release.gate");
+        let child_release = dir.path().join("old-child-release.gate");
         let child_gone_marker = dir.path().join("old-child-gone.txt");
         let new_started_check = dir.path().join("new-saw-child-gone.txt");
 
@@ -5472,22 +5516,27 @@ mod tests {
         .unwrap();
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
 
-        // Simulate old process + lingering helper child (e.g., WebKitNetworkProcess) that exits
-        // 0.8s after old_pid exits, plus a lingering AppImage wrapper parent (`old_ppid`).
+        // Simulate old process + lingering helper child (e.g., WebKitNetworkProcess) using
+        // explicit file gates so ordering is deterministic regardless of CPU load.
         let mut old_proc = Command::new("/bin/sh")
             .args([
                 "-c",
                 &format!(
-                    "(sleep 0.9; printf 'done\\n' > '{}') &\nsleep 0.25\nexit 0\n",
-                    child_gone_marker.display()
+                    "(printf 'alive\\n' > '{}'; while [ ! -f '{}' ]; do sleep 0.05; done; printf 'done\\n' > '{}') &\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nexit 0\n",
+                    child_started.display(),
+                    child_release.display(),
+                    child_gone_marker.display(),
+                    old_release.display(),
                 ),
             ])
             .spawn()
             .unwrap();
         let old_pid = old_proc.id();
-        // Give the shell a moment to spawn its background child before spawning the supervisor so
-        // `collect_children "$LEGION_OLD_PID"` sees it while old_pid is still running.
-        std::thread::sleep(Duration::from_millis(80));
+        wait_until(
+            Duration::from_secs(30),
+            "old helper child to start before spawning supervisor",
+            || child_started.exists(),
+        );
 
         spawn_unix_swap_supervisor(&UnixSwapPlan {
             old_pid,
@@ -5506,27 +5555,43 @@ mod tests {
             update_lock_path: None,
             stage_file_path: None,
             reopen_marker_path: None,
-            log_path: Some(dir.path().join("supervisor.log")),
+            log_path: Some(sup_log.clone()),
             new_start_log_path: Some(dir.path().join(NEW_START_LOG_FILENAME)),
             rollback_ps_path: Some(dir.path().join(ROLLBACK_PS_FILENAME)),
             single_instance_dbus_name: None,
             single_instance_socket_path: None,
-            pre_swap_wait_secs: 6,
-            wait_secs: 6,
+            pre_swap_wait_secs: 20,
+            wait_secs: 20,
             exit_grace_secs: 2,
             rollback_retries: 4,
             verify_only: true,
         })
         .unwrap();
 
+        // Wait until supervisor has recorded old_pid and its collected children before letting
+        // old_pid exit while the helper child stays alive.
+        wait_until(
+            Duration::from_secs(30),
+            "supervisor to record old_pid and old_children",
+            || {
+                fs::read_to_string(&sup_log)
+                    .map(|s| s.contains("supervisor: start old_pid="))
+                    .unwrap_or(false)
+            },
+        );
+        fs::write(&old_release, b"go\n").unwrap();
         let _ = old_proc.wait();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if ready.exists() && !backup.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        assert!(
+            !ready.exists(),
+            "supervisor must not launch new build while old helper child is still alive"
+        );
+        fs::write(&child_release, b"go\n").unwrap();
+
+        wait_until(
+            Duration::from_secs(30),
+            "new build ready marker and backup cleanup after old child exits",
+            || ready.exists() && !backup.exists(),
+        );
         assert!(ready.exists(), "expected new build ready marker");
         assert!(!rollback.exists(), "expected no rollback");
         assert!(
@@ -5601,10 +5666,10 @@ mod tests {
 
     #[cfg(unix)]
     fn spawn_retry_etxtbsy(cmd: &mut Command) -> std::process::Child {
-        for attempt in 0..10u8 {
+        for attempt in 0..40u8 {
             match cmd.spawn() {
                 Ok(child) => return child,
-                Err(err) if err.raw_os_error() == Some(26) && attempt < 9 => {
+                Err(err) if err.raw_os_error() == Some(26) && attempt < 39 => {
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }
                 Err(err) => panic!("failed to spawn test script: {err}"),
@@ -5617,7 +5682,7 @@ mod tests {
     #[test]
     fn unix_swap_supervisor_defers_cleanly_when_another_instance_holds_install() {
         use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("Legion.AppImage");
@@ -5627,16 +5692,29 @@ mod tests {
         let rollback = dir.path().join("rollback-13.json");
         let deferred = dir.path().join("deferred-13.json");
         let lock_file = dir.path().join(UPDATE_LOCK_FILENAME);
+        let busy_ready = dir.path().join("busy-ready.txt");
 
-        fs::write(&target, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::write(
+            &target,
+            format!(
+                "#!/bin/sh\nprintf 'busy\\n' > '{}'\nsleep 60\n",
+                busy_ready.display()
+            ),
+        )
+        .unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(&staged, "#!/bin/sh\necho new-v2\n").unwrap();
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(&lock_file, "{}").unwrap();
 
-        // Spawn a second running process executing $LEGION_TARGET so the install is actively in use.
+        // Spawn a second running process executing $LEGION_TARGET and wait until it is visibly
+        // running before starting the supervisor.
         let mut busy_child = spawn_retry_etxtbsy(&mut Command::new(&target));
-        std::thread::sleep(Duration::from_millis(120));
+        wait_until(
+            Duration::from_secs(30),
+            "busy target instance to start executing",
+            || busy_ready.exists(),
+        );
 
         let mut exited_child = Command::new("/bin/sh")
             .args(["-c", "exit 0"])
@@ -5675,13 +5753,11 @@ mod tests {
         })
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            if deferred.exists() && !lock_file.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_until(
+            Duration::from_secs(30),
+            "deferred marker and update.lock release",
+            || deferred.exists() && !lock_file.exists(),
+        );
 
         let _ = busy_child.kill();
         let _ = busy_child.wait();
@@ -5705,7 +5781,7 @@ mod tests {
         );
         assert!(!lock_file.exists(), "update.lock must be released on defer");
         assert!(
-            fs::read_to_string(&target).unwrap().contains("sleep 30"),
+            fs::read_to_string(&target).unwrap().contains("sleep 60"),
             "original install must remain untouched when deferred"
         );
     }
@@ -5714,7 +5790,7 @@ mod tests {
     #[test]
     fn unix_swap_supervisor_rollback_keeps_new_intact_when_other_process_holds_target_open() {
         use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("Legion.AppImage");
@@ -5724,17 +5800,20 @@ mod tests {
         let rollback = dir.path().join("rollback-14.json");
         let lock_file = dir.path().join(UPDATE_LOCK_FILENAME);
         let launched_flag = dir.path().join("new-launched.txt");
+        let holder_ready = dir.path().join("holder-ready.txt");
+        let fail_gate = dir.path().join("v2-fail.gate");
 
         fs::write(&target, "#!/bin/sh\necho old-v1\n").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
 
-        // New v2 script marks that it started, then exits 1 without writing ready marker.
-        // While it fails, this test spawns an independent process holding $LEGION_TARGET open so
-        // rollback retries hit busy and MUST leave the new copy intact (never half-replaced) with
-        // install_state == "new_kept_files_in_use".
+        // New v2 script marks that it started and waits for `fail_gate` before exiting 1 without
+        // writing the ready marker, guaranteeing `holder` is already executing `$target` before
+        // rollback begins regardless of host CPU load.
         let v2_body = format!(
-            "#!/bin/sh\nif [ \"${{HOLD_OPEN:-0}}\" = \"1\" ]; then\n  sleep 30\n  exit 0\nfi\nprintf 'started\\n' > '{}'\nexit 1\n",
-            launched_flag.display()
+            "#!/bin/sh\nif [ \"${{HOLD_OPEN:-0}}\" = \"1\" ]; then\n  printf 'holding\\n' > '{}'\n  sleep 60\n  exit 0\nfi\nprintf 'started\\n' > '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nexit 1\n",
+            holder_ready.display(),
+            launched_flag.display(),
+            fail_gate.display()
         );
         fs::write(&staged, &v2_body).unwrap();
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
@@ -5773,29 +5852,32 @@ mod tests {
             rollback_ps_path: Some(dir.path().join(ROLLBACK_PS_FILENAME)),
             single_instance_dbus_name: None,
             single_instance_socket_path: None,
-            pre_swap_wait_secs: 4,
-            wait_secs: 4,
+            pre_swap_wait_secs: 10,
+            wait_secs: 20,
             exit_grace_secs: 1,
             rollback_retries: 4,
             verify_only: true,
         })
         .unwrap();
 
-        // As soon as the swap completes and v2 launches, open a second process executing $target.
-        let swap_deadline = Instant::now() + Duration::from_secs(6);
-        while Instant::now() < swap_deadline && !launched_flag.exists() {
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        assert!(launched_flag.exists(), "expected v2 to launch after swap");
+        // As soon as the swap completes and v2 launches, open a second process executing $target
+        // and wait until it is actively running before letting v2 exit 1.
+        wait_until(Duration::from_secs(30), "v2 to launch after swap", || {
+            launched_flag.exists()
+        });
         let mut holder = spawn_retry_etxtbsy(Command::new(&target).env("HOLD_OPEN", "1"));
+        wait_until(
+            Duration::from_secs(30),
+            "holder process to start executing $target",
+            || holder_ready.exists(),
+        );
+        fs::write(&fail_gate, b"fail\n").unwrap();
 
-        let rb_deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < rb_deadline {
-            if rollback.exists() && !lock_file.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_until(
+            Duration::from_secs(30),
+            "rollback marker and update.lock release",
+            || rollback.exists() && !lock_file.exists(),
+        );
 
         let _ = holder.kill();
         let _ = holder.wait();
@@ -5822,7 +5904,7 @@ mod tests {
     #[test]
     fn unix_swap_supervisor_reopen_requested_launches_window_after_verify_only() {
         use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("Legion.AppImage");
@@ -5888,16 +5970,16 @@ mod tests {
         })
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            if let Ok(text) = fs::read_to_string(&modes_log)
-                && text.lines().count() >= 2
-                && !lock_file.exists()
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_until(
+            Duration::from_secs(30),
+            "verify_only + interactive reopen launch log and lock release",
+            || {
+                fs::read_to_string(&modes_log)
+                    .map(|text| text.lines().count() >= 2)
+                    .unwrap_or(false)
+                    && !lock_file.exists()
+            },
+        );
 
         let text = fs::read_to_string(&modes_log).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -6036,7 +6118,7 @@ mod tests {
     #[test]
     fn unix_swap_supervisor_restores_previous_copy_on_sigterm_after_swap() {
         use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("Legion.AppImage");
@@ -6046,13 +6128,14 @@ mod tests {
         let rollback = dir.path().join("rollback-16.json");
         let stage_file = pending_stage_path(dir.path(), 16);
         let lock_file = dir.path().join(UPDATE_LOCK_FILENAME);
+        let sup_log = dir.path().join("supervisor.log");
         let v1_ran = dir.path().join("v1-ran.txt");
 
         let v1_body = format!("#!/bin/sh\nprintf 'v1\\n' >> '{}'\n", v1_ran.display());
         fs::write(&target, &v1_body).unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
         // New v2 hangs forever without writing the ready marker.
-        fs::write(&staged, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::write(&staged, "#!/bin/sh\nsleep 60\n").unwrap();
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(&lock_file, "{}").unwrap();
 
@@ -6084,45 +6167,45 @@ mod tests {
             update_lock_path: Some(lock_file.clone()),
             stage_file_path: Some(stage_file.clone()),
             reopen_marker_path: None,
-            log_path: Some(dir.path().join("supervisor.log")),
+            log_path: Some(sup_log.clone()),
             new_start_log_path: Some(dir.path().join(NEW_START_LOG_FILENAME)),
             rollback_ps_path: None,
             single_instance_dbus_name: None,
             single_instance_socket_path: None,
-            pre_swap_wait_secs: 4,
-            wait_secs: 25,
+            pre_swap_wait_secs: 10,
+            wait_secs: 30,
             exit_grace_secs: 1,
             rollback_retries: 8,
             verify_only: false,
         })
         .unwrap();
 
-        // Wait until the swap has completed (`pending-stage-16.txt` == "swapped").
-        let swap_deadline = Instant::now() + Duration::from_secs(6);
-        while Instant::now() < swap_deadline {
-            if read_pending_stage(dir.path(), 16).as_deref() == Some("swapped") {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        // Wait deterministically until the swap has completed AND v2 has been launched.
+        wait_until(
+            Duration::from_secs(30),
+            "supervisor to swap and launch v2 before SIGTERM",
+            || {
+                read_pending_stage(dir.path(), 16).as_deref() == Some("swapped")
+                    && fs::read_to_string(&sup_log)
+                        .map(|s| s.contains("supervisor: launched new_pid="))
+                        .unwrap_or(false)
+            },
+        );
         assert_eq!(
             read_pending_stage(dir.path(), 16).as_deref(),
             Some("swapped"),
             "supervisor must record swapped stage before launching v2"
         );
-        std::thread::sleep(Duration::from_millis(200));
 
         // Send SIGTERM to the supervisor while v2 is unverified.
         let rpid = rustix::process::Pid::from_raw(sup_pid as i32).unwrap();
         rustix::process::kill_process(rpid, rustix::process::Signal::TERM).unwrap();
 
-        let rb_deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < rb_deadline {
-            if rollback.exists() && !lock_file.exists() && !backup.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_until(
+            Duration::from_secs(30),
+            "SIGTERM rollback marker, lock release, and backup restoration",
+            || rollback.exists() && !lock_file.exists() && !backup.exists(),
+        );
         assert!(
             rollback.exists(),
             "SIGTERM after swap must write rollback record"
@@ -6147,7 +6230,7 @@ mod tests {
     #[test]
     fn unix_swap_supervisor_reopens_existing_app_when_deferred_with_reopen_requested() {
         use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("Legion.AppImage");
@@ -6159,11 +6242,13 @@ mod tests {
         let lock_file = dir.path().join(UPDATE_LOCK_FILENAME);
         let reopen_file = dir.path().join(REOPEN_REQUESTED_FILENAME);
         let reopened_log = dir.path().join("reopened.txt");
+        let busy_ready = dir.path().join("busy-ready-17.txt");
 
         fs::write(
             &target,
             format!(
-                "#!/bin/sh\nif [ \"${{HOLD_BUSY:-0}}\" = \"1\" ]; then\n  sleep 30\n  exit 0\nfi\nprintf 'reopened verify=%s\\n' \"${{LEGION_UPDATE_VERIFY_ONLY:-0}}\" >> '{}'\n",
+                "#!/bin/sh\nif [ \"${{HOLD_BUSY:-0}}\" = \"1\" ]; then\n  printf 'busy\\n' > '{}'\n  sleep 60\n  exit 0\nfi\nprintf 'reopened verify=%s\\n' \"${{LEGION_UPDATE_VERIFY_ONLY:-0}}\" >> '{}'\n",
+                busy_ready.display(),
                 reopened_log.display()
             ),
         )
@@ -6175,7 +6260,11 @@ mod tests {
         request_reopen_after_update(dir.path());
 
         let mut busy = spawn_retry_etxtbsy(Command::new(&target).env("HOLD_BUSY", "1"));
-        std::thread::sleep(Duration::from_millis(120));
+        wait_until(
+            Duration::from_secs(30),
+            "busy existing app instance to start executing",
+            || busy_ready.exists(),
+        );
 
         let mut exited_child = Command::new("/bin/sh")
             .args(["-c", "exit 0"])
@@ -6214,13 +6303,11 @@ mod tests {
         })
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            if deferred.exists() && reopened_log.exists() && !lock_file.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_until(
+            Duration::from_secs(30),
+            "deferred marker, interactive reopen log, and update.lock release",
+            || deferred.exists() && reopened_log.exists() && !lock_file.exists(),
+        );
         let _ = busy.kill();
         let _ = busy.wait();
 
@@ -6245,7 +6332,7 @@ mod tests {
     #[test]
     fn unix_swap_supervisor_stops_writing_new_start_log_after_ready_marker() {
         use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("Legion.AppImage");
@@ -6253,18 +6340,23 @@ mod tests {
         let backup = dir.path().join(".Legion.AppImage.prev");
         let ready = dir.path().join("started-18.ok");
         let rollback = dir.path().join("rollback-18.json");
+        let lock_file = dir.path().join(UPDATE_LOCK_FILENAME);
         let new_log = dir.path().join(NEW_START_LOG_FILENAME);
+        let after_ready_gate = dir.path().join("after-ready.gate");
         let done_flag = dir.path().join("child-done.txt");
 
         fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
-        // Writes before ready, confirms ready, sleeps while supervisor removes new-start.log, then
-        // writes multiple lines after ready — none of which may recreate or write to new-start.log.
+        fs::write(&lock_file, "{}").unwrap();
+        // Writes before ready, confirms ready, waits for the test to observe that the supervisor
+        // removed new-start.log and released update.lock, then writes multiple post-ready lines —
+        // none of which may recreate or write to new-start.log.
         fs::write(
             &staged,
             format!(
-                "#!/bin/sh\necho 'before-ready'\nprintf 'ok\\n' > '{}'\nsleep 0.6\necho 'after-ready-1'\necho 'after-ready-2'\necho 'after-ready-3' >&2\nprintf 'done\\n' > '{}'\n",
+                "#!/bin/sh\necho 'before-ready'\nprintf 'ok\\n' > '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\necho 'after-ready-1'\necho 'after-ready-2'\necho 'after-ready-3' >&2\nprintf 'done\\n' > '{}'\n",
                 ready.display(),
+                after_ready_gate.display(),
                 done_flag.display()
             ),
         )
@@ -6292,7 +6384,7 @@ mod tests {
             deferred_marker_path: None,
             deferred_json: None,
             target_sequence: 18,
-            update_lock_path: None,
+            update_lock_path: Some(lock_file.clone()),
             stage_file_path: None,
             reopen_marker_path: None,
             log_path: Some(dir.path().join("supervisor.log")),
@@ -6300,27 +6392,31 @@ mod tests {
             rollback_ps_path: None,
             single_instance_dbus_name: None,
             single_instance_socket_path: None,
-            pre_swap_wait_secs: 4,
-            wait_secs: 6,
+            pre_swap_wait_secs: 10,
+            wait_secs: 20,
             exit_grace_secs: 1,
             rollback_retries: 4,
             verify_only: false,
         })
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if ready.exists() && done_flag.exists() && !backup.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_until(
+            Duration::from_secs(30),
+            "supervisor to observe ready, remove backup & new-start.log, and release lock",
+            || ready.exists() && !backup.exists() && !new_log.exists() && !lock_file.exists(),
+        );
+        fs::write(&after_ready_gate, b"go\n").unwrap();
+
+        wait_until(
+            Duration::from_secs(30),
+            "post-ready child lines to complete without SIGPIPE",
+            || done_flag.exists(),
+        );
         assert!(ready.exists(), "expected ready marker");
         assert!(
             done_flag.exists(),
             "expected post-ready child lines to complete without SIGPIPE"
         );
-        std::thread::sleep(Duration::from_millis(150));
         assert!(
             !new_log.exists(),
             "new-start.log must not be written or recreated after ready marker is confirmed"

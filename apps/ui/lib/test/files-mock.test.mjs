@@ -187,7 +187,7 @@ test('mock link serves fs.tags, audio covers via fs.thumb up to 1024px, and reco
   const tools = await link.tools({ on: 'tower' });
   const caps = detectFileCapabilities({ tools, link });
   assert.equal(caps.hasTags, true);
-  assert.equal(caps.hasAudioCovers, true);
+  assert.equal(caps.hasAudioThumb, true);
   assert.equal(caps.thumbMaxSize, 1024);
 
   const tags = await link.call(
@@ -239,7 +239,7 @@ test('mock link serves fs.tags, audio covers via fs.thumb up to 1024px, and reco
   const oldLink = createMockLink('old');
   const oldCaps = detectFileCapabilities({ tools: await oldLink.tools({ on: 'tower' }), link: oldLink });
   assert.equal(oldCaps.hasTags, false);
-  assert.equal(oldCaps.hasAudioCovers, false);
+  assert.equal(oldCaps.hasAudioThumb, false);
   await assert.rejects(() => oldLink.call('fs.tags', { paths: ['/home/me/Music/Album/01 - Morning Light.flac'] }, { on: 'tower' }));
 
   const noFsLink = createMockLink('no-fullscreen');
