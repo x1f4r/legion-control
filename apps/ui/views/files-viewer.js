@@ -3,6 +3,7 @@
 
 import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
+import { plainErrorMessage } from '../lib/errors.js';
 import {
   baseFileName,
   entryCategory,
@@ -40,6 +41,7 @@ export function FilesViewer({
   entry,
   siblings = [],
   link,
+  capsStore = null,
   caps,
   deviceNoun = 'phone',
   technical = false,
@@ -152,10 +154,26 @@ export function FilesViewer({
     setHashInfo(null);
     setTextState({ content: '', size: 0, loaded: 0, eof: true, binary: false, loading: false, error: null });
 
+    const runCall = (tool, args, opts = {}) =>
+      capsStore
+        ? capsStore.call(tool, args, { ...opts, on: machine }).then((r) => r.value)
+        : link.call(tool, args, { ...opts, on: machine });
+
+    if (caps && caps.known === false) {
+      if (category === 'text') {
+        setTextState((prev) => ({ ...prev, loading: true, error: null }));
+      } else if (category === 'image' || category === 'video' || category === 'audio') {
+        setMediaLoading(true);
+      }
+      return () => {
+        ctrl.abort();
+        stopMediaElements();
+      };
+    }
+
     if (category === 'text') {
       setTextState((prev) => ({ ...prev, loading: true, error: null }));
-      link
-        .call('fs.read', { path, offset: 0, length: TEXT_CHUNK_BYTES }, { on: machine, signal: ctrl.signal })
+      runCall('fs.read', { path, offset: 0, length: TEXT_CHUNK_BYTES }, { signal: ctrl.signal })
         .then((res) => {
           if (ctrl.signal.aborted) return;
           if (res?.encoding === 'base64') {
@@ -195,8 +213,7 @@ export function FilesViewer({
           });
       } else if (category === 'image' && caps?.hasThumb) {
         setMediaLoading(true);
-        link
-          .call('fs.thumb', { paths: [path], size: 512, fit: 'contain' }, { on: machine, signal: ctrl.signal })
+        runCall('fs.thumb', { paths: [path], size: 512, fit: 'contain' }, { signal: ctrl.signal })
           .then((res) => {
             if (ctrl.signal.aborted) return;
             const t = res?.thumbnails?.[path];
@@ -204,6 +221,30 @@ export function FilesViewer({
               setMediaUrl(`data:${t.mime};base64,${t.content}`);
             } else {
               setMediaError({ code: 'unsupported', message: 'Preview is not available.' });
+            }
+            setMediaLoading(false);
+          })
+          .catch((err) => {
+            if (ctrl.signal.aborted) return;
+            setMediaLoading(false);
+            setMediaError(err);
+          });
+      } else if (
+        category === 'image' &&
+        caps?.hasRead &&
+        effectiveEntry.size != null &&
+        effectiveEntry.size > 0 &&
+        effectiveEntry.size <= 1048576
+      ) {
+        // Inline fallback for small pictures on older machines without content addresses or thumbnails.
+        setMediaLoading(true);
+        runCall('fs.read', { path, offset: 0, length: 1048576, encoding: 'base64' }, { signal: ctrl.signal })
+          .then((res) => {
+            if (ctrl.signal.aborted) return;
+            if (res?.eof && res?.content) {
+              setMediaUrl(`data:${mime};base64,${res.content}`);
+            } else {
+              setMediaError({ code: 'unsupported', message: 'Preview is not available on this machine yet.' });
             }
             setMediaLoading(false);
           })
@@ -221,7 +262,7 @@ export function FilesViewer({
       ctrl.abort();
       stopMediaElements();
     };
-  }, [machine, path, category]);
+  }, [machine, path, category, caps?.known, caps?.hasContentUrl, caps?.hasThumb, caps?.hasRead]);
 
   // Keyboard navigation inside viewer: Escape closes, Left/Right steps through pictures.
   useEffect(() => {
@@ -474,9 +515,9 @@ export function FilesViewer({
     if (category === 'image') {
       if (mediaError) {
         const msg =
-          mediaError.code === 'unsupported'
+          mediaError.code === 'unsupported' || mediaError.code === 'needs_newer_legion'
             ? `This version of Legion on ${machine} doesn't serve picture previews yet.`
-            : mediaError.message || 'Could not load this picture.';
+            : plainErrorMessage(mediaError, 'Could not load this picture.', { technical, deviceNoun });
         return renderFallbackCard("Can't show this picture here", msg);
       }
       if (!mediaUrl) {
