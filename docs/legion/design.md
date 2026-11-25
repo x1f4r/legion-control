@@ -144,7 +144,7 @@ are RFC 3339 UTC, durations are seconds.
 | `sys` | `sys.info`, `sys.procs`, `sys.kill` | OS, CPU, memory, disks, GPU, uptime, process control |
 | `exec` | `exec.run` | bounded command: timeout, captured output, kills the whole tree |
 | `job` | `job.start`, `job.list`, `job.status`, `job.logs`, `job.cancel`, `job.wait` | outlives the session |
-| `fs` | `fs.list`, `fs.stat`, `fs.read`, `fs.write`, `fs.edit`, `fs.mkdir`, `fs.move`, `fs.copy`, `fs.remove`, `fs.find`, `fs.grep`, `fs.hash`, `fs.manifest` | one machine |
+| `fs` | `fs.list`, `fs.stat`, `fs.read`, `fs.write`, `fs.edit`, `fs.mkdir`, `fs.move`, `fs.copy`, `fs.remove`, `fs.find`, `fs.grep`, `fs.hash`, `fs.manifest`, `fs.thumb` | one machine |
 | `fs` (fleet) | `fs.transfer` | between any two machines, or to and from this one |
 | `proj` | `proj.list`, `proj.add`, `proj.remove`, `proj.status`, `proj.clone`, `proj.pull`, `proj.run`, `proj.discover` | named projects and where they live |
 | `svc` | `svc.list`, `svc.status`, `svc.start`, `svc.stop`, `svc.restart`, `svc.logs` | systemd, launchd, Windows services |

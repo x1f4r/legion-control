@@ -64,7 +64,7 @@ next
   - Check that everything is configured and reachable with `legion meta.doctor`.
 ```
 
-List the tools built into the binary (75 tools across 15 families, plus any local extensions):
+List the tools built into the binary (79 tools across 15 families, plus any local extensions):
 
 ```sh
 legion tools
@@ -92,12 +92,15 @@ legion fs.list path=~/docs
 ```text
 path       /home/me/docs
 entries
-  - name   hello.txt
-    path   /home/me/docs/hello.txt
-    kind   file
-    size   17
-    mtime  2026-11-24T02:40:18.942Z
-    mode   0644
+  - name      hello.txt
+    path      /home/me/docs/hello.txt
+    kind      file
+    size      17
+    mtime     2026-11-24T02:40:18.942Z
+    mode      0644
+    category  text
+    mime      text/plain
+total      1
 truncated  false
 ```
 

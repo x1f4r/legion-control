@@ -3,7 +3,60 @@
 Task-oriented walk-throughs for day-to-day work with Legion. Every transcript below comes from the
 built binary with placeholder machine names, users, and addresses.
 
-## Files and transfer (`legion cp` and `fs.transfer`)
+## Files and transfer (`fs.*`, `legion cp`, and `fs.transfer`)
+
+### Browsing, searching, and thumbnails (`fs.list`, `fs.find`, `fs.stat`, `fs.thumb`)
+
+Regular files reported by `fs.list`, `fs.find`, and `fs.stat` include `category` (`image`, `video`,
+`audio`, `document`, `text`, `archive`, or `other`) and `mime`, determined strictly by file
+extension (case-insensitive, without opening files). Directories, symbolic links, and special files
+keep their existing `kind` and omit `category` and `mime`.
+
+- **Listing (`fs.list`)**: sorts directories first, then entries by `sort` (`name`, `modified`, or
+  `size`) and `order` (`asc` or `desc`), using natural case-insensitive ordering for `name`
+  (`file2.jpg` before `file10.jpg`). Pass `categories` (for example `categories='["image"]'`) to
+  keep directories alongside matching files, and `offset` / `limit` to page through results using
+  `total` and `truncated`.
+- **Searching (`fs.find`)**: filters by `name` (all whitespace-separated words must appear in the
+  file name, case-insensitive and Unicode-aware), `glob`, `kind`, `categories`, `min_size`,
+  `max_size`, `modified_after`, and `modified_before` (RFC 3339 timestamps in the same format
+  returned by `fs.stat`). `hidden` is controlled independently of `ignore`, so
+  `ignore=false hidden=false` searches ignored build trees without entering dotfiles. Every search
+  runs inside `budget_ms` (default `10000`, up to `60000`); stopping early sets `truncated: true`
+  and `reason: "time"` or `"limit"`.
+- **Searching across the fleet (`fs.find --on all`)**: fans out concurrently to this node and every
+  machine in `fleet.toml`, returning:
+
+  ```json
+  {
+    "results": {
+      "tower": {
+        "ok": {
+          "machine": "tower",
+          "matches": [{"path": "/home/me/photos/holiday.jpg", "kind": "file", "size": 204800, "mtime": "2026-11-24T02:40:18.942Z", "category": "image", "mime": "image/jpeg"}],
+          "truncated": false
+        }
+      },
+      "pi": {
+        "error": {"code": "unreachable", "message": "…", "hint": "…", "machine": "pi"}
+      }
+    }
+  }
+  ```
+
+  Each reachable machine names itself in `machine` inside its `ok` object, and unreachable machines
+  appear under their own key with `error.code = "unreachable"` without failing the search.
+- **Thumbnails (`fs.thumb`)**: generates thumbnails on the node for 1 to 32 paths per call (`size`
+  96 to 512, default 256; `fit` `"contain"` or `"cover"`), returning `{"results": [{"path": …,
+  "ok": {"mime", "content", "width", "height"}} | {"path": …, "error": …}]}` in input order.
+  JPEG, PNG, GIF (first frame), WebP, and BMP images are decoded with EXIF orientation applied
+  under hard limits (64 MiB source, 100 megapixels, bounded memory and concurrency), outputting
+  JPEG or PNG when transparent. Video posters use `ffmpeg` when it is on the node's `PATH` and
+  report `unsupported` otherwise. Results are cached in a 256 MiB LRU store under the node's state
+  directory (`thumb-cache/`), inaccessible to non-admin roles through `fs.*`, and every path
+  requires the same permission as `fs.read`.
+
+### Copying and syncing (`legion cp` and `fs.transfer`)
 
 `legion cp` is the command-line wrapper over `fs.transfer`. Each endpoint is either a local path
 (absolute or starting with `~`, including Windows drive paths like `C:\Users\me\file.txt`) or

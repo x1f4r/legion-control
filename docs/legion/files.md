@@ -62,21 +62,28 @@ node.
 
 - `fs.list` gains `sort` (`name`, `modified`, `size`), `order` (`asc`, `desc`), `categories`
   (list, keeps directories), `offset`, and reports `total` and `truncated`. Directories still
-  come first.
-- `fs.find` gains `name` (words that must all appear in the file name, case-insensitive),
-  `categories`, `min_size`, `max_size`, `modified_after`, `modified_before`, `sort`, `order`,
-  `hidden` (separate from `ignore`, so a search can skip dot files without obeying `.gitignore`)
-  and `budget_ms` (default 10 000, at most 60 000). A search that runs out of time or reaches
-  `limit` returns what it has with `truncated: true` and `reason` (`time` or `limit`). With
-  `on: "all"` it is a search of the fleet; machines that are off are reported, not waited for.
-- `fs.thumb` (read): `{paths: [1..32], size: 96..512 = 256, fit: "cover" | "contain"}` returns,
-  per path, `{mime, content (base64), width, height}` or an error. Pictures are decoded on the
-  node (JPEG, PNG, GIF first frame, WebP, BMP; EXIF orientation applied) inside hard limits:
-  source at most 64 MiB and 100 megapixels, decoding off the async threads, a bounded number at
-  once. Video posters are made with `ffmpeg` when the node has it and reported `unsupported`
-  otherwise. Results are cached in the state directory under a key of path, size, modification
-  time and parameters, with the cache capped (256 MiB, least recently used first). A thumbnail of
-  a file is allowed exactly when `fs.read` of it is.
+  come first; `name` uses natural case-insensitive order (`file2` before `file10`).
+- `fs.find` gains `name` (whitespace-separated words that must all appear in the file name,
+  case-insensitive, Unicode-aware), `categories`, `min_size`, `max_size`, `modified_after`,
+  `modified_before` (RFC 3339 timestamps in the same format `fs.stat` and `fs.list` return),
+  `sort`, `order`, `hidden` (separate from `ignore`, defaulting to `false` when `ignore` is
+  `true` and `true` when `ignore` is `false`, so a search can skip hidden entries without obeying
+  `.gitignore`) and `budget_ms` (default 10 000, at most 60 000). Each reply carries `machine`
+  (the node that produced it); a search that runs out of time or reaches `limit` returns what it
+  has with `truncated: true` and `reason` (`time` or `limit`). With `on: "all"` it fans out
+  concurrently across the fleet, returning `{"results": {"<machine>": {"ok": {machine, matches,
+  truncated, reason?}} | {"error": {code, message, hint?, machine}}}}` so unreachable machines are
+  reported per key rather than failing the search.
+- `fs.thumb` (read): `{paths: [1..32], size: 96..512 = 256, fit: "contain" | "cover"}` returns
+  `{"results": [{path, ok: {mime, content (base64), width, height}} | {path, error}]}` in input
+  order. Pictures are decoded on the node (JPEG, PNG, GIF first frame, WebP, BMP; EXIF
+  orientation applied) inside hard limits: source at most 64 MiB and 100 megapixels, bounded
+  decoder memory, decoding off the async threads, a bounded number at once. Output is JPEG, or
+  PNG when the source has transparency. Video posters are made with `ffmpeg` (no shell, a frame a
+  little way in, hard time limit) when the node has it on `PATH` and reported `unsupported`
+  otherwise. Results are cached in the state directory (`thumb-cache/`) under a key of path,
+  source size, modification time and parameters, with the cache capped at 256 MiB (least recently
+  used first). A thumbnail of a file is allowed exactly when `fs.read` of it is.
 
 ### Moving
 
