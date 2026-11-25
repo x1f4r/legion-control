@@ -144,19 +144,26 @@ on the session the link already has for that machine (a new exec channel on the 
 a child for a local node) and returns the size, modification time, file identity, and an async
 reader. On SSH connections:
 
-- **Slots and fair waiting**: at most 8 active content channels run on one SSH connection (strictly
-  below OpenSSH's default `MaxSessions` of 10, leaving room for RPC). When all 8 slots are actively
-  reading, further opens wait fairly in FIFO order up to the SSH connect timeout before returning a
-  retryable `busy` error; on teardown or parking, `legion-link` sends stdin EOF and holds the permit
-  until `sshd` confirms channel close (`SSH_MSG_CHANNEL_CLOSE`), falling back to a local channel
-  close after 2 seconds if a remote ignores stdin EOF.
-- **Parking and transparent reopening**: a stream holds an SSH channel and slot only while actively
-  read. After ~2 seconds of reader inactivity, `ContentStream` parks its channel — closing the SSH
-  channel and freeing its slot while keeping already-buffered bytes (within a bounded per-channel
-  window cap). On the next read after parking, or after any idle close (remote 120-second idle
-  timeout or SSH session reconnect), it transparently reopens at the exact next byte offset,
-  verifying `(size, mtime, file_id)` (failing cleanly if the file changed on disk) with bounded
-  consecutive retries.
+- **Slots, fair waiting, and bounded SSH reconnect**: at most 8 active content channels run on one
+  SSH connection (strictly below OpenSSH's default `MaxSessions` of 10, leaving room for RPC). When
+  all 8 slots are actively reading, further opens wait fairly in FIFO order up to the SSH connect
+  timeout before returning a retryable `busy` error; on teardown or parking, `legion-link` sends
+  stdin EOF and holds the permit until `sshd` confirms channel close (`SSH_MSG_CHANNEL_CLOSE`),
+  falling back to a local channel close after 2 seconds if a remote ignores stdin EOF. If `sshd`
+  keeps refusing new channels even while `legion-link`'s own permits are free, the link retires the
+  poisoned SSH session, reconnects once, and retries, bounded to at most one such reconnect per
+  minute per machine.
+- **Parking, bounded buffers, per-link cap, and transparent reopening**: a stream holds an SSH
+  channel and slot only while actively read. After ~2 seconds of reader inactivity (including when a
+  pending `read()` future is dropped or timed out before bytes arrive), `ContentStream` parks its
+  channel — closing the SSH channel, releasing its slot, and dropping its read/write buffers and
+  channel queue down to at most 64 KiB of already-promised payload read-ahead. Parked streams are
+  capped per `Link` (256 by default); opening or parking past the cap closes the least recently used
+  parked stream cleanly so its next read fails like an expired stream. On the next read after
+  parking, or after any idle close (remote 120-second idle timeout or SSH session reconnect), a
+  surviving stream transparently reopens at the exact next byte offset, verifying
+  `(size, mtime, file_id)` (failing cleanly if the file changed on disk) with bounded consecutive
+  retries.
 - **Misbehaving-remote bounds**: active remote reads enforce a 30-second per-window progress
   timeout (armed only while waiting on a live channel, never while parked) and a cap of 32
   consecutive `{"busy": true}` lines.
@@ -250,8 +257,10 @@ the `Host`/`Origin` guard, and the headers, over a small trait that opens a byte
 mount it:
 
 - **The HTTP door**: `GET /v1/health` advertises `"content": true` so the web UI enables content
-  addresses once on connect and remembers per-machine `unsupported` replies for the session when
-  browsing an older remote node. `POST /v1/content` (bearer token) with `{on, path}` returns
+  addresses once on connect and remembers per-machine `unsupported` replies only until the next
+  successful contact with that machine reports its capabilities again (reconnect, `/v1/health`,
+  `meta.version`, `meta.whoami`, `meta.tools`, tool list refresh, or a successful content address).
+  `POST /v1/content` (bearer token) with `{on, path}` returns
   `{url, expires_in}`; the URL is `/v1/content/<ticket>/<file name>` on the same origin, with
   `Cross-Origin-Resource-Policy: same-origin` always set (origins listed in `[serve] origins` read
   content via CORS `fetch()` or `crossorigin`, not no-cors embedding). The door reads remote files
@@ -323,13 +332,22 @@ nothing without a word, daily actions in reach of the thumb, plain words first, 
   back arrow all do the same thing: close the sheet, then the viewer, then go to the folder this
   one was opened from, and leave Files only from its first screen. Sideways swiping between tabs
   is off inside a folder so it cannot fight the back gesture.
-- **The viewer** covers the screen. Pictures zoom with a pinch or double tap, and swiping
-  sideways goes to the next picture in the folder as it is currently sorted and filtered. Video
-  and audio use the platform's own player with the content address. Text shows the first
-  128 KiB and offers more. Everything else shows what it is and two buttons: Open in another app,
-  Download. The viewer's actions (Download, Send to, Star, More) are at the bottom.
-- **When a video will not play** the viewer says so in a sentence and offers Download and Open in
-  another app. A phone plays what its own decoders play; Legion does not convert video.
+- **The viewer** covers the screen, keying its active address and error state to the current file so
+  switching files while mounted never carries an old address or error onto the next file. Pictures
+  zoom with a pinch or double tap, and swiping sideways goes to the next picture in the folder as it
+  is currently sorted and filtered. Video and audio use the platform's own player with the content
+  address. Text shows the first 128 KiB and offers more. Everything else shows what it is and two
+  buttons: Open in another app, Download. The viewer's actions (Download, Send to, Star, More) are
+  at the bottom.
+- **When media is interrupted or will not play**: on a media error (for example a ticket expiring
+  during a pause or a door restart), the viewer silently requests one fresh content address for the
+  same file, swaps the source, seeks back to where playback stopped, and resumes if it was playing,
+  without showing an error. It tries at most one fresh address per failure (never looping on a
+  second failure within 10 seconds): if the file cannot be reached (machine off, moved, or changed),
+  it says "Couldn't reach this file" with a **Try again** button; only when a fresh address actually
+  answers HTTP 200 and the player still cannot decode it does the viewer say this device cannot play
+  that kind of video or audio (or show that picture) and offer Download and Open in another app. A
+  phone plays what its own decoders play; Legion does not convert video.
 - **Send to** is one sheet: Copy or Move, which machine (off machines are listed and say so, with
   Wake where it exists), which folder there (starting from pinned folders and the last places
   used), then one button that says what will happen ("Copy to pi"). The transfer runs in the
