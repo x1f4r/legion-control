@@ -602,7 +602,19 @@ fi
 
 launch_target() {
   if [ "${LEGION_UNSET_APPIMAGE:-0}" = "1" ]; then
-    ( unset APPIMAGE APPDIR ARGV0 OWD; exec "$LEGION_EXEC" ) >/dev/null 2>&1 &
+    (
+      if [ -n "${APPDIR:-}" ] && [ -n "${XDG_DATA_DIRS:-}" ]; then
+        case "$XDG_DATA_DIRS" in
+          "$APPDIR/usr/share:"*) XDG_DATA_DIRS="${XDG_DATA_DIRS#"$APPDIR/usr/share:"}" ;;
+        esac
+        export XDG_DATA_DIRS
+      fi
+      unset APPIMAGE APPDIR ARGV0 OWD LD_LIBRARY_PATH \
+        GTK_DATA_PREFIX GTK_EXE_PREFIX GTK_PATH GTK_IM_MODULE_FILE \
+        GDK_PIXBUF_MODULE_FILE GSETTINGS_SCHEMA_DIR GI_TYPELIB_PATH GIO_MODULE_DIR \
+        GST_PLUGIN_SYSTEM_PATH_1_0 GST_PLUGIN_PATH_1_0 GST_PLUGIN_SCANNER_1_0 GST_PTP_HELPER_1_0
+      exec "$LEGION_EXEC"
+    ) >/dev/null 2>&1 &
   else
     "$LEGION_EXEC" >/dev/null 2>&1 &
   fi
@@ -623,6 +635,10 @@ while [ "$j" -lt "$ticks" ]; do
   if ! kill -0 "$NEW_PID" 2>/dev/null; then
     break
   fi
+  new_stat="$(ps -o stat= -p "$NEW_PID" 2>/dev/null || true)"
+  case "$new_stat" in
+    ""|*Z*) break ;;
+  esac
   sleep 0.25 2>/dev/null || sleep 1
   j=$((j + 1))
 done
