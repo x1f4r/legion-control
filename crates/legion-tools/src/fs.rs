@@ -9,12 +9,23 @@ mod manage;
 mod platform;
 mod read;
 mod search;
+mod thumb;
+mod thumb_cache;
+mod thumb_limit;
+mod thumb_probe;
+mod thumb_worker;
 mod write;
 
+pub use thumb_worker::{
+    THUMB_WORKER_MODE, enable_thumb_worker_self, measured_worker_baseline_bytes_for_test,
+    set_thumb_decode_timeout_for_test, set_thumb_timeout_cpu_busy_for_test, try_thumb_worker_cli,
+};
+
+use std::cmp::Ordering;
 use std::fs::{self, FileType, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use legion_core::proto::{ErrorBody, ErrorCode, EventKind};
 use legion_core::{Access, CancellationToken, Ctx, Grant, Place, Registry, ToolError};
@@ -36,6 +47,7 @@ pub fn register(registry: &mut Registry) {
     write::register(registry);
     manage::register(registry);
     search::register(registry);
+    thumb::register(registry);
 }
 
 /// The kind of a filesystem entry, reported without following symbolic links.
@@ -74,6 +86,147 @@ pub enum Encoding {
     Utf8,
     /// Standard base64-encoded bytes.
     Base64,
+}
+
+/// Field used to order directory listings and search matches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SortField {
+    /// Natural, case-insensitive comparison of the file name (`file2` before `file10`).
+    #[default]
+    Name,
+    /// Last modification timestamp.
+    Modified,
+    /// File size in bytes.
+    Size,
+}
+
+/// Sort direction for directory listings and search matches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SortOrder {
+    /// Smallest / earliest / A-Z first.
+    #[default]
+    Asc,
+    /// Largest / newest / Z-A first.
+    Desc,
+}
+
+/// Compares two names in natural order (`file2` before `file10`), case-insensitively across
+/// Unicode, with a deterministic raw-string tie-breaker so the result is a strict total order.
+pub(crate) fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let mut ai = a;
+    let mut bi = b;
+
+    loop {
+        match (next_natural_chunk(ai), next_natural_chunk(bi)) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some((ca, rest_a)), Some((cb, rest_b))) => {
+                let ord = compare_natural_chunks(ca, cb);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+                ai = rest_a;
+                bi = rest_b;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NaturalChunk<'a> {
+    Number(&'a str),
+    Text(&'a str),
+}
+
+fn next_natural_chunk(input: &str) -> Option<(NaturalChunk<'_>, &str)> {
+    let first = input.as_bytes().first()?;
+    if first.is_ascii_digit() {
+        let end = input
+            .bytes()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(input.len());
+        Some((NaturalChunk::Number(&input[..end]), &input[end..]))
+    } else {
+        let end = input
+            .bytes()
+            .position(|b| b.is_ascii_digit())
+            .unwrap_or(input.len());
+        Some((NaturalChunk::Text(&input[..end]), &input[end..]))
+    }
+}
+
+fn compare_natural_chunks(a: NaturalChunk<'_>, b: NaturalChunk<'_>) -> Ordering {
+    match (a, b) {
+        (NaturalChunk::Number(na), NaturalChunk::Number(nb)) => {
+            let sa = na.trim_start_matches('0');
+            let sb = nb.trim_start_matches('0');
+            sa.len().cmp(&sb.len()).then_with(|| sa.cmp(sb))
+        }
+        (NaturalChunk::Text(ta), NaturalChunk::Text(tb)) => compare_text_case_insensitive(ta, tb),
+        // Every ASCII digit lies in the contiguous U+0030..=U+0039 block with no non-digits
+        // inside, so comparing any digit against any non-digit character yields a transitive order
+        // matching standard code-point ordering (`.` / `-` < digits < letters / `_`).
+        (NaturalChunk::Number(_), NaturalChunk::Text(tb)) => {
+            let Some(ch) = tb.chars().next() else {
+                return Ordering::Greater;
+            };
+            let lower = ch.to_lowercase().next().unwrap_or(ch);
+            '0'.cmp(&lower)
+        }
+        (NaturalChunk::Text(ta), NaturalChunk::Number(_)) => {
+            let Some(ch) = ta.chars().next() else {
+                return Ordering::Less;
+            };
+            let lower = ch.to_lowercase().next().unwrap_or(ch);
+            lower.cmp(&'0')
+        }
+    }
+}
+
+fn compare_text_case_insensitive(a: &str, b: &str) -> Ordering {
+    let mut ca = a.chars().flat_map(char::to_lowercase);
+    let mut cb = b.chars().flat_map(char::to_lowercase);
+    loop {
+        match (ca.next(), cb.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let ord = x.cmp(&y);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
+    }
+}
+
+/// Compares two entries by `sort` and `order`, breaking ties in `modified` or `size` by natural
+/// ascending name so ordering is always deterministic.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compare_by_sort(
+    sort: SortField,
+    order: SortOrder,
+    a_name: &str,
+    b_name: &str,
+    a_mtime: Option<SystemTime>,
+    b_mtime: Option<SystemTime>,
+    a_size: u64,
+    b_size: u64,
+) -> Ordering {
+    let primary = match sort {
+        SortField::Name => natural_cmp(a_name, b_name),
+        SortField::Modified => a_mtime.cmp(&b_mtime),
+        SortField::Size => a_size.cmp(&b_size),
+    };
+    let ordered = match order {
+        SortOrder::Asc => primary,
+        SortOrder::Desc => primary.reverse(),
+    };
+    ordered.then_with(|| natural_cmp(a_name, b_name))
 }
 
 /// Sends periodic `progress` events from a blocking worker back to the calling [`Ctx`].
@@ -417,6 +570,31 @@ pub(crate) fn check_fs_path(
     Ok(resolved)
 }
 
+/// Opens `path` for reading without ever blocking on a FIFO or acquiring a controlling terminal,
+/// verifying on the open handle itself that it is a regular file.
+pub(crate) fn open_regular_file(
+    path: &Path,
+    action: &str,
+    dir_hint: &str,
+) -> Result<(std::fs::File, Metadata), ToolError> {
+    legion_os::open_regular::open_regular_read(path).map_err(|err| match err {
+        legion_os::open_regular::OpenRegularError::IsDirectory => ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("{} is a directory, not a file.", path.display()),
+        )
+        .with_hint(dir_hint),
+        legion_os::open_regular::OpenRegularError::NotRegularFile => ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "{} is not a regular file (it is a named pipe, socket or device).",
+                path.display()
+            ),
+        )
+        .with_hint("Pass a regular file path; special files are refused without blocking."),
+        legion_os::open_regular::OpenRegularError::Io(error) => map_io_error(action, path, error),
+    })
+}
+
 /// Confirms `path` exists and refers to a regular file via `stat` before opening it, so named
 /// pipes, sockets and device nodes are refused immediately instead of blocking on `File::open`.
 pub(crate) fn check_regular_file(
@@ -681,6 +859,55 @@ mod tests {
         ];
         for path in allowed {
             assert!(validate_windows_path(path).is_ok(), "{path} was rejected");
+        }
+    }
+
+    #[test]
+    fn natural_cmp_orders_numbers_case_and_unicode_transitively() {
+        let mut names = vec![
+            "file10.txt",
+            "file2.txt",
+            "file1.txt",
+            "File20.txt",
+            "file02.txt",
+            "B.txt",
+            "a.txt",
+            ".hidden",
+            "über10.txt",
+            "Über2.txt",
+            "big999999999999999999999999999999.txt",
+            "big1000000000000000000000000000000.txt",
+        ];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(
+            names,
+            vec![
+                ".hidden",
+                "a.txt",
+                "B.txt",
+                "big999999999999999999999999999999.txt",
+                "big1000000000000000000000000000000.txt",
+                "file1.txt",
+                "file02.txt",
+                "file2.txt",
+                "file10.txt",
+                "File20.txt",
+                "Über2.txt",
+                "über10.txt",
+            ]
+        );
+
+        // Verify strict weak ordering (antisymmetry and transitivity) across all pairs/triples.
+        for &x in &names {
+            assert_eq!(natural_cmp(x, x), Ordering::Equal);
+            for &y in &names {
+                assert_eq!(natural_cmp(x, y), natural_cmp(y, x).reverse());
+                for &z in &names {
+                    if natural_cmp(x, y) == Ordering::Less && natural_cmp(y, z) == Ordering::Less {
+                        assert_eq!(natural_cmp(x, z), Ordering::Less, "{x} < {y} < {z}");
+                    }
+                }
+            }
         }
     }
 }

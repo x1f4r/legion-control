@@ -41,6 +41,7 @@ impl SyntheticFs {
                     mode: Some(0o644),
                     link_target: None,
                     change_id: Some(i as u64 + 1),
+                    file_identity: Some((1, i as u64 + 1)),
                 },
             });
         }
@@ -64,6 +65,18 @@ impl SyncFs for SyntheticFs {
 
     fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
         *self.marker.lock().unwrap() = Some(marker.clone());
+        Ok(())
+    }
+
+    fn append_deletion_log(&self, _bytes: &[u8]) -> legion_sync::Result<()> {
+        Ok(())
+    }
+
+    fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    fn compact_deletion_log(&self, _bytes: &[u8]) -> legion_sync::Result<()> {
         Ok(())
     }
 
@@ -155,6 +168,15 @@ impl SyncFs for SyntheticFs {
 
     fn stat_tmp(&self, _tmp_name: &str) -> legion_sync::Result<Option<FsMeta>> {
         Ok(None)
+    }
+
+    fn set_tmp_metadata(
+        &self,
+        _tmp_name: &str,
+        _mtime: Timestamp,
+        _mode: Option<u32>,
+    ) -> legion_sync::Result<()> {
+        Ok(())
     }
 
     fn hash_tmp(&self, _tmp_name: &str) -> legion_sync::Result<(Hash, u64)> {
@@ -359,13 +381,21 @@ impl Peer for BenchPeer {
         &self.member_id
     }
 
-    fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
+    fn handshake(
+        &self,
+        _caller: &legion_sync::HandshakeHello,
+    ) -> legion_sync::Result<PeerHandshake> {
         Ok(PeerHandshake {
             folder_id: self.folder_id.clone(),
             member_id: self.member_id.clone(),
             incarnation: self.incarnation,
             snapshot_seq: self.records.len() as u64,
+            head_fingerprint: self.records.last().map(IndexRecord::head_fingerprint),
             protocol_version: SYNC_PROTOCOL_VERSION,
+            caller_pulled: None,
+            caller_acked: None,
+            caller_pull_matches: None,
+            caller_regressed: false,
         })
     }
 
@@ -392,6 +422,7 @@ impl Peer for BenchPeer {
             caller_acked: None,
             caller_acked_fingerprint: None,
             head_fingerprint: self.records.last().map(IndexRecord::head_fingerprint),
+            chain_fingerprints: std::collections::BTreeMap::new(),
         })
     }
 

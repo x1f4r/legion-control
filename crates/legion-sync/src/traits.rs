@@ -4,7 +4,7 @@
 //! real disks (`RealFs` + `RedbIndexStore`), network peers (supplied by upper crates), and the
 //! deterministic fault-injecting simulator.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::sync::atomic::AtomicBool;
 
@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::model::{
-    BinEntry, FetchOptions, FolderMarker, FolderMeta, HeldBackRecord, IndexRecord, MemberId,
-    PeerCursor, PeerHandshake, PendingOp, RecordsPage,
+    BinEntry, DeferredItem, FetchOptions, FolderMarker, FolderMeta, HandshakeHello, HeldBackRecord,
+    IndexRecord, MemberId, PeerCursor, PeerHandshake, PendingOp, RecordsPage, SyncProblem,
 };
 use crate::path::IgnoreMatcher;
 
@@ -94,6 +94,10 @@ pub struct FsMeta {
     /// `ChangeTime` + `FileId` on Windows) so same-size, same-mtime overwrites and renames are
     /// detected without re-hashing unchanged files.
     pub change_id: Option<u64>,
+    /// Stable filesystem object identity `(dev, ino)` on platforms where atomic rename/exchange
+    /// preserves it across placement (Unix); `None` when the platform may not preserve identity
+    /// across replacement so post-placement verification re-hashes instead.
+    pub file_identity: Option<(u64, u64)>,
 }
 
 /// One live entry discovered during a [`SyncFs::walk`] or [`SyncFs::walk_subtree`].
@@ -139,6 +143,15 @@ pub trait SyncFs {
 
     /// Atomically writes the folder identity marker to `.legion-sync/marker.json`.
     fn write_marker(&self, marker: &FolderMarker) -> Result<()>;
+
+    /// Appends serialized NDJSON entries to `.legion-sync/deletions.log` and syncs them to disk.
+    fn append_deletion_log(&self, bytes: &[u8]) -> Result<()>;
+
+    /// Reads the raw bytes of `.legion-sync/deletions.log` (empty `Vec` if absent).
+    fn read_deletion_log(&self) -> Result<Vec<u8>>;
+
+    /// Atomically replaces `.legion-sync/deletions.log` with compacted NDJSON bytes.
+    fn compact_deletion_log(&self, bytes: &[u8]) -> Result<()>;
 
     /// Ensures `.legion-sync/tmp` and `.legion-sync/bin` exist. Called only when initializing a
     /// new folder or after verifying an existing folder marker.
@@ -213,6 +226,10 @@ pub trait SyncFs {
 
     /// Inspects a staged file inside `.legion-sync/tmp/<tmp_name>`.
     fn stat_tmp(&self, tmp_name: &str) -> Result<Option<FsMeta>>;
+
+    /// Applies modification time and (on Unix) permission bits to a staged file inside
+    /// `.legion-sync/tmp/<tmp_name>` *before* it is placed into the live tree.
+    fn set_tmp_metadata(&self, tmp_name: &str, mtime: Timestamp, mode: Option<u32>) -> Result<()>;
 
     /// Computes the BLAKE3 digest and byte length of `.legion-sync/tmp/<tmp_name>`.
     fn hash_tmp(&self, tmp_name: &str) -> Result<(Hash, u64)>;
@@ -301,8 +318,8 @@ pub trait Peer {
     /// Member identifier of this peer.
     fn member_id(&self) -> &str;
 
-    /// Exchanges folder/incarnation identity and protocol version before pulling.
-    fn handshake(&self) -> Result<PeerHandshake>;
+    /// Exchanges bidirectional folder/incarnation/sequence-fingerprint identity before pulling.
+    fn handshake(&self, caller: &HandshakeHello) -> Result<PeerHandshake>;
 
     /// Fetches index records created or updated after `(since_incarnation, since_seq)`, up to
     /// `limit` entries, from a single consistent snapshot of the peer's index.
@@ -345,10 +362,12 @@ pub struct StoreBatch {
     pub upsert_bin: Vec<BinEntry>,
     /// Bin entry IDs to remove (restored or expired).
     pub remove_bin: Vec<String>,
-    /// Held-back peer records to insert or update.
+    /// Held-back peer records to insert or update (keyed by `(from_peer, record.path)`).
     pub upsert_held_back: Vec<HeldBackRecord>,
-    /// Held-back record paths to remove (resolved, applied, or deleted).
-    pub remove_held_back: Vec<String>,
+    /// Held-back record keys `(from_peer, path)` to remove (resolved, applied, or superseded).
+    pub remove_held_back: Vec<(MemberId, String)>,
+    /// When `true`, clears all held-back entries (used on incarnation rotation).
+    pub clear_held_back: bool,
     /// Deleted-file content hashes to record per path (persisted across tombstone GC so a
     /// rejoining or re-added member with an old copy never resurrects a deleted file).
     pub upsert_deleted_history: Vec<(String, Vec<Hash>)>,
@@ -357,6 +376,28 @@ pub struct StoreBatch {
     /// Update to the write-ahead crash journal (`Some(Some(op))` sets it; `Some(None)` clears it;
     /// `None` leaves it unchanged).
     pub set_pending_op: Option<Option<PendingOp>>,
+    /// Staged download tmp filenames written by the engine itself to register before creation so
+    /// recovery knows which `.legion-sync/tmp/` entries are disposable engine downloads.
+    pub add_staged_tmps: Vec<String>,
+    /// Staged download tmp filenames to unregister (once placed, exchanged with a live user file,
+    /// or cleaned up).
+    pub remove_staged_tmps: Vec<String>,
+    /// Dense chained sequence fingerprints `(seq, chain_fp)` to insert for our own incarnation.
+    pub upsert_seq_fingerprints: Vec<(u64, Hash)>,
+    /// Prune stored sequence fingerprints strictly less than this sequence number.
+    pub prune_seq_fingerprints_below: Option<u64>,
+    /// Clear all stored sequence fingerprints (used on incarnation rotation).
+    pub clear_seq_fingerprints: bool,
+    /// Durable problems to insert or update (`key -> SyncProblem`).
+    pub upsert_problems: Vec<(String, SyncProblem)>,
+    /// Durable problem keys to remove.
+    pub remove_problems: Vec<String>,
+    /// Durable deferrals to insert or update (keyed by `(peer, path)`).
+    pub upsert_deferrals: Vec<DeferredItem>,
+    /// Durable deferral keys `(peer, path)` to remove.
+    pub remove_deferrals: Vec<(MemberId, String)>,
+    /// When `true`, clears all durable deferrals (used on incarnation rotation).
+    pub clear_deferrals: bool,
 }
 
 impl StoreBatch {
@@ -371,9 +412,20 @@ impl StoreBatch {
             && self.remove_bin.is_empty()
             && self.upsert_held_back.is_empty()
             && self.remove_held_back.is_empty()
+            && !self.clear_held_back
             && self.upsert_deleted_history.is_empty()
             && self.remove_deleted_history.is_empty()
             && self.set_pending_op.is_none()
+            && self.add_staged_tmps.is_empty()
+            && self.remove_staged_tmps.is_empty()
+            && self.upsert_seq_fingerprints.is_empty()
+            && self.prune_seq_fingerprints_below.is_none()
+            && !self.clear_seq_fingerprints
+            && self.upsert_problems.is_empty()
+            && self.remove_problems.is_empty()
+            && self.upsert_deferrals.is_empty()
+            && self.remove_deferrals.is_empty()
+            && !self.clear_deferrals
     }
 }
 
@@ -446,6 +498,18 @@ pub trait IndexStore {
 
     /// Loads the active write-ahead [`PendingOp`], if any.
     fn load_pending_op(&self) -> Result<Option<PendingOp>>;
+
+    /// Lists tmp filenames currently proven to be engine-written staged downloads.
+    fn list_staged_tmps(&self) -> Result<BTreeSet<String>>;
+
+    /// Looks up the stored chained sequence fingerprint at `seq` for our current incarnation.
+    fn get_seq_fingerprint(&self, seq: u64) -> Result<Option<Hash>>;
+
+    /// Lists all durable sync problems stored in the index (`(key, SyncProblem)`).
+    fn list_problems(&self) -> Result<Vec<(String, SyncProblem)>>;
+
+    /// Lists all durable deferred sync items stored in the index.
+    fn list_deferrals(&self) -> Result<Vec<DeferredItem>>;
 
     /// Returns the total number of records (live + tombstones) in the index.
     fn record_count(&self) -> Result<u64>;

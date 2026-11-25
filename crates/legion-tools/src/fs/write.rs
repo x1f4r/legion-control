@@ -1,7 +1,7 @@
 //! File creation and modification tools: `fs.write`, `fs.edit` and `fs.mkdir`.
 
 use std::borrow::Cow;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -702,7 +702,11 @@ fn check_expected_hash(path: &Path, expected: &str, actual: &str) -> Result<(), 
 }
 
 fn hash_file(path: &Path, cancel: &CancellationToken, tool: &str) -> Result<String, ToolError> {
-    let mut file = File::open(path).map_err(|error| map_io_error("read", path, error))?;
+    let (mut file, _meta) = super::open_regular_file(
+        path,
+        "read",
+        "Pass a regular file path; directories cannot be hashed.",
+    )?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = [0u8; HASH_CHUNK_BYTES];
     loop {
@@ -741,7 +745,11 @@ fn read_file_cancellable(
     cancel: &CancellationToken,
     tool: &str,
 ) -> Result<Vec<u8>, ToolError> {
-    let mut file = File::open(path).map_err(|error| map_io_error("read", path, error))?;
+    let (mut file, _meta) = super::open_regular_file(
+        path,
+        "read",
+        "Pass a regular file path; directories cannot be edited.",
+    )?;
     let mut out = Vec::new();
     let mut buf = [0u8; HASH_CHUNK_BYTES];
     loop {

@@ -84,23 +84,29 @@ pub use engine::{
     check_fetch_file_from_store, check_serve_allowed_from_store, serve_handshake_from_store,
     serve_records_since_from_store,
 };
-pub use error::{FsErrorKind, Result, SyncError};
+pub use error::{FsErrorKind, INDEX_DAMAGED_PROBLEM_SENTENCE, Result, SyncError};
 pub use fs_real::{RealFs, check_folders_not_nested};
 pub use model::{
     BinEntry, BinReason, ConflictChoice, ConflictInfo, DEFAULT_BIN_RETENTION,
-    DEFAULT_BRAKE_MIN_FILES, DEFAULT_BRAKE_MIN_PERCENT, DEFAULT_FETCH_TIMEOUT, DeferredItem,
-    DeletionBrake, DeletionBrakeConfig, DeletionBrakeDecision, ExpectedLocalSnapshot, FetchOptions,
-    FolderConfig, FolderId, FolderMarker, FolderMeta, FolderStatus, HeldBackRecord,
-    INDEX_SCHEMA_VERSION, IndexRecord, MAX_ANCESTRY_HASHES, MAX_DEFERRAL_ATTEMPTS,
-    MAX_HELD_BACK_ENTRIES, MAX_LINK_TARGET_BYTES, MAX_PAGE_RECORDS, MAX_PEER_PROBLEMS,
+    DEFAULT_BRAKE_MIN_FILES, DEFAULT_BRAKE_MIN_PERCENT, DEFAULT_BRAKE_SETTLE_SECS,
+    DEFAULT_BRAKE_WINDOW_SECS, DEFAULT_FETCH_TIMEOUT, DeferredItem, DeletionBrake,
+    DeletionBrakeConfig, DeletionBrakeDecision, DeletionWindowState, ExpectedLocalSnapshot,
+    FORCED_ROTATION_COOLDOWN_SECS, FetchOptions, FolderConfig, FolderDeletionLogEntry,
+    FolderDeletionRecord, FolderId, FolderMarker, FolderMeta, FolderStatus, HandshakeHello,
+    HeldBackRecord, INDEX_SCHEMA_VERSION, InboundDeletionBrake, InboundDeletionBrakeDecision,
+    IndexRecord, MAX_ANCESTRY_HASHES, MAX_DEFERRAL_ATTEMPTS, MAX_HELD_BACK_ENTRIES,
+    MAX_LINK_TARGET_BYTES, MAX_PAGE_RECORDS, MAX_PEER_PROBLEMS, MAX_VERSION_COUNTER,
     MAX_VV_INCARNATIONS_PER_MEMBER, MIN_PLAUSIBLE_CLOCK_SECS, MemberId, MemberState, MemberStatus,
-    PeerCursor, PeerHandshake, PendingOp, ProblemKind, RecordsPage, RestoreStrategy,
-    SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, validate_folder_id, validate_member_id,
+    PeerAckView, PeerCursor, PeerHandshake, PendingLocalDeletion, PendingOp, ProblemKind,
+    RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress,
+    chain_fingerprint, encode_deletion_log_entries, parse_deletion_log, validate_folder_id,
+    validate_member_id,
 };
 pub use path::{
-    IgnoreMatcher, ParsedConflictPath, SYNC_BIN_DIR, SYNC_MARKER_FILE, SYNC_META_DIR, SYNC_TMP_DIR,
-    check_fs_compatibility, conflict_copy_path, is_fixed_ignored, is_internal_sync_path,
-    is_os_litter_name, parse_conflict_copy_path, validate_sync_path,
+    IgnoreMatcher, ParsedConflictPath, SYNC_BIN_DIR, SYNC_DELETIONS_LOG_FILE, SYNC_MARKER_FILE,
+    SYNC_META_DIR, SYNC_TMP_DIR, check_fs_compatibility, check_symlink_target_contained,
+    conflict_copy_path, is_fixed_ignored, is_internal_sync_path, is_os_litter_name,
+    parse_conflict_copy_path, validate_sync_path,
 };
 pub use reconcile::{
     LocalIndexView, ReconcileDecision, compare_live_winner, derive_conflict_of, reconcile_record,

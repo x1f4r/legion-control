@@ -48,6 +48,8 @@ targets:
         LSRequiresIPhoneOS: true
         NSCameraUsageDescription: Legion uses the camera to scan the pairing code shown by your computer.
         NSLocalNetworkUsageDescription: Legion uses the local network to reach your own machines.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         UILaunchStoryboardName: LaunchScreen
         UIRequiredDeviceCapabilities: [arm64, metal]
         UISupportedInterfaceOrientations:

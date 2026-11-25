@@ -349,6 +349,77 @@ pub struct DisagreementView {
     pub reports: Vec<DisagreementEntryView>,
 }
 
+/// Platform background transfer capabilities reported in [`AppState`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferCapabilities {
+    /// True when transfers continue running after leaving the app or closing the window.
+    pub background: bool,
+    /// True when the OS pauses transfers while the app is in the background (iOS and iPadOS).
+    pub pauses_in_background: bool,
+    /// True when native device-to-machine file picking and upload is implemented on this platform.
+    #[serde(default = "default_true")]
+    pub can_upload: bool,
+    /// True when native "Open in another app" is implemented on this platform.
+    #[serde(default = "default_true")]
+    pub can_open_externally: bool,
+    /// True when tapping a finished download can open it directly in a viewer/chooser.
+    #[serde(default = "default_true")]
+    pub can_open_downloads: bool,
+    /// Plain-language note explaining background behaviour on this platform, when relevant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_note: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl TransferCapabilities {
+    /// Returns the native transfer capability description for the current compile target.
+    pub fn current_platform() -> Self {
+        #[cfg(target_os = "ios")]
+        {
+            Self {
+                background: false,
+                pauses_in_background: true,
+                can_upload: false,
+                can_open_externally: false,
+                can_open_downloads: false,
+                background_note: Some(
+                    "Transfers pause when you leave Legion on iPhone and iPad, and resume when you open it again."
+                        .to_owned(),
+                ),
+            }
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            Self {
+                background: true,
+                pauses_in_background: false,
+                can_upload: true,
+                can_open_externally: true,
+                can_open_downloads: true,
+                background_note: None,
+            }
+        }
+    }
+}
+
+/// Resolved link handle and pairing holder identity for content serving and device transfers.
+#[derive(Clone)]
+pub struct ContentTarget {
+    /// Live `legion-link` handle holding the machine's session.
+    pub link: legion_link::Link,
+    /// Node key configured on `link` (`"local"` for the desktop local pipe, or the SSH node name).
+    pub link_node: String,
+    /// Machine name displayed to the user.
+    pub machine: String,
+    /// Principal name associated with this target.
+    pub principal: String,
+    /// Opaque holder string bound to this specific pairing epoch (`pairing:<link_node>:<epoch>`).
+    pub holder: String,
+}
+
 /// Snapshot returned by the `state` command.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppState {
@@ -373,6 +444,9 @@ pub struct AppState {
     /// Fleet delivery summary from the most recent pairing in this session, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_paired: Option<PairSummary>,
+    /// Background transfer behaviour supported by this platform.
+    #[serde(default = "TransferCapabilities::current_platform")]
+    pub transfer_capabilities: TransferCapabilities,
 }
 
 /// Identifier of an in-flight call for cancellation.
@@ -475,6 +549,19 @@ pub trait Backend: Send + Sync {
     fn update_sources(&self) -> Result<Option<(legion_link::Link, Vec<String>)>, AppError> {
         Ok(None)
     }
+
+    /// Resolves `machine` to its live [`ContentTarget`] for content serving and bulk transfers.
+    ///
+    /// Never falls back to another machine. Returns `NotFound` when `machine` is not configured on
+    /// this device or `NotPaired` when no nodes exist.
+    fn content_target(&self, _machine: &str) -> Result<ContentTarget, AppError> {
+        Err(AppError::not_paired())
+    }
+
+    /// Fast synchronous check that a content ticket's pairing holder is still active.
+    fn is_pairing_holder_live(&self, _holder: &str) -> bool {
+        false
+    }
 }
 
 /// Fallback backend returning honest unpaired responses.
@@ -493,6 +580,7 @@ impl Backend for Unpaired {
                 routes: BTreeMap::new(),
                 disagreements: Vec::new(),
                 last_paired: None,
+                transfer_capabilities: TransferCapabilities::current_platform(),
             })
         })
     }
@@ -614,6 +702,7 @@ mod tests {
             routes: BTreeMap::new(),
             disagreements: Vec::new(),
             last_paired: None,
+            transfer_capabilities: TransferCapabilities::current_platform(),
         };
         let json = serde_json::to_value(&unpaired)?;
         assert_eq!(json["ready"], false);
@@ -641,6 +730,7 @@ mod tests {
             routes: BTreeMap::new(),
             disagreements: Vec::new(),
             last_paired: None,
+            transfer_capabilities: TransferCapabilities::current_platform(),
         };
         let ready_json = serde_json::to_value(&ready)?;
         assert_eq!(ready_json["ready"], true);

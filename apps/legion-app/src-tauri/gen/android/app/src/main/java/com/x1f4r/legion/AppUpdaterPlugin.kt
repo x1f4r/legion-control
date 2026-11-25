@@ -41,12 +41,13 @@ class InstallApkArgs {
  */
 @TauriPlugin
 class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
+  private val appContext = activity.applicationContext
   private val ioExecutor = Executors.newSingleThreadExecutor()
 
   private fun currentInstallerPackage(): String? {
     return try {
-      val pm = activity.packageManager
-      val pkg = activity.packageName
+      val pm = appContext.packageManager
+      val pkg = appContext.packageName
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
         pm.getInstallSourceInfo(pkg).installingPackageName
       } else {
@@ -54,7 +55,11 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
         pm.getInstallerPackageName(pkg)
       }
     } catch (e: Exception) {
-      Log.w(TAG, "Could not inspect install source info: ${e.message}")
+      if (BuildConfig.DEBUG) {
+        Log.w(TAG, "Could not inspect install source info: ${e.message}")
+      } else {
+        Log.w(TAG, "Could not inspect install source info")
+      }
       null
     }
   }
@@ -64,9 +69,13 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
       return null
     }
     return try {
-      activity.packageManager.getInstallSourceInfo(activity.packageName).updateOwnerPackageName
+      appContext.packageManager.getInstallSourceInfo(appContext.packageName).updateOwnerPackageName
     } catch (e: Exception) {
-      Log.w(TAG, "Could not inspect update owner info: ${e.message}")
+      if (BuildConfig.DEBUG) {
+        Log.w(TAG, "Could not inspect update owner info: ${e.message}")
+      } else {
+        Log.w(TAG, "Could not inspect update owner info")
+      }
       null
     }
   }
@@ -76,21 +85,25 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
       val cm = activity.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
       cm?.isActiveNetworkMetered ?: false
     } catch (e: Exception) {
-      Log.w(TAG, "Could not inspect active network metered state: ${e.message}")
+      if (BuildConfig.DEBUG) {
+        Log.w(TAG, "Could not inspect active network metered state: ${e.message}")
+      } else {
+        Log.w(TAG, "Could not inspect active network metered state")
+      }
       false
     }
   }
 
   private fun capabilitiesPayload(): JSObject {
-    val canInstall = activity.packageManager.canRequestPackageInstalls()
+    val canInstall = appContext.packageManager.canRequestPackageInstalls()
     val installer = currentInstallerPackage()
     val updateOwner = currentUpdateOwnerPackage()
-    val selfInstaller = installer == activity.packageName
+    val selfInstaller = installer == appContext.packageName
     // Android 12+ (API 31+) allows prompt-free self-updates when UPDATE_PACKAGES_WITHOUT_USER_ACTION
     // is declared, Install unknown apps is granted, and no competing update owner holds the package
     // (on API 34+, Android checks updateOwnerPackageName; on API 31-33, installerPackageName).
     val ownerAllowsSilent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-      updateOwner == null || updateOwner == activity.packageName
+      updateOwner == null || updateOwner == appContext.packageName
     } else {
       selfInstaller || installer == null
     }
@@ -109,13 +122,15 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun capabilities(invoke: Invoke) {
     val payload = capabilitiesPayload()
-    Log.i(TAG, "capabilities: $payload")
+    if (BuildConfig.DEBUG) {
+      Log.i(TAG, "capabilities: $payload")
+    }
     invoke.resolve(payload)
   }
 
   @Command
   fun requestInstallPermission(invoke: Invoke) {
-    if (activity.packageManager.canRequestPackageInstalls()) {
+    if (appContext.packageManager.canRequestPackageInstalls()) {
       val out = capabilitiesPayload()
       out.put("granted", true)
       invoke.resolve(out)
@@ -123,14 +138,14 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     }
     val intent = Intent(
       Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-      Uri.parse("package:${activity.packageName}"),
+      Uri.parse("package:${appContext.packageName}"),
     )
     startActivityForResult(invoke, intent, "onUnknownSourcesResult")
   }
 
   @ActivityCallback
   fun onUnknownSourcesResult(invoke: Invoke, _result: ActivityResult) {
-    val granted = activity.packageManager.canRequestPackageInstalls()
+    val granted = appContext.packageManager.canRequestPackageInstalls()
     val out = capabilitiesPayload()
     out.put("granted", granted)
     Log.i(TAG, "onUnknownSourcesResult: granted=$granted")
@@ -147,7 +162,7 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
       return
     }
 
-    if (!activity.packageManager.canRequestPackageInstalls()) {
+    if (!appContext.packageManager.canRequestPackageInstalls()) {
       val out = capabilitiesPayload()
       out.put("status", "needs_permission")
       out.put("prompted", false)
@@ -157,7 +172,7 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     val apkFile = File(rawPath).canonicalFile
-    val allowedRoot = File(activity.dataDir, "updates").canonicalFile
+    val allowedRoot = File(appContext.dataDir, "updates").canonicalFile
     val allowedRootPath = allowedRoot.path.trimEnd(File.separatorChar) + File.separatorChar
     if (!apkFile.path.startsWith(allowedRootPath) || !apkFile.isFile) {
       invoke.reject("Refusing to install APK outside the app's private updates directory.")
@@ -165,18 +180,25 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     val installerPkg = currentInstallerPackage()
-    Log.i(
-      TAG,
-      "Starting PackageInstaller session: apk=${apkFile.name} bytes=${apkFile.length()} api=${Build.VERSION.SDK_INT} installer=$installerPkg background=$background",
-    )
+    if (BuildConfig.DEBUG) {
+      Log.i(
+        TAG,
+        "Starting PackageInstaller session: apk=${apkFile.name} bytes=${apkFile.length()} api=${Build.VERSION.SDK_INT} installer=$installerPkg background=$background",
+      )
+    } else {
+      Log.i(
+        TAG,
+        "Starting PackageInstaller session: bytes=${apkFile.length()} api=${Build.VERSION.SDK_INT} background=$background",
+      )
+    }
 
     ioExecutor.execute {
       var session: PackageInstaller.Session? = null
       var sessionId = -1
       try {
-        val installer = activity.packageManager.packageInstaller
+        val installer = appContext.packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
-        params.setAppPackageName(activity.packageName)
+        params.setAppPackageName(appContext.packageName)
         params.setSize(apkFile.length())
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
           params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
@@ -207,7 +229,7 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
           PendingIntent.FLAG_UPDATE_CURRENT
         }
         val pendingIntent = PendingIntent.getBroadcast(
-          activity,
+          appContext,
           sessionId,
           callbackIntent,
           flags,
@@ -216,7 +238,11 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
         Log.i(TAG, "Committing PackageInstaller session $sessionId (background=$background)")
         session.commit(pendingIntent.intentSender)
       } catch (e: Exception) {
-        Log.e(TAG, "Failed to commit PackageInstaller session $sessionId", e)
+        if (BuildConfig.DEBUG) {
+          Log.e(TAG, "Failed to commit PackageInstaller session $sessionId", e)
+        } else {
+          Log.e(TAG, "Failed to commit PackageInstaller session $sessionId (${e.javaClass.simpleName})")
+        }
         if (sessionId >= 0) {
           pendingInstalls.remove(sessionId)
         }
@@ -254,7 +280,11 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
         put("prompted", entry.prompted.get())
         put("message", message)
       }
-      Log.i(TAG, "Session $sessionId finished: $payload")
+      if (BuildConfig.DEBUG) {
+        Log.i(TAG, "Session $sessionId finished: $payload")
+      } else {
+        Log.i(TAG, "Session $sessionId finished: status=$status prompted=${entry.prompted.get()}")
+      }
       entry.invoke.resolve(payload)
     }
   }

@@ -576,7 +576,7 @@ export function FolderBrowser({
   onStartSelectWith,
   onToggleStar,
   onSendTo,
-  onWakeMachine,
+  onEnsureAwake,
   wakePendingSet = null,
   onRefreshFleet,
   onNewFolder,
@@ -785,14 +785,18 @@ export function FolderBrowser({
               : offlineMachineSub(machineObj || { name: machine })}
           </span>
         </div>
-        ${machineObj?.canWake && canWake && onWakeMachine
+        ${machineObj?.canWake && canWake && onEnsureAwake
           ? html`
               <div class="actions">
                 <button
                   type="button"
                   class="btn primary"
                   disabled=${isWaking}
-                  onClick=${() => onWakeMachine(machineObj)}
+                  onClick=${() =>
+                    onEnsureAwake(machineObj, {
+                      kind: 'files',
+                      label: 'open its files',
+                    })}
                 >
                   ${isWaking ? `Waking ${machine}…` : `Wake ${machine}`}
                 </button>
@@ -1830,17 +1834,24 @@ export function FilesView({
   filesActions,
   wakePendingSet = null,
   onRefreshFleet,
-  onWakeMachine,
+  onEnsureAwake,
   onRequestConfirm,
   onToast,
 }) {
   const machines = snapshot?.machines || [];
   const technical = Boolean(settings?.technical);
   const localNode = nodeInfo?.node || machines.find((m) => m.reachable)?.name || null;
+  const activeMachine = route.viewer?.machine || route.machine || localNode;
+
+  const [contentSupportRev, setContentSupportRev] = useState(0);
+  useEffect(() => {
+    if (typeof link?.onContentSupportChange !== 'function') return undefined;
+    return link.onContentSupportChange(() => setContentSupportRev((n) => n + 1));
+  }, [link]);
 
   const caps = useMemo(
-    () => detectFileCapabilities({ tools, allowedSet, link }),
-    [tools, allowedSet, link],
+    () => detectFileCapabilities({ tools, allowedSet, link, machine: activeMachine }),
+    [tools, allowedSet, link, activeMachine, contentSupportRev],
   );
 
   const [favourites, setFavourites] = useState([]);
@@ -1967,27 +1978,39 @@ export function FilesView({
   );
 
   const startDownload = useCallback(
-    (machine, items) => {
+    async (machine, items) => {
       if (!caps.hasDownload || typeof link?.download !== 'function') return;
       const list = Array.isArray(items) ? items.filter((i) => i.kind !== 'dir') : [items];
       if (list.length === 0) return;
-      for (const item of list) {
-        link
-          .download({
-            machine,
-            path: item.path,
-            name: item.name || baseFileName(item.path),
-            size: item.size,
-            mime: item.mime,
-          })
-          .catch(() => {});
-      }
+      let firstError = null;
+      const results = await Promise.all(
+        list.map((item) =>
+          link
+            .download({
+              machine,
+              path: item.path,
+              name: item.name || baseFileName(item.path),
+              size: item.size,
+              mime: item.mime,
+            })
+            .catch((err) => {
+              if (!firstError) firstError = err;
+              return null;
+            }),
+        ),
+      );
+      const started = results.filter(Boolean);
+      const transferIds = started.map((r) => r?.id).filter(Boolean);
       if (onToast) {
+        if (started.length === 0 && firstError) {
+          onToast(firstError?.message || 'Could not start download.', { tone: 'error' });
+          return;
+        }
         onToast(
           list.length === 1
-            ? `Downloading ${list[0].name || baseFileName(list[0].path)} — watch progress in Activity.`
-            : `Downloading ${list.length} items — watch progress in Activity.`,
-          { actionLabel: 'Activity', actionHref: '#/activity' },
+            ? `Downloading ${list[0].name || baseFileName(list[0].path)}. Watch progress in Activity.`
+            : `Downloading ${list.length} items. Watch progress in Activity.`,
+          { actionLabel: 'Activity', actionHref: '#/activity', transferIds },
         );
       }
     },
@@ -2002,14 +2025,25 @@ export function FilesView({
         .then((res) => {
           if (!res) return;
           setReloadToken((n) => n + 1);
+          const transferIds =
+            Array.isArray(res.ids) && res.ids.length > 0
+              ? res.ids.filter(Boolean)
+              : res.id
+                ? [res.id]
+                : [];
           if (onToast) {
-            onToast('Uploading to ' + machine + ' — watch progress in Activity.', {
+            onToast(`Uploading to ${machine}. Watch progress in Activity.`, {
               actionLabel: 'Activity',
               actionHref: '#/activity',
+              transferIds,
             });
           }
         })
-        .catch(() => {});
+        .catch((err) => {
+          if (onToast && err?.code !== 'cancelled') {
+            onToast(err?.message || `Could not upload to ${machine}.`, { tone: 'error' });
+          }
+        });
     },
     [caps.hasUpload, link, onToast],
   );
@@ -2135,7 +2169,7 @@ export function FilesView({
           onStartSelectWith=${filesActions.startSelect}
           onToggleStar=${toggleStar}
           onSendTo=${(m, items) => filesActions.openSheet({ kind: 'send', sourceMachine: m, items })}
-          onWakeMachine=${onWakeMachine}
+          onEnsureAwake=${onEnsureAwake}
           wakePendingSet=${wakePendingSet}
           onRefreshFleet=${onRefreshFleet}
           onNewFolder=${(m, p) => filesActions.openSheet({ kind: 'mkdir', machine: m, parentPath: p })}
@@ -2357,7 +2391,7 @@ export function FilesView({
               deviceNoun=${deviceNoun}
               technical=${technical}
               link=${link}
-              onWakeMachine=${onWakeMachine}
+              onEnsureAwake=${onEnsureAwake}
               onRefreshFleet=${onRefreshFleet}
               onLocalDone=${() => setReloadToken((n) => n + 1)}
               onStarted=${(info) => {
@@ -2365,7 +2399,15 @@ export function FilesView({
                 if (onToast) {
                   onToast(
                     info.message,
-                    info.local ? {} : { actionLabel: 'Activity', actionHref: '#/activity' },
+                    info.local
+                      ? {}
+                      : {
+                          actionLabel: 'Activity',
+                          actionHref: '#/activity',
+                          transferIds: info.transferIds,
+                          transferIdsPromise: info.transferIdsPromise,
+                          transferJobsPromise: info.transferJobsPromise,
+                        },
                   );
                 }
               }}
@@ -2522,11 +2564,17 @@ export function MachineFilesBrowser({
   settings,
   deviceNoun,
   thumbCache,
-  onWakeMachine,
+  onEnsureAwake,
 }) {
+  const [contentSupportRev, setContentSupportRev] = useState(0);
+  useEffect(() => {
+    if (typeof link?.onContentSupportChange !== 'function') return undefined;
+    return link.onContentSupportChange(() => setContentSupportRev((n) => n + 1));
+  }, [link]);
+
   const caps = useMemo(
-    () => detectFileCapabilities({ tools, allowedSet, link }),
-    [tools, allowedSet, link],
+    () => detectFileCapabilities({ tools, allowedSet, link, machine: machine?.name || null }),
+    [tools, allowedSet, link, machine?.name, contentSupportRev],
   );
   const technical = Boolean(settings?.technical);
   const [sortPref, setSortPref] = useState({ sort: 'name', order: 'asc' });
@@ -2571,7 +2619,7 @@ export function MachineFilesBrowser({
             viewer: { machine: m, path: entry.path },
           });
         }}
-        onWakeMachine=${onWakeMachine}
+        onEnsureAwake=${onEnsureAwake}
         onOpenSearch=${(q, m, p) => {
           window.location.hash = routeHref({
             section: 'files',

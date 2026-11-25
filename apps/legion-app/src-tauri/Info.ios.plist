@@ -8,5 +8,9 @@
 	<string>Legion uses the camera to scan the pairing code shown by your computer.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Legion uses the local network to reach your own machines.</string>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 </dict>
 </plist>

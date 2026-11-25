@@ -14,6 +14,9 @@ pub const SYNC_META_DIR: &str = ".legion-sync";
 /// Relative path of the folder identity marker inside `.legion-sync/`.
 pub const SYNC_MARKER_FILE: &str = ".legion-sync/marker.json";
 
+/// Relative path of the append-only, compacted folder deletion log inside `.legion-sync/`.
+pub const SYNC_DELETIONS_LOG_FILE: &str = ".legion-sync/deletions.log";
+
 /// Relative directory inside the sync folder for deleted and replaced copies.
 pub const SYNC_BIN_DIR: &str = ".legion-sync/bin";
 
@@ -141,6 +144,61 @@ pub fn validate_sync_path(raw: &str) -> Result<String> {
     }
 
     Ok(raw.to_string())
+}
+
+/// Verifies that symbolic link target `target` located at sync-relative path `link_rel_path` is a
+/// relative path that lexically resolves strictly inside the sync folder and never enters
+/// `.legion-sync`.
+///
+/// Absolute targets, targets containing backslashes or drive prefixes, targets pointing into
+/// `.legion-sync`, and relative targets whose `..` segments escape above the sync folder root are
+/// refused so they are held back and listed instead of synced.
+pub fn check_symlink_target_contained(
+    link_rel_path: &str,
+    target: &str,
+) -> std::result::Result<(), String> {
+    if target.is_empty() {
+        return Err("its target is empty".to_string());
+    }
+    if target.len() > crate::model::MAX_LINK_TARGET_BYTES {
+        return Err(format!(
+            "its target exceeds {} bytes",
+            crate::model::MAX_LINK_TARGET_BYTES
+        ));
+    }
+    if target.as_bytes().contains(&0) {
+        return Err("its target contains a NUL byte".to_string());
+    }
+    if target.starts_with('/') {
+        return Err("absolute symbolic links are not synced".to_string());
+    }
+    if target.contains('\\') {
+        return Err("symbolic links containing backslashes are not synced".to_string());
+    }
+
+    let mut stack: Vec<&str> = match parent_path(link_rel_path) {
+        Some(parent) => parent.split('/').collect(),
+        None => Vec::new(),
+    };
+    for seg in target.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if has_windows_drive_prefix(seg) {
+            return Err("symbolic links with drive prefixes are not synced".to_string());
+        }
+        if seg == ".." {
+            if stack.pop().is_none() {
+                return Err("it points outside the sync folder".to_string());
+            }
+        } else {
+            if is_dot_legion_sync_segment(seg) {
+                return Err("it points into '.legion-sync'".to_string());
+            }
+            stack.push(seg);
+        }
+    }
+    Ok(())
 }
 
 /// Validates a flat filename used inside `.legion-sync/tmp/` or `.legion-sync/bin/`.
@@ -762,5 +820,32 @@ mod tests {
                 .0,
             ProblemKind::UnsupportedSymlink
         );
+    }
+
+    #[test]
+    fn checks_symlink_target_containment() {
+        assert!(check_symlink_target_contained("link", "target.txt").is_ok());
+        assert!(check_symlink_target_contained("sub/link", "../target.txt").is_ok());
+        assert!(check_symlink_target_contained("a/b/link", "./../c/../d.txt").is_ok());
+        assert!(check_symlink_target_contained("sub/link", "..").is_ok());
+
+        for (path, target) in [
+            ("link", ""),
+            ("link", "/etc/passwd"),
+            ("sub/link", "/abs/path"),
+            ("link", "../outside.txt"),
+            ("sub/link", "../../outside.txt"),
+            ("sub/link", "a/../../../escape"),
+            ("link", ".legion-sync/marker.json"),
+            ("sub/link", "../.LEGION-SYNC/bin/x"),
+            ("link", "sub\\file.txt"),
+            ("link", "C:evil.txt"),
+            ("link", "bad\0target"),
+        ] {
+            assert!(
+                check_symlink_target_contained(path, target).is_err(),
+                "expected ({path:?} -> {target:?}) to be refused"
+            );
+        }
     }
 }

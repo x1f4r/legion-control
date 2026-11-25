@@ -42,7 +42,7 @@ export function SendToSheet({
   deviceNoun = 'phone',
   technical = false,
   link,
-  onWakeMachine,
+  onEnsureAwake,
   onRefreshFleet,
   onLocalDone,
   onStarted,
@@ -161,10 +161,11 @@ export function SendToSheet({
   const allSizesKnown =
     items.length > 0 && items.every((it) => it && it.kind !== 'dir' && Number.isFinite(it.size));
   const totalBytes = allSizesKnown ? items.reduce((sum, it) => sum + it.size, 0) : 0;
-  const title =
+  const what =
     items.length === 1
-      ? `Send ${items[0].name || baseFileName(items[0].path)}`
-      : `Send ${items.length} items`;
+      ? items[0].name || baseFileName(items[0].path)
+      : `${items.length} items`;
+  const title = `Send ${what}`;
   const subParts = [
     allSizesKnown ? formatBytes(totalBytes) : null,
     `from ${sourceMachine}`,
@@ -187,40 +188,38 @@ export function SendToSheet({
     if (!onStarted) onClose();
 
     if (destMachine === '__device__') {
-      const startedNames = [];
-      for (const item of items) {
-        if (item.kind === 'dir') continue;
-        startedNames.push(item.name || baseFileName(item.path));
-        if (typeof link?.download === 'function') {
-          link
-            .download({
-              machine: sourceMachine,
-              path: item.path,
-              name: item.name || baseFileName(item.path),
-              size: item.size,
-              mime: item.mime,
-            })
-            .catch(() => {});
-        }
-      }
+      const downloadable = items.filter((item) => item.kind !== 'dir');
+      const startedNames = downloadable.map((item) => item.name || baseFileName(item.path));
+      const transferIdsPromise =
+        typeof link?.download === 'function'
+          ? Promise.all(
+              downloadable.map((item) =>
+                link
+                  .download({
+                    machine: sourceMachine,
+                    path: item.path,
+                    name: item.name || baseFileName(item.path),
+                    size: item.size,
+                    mime: item.mime,
+                  })
+                  .catch(() => null),
+              ),
+            ).then((results) => results.map((r) => r?.id).filter(Boolean))
+          : Promise.resolve([]);
       if (onStarted) {
         onStarted({
           kind: 'download',
+          transferIdsPromise,
           message:
             startedNames.length === 1
-              ? `Downloading ${startedNames[0]} — watch progress in Activity.`
-              : `Downloading ${startedNames.length} items — watch progress in Activity.`,
+              ? `Downloading ${startedNames[0]}. Watch progress in Activity.`
+              : `Downloading ${startedNames.length} items. Watch progress in Activity.`,
         });
       }
       return;
     }
 
     recordRecentDestination(safeStorage(), destMachine, targetDir);
-
-    const what =
-      items.length === 1
-        ? items[0].name || baseFileName(items[0].path)
-        : `${items.length} items`;
 
     // Same-machine Move uses `fs.move` and same-machine Copy uses `fs.copy` — instant, no job.
     if (destMachine === sourceMachine && ((isMove && caps?.hasMove) || (!isMove && caps?.hasCopy))) {
@@ -246,6 +245,7 @@ export function SendToSheet({
     }
 
     const runTransfers = async () => {
+      const startedJobs = [];
       for (const item of items) {
         const destPath = buildTransferDestination(targetDir, item.path);
         const baseArgs = {
@@ -256,8 +256,9 @@ export function SendToSheet({
         if (caps?.hasTransferIfExists) baseArgs.if_exists = 'rename';
         if (isMove && caps?.hasTransferMove) baseArgs.move = true;
 
+        let res = null;
         try {
-          await link.call('fs.transfer', baseArgs, { on: sourceMachine });
+          res = await link.call('fs.transfer', baseArgs, { on: sourceMachine });
         } catch {
           // Fall back to starting the transfer on the destination when the source cannot reach it.
           const fallbackArgs = {
@@ -265,17 +266,28 @@ export function SendToSheet({
             from: `${sourceMachine}:${item.path}`,
             to: destPath,
           };
-          await link.call('fs.transfer', fallbackArgs, { on: destMachine }).catch(() => {});
+          res = await link.call('fs.transfer', fallbackArgs, { on: destMachine }).catch(() => null);
+        }
+        if (res?.job?.id) {
+          startedJobs.push({
+            id: res.job.id,
+            machine: res.job.machine || sourceMachine,
+            label: item.name || baseFileName(item.path),
+            move: isMove,
+            destMachine,
+          });
         }
       }
+      return startedJobs;
     };
-    runTransfers();
+    const transferJobsPromise = runTransfers();
 
     const verb = isMove ? 'Moving' : 'Copying';
     if (onStarted) {
       onStarted({
         kind: 'transfer',
-        message: `${verb} ${what} to ${destMachine} — watch progress in Activity.`,
+        transferJobsPromise,
+        message: `${verb} ${what} to ${destMachine}. Watch progress in Activity.`,
       });
     }
   }
@@ -425,13 +437,21 @@ export function SendToSheet({
                         <span class="title">${m.name}</span>
                         <span class="sub">${waking ? 'Waking…' : 'Off · turn it on to send here'}</span>
                       </span>
-                      ${m.canWake && canWake && onWakeMachine
+                      ${m.canWake && canWake && onEnsureAwake
                         ? html`
                             <button
                               type="button"
                               class="btn small"
                               disabled=${waking}
-                              onClick=${() => onWakeMachine(m)}
+                              onClick=${() =>
+                                onEnsureAwake(m, {
+                                  kind: 'transfer',
+                                  label: `send ${what} to ${m.name}`,
+                                  forgettable: true,
+                                  onContinue: () => {
+                                    setDest(m.name);
+                                  },
+                                })}
                             >
                               ${waking ? 'Waking…' : 'Wake'}
                             </button>

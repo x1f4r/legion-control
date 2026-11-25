@@ -15,6 +15,7 @@ path = "src/main.rs"
 legion-core.workspace = true
 legion-doors.workspace = true
 legion-net.workspace = true
+legion-os.workspace = true
 legion-proto.workspace = true
 legion-sync.workspace = true
 legion-tools.workspace = true

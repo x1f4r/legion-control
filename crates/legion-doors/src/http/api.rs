@@ -30,7 +30,12 @@ const QUEUE: usize = 256;
 pub(crate) async fn health(State(shared): State<Arc<Shared>>) -> Response<Body> {
     reply::json(
         StatusCode::OK,
-        &json!({"ok": true, "node": shared.node.name(), "version": VERSION}),
+        &json!({
+            "ok": true,
+            "node": shared.node.name(),
+            "version": VERSION,
+            "content": true,
+        }),
     )
 }
 

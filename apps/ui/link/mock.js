@@ -451,18 +451,44 @@ const MOCK_TOOLS = [
   {
     name: 'sys.info',
     effect: 'read',
-    description: 'Describe this machine: host name, operating system, uptime, CPU, memory, disks, and GPUs.',
+    description: 'Describe this machine: host name, operating system, uptime, CPU, memory, disks, graphics cards, and battery.',
     input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'sys.procs',
+    effect: 'read',
+    description: 'List the processes running on this machine, busiest first, or grouped by program.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        filter: { type: 'string', description: 'Keep only processes whose name or command line contains this.' },
+        sort: { type: 'string', enum: ['cpu', 'memory', 'gpu_memory'], description: 'What the busiest are measured by.' },
+        limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Maximum rows to return.' },
+        group: { type: 'boolean', default: false, description: 'Combine processes with the same name and user.' },
+      },
+    },
   },
   {
     name: 'sys.kill',
     effect: 'destroy',
-    description: 'Stop a process: ask it to exit, and force it after a short grace if it has not.',
+    description: 'Stop one process or up to 64 verified targets.',
     input_schema: {
       type: 'object',
-      required: ['pid'],
       properties: {
         pid: { type: 'integer', minimum: 0, description: 'Process id.' },
+        start_time: { type: 'string', description: 'Process start time.' },
+        targets: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['pid', 'start_time'],
+            properties: {
+              pid: { type: 'integer', minimum: 0 },
+              start_time: { type: 'string' },
+            },
+          },
+          description: 'Verified {pid, start_time} targets.',
+        },
         tree: { type: 'boolean', default: false, description: 'Stop descendants too.' },
         force: { type: 'boolean', default: false, description: 'Stop immediately.' },
       },
@@ -555,6 +581,17 @@ export function createMockLink(mode = '') {
   const isUpdateFailed = flags.has('update-failed');
   const isUpdateMetered = flags.has('update-metered');
   const isUpdateSeq0 = flags.has('update-seq0');
+  const isMinimal = flags.has('minimal');
+  const isAmber = flags.has('amber') || flags.has('hot');
+  const isWakeNever = flags.has('wake-never');
+  let wakeTicksTarget = null;
+  for (const f of flags) {
+    if (f.startsWith('wake-ticks=')) {
+      const n = Number.parseInt(f.slice('wake-ticks='.length), 10);
+      if (Number.isFinite(n) && n >= 0) wakeTicksTarget = n;
+    }
+  }
+  const wakeStateByMachine = new Map();
 
   let authed = !isToken && !isPair && !isRepair;
   let repaired = false;
@@ -715,11 +752,78 @@ export function createMockLink(mode = '') {
         os: { family: 'linux', name: 'Linux', version: '7.2', kernel: '7.2.0', arch: 'x86_64' },
         uptime_s: 11 * 3600 + 26 * 60,
         boot_id: '7b51c60a-0d29-42b0-9c52-88b6d5a10001',
-        cpu: { model: 'Ryzen 9 9950X3D', cores: 32, usage_pct: 71.0, load: [3.2, 2.9, 2.4] },
+        cpu: {
+          model: 'Ryzen 9 9950X3D',
+          cores: 32,
+          usage_pct: 71.0,
+          load: [3.2, 2.9, 2.4],
+          temperature_c: isAmber ? 89.0 : 72.4,
+        },
         memory: { total: 60e9, used: 29e9, available: 31e9, swap_total: 32e9, swap_used: 0 },
         disks: [{ mount: '/', fs: 'btrfs', total: 2.8e12, available: 2.553e12 }],
-        gpus: [{ name: 'RTX 5080', memory_total: 16e9, memory_used: 11e9, utilization_pct: 69.0 }],
+        gpus: [
+          {
+            name: 'RTX 5080',
+            vendor: 'nvidia',
+            memory_total: 16e9,
+            memory_used: 9.1e9,
+            utilization_pct: 69.0,
+            temperature_c: isAmber ? 88.0 : 68.0,
+            power_w: 245.5,
+          },
+        ],
       },
+      procs: [
+        {
+          name: 'rustc',
+          user: 'me',
+          count: 12,
+          cpu_pct: 1984.0,
+          memory: 4.8e9,
+          cmd: 'rustc --crate-name legion_core --edition=2024 --emit=dep-info,link',
+          members: Array.from({ length: 12 }, (_, i) => ({
+            pid: 3100 + i,
+            start_time: isoAgo(840 - i * 15),
+          })),
+          more: 0,
+        },
+        {
+          name: 'python3',
+          user: 'me',
+          count: 1,
+          cpu_pct: 42.0,
+          memory: 3.2e9,
+          gpu_memory: 9.1e9,
+          cmd: 'python3 train.py --epochs 20 --batch-size 32',
+          stubborn: true,
+          members: [{ pid: 4120, start_time: isoAgo(2100) }],
+          more: 0,
+        },
+        {
+          name: 'chromium',
+          user: 'me',
+          count: 8,
+          cpu_pct: 128.0,
+          memory: 5.4e9,
+          cmd: '/usr/lib/chromium/chromium --enable-features=UseOzonePlatform',
+          members: Array.from({ length: 8 }, (_, i) => ({
+            pid: 5100 + i,
+            start_time: isoAgo(7200),
+          })),
+          more: 0,
+        },
+        {
+          name: 'legion',
+          user: 'me',
+          count: 1,
+          cpu_pct: 2.0,
+          memory: 45e6,
+          self: true,
+          cmd: 'legion serve --listen 127.0.0.1:7117',
+          members: [{ pid: 1042, start_time: isoAgo(11 * 3600) }],
+          more: 0,
+        },
+      ],
       jobs: [
         {
           id: 'j-backup-1',
@@ -831,17 +935,30 @@ export function createMockLink(mode = '') {
     },
     pi: {
       reachable: true,
-      sys: {
-        node: 'pi',
-        hostname: 'pi',
-        os: { family: 'linux', name: 'Debian', version: '13', kernel: '6.12.0', arch: 'aarch64' },
-        uptime_s: 41 * 86400 + 3600,
-        boot_id: 'a011c60a-0d29-42b0-9c52-88b6d5a10002',
-        cpu: { model: 'Cortex-A76', cores: 4, usage_pct: 6.0, load: [0.18, 0.22, 0.2] },
-        memory: { total: 8e9, used: 2.5e9, available: 5.5e9, swap_total: 2e9, swap_used: 0 },
-        disks: [{ mount: '/', fs: 'ext4', total: 128e9, available: 71.7e9 }],
-        gpus: [],
-      },
+      sys: isMinimal
+        ? {
+            node: 'pi',
+            hostname: 'pi',
+            os: { family: 'linux', name: 'Debian', version: '13', arch: 'aarch64' },
+            uptime_s: 41 * 86400 + 3600,
+            boot_id: 'a011c60a-0d29-42b0-9c52-88b6d5a10002',
+            cpu: {},
+            memory: {},
+            disks: [],
+            gpus: [],
+          }
+        : {
+            node: 'pi',
+            hostname: 'pi',
+            os: { family: 'linux', name: 'Debian', version: '13', kernel: '6.12.0', arch: 'aarch64' },
+            uptime_s: 41 * 86400 + 3600,
+            boot_id: 'a011c60a-0d29-42b0-9c52-88b6d5a10002',
+            cpu: { model: 'Cortex-A76', cores: 4, usage_pct: 6.0, load: [0.18, 0.22, 0.2], temperature_c: 48.2 },
+            memory: { total: 8e9, used: 2.5e9, available: 5.5e9, swap_total: 2e9, swap_used: 0 },
+            disks: [{ mount: '/', fs: 'ext4', total: 128e9, available: isAmber ? 3.8e9 : 71.7e9 }],
+            gpus: [],
+          },
+      procs: [],
       jobs: [],
       services: [
         { name: 'tailscaled.service', scope: 'system', state: 'running', enabled: true, description: 'Tailscale node agent' },
@@ -869,7 +986,14 @@ export function createMockLink(mode = '') {
         memory: { total: 128e9, used: 99.8e9, available: 28.2e9, swap_total: 0, swap_used: 0 },
         disks: [{ mount: '/', fs: 'apfs', total: 2e12, available: 140e9 }],
         gpus: [],
+        battery: {
+          percent: isAmber ? 12 : 84,
+          state: 'discharging',
+          on_ac: false,
+          time_left_s: isAmber ? 1800 : 15300,
+        },
       },
+      procs: [],
       jobs: [],
       services: [
         { name: 'net.example.legion', scope: 'user', state: 'running', enabled: true, description: 'Legion HTTP door' },
@@ -935,12 +1059,54 @@ export function createMockLink(mode = '') {
     };
   }
 
+  function bringMockMachineOnline(wakeTarget, targetMachine) {
+    targetMachine.reachable = true;
+    targetMachine.error = null;
+    if (!targetMachine.sys) {
+      targetMachine.sys = {
+        node: wakeTarget,
+        hostname: wakeTarget,
+        os: { family: 'linux', name: 'Linux', version: '6.12', arch: 'x86_64' },
+        uptime_s: 12,
+        cpu: { model: 'Ryzen 9 5900HX', cores: 16, usage_pct: 14.0, load: [0.18, 0.14, 0.1], temperature_c: 51.0 },
+        memory: { total: 32e9, used: 6e9, available: 26e9, swap_total: 8e9, swap_used: 0 },
+        disks: [{ mount: '/', fs: 'ext4', total: 1000e9, available: 580e9 }],
+        gpus: [
+          {
+            name: 'AMD GPU',
+            vendor: 'amd',
+            memory_total: 4e9,
+            memory_used: 0.6e9,
+            utilization_pct: 8.0,
+            temperature_c: 46.0,
+            power_w: 14.2,
+          },
+        ],
+        battery: { percent: 78, state: 'charging', on_ac: true, time_left_s: 2400 },
+      };
+    }
+    if (!Array.isArray(targetMachine.procs)) targetMachine.procs = [];
+    if (!Array.isArray(targetMachine.jobs)) targetMachine.jobs = [];
+    if (!Array.isArray(targetMachine.services)) targetMachine.services = [];
+    if (!Array.isArray(targetMachine.projects)) targetMachine.projects = [];
+    if (!targetMachine.power) {
+      targetMachine.power = {
+        system: 'linux',
+        boot_id: 'woken-boot-id',
+        busy: { state: 'idle', reasons: [] },
+        targets: [],
+        sudo: true,
+        pending: null,
+      };
+    }
+  }
+
   const filesState = createMockFilesState({
     machines,
     flags,
     activeNodeRef: () => activeNode,
     isAuthedRef: () => authed,
-    canReadRef: () => allowedTools.includes('fs.read'),
+    canReadRef: () => allowedTools.includes('fs.read') && !isDenyRead,
   });
 
   function resolveOne(target, tool, args, onEvent) {
@@ -1028,6 +1194,20 @@ export function createMockLink(mode = '') {
       }
       case 'fleet.ping': {
         const answering = isPrimaryOffline && activeNode === 'tower' ? 'pi' : activeNode;
+        const requested = Array.isArray(args?.machines) ? args.machines : [];
+        // Advance deterministic wake-ticks counters when polled via fleet.ping.
+        if (wakeTicksTarget !== null && !isWakeNever) {
+          for (const targetName of requested) {
+            const st = wakeStateByMachine.get(targetName);
+            const targetMachine = machines[targetName];
+            if (st && targetMachine && !targetMachine.reachable) {
+              st.pings += 1;
+              if (st.pings >= wakeTicksTarget) {
+                bringMockMachineOnline(targetName, targetMachine);
+              }
+            }
+          }
+        }
         const all = [
           isPrimaryOffline
             ? { machine: 'tower', reachable: false, error: machines.tower.error }
@@ -1042,8 +1222,8 @@ export function createMockLink(mode = '') {
         if (isFirst) {
           all.push({ machine: 'mini', reachable: false, error: machines.mini.error });
         }
-        if (Array.isArray(args?.machines) && args.machines.length > 0) {
-          const wanted = new Set(args.machines);
+        if (requested.length > 0) {
+          const wanted = new Set(requested);
           return { answered_by: answering, results: all.filter((entry) => wanted.has(entry.machine)) };
         }
         return { answered_by: answering, results: all.filter((entry) => entry.machine !== answering) };
@@ -1203,6 +1383,90 @@ export function createMockLink(mode = '') {
       }
       case 'sys.info':
         return m.sys;
+      case 'sys.procs': {
+        const rawList = Array.isArray(m.procs) ? m.procs : [];
+        const needle = args?.filter ? String(args.filter).toLowerCase() : '';
+        const filtered = needle
+          ? rawList.filter(
+              (p) =>
+                p.name.toLowerCase().includes(needle) ||
+                String(p.cmd || '').toLowerCase().includes(needle),
+            )
+          : rawList;
+        const sortBy = args?.sort || 'cpu';
+        const sorted = [...filtered].sort((a, b) => {
+          if (sortBy === 'gpu_memory') return (b.gpu_memory || 0) - (a.gpu_memory || 0);
+          if (sortBy === 'memory') return (b.memory || 0) - (a.memory || 0);
+          return (b.cpu_pct || 0) - (a.cpu_pct || 0);
+        });
+        const limit = Number.isInteger(args?.limit) ? Math.max(1, Math.min(500, args.limit)) : 30;
+        const rows = sorted.slice(0, limit).map(({ stubborn: _s, refuseReason: _r, ...rest }) => rest);
+        return { procs: rows, total: sorted.length, truncated: sorted.length > rows.length };
+      }
+      case 'sys.kill': {
+        const list = Array.isArray(m.procs) ? m.procs : [];
+        const force = Boolean(args?.force);
+        if (Array.isArray(args?.targets)) {
+          const results = [];
+          const stoppedPids = new Set();
+          for (const target of args.targets) {
+            if (target.pid === 0 || target.pid === 1) {
+              results.push({
+                pid: target.pid,
+                status: 'refused',
+                code: 'denied',
+                message: 'The system requires this program and will not stop it.',
+              });
+              continue;
+            }
+            const group = list.find((g) => (g.members || []).some((mem) => mem.pid === target.pid));
+            if (!group) {
+              results.push({ pid: target.pid, status: 'gone' });
+              continue;
+            }
+            if (group.self) {
+              results.push({
+                pid: target.pid,
+                status: 'refused',
+                code: 'denied',
+                message: 'Legion cannot stop itself.',
+              });
+              continue;
+            }
+            if (group.refuseReason) {
+              results.push({
+                pid: target.pid,
+                status: 'refused',
+                code: 'denied',
+                message: group.refuseReason,
+              });
+              continue;
+            }
+            const mem = group.members.find((x) => x.pid === target.pid);
+            if (mem && target.start_time && mem.start_time !== target.start_time) {
+              results.push({ pid: target.pid, status: 'reused' });
+              continue;
+            }
+            if (group.stubborn && !force) {
+              results.push({ pid: target.pid, status: 'still_running' });
+              continue;
+            }
+            stoppedPids.add(target.pid);
+            results.push({ pid: target.pid, status: 'stopped' });
+          }
+          if (stoppedPids.size > 0) {
+            m.procs = list
+              .map((g) => {
+                const remaining = (g.members || []).filter((mem) => !stoppedPids.has(mem.pid));
+                if (remaining.length === 0) return null;
+                return { ...g, count: remaining.length, members: remaining };
+              })
+              .filter(Boolean);
+          }
+          return { results };
+        }
+        return { pid: args?.pid ?? 0, stopped: true, survivors: [] };
+      }
       case 'exec.run': {
         const line = args?.cmd || (Array.isArray(args?.argv) ? args.argv.join(' ') : '');
         const stdout = line.startsWith('df')
@@ -1379,23 +1643,14 @@ export function createMockLink(mode = '') {
       case 'power.wake': {
         const wakeTarget = args?.machine || 'laptop';
         if (!args?.dry_run && machines[wakeTarget] && !machines[wakeTarget].reachable) {
-          setTimeout(() => {
-            const targetMachine = machines[wakeTarget];
-            if (!targetMachine || targetMachine.reachable) return;
-            targetMachine.reachable = true;
-            targetMachine.error = null;
-            if (!targetMachine.sys) {
-              targetMachine.sys = {
-                node: wakeTarget,
-                os: { family: 'linux', name: 'Linux', arch: 'x86_64' },
-                uptime_s: 12,
-                load: [0.18, 0.14, 0.1],
-                memory: { total: 32 * 1024 ** 3, used: 6 * 1024 ** 3, available: 26 * 1024 ** 3 },
-                disks: [{ mount: '/', total: 1000 * 1024 ** 3, used: 420 * 1024 ** 3, available: 580 * 1024 ** 3 }],
-                gpus: [],
-              };
-            }
-          }, 450);
+          wakeStateByMachine.set(wakeTarget, { pings: 0 });
+          if (!isWakeNever && wakeTicksTarget === null) {
+            setTimeout(() => {
+              const targetMachine = machines[wakeTarget];
+              if (!targetMachine || targetMachine.reachable) return;
+              bringMockMachineOnline(wakeTarget, targetMachine);
+            }, 450);
+          }
         }
         return {
           machine: wakeTarget,

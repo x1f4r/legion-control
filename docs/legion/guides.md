@@ -3,7 +3,99 @@
 Task-oriented walk-throughs for day-to-day work with Legion. Every transcript below comes from the
 built binary with placeholder machine names, users, and addresses.
 
-## Files and transfer (`legion cp` and `fs.transfer`)
+## Files and transfer (`fs.*`, `legion cp`, and `fs.transfer`)
+
+### Browsing, searching, and thumbnails (`fs.list`, `fs.find`, `fs.stat`, `fs.thumb`)
+
+Regular files reported by `fs.list`, `fs.find`, and `fs.stat` include `category` (`image`, `video`,
+`audio`, `document`, `text`, `archive`, or `other`) and `mime`, determined by file extension
+(case-insensitive, without opening files in `fs.list` or `fs.stat`; in `fs.find` and `fs.thumb`,
+regular `.ts` files are sniffed for MPEG-TS sync packets so `.ts` video recordings classify as
+`video` / `video/mp2t` while TypeScript files stay `text` / `text/typescript`). Directories,
+symbolic links, and special files keep their existing `kind` and omit `category` and `mime`.
+
+- **Listing (`fs.list`)**: sorts directories first, then entries by `sort` (`name`, `modified`, or
+  `size`) and `order` (`asc` or `desc`), using natural case-insensitive ordering for `name`
+  (`file2.jpg` before `file10.jpg`). Pass `categories` (for example `categories='["image"]'`) to
+  keep directories alongside matching files, and `offset` / `limit` to page through results using
+  `total`, `total_exact`, and `truncated`. Single-level listings (`depth=1`) always report an
+  exact `total`; recursive listings (`depth > 1`) stay on one filesystem and stop counting once
+  past the page cap or time budget, returning a lower bound with `total_exact: false`.
+- **Searching (`fs.find`)**: filters by `name` (all whitespace-separated words must appear in the
+  file name, case-insensitive and Unicode-aware), `glob`, `kind`, `categories`, `min_size`,
+  `max_size`, `modified_after`, and `modified_before` (RFC 3339 timestamps in the same format
+  returned by `fs.stat`). `hidden` is controlled independently of `ignore`, so
+  `ignore=false hidden=false` searches ignored build trees without entering dotfiles. Without
+  `sort`, matches stream in directory-entry order for speed; pass `sort` when deterministic order
+  is needed. Every search runs inside `budget_ms` (default `10000`, up to `60000`), checked across
+  unreadable directories too; stopping early sets `truncated: true` and `reason: "time"` or
+  `"limit"`.
+- **Searching across the fleet (`fs.find --on all`)**: fans out concurrently to this node and every
+  machine in `fleet.toml`, returning:
+
+  ```json
+  {
+    "results": {
+      "tower": {
+        "ok": {
+          "machine": "tower",
+          "matches": [{"path": "/home/me/photos/holiday.jpg", "kind": "file", "size": 204800, "mtime": "2026-11-24T02:40:18.942Z", "category": "image", "mime": "image/jpeg"}],
+          "truncated": false
+        }
+      },
+      "pi": {
+        "error": {"code": "unreachable", "message": "…", "hint": "…", "machine": "pi"}
+      }
+    }
+  }
+  ```
+
+  Each reachable machine names itself in `machine` inside its `ok` object, and unreachable machines
+  appear under their own key with `error.code = "unreachable"` without failing the search.
+- **Thumbnails (`fs.thumb`)**: generates thumbnails on the node for 1 to 32 paths per call (`size`
+  96 to 512, default 256; `fit` `"contain"` or `"cover"`), returning exactly one result per input
+  path in input order: `{"results": [{"path": …, "ok": {"mime", "content", "width", "height"}} |
+  {"path": …, "error": …}]}`. Regular files are opened non-blockingly (`O_NONBLOCK | O_NOCTTY` plus
+  `fstat` regular-file check on Unix; disk file check on Windows) so swapping a file for a FIFO
+  cannot hang a node thread. JPEG, PNG, GIF (first frame), WebP, and BMP images are header-peeked
+  (`<= 128 KiB`, scanning GIF extension blocks up to the peek bound), reserved against the fair
+  pool before reading full bytes, and decoded out-of-process in a memory-bounded worker receiving
+  the open file handle on `stdin` with a cleared minimal environment (with EXIF orientation applied).
+  Admission caps source files at 64 MiB and estimated peak decode memory at 256 MiB per image
+  (admitting 48–61 MP baseline photos while capping heavier progressive/16-bit/interlaced images),
+  with embedded MPF preview / EXIF IFD1 thumbnail fallback for over-cap JPEGs. Every worker enforces
+  an exact cross-OS live-heap cap via a capped global allocator (sized at `1.35x estimated_peak +
+  8 MiB`, floored at `16 MiB`), backed by a 10 ms RSS watchdog on every platform (including macOS)
+  set at the measured per-platform worker baseline plus `heap_cap` plus `max(6 MiB, 10% of
+  heap_cap)`, OS backstop limits above that (`RLIMIT_AS` with virtual-address headroom on Linux,
+  `RLIMIT_DATA` on other non-macOS Unix, suspended-create Job Object limits on Windows), and a 10 s
+  wall-clock kill timeout. Each worker reserves its exact watchdog resident limit (`baseline +
+  heap_cap + max(6 MiB, 10%)`) from the shared in-flight budget of `min(512 MiB, effective RAM /
+  8)` (honoring cgroup v2/v1 and Windows Job Object limits, floored at 256 MiB) across up to 16
+  concurrent decodes (scaled to CPU cores, bounded by the shared byte budget) round-robin per
+  principal with anti-starvation aging, plus a 10 s wait timeout returning retryable `busy`. Only
+  allocator-cap memory kills (where the capped allocator stopped an image exceeding its heap cap)
+  are cached as bad-file entries in `thumb-cache/` keyed by file identity plus `size` and `fit`
+  (expiring after 1 day); backstop kills while under the heap cap, external kills
+  (`SIGKILL`/`SIGTERM`), and crashes return a transient per-path error without poisoning the cache,
+  and timeouts are never cached permanently as bad (repeated CPU-busy timeouts of the same
+  file/size/fit trigger a 5-minute in-memory back-off). Output is JPEG, or PNG when transparent.
+  Video posters (including sniffed MPEG-TS `.ts` recordings) run `ffmpeg` by resolved absolute path
+  with a cleared minimal environment and `MALLOC_ARENA_MAX=2` (`-threads 1` limits decoder,
+  encoder, and filter threads rather than making `ffmpeg` strictly single-threaded), enforced by
+  the RSS watchdog (256 MiB resident limit for `<= 1080p` sharing the 512 MiB pool; `> 1080p` 4K/8K
+  videos drain the shared pool and all video slots to run strictly alone under an exclusive
+  `min(768 MiB, max(256 MiB, effective RAM / 4))` resident budget, honoring rotation metadata) plus
+  a +1 GiB address-space backstop (`-max_pixels 67108864`,
+  `-max_alloc 134217728`, `-protocol_whitelist file`, MOV/MP4 pinned with `-enable_drefs 0
+  -use_absolute_path 0`, non-MOV `-format_whitelist` excluding MOV and playlists, video-only
+  mapping, 15 s timeout) when `ffmpeg` is on `PATH` and report `unsupported` otherwise. Positive
+  thumbnails and expiring bad-file entries share a lock-free 256 MiB disk-reconciled LRU cache
+  under the node's state directory (`thumb-cache/`), keyed by path, OS file identity, metadata
+  change time, size, mtime, and parameters, inaccessible to non-admin roles through `fs.*`, and
+  every path requires the same permission as `fs.read`.
+
+### Copying and syncing (`legion cp` and `fs.transfer`)
 
 `legion cp` is the command-line wrapper over `fs.transfer`. Each endpoint is either a local path
 (absolute or starting with `~`, including Windows drive paths like `C:\Users\me\file.txt`) or
@@ -961,7 +1053,7 @@ curl -sS http://127.0.0.1:7117/v1/health
 ```
 
 ```json
-{"ok":true,"node":"tower","version":"0.1.0"}
+{"ok":true,"node":"tower","version":"0.1.0","content":true}
 ```
 
 List allowed tools for the token's principal:
@@ -985,6 +1077,104 @@ curl -sS \
 ```
 
 Pass `"on": "pi"` or `"on": "all"` in the JSON body to target remote machines.
+
+### File content (`POST /v1/content`)
+
+To feed a file to an `<img>`, `<video>`, `<audio>`, or resumable download with byte-range access,
+mint a short-lived content address with `POST /v1/content`:
+
+```sh
+curl -sS \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"path":"~/projects/app/clip.mp4","on":"pi"}' \
+  http://127.0.0.1:7117/v1/content
+```
+
+```json
+{"url":"/v1/content/<ticket>/clip.mp4","expires_in":900}
+```
+
+Omit `"on"` to read a file on the node serving HTTP itself; when `"on"` names another machine in
+`fleet.toml`, the node reads the requested byte range through its own `legion stream` session to
+that machine. `"on"` must name a single machine (never `"all"` or a list).
+
+Fetch the returned same-origin address with `GET` or `HEAD`, with optional single-range `Range`,
+`If-Range` (matched against the strong `ETag` built from size and modification time), and
+`?download=1` to force `Content-Disposition: attachment`:
+
+```sh
+curl -sS -r 0-65535 http://127.0.0.1:7117/v1/content/<ticket>/clip.mp4 -o chunk.bin
+curl -sSI 'http://127.0.0.1:7117/v1/content/<ticket>/clip.mp4?download=1'
+```
+
+Security and lifecycle guarantees:
+
+- **Tickets, revocation bounds, and audit durability**: 256 random bits bound to one bearer token,
+  one principal, one machine, and one bounded file path (at most 4 KiB; `POST /v1/content` bodies
+  are capped at 16 KiB). Permissions are checked as `fs.read` when the ticket is minted, on every
+  `GET` or `HEAD`, on an independent 1-second liveness timer per active stream (not tied to body
+  polling or client read speed), and immediately before yielding another 64 KiB frame after socket
+  backpressure. Revoking a token or removing a principal revokes every ticket of that holder; a
+  narrowed path, expiry, or crossing the 6-hour hard limit ends only that ticket and leaves the
+  holder's other still-allowed tickets serving. Active content sockets request `SO_SNDBUF = 128 KiB`
+  before sending the response (effective kernel buffer varies by OS: 256 KiB on Linux due to kernel
+  doubling, ~128–147 KiB on macOS, 128 KiB on Windows), and for what the door itself decides (its
+  bearer tokens, local principals and paths in `policy.toml`, and ticket lifetime) detecting a
+  revocation cancels the connection first (before flushing audit records), stops handing bytes to
+  the socket, discards server buffers, releases any remote pipe, and sends TCP RST
+  (`SO_LINGER(0)`). That guarantees server-side cutoff within 2 seconds even for slow (20 KB/s) or
+  completely stalled readers, zero bytes handed to the socket after cutoff with the connection
+  closed, and at most the physical ceiling (`effective SO_SNDBUF + client effective SO_RCVBUF +
+  bytes the client reads before cutoff + 64 KiB`, collapsing to `effective SO_SNDBUF + client
+  effective SO_RCVBUF + 64 KiB` for a stalled reader) handed to the socket between revocation and
+  cutoff. For a file on a remote machine, the door does not watch that machine's `policy.toml`: a
+  policy change on the remote machine takes effect at that machine's next check of the stream, which
+  a slow reader delays, and the slow-reader timeout is the backstop. The send-buffer bound (256 KiB
+  effective on Linux) applies to the loopback hop only; behind Tailscale Serve (or another reverse
+  proxy), its own buffers sit beyond it. Bytes already received into the client OS's own TCP receive
+  buffer before revocation cannot be taken back and stay drainable by the client (varying by OS and
+  receive-buffer autotuning, e.g. ~128–256 KiB on Linux loopback and ~384–650 KiB on macOS
+  loopback). Tickets expire using a suspend-safe clock (15 minutes after last use, 6 hours absolute
+  maximum), are capped at 128 per token (evicting the oldest), and are never logged.
+  Minting writes one durable `content.ticket` entry; the first `GET` or `HEAD` on a ticket writes
+  one durable `content.open` entry immediately so every access survives `SIGKILL` or power loss;
+  ongoing reads coalesce to at most one `content.read` summary per ticket per minute (and
+  `stream.get` on remote nodes) with request count and bytes served.
+- **Headers and isolation**: every reply carries `X-Content-Type-Options: nosniff`,
+  `Cross-Origin-Resource-Policy: same-origin`, `Referrer-Policy: no-referrer`, `Cache-Control:
+  private, no-store`, and unconditionally
+  `Content-Security-Policy: sandbox; default-src 'none'; frame-ancestors 'none'`. `Content-Type`
+  comes from a fixed allow-list (raster images, SVG, video, audio, `text/vtt; charset=utf-8` for
+  `.vtt`, and `text/plain; charset=utf-8` for all other text files including HTML); unlisted types
+  — including PDF — are served as `application/octet-stream` with `Content-Disposition:
+  attachment`. Opened HTML, SVG, or PDF files can never run script or be framed inside the
+  interface's origin.
+- **Host, `Origin`, and third-party pages**: `/v1/content/<ticket>/<name>` enforces the same `Host`
+  and `Origin` checks as every other route. Because `<img>`, `<video>`, `<audio>`, and direct
+  downloads send no `Origin` header, an absent `Origin` is accepted on `GET` and `HEAD`; if a
+  browser sends an `Origin`, it must match the same origin or `[serve] origins` in `node.toml`,
+  otherwise the request is refused with `403`. Because `Cross-Origin-Resource-Policy` is always
+  `same-origin` on the HTTP door, listed cross-origin pages must fetch content using CORS
+  (`fetch()` or `crossorigin`) rather than no-cors embedding. Against a third-party page that
+  somehow learns a ticket, secrecy of the 256-bit ticket is the first barrier, while `Origin`
+  refusal, `Cross-Origin-Resource-Policy: same-origin`, `frame-ancestors 'none'`, and `sandbox;
+  default-src 'none'` block cross-origin reads, no-cors embeds, framing, and script execution.
+- **History and exposure**: a content address remains usable for up to 6 hours while in active use
+  and appears in browser history if opened directly in a tab; damage is limited because it grants
+  read-only access to one file, expires after 15 minutes idle or 6 hours total, cuts off active
+  readers within ~2 seconds when the token or `fs.read` policy is revoked, and never caches or
+  executes in the interface's origin.
+- **Concurrency and slow-reader protection**: active content streams are capped per ticket (8), per
+  holder (16), and globally (64), answering `429 Too Many Requests` with `Retry-After` and
+  `Connection: close`, and stalled or overly slow readers are disconnected after a write-idle
+  timeout (15 s) or minimum transfer rate window (40 KiB / 10 s) so API and UI routes stay
+  responsive. Remote reads reuse warm `keep_open` `legion stream` pipes from a dedicated per-target
+  content pool (separate from transfers and RPC, which never share permits with content), reading in
+  bounded windows with per-holder fair sharing and returning `503 Service Unavailable` with
+  `Retry-After` if acquiring a pipe times out. The web UI reads `"content": true` from `/v1/health`
+  once and remembers per-machine `unsupported` replies for the session so older remote nodes fall
+  back cleanly without breaking supported machines.
 
 ### Event stream (SSE)
 

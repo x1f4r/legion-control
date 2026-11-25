@@ -272,19 +272,19 @@ textarea {
 .app {
   height: 100%;
   display: grid;
-  grid-template: "bar" auto "main" minmax(0, 1fr) "nav" auto / minmax(0, 1fr);
+  grid-template: "bar" auto "toast" auto "main" minmax(0, 1fr) "nav" auto / minmax(0, 1fr);
 }
 
 .app.docked {
-  grid-template: "bar" auto "main" minmax(0, 1fr) "dock" auto "nav" auto / minmax(0, 1fr);
+  grid-template: "bar" auto "toast" auto "main" minmax(0, 1fr) "dock" auto "nav" auto / minmax(0, 1fr);
 }
 
 .app.standalone {
-  grid-template: "bar" auto "main" minmax(0, 1fr) / minmax(0, 1fr);
+  grid-template: "bar" auto "toast" auto "main" minmax(0, 1fr) / minmax(0, 1fr);
 }
 
 .app.standalone.docked {
-  grid-template: "bar" auto "main" minmax(0, 1fr) "dock" auto / minmax(0, 1fr);
+  grid-template: "bar" auto "toast" auto "main" minmax(0, 1fr) "dock" auto / minmax(0, 1fr);
 }
 
 /* The top of a screen says where you are and nothing else. No product name. */
@@ -439,19 +439,19 @@ textarea {
 /* Wide: navigation becomes a rail, and a list can sit beside its detail. */
 @container shell (min-width: 820px) {
   .app {
-    grid-template: "nav bar" auto "nav main" minmax(0, 1fr) / 84px minmax(0, 1fr);
+    grid-template: "nav bar" auto "nav toast" auto "nav main" minmax(0, 1fr) / 84px minmax(0, 1fr);
   }
 
   .app.docked {
-    grid-template: "nav bar" auto "nav main" minmax(0, 1fr) "nav dock" auto / 84px minmax(0, 1fr);
+    grid-template: "nav bar" auto "nav toast" auto "nav main" minmax(0, 1fr) "nav dock" auto / 84px minmax(0, 1fr);
   }
 
   .app.standalone {
-    grid-template: "bar" auto "main" minmax(0, 1fr) / minmax(0, 1fr);
+    grid-template: "bar" auto "toast" auto "main" minmax(0, 1fr) / minmax(0, 1fr);
   }
 
   .app.standalone.docked {
-    grid-template: "bar" auto "main" minmax(0, 1fr) "dock" auto / minmax(0, 1fr);
+    grid-template: "bar" auto "toast" auto "main" minmax(0, 1fr) "dock" auto / minmax(0, 1fr);
   }
 
   .top {
@@ -977,6 +977,63 @@ button.row:active {
 
 .gauge .meter i {
   background: var(--text);
+}
+
+.gauge .meter.warn i,
+.gauge .meter.high i {
+  background: var(--warn);
+}
+
+.gauge .meter.full i {
+  background: var(--bad);
+}
+
+.gauge.warn header span:last-child {
+  color: var(--warn);
+}
+
+.machine-state {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 2px 10px;
+  color: var(--dim);
+  font-size: var(--text-sub);
+}
+
+.stale-values {
+  opacity: 0.55;
+  transition: opacity 0.2s ease;
+}
+
+.attention-word {
+  color: var(--warn);
+  font-size: var(--text-sub);
+  font-weight: 550;
+}
+
+.proc-count {
+  margin-left: 6px;
+  color: var(--dim);
+  font-weight: 450;
+  font-size: var(--text-sub);
+}
+
+.wake-elapsed {
+  font-variant-numeric: tabular-nums;
+  font-size: 16px;
+  color: var(--dim);
+}
+
+.wake-then {
+  color: var(--dim);
+}
+
+.wake-note {
+  margin: 10px 0 0 !important;
+  font-size: var(--text-small);
+  color: var(--dim);
+  text-align: center;
 }
 
 /* ── Tiles (Actions) ────────────────────────────────────────────────────────────────────────── */
@@ -2441,22 +2498,22 @@ button.row:active {
   color: var(--dim);
 }
 
-/* Non-modal confirmation toast below the header so it never blocks bottom thumb controls. */
+/* Non-modal banner in its own row between header and main so it never covers list rows or bottom thumb controls. */
 .toast-banner {
-  position: absolute;
-  left: var(--pad);
-  right: var(--pad);
-  top: calc(var(--safe-top) + 62px);
-  z-index: 25;
+  grid-area: toast;
   display: flex;
   align-items: center;
   gap: 10px;
+  margin: 0 var(--pad) 8px;
   padding: 10px 12px;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius);
   background: var(--surface);
   color: var(--text);
-  box-shadow: 0 8px 24px rgb(0 0 0 / 0.35);
+}
+
+.toast-banner.error {
+  border-color: var(--bad);
 }
 
 .toast-banner span {
@@ -2566,11 +2623,7 @@ button.row:active {
   }
 
   .toast-banner {
-    left: auto;
-    right: 28px;
-    top: 20px;
-    bottom: auto;
-    max-width: 420px;
+    margin: 0 28px 8px;
   }
 }
 

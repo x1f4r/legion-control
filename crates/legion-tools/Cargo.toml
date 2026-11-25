@@ -26,6 +26,7 @@ gethostname.workspace = true
 getrandom.workspace = true
 globset.workspace = true
 ignore.workspace = true
+image.workspace = true
 jiff.workspace = true
 legion-core.workspace = true
 legion-os.workspace = true
@@ -75,5 +76,21 @@ harness = false
 name = "sys"
 harness = false
 
-[lints]
-workspace = true
+[[test]]
+name = "thumb_worker"
+harness = false
+
+# Mirrors `[workspace.lints]` except `unsafe_code = "deny"` instead of `"forbid"` solely so the
+# standalone integration test binary `tests/thumb_mem.rs` can install a `#[global_allocator]` to
+# measure peak decode memory. The library itself keeps `#![forbid(unsafe_code)]` in `src/lib.rs`.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+dbg_macro = "warn"
+result_large_err = "allow"

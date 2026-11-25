@@ -63,8 +63,11 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
         &self.member_id
     }
 
-    fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
-        self.engine.serve_handshake(&self.caller)
+    fn handshake(
+        &self,
+        caller: &legion_sync::HandshakeHello,
+    ) -> legion_sync::Result<PeerHandshake> {
+        self.engine.serve_handshake(&self.caller, caller)
     }
 
     fn records_since(
@@ -386,7 +389,12 @@ fn probe_a5_reinstalled_member_propagates_deletions_and_edits() {
     drop(b);
     fs::remove_dir_all(mb.db.parent().unwrap()).unwrap();
     let mut b = mb.open();
-    b.scan(now()).unwrap();
+    // Item 7: missing index beside existing marker and non-empty folder stops as damaged until
+    // explicitly rebuilt from disk.
+    assert!(b.is_index_damaged());
+    assert!(matches!(b.scan(now()), Err(SyncError::IndexDamaged { .. })));
+    b.rebuild_from_disk(now()).unwrap();
+    assert!(!b.is_index_damaged());
     pull(&mut b, &a).unwrap();
     pull(&mut a, &b).unwrap();
 
@@ -514,13 +522,21 @@ impl Peer for FakePeer {
         &self.id
     }
 
-    fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
+    fn handshake(
+        &self,
+        _caller: &legion_sync::HandshakeHello,
+    ) -> legion_sync::Result<PeerHandshake> {
         Ok(PeerHandshake {
             folder_id: "docs".to_string(),
             member_id: self.id.clone(),
             incarnation: self.incarnation,
             snapshot_seq: 1,
+            head_fingerprint: None,
             protocol_version: SYNC_PROTOCOL_VERSION,
+            caller_pulled: None,
+            caller_acked: None,
+            caller_pull_matches: None,
+            caller_regressed: false,
         })
     }
 
@@ -541,6 +557,7 @@ impl Peer for FakePeer {
                 caller_acked: None,
                 caller_acked_fingerprint: None,
                 head_fingerprint: None,
+                chain_fingerprints: BTreeMap::new(),
             })
         } else {
             Ok(p.remove(0))
@@ -631,6 +648,7 @@ fn probe_b1_peer_fetch_caps_read_at_declared_size_plus_one() {
             caller_acked: None,
             caller_acked_fingerprint: None,
             head_fingerprint: None,
+            chain_fingerprints: BTreeMap::new(),
         }]),
         stream: Some(big),
         bytes_read: Arc::clone(&counter),
@@ -672,6 +690,7 @@ fn probe_b2_one_bad_record_is_skipped_and_good_records_still_apply() {
             caller_acked: None,
             caller_acked_fingerprint: None,
             head_fingerprint: None,
+            chain_fingerprints: BTreeMap::new(),
         }]),
         stream: Some(b"good".to_vec()),
         bytes_read: Arc::new(AtomicU64::new(0)),
@@ -699,6 +718,7 @@ fn probe_b3_hostile_peer_cannot_cause_early_tombstone_gc() {
     // acknowledged `a`'s deletion tombstone, and `evil` can never speak for `b` or `c`.
     let a_inc = a.meta().unwrap().incarnation;
     let a_seq = a.meta().unwrap().local_seq;
+    let a_fp = a.meta().unwrap().head_fingerprint;
     let peer = FakePeer {
         id: "evil".into(),
         incarnation: 1,
@@ -708,8 +728,9 @@ fn probe_b3_hostile_peer_cannot_cause_early_tombstone_gc() {
             snapshot_seq: 0,
             has_more: false,
             caller_acked: Some((a_inc, a_seq)),
-            caller_acked_fingerprint: None,
+            caller_acked_fingerprint: a_fp,
             head_fingerprint: None,
+            chain_fingerprints: BTreeMap::new(),
         }]),
         stream: None,
         bytes_read: Arc::new(AtomicU64::new(0)),
@@ -750,6 +771,7 @@ fn probe_b4_peer_modified_by_cannot_forge_conflict_copy_path() {
             caller_acked: None,
             caller_acked_fingerprint: None,
             head_fingerprint: None,
+            chain_fingerprints: BTreeMap::new(),
         }]),
         stream: Some(b"theirs".to_vec()),
         bytes_read: Arc::new(AtomicU64::new(0)),
@@ -1002,6 +1024,19 @@ fn item_b3_mass_deletion_brake_pauses_and_handles_rescan_and_confirm() {
         .unwrap();
     assert!(!confirmed.brake_tripped);
     assert_eq!(confirmed.deleted, 55);
+    // Item 8: matching inbound peer deletion brake pauses `b`'s pull from `a` before deleting 55/60
+    // files, until `b` chooses `ApplyDeletions` (or `KeepLocalFiles`).
+    assert!(matches!(pull(&mut b, &a), Err(SyncError::Paused { .. })));
+    let b_st = b.status().unwrap();
+    assert_eq!(b_st.inbound_brakes.len(), 1);
+    assert_eq!(b_st.inbound_brakes[0].deleted_count, 55);
+    assert_eq!(mb.tree().len(), 60);
+    b.resolve_inbound_deletion_brake(
+        "a",
+        legion_sync::InboundDeletionBrakeDecision::ApplyDeletions,
+        now(),
+    )
+    .unwrap();
     pull(&mut b, &a).unwrap();
     assert_eq!(mb.tree().len(), 5);
 }
@@ -1151,6 +1186,7 @@ fn item_f_path_safety_restore_destinations_and_held_back_bound() {
             caller_acked: None,
             caller_acked_fingerprint: None,
             head_fingerprint: None,
+            chain_fingerprints: BTreeMap::new(),
         }]),
         stream: None,
         bytes_read: Arc::new(AtomicU64::new(0)),
@@ -1213,6 +1249,7 @@ fn item_f_path_safety_restore_destinations_and_held_back_bound() {
             caller_acked: None,
             caller_acked_fingerprint: None,
             head_fingerprint: None,
+            chain_fingerprints: BTreeMap::new(),
         });
     }
     let flood_peer = FakePeer {
@@ -1227,6 +1264,25 @@ fn item_f_path_safety_restore_destinations_and_held_back_bound() {
         win.store().held_back_count().unwrap(),
         MAX_HELD_BACK_ENTRIES
     );
+    // Item 4: stopped pulling at the cap instead of dropping records, with a visible problem.
+    let evil_cursor = win
+        .store()
+        .load_peer_cursors()
+        .unwrap()
+        .remove("evil")
+        .unwrap();
+    assert_eq!(evil_cursor.seq, MAX_HELD_BACK_ENTRIES as u64);
+    assert_eq!(evil_cursor.applied_ack_seq, 0);
+    match win.status().unwrap().state {
+        MemberState::Problem { problems, .. } => {
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.kind == ProblemKind::HeldBackLimitReached)
+            );
+        }
+        other => panic!("expected HeldBackLimitReached problem, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1517,6 +1573,15 @@ fn item_g_mid_apply_non_crash_error_recovers_immediately() {
         fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
             self.inner.write_marker(marker)
         }
+        fn append_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
+            self.inner.append_deletion_log(bytes)
+        }
+        fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
+            self.inner.read_deletion_log()
+        }
+        fn compact_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
+            self.inner.compact_deletion_log(bytes)
+        }
         fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
             self.inner.ensure_internal_dirs()
         }
@@ -1590,6 +1655,14 @@ fn item_g_mid_apply_non_crash_error_recovers_immediately() {
         }
         fn stat_tmp(&self, tmp_name: &str) -> legion_sync::Result<Option<legion_sync::FsMeta>> {
             self.inner.stat_tmp(tmp_name)
+        }
+        fn set_tmp_metadata(
+            &self,
+            tmp_name: &str,
+            mtime: Timestamp,
+            mode: Option<u32>,
+        ) -> legion_sync::Result<()> {
+            self.inner.set_tmp_metadata(tmp_name, mtime, mode)
         }
         fn hash_tmp(&self, tmp_name: &str) -> legion_sync::Result<(Hash, u64)> {
             self.inner.hash_tmp(tmp_name)
@@ -1728,13 +1801,21 @@ fn item_k_ranged_resumable_fetch_and_cancellation() {
             &self.id
         }
 
-        fn handshake(&self) -> legion_sync::Result<PeerHandshake> {
+        fn handshake(
+            &self,
+            _caller: &legion_sync::HandshakeHello,
+        ) -> legion_sync::Result<PeerHandshake> {
             Ok(PeerHandshake {
                 folder_id: "docs".into(),
                 member_id: self.id.clone(),
                 incarnation: self.incarnation,
                 snapshot_seq: 1,
+                head_fingerprint: None,
                 protocol_version: SYNC_PROTOCOL_VERSION,
+                caller_pulled: None,
+                caller_acked: None,
+                caller_pull_matches: None,
+                caller_regressed: false,
             })
         }
 
@@ -1763,6 +1844,7 @@ fn item_k_ranged_resumable_fetch_and_cancellation() {
                 caller_acked: None,
                 caller_acked_fingerprint: None,
                 head_fingerprint: None,
+                chain_fingerprints: BTreeMap::new(),
             })
         }
 

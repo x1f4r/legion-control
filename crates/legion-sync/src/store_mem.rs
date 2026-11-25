@@ -8,8 +8,8 @@ use legion_xfer::{EntryKind, Hash};
 
 use crate::error::Result;
 use crate::model::{
-    BinEntry, FolderMeta, HeldBackRecord, INDEX_SCHEMA_VERSION, IndexRecord,
-    MAX_DELETED_HISTORY_PATHS, MemberId, PeerCursor, PendingOp, RecordsPage,
+    BinEntry, DeferredItem, FolderMeta, HeldBackRecord, INDEX_SCHEMA_VERSION, IndexRecord,
+    MAX_DELETED_HISTORY_PATHS, MemberId, PeerCursor, PendingOp, RecordsPage, SyncProblem,
 };
 use crate::path::fold_case;
 use crate::traits::{IndexStore, StoreBatch};
@@ -28,9 +28,13 @@ pub struct MemoryIndexStore {
     live_files: u64,
     peer_cursors: BTreeMap<MemberId, PeerCursor>,
     bin_entries: BTreeMap<String, BinEntry>,
-    held_back: BTreeMap<String, HeldBackRecord>,
+    held_back: BTreeMap<(MemberId, String), HeldBackRecord>,
     deleted_history: BTreeMap<String, Vec<Hash>>,
     pending_op: Option<PendingOp>,
+    staged_tmps: BTreeSet<String>,
+    seq_fingerprints: BTreeMap<u64, Hash>,
+    problems: BTreeMap<String, SyncProblem>,
+    deferrals: BTreeMap<(MemberId, String), DeferredItem>,
 }
 
 impl Default for MemoryIndexStore {
@@ -56,6 +60,10 @@ impl MemoryIndexStore {
             held_back: BTreeMap::new(),
             deleted_history: BTreeMap::new(),
             pending_op: None,
+            staged_tmps: BTreeSet::new(),
+            seq_fingerprints: BTreeMap::new(),
+            problems: BTreeMap::new(),
+            deferrals: BTreeMap::new(),
         }
     }
 
@@ -217,6 +225,7 @@ impl IndexStore for MemoryIndexStore {
         };
 
         let mut records = Vec::new();
+        let mut chain_fingerprints = BTreeMap::new();
         let mut has_more = false;
         for (_, path) in self
             .by_seq
@@ -227,8 +236,21 @@ impl IndexStore for MemoryIndexStore {
                 break;
             }
             if let Some(rec) = self.records.get(path) {
+                if let Some(&fp) = self.seq_fingerprints.get(&rec.seq) {
+                    chain_fingerprints.insert(rec.seq, fp);
+                }
+                if rec.seq > 1
+                    && let Some(&prev_fp) = self.seq_fingerprints.get(&(rec.seq - 1))
+                {
+                    chain_fingerprints.insert(rec.seq - 1, prev_fp);
+                }
                 records.push(rec.for_wire());
             }
+        }
+        if snapshot_seq > 0
+            && let Some(&fp) = self.seq_fingerprints.get(&snapshot_seq)
+        {
+            chain_fingerprints.insert(snapshot_seq, fp);
         }
 
         let (caller_acked, caller_acked_fingerprint) = self
@@ -236,7 +258,10 @@ impl IndexStore for MemoryIndexStore {
             .get(caller_member)
             .filter(|c| c.incarnation != 0)
             .map_or((None, None), |c| {
-                (Some((c.incarnation, c.seq)), c.head_fingerprint)
+                (
+                    Some((c.incarnation, c.applied_ack_seq)),
+                    c.acked_fingerprint,
+                )
             });
 
         Ok(RecordsPage {
@@ -247,6 +272,7 @@ impl IndexStore for MemoryIndexStore {
             caller_acked,
             caller_acked_fingerprint,
             head_fingerprint,
+            chain_fingerprints,
         })
     }
 
@@ -298,6 +324,26 @@ impl IndexStore for MemoryIndexStore {
         Ok(self.pending_op.clone())
     }
 
+    fn list_staged_tmps(&self) -> Result<BTreeSet<String>> {
+        Ok(self.staged_tmps.clone())
+    }
+
+    fn get_seq_fingerprint(&self, seq: u64) -> Result<Option<Hash>> {
+        Ok(self.seq_fingerprints.get(&seq).copied())
+    }
+
+    fn list_problems(&self) -> Result<Vec<(String, SyncProblem)>> {
+        Ok(self
+            .problems
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+
+    fn list_deferrals(&self) -> Result<Vec<DeferredItem>> {
+        Ok(self.deferrals.values().cloned().collect())
+    }
+
     fn record_count(&self) -> Result<u64> {
         Ok(self.records.len() as u64)
     }
@@ -337,11 +383,15 @@ impl IndexStore for MemoryIndexStore {
         for entry in batch.upsert_bin {
             self.bin_entries.insert(entry.id.clone(), entry);
         }
-        for path in batch.remove_held_back {
-            self.held_back.remove(&path);
+        if batch.clear_held_back {
+            self.held_back.clear();
+        }
+        for key in batch.remove_held_back {
+            self.held_back.remove(&key);
         }
         for item in batch.upsert_held_back {
-            self.held_back.insert(item.record.path.clone(), item);
+            self.held_back
+                .insert((item.from_peer.clone(), item.record.path.clone()), item);
         }
         for path in batch.remove_deleted_history {
             self.deleted_history.remove(&path);
@@ -361,6 +411,45 @@ impl IndexStore for MemoryIndexStore {
         }
         if let Some(op_update) = batch.set_pending_op {
             self.pending_op = op_update;
+        }
+        for tmp in batch.remove_staged_tmps {
+            self.staged_tmps.remove(&tmp);
+        }
+        for tmp in batch.add_staged_tmps {
+            self.staged_tmps.insert(tmp);
+        }
+        if batch.clear_seq_fingerprints {
+            self.seq_fingerprints.clear();
+        }
+        if let Some(min_keep) = batch.prune_seq_fingerprints_below {
+            // Retain every fingerprint at or above `min_keep`, PLUS `rec.seq` and `rec.seq - 1`
+            // for every record still stored in `by_seq` so newly joining or rejoining members
+            // stopping at any page or deferral boundary always receive and validate valid chained
+            // fingerprints.
+            self.seq_fingerprints.retain(|&seq, _| {
+                seq >= min_keep
+                    || self.by_seq.contains_key(&seq)
+                    || self.by_seq.contains_key(&seq.saturating_add(1))
+            });
+        }
+        for (seq, fp) in batch.upsert_seq_fingerprints {
+            self.seq_fingerprints.insert(seq, fp);
+        }
+        for key in batch.remove_problems {
+            self.problems.remove(&key);
+        }
+        for (key, prob) in batch.upsert_problems {
+            self.problems.insert(key, prob);
+        }
+        if batch.clear_deferrals {
+            self.deferrals.clear();
+        }
+        for key in batch.remove_deferrals {
+            self.deferrals.remove(&key);
+        }
+        for item in batch.upsert_deferrals {
+            self.deferrals
+                .insert((item.peer.clone(), item.path.clone()), item);
         }
         Ok(())
     }

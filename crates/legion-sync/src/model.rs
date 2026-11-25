@@ -20,10 +20,16 @@ pub type MemberId = String;
 
 /// Current durable index schema version. Opening an index with a higher version is refused
 /// cleanly with [`SyncError::SchemaTooNew`].
-pub const INDEX_SCHEMA_VERSION: u32 = 2;
+pub const INDEX_SCHEMA_VERSION: u32 = 3;
 
-/// Sync wire/trait protocol version advertised in [`PeerHandshake`].
-pub const SYNC_PROTOCOL_VERSION: u32 = 2;
+/// Sync wire/trait protocol version advertised in [`PeerHandshake`] and [`HandshakeHello`].
+pub const SYNC_PROTOCOL_VERSION: u32 = 3;
+
+/// Maximum version vector counter value accepted for any member key (`2^62`).
+pub const MAX_VERSION_COUNTER: u64 = 1u64 << 62;
+
+/// Minimum interval (in seconds) between peer-forced incarnation rotations per peer (1 hour).
+pub const FORCED_ROTATION_COOLDOWN_SECS: u64 = 3_600;
 
 /// Default retention duration for files moved to `.legion-sync/bin` (30 days).
 pub const DEFAULT_BIN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -60,12 +66,22 @@ pub const MAX_DELETED_HISTORY_PATHS: usize = 100_000;
 /// local clock is earlier than this floor or earlier than the newest bin entry.
 pub const MIN_PLAUSIBLE_CLOCK_SECS: i64 = 1_767_225_600;
 
-/// Default minimum count of deleted files in one scan required to trip the mass-deletion brake.
+/// Default minimum count of deleted files over the rolling brake window required to trip the
+/// mass-deletion brake.
 pub const DEFAULT_BRAKE_MIN_FILES: usize = 50;
 
-/// Default minimum percentage (1..=100) of live files deleted in one scan required to trip the
-/// mass-deletion brake (more than a quarter).
+/// Default minimum percentage (1..=100) of live files deleted over the rolling brake window
+/// required to trip the mass-deletion brake (more than a quarter).
 pub const DEFAULT_BRAKE_MIN_PERCENT: u8 = 25;
+
+/// Default settle period (in seconds) that unmatched local deletions wait before peers see them
+/// so cross-scan moves can be recognized and mass-deletion storms cannot leak before the brake
+/// trips (30 seconds).
+pub const DEFAULT_BRAKE_SETTLE_SECS: u64 = 30;
+
+/// Default rolling window (in seconds) over which pending and recently emitted deletions are
+/// counted against the live file count at the window's start (10 minutes).
+pub const DEFAULT_BRAKE_WINDOW_SECS: u64 = 600;
 
 /// Generates a cryptographically random non-zero 64-bit incarnation identifier.
 pub fn random_incarnation_id() -> Result<u64> {
@@ -184,15 +200,32 @@ pub fn validate_member_id(member: &str) -> Result<()> {
     Ok(())
 }
 
-/// Threshold configuration for the mass-deletion brake.
+fn default_brake_settle_secs() -> u64 {
+    DEFAULT_BRAKE_SETTLE_SECS
+}
+
+fn default_brake_window_secs() -> u64 {
+    DEFAULT_BRAKE_WINDOW_SECS
+}
+
+/// Threshold configuration for the move-aware, windowed outbound and inbound mass-deletion brakes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeletionBrakeConfig {
-    /// Minimum number of live files that must vanish in one scan to trip the brake (default 50).
-    /// Setting this to `usize::MAX` disables the brake.
+    /// Minimum number of live files that must vanish in the rolling window to trip the brake
+    /// (default 50). Setting this to `usize::MAX` disables both outbound and inbound brakes.
     pub min_deleted_files: usize,
-    /// Minimum percentage (`1..=100`) of currently live files that must vanish in one scan
+    /// Minimum percentage (`1..=100`) of live files at the window's start that must vanish
     /// together with `min_deleted_files` to trip the brake (default 25, i.e. more than a quarter).
     pub min_deleted_percent: u8,
+    /// Settle delay in seconds before unmatched local deletions become visible to peers so
+    /// cross-scan moves are recognized and split deletion storms are caught before leaking
+    /// (default 30 seconds).
+    #[serde(default = "default_brake_settle_secs")]
+    pub settle_secs: u64,
+    /// Rolling window duration in seconds over which pending and recent deletions are counted
+    /// against the window-start live file count (default 600 seconds / 10 minutes).
+    #[serde(default = "default_brake_window_secs")]
+    pub window_secs: u64,
 }
 
 impl Default for DeletionBrakeConfig {
@@ -200,11 +233,28 @@ impl Default for DeletionBrakeConfig {
         Self {
             min_deleted_files: DEFAULT_BRAKE_MIN_FILES,
             min_deleted_percent: DEFAULT_BRAKE_MIN_PERCENT,
+            settle_secs: DEFAULT_BRAKE_SETTLE_SECS,
+            window_secs: DEFAULT_BRAKE_WINDOW_SECS,
         }
     }
 }
 
 impl DeletionBrakeConfig {
+    /// Returns a configuration with both outbound and inbound mass-deletion brakes disabled.
+    pub fn disabled() -> Self {
+        Self {
+            min_deleted_files: usize::MAX,
+            min_deleted_percent: 100,
+            settle_secs: 0,
+            window_secs: 0,
+        }
+    }
+
+    /// Returns `true` if the mass-deletion brake is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.min_deleted_files != usize::MAX
+    }
+
     /// Returns `true` if deleting `deleted_files` out of `total_live_files` trips the brake.
     pub fn should_trip(&self, deleted_files: usize, total_live_files: usize) -> bool {
         if deleted_files == 0 || total_live_files == 0 {
@@ -219,18 +269,18 @@ impl DeletionBrakeConfig {
     }
 }
 
-/// Persisted state describing a tripped mass-deletion brake awaiting a person's answer.
+/// Persisted state describing a tripped outbound mass-deletion brake awaiting a person's answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeletionBrake {
-    /// Number of live files that disappeared in the scan that tripped the brake.
+    /// Number of live files that disappeared in the rolling window that tripped the brake.
     pub deleted_count: usize,
-    /// Number of live files indexed before the scan.
+    /// Number of live files at the start of the rolling window.
     pub total_live_files: usize,
     /// Up to 10 sample missing paths shown to the person.
     pub sample_paths: Vec<String>,
 }
 
-/// A person's response to a tripped mass-deletion brake.
+/// A person's response to a tripped outbound mass-deletion brake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeletionBrakeDecision {
@@ -238,6 +288,64 @@ pub enum DeletionBrakeDecision {
     ConfirmDeleted,
     /// "They are not": unpause and rescan with the brake still armed.
     Rescan,
+}
+
+/// A local deletion held pending during the move-awareness settle period before peers see it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingLocalDeletion {
+    /// Prior indexed live record that vanished from disk.
+    pub old_record: IndexRecord,
+    /// Timestamp when the disappearance was first observed.
+    pub detected_at: Timestamp,
+}
+
+/// Rolling deletion-window accounting persisted in [`FolderMeta`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletionWindowState {
+    /// Start timestamp of the current rolling brake window.
+    pub window_start: Timestamp,
+    /// Number of live files indexed when the rolling window began.
+    pub window_start_live_files: usize,
+    /// Distinct file deletions already emitted during the current rolling window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emitted_deletions: Vec<(String, Timestamp)>,
+    /// Recent `(path, hash, timestamp)` of regular files newly created or modified within the
+    /// settle period (used to recognize cross-scan moves even when the destination is scanned
+    /// before the source; a deletion only matches a *different* path with the same hash).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_created_hashes: Vec<(String, Hash, Timestamp)>,
+}
+
+/// Persisted state describing a tripped inbound mass-deletion brake for one peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboundDeletionBrake {
+    /// Peer whose changes would delete more than the threshold of live files.
+    pub peer: MemberId,
+    /// Number of local live files that would be deleted in the rolling inbound window.
+    pub deleted_count: usize,
+    /// Number of live files at the start of the rolling inbound window.
+    pub total_live_files: usize,
+    /// Highest peer sequence number among the blocked deletion records.
+    pub max_blocked_seq: u64,
+    /// Up to 10 sample paths that would be deleted.
+    pub sample_paths: Vec<String>,
+    /// All candidate live file paths blocked by this inbound brake.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_paths: Vec<String>,
+    /// Peer deletion tombstones held back so choosing `KeepLocalFiles` can re-assert local files
+    /// strictly newer than every blocked tombstone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_tombstones: Vec<IndexRecord>,
+}
+
+/// A person's response to a tripped inbound peer mass-deletion brake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboundDeletionBrakeDecision {
+    /// Allow and apply the peer's blocked deletions on the next pull.
+    ApplyDeletions,
+    /// Keep this machine's local files and re-assert them as newer than the peer's deletions.
+    KeepLocalFiles,
 }
 
 /// Identity marker written inside `.legion-sync/marker.json` when a member joins a sync folder.
@@ -384,18 +492,28 @@ pub struct FolderMeta {
     /// resurrecting deletions.
     #[serde(default)]
     pub join_mode: bool,
-    /// Fingerprint of the latest record written at `local_seq` (for same-seq clone detection).
+    /// Chained fingerprint at `local_seq` (commits to the full sequence history `1..=local_seq`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_fingerprint: Option<Hash>,
-    /// Rolling window of recent `(seq -> record_fingerprint)` entries (up to 64) used to detect
-    /// rollback/clones even after local sequence numbers advance past what a peer acknowledged.
+    /// Last timestamp at which each peer forced an incarnation rotation (rate-limited to at most
+    /// once per hour per peer).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub recent_seq_fingerprints: BTreeMap<u64, Hash>,
+    pub last_forced_rotation_by_peer: BTreeMap<MemberId, Timestamp>,
     /// Directories deleted remotely that were intentionally kept on disk only because they still
     /// hold ignored or held-back local files, persisted across tombstone GC and restarts so scans
     /// never revive them unless synced files are later added inside.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub kept_deleted_dirs: BTreeSet<String>,
+    /// Live paths that raced with a person's save or move during placement or crash recovery and
+    /// must be hashed on the next scan regardless of cached stat metadata.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub needs_rescan: BTreeSet<String>,
+    /// Local deletions waiting through the settle period before peers see them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pending_deletions: BTreeMap<String, PendingLocalDeletion>,
+    /// Rolling window state for the outbound move-aware deletion brake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_window: Option<DeletionWindowState>,
 }
 
 impl FolderMeta {
@@ -418,22 +536,21 @@ impl FolderMeta {
             pending_brake: None,
             join_mode: true,
             head_fingerprint: None,
-            recent_seq_fingerprints: BTreeMap::new(),
+            last_forced_rotation_by_peer: BTreeMap::new(),
             kept_deleted_dirs: BTreeSet::new(),
+            needs_rescan: BTreeSet::new(),
+            pending_deletions: BTreeMap::new(),
+            deletion_window: None,
         }
     }
 
-    /// Records the fingerprint of the record assigned `seq`, keeping the newest 64 entries.
-    pub fn record_seq_fingerprint(&mut self, seq: u64, fingerprint: Hash) {
-        self.head_fingerprint = Some(fingerprint);
-        self.recent_seq_fingerprints.insert(seq, fingerprint);
-        while self.recent_seq_fingerprints.len() > 64 {
-            if let Some(oldest) = self.recent_seq_fingerprints.keys().next().copied() {
-                self.recent_seq_fingerprints.remove(&oldest);
-            } else {
-                break;
-            }
-        }
+    /// Computes and advances the chained digest for sequence number `seq` with `record_fp`,
+    /// updating [`Self::head_fingerprint`] and returning the new chained digest to persist in the
+    /// index's sequence fingerprint table.
+    pub fn advance_chain_fingerprint(&mut self, seq: u64, record_fp: Hash) -> Hash {
+        let chain = chain_fingerprint(self.head_fingerprint, seq, record_fp);
+        self.head_fingerprint = Some(chain);
+        chain
     }
 
     /// Returns this member's active `(local_member, incarnation)` [`VersionKey`].
@@ -453,6 +570,18 @@ impl FolderMeta {
         self.local_clock
     }
 
+    /// Advances `version` for this member's active `(local_member, incarnation)` key to strictly
+    /// exceed both its previous value and `self.local_clock`, updating `self.local_clock` to match
+    /// the issued counter so `self.local_clock` is always `>=` every counter issued locally.
+    pub fn bump_version(&mut self, version: &mut VersionVector) -> u64 {
+        let vkey = self.version_key();
+        let issued = version.bump_above(vkey, self.local_clock);
+        if issued > self.local_clock {
+            self.local_clock = issued;
+        }
+        issued
+    }
+
     /// Returns `true` if `member` is a current or known former member of this folder.
     pub fn is_known_member(&self, member: &str) -> bool {
         self.members.contains(member) || self.former_members.contains(member)
@@ -468,7 +597,39 @@ impl FolderMeta {
     }
 }
 
+/// Computes the chained sequence fingerprint for `seq`, binding `prev_chain`, `seq`, and
+/// `record_fp` so any divergence at any earlier sequence number changes every subsequent digest.
+pub fn chain_fingerprint(prev_chain: Option<Hash>, seq: u64, record_fp: Hash) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"legion-sync-chain-v1");
+    if let Some(prev) = prev_chain {
+        hasher.update(prev.as_bytes());
+    } else {
+        hasher.update(&[0u8; 32]);
+    }
+    hasher.update(&seq.to_le_bytes());
+    hasher.update(record_fp.as_bytes());
+    Hash::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// Direct view of what one member has pulled from or applied/acknowledged from another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerAckView {
+    /// Observed peer incarnation identifier.
+    pub incarnation: u64,
+    /// Sequence number within `incarnation`.
+    pub seq: u64,
+    /// Chained fingerprint observed at `(incarnation, seq)` (`None` when `seq == 0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<Hash>,
+}
+
 /// Direct synchronization cursor and acknowledgement state for one peer member.
+///
+/// Keeps two separate positions:
+/// - [`Self::seq`] is the **pull position** (may advance past records stored durably as unapplied).
+/// - [`Self::applied_ack_seq`] is the **acknowledgement** reported back to the peer, which never
+///   advances past the oldest unapplied record from `(peer, incarnation)`.
 ///
 /// Only direct knowledge received straight from `peer` is stored here; third-party claims about
 /// other members are never accepted.
@@ -476,26 +637,72 @@ impl FolderMeta {
 pub struct PeerCursor {
     /// Incarnation ID last observed for this peer (`0` before first contact).
     pub incarnation: u64,
-    /// Highest contiguous sequence number processed from `(peer, incarnation)`.
+    /// Highest contiguous sequence number pulled from `(peer, incarnation)`.
     pub seq: u64,
-    /// Our own incarnation that `peer` directly reported having pulled up to `acked_local_seq`.
+    /// Highest sequence number in `(peer, incarnation)` that has been fully applied (never past
+    /// the oldest unapplied held-back or deferred record from this peer/incarnation).
+    #[serde(default)]
+    pub applied_ack_seq: u64,
+    /// Chained fingerprint observed at `(incarnation, applied_ack_seq)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acked_fingerprint: Option<Hash>,
+    /// Our own incarnation that `peer` directly reported having applied up to `acked_local_seq`.
     pub acked_local_incarnation: u64,
-    /// Highest `local_seq` of our own `acked_local_incarnation` that `peer` directly confirmed.
+    /// Highest `local_seq` of our own `acked_local_incarnation` that `peer` directly confirmed
+    /// applying.
     pub acked_local_seq: u64,
     /// Distinct earlier incarnations previously seen for this peer (bounded); seeing an earlier
     /// incarnation return after switching away flags a duplicate member ID (cloned machine).
     #[serde(default)]
     pub prior_incarnations: Vec<u64>,
-    /// Fingerprint of the peer's latest record at `(incarnation, seq)` for same-seq clone
-    /// detection.
+    /// Chained fingerprint of the peer's history at `(incarnation, seq)` (the pull position).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_fingerprint: Option<Hash>,
-    /// Set when a duplicate member ID or same-seq divergence was detected for this peer.
+    /// Set when a duplicate member ID or rollback/divergence was detected for this peer.
     #[serde(default)]
     pub duplicate_detected: bool,
     /// Set permanently when two distinct live incarnations alternated under this member ID.
     #[serde(default)]
     pub alternation_detected: bool,
+    /// Start timestamp of this peer's rolling inbound deletion brake window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_window_start: Option<Timestamp>,
+    /// Number of local live files at the start of this peer's rolling inbound deletion window.
+    #[serde(default)]
+    pub inbound_window_start_live_files: usize,
+    /// Local regular files binned due to this peer's deletions inside the rolling inbound window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbound_binned_in_window: Vec<(String, Timestamp)>,
+    /// Active inbound mass-deletion brake pausing pulls from this peer until resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_brake: Option<InboundDeletionBrake>,
+    /// Peer sequence number up to which inbound mass deletions were explicitly confirmed.
+    #[serde(default)]
+    pub allow_inbound_mass_deletion_until_seq: u64,
+}
+
+/// Caller-side handshake message sent to a peer before pulling any page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandshakeHello {
+    /// Sync folder identifier.
+    pub folder_id: FolderId,
+    /// Caller's member identifier.
+    pub member_id: MemberId,
+    /// Caller's active incarnation identifier.
+    pub incarnation: u64,
+    /// Caller's current `local_seq` in `incarnation`.
+    pub snapshot_seq: u64,
+    /// Caller's chained fingerprint at `(incarnation, snapshot_seq)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_fingerprint: Option<Hash>,
+    /// Sync protocol version supported by the caller.
+    pub protocol_version: u32,
+    /// Highest contiguous position the caller has pulled from the callee (`(inc, seq, chain_fp)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_pulled: Option<PeerAckView>,
+    /// Highest fully-applied position the caller acknowledges to the callee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_acked: Option<PeerAckView>,
 }
 
 /// Handshake summary returned by a peer before pulling records or files.
@@ -509,8 +716,26 @@ pub struct PeerHandshake {
     pub incarnation: u64,
     /// Peer's current `local_seq` in `incarnation`.
     pub snapshot_seq: u64,
+    /// Peer's chained fingerprint at `(incarnation, snapshot_seq)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_fingerprint: Option<Hash>,
     /// Sync protocol version supported by the peer.
     pub protocol_version: u32,
+    /// Highest contiguous position the peer has pulled from the caller (`(inc, seq, chain_fp)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pulled: Option<PeerAckView>,
+    /// Highest fully-applied position the peer acknowledges to the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_acked: Option<PeerAckView>,
+    /// Result of verifying `HandshakeHello::peer_pulled` against the peer's own sequence
+    /// fingerprint history (`Some(false)` means the peer's index went back in time or diverged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pull_matches: Option<bool>,
+    /// `true` when the caller claimed a pull/ack position for this peer's current incarnation that
+    /// is strictly behind what the caller previously directly acknowledged (meaning the caller
+    /// rolled back in time).
+    #[serde(default)]
+    pub caller_regressed: bool,
 }
 
 /// Per-fetch transfer options supporting ranged resume, timeouts, and cooperative cancellation.
@@ -675,13 +900,22 @@ impl IndexRecord {
         self.recent_hashes = combined;
     }
 
-    /// Computes a compact digest of this record's identity for same-seq clone detection.
+    /// Computes a compact digest of this record's identity for chained sequence fingerprinting.
     pub fn head_fingerprint(&self) -> Hash {
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.path.as_bytes());
         hasher.update(&[0]);
         hasher.update(&self.seq.to_le_bytes());
         hasher.update(&[u8::from(self.deleted)]);
+        let kind_byte = match self.kind {
+            EntryKind::File => 1u8,
+            EntryKind::Dir => 2u8,
+            EntryKind::Symlink => 3u8,
+        };
+        hasher.update(&[kind_byte]);
+        hasher.update(&self.size.to_le_bytes());
+        hasher.update(&self.mtime.secs.to_le_bytes());
+        hasher.update(&self.mtime.nanos.to_le_bytes());
         if let Some(h) = self.hash {
             hasher.update(h.as_bytes());
         }
@@ -689,6 +923,13 @@ impl IndexRecord {
             hasher.update(t.as_bytes());
         }
         hasher.update(self.modified_by.as_bytes());
+        hasher.update(&[0]);
+        for (key, counter) in self.version.iter() {
+            hasher.update(key.member.as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&key.incarnation.to_le_bytes());
+            hasher.update(&counter.to_le_bytes());
+        }
         Hash::from_bytes(*hasher.finalize().as_bytes())
     }
 }
@@ -704,16 +945,21 @@ pub struct RecordsPage {
     pub snapshot_seq: u64,
     /// `true` if more records exist beyond this page in the snapshot.
     pub has_more: bool,
-    /// Direct acknowledgement ONLY: the `(incarnation, seq)` of the *caller* that this peer itself
-    /// has directly pulled and applied. Never carries third-party claims.
+    /// Direct acknowledgement ONLY: the `(incarnation, applied_ack_seq)` of the *caller* that this
+    /// peer itself has directly pulled and applied. Never advances past unapplied records and never
+    /// carries third-party claims.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_acked: Option<(u64, u64)>,
-    /// Fingerprint observed by this peer at the caller's acknowledged `(incarnation, seq)`.
+    /// Chained fingerprint observed by this peer at the caller's acknowledged `(incarnation, seq)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_acked_fingerprint: Option<Hash>,
-    /// Fingerprint of the serving peer's record at `snapshot_seq` (for same-seq clone detection).
+    /// Chained fingerprint of the serving peer's history at `snapshot_seq`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_fingerprint: Option<Hash>,
+    /// Chained fingerprints for sequence numbers referenced by this page (`r.seq`, `r.seq - 1`, and
+    /// `snapshot_seq`) so receivers can record exact pull and applied-ack fingerprints.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub chain_fingerprints: BTreeMap<u64, Hash>,
 }
 
 /// Why an entry was moved into `.legion-sync/bin`.
@@ -801,6 +1047,9 @@ pub enum ProblemKind {
     FolderMarkerMissing,
     /// A scan saw a large fraction of the folder disappear and tripped the mass-deletion brake.
     DeletionBrakeTripped,
+    /// Pulling from a peer would delete a large fraction of live files and tripped the inbound
+    /// peer deletion brake.
+    InboundDeletionBrakeTripped,
     /// Two live machines presented alternating incarnations under the same member ID.
     DuplicateMemberId,
     /// A peer sent a malformed or unauthorized record that was skipped.
@@ -808,10 +1057,18 @@ pub enum ProblemKind {
     /// A directory deleted elsewhere was kept locally because it still holds ignored or held-back
     /// files.
     DirectoryKeptLocalFiles,
-    /// The held-back table reached [`MAX_HELD_BACK_ENTRIES`].
+    /// The held-back table reached [`MAX_HELD_BACK_ENTRIES`] and pulling from the peer stopped.
     HeldBackLimitReached,
-    /// A record exceeded [`MAX_DEFERRAL_ATTEMPTS`] consecutive deferrals.
+    /// A record exceeded [`MAX_DEFERRAL_ATTEMPTS`] consecutive deferrals and is held unapplied.
     DeferredLimitExceeded,
+    /// A record mentions a syntactically valid member this machine does not know yet ("not yet").
+    UnknownMember,
+    /// This machine rotated its incarnation because a peer reported a newer or divergent history.
+    PeerForcedRotation,
+    /// A peer repeatedly tried to force incarnation rotation faster than once per hour.
+    PeerRollbackRateLimited,
+    /// Local sync index file is missing, empty, or damaged; folder is stopped until rebuilt.
+    IndexDamaged,
 }
 
 /// Human-readable problem reported in [`FolderStatus`].
@@ -828,19 +1085,30 @@ pub struct SyncProblem {
     pub sentence: String,
 }
 
-/// A peer record that could not be materialized on the local filesystem and is held back until
-/// the local or remote condition clears.
+/// A peer record that could not be applied yet and is stored durably until the local, membership,
+/// or remote condition clears. While present, this member's acknowledgement to `from_peer` never
+/// advances past `peer_seq - 1`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldBackRecord {
-    /// The incoming peer record that was held back.
+    /// The incoming peer record that was not applied.
     pub record: IndexRecord,
     /// Peer from which the record was received.
     pub from_peer: MemberId,
-    /// Specific problem describing why the record was held back.
+    /// Specific problem describing why the record was not applied.
     pub problem: SyncProblem,
+    /// Peer incarnation in which `peer_seq` was observed.
+    #[serde(default)]
+    pub peer_incarnation: u64,
+    /// Sequence number of this record on `from_peer`.
+    #[serde(default)]
+    pub peer_seq: u64,
+    /// Peer's chained fingerprint at `peer_seq - 1` (if `peer_seq > 1` and available).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_chain_fingerprint: Option<Hash>,
 }
 
-/// An item temporarily deferred during sync with an explicit reason and retry count.
+/// An item temporarily deferred during sync with an explicit reason and retry count, persisted
+/// durably until applied or promoted to held-back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeferredItem {
     /// Peer that sent the deferred record.
@@ -851,6 +1119,149 @@ pub struct DeferredItem {
     pub reason: String,
     /// Number of consecutive pull attempts that deferred this item.
     pub attempts: u32,
+    /// Peer incarnation in which `peer_seq` was observed.
+    #[serde(default)]
+    pub peer_incarnation: u64,
+    /// Sequence number of this record on `peer`.
+    #[serde(default)]
+    pub peer_seq: u64,
+    /// Peer's chained fingerprint at `peer_seq - 1` (if `peer_seq > 1` and available).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_chain_fingerprint: Option<Hash>,
+}
+
+/// One line in the append-only, compacted `.legion-sync/deletions.log` kept inside the folder so
+/// wiping the index while keeping the folder never resurrects deleted files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum FolderDeletionLogEntry {
+    /// A path was deleted and its tombstone is active.
+    Deleted {
+        /// Normalized relative path inside the sync folder.
+        path: String,
+        /// Original entry kind.
+        kind: EntryKind,
+        /// Recent content hashes of the deleted entry.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hashes: Vec<Hash>,
+        /// Version vector of the deletion tombstone.
+        version: VersionVector,
+        /// Deletion timestamp.
+        mtime: Timestamp,
+        /// Member that authored the deletion.
+        modified_by: MemberId,
+    },
+    /// A previously deleted path became live again.
+    Revived {
+        /// Normalized relative path inside the sync folder.
+        path: String,
+    },
+}
+
+/// Active deletion entry recovered by replaying `.legion-sync/deletions.log`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderDeletionRecord {
+    /// Normalized relative path inside the sync folder.
+    pub path: String,
+    /// Original entry kind.
+    pub kind: EntryKind,
+    /// Recent content hashes of the deleted entry.
+    pub hashes: Vec<Hash>,
+    /// Version vector of the deletion tombstone.
+    pub version: VersionVector,
+    /// Deletion timestamp.
+    pub mtime: Timestamp,
+    /// Member that authored the deletion.
+    pub modified_by: MemberId,
+}
+
+impl FolderDeletionLogEntry {
+    /// Builds a `Deleted` log entry from a tombstone [`IndexRecord`].
+    pub fn from_tombstone(rec: &IndexRecord) -> Self {
+        Self::Deleted {
+            path: rec.path.clone(),
+            kind: rec.kind,
+            hashes: rec.recent_hashes.clone(),
+            version: rec.version.clone(),
+            mtime: rec.mtime,
+            modified_by: rec.modified_by.clone(),
+        }
+    }
+}
+
+/// Serializes one or more [`FolderDeletionLogEntry`] items as NDJSON bytes.
+pub fn encode_deletion_log_entries(entries: &[FolderDeletionLogEntry]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for entry in entries {
+        serde_json::to_writer(&mut out, entry).map_err(|err| SyncError::Storage {
+            context: "serialize deletion log entry".to_string(),
+            detail: err.to_string(),
+        })?;
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
+/// Replays NDJSON bytes from `.legion-sync/deletions.log`, tolerating an incomplete trailing line
+/// from a crash, and returns the map of currently active deletions.
+pub fn parse_deletion_log(bytes: &[u8]) -> BTreeMap<String, FolderDeletionRecord> {
+    let mut active = BTreeMap::new();
+    for line in bytes.split(|&b| b == b'\n') {
+        let trimmed = trim_ascii_whitespace(line);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_slice::<FolderDeletionLogEntry>(trimmed) else {
+            // Tolerate a truncated trailing line after an abrupt crash.
+            continue;
+        };
+        match entry {
+            FolderDeletionLogEntry::Deleted {
+                path,
+                kind,
+                hashes,
+                version,
+                mtime,
+                modified_by,
+            } => {
+                if crate::path::validate_sync_path(&path).is_ok() {
+                    active.insert(
+                        path.clone(),
+                        FolderDeletionRecord {
+                            path,
+                            kind,
+                            hashes,
+                            version,
+                            mtime,
+                            modified_by,
+                        },
+                    );
+                }
+            }
+            FolderDeletionLogEntry::Revived { path } => {
+                active.remove(&path);
+            }
+        }
+    }
+    active
+}
+
+fn trim_ascii_whitespace(mut slice: &[u8]) -> &[u8] {
+    while let Some((&first, rest)) = slice.split_first() {
+        if first.is_ascii_whitespace() {
+            slice = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((&last, rest)) = slice.split_last() {
+        if last.is_ascii_whitespace() {
+            slice = rest;
+        } else {
+            break;
+        }
+    }
+    slice
 }
 
 /// An unresolved conflict ("file with two versions") reported in [`FolderStatus`].
@@ -938,9 +1349,12 @@ pub struct FolderStatus {
     pub conflicts: Vec<ConflictInfo>,
     /// Contents of `.legion-sync/bin`.
     pub bin: Vec<BinEntry>,
-    /// Active mass-deletion brake awaiting a person's confirmation, if any.
+    /// Active outbound mass-deletion brake awaiting a person's confirmation, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_brake: Option<DeletionBrake>,
+    /// Active inbound peer mass-deletion brakes pausing individual peers until resolved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbound_brakes: Vec<InboundDeletionBrake>,
     /// Temporarily deferred items with their reasons and retry counts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deferred: Vec<DeferredItem>,

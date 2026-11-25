@@ -92,12 +92,14 @@
 //! nodes time out.
 
 pub mod command;
+pub mod content;
 pub mod invite;
 #[cfg(feature = "ssh")]
 pub mod key;
 pub mod link;
 #[cfg(feature = "local")]
 pub mod local;
+pub mod put;
 pub mod session;
 #[cfg(feature = "ssh")]
 pub mod ssh;
@@ -142,6 +144,7 @@ pub(crate) fn strip_remote_sent(mut err: legion_proto::ErrorBody) -> legion_prot
 }
 
 pub use command::{RemoteOs, Subcommand, remote_command, validate_program};
+pub use content::{ContentStream, ContentTime, RawStream, StreamOpenError, StreamOpener};
 #[cfg(feature = "ssh")]
 pub use invite::enrol;
 pub use invite::{
@@ -157,6 +160,7 @@ pub use link::{
     MachineRouteStatus, NodeLink, NodeOrigin, PendingIdentityChange, Route, RoutedValue,
     SessionOpener, parse_optional_target, public_key_fingerprint,
 };
+pub use put::{PutRequest, PutResult, PutStream};
 pub use session::{
     CallError, OpenError, Session, SessionInfo, TransportHandle, cancel_reply_timeout,
 };

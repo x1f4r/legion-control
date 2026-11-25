@@ -10,11 +10,15 @@ use std::time::Duration;
 
 use legion_xfer::{EntryKind, Hash, Timestamp};
 
-use crate::error::Result;
-use crate::model::{DeletionBrake, DeletionBrakeConfig, IndexRecord, MAX_ANCESTRY_HASHES};
+use crate::error::{FsErrorKind, Result, SyncError};
+use crate::model::{
+    DeletionBrake, DeletionBrakeConfig, DeletionWindowState, FolderDeletionLogEntry, IndexRecord,
+    MAX_ANCESTRY_HASHES, PendingLocalDeletion, ProblemKind, SyncProblem,
+    encode_deletion_log_entries,
+};
 use crate::path::{
-    IgnoreMatcher, is_descendant_of, is_legion_inflight_name, is_os_litter_name, path_depth,
-    validate_sync_path,
+    IgnoreMatcher, check_symlink_target_contained, is_descendant_of, is_legion_inflight_name,
+    is_os_litter_name, path_depth, validate_sync_path,
 };
 use crate::reconcile::derive_conflict_of;
 use crate::traits::{FsMeta, FsWalkEntry, IndexStore, StoreBatch, SyncFs};
@@ -56,6 +60,8 @@ pub struct ScanReport {
     pub held_back_unstable: Vec<String>,
     /// Paths that could not be inspected during the walk (`(path, reason)`).
     pub skipped_errors: Vec<(String, String)>,
+    /// Local entries held back by outbound policy (for example absolute or escaping symbolic links).
+    pub held_back_problems: Vec<SyncProblem>,
     /// `true` when the mass-deletion brake tripped, pausing the folder and recording 0 deletions.
     pub brake_tripped: bool,
 }
@@ -198,6 +204,14 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         }
     };
 
+    if meta.pending_brake.is_some() && !options.allow_mass_deletion {
+        return Ok(ScanReport {
+            skipped_errors: walk_skipped,
+            brake_tripped: true,
+            ..ScanReport::default()
+        });
+    }
+
     let held_back_paths: BTreeSet<String> = if store.held_back_count()? > 0 {
         store
             .list_held_back()?
@@ -217,6 +231,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
     let mut still_tracking: BTreeSet<String> = BTreeSet::new();
     let mut kept_dirs_seen: BTreeSet<String> = BTreeSet::new();
     let mut kept_dirs_revived: BTreeSet<String> = BTreeSet::new();
+    let mut cleared_rescan_paths: BTreeSet<String> = BTreeSet::new();
     let mut disk_idx = 0usize;
 
     let mut visit_record = |rec: IndexRecord| -> Result<bool> {
@@ -232,7 +247,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
                 }
                 kept_dirs_revived.insert(entry.path.clone());
             }
-            handle_new_disk_entry(
+            if handle_new_disk_entry(
                 fs,
                 entry,
                 tracker,
@@ -241,7 +256,10 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
                 options,
                 &mut changes,
                 &mut report,
-            )?;
+            )? && meta.needs_rescan.contains(&entry.path)
+            {
+                cleared_rescan_paths.insert(entry.path.clone());
+            }
             disk_idx += 1;
         }
 
@@ -258,25 +276,35 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
                     kept_dirs_revived.insert(entry.path.clone());
                 }
             }
-            handle_existing_disk_entry(
+            let force_hash = meta.needs_rescan.contains(&entry.path);
+            if handle_existing_disk_entry(
                 fs,
                 entry,
                 rec,
                 ignore,
                 &held_back_paths,
+                force_hash,
                 tracker,
                 &mut still_tracking,
                 now,
                 options,
                 &mut changes,
                 &mut report,
-            )?;
+            )? && force_hash
+            {
+                cleared_rescan_paths.insert(entry.path.clone());
+            }
             disk_idx += 1;
         } else if !rec.deleted
             && !ignore.is_path_or_ancestor_ignored(&rec.path, rec.kind == EntryKind::Dir)
             && !is_under_skipped(&rec.path, &walk_skipped)
         {
+            if meta.needs_rescan.contains(&rec.path) {
+                cleared_rescan_paths.insert(rec.path.clone());
+            }
             changes.push(PendingChange::Delete { old: rec });
+        } else if rec.deleted && meta.needs_rescan.contains(&rec.path) {
+            cleared_rescan_paths.insert(rec.path.clone());
         }
 
         Ok(true)
@@ -298,7 +326,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             }
             kept_dirs_revived.insert(entry.path.clone());
         }
-        handle_new_disk_entry(
+        if handle_new_disk_entry(
             fs,
             entry,
             tracker,
@@ -307,7 +335,10 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             options,
             &mut changes,
             &mut report,
-        )?;
+        )? && meta.needs_rescan.contains(&entry.path)
+        {
+            cleared_rescan_paths.insert(entry.path.clone());
+        }
         disk_idx += 1;
     }
 
@@ -325,13 +356,34 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             kept_dirs_changed = true;
         }
     }
+    for p in cleared_rescan_paths {
+        if meta.needs_rescan.remove(&p) {
+            kept_dirs_changed = true;
+        }
+    }
+    if subtree_root.is_none() && !meta.needs_rescan.is_empty() {
+        let before = meta.needs_rescan.len();
+        // Clear any needs_rescan paths that are neither on disk nor unstable/skipped (e.g.
+        // disappeared before they were ever indexed).
+        let unstable_set: BTreeSet<&str> = report
+            .held_back_unstable
+            .iter()
+            .map(String::as_str)
+            .collect();
+        meta.needs_rescan.retain(|p| {
+            unstable_set.contains(p.as_str()) || is_under_skipped(p, &report.skipped_errors)
+        });
+        if meta.needs_rescan.len() != before {
+            kept_dirs_changed = true;
+        }
+    }
 
     if subtree_root.is_none() {
         tracker.retain_paths(&still_tracking);
     }
 
     // Re-filter deletions against any errors added during hashing/statting.
-    let mut deletes: Vec<IndexRecord> = Vec::new();
+    let mut raw_deletes: Vec<IndexRecord> = Vec::new();
     let mut upserts: Vec<PendingUpsert> = Vec::new();
     let mut stat_refreshes: Vec<IndexRecord> = Vec::new();
 
@@ -339,7 +391,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         match change {
             PendingChange::Delete { old } => {
                 if !is_under_skipped(&old.path, &report.skipped_errors) {
-                    deletes.push(old);
+                    raw_deletes.push(old);
                 }
             }
             PendingChange::Upsert(item) => upserts.push(item),
@@ -347,35 +399,357 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         }
     }
 
-    // Item B3: mass-deletion brake.
-    let deleted_files = deletes.iter().filter(|r| r.kind == EntryKind::File).count();
-    let total_live_files = store.live_file_count()? as usize;
-    if !options.allow_mass_deletion && brake_config.should_trip(deleted_files, total_live_files) {
-        let sample_paths = deletes
-            .iter()
-            .filter(|r| r.kind == EntryKind::File)
-            .take(10)
-            .map(|r| r.path.clone())
-            .collect();
-        meta.paused = true;
-        meta.pending_brake = Some(DeletionBrake {
-            deleted_count: deleted_files,
-            total_live_files,
-            sample_paths,
+    // Any path present on disk in this scan cancels a previously pending local deletion for it.
+    let seen_live_paths: BTreeSet<&str> = disk_entries.iter().map(|e| e.path.as_str()).collect();
+    let mut brake_meta_dirty = false;
+    if !meta.pending_deletions.is_empty() {
+        let before = meta.pending_deletions.len();
+        meta.pending_deletions
+            .retain(|p, _| !seen_live_paths.contains(p.as_str()));
+        if meta.pending_deletions.len() != before {
+            brake_meta_dirty = true;
+        }
+    }
+
+    // Item 8: move-aware, windowed outbound mass-deletion brake (30s settle + 10m rolling window).
+    const MAX_RECENT_CREATED_HASHES: usize = 50_000;
+    let settle_secs = brake_config.settle_secs as i64;
+    let window_secs = brake_config.window_secs as i64;
+    let current_live_files = store.live_file_count()? as usize;
+
+    let had_window = meta.deletion_window.is_some();
+    let mut window = meta
+        .deletion_window
+        .take()
+        .unwrap_or_else(|| DeletionWindowState {
+            window_start: now,
+            window_start_live_files: current_live_files,
+            emitted_deletions: Vec::new(),
+            recent_created_hashes: Vec::new(),
         });
-        let batch = StoreBatch {
-            folder_meta: Some(meta),
-            ..StoreBatch::default()
-        };
-        store.apply_batch(batch)?;
-        report.brake_tripped = true;
-        report.deleted = 0;
-        return Ok(report);
+
+    let before_recent = window.recent_created_hashes.len();
+    window
+        .recent_created_hashes
+        .retain(|(_, _, t)| now.secs >= t.secs && (now.secs - t.secs) <= settle_secs);
+    if window.recent_created_hashes.len() != before_recent {
+        brake_meta_dirty = true;
+    }
+
+    let before_emitted = window.emitted_deletions.len();
+    window.emitted_deletions.retain(|(p, t)| {
+        now.secs >= t.secs
+            && (now.secs - t.secs) <= window_secs
+            && !seen_live_paths.contains(p.as_str())
+    });
+    if window.emitted_deletions.len() != before_emitted {
+        brake_meta_dirty = true;
+    }
+
+    if window.emitted_deletions.is_empty() && meta.pending_deletions.is_empty() {
+        window.window_start = now;
+        window.window_start_live_files = current_live_files;
+    } else if now.secs < window.window_start.secs
+        || (now.secs - window.window_start.secs) > window_secs
+    {
+        let mut oldest = now;
+        for (_, t) in &window.emitted_deletions {
+            if t.secs < oldest.secs {
+                oldest = *t;
+            }
+        }
+        for pd in meta.pending_deletions.values() {
+            if pd.detected_at.secs < oldest.secs {
+                oldest = pd.detected_at;
+            }
+        }
+        window.window_start = oldest;
+        window.window_start_live_files = current_live_files + window.emitted_deletions.len();
+        brake_meta_dirty = true;
+    }
+
+    // Build per-hash list of newly created/modified paths in this scan for move matching.
+    let mut upsert_paths_by_hash: BTreeMap<Hash, Vec<String>> = BTreeMap::new();
+    for u in &upserts {
+        if u.meta.kind == EntryKind::File
+            && let Some(h) = u.hash
+            && u.prev
+                .as_ref()
+                .is_none_or(|p| p.deleted || p.hash != Some(h))
+        {
+            upsert_paths_by_hash
+                .entry(h)
+                .or_default()
+                .push(u.path.clone());
+        }
+    }
+
+    let mut matched_move_deletes: Vec<IndexRecord> = Vec::new();
+
+    // Cross-scan move recognition: if a previously pending deletion's content hash just appeared
+    // at a DIFFERENT path within the settle period, promote it as a move (never counted by the
+    // brake).
+    if !meta.pending_deletions.is_empty() && !upsert_paths_by_hash.is_empty() {
+        let mut moved_paths: Vec<String> = Vec::new();
+        for (p, pd) in &meta.pending_deletions {
+            if pd.old_record.kind == EntryKind::File
+                && let Some(h) = pd.old_record.hash
+                && let Some(paths) = upsert_paths_by_hash.get_mut(&h)
+                && let Some(idx) = paths.iter().position(|up| up != p)
+            {
+                paths.swap_remove(idx);
+                moved_paths.push(p.clone());
+            }
+        }
+        for p in moved_paths {
+            if let Some(pd) = meta.pending_deletions.remove(&p) {
+                brake_meta_dirty = true;
+                if fs.stat_live(&p)?.is_none() {
+                    matched_move_deletes.push(pd.old_record);
+                }
+            }
+        }
+    }
+
+    // Partition this scan's deletions into moves (matching a DIFFERENT path in this scan's upserts
+    // or recent created files within `settle_secs`), unmatched regular-file deletions, and
+    // dir/symlink deletions.
+    let mut unmatched_file_deletes: Vec<IndexRecord> = Vec::new();
+    let mut dir_and_other_deletes: Vec<IndexRecord> = Vec::new();
+    for old in raw_deletes {
+        if old.kind == EntryKind::File {
+            let mut is_move = false;
+            if let Some(h) = old.hash {
+                if let Some(paths) = upsert_paths_by_hash.get_mut(&h)
+                    && let Some(idx) = paths.iter().position(|up| up != &old.path)
+                {
+                    paths.swap_remove(idx);
+                    is_move = true;
+                } else if let Some(pos) = window
+                    .recent_created_hashes
+                    .iter()
+                    .position(|(rp, rh, _)| *rh == h && rp != &old.path)
+                {
+                    window.recent_created_hashes.swap_remove(pos);
+                    brake_meta_dirty = true;
+                    is_move = true;
+                }
+            }
+            // Drop any stale recent-created record for the deleted path itself so a second
+            // deletion of another identical file cannot match a vanished path.
+            let prev_len = window.recent_created_hashes.len();
+            window
+                .recent_created_hashes
+                .retain(|(rp, _, _)| rp != &old.path);
+            if window.recent_created_hashes.len() != prev_len {
+                brake_meta_dirty = true;
+            }
+            if is_move {
+                matched_move_deletes.push(old);
+            } else {
+                unmatched_file_deletes.push(old);
+            }
+        } else {
+            dir_and_other_deletes.push(old);
+        }
+    }
+
+    // Record remaining unmatched new file `(path, hash)` entries so a follow-up subtree scan that
+    // notices the vanished old path within `settle_secs` recognizes the move too.
+    if brake_config.is_enabled() && settle_secs > 0 && !upsert_paths_by_hash.is_empty() {
+        for (h, paths) in upsert_paths_by_hash {
+            for p in paths {
+                if window.recent_created_hashes.len() >= MAX_RECENT_CREATED_HASHES {
+                    break;
+                }
+                window.recent_created_hashes.push((p, h, now));
+                brake_meta_dirty = true;
+            }
+        }
+    }
+
+    let effective_baseline = window.window_start_live_files.max(current_live_files);
+    let brake_active = !options.allow_mass_deletion
+        && brake_config.is_enabled()
+        && effective_baseline > brake_config.min_deleted_files;
+
+    let mut deletes: Vec<IndexRecord> = matched_move_deletes;
+    if !brake_active {
+        // Either the user confirmed the mass deletion, the brake is disabled, or the folder is
+        // small enough that the brake can never trip: emit all deletions immediately.
+        deletes.extend(unmatched_file_deletes);
+        deletes.extend(dir_and_other_deletes);
+        if !meta.pending_deletions.is_empty() {
+            let drained = std::mem::take(&mut meta.pending_deletions);
+            brake_meta_dirty = true;
+            for (p, pd) in drained {
+                if !is_under_skipped(&p, &report.skipped_errors)
+                    && fs.stat_live(&p)?.is_none()
+                    && !deletes.iter().any(|d| d.path == p)
+                {
+                    deletes.push(pd.old_record);
+                }
+            }
+        }
+        if options.allow_mass_deletion {
+            let confirmed_files = deletes.iter().filter(|d| d.kind == EntryKind::File).count();
+            window.emitted_deletions.clear();
+            window.window_start = now;
+            window.window_start_live_files = current_live_files.saturating_sub(confirmed_files);
+            brake_meta_dirty = true;
+        }
+    } else {
+        // Hold unmatched regular-file deletions pending for the settle period before peers see
+        // them, preserving each path's first `detected_at`.
+        for old in unmatched_file_deletes {
+            let path = old.path.clone();
+            if let std::collections::btree_map::Entry::Vacant(e) =
+                meta.pending_deletions.entry(path)
+            {
+                e.insert(PendingLocalDeletion {
+                    old_record: old,
+                    detected_at: now,
+                });
+                brake_meta_dirty = true;
+            }
+        }
+        for old in dir_and_other_deletes {
+            if old.kind == EntryKind::Dir {
+                let has_pending_child = meta
+                    .pending_deletions
+                    .keys()
+                    .any(|k| is_descendant_of(k, &old.path));
+                if has_pending_child {
+                    let path = old.path.clone();
+                    if let std::collections::btree_map::Entry::Vacant(e) =
+                        meta.pending_deletions.entry(path)
+                    {
+                        e.insert(PendingLocalDeletion {
+                            old_record: old,
+                            detected_at: now,
+                        });
+                        brake_meta_dirty = true;
+                    }
+                } else {
+                    deletes.push(old);
+                }
+            } else {
+                deletes.push(old);
+            }
+        }
+
+        // Count distinct file deletions across BOTH pending deletions and already-emitted
+        // deletions in the rolling window against the window-start live file count!
+        let mut distinct_deleted_files: BTreeSet<&str> = BTreeSet::new();
+        for (p, _) in &window.emitted_deletions {
+            distinct_deleted_files.insert(p.as_str());
+        }
+        for (p, pd) in &meta.pending_deletions {
+            if pd.old_record.kind == EntryKind::File {
+                distinct_deleted_files.insert(p.as_str());
+            }
+        }
+        let total_window_deleted = distinct_deleted_files.len();
+        if brake_config.should_trip(total_window_deleted, effective_baseline) {
+            let mut sample_paths: Vec<String> = meta
+                .pending_deletions
+                .values()
+                .filter(|pd| pd.old_record.kind == EntryKind::File)
+                .take(10)
+                .map(|pd| pd.old_record.path.clone())
+                .collect();
+            if sample_paths.len() < 10 {
+                for (p, _) in &window.emitted_deletions {
+                    if sample_paths.len() >= 10 {
+                        break;
+                    }
+                    if !sample_paths.contains(p) {
+                        sample_paths.push(p.clone());
+                    }
+                }
+            }
+            meta.paused = true;
+            meta.pending_brake = Some(DeletionBrake {
+                deleted_count: total_window_deleted,
+                total_live_files: effective_baseline,
+                sample_paths,
+            });
+            meta.deletion_window = Some(window);
+            let batch = StoreBatch {
+                folder_meta: Some(meta),
+                ..StoreBatch::default()
+            };
+            store.apply_batch(batch)?;
+            report.brake_tripped = true;
+            report.deleted = 0;
+            return Ok(report);
+        }
+
+        // Promote any pending deletions whose settle period has elapsed (checking disk first).
+        let mut ready_files: Vec<String> = Vec::new();
+        for (p, pd) in &meta.pending_deletions {
+            if pd.old_record.kind != EntryKind::Dir
+                && !is_under_skipped(p, &report.skipped_errors)
+                && (settle_secs == 0
+                    || (now.secs >= pd.detected_at.secs
+                        && (now.secs - pd.detected_at.secs) >= settle_secs))
+            {
+                ready_files.push(p.clone());
+            }
+        }
+        for p in ready_files {
+            if let Some(pd) = meta.pending_deletions.remove(&p) {
+                brake_meta_dirty = true;
+                if fs.stat_live(&p)?.is_none() {
+                    if pd.old_record.kind == EntryKind::File
+                        && !window.emitted_deletions.iter().any(|(ep, _)| ep == &p)
+                    {
+                        window.emitted_deletions.push((p, now));
+                    }
+                    deletes.push(pd.old_record);
+                }
+            }
+        }
+
+        // Promote pending directories once no descendant remains pending (either settled or moved).
+        let ready_dirs: Vec<String> = meta
+            .pending_deletions
+            .iter()
+            .filter(|(p, pd)| {
+                pd.old_record.kind == EntryKind::Dir
+                    && !is_under_skipped(p, &report.skipped_errors)
+                    && !meta
+                        .pending_deletions
+                        .keys()
+                        .any(|other| is_descendant_of(other, p))
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        for p in ready_dirs {
+            if let Some(pd) = meta.pending_deletions.remove(&p) {
+                brake_meta_dirty = true;
+                if fs.stat_live(&p)?.is_none() {
+                    deletes.push(pd.old_record);
+                }
+            }
+        }
+    }
+
+    let keep_window = !window.emitted_deletions.is_empty()
+        || !window.recent_created_hashes.is_empty()
+        || !meta.pending_deletions.is_empty();
+    if keep_window {
+        meta.deletion_window = Some(window);
+        if !had_window {
+            brake_meta_dirty = true;
+        }
+    } else if had_window {
+        brake_meta_dirty = true;
     }
 
     let finish_join_mode = subtree_root.is_none() && meta.join_mode;
     if deletes.is_empty() && upserts.is_empty() && stat_refreshes.is_empty() {
-        if finish_join_mode || kept_dirs_changed {
+        if finish_join_mode || kept_dirs_changed || brake_meta_dirty {
             if finish_join_mode {
                 meta.join_mode = false;
             }
@@ -404,19 +778,18 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
     });
 
     let mut batch = StoreBatch::default();
-    let vkey = meta.version_key();
     let join_mode_active = meta.join_mode;
 
     for rec in stat_refreshes {
         batch.upsert_records.push(rec);
     }
 
-    let mut meta_dirty = kept_dirs_changed;
+    let mut meta_dirty = kept_dirs_changed || brake_meta_dirty;
+    let mut del_log_entries: Vec<FolderDeletionLogEntry> = Vec::new();
 
     for old in deletes {
         let mut version = old.version;
-        let clock = meta.next_clock();
-        version.bump_above(vkey.clone(), clock);
+        meta.bump_version(&mut version);
         let seq = meta.next_seq();
         meta_dirty = true;
 
@@ -452,7 +825,9 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             conflict_of: None,
             conflict_dismissed: false,
         };
-        meta.record_seq_fingerprint(seq, rec.head_fingerprint());
+        let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
+        batch.upsert_seq_fingerprints.push((seq, chain));
+        del_log_entries.push(FolderDeletionLogEntry::from_tombstone(&rec));
         batch.upsert_records.push(rec);
         report.deleted += 1;
     }
@@ -465,12 +840,12 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         is_kind_change,
     } in upserts
     {
+        let was_deleted = prev.as_ref().is_some_and(|p| p.deleted);
         let is_new = prev.as_ref().is_none_or(|p| p.deleted);
         let mut version = prev
             .as_ref()
             .map_or_else(VersionVector::new, |p| p.version.clone());
-        let clock = meta.next_clock();
-        version.bump_above(vkey.clone(), clock);
+        meta.bump_version(&mut version);
         let seq = meta.next_seq();
         meta_dirty = true;
 
@@ -521,7 +896,13 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             conflict_dismissed,
         };
         rec.conflict_of = derive_conflict_of(&rec, &meta);
-        meta.record_seq_fingerprint(seq, rec.head_fingerprint());
+        let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
+        batch.upsert_seq_fingerprints.push((seq, chain));
+        if was_deleted {
+            del_log_entries.push(FolderDeletionLogEntry::Revived {
+                path: rec.path.clone(),
+            });
+        }
         batch.upsert_records.push(rec);
 
         if is_kind_change {
@@ -531,6 +912,11 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         } else {
             report.modified += 1;
         }
+    }
+
+    if !del_log_entries.is_empty() {
+        let encoded = encode_deletion_log_entries(&del_log_entries)?;
+        fs.append_deletion_log(&encoded)?;
     }
 
     if finish_join_mode {
@@ -545,12 +931,217 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
     Ok(report)
 }
 
+/// Promotes any pending local deletions whose settle period has elapsed at `now` without needing
+/// a full folder walk, verifying each path is still absent on disk and still enforcing the rolling
+/// window mass-deletion brake.
+pub fn flush_settled_deletions<F: SyncFs, S: IndexStore>(
+    fs: &F,
+    store: &mut S,
+    brake_config: DeletionBrakeConfig,
+    now: Timestamp,
+) -> Result<usize> {
+    let Some(mut meta) = store.load_meta()? else {
+        return Ok(0);
+    };
+    if meta.paused || meta.pending_brake.is_some() || meta.pending_deletions.is_empty() {
+        return Ok(0);
+    }
+
+    let settle_secs = brake_config.settle_secs as i64;
+    let window_secs = brake_config.window_secs as i64;
+    let current_live_files = store.live_file_count()? as usize;
+
+    let mut window = meta
+        .deletion_window
+        .take()
+        .unwrap_or_else(|| DeletionWindowState {
+            window_start: now,
+            window_start_live_files: current_live_files,
+            emitted_deletions: Vec::new(),
+            recent_created_hashes: Vec::new(),
+        });
+    window
+        .emitted_deletions
+        .retain(|(_, t)| now.secs >= t.secs && (now.secs - t.secs) <= window_secs);
+    window
+        .recent_created_hashes
+        .retain(|(_, _, t)| now.secs >= t.secs && (now.secs - t.secs) <= settle_secs);
+
+    let effective_baseline = window.window_start_live_files.max(current_live_files);
+    if brake_config.is_enabled() {
+        let mut distinct: BTreeSet<&str> = BTreeSet::new();
+        for (p, _) in &window.emitted_deletions {
+            distinct.insert(p.as_str());
+        }
+        for (p, pd) in &meta.pending_deletions {
+            if pd.old_record.kind == EntryKind::File {
+                distinct.insert(p.as_str());
+            }
+        }
+        if brake_config.should_trip(distinct.len(), effective_baseline) {
+            let sample_paths = meta
+                .pending_deletions
+                .values()
+                .filter(|pd| pd.old_record.kind == EntryKind::File)
+                .take(10)
+                .map(|pd| pd.old_record.path.clone())
+                .collect();
+            meta.paused = true;
+            meta.pending_brake = Some(DeletionBrake {
+                deleted_count: distinct.len(),
+                total_live_files: effective_baseline,
+                sample_paths,
+            });
+            meta.deletion_window = Some(window);
+            store.apply_batch(StoreBatch {
+                folder_meta: Some(meta),
+                ..StoreBatch::default()
+            })?;
+            return Ok(0);
+        }
+    }
+
+    let mut deletes = Vec::new();
+    let mut dirty = false;
+    let ready_files: Vec<String> = meta
+        .pending_deletions
+        .iter()
+        .filter(|(_, pd)| {
+            pd.old_record.kind != EntryKind::Dir
+                && (settle_secs == 0
+                    || (now.secs >= pd.detected_at.secs
+                        && (now.secs - pd.detected_at.secs) >= settle_secs))
+        })
+        .map(|(p, _)| p.clone())
+        .collect();
+    for p in ready_files {
+        if let Some(pd) = meta.pending_deletions.remove(&p) {
+            dirty = true;
+            if fs.stat_live(&p)?.is_none() {
+                if pd.old_record.kind == EntryKind::File
+                    && !window.emitted_deletions.iter().any(|(ep, _)| ep == &p)
+                {
+                    window.emitted_deletions.push((p, now));
+                }
+                deletes.push(pd.old_record);
+            }
+        }
+    }
+
+    let ready_dirs: Vec<String> = meta
+        .pending_deletions
+        .iter()
+        .filter(|(p, pd)| {
+            pd.old_record.kind == EntryKind::Dir
+                && !meta
+                    .pending_deletions
+                    .keys()
+                    .any(|other| is_descendant_of(other, p))
+        })
+        .map(|(p, _)| p.clone())
+        .collect();
+    for p in ready_dirs {
+        if let Some(pd) = meta.pending_deletions.remove(&p) {
+            dirty = true;
+            if fs.stat_live(&p)?.is_none() {
+                deletes.push(pd.old_record);
+            }
+        }
+    }
+
+    let keep_window = !window.emitted_deletions.is_empty()
+        || !window.recent_created_hashes.is_empty()
+        || !meta.pending_deletions.is_empty();
+    meta.deletion_window = keep_window.then_some(window);
+
+    if deletes.is_empty() {
+        if dirty {
+            store.apply_batch(StoreBatch {
+                folder_meta: Some(meta),
+                ..StoreBatch::default()
+            })?;
+        }
+        return Ok(0);
+    }
+
+    deletes.sort_by(|a, b| {
+        path_depth(&b.path)
+            .cmp(&path_depth(&a.path))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    let mut batch = StoreBatch::default();
+    let mut del_log_entries = Vec::with_capacity(deletes.len());
+    let count = deletes.len();
+    for old in deletes {
+        let mut version = old.version;
+        meta.bump_version(&mut version);
+        let seq = meta.next_seq();
+        let mut recent_hashes = old.recent_hashes;
+        if let Some(h) = old.hash {
+            recent_hashes.retain(|x| *x != h);
+            recent_hashes.insert(0, h);
+            recent_hashes.truncate(MAX_ANCESTRY_HASHES);
+        }
+        if !recent_hashes.is_empty() {
+            batch
+                .upsert_deleted_history
+                .push((old.path.clone(), recent_hashes.clone()));
+        }
+        let rec = IndexRecord {
+            path: old.path,
+            kind: old.kind,
+            size: 0,
+            mtime: now,
+            disk_mtime: None,
+            disk_change_id: None,
+            mode: None,
+            hash: None,
+            link_target: None,
+            deleted: true,
+            version,
+            modified_by: meta.local_member.clone(),
+            seq,
+            recent_hashes,
+            from_join: false,
+            conflict_of: None,
+            conflict_dismissed: false,
+        };
+        let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
+        batch.upsert_seq_fingerprints.push((seq, chain));
+        del_log_entries.push(FolderDeletionLogEntry::from_tombstone(&rec));
+        batch.upsert_records.push(rec);
+    }
+    if !del_log_entries.is_empty() {
+        let encoded = encode_deletion_log_entries(&del_log_entries)?;
+        fs.append_deletion_log(&encoded)?;
+    }
+    batch.folder_meta = Some(meta);
+    store.apply_batch(batch)?;
+    Ok(count)
+}
+
 /// Rescans a single relative path on disk and commits any detected local change atomically.
 pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
     fs: &F,
     store: &mut S,
     rel_path: &str,
     now: Timestamp,
+) -> Result<SingleRescanOutcome> {
+    rescan_single_path_with_force(fs, store, rel_path, now, false)
+}
+
+/// Rescans a single relative path on disk; when `force_bump` is `true` (used after the engine
+/// already displaced the previously indexed file and a person concurrently placed a new file at
+/// `rel_path`), a live entry on disk always receives a bumped version even if its content hash
+/// matches the displaced record's hash (for example when the person renamed a conflict copy back
+/// into place or undid an edit).
+pub fn rescan_single_path_with_force<F: SyncFs, S: IndexStore>(
+    fs: &F,
+    store: &mut S,
+    rel_path: &str,
+    now: Timestamp,
+    force_bump: bool,
 ) -> Result<SingleRescanOutcome> {
     let clean = validate_sync_path(rel_path)?;
     let mut meta = store
@@ -559,14 +1150,30 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
             context: "rescan_single_path".to_string(),
             detail: "index store is not initialized".to_string(),
         })?;
-    let vkey = meta.version_key();
     let prev = store.get_record(&clean)?;
     let disk_opt = fs.stat_live(&clean)?;
 
     match (prev, disk_opt) {
-        (None, None) => Ok(SingleRescanOutcome::Unchanged),
-        (Some(ref rec), None) if rec.deleted => Ok(SingleRescanOutcome::Unchanged),
+        (None, None) => {
+            if meta.needs_rescan.remove(&clean) {
+                store.apply_batch(StoreBatch {
+                    folder_meta: Some(meta),
+                    ..StoreBatch::default()
+                })?;
+            }
+            Ok(SingleRescanOutcome::Unchanged)
+        }
+        (Some(ref rec), None) if rec.deleted => {
+            if meta.needs_rescan.remove(&clean) {
+                store.apply_batch(StoreBatch {
+                    folder_meta: Some(meta),
+                    ..StoreBatch::default()
+                })?;
+            }
+            Ok(SingleRescanOutcome::Unchanged)
+        }
         (Some(old), None) => {
+            meta.needs_rescan.remove(&clean);
             // If an indexed directory disappeared from disk, any live indexed descendants under
             // it have necessarily vanished too; tombstone them deepest-first in the same batch so
             // stale ghost subdirectories are never served before the next full scan.
@@ -588,12 +1195,13 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
 
             let mut upsert_records = Vec::with_capacity(to_tombstone.len());
             let mut upsert_deleted_history = Vec::new();
+            let mut upsert_seq_fingerprints = Vec::with_capacity(to_tombstone.len());
+            let mut del_log_entries = Vec::with_capacity(to_tombstone.len());
             let mut main_record = None;
             for item in to_tombstone {
                 let is_main = item.path == clean;
                 let mut version = item.version;
-                let clock = meta.next_clock();
-                version.bump_above(vkey.clone(), clock);
+                meta.bump_version(&mut version);
                 let seq = meta.next_seq();
                 let mut recent_hashes = item.recent_hashes;
                 if let Some(h) = item.hash {
@@ -623,7 +1231,9 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                     conflict_of: None,
                     conflict_dismissed: false,
                 };
-                meta.record_seq_fingerprint(seq, rec.head_fingerprint());
+                let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
+                upsert_seq_fingerprints.push((seq, chain));
+                del_log_entries.push(FolderDeletionLogEntry::from_tombstone(&rec));
                 if is_main {
                     main_record = Some(rec.clone());
                 }
@@ -633,23 +1243,49 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                 context: "rescan_single_path".to_string(),
                 detail: "missing main tombstone record".to_string(),
             })?;
+            if !del_log_entries.is_empty() {
+                let encoded = encode_deletion_log_entries(&del_log_entries)?;
+                fs.append_deletion_log(&encoded)?;
+            }
             let batch = StoreBatch {
                 folder_meta: Some(meta),
                 upsert_records,
                 upsert_deleted_history,
+                upsert_seq_fingerprints,
                 ..StoreBatch::default()
             };
             store.apply_batch(batch)?;
             Ok(SingleRescanOutcome::Updated(Box::new(record)))
         }
         (prev_opt, Some(disk_meta)) => {
+            if disk_meta.kind == EntryKind::Symlink
+                && check_symlink_target_contained(
+                    &clean,
+                    disk_meta.link_target.as_deref().unwrap_or_default(),
+                )
+                .is_err()
+            {
+                return Ok(SingleRescanOutcome::Unchanged);
+            }
             let hash = if disk_meta.kind == EntryKind::File {
-                let (h, bytes_read) = fs.hash_live(&clean)?;
+                let (h, bytes_read) = match fs.hash_live(&clean) {
+                    Ok(pair) => pair,
+                    Err(SyncError::Fs {
+                        kind: FsErrorKind::NotFound,
+                        ..
+                    })
+                    | Err(SyncError::Conflict { .. }) => {
+                        return Ok(SingleRescanOutcome::Unstable);
+                    }
+                    Err(err) => return Err(err),
+                };
                 let after = fs.stat_live(&clean)?;
                 let stable = after.as_ref().is_some_and(|m| {
                     m.kind == EntryKind::File
                         && m.size == disk_meta.size
                         && m.mtime == disk_meta.mtime
+                        && m.change_id == disk_meta.change_id
+                        && m.file_identity == disk_meta.file_identity
                         && bytes_read == disk_meta.size
                 });
                 if !stable {
@@ -660,25 +1296,34 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                 None
             };
 
-            if let Some(ref existing) = prev_opt
+            if !force_bump
+                && let Some(ref existing) = prev_opt
                 && !existing.deleted
                 && existing.kind == disk_meta.kind
                 && existing.hash == hash
                 && existing.link_target == disk_meta.link_target
                 && !mode_changed(existing.mode, disk_meta.mode)
             {
-                if existing.disk_mtime != Some(disk_meta.mtime)
-                    || existing.disk_change_id != disk_meta.change_id
-                {
-                    let mut refreshed = existing.clone();
-                    refreshed.disk_mtime = Some(disk_meta.mtime);
-                    refreshed.disk_change_id = disk_meta.change_id;
+                let cleared = meta.needs_rescan.remove(&clean);
+                let stat_diff = existing.disk_mtime != Some(disk_meta.mtime)
+                    || existing.disk_change_id != disk_meta.change_id;
+                if stat_diff || cleared {
                     let mut batch = StoreBatch::default();
-                    batch.upsert_records.push(refreshed);
+                    if stat_diff {
+                        let mut refreshed = existing.clone();
+                        refreshed.disk_mtime = Some(disk_meta.mtime);
+                        refreshed.disk_change_id = disk_meta.change_id;
+                        batch.upsert_records.push(refreshed);
+                    }
+                    if cleared {
+                        batch.folder_meta = Some(meta);
+                    }
                     store.apply_batch(batch)?;
                 }
                 return Ok(SingleRescanOutcome::Unchanged);
             }
+
+            meta.needs_rescan.remove(&clean);
 
             let is_kind_change = prev_opt
                 .as_ref()
@@ -686,8 +1331,7 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
             let mut version = prev_opt
                 .as_ref()
                 .map_or_else(VersionVector::new, |p| p.version.clone());
-            let clock = meta.next_clock();
-            version.bump_above(vkey, clock);
+            meta.bump_version(&mut version);
             let seq = meta.next_seq();
             let mode = disk_meta.mode.or_else(|| {
                 prev_opt
@@ -712,6 +1356,7 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                 .as_ref()
                 .is_some_and(|p| !p.deleted && !is_kind_change && p.conflict_dismissed);
 
+            let was_deleted = prev_opt.as_ref().is_some_and(|p| p.deleted);
             let mut record = IndexRecord {
                 path: clean,
                 kind: disk_meta.kind,
@@ -736,10 +1381,17 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                 conflict_dismissed,
             };
             record.conflict_of = derive_conflict_of(&record, &meta);
-            meta.record_seq_fingerprint(seq, record.head_fingerprint());
+            let chain = meta.advance_chain_fingerprint(seq, record.head_fingerprint());
+            if was_deleted {
+                let encoded = encode_deletion_log_entries(&[FolderDeletionLogEntry::Revived {
+                    path: record.path.clone(),
+                }])?;
+                fs.append_deletion_log(&encoded)?;
+            }
             let batch = StoreBatch {
                 folder_meta: Some(meta),
                 upsert_records: vec![record.clone()],
+                upsert_seq_fingerprints: vec![(seq, chain)],
                 ..StoreBatch::default()
             };
             store.apply_batch(batch)?;
@@ -758,7 +1410,22 @@ fn handle_new_disk_entry<F: SyncFs>(
     options: ScanOptions,
     changes: &mut Vec<PendingChange>,
     report: &mut ScanReport,
-) -> Result<()> {
+) -> Result<bool> {
+    if entry.meta.kind == EntryKind::Symlink
+        && let Err(reason) = check_symlink_target_contained(
+            &entry.path,
+            entry.meta.link_target.as_deref().unwrap_or_default(),
+        )
+    {
+        report.held_back_problems.push(SyncProblem {
+            path: entry.path.clone(),
+            kind: ProblemKind::UnsupportedSymlink,
+            peer: None,
+            sentence: format!("'{}' was held back because {reason}.", entry.path),
+        });
+        return Ok(true);
+    }
+
     let hash = match entry.meta.kind {
         EntryKind::File => {
             match check_and_hash_file(
@@ -772,7 +1439,7 @@ fn handle_new_disk_entry<F: SyncFs>(
                 report,
             )? {
                 Some(h) => Some(h),
-                None => return Ok(()),
+                None => return Ok(false),
             }
         }
         EntryKind::Dir | EntryKind::Symlink => None,
@@ -785,7 +1452,7 @@ fn handle_new_disk_entry<F: SyncFs>(
         prev: None,
         is_kind_change: false,
     }));
-    Ok(())
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -795,13 +1462,28 @@ fn handle_existing_disk_entry<F: SyncFs>(
     rec: IndexRecord,
     ignore: &IgnoreMatcher,
     held_back_paths: &BTreeSet<String>,
+    force_hash: bool,
     tracker: &mut PendingStabilityTracker,
     still_tracking: &mut BTreeSet<String>,
     now: Timestamp,
     options: ScanOptions,
     changes: &mut Vec<PendingChange>,
     report: &mut ScanReport,
-) -> Result<()> {
+) -> Result<bool> {
+    if entry.meta.kind == EntryKind::Symlink
+        && let Err(reason) = check_symlink_target_contained(
+            &entry.path,
+            entry.meta.link_target.as_deref().unwrap_or_default(),
+        )
+    {
+        report.held_back_problems.push(SyncProblem {
+            path: entry.path.clone(),
+            kind: ProblemKind::UnsupportedSymlink,
+            peer: None,
+            sentence: format!("'{}' was held back because {reason}.", entry.path),
+        });
+        return Ok(true);
+    }
     // Item H: a directory that was deleted elsewhere and intentionally kept on disk only because
     // it still contains ignored or held-back files must NOT be revived as a new directory on scan.
     if rec.deleted
@@ -809,15 +1491,16 @@ fn handle_existing_disk_entry<F: SyncFs>(
         && dir_holds_only_local_non_synced_files(fs, &entry.path, ignore, held_back_paths)?
     {
         report.unchanged += 1;
-        return Ok(());
+        return Ok(true);
     }
 
     if !rec.deleted
+        && !force_hash
         && !(options.verify_checksums && entry.meta.kind == EntryKind::File)
         && is_stat_unchanged(&rec, &entry.meta)
     {
         report.unchanged += 1;
-        return Ok(());
+        return Ok(true);
     }
 
     let is_kind_change = !rec.deleted && rec.kind != entry.meta.kind;
@@ -834,7 +1517,7 @@ fn handle_existing_disk_entry<F: SyncFs>(
                 report,
             )? {
                 Some(h) => Some(h),
-                None => return Ok(()),
+                None => return Ok(false),
             }
         }
         EntryKind::Dir | EntryKind::Symlink => None,
@@ -856,7 +1539,7 @@ fn handle_existing_disk_entry<F: SyncFs>(
             changes.push(PendingChange::RefreshDiskStatOnly { record: refreshed });
         }
         report.unchanged += 1;
-        return Ok(());
+        return Ok(true);
     }
 
     changes.push(PendingChange::Upsert(PendingUpsert {
@@ -866,7 +1549,7 @@ fn handle_existing_disk_entry<F: SyncFs>(
         prev: Some(rec),
         is_kind_change,
     }));
-    Ok(())
+    Ok(true)
 }
 
 /// Returns `true` when `dir_path` is non-empty on disk AND every entry inside it is excluded from
@@ -962,6 +1645,8 @@ fn check_and_hash_file<F: SyncFs>(
         m.kind == EntryKind::File
             && m.size == meta1.size
             && m.mtime == meta1.mtime
+            && m.change_id == meta1.change_id
+            && m.file_identity == meta1.file_identity
             && bytes_read == meta1.size
     });
     if !stable {
@@ -1032,7 +1717,15 @@ pub fn disk_matches_index<F: SyncFs>(
                     if !mtime_ok || mode_changed(rec.mode, disk.mode) {
                         return Ok(false);
                     }
-                    let (actual_hash, bytes_read) = fs.hash_live(path)?;
+                    let (actual_hash, bytes_read) = match fs.hash_live(path) {
+                        Ok(pair) => pair,
+                        Err(SyncError::Fs {
+                            kind: FsErrorKind::NotFound,
+                            ..
+                        })
+                        | Err(SyncError::Conflict { .. }) => return Ok(false),
+                        Err(err) => return Err(err),
+                    };
                     Ok(bytes_read == rec.size && rec.hash == Some(actual_hash))
                 }
             }
