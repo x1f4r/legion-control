@@ -131,6 +131,11 @@ impl TransferPlatform for DesktopTransferPlatform {
             };
             let dst = unique_dest_path(dir, &target_name);
             move_file_across_fs(part_path, &dst).await?;
+            #[cfg(unix)]
+            if !open_after_done {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o644));
+            }
             Ok(dst.to_string_lossy().into_owned())
         })
     }

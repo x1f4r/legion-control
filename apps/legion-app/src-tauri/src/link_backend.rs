@@ -240,11 +240,20 @@ impl LinkBackend {
             None => Link::with_options(link_cfg, link_options),
         };
 
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let initial_local_node_name = if local_program.is_some() {
+            read_local_node_name_hint()
+        } else {
+            None
+        };
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let initial_local_node_name: Option<String> = None;
+
         let mut state = BackendState {
             data,
             store_error,
             local_program,
-            local_node_name: None,
+            local_node_name: initial_local_node_name,
             active_node,
             preferred_relay: None,
             last_paired: None,
@@ -361,9 +370,8 @@ impl LinkBackend {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if guard.data.link.node(machine).is_none()
-                && guard.local_program.is_some()
-                && guard.local_node_name.as_deref() == Some(machine)
+            if guard.local_program.is_some()
+                && (machine == LOCAL_NODE_ID || guard.local_node_name.as_deref() == Some(machine))
             {
                 return LOCAL_NODE_ID.to_owned();
             }
@@ -1000,6 +1008,22 @@ impl Backend for LinkBackend {
             return Err(err.clone());
         }
         let link = guard.link.clone();
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if guard.local_program.is_some()
+            && (trimmed == LOCAL_NODE_ID || guard.local_node_name.as_deref() == Some(trimmed))
+        {
+            let epoch = match guard.pairing_epochs.get(LOCAL_NODE_ID).copied() {
+                Some(ep) => ep,
+                None => guard.set_fresh_epoch(LOCAL_NODE_ID),
+            };
+            return Ok(ContentTarget {
+                link,
+                link_node: LOCAL_NODE_ID.to_owned(),
+                machine: trimmed.to_owned(),
+                principal: "local".to_owned(),
+                holder: format_pairing_holder(LOCAL_NODE_ID, epoch),
+            });
+        }
         if let Some(entry) = guard.data.link.node(trimmed).cloned() {
             let epoch = match guard.pairing_epochs.get(&entry.node).copied() {
                 Some(ep) => ep,
@@ -1018,22 +1042,6 @@ impl Backend for LinkBackend {
                 machine: entry.node.clone(),
                 principal,
                 holder: format_pairing_holder(&entry.node, epoch),
-            });
-        }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if guard.local_program.is_some()
-            && (trimmed == LOCAL_NODE_ID || guard.local_node_name.as_deref() == Some(trimmed))
-        {
-            let epoch = match guard.pairing_epochs.get(LOCAL_NODE_ID).copied() {
-                Some(ep) => ep,
-                None => guard.set_fresh_epoch(LOCAL_NODE_ID),
-            };
-            return Ok(ContentTarget {
-                link,
-                link_node: LOCAL_NODE_ID.to_owned(),
-                machine: trimmed.to_owned(),
-                principal: "local".to_owned(),
-                holder: format_pairing_holder(LOCAL_NODE_ID, epoch),
             });
         }
         let any_configured = !guard.data.link.nodes.is_empty() || guard.local_program.is_some();
@@ -1339,6 +1347,46 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
         last_paired: state.last_paired.clone(),
         transfer_capabilities: TransferCapabilities::current_platform(),
     }
+}
+
+/// Reads the local node's configured name from `node.toml` (when present) so persisted desktop
+/// transfers and content requests targeting the local node's real name route over the local pipe
+/// immediately on startup, even before the first `meta.whoami` call or after `learn()`.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn read_local_node_name_hint() -> Option<String> {
+    use std::path::PathBuf;
+
+    let candidate = if let Some(home) = std::env::var_os("LEGION_HOME").filter(|v| !v.is_empty()) {
+        PathBuf::from(home).join("config").join("node.toml")
+    } else if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        PathBuf::from(xdg).join("legion").join("node.toml")
+    } else if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
+        PathBuf::from(appdata).join("legion").join("node.toml")
+    } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        PathBuf::from(home)
+            .join(".config")
+            .join("legion")
+            .join("node.toml")
+    } else {
+        return None;
+    };
+    let text = std::fs::read_to_string(candidate).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix("name") {
+            let rest = rest.trim_start();
+            if let Some(val) = rest.strip_prefix('=') {
+                let unquoted = val.trim().trim_matches('"').trim_matches('\'').trim();
+                if !unquoted.is_empty() {
+                    return Some(unquoted.to_owned());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Discovers an installed `legion` binary on desktop hosts (absolute `PATH` entries first, then

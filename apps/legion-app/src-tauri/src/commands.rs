@@ -33,6 +33,15 @@ pub const INTERFACE_READY_MARKER: &str = "legion-app: interface ready";
 /// Optional environment variable naming a file to write [`INTERFACE_READY_MARKER`] to on ready.
 pub const READY_FILE_ENV: &str = "LEGION_APP_READY_FILE";
 
+/// Optional environment variable naming a JSON spec file for the CI content-media smoke check.
+pub const MEDIA_CHECK_FILE_ENV: &str = "LEGION_APP_MEDIA_CHECK_FILE";
+
+/// Log line emitted when the opt-in CI content-media smoke check decodes both image and video.
+pub const MEDIA_CHECK_OK_MARKER: &str = "legion-app: media check ok";
+
+/// Log line emitted when the opt-in CI content-media smoke check fails.
+pub const MEDIA_CHECK_FAILED_MARKER: &str = "legion-app: media check failed";
+
 /// Maximum accepted pairing invite length at the command seam (8 KiB).
 pub const MAX_INVITE_BYTES: usize = 8 * 1024;
 
@@ -376,6 +385,189 @@ pub async fn dismiss_identity_change(
 #[tauri::command]
 pub fn device_name() -> String {
     default_device_name()
+}
+
+/// Host-provided specification for the opt-in content-media smoke check (`LEGION_APP_MEDIA_CHECK_FILE`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MediaCheckSpec {
+    /// Target machine name (e.g. `"tower"`).
+    pub machine: String,
+    /// Optional single-use pairing invite for mobile targets without a local `legion` binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<String>,
+    /// Remote path to a test image file (e.g. PNG).
+    pub image_path: String,
+    /// Remote path to a short WebM test video file.
+    pub video_path: String,
+    /// Optional timestamp (seconds) to seek the video to after initial metadata loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seek_to: Option<f64>,
+    /// Optional host path where [`media_check_report`] writes the JSON result. Never read from JS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_file: Option<String>,
+}
+
+/// Public subset of [`MediaCheckSpec`] exposed to the web view (omits host `out_file` path).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PublicMediaCheckSpec {
+    /// Target machine name.
+    pub machine: String,
+    /// Optional single-use pairing invite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<String>,
+    /// Remote path to a test image file.
+    pub image_path: String,
+    /// Remote path to a short WebM test video file.
+    pub video_path: String,
+    /// Optional timestamp (seconds) to seek the video to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seek_to: Option<f64>,
+}
+
+/// Decoded media verification report submitted by the web view after loading content URLs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MediaCheckReport {
+    /// True when both the image and video decoded with non-zero dimensions.
+    pub ok: bool,
+    /// Decoded image natural width in pixels.
+    pub image_width: u32,
+    /// Decoded image natural height in pixels.
+    pub image_height: u32,
+    /// Decoded video width in pixels.
+    pub video_width: u32,
+    /// Decoded video height in pixels.
+    pub video_height: u32,
+    /// Decoded video duration in seconds (0 when unavailable).
+    #[serde(default)]
+    pub video_duration: f64,
+    /// Observed `video.currentTime` after seeking when `seek_to` was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeked_time: Option<f64>,
+    /// Origin/scheme prefix of the minted image content URL (ticket redacted).
+    #[serde(default)]
+    pub image_origin: String,
+    /// Origin/scheme prefix of the minted video content URL (ticket redacted).
+    #[serde(default)]
+    pub video_origin: String,
+    /// Failure description when `ok` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn load_media_check_spec(app: &tauri::AppHandle) -> Result<Option<MediaCheckSpec>, AppError> {
+    let spec_path = if let Some(p) = std::env::var_os(MEDIA_CHECK_FILE_ENV)
+        .filter(|val| !val.is_empty())
+        .map(std::path::PathBuf::from)
+    {
+        Some(p)
+    } else {
+        #[cfg(all(target_os = "android", debug_assertions))]
+        {
+            use tauri::Manager as _;
+            app.path()
+                .app_data_dir()
+                .ok()
+                .map(|d| d.join("media-check.json"))
+                .filter(|p| p.is_file())
+        }
+        #[cfg(not(all(target_os = "android", debug_assertions)))]
+        {
+            let _ = app;
+            None
+        }
+    };
+
+    let Some(path) = spec_path else {
+        return Ok(None);
+    };
+    let raw = fs::read_to_string(&path).map_err(|err| {
+        AppError::new(
+            ErrorCode::Failed,
+            format!("Could not read media check spec {}: {err}", path.display()),
+        )
+    })?;
+    let spec: MediaCheckSpec = serde_json::from_str(&raw).map_err(|err| {
+        AppError::new(
+            ErrorCode::InvalidArgs,
+            format!("Invalid media check spec {}: {err}", path.display()),
+        )
+    })?;
+    Ok(Some(spec))
+}
+
+/// Returns the active opt-in CI content-media smoke check specification, or `None` in normal runs.
+#[tauri::command]
+pub fn media_check_spec(app: tauri::AppHandle) -> Result<Option<PublicMediaCheckSpec>, AppError> {
+    let Some(spec) = load_media_check_spec(&app)? else {
+        return Ok(None);
+    };
+    Ok(Some(PublicMediaCheckSpec {
+        machine: spec.machine,
+        invite: spec.invite,
+        image_path: spec.image_path,
+        video_path: spec.video_path,
+        seek_to: spec.seek_to,
+    }))
+}
+
+/// Records the result of the opt-in CI content-media smoke check (logs marker + writes configured
+/// `out_file` if any). Refuses calls when no host media-check spec is active.
+#[tauri::command]
+pub fn media_check_report(app: tauri::AppHandle, report: MediaCheckReport) -> Result<(), AppError> {
+    let Some(spec) = load_media_check_spec(&app)? else {
+        return Ok(());
+    };
+    let summary = format!(
+        "img={}x{} vid={}x{} dur={:.2}s origin={}",
+        report.image_width,
+        report.image_height,
+        report.video_width,
+        report.video_height,
+        report.video_duration,
+        report.image_origin
+    );
+    if report.ok {
+        let line = format!("{MEDIA_CHECK_OK_MARKER} ({summary})");
+        println!("{line}");
+        let _ = std::io::stdout().flush();
+        #[cfg(target_os = "android")]
+        log::info!(target: "legion-app", "{line}");
+    } else {
+        let reason = report.error.as_deref().unwrap_or("unknown error");
+        let line = format!("{MEDIA_CHECK_FAILED_MARKER} ({summary}; error={reason})");
+        eprintln!("{line}");
+        let _ = std::io::stderr().flush();
+        #[cfg(target_os = "android")]
+        log::error!(target: "legion-app", "{line}");
+    }
+
+    if let Some(out_file) = spec.out_file.as_deref().filter(|s| !s.trim().is_empty()) {
+        let out_path = Path::new(out_file);
+        if let Some(parent) = out_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                AppError::new(
+                    ErrorCode::Internal,
+                    format!("Could not create media check report directory: {err}"),
+                )
+            })?;
+        }
+        let encoded = serde_json::to_string_pretty(&report).map_err(|err| {
+            AppError::new(
+                ErrorCode::Internal,
+                format!("Could not encode media check report: {err}"),
+            )
+        })?;
+        fs::write(out_path, format!("{encoded}\n")).map_err(|err| {
+            AppError::new(
+                ErrorCode::Internal,
+                format!("Could not write media check report: {err}"),
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 /// Signals that the web interface has mounted and painted its initial view.

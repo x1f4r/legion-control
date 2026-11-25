@@ -87,6 +87,183 @@ export function createAppLink() {
   let nextCallId = 1;
   let readySent = false;
 
+  async function runConfiguredMediaCheck() {
+    if (typeof document === 'undefined' || !document.body) return;
+    let spec;
+    try {
+      spec = await invoke('media_check_spec');
+    } catch {
+      return;
+    }
+    if (!spec || typeof spec !== 'object' || !spec.machine || !spec.image_path || !spec.video_path) {
+      return;
+    }
+
+    const originOf = (rawUrl) => {
+      try {
+        return new URL(rawUrl).origin;
+      } catch {
+        return '';
+      }
+    };
+
+    const report = {
+      ok: false,
+      image_width: 0,
+      image_height: 0,
+      video_width: 0,
+      video_height: 0,
+      video_duration: 0,
+      image_origin: '',
+      video_origin: '',
+      error: null,
+    };
+
+    try {
+      if (spec.invite) {
+        const current = await rawState().catch(() => null);
+        const alreadyPaired =
+          Array.isArray(current?.nodes) && current.nodes.some((n) => n.node === spec.machine);
+        if (!alreadyPaired) {
+          await pair(spec.invite, 'ci-media');
+        }
+      }
+
+      const [imgTicket, vidTicket] = await Promise.all([
+        contentUrl({ machine: spec.machine, path: spec.image_path }),
+        contentUrl({ machine: spec.machine, path: spec.video_path }),
+      ]);
+      report.image_origin = originOf(imgTicket?.url || '');
+      report.video_origin = originOf(vidTicket?.url || '');
+
+      const imgResult = await new Promise((resolve, reject) => {
+        const img = new Image();
+        const timer = window.setTimeout(() => reject(new Error('Image load timed out')), 20000);
+        const done = (ok, err) => {
+          window.clearTimeout(timer);
+          if (ok) {
+            resolve({ width: img.naturalWidth, height: img.naturalHeight });
+          } else {
+            reject(err || new Error('Image failed to load'));
+          }
+        };
+        img.onload = () => {
+          if (typeof img.decode === 'function') {
+            img.decode().then(
+              () => done(true),
+              () => done(img.naturalWidth > 0 && img.naturalHeight > 0),
+            );
+          } else {
+            done(true);
+          }
+        };
+        img.onerror = () => done(false, new Error('Image element errored'));
+        img.src = imgTicket.url;
+      });
+      report.image_width = imgResult.width;
+      report.image_height = imgResult.height;
+
+      const vidResult = await new Promise((resolve, reject) => {
+        const video = document.createElement('video');
+        const wantSeek =
+          typeof spec.seek_to === 'number' && Number.isFinite(spec.seek_to) && spec.seek_to > 0;
+        video.muted = true;
+        video.playsInline = true;
+        video.setAttribute('playsinline', '');
+        video.preload = wantSeek ? 'metadata' : 'auto';
+        video.style.cssText =
+          'position:fixed;left:-9999px;top:-9999px;width:64px;height:64px;opacity:0;pointer-events:none;';
+        document.body.appendChild(video);
+        let seekStarted = false;
+        const cleanup = () => {
+          window.clearTimeout(timer);
+          video.removeEventListener('loadedmetadata', onMeta);
+          video.removeEventListener('loadeddata', onLoaded);
+          video.removeEventListener('canplay', onLoaded);
+          video.removeEventListener('seeked', onSeeked);
+          video.removeEventListener('error', onError);
+          try {
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+          } catch {
+            // Ignore cleanup errors.
+          }
+          video.remove();
+        };
+        const timer = window.setTimeout(() => {
+          const st = `readyState=${video.readyState} net=${video.networkState} t=${video.currentTime}`;
+          cleanup();
+          reject(new Error(`Video load timed out (${st})`));
+        }, 30000);
+        const onSeeked = () => {
+          const width = video.videoWidth || 0;
+          const height = video.videoHeight || 0;
+          const duration = Number.isFinite(video.duration) ? video.duration : 0;
+          const seekedTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+          cleanup();
+          resolve({ width, height, duration, seekedTime });
+        };
+        const onMeta = () => {
+          if (wantSeek && !seekStarted) {
+            seekStarted = true;
+            video.currentTime = spec.seek_to;
+          }
+        };
+        const onLoaded = () => {
+          const width = video.videoWidth || 0;
+          const height = video.videoHeight || 0;
+          const duration = Number.isFinite(video.duration) ? video.duration : 0;
+          if (width <= 0 || height <= 0) return;
+          if (wantSeek) {
+            if (!seekStarted) {
+              seekStarted = true;
+              video.currentTime = spec.seek_to;
+            }
+            return;
+          }
+          cleanup();
+          resolve({ width, height, duration, seekedTime: null });
+        };
+        const onError = () => {
+          const code = video.error ? video.error.code : 'unknown';
+          const msg = video.error?.message || '';
+          cleanup();
+          reject(new Error(`Video error code=${code} ${msg}`.trim()));
+        };
+        video.addEventListener('loadedmetadata', onMeta);
+        video.addEventListener('loadeddata', onLoaded);
+        video.addEventListener('canplay', onLoaded);
+        video.addEventListener('seeked', onSeeked);
+        video.addEventListener('error', onError);
+        video.src = vidTicket.url;
+        video.load();
+      });
+      report.video_width = vidResult.width;
+      report.video_height = vidResult.height;
+      report.video_duration = vidResult.duration;
+      if (typeof vidResult.seekedTime === 'number') {
+        report.seeked_time = vidResult.seekedTime;
+      }
+      report.ok =
+        report.image_width > 0 &&
+        report.image_height > 0 &&
+        report.video_width > 0 &&
+        report.video_height > 0 &&
+        (typeof spec.seek_to !== 'number' ||
+          (typeof vidResult.seekedTime === 'number' && Math.abs(vidResult.seekedTime - spec.seek_to) < 5));
+    } catch (err) {
+      report.ok = false;
+      report.error = err?.message ? String(err.message) : String(err);
+    }
+
+    try {
+      await invoke('media_check_report', { report });
+    } catch {
+      // Ignore reporting failures during shutdown.
+    }
+  }
+
   function signalReady() {
     if (readySent) return;
     readySent = true;
@@ -94,7 +271,11 @@ export function createAppLink() {
     const fire = () => {
       if (fired) return;
       fired = true;
-      invoke('ready').catch(() => {});
+      invoke('ready')
+        .catch(() => {})
+        .finally(() => {
+          runConfiguredMediaCheck().catch(() => {});
+        });
     };
     if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
       window.requestAnimationFrame(() => window.requestAnimationFrame(fire));
