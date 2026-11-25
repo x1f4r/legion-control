@@ -77,33 +77,11 @@ pub(super) fn self_and_ancestors() -> HashSet<u32> {
 
 #[cfg(target_os = "macos")]
 pub(super) fn self_and_ancestors() -> HashSet<u32> {
-    let mut seen = HashSet::new();
-    let own = std::process::id();
-    seen.insert(own);
-    let Some((mut parent_pid, mut child_start)) = macos_proc::parent_and_start(own) else {
-        return seen;
-    };
-    for _ in 0..MAX_ANCESTOR_HOPS {
-        if parent_pid <= 1 || !seen.insert(parent_pid) {
-            break;
-        }
-        match macos_proc::parent_and_start(parent_pid) {
-            Some((next_ppid, parent_start)) => {
-                if !child_not_older_than_parent(
-                    child_start,
-                    parent_start,
-                    EXACT_START_BACKWARD_TOLERANCE,
-                ) {
-                    seen.remove(&parent_pid);
-                    break;
-                }
-                child_start = parent_start;
-                parent_pid = next_ppid;
-            }
-            None => break,
-        }
-    }
-    seen
+    super::macos_self_and_ancestors(
+        std::process::id(),
+        MAX_ANCESTOR_HOPS,
+        macos_proc::parent_and_start,
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -175,36 +153,12 @@ fn is_ancestor_of_current(identity: &ProcessId) -> bool {
 
 #[cfg(target_os = "macos")]
 fn is_ancestor_of_current(identity: &ProcessId) -> bool {
-    let Some((mut parent_pid, mut child_start)) = macos_proc::parent_and_start(std::process::id())
-    else {
-        return false;
-    };
-    let mut seen = HashSet::new();
-    seen.insert(std::process::id());
-
-    for _ in 0..MAX_ANCESTOR_HOPS {
-        if parent_pid <= 1 || !seen.insert(parent_pid) {
-            break;
-        }
-        match macos_proc::parent_and_start(parent_pid) {
-            Some((next_ppid, parent_start)) => {
-                if !child_not_older_than_parent(
-                    child_start,
-                    parent_start,
-                    EXACT_START_BACKWARD_TOLERANCE,
-                ) {
-                    break;
-                }
-                if parent_pid == identity.pid && parent_start == identity.start_time {
-                    return true;
-                }
-                child_start = parent_start;
-                parent_pid = next_ppid;
-            }
-            None => return parent_pid == identity.pid,
-        }
-    }
-    false
+    super::macos_is_ancestor_of_current(
+        std::process::id(),
+        MAX_ANCESTOR_HOPS,
+        identity,
+        macos_proc::parent_and_start,
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -601,25 +555,13 @@ mod macos_proc {
             return None;
         }
         let start_us = macos_start_time_us(info.pbi_start_tvsec, info.pbi_start_tvusec)?;
-        let cstr_to_string = |buf: &[libc::c_char]| -> String {
-            let bytes: Vec<u8> = buf
-                .iter()
-                .take_while(|&&c| c != 0)
-                .map(|&c| c as u8)
-                .collect();
-            String::from_utf8_lossy(&bytes).into_owned()
-        };
-        let mut comm = cstr_to_string(&info.pbi_name);
-        if comm.is_empty() {
-            comm = cstr_to_string(&info.pbi_comm);
-        }
+        let name_bytes = info.pbi_name.map(|c| c as u8);
+        let comm_bytes = info.pbi_comm.map(|c| c as u8);
+        let comm = crate::procid::parse_macos_bsd_comm(&name_bytes, &comm_bytes);
         Some((info.pbi_ppid, start_us, info.pbi_ruid, info.pbi_uid, comm))
     }
 
     pub(super) fn query_executable_path(pid: u32) -> Option<std::path::PathBuf> {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
         const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
         let raw_pid = libc::c_int::try_from(pid).ok()?;
         let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
@@ -632,19 +574,7 @@ mod macos_proc {
                 PROC_PIDPATHINFO_MAXSIZE as u32,
             )
         };
-        if written <= 0 {
-            return None;
-        }
-        let len = usize::try_from(written).ok()?.min(buf.len());
-        let slice = &buf[..len];
-        let trimmed = slice
-            .iter()
-            .position(|&b| b == 0)
-            .map_or(slice, |idx| &slice[..idx]);
-        if trimmed.is_empty() {
-            return None;
-        }
-        Some(std::path::PathBuf::from(OsStr::from_bytes(trimmed)))
+        crate::procid::parse_macos_proc_path(&buf, written)
     }
 
     pub(super) fn query_argv(pid: u32) -> Option<Vec<String>> {
@@ -807,13 +737,7 @@ pub(super) fn boot_id() -> Result<String> {
     cmd.args(["-n", "kern.bootsessionuuid"]);
     let raw =
         super::run_command_stdout_with_timeout(cmd, Duration::from_secs(5), "/usr/sbin/sysctl")?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(OsError::Platform {
-            detail: "sysctl kern.bootsessionuuid returned empty output".into(),
-        });
-    }
-    Ok(trimmed.to_owned())
+    super::parse_macos_boot_id(&raw)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

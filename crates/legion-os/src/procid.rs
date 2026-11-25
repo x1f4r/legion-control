@@ -5,6 +5,7 @@
 //! [`ProcessId`] pairs the PID with the process's kernel start timestamp, and [`boot_id`]
 //! identifies the current boot so records from before a reboot can be discarded immediately.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -1155,6 +1156,139 @@ pub(crate) fn resolve_macos_pid_identity(
     Some(ProcessId::new(pid, sample.start_us))
 }
 
+/// Extract a process's command name from Darwin `proc_bsdinfo::{pbi_name, pbi_comm}` byte arrays,
+/// preferring `pbi_name` (32 bytes) and falling back to `pbi_comm` (16 bytes) when empty.
+#[allow(dead_code)]
+pub(crate) fn parse_macos_bsd_comm(pbi_name: &[u8], pbi_comm: &[u8]) -> String {
+    let take_cstr = |buf: &[u8]| -> String {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
+    };
+    let name = take_cstr(pbi_name);
+    if !name.is_empty() {
+        name
+    } else {
+        take_cstr(pbi_comm)
+    }
+}
+
+/// Decode the byte slice written by macOS `proc_pidpath` into a [`PathBuf`].
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) fn parse_macos_proc_path(buf: &[u8], written: i32) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    if written <= 0 {
+        return None;
+    }
+    let len = usize::try_from(written).ok()?.min(buf.len());
+    let slice = &buf[..len];
+    let trimmed = slice
+        .iter()
+        .position(|&b| b == 0)
+        .map_or(slice, |idx| &slice[..idx]);
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(OsStr::from_bytes(trimmed)))
+}
+
+/// Parse stdout from macOS `/usr/sbin/sysctl -n kern.bootsessionuuid`.
+#[allow(dead_code)]
+pub(crate) fn parse_macos_boot_id(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(OsError::Platform {
+            detail: "sysctl kern.bootsessionuuid returned empty output".into(),
+        });
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Walk the macOS ancestor chain starting from `own_pid` using `lookup(pid) -> Option<(ppid, start_us)>`,
+/// applying [`WALL_CLOCK_BACKWARD_TOLERANCE_MICROS`] against NTP/RTC wall-clock steps.
+#[allow(dead_code)]
+pub(crate) fn macos_self_and_ancestors<F>(
+    own_pid: u32,
+    max_hops: usize,
+    mut lookup: F,
+) -> HashSet<u32>
+where
+    F: FnMut(u32) -> Option<(u32, u64)>,
+{
+    let mut seen = HashSet::new();
+    seen.insert(own_pid);
+    let Some((mut parent_pid, mut child_start)) = lookup(own_pid) else {
+        return seen;
+    };
+    for _ in 0..max_hops {
+        if parent_pid <= 1 || !seen.insert(parent_pid) {
+            break;
+        }
+        match lookup(parent_pid) {
+            Some((next_ppid, parent_start)) => {
+                if !child_not_older_than_parent(
+                    child_start,
+                    parent_start,
+                    WALL_CLOCK_BACKWARD_TOLERANCE_MICROS,
+                ) {
+                    seen.remove(&parent_pid);
+                    break;
+                }
+                child_start = parent_start;
+                parent_pid = next_ppid;
+            }
+            None => break,
+        }
+    }
+    seen
+}
+
+/// Check whether `identity` is an ancestor of `own_pid` on macOS using
+/// `lookup(pid) -> Option<(ppid, start_us)>`. If reading a parent fails (e.g. `EPERM` on a
+/// root-owned parent), conservatively protects that parent PID.
+#[allow(dead_code)]
+pub(crate) fn macos_is_ancestor_of_current<F>(
+    own_pid: u32,
+    max_hops: usize,
+    identity: &ProcessId,
+    mut lookup: F,
+) -> bool
+where
+    F: FnMut(u32) -> Option<(u32, u64)>,
+{
+    let Some((mut parent_pid, mut child_start)) = lookup(own_pid) else {
+        return false;
+    };
+    let mut seen = HashSet::new();
+    seen.insert(own_pid);
+
+    for _ in 0..max_hops {
+        if parent_pid <= 1 || !seen.insert(parent_pid) {
+            break;
+        }
+        match lookup(parent_pid) {
+            Some((next_ppid, parent_start)) => {
+                if !child_not_older_than_parent(
+                    child_start,
+                    parent_start,
+                    WALL_CLOCK_BACKWARD_TOLERANCE_MICROS,
+                ) {
+                    break;
+                }
+                if parent_pid == identity.pid && parent_start == identity.start_time {
+                    return true;
+                }
+                child_start = parent_start;
+                parent_pid = next_ppid;
+            }
+            None => return parent_pid == identity.pid,
+        }
+    }
+    false
+}
+
 /// Run a short helper command synchronously with a hard timeout and return its stdout.
 ///
 /// Used by macOS and Windows `boot_id` lookups so a stalled WMI/sysctl call cannot block a caller
@@ -1347,6 +1481,108 @@ mod tests {
             resolve_macos_pid_identity(4242, false, None, Some(zero)),
             None
         );
+    }
+
+    #[test]
+    fn macos_helpers_parse_bsd_comm_proc_path_boot_id_and_walk_ancestors() {
+        // `pbi_name` is preferred when non-empty; otherwise falls back to `pbi_comm`.
+        assert_eq!(
+            parse_macos_bsd_comm(b"sshd-session\0garbage", b"sshd\0"),
+            "sshd-session"
+        );
+        assert_eq!(parse_macos_bsd_comm(b"\0ignored", b"zsh\0tail"), "zsh");
+        assert_eq!(parse_macos_bsd_comm(b"", b""), "");
+
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                parse_macos_proc_path(b"/usr/local/bin/legion\0extra", 21),
+                Some(PathBuf::from("/usr/local/bin/legion"))
+            );
+            assert_eq!(
+                parse_macos_proc_path(b"/usr/local/bin/legion\0extra", 64),
+                Some(PathBuf::from("/usr/local/bin/legion"))
+            );
+            assert_eq!(parse_macos_proc_path(b"/usr/bin/true\0", 0), None);
+            assert_eq!(parse_macos_proc_path(b"/usr/bin/true\0", -1), None);
+            assert_eq!(parse_macos_proc_path(b"\0\0\0", 3), None);
+        }
+
+        // `sysctl -n kern.bootsessionuuid` output trimming and empty rejection.
+        assert_eq!(
+            parse_macos_boot_id("A1B2C3D4-E5F6-7890-ABCD-EF0123456789\n").unwrap(),
+            "A1B2C3D4-E5F6-7890-ABCD-EF0123456789"
+        );
+        assert!(parse_macos_boot_id("   \n").is_err());
+
+        // Ancestor walk handles normal chain, backward NTP step within tolerance, recycled PID
+        // beyond tolerance, and unreadable (e.g. root-owned) parent.
+        let base = 1_750_000_000_000_000u64;
+        let table = |pid: u32| -> Option<(u32, u64)> {
+            match pid {
+                // own -> parent 200 (started 10s earlier)
+                300 => Some((200, base)),
+                // parent 200 -> grandparent 100 (clock stepped backward 1 hour -> still valid)
+                200 => Some((100, base - 10_000_000)),
+                100 => Some((50, base + 3_600_000_000)),
+                // pid 50 is root-owned (EPERM -> None)
+                50 => None,
+                _ => None,
+            }
+        };
+        let ancestors = macos_self_and_ancestors(300, 64, table);
+        assert!(ancestors.contains(&300));
+        assert!(ancestors.contains(&200));
+        assert!(ancestors.contains(&100));
+        // Unreadable parent 50 stays conservatively protected in the ancestor set.
+        assert!(ancestors.contains(&50));
+
+        assert!(macos_is_ancestor_of_current(
+            300,
+            64,
+            &ProcessId::new(200, base - 10_000_000),
+            table
+        ));
+        assert!(macos_is_ancestor_of_current(
+            300,
+            64,
+            &ProcessId::new(100, base + 3_600_000_000),
+            table
+        ));
+        // Wrong start_time for pid 200 is not treated as an ancestor.
+        assert!(!macos_is_ancestor_of_current(
+            300,
+            64,
+            &ProcessId::new(200, base + 99),
+            table
+        ));
+        // Unreadable parent 50 is protected conservatively.
+        assert!(macos_is_ancestor_of_current(
+            300,
+            64,
+            &ProcessId::new(50, 123),
+            table
+        ));
+
+        // Recycled parent whose start_time is more than 24h after its child breaks the chain.
+        let recycled_table = |pid: u32| -> Option<(u32, u64)> {
+            match pid {
+                300 => Some((200, base)),
+                200 => Some((100, base + WALL_CLOCK_BACKWARD_TOLERANCE_MICROS + 1)),
+                100 => Some((1, base - 5_000_000)),
+                _ => None,
+            }
+        };
+        let recycled_ancestors = macos_self_and_ancestors(300, 64, recycled_table);
+        assert!(recycled_ancestors.contains(&300));
+        assert!(!recycled_ancestors.contains(&200));
+        assert!(!recycled_ancestors.contains(&100));
+        assert!(!macos_is_ancestor_of_current(
+            300,
+            64,
+            &ProcessId::new(200, base + WALL_CLOCK_BACKWARD_TOLERANCE_MICROS + 1),
+            recycled_table
+        ));
     }
 
     #[test]

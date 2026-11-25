@@ -370,8 +370,7 @@ pub async fn probe_battery(
     #[cfg(target_os = "macos")]
     {
         let _ = sys_root;
-        let text = run_probe_command(macos_cmd, timeout).await?;
-        parse_macos_pmset_batt(&text)
+        probe_macos_battery(macos_cmd, timeout).await
     }
     #[cfg(windows)]
     {
@@ -1094,10 +1093,17 @@ fn parse_nvidia_opt_f64(raw: &str) -> Result<Option<f64>, ()> {
 
 // ── macOS & Windows battery parsers ──────────────────────────────────────────────────────────
 
+/// Probe the macOS system battery by running `cmd` (normally `/usr/bin/pmset -g batt`) within
+/// `timeout` and parsing its output.
+pub async fn probe_macos_battery(cmd: CommandSpec, timeout: Duration) -> Option<Battery> {
+    let text = run_probe_command(cmd, timeout).await?;
+    parse_macos_pmset_batt(&text)
+}
+
 /// Parse macOS `pmset -g batt` output.
 ///
-/// Desktop Macs without an internal battery print only the power source header line and return
-/// `None`.
+/// Desktop Macs without an internal battery (or with only an external UPS) print no present
+/// `InternalBattery` line and return `None`.
 pub fn parse_macos_pmset_batt(text: &str) -> Option<Battery> {
     let mut on_ac: Option<bool> = None;
     for line in text.lines() {
@@ -1110,30 +1116,40 @@ pub fn parse_macos_pmset_batt(text: &str) -> Option<Battery> {
         if !line.contains("InternalBattery") {
             continue;
         }
-        // Example: `-InternalBattery-0 (id=1234567)	84%; charging; 0:42 remaining present: true`
+        if lower.contains("present: false") {
+            continue;
+        }
+        // Examples:
+        // `-InternalBattery-0 (id=1234567)\t84%; charging; 0:42 remaining present: true`
+        // `-InternalBattery-0 (id=1234567)\t80%; AC attached; not charging present: true`
+        // `-InternalBattery-0 (id=1234567)\t100%; charged; 0:00 remaining present: true`
         let after_tab = line.split_once('\t').map_or(line, |(_, rhs)| rhs);
         let parts: Vec<&str> = after_tab.split(';').map(str::trim).collect();
-        let percent_part = parts.first()?;
-        let percent_str = percent_part.strip_suffix('%')?.trim();
+        let percent_token = parts.first()?.split_whitespace().last()?;
+        let percent_str = percent_token.strip_suffix('%')?.trim();
         let percent = percent_str.parse::<u8>().ok()?.min(100);
 
         let state_raw = parts.get(1).copied().unwrap_or("").to_ascii_lowercase();
         let state = if state_raw.contains("discharging") {
             BatteryState::Discharging
-        } else if state_raw.contains("charging") && !state_raw.contains("not charging") {
+        } else if state_raw.contains("not charging") {
+            BatteryState::Unknown
+        } else if state_raw.contains("charging") || state_raw.contains("finishing charge") {
             BatteryState::Charging
         } else if state_raw.contains("charged") {
             BatteryState::Full
-        } else if state_raw.contains("finishing charge") {
-            BatteryState::Charging
         } else {
             BatteryState::Unknown
         };
 
-        let time_left_s = parts
-            .iter()
-            .skip(2)
-            .find_map(|segment| parse_pmset_remaining(segment));
+        let time_left_s = if matches!(state, BatteryState::Charging | BatteryState::Discharging) {
+            parts
+                .iter()
+                .skip(2)
+                .find_map(|segment| parse_pmset_remaining(segment))
+        } else {
+            None
+        };
 
         return Some(Battery {
             percent,
@@ -1655,8 +1671,9 @@ mod tests {
 
     #[test]
     fn macos_and_windows_battery_parsers_handle_all_states() {
+        // Charging on AC with remaining time.
         let charging = "Now drawing from 'AC Power'\n \
-             -InternalBattery-0 (id=1234567)\t84%; charging; 0:42 remaining present: true\n";
+             -InternalBattery-0 (id=4653155)\t84%; charging; 0:42 remaining present: true\n";
         assert_eq!(
             parse_macos_pmset_batt(charging),
             Some(Battery {
@@ -1667,8 +1684,108 @@ mod tests {
             })
         );
 
+        // Discharging on battery power with hours:minutes remaining.
+        let discharging = "Now drawing from 'Battery Power'\n \
+             -InternalBattery-0 (id=4653155)\t78%; discharging; 6:12 remaining present: true\n";
+        assert_eq!(
+            parse_macos_pmset_batt(discharging),
+            Some(Battery {
+                percent: 78,
+                state: BatteryState::Discharging,
+                on_ac: Some(false),
+                time_left_s: Some(6 * 3600 + 12 * 60),
+            })
+        );
+
+        // Discharging with `(no estimate)`.
+        let no_est = "Now drawing from 'Battery Power'\n \
+             -InternalBattery-0 (id=4653155)\t65%; discharging; (no estimate) present: true\n";
+        assert_eq!(
+            parse_macos_pmset_batt(no_est),
+            Some(Battery {
+                percent: 65,
+                state: BatteryState::Discharging,
+                on_ac: Some(false),
+                time_left_s: None,
+            })
+        );
+
+        // Fully charged on AC (`0:00 remaining` -> `time_left_s: None`).
+        let full = "Now drawing from 'AC Power'\n \
+             -InternalBattery-0 (id=4653155)\t100%; charged; 0:00 remaining present: true\n";
+        assert_eq!(
+            parse_macos_pmset_batt(full),
+            Some(Battery {
+                percent: 100,
+                state: BatteryState::Full,
+                on_ac: Some(true),
+                time_left_s: None,
+            })
+        );
+
+        // Finishing charge on AC.
+        let finishing = "Now drawing from 'AC Power'\n \
+             -InternalBattery-0 (id=4653155)\t99%; finishing charge; 0:08 remaining present: true\n";
+        assert_eq!(
+            parse_macos_pmset_batt(finishing),
+            Some(Battery {
+                percent: 99,
+                state: BatteryState::Charging,
+                on_ac: Some(true),
+                time_left_s: Some(8 * 60),
+            })
+        );
+
+        // Optimized Battery Charging / charge-limit hold: `AC attached; not charging`.
+        let ac_hold = "Now drawing from 'AC Power'\n \
+             -InternalBattery-0 (id=4653155)\t80%; AC attached; not charging present: true\n";
+        assert_eq!(
+            parse_macos_pmset_batt(ac_hold),
+            Some(Battery {
+                percent: 80,
+                state: BatteryState::Unknown,
+                on_ac: Some(true),
+                time_left_s: None,
+            })
+        );
+
+        // Space-separated fallback without a tab character.
+        let spaced = "Now drawing from 'Battery Power'\n \
+             -InternalBattery-0 (id=4653155) 52%; discharging; 2:05 remaining present: true\n";
+        assert_eq!(
+            parse_macos_pmset_batt(spaced),
+            Some(Battery {
+                percent: 52,
+                state: BatteryState::Discharging,
+                on_ac: Some(false),
+                time_left_s: Some(2 * 3600 + 5 * 60),
+            })
+        );
+
+        // Battery absent (`present: false`), desktop Mac, and external UPS only -> `None`.
+        let not_present = "Now drawing from 'AC Power'\n \
+             -InternalBattery-0 (id=4653155)\t0%; not charging; (no estimate) present: false\n";
+        assert_eq!(parse_macos_pmset_batt(not_present), None);
+
         let desktop = "Now drawing from 'AC Power'\n";
         assert_eq!(parse_macos_pmset_batt(desktop), None);
+
+        let ups_only = "Now drawing from 'AC Power'\n \
+             -Back-UPS ES 750G (id=123456)\t100%; charged; 0:00 remaining present: true\n";
+        assert_eq!(parse_macos_pmset_batt(ups_only), None);
+
+        // Invalid minutes in remaining estimate are ignored without dropping the battery reading.
+        let bad_time = "Now drawing from 'Battery Power'\n \
+             -InternalBattery-0 (id=4653155)\t40%; discharging; 1:75 remaining present: true\n";
+        assert_eq!(
+            parse_macos_pmset_batt(bad_time),
+            Some(Battery {
+                percent: 40,
+                state: BatteryState::Discharging,
+                on_ac: Some(false),
+                time_left_s: None,
+            })
+        );
 
         assert_eq!(
             parse_windows_power_status(0, 1, 15, 3600),
@@ -1690,6 +1807,49 @@ mod tests {
         );
         // No system battery flag (128).
         assert_eq!(parse_windows_power_status(1, 128, 255, u32::MAX), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_macos_battery_runs_command_parses_recorded_output_and_respects_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("pmset.txt");
+        fs::write(
+            &fixture,
+            "Now drawing from 'Battery Power'\n \
+             -InternalBattery-0 (id=4653155)\t73%; discharging; 4:30 remaining present: true\n",
+        )
+        .unwrap();
+        let batt = probe_macos_battery(
+            CommandSpec::argv("cat", [fixture.to_string_lossy().as_ref()]),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(
+            batt,
+            Some(Battery {
+                percent: 73,
+                state: BatteryState::Discharging,
+                on_ac: Some(false),
+                time_left_s: Some(4 * 3600 + 30 * 60),
+            })
+        );
+
+        let missing = probe_macos_battery(
+            CommandSpec::argv("legion-nonexistent-pmset", Vec::<&str>::new()),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(missing, None);
+
+        let started = Instant::now();
+        let slow = probe_macos_battery(
+            CommandSpec::argv("sh", ["-c", "sleep 5"]),
+            Duration::from_millis(120),
+        )
+        .await;
+        assert_eq!(slow, None);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
