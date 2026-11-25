@@ -441,13 +441,61 @@ async fn real_sshd_session_and_security_checks() {
             &expected[2 * 1024 * 1024..2 * 1024 * 1024 + 512 * 1024]
         );
 
-        // Resuming the unread first stream delivers every byte accurately across chunks.
+        // Resuming the unread first stream delivers every byte accurately across windows.
         let mut paused_buf = Vec::with_capacity(expected.len());
         tokio::time::timeout(Duration::from_secs(15), paused.read_to_end(&mut paused_buf))
             .await
             .expect("resumed stream timed out")
             .unwrap();
         assert_eq!(paused_buf, expected);
+
+        // Unread stream paused in the middle of a window (after consuming past window 0 so
+        // read-ahead is active) must also never stall RPC calls or sibling streams on the same
+        // SSH connection.
+        let mut mid_paused = link
+            .open_content(&env.node, sample_file, 0, None)
+            .await
+            .unwrap();
+        let mut mid_prefix = vec![0u8; 400 * 1024];
+        mid_paused.read_exact(&mut mid_prefix).await.unwrap();
+        assert_eq!(mid_prefix, &expected[..mid_prefix.len()]);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mid_hello = tokio::time::timeout(Duration::from_secs(3), link.hello(&env.node))
+            .await
+            .expect("hello stalled behind mid-window unread content stream")
+            .unwrap();
+        assert_eq!(mid_hello["node"], json!(env.node));
+
+        let mut mid_sibling = tokio::time::timeout(
+            Duration::from_secs(3),
+            link.open_content(&env.node, sample_file, 1024 * 1024, Some(256 * 1024)),
+        )
+        .await
+        .expect("sibling stream open stalled behind mid-window unread stream")
+        .unwrap();
+        let mut mid_sibling_buf = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            mid_sibling.read_to_end(&mut mid_sibling_buf),
+        )
+        .await
+        .expect("sibling stream read stalled behind mid-window unread stream")
+        .unwrap();
+        assert_eq!(
+            mid_sibling_buf,
+            &expected[1024 * 1024..1024 * 1024 + 256 * 1024]
+        );
+
+        let mut mid_rest = Vec::with_capacity(expected.len() - mid_prefix.len());
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            mid_paused.read_to_end(&mut mid_rest),
+        )
+        .await
+        .expect("resumed mid-window stream timed out")
+        .unwrap();
+        assert_eq!(mid_rest, &expected[mid_prefix.len()..]);
 
         // Opening 12 concurrent streams (exceeding sshd's default MaxSessions of 10) queues
         // cleanly without discarding the healthy SSH connection.

@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::command::{RemoteOs, Subcommand, remote_command};
-use crate::content::{RawStream, StreamOpenError, StreamOpener};
+use crate::content::{RawStream, StreamOpenError, StreamOpener, WindowPolicy};
 use crate::invite::SshTarget;
 pub use crate::invite::SshTimeouts;
 use crate::key::DeviceKey;
@@ -42,14 +42,19 @@ const CHANNEL_BUFFER_BYTES: usize = 64 * 1024;
 /// OpenSSH's default `MaxSessions = 10`, leaving room for the multiplexed RPC channel).
 const MAX_CONCURRENT_SSH_STREAMS: usize = 8;
 
-/// Maximum bytes requested per SSH `legion stream get` channel so an unread or paused stream
-/// finishes into a bounded buffer, releases its SSH channel slot, and never stalls russh's
-/// single session event loop.
-const SSH_STREAM_CHUNK_BYTES: u64 = 1024 * 1024;
+/// Initial pull-based window requested on an SSH `keep_open` `legion stream get` channel for fast
+/// time to first byte and minimal buffering on an unread stream.
+const SSH_STREAM_INITIAL_WINDOW: u64 = 256 * 1024;
 
-/// Hard memory cap for one SSH stream channel's non-blocking receive buffer (one full chunk plus
-/// headroom for JSON greeting/reply headers).
-const SSH_STREAM_BUFFER_CAP: usize = (SSH_STREAM_CHUNK_BYTES as usize) + 128 * 1024;
+/// Maximum adaptive pull-based window requested on an SSH `keep_open` `legion stream get` channel.
+const SSH_STREAM_MAX_WINDOW: u64 = 4 * 1024 * 1024;
+
+/// Hard memory cap for one SSH stream channel's non-blocking receive buffer (current window plus
+/// one pipelined read-ahead window plus framing headroom).
+const SSH_STREAM_BUFFER_CAP: usize = (2 * SSH_STREAM_MAX_WINDOW as usize) + 256 * 1024;
+
+/// Per-channel SSH receive window size (4 MiB) so high-RTT links keep the pipe full.
+const SSH_CHANNEL_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
 
 /// A live in-process SSH exec channel split into async stdin/stdout streams and a lifecycle handle.
 pub struct SshPipe {
@@ -1113,6 +1118,7 @@ fn build_ssh_config(
         preferred,
         keepalive_interval: timeouts.keepalive_interval,
         keepalive_max: timeouts.keepalive_max,
+        window_size: SSH_CHANNEL_WINDOW_SIZE,
         nodelay: true,
         ..client::Config::default()
     })
@@ -1214,8 +1220,11 @@ struct SshStreamOpener {
 }
 
 impl StreamOpener for SshStreamOpener {
-    fn max_chunk_bytes(&self) -> Option<u64> {
-        Some(SSH_STREAM_CHUNK_BYTES)
+    fn window_policy(&self) -> Option<WindowPolicy> {
+        Some(WindowPolicy {
+            initial_bytes: SSH_STREAM_INITIAL_WINDOW,
+            max_bytes: SSH_STREAM_MAX_WINDOW,
+        })
     }
 
     fn open_stream(
@@ -1340,17 +1349,20 @@ fn classify_channel_open_error(err: russh::Error) -> StreamOpenError {
 
 struct SshStreamGuard {
     cancel: CancellationToken,
+    rx_finished: CancellationToken,
 }
 
 impl Drop for SshStreamGuard {
     fn drop(&mut self) {
-        self.cancel.cancel();
+        if !self.rx_finished.is_cancelled() {
+            self.cancel.cancel();
+        }
     }
 }
 
 #[derive(Default)]
 struct ChannelBufState {
-    queue: VecDeque<Vec<u8>>,
+    queue: VecDeque<Box<dyn AsRef<[u8]> + Send>>,
     head_offset: usize,
     buffered: usize,
     eof: bool,
@@ -1366,15 +1378,20 @@ struct BoundedChannelReader {
 
 impl Drop for BoundedChannelReader {
     fn drop(&mut self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.reader_dropped = true;
-        state.queue.clear();
-        state.buffered = 0;
-        drop(state);
-        self.cancel.cancel();
+        let should_cancel = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let incomplete = !state.eof;
+            state.reader_dropped = true;
+            state.queue.clear();
+            state.buffered = 0;
+            incomplete
+        };
+        if should_cancel {
+            self.cancel.cancel();
+        }
     }
 }
 
@@ -1391,17 +1408,25 @@ impl AsyncRead for BoundedChannelReader {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(front) = state.queue.front() {
-            let front_len = front.len();
-            let avail = &front[state.head_offset..];
+        let mut copied = 0usize;
+        while buf.remaining() > 0 {
+            let Some(front) = state.queue.front() else {
+                break;
+            };
+            let slice = (**front).as_ref();
+            let front_len = slice.len();
+            let avail = &slice[state.head_offset..];
             let take = avail.len().min(buf.remaining());
             buf.put_slice(&avail[..take]);
             state.head_offset += take;
             state.buffered -= take;
+            copied += take;
             if state.head_offset >= front_len {
                 state.queue.pop_front();
                 state.head_offset = 0;
             }
+        }
+        if copied > 0 {
             return Poll::Ready(Ok(()));
         }
         if let Some(err) = state.error.take() {
@@ -1416,9 +1441,9 @@ impl AsyncRead for BoundedChannelReader {
 }
 
 /// Bridges an independent SSH exec channel for `legion stream` without ever blocking russh's
-/// single session reader loop: incoming data is drained immediately into a bounded per-channel
-/// buffer (`SSH_STREAM_BUFFER_CAP`), and the SSH channel and its concurrency permit are closed as
-/// soon as the chunk finishes or the reader is cancelled/dropped.
+/// single session reader loop: incoming packets are queued directly into a bounded per-channel
+/// buffer (`SSH_STREAM_BUFFER_CAP`), and the SSH channel and its concurrency permit close when
+/// the remote finishes or the reader is cancelled/dropped.
 fn bridge_stream_channel(channel: Channel<client::Msg>, permit: OwnedSemaphorePermit) -> RawStream {
     let (mut read_half, write_half) = channel.split();
     let (mut stdin_read, stdin_write) = tokio::io::duplex(CHANNEL_BUFFER_BYTES);
@@ -1470,7 +1495,7 @@ fn bridge_stream_channel(channel: Channel<client::Msg>, permit: OwnedSemaphorePe
                         break;
                     }
                     state.buffered += data.len();
-                    state.queue.push_back(data.to_vec());
+                    state.queue.push_back(Box::new(data));
                     if let Some(waker) = state.waker.take() {
                         waker.wake();
                     }
@@ -1499,7 +1524,7 @@ fn bridge_stream_channel(channel: Channel<client::Msg>, permit: OwnedSemaphorePe
     });
 
     let tx_cancel = channel_cancel.clone();
-    let tx_rx_done = rx_finished;
+    let tx_rx_done = rx_finished.clone();
     tokio::spawn(async move {
         let _permit = permit;
         let mut buf = vec![0u8; 16 * 1024];
@@ -1558,6 +1583,7 @@ fn bridge_stream_channel(channel: Channel<client::Msg>, permit: OwnedSemaphorePe
         cancel: channel_cancel.clone(),
         guard: Some(Box::new(SshStreamGuard {
             cancel: channel_cancel,
+            rx_finished,
         })),
     }
 }
