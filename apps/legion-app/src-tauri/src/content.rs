@@ -764,6 +764,7 @@ impl AppContentServer {
         .await;
         if let Some(key_hash) = ticket_key_hash
             && collected.status() != initial_status
+            && self.tickets.contains_hash(&key_hash)
         {
             self.record_ticket_status(
                 key_hash,
@@ -1027,17 +1028,7 @@ impl AppContentServer {
         let cors_origin = match guard.check(headers, uri) {
             Ok(origin) => origin,
             Err(rejection) => {
-                let resp = guard_error_response(rejection, options.corp);
-                if let Some((ticket_id, _)) = parse_content_path(uri.path()) {
-                    self.record_ticket_status(
-                        ticket_hash(ticket_id),
-                        resp.status(),
-                        resp.headers(),
-                        resp.body().fixed_bytes(),
-                        true,
-                    );
-                }
-                return resp;
+                return guard_error_response(rejection, options.corp);
             }
         };
 
@@ -1048,8 +1039,13 @@ impl AppContentServer {
         let Some((ticket_id, file_name)) = parse_content_path(uri.path()) else {
             return not_found_response(options.corp, cors_origin);
         };
-        let key_hash = ticket_hash(ticket_id);
-        let stream_failed = self.ensure_ticket_stream_flag(key_hash);
+
+        // Only track status and stream-failure state for requests that present a real, live ticket.
+        // Requests with unknown, expired, or invalid tickets must never allocate status slots and
+        // evict the viewer's diagnosis for an active media URL.
+        let valid_ticket = self.tickets.lookup(ticket_id);
+        let key_hash = valid_ticket.as_ref().map(|t| t.key_hash);
+        let stream_failed = key_hash.map(|h| self.ensure_ticket_stream_flag(h));
 
         self.active_streams.fetch_add(1, Ordering::AcqRel);
         let active_guard = ActiveStreamGuard {
@@ -1059,7 +1055,7 @@ impl AppContentServer {
         let hooks = StreamHooks {
             limiter: Some(self.limiter.clone()),
             bytes_served: None,
-            stream_failed: Some(stream_failed),
+            stream_failed,
             active_guard: Some(Box::new(active_guard)),
         };
 
@@ -1080,13 +1076,15 @@ impl AppContentServer {
             apply_cors_headers(response.headers_mut(), origin);
         }
 
-        self.record_ticket_status(
-            key_hash,
-            response.status(),
-            response.headers(),
-            response.body().fixed_bytes(),
-            true,
-        );
+        if let Some(key_hash) = key_hash {
+            self.record_ticket_status(
+                key_hash,
+                response.status(),
+                response.headers(),
+                response.body().fixed_bytes(),
+                true,
+            );
+        }
         self.record_request_log(method, file_name, headers, &response);
         response
     }
@@ -3650,6 +3648,84 @@ mod tests {
 
         squatter_stop.cancel();
         let _ = squatter_task.await;
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn invalid_ticket_requests_cannot_evict_valid_ticket_status() {
+        let flac_bytes: Vec<u8> = (0..(64 * 1024)).map(|i| (i % 251) as u8).collect();
+        let mut files = HashMap::new();
+        files.insert("/home/me/track.flac".to_owned(), flac_bytes);
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let valid = server
+            .mint_url("tower", "/home/me/track.flac", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let valid_path = valid
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+
+        let (st, head, _) = raw_http(
+            port,
+            &format!(
+                "GET {valid_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=0-1023\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(st, 206, "{head}");
+
+        // Flood more than MAX_REQUEST_LOG (64) junk requests — both invalid 43-char ticket IDs
+        // (404) and guard-rejected Origin/Host requests (403/421). None may allocate status slots
+        // or evict the real URL's diagnosis.
+        let mut sample_junk_url = String::new();
+        for i in 0..80usize {
+            let fake_id = format!("junk{i:039}");
+            assert_eq!(fake_id.len(), 43);
+            let fake_path = format!("/v1/content/{fake_id}/track.flac");
+            if i == 0 {
+                sample_junk_url = format!("http://127.0.0.1:{port}{fake_path}");
+            }
+            let req = if i % 3 == 0 {
+                format!(
+                    "GET {fake_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nConnection: close\r\n\r\n"
+                )
+            } else if i % 3 == 1 {
+                format!(
+                    "GET {fake_path} HTTP/1.1\r\nHost: evil.example:{port}\r\nConnection: close\r\n\r\n"
+                )
+            } else {
+                format!(
+                    "GET {fake_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+            };
+            let (junk_st, _, _) = raw_http(port, &req).await;
+            assert!(matches!(junk_st, 403 | 404 | 421), "got {junk_st}");
+        }
+
+        let preserved = server.content_status_for_url(&valid.url);
+        assert_eq!(preserved.request_count, 1);
+        assert_eq!(preserved.status, Some(206));
+        assert_eq!(preserved.content_type.as_deref(), Some("audio/flac"));
+        assert!(!preserved.stream_failed);
+        assert!(preserved.ticket_live);
+
+        assert_eq!(
+            server.content_status_for_url(&sample_junk_url),
+            ContentUrlStatus::default(),
+            "unknown tickets must never populate content_status"
+        );
+
         server.shutdown();
     }
 }
