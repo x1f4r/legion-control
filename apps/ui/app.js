@@ -40,7 +40,6 @@ import {
   writeSettings,
 } from './lib/settings.js';
 import {
-  IDLE_INSTALL_DELAY_MS,
   PERIODIC_CHECK_INTERVAL_MS,
   isSafeForAutoInstall,
   shouldCheckOnResume,
@@ -79,6 +78,15 @@ function safeLocalStorage() {
 }
 
 const WAKE_TTL_MS = 120_000;
+const PASSIVE_REFRESH_TOOLS = new Set([
+  'fleet.list',
+  'fleet.ping',
+  'sys.info',
+  'power.status',
+  'job.list',
+  'meta.whoami',
+  'meta.version',
+]);
 
 function ConfirmSheet({ request, technical, onClose }) {
   const [dryResult, setDryResult] = useState(null);
@@ -226,7 +234,23 @@ function ConfirmSheet({ request, technical, onClose }) {
 }
 
 function App() {
-  const link = useMemo(() => createLink(), []);
+  const rawLink = useMemo(() => createLink(), []);
+  const activeCallsRef = useRef(0);
+  const link = useMemo(() => {
+    if (typeof rawLink.call !== 'function') return rawLink;
+    return {
+      ...rawLink,
+      async call(tool, args, options) {
+        const isInteractive = Boolean(options?.onEvent) || !PASSIVE_REFRESH_TOOLS.has(tool);
+        if (isInteractive) activeCallsRef.current += 1;
+        try {
+          return await rawLink.call(tool, args, options);
+        } finally {
+          if (isInteractive) activeCallsRef.current = Math.max(0, activeCallsRef.current - 1);
+        }
+      },
+    };
+  }, [rawLink]);
   const sessionCache = useMemo(() => createSessionCache(), []);
   const persistentCache = useMemo(() => createPersistentCache(), []);
   const shellRef = useRef(null);
@@ -266,14 +290,23 @@ function App() {
   const [pairNotice, setPairNotice] = useState(null);
   const [updateState, setUpdateState] = useState(null);
   const [whatIsNewOpen, setWhatIsNewOpen] = useState(false);
+  const [startupUpdating, setStartupUpdating] = useState(false);
   const [wakeSentAt, setWakeSentAt] = useState({});
   const sheetHistoryRef = useRef(false);
   const learnInFlightRef = useRef(false);
   const updateCheckInFlightRef = useRef(false);
-  const lastInteractionRef = useRef(Date.now());
+  const userInteractedRef = useRef(false);
   const startupAutoInstallRanRef = useRef(false);
   const updateStateRef = useRef(updateState);
   updateStateRef.current = updateState;
+  const confirmRequestRef = useRef(confirmRequest);
+  confirmRequestRef.current = confirmRequest;
+  const whatIsNewOpenRef = useRef(whatIsNewOpen);
+  whatIsNewOpenRef.current = whatIsNewOpen;
+  const commandDraftRef = useRef(commandDraft);
+  commandDraftRef.current = commandDraft;
+  const pairingOpenRef = useRef(pairingOpen);
+  pairingOpenRef.current = pairingOpen;
 
   const nodeInfo = linkState?.nodes?.[0] || null;
   const nodeInfoRef = useRef(nodeInfo);
@@ -434,6 +467,24 @@ function App() {
 
   const handleInstallUpdate = useCallback(async () => {
     if (typeof link.installUpdate !== 'function') return null;
+    if (commandDraftRef.current.running || activeCallsRef.current > 0) {
+      if (!sheetHistoryRef.current) {
+        window.history.pushState({ legionSheet: true }, '');
+        sheetHistoryRef.current = true;
+      }
+      setConfirmRequest({
+        title: 'Update and restart now?',
+        summary:
+          'Something is still running in Legion. Installing the update will restart the app and interrupt it.',
+        confirmLabel: 'Update now',
+        danger: false,
+        async onConfirm() {
+          const next = await link.installUpdate();
+          if (next) setUpdateState(next);
+        },
+      });
+      return null;
+    }
     const next = await link.installUpdate();
     if (next) setUpdateState(next);
     return next;
@@ -577,16 +628,68 @@ function App() {
     [link, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
   );
 
-  // Subscribe to native updater state and handle startup/periodic/idle update hooks.
+  // Subscribe to native updater state and apply ready updates on startup before user interaction.
   useEffect(() => {
+    const markInteracted = () => {
+      userInteractedRef.current = true;
+    };
+    window.addEventListener('pointerdown', markInteracted, { passive: true, once: true });
+    window.addEventListener('keydown', markInteracted, { passive: true, once: true });
+    window.addEventListener('touchstart', markInteracted, { passive: true, once: true });
+
     if (typeof link.watchUpdates !== 'function' && typeof link.updateState !== 'function') {
-      return;
+      return () => {
+        window.removeEventListener('pointerdown', markInteracted);
+        window.removeEventListener('keydown', markInteracted);
+        window.removeEventListener('touchstart', markInteracted);
+      };
     }
+
     let alive = true;
+    const maybeRunStartupInstall = (st) => {
+      if (
+        !alive ||
+        !st ||
+        startupAutoInstallRanRef.current ||
+        typeof link.maybeAutoInstall !== 'function'
+      ) {
+        return;
+      }
+      if (
+        !isSafeForAutoInstall({
+          updateState: st,
+          trigger: 'startup',
+          userInteracted: userInteractedRef.current,
+          hasOpenSheet: Boolean(confirmRequestRef.current || whatIsNewOpenRef.current),
+          hasCommandDraft: Boolean(commandDraftRef.current.cmd?.trim()),
+          isRunningCommand: Boolean(commandDraftRef.current.running),
+          activeCalls: activeCallsRef.current,
+          isPairingOpen: Boolean(pairingOpenRef.current),
+        })
+      ) {
+        return;
+      }
+      startupAutoInstallRanRef.current = true;
+      const isMock = Boolean(link.mockFlags);
+      if (!isMock) setStartupUpdating(true);
+      link
+        .maybeAutoInstall('startup')
+        .then((res) => {
+          if (alive && (!res || res.phase !== 'installing')) {
+            setStartupUpdating(false);
+          }
+        })
+        .catch(() => {
+          if (alive) setStartupUpdating(false);
+        });
+    };
+
     const unwatch =
       typeof link.watchUpdates === 'function'
         ? link.watchUpdates((st) => {
-            if (alive && st) setUpdateState(st);
+            if (!alive || !st) return;
+            setUpdateState(st);
+            maybeRunStartupInstall(st);
           })
         : () => {};
     if (typeof link.updateState === 'function') {
@@ -595,31 +698,22 @@ function App() {
         .then((st) => {
           if (!alive || !st) return;
           setUpdateState(st);
-          if (
-            !startupAutoInstallRanRef.current &&
-            typeof link.maybeAutoInstall === 'function' &&
-            isSafeForAutoInstall({ updateState: st, startup: true })
-          ) {
-            startupAutoInstallRanRef.current = true;
-            link.maybeAutoInstall().catch(() => {});
-          }
+          maybeRunStartupInstall(st);
         })
         .catch(() => {});
     }
     return () => {
       alive = false;
       unwatch();
+      window.removeEventListener('pointerdown', markInteracted);
+      window.removeEventListener('keydown', markInteracted);
+      window.removeEventListener('touchstart', markInteracted);
     };
   }, [link]);
 
-  // Track user interactions and trigger periodic (6h) update checks plus safe idle auto-install.
+  // Trigger periodic (6h) update checks while the app is open and visible.
   useEffect(() => {
     if (!linkState?.ready || typeof link.checkUpdates !== 'function') return;
-    const markActive = () => {
-      lastInteractionRef.current = Date.now();
-    };
-    window.addEventListener('pointerdown', markActive, { passive: true });
-    window.addEventListener('keydown', markActive, { passive: true });
 
     const periodicTimer = window.setInterval(() => {
       if (document.visibilityState === 'visible') {
@@ -627,38 +721,10 @@ function App() {
       }
     }, PERIODIC_CHECK_INTERVAL_MS);
 
-    const idleTimer = window.setInterval(() => {
-      if (typeof link.maybeAutoInstall !== 'function') return;
-      const safe = isSafeForAutoInstall({
-        updateState: updateStateRef.current,
-        hasOpenSheet: Boolean(confirmRequest || whatIsNewOpen),
-        hasCommandDraft: Boolean(commandDraft.cmd?.trim()),
-        isRunningCommand: Boolean(commandDraft.running),
-        isPairingOpen: Boolean(pairingOpen),
-        lastInteractionMs: lastInteractionRef.current,
-        nowMs: Date.now(),
-      });
-      if (safe) {
-        link.maybeAutoInstall().catch(() => {});
-      }
-    }, Math.min(IDLE_INSTALL_DELAY_MS, 10_000));
-
     return () => {
-      window.removeEventListener('pointerdown', markActive);
-      window.removeEventListener('keydown', markActive);
       window.clearInterval(periodicTimer);
-      window.clearInterval(idleTimer);
     };
-  }, [
-    link,
-    linkState?.ready,
-    checkUpdatesQuietly,
-    confirmRequest,
-    whatIsNewOpen,
-    commandDraft.cmd,
-    commandDraft.running,
-    pairingOpen,
-  ]);
+  }, [link, linkState?.ready, checkUpdatesQuietly]);
 
   useEffect(() => {
     let alive = true;
@@ -701,6 +767,20 @@ function App() {
     const onVisibilityChange = async () => {
       if (document.visibilityState === 'hidden') {
         wasHidden = true;
+        if (
+          typeof link.maybeAutoInstall === 'function' &&
+          isSafeForAutoInstall({
+            updateState: updateStateRef.current,
+            trigger: 'background',
+            hasOpenSheet: Boolean(confirmRequestRef.current || whatIsNewOpenRef.current),
+            hasCommandDraft: Boolean(commandDraftRef.current.cmd?.trim()),
+            isRunningCommand: Boolean(commandDraftRef.current.running),
+            activeCalls: activeCallsRef.current,
+            isPairingOpen: Boolean(pairingOpenRef.current),
+          })
+        ) {
+          link.maybeAutoInstall('background').catch(() => {});
+        }
         return;
       }
       if (document.visibilityState !== 'visible') return;
@@ -1318,7 +1398,9 @@ function App() {
   return html`
     <div ref=${shellRef} class="shell">
       <${IconSprite} />
-      ${booting
+      ${startupUpdating
+        ? html`<div class="startup-update" role="status" aria-live="polite">Updating…</div>`
+        : booting
         ? html`
             <div class="app standalone">
               <header class="top"><h1>Machines</h1></header>

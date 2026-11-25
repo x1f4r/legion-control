@@ -547,11 +547,23 @@ export function createMockLink(mode = '') {
   const isUpdate = flags.has('update');
   const isUpdated = flags.has('updated');
   const isUpdateDeb = flags.has('update-deb');
+  const isUpdateFailed = flags.has('update-failed');
+  const isUpdateMetered = flags.has('update-metered');
+  const isUpdateSeq0 = flags.has('update-seq0');
 
   let authed = !isToken && !isPair && !isRepair;
   let repaired = false;
   const kind =
-    isPair || isMulti || isRepair || isFleet || isUpdate || isUpdated || isUpdateDeb
+    isPair ||
+    isMulti ||
+    isRepair ||
+    isFleet ||
+    isUpdate ||
+    isUpdated ||
+    isUpdateDeb ||
+    isUpdateFailed ||
+    isUpdateMetered ||
+    isUpdateSeq0
       ? 'app'
       : 'mock';
   let jobCounter = 10;
@@ -1737,14 +1749,25 @@ export function createMockLink(mode = '') {
   }
 
   const updateWatchers = new Set();
+  const mockDebSha256 = 'a'.repeat(64);
   let mockUpdateState =
     kind === 'app'
       ? {
-          phase: isUpdateDeb ? 'manual' : isUpdate ? 'ready' : 'up_to_date',
+          phase: isUpdateSeq0
+            ? 'unsupported'
+            : isUpdateDeb
+              ? 'manual'
+              : isUpdateFailed
+                ? 'error'
+                : isUpdateMetered
+                  ? 'available'
+                  : isUpdate
+                    ? 'ready'
+                    : 'up_to_date',
           current: {
             version: isUpdated ? '0.2.0' : '0.1.0',
             build: isUpdated ? 'feedface1234' : 'abc123456789',
-            sequence: isUpdated ? 202611250205 : 202611250200,
+            sequence: isUpdateSeq0 ? 0 : isUpdated ? 202611250205 : 202611250200,
             os: isUpdateDeb ? 'linux' : 'android',
             arch: isUpdateDeb ? 'x86_64' : 'aarch64',
             install_kind: isUpdateDeb ? 'deb' : 'apk',
@@ -1752,15 +1775,18 @@ export function createMockLink(mode = '') {
             release_key_fingerprint: 'SHA256:MockReleaseKey11111111111111111111111111111',
             preview_key_fingerprint: 'SHA256:MockPreviewKey22222222222222222222222222222',
           },
-          sequence_floor: isUpdated ? 202611250205 : 202611250200,
+          sequence_floor: isUpdateSeq0 ? 0 : isUpdated ? 202611250205 : 202611250200,
           auto_update: true,
-          can_self_install: !isUpdateDeb,
-          unsupported_reason: null,
-          manual_command: isUpdateDeb
-            ? 'sudo apt-get install /home/me/.local/share/com.x1f4r.legion/updates/downloads/preview-202611250205/legion-app_0.2.0_amd64.deb'
+          can_self_install: !isUpdateDeb && !isUpdateSeq0,
+          unsupported_reason: isUpdateSeq0
+            ? 'This build has sequence 0, so self-updates are disabled.'
             : null,
+          manual_command: isUpdateDeb
+            ? 'sudo apt-get install /home/me/.local/share/com.x1f4r.legion/updates/verified/legion-app_0.2.0_amd64.deb'
+            : null,
+          manual_sha256: isUpdateDeb ? mockDebSha256 : null,
           available:
-            isUpdate || isUpdateDeb
+            isUpdate || isUpdateDeb || isUpdateFailed || isUpdateMetered
               ? {
                   channel: 'preview',
                   version: '0.2.0',
@@ -1772,12 +1798,13 @@ export function createMockLink(mode = '') {
                   key_fingerprint: 'SHA256:MockPreviewKey22222222222222222222222222222',
                   source_node: 'tower',
                   artifact_name: isUpdateDeb ? 'legion-app_0.2.0_amd64.deb' : 'Legion-0.2.0.apk',
-                  artifact_sha256: '0'.repeat(64),
+                  artifact_sha256: isUpdateDeb ? mockDebSha256 : '0'.repeat(64),
                   artifact_size: 18_000_000,
-                  downloaded: true,
+                  downloaded: !isUpdateMetered,
                 }
               : null,
           progress: null,
+          metered_paused: isUpdateMetered,
           last_checked_at: isoAgo(30),
           checked_nodes: ['tower'],
           just_updated: isUpdated
@@ -1791,6 +1818,15 @@ export function createMockLink(mode = '') {
               }
             : null,
           rolled_back: null,
+          failed_update: isUpdateFailed
+            ? {
+                channel: 'preview',
+                version: '0.2.0',
+                sequence: 202611250205,
+                reason: 'Version 0.2.0 did not finish installing.',
+                failed_at: isoAgo(120),
+              }
+            : null,
           android: isUpdateDeb
             ? null
             : {
@@ -1799,8 +1835,10 @@ export function createMockLink(mode = '') {
                 installerPackage: 'com.x1f4r.legion',
                 apiLevel: 35,
                 supportsSilentSelfUpdate: true,
+                isMetered: isUpdateMetered,
               },
-          last_error: null,
+          last_error: isUpdateFailed ? 'Version 0.2.0 did not finish installing.' : null,
+          last_error_detail: isUpdateFailed ? 'INSTALL_FAILED_VERIFICATION_FAILURE' : null,
         }
       : null;
 
@@ -1878,7 +1916,7 @@ export function createMockLink(mode = '') {
     return structuredClone(mockUpdateState);
   }
 
-  async function maybeAutoInstall() {
+  async function maybeAutoInstall(_trigger = 'startup') {
     return updateState();
   }
 

@@ -472,9 +472,9 @@ export function createAppLink() {
     }
   }
 
-  async function maybeAutoInstall() {
+  async function maybeAutoInstall(trigger = 'startup') {
     try {
-      return await invoke('update_maybe_auto_install');
+      return await invoke('update_maybe_auto_install', { trigger });
     } catch (err) {
       throw normalizeError(err);
     }

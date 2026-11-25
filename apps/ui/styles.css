@@ -1619,6 +1619,78 @@ button.row:active {
   font-size: 14px;
 }
 
+/* Quiet one-time post-update line: no border, no box, no framed buttons. */
+.update-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 2px 10px;
+  padding: 2px 0;
+  color: var(--dim);
+  font-size: var(--text-sub);
+}
+
+.update-note-link {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  min-height: 36px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.update-note-action {
+  color: var(--text);
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 3px;
+}
+
+.update-note-link:hover .update-note-action {
+  color: var(--accent);
+  text-decoration-color: var(--accent);
+}
+
+.update-note-text {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+}
+
+.update-note-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 36px;
+  min-height: 36px;
+  margin-right: -8px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--faint);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.update-note-dismiss:hover {
+  color: var(--text);
+}
+
+.startup-update {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  padding: 24px;
+  color: var(--dim);
+  font-size: var(--text-base);
+}
+
 .empty {
   display: grid;
   justify-items: center;

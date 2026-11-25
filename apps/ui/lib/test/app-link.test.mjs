@@ -306,7 +306,8 @@ test('createAppLink wraps native update commands and live update watch channel',
     assert.equal((await link.setAutoUpdate(false)).auto_update, false);
     await link.installUpdate();
     await link.dismissUpdateNotice();
-    await link.maybeAutoInstall();
+    await link.maybeAutoInstall('startup');
+    await link.maybeAutoInstall('background');
     for (const cmd of [
       'update_watch',
       'update_state',
@@ -318,6 +319,14 @@ test('createAppLink wraps native update commands and live update watch channel',
     ]) {
       assert.ok(seen.some((c) => c.command === cmd), `expected ${cmd}`);
     }
+    assert.ok(
+      seen.some((c) => c.command === 'update_maybe_auto_install' && c.payload?.trigger === 'startup'),
+      'expected startup trigger payload',
+    );
+    assert.ok(
+      seen.some((c) => c.command === 'update_maybe_auto_install' && c.payload?.trigger === 'background'),
+      'expected background trigger payload',
+    );
   } finally {
     if (prevWindow === undefined) {
       delete globalThis.window;

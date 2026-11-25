@@ -1111,20 +1111,45 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     await p.getByText('preview + stable').waitFor();
     await p.getByText(/SHA256:MockPreviewKey/).waitFor();
 
-    // 12. Linux .deb mode (`update-deb`): never offers Update now, shows exact apt-get command.
+    // 12. Linux .deb mode (`update-deb`): never offers Update now, shows exact apt-get command
+    //     and verified private copy SHA-256.
     await p.goto(`${server.url}/?mock=multi,update-deb#/settings/about`, { waitUntil: 'domcontentloaded' });
     await p.getByText('Version 0.2.0 is available').waitFor();
     await p.getByText(/sudo apt-get install /).waitFor();
+    await p.getByText(/SHA-256: a{64}/).waitFor();
     assert.equal(await p.getByRole('button', { name: 'Update now' }).count(), 0);
 
-    // 13. One-time "Updated to 0.2.0 · What is new" notice on first screen, sheet, and dismiss.
+    // 12b. Failed update (`update-failed`): plain mode hides raw error detail and offers Try again;
+    //      Technical details exposes raw error detail.
+    await p.goto(`${server.url}/?mock=multi,update-failed#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Version 0.2.0 did not finish installing.').waitFor();
+    await p.getByRole('button', { name: 'Try again' }).waitFor();
+    assert.ok(
+      !(await p.locator('main.main').innerText()).includes('INSTALL_FAILED_VERIFICATION_FAILURE'),
+      'Raw installer error must stay hidden outside Technical details',
+    );
+    await p.goto(`${server.url}/?mock=multi,update-failed,tech#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('INSTALL_FAILED_VERIFICATION_FAILURE').waitFor();
+
+    // 12c. Metered pause (`update-metered`) and sequence-0 build (`update-seq0`).
+    await p.goto(`${server.url}/?mock=multi,update-metered#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText(/metered connection/i).waitFor();
+    await p.getByRole('button', { name: 'Update now' }).waitFor();
+
+    await p.goto(`${server.url}/?mock=multi,update-seq0,tech#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Updates disabled in this build').waitFor();
+    await p.getByText('0 (updates disabled)').waitFor();
+
+    // 13. Quiet unbordered one-time "Updated to 0.2.0 · What is new" notice on first screen, sheet, and dismiss.
     await p.goto(`${server.url}/?mock=multi,updated#/machines`, { waitUntil: 'domcontentloaded' });
-    await p.getByText(/Updated to 0\.2\.0/).waitFor();
-    await p.getByRole('button', { name: 'What is new' }).click();
+    const updateRow = p.locator('.update-note');
+    await updateRow.waitFor();
+    assert.equal(await updateRow.locator('.btn').count(), 0, 'Post-update row must not contain bordered buttons');
+    await updateRow.locator('.update-note-link').click();
     await p.locator('.sheet').getByText('What is new in 0.2.0').waitFor();
     await p.locator('.sheet').getByText('Automatic fleet updates and faster status refresh.').waitFor();
     await p.locator('.sheet').getByRole('button', { name: 'Done' }).click();
-    await p.getByText(/Updated to 0\.2\.0/).waitFor({ state: 'hidden' });
+    await p.locator('.update-note').waitFor({ state: 'hidden' });
 
     await ctx.close();
     assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);
