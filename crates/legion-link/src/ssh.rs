@@ -1351,6 +1351,7 @@ fn classify_channel_open_error(err: russh::Error) -> StreamOpenError {
             )
             .with_details(json!({
                 "reason": "channel_open_failure",
+                "permits_free": true,
                 "retryable": true,
             })),
         ),

@@ -156,11 +156,12 @@ pub use invite::{
 #[cfg(feature = "ssh")]
 pub use key::DeviceKey;
 pub use link::{
-    ConflictingIdentityReport, DEFAULT_IDLE_TIMEOUT, DEFAULT_UNSYNCED_BACKOFF, DisagreementReport,
-    LearnDisagreement, LearnReport, Link, LinkConfig, LinkOptions, MAX_CONFIGURED_NODES,
-    MAX_ENDPOINT_FIELD_LEN, MAX_ENDPOINT_HOST_KEY_LEN, MAX_ENDPOINT_HOST_KEYS, MAX_ENDPOINT_HOSTS,
-    MachineRouteStatus, NodeLink, NodeOrigin, PendingIdentityChange, Route, RoutedValue,
-    SessionOpener, parse_optional_target, public_key_fingerprint,
+    ConflictingIdentityReport, DEFAULT_CHANNEL_REFUSED_RECONNECT_COOLDOWN, DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_UNSYNCED_BACKOFF, DisagreementReport, LearnDisagreement, LearnReport, Link, LinkConfig,
+    LinkOptions, MAX_CONFIGURED_NODES, MAX_ENDPOINT_FIELD_LEN, MAX_ENDPOINT_HOST_KEY_LEN,
+    MAX_ENDPOINT_HOST_KEYS, MAX_ENDPOINT_HOSTS, MachineRouteStatus, NodeLink, NodeOrigin,
+    PendingIdentityChange, Route, RoutedValue, SessionOpener, parse_optional_target,
+    public_key_fingerprint,
 };
 pub use session::{
     CallError, OpenError, Session, SessionInfo, TransportHandle, cancel_reply_timeout,

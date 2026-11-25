@@ -4132,4 +4132,205 @@ mod tests {
             assert_eq!(pool.len(), 0);
         }
     }
+
+    #[tokio::test]
+    async fn channel_refused_with_free_permits_reconnects_once_per_minute() {
+        struct SessionScopedOpener {
+            session_id: usize,
+            refuse_sessions: Arc<Mutex<Vec<usize>>>,
+            payload: Arc<Vec<u8>>,
+        }
+
+        impl StreamOpener for SessionScopedOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let sid = self.session_id;
+                let refuse = self
+                    .refuse_sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains(&sid);
+                let payload = Arc::clone(&self.payload);
+                Box::pin(async move {
+                    if refuse {
+                        return Err(StreamOpenError::ChannelRefused(
+                            ErrorBody::new(
+                                ErrorCode::Busy,
+                                "The SSH server refused to open another stream channel.",
+                            )
+                            .with_details(json!({
+                                "reason": "channel_open_failure",
+                                "permits_free": true,
+                                "retryable": true,
+                            })),
+                        ));
+                    }
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(8 * 1024);
+                    tokio::spawn(async move {
+                        let mut r = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": 0u64,
+                            "length": payload.len(),
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": 42u64,
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        let _ = server_out.write_all(&payload).await;
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: CancellationToken::new(),
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        let session_opens = Arc::new(AtomicUsize::new(0));
+        let refuse_sessions = Arc::new(Mutex::new(vec![1usize]));
+        let payload = Arc::new(b"fresh-session-content".to_vec());
+
+        let make_link = |cooldown: Duration| {
+            let opens = Arc::clone(&session_opens);
+            let refuses = Arc::clone(&refuse_sessions);
+            let data = Arc::clone(&payload);
+            let mut config = LinkConfig::default();
+            config.upsert_node(NodeLink::local("tower", "/bin/true"));
+            let opener: SessionOpener = Arc::new(move |entry, _key, cancel| {
+                let sid = opens.fetch_add(1, Ordering::SeqCst) + 1;
+                let stream_opener: Arc<dyn StreamOpener> = Arc::new(SessionScopedOpener {
+                    session_id: sid,
+                    refuse_sessions: Arc::clone(&refuses),
+                    payload: Arc::clone(&data),
+                });
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_proto::Request = serde_json::from_str(&line).unwrap();
+                            let reply = Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: "tower".to_owned(),
+                                    version: VERSION.to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(FakeTransport {
+                            opener: stream_opener,
+                        }),
+                        &entry.node,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|err| err.into_error())
+                })
+            });
+            Link::with_opener(
+                config,
+                LinkOptions {
+                    channel_refused_reconnect_cooldown: cooldown,
+                    ..LinkOptions::default()
+                },
+                opener,
+            )
+        };
+
+        // 1. Default 60 s cooldown: session 1 refuses with free permits -> reconnects ONCE to
+        //    session 2 and succeeds; when session 2 also refuses within 60 s, returns Busy without
+        //    opening session 3.
+        let link = make_link(Duration::from_secs(60));
+        let _ = link.hello("tower").await.unwrap();
+        assert_eq!(session_opens.load(Ordering::SeqCst), 1);
+
+        let mut s = link.open_content("tower", "/a.bin", 0, None).await.unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, *payload);
+        assert_eq!(
+            session_opens.load(Ordering::SeqCst),
+            2,
+            "expected one reconnect when sshd refused channels with free permits"
+        );
+
+        // Poison session 2 too: within the 60 s cooldown it must NOT reconnect again.
+        refuse_sessions.lock().unwrap().push(2);
+        let err = link
+            .open_content("tower", "/b.bin", 0, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code, ErrorCode::Busy, "{err}");
+        assert_eq!(
+            session_opens.load(Ordering::SeqCst),
+            2,
+            "reconnect must be rate-limited to once per cooldown window"
+        );
+        // Existing RPC session remains usable.
+        let _ = link.hello("tower").await.unwrap();
+        assert_eq!(session_opens.load(Ordering::SeqCst), 2);
+
+        // 2. With a short cooldown, once the cooldown elapses a new refusal reconnects once more.
+        session_opens.store(0, Ordering::SeqCst);
+        *refuse_sessions.lock().unwrap() = vec![1, 2];
+        let fast_link = make_link(Duration::from_millis(50));
+        let _ = fast_link.hello("tower").await.unwrap();
+        assert_eq!(session_opens.load(Ordering::SeqCst), 1);
+        // Session 1 refuses -> reconnects to session 2, which also refuses -> Busy (session_opens=2).
+        let err1 = fast_link
+            .open_content("tower", "/c.bin", 0, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err1.code, ErrorCode::Busy, "{err1}");
+        assert_eq!(session_opens.load(Ordering::SeqCst), 2);
+        // Wait past cooldown -> session 2 refuses -> reconnects to session 3 -> succeeds!
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        let mut s3 = fast_link
+            .open_content("tower", "/d.bin", 0, None)
+            .await
+            .unwrap();
+        let mut out3 = Vec::new();
+        s3.read_to_end(&mut out3).await.unwrap();
+        assert_eq!(out3, *payload);
+        assert_eq!(session_opens.load(Ordering::SeqCst), 3);
+    }
 }
