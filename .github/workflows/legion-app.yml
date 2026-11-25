@@ -321,18 +321,10 @@ jobs:
           mkdir -p "$WORK/bin" "$WORK/run" "$WORK/node" "$DIAG"
           chmod 700 "$WORK"
 
-          PID1=""
-          PID2=""
-          XVFB_PID=""
-          DBUS_SESSION_BUS_PID=""
           dump_diag() {
             local rc=$?
             set +e
-            [ -n "$PID1" ] && kill "$PID1" 2>/dev/null || true
-            [ -n "$PID2" ] && kill "$PID2" 2>/dev/null || true
             pkill -f "$WORK/run/Legion.AppImage" 2>/dev/null || true
-            [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
-            [ -n "$DBUS_SESSION_BUS_PID" ] && kill "$DBUS_SESSION_BUS_PID" 2>/dev/null || true
             {
               echo "=== Linux self-update diagnostics (exit=$rc) ==="
               echo "--- ps aux ---"
@@ -415,14 +407,21 @@ jobs:
           LEGION_HOME="$WORK/node" "$WORK/bin/legion" update.publish "from=$WORK/set-2" --json
           LEGION_HOME="$WORK/node" "$WORK/bin/legion" update.list --json > "$DIAG/node-update-list.json"
 
-          # Keep Xvfb and D-Bus alive across seq1 exit and seq2 relaunch by the swap supervisor.
-          Xvfb :99 -screen 0 1280x800x24 >"$DIAG/xvfb.log" 2>&1 &
-          XVFB_PID=$!
-          export DISPLAY=":99"
-          eval "$(dbus-launch --sh-syntax)"
-          sleep 1
+          # Run both launches inside one dbus-run-session + xvfb-run so Xvfb gets a free display
+          # and valid XAUTHORITY and stays alive across seq1 exit and seq2 relaunch.
+          cat << 'INNER' > "$WORK/run-appimage-test.sh"
+          #!/usr/bin/env bash
+          set -euo pipefail
+          PID1=""
+          PID2=""
+          cleanup_inner() {
+            [ -n "$PID1" ] && kill "$PID1" 2>/dev/null || true
+            [ -n "$PID2" ] && kill "$PID2" 2>/dev/null || true
+            pkill -f "$WORK/run/Legion.AppImage" 2>/dev/null || true
+          }
+          trap cleanup_inner EXIT
 
-          # Launch 1: start seq1 under persistent Xvfb and wait for verified download of seq2.
+          # Launch 1: start seq1 and wait for verified download of seq2.
           PATH="$WORK/bin:$PATH" \
           LEGION_HOME="$WORK/node" \
           APPIMAGE_EXTRACT_AND_RUN=1 \
@@ -486,6 +485,10 @@ jobs:
           PID2=""
           cat "$APP_DATA/current-build.json" || true
           [ "$UPDATED" -eq 1 ]
+          INNER
+          chmod +x "$WORK/run-appimage-test.sh"
+          WORK="$WORK" DIAG="$DIAG" APP_DATA="$APP_DATA" SEQ1="$SEQ1" SEQ2="$SEQ2" \
+            dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" "$WORK/run-appimage-test.sh"
       - name: Upload Linux self-update diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
