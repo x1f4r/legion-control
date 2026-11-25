@@ -19,17 +19,21 @@ use crate::model::{
     BinEntry, ConflictChoice, ConflictInfo, DeferredItem, DeletionBrakeConfig,
     DeletionBrakeDecision, FORCED_ROTATION_COOLDOWN_SECS, FetchOptions, FolderConfig,
     FolderDeletionLogEntry, FolderDeletionRecord, FolderMarker, FolderMeta, FolderStatus,
-    HandshakeHello, HeldBackRecord, INDEX_SCHEMA_VERSION, IndexRecord, MAX_DEFERRAL_ATTEMPTS,
-    MAX_HELD_BACK_ENTRIES, MAX_PAGE_RECORDS, MAX_PEER_PROBLEMS, MemberId, MemberState,
-    MemberStatus, PeerAckView, PeerCursor, PeerHandshake, ProblemKind, RecordsPage,
-    RestoreStrategy, SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, encode_deletion_log_entries,
-    parse_deletion_log, random_incarnation_id, validate_member_id,
+    HandshakeHello, HeldBackRecord, INDEX_SCHEMA_VERSION, InboundDeletionBrake,
+    InboundDeletionBrakeDecision, IndexRecord, MAX_DEFERRAL_ATTEMPTS, MAX_HELD_BACK_ENTRIES,
+    MAX_PAGE_RECORDS, MAX_PEER_PROBLEMS, MemberId, MemberState, MemberStatus, PeerAckView,
+    PeerCursor, PeerHandshake, ProblemKind, RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION,
+    SyncProblem, SyncProgress, encode_deletion_log_entries, parse_deletion_log,
+    random_incarnation_id, validate_member_id,
 };
 use crate::path::{
     IgnoreMatcher, is_descendant_of, is_internal_sync_path, path_depth, validate_sync_path,
 };
 use crate::reconcile::{LocalIndexView, ReconcileDecision, reconcile_record};
-use crate::scan::{PendingStabilityTracker, ScanOptions, ScanReport, scan_folder, scan_subtree};
+use crate::scan::{
+    PendingStabilityTracker, ScanOptions, ScanReport,
+    flush_settled_deletions as scan_flush_settled_deletions, scan_folder, scan_subtree,
+};
 use crate::store_redb::RedbIndexStore;
 use crate::traits::{IndexStore, Peer, StoreBatch, SyncFs};
 
@@ -550,10 +554,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             &self.fs,
             &mut self.store,
             &self.ignore,
-            DeletionBrakeConfig {
-                min_deleted_files: usize::MAX,
-                min_deleted_percent: 100,
-            },
+            DeletionBrakeConfig::disabled(),
             &mut self.stability,
             now,
             ScanOptions {
@@ -666,6 +667,116 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     },
                 ),
                 DeletionBrakeDecision::Rescan => e.scan_with_options_inner(now, ScanOptions::default()),
+            }
+        })
+    }
+
+    /// Promotes any pending local deletions whose settle period has elapsed at `now` without
+    /// requiring a full folder walk, returning the number of deletion records emitted.
+    pub fn flush_settled_deletions(&mut self, now: Timestamp) -> Result<usize> {
+        self.guard_mut("flush_settled_deletions", |e| {
+            e.last_now = now;
+            e.verify_folder_marker()?;
+            scan_flush_settled_deletions(&e.fs, &mut e.store, e.deletion_brake, now)
+        })
+    }
+
+    /// Responds to a tripped inbound mass-deletion brake for `peer_id`.
+    ///
+    /// - [`InboundDeletionBrakeDecision::ApplyDeletions`] unpauses `peer_id` and allows its
+    ///   blocked deletions up to `max_blocked_seq` to apply on the next pull.
+    /// - [`InboundDeletionBrakeDecision::KeepLocalFiles`] unpauses `peer_id` and re-asserts every
+    ///   blocked live local file strictly newer than the peer's deletion tombstones, returning the
+    ///   number of local files re-asserted.
+    pub fn resolve_inbound_deletion_brake(
+        &mut self,
+        peer_id: &str,
+        decision: InboundDeletionBrakeDecision,
+        now: Timestamp,
+    ) -> Result<usize> {
+        self.guard_mut("resolve_inbound_deletion_brake", |e| {
+            e.last_now = now;
+            e.verify_folder_marker()?;
+            let mut cursors = e.store.load_peer_cursors()?;
+            let Some(mut cursor) = cursors.remove(peer_id) else {
+                return Err(SyncError::Conflict {
+                    path: peer_id.to_string(),
+                    reason: format!(
+                        "no inbound mass-deletion brake is awaiting confirmation for peer '{peer_id}'"
+                    ),
+                });
+            };
+            let Some(brake) = cursor.inbound_brake.take() else {
+                return Err(SyncError::Conflict {
+                    path: peer_id.to_string(),
+                    reason: format!(
+                        "no inbound mass-deletion brake is awaiting confirmation for peer '{peer_id}'"
+                    ),
+                });
+            };
+
+            let remove_problems = vec![peer_problem_key(
+                peer_id,
+                ProblemKind::InboundDeletionBrakeTripped,
+                "",
+            )];
+            cursor.inbound_binned_in_window.clear();
+            cursor.inbound_window_start = None;
+            cursor.inbound_window_start_live_files = 0;
+
+            match decision {
+                InboundDeletionBrakeDecision::ApplyDeletions => {
+                    cursor.allow_inbound_mass_deletion_until_seq = cursor
+                        .allow_inbound_mass_deletion_until_seq
+                        .max(brake.max_blocked_seq);
+                    let mut batch = StoreBatch {
+                        remove_problems,
+                        ..StoreBatch::default()
+                    };
+                    batch.set_peer_cursors.insert(peer_id.to_string(), cursor);
+                    e.store.apply_batch(batch)?;
+                    Ok(0)
+                }
+                InboundDeletionBrakeDecision::KeepLocalFiles => {
+                    let mut meta = e.meta()?;
+                    let mut batch = StoreBatch {
+                        remove_problems,
+                        ..StoreBatch::default()
+                    };
+                    let mut del_log_entries = Vec::new();
+                    let mut reasserted = 0usize;
+                    for tomb in &brake.blocked_tombstones {
+                        let Some(mut local) = e.store.get_record(&tomb.path)? else {
+                            continue;
+                        };
+                        if local.deleted {
+                            continue;
+                        }
+                        local.version.merge(&tomb.version);
+                        meta.bump_version(&mut local.version);
+                        let seq = meta.next_seq();
+                        local.seq = seq;
+                        local.modified_by = meta.local_member.clone();
+                        local.from_join = false;
+                        let chain = meta.advance_chain_fingerprint(seq, local.head_fingerprint());
+                        batch.upsert_seq_fingerprints.push((seq, chain));
+                        del_log_entries.push(FolderDeletionLogEntry::Revived {
+                            path: local.path.clone(),
+                        });
+                        batch.upsert_records.push(local);
+                        reasserted += 1;
+                    }
+                    if !del_log_entries.is_empty() {
+                        let encoded = encode_deletion_log_entries(&del_log_entries)?;
+                        e.fs.append_deletion_log(&encoded)?;
+                    }
+                    if reasserted > 0 {
+                        batch.folder_meta = Some(meta);
+                    }
+                    batch.set_peer_cursors.insert(peer_id.to_string(), cursor);
+                    e.store.apply_batch(batch)?;
+                    Ok(reasserted)
+                }
             }
         })
     }
@@ -987,15 +1098,21 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             return Ok(PullReport::default());
         }
 
-        // Refuse syncing with a peer permanently flagged for alternating incarnations.
+        // Refuse syncing with a peer permanently flagged for alternating incarnations, or paused
+        // by an unresolved inbound mass-deletion brake.
         let mut initial_cursors = self.store.load_peer_cursors()?;
-        if let Some(existing_cursor) = initial_cursors.get(&peer_id)
-            && existing_cursor.alternation_detected
-        {
-            return Err(SyncError::Conflict {
-                path: peer_id.clone(),
-                reason: duplicate_member_sentence(&peer_id),
-            });
+        if let Some(existing_cursor) = initial_cursors.get(&peer_id) {
+            if existing_cursor.alternation_detected {
+                return Err(SyncError::Conflict {
+                    path: peer_id.clone(),
+                    reason: duplicate_member_sentence(&peer_id),
+                });
+            }
+            if existing_cursor.inbound_brake.is_some() {
+                return Err(SyncError::Paused {
+                    folder_id: meta.folder_id,
+                });
+            }
         }
 
         // Bidirectional handshake FIRST (before any page moves in either direction!).
@@ -1323,6 +1440,137 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             let (rename_pairs, remaining_after_renames) =
                 self.extract_local_rename_pairs(&peer_id, ordered)?;
 
+            // Split remaining records into Phase 1 (deletions, deepest-first), Phase 2 (live
+            // directories, shallowest-first), and remaining live non-directory records.
+            let mut delete_records = Vec::new();
+            let mut live_dir_records = Vec::new();
+            let mut live_non_dir_records = Vec::new();
+            for rec in remaining_after_renames {
+                if rec.deleted {
+                    delete_records.push(rec);
+                } else if rec.kind == EntryKind::Dir {
+                    live_dir_records.push(rec);
+                } else {
+                    live_non_dir_records.push(rec);
+                }
+            }
+
+            // Item 8: matching inbound peer deletion brake! Checked BEFORE mutating disk so a
+            // peer's mass deletion pauses that peer without touching local files or advancing its
+            // cursor, letting the person choose ApplyDeletions or KeepLocalFiles.
+            if self.deletion_brake.is_enabled() && !delete_records.is_empty() {
+                let window_secs = self.deletion_brake.window_secs as i64;
+                cursor
+                    .inbound_binned_in_window
+                    .retain(|(_, t)| now.secs >= t.secs && (now.secs - t.secs) <= window_secs);
+                let current_live_files = self.store.live_file_count()? as usize;
+                let window_expired = cursor
+                    .inbound_window_start
+                    .is_none_or(|ws| now.secs < ws.secs || (now.secs - ws.secs) > window_secs);
+                if cursor.inbound_binned_in_window.is_empty() || cursor.inbound_window_start.is_none()
+                {
+                    cursor.inbound_window_start = Some(now);
+                    cursor.inbound_window_start_live_files = current_live_files;
+                } else if window_expired {
+                    cursor.inbound_window_start = Some(now);
+                    cursor.inbound_window_start_live_files =
+                        current_live_files + cursor.inbound_binned_in_window.len();
+                }
+
+                let live_create_hashes: BTreeSet<Hash> = live_non_dir_records
+                    .iter()
+                    .filter(|r| !r.deleted && r.kind == EntryKind::File)
+                    .filter_map(|r| r.hash)
+                    .collect();
+                let cur_meta = self.meta()?;
+                let caps = self.fs.capabilities();
+                let view = StoreIndexView::new(&self.store);
+                let mut candidate_tombstones: Vec<IndexRecord> = Vec::new();
+                for remote in &delete_records {
+                    if remote.seq <= cursor.allow_inbound_mass_deletion_until_seq {
+                        continue;
+                    }
+                    let Some(local) = view.get_record(&remote.path) else {
+                        continue;
+                    };
+                    if local.deleted || local.kind != EntryKind::File {
+                        continue;
+                    }
+                    if local
+                        .hash
+                        .is_some_and(|h| live_create_hashes.contains(&h))
+                    {
+                        continue;
+                    }
+                    if matches!(
+                        reconcile_record(&view, remote, &peer_id, &cur_meta, &caps, &self.ignore),
+                        ReconcileDecision::DeleteToBin { .. }
+                    ) {
+                        candidate_tombstones.push(remote.clone());
+                    }
+                }
+
+                let mut distinct_inbound_deletes: BTreeSet<&str> = BTreeSet::new();
+                for (p, _) in &cursor.inbound_binned_in_window {
+                    distinct_inbound_deletes.insert(p.as_str());
+                }
+                for tomb in &candidate_tombstones {
+                    distinct_inbound_deletes.insert(tomb.path.as_str());
+                }
+                let inbound_baseline = cursor
+                    .inbound_window_start_live_files
+                    .max(current_live_files);
+                if !candidate_tombstones.is_empty()
+                    && self
+                        .deletion_brake
+                        .should_trip(distinct_inbound_deletes.len(), inbound_baseline)
+                {
+                    let deleted_count = distinct_inbound_deletes.len();
+                    let max_blocked_seq = candidate_tombstones
+                        .iter()
+                        .map(|r| r.seq)
+                        .max()
+                        .unwrap_or(page.snapshot_seq);
+                    let sample_paths: Vec<String> = candidate_tombstones
+                        .iter()
+                        .take(10)
+                        .map(|r| r.path.clone())
+                        .collect();
+                    let blocked_paths: Vec<String> =
+                        candidate_tombstones.iter().map(|r| r.path.clone()).collect();
+                    let sentence = format!(
+                        "Paused syncing from '{peer_id}' because its changes would delete {deleted_count} of {inbound_baseline} files; choose whether to apply the deletions or keep this machine's files."
+                    );
+                    cursor.inbound_brake = Some(InboundDeletionBrake {
+                        peer: peer_id.clone(),
+                        deleted_count,
+                        total_live_files: inbound_baseline,
+                        max_blocked_seq,
+                        sample_paths,
+                        blocked_paths,
+                        blocked_tombstones: candidate_tombstones,
+                    });
+                    let mut batch = StoreBatch::default();
+                    batch
+                        .set_peer_cursors
+                        .insert(peer_id.clone(), cursor);
+                    batch.upsert_problems.push((
+                        peer_problem_key(&peer_id, ProblemKind::InboundDeletionBrakeTripped, ""),
+                        SyncProblem {
+                            path: String::new(),
+                            kind: ProblemKind::InboundDeletionBrakeTripped,
+                            peer: Some(peer_id.clone()),
+                            sentence,
+                        },
+                    ));
+                    self.store.apply_batch(batch)?;
+                    self.active_progress.remove(&peer_id);
+                    return Err(SyncError::Paused {
+                        folder_id: local_meta.folder_id,
+                    });
+                }
+            }
+
             let mut seq_results: BTreeMap<u64, bool> = BTreeMap::new();
             let mut page_held_back: BTreeMap<(MemberId, String), HeldBackRecord> = BTreeMap::new();
             let mut existing_held_by_key: BTreeMap<(MemberId, String), HeldBackRecord> =
@@ -1410,21 +1658,6 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 remaining_files = remaining_files.saturating_sub(2);
             }
 
-            // Split remaining records into Phase 1 (deletions, deepest-first), Phase 2 (live
-            // directories, shallowest-first), and remaining live non-directory records.
-            let mut delete_records = Vec::new();
-            let mut live_dir_records = Vec::new();
-            let mut live_non_dir_records = Vec::new();
-            for rec in remaining_after_renames {
-                if rec.deleted {
-                    delete_records.push(rec);
-                } else if rec.kind == EntryKind::Dir {
-                    live_dir_records.push(rec);
-                } else {
-                    live_non_dir_records.push(rec);
-                }
-            }
-
             // Phase 1: apply deletions first.
             if !held_back_full {
                 for remote in delete_records {
@@ -1434,6 +1667,12 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         });
                     }
                     let remote_seq = remote.seq;
+                    let was_live_file = self.deletion_brake.is_enabled()
+                        && remote_seq > cursor.allow_inbound_mass_deletion_until_seq
+                        && self
+                            .store
+                            .get_record(&remote.path)?
+                            .is_some_and(|r| !r.deleted && r.kind == EntryKind::File);
                     let completed = self.process_one_remote(
                         peer,
                         &remote,
@@ -1447,6 +1686,21 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         &mut known_held_keys,
                         &mut held_back_full,
                     )?;
+                    if was_live_file
+                        && completed
+                        && self
+                            .store
+                            .get_record(&remote.path)?
+                            .is_some_and(|r| r.deleted)
+                        && !cursor
+                            .inbound_binned_in_window
+                            .iter()
+                            .any(|(p, _)| p == &remote.path)
+                    {
+                        cursor
+                            .inbound_binned_in_window
+                            .push((remote.path.clone(), now));
+                    }
                     seq_results.insert(remote_seq, completed);
                     if !completed {
                         any_deferred = true;
@@ -2612,6 +2866,11 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         cursor.applied_ack_seq = 0;
         cursor.head_fingerprint = None;
         cursor.acked_fingerprint = None;
+        cursor.inbound_window_start = None;
+        cursor.inbound_window_start_live_files = 0;
+        cursor.inbound_binned_in_window.clear();
+        cursor.inbound_brake = None;
+        cursor.allow_inbound_mass_deletion_until_seq = 0;
 
         let remove_held_back: Vec<(MemberId, String)> = self
             .store
@@ -2634,6 +2893,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             remove_problems: vec![
                 peer_problem_key(peer_id, ProblemKind::DuplicateMemberId, ""),
                 peer_problem_key(peer_id, ProblemKind::HeldBackLimitReached, ""),
+                peer_problem_key(peer_id, ProblemKind::InboundDeletionBrakeTripped, ""),
             ],
             ..StoreBatch::default()
         };
@@ -2746,10 +3006,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             &self.fs,
             &mut self.store,
             &self.ignore,
-            DeletionBrakeConfig {
-                min_deleted_files: usize::MAX,
-                min_deleted_percent: 100,
-            },
+            DeletionBrakeConfig::disabled(),
             &mut self.stability,
             now,
             ScanOptions {
@@ -3230,6 +3487,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             conflicts: Vec::new(),
             bin: Vec::new(),
             pending_brake: None,
+            inbound_brakes: Vec::new(),
             deferred: Vec::new(),
         }
     }
@@ -3281,6 +3539,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
         all_problems.extend(stored_problems.iter().cloned());
         all_problems.extend(held.iter().map(|h| h.problem.clone()));
+        let mut inbound_brakes: Vec<InboundDeletionBrake> = Vec::new();
         for (member, c) in &cursors {
             if c.duplicate_detected
                 && !all_problems.iter().any(|p| {
@@ -3294,6 +3553,23 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     peer: Some(member.clone()),
                     sentence: duplicate_member_sentence(member),
                 });
+            }
+            if let Some(ref ib) = c.inbound_brake {
+                inbound_brakes.push(ib.clone());
+                if !all_problems.iter().any(|p| {
+                    p.kind == ProblemKind::InboundDeletionBrakeTripped
+                        && p.peer.as_deref() == Some(member.as_str())
+                }) {
+                    all_problems.push(SyncProblem {
+                        path: String::new(),
+                        kind: ProblemKind::InboundDeletionBrakeTripped,
+                        peer: Some(member.clone()),
+                        sentence: format!(
+                            "Paused syncing from '{member}' because its changes would delete {} of {} files; choose whether to apply the deletions or keep this machine's files.",
+                            ib.deleted_count, ib.total_live_files
+                        ),
+                    });
+                }
             }
         }
         all_problems.sort_by(|a, b| {
@@ -3413,6 +3689,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             conflicts,
             bin,
             pending_brake: meta.pending_brake,
+            inbound_brakes,
             deferred,
         })
     }

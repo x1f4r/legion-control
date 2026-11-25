@@ -2184,10 +2184,7 @@ const PATH_POOL: &[&str] = &[
 ];
 
 fn brake_disabled() -> DeletionBrakeConfig {
-    DeletionBrakeConfig {
-        min_deleted_files: usize::MAX,
-        min_deleted_percent: 100,
-    }
+    DeletionBrakeConfig::disabled()
 }
 
 impl SimWorld {

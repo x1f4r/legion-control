@@ -40,6 +40,9 @@ fn i1_truncated_or_torn_index() {
             fs::remove_file(t.join(format!("tower/f{i}.txt"))).unwrap();
         }
         tower.scan(ts(2)).unwrap();
+        // Let the 50 unmatched deletions finish the 30s move-awareness settle period so they
+        // commit as tombstones and into `.legion-sync/deletions.log`.
+        assert_eq!(tower.flush_settled_deletions(ts(35)).unwrap(), 50);
     }
     let orig = fs::read(t.join("tower.redb")).unwrap();
     let orig_marker = fs::read(t.join("tower/.legion-sync/marker.json")).unwrap();

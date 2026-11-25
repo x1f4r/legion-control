@@ -1018,6 +1018,22 @@ fn item_b3_mass_deletion_brake_pauses_and_handles_rescan_and_confirm() {
         .unwrap();
     assert!(!confirmed.brake_tripped);
     assert_eq!(confirmed.deleted, 55);
+    // Item 8: matching inbound peer deletion brake pauses `b`'s pull from `a` before deleting 55/60
+    // files, until `b` chooses `ApplyDeletions` (or `KeepLocalFiles`).
+    assert!(matches!(
+        pull(&mut b, &a),
+        Err(SyncError::Paused { .. })
+    ));
+    let b_st = b.status().unwrap();
+    assert_eq!(b_st.inbound_brakes.len(), 1);
+    assert_eq!(b_st.inbound_brakes[0].deleted_count, 55);
+    assert_eq!(mb.tree().len(), 60);
+    b.resolve_inbound_deletion_brake(
+        "a",
+        legion_sync::InboundDeletionBrakeDecision::ApplyDeletions,
+        now(),
+    )
+    .unwrap();
     pull(&mut b, &a).unwrap();
     assert_eq!(mb.tree().len(), 5);
 }
