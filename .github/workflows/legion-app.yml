@@ -6,12 +6,14 @@ on:
       - 'apps/**'
       - 'crates/**'
       - '.github/workflows/legion-app.yml'
+      - 'scripts/ios-sim-resume.sh'
       - 'rust-toolchain.toml'
   pull_request:
     paths:
       - 'apps/**'
       - 'crates/**'
       - '.github/workflows/legion-app.yml'
+      - 'scripts/ios-sim-resume.sh'
       - 'rust-toolchain.toml'
   workflow_dispatch:
     inputs:
@@ -758,9 +760,9 @@ jobs:
             local found=0
             local media_ok=0
             local media_failed=0
-            local resume_triggered=0
             local resume_ok=0
-            for i in $(seq 1 110); do
+            local app_exited=0
+            for i in $(seq 1 90); do
               if [ "$found" -eq 0 ]; then
                 if [ -f "$ready_file" ] && grep -q "legion-app: interface ready" "$ready_file"; then
                   echo "$kind interface ready (file) after ${i}s: $(cat "$ready_file")"
@@ -779,40 +781,32 @@ jobs:
                   break
                 fi
               fi
-              if [ "$media_ok" -eq 1 ] && [ "$resume_triggered" -eq 0 ]; then
-                echo "Backgrounding and resuming Legion on $kind to verify loopback survival..."
-                resume_triggered=1
-                local resume_t0 resume_t1
-                resume_t0="$(date +%s)"
-                xcrun simctl launch "$udid" com.apple.Preferences >/dev/null || true
-                sleep 3
-                xcrun simctl launch "$udid" com.x1f4r.legion >/dev/null || true
-                resume_t1="$(date +%s)"
-                echo "$kind background/resume switch completed in $((resume_t1 - resume_t0))s"
-              fi
-              if [ "$resume_triggered" -eq 1 ] && [ "$resume_ok" -eq 0 ] && [ -f "$media_out" ]; then
-                local resume_status
-                resume_status="$(node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); if (r.ok && r.resume_ok === true) { console.log("pass"); } else if (r.ok === false) { console.log("fail"); } else { console.log("pending"); }' "$media_out")"
-                if [ "$resume_status" = "pass" ]; then
-                  echo "$kind post-resume loopback media check passed after ${i}s"
-                  cat "$media_out"
-                  resume_ok=1
-                elif [ "$resume_status" = "fail" ]; then
-                  echo "$kind post-resume loopback media check reported failure after ${i}s:"
-                  cat "$media_out"
-                  media_failed=1
-                  break
-                fi
-              fi
-              if [ "$found" -eq 1 ] && [ "$media_ok" -eq 1 ] && [ "$resume_ok" -eq 1 ]; then
+              if [ "$found" -eq 1 ] && [ "$media_ok" -eq 1 ]; then
                 break
               fi
               if [ -n "$app_pid" ] && ! kill -0 "$app_pid" 2>/dev/null; then
                 echo "$kind app process $app_pid exited after ${i}s"
+                app_exited=1
                 break
               fi
               sleep 1
             done
+
+            if [ "$found" -eq 1 ] && [ "$media_ok" -eq 1 ]; then
+              if bash scripts/ios-sim-resume.sh \
+                --kind "$kind" \
+                --udid "$udid" \
+                --media-out "$media_out" \
+                --app-pid "$app_pid" \
+                --cycles 3 \
+                --wait-secs 30 \
+                --frontmost-timeout 20; then
+                resume_ok=1
+              else
+                media_failed=1
+              fi
+            fi
+
             if [ -f "$media_work/sshd.pid" ]; then
               kill "$(cat "$media_work/sshd.pid")" 2>/dev/null || true
             fi
@@ -821,7 +815,17 @@ jobs:
             echo "--- $kind stderr ---"
             cat "$stderr_log" || true
             if [ "$found" -ne 1 ] || [ "$media_ok" -ne 1 ] || [ "$resume_ok" -ne 1 ]; then
-              echo "Failed waiting for $kind ready ($found), media check ($media_ok), resume ($resume_ok)"
+              local missing_stage="unknown"
+              if [ "$app_exited" -eq 1 ]; then
+                missing_stage="app process exited before initial check completed"
+              elif [ "$found" -ne 1 ]; then
+                missing_stage="interface ready"
+              elif [ "$media_ok" -ne 1 ]; then
+                missing_stage="initial media check"
+              else
+                missing_stage="post-resume check"
+              fi
+              echo "Failed $kind at stage: $missing_stage (ready=$found, media_check=$media_ok, resume=$resume_ok)"
               if [ -f "$media_out" ]; then
                 echo "--- $kind media-result.json ---"
                 cat "$media_out" || true

@@ -9,8 +9,9 @@ pub mod transfers;
 pub mod updater;
 
 use std::sync::Arc;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(not(target_os = "android"))]
 use tauri::WindowEvent;
 use tauri::webview::NewWindowResponse;
 use tauri::{Manager, RunEvent, Url, WebviewWindowBuilder};
@@ -363,7 +364,10 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Legion application");
 
-    app.run(|app_handle, event| match event {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let mobile_suspended = AtomicBool::new(false);
+
+    app.run(move |app_handle, event| match event {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         RunEvent::WindowEvent {
             label,
@@ -392,26 +396,46 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }
-        #[cfg(target_os = "ios")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         RunEvent::WindowEvent {
             event: WindowEvent::Suspended,
             ..
         } => {
+            mobile_suspended.store(true, Ordering::Release);
+            #[cfg(target_os = "ios")]
             app_handle
                 .state::<SharedTransfers>()
                 .0
                 .pause_all_active(PauseReason::Background);
         }
-        #[cfg(target_os = "ios")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         RunEvent::WindowEvent {
             event: WindowEvent::Resumed,
             ..
         } => {
+            mobile_suspended.store(false, Ordering::Release);
             app_handle.state::<SharedContentServer>().0.on_app_resumed();
+            #[cfg(target_os = "ios")]
             app_handle
                 .state::<SharedTransfers>()
                 .0
                 .resume_paused_for(PauseReason::Background);
+        }
+        #[cfg(target_os = "ios")]
+        RunEvent::WindowEvent {
+            event: WindowEvent::Focused(true),
+            ..
+        } => {
+            // If iOS went inactive (`sceneWillResignActive`) and returned to active
+            // (`sceneDidBecomeActive`) without entering background, `WindowEvent::Resumed` does
+            // not fire; still recover the listener and resume background-paused transfers.
+            if mobile_suspended.swap(false, Ordering::AcqRel) {
+                app_handle.state::<SharedContentServer>().0.on_app_resumed();
+                app_handle
+                    .state::<SharedTransfers>()
+                    .0
+                    .resume_paused_for(PauseReason::Background);
+            }
         }
         RunEvent::ExitRequested { code, api, .. } => {
             let transfers = app_handle.state::<SharedTransfers>();
@@ -540,6 +564,26 @@ mod tests {
             desktop.lines().any(|line| line.trim() == "Name=Legion"),
             "desktop template should keep Name=Legion for application launchers"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn default_capability_allows_event_listen_without_emit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let raw = std::fs::read_to_string(manifest_dir.join("capabilities/default.json"))?;
+        let cap: serde_json::Value = serde_json::from_str(&raw)?;
+        let perms: Vec<&str> = cap
+            .get("permissions")
+            .and_then(|v| v.as_array())
+            .ok_or("missing permissions array in capabilities/default.json")?
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(perms.contains(&"core:event:allow-listen"));
+        assert!(perms.contains(&"core:event:allow-unlisten"));
+        assert!(!perms.contains(&"core:event:allow-emit"));
+        assert!(!perms.contains(&"core:event:allow-emit-to"));
         Ok(())
     }
 }

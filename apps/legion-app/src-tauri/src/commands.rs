@@ -569,6 +569,9 @@ pub struct MediaCheckReport {
     /// Result of post-resume loopback media reload check when requested (iOS).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_ok: Option<bool>,
+    /// Lifecycle trigger that fired the post-resume media check (e.g. `tauri://resumed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_trigger: Option<String>,
     /// Failure description when `ok` is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createAppLink } from '../../link/app.js';
+import { createForegroundResumeController } from '../resume.js';
 
 test('createAppLink uses a distinct random call ID prefix per page load', async () => {
   const calls = [];
@@ -787,4 +788,438 @@ test('createAppLink does not mark relay or target unsupported on relay_too_old a
       globalThis.window = prevWindow;
     }
   }
+});
+
+test('createAppLink onAppResume listens to native tauri://resumed and deduplicates focus fallback', async () => {
+  const prevWindow = globalThis.window;
+  const handlers = new Map();
+  let unlistenCount = 0;
+
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke: () => Promise.resolve({}),
+      },
+      event: {
+        listen(name, cb) {
+          handlers.set(name, cb);
+          return Promise.resolve(() => {
+            unlistenCount += 1;
+            handlers.delete(name);
+          });
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    const events = [];
+    const unsub = link.onAppResume((ev) => events.push(ev.source));
+    // Allow async listen() promises to settle.
+    await new Promise((r) => setTimeout(r, 0));
+
+    assert.ok(handlers.has('tauri://resumed'));
+    assert.ok(handlers.has('tauri://suspended'));
+    assert.ok(handlers.has('tauri://focus'));
+
+    // Focus alone without prior suspend (e.g. startup or desktop focus) never triggers resume.
+    handlers.get('tauri://focus')({});
+    assert.deepEqual(events, []);
+
+    // Native tauri://resumed fires even when neither suspended nor hidden was ever seen.
+    handlers.get('tauri://resumed')({});
+    assert.deepEqual(events, ['tauri://resumed']);
+
+    // Standard iOS/Android sequence: suspended -> resumed -> focus fires once only.
+    handlers.get('tauri://suspended')({});
+    handlers.get('tauri://resumed')({});
+    handlers.get('tauri://focus')({});
+    assert.deepEqual(events, ['tauri://resumed', 'tauri://resumed']);
+
+    // Short iOS inactive -> active without sceneDidEnterBackground: suspended -> focus fires once.
+    handlers.get('tauri://suspended')({});
+    handlers.get('tauri://focus')({});
+    assert.deepEqual(events, ['tauri://resumed', 'tauri://resumed', 'tauri://focus']);
+
+    unsub();
+    assert.equal(unlistenCount, 3);
+    assert.equal(handlers.size, 0);
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+});
+
+test('debug media check resume stage resolves from native tauri://resumed even when web view never sees hidden', async () => {
+  const prevWindow = globalThis.window;
+  const prevDocument = globalThis.document;
+  const prevImage = globalThis.Image;
+
+  const tauriListeners = new Map();
+  const winListeners = new Map();
+  const docListeners = new Map();
+  const reports = [];
+  const order = [];
+  let listenSettled = false;
+
+  function makeEventTarget(map) {
+    return {
+      addEventListener(name, fn) {
+        if (!map.has(name)) map.set(name, new Set());
+        map.get(name).add(fn);
+      },
+      removeEventListener(name, fn) {
+        map.get(name)?.delete(fn);
+      },
+      dispatch(name) {
+        for (const fn of [...(map.get(name) || [])]) fn();
+      },
+    };
+  }
+
+  const winTarget = makeEventTarget(winListeners);
+  const docTarget = makeEventTarget(docListeners);
+
+  globalThis.Image = class FakeImage {
+    constructor() {
+      this.naturalWidth = 16;
+      this.naturalHeight = 16;
+      this.onload = null;
+      this.onerror = null;
+    }
+    set src(_v) {
+      queueMicrotask(() => this.onload?.());
+    }
+    decode() {
+      return Promise.resolve();
+    }
+  };
+
+  globalThis.document = {
+    visibilityState: 'visible',
+    body: {
+      appendChild() {},
+    },
+    addEventListener: docTarget.addEventListener,
+    removeEventListener: docTarget.removeEventListener,
+    createElement(tag) {
+      assert.equal(tag, 'video');
+      const vListeners = new Map();
+      const video = {
+        muted: false,
+        playsInline: false,
+        preload: '',
+        style: {},
+        videoWidth: 64,
+        videoHeight: 64,
+        duration: 3,
+        currentTime: 0,
+        readyState: 4,
+        networkState: 1,
+        setAttribute() {},
+        removeAttribute() {},
+        pause() {},
+        load() {},
+        remove() {},
+        addEventListener(name, fn) {
+          if (!vListeners.has(name)) vListeners.set(name, new Set());
+          vListeners.get(name).add(fn);
+        },
+        removeEventListener(name, fn) {
+          vListeners.get(name)?.delete(fn);
+        },
+        set src(_v) {
+          queueMicrotask(() => {
+            for (const fn of [...(vListeners.get('loadeddata') || [])]) fn();
+          });
+        },
+      };
+      return video;
+    },
+  };
+
+  let intermediateResolve;
+  const intermediateReportSeen = new Promise((r) => {
+    intermediateResolve = r;
+  });
+  let finalResolve;
+  const finalReportSeen = new Promise((r) => {
+    finalResolve = r;
+  });
+
+  globalThis.window = {
+    location: { origin: 'tauri://localhost' },
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    addEventListener: winTarget.addEventListener,
+    removeEventListener: winTarget.removeEventListener,
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          if (command === 'state') {
+            return Promise.resolve({ ready: true, nodes: [{ node: 'tower' }] });
+          }
+          if (command === 'ready') return Promise.resolve();
+          if (command === 'media_check_spec') {
+            return Promise.resolve({
+              machine: 'tower',
+              image_path: '/home/me/a.png',
+              video_path: '/home/me/b.mp4',
+              verify_resume: true,
+            });
+          }
+          if (command === 'content_url') {
+            return Promise.resolve({
+              url: `http://127.0.0.1:49999/v1/content/tok/${payload.path.split('/').pop()}`,
+              expires_in: 900,
+            });
+          }
+          if (command === 'media_check_report') {
+            reports.push(payload.report);
+            order.push(`report:resume_ok=${payload.report.resume_ok}:listenSettled=${listenSettled}`);
+            if (payload.report.resume_ok === false) intermediateResolve(payload.report);
+            if (payload.report.resume_ok === true) finalResolve(payload.report);
+            return Promise.resolve();
+          }
+          return Promise.resolve({});
+        },
+      },
+      event: {
+        listen(name, cb) {
+          return new Promise((resolve) => {
+            setTimeout(() => {
+              tauriListeners.set(name, cb);
+              if (name === 'tauri://resumed') {
+                listenSettled = true;
+                order.push('listen:tauri://resumed');
+              }
+              resolve(() => tauriListeners.delete(name));
+            }, 5);
+          });
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    await link.state();
+    await intermediateReportSeen;
+
+    // Native tauri://resumed listener must have finished registering BEFORE the intermediate report.
+    assert.equal(order[0], 'listen:tauri://resumed');
+    assert.equal(order[1], 'report:resume_ok=false:listenSettled=true');
+    assert.equal(globalThis.document.visibilityState, 'visible');
+
+    // Emit native resume while document.visibilityState stays 'visible' (never hidden).
+    tauriListeners.get('tauri://resumed')({});
+    const finalReport = await finalReportSeen;
+
+    assert.equal(finalReport.ok, true);
+    assert.equal(finalReport.resume_ok, true);
+    assert.equal(finalReport.resume_trigger, 'tauri://resumed');
+    assert.equal(reports.length, 2);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevDocument === undefined) delete globalThis.document;
+    else globalThis.document = prevDocument;
+    if (prevImage === undefined) delete globalThis.Image;
+    else globalThis.Image = prevImage;
+  }
+});
+
+test('debug media check resume stage still falls back to DOM visibilitychange when native events are absent', async () => {
+  const prevWindow = globalThis.window;
+  const prevDocument = globalThis.document;
+  const prevImage = globalThis.Image;
+
+  const docListeners = new Map();
+  let intermediateResolve;
+  const intermediateReportSeen = new Promise((r) => {
+    intermediateResolve = r;
+  });
+  let finalResolve;
+  const finalReportSeen = new Promise((r) => {
+    finalResolve = r;
+  });
+
+  globalThis.Image = class FakeImage {
+    constructor() {
+      this.naturalWidth = 16;
+      this.naturalHeight = 16;
+      this.onload = null;
+    }
+    set src(_v) {
+      queueMicrotask(() => this.onload?.());
+    }
+    decode() {
+      return Promise.resolve();
+    }
+  };
+
+  globalThis.document = {
+    visibilityState: 'visible',
+    body: { appendChild() {} },
+    addEventListener(name, fn) {
+      if (!docListeners.has(name)) docListeners.set(name, new Set());
+      docListeners.get(name).add(fn);
+    },
+    removeEventListener(name, fn) {
+      docListeners.get(name)?.delete(fn);
+    },
+    createElement() {
+      const vListeners = new Map();
+      return {
+        style: {},
+        videoWidth: 64,
+        videoHeight: 64,
+        duration: 3,
+        currentTime: 0,
+        setAttribute() {},
+        removeAttribute() {},
+        pause() {},
+        load() {},
+        remove() {},
+        addEventListener(name, fn) {
+          if (!vListeners.has(name)) vListeners.set(name, new Set());
+          vListeners.get(name).add(fn);
+        },
+        removeEventListener(name, fn) {
+          vListeners.get(name)?.delete(fn);
+        },
+        set src(_v) {
+          queueMicrotask(() => {
+            for (const fn of [...(vListeners.get('loadeddata') || [])]) fn();
+          });
+        },
+      };
+    },
+  };
+
+  globalThis.window = {
+    location: { origin: 'tauri://localhost' },
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    addEventListener() {},
+    removeEventListener() {},
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          if (command === 'state') return Promise.resolve({ ready: true, nodes: [{ node: 'tower' }] });
+          if (command === 'ready') return Promise.resolve();
+          if (command === 'media_check_spec') {
+            return Promise.resolve({
+              machine: 'tower',
+              image_path: '/home/me/a.png',
+              video_path: '/home/me/b.mp4',
+              verify_resume: true,
+            });
+          }
+          if (command === 'content_url') {
+            return Promise.resolve({
+              url: `http://127.0.0.1:49999/v1/content/tok/${payload.path.split('/').pop()}`,
+              expires_in: 900,
+            });
+          }
+          if (command === 'media_check_report') {
+            if (payload.report.resume_ok === false) intermediateResolve(payload.report);
+            if (payload.report.resume_ok === true) finalResolve(payload.report);
+            return Promise.resolve();
+          }
+          return Promise.resolve({});
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    await link.state();
+    await intermediateReportSeen;
+
+    globalThis.document.visibilityState = 'hidden';
+    for (const fn of [...(docListeners.get('visibilitychange') || [])]) fn();
+    globalThis.document.visibilityState = 'visible';
+    for (const fn of [...(docListeners.get('visibilitychange') || [])]) fn();
+
+    const finalReport = await finalReportSeen;
+    assert.equal(finalReport.ok, true);
+    assert.equal(finalReport.resume_ok, true);
+    assert.equal(finalReport.resume_trigger, 'dom-visibility');
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevDocument === undefined) delete globalThis.document;
+    else globalThis.document = prevDocument;
+    if (prevImage === undefined) delete globalThis.Image;
+    else globalThis.Image = prevImage;
+  }
+});
+
+test('createForegroundResumeController runs session invalidation on native resume without hidden and deduplicates DOM visibility', async () => {
+  let visibility = 'visible';
+  let clock = 10_000;
+  let invalidations = 0;
+  let capsInvalidated = 0;
+  let refreshes = 0;
+  let updateChecks = 0;
+  let backgrounds = 0;
+
+  const ctrl = createForegroundResumeController({
+    getVisibilityState: () => visibility,
+    invalidateSessions: async () => {
+      invalidations += 1;
+    },
+    onBackground: () => {
+      backgrounds += 1;
+    },
+    onInvalidate: () => {
+      capsInvalidated += 1;
+    },
+    onRefresh: () => {
+      refreshes += 1;
+    },
+    onCheckUpdates: () => {
+      updateChecks += 1;
+    },
+    dedupeMs: 1500,
+    now: () => clock,
+  });
+
+  // 1) Native resume fires even though visibilityState never became 'hidden'.
+  assert.equal(await ctrl.handleNativeResume(), true);
+  assert.equal(invalidations, 1);
+  assert.equal(capsInvalidated, 1);
+  assert.equal(refreshes, 1);
+  assert.equal(updateChecks, 1);
+
+  // 2) DOM visibilitychange arriving 100ms later for the same foreground return is deduplicated.
+  clock += 100;
+  visibility = 'hidden';
+  await ctrl.handleVisibilityChange();
+  assert.equal(backgrounds, 1);
+  visibility = 'visible';
+  assert.equal(await ctrl.handleVisibilityChange(), false);
+  assert.equal(invalidations, 1);
+  assert.equal(refreshes, 1);
+
+  // 3) After the dedupe window passes, DOM hidden -> visible runs full recovery as second trigger.
+  clock += 2000;
+  visibility = 'hidden';
+  await ctrl.handleVisibilityChange();
+  visibility = 'visible';
+  assert.equal(await ctrl.handleVisibilityChange(), true);
+  assert.equal(invalidations, 2);
+  assert.equal(capsInvalidated, 2);
+  assert.equal(refreshes, 2);
+  assert.equal(updateChecks, 2);
 });

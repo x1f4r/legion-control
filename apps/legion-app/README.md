@@ -20,8 +20,11 @@ an internal `Backend` trait.
   with caller-scoped cancellation. Machine calls always name their target machine; only door-level
   discovery reads may omit `on` and fall back to another directly paired node when a request never
   left this device (`details.sent == false`), caching an expiring in-memory relay preference hint
-  without persisting or changing any machine target. On mobile resume from background, cached
-  sessions are closed before refreshing.
+  without persisting or changing any machine target. On mobile resume from background, Tauri's
+  native `WindowEvent::Resumed` (`tauri://resumed`, plus `tauri://suspended` -> `tauri://focus` on
+  iOS inactive returns) triggers loopback listener probing in Rust and session invalidation +
+  refresh in the interface even when the web view never saw `visibilityState === 'hidden'`, with
+  DOM `visibilitychange` kept as a second trigger.
 - **State safety, revocation, and unpairing:** If `legion-app.json` is damaged or written by a
   newer schema version, the app enters repair mode, refuses writes, and offers an explicit repair
   action that moves the file aside to `legion-app.json.damaged-<timestamp>` without deleting it. If
@@ -127,15 +130,18 @@ fixed log line.
   requests.
 - **Content addresses (`content_url`), status (`content_status`), and revocation (`content_revoke`):**
   - All platforms (Linux, macOS, Windows, iOS/iPadOS, and Android) mount `legion-content` lazily on
-    `http://127.0.0.1:<ephemeral-port>` (deciding liveness from Legion's own accept-task state and
-    always binding a fresh OS-chosen port on recovery; capped at 32 simultaneous connections with a
-    5-second header-read timeout, a 2-second header timeout for unauthenticated connections,
-    `Connection: close` on `404` and guard rejections, eviction of the oldest unauthenticated
-    connection before refusing a new one at the cap, exponential accept-error backoff, mobile
-    resume recovery, and stopping 60 seconds after no live tickets or active streams remain),
-    validate `Host` and `Origin` through `HostOriginGuard` (`tauri://localhost` on Linux/macOS/iOS;
-    `http://tauri.localhost` and `https://tauri.localhost` on Windows and Android; never `null`),
-    and set `Cross-Origin-Resource-Policy: cross-origin`.
+    `http://127.0.0.1:<ephemeral-port>` (deciding liveness from both Legion's own accept-task state
+    and a short loopback proof-of-ownership probe using a per-listener 256-bit secret that is never
+    logged or placed in any URL — run on mobile resume and before minting once the last verified
+    proof is older than 2 seconds, returning generic `404` without the secret, counting as
+    unauthenticated under connection limits, and always binding a fresh OS-chosen port on failure;
+    capped at 32 simultaneous connections with a 5-second header-read timeout, a 2-second header
+    timeout for unauthenticated connections, `Connection: close` on `404` and guard rejections,
+    eviction of the oldest unauthenticated connection before refusing a new one at the cap,
+    exponential accept-error backoff, mobile resume recovery, and stopping 60 seconds after no live
+    tickets or active streams remain), validate `Host` and `Origin` through `HostOriginGuard`
+    (`tauri://localhost` on Linux/macOS/iOS; `http://tauri.localhost` and `https://tauri.localhost`
+    on Windows and Android; never `null`), and set `Cross-Origin-Resource-Policy: cross-origin`.
   - On Android, `res/xml/network_security_config.xml` denies cleartext traffic globally
     (`cleartextTrafficPermitted="false"`) and permits cleartext strictly for `127.0.0.1`, so
     WebView streams and seeks arbitrarily large media with flat memory while keeping cleartext

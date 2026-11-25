@@ -3,5 +3,8 @@
   "identifier": "default",
   "description": "Minimal capability for the main Legion window",
   "windows": ["main"],
-  "permissions": []
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
 }
