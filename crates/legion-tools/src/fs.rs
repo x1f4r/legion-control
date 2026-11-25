@@ -570,6 +570,31 @@ pub(crate) fn check_fs_path(
     Ok(resolved)
 }
 
+/// Opens `path` for reading without ever blocking on a FIFO or acquiring a controlling terminal,
+/// verifying on the open handle itself that it is a regular file.
+pub(crate) fn open_regular_file(
+    path: &Path,
+    action: &str,
+    dir_hint: &str,
+) -> Result<(std::fs::File, Metadata), ToolError> {
+    legion_os::open_regular::open_regular_read(path).map_err(|err| match err {
+        legion_os::open_regular::OpenRegularError::IsDirectory => ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("{} is a directory, not a file.", path.display()),
+        )
+        .with_hint(dir_hint),
+        legion_os::open_regular::OpenRegularError::NotRegularFile => ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "{} is not a regular file (it is a named pipe, socket or device).",
+                path.display()
+            ),
+        )
+        .with_hint("Pass a regular file path; special files are refused without blocking."),
+        legion_os::open_regular::OpenRegularError::Io(error) => map_io_error(action, path, error),
+    })
+}
+
 /// Confirms `path` exists and refers to a regular file via `stat` before opening it, so named
 /// pipes, sockets and device nodes are refused immediately instead of blocking on `File::open`.
 pub(crate) fn check_regular_file(

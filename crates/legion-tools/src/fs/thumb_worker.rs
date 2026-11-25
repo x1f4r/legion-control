@@ -3,12 +3,18 @@
 //! When `legion` runs in production (or inside an opt-in integration harness), image decoding is
 //! isolated in a hidden `__thumb-worker` subcommand of the same binary:
 //!
-//! - The parent process verifies policy, opens the regular file once, peeks only the header prefix
-//!   (`<= 128 KiB`), reserves estimated bytes from the fair image pool, and hands the already-opened
-//!   file handle to the worker on `stdin`. The worker never opens any file by path.
-//! - The child runs under `legion_os::run` with a hard OS memory limit (`RLIMIT_AS` on Linux,
-//!   `RLIMIT_DATA` on other non-macOS Unix, Job Object memory limit on Windows), a 10 ms RSS
-//!   watchdog on every platform (including macOS), and a hard wall-clock timeout.
+//! - The parent process verifies policy, opens the regular file non-blockingly once, peeks only
+//!   the header prefix (`<= 128 KiB`), reserves the worker's exact resident budget from the fair
+//!   in-flight pool, and hands the already-opened file handle to the worker on `stdin`. The worker
+//!   opens nothing by path and starts with a cleared, minimal environment.
+//! - As its very first act, the worker validates its arguments and arms
+//!   [`legion_os::capped_alloc::set_memory_cap`] to its exact live-heap cap. If decoding attempts
+//!   to exceed that cap on *any* OS (including macOS), the worker exits immediately with
+//!   [`legion_os::capped_alloc::CAP_EXCEEDED_EXIT_CODE`] (`107`) — zero sampling gap, zero
+//!   overshoot, and unambiguously distinguished from external signals.
+//! - The child is additionally backed by OS limits (`RLIMIT_AS` on Linux, `RLIMIT_DATA` on other
+//!   non-macOS Unix, suspended-create Job Object memory limit on Windows), a 10 ms RSS watchdog on
+//!   every platform, and a hard wall-clock timeout.
 //! - The worker writes a length-prefixed binary frame (`LGTW`) to `stdout` carrying either the
 //!   encoded JPEG/PNG thumbnail bytes or a structured JSON [`ErrorBody`].
 
@@ -22,6 +28,7 @@ use std::time::Duration;
 
 use legion_core::CancellationToken;
 use legion_core::proto::{ErrorBody, ErrorCode};
+use legion_os::capped_alloc::{self, CAP_EXCEEDED_EXIT_CODE};
 use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
 use serde_json::json;
@@ -40,10 +47,17 @@ const MIME_JPEG_TAG: u8 = 1;
 const MIME_PNG_TAG: u8 = 2;
 const MAX_WORKER_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WORKER_ERR_BYTES: usize = 16 * 1024;
-/// Virtual address headroom added to `memory_limit` when computing Linux `RLIMIT_AS` for the
-/// worker binary (covers binary mappings, libc, and allocator arenas; measured `legion` baseline
-/// `VmPeak` is ~24 MiB).
-const WORKER_RLIMIT_AS_HEADROOM: u64 = 192 * 1024 * 1024;
+/// Hard upper bounds enforced by the worker itself on its own CLI arguments so invoking
+/// `__thumb-worker` manually with absurd values (such as `4294967295`) cannot trigger huge
+/// allocations before parsing fails.
+const WORKER_MIN_SIZE: u32 = 96;
+const WORKER_MAX_SIZE: u32 = 512;
+const WORKER_HARD_MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+const WORKER_HARD_MAX_HEAP_CAP_BYTES: u64 = 512 * 1024 * 1024;
+/// Generous virtual-address-space backstop added above the worker's RSS limit on Linux/Windows.
+/// Exact heap enforcement is performed by `CappedAlloc` and the 10 ms RSS watchdog; `RLIMIT_AS`
+/// stays purely as a backstop so allocator arenas or library mappings never cause false kills.
+const WORKER_RLIMIT_AS_HEADROOM: u64 = 256 * 1024 * 1024;
 
 static WORKER_ENABLED: AtomicBool = AtomicBool::new(false);
 static TEST_DECODE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
@@ -81,17 +95,25 @@ pub(crate) fn effective_decode_timeout(default: Duration) -> Duration {
 #[derive(Debug)]
 pub(crate) enum WorkerOutcome {
     Ok(CachedThumb),
-    /// The worker returned a structured error frame (corrupt file, `too_large`, etc.).
+    /// The worker returned a structured error frame (corrupt file, header-probed `too_large`, etc.).
     Rejected(ErrorBody),
-    /// The worker was killed by the OS memory limit or RSS watchdog (should be cached as a bad
-    /// file so reopening the directory does not repeat the kill).
-    KilledForMemory {
+    /// This node's own memory limit decided the failure (`CappedAlloc` exit 107, RSS watchdog
+    /// measured `rss > limit`, or explicit allocator OOM under our limit). Safe to cache as a
+    /// temporary expiring bad-file record.
+    MemoryLimitExceeded {
         error: ErrorBody,
         #[allow(dead_code)]
         peak_rss_bytes: u64,
     },
-    /// The worker terminated abnormally without producing a valid response frame.
-    Crashed(ErrorBody),
+    /// The worker exceeded the wall-clock decode timeout (not permanently cached as bad).
+    TimedOut {
+        error: ErrorBody,
+        cpu_busy: bool,
+    },
+    /// The worker died for a reason NOT decided by our own limits (for example an external
+    /// `SIGKILL`, `SIGTERM`, OS low-memory killer, or unexpected crash). Transient and NEVER cached
+    /// as a bad file.
+    TransientFailure(ErrorBody),
 }
 
 /// Dispatches the hidden `__thumb-worker` CLI mode if present as the first argument.
@@ -107,54 +129,131 @@ pub fn try_thumb_worker_cli(args: impl IntoIterator<Item = OsString>) -> Option<
     Some(run_worker_main(&rest))
 }
 
-fn run_worker_main(args: &[OsString]) -> ExitCode {
-    if args.len() < 5 {
-        let _ = write_err_frame(&ErrorBody::new(
-            ErrorCode::Internal,
+#[derive(Debug)]
+struct WorkerArgs {
+    size: u32,
+    fit: ThumbFit,
+    expected_source_bytes: u64,
+    max_source_bytes: u64,
+    heap_cap_usize: usize,
+    display_label: String,
+}
+
+fn parse_worker_args(args: &[OsString]) -> Result<WorkerArgs, ErrorBody> {
+    // Expect: <size> <fit> <expected_source_bytes> <max_source_bytes> <heap_cap_bytes> <display_label>
+    if args.len() < 6 {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
             "Invalid thumbnail worker arguments.",
         ));
-        return ExitCode::from(2);
     }
-    let Ok(size) = args[0].to_string_lossy().parse::<u32>() else {
-        let _ = write_err_frame(&ErrorBody::new(
-            ErrorCode::Internal,
+    let size = args[0].to_string_lossy().parse::<u32>().map_err(|_| {
+        ErrorBody::new(
+            ErrorCode::InvalidArgs,
             "Invalid thumbnail worker size argument.",
+        )
+    })?;
+    if !(WORKER_MIN_SIZE..=WORKER_MAX_SIZE).contains(&size) {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "Thumbnail worker size must be between {WORKER_MIN_SIZE} and {WORKER_MAX_SIZE}, got {size}."
+            ),
         ));
-        return ExitCode::from(2);
-    };
+    }
     let fit = match args[1].to_string_lossy().as_ref() {
         "contain" => ThumbFit::Contain,
         "cover" => ThumbFit::Cover,
         _ => {
-            let _ = write_err_frame(&ErrorBody::new(
-                ErrorCode::Internal,
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
                 "Invalid thumbnail worker fit argument.",
             ));
+        }
+    };
+    let expected_source_bytes = args[2].to_string_lossy().parse::<u64>().map_err(|_| {
+        ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Invalid thumbnail worker expected_source_bytes argument.",
+        )
+    })?;
+    let max_source_bytes = args[3].to_string_lossy().parse::<u64>().map_err(|_| {
+        ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Invalid thumbnail worker max_source_bytes argument.",
+        )
+    })?;
+    if max_source_bytes == 0 || max_source_bytes > WORKER_HARD_MAX_SOURCE_BYTES {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Thumbnail worker max_source_bytes ({max_source_bytes}) exceeds hard limit."),
+        ));
+    }
+    if expected_source_bytes > max_source_bytes {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "Thumbnail worker expected_source_bytes ({expected_source_bytes}) exceeds max_source_bytes ({max_source_bytes})."
+            ),
+        ));
+    }
+    let heap_cap_bytes = args[4].to_string_lossy().parse::<u64>().map_err(|_| {
+        ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Invalid thumbnail worker heap_cap_bytes argument.",
+        )
+    })?;
+    if heap_cap_bytes == 0 || heap_cap_bytes > WORKER_HARD_MAX_HEAP_CAP_BYTES {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Thumbnail worker heap_cap_bytes ({heap_cap_bytes}) is out of range."),
+        ));
+    }
+    let heap_cap_usize = usize::try_from(heap_cap_bytes).map_err(|_| {
+        ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Thumbnail worker heap_cap_bytes exceeds addressable range.",
+        )
+    })?;
+
+    Ok(WorkerArgs {
+        size,
+        fit,
+        expected_source_bytes,
+        max_source_bytes,
+        heap_cap_usize,
+        display_label: args[5].to_string_lossy().into_owned(),
+    })
+}
+
+fn run_worker_main(args: &[OsString]) -> ExitCode {
+    let parsed = match parse_worker_args(args) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let _ = write_err_frame(&err);
             return ExitCode::from(2);
         }
     };
-    let Ok(expected_source_bytes) = args[2].to_string_lossy().parse::<u64>() else {
-        let _ = write_err_frame(&ErrorBody::new(
-            ErrorCode::Internal,
-            "Invalid thumbnail worker expected_source_bytes argument.",
-        ));
-        return ExitCode::from(2);
-    };
-    let Ok(max_source_bytes) = args[3].to_string_lossy().parse::<u64>() else {
-        let _ = write_err_frame(&ErrorBody::new(
-            ErrorCode::Internal,
-            "Invalid thumbnail worker max_source_bytes argument.",
-        ));
-        return ExitCode::from(2);
-    };
+    let WorkerArgs {
+        size,
+        fit,
+        expected_source_bytes,
+        max_source_bytes,
+        heap_cap_usize,
+        display_label,
+    } = parsed;
+
+    // Arm the exact process-wide live-heap allocator cap BEFORE touching stdin or allocating
+    // buffers for untrusted input.
+    capped_alloc::set_memory_cap(heap_cap_usize);
+
     // Display label ONLY (for error messages and extension phrasing). The worker NEVER opens any
     // path on disk; all image bytes arrive strictly through the inherited stdin file handle.
-    let display_label = args[4].to_string_lossy().into_owned();
     let label_path = Path::new(&display_label);
 
     // Pre-allocate exact capacity (+1 for the overflow sentinel byte) so `read_to_end` never
     // triggers a 2x Vec doubling spike on large (up to 64 MiB) source files.
-    let prealloc = usize::try_from(expected_source_bytes.min(max_source_bytes))
+    let prealloc = usize::try_from(expected_source_bytes)
         .unwrap_or(0)
         .saturating_add(1);
     let mut bytes = Vec::with_capacity(prealloc);
@@ -301,8 +400,28 @@ fn parse_worker_frame(raw: &[u8]) -> Option<Result<CachedThumb, ErrorBody>> {
     }
 }
 
-/// Runs the out-of-process `__thumb-worker` on the already-opened `file`, enforcing `memory_limit`
-/// via OS limits + RSS watchdog and `timeout` via hard termination.
+/// Minimal safe environment variables needed to start a child process without inheriting node
+/// secrets, credentials, or arbitrary user environment.
+pub(crate) fn minimal_system_env() -> Vec<(OsString, OsString)> {
+    #[cfg(windows)]
+    {
+        let mut vars = Vec::new();
+        for key in ["SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "PATHEXT"] {
+            if let Some(val) = std::env::var_os(key) {
+                vars.push((OsString::from(key), val));
+            }
+        }
+        vars
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// Runs the out-of-process `__thumb-worker` on the already-opened `file`, enforcing an exact
+/// `heap_cap_bytes` via [`capped_alloc`] plus `rss_limit_bytes` via the RSS watchdog and OS
+/// backstops, and `timeout` via hard termination.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_thumb_worker(
     display_path: &Path,
@@ -311,7 +430,8 @@ pub(crate) async fn run_thumb_worker(
     fit: ThumbFit,
     expected_source_bytes: u64,
     max_source_bytes: u64,
-    memory_limit: u64,
+    heap_cap_bytes: u64,
+    rss_limit_bytes: u64,
     timeout: Duration,
     cancel: CancellationToken,
 ) -> Result<WorkerOutcome, ErrorBody> {
@@ -328,7 +448,7 @@ pub(crate) async fn run_thumb_worker(
         ThumbFit::Cover => "cover",
     };
 
-    let options = RunOptions::new(CommandSpec::Argv {
+    let mut options = RunOptions::new(CommandSpec::Argv {
         program: exe.into_os_string(),
         args: vec![
             OsString::from(THUMB_WORKER_MODE),
@@ -336,17 +456,22 @@ pub(crate) async fn run_thumb_worker(
             OsString::from(fit_str),
             OsString::from(expected_source_bytes.to_string()),
             OsString::from(max_source_bytes.to_string()),
+            OsString::from(heap_cap_bytes.to_string()),
             display_path.as_os_str().to_os_string(),
         ],
     })
+    .env_clear(true)
+    .envs(minimal_system_env())
     .stdin_file(file)
-    .memory_limit(memory_limit)
+    .memory_limit(rss_limit_bytes)
     .rlimit_as_headroom(WORKER_RLIMIT_AS_HEADROOM)
     .timeout(timeout)
     .kill_grace(Duration::ZERO)
     .capture_limit(MAX_WORKER_STDOUT_BYTES)
     .raw_stdout(true)
     .cancel(cancel);
+    // Keep glibc single-arena lean inside the worker as well.
+    options = options.env("MALLOC_ARENA_MAX", "2");
 
     let output = run(options).await.map_err(|err| {
         ErrorBody::new(
@@ -361,8 +486,38 @@ pub(crate) async fn run_thumb_worker(
     if output.cancelled {
         return Err(cancelled_error("fs.thumb"));
     }
-    if output.killed_for_memory {
-        let limit_mib = memory_limit / (1024 * 1024);
+    if output.timed_out {
+        let cpu_busy = output
+            .cpu_time
+            .is_some_and(|cpu| cpu.mul_f32(2.0) >= timeout);
+        let err = ErrorBody::new(
+            ErrorCode::Timeout,
+            format!(
+                "Decoding a thumbnail for {} exceeded the {}-second time limit.",
+                display_path.display(),
+                timeout.as_secs().max(1)
+            ),
+        )
+        .with_hint("The image may be malformed or too expensive to decode quickly.");
+        return Ok(WorkerOutcome::TimedOut {
+            error: err,
+            cpu_busy,
+        });
+    }
+
+    // Only classify as a memory-limit rejection (eligible for negative bad-file caching) when our
+    // own limit decided it: `CappedAlloc` exit code 107, our RSS watchdog observing `rss > limit`,
+    // or an explicit allocator OOM under our OS limit.
+    let cap_exceeded = output.exit_code == Some(CAP_EXCEEDED_EXIT_CODE);
+    if cap_exceeded || output.killed_for_memory {
+        let limit_mib = rss_limit_bytes / (1024 * 1024);
+        let enforced_by = if cap_exceeded {
+            "allocator_cap"
+        } else if output.memory_watchdog_killed {
+            "rss_watchdog"
+        } else {
+            "os_limit"
+        };
         let err = ErrorBody::new(
             ErrorCode::Failed,
             format!(
@@ -374,24 +529,15 @@ pub(crate) async fn run_thumb_worker(
         .with_details(json!({
             "reason": "too_large",
             "killed_for_memory": true,
-            "limit_bytes": memory_limit,
+            "enforced_by": enforced_by,
+            "limit_bytes": rss_limit_bytes,
+            "heap_cap_bytes": heap_cap_bytes,
             "peak_rss_bytes": output.peak_rss_bytes,
         }));
-        return Ok(WorkerOutcome::KilledForMemory {
+        return Ok(WorkerOutcome::MemoryLimitExceeded {
             error: err,
             peak_rss_bytes: output.peak_rss_bytes,
         });
-    }
-    if output.timed_out {
-        return Err(ErrorBody::new(
-            ErrorCode::Timeout,
-            format!(
-                "Decoding a thumbnail for {} exceeded the {}-second time limit.",
-                display_path.display(),
-                timeout.as_secs().max(1)
-            ),
-        )
-        .with_hint("The image may be malformed or too expensive to decode quickly."));
     }
 
     if let Some(parsed) = parse_worker_frame(&output.stdout_bytes) {
@@ -401,12 +547,14 @@ pub(crate) async fn run_thumb_worker(
         };
     }
 
-    // Worker died without emitting a valid frame (e.g. OOM killer signal, allocator abort, panic).
+    // Worker died for an external or unexpected reason (e.g. external SIGKILL/SIGTERM, host OOM
+    // killer under unrelated memory pressure, or crash). Report truthfully and do NOT mark the
+    // file bad in cache.
     let detail = output.stderr.text.trim();
-    let summary = if !detail.is_empty() {
+    let summary = if let Some(sig) = output.signal {
+        format!("terminated by signal {sig}")
+    } else if !detail.is_empty() {
         detail.lines().next().unwrap_or(detail).trim().to_owned()
-    } else if let Some(sig) = output.signal {
-        format!("killed by signal {sig}")
     } else if let Some(code) = output.exit_code {
         format!("exited with status {code}")
     } else {
@@ -415,12 +563,12 @@ pub(crate) async fn run_thumb_worker(
     let err = ErrorBody::new(
         ErrorCode::Failed,
         format!(
-            "Thumbnail worker failed while decoding {}: {summary}.",
+            "Thumbnail worker for {} stopped unexpectedly ({summary}).",
             display_path.display()
         ),
     )
-    .with_hint("The image may be malformed or exceed memory limits.");
-    Ok(WorkerOutcome::Crashed(err))
+    .with_hint("This failure was not caused by the thumbnail memory limit; retry fs.thumb.");
+    Ok(WorkerOutcome::TransientFailure(err))
 }
 
 #[cfg(test)]
@@ -459,5 +607,42 @@ mod tests {
         // Truncated and bad-magic frames must return None.
         assert!(parse_worker_frame(b"NOPE").is_none());
         assert!(parse_worker_frame(&raw[..raw.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn worker_cli_rejects_absurd_arguments_without_allocating() {
+        // Reproduces manual invocation with u32::MAX size / expected bytes / absurd heap cap.
+        let err1 = parse_worker_args(&[
+            OsString::from("4294967295"),
+            OsString::from("contain"),
+            OsString::from("4294967295"),
+            OsString::from("67108864"),
+            OsString::from("67108864"),
+            OsString::from("/bogus.jpg"),
+        ])
+        .unwrap_err();
+        assert_eq!(err1.code, ErrorCode::InvalidArgs);
+
+        let err2 = parse_worker_args(&[
+            OsString::from("256"),
+            OsString::from("contain"),
+            OsString::from("4294967295"),
+            OsString::from("67108864"),
+            OsString::from("67108864"),
+            OsString::from("/bogus.jpg"),
+        ])
+        .unwrap_err();
+        assert_eq!(err2.code, ErrorCode::InvalidArgs);
+
+        let err3 = parse_worker_args(&[
+            OsString::from("256"),
+            OsString::from("contain"),
+            OsString::from("1024"),
+            OsString::from("67108864"),
+            OsString::from("999999999999"),
+            OsString::from("/bogus.jpg"),
+        ])
+        .unwrap_err();
+        assert_eq!(err3.code, ErrorCode::InvalidArgs);
     }
 }

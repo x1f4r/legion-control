@@ -1,6 +1,6 @@
 //! Read-only inspection tools: `fs.list`, `fs.stat`, `fs.read` and `fs.hash`.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -16,8 +16,8 @@ use serde_json::json;
 
 use super::{
     Encoding, EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, SortField, SortOrder,
-    cancelled_error, check_fs_path, check_regular_file, compare_by_sort, format_blake3,
-    format_mtime, is_hidden, map_io_error, path_to_string, platform, run_blocking,
+    cancelled_error, check_fs_path, compare_by_sort, format_blake3, format_mtime, is_hidden,
+    map_io_error, path_to_string, platform, run_blocking,
 };
 
 const MAX_LIST_DEPTH: u32 = 8;
@@ -564,18 +564,8 @@ async fn read(ctx: &Ctx, args: ReadArgs) -> Result<ReadResult, ToolError> {
     let requested_encoding = args.encoding;
 
     run_blocking(ctx, "fs.read", move |cancel, _progress| {
-        check_regular_file(&path, "read", "Use fs.list to inspect a directory.")?;
-        let mut file = File::open(&path).map_err(|error| map_io_error("read", &path, error))?;
-        let meta = file
-            .metadata()
-            .map_err(|error| map_io_error("read", &path, error))?;
-        if !meta.is_file() {
-            return Err(ErrorBody::new(
-                ErrorCode::InvalidArgs,
-                format!("{} is not a regular file.", path.display()),
-            )
-            .with_hint("Pass a regular file path to fs.read."));
-        }
+        let (mut file, meta) =
+            super::open_regular_file(&path, "read", "Use fs.list to inspect a directory.")?;
         let size = meta.len();
         let base64_raw_limit = max_base64_raw_bytes(&path, size, offset);
         let effective_length = if requested_encoding == Some(Encoding::Base64) {
@@ -832,18 +822,8 @@ struct HashResult {
 async fn hash(ctx: &Ctx, args: HashArgs) -> Result<HashResult, ToolError> {
     let path = check_fs_path(ctx.grant(), &args.path, Access::Read)?;
     run_blocking(ctx, "fs.hash", move |cancel, mut progress| {
-        check_regular_file(&path, "hash", "Pass a file path to fs.hash.")?;
-        let mut file = File::open(&path).map_err(|error| map_io_error("hash", &path, error))?;
-        let meta = file
-            .metadata()
-            .map_err(|error| map_io_error("hash", &path, error))?;
-        if !meta.is_file() {
-            return Err(ErrorBody::new(
-                ErrorCode::InvalidArgs,
-                format!("{} is not a regular file.", path.display()),
-            )
-            .with_hint("Pass a regular file path to fs.hash."));
-        }
+        let (mut file, meta) =
+            super::open_regular_file(&path, "hash", "Pass a file path to fs.hash.")?;
         let total = meta.len();
         let mut hasher = blake3::Hasher::new();
         let mut buf = [0u8; STREAM_CHUNK_BYTES];

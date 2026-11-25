@@ -6,7 +6,7 @@
 //! and every extracted embedded image must pass the exact same header probe and decode limits as
 //! a top-level file.
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Cursor, Read as _, Seek as _, SeekFrom};
 use std::path::Path;
 
@@ -25,12 +25,10 @@ pub(crate) const MAX_EMBEDDED_THUMB_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const HEADER_PEEK_BYTES: usize = 128 * 1024;
 /// Extended header prefix used only when a JPEG carries >128 KiB of metadata before SOF (512 KiB).
 const MAX_HEADER_PEEK_BYTES: usize = 512 * 1024;
-/// Maximum GIF extension/image blocks scanned while locating the first frame descriptor.
-const MAX_GIF_BLOCKS: usize = 128;
 /// Maximum WebP chunks scanned inside an extended (`VP8X`) or animated (`ANMF`) container.
 const MAX_WEBP_CHUNKS: usize = 64;
-/// Fixed allocator overhead covering decoder tables and small resize buffers (2 MiB).
-const BASE_DECODE_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
+/// Fixed allocator overhead covering decoder tables and small resize buffers (4 MiB).
+const BASE_DECODE_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
 /// Maximum JPEG marker segments scanned before SOS so crafted files cannot spin CPU.
 const MAX_JPEG_MARKERS: usize = 1024;
 /// Maximum TIFF IFD entries scanned in EXIF IFD0/IFD1 or MPF index IFD.
@@ -219,6 +217,10 @@ pub(crate) struct HeaderPeek {
     /// True when an over-cap JPEG may still carry an embedded EXIF/MPF preview that the worker can
     /// extract and decode within the 256 MiB cap.
     pub(crate) may_have_embedded_preview: bool,
+    /// True when inner frame dimensions could not be verified within the bounded header peek (for
+    /// example, a GIF with >128 KiB of leading extension blocks before its first image descriptor),
+    /// so the caller must reserve the full expensive-case budget.
+    pub(crate) uncertain_frame_bounds: bool,
 }
 
 /// Estimates peak heap allocation in bytes for decoding an image of `width x height` pixels with
@@ -350,9 +352,24 @@ pub(crate) fn probe_image_profile_with_source_size(
         }
         ImageFormat::Png => (parse_png_subtype(bytes), None),
         ImageFormat::Gif => {
-            let (gw, gh) = parse_gif_max_dimensions(bytes);
+            let (gw, gh, found_frame) = parse_gif_max_dimensions(bytes);
             w = w.max(gw);
             h = h.max(gh);
+            if !found_frame && source_bytes > bytes.len() {
+                // First image descriptor lies past the scanned prefix: treat as expensive so a
+                // long run of extension blocks cannot smuggle a huge frame on a tiny reservation.
+                let estimated_peak_bytes = MAX_IMAGE_DECODE_BYTES;
+                return Ok((
+                    ImageProfile {
+                        format,
+                        subtype: ImageSubtype::Gif,
+                        width: w,
+                        height: h,
+                        estimated_peak_bytes,
+                    },
+                    None,
+                ));
+            }
             (ImageSubtype::Gif, None)
         }
         ImageFormat::WebP => {
@@ -420,30 +437,33 @@ pub(crate) fn peek_image_file(
 
     let (profile, jpeg_meta) = match probed {
         Ok(pair) => pair,
-        // If a large JPEG still has >512 KiB of metadata before SOF, reserve a conservative
+        // If a large JPEG still has >512 KiB of metadata before SOF, reserve the full expensive-case
         // budget and let the memory-limited decode worker inspect the full stream.
         Err(_) if is_jpeg_magic && file_size > prefix.len() as u64 => {
-            let conservative_est =
-                (file_size.saturating_add(64 * 1024 * 1024)).min(MAX_IMAGE_DECODE_BYTES);
             return Ok(HeaderPeek {
                 profile: ImageProfile {
                     format: ImageFormat::Jpeg,
                     subtype: ImageSubtype::JpegProgressiveOther,
                     width: 1,
                     height: 1,
-                    estimated_peak_bytes: conservative_est,
+                    estimated_peak_bytes: MAX_IMAGE_DECODE_BYTES,
                 },
                 may_have_embedded_preview: true,
+                uncertain_frame_bounds: true,
             });
         }
         Err(err) => return Err(err),
     };
 
+    let uncertain_frame_bounds = profile.format == ImageFormat::Gif
+        && file_size > prefix.len() as u64
+        && !parse_gif_max_dimensions(&prefix).2;
     let may_have_embedded_preview =
         jpeg_meta.is_some_and(|meta| meta.saw_embedded_marker || !meta.embedded_thumbs.is_empty());
     Ok(HeaderPeek {
         profile,
         may_have_embedded_preview,
+        uncertain_frame_bounds,
     })
 }
 
@@ -501,10 +521,16 @@ fn parse_png_subtype(bytes: &[u8]) -> ImageSubtype {
     }
 }
 
-fn parse_gif_max_dimensions(bytes: &[u8]) -> (u32, u32) {
+/// Walks GIF extension blocks up to the byte bound of `bytes` to locate the first Image
+/// Descriptor (`0x2C`), returning `(max_width, max_height, found_image_descriptor)`.
+///
+/// Bounding strictly by byte offset (rather than a fixed extension-block count) ensures a crafted
+/// file with hundreds of tiny comment blocks cannot push its first frame descriptor past a block
+/// cap while still keeping the scan O(prefix length).
+fn parse_gif_max_dimensions(bytes: &[u8]) -> (u32, u32, bool) {
     // GIF87a / GIF89a header (6) + Logical Screen Descriptor (7) = 13 bytes.
     if bytes.len() < 13 || (&bytes[0..6] != b"GIF87a" && &bytes[0..6] != b"GIF89a") {
-        return (0, 0);
+        return (0, 0, false);
     }
     let mut max_w = u32::from(u16::from_le_bytes([bytes[6], bytes[7]]));
     let mut max_h = u32::from(u16::from_le_bytes([bytes[8], bytes[9]]));
@@ -515,21 +541,30 @@ fn parse_gif_max_dimensions(bytes: &[u8]) -> (u32, u32) {
         pos = pos.saturating_add(gct_entries * 3);
     }
 
-    for _ in 0..MAX_GIF_BLOCKS {
-        let Some(&introducer) = bytes.get(pos) else {
-            break;
-        };
-        match introducer {
+    let mut found_frame = false;
+    while pos < bytes.len() {
+        match bytes[pos] {
             0x21 => {
                 // Extension block: introducer (1) + label (1) + sub-blocks terminated by 0x00.
-                pos = pos.saturating_add(2);
-                while let Some(&sub_len) = bytes.get(pos) {
-                    pos = pos.saturating_add(1);
+                let Some(mut cur) = pos.checked_add(2) else {
+                    break;
+                };
+                let mut terminated = false;
+                while let Some(&sub_len) = bytes.get(cur) {
+                    cur = cur.saturating_add(1);
                     if sub_len == 0 {
+                        terminated = true;
                         break;
                     }
-                    pos = pos.saturating_add(usize::from(sub_len));
+                    let Some(next) = cur.checked_add(usize::from(sub_len)) else {
+                        return (max_w, max_h, false);
+                    };
+                    cur = next;
                 }
+                if !terminated || cur <= pos {
+                    break;
+                }
+                pos = cur;
             }
             0x2C => {
                 // Image Descriptor: 0x2C + left(2) + top(2) + width(2) + height(2) + packed(1).
@@ -540,14 +575,18 @@ fn parse_gif_max_dimensions(bytes: &[u8]) -> (u32, u32) {
                     let fh = u32::from(u16::from_le_bytes([desc[6], desc[7]]));
                     max_w = max_w.max(fw).max(left.saturating_add(fw));
                     max_h = max_h.max(fh).max(top.saturating_add(fh));
+                    found_frame = true;
                 }
                 break;
             }
-            0x3B => break,
+            0x3B => {
+                found_frame = true;
+                break;
+            }
             _ => break,
         }
     }
-    (max_w, max_h)
+    (max_w, max_h, found_frame)
 }
 
 fn parse_vp8_dims(payload: &[u8]) -> Option<(u32, u32)> {
@@ -945,7 +984,7 @@ fn looks_like_text(bytes: &[u8]) -> bool {
 }
 
 /// Sniffs whether a regular `.ts` file on disk is an MPEG-TS video recording rather than a
-/// TypeScript source file. Refuses special files before opening so FIFOs/devices cannot block.
+/// TypeScript source file, using non-blocking regular-file open so swapped FIFOs never block.
 pub(crate) fn is_mpeg_ts_file(path: &Path) -> bool {
     if !path
         .extension()
@@ -954,15 +993,12 @@ pub(crate) fn is_mpeg_ts_file(path: &Path) -> bool {
     {
         return false;
     }
-    let Ok(meta) = fs::metadata(path) else {
+    let Ok((file, meta)) = legion_os::open_regular::open_regular_read(path) else {
         return false;
     };
-    if !meta.is_file() || meta.len() < 189 {
+    if meta.len() < 189 {
         return false;
     }
-    let Ok(file) = File::open(path) else {
-        return false;
-    };
     let mut buf = Vec::with_capacity(1024);
     if file.take(1024).read_to_end(&mut buf).is_err() {
         return false;
@@ -1417,6 +1453,30 @@ pub(crate) mod tests {
             !profile.fits_cap(),
             "8000x8000 GIF frame inside 64x64 logical screen must exceed cap: {profile:?}"
         );
+
+        // Reproduces `mkgif2.py`: 250 comment extension blocks before an 8000x8000 frame must STILL
+        // be scanned and rejected (no fixed 128-block cutoff).
+        let mut gif_many_ext = Vec::new();
+        gif_many_ext.extend_from_slice(b"GIF89a");
+        gif_many_ext.extend_from_slice(&16u16.to_le_bytes());
+        gif_many_ext.extend_from_slice(&16u16.to_le_bytes());
+        gif_many_ext.extend_from_slice(&[0x80, 0x00, 0x00, 0, 0, 0, 255, 255, 255]);
+        for _ in 0..250 {
+            gif_many_ext.extend_from_slice(&[0x21, 0xFE, 0x01, b'x', 0x00]);
+        }
+        gif_many_ext.push(0x2C);
+        gif_many_ext.extend_from_slice(&0u16.to_le_bytes());
+        gif_many_ext.extend_from_slice(&0u16.to_le_bytes());
+        gif_many_ext.extend_from_slice(&8000u16.to_le_bytes());
+        gif_many_ext.extend_from_slice(&8000u16.to_le_bytes());
+        gif_many_ext.push(0x00);
+        gif_many_ext.extend_from_slice(&[0x02, 0x00, 0x3B]);
+
+        let (profile2, _) =
+            probe_image_profile(Path::new("/liegif_ext250.gif"), &gif_many_ext).unwrap();
+        assert_eq!(profile2.width, 8000);
+        assert_eq!(profile2.height, 8000);
+        assert!(!profile2.fits_cap());
     }
 
     #[test]

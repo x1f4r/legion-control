@@ -42,6 +42,8 @@ const MIME_JPEG_TAG: u8 = 1;
 const MIME_PNG_TAG: u8 = 2;
 const BAD_ENTRY_TAG: u8 = 3;
 const MAX_BAD_ERROR_BYTES: usize = 16 * 1024;
+/// Negative bad-file cache records expire after 7 days so files are retried once after expiry.
+pub(crate) const BAD_ENTRY_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 const ENTRY_HEADER_LEN: usize = 14;
 const LOCK_FILE: &str = "cache.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -243,13 +245,24 @@ impl ThumbCache {
     }
 
     /// Looks up a cached negative bad-file entry by [`bad_cache_key`], lock-free.
+    ///
+    /// Entries older than [`BAD_ENTRY_TTL`] (7 days) are deleted and treated as a miss so the
+    /// file is retried once after expiry.
     pub(crate) fn get_bad(&self, key: &str) -> Option<ErrorBody> {
+        self.get_bad_at(key, now_unix_secs())
+    }
+
+    pub(crate) fn get_bad_at(&self, key: &str, now_secs: u64) -> Option<ErrorBody> {
         let entry_path = self.entry_path(key);
         let raw = fs::read(&entry_path).ok()?;
-        let Some(err) = decode_bad_entry(&raw) else {
+        let Some((recorded_at, err)) = decode_bad_entry(&raw) else {
             let _ = fs::remove_file(&entry_path);
             return None;
         };
+        if now_secs.saturating_sub(recorded_at) >= BAD_ENTRY_TTL.as_secs() {
+            let _ = fs::remove_file(&entry_path);
+            return None;
+        }
         let _ = self.touch_recency(&entry_path);
         Some(err)
     }
@@ -264,11 +277,15 @@ impl ThumbCache {
         self.write_encoded(key, &encoded);
     }
 
-    /// Stores a negative bad-file entry atomically under `key` (sharing the same LRU byte cap and
-    /// reconciliation as positive thumbnail entries) so reopening a folder with a file that killed
-    /// a worker returns the cached per-path error without re-spawning a worker.
+    /// Stores a negative bad-file entry atomically under `key` (sharing the same LRU byte cap,
+    /// reconciliation, and 7-day expiry as positive thumbnail entries) so reopening a folder with
+    /// a file rejected by this node's own memory limit does not repeat the kill.
     pub(crate) fn put_bad(&self, key: &str, error: &ErrorBody) {
-        let Some(encoded) = encode_bad_entry(error) else {
+        self.put_bad_at(key, error, now_unix_secs());
+    }
+
+    pub(crate) fn put_bad_at(&self, key: &str, error: &ErrorBody, recorded_at_secs: u64) {
+        let Some(encoded) = encode_bad_entry(error, recorded_at_secs) else {
             return;
         };
         self.write_encoded(key, &encoded);
@@ -503,7 +520,13 @@ fn decode_entry(raw: &[u8]) -> Option<CachedThumb> {
     })
 }
 
-fn encode_bad_entry(error: &ErrorBody) -> Option<Vec<u8>> {
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn encode_bad_entry(error: &ErrorBody, recorded_at_secs: u64) -> Option<Vec<u8>> {
     let payload = serde_json::to_vec(error).ok()?;
     if payload.is_empty() || payload.len() > MAX_BAD_ERROR_BYTES {
         return None;
@@ -512,13 +535,12 @@ fn encode_bad_entry(error: &ErrorBody) -> Option<Vec<u8>> {
     out.extend_from_slice(ENTRY_MAGIC);
     out.push(ENTRY_VERSION);
     out.push(BAD_ENTRY_TAG);
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&recorded_at_secs.to_le_bytes());
     out.extend_from_slice(&payload);
     Some(out)
 }
 
-fn decode_bad_entry(raw: &[u8]) -> Option<ErrorBody> {
+fn decode_bad_entry(raw: &[u8]) -> Option<(u64, ErrorBody)> {
     if raw.len() <= ENTRY_HEADER_LEN
         || raw.len() > ENTRY_HEADER_LEN + MAX_BAD_ERROR_BYTES
         || &raw[..4] != ENTRY_MAGIC
@@ -527,7 +549,9 @@ fn decode_bad_entry(raw: &[u8]) -> Option<ErrorBody> {
     {
         return None;
     }
-    serde_json::from_slice(&raw[ENTRY_HEADER_LEN..]).ok()
+    let recorded_at = u64::from_le_bytes(raw[6..14].try_into().ok()?);
+    let err: ErrorBody = serde_json::from_slice(&raw[ENTRY_HEADER_LEN..]).ok()?;
+    Some((recorded_at, err))
 }
 
 /// Creates a throwaway directory for temporary `ffmpeg` frame output inside the cache directory
@@ -878,5 +902,22 @@ mod tests {
         assert_eq!(cache.get_bad(&k2), None);
         // Positive lookup on the same key must not treat a bad entry as a valid thumbnail.
         assert_eq!(cache.get(&k1), None);
+
+        // Entries older than BAD_ENTRY_TTL (7 days) expire, are removed, and return None for retry.
+        let k_exp = bad_cache_key(Path::new("/old_bomb.gif"), 123, Some(500), fid(1, 12, 100));
+        cache.put_bad_at(&k_exp, &err, 1_000_000);
+        assert!(
+            cache
+                .get_bad_at(&k_exp, 1_000_000 + BAD_ENTRY_TTL.as_secs() - 1)
+                .is_some()
+        );
+        assert_eq!(
+            cache.get_bad_at(&k_exp, 1_000_000 + BAD_ENTRY_TTL.as_secs()),
+            None
+        );
+        assert!(
+            !cache.entry_path(&k_exp).exists(),
+            "expired bad entry must be deleted on miss"
+        );
     }
 }

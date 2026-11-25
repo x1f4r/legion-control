@@ -1197,6 +1197,7 @@ dependencies = [
  "legion-core",
  "legion-doors",
  "legion-net",
+ "legion-os",
  "legion-proto",
  "legion-tools",
  "qrcode",
@@ -1350,6 +1351,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "globset",
+ "legion-os",
  "serde",
  "serde_json",
  "tar",

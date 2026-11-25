@@ -4,17 +4,27 @@
 //!
 //! - **Authorization parity**: requires `fs.read` permission on the role and per-path `check_fs_path`
 //!   confinement before touching the file system or the thumbnail cache.
-//! - **Open-once image reads**: images are stat'd to refuse special files (FIFOs/sockets/devices),
-//!   opened once, checked via the open handle's size, mtime, OS file identity (`dev`/`ino` or
-//!   Windows volume+file index) and metadata change time (`ctime` / NTFS `ChangeTime`), and read
-//!   directly from that handle so rename swaps cannot substitute another file.
+//! - **Open-once non-blocking regular-file reads**: files are opened once non-blockingly via
+//!   [`legion_os::open_regular::open_regular_read`] (`O_NONBLOCK | O_NOCTTY` plus `fstat` regular-
+//!   file verification on Unix; disk-file verification on Windows) so swapping a file for a FIFO
+//!   or special file can never block a node thread; the open handle's size, mtime, OS file
+//!   identity (`dev`/`ino` or Windows volume+file index) and metadata change time (`ctime` / NTFS
+//!   `ChangeTime`) are checked before and after reading so rename swaps cannot substitute another
+//!   file.
 //! - **Per-format estimated decode memory cap (256 MiB)**: rather than a blanket pixel cap that
 //!   would reject 48–61 MP baseline phone/camera JPEGs, [`thumb_probe`](super::thumb_probe) reads
 //!   the format and encoding subtype from the header before decoding and multiplies pixels by a
-//!   counting-allocator-measured bytes-per-pixel factor (plus compressed source bytes and 2 MiB
+//!   counting-allocator-measured bytes-per-pixel factor (plus compressed source bytes and 4 MiB
 //!   overhead). Images whose estimated peak fits within **256 MiB** are decoded directly (e.g.,
 //!   50 MP baseline 4:2:0 JPEG peaks around ~145 MiB + source size; 25 MP progressive 4:4:4 JPEG
 //!   peaks around ~215 MiB).
+//! - **Exact cross-OS worker heap cap + matching in-flight budget**: each `__thumb-worker` arms
+//!   [`legion_os::capped_alloc::set_memory_cap`] with its admitted heap cap before allocating and
+//!   exits immediately with [`CAP_EXCEEDED_EXIT_CODE`](legion_os::capped_alloc::CAP_EXCEEDED_EXIT_CODE)
+//!   on overshoot, backed by OS limits (`RLIMIT_AS` with headroom on Linux, `RLIMIT_DATA` on other
+//!   non-macOS Unix, suspended-create Job Object limits on Windows) and a 10 ms RSS watchdog. Each
+//!   worker reserves its exact resident limit (`heap_cap + 12 MiB`) from the shared in-flight byte
+//!   pool so the sum of live workers' limits never exceeds `min(512 MiB, effective_ram / 8)`.
 //! - **Embedded EXIF/MPF preview fallback**: when a JPEG exceeds the 256 MiB decode cap (such as a
 //!   200 MP photo or a 36+ MP progressive 4:4:4 JPEG), `fs.thumb` extracts an embedded MPF APP2
 //!   preview (preferred) or EXIF IFD1 thumbnail with strict overflow-safe offset/length bounds,
@@ -37,24 +47,38 @@
 //!   *after* resizing (avoiding a second full-resolution frame allocation on rotated portrait
 //!   photos).
 //! - **Hardened `ffmpeg` video posters**:
-//!   - Videos use a separate fair pool (**2** concurrent `ffmpeg` subprocesses, round-robin by
-//!     principal, **15 s** wait timeout) so video floods never stall image thumbnails.
-//!   - `ffmpeg` is invoked directly with no shell, `-threads 1`, `-nostdin`, `-protocol_whitelist
-//!     file`, `-format_whitelist mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,asf,flv,mpeg,mpegts,ogg,rm,mpegvideo`,
-//!     and `-map 0:v:0 -an -sn -dn` so manifests, playlists (`dash`, `hls`, `concat`), network
-//!     protocols, and attachment streams are strictly blocked.
-//!   - Passing an already-opened FD to `ffmpeg` is not used because `legion-os::run` feeds `stdin`
-//!     over a non-seekable pipe (breaking `-ss` seeking and MP4 files with trailing `moov` atoms),
-//!     sets `CLOEXEC` without `pre_exec`, and `legion-tools` keeps `#![forbid(unsafe_code)]`;
-//!     instead we combine the protocol/format whitelists with a post-extraction `FileStamp` check
-//!     (`FileId`, `ctime`, size, mtime) so any swap during extraction fails with `conflict`.
+//!   - `ffmpeg` is invoked directly by resolved absolute path with a cleared minimal environment
+//!     (`MALLOC_ARENA_MAX=2`, fixed minimal `PATH`, throwaway temp dir), no shell, `-threads 1`
+//!     on both input and output plus `-filter_threads 1` (limiting decoder/encoder/filter pools —
+//!     `ffmpeg` still creates helper threads internally, so `MALLOC_ARENA_MAX=2` keeps glibc arena
+//!     reservations small), `-max_pixels 67108864`, `-max_alloc 134217728`, `-protocol_whitelist
+//!     file`, MOV/MP4 demuxer pinned with `-enable_drefs 0 -use_absolute_path 0`, non-MOV
+//!     `-format_whitelist` excluding MOV and playlists/manifests, and `-map 0:v:0 -an -sn -dn`.
+//!   - Measured `ffmpeg` peaks on Linux x86_64 with `MALLOC_ARENA_MAX=2`:
+//!     - 1080p H.264: 73 MiB RSS / 501 MiB VmPeak (79 ms)
+//!     - 1080p portrait phone clip (90° rotation metadata): 76 MiB RSS / 501 MiB VmPeak (84 ms, outputs 576×1024)
+//!     - 1080p HEVC 10-bit: 111 MiB RSS / 522 MiB VmPeak (166 ms)
+//!     - 4K H.264: 109–135 MiB RSS / 501–520 MiB VmPeak (192 ms)
+//!     - 4K long-GOP (240-frame GOP): 119 MiB RSS / 501 MiB VmPeak (131 ms)
+//!     - 4K HEVC 8-bit: 146 MiB RSS / 557 MiB VmPeak (84 ms)
+//!     - 4K HEVC 10-bit: 242–265 MiB RSS / 652–676 MiB VmPeak (424–460 ms)
+//!     - 8K H.264: 209 MiB RSS / 603 MiB VmPeak (140 ms)
+//!     - 8K HEVC: 418–534 MiB RSS / 828–945 MiB VmPeak (311–404 ms)
+//!     - 8K H.264 (16 ref frames): 395 MiB RSS / 851 MiB VmPeak (651 MiB RSS / 1051 MiB VmPeak during `-ss 1` scan)
+//!   - Based on those measurements, the 10 ms RSS watchdog decides on resident memory (256 MiB for
+//!     sniffed `<= 1080p` clips, 768 MiB capped to `max(256 MiB, effective_ram / 4)` for 4K/8K or
+//!     unknown dimensions), while `RLIMIT_AS` stays a generous +1 GiB address-space backstop
+//!     (1280–1792 MiB) so `pthread_create()` never fails on legitimate 4K/8K HEVC clips. Every
+//!     `ffmpeg` call reserves its tier from the shared in-flight byte pool, and big (>1080p) clips
+//!     run strictly one at a time.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{self, File, Metadata};
 use std::io::{Cursor, Read as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -84,9 +108,11 @@ use super::thumb_probe::{
     probe_image_profile, too_large_error,
 };
 use super::thumb_worker::{
-    WorkerOutcome, effective_decode_timeout, run_thumb_worker, worker_enabled,
+    WorkerOutcome, effective_decode_timeout, minimal_system_env, run_thumb_worker, worker_enabled,
 };
-use super::{cancelled_error, check_fs_path, check_regular_file, map_io_error, platform};
+use super::{
+    cancelled_error, check_fs_path, check_regular_file, map_io_error, open_regular_file, platform,
+};
 
 const MIN_PATHS: usize = 1;
 const MAX_PATHS: usize = 32;
@@ -97,6 +123,11 @@ const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_IN_FLIGHT_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_IN_FLIGHT_IMAGES: usize = 8;
 const MAX_IN_FLIGHT_VIDEOS: usize = 2;
+/// Fixed non-heap RSS allowance for a `__thumb-worker` process (binary, libc, stack). Included in
+/// each worker's reservation so `sum(live worker resident limits) <= in_flight_budget`.
+const WORKER_FIXED_OVERHEAD_BYTES: u64 = 12 * 1024 * 1024;
+const MIN_IMAGE_HEAP_CAP_BYTES: u64 = 12 * 1024 * 1024;
+const MAX_IMAGE_HEAP_CAP_BYTES: u64 = MAX_IMAGE_DECODE_BYTES - WORKER_FIXED_OVERHEAD_BYTES;
 const IMAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const IMAGE_DECODE_TIMEOUT: Duration = Duration::from_secs(10);
 const VIDEO_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -104,13 +135,26 @@ const JPEG_QUALITY: u8 = 82;
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(15);
 const FFMPEG_KILL_GRACE: Duration = Duration::from_secs(1);
 const FFMPEG_CAPTURE_LIMIT: usize = 32 * 1024;
-/// Maximum single video frame pixel count admitted by `ffmpeg` (64 MP; blocks 16k×16k bombs).
+/// Resident memory limit for sniffed <=1080p videos (256 MiB; up to 2 fit in a 512 MiB budget).
+const VIDEO_SMALL_RSS_LIMIT: u64 = 256 * 1024 * 1024;
+/// Resident memory limit for >1080p (4K/8K) or unknown-resolution videos (768 MiB; covers measured
+/// 8K HEVC 534 MiB and 8K H.264 16-ref 651 MiB peaks, run one at a time).
+const VIDEO_BIG_RSS_LIMIT: u64 = 768 * 1024 * 1024;
+/// Maximum single video frame pixel count admitted by `ffmpeg` (64 MP; admits 8K 33.2 MP while
+/// blocking 16k×16k bombs).
 const FFMPEG_MAX_PIXELS: &str = "67108864";
 /// Maximum single `av_malloc` allocation in `ffmpeg` (128 MiB).
 const FFMPEG_MAX_ALLOC: &str = "134217728";
-/// Virtual address space headroom added to `ffmpeg`'s RSS cap for Linux `RLIMIT_AS` so system
-/// shared libraries load cleanly while rogue frame allocations still hit the limit.
-const FFMPEG_RLIMIT_AS_HEADROOM: u64 = 512 * 1024 * 1024;
+/// Generous virtual-address-space backstop added above `ffmpeg`'s resident cap (+1 GiB) so glibc
+/// arenas and shared libraries never trigger `pthread_create()` failures on 4K/8K HEVC clips;
+/// actual memory enforcement is performed by the 10 ms RSS watchdog.
+const FFMPEG_RLIMIT_AS_HEADROOM: u64 = 1024 * 1024 * 1024;
+/// Number of timeouts on the same file identity within `TIMEOUT_WINDOW` before applying a short
+/// process-local back-off (never written to disk as a permanent bad-file record).
+const TIMEOUT_BACKOFF_THRESHOLD: u32 = 2;
+const TIMEOUT_WINDOW: Duration = Duration::from_secs(10 * 60);
+const TIMEOUT_BACKOFF_DURATION: Duration = Duration::from_secs(5 * 60);
+const MAX_TIMEOUT_BACKOFF_ENTRIES: usize = 1024;
 
 /// Strictly allow only local file I/O in `ffmpeg` — blocks `http`, `https`, `concat`, `crypto`,
 /// `data`, `pipe`, `subfile`, and all network/virtual protocols.
@@ -131,8 +175,87 @@ enum VideoContainer {
     Other,
 }
 
+/// Resident-memory scheduling tier for a video poster extraction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoTier {
+    /// Confirmed `<= 1920x1080`: 256 MiB RSS cap, up to 2 concurrent within a 512 MiB budget.
+    Small,
+    /// `> 1080p` (4K/8K) or unknown resolution: up to 768 MiB RSS cap, strictly 1 at a time.
+    Big,
+}
+
+struct TimeoutEntry {
+    count: u32,
+    last_seen: Instant,
+    backoff_until: Option<Instant>,
+}
+
+/// Bounded in-memory backoff tracker for repeated timeouts of the same file identity.
+///
+/// Timeouts are intentionally NOT written to the on-disk bad-file cache; this short in-memory
+/// back-off keeps a spinning file from monopolizing worker slots on repeated folder reopens.
+struct TimeoutBackoff {
+    entries: Mutex<HashMap<String, TimeoutEntry>>,
+}
+
+impl TimeoutBackoff {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn active_remaining(&self, bad_key: &str) -> Option<Duration> {
+        let now = Instant::now();
+        let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = guard.get(bad_key)?;
+        if let Some(until) = entry.backoff_until {
+            if until > now {
+                return Some(until.saturating_duration_since(now));
+            }
+            guard.remove(bad_key);
+        }
+        None
+    }
+
+    fn record_timeout(&self, bad_key: &str) {
+        let now = Instant::now();
+        let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.len() >= MAX_TIMEOUT_BACKOFF_ENTRIES {
+            guard.retain(|_, v| {
+                v.backoff_until.is_some_and(|u| u > now)
+                    || now.saturating_duration_since(v.last_seen) < TIMEOUT_WINDOW
+            });
+            if guard.len() >= MAX_TIMEOUT_BACKOFF_ENTRIES {
+                guard.clear();
+            }
+        }
+        let entry = guard
+            .entry(bad_key.to_owned())
+            .or_insert_with(|| TimeoutEntry {
+                count: 0,
+                last_seen: now,
+                backoff_until: None,
+            });
+        if now.saturating_duration_since(entry.last_seen) > TIMEOUT_WINDOW {
+            entry.count = 0;
+            entry.backoff_until = None;
+        }
+        entry.count = entry.count.saturating_add(1);
+        entry.last_seen = now;
+        if entry.count >= TIMEOUT_BACKOFF_THRESHOLD {
+            entry.backoff_until = Some(now + TIMEOUT_BACKOFF_DURATION);
+        }
+    }
+}
+
 static IMAGE_POOL: OnceLock<Arc<FairPool>> = OnceLock::new();
 static VIDEO_POOL: OnceLock<Arc<FairPool>> = OnceLock::new();
+static TIMEOUT_BACKOFF: OnceLock<TimeoutBackoff> = OnceLock::new();
+
+fn timeout_backoff() -> &'static TimeoutBackoff {
+    TIMEOUT_BACKOFF.get_or_init(TimeoutBackoff::new)
+}
 
 fn machine_in_flight_image_budget() -> u64 {
     let effective_ram = effective_memory_bytes();
@@ -143,8 +266,26 @@ fn machine_in_flight_image_budget() -> u64 {
     )
 }
 
-fn video_worker_memory_limit() -> u64 {
-    (machine_in_flight_image_budget() / 2).clamp(192 * 1024 * 1024, MAX_IMAGE_DECODE_BYTES)
+fn video_big_rss_limit() -> u64 {
+    let effective_ram = effective_memory_bytes();
+    if effective_ram == 0 {
+        return VIDEO_BIG_RSS_LIMIT;
+    }
+    let quarter = effective_ram / 4;
+    quarter.clamp(VIDEO_SMALL_RSS_LIMIT, VIDEO_BIG_RSS_LIMIT)
+}
+
+fn video_tier_limits(tier: VideoTier) -> (u64, u64, u64) {
+    // Returns `(rss_limit_bytes, in_flight_reserve_bytes, video_pool_slots)`.
+    let budget = machine_in_flight_image_budget();
+    match tier {
+        VideoTier::Small => (VIDEO_SMALL_RSS_LIMIT, VIDEO_SMALL_RSS_LIMIT.min(budget), 1),
+        VideoTier::Big => (
+            video_big_rss_limit(),
+            budget, // Reserve the full shared in-flight budget so big videos run alone.
+            MAX_IN_FLIGHT_VIDEOS as u64,
+        ),
+    }
 }
 
 fn image_pool() -> Arc<FairPool> {
@@ -516,9 +657,9 @@ async fn thumb_one(
     }
 }
 
-/// Prepared image file opened once, verified against TOCTOU swaps, checked against positive and
-/// negative cache entries, and header-peeked (`<= 128 KiB`) BEFORE requesting byte-budget capacity
-/// or reading the full source file.
+/// Prepared image file opened non-blockingly once, verified against TOCTOU swaps, checked against
+/// positive and expiring negative cache entries, and header-peeked (`<= 128 KiB`) BEFORE
+/// requesting byte-budget capacity or reading the full source file.
 enum ImagePrep {
     CacheHit(CachedThumb),
     CachedBad(ErrorBody),
@@ -528,7 +669,8 @@ enum ImagePrep {
         open_stamp: FileStamp,
         file: File,
         reserve_bytes: u64,
-        worker_mem_limit: u64,
+        heap_cap_bytes: u64,
+        rss_limit_bytes: u64,
     },
 }
 
@@ -554,29 +696,49 @@ async fn thumb_image(
         )
     })?;
 
-    let (key, bad_key, open_stamp, file, reserve_bytes, worker_mem_limit) = match prep {
-        Ok(ImagePrep::CacheHit(hit)) => return Ok(ThumbItem::from_cached(raw_path, hit)),
-        Ok(ImagePrep::CachedBad(err)) => return Ok(ThumbItem::from_error(raw_path, err)),
-        Ok(ImagePrep::Ready {
-            key,
-            bad_key,
-            open_stamp,
-            file,
-            reserve_bytes,
-            worker_mem_limit,
-        }) => (
-            key,
-            bad_key,
-            open_stamp,
-            file,
-            reserve_bytes,
-            worker_mem_limit,
-        ),
-        Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
-    };
+    let (key, bad_key, open_stamp, file, reserve_bytes, heap_cap_bytes, rss_limit_bytes) =
+        match prep {
+            Ok(ImagePrep::CacheHit(hit)) => return Ok(ThumbItem::from_cached(raw_path, hit)),
+            Ok(ImagePrep::CachedBad(err)) => return Ok(ThumbItem::from_error(raw_path, err)),
+            Ok(ImagePrep::Ready {
+                key,
+                bad_key,
+                open_stamp,
+                file,
+                reserve_bytes,
+                heap_cap_bytes,
+                rss_limit_bytes,
+            }) => (
+                key,
+                bad_key,
+                open_stamp,
+                file,
+                reserve_bytes,
+                heap_cap_bytes,
+                rss_limit_bytes,
+            ),
+            Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
+        };
 
-    // Reserve estimated decode + source bytes from the fair image pool BEFORE reading the full
-    // file or launching a decode worker.
+    if let Some(remaining) = timeout_backoff().active_remaining(&bad_key) {
+        return Ok(ThumbItem::from_error(
+            raw_path,
+            ErrorBody::new(
+                ErrorCode::Timeout,
+                format!(
+                    "Decoding {} timed out repeatedly and is in a temporary back-off ({} s remaining).",
+                    resolved.display(),
+                    remaining.as_secs().max(1)
+                ),
+            )
+            .with_hint(
+                "Timeouts are not cached permanently; retry after the short back-off expires.",
+            ),
+        ));
+    }
+
+    // Reserve the worker's exact resident budget from the fair image pool BEFORE reading the full
+    // file or launching a decode worker so the sum of live workers' limits never exceeds budget.
     let permit = match image_pool()
         .acquire(principal, reserve_bytes, IMAGE_WAIT_TIMEOUT, &cancel)
         .await
@@ -618,7 +780,8 @@ async fn thumb_image(
             fit,
             open_stamp.size,
             MAX_SOURCE_BYTES,
-            worker_mem_limit,
+            heap_cap_bytes,
+            rss_limit_bytes,
             decode_timeout,
             cancel.clone(),
         )
@@ -652,8 +815,19 @@ async fn thumb_image(
                 let _ = tokio::task::spawn_blocking(move || cache_put.put(&key, &thumb_put)).await;
                 Ok(ThumbItem::from_cached(raw_path, thumb))
             }
-            WorkerOutcome::Rejected(err) => Ok(ThumbItem::from_error(raw_path, err)),
-            WorkerOutcome::KilledForMemory { error, .. } | WorkerOutcome::Crashed(error) => {
+            WorkerOutcome::Rejected(err) | WorkerOutcome::TransientFailure(err) => {
+                // External kills, crashes, and normal format rejections are NOT cached as bad.
+                Ok(ThumbItem::from_error(raw_path, err))
+            }
+            WorkerOutcome::TimedOut { error, cpu_busy } => {
+                // Timeouts are NOT stored permanently on disk; repeated CPU-busy timeouts get a
+                // short in-memory back-off to bound repeated damage.
+                if cpu_busy {
+                    timeout_backoff().record_timeout(&bad_key);
+                }
+                Ok(ThumbItem::from_error(raw_path, error))
+            }
+            WorkerOutcome::MemoryLimitExceeded { error, .. } => {
                 let resolved_check = resolved.clone();
                 let cache_bad = cache.clone();
                 let err_bad = error.clone();
@@ -745,12 +919,12 @@ async fn thumb_video(
     let resolved_stat = resolved.clone();
     let cache_get = cache.clone();
     let pre = tokio::task::spawn_blocking(move || {
-        let meta = check_regular_file(
+        let (file, meta) = open_regular_file(
             &resolved_stat,
             "thumbnail",
             "Pass a regular file path to fs.thumb; directories cannot be thumbnailed.",
         )?;
-        let stamp = FileStamp::from_path(&resolved_stat, &meta);
+        let stamp = FileStamp::from_open_file(&file, &meta);
         let key = cache_key(
             &resolved_stat,
             stamp.size,
@@ -766,10 +940,10 @@ async fn thumb_video(
         } else {
             None
         };
-        let container = if hit.is_none() && bad.is_none() {
-            sniff_video_container(&resolved_stat)
+        let (container, tier) = if hit.is_none() && bad.is_none() {
+            sniff_video_info(&resolved_stat, file)
         } else {
-            VideoContainer::Other
+            (VideoContainer::Other, VideoTier::Small)
         };
         Ok::<
             (
@@ -777,11 +951,12 @@ async fn thumb_video(
                 String,
                 String,
                 VideoContainer,
+                VideoTier,
                 Option<CachedThumb>,
                 Option<ErrorBody>,
             ),
             ToolError,
-        >((stamp, key, bad_key, container, hit, bad))
+        >((stamp, key, bad_key, container, tier, hit, bad))
     })
     .await
     .map_err(|err| {
@@ -791,7 +966,7 @@ async fn thumb_video(
         )
     })?;
 
-    let (stamp, key, bad_key, container, hit, bad) = match pre {
+    let (stamp, key, bad_key, container, initial_tier, hit, bad) = match pre {
         Ok(v) => v,
         Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
     };
@@ -801,41 +976,98 @@ async fn thumb_video(
     if let Some(bad) = bad {
         return Ok(ThumbItem::from_error(raw_path, bad));
     }
-
-    let permit = match video_pool()
-        .acquire(principal, 1, VIDEO_WAIT_TIMEOUT, &cancel)
-        .await
-    {
-        Ok(permit) => permit,
-        Err(AcquireError::Cancelled) => return Err(cancelled_error("fs.thumb")),
-        Err(AcquireError::TimedOut) => {
-            return Ok(ThumbItem::from_error(
-                raw_path,
-                ErrorBody::new(
-                    ErrorCode::Busy,
-                    format!(
-                        "Timed out waiting for a video thumbnail slot for {}.",
-                        resolved.display()
-                    ),
-                )
-                .with_hint(
-                    "Video thumbnail extraction is busy on this node; retry fs.thumb shortly.",
+    if let Some(remaining) = timeout_backoff().active_remaining(&bad_key) {
+        return Ok(ThumbItem::from_error(
+            raw_path,
+            ErrorBody::new(
+                ErrorCode::Timeout,
+                format!(
+                    "Extracting a poster for {} timed out repeatedly and is in a temporary back-off ({} s remaining).",
+                    resolved.display(),
+                    remaining.as_secs().max(1)
                 ),
-            ));
-        }
-    };
+            )
+            .with_hint(
+                "Timeouts are not cached permanently; retry after the short back-off expires.",
+            ),
+        ));
+    }
 
-    let outcome = extract_video_poster(
-        &resolved,
-        stamp,
-        container,
-        cache_dir,
-        size,
-        fit,
-        cancel.clone(),
-    )
-    .await;
-    drop(permit);
+    let mut tier = initial_tier;
+    let outcome = loop {
+        let (rss_limit, budget_reserve, video_slots) = video_tier_limits(tier);
+        let video_permit = match video_pool()
+            .acquire(principal, video_slots, VIDEO_WAIT_TIMEOUT, &cancel)
+            .await
+        {
+            Ok(permit) => permit,
+            Err(AcquireError::Cancelled) => return Err(cancelled_error("fs.thumb")),
+            Err(AcquireError::TimedOut) => {
+                return Ok(ThumbItem::from_error(
+                    raw_path,
+                    ErrorBody::new(
+                        ErrorCode::Busy,
+                        format!(
+                            "Timed out waiting for a video thumbnail slot for {}.",
+                            resolved.display()
+                        ),
+                    )
+                    .with_hint(
+                        "Video thumbnail extraction is busy on this node; retry fs.thumb shortly.",
+                    ),
+                ));
+            }
+        };
+        let mem_permit = match image_pool()
+            .acquire(principal, budget_reserve, VIDEO_WAIT_TIMEOUT, &cancel)
+            .await
+        {
+            Ok(permit) => permit,
+            Err(AcquireError::Cancelled) => {
+                drop(video_permit);
+                return Err(cancelled_error("fs.thumb"));
+            }
+            Err(AcquireError::TimedOut) => {
+                drop(video_permit);
+                return Ok(ThumbItem::from_error(
+                    raw_path,
+                    ErrorBody::new(
+                        ErrorCode::Busy,
+                        format!(
+                            "Timed out waiting for thumbnail memory budget for {}.",
+                            resolved.display()
+                        ),
+                    )
+                    .with_hint("Thumbnail decoding is busy on this node; retry fs.thumb shortly."),
+                ));
+            }
+        };
+
+        let attempt = extract_video_poster(
+            &resolved,
+            stamp,
+            container,
+            rss_limit,
+            cache_dir,
+            size,
+            fit,
+            cancel.clone(),
+        )
+        .await;
+        drop(mem_permit);
+        drop(video_permit);
+
+        // If a sniffed <=1080p video unexpectedly tripped the 256 MiB small-tier watchdog, retry
+        // once in the exclusive big tier (768 MiB, 1 at a time) before treating it as too large.
+        if tier == VideoTier::Small
+            && let Err(ref err) = attempt
+            && is_our_memory_kill(err)
+        {
+            tier = VideoTier::Big;
+            continue;
+        }
+        break attempt;
+    };
 
     match outcome {
         Ok(thumb) => {
@@ -846,13 +1078,17 @@ async fn thumb_video(
         }
         Err(err) if err.code == ErrorCode::Cancelled => Err(err),
         Err(err) => {
-            let killed_for_memory = err
-                .details
-                .as_ref()
-                .and_then(|d| d.get("killed_for_memory"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if killed_for_memory {
+            if err.code == ErrorCode::Timeout {
+                let cpu_busy = err
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.get("cpu_busy"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if cpu_busy {
+                    timeout_backoff().record_timeout(&bad_key);
+                }
+            } else if is_our_memory_kill(&err) {
                 let cache_bad = cache.clone();
                 let err_bad = err.clone();
                 let _ = tokio::task::spawn_blocking(move || cache_bad.put_bad(&bad_key, &err_bad))
@@ -861,6 +1097,14 @@ async fn thumb_video(
             Ok(ThumbItem::from_error(raw_path, err))
         }
     }
+}
+
+fn is_our_memory_kill(err: &ErrorBody) -> bool {
+    err.details
+        .as_ref()
+        .and_then(|d| d.get("killed_for_memory"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Selects either the full image (when its estimated decode peak fits the 256 MiB cap) or the best
@@ -918,17 +1162,13 @@ where
 
     between_stat_and_open();
 
-    let mut file = File::open(path).map_err(|err| map_io_error("read", path, err))?;
-    let open_meta = file
-        .metadata()
-        .map_err(|err| map_io_error("read", path, err))?;
-    if !open_meta.is_file() {
-        return Err(ErrorBody::new(
-            ErrorCode::InvalidArgs,
-            format!("{} is not a regular file.", path.display()),
-        )
-        .with_hint("Pass a regular file path to fs.thumb."));
-    }
+    // Non-blocking open (`O_NONBLOCK | O_NOCTTY` on Unix, disk-handle check on Windows) ensures a
+    // FIFO swapped into `path` after `stat` can never block a node thread.
+    let (mut file, open_meta) = open_regular_file(
+        path,
+        "read",
+        "Pass a regular file path to fs.thumb; directories cannot be thumbnailed.",
+    )?;
     let open_stamp = FileStamp::from_open_file(&file, &open_meta);
     if open_stamp != pre_stamp {
         return Err(changed_while_reading(path));
@@ -983,24 +1223,28 @@ where
         return Err(too_large_error(path, &peek.profile));
     }
 
-    let (reserve_bytes, worker_mem_limit) = if peek.profile.fits_cap() {
-        let reserve = peek.profile.estimated_peak_bytes;
-        let limit = reserve
-            .saturating_add(48 * 1024 * 1024)
-            .clamp(64 * 1024 * 1024, MAX_IMAGE_DECODE_BYTES);
-        (reserve, limit)
+    // Reserve EXACTLY what the worker is allowed to use (`rss_limit_bytes == reserve_bytes`,
+    // `heap_cap_bytes == reserve_bytes - WORKER_FIXED_OVERHEAD_BYTES`) so the sum of all live
+    // workers' limits never exceeds the in-flight budget.
+    let heap_cap_bytes = if peek.uncertain_frame_bounds {
+        MAX_IMAGE_HEAP_CAP_BYTES
+    } else if peek.profile.fits_cap() {
+        peek.profile
+            .estimated_peak_bytes
+            .clamp(MIN_IMAGE_HEAP_CAP_BYTES, MAX_IMAGE_HEAP_CAP_BYTES)
     } else {
-        // Over-cap JPEG with EXIF/MPF marker: reserve source + preview headroom and cap the
+        // Over-cap JPEG with EXIF/MPF marker: reserve 2x source + preview headroom and cap the
         // worker tightly so it can only decode an embedded preview, never the full over-cap frame.
-        let reserve = open_stamp
+        open_stamp
             .size
-            .saturating_add(48 * 1024 * 1024)
-            .min(MAX_IMAGE_DECODE_BYTES);
-        let limit = reserve
+            .saturating_mul(2)
             .saturating_add(32 * 1024 * 1024)
-            .clamp(64 * 1024 * 1024, MAX_IMAGE_DECODE_BYTES);
-        (reserve, limit)
+            .clamp(MIN_IMAGE_HEAP_CAP_BYTES, MAX_IMAGE_HEAP_CAP_BYTES)
     };
+    let reserve_bytes = heap_cap_bytes
+        .saturating_add(WORKER_FIXED_OVERHEAD_BYTES)
+        .min(MAX_IMAGE_DECODE_BYTES);
+    let rss_limit_bytes = reserve_bytes;
 
     Ok(ImagePrep::Ready {
         key,
@@ -1008,7 +1252,8 @@ where
         open_stamp,
         file,
         reserve_bytes,
-        worker_mem_limit,
+        heap_cap_bytes,
+        rss_limit_bytes,
     })
 }
 
@@ -1268,31 +1513,126 @@ fn encode_thumbnail(img: &DynamicImage) -> Result<CachedThumb, ErrorBody> {
     })
 }
 
-/// Sniffs whether a regular video file belongs to the MOV/MP4 demuxer family (by extension or
-/// leading ISO BMFF box header) so `ffmpeg` always pins `-enable_drefs 0 -use_absolute_path 0` for
-/// MOV/MP4 inputs and excludes the MOV demuxer entirely for all other formats.
-fn sniff_video_container(path: &Path) -> VideoContainer {
-    if let Some(ext) = path.extension().and_then(|e| e.to_str())
-        && matches!(
-            ext.to_ascii_lowercase().as_str(),
+/// Sniffs both container family (`MovFamily` vs `Other`) and resident-memory tier (`Small` for
+/// confirmed `<= 1920x1080`, `Big` for `> 1080p` or unknown dimensions) directly from an already-
+/// opened regular file handle (never blocking on FIFOs).
+fn sniff_video_info(path: &Path, file: File) -> (VideoContainer, VideoTier) {
+    let mut header = Vec::with_capacity(64 * 1024);
+    let _ = file.take(64 * 1024).read_to_end(&mut header);
+
+    let is_mov_ext = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
             "mov" | "mp4" | "m4v" | "m4a" | "3gp" | "3g2" | "mj2"
         )
-    {
-        return VideoContainer::MovFamily;
-    }
-    if let Ok(file) = File::open(path) {
-        let mut header = [0u8; 12];
-        let n = file.take(12).read(&mut header).unwrap_or(0);
-        if n >= 8
-            && matches!(
-                &header[4..8],
-                b"ftyp" | b"moov" | b"mdat" | b"free" | b"skip" | b"wide" | b"pnot"
-            )
+    });
+    let is_mov_magic = header.len() >= 8
+        && matches!(
+            &header[4..8],
+            b"ftyp" | b"moov" | b"mdat" | b"free" | b"skip" | b"wide" | b"pnot"
+        );
+    let container = if is_mov_ext || is_mov_magic {
+        VideoContainer::MovFamily
+    } else {
+        VideoContainer::Other
+    };
+
+    let dims = match container {
+        VideoContainer::MovFamily => parse_mov_tkhd_dimensions(&header),
+        VideoContainer::Other => None,
+    };
+    let tier = match dims {
+        Some((w, h))
+            if w > 0 && h > 0 && u64::from(w).saturating_mul(u64::from(h)) <= 1920 * 1080 =>
         {
-            return VideoContainer::MovFamily;
+            VideoTier::Small
+        }
+        _ => VideoTier::Big,
+    };
+    (container, tier)
+}
+
+/// Scans an MP4/MOV header prefix for `tkhd` track header boxes and returns the largest coded
+/// `(width, height)` found (fixed-point 16.16 pixels). Returns `None` when `moov` is at EOF or no
+/// video `tkhd` is present in the prefix, causing the caller to use the conservative `Big` tier.
+fn parse_mov_tkhd_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let mut max_w = 0u32;
+    let mut max_h = 0u32;
+    let mut i = 0usize;
+    while i + 12 <= bytes.len() {
+        if &bytes[i + 4..i + 8] == b"tkhd" {
+            let version = bytes[i + 8];
+            let dims_off = match version {
+                0 => i + 8 + 4 + 72, // version+flags(4) + 72 bytes to width(4), height(4)
+                1 => i + 8 + 4 + 84, // 64-bit times add 12 bytes
+                _ => {
+                    i += 4;
+                    continue;
+                }
+            };
+            if let Some(sl) = bytes.get(dims_off..dims_off + 8) {
+                let w = u32::from_be_bytes([sl[0], sl[1], sl[2], sl[3]]) >> 16;
+                let h = u32::from_be_bytes([sl[4], sl[5], sl[6], sl[7]]) >> 16;
+                if w > 0 && h > 0 && w <= 65_535 && h <= 65_535 {
+                    max_w = max_w.max(w);
+                    max_h = max_h.max(h);
+                }
+            }
+            i += 8;
+        } else {
+            i += 1;
         }
     }
-    VideoContainer::Other
+    (max_w > 0 && max_h > 0).then_some((max_w, max_h))
+}
+
+/// Resolves `ffmpeg`'s absolute path from the current `PATH` before clearing the child environment.
+fn resolve_ffmpeg_path() -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    #[cfg(windows)]
+    let names = ["ffmpeg.exe", "ffmpeg.cmd", "ffmpeg.bat", "ffmpeg"];
+    #[cfg(not(windows))]
+    let names = ["ffmpeg"];
+
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Builds the minimal cleared environment for `ffmpeg`: `MALLOC_ARENA_MAX=2` (preventing glibc
+/// per-thread 64 MiB arena explosion on 4K/8K HEVC), a fixed minimal `PATH`, the throwaway temp
+/// directory, and required Windows system-root variables.
+fn minimal_ffmpeg_env(temp_dir: &Path) -> Vec<(OsString, OsString)> {
+    let mut vars = minimal_system_env();
+    let temp = temp_dir.as_os_str().to_os_string();
+    vars.push((OsString::from("MALLOC_ARENA_MAX"), OsString::from("2")));
+    vars.push((OsString::from("TMPDIR"), temp.clone()));
+    vars.push((OsString::from("TEMP"), temp.clone()));
+    vars.push((OsString::from("TMP"), temp));
+    #[cfg(windows)]
+    {
+        let sys_root =
+            std::env::var_os("SYSTEMROOT").unwrap_or_else(|| OsString::from(r"C:\Windows"));
+        let mut minimal_path = OsString::new();
+        minimal_path.push(&sys_root);
+        minimal_path.push(r"\System32;");
+        minimal_path.push(&sys_root);
+        vars.push((OsString::from("PATH"), minimal_path));
+    }
+    #[cfg(not(windows))]
+    {
+        vars.push((OsString::from("PATH"), OsString::from("/usr/bin:/bin")));
+    }
+    vars
 }
 
 /// Builds the locked-down `ffmpeg` argument list for single-frame video poster extraction.
@@ -1364,15 +1704,27 @@ fn build_ffmpeg_args(
     args
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn extract_video_poster(
     resolved: &Path,
     expected_stamp: FileStamp,
     container: VideoContainer,
+    rss_limit: u64,
     cache_dir: &Path,
     target_size: u32,
     fit: ThumbFit,
     cancel: CancellationToken,
 ) -> Result<CachedThumb, ErrorBody> {
+    let ffmpeg_bin = resolve_ffmpeg_path().ok_or_else(|| {
+        ErrorBody::new(
+            ErrorCode::Unsupported,
+            "Video thumbnails are not available on this node because ffmpeg is not on PATH.",
+        )
+        .with_hint(
+            "Install ffmpeg on this node and ensure it is on PATH to generate video thumbnails.",
+        )
+    })?;
+
     let deadline = Instant::now() + FFMPEG_TIMEOUT;
     let temp_dir = temp_dir_in_cache(cache_dir)
         .or_else(|_| tempfile::tempdir())
@@ -1387,11 +1739,14 @@ async fn extract_video_poster(
     let input_arg = platform::ffmpeg_input_arg(resolved);
 
     let seek_outcome = run_ffmpeg_extract(
+        &ffmpeg_bin,
+        temp_dir.path(),
         resolved,
         &input_arg,
         &frame_arg,
         Some("1"),
         container,
+        rss_limit,
         deadline,
         cancel.clone(),
     )
@@ -1417,11 +1772,14 @@ async fn extract_video_poster(
             }
         }
         let fallback_outcome = run_ffmpeg_extract(
+            &ffmpeg_bin,
+            temp_dir.path(),
             resolved,
             &input_arg,
             &frame_arg,
             None,
             container,
+            rss_limit,
             deadline,
             cancel.clone(),
         )
@@ -1492,12 +1850,16 @@ async fn extract_video_poster(
     })?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_ffmpeg_extract(
+    ffmpeg_bin: &Path,
+    temp_dir: &Path,
     resolved: &Path,
     input_arg: &str,
     frame_arg: &str,
     seek: Option<&str>,
     container: VideoContainer,
+    rss_limit: u64,
     deadline: Instant,
     cancel: CancellationToken,
 ) -> Result<legion_os::run::RunOutput, ErrorBody> {
@@ -1511,12 +1873,13 @@ async fn run_ffmpeg_extract(
     }
 
     let args = build_ffmpeg_args(input_arg, frame_arg, seek, container);
-    let mem_limit = video_worker_memory_limit();
     let options = RunOptions::new(CommandSpec::Argv {
-        program: "ffmpeg".into(),
+        program: ffmpeg_bin.as_os_str().to_os_string(),
         args: args.into_iter().map(Into::into).collect(),
     })
-    .memory_limit(mem_limit)
+    .env_clear(true)
+    .envs(minimal_ffmpeg_env(temp_dir))
+    .memory_limit(rss_limit)
     .rlimit_as_headroom(FFMPEG_RLIMIT_AS_HEADROOM)
     .timeout(remaining)
     .kill_grace(FFMPEG_KILL_GRACE)
@@ -1541,11 +1904,11 @@ async fn run_ffmpeg_extract(
         return Err(cancelled_error("fs.thumb"));
     }
     if output.killed_for_memory {
-        let limit_mib = mem_limit / (1024 * 1024);
+        let limit_mib = rss_limit / (1024 * 1024);
         return Err(ErrorBody::new(
             ErrorCode::Failed,
             format!(
-                "Extracting a video poster for {} exceeded the {limit_mib} MiB memory limit and ffmpeg was stopped.",
+                "Extracting a video poster for {} exceeded the {limit_mib} MiB resident memory limit and ffmpeg was stopped.",
                 resolved.display()
             ),
         )
@@ -1553,18 +1916,20 @@ async fn run_ffmpeg_extract(
         .with_details(json!({
             "reason": "too_large",
             "killed_for_memory": true,
-            "limit_bytes": mem_limit,
+            "limit_bytes": rss_limit,
             "peak_rss_bytes": output.peak_rss_bytes,
         })));
     }
     if output.timed_out {
+        let cpu_busy = output
+            .cpu_time
+            .is_some_and(|cpu| cpu.mul_f32(2.0) >= remaining);
         return Err(ErrorBody::new(
             ErrorCode::Timeout,
             "Extracting a video poster frame with ffmpeg exceeded the time limit.",
         )
-        .with_hint(
-            "The video may be corrupted or too slow to decode within the 15-second limit.",
-        ));
+        .with_hint("The video may be corrupted or too slow to decode within the 15-second limit.")
+        .with_details(json!({ "cpu_busy": cpu_busy })));
     }
     Ok(output)
 }

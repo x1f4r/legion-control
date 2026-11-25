@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -871,9 +871,12 @@ fn grep_file(path: &Path, fail_on_open: bool, state: &mut GrepState<'_>) -> Resu
     if state.cancel.is_cancelled() {
         return Err(cancelled_error("fs.grep"));
     }
-    match fs::metadata(path) {
-        Ok(meta) if meta.is_file() => {}
-        Ok(_) if fail_on_open => {
+    let file = match legion_os::open_regular::open_regular_read(path) {
+        Ok((file, _meta)) => file,
+        Err(
+            legion_os::open_regular::OpenRegularError::IsDirectory
+            | legion_os::open_regular::OpenRegularError::NotRegularFile,
+        ) if fail_on_open => {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
                 format!(
@@ -883,13 +886,9 @@ fn grep_file(path: &Path, fail_on_open: bool, state: &mut GrepState<'_>) -> Resu
             )
             .with_hint("Pass a regular file or directory to fs.grep."));
         }
-        Ok(_) => return Ok(()),
-        Err(error) if fail_on_open => return Err(map_io_error("read", path, error)),
-        Err(_) => return Ok(()),
-    }
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if fail_on_open => return Err(map_io_error("read", path, error)),
+        Err(legion_os::open_regular::OpenRegularError::Io(error)) if fail_on_open => {
+            return Err(map_io_error("read", path, error));
+        }
         Err(_) => return Ok(()),
     };
     let mut reader = BufReader::with_capacity(BINARY_PROBE_BYTES, file);

@@ -55,29 +55,39 @@ symbolic links, and special files keep their existing `kind` and omit `category`
 - **Thumbnails (`fs.thumb`)**: generates thumbnails on the node for 1 to 32 paths per call (`size`
   96 to 512, default 256; `fit` `"contain"` or `"cover"`), returning exactly one result per input
   path in input order: `{"results": [{"path": …, "ok": {"mime", "content", "width", "height"}} |
-  {"path": …, "error": …}]}`. JPEG, PNG, GIF (first frame), WebP, and BMP images are opened once,
-  header-peeked (`<= 128 KiB`), reserved against the fair pool before reading full bytes, and
-  decoded out-of-process in a memory-bounded worker receiving the open file handle on `stdin` (with
-  EXIF orientation applied). Admission caps source files at 64 MiB and estimated peak decode memory
-  at 256 MiB per image (admitting 48–61 MP baseline photos while capping heavier
-  progressive/16-bit/interlaced images), with embedded MPF preview / EXIF IFD1 thumbnail fallback
-  for over-cap JPEGs. Every worker is additionally bounded from the outside by OS memory limits
-  (`RLIMIT_AS` on Linux, `RLIMIT_DATA` on other non-macOS Unix, Job Object limits on Windows), a
-  10 ms RSS watchdog on every platform, and a 10 s wall-clock kill timeout; a killed or crashed
-  worker returns a per-path error without affecting sibling paths and records a negative bad-file
-  entry in `thumb-cache/` for that file identity so reopening the folder does not repeat the kill.
-  In-flight scheduling is bounded to `min(512 MiB, effective RAM / 8)` (honoring cgroup v2/v1 and
-  Windows Job Object limits, floored at 256 MiB) and 8 concurrent decodes round-robin per principal
-  with anti-starvation aging, plus a 10 s wait timeout returning retryable `busy`. Output is JPEG,
-  or PNG when transparent. Video posters (including sniffed MPEG-TS `.ts` recordings) run in a
-  separate 2-slot fair pool with `ffmpeg` under the same OS memory limit and RSS watchdog
-  (`-max_pixels 67108864`, `-max_alloc 134217728`, `-protocol_whitelist file`, MOV/MP4 pinned with
-  `-enable_drefs 0 -use_absolute_path 0`, non-MOV `-format_whitelist` excluding MOV and playlists,
-  `-threads 1`, video-only mapping, 15 s timeout) when it is on the node's `PATH` and report
-  `unsupported` otherwise. Positive and negative results share a lock-free 256 MiB disk-reconciled
-  LRU cache under the node's state directory (`thumb-cache/`), keyed by path, OS file identity,
-  metadata change time, size, mtime, and parameters, inaccessible to non-admin roles through `fs.*`,
-  and every path requires the same permission as `fs.read`.
+  {"path": …, "error": …}]}`. Regular files are opened non-blockingly (`O_NONBLOCK | O_NOCTTY` plus
+  `fstat` regular-file check on Unix; disk file check on Windows) so swapping a file for a FIFO
+  cannot hang a node thread. JPEG, PNG, GIF (first frame), WebP, and BMP images are header-peeked
+  (`<= 128 KiB`, scanning GIF extension blocks up to the peek bound), reserved against the fair
+  pool before reading full bytes, and decoded out-of-process in a memory-bounded worker receiving
+  the open file handle on `stdin` with a cleared minimal environment (with EXIF orientation applied).
+  Admission caps source files at 64 MiB and estimated peak decode memory at 256 MiB per image
+  (admitting 48–61 MP baseline photos while capping heavier progressive/16-bit/interlaced images),
+  with embedded MPF preview / EXIF IFD1 thumbnail fallback for over-cap JPEGs. Every worker enforces
+  an exact cross-OS live-heap cap via a capped global allocator, backed by OS limits (`RLIMIT_AS`
+  with virtual-address headroom on Linux, `RLIMIT_DATA` on other non-macOS Unix, suspended-create
+  Job Object limits on Windows), a 10 ms RSS watchdog on every platform (including macOS), and a
+  10 s wall-clock kill timeout. Each worker reserves its exact resident limit (`heap_cap + 12 MiB`)
+  from the shared in-flight budget of `min(512 MiB, effective RAM / 8)` (honoring cgroup v2/v1 and
+  Windows Job Object limits, floored at 256 MiB) across at most 8 concurrent decodes round-robin per
+  principal with anti-starvation aging, plus a 10 s wait timeout returning retryable `busy`. Only
+  memory kills decided by this node's own limits are cached as bad-file entries in `thumb-cache/`
+  (expiring after 7 days); external kills (`SIGKILL`/`SIGTERM`) and crashes return a transient
+  per-path error without poisoning the cache, and timeouts are never cached permanently as bad
+  (repeated CPU-busy timeouts of the same file trigger a 5-minute in-memory back-off). Output is
+  JPEG, or PNG when transparent. Video posters (including sniffed MPEG-TS `.ts` recordings) run
+  `ffmpeg` by resolved absolute path with a cleared minimal environment and `MALLOC_ARENA_MAX=2`
+  (`-threads 1` limits decoder, encoder, and filter threads rather than making `ffmpeg` strictly
+  single-threaded), enforced by the RSS watchdog (256 MiB resident limit for `<= 1080p`, up to
+  768 MiB for `> 1080p` up to 8K one at a time, reserving against the shared in-flight budget and
+  honoring rotation metadata) plus a +1 GiB address-space backstop (`-max_pixels 67108864`,
+  `-max_alloc 134217728`, `-protocol_whitelist file`, MOV/MP4 pinned with `-enable_drefs 0
+  -use_absolute_path 0`, non-MOV `-format_whitelist` excluding MOV and playlists, video-only
+  mapping, 15 s timeout) when `ffmpeg` is on `PATH` and report `unsupported` otherwise. Positive
+  thumbnails and expiring bad-file entries share a lock-free 256 MiB disk-reconciled LRU cache
+  under the node's state directory (`thumb-cache/`), keyed by path, OS file identity, metadata
+  change time, size, mtime, and parameters, inaccessible to non-admin roles through `fs.*`, and
+  every path requires the same permission as `fs.read`.
 
 ### Copying and syncing (`legion cp` and `fs.transfer`)
 
