@@ -64,6 +64,8 @@ qrcode = { version = "0.15.0", default-features = false }
 redb = "5.0.0"
 # Property-based testing for sync version-vector laws.
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
+# Unicode compatibility normalisation (NFKC) for sync path safety and macOS equivalence.
+unicode-normalization = "0.1.26"
 regex = "1.13.2"
 legion-doors = { path = "crates/legion-doors" }
 # The official MCP SDK; it speaks the revisions with and without the initialize handshake.

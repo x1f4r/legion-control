@@ -1,29 +1,61 @@
 //! Real-disk [`SyncFs`] implementation over `std::fs`, `legion-xfer`, and `legion-os`.
 
 use std::fs::{self, File, FileTimes, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use legion_os::atomic::{WriteOptions, replace_file, write_atomic};
+use legion_os::atomic::{
+    WriteOptions, exchange_files, file_change_id, rename_no_replace, replace_with_backup,
+    write_atomic,
+};
 use legion_xfer::hash::hash_reader;
 use legion_xfer::{EntryKind, Hash, Timestamp};
 
-use crate::error::{FsErrorKind, Result, SyncError};
+use crate::error::{Result, SyncError};
+use crate::model::FolderMarker;
 use crate::path::{
-    IgnoreMatcher, SYNC_BIN_DIR, SYNC_META_DIR, SYNC_TMP_DIR, ancestors,
-    validate_flat_internal_name, validate_sync_path,
+    IgnoreMatcher, SYNC_BIN_DIR, SYNC_MARKER_FILE, SYNC_META_DIR, SYNC_TMP_DIR, ancestors,
+    check_fs_compatibility, is_dot_legion_sync_segment, validate_flat_internal_name,
+    validate_sync_path,
 };
 use crate::traits::{FsCapabilities, FsMeta, FsWalkEntry, FsWalkResult, SyncFs, SyncWrite};
 
 static REAL_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Checks that `new_root` is neither equal to, inside, nor containing any path in
+/// `existing_roots`.
+pub fn check_folders_not_nested(new_root: &Path, existing_roots: &[&Path]) -> Result<()> {
+    let new_norm = canonical_or_lexical(new_root);
+    for &existing in existing_roots {
+        let ex_norm = canonical_or_lexical(existing);
+        if new_norm == ex_norm || new_norm.starts_with(&ex_norm) || ex_norm.starts_with(&new_norm) {
+            return Err(SyncError::InvalidConfig {
+                message: format!(
+                    "sync folder {} overlaps with existing sync folder {}",
+                    new_root.display(),
+                    existing.display()
+                ),
+                hint: Some(
+                    "A sync folder cannot be created inside another sync folder or contain one."
+                        .to_string(),
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn canonical_or_lexical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Real filesystem backend rooted at one local sync folder directory.
 ///
-/// Enforces root containment on every live operation: paths are validated, intermediate symlinks
-/// are refused so nothing ever traverses outside the sync root, and `.legion-sync/tmp` and
-/// `.legion-sync/bin` are accessed only through flat internal names.
+/// Opening a [`RealFs`] does *not* silently recreate `.legion-sync/` or its marker file, so an
+/// unmounted external drive or empty mount point is caught by [`crate::SyncEngine`] rather than
+/// looking like a valid empty folder.
 #[derive(Debug, Clone)]
 pub struct RealFs {
     root: PathBuf,
@@ -31,19 +63,12 @@ pub struct RealFs {
 }
 
 impl RealFs {
-    /// Opens `root` as a sync folder, creating `root`, `.legion-sync/tmp`, and `.legion-sync/bin`
-    /// if missing and probing the filesystem's case sensitivity.
+    /// Opens `root` as a sync folder handle without creating `.legion-sync/` or `marker.json`.
+    ///
+    /// Probes the filesystem's case sensitivity (without creating `.legion-sync/`) when `root`
+    /// already exists, or uses OS defaults when `root` does not exist yet.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root)
-            .map_err(|err| SyncError::from_io(Some(root.display().to_string()), err))?;
-        let tmp_dir = root.join(SYNC_TMP_DIR);
-        let bin_dir = root.join(SYNC_BIN_DIR);
-        fs::create_dir_all(&tmp_dir)
-            .map_err(|err| SyncError::from_io(Some(tmp_dir.display().to_string()), err))?;
-        fs::create_dir_all(&bin_dir)
-            .map_err(|err| SyncError::from_io(Some(bin_dir.display().to_string()), err))?;
-
         let caps = detect_capabilities(&root);
         Ok(Self { root, caps })
     }
@@ -51,14 +76,23 @@ impl RealFs {
     /// Opens `root` with explicitly supplied [`FsCapabilities`] (useful for testing Windows or
     /// case-insensitive rules against a temporary Linux directory).
     pub fn open_with_capabilities(root: impl AsRef<Path>, caps: FsCapabilities) -> Result<Self> {
-        let mut fs_handle = Self::open(root)?;
-        fs_handle.caps = caps;
-        Ok(fs_handle)
+        Ok(Self {
+            root: root.as_ref().to_path_buf(),
+            caps,
+        })
     }
 
     /// Returns the root directory path of this sync folder.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn meta_dir(&self) -> PathBuf {
+        self.root.join(SYNC_META_DIR)
+    }
+
+    fn marker_path(&self) -> PathBuf {
+        self.root.join(SYNC_MARKER_FILE)
     }
 
     fn tmp_dir(&self) -> PathBuf {
@@ -69,8 +103,21 @@ impl RealFs {
         self.root.join(SYNC_BIN_DIR)
     }
 
-    fn resolve_live(&self, rel_path: &str) -> Result<PathBuf> {
+    fn guard_platform_path(&self, clean: &str, kind: EntryKind) -> Result<()> {
+        if self.caps.windows_naming
+            && let Err((_, msg)) = check_fs_compatibility(clean, kind, &self.caps)
+        {
+            return Err(SyncError::InvalidPath {
+                path: clean.to_string(),
+                reason: msg,
+            });
+        }
+        Ok(())
+    }
+
+    fn resolve_live(&self, rel_path: &str, kind: EntryKind) -> Result<PathBuf> {
         let clean = validate_sync_path(rel_path)?;
+        self.guard_platform_path(&clean, kind)?;
         let mut out = self.root.clone();
         for seg in clean.split('/') {
             out.push(seg);
@@ -80,12 +127,11 @@ impl RealFs {
 
     /// Verifies that no strict ancestor of `rel_path` is a symbolic link.
     ///
-    /// Returns `Ok(true)` if all existing ancestors are directories (so `rel_path` could exist),
-    /// or `Ok(false)` if an existing ancestor is a regular file (meaning `rel_path` cannot exist).
-    fn check_ancestors_not_symlink(&self, rel_path: &str) -> Result<bool> {
-        let clean = validate_sync_path(rel_path)?;
+    /// Returns `Ok(true)` if all existing ancestors are directories, or `Ok(false)` if an
+    /// existing ancestor is missing or a regular file.
+    fn check_ancestors_not_symlink(&self, clean: &str) -> Result<bool> {
         let mut current = self.root.clone();
-        for anc in ancestors(&clean) {
+        for anc in ancestors(clean) {
             let seg = anc.rsplit_once('/').map_or(anc, |(_, s)| s);
             current.push(seg);
             match fs::symlink_metadata(&current) {
@@ -94,7 +140,7 @@ impl RealFs {
                         let reason =
                             format!("ancestor '{anc}' is a symbolic link and cannot be traversed");
                         return Err(SyncError::InvalidPath {
-                            path: clean,
+                            path: clean.to_string(),
                             reason,
                         });
                     }
@@ -110,10 +156,9 @@ impl RealFs {
     }
 
     /// Verifies that no strict ancestor directory of `rel_path` is a symlink or non-directory.
-    fn ensure_no_symlink_ancestors(&self, rel_path: &str) -> Result<()> {
-        let clean = validate_sync_path(rel_path)?;
+    fn ensure_no_symlink_ancestors(&self, clean: &str) -> Result<()> {
         let mut current = self.root.clone();
-        for anc in ancestors(&clean) {
+        for anc in ancestors(clean) {
             let seg = anc.rsplit_once('/').map_or(anc, |(_, s)| s);
             current.push(seg);
             match fs::symlink_metadata(&current) {
@@ -122,14 +167,14 @@ impl RealFs {
                         let reason =
                             format!("ancestor '{anc}' is a symbolic link and cannot be traversed");
                         return Err(SyncError::InvalidPath {
-                            path: clean,
+                            path: clean.to_string(),
                             reason,
                         });
                     }
                     if !meta.file_type().is_dir() {
                         let reason = format!("ancestor '{anc}' is not a directory");
                         return Err(SyncError::Conflict {
-                            path: clean,
+                            path: clean.to_string(),
                             reason,
                         });
                     }
@@ -141,11 +186,10 @@ impl RealFs {
         Ok(())
     }
 
-    fn ensure_parent_dirs(&self, rel_path: &str) -> Result<PathBuf> {
-        let clean = validate_sync_path(rel_path)?;
-        self.ensure_no_symlink_ancestors(&clean)?;
+    fn ensure_parent_dirs(&self, clean: &str) -> Result<PathBuf> {
+        self.ensure_no_symlink_ancestors(clean)?;
         let mut current = self.root.clone();
-        for anc in ancestors(&clean) {
+        for anc in ancestors(clean) {
             let seg = anc.rsplit_once('/').map_or(anc, |(_, s)| s);
             current.push(seg);
             match fs::symlink_metadata(&current) {
@@ -153,7 +197,7 @@ impl RealFs {
                     if !meta.file_type().is_dir() {
                         let reason = format!("ancestor '{anc}' is not a directory");
                         return Err(SyncError::Conflict {
-                            path: clean,
+                            path: clean.to_string(),
                             reason,
                         });
                     }
@@ -217,6 +261,80 @@ impl SyncFs for RealFs {
         self.caps
     }
 
+    fn read_marker(&self) -> Result<Option<FolderMarker>> {
+        let path = self.marker_path();
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let marker: FolderMarker =
+                    serde_json::from_slice(&bytes).map_err(|err| SyncError::CorruptData {
+                        context: SYNC_MARKER_FILE.to_string(),
+                        detail: err.to_string(),
+                    })?;
+                Ok(Some(marker))
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(SyncError::from_io(Some(SYNC_MARKER_FILE.to_string()), err)),
+        }
+    }
+
+    fn write_marker(&self, marker: &FolderMarker) -> Result<()> {
+        self.ensure_internal_dirs()?;
+        let bytes = serde_json::to_vec_pretty(marker).map_err(|err| SyncError::Storage {
+            context: "serialize folder marker".to_string(),
+            detail: err.to_string(),
+        })?;
+        write_atomic(self.marker_path(), &bytes, WriteOptions::with_mode(0o600))
+            .map_err(|err| SyncError::from_os(Some(SYNC_MARKER_FILE.to_string()), err))?;
+        sync_dir(&self.meta_dir());
+        Ok(())
+    }
+
+    fn ensure_internal_dirs(&self) -> Result<()> {
+        fs::create_dir_all(&self.root)
+            .map_err(|err| SyncError::from_io(Some(self.root.display().to_string()), err))?;
+        fs::create_dir_all(self.tmp_dir())
+            .map_err(|err| SyncError::from_io(Some(SYNC_TMP_DIR.to_string()), err))?;
+        fs::create_dir_all(self.bin_dir())
+            .map_err(|err| SyncError::from_io(Some(SYNC_BIN_DIR.to_string()), err))?;
+        Ok(())
+    }
+
+    fn check_not_nested(&self) -> Result<()> {
+        // 1. Refuse creating/opening inside an ancestor that already has a `.legion-sync` marker.
+        let abs = canonical_or_lexical(&self.root);
+        let mut cursor = abs.parent();
+        while let Some(anc) = cursor {
+            if anc.join(SYNC_META_DIR).is_dir() {
+                return Err(SyncError::InvalidConfig {
+                    message: format!(
+                        "sync folder {} cannot be inside existing sync folder {}",
+                        self.root.display(),
+                        anc.display()
+                    ),
+                    hint: Some("Choose a directory outside any existing sync folder.".to_string()),
+                });
+            }
+            cursor = anc.parent();
+        }
+
+        // 2. Refuse opening a directory that already contains a nested `.legion-sync` folder.
+        if self.root.is_dir()
+            && let Some(nested) = find_nested_sync_dir(&self.root, true)
+        {
+            return Err(SyncError::InvalidConfig {
+                message: format!(
+                    "sync folder {} cannot contain nested sync folder {}",
+                    self.root.display(),
+                    nested.display()
+                ),
+                hint: Some(
+                    "Remove the nested sync folder or choose a separate directory.".to_string(),
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn walk(&self, ignore: &IgnoreMatcher) -> Result<FsWalkResult> {
         let mut entries = Vec::new();
         let mut skipped = Vec::new();
@@ -226,19 +344,71 @@ impl SyncFs for RealFs {
         Ok(FsWalkResult { entries, skipped })
     }
 
+    fn walk_subtree(&self, rel_root: &str, ignore: &IgnoreMatcher) -> Result<FsWalkResult> {
+        let clean = validate_sync_path(rel_root)?;
+        let mut entries = Vec::new();
+        let mut skipped = Vec::new();
+        if !self.check_ancestors_not_symlink(&clean)? {
+            return Ok(FsWalkResult { entries, skipped });
+        }
+        let full = self.resolve_live(&clean, EntryKind::Dir)?;
+        let meta = match fs::symlink_metadata(&full) {
+            Ok(m) => m,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(FsWalkResult { entries, skipped });
+            }
+            Err(err) => {
+                skipped.push((clean, err.to_string()));
+                return Ok(FsWalkResult { entries, skipped });
+            }
+        };
+
+        let ft = meta.file_type();
+        let is_dir = ft.is_dir();
+        if ignore.is_path_or_ancestor_ignored(&clean, is_dir) {
+            return Ok(FsWalkResult { entries, skipped });
+        }
+
+        if is_dir {
+            entries.push(FsWalkEntry {
+                path: clean.clone(),
+                meta: FsMeta {
+                    kind: EntryKind::Dir,
+                    size: 0,
+                    mtime: metadata_mtime(&meta),
+                    mode: entry_mode(&meta),
+                    link_target: None,
+                    change_id: file_change_id(&full, &meta),
+                },
+            });
+            walk_dir(&full, &clean, ignore, &mut entries, &mut skipped)?;
+        } else if let Some(fs_meta) = stat_path(&full, &clean)? {
+            entries.push(FsWalkEntry {
+                path: clean,
+                meta: fs_meta,
+            });
+        }
+
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        skipped.sort();
+        Ok(FsWalkResult { entries, skipped })
+    }
+
     fn stat_live(&self, rel_path: &str) -> Result<Option<FsMeta>> {
         let clean = validate_sync_path(rel_path)?;
+        self.guard_platform_path(&clean, EntryKind::File)?;
         if !self.check_ancestors_not_symlink(&clean)? {
             return Ok(None);
         }
-        let full = self.resolve_live(&clean)?;
+        let full = self.resolve_live(&clean, EntryKind::File)?;
         stat_path(&full, &clean)
     }
 
     fn hash_live(&self, rel_path: &str) -> Result<(Hash, u64)> {
         let clean = validate_sync_path(rel_path)?;
+        self.guard_platform_path(&clean, EntryKind::File)?;
         self.ensure_no_symlink_ancestors(&clean)?;
-        let full = self.resolve_live(&clean)?;
+        let full = self.resolve_live(&clean, EntryKind::File)?;
         let meta =
             fs::symlink_metadata(&full).map_err(|e| SyncError::from_io(Some(clean.clone()), e))?;
         if !meta.file_type().is_file() {
@@ -251,10 +421,11 @@ impl SyncFs for RealFs {
         hash_reader(&mut file).map_err(SyncError::from)
     }
 
-    fn open_live_read(&self, rel_path: &str) -> Result<Box<dyn Read + Send>> {
+    fn open_live_read_at(&self, rel_path: &str, offset: u64) -> Result<Box<dyn Read + Send>> {
         let clean = validate_sync_path(rel_path)?;
+        self.guard_platform_path(&clean, EntryKind::File)?;
         self.ensure_no_symlink_ancestors(&clean)?;
-        let full = self.resolve_live(&clean)?;
+        let full = self.resolve_live(&clean, EntryKind::File)?;
         let meta =
             fs::symlink_metadata(&full).map_err(|e| SyncError::from_io(Some(clean.clone()), e))?;
         if !meta.file_type().is_file() {
@@ -263,14 +434,19 @@ impl SyncFs for RealFs {
                 reason: "expected a regular file to stream to peer".to_string(),
             });
         }
-        let file = File::open(&full).map_err(|e| SyncError::from_io(Some(clean), e))?;
+        let mut file = File::open(&full).map_err(|e| SyncError::from_io(Some(clean.clone()), e))?;
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| SyncError::from_io(Some(clean), e))?;
+        }
         Ok(Box::new(file))
     }
 
     fn create_dir_all_live(&self, rel_path: &str) -> Result<()> {
         let clean = validate_sync_path(rel_path)?;
+        self.guard_platform_path(&clean, EntryKind::Dir)?;
         let parent = self.ensure_parent_dirs(&clean)?;
-        let full = self.resolve_live(&clean)?;
+        let full = self.resolve_live(&clean, EntryKind::Dir)?;
         match fs::symlink_metadata(&full) {
             Ok(meta) if meta.file_type().is_dir() => Ok(()),
             Ok(_) => Err(SyncError::Conflict {
@@ -288,12 +464,17 @@ impl SyncFs for RealFs {
 
     fn list_dir_live(&self, rel_path: &str) -> Result<Vec<String>> {
         let clean = validate_sync_path(rel_path)?;
+        self.guard_platform_path(&clean, EntryKind::Dir)?;
         self.ensure_no_symlink_ancestors(&clean)?;
-        let full = self.resolve_live(&clean)?;
+        let full = self.resolve_live(&clean, EntryKind::Dir)?;
         let mut names = Vec::new();
         for item in fs::read_dir(&full).map_err(|e| SyncError::from_io(Some(clean.clone()), e))? {
             let entry = item.map_err(|e| SyncError::from_io(Some(clean.clone()), e))?;
-            names.push(entry.file_name().to_string_lossy().into_owned());
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_dot_legion_sync_segment(&name) {
+                continue;
+            }
+            names.push(name);
         }
         names.sort();
         Ok(names)
@@ -301,8 +482,9 @@ impl SyncFs for RealFs {
 
     fn remove_empty_dir_live(&self, rel_path: &str) -> Result<()> {
         let clean = validate_sync_path(rel_path)?;
+        self.guard_platform_path(&clean, EntryKind::Dir)?;
         self.ensure_no_symlink_ancestors(&clean)?;
-        let full = self.resolve_live(&clean)?;
+        let full = self.resolve_live(&clean, EntryKind::Dir)?;
         fs::remove_dir(&full).map_err(|e| SyncError::from_io(Some(clean), e))?;
         if let Some(parent) = full.parent() {
             sync_dir(parent);
@@ -312,17 +494,19 @@ impl SyncFs for RealFs {
 
     fn create_symlink_live(&self, rel_path: &str, target: &str) -> Result<()> {
         let clean = validate_sync_path(rel_path)?;
+        self.guard_platform_path(&clean, EntryKind::Symlink)?;
         let parent = self.ensure_parent_dirs(&clean)?;
-        let full = self.resolve_live(&clean)?;
-        create_symlink_atomic(Path::new(target), &full, &clean)?;
+        let full = self.resolve_live(&clean, EntryKind::Symlink)?;
+        create_symlink_no_replace(Path::new(target), &full, &clean)?;
         sync_dir(&parent);
         Ok(())
     }
 
     fn remove_symlink_live(&self, rel_path: &str) -> Result<()> {
         let clean = validate_sync_path(rel_path)?;
+        self.guard_platform_path(&clean, EntryKind::Symlink)?;
         self.ensure_no_symlink_ancestors(&clean)?;
-        let full = self.resolve_live(&clean)?;
+        let full = self.resolve_live(&clean, EntryKind::Symlink)?;
         let meta =
             fs::symlink_metadata(&full).map_err(|e| SyncError::from_io(Some(clean.clone()), e))?;
         if !meta.file_type().is_symlink() {
@@ -340,8 +524,9 @@ impl SyncFs for RealFs {
 
     fn set_live_metadata(&self, rel_path: &str, mtime: Timestamp, mode: Option<u32>) -> Result<()> {
         let clean = validate_sync_path(rel_path)?;
+        self.guard_platform_path(&clean, EntryKind::File)?;
         self.ensure_no_symlink_ancestors(&clean)?;
-        let full = self.resolve_live(&clean)?;
+        let full = self.resolve_live(&clean, EntryKind::File)?;
         let meta =
             fs::symlink_metadata(&full).map_err(|e| SyncError::from_io(Some(clean.clone()), e))?;
         if meta.file_type().is_symlink() {
@@ -364,18 +549,17 @@ impl SyncFs for RealFs {
         Ok(())
     }
 
-    fn rename_live_to_live(&self, from_rel: &str, to_rel: &str) -> Result<()> {
+    fn rename_live_to_live_no_replace(&self, from_rel: &str, to_rel: &str) -> Result<()> {
         let clean_from = validate_sync_path(from_rel)?;
         let clean_to = validate_sync_path(to_rel)?;
+        self.guard_platform_path(&clean_from, EntryKind::File)?;
+        self.guard_platform_path(&clean_to, EntryKind::File)?;
         self.ensure_no_symlink_ancestors(&clean_from)?;
         let parent_to = self.ensure_parent_dirs(&clean_to)?;
-        let full_from = self.resolve_live(&clean_from)?;
-        let full_to = self.resolve_live(&clean_to)?;
-        replace_file(&full_from, &full_to).map_err(|err| SyncError::Fs {
-            path: Some(clean_to),
-            detail: err.to_string(),
-            kind: FsErrorKind::Other,
-        })?;
+        let full_from = self.resolve_live(&clean_from, EntryKind::File)?;
+        let full_to = self.resolve_live(&clean_to, EntryKind::File)?;
+        rename_no_replace(&full_from, &full_to)
+            .map_err(|err| SyncError::from_os(Some(clean_to), err))?;
         sync_dir(&parent_to);
         if let Some(parent_from) = full_from.parent() {
             sync_dir(parent_from);
@@ -383,9 +567,32 @@ impl SyncFs for RealFs {
         Ok(())
     }
 
+    fn sync_parent_dir_live(&self, live_rel: &str) {
+        if let Ok(clean) = validate_sync_path(live_rel)
+            && let Ok(full) = self.resolve_live(&clean, EntryKind::File)
+            && let Some(parent) = full.parent()
+        {
+            sync_dir(parent);
+        }
+    }
+
+    fn sync_tmp_dir(&self) {
+        sync_dir(&self.tmp_dir());
+    }
+
     fn create_tmp(&self, tmp_name: &str) -> Result<Box<dyn SyncWrite>> {
         let full = self.resolve_tmp(tmp_name)?;
         let file = create_private_file(&full)
+            .map_err(|e| SyncError::from_io(Some(format!("{SYNC_TMP_DIR}/{tmp_name}")), e))?;
+        Ok(Box::new(RealSyncWriter { path: full, file }))
+    }
+
+    fn open_tmp_append(&self, tmp_name: &str) -> Result<Box<dyn SyncWrite>> {
+        let full = self.resolve_tmp(tmp_name)?;
+        let file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&full)
             .map_err(|e| SyncError::from_io(Some(format!("{SYNC_TMP_DIR}/{tmp_name}")), e))?;
         Ok(Box::new(RealSyncWriter { path: full, file }))
     }
@@ -418,33 +625,111 @@ impl SyncFs for RealFs {
         list_flat_dir(&self.tmp_dir(), SYNC_TMP_DIR)
     }
 
-    fn commit_tmp_to_live(&self, tmp_name: &str, live_rel: &str) -> Result<()> {
+    fn commit_tmp_to_live_no_replace(&self, tmp_name: &str, live_rel: &str) -> Result<()> {
         let clean = validate_sync_path(live_rel)?;
+        self.guard_platform_path(&clean, EntryKind::File)?;
         let parent = self.ensure_parent_dirs(&clean)?;
         let src = self.resolve_tmp(tmp_name)?;
-        let dst = self.resolve_live(&clean)?;
-        // Default readable permissions before publishing on Unix; caller may refine with set_live_metadata.
+        let dst = self.resolve_live(&clean, EntryKind::File)?;
         set_unix_mode(&src, 0o644, &clean)?;
-        replace_file(&src, &dst).map_err(|err| SyncError::Fs {
-            path: Some(clean),
-            detail: err.to_string(),
-            kind: FsErrorKind::Other,
-        })?;
+        rename_no_replace(&src, &dst).map_err(|err| SyncError::from_os(Some(clean), err))?;
         sync_dir(&parent);
         sync_dir(&self.tmp_dir());
         Ok(())
     }
 
-    fn move_live_to_bin(&self, live_rel: &str, bin_data_name: &str) -> Result<()> {
+    fn commit_tmp_to_live_no_replace_deferred_dir_sync(
+        &self,
+        tmp_name: &str,
+        live_rel: &str,
+    ) -> Result<()> {
         let clean = validate_sync_path(live_rel)?;
+        self.guard_platform_path(&clean, EntryKind::File)?;
+        let _parent = self.ensure_parent_dirs(&clean)?;
+        let src = self.resolve_tmp(tmp_name)?;
+        let dst = self.resolve_live(&clean, EntryKind::File)?;
+        set_unix_mode(&src, 0o644, &clean)?;
+        rename_no_replace(&src, &dst).map_err(|err| SyncError::from_os(Some(clean), err))?;
+        Ok(())
+    }
+
+    fn exchange_tmp_with_live(&self, tmp_name: &str, live_rel: &str) -> Result<bool> {
+        let clean = validate_sync_path(live_rel)?;
+        self.guard_platform_path(&clean, EntryKind::File)?;
         self.ensure_no_symlink_ancestors(&clean)?;
-        let src = self.resolve_live(&clean)?;
+        let src = self.resolve_tmp(tmp_name)?;
+        let dst = self.resolve_live(&clean, EntryKind::File)?;
+        set_unix_mode(&src, 0o644, &clean)?;
+        match exchange_files(&src, &dst) {
+            Ok(()) => {
+                if let Some(parent) = dst.parent() {
+                    sync_dir(parent);
+                }
+                sync_dir(&self.tmp_dir());
+                Ok(true)
+            }
+            Err(legion_os::OsError::Unsupported { .. }) => Ok(false),
+            Err(err) => Err(SyncError::from_os(Some(clean), err)),
+        }
+    }
+
+    fn replace_live_with_tmp_backup(
+        &self,
+        tmp_name: &str,
+        live_rel: &str,
+        backup_tmp: &str,
+    ) -> Result<bool> {
+        let clean = validate_sync_path(live_rel)?;
+        self.guard_platform_path(&clean, EntryKind::File)?;
+        self.ensure_no_symlink_ancestors(&clean)?;
+        let staged = self.resolve_tmp(tmp_name)?;
+        let target = self.resolve_live(&clean, EntryKind::File)?;
+        let backup = self.resolve_tmp(backup_tmp)?;
+        match replace_with_backup(&staged, &target, &backup) {
+            Ok(()) => {
+                if let Some(parent) = target.parent() {
+                    sync_dir(parent);
+                }
+                sync_dir(&self.tmp_dir());
+                Ok(true)
+            }
+            Err(legion_os::OsError::Unsupported { .. }) => Ok(false),
+            Err(err) => Err(SyncError::from_os(Some(clean), err)),
+        }
+    }
+
+    fn move_live_to_tmp_no_replace(&self, live_rel: &str, tmp_name: &str) -> Result<()> {
+        let clean = validate_sync_path(live_rel)?;
+        self.guard_platform_path(&clean, EntryKind::File)?;
+        self.ensure_no_symlink_ancestors(&clean)?;
+        let src = self.resolve_live(&clean, EntryKind::File)?;
+        let dst = self.resolve_tmp(tmp_name)?;
+        rename_no_replace(&src, &dst).map_err(|err| SyncError::from_os(Some(clean), err))?;
+        sync_dir(&self.tmp_dir());
+        if let Some(parent) = src.parent() {
+            sync_dir(parent);
+        }
+        Ok(())
+    }
+
+    fn move_tmp_to_bin_no_replace(&self, tmp_name: &str, bin_data_name: &str) -> Result<()> {
+        let src = self.resolve_tmp(tmp_name)?;
         let dst = self.resolve_bin(bin_data_name)?;
-        replace_file(&src, &dst).map_err(|err| SyncError::Fs {
-            path: Some(clean),
-            detail: err.to_string(),
-            kind: FsErrorKind::Other,
+        rename_no_replace(&src, &dst).map_err(|err| {
+            SyncError::from_os(Some(format!("{SYNC_BIN_DIR}/{bin_data_name}")), err)
         })?;
+        sync_dir(&self.bin_dir());
+        sync_dir(&self.tmp_dir());
+        Ok(())
+    }
+
+    fn move_live_to_bin_no_replace(&self, live_rel: &str, bin_data_name: &str) -> Result<()> {
+        let clean = validate_sync_path(live_rel)?;
+        self.guard_platform_path(&clean, EntryKind::File)?;
+        self.ensure_no_symlink_ancestors(&clean)?;
+        let src = self.resolve_live(&clean, EntryKind::File)?;
+        let dst = self.resolve_bin(bin_data_name)?;
+        rename_no_replace(&src, &dst).map_err(|err| SyncError::from_os(Some(clean), err))?;
         sync_dir(&self.bin_dir());
         if let Some(parent) = src.parent() {
             sync_dir(parent);
@@ -454,11 +739,8 @@ impl SyncFs for RealFs {
 
     fn write_bin_meta(&self, meta_name: &str, bytes: &[u8]) -> Result<()> {
         let dst = self.resolve_bin(meta_name)?;
-        write_atomic(&dst, bytes, WriteOptions::with_mode(0o600)).map_err(|err| SyncError::Fs {
-            path: Some(format!("{SYNC_BIN_DIR}/{meta_name}")),
-            detail: err.to_string(),
-            kind: FsErrorKind::Other,
-        })?;
+        write_atomic(&dst, bytes, WriteOptions::with_mode(0o600))
+            .map_err(|err| SyncError::from_os(Some(format!("{SYNC_BIN_DIR}/{meta_name}")), err))?;
         Ok(())
     }
 
@@ -522,6 +804,31 @@ impl SyncFs for RealFs {
     }
 }
 
+fn find_nested_sync_dir(dir: &Path, is_root: bool) -> Option<PathBuf> {
+    let rd = fs::read_dir(dir).ok()?;
+    for item in rd.flatten() {
+        let name = item.file_name();
+        let name_str = name.to_string_lossy();
+        let Ok(ft) = item.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() || !ft.is_dir() {
+            continue;
+        }
+        if is_dot_legion_sync_segment(&name_str) {
+            if is_root {
+                // Root's own `.legion-sync` is expected; do not descend into it.
+                continue;
+            }
+            return Some(dir.to_path_buf());
+        }
+        if let Some(found) = find_nested_sync_dir(&item.path(), false) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn walk_dir(
     dir: &Path,
     prefix: &str,
@@ -555,7 +862,7 @@ fn walk_dir(
             skipped.push((rel, "non-UTF-8 file name".to_string()));
             continue;
         };
-        if prefix.is_empty() && name.eq_ignore_ascii_case(SYNC_META_DIR) {
+        if is_dot_legion_sync_segment(name) {
             continue;
         }
         let rel = join_rel(prefix, name);
@@ -582,7 +889,7 @@ fn walk_dir(
                     mtime: metadata_mtime(&meta),
                     mode: entry_mode(&meta),
                     link_target: None,
-                    change_id: disk_change_id(&meta),
+                    change_id: file_change_id(&full_path, &meta),
                 },
             });
             walk_dir(&full_path, &rel, ignore, entries, skipped)?;
@@ -597,7 +904,7 @@ fn walk_dir(
                             mtime: metadata_mtime(&meta),
                             mode: entry_mode(&meta),
                             link_target: Some(t.to_string()),
-                            change_id: disk_change_id(&meta),
+                            change_id: file_change_id(&full_path, &meta),
                         },
                     }),
                     None => skipped.push((rel, "non-UTF-8 symbolic link target".to_string())),
@@ -613,7 +920,7 @@ fn walk_dir(
                     mtime: metadata_mtime(&meta),
                     mode: entry_mode(&meta),
                     link_target: None,
-                    change_id: disk_change_id(&meta),
+                    change_id: file_change_id(&full_path, &meta),
                 },
             });
         } else {
@@ -638,7 +945,7 @@ fn stat_path(full: &Path, label: &str) -> Result<Option<FsMeta>> {
             mtime: metadata_mtime(&meta),
             mode: entry_mode(&meta),
             link_target: None,
-            change_id: disk_change_id(&meta),
+            change_id: file_change_id(full, &meta),
         }))
     } else if ft.is_symlink() {
         let target = fs::read_link(full).map_err(|e| SyncError::from_io(Some(label.into()), e))?;
@@ -654,7 +961,7 @@ fn stat_path(full: &Path, label: &str) -> Result<Option<FsMeta>> {
             mtime: metadata_mtime(&meta),
             mode: entry_mode(&meta),
             link_target: Some(target_str.to_string()),
-            change_id: disk_change_id(&meta),
+            change_id: file_change_id(full, &meta),
         }))
     } else if ft.is_file() {
         Ok(Some(FsMeta {
@@ -663,7 +970,7 @@ fn stat_path(full: &Path, label: &str) -> Result<Option<FsMeta>> {
             mtime: metadata_mtime(&meta),
             mode: entry_mode(&meta),
             link_target: None,
-            change_id: disk_change_id(&meta),
+            change_id: file_change_id(full, &meta),
         }))
     } else {
         Err(SyncError::Unsupported {
@@ -721,12 +1028,22 @@ fn timestamp_to_system_time(ts: Timestamp) -> Option<SystemTime> {
 }
 
 fn detect_capabilities(root: &Path) -> FsCapabilities {
-    let case_insensitive = probe_case_insensitive(&root.join(SYNC_TMP_DIR));
+    // Probe in `root` (or nearest existing ancestor) without creating `.legion-sync/`.
+    let probe_dir = if root.is_dir() {
+        Some(root)
+    } else {
+        root.parent().filter(|p| p.is_dir())
+    };
+    let case_insensitive = match probe_dir {
+        Some(dir) => probe_case_insensitive(dir),
+        None => cfg!(any(windows, target_os = "macos")),
+    };
     #[cfg(windows)]
     {
         let root_len = root.to_string_lossy().len();
         FsCapabilities {
             case_insensitive,
+            unicode_normalizing: false,
             windows_naming: true,
             supports_symlinks: false,
             max_segment_len: 255,
@@ -742,6 +1059,7 @@ fn detect_capabilities(root: &Path) -> FsCapabilities {
         };
         FsCapabilities {
             case_insensitive,
+            unicode_normalizing: cfg!(target_os = "macos"),
             windows_naming: false,
             supports_symlinks: true,
             max_segment_len: 255,
@@ -750,11 +1068,11 @@ fn detect_capabilities(root: &Path) -> FsCapabilities {
     }
 }
 
-fn probe_case_insensitive(tmp_dir: &Path) -> bool {
+fn probe_case_insensitive(dir: &Path) -> bool {
     let pid = std::process::id();
     let seq = REAL_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let upper = tmp_dir.join(format!(".legion-CaseProbe-{pid}-{seq}.tmp"));
-    let lower = tmp_dir.join(format!(".legion-caseprobe-{pid}-{seq}.tmp"));
+    let upper = dir.join(format!(".legion-CaseProbe-{pid}-{seq}.tmp"));
+    let lower = dir.join(format!(".legion-caseprobe-{pid}-{seq}.tmp"));
     let _ = fs::remove_file(&upper);
     let _ = fs::remove_file(&lower);
     let created = OpenOptions::new()
@@ -778,27 +1096,6 @@ fn entry_mode(meta: &fs::Metadata) -> Option<u32> {
 
 #[cfg(not(unix))]
 fn entry_mode(_meta: &fs::Metadata) -> Option<u32> {
-    None
-}
-
-#[cfg(unix)]
-fn disk_change_id(meta: &fs::Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for v in [
-        meta.dev(),
-        meta.ino(),
-        meta.ctime() as u64,
-        meta.ctime_nsec() as u64,
-    ] {
-        h ^= v;
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    Some(h)
-}
-
-#[cfg(not(unix))]
-fn disk_change_id(_meta: &fs::Metadata) -> Option<u64> {
     None
 }
 
@@ -845,32 +1142,14 @@ fn sync_dir(dir: &Path) {
 fn sync_dir(_dir: &Path) {}
 
 #[cfg(unix)]
-fn create_symlink_atomic(target: &Path, dest: &Path, label: &str) -> Result<()> {
-    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
-    let pid = std::process::id();
-    loop {
-        let seq = REAL_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = parent.join(format!(".legion-link-{pid}-{seq}.tmp"));
-        match std::os::unix::fs::symlink(target, &tmp) {
-            Ok(()) => {
-                if let Err(err) = replace_file(&tmp, dest) {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(SyncError::Fs {
-                        path: Some(label.to_string()),
-                        detail: err.to_string(),
-                        kind: FsErrorKind::Other,
-                    });
-                }
-                return Ok(());
-            }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(SyncError::from_io(Some(label.to_string()), err)),
-        }
-    }
+fn create_symlink_no_replace(target: &Path, dest: &Path, label: &str) -> Result<()> {
+    // `std::os::unix::fs::symlink` fails atomically with `EEXIST` if `dest` already exists.
+    std::os::unix::fs::symlink(target, dest)
+        .map_err(|err| SyncError::from_io(Some(label.to_string()), err))
 }
 
 #[cfg(not(unix))]
-fn create_symlink_atomic(_target: &Path, _dest: &Path, label: &str) -> Result<()> {
+fn create_symlink_no_replace(_target: &Path, _dest: &Path, label: &str) -> Result<()> {
     Err(SyncError::Unsupported {
         reason: format!("'{label}' is a symbolic link, which is held back on Windows"),
         hint: Some(

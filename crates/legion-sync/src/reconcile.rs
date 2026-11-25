@@ -1,17 +1,20 @@
-//! Pure pull-only reconciliation logic.
+//! Pure pull-only reconciliation logic and untrusted-peer record validation.
 //!
-//! Given a local index lookup and a remote peer's [`IndexRecord`], [`reconcile_record`] produces a
-//! deterministic [`ReconcileDecision`] without performing any disk or network I/O.
+//! Given a local index lookup, folder metadata, and a remote peer's [`IndexRecord`],
+//! [`reconcile_record`] validates every untrusted field and produces a deterministic
+//! [`ReconcileDecision`] without performing any disk or network I/O.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 
-use legion_xfer::EntryKind;
+use legion_xfer::{EntryKind, Hash};
 
-use crate::model::{IndexRecord, MemberId, ProblemKind, SyncProblem};
+use crate::model::{
+    BinReason, FolderMeta, IndexRecord, MAX_ANCESTRY_HASHES, MAX_LINK_TARGET_BYTES,
+    MAX_VV_INCARNATIONS_PER_MEMBER, ProblemKind, SyncProblem, validate_member_id,
+};
 use crate::path::{
     IgnoreMatcher, ancestors, check_fs_compatibility, conflict_copy_path, fold_case,
-    validate_sync_path,
+    fs_equivalence_key, parse_conflict_copy_path, validate_sync_path,
 };
 use crate::traits::FsCapabilities;
 use crate::version::{VersionOrder, VersionVector};
@@ -26,22 +29,33 @@ pub trait LocalIndexView {
 
     /// Returns all live exact paths in the local index matching `folded_path`.
     fn live_paths_for_folded(&self, folded_path: &str) -> Vec<String>;
+
+    /// Returns historically deleted content hashes recorded for `path`.
+    fn get_deleted_history(&self, path: &str) -> Vec<Hash>;
 }
 
 /// Action decided by [`reconcile_record`] for one incoming peer record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconcileDecision {
-    /// Incoming path violated universal safety rules (escape, traversal, `.legion-sync`).
-    RejectUnsafe {
-        /// Raw unsafe path sent by the peer.
+    /// Incoming record violated safety, size, member, or structural invariants and must be
+    /// skipped and reported without stalling the peer.
+    RejectInvalid {
+        /// Raw path sent by the peer (truncated if huge).
         path: String,
-        /// Explanation of why the path was refused.
+        /// Explanation of why the record was refused.
         reason: String,
     },
     /// Path is excluded by fixed or per-folder ignore rules.
     Ignore,
     /// Local index is already equal or strictly newer; nothing to change.
     Keep,
+    /// Local state wins over a stale incoming join/re-add record; bump the local clock above
+    /// `record.version` so the peer pulls the current live version or tombstone and moves its
+    /// stale file to its local bin.
+    KeepAndSupersede {
+        /// Record to commit after bumping the local clock and assigning a fresh `seq`.
+        record: IndexRecord,
+    },
     /// Index metadata should be updated without transferring or replacing file bytes (quiet merge
     /// of identical content, absorbing a remote deletion for an absent path, or keeping a local
     /// live file in a delete-vs-change race with merged version vector).
@@ -55,11 +69,15 @@ pub enum ReconcileDecision {
     Fetch {
         /// Target live record to place and commit (caller assigns a fresh local `seq`).
         record: IndexRecord,
+        /// Bin reason for any replaced local file (`ReplacedByPeer` or `StaleOnJoin`).
+        bin_reason: BinReason,
     },
     /// Remote deletion wins and the local live entry should be moved to `.legion-sync/bin`.
     DeleteToBin {
         /// Target tombstone record to commit (caller assigns a fresh local `seq`).
         tombstone: IndexRecord,
+        /// Bin reason for the deleted local file (`DeletedByPeer` or `StaleOnJoin`).
+        bin_reason: BinReason,
     },
     /// Remote attempted to delete a directory that still has live local descendants; keep the
     /// directory alive with a strictly dominating version vector.
@@ -74,7 +92,8 @@ pub enum ReconcileDecision {
     ConflictLocalLoses {
         /// Remote winning entry taking the original path.
         winner_record: IndexRecord,
-        /// Local losing entry moving to the conflict copy path.
+        /// Local losing entry moving to the conflict copy path (assigned a fresh independent
+        /// version vector when applied).
         loser_record: IndexRecord,
     },
     /// Concurrent edit with different content where the local entry keeps `winner_record.path`
@@ -82,11 +101,11 @@ pub enum ReconcileDecision {
     ConflictRemoteLoses {
         /// Local winning entry updated with the merged version vector.
         winner_record: IndexRecord,
-        /// Remote losing entry placed at the conflict copy path.
+        /// Remote losing entry placed at the conflict copy path (assigned a fresh independent
+        /// version vector when applied).
         loser_record: IndexRecord,
-        /// `true` when the winner is a local directory that had to beat a strictly newer remote
-        /// file/symlink because live descendants exist under the directory, requiring a fresh
-        /// local clock bump on `winner_record.version`.
+        /// `true` when the winner requires a fresh local clock bump on `winner_record.version`
+        /// (for example a live directory with children or a live conflict copy refusing replacement).
         bump_winner_clock: bool,
     },
     /// Entry cannot be represented on the local filesystem (case clash, Windows naming rules,
@@ -95,6 +114,145 @@ pub enum ReconcileDecision {
         /// Human-readable problem explaining why the record is held back.
         problem: SyncProblem,
     },
+}
+
+/// Validates every untrusted field of an incoming peer [`IndexRecord`] against `meta`.
+///
+/// Returns the canonical validated relative path on success, or a plain-language rejection reason.
+pub fn validate_incoming_record(
+    remote: &IndexRecord,
+    meta: &FolderMeta,
+) -> std::result::Result<String, String> {
+    let clean_path = validate_sync_path(&remote.path).map_err(|err| err.to_string())?;
+
+    if validate_member_id(&remote.modified_by).is_err()
+        || !meta.is_known_member(&remote.modified_by)
+    {
+        return Err(format!(
+            "record modifier {:?} is not a known member of folder {:?}",
+            remote.modified_by, meta.folder_id
+        ));
+    }
+
+    if remote.mtime.nanos >= 1_000_000_000 {
+        return Err(format!(
+            "record has invalid nanosecond timestamp {}",
+            remote.mtime.nanos
+        ));
+    }
+
+    if remote.recent_hashes.len() > MAX_ANCESTRY_HASHES {
+        return Err(format!(
+            "record ancestry list has {} entries, exceeding limit of {MAX_ANCESTRY_HASHES}",
+            remote.recent_hashes.len()
+        ));
+    }
+
+    let mut prev_member: Option<&str> = None;
+    let mut member_inc_count: usize = 0;
+    for (key, _counter) in remote.version.iter() {
+        if key.incarnation == 0 {
+            return Err(format!(
+                "version vector entry for {:?} has zero incarnation",
+                key.member
+            ));
+        }
+        if validate_member_id(&key.member).is_err() || !meta.is_known_member(&key.member) {
+            return Err(format!(
+                "version vector references unknown member {:?}",
+                key.member
+            ));
+        }
+        if prev_member == Some(key.member.as_str()) {
+            member_inc_count += 1;
+        } else {
+            prev_member = Some(key.member.as_str());
+            member_inc_count = 1;
+        }
+        if member_inc_count > MAX_VV_INCARNATIONS_PER_MEMBER {
+            return Err(format!(
+                "version vector has more than {MAX_VV_INCARNATIONS_PER_MEMBER} incarnations for member {:?}",
+                key.member
+            ));
+        }
+    }
+
+    if remote.deleted {
+        if remote.size != 0 || remote.hash.is_some() || remote.link_target.is_some() {
+            return Err(
+                "deletion tombstone must have zero size and no file hash or symlink target"
+                    .to_string(),
+            );
+        }
+    } else {
+        match remote.kind {
+            EntryKind::File => {
+                if remote.hash.is_none() {
+                    return Err("live file record is missing its BLAKE3 hash".to_string());
+                }
+                if remote.link_target.is_some() {
+                    return Err("live file record must not carry a symlink target".to_string());
+                }
+            }
+            EntryKind::Dir => {
+                if remote.size != 0 || remote.hash.is_some() || remote.link_target.is_some() {
+                    return Err(
+                        "directory record must have zero size and no file hash or symlink target"
+                            .to_string(),
+                    );
+                }
+            }
+            EntryKind::Symlink => {
+                if remote.size != 0 || remote.hash.is_some() {
+                    return Err("symlink record must have zero size and no file hash".to_string());
+                }
+                let Some(ref target) = remote.link_target else {
+                    return Err("live symlink record is missing link_target".to_string());
+                };
+                if target.is_empty() || target.len() > MAX_LINK_TARGET_BYTES {
+                    return Err(format!(
+                        "symlink target length {} is out of bounds (1..={MAX_LINK_TARGET_BYTES})",
+                        target.len()
+                    ));
+                }
+                if target.as_bytes().contains(&0) {
+                    return Err("symlink target contains a NUL byte".to_string());
+                }
+            }
+        }
+    }
+
+    Ok(clean_path)
+}
+
+/// Computes the 6-lowercase-hex-character short content hash tag for `rec`.
+pub fn record_short_hash6(rec: &IndexRecord) -> String {
+    if let Some(hash) = rec.hash {
+        let hex = hash.to_hex();
+        return hex[..6.min(hex.len())].to_string();
+    }
+    if let Some(ref target) = rec.link_target {
+        let hex = legion_xfer::hash::hash_bytes(target.as_bytes()).to_hex();
+        return hex[..6.min(hex.len())].to_string();
+    }
+    let hex = legion_xfer::hash::hash_bytes(b"dir").to_hex();
+    hex[..6.min(hex.len())].to_string()
+}
+
+/// Derives `conflict_of` locally from the record's filename, content hash, and this folder's known
+/// member list. Never trusts any peer-asserted `conflict_of` value.
+pub fn derive_conflict_of(rec: &IndexRecord, meta: &FolderMeta) -> Option<String> {
+    if rec.deleted || rec.conflict_dismissed || rec.kind == EntryKind::Dir {
+        return None;
+    }
+    let parsed = parse_conflict_copy_path(&rec.path)?;
+    if !meta.is_known_member(&parsed.member) {
+        return None;
+    }
+    if record_short_hash6(rec) != parsed.hash6 {
+        return None;
+    }
+    Some(parsed.original_path)
 }
 
 /// Deterministic total ordering between two live [`IndexRecord`] values used to decide which
@@ -106,42 +264,10 @@ pub enum ReconcileDecision {
 pub fn compare_live_winner(a: &IndexRecord, b: &IndexRecord) -> Ordering {
     a.mtime
         .cmp(&b.mtime)
-        // Alphabetically smaller member name wins mtime ties.
         .then_with(|| b.modified_by.cmp(&a.modified_by))
         .then_with(|| a.kind.cmp(&b.kind))
         .then_with(|| a.hash.cmp(&b.hash))
         .then_with(|| a.link_target.cmp(&b.link_target))
-}
-
-/// Merges two tombstone dependency maps via componentwise maximum.
-pub fn merge_tombstone_deps(
-    a: &BTreeMap<MemberId, u64>,
-    b: &BTreeMap<MemberId, u64>,
-) -> BTreeMap<MemberId, u64> {
-    let mut out = a.clone();
-    for (member, &seq) in b {
-        let entry = out.entry(member.clone()).or_insert(0);
-        if seq > *entry {
-            *entry = seq;
-        }
-    }
-    out
-}
-
-/// Ensures a tombstone carries at least one origin `(member, seq)` dependency so it is never
-/// prematurely garbage-collected.
-pub fn effective_tombstone_deps(
-    remote: &IndexRecord,
-    peer_member: &str,
-) -> BTreeMap<MemberId, u64> {
-    if !remote.tombstone_deps.is_empty() {
-        return remote.tombstone_deps.clone();
-    }
-    let mut deps = BTreeMap::new();
-    if remote.seq > 0 {
-        deps.insert(peer_member.to_string(), remote.seq);
-    }
-    deps
 }
 
 /// Decides what the local member should do with an incoming `remote` record from `peer_member`.
@@ -149,15 +275,16 @@ pub fn reconcile_record(
     local_view: &dyn LocalIndexView,
     remote: &IndexRecord,
     peer_member: &str,
+    meta: &FolderMeta,
     caps: &FsCapabilities,
     ignore: &IgnoreMatcher,
 ) -> ReconcileDecision {
-    let clean_path = match validate_sync_path(&remote.path) {
+    let clean_path = match validate_incoming_record(remote, meta) {
         Ok(p) => p,
-        Err(err) => {
-            return ReconcileDecision::RejectUnsafe {
-                path: remote.path.clone(),
-                reason: err.to_string(),
+        Err(reason) => {
+            return ReconcileDecision::RejectInvalid {
+                path: remote.path.chars().take(128).collect(),
+                reason,
             };
         }
     };
@@ -166,31 +293,91 @@ pub fn reconcile_record(
         return ReconcileDecision::Ignore;
     }
 
+    let peer_is_rejoining = meta.rejoining_peers.contains(peer_member);
     let local_opt = local_view.get_record(&clean_path);
     match local_opt {
-        None => reconcile_without_local(local_view, remote, &clean_path, peer_member, caps),
-        Some(local) => {
-            reconcile_with_local(local_view, &local, remote, &clean_path, peer_member, caps)
-        }
+        None => reconcile_without_local(
+            local_view,
+            remote,
+            &clean_path,
+            peer_member,
+            peer_is_rejoining,
+            meta,
+            caps,
+        ),
+        Some(local) => reconcile_with_local(
+            local_view,
+            &local,
+            remote,
+            &clean_path,
+            peer_member,
+            peer_is_rejoining,
+            meta,
+            caps,
+        ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_without_local(
     local_view: &dyn LocalIndexView,
     remote: &IndexRecord,
     clean_path: &str,
     peer_member: &str,
+    peer_is_rejoining: bool,
+    meta: &FolderMeta,
     caps: &FsCapabilities,
 ) -> ReconcileDecision {
     if remote.deleted {
-        let mut tombstone = remote.for_wire();
-        tombstone.path = clean_path.to_string();
-        tombstone.tombstone_deps = effective_tombstone_deps(remote, peer_member);
+        let mut tombstone = sanitize_remote(remote, clean_path, meta);
+        tombstone.from_join = false;
         tombstone.conflict_of = None;
         return ReconcileDecision::MetadataOnly {
             record: tombstone,
             update_disk_metadata: false,
         };
+    }
+
+    // Rule D: if a joining or re-added peer presents a file whose exact hash was previously
+    // deleted here (even after the original tombstone was garbage-collected), do NOT let it
+    // resurrect the deleted file. Synthesize a tombstone dominating the peer's version so the
+    // peer moves its stale copy to its local bin.
+    if (remote.from_join || peer_is_rejoining)
+        && let Some(remote_hash) = remote.hash
+    {
+        let deleted_hist = local_view.get_deleted_history(clean_path);
+        if deleted_hist.contains(&remote_hash) {
+            let mut recent_hashes = Vec::with_capacity(MAX_ANCESTRY_HASHES);
+            recent_hashes.push(remote_hash);
+            for h in deleted_hist {
+                if recent_hashes.len() >= MAX_ANCESTRY_HASHES {
+                    break;
+                }
+                if !recent_hashes.contains(&h) {
+                    recent_hashes.push(h);
+                }
+            }
+            let tombstone = IndexRecord {
+                path: clean_path.to_string(),
+                kind: remote.kind,
+                size: 0,
+                mtime: remote.mtime,
+                disk_mtime: None,
+                disk_change_id: None,
+                mode: None,
+                hash: None,
+                link_target: None,
+                deleted: true,
+                version: remote.version.clone(),
+                modified_by: meta.local_member.clone(),
+                seq: 0,
+                recent_hashes,
+                from_join: false,
+                conflict_of: None,
+                conflict_dismissed: false,
+            };
+            return ReconcileDecision::KeepAndSupersede { record: tombstone };
+        }
     }
 
     if let Some(problem) =
@@ -199,34 +386,29 @@ fn reconcile_without_local(
         return ReconcileDecision::HoldBack { problem };
     }
 
-    let mut target = remote.for_wire();
-    target.path = clean_path.to_string();
-    target.tombstone_deps.clear();
-    ReconcileDecision::Fetch { record: target }
+    let mut target = sanitize_remote(remote, clean_path, meta);
+    target.from_join = false;
+    ReconcileDecision::Fetch {
+        record: target,
+        bin_reason: BinReason::ReplacedByPeer,
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_with_local(
     local_view: &dyn LocalIndexView,
     local: &IndexRecord,
     remote: &IndexRecord,
     clean_path: &str,
     peer_member: &str,
+    peer_is_rejoining: bool,
+    meta: &FolderMeta,
     caps: &FsCapabilities,
 ) -> ReconcileDecision {
     match local.version.compare(&remote.version) {
         VersionOrder::Newer => ReconcileDecision::Keep,
         VersionOrder::Equal => {
             if local.deleted && remote.deleted {
-                let remote_deps = effective_tombstone_deps(remote, peer_member);
-                let merged_deps = merge_tombstone_deps(&local.tombstone_deps, &remote_deps);
-                if merged_deps != local.tombstone_deps {
-                    let mut updated = local.clone();
-                    updated.tombstone_deps = merged_deps;
-                    return ReconcileDecision::MetadataOnly {
-                        record: updated,
-                        update_disk_metadata: false,
-                    };
-                }
                 return ReconcileDecision::Keep;
             }
             if local.content_equal(remote) {
@@ -234,31 +416,54 @@ fn reconcile_with_local(
             }
             // Defensive fallback: identical versions with divergent content should never occur,
             // but treating them as concurrent guarantees neither version is ever lost.
-            reconcile_concurrent(local_view, local, remote, clean_path, peer_member, caps)
+            reconcile_concurrent(
+                local_view,
+                local,
+                remote,
+                clean_path,
+                peer_member,
+                peer_is_rejoining,
+                meta,
+                caps,
+            )
         }
-        VersionOrder::Older => {
-            reconcile_remote_newer(local_view, local, remote, clean_path, peer_member, caps)
-        }
-        VersionOrder::Concurrent => {
-            reconcile_concurrent(local_view, local, remote, clean_path, peer_member, caps)
-        }
+        VersionOrder::Older => reconcile_remote_newer(
+            local_view,
+            local,
+            remote,
+            clean_path,
+            peer_member,
+            meta,
+            caps,
+        ),
+        VersionOrder::Concurrent => reconcile_concurrent(
+            local_view,
+            local,
+            remote,
+            clean_path,
+            peer_member,
+            peer_is_rejoining,
+            meta,
+            caps,
+        ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_remote_newer(
     local_view: &dyn LocalIndexView,
     local: &IndexRecord,
     remote: &IndexRecord,
     clean_path: &str,
     peer_member: &str,
+    meta: &FolderMeta,
     caps: &FsCapabilities,
 ) -> ReconcileDecision {
     if remote.deleted {
-        let remote_deps = effective_tombstone_deps(remote, peer_member);
         if local.deleted {
-            let mut tombstone = remote.for_wire();
-            tombstone.path = clean_path.to_string();
-            tombstone.tombstone_deps = merge_tombstone_deps(&local.tombstone_deps, &remote_deps);
+            let mut tombstone = sanitize_remote(remote, clean_path, meta);
+            tombstone.merge_ancestry_from(local);
+            tombstone.from_join = false;
             tombstone.conflict_of = None;
             return ReconcileDecision::MetadataOnly {
                 record: tombstone,
@@ -275,11 +480,22 @@ fn reconcile_remote_newer(
             };
         }
 
-        let mut tombstone = remote.for_wire();
-        tombstone.path = clean_path.to_string();
-        tombstone.tombstone_deps = remote_deps;
+        let mut tombstone = sanitize_remote(remote, clean_path, meta);
+        if let Some(lh) = local.hash {
+            tombstone.push_ancestry_hash(lh);
+        }
+        tombstone.merge_ancestry_from(local);
+        tombstone.from_join = false;
         tombstone.conflict_of = None;
-        return ReconcileDecision::DeleteToBin { tombstone };
+        let bin_reason = if local.from_join {
+            BinReason::StaleOnJoin
+        } else {
+            BinReason::DeletedByPeer
+        };
+        return ReconcileDecision::DeleteToBin {
+            tombstone,
+            bin_reason,
+        };
     }
 
     // Remote is live and strictly newer.
@@ -291,13 +507,30 @@ fn reconcile_remote_newer(
         if remote.mode.is_some() {
             updated.mode = remote.mode;
         }
-        updated.conflict_of = remote.conflict_of.clone();
-        updated.tombstone_deps.clear();
+        updated.merge_ancestry_from(remote);
+        updated.from_join = false;
+        updated.conflict_of = derive_conflict_of(&updated, meta);
         let update_disk_metadata = local.mtime != remote.mtime || local.mode != updated.mode;
         return ReconcileDecision::MetadataOnly {
             record: updated,
             update_disk_metadata,
         };
+    }
+
+    // Decision A: sync NEVER replaces a live conflict copy with different content. Keep the live
+    // conflict copy untouched and place the incoming different version at its own conflict copy
+    // path so nothing flagged as one of two versions is ever overwritten without a person acting.
+    if !local.deleted && local.conflict_of.is_some() && !local.conflict_dismissed {
+        return build_remote_loses_conflict(
+            local_view,
+            local,
+            remote,
+            clean_path,
+            peer_member,
+            meta,
+            caps,
+            true,
+        );
     }
 
     // Sequential directory -> file/symlink replacement when live local descendants still exist
@@ -314,6 +547,7 @@ fn reconcile_remote_newer(
             remote,
             clean_path,
             peer_member,
+            meta,
             caps,
             true,
         );
@@ -334,34 +568,51 @@ fn reconcile_remote_newer(
         return ReconcileDecision::HoldBack { problem };
     }
 
-    let mut target = remote.for_wire();
-    target.path = clean_path.to_string();
-    target.tombstone_deps.clear();
-    ReconcileDecision::Fetch { record: target }
+    let mut target = sanitize_remote(remote, clean_path, meta);
+    if !local.deleted
+        && let Some(lh) = local.hash
+    {
+        target.push_ancestry_hash(lh);
+    }
+    target.merge_ancestry_from(local);
+    target.from_join = false;
+    let bin_reason = if local.from_join {
+        BinReason::StaleOnJoin
+    } else {
+        BinReason::ReplacedByPeer
+    };
+    ReconcileDecision::Fetch {
+        record: target,
+        bin_reason,
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_concurrent(
     local_view: &dyn LocalIndexView,
     local: &IndexRecord,
     remote: &IndexRecord,
     clean_path: &str,
     peer_member: &str,
+    peer_is_rejoining: bool,
+    meta: &FolderMeta,
     caps: &FsCapabilities,
 ) -> ReconcileDecision {
     let merged_version = local.version.merge(&remote.version);
 
     // Concurrent deletions merge quietly.
     if local.deleted && remote.deleted {
-        let remote_deps = effective_tombstone_deps(remote, peer_member);
         let mut merged = if compare_live_winner(local, remote) != Ordering::Less {
             local.clone()
         } else {
-            remote.for_wire()
+            sanitize_remote(remote, clean_path, meta)
         };
         merged.path = clean_path.to_string();
         merged.deleted = true;
         merged.version = merged_version;
-        merged.tombstone_deps = merge_tombstone_deps(&local.tombstone_deps, &remote_deps);
+        merged.merge_ancestry_from(local);
+        merged.merge_ancestry_from(remote);
+        merged.from_join = false;
         merged.conflict_of = None;
         return ReconcileDecision::MetadataOnly {
             record: merged,
@@ -369,11 +620,81 @@ fn reconcile_concurrent(
         };
     }
 
-    // Delete vs change: the change always wins.
+    // Rule D (local side is joining/reinstalling/rolled-back): check if our pre-existing local
+    // file's hash is already known to be stale or deleted in the peer's ancestry.
+    if local.from_join
+        && !local.deleted
+        && let Some(local_hash) = local.hash
+    {
+        if remote.deleted {
+            if remote.recent_hashes.contains(&local_hash) {
+                let mut tombstone = sanitize_remote(remote, clean_path, meta);
+                tombstone.version = merged_version;
+                tombstone.push_ancestry_hash(local_hash);
+                tombstone.from_join = false;
+                tombstone.conflict_of = None;
+                return ReconcileDecision::DeleteToBin {
+                    tombstone,
+                    bin_reason: BinReason::StaleOnJoin,
+                };
+            }
+        } else if !local.content_equal(remote) && remote.recent_hashes.contains(&local_hash) {
+            if let Some(problem) = check_local_representable(
+                local_view,
+                clean_path,
+                remote.kind,
+                peer_member,
+                caps,
+                Some(clean_path),
+            ) {
+                return ReconcileDecision::HoldBack { problem };
+            }
+            let mut target = sanitize_remote(remote, clean_path, meta);
+            target.version = merged_version;
+            target.push_ancestry_hash(local_hash);
+            target.from_join = false;
+            return ReconcileDecision::Fetch {
+                record: target,
+                bin_reason: BinReason::StaleOnJoin,
+            };
+        }
+    }
+
+    // Rule D (remote side is joining/re-added/rolled-back): if the remote pre-existing file's hash
+    // is in our ancestry or deleted history, keep our current state (live file or tombstone) and
+    // supersede remote's version so the peer moves its stale copy to its own local bin.
+    if (remote.from_join || peer_is_rejoining)
+        && !remote.deleted
+        && let Some(remote_hash) = remote.hash
+    {
+        if local.deleted {
+            let in_history = local.recent_hashes.contains(&remote_hash)
+                || local_view
+                    .get_deleted_history(clean_path)
+                    .contains(&remote_hash);
+            if in_history {
+                let mut tombstone = local.clone();
+                tombstone.version = merged_version;
+                tombstone.push_ancestry_hash(remote_hash);
+                tombstone.from_join = false;
+                tombstone.conflict_of = None;
+                return ReconcileDecision::KeepAndSupersede { record: tombstone };
+            }
+        } else if !local.content_equal(remote) && local.recent_hashes.contains(&remote_hash) {
+            let mut kept = local.clone();
+            kept.version = merged_version;
+            kept.push_ancestry_hash(remote_hash);
+            kept.from_join = false;
+            return ReconcileDecision::KeepAndSupersede { record: kept };
+        }
+    }
+
+    // Delete vs change (for genuine concurrent changes or unknown content): the change always wins.
     if !local.deleted && remote.deleted {
         let mut kept = local.clone();
         kept.version = merged_version;
-        kept.tombstone_deps.clear();
+        kept.merge_ancestry_from(remote);
+        kept.from_join = false;
         return ReconcileDecision::MetadataOnly {
             record: kept,
             update_disk_metadata: false,
@@ -385,11 +706,14 @@ fn reconcile_concurrent(
         {
             return ReconcileDecision::HoldBack { problem };
         }
-        let mut revived = remote.for_wire();
-        revived.path = clean_path.to_string();
+        let mut revived = sanitize_remote(remote, clean_path, meta);
         revived.version = merged_version;
-        revived.tombstone_deps.clear();
-        return ReconcileDecision::Fetch { record: revived };
+        revived.merge_ancestry_from(local);
+        revived.from_join = false;
+        return ReconcileDecision::Fetch {
+            record: revived,
+            bin_reason: BinReason::ReplacedByPeer,
+        };
     }
 
     // Both live and concurrent with identical content -> merge quietly.
@@ -406,11 +730,9 @@ fn reconcile_concurrent(
         if winner.mode.is_some() {
             merged.mode = winner.mode;
         }
-        merged.conflict_of = local
-            .conflict_of
-            .clone()
-            .or_else(|| remote.conflict_of.clone());
-        merged.tombstone_deps.clear();
+        merged.merge_ancestry_from(remote);
+        merged.from_join = false;
+        merged.conflict_of = derive_conflict_of(&merged, meta);
         let update_disk_metadata = local.mtime != merged.mtime || local.mode != merged.mode;
         return ReconcileDecision::MetadataOnly {
             record: merged,
@@ -420,7 +742,7 @@ fn reconcile_concurrent(
 
     // Both live and concurrent with different content -> keep both!
     // Directory always keeps the original path when conflicting with a file or symlink so all
-    // descendants keep their paths without recursive renames.
+    // descendants keep their paths without recursive renames (symmetric across all members).
     if local.kind == EntryKind::Dir && remote.kind != EntryKind::Dir {
         return build_remote_loses_conflict(
             local_view,
@@ -428,6 +750,7 @@ fn reconcile_concurrent(
             remote,
             clean_path,
             peer_member,
+            meta,
             caps,
             false,
         );
@@ -439,6 +762,36 @@ fn reconcile_concurrent(
             remote,
             clean_path,
             peer_member,
+            meta,
+            caps,
+        );
+    }
+
+    // Never replace a live conflict copy with different content; enforce symmetrically using the
+    // canonical conflict-copy name/hash match so every member picks the exact same winner for the
+    // merged version vector (preventing equal-VV split-brain divergence).
+    let local_matches_conflict_copy = derive_conflict_of(local, meta).is_some();
+    let remote_matches_conflict_copy = derive_conflict_of(remote, meta).is_some();
+    if local_matches_conflict_copy && !remote_matches_conflict_copy {
+        return build_remote_loses_conflict(
+            local_view,
+            local,
+            remote,
+            clean_path,
+            peer_member,
+            meta,
+            caps,
+            false,
+        );
+    }
+    if !local_matches_conflict_copy && remote_matches_conflict_copy {
+        return build_local_loses_conflict(
+            local_view,
+            local,
+            remote,
+            clean_path,
+            peer_member,
+            meta,
             caps,
         );
     }
@@ -450,24 +803,49 @@ fn reconcile_concurrent(
             remote,
             clean_path,
             peer_member,
+            meta,
             caps,
             false,
         )
     } else {
-        build_local_loses_conflict(local_view, local, remote, clean_path, peer_member, caps)
+        build_local_loses_conflict(
+            local_view,
+            local,
+            remote,
+            clean_path,
+            peer_member,
+            meta,
+            caps,
+        )
     }
 }
 
+fn sanitize_remote(remote: &IndexRecord, clean_path: &str, meta: &FolderMeta) -> IndexRecord {
+    let mut rec = remote.for_wire();
+    rec.path = clean_path.to_string();
+    if let Some(canon) = meta.canonical_member_name(&remote.modified_by) {
+        rec.modified_by = canon.to_string();
+    }
+    rec.conflict_dismissed = false;
+    rec.conflict_of = derive_conflict_of(&rec, meta);
+    rec
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_remote_loses_conflict(
     local_view: &dyn LocalIndexView,
     local: &IndexRecord,
     remote: &IndexRecord,
     clean_path: &str,
     peer_member: &str,
+    meta: &FolderMeta,
     caps: &FsCapabilities,
-    needs_dir_bump: bool,
+    needs_winner_bump: bool,
 ) -> ReconcileDecision {
-    let conflict_path = choose_conflict_path(local_view, clean_path, remote);
+    let loser_member = meta
+        .canonical_member_name(&remote.modified_by)
+        .unwrap_or(peer_member);
+    let conflict_path = choose_conflict_path(local_view, clean_path, remote, loser_member);
     if let Some(problem) = check_local_representable(
         local_view,
         &conflict_path,
@@ -481,17 +859,21 @@ fn build_remote_loses_conflict(
 
     let mut winner = local.clone();
     winner.version = local.version.merge(&remote.version);
-    winner.tombstone_deps.clear();
+    winner.merge_ancestry_from(remote);
+    winner.from_join = false;
 
-    let mut loser = remote.for_wire();
-    loser.path = conflict_path;
-    loser.conflict_of = Some(clean_path.to_string());
-    loser.tombstone_deps.clear();
+    // Decision A: conflict copy is a new independent file; its version is assigned fresh by apply.
+    let mut loser = sanitize_remote(remote, &conflict_path, meta);
+    loser.version = VersionVector::new();
+    loser.recent_hashes.clear();
+    loser.from_join = false;
+    loser.conflict_dismissed = false;
+    loser.conflict_of = derive_conflict_of(&loser, meta).or_else(|| Some(clean_path.to_string()));
 
     ReconcileDecision::ConflictRemoteLoses {
         winner_record: winner,
         loser_record: loser,
-        bump_winner_clock: needs_dir_bump,
+        bump_winner_clock: needs_winner_bump,
     }
 }
 
@@ -501,6 +883,7 @@ fn build_local_loses_conflict(
     remote: &IndexRecord,
     clean_path: &str,
     peer_member: &str,
+    meta: &FolderMeta,
     caps: &FsCapabilities,
 ) -> ReconcileDecision {
     if let Some(problem) = check_local_representable(
@@ -514,7 +897,10 @@ fn build_local_loses_conflict(
         return ReconcileDecision::HoldBack { problem };
     }
 
-    let conflict_path = choose_conflict_path(local_view, clean_path, local);
+    let loser_member = meta
+        .canonical_member_name(&local.modified_by)
+        .unwrap_or(meta.local_member.as_str());
+    let conflict_path = choose_conflict_path(local_view, clean_path, local, loser_member);
     if let Some(problem) = check_local_representable(
         local_view,
         &conflict_path,
@@ -526,15 +912,19 @@ fn build_local_loses_conflict(
         return ReconcileDecision::HoldBack { problem };
     }
 
-    let mut winner = remote.for_wire();
-    winner.path = clean_path.to_string();
+    let mut winner = sanitize_remote(remote, clean_path, meta);
     winner.version = local.version.merge(&remote.version);
-    winner.tombstone_deps.clear();
+    winner.merge_ancestry_from(local);
+    winner.from_join = false;
 
+    // Decision A: conflict copy is a new independent file; its version is assigned fresh by apply.
     let mut loser = local.clone();
     loser.path = conflict_path;
-    loser.conflict_of = Some(clean_path.to_string());
-    loser.tombstone_deps.clear();
+    loser.version = VersionVector::new();
+    loser.recent_hashes.clear();
+    loser.from_join = false;
+    loser.conflict_dismissed = false;
+    loser.conflict_of = derive_conflict_of(&loser, meta).or_else(|| Some(clean_path.to_string()));
 
     ReconcileDecision::ConflictLocalLoses {
         winner_record: winner,
@@ -542,61 +932,44 @@ fn build_local_loses_conflict(
     }
 }
 
-/// Computes the deterministic conflict copy path for `loser`, falling back to a short hash suffix
-/// only if the primary `name (changed on <machine> <date>).ext` path already holds live content
-/// that differs from `loser`.
+/// Computes the deterministic conflict copy path for `loser` using the canonical folder member
+/// name and mandatory 6-hex-character content hash (`name (changed on <member> <date>, <hash6>).ext`),
+/// adding a numeric disambiguator only in the rare event of a live hash-prefix collision with
+/// different content.
 pub fn choose_conflict_path(
     local_view: &dyn LocalIndexView,
     original_path: &str,
     loser: &IndexRecord,
+    canonical_member: &str,
 ) -> String {
-    let primary = conflict_copy_path(original_path, &loser.modified_by, loser.mtime, None);
+    let hash6 = record_short_hash6(loser);
+    let primary = conflict_copy_path(original_path, canonical_member, loser.mtime, &hash6, None);
     match local_view.get_record(&primary) {
         None => primary,
         Some(existing) if existing.deleted || existing.content_equal(loser) => primary,
         Some(_) => {
-            let short = loser_short_tag(loser);
-            let candidate =
-                conflict_copy_path(original_path, &loser.modified_by, loser.mtime, Some(&short));
-            match local_view.get_record(&candidate) {
-                None => candidate,
-                Some(existing) if existing.deleted || existing.content_equal(loser) => candidate,
-                Some(_) => {
-                    for n in 2u32..10_000 {
-                        let tag = format!("{short}-{n}");
-                        let alt = conflict_copy_path(
-                            original_path,
-                            &loser.modified_by,
-                            loser.mtime,
-                            Some(&tag),
-                        );
-                        match local_view.get_record(&alt) {
-                            None => return alt,
-                            Some(e) if e.deleted || e.content_equal(loser) => return alt,
-                            Some(_) => continue,
-                        }
-                    }
-                    candidate
+            for n in 2u32..10_000 {
+                let tag = n.to_string();
+                let alt = conflict_copy_path(
+                    original_path,
+                    canonical_member,
+                    loser.mtime,
+                    &hash6,
+                    Some(&tag),
+                );
+                match local_view.get_record(&alt) {
+                    None => return alt,
+                    Some(e) if e.deleted || e.content_equal(loser) => return alt,
+                    Some(_) => continue,
                 }
             }
+            primary
         }
     }
 }
 
-fn loser_short_tag(loser: &IndexRecord) -> String {
-    if let Some(hash) = loser.hash {
-        let hex = hash.to_hex();
-        return hex[..8.min(hex.len())].to_string();
-    }
-    if let Some(ref target) = loser.link_target {
-        let h = legion_xfer::hash::hash_bytes(target.as_bytes()).to_hex();
-        return h[..8.min(h.len())].to_string();
-    }
-    format!("{}", loser.mtime.secs)
-}
-
-/// Checks platform naming/length/symlink rules and case-insensitive collisions against the local
-/// index.
+/// Checks platform naming/length/symlink rules and case-insensitive / Unicode-normalizing
+/// collisions against the local index.
 pub fn check_local_representable(
     local_view: &dyn LocalIndexView,
     rel_path: &str,
@@ -614,21 +987,23 @@ pub fn check_local_representable(
         });
     }
 
-    if caps.case_insensitive {
-        // Check exact path and every ancestor prefix for a case-only collision with a different
-        // live path in the local index.
+    if caps.case_insensitive || caps.unicode_normalizing {
         let mut to_check = ancestors(rel_path);
         to_check.push(rel_path);
         for candidate in to_check {
             let folded = fold_case(candidate);
+            let cand_equiv = fs_equivalence_key(candidate, caps);
             for existing in local_view.live_paths_for_folded(&folded) {
-                if existing != candidate && replacing_exact != Some(existing.as_str()) {
+                if existing != candidate
+                    && replacing_exact != Some(existing.as_str())
+                    && fs_equivalence_key(&existing, caps) == cand_equiv
+                {
                     return Some(SyncProblem {
                         path: rel_path.to_string(),
                         kind: ProblemKind::CaseClash,
                         peer: Some(peer_member.to_string()),
                         sentence: format!(
-                            "'{rel_path}' was held back because its name differs only in letter case from '{existing}' on this file system."
+                            "'{rel_path}' was held back because its name clashes with '{existing}' on this file system."
                         ),
                     });
                 }

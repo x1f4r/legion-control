@@ -1,19 +1,19 @@
-//! Compact, versioned binary codec for durable index records.
+//! Compact, versioned binary codec for durable index records and auxiliary tables.
 //!
-//! Storing 500,000 [`IndexRecord`] values in `redb` as JSON would consume ~125 MiB and spend
-//! seconds parsing keys and field names on full scans. This small zero-`unsafe` binary encoding
-//! cuts record size by ~3.5x and decodes ~10x faster while remaining explicit and bounds-checked.
+//! Format version 2 adds `(member, incarnation)` [`VersionKey`] entries, short content hash
+//! ancestry (`recent_hashes`), `from_join`, and local `conflict_dismissed` flags while remaining
+//! bounds-checked and zero-`unsafe`.
 
 use std::collections::BTreeMap;
 
 use legion_xfer::{EntryKind, Hash, Timestamp};
 
 use crate::error::{Result, SyncError};
-use crate::model::{IndexRecord, MemberId};
-use crate::version::VersionVector;
+use crate::model::IndexRecord;
+use crate::version::{VersionKey, VersionVector};
 
 /// Format version prefix stored at byte 0 of every encoded [`IndexRecord`].
-const RECORD_CODEC_VERSION: u8 = 1;
+const RECORD_CODEC_VERSION: u8 = 2;
 
 const FLAG_DELETED: u8 = 1 << 0;
 const FLAG_HAS_DISK_MTIME: u8 = 1 << 1;
@@ -22,10 +22,13 @@ const FLAG_HAS_HASH: u8 = 1 << 3;
 const FLAG_HAS_LINK_TARGET: u8 = 1 << 4;
 const FLAG_HAS_CONFLICT_OF: u8 = 1 << 5;
 const FLAG_HAS_CHANGE_ID: u8 = 1 << 6;
+const FLAG_FROM_JOIN: u8 = 1 << 7;
+
+const FLAG2_CONFLICT_DISMISSED: u8 = 1 << 0;
 
 /// Encodes `record` into a compact self-contained byte vector.
 pub fn encode_record(record: &IndexRecord) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(96 + record.path.len());
+    let mut buf = Vec::with_capacity(112 + record.path.len() + record.recent_hashes.len() * 32);
     buf.push(RECORD_CODEC_VERSION);
     buf.push(match record.kind {
         EntryKind::File => 0,
@@ -55,7 +58,16 @@ pub fn encode_record(record: &IndexRecord) -> Vec<u8> {
     if record.disk_change_id.is_some() {
         flags |= FLAG_HAS_CHANGE_ID;
     }
+    if record.from_join {
+        flags |= FLAG_FROM_JOIN;
+    }
     buf.push(flags);
+
+    let mut flags2 = 0u8;
+    if record.conflict_dismissed {
+        flags2 |= FLAG2_CONFLICT_DISMISSED;
+    }
+    buf.push(flags2);
 
     write_str(&mut buf, &record.path);
     buf.extend_from_slice(&record.size.to_le_bytes());
@@ -84,15 +96,15 @@ pub fn encode_record(record: &IndexRecord) -> Vec<u8> {
     buf.extend_from_slice(&record.seq.to_le_bytes());
 
     write_u32(&mut buf, record.version.len());
-    for (member, counter) in record.version.iter() {
-        write_str(&mut buf, member);
+    for (key, counter) in record.version.iter() {
+        write_str(&mut buf, &key.member);
+        buf.extend_from_slice(&key.incarnation.to_le_bytes());
         buf.extend_from_slice(&counter.to_le_bytes());
     }
 
-    write_u32(&mut buf, record.tombstone_deps.len());
-    for (member, dep_seq) in &record.tombstone_deps {
-        write_str(&mut buf, member);
-        buf.extend_from_slice(&dep_seq.to_le_bytes());
+    write_u32(&mut buf, record.recent_hashes.len());
+    for hash in &record.recent_hashes {
+        buf.extend_from_slice(hash.as_bytes());
     }
 
     buf
@@ -122,7 +134,11 @@ pub fn decode_record(bytes: &[u8]) -> Result<IndexRecord> {
     };
 
     let flags = cur.read_u8()?;
+    let flags2 = cur.read_u8()?;
     let deleted = (flags & FLAG_DELETED) != 0;
+    let from_join = (flags & FLAG_FROM_JOIN) != 0;
+    let conflict_dismissed = (flags2 & FLAG2_CONFLICT_DISMISSED) != 0;
+
     let path = cur.read_string()?;
     let size = cur.read_u64()?;
     let mtime = Timestamp::new(cur.read_i64()?, cur.read_u32()?);
@@ -163,16 +179,15 @@ pub fn decode_record(bytes: &[u8]) -> Result<IndexRecord> {
     let mut vv_map = BTreeMap::new();
     for _ in 0..vv_len {
         let member = cur.read_string()?;
+        let incarnation = cur.read_u64()?;
         let counter = cur.read_u64()?;
-        vv_map.insert(member, counter);
+        vv_map.insert(VersionKey::new(member, incarnation), counter);
     }
 
-    let deps_len = cur.read_u32()? as usize;
-    let mut tombstone_deps = BTreeMap::<MemberId, u64>::new();
-    for _ in 0..deps_len {
-        let member = cur.read_string()?;
-        let dep_seq = cur.read_u64()?;
-        tombstone_deps.insert(member, dep_seq);
+    let hist_len = cur.read_u32()? as usize;
+    let mut recent_hashes = Vec::with_capacity(hist_len.min(32));
+    for _ in 0..hist_len {
+        recent_hashes.push(Hash::from_bytes(cur.read_array::<32>()?));
     }
 
     if !cur.is_empty() {
@@ -196,8 +211,10 @@ pub fn decode_record(bytes: &[u8]) -> Result<IndexRecord> {
         version: VersionVector::from_map(vv_map),
         modified_by,
         seq,
-        tombstone_deps,
+        recent_hashes,
+        from_join,
         conflict_of,
+        conflict_dismissed,
     })
 }
 
@@ -223,6 +240,33 @@ pub fn decode_string_list(bytes: &[u8]) -> Result<Vec<String>> {
         return Err(SyncError::CorruptData {
             context: "case map entry".to_string(),
             detail: "trailing bytes in string list".to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Encodes a list of BLAKE3 hashes for deleted-file history storage.
+pub fn encode_hash_list(hashes: &[Hash]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + hashes.len() * 32);
+    write_u32(&mut buf, hashes.len());
+    for h in hashes {
+        buf.extend_from_slice(h.as_bytes());
+    }
+    buf
+}
+
+/// Decodes a list of BLAKE3 hashes from deleted-file history storage.
+pub fn decode_hash_list(bytes: &[u8]) -> Result<Vec<Hash>> {
+    let mut cur = Cursor::new(bytes, "deleted history entry");
+    let count = cur.read_u32()? as usize;
+    let mut out = Vec::with_capacity(count.min(32));
+    for _ in 0..count {
+        out.push(Hash::from_bytes(cur.read_array::<32>()?));
+    }
+    if !cur.is_empty() {
+        return Err(SyncError::CorruptData {
+            context: "deleted history entry".to_string(),
+            detail: "trailing bytes in hash list".to_string(),
         });
     }
     Ok(out)
@@ -311,11 +355,9 @@ mod tests {
 
     #[test]
     fn record_binary_round_trip() {
-        let mut deps = BTreeMap::new();
-        deps.insert("tower".to_string(), 42);
         let mut vv = VersionVector::new();
-        vv.set("tower", 7);
-        vv.set("pi", 3);
+        vv.set(VersionKey::new("tower", 0x1111), 7);
+        vv.set(VersionKey::new("pi", 0x2222), 3);
 
         let rec = IndexRecord {
             path: "docs/notes.txt".to_string(),
@@ -331,8 +373,10 @@ mod tests {
             version: vv,
             modified_by: "tower".to_string(),
             seq: 99,
-            tombstone_deps: deps,
+            recent_hashes: vec![hash_bytes(b"v0"), hash_bytes(b"v1")],
+            from_join: true,
             conflict_of: Some("docs/orig.txt".to_string()),
+            conflict_dismissed: true,
         };
 
         let encoded = encode_record(&rec);
@@ -343,7 +387,7 @@ mod tests {
     #[test]
     fn rejects_truncated_or_bad_version_record() {
         assert!(decode_record(&[]).is_err());
-        assert!(decode_record(&[99, 0, 0]).is_err());
-        assert!(decode_record(&[1, 0, 0, 10, 0, 0, 0]).is_err());
+        assert!(decode_record(&[99, 0, 0, 0]).is_err());
+        assert!(decode_record(&[2, 0, 0, 0, 10, 0, 0, 0]).is_err());
     }
 }

@@ -1,7 +1,7 @@
 //! Structured errors for the folder synchronization engine.
 //!
 //! Every error maps to a stable [`legion_proto::ErrorCode`], a plain-language sentence, and an
-//! actionable hint so callers and future CLI/MCP/HTTP tools can report failures consistently.
+//! actionable hint so callers and upper-layer tools can report failures consistently.
 
 use legion_proto::{ErrorBody, ErrorCode};
 use legion_xfer::Hash;
@@ -20,6 +20,10 @@ pub enum FsErrorKind {
     AlreadyExists,
     /// Directory could not be removed because it still held entries.
     DirectoryNotEmpty,
+    /// Storage volume ran out of space or quota.
+    NoSpace,
+    /// Rename crossed filesystems or mount points (`EXDEV`).
+    CrossDevice,
     /// Simulated or injected crash fault used by crash-recovery tests.
     Crash,
     /// Any other I/O error.
@@ -102,7 +106,7 @@ pub enum SyncError {
         actual: u64,
     },
 
-    /// Operation conflicted with current state (for example a paused folder or mismatched state).
+    /// Operation conflicted with current state (for example disk changed since last scan).
     #[error("conflict at {path}: {reason}")]
     Conflict {
         /// Relative path or folder identifier.
@@ -111,7 +115,7 @@ pub enum SyncError {
         reason: String,
     },
 
-    /// Operation is unsupported on this platform or filesystem.
+    /// Operation is unsupported on this platform, filesystem, or schema version.
     #[error("{reason}")]
     Unsupported {
         /// Explanation of what is unsupported.
@@ -129,11 +133,45 @@ pub enum SyncError {
         detail: String,
     },
 
-    /// Folder syncing is currently paused.
+    /// A fetch or peer call exceeded its allowed duration.
+    #[error("timed out during {operation}: {detail}")]
+    Timeout {
+        /// Operation that timed out.
+        operation: String,
+        /// Timeout detail.
+        detail: String,
+    },
+
+    /// Caller cancelled an in-flight sync operation.
+    #[error("sync operation cancelled: {operation}")]
+    Cancelled {
+        /// Operation that was cancelled.
+        operation: String,
+    },
+
+    /// Folder syncing is currently paused (by user or by the mass-deletion brake).
     #[error("sync folder {folder_id:?} is paused")]
     Paused {
         /// Folder identifier.
         folder_id: String,
+    },
+
+    /// Sync folder root is missing its identity marker or points to a different folder/drive.
+    #[error("{sentence}")]
+    FolderUnavailable {
+        /// Folder identifier.
+        folder_id: String,
+        /// Human-readable explanation shown to the person.
+        sentence: String,
+    },
+
+    /// Index file was written by a newer schema version than this build understands.
+    #[error("sync index schema version {found} is newer than supported version {supported}")]
+    SchemaTooNew {
+        /// Schema version found on disk.
+        found: u32,
+        /// Highest schema version supported by this build.
+        supported: u32,
     },
 
     /// Index store read, write, or transaction error.
@@ -187,15 +225,21 @@ impl SyncError {
             | Self::SizeMismatch { .. }
             | Self::Conflict { .. }
             | Self::Paused { .. } => ErrorCode::Conflict,
-            Self::Unsupported { .. } => ErrorCode::Unsupported,
+            Self::Unsupported { .. } | Self::SchemaTooNew { .. } => ErrorCode::Unsupported,
             Self::PeerUnavailable { .. } => ErrorCode::Unreachable,
+            Self::Timeout { .. } => ErrorCode::Timeout,
+            Self::Cancelled { .. } => ErrorCode::Cancelled,
+            Self::FolderUnavailable { .. } => ErrorCode::Failed,
             Self::Storage { .. } | Self::CorruptData { .. } => ErrorCode::Internal,
             Self::Fs { kind, .. } => match kind {
                 FsErrorKind::NotFound => ErrorCode::NotFound,
                 FsErrorKind::PermissionDenied => ErrorCode::Denied,
                 FsErrorKind::AlreadyExists => ErrorCode::Exists,
                 FsErrorKind::DirectoryNotEmpty => ErrorCode::Conflict,
-                FsErrorKind::Crash | FsErrorKind::Other => ErrorCode::Failed,
+                FsErrorKind::NoSpace
+                | FsErrorKind::CrossDevice
+                | FsErrorKind::Crash
+                | FsErrorKind::Other => ErrorCode::Failed,
             },
         }
     }
@@ -205,7 +249,7 @@ impl SyncError {
         match self {
             Self::InvalidConfig { hint, .. } | Self::Unsupported { hint, .. } => hint.clone(),
             Self::InvalidPath { .. } => Some(
-                "Use a relative path inside the sync folder without leading slashes, '..' segments, or '.legion-sync'."
+                "Use a relative path inside the sync folder without leading slashes, '..' segments, Windows drive prefixes, control characters, or '.legion-sync'."
                     .to_string(),
             ),
             Self::InvalidPattern { .. } => {
@@ -219,22 +263,35 @@ impl SyncError {
                 Some("Check the path or identifier and try again.".to_string())
             }
             Self::Exists { .. } => Some(
-                "Choose a different target path or enable overwrite or rename when restoring."
+                "Choose a different target path or use overwrite or rename when restoring."
                     .to_string(),
             ),
             Self::HashMismatch { .. } | Self::SizeMismatch { .. } => Some(
                 "The file may have changed on the peer while transferring; retry syncing."
                     .to_string(),
             ),
-            Self::Conflict { .. } => {
-                Some("Inspect the folder status and resolve any conflicts before retrying.".to_string())
-            }
+            Self::Conflict { .. } => Some(
+                "Inspect the folder status, scan local changes, and resolve any conflicts before retrying."
+                    .to_string(),
+            ),
             Self::PeerUnavailable { .. } => {
                 Some("Wait for the peer machine to come back online and sync again.".to_string())
             }
-            Self::Paused { .. } => {
-                Some("Resume the sync folder before running a sync.".to_string())
+            Self::Timeout { .. } => {
+                Some("Check network connectivity to the peer and retry syncing.".to_string())
             }
+            Self::Cancelled { .. } => None,
+            Self::Paused { .. } => Some(
+                "Resume the sync folder (or confirm/rescan any pending deletion brake) before syncing."
+                    .to_string(),
+            ),
+            Self::FolderUnavailable { .. } => Some(
+                "Reconnect the drive or restore the original folder before resuming sync."
+                    .to_string(),
+            ),
+            Self::SchemaTooNew { .. } => Some(
+                "Upgrade Legion to a newer release before opening this sync folder.".to_string(),
+            ),
             Self::Storage { .. } | Self::CorruptData { .. } => Some(
                 "Check disk space and permissions for the sync index, or rebuild the local index."
                     .to_string(),
@@ -247,24 +304,31 @@ impl SyncError {
                     "Remove or move remaining files inside the directory and sync again."
                         .to_string(),
                 ),
-                FsErrorKind::Crash => {
-                    Some("Restart the sync engine to run crash recovery.".to_string())
+                FsErrorKind::NoSpace => {
+                    Some("Free disk space on the sync volume and retry.".to_string())
                 }
-                _ => None,
+                FsErrorKind::CrossDevice => Some(
+                    "Ensure '.legion-sync/tmp', '.legion-sync/bin', and the sync folder live on the same volume."
+                        .to_string(),
+                ),
+                FsErrorKind::Crash => {
+                    Some("Re-open the sync folder so crash recovery completes cleanly.".to_string())
+                }
+                FsErrorKind::NotFound | FsErrorKind::AlreadyExists | FsErrorKind::Other => None,
             },
         }
     }
 
-    /// Converts this error into Legion's standard wire [`ErrorBody`].
+    /// Converts this error into the protocol [`ErrorBody`] wire shape.
     pub fn to_error_body(&self) -> ErrorBody {
-        let body = ErrorBody::new(self.code(), self.to_string());
-        match self.hint() {
-            Some(hint) => body.with_hint(hint),
-            None => body,
+        let mut body = ErrorBody::new(self.code(), self.to_string());
+        if let Some(hint) = self.hint() {
+            body = body.with_hint(hint);
         }
+        body
     }
 
-    /// Returns `true` if this error represents an injected or simulated crash fault.
+    /// Returns `true` if this error represents an injected simulated crash.
     pub fn is_crash(&self) -> bool {
         matches!(
             self,
@@ -275,13 +339,23 @@ impl SyncError {
         )
     }
 
-    /// Classifies a standard [`std::io::Error`] tied to an optional relative path.
+    /// Classifies a standard `std::io::Error` into [`SyncError::Fs`].
     pub fn from_io(path: Option<String>, err: std::io::Error) -> Self {
-        let kind = match err.kind() {
-            std::io::ErrorKind::NotFound => FsErrorKind::NotFound,
-            std::io::ErrorKind::PermissionDenied => FsErrorKind::PermissionDenied,
-            std::io::ErrorKind::AlreadyExists => FsErrorKind::AlreadyExists,
-            std::io::ErrorKind::DirectoryNotEmpty => FsErrorKind::DirectoryNotEmpty,
+        let kind = classify_io_error(&err);
+        Self::Fs {
+            path,
+            detail: err.to_string(),
+            kind,
+        }
+    }
+
+    /// Converts a [`legion_os::OsError`] into [`SyncError::Fs`].
+    pub fn from_os(path: Option<String>, err: legion_os::OsError) -> Self {
+        let kind = match &err {
+            legion_os::OsError::NotFound { .. } => FsErrorKind::NotFound,
+            legion_os::OsError::PermissionDenied { .. } => FsErrorKind::PermissionDenied,
+            legion_os::OsError::AlreadyExists { .. } => FsErrorKind::AlreadyExists,
+            legion_os::OsError::Io { source, .. } => classify_io_error(source),
             _ => FsErrorKind::Other,
         };
         Self::Fs {
@@ -292,29 +366,49 @@ impl SyncError {
     }
 }
 
+fn classify_io_error(err: &std::io::Error) -> FsErrorKind {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::NotFound => FsErrorKind::NotFound,
+        ErrorKind::PermissionDenied => FsErrorKind::PermissionDenied,
+        ErrorKind::AlreadyExists => FsErrorKind::AlreadyExists,
+        ErrorKind::DirectoryNotEmpty => FsErrorKind::DirectoryNotEmpty,
+        ErrorKind::StorageFull => FsErrorKind::NoSpace,
+        ErrorKind::CrossesDevices => FsErrorKind::CrossDevice,
+        _ => {
+            #[cfg(unix)]
+            {
+                if matches!(err.raw_os_error(), Some(28 | 122)) {
+                    // ENOSPC (28) / EDQUOT (122 on Linux)
+                    return FsErrorKind::NoSpace;
+                }
+                if err.raw_os_error() == Some(18) {
+                    // EXDEV (18)
+                    return FsErrorKind::CrossDevice;
+                }
+            }
+            #[cfg(windows)]
+            {
+                if matches!(err.raw_os_error(), Some(39 | 112)) {
+                    // ERROR_HANDLE_DISK_FULL (39) / ERROR_DISK_FULL (112)
+                    return FsErrorKind::NoSpace;
+                }
+                if err.raw_os_error() == Some(17) {
+                    // ERROR_NOT_SAME_DEVICE (17)
+                    return FsErrorKind::CrossDevice;
+                }
+            }
+            FsErrorKind::Other
+        }
+    }
+}
+
 impl From<legion_xfer::Error> for SyncError {
     fn from(err: legion_xfer::Error) -> Self {
         match err {
-            legion_xfer::Error::NotFound { path, source } => Self::Fs {
-                path: Some(path.display().to_string()),
-                detail: source.to_string(),
-                kind: FsErrorKind::NotFound,
-            },
-            legion_xfer::Error::PermissionDenied { path, source } => Self::Fs {
-                path: Some(path.display().to_string()),
-                detail: source.to_string(),
-                kind: FsErrorKind::PermissionDenied,
-            },
-            legion_xfer::Error::Exists { path, source } => Self::Fs {
-                path: Some(path.display().to_string()),
-                detail: source
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "path already exists".to_string()),
-                kind: FsErrorKind::AlreadyExists,
-            },
-            legion_xfer::Error::Conflict { path, reason } => Self::Conflict {
-                path: path.display().to_string(),
-                reason,
+            legion_xfer::Error::InvalidPattern { pattern, source } => Self::InvalidPattern {
+                pattern,
+                reason: source.to_string(),
             },
             legion_xfer::Error::HashMismatch {
                 path,
@@ -325,29 +419,29 @@ impl From<legion_xfer::Error> for SyncError {
                 expected,
                 actual,
             },
-            legion_xfer::Error::UnsafeArchiveEntry { entry, reason } => Self::InvalidPath {
-                path: entry,
-                reason,
+            legion_xfer::Error::NotFound { path, .. } => Self::NotFound {
+                what: path.display().to_string(),
             },
-            legion_xfer::Error::InvalidPattern { pattern, source } => Self::InvalidPattern {
-                pattern,
-                reason: source.to_string(),
+            legion_xfer::Error::PermissionDenied { path, source } => Self::Fs {
+                path: Some(path.display().to_string()),
+                detail: source.to_string(),
+                kind: FsErrorKind::PermissionDenied,
             },
-            legion_xfer::Error::InvalidHash { input, reason } => Self::CorruptData {
-                context: format!("hash {input:?}"),
-                detail: reason,
-            },
-            legion_xfer::Error::BadOffset {
-                path,
-                requested,
-                actual,
-            } => Self::Conflict {
+            legion_xfer::Error::Exists { path, .. } => Self::Exists {
                 path: path.display().to_string(),
-                reason: format!("requested offset {requested}, actual length {actual}"),
+            },
+            legion_xfer::Error::Conflict { path, reason } => Self::Conflict {
+                path: path.display().to_string(),
+                reason,
             },
             legion_xfer::Error::Io { path, source } => {
                 Self::from_io(path.map(|p| p.display().to_string()), source)
             }
+            other => Self::Fs {
+                path: None,
+                detail: other.to_string(),
+                kind: FsErrorKind::Other,
+            },
         }
     }
 }

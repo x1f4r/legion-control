@@ -1,22 +1,26 @@
 //! Folder scanner converting live filesystem state into incremental index updates.
 //!
-//! Unchanged entries (matching kind, size, modification time, and Unix mode) are skipped in a
-//! single streaming merge against the sorted index without re-hashing. Files that change between
-//! two observations (either across consecutive scans when two-look confirmation is enabled, or
-//! between the walk stat and the post-hash stat) are held back until stable.
+//! Unchanged entries (matching kind, size, modification time, local change id, and Unix mode) are
+//! skipped in a single streaming merge against the sorted index without re-hashing, unless
+//! [`ScanOptions::verify_checksums`] is enabled. Unreadable directories or entries never invent
+//! deletions, and the mass-deletion brake pauses before committing large-scale deletions.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use legion_xfer::{EntryKind, Timestamp};
+use legion_xfer::{EntryKind, Hash, Timestamp};
 
 use crate::error::Result;
-use crate::model::IndexRecord;
-use crate::path::{IgnoreMatcher, path_depth, validate_sync_path};
+use crate::model::{DeletionBrake, DeletionBrakeConfig, IndexRecord, MAX_ANCESTRY_HASHES};
+use crate::path::{
+    IgnoreMatcher, is_descendant_of, is_legion_inflight_name, is_os_litter_name, path_depth,
+    validate_sync_path,
+};
+use crate::reconcile::derive_conflict_of;
 use crate::traits::{FsMeta, FsWalkEntry, IndexStore, StoreBatch, SyncFs};
 use crate::version::VersionVector;
 
-/// Options controlling how [`scan_folder`] detects in-flight writes.
+/// Options controlling how [`scan_folder`] and [`scan_subtree`] inspect the local disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanOptions {
     /// When `true`, newly created or modified regular files must show the same `(size, mtime)`
@@ -25,9 +29,15 @@ pub struct ScanOptions {
     /// Minimum age (`now - mtime`) a new or modified regular file must reach before being
     /// committed. Files newer than this window are held back as still changing.
     pub min_stable_age: Duration,
+    /// When `true`, compute BLAKE3 checksums for *every* regular file even if `(size, mtime,
+    /// change_id)` appear unchanged (for periodic integrity audits or detecting same-size
+    /// same-mtime overwrites on filesystems without reliable change ids).
+    pub verify_checksums: bool,
+    /// Internal override set when the user explicitly confirms a tripped mass-deletion brake.
+    pub allow_mass_deletion: bool,
 }
 
-/// Summary of one folder scan.
+/// Summary of one folder or subtree scan.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanReport {
     /// Newly discovered live entries added to the index.
@@ -38,7 +48,7 @@ pub struct ScanReport {
     pub deleted: usize,
     /// Entries whose kind changed (for example file replaced by directory or back).
     pub kind_changed: usize,
-    /// Entries that matched the index and required no hashing or writes.
+    /// Entries that matched the index and required no writes.
     pub unchanged: usize,
     /// Regular files whose bytes were streamed through BLAKE3 during this scan.
     pub hashed: usize,
@@ -46,6 +56,8 @@ pub struct ScanReport {
     pub held_back_unstable: Vec<String>,
     /// Paths that could not be inspected during the walk (`(path, reason)`).
     pub skipped_errors: Vec<(String, String)>,
+    /// `true` when the mass-deletion brake tripped, pausing the folder and recording 0 deletions.
+    pub brake_tripped: bool,
 }
 
 /// Tracks `(size, mtime)` of files awaiting a second stable look across consecutive scans.
@@ -60,14 +72,10 @@ impl PendingStabilityTracker {
         Self::default()
     }
 
-    /// Removes observations for paths no longer awaiting confirmation.
     fn retain_paths(&mut self, active: &BTreeSet<String>) {
         self.observed.retain(|k, _| active.contains(k));
     }
 
-    /// Checks whether `path` has already been seen with identical `(size, mtime)`.
-    ///
-    /// Returns `true` if stable; otherwise records the latest observation and returns `false`.
     fn confirm(&mut self, path: &str, size: u64, mtime: Timestamp) -> bool {
         if self.observed.get(path) == Some(&(size, mtime)) {
             self.observed.remove(path);
@@ -93,7 +101,7 @@ pub enum SingleRescanOutcome {
 struct PendingUpsert {
     path: String,
     meta: FsMeta,
-    hash: Option<legion_xfer::Hash>,
+    hash: Option<Hash>,
     prev: Option<IndexRecord>,
     is_kind_change: bool,
 }
@@ -101,15 +109,81 @@ struct PendingUpsert {
 enum PendingChange {
     Delete { old: IndexRecord },
     Upsert(PendingUpsert),
-    RefreshDiskMtimeOnly { record: IndexRecord },
+    RefreshDiskStatOnly { record: IndexRecord },
 }
 
-/// Scans `fs` against `store`, returning a [`ScanReport`] and committing all index updates in one
-/// atomic transaction.
+/// Returns `true` if `candidate` equals or lies under any skipped/unreadable path.
+pub fn is_under_skipped(candidate: &str, skipped: &[(String, String)]) -> bool {
+    skipped.iter().any(|(skip_path, _)| {
+        skip_path.is_empty() || candidate == skip_path || is_descendant_of(candidate, skip_path)
+    })
+}
+
+/// Scans the entire live folder `fs` against `store`, protecting unreadable subtrees and enforcing
+/// the mass-deletion brake, and commits all index updates in one atomic transaction.
+#[allow(clippy::too_many_arguments)]
 pub fn scan_folder<F: SyncFs, S: IndexStore>(
     fs: &F,
     store: &mut S,
     ignore: &IgnoreMatcher,
+    brake_config: DeletionBrakeConfig,
+    tracker: &mut PendingStabilityTracker,
+    now: Timestamp,
+    options: ScanOptions,
+) -> Result<ScanReport> {
+    let walk = fs.walk(ignore)?;
+    scan_walk_against_store(
+        fs,
+        store,
+        None,
+        walk.entries,
+        walk.skipped,
+        ignore,
+        brake_config,
+        tracker,
+        now,
+        options,
+    )
+}
+
+/// Scans only the entry or subtree rooted at `rel_root` against `store` without walking unrelated
+/// parts of the folder (intended for file watchers).
+#[allow(clippy::too_many_arguments)]
+pub fn scan_subtree<F: SyncFs, S: IndexStore>(
+    fs: &F,
+    store: &mut S,
+    rel_root: &str,
+    ignore: &IgnoreMatcher,
+    brake_config: DeletionBrakeConfig,
+    tracker: &mut PendingStabilityTracker,
+    now: Timestamp,
+    options: ScanOptions,
+) -> Result<ScanReport> {
+    let clean_root = validate_sync_path(rel_root)?;
+    let walk = fs.walk_subtree(&clean_root, ignore)?;
+    scan_walk_against_store(
+        fs,
+        store,
+        Some(&clean_root),
+        walk.entries,
+        walk.skipped,
+        ignore,
+        brake_config,
+        tracker,
+        now,
+        options,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
+    fs: &F,
+    store: &mut S,
+    subtree_root: Option<&str>,
+    disk_entries: Vec<FsWalkEntry>,
+    walk_skipped: Vec<(String, String)>,
+    ignore: &IgnoreMatcher,
+    brake_config: DeletionBrakeConfig,
     tracker: &mut PendingStabilityTracker,
     now: Timestamp,
     options: ScanOptions,
@@ -123,24 +197,44 @@ pub fn scan_folder<F: SyncFs, S: IndexStore>(
             });
         }
     };
-    let mut matrix = store.load_causal_matrix()?;
 
-    let walk = fs.walk(ignore)?;
-    let disk_entries = walk.entries;
+    let held_back_paths: BTreeSet<String> = if store.held_back_count()? > 0 {
+        store
+            .list_held_back()?
+            .into_iter()
+            .map(|h| h.record.path)
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+
     let mut report = ScanReport {
-        skipped_errors: walk.skipped,
+        skipped_errors: walk_skipped.clone(),
         ..ScanReport::default()
     };
 
     let mut changes: Vec<PendingChange> = Vec::new();
     let mut still_tracking: BTreeSet<String> = BTreeSet::new();
+    let mut kept_dirs_seen: BTreeSet<String> = BTreeSet::new();
+    let mut kept_dirs_revived: BTreeSet<String> = BTreeSet::new();
     let mut disk_idx = 0usize;
 
-    store.scan_records_in_order(&mut |rec| {
+    let mut visit_record = |rec: IndexRecord| -> Result<bool> {
         while disk_idx < disk_entries.len() && disk_entries[disk_idx].path < rec.path {
+            let entry = &disk_entries[disk_idx];
+            if entry.meta.kind == EntryKind::Dir && meta.kept_deleted_dirs.contains(&entry.path) {
+                kept_dirs_seen.insert(entry.path.clone());
+                if dir_holds_only_local_non_synced_files(fs, &entry.path, ignore, &held_back_paths)?
+                {
+                    report.unchanged += 1;
+                    disk_idx += 1;
+                    continue;
+                }
+                kept_dirs_revived.insert(entry.path.clone());
+            }
             handle_new_disk_entry(
                 fs,
-                &disk_entries[disk_idx],
+                entry,
                 tracker,
                 &mut still_tracking,
                 now,
@@ -152,10 +246,24 @@ pub fn scan_folder<F: SyncFs, S: IndexStore>(
         }
 
         if disk_idx < disk_entries.len() && disk_entries[disk_idx].path == rec.path {
+            let entry = &disk_entries[disk_idx];
+            if entry.meta.kind == EntryKind::Dir && meta.kept_deleted_dirs.contains(&entry.path) {
+                kept_dirs_seen.insert(entry.path.clone());
+                if !dir_holds_only_local_non_synced_files(
+                    fs,
+                    &entry.path,
+                    ignore,
+                    &held_back_paths,
+                )? {
+                    kept_dirs_revived.insert(entry.path.clone());
+                }
+            }
             handle_existing_disk_entry(
                 fs,
-                &disk_entries[disk_idx],
+                entry,
                 rec,
+                ignore,
+                &held_back_paths,
                 tracker,
                 &mut still_tracking,
                 now,
@@ -166,17 +274,33 @@ pub fn scan_folder<F: SyncFs, S: IndexStore>(
             disk_idx += 1;
         } else if !rec.deleted
             && !ignore.is_path_or_ancestor_ignored(&rec.path, rec.kind == EntryKind::Dir)
+            && !is_under_skipped(&rec.path, &walk_skipped)
         {
             changes.push(PendingChange::Delete { old: rec });
         }
 
         Ok(true)
-    })?;
+    };
+
+    match subtree_root {
+        None => store.scan_records_in_order(&mut visit_record)?,
+        Some(root) => store.scan_subtree_in_order(root, &mut visit_record)?,
+    }
 
     while disk_idx < disk_entries.len() {
+        let entry = &disk_entries[disk_idx];
+        if entry.meta.kind == EntryKind::Dir && meta.kept_deleted_dirs.contains(&entry.path) {
+            kept_dirs_seen.insert(entry.path.clone());
+            if dir_holds_only_local_non_synced_files(fs, &entry.path, ignore, &held_back_paths)? {
+                report.unchanged += 1;
+                disk_idx += 1;
+                continue;
+            }
+            kept_dirs_revived.insert(entry.path.clone());
+        }
         handle_new_disk_entry(
             fs,
-            &disk_entries[disk_idx],
+            entry,
             tracker,
             &mut still_tracking,
             now,
@@ -187,22 +311,81 @@ pub fn scan_folder<F: SyncFs, S: IndexStore>(
         disk_idx += 1;
     }
 
-    tracker.retain_paths(&still_tracking);
-
-    if changes.is_empty() {
-        return Ok(report);
+    let mut kept_dirs_changed = false;
+    for p in kept_dirs_revived {
+        if meta.kept_deleted_dirs.remove(&p) {
+            kept_dirs_changed = true;
+        }
+    }
+    if subtree_root.is_none() && !meta.kept_deleted_dirs.is_empty() {
+        let before = meta.kept_deleted_dirs.len();
+        meta.kept_deleted_dirs
+            .retain(|p| kept_dirs_seen.contains(p) || is_under_skipped(p, &walk_skipped));
+        if meta.kept_deleted_dirs.len() != before {
+            kept_dirs_changed = true;
+        }
     }
 
+    if subtree_root.is_none() {
+        tracker.retain_paths(&still_tracking);
+    }
+
+    // Re-filter deletions against any errors added during hashing/statting.
     let mut deletes: Vec<IndexRecord> = Vec::new();
     let mut upserts: Vec<PendingUpsert> = Vec::new();
-    let mut mtime_refreshes: Vec<IndexRecord> = Vec::new();
+    let mut stat_refreshes: Vec<IndexRecord> = Vec::new();
 
     for change in changes {
         match change {
-            PendingChange::Delete { old } => deletes.push(old),
+            PendingChange::Delete { old } => {
+                if !is_under_skipped(&old.path, &report.skipped_errors) {
+                    deletes.push(old);
+                }
+            }
             PendingChange::Upsert(item) => upserts.push(item),
-            PendingChange::RefreshDiskMtimeOnly { record } => mtime_refreshes.push(record),
+            PendingChange::RefreshDiskStatOnly { record } => stat_refreshes.push(record),
         }
+    }
+
+    // Item B3: mass-deletion brake.
+    let deleted_files = deletes.iter().filter(|r| r.kind == EntryKind::File).count();
+    let total_live_files = store.live_file_count()? as usize;
+    if !options.allow_mass_deletion && brake_config.should_trip(deleted_files, total_live_files) {
+        let sample_paths = deletes
+            .iter()
+            .filter(|r| r.kind == EntryKind::File)
+            .take(10)
+            .map(|r| r.path.clone())
+            .collect();
+        meta.paused = true;
+        meta.pending_brake = Some(DeletionBrake {
+            deleted_count: deleted_files,
+            total_live_files,
+            sample_paths,
+        });
+        let batch = StoreBatch {
+            folder_meta: Some(meta),
+            ..StoreBatch::default()
+        };
+        store.apply_batch(batch)?;
+        report.brake_tripped = true;
+        report.deleted = 0;
+        return Ok(report);
+    }
+
+    let finish_join_mode = subtree_root.is_none() && meta.join_mode;
+    if deletes.is_empty() && upserts.is_empty() && stat_refreshes.is_empty() {
+        if finish_join_mode || kept_dirs_changed {
+            if finish_join_mode {
+                meta.join_mode = false;
+            }
+            let batch = StoreBatch {
+                folder_meta: Some(meta),
+                ..StoreBatch::default()
+            };
+            store.apply_batch(batch)?;
+        }
+        return Ok(report);
     }
 
     // Emit deletions deepest-first so children receive smaller seq numbers than their parent
@@ -221,24 +404,36 @@ pub fn scan_folder<F: SyncFs, S: IndexStore>(
     });
 
     let mut batch = StoreBatch::default();
+    let vkey = meta.version_key();
+    let join_mode_active = meta.join_mode;
 
-    for rec in mtime_refreshes {
+    for rec in stat_refreshes {
         batch.upsert_records.push(rec);
     }
 
-    let mut seq_bumped = false;
+    let mut meta_dirty = kept_dirs_changed;
 
     for old in deletes {
         let mut version = old.version;
         let clock = meta.next_clock();
-        version.bump_above(meta.local_member.clone(), clock);
+        version.bump_above(vkey.clone(), clock);
         let seq = meta.next_seq();
-        seq_bumped = true;
+        meta_dirty = true;
 
-        let mut deps = BTreeMap::new();
-        deps.insert(meta.local_member.clone(), seq);
+        let mut recent_hashes = old.recent_hashes;
+        if let Some(h) = old.hash {
+            recent_hashes.retain(|x| *x != h);
+            recent_hashes.insert(0, h);
+            recent_hashes.truncate(MAX_ANCESTRY_HASHES);
+        }
 
-        batch.upsert_records.push(IndexRecord {
+        if !recent_hashes.is_empty() {
+            batch
+                .upsert_deleted_history
+                .push((old.path.clone(), recent_hashes.clone()));
+        }
+
+        let rec = IndexRecord {
             path: old.path,
             kind: old.kind,
             size: 0,
@@ -252,9 +447,13 @@ pub fn scan_folder<F: SyncFs, S: IndexStore>(
             version,
             modified_by: meta.local_member.clone(),
             seq,
-            tombstone_deps: deps,
+            recent_hashes,
+            from_join: false,
             conflict_of: None,
-        });
+            conflict_dismissed: false,
+        };
+        meta.record_seq_fingerprint(seq, rec.head_fingerprint());
+        batch.upsert_records.push(rec);
         report.deleted += 1;
     }
 
@@ -271,23 +470,34 @@ pub fn scan_folder<F: SyncFs, S: IndexStore>(
             .as_ref()
             .map_or_else(VersionVector::new, |p| p.version.clone());
         let clock = meta.next_clock();
-        version.bump_above(meta.local_member.clone(), clock);
+        version.bump_above(vkey.clone(), clock);
         let seq = meta.next_seq();
-        seq_bumped = true;
+        meta_dirty = true;
 
-        // Preserve Unix permission bits when scanning on Windows (where `fmeta.mode` is `None`).
         let mode = fmeta.mode.or_else(|| {
             prev.as_ref()
                 .filter(|p| !p.deleted && p.kind == fmeta.kind)
                 .and_then(|p| p.mode)
         });
-        // Preserve conflict tag if a conflict copy was edited locally (unless kind changed).
-        let conflict_of = prev
-            .as_ref()
-            .filter(|p| !p.deleted && !is_kind_change)
-            .and_then(|p| p.conflict_of.clone());
 
-        batch.upsert_records.push(IndexRecord {
+        let mut recent_hashes = prev
+            .as_ref()
+            .map_or_else(Vec::new, |p| p.recent_hashes.clone());
+        if let Some(ref p) = prev
+            && !p.deleted
+            && let Some(old_h) = p.hash
+            && Some(old_h) != hash
+        {
+            recent_hashes.retain(|h| *h != old_h);
+            recent_hashes.insert(0, old_h);
+            recent_hashes.truncate(MAX_ANCESTRY_HASHES);
+        }
+
+        let conflict_dismissed = prev
+            .as_ref()
+            .is_some_and(|p| !p.deleted && !is_kind_change && p.conflict_dismissed);
+
+        let mut rec = IndexRecord {
             path,
             kind: fmeta.kind,
             size: if fmeta.kind == EntryKind::File {
@@ -305,9 +515,14 @@ pub fn scan_folder<F: SyncFs, S: IndexStore>(
             version,
             modified_by: meta.local_member.clone(),
             seq,
-            tombstone_deps: BTreeMap::new(),
-            conflict_of,
-        });
+            recent_hashes,
+            from_join: prev.is_none() && join_mode_active,
+            conflict_of: None,
+            conflict_dismissed,
+        };
+        rec.conflict_of = derive_conflict_of(&rec, &meta);
+        meta.record_seq_fingerprint(seq, rec.head_fingerprint());
+        batch.upsert_records.push(rec);
 
         if is_kind_change {
             report.kind_changed += 1;
@@ -318,10 +533,12 @@ pub fn scan_folder<F: SyncFs, S: IndexStore>(
         }
     }
 
-    if seq_bumped {
-        matrix.record_seen(&meta.local_member, &meta.local_member, meta.local_seq);
+    if finish_join_mode {
+        meta.join_mode = false;
+        meta_dirty = true;
+    }
+    if meta_dirty {
         batch.folder_meta = Some(meta);
-        batch.causal_matrix = Some(matrix);
     }
 
     store.apply_batch(batch)?;
@@ -329,9 +546,6 @@ pub fn scan_folder<F: SyncFs, S: IndexStore>(
 }
 
 /// Rescans a single relative path on disk and commits any detected local change atomically.
-///
-/// Called by `apply` whenever its pre-replace re-check discovers that the live entry changed
-/// between the last scan and the moment of replacement or deletion.
 pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
     fs: &F,
     store: &mut S,
@@ -345,7 +559,7 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
             context: "rescan_single_path".to_string(),
             detail: "index store is not initialized".to_string(),
         })?;
-    let mut matrix = store.load_causal_matrix()?;
+    let vkey = meta.version_key();
     let prev = store.get_record(&clean)?;
     let disk_opt = fs.stat_live(&clean)?;
 
@@ -353,34 +567,76 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
         (None, None) => Ok(SingleRescanOutcome::Unchanged),
         (Some(ref rec), None) if rec.deleted => Ok(SingleRescanOutcome::Unchanged),
         (Some(old), None) => {
-            let mut version = old.version;
-            let clock = meta.next_clock();
-            version.bump_above(meta.local_member.clone(), clock);
-            let seq = meta.next_seq();
-            let mut deps = BTreeMap::new();
-            deps.insert(meta.local_member.clone(), seq);
-            let record = IndexRecord {
-                path: clean,
-                kind: old.kind,
-                size: 0,
-                mtime: now,
-                disk_mtime: None,
-                disk_change_id: None,
-                mode: None,
-                hash: None,
-                link_target: None,
-                deleted: true,
-                version,
-                modified_by: meta.local_member.clone(),
-                seq,
-                tombstone_deps: deps,
-                conflict_of: None,
-            };
-            matrix.record_seen(&meta.local_member, &meta.local_member, meta.local_seq);
+            // If an indexed directory disappeared from disk, any live indexed descendants under
+            // it have necessarily vanished too; tombstone them deepest-first in the same batch so
+            // stale ghost subdirectories are never served before the next full scan.
+            let mut to_tombstone: Vec<IndexRecord> = Vec::new();
+            if old.kind == EntryKind::Dir {
+                store.scan_subtree_in_order(&clean, &mut |rec| {
+                    if !rec.deleted && rec.path != clean {
+                        to_tombstone.push(rec);
+                    }
+                    Ok(true)
+                })?;
+                to_tombstone.sort_by(|a, b| {
+                    path_depth(&b.path)
+                        .cmp(&path_depth(&a.path))
+                        .then_with(|| a.path.cmp(&b.path))
+                });
+            }
+            to_tombstone.push(old);
+
+            let mut upsert_records = Vec::with_capacity(to_tombstone.len());
+            let mut upsert_deleted_history = Vec::new();
+            let mut main_record = None;
+            for item in to_tombstone {
+                let is_main = item.path == clean;
+                let mut version = item.version;
+                let clock = meta.next_clock();
+                version.bump_above(vkey.clone(), clock);
+                let seq = meta.next_seq();
+                let mut recent_hashes = item.recent_hashes;
+                if let Some(h) = item.hash {
+                    recent_hashes.retain(|x| *x != h);
+                    recent_hashes.insert(0, h);
+                    recent_hashes.truncate(MAX_ANCESTRY_HASHES);
+                }
+                if !recent_hashes.is_empty() {
+                    upsert_deleted_history.push((item.path.clone(), recent_hashes.clone()));
+                }
+                let rec = IndexRecord {
+                    path: item.path,
+                    kind: item.kind,
+                    size: 0,
+                    mtime: now,
+                    disk_mtime: None,
+                    disk_change_id: None,
+                    mode: None,
+                    hash: None,
+                    link_target: None,
+                    deleted: true,
+                    version,
+                    modified_by: meta.local_member.clone(),
+                    seq,
+                    recent_hashes,
+                    from_join: false,
+                    conflict_of: None,
+                    conflict_dismissed: false,
+                };
+                meta.record_seq_fingerprint(seq, rec.head_fingerprint());
+                if is_main {
+                    main_record = Some(rec.clone());
+                }
+                upsert_records.push(rec);
+            }
+            let record = main_record.ok_or_else(|| crate::error::SyncError::Storage {
+                context: "rescan_single_path".to_string(),
+                detail: "missing main tombstone record".to_string(),
+            })?;
             let batch = StoreBatch {
                 folder_meta: Some(meta),
-                causal_matrix: Some(matrix),
-                upsert_records: vec![record.clone()],
+                upsert_records,
+                upsert_deleted_history,
                 ..StoreBatch::default()
             };
             store.apply_batch(batch)?;
@@ -389,7 +645,6 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
         (prev_opt, Some(disk_meta)) => {
             let hash = if disk_meta.kind == EntryKind::File {
                 let (h, bytes_read) = fs.hash_live(&clean)?;
-                // Look-2 stability check: ensure the file did not mutate while hashing.
                 let after = fs.stat_live(&clean)?;
                 let stable = after.as_ref().is_some_and(|m| {
                     m.kind == EntryKind::File
@@ -432,7 +687,7 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                 .as_ref()
                 .map_or_else(VersionVector::new, |p| p.version.clone());
             let clock = meta.next_clock();
-            version.bump_above(meta.local_member.clone(), clock);
+            version.bump_above(vkey, clock);
             let seq = meta.next_seq();
             let mode = disk_meta.mode.or_else(|| {
                 prev_opt
@@ -440,12 +695,24 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                     .filter(|p| !p.deleted && p.kind == disk_meta.kind)
                     .and_then(|p| p.mode)
             });
-            let conflict_of = prev_opt
-                .as_ref()
-                .filter(|p| !p.deleted && !is_kind_change)
-                .and_then(|p| p.conflict_of.clone());
 
-            let record = IndexRecord {
+            let mut recent_hashes = prev_opt
+                .as_ref()
+                .map_or_else(Vec::new, |p| p.recent_hashes.clone());
+            if let Some(ref p) = prev_opt
+                && !p.deleted
+                && let Some(old_h) = p.hash
+                && Some(old_h) != hash
+            {
+                recent_hashes.retain(|h| *h != old_h);
+                recent_hashes.insert(0, old_h);
+                recent_hashes.truncate(MAX_ANCESTRY_HASHES);
+            }
+            let conflict_dismissed = prev_opt
+                .as_ref()
+                .is_some_and(|p| !p.deleted && !is_kind_change && p.conflict_dismissed);
+
+            let mut record = IndexRecord {
                 path: clean,
                 kind: disk_meta.kind,
                 size: if disk_meta.kind == EntryKind::File {
@@ -463,13 +730,15 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                 version,
                 modified_by: meta.local_member.clone(),
                 seq,
-                tombstone_deps: BTreeMap::new(),
-                conflict_of,
+                recent_hashes,
+                from_join: false,
+                conflict_of: None,
+                conflict_dismissed,
             };
-            matrix.record_seen(&meta.local_member, &meta.local_member, meta.local_seq);
+            record.conflict_of = derive_conflict_of(&record, &meta);
+            meta.record_seq_fingerprint(seq, record.head_fingerprint());
             let batch = StoreBatch {
                 folder_meta: Some(meta),
-                causal_matrix: Some(matrix),
                 upsert_records: vec![record.clone()],
                 ..StoreBatch::default()
             };
@@ -524,6 +793,8 @@ fn handle_existing_disk_entry<F: SyncFs>(
     fs: &F,
     entry: &FsWalkEntry,
     rec: IndexRecord,
+    ignore: &IgnoreMatcher,
+    held_back_paths: &BTreeSet<String>,
     tracker: &mut PendingStabilityTracker,
     still_tracking: &mut BTreeSet<String>,
     now: Timestamp,
@@ -531,7 +802,20 @@ fn handle_existing_disk_entry<F: SyncFs>(
     changes: &mut Vec<PendingChange>,
     report: &mut ScanReport,
 ) -> Result<()> {
-    if !rec.deleted && is_stat_unchanged(&rec, &entry.meta) {
+    // Item H: a directory that was deleted elsewhere and intentionally kept on disk only because
+    // it still contains ignored or held-back files must NOT be revived as a new directory on scan.
+    if rec.deleted
+        && entry.meta.kind == EntryKind::Dir
+        && dir_holds_only_local_non_synced_files(fs, &entry.path, ignore, held_back_paths)?
+    {
+        report.unchanged += 1;
+        return Ok(());
+    }
+
+    if !rec.deleted
+        && !(options.verify_checksums && entry.meta.kind == EntryKind::File)
+        && is_stat_unchanged(&rec, &entry.meta)
+    {
         report.unchanged += 1;
         return Ok(());
     }
@@ -556,8 +840,8 @@ fn handle_existing_disk_entry<F: SyncFs>(
         EntryKind::Dir | EntryKind::Symlink => None,
     };
 
-    // If only mtime changed on a regular file (for example `touch`), refresh `disk_mtime` without
-    // bumping the causal version vector or churning peers.
+    // If only mtime/change_id changed (or verify_checksums confirmed identical bytes), refresh
+    // local stat fields without bumping the causal version vector or churning peers.
     if !rec.deleted
         && !is_kind_change
         && entry.meta.kind == EntryKind::File
@@ -565,10 +849,12 @@ fn handle_existing_disk_entry<F: SyncFs>(
         && rec.size == entry.meta.size
         && !mode_changed(rec.mode, entry.meta.mode)
     {
-        let mut refreshed = rec;
-        refreshed.disk_mtime = Some(entry.meta.mtime);
-        refreshed.disk_change_id = entry.meta.change_id;
-        changes.push(PendingChange::RefreshDiskMtimeOnly { record: refreshed });
+        if rec.disk_mtime != Some(entry.meta.mtime) || rec.disk_change_id != entry.meta.change_id {
+            let mut refreshed = rec;
+            refreshed.disk_mtime = Some(entry.meta.mtime);
+            refreshed.disk_change_id = entry.meta.change_id;
+            changes.push(PendingChange::RefreshDiskStatOnly { record: refreshed });
+        }
         report.unchanged += 1;
         return Ok(());
     }
@@ -583,6 +869,44 @@ fn handle_existing_disk_entry<F: SyncFs>(
     Ok(())
 }
 
+/// Returns `true` when `dir_path` is non-empty on disk AND every entry inside it is excluded from
+/// syncing (ignored by custom/fixed rules or held back), meaning the directory only remains on
+/// disk to house local-only files.
+fn dir_holds_only_local_non_synced_files<F: SyncFs>(
+    fs: &F,
+    dir_path: &str,
+    ignore: &IgnoreMatcher,
+    held_back_paths: &BTreeSet<String>,
+) -> Result<bool> {
+    let children = match fs.list_dir_live(dir_path) {
+        Ok(c) => c,
+        Err(err) if err.is_crash() => return Err(err),
+        Err(_) => return Ok(false),
+    };
+    if children.is_empty() {
+        return Ok(false);
+    }
+    for name in children {
+        let child_rel = format!("{dir_path}/{name}");
+        let is_dir = fs
+            .stat_live(&child_rel)
+            .ok()
+            .flatten()
+            .is_some_and(|m| m.kind == EntryKind::Dir);
+        let ignored = ignore.is_ignored(&child_rel, &name, is_dir)
+            || is_os_litter_name(&name)
+            || is_legion_inflight_name(&name);
+        let held = held_back_paths.contains(&child_rel)
+            || held_back_paths
+                .iter()
+                .any(|p| is_descendant_of(p, &child_rel));
+        if !ignored && !held {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_and_hash_file<F: SyncFs>(
     fs: &F,
@@ -593,7 +917,7 @@ fn check_and_hash_file<F: SyncFs>(
     now: Timestamp,
     options: ScanOptions,
     report: &mut ScanReport,
-) -> Result<Option<legion_xfer::Hash>> {
+) -> Result<Option<Hash>> {
     if !options.min_stable_age.is_zero() {
         let age_secs = now.secs.saturating_sub(meta1.mtime.secs);
         let required_secs = i64::try_from(options.min_stable_age.as_secs()).unwrap_or(i64::MAX);
@@ -623,8 +947,6 @@ fn check_and_hash_file<F: SyncFs>(
     };
     report.hashed += 1;
 
-    // Look-2 stability verification: if the file vanished or changed while streaming its bytes,
-    // hold it back rather than publishing torn content.
     let meta2 = match fs.stat_live(path) {
         Ok(m) => m,
         Err(err) if err.is_crash() => return Err(err),
@@ -674,15 +996,13 @@ fn is_stat_unchanged(rec: &IndexRecord, disk: &FsMeta) -> bool {
 
 fn mode_changed(recorded: Option<u32>, disk: Option<u32>) -> bool {
     match (recorded, disk) {
-        // Windows provides `None` for disk mode; never treat that as a mode change.
-        (_, None) => false,
-        (None, Some(_)) => false,
+        (_, None) | (None, Some(_)) => false,
         (Some(a), Some(b)) => (a & 0o777) != (b & 0o777),
     }
 }
 
-/// Checks whether a live path on disk still matches the index record `expected` before apply
-/// overwrites or deletes it.
+/// Checks whether a live path on disk still matches the index record `expected` before apply,
+/// restore, or conflict resolution mutates it.
 ///
 /// For regular files, verifies both `stat` metadata and the BLAKE3 hash so even same-size,
 /// same-timestamp edits between scan and apply are caught and never overwritten.

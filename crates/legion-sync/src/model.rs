@@ -1,13 +1,15 @@
 //! Core domain types for hubless folder synchronization.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use legion_xfer::{EntryKind, Hash, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SyncError};
-use crate::version::VersionVector;
+use crate::version::{VersionKey, VersionVector};
 
 /// Stable identifier of a sync folder (for example `"documents"` or a UUID).
 pub type FolderId = String;
@@ -16,8 +18,102 @@ pub type FolderId = String;
 /// `"laptop"`).
 pub type MemberId = String;
 
+/// Current durable index schema version. Opening an index with a higher version is refused
+/// cleanly with [`SyncError::SchemaTooNew`].
+pub const INDEX_SCHEMA_VERSION: u32 = 2;
+
+/// Sync wire/trait protocol version advertised in [`PeerHandshake`].
+pub const SYNC_PROTOCOL_VERSION: u32 = 2;
+
 /// Default retention duration for files moved to `.legion-sync/bin` (30 days).
 pub const DEFAULT_BIN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Default fetch timeout when pulling a file from a peer.
+pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Maximum number of recent content hashes retained in [`IndexRecord::recent_hashes`].
+pub const MAX_ANCESTRY_HASHES: usize = 16;
+
+/// Maximum number of records accepted in one [`RecordsPage`].
+pub const MAX_PAGE_RECORDS: usize = 4_096;
+
+/// Maximum number of distinct incarnations per member accepted in one incoming [`VersionVector`].
+pub const MAX_VV_INCARNATIONS_PER_MEMBER: usize = 8;
+
+/// Maximum byte length of a symbolic link target accepted from a peer.
+pub const MAX_LINK_TARGET_BYTES: usize = 4_096;
+
+/// Maximum number of entries retained in the durable held-back table.
+pub const MAX_HELD_BACK_ENTRIES: usize = 4_096;
+
+/// Maximum number of invalid-record problems retained per peer.
+pub const MAX_PEER_PROBLEMS: usize = 256;
+
+/// Maximum number of consecutive deferrals for one `(peer, path)` before promoting it to a
+/// visible problem and advancing past it so no single record stalls a peer forever.
+pub const MAX_DEFERRAL_ATTEMPTS: u32 = 8;
+
+/// Maximum number of deleted `(path -> hashes)` history entries retained for join/re-add safety.
+pub const MAX_DELETED_HISTORY_PATHS: usize = 100_000;
+
+/// Minimum plausible wall-clock timestamp (2026-01-01T00:00:00Z). Bin expiry never runs when the
+/// local clock is earlier than this floor or earlier than the newest bin entry.
+pub const MIN_PLAUSIBLE_CLOCK_SECS: i64 = 1_767_225_600;
+
+/// Default minimum count of deleted files in one scan required to trip the mass-deletion brake.
+pub const DEFAULT_BRAKE_MIN_FILES: usize = 50;
+
+/// Default minimum percentage (1..=100) of live files deleted in one scan required to trip the
+/// mass-deletion brake (more than a quarter).
+pub const DEFAULT_BRAKE_MIN_PERCENT: u8 = 25;
+
+/// Generates a cryptographically random non-zero 64-bit incarnation identifier.
+pub fn random_incarnation_id() -> Result<u64> {
+    let mut buf = [0u8; 8];
+    for _ in 0..16 {
+        getrandom::fill(&mut buf).map_err(|err| SyncError::Storage {
+            context: "generate incarnation id".to_string(),
+            detail: err.to_string(),
+        })?;
+        let val = u64::from_le_bytes(buf);
+        if val != 0 {
+            return Ok(val);
+        }
+    }
+    Ok(1)
+}
+
+/// Generates a 16-hex-character random token for bin and temporary identifiers (unique across
+/// process restarts and clock jumps).
+///
+/// Each thread seeds a local SplitMix64 state once from OS randomness (`getrandom`), so high
+/// throughput apply batches avoid per-file OS RNG syscalls while still producing unique tokens
+/// across restarts, threads, and clock jumps.
+pub fn random_hex_token() -> String {
+    use std::cell::Cell;
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new({
+            let mut buf = [0u8; 8];
+            if getrandom::fill(&mut buf).is_ok() {
+                u64::from_le_bytes(buf)
+            } else {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x9e37_79b9_7f4a_7c15)
+            }
+        });
+    }
+    let val = STATE.with(|cell| {
+        let s = cell.get().wrapping_add(0x9e37_79b9_7f4a_7c15);
+        cell.set(s);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    });
+    format!("{val:016x}")
+}
 
 /// Validates a sync folder identifier.
 pub fn validate_folder_id(id: &str) -> Result<()> {
@@ -34,8 +130,8 @@ pub fn validate_folder_id(id: &str) -> Result<()> {
         });
     }
     if id
-        .bytes()
-        .any(|b| b == 0 || b < 0x20 || b == b'/' || b == b'\\')
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '/' | '\\'))
     {
         return Err(SyncError::InvalidConfig {
             message: format!("sync folder id {id:?} contains disallowed characters"),
@@ -51,7 +147,7 @@ pub fn validate_folder_id(id: &str) -> Result<()> {
 /// Validates a member (machine) identifier.
 ///
 /// Member identifiers appear inside conflict copy filenames
-/// (`name (changed on <machine> <date>).ext`), so characters forbidden in cross-platform
+/// (`name (changed on <machine> <date>, <hash6>).ext`), so characters forbidden in cross-platform
 /// filenames are refused here.
 pub fn validate_member_id(member: &str) -> Result<()> {
     if member.is_empty() || member.len() > 64 {
@@ -72,7 +168,11 @@ pub fn validate_member_id(member: &str) -> Result<()> {
         });
     }
     if member.chars().any(|c| {
-        c.is_control() || matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
+        c.is_control()
+            || matches!(
+                c,
+                '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*' | '#'
+            )
     }) {
         return Err(SyncError::InvalidConfig {
             message: format!("member id {member:?} contains disallowed filename characters"),
@@ -84,6 +184,90 @@ pub fn validate_member_id(member: &str) -> Result<()> {
     Ok(())
 }
 
+/// Threshold configuration for the mass-deletion brake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletionBrakeConfig {
+    /// Minimum number of live files that must vanish in one scan to trip the brake (default 50).
+    /// Setting this to `usize::MAX` disables the brake.
+    pub min_deleted_files: usize,
+    /// Minimum percentage (`1..=100`) of currently live files that must vanish in one scan
+    /// together with `min_deleted_files` to trip the brake (default 25, i.e. more than a quarter).
+    pub min_deleted_percent: u8,
+}
+
+impl Default for DeletionBrakeConfig {
+    fn default() -> Self {
+        Self {
+            min_deleted_files: DEFAULT_BRAKE_MIN_FILES,
+            min_deleted_percent: DEFAULT_BRAKE_MIN_PERCENT,
+        }
+    }
+}
+
+impl DeletionBrakeConfig {
+    /// Returns `true` if deleting `deleted_files` out of `total_live_files` trips the brake.
+    pub fn should_trip(&self, deleted_files: usize, total_live_files: usize) -> bool {
+        if deleted_files == 0 || total_live_files == 0 {
+            return false;
+        }
+        if deleted_files <= self.min_deleted_files {
+            return false;
+        }
+        let lhs = (deleted_files as u128).saturating_mul(100);
+        let rhs = (total_live_files as u128).saturating_mul(u128::from(self.min_deleted_percent));
+        lhs > rhs
+    }
+}
+
+/// Persisted state describing a tripped mass-deletion brake awaiting a person's answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletionBrake {
+    /// Number of live files that disappeared in the scan that tripped the brake.
+    pub deleted_count: usize,
+    /// Number of live files indexed before the scan.
+    pub total_live_files: usize,
+    /// Up to 10 sample missing paths shown to the person.
+    pub sample_paths: Vec<String>,
+}
+
+/// A person's response to a tripped mass-deletion brake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionBrakeDecision {
+    /// "They are really deleted": unpause and proceed to record and propagate the deletions.
+    ConfirmDeleted,
+    /// "They are not": unpause and rescan with the brake still armed.
+    Rescan,
+}
+
+/// Identity marker written inside `.legion-sync/marker.json` when a member joins a sync folder.
+///
+/// Checked before every scan and apply so an unmounted drive or replaced directory stops with a
+/// clear problem instead of recording mass deletions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderMarker {
+    /// Marker format version (`1`).
+    pub version: u32,
+    /// Sync folder identifier.
+    pub folder_id: FolderId,
+    /// Member identifier.
+    pub member_id: MemberId,
+    /// Active index incarnation identifier.
+    pub incarnation: u64,
+}
+
+impl FolderMarker {
+    /// Creates a v1 folder marker for `(folder_id, member_id, incarnation)`.
+    pub fn new(folder_id: FolderId, member_id: MemberId, incarnation: u64) -> Self {
+        Self {
+            version: 1,
+            folder_id,
+            member_id,
+            incarnation,
+        }
+    }
+}
+
 /// Configuration for initializing or opening a [`crate::SyncEngine`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FolderConfig {
@@ -93,12 +277,24 @@ pub struct FolderConfig {
     pub local_member: MemberId,
     /// Current members of the folder (must include `local_member` while participating).
     pub members: BTreeSet<MemberId>,
+    /// Members that previously belonged to this folder (from the shared folder definition so a
+    /// newly joined member can still verify historical version vectors and conflict labels
+    /// authored before those members left).
+    #[serde(default)]
+    pub former_members: BTreeSet<MemberId>,
     /// Per-folder ignore globs (trailing `/` restricts to directories).
     #[serde(default)]
     pub ignore: Vec<String>,
     /// How long deleted or replaced files remain in `.legion-sync/bin` before expiry.
     #[serde(default = "default_bin_retention_secs")]
     pub bin_retention_secs: u64,
+    /// Mass-deletion brake thresholds.
+    #[serde(default)]
+    pub deletion_brake: DeletionBrakeConfig,
+    /// Optional explicit initial incarnation (used by deterministic tests; `None` picks a random
+    /// non-zero 64-bit value via `getrandom`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_incarnation: Option<u64>,
 }
 
 fn default_bin_retention_secs() -> u64 {
@@ -106,7 +302,8 @@ fn default_bin_retention_secs() -> u64 {
 }
 
 impl FolderConfig {
-    /// Creates a configuration with default 30-day bin retention and no custom ignore rules.
+    /// Creates a configuration with default 30-day bin retention, default deletion brake, and no
+    /// custom ignore rules.
     pub fn new(
         id: impl Into<FolderId>,
         local_member: impl Into<MemberId>,
@@ -119,8 +316,11 @@ impl FolderConfig {
             id: id.into(),
             local_member: local,
             members: set,
+            former_members: BTreeSet::new(),
             ignore: Vec::new(),
             bin_retention_secs: DEFAULT_BIN_RETENTION.as_secs(),
+            deletion_brake: DeletionBrakeConfig::default(),
+            initial_incarnation: None,
         }
     }
 
@@ -130,6 +330,17 @@ impl FolderConfig {
         validate_member_id(&self.local_member)?;
         for member in &self.members {
             validate_member_id(member)?;
+        }
+        for member in &self.former_members {
+            validate_member_id(member)?;
+        }
+        if let Some(inc) = self.initial_incarnation
+            && inc == 0
+        {
+            return Err(SyncError::InvalidConfig {
+                message: "initial_incarnation must be non-zero".to_string(),
+                hint: Some("Omit initial_incarnation to generate a random ID.".to_string()),
+            });
         }
         Ok(())
     }
@@ -147,42 +358,197 @@ pub struct FolderMeta {
     pub folder_id: FolderId,
     /// Local machine identifier.
     pub local_member: MemberId,
-    /// Current member set for this folder.
+    /// Current random non-zero incarnation of this member's index.
+    pub incarnation: u64,
+    /// Current active member set for this folder.
     pub members: BTreeSet<MemberId>,
-    /// Strictly monotonic per-member sequence number assigned to every index record update.
+    /// Members that previously belonged to this folder (validated names retained so historical
+    /// version vectors and conflict labels remain verifiable without trusting arbitrary peer text).
+    #[serde(default)]
+    pub former_members: BTreeSet<MemberId>,
+    /// Peers recently added or re-added whose pre-existing files should be checked against deleted
+    /// history on first sync.
+    #[serde(default)]
+    pub rejoining_peers: BTreeSet<MemberId>,
+    /// Strictly monotonic per-incarnation sequence number assigned to every index record update.
     pub local_seq: u64,
-    /// Strictly monotonic per-member logical clock used for version vector counters.
-    ///
-    /// Never resets even if tombstones are garbage-collected, guaranteeing a member never reuses
-    /// a lower version counter after a deletion has been pruned.
+    /// Strictly monotonic per-incarnation logical clock used for version vector counters.
     pub local_clock: u64,
     /// Whether syncing is currently paused on this member.
     pub paused: bool,
+    /// Active mass-deletion brake state awaiting user confirmation, if tripped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_brake: Option<DeletionBrake>,
+    /// When `true`, files discovered by the initial scan on disk (join, reinstall, or rollback)
+    /// are tagged `from_join = true` so stale copies are binned rather than causing conflicts or
+    /// resurrecting deletions.
+    #[serde(default)]
+    pub join_mode: bool,
+    /// Fingerprint of the latest record written at `local_seq` (for same-seq clone detection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_fingerprint: Option<Hash>,
+    /// Rolling window of recent `(seq -> record_fingerprint)` entries (up to 64) used to detect
+    /// rollback/clones even after local sequence numbers advance past what a peer acknowledged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub recent_seq_fingerprints: BTreeMap<u64, Hash>,
+    /// Directories deleted remotely that were intentionally kept on disk only because they still
+    /// hold ignored or held-back local files, persisted across tombstone GC and restarts so scans
+    /// never revive them unless synced files are later added inside.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub kept_deleted_dirs: BTreeSet<String>,
 }
 
 impl FolderMeta {
-    /// Creates initial folder metadata from a [`FolderConfig`].
-    pub fn new(config: &FolderConfig) -> Self {
+    /// Creates initial folder metadata from a [`FolderConfig`] and `incarnation`.
+    pub fn new(config: &FolderConfig, incarnation: u64) -> Self {
+        let mut former = config.former_members.clone();
+        for m in &config.members {
+            former.remove(m);
+        }
         Self {
             folder_id: config.id.clone(),
             local_member: config.local_member.clone(),
+            incarnation,
             members: config.members.clone(),
+            former_members: former,
+            rejoining_peers: BTreeSet::new(),
             local_seq: 0,
             local_clock: 0,
             paused: false,
+            pending_brake: None,
+            join_mode: true,
+            head_fingerprint: None,
+            recent_seq_fingerprints: BTreeMap::new(),
+            kept_deleted_dirs: BTreeSet::new(),
         }
     }
 
-    /// Allocates and returns the next sequence number.
+    /// Records the fingerprint of the record assigned `seq`, keeping the newest 64 entries.
+    pub fn record_seq_fingerprint(&mut self, seq: u64, fingerprint: Hash) {
+        self.head_fingerprint = Some(fingerprint);
+        self.recent_seq_fingerprints.insert(seq, fingerprint);
+        while self.recent_seq_fingerprints.len() > 64 {
+            if let Some(oldest) = self.recent_seq_fingerprints.keys().next().copied() {
+                self.recent_seq_fingerprints.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Returns this member's active `(local_member, incarnation)` [`VersionKey`].
+    pub fn version_key(&self) -> VersionKey {
+        VersionKey::new(self.local_member.clone(), self.incarnation)
+    }
+
+    /// Allocates and returns the next sequence number within this incarnation.
     pub fn next_seq(&mut self) -> u64 {
         self.local_seq = self.local_seq.saturating_add(1);
         self.local_seq
     }
 
-    /// Allocates and returns the next local logical clock value.
+    /// Allocates and returns the next local logical clock value within this incarnation.
     pub fn next_clock(&mut self) -> u64 {
         self.local_clock = self.local_clock.saturating_add(1);
         self.local_clock
+    }
+
+    /// Returns `true` if `member` is a current or known former member of this folder.
+    pub fn is_known_member(&self, member: &str) -> bool {
+        self.members.contains(member) || self.former_members.contains(member)
+    }
+
+    /// Resolves `candidate` to the canonical member identifier stored in this folder's own member
+    /// lists, never returning unvalidated peer text.
+    pub fn canonical_member_name(&self, candidate: &str) -> Option<&str> {
+        if let Some(m) = self.members.get(candidate) {
+            return Some(m.as_str());
+        }
+        self.former_members.get(candidate).map(String::as_str)
+    }
+}
+
+/// Direct synchronization cursor and acknowledgement state for one peer member.
+///
+/// Only direct knowledge received straight from `peer` is stored here; third-party claims about
+/// other members are never accepted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerCursor {
+    /// Incarnation ID last observed for this peer (`0` before first contact).
+    pub incarnation: u64,
+    /// Highest contiguous sequence number processed from `(peer, incarnation)`.
+    pub seq: u64,
+    /// Our own incarnation that `peer` directly reported having pulled up to `acked_local_seq`.
+    pub acked_local_incarnation: u64,
+    /// Highest `local_seq` of our own `acked_local_incarnation` that `peer` directly confirmed.
+    pub acked_local_seq: u64,
+    /// Distinct earlier incarnations previously seen for this peer (bounded); seeing an earlier
+    /// incarnation return after switching away flags a duplicate member ID (cloned machine).
+    #[serde(default)]
+    pub prior_incarnations: Vec<u64>,
+    /// Fingerprint of the peer's latest record at `(incarnation, seq)` for same-seq clone
+    /// detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_fingerprint: Option<Hash>,
+    /// Set when a duplicate member ID or same-seq divergence was detected for this peer.
+    #[serde(default)]
+    pub duplicate_detected: bool,
+    /// Set permanently when two distinct live incarnations alternated under this member ID.
+    #[serde(default)]
+    pub alternation_detected: bool,
+}
+
+/// Handshake summary returned by a peer before pulling records or files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerHandshake {
+    /// Sync folder identifier served by the peer.
+    pub folder_id: FolderId,
+    /// Member identifier of the peer.
+    pub member_id: MemberId,
+    /// Peer's active incarnation identifier.
+    pub incarnation: u64,
+    /// Peer's current `local_seq` in `incarnation`.
+    pub snapshot_seq: u64,
+    /// Sync protocol version supported by the peer.
+    pub protocol_version: u32,
+}
+
+/// Per-fetch transfer options supporting ranged resume, timeouts, and cooperative cancellation.
+#[derive(Debug, Clone)]
+pub struct FetchOptions {
+    /// Byte offset to start or resume reading from (`0` for the start of the file).
+    pub offset: u64,
+    /// Maximum wall-clock duration allowed for this transfer.
+    pub timeout: Duration,
+    /// Optional cancellation flag checked during streaming reads.
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl Default for FetchOptions {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            timeout: DEFAULT_FETCH_TIMEOUT,
+            cancel: None,
+        }
+    }
+}
+
+impl FetchOptions {
+    /// Creates options starting at `offset` with default timeout and optional cancellation flag.
+    pub fn at_offset(offset: u64, timeout: Duration, cancel: Option<Arc<AtomicBool>>) -> Self {
+        Self {
+            offset,
+            timeout,
+            cancel,
+        }
+    }
+
+    /// Returns `true` if cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -198,14 +564,9 @@ pub struct IndexRecord {
     /// Logical modification time carried across members for deterministic conflict tie-breaking.
     pub mtime: Timestamp,
     /// Actual modification time observed on the local filesystem after writing or scanning.
-    ///
-    /// Stored locally to avoid spurious re-hashes on filesystems that truncate sub-second
-    /// timestamps (such as HFS+ or FAT), and omitted on the wire so every member sees the exact
-    /// same logical [`Self::mtime`].
     #[serde(skip)]
     pub disk_mtime: Option<Timestamp>,
-    /// Optional local-only change fingerprint from `lstat` (inode/ctime on Unix), used to detect
-    /// same-size, same-mtime overwrites or renames without re-hashing unchanged files.
+    /// Local-only change fingerprint (inode/ctime on Unix, NTFS change time + file ID on Windows).
     #[serde(skip)]
     pub disk_change_id: Option<u64>,
     /// Unix permission bits (`0o777` mask) when known; preserved through Windows relays.
@@ -219,29 +580,39 @@ pub struct IndexRecord {
     pub link_target: Option<String>,
     /// `true` when this record is a deletion tombstone.
     pub deleted: bool,
-    /// Causal version vector for this path.
+    /// Causal version vector for this path keyed by `(member, incarnation)`.
     pub version: VersionVector,
     /// Member that authored the latest modification or deletion of this version.
     pub modified_by: MemberId,
     /// Monotonic local sequence number assigned by the member serving this record.
     pub seq: u64,
-    /// Origin `(member, seq)` dependencies for deletion tombstones.
+    /// Short ancestry of the most recent previous content hashes for this path (up to
+    /// [`MAX_ANCESTRY_HASHES`]). For deletion records, `recent_hashes[0]` is the hash of the file
+    /// that was deleted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_hashes: Vec<Hash>,
+    /// `true` when this live record came from pre-existing files discovered on disk during join,
+    /// rollback, or reinstall before reconciling with peers.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub from_join: bool,
+    /// Locally derived original path when this live file is a conflict copy.
     ///
-    /// Empty for live records. A tombstone may be garbage-collected once every current member in
-    /// the folder has transitively observed every `(origin, seq)` in this map.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub tombstone_deps: BTreeMap<MemberId, u64>,
-    /// If this live record was created as a conflict copy of another path, names that original
-    /// path so every member reports the same two-versions list until resolved.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Never accepted from a peer on the wire; always derived locally from the canonical conflict
+    /// filename syntax and local conflict state.
+    #[serde(skip)]
     pub conflict_of: Option<String>,
+    /// Local-only flag set when a person chooses [`ConflictChoice::KeepBoth`] so the file is no
+    /// longer listed as an open conflict locally.
+    #[serde(skip)]
+    pub conflict_dismissed: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 impl IndexRecord {
     /// Returns `true` when `self` and `other` represent the exact same filesystem content.
-    ///
-    /// Two deletions have equal content. Two live entries have equal content iff they share the
-    /// same kind and, for files, the same BLAKE3 hash (and size), or for symlinks, the same target.
     pub fn content_equal(&self, other: &Self) -> bool {
         if self.deleted != other.deleted {
             return false;
@@ -261,156 +632,88 @@ impl IndexRecord {
         }
     }
 
-    /// Returns a copy suitable for sending over the wire (stripping local-only disk metadata).
+    /// Returns a copy suitable for sending over the wire (stripping all local-only fields,
+    /// including `conflict_of` which receivers derive locally).
     pub fn for_wire(&self) -> Self {
         let mut wire = self.clone();
         wire.disk_mtime = None;
         wire.disk_change_id = None;
+        wire.conflict_of = None;
+        wire.conflict_dismissed = false;
         wire
     }
-}
 
-/// Pairwise transitive causal knowledge matrix used for safe tombstone garbage collection.
-///
-/// `rows[observer][origin] = seq` records that `observer` has causally absorbed every index change
-/// `origin` made up to `origin`'s sequence number `seq`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CausalMatrix {
-    /// Map from observer member -> (origin member -> highest absorbed sequence number).
-    pub rows: BTreeMap<MemberId, BTreeMap<MemberId, u64>>,
-}
-
-impl CausalMatrix {
-    /// Creates an empty causal matrix.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns the highest `origin` sequence number known to have been absorbed by `observer`.
-    pub fn get(&self, observer: &str, origin: &str) -> u64 {
-        self.rows
-            .get(observer)
-            .and_then(|row| row.get(origin))
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Raises `rows[observer][origin]` to at least `seq`.
-    pub fn record_seen(&mut self, observer: &str, origin: &str, seq: u64) {
-        if seq == 0 {
+    /// Prepends `hash` to [`Self::recent_hashes`], deduplicating and truncating to
+    /// [`MAX_ANCESTRY_HASHES`].
+    pub fn push_ancestry_hash(&mut self, hash: Hash) {
+        if self.hash == Some(hash) && !self.deleted {
             return;
         }
-        let row = self.rows.entry(observer.to_string()).or_default();
-        let entry = row.entry(origin.to_string()).or_insert(0);
-        if seq > *entry {
-            *entry = seq;
-        }
+        self.recent_hashes.retain(|h| *h != hash);
+        self.recent_hashes.insert(0, hash);
+        self.recent_hashes.truncate(MAX_ANCESTRY_HASHES);
     }
 
-    /// Ensures every member in `members` has a row in the matrix.
-    pub fn ensure_members(&mut self, members: &BTreeSet<MemberId>) {
-        for member in members {
-            self.rows.entry(member.clone()).or_default();
-        }
-    }
-
-    /// Updates the matrix after `local` finishes absorbing *all* records of `peer` up to
-    /// `peer_snapshot_seq`, where `peer_matrix` was captured at the exact same snapshot.
-    pub fn absorb_peer_full(
-        &mut self,
-        local: &str,
-        peer: &str,
-        peer_snapshot_seq: u64,
-        peer_matrix: &CausalMatrix,
-    ) {
-        self.record_seen(local, peer, peer_snapshot_seq);
-        if let Some(peer_row) = peer_matrix.rows.get(peer) {
-            for (origin, &seq) in peer_row {
-                self.record_seen(local, origin, seq);
+    /// Merges ancestry hashes from `other` into `self.recent_hashes`, capped to
+    /// [`MAX_ANCESTRY_HASHES`].
+    pub fn merge_ancestry_from(&mut self, other: &Self) {
+        let mut combined = Vec::with_capacity(MAX_ANCESTRY_HASHES);
+        for &h in &self.recent_hashes {
+            if (self.deleted || self.hash != Some(h)) && !combined.contains(&h) {
+                combined.push(h);
             }
         }
-        self.merge_other_rows(local, peer_matrix);
-    }
-
-    /// Updates the matrix after `local` absorbs a partial prefix of `peer`'s records up to
-    /// `processed_seq` (without yet reaching `peer_snapshot_seq`).
-    ///
-    /// Does NOT copy `peer`'s own transitive row into `local`'s row because records between
-    /// `processed_seq` and `peer_snapshot_seq` have not yet been applied.
-    pub fn absorb_peer_partial(
-        &mut self,
-        local: &str,
-        peer: &str,
-        processed_seq: u64,
-        peer_matrix: &CausalMatrix,
-    ) {
-        self.record_seen(local, peer, processed_seq);
-        self.merge_other_rows(local, peer_matrix);
-    }
-
-    fn merge_other_rows(&mut self, local: &str, peer_matrix: &CausalMatrix) {
-        for (observer, row) in &peer_matrix.rows {
-            if observer == local {
-                continue;
+        for &h in &other.recent_hashes {
+            if combined.len() >= MAX_ANCESTRY_HASHES {
+                break;
             }
-            for (origin, &seq) in row {
-                self.record_seen(observer, origin, seq);
+            if (self.deleted || self.hash != Some(h)) && !combined.contains(&h) {
+                combined.push(h);
             }
         }
+        combined.truncate(MAX_ANCESTRY_HASHES);
+        self.recent_hashes = combined;
     }
 
-    /// Returns `true` when every member in `current_members` has causally observed every
-    /// `(origin, seq)` pair in `deps`.
-    pub fn all_members_seen(
-        &self,
-        current_members: &BTreeSet<MemberId>,
-        deps: &BTreeMap<MemberId, u64>,
-    ) -> bool {
-        if current_members.is_empty() || deps.is_empty() {
-            return false;
+    /// Computes a compact digest of this record's identity for same-seq clone detection.
+    pub fn head_fingerprint(&self) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.path.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&self.seq.to_le_bytes());
+        hasher.update(&[u8::from(self.deleted)]);
+        if let Some(h) = self.hash {
+            hasher.update(h.as_bytes());
         }
-        for (origin, &required_seq) in deps {
-            for member in current_members {
-                if self.get(member, origin) < required_seq {
-                    return false;
-                }
-            }
+        if let Some(ref t) = self.link_target {
+            hasher.update(t.as_bytes());
         }
-        true
-    }
-
-    /// Removes the observer row for a member that left the folder so it no longer blocks
-    /// tombstone garbage collection.
-    pub fn remove_observer(&mut self, member: &str) {
-        self.rows.remove(member);
-    }
-
-    /// Prunes origin columns belonging to members that are neither current members nor referenced
-    /// by any remaining tombstone.
-    pub fn prune_unused_origins(
-        &mut self,
-        current_members: &BTreeSet<MemberId>,
-        active_dep_origins: &BTreeSet<MemberId>,
-    ) {
-        for row in self.rows.values_mut() {
-            row.retain(|origin, _| {
-                current_members.contains(origin) || active_dep_origins.contains(origin)
-            });
-        }
+        hasher.update(self.modified_by.as_bytes());
+        Hash::from_bytes(*hasher.finalize().as_bytes())
     }
 }
 
 /// Page of records returned by [`crate::Peer::records_since`] from one consistent snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordsPage {
+    /// Active incarnation ID of the serving peer at this snapshot.
+    pub incarnation: u64,
     /// Records with `seq > since_seq`, ordered by ascending `seq`.
     pub records: Vec<IndexRecord>,
     /// Peer's `local_seq` at the consistent snapshot where this page was read.
     pub snapshot_seq: u64,
     /// `true` if more records exist beyond this page in the snapshot.
     pub has_more: bool,
-    /// Peer's causal matrix captured at the exact same snapshot.
-    pub matrix: CausalMatrix,
+    /// Direct acknowledgement ONLY: the `(incarnation, seq)` of the *caller* that this peer itself
+    /// has directly pulled and applied. Never carries third-party claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_acked: Option<(u64, u64)>,
+    /// Fingerprint observed by this peer at the caller's acknowledged `(incarnation, seq)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_acked_fingerprint: Option<Hash>,
+    /// Fingerprint of the serving peer's record at `snapshot_seq` (for same-seq clone detection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_fingerprint: Option<Hash>,
 }
 
 /// Why an entry was moved into `.legion-sync/bin`.
@@ -423,12 +726,16 @@ pub enum BinReason {
     ReplacedByPeer,
     /// Replaced while resolving a conflict or restoring from the bin.
     ReplacedLocally,
+    /// Stale pre-existing file moved to bin during join/rollback reconciliation.
+    StaleOnJoin,
+    /// Operating-system litter file moved to bin when removing a deleted directory.
+    OsLitterInDeletedDir,
 }
 
 /// Self-describing metadata for one item stored in `.legion-sync/bin`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinEntry {
-    /// Unique identifier for this bin entry.
+    /// Unique random identifier for this bin entry.
     pub id: String,
     /// Original relative path inside the sync folder.
     pub original_path: String,
@@ -463,18 +770,18 @@ pub enum RestoreStrategy {
     /// Refuse with [`SyncError::Exists`] if a live entry already exists at the destination.
     #[default]
     FailIfExists,
-    /// Move the existing live entry into `.legion-sync/bin` first, then restore.
+    /// Move the existing indexed live entry into `.legion-sync/bin` first, then restore.
+    /// Still refuses if the file on disk has changed since the last scan.
     Replace,
     /// Restore alongside the existing file under `name (restored <date>).ext`.
     Rename,
 }
 
-/// Classification of a held-back path problem that requires user attention or disappears when the
-/// conflicting path is renamed or deleted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Classification of a sync problem reported in [`FolderStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProblemKind {
-    /// Two live paths differ only in letter case on a case-insensitive filesystem.
+    /// Two live paths differ only in letter case (or Unicode normalization) on this filesystem.
     CaseClash,
     /// Filename contains characters forbidden by Windows (`< > : " | ? *` or control bytes).
     ForbiddenWindowsChar,
@@ -488,21 +795,36 @@ pub enum ProblemKind {
     PathTooLong,
     /// Symbolic links are held back on Windows.
     UnsupportedSymlink,
-    /// An entry could not be read or written because of local permissions or filesystem error.
+    /// An entry or directory could not be read or written because of permissions or I/O errors.
     FilesystemError,
+    /// Folder identity marker is missing or does not match the index (e.g. unmounted drive).
+    FolderMarkerMissing,
+    /// A scan saw a large fraction of the folder disappear and tripped the mass-deletion brake.
+    DeletionBrakeTripped,
+    /// Two live machines presented alternating incarnations under the same member ID.
+    DuplicateMemberId,
+    /// A peer sent a malformed or unauthorized record that was skipped.
+    InvalidPeerRecord,
+    /// A directory deleted elsewhere was kept locally because it still holds ignored or held-back
+    /// files.
+    DirectoryKeptLocalFiles,
+    /// The held-back table reached [`MAX_HELD_BACK_ENTRIES`].
+    HeldBackLimitReached,
+    /// A record exceeded [`MAX_DEFERRAL_ATTEMPTS`] consecutive deferrals.
+    DeferredLimitExceeded,
 }
 
 /// Human-readable problem reported in [`FolderStatus`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncProblem {
-    /// Relative path affected by the problem.
+    /// Relative path affected by the problem (empty string for folder-wide problems).
     pub path: String,
     /// Machine-readable problem classification.
     pub kind: ProblemKind,
-    /// Peer that offered this record, if the problem came from pulling a remote record.
+    /// Peer involved, if applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer: Option<MemberId>,
-    /// Plain-language sentence explaining why this item is held back.
+    /// Plain-language sentence explaining the problem.
     pub sentence: String,
 }
 
@@ -516,6 +838,19 @@ pub struct HeldBackRecord {
     pub from_peer: MemberId,
     /// Specific problem describing why the record was held back.
     pub problem: SyncProblem,
+}
+
+/// An item temporarily deferred during sync with an explicit reason and retry count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredItem {
+    /// Peer that sent the deferred record.
+    pub peer: MemberId,
+    /// Relative path of the deferred record.
+    pub path: String,
+    /// Plain-language reason why it was deferred.
+    pub reason: String,
+    /// Number of consecutive pull attempts that deferred this item.
+    pub attempts: u32,
 }
 
 /// An unresolved conflict ("file with two versions") reported in [`FolderStatus`].
@@ -544,7 +879,7 @@ pub enum ConflictChoice {
     KeepOriginal,
     /// Move the original path to the bin and promote the conflict copy to the original path.
     KeepConflict,
-    /// Keep both files as ordinary files and clear the conflict flag.
+    /// Keep both files as ordinary files and clear the conflict flag locally.
     KeepBoth,
 }
 
@@ -598,100 +933,149 @@ pub struct FolderStatus {
     /// Overall state of this member.
     pub state: MemberState,
     /// Status per folder member (including self).
-    pub members: BTreeMap<MemberId, MemberStatus>,
-    /// Files currently having two versions.
+    pub members: Vec<MemberStatus>,
+    /// Files that currently have two versions awaiting resolution.
     pub conflicts: Vec<ConflictInfo>,
-    /// Current contents of `.legion-sync/bin`.
+    /// Contents of `.legion-sync/bin`.
     pub bin: Vec<BinEntry>,
+    /// Active mass-deletion brake awaiting a person's confirmation, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_brake: Option<DeletionBrake>,
+    /// Temporarily deferred items with their reasons and retry counts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred: Vec<DeferredItem>,
 }
 
-/// Snapshot of what the local live disk held immediately before a crash-safe apply began.
+/// Snapshot of what was expected on disk at the target path immediately before an apply began,
+/// used by crash recovery to distinguish a pre-mutation crash from a mid-mutation crash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExpectedLocalSnapshot {
-    /// No live entry existed at the path.
+    /// Path did not exist on disk before apply.
     Missing,
-    /// A regular file with the recorded size, mtime, and BLAKE3 hash existed.
+    /// Path held a regular file with these verified properties.
     File {
-        /// File size in bytes.
+        /// Expected byte length.
         size: u64,
-        /// Logical or disk modification time.
+        /// Expected disk modification time.
         mtime: Timestamp,
-        /// Verified BLAKE3 digest.
+        /// Expected BLAKE3 digest.
         hash: Hash,
     },
-    /// A directory existed.
+    /// Path held a directory.
     Dir,
-    /// A symbolic link existed with the given target.
+    /// Path held a symbolic link with this target.
     Symlink {
-        /// Verbatim symlink target.
+        /// Expected link target string.
         link_target: String,
     },
 }
 
-/// Write-ahead intent persisted in the index store before mutating the live working tree.
-///
-/// If the process crashes at any step between moving an old file to `.legion-sync/bin`, creating a
-/// conflict copy, renaming a staged file into place, and committing the index record, startup
-/// recovery inspects this journal entry alongside the filesystem and deterministically completes
-/// or rolls back the operation without losing data or creating spurious conflicts.
+/// Durable write-ahead intent persisted in the index store immediately before mutating the live
+/// tree, so restarting or recovering after a crash or error at any step converges without loss.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum PendingOp {
-    /// Placing a fetched file, directory, or symlink at `target_record.path`, optionally moving an
-    /// existing entry to `.legion-sync/bin` first.
+    /// Replacing or creating a single live path (moving any existing entry to `.legion-sync/bin`).
     Place {
-        /// Target index record to commit on completion.
+        /// Record to commit once the live path is materialized.
         target_record: IndexRecord,
-        /// Staged filename inside `.legion-sync/tmp/`, when `target_record.kind == EntryKind::File`.
+        /// Staged filename inside `.legion-sync/tmp/` for regular files.
         staged_tmp: Option<String>,
-        /// Metadata for the previous live entry moved to `.legion-sync/bin/`, if any.
+        /// Optional temporary claim filename inside `.legion-sync/tmp/` used during swap/claim.
+        claim_tmp: Option<String>,
+        /// Bin metadata for the displaced prior live entry, if any.
         bin_entry: Option<BinEntry>,
-        /// What the live disk held before touching it.
+        /// Expected disk state at `target_record.path` prior to mutation.
         expected_local: ExpectedLocalSnapshot,
     },
-    /// Deleting an existing live entry to `.legion-sync/bin/` and committing a tombstone.
+    /// Deleting a live path into `.legion-sync/bin` and recording a tombstone.
     Delete {
-        /// Target deletion tombstone to commit on completion.
+        /// Tombstone record to commit once the live entry is moved to the bin.
         target_record: IndexRecord,
-        /// Metadata for the deleted entry moved to `.legion-sync/bin/`, if any.
+        /// Optional temporary claim filename inside `.legion-sync/tmp/`.
+        claim_tmp: Option<String>,
+        /// Bin metadata for the deleted entry, if it was a file or symlink.
         bin_entry: Option<BinEntry>,
-        /// What the live disk held before deleting it.
+        /// Expected disk state at `target_record.path` prior to deletion.
         expected_local: ExpectedLocalSnapshot,
     },
-    /// Resolving a concurrent conflict where the local entry loses and moves to `loser_record.path`
-    /// while the remote winner takes `winner_record.path`.
+    /// Local rename optimization: move an existing live file at `from_record.path` to
+    /// `to_record.path` (same hash, no download).
+    LocalRename {
+        /// Tombstone for the old path.
+        from_record: IndexRecord,
+        /// Live record for the new path.
+        to_record: IndexRecord,
+        /// Expected disk state at `from_record.path` prior to rename.
+        expected_from: ExpectedLocalSnapshot,
+    },
+    /// Concurrent conflict where the local version loses and moves to `loser_record.path` while
+    /// the remote version wins `winner_record.path`.
     ConflictLocalLoses {
-        /// Winning record taking the original path.
+        /// Record for the original (winning) path.
         winner_record: IndexRecord,
-        /// Losing record moving to the conflict copy path.
+        /// Independent record for the conflict copy (losing) path.
         loser_record: IndexRecord,
-        /// Staged filename inside `.legion-sync/tmp/` for the winning file, if it is a file.
+        /// Staged filename inside `.legion-sync/tmp/` for the winning remote file, if a file.
         winner_tmp: Option<String>,
-        /// Whether the conflict copy already existed with identical content before apply.
+        /// `true` if `loser_record.path` already held identical bytes before this op.
         conflict_already_present: bool,
-        /// What the live disk held at the original path before touching it.
+        /// Expected disk state at `winner_record.path` prior to mutation.
         expected_local: ExpectedLocalSnapshot,
     },
-    /// Resolving a concurrent conflict where the local entry keeps `winner_record.path` and the
-    /// remote loser is written to `loser_record.path`.
+    /// Concurrent conflict where the local version wins `winner_record.path` and the remote
+    /// version is placed at `loser_record.path`.
     ConflictRemoteLoses {
-        /// Updated winning record (merged version vector) at the original path.
+        /// Updated record for the original (winning) path.
         winner_record: IndexRecord,
-        /// Losing record placed at the conflict copy path.
+        /// Independent record for the conflict copy (losing) path.
         loser_record: IndexRecord,
-        /// Staged filename inside `.legion-sync/tmp/` for the losing file, if it is a file.
+        /// Staged filename inside `.legion-sync/tmp/` for the losing remote file, if a file.
         loser_tmp: Option<String>,
-        /// Whether the conflict copy already existed with identical content before apply.
+        /// `true` if `loser_record.path` already held identical bytes before this op.
         conflict_already_present: bool,
-        /// What the live disk held at the original path before touching it.
+        /// Expected disk state at `winner_record.path` prior to mutation.
         expected_local: ExpectedLocalSnapshot,
+    },
+    /// Crash-safe restore of a bin entry into the live tree.
+    RestoreFromBin {
+        /// Restored live record to commit.
+        target_record: IndexRecord,
+        /// Bin entry ID being restored (to remove from bin on completion).
+        restored_bin_id: String,
+        /// Storage filename of the restored bin entry (to remove on completion).
+        restored_storage_name: String,
+        /// Staged filename inside `.legion-sync/tmp/` copied from bin.
+        staged_tmp: Option<String>,
+        /// Optional temporary claim filename for a displaced live file under `Replace`.
+        claim_tmp: Option<String>,
+        /// Bin metadata for a displaced live file under `Replace`, if any.
+        replacement_bin: Option<BinEntry>,
+        /// Expected disk state at `target_record.path` prior to restore.
+        expected_local: ExpectedLocalSnapshot,
+    },
+    /// Crash-safe conflict resolution (`KeepConflict`: promote conflict copy to original path).
+    ResolveKeepConflict {
+        /// Promoted live record at original path.
+        promoted_record: IndexRecord,
+        /// Tombstone record for the old conflict copy path.
+        deleted_conflict_record: IndexRecord,
+        /// Optional temporary claim filename for the displaced original file.
+        claim_tmp: Option<String>,
+        /// Bin metadata for the displaced original file, if any.
+        bin_entry: Option<BinEntry>,
+        /// Expected disk state at `promoted_record.path` prior to mutation.
+        expected_orig: ExpectedLocalSnapshot,
+        /// Expected disk state at `deleted_conflict_record.path` prior to mutation.
+        expected_conflict: ExpectedLocalSnapshot,
     },
 }
 
-/// Progress snapshot reported during or between peer sync passes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Active sync progress tracked for a peer during `pull_from_peer`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncProgress {
-    /// Number of entries still waiting to be applied.
+    /// Files remaining to pull/apply.
     pub files_left: u64,
-    /// Number of bytes still waiting to be transferred.
+    /// Bytes remaining to transfer.
     pub bytes_left: u64,
 }
