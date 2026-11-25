@@ -615,6 +615,37 @@ impl IndexStore for RedbIndexStore {
         })
     }
 
+    fn visit_version_keys_since(
+        &self,
+        since_seq: u64,
+        visitor: &mut dyn FnMut(&crate::version::VersionKey),
+    ) -> Result<()> {
+        catch_redb(&self.path_label, || {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| storage_err("begin read", e))?;
+            let by_seq = txn.open_table(BY_SEQ_TABLE).map_err(table_err)?;
+            let records_table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
+            let range = by_seq
+                .range((Bound::Excluded(since_seq), Bound::Unbounded))
+                .map_err(|e| storage_err("range by_seq", e))?;
+            for item in range {
+                let (_, path_guard) = item.map_err(|e| storage_err("step by_seq", e))?;
+                if let Some(rec_guard) = records_table
+                    .get(path_guard.value())
+                    .map_err(|e| storage_err("lookup record by_seq", e))?
+                {
+                    let rec = decode_record(rec_guard.value())?;
+                    for (k, _) in rec.version.iter() {
+                        visitor(k);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn records_since(
         &self,
         caller_member: &str,

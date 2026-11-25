@@ -2118,6 +2118,14 @@ impl IndexStore for FaultyIndexStore {
         self.inner.live_file_count()
     }
 
+    fn visit_version_keys_since(
+        &self,
+        since_seq: u64,
+        visitor: &mut dyn FnMut(&VersionKey),
+    ) -> legion_sync::Result<()> {
+        self.inner.visit_version_keys_since(since_seq, visitor)
+    }
+
     fn apply_batch(&mut self, batch: StoreBatch) -> legion_sync::Result<()> {
         if let Some(left) = self.fail_countdown {
             if left == 0 {

@@ -335,6 +335,12 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             Err(_) => (Some(index_damaged_problem()), false, true, BTreeSet::new()),
         };
 
+        let initial_may_have_retired = if index_damaged {
+            true
+        } else {
+            store.record_count().unwrap_or(1) > 0
+        };
+
         let mut engine = Self {
             bin_retention_secs: config.bin_retention_secs,
             deletion_brake: config.deletion_brake,
@@ -351,7 +357,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             skipped_paths,
             folder_problem,
             index_damaged,
-            may_have_retired_vv_keys: true,
+            may_have_retired_vv_keys: initial_may_have_retired,
             last_now: Timestamp::from_system_time(std::time::SystemTime::now()),
         };
         if needs_recover {
@@ -1271,7 +1277,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
         // Bidirectional handshake FIRST (before any page moves in either direction!).
         let mut meta = meta;
-        let mut hs = self.do_handshake(peer, &peer_id, &meta, initial_cursors.get(&peer_id))?;
+        let mut hs = self.do_handshake(peer, &peer_id, &meta, &initial_cursors)?;
 
         let existing_for_peer = initial_cursors.get(&peer_id).cloned();
         let peer_expected_rejoin = hs.caller_rejoining
@@ -1329,7 +1335,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             self.recover_own_rollback(&peer_id, &meta, now)?;
             meta = self.meta()?;
             initial_cursors = self.store.load_peer_cursors()?;
-            hs = self.do_handshake(peer, &peer_id, &meta, initial_cursors.get(&peer_id))?;
+            hs = self.do_handshake(peer, &peer_id, &meta, &initial_cursors)?;
         }
 
         // Item 5: check if the PEER went back in time BEFORE any page moves!
@@ -1626,12 +1632,29 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
             if !self.may_have_retired_vv_keys && !page.records.is_empty() {
                 let own_key = local_meta.version_key();
-                for rec in &page.records {
-                    if rec.version.iter().any(|(k, _)| {
-                        *k != own_key && !(k.member == peer_id && k.incarnation == page.incarnation)
-                    }) {
-                        self.may_have_retired_vv_keys = true;
-                        break;
+                let mut cursors_cache: Option<BTreeMap<MemberId, PeerCursor>> = None;
+                'check_retired: for rec in &page.records {
+                    for (k, _) in rec.version.iter() {
+                        if *k == own_key
+                            || (k.member == peer_id && k.incarnation == page.incarnation)
+                        {
+                            continue;
+                        }
+                        if !local_meta.members.contains(&k.member) {
+                            self.may_have_retired_vv_keys = true;
+                            break 'check_retired;
+                        }
+                        if cursors_cache.is_none() {
+                            cursors_cache = Some(self.store.load_peer_cursors()?);
+                        }
+                        if let Some(ref map) = cursors_cache
+                            && !map
+                                .get(&k.member)
+                                .is_some_and(|c| c.incarnation == k.incarnation)
+                        {
+                            self.may_have_retired_vv_keys = true;
+                            break 'check_retired;
+                        }
                     }
                 }
             }
@@ -2448,8 +2471,9 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         peer: &dyn Peer,
         peer_id: &str,
         meta: &FolderMeta,
-        cursor: Option<&PeerCursor>,
+        all_cursors: &BTreeMap<MemberId, PeerCursor>,
     ) -> Result<PeerHandshake> {
+        let cursor = all_cursors.get(peer_id);
         let (peer_pulled, peer_acked) = match cursor.filter(|c| c.incarnation != 0) {
             Some(c) => (
                 Some(PeerAckView {
@@ -2465,8 +2489,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             ),
             None => (None, None),
         };
-        let all_cursors = self.store.load_peer_cursors()?;
-        let unsettled_vv_keys = self.local_unsettled_retired_vv_keys(meta, &all_cursors)?;
+        let unsettled_vv_keys = self.local_unsettled_retired_vv_keys(meta, all_cursors)?;
         let hello = HandshakeHello {
             folder_id: meta.folder_id.clone(),
             member_id: meta.local_member.clone(),
@@ -2479,7 +2502,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             peer_rejoining: meta.rejoining_peers.contains(peer_id),
             refused_from_peer: self.refusal_summary_for_peer(peer_id)?,
             pruned_incarnations: meta.pruned_incarnations.iter().cloned().collect(),
-            known_incarnations: local_known_incarnations(meta, &all_cursors),
+            known_incarnations: local_known_incarnations(meta, all_cursors),
             known_members: meta.members.clone(),
             unsettled_vv_keys,
         };
@@ -3835,30 +3858,12 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
         let mut unsettled = BTreeSet::new();
         if self.may_have_retired_vv_keys && min_direct_ack < meta.local_seq {
-            let mut since_seq = min_direct_ack;
-            loop {
-                let page = self.store.records_since(
-                    &meta.local_member,
-                    meta.incarnation,
-                    since_seq,
-                    MAX_PAGE_RECORDS,
-                )?;
-                if page.records.is_empty() {
-                    break;
-                }
-                for rec in &page.records {
-                    for (k, _) in rec.version.iter() {
-                        if is_non_active(k) {
-                            unsettled.insert(k.clone());
-                        }
+            self.store
+                .visit_version_keys_since(min_direct_ack, &mut |k| {
+                    if is_non_active(k) {
+                        unsettled.insert(k.clone());
                     }
-                }
-                let last_seq = page.records.last().map_or(since_seq, |r| r.seq);
-                if !page.has_more || last_seq <= since_seq {
-                    break;
-                }
-                since_seq = last_seq;
-            }
+                })?;
         }
         if held_count > 0 {
             for hb in self.store.list_held_back()? {
