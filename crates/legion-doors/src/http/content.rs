@@ -558,33 +558,54 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
                     tokio::select! {
                         biased;
                         () = watch_ctrl.abort.cancelled() => {
-                            let removed = watch_shared
-                                .content_tickets
-                                .revoke_holder_hashes(&watch_ticket.holder);
-                            watch_shared
-                                .content_audit
-                                .flush_removed(&watch_shared.node, &removed)
-                                .await;
+                            revoke_and_flush_after_abort(
+                                &watch_shared,
+                                &watch_source,
+                                &watch_ticket,
+                            )
+                            .await;
                             break;
                         }
                         () = stop_watcher.cancelled() => break,
                         () = watch_shared.link.shutdown.cancelled() => break,
                         () = tokio::time::sleep(watch_interval) => {
-                            let live = watch_shared.content_tickets.is_live(&watch_ticket.key_hash)
-                                && watch_source.check_live(&watch_ticket).is_ok();
-                            if !live {
-                                // Abort the TCP connection first so zero further bytes can be
-                                // handed to the socket while the revoked ticket's audit summary
-                                // flushes to disk.
-                                watch_ctrl.abort.cancel();
-                                let removed = watch_shared
-                                    .content_tickets
-                                    .revoke_holder_hashes(&watch_ticket.holder);
-                                watch_shared
-                                    .content_audit
-                                    .flush_removed(&watch_shared.node, &removed)
-                                    .await;
-                                break;
+                            match check_stream_liveness(
+                                &watch_shared,
+                                &watch_source,
+                                &watch_ticket,
+                            ) {
+                                LivenessOutcome::Live => {}
+                                LivenessOutcome::HolderRevoked => {
+                                    // Abort the TCP connection first so zero further bytes can be
+                                    // handed to the socket while the revoked holder's audit
+                                    // summaries flush to disk.
+                                    watch_ctrl.abort.cancel();
+                                    let removed = watch_shared
+                                        .content_tickets
+                                        .revoke_holder_hashes(&watch_ticket.holder);
+                                    watch_shared
+                                        .content_audit
+                                        .flush_removed(&watch_shared.node, &removed)
+                                        .await;
+                                    break;
+                                }
+                                LivenessOutcome::TicketEnded => {
+                                    // Only this ticket expired, reached its hard cap, or lost path
+                                    // permission: end only this ticket and leave the holder's
+                                    // other tickets intact.
+                                    watch_ctrl.abort.cancel();
+                                    watch_shared
+                                        .content_tickets
+                                        .revoke_hash(&watch_ticket.key_hash);
+                                    watch_shared
+                                        .content_audit
+                                        .flush_removed(
+                                            &watch_shared.node,
+                                            &[watch_ticket.key_hash],
+                                        )
+                                        .await;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -609,6 +630,54 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
     } else {
         stop_watcher.cancel();
         response.map(Body::new)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LivenessOutcome {
+    Live,
+    HolderRevoked,
+    TicketEnded,
+}
+
+fn check_stream_liveness(
+    shared: &Shared,
+    source: &DoorContentSource,
+    ticket: &Ticket,
+) -> LivenessOutcome {
+    match source.check_live(ticket) {
+        Err(OpenRangeError::TicketRevoked) => LivenessOutcome::HolderRevoked,
+        Err(_) => LivenessOutcome::TicketEnded,
+        Ok(()) => {
+            if shared.content_tickets.is_live(&ticket.key_hash) {
+                LivenessOutcome::Live
+            } else {
+                LivenessOutcome::TicketEnded
+            }
+        }
+    }
+}
+
+async fn revoke_and_flush_after_abort(
+    shared: &Shared,
+    source: &DoorContentSource,
+    ticket: &Ticket,
+) {
+    match check_stream_liveness(shared, source, ticket) {
+        LivenessOutcome::HolderRevoked => {
+            let removed = shared.content_tickets.revoke_holder_hashes(&ticket.holder);
+            shared
+                .content_audit
+                .flush_removed(&shared.node, &removed)
+                .await;
+        }
+        LivenessOutcome::TicketEnded | LivenessOutcome::Live => {
+            shared.content_tickets.revoke_hash(&ticket.key_hash);
+            shared
+                .content_audit
+                .flush_removed(&shared.node, &[ticket.key_hash])
+                .await;
+        }
     }
 }
 
@@ -640,16 +709,15 @@ impl http_body::Body for AuditCountingBody {
                     "content stream was revoked",
                 ))));
             }
-            if check.ctrl.backpressured.swap(false, Ordering::AcqRel) {
-                let live = check.shared.content_tickets.is_live(&check.ticket.key_hash)
-                    && check.source.check_live(&check.ticket).is_ok();
-                if !live {
-                    check.ctrl.abort.cancel();
-                    return std::task::Poll::Ready(Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "content ticket revoked",
-                    ))));
-                }
+            if check.ctrl.backpressured.swap(false, Ordering::AcqRel)
+                && check_stream_liveness(&check.shared, &check.source, &check.ticket)
+                    != LivenessOutcome::Live
+            {
+                check.ctrl.abort.cancel();
+                return std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "content ticket revoked",
+                ))));
             }
         }
         let poll = Pin::new(&mut self.inner).poll_frame(cx);
@@ -833,10 +901,18 @@ impl ContentSource for DoorContentSource {
                 self.shared.node.paths(),
             )
             .map_err(|_| {
-                OpenRangeError::Error(ErrorBody::new(
-                    ErrorCode::Denied,
-                    "Access to this file was denied.",
-                ))
+                if !policy
+                    .principals
+                    .keys()
+                    .any(|p| p.as_str() == ticket.principal)
+                {
+                    OpenRangeError::TicketRevoked
+                } else {
+                    OpenRangeError::Error(ErrorBody::new(
+                        ErrorCode::Denied,
+                        "Access to this file was denied.",
+                    ))
+                }
             })?;
         if ticket.machine == self.shared.node.name()
             && grant.check_path(&ticket.path, Access::Read).is_err()

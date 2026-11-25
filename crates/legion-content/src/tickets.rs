@@ -341,7 +341,12 @@ impl TicketTable {
 
     /// Removes one ticket by id, returning `true` if it existed.
     pub fn revoke(&self, id: &str) -> bool {
-        self.lock().entries.remove(&ticket_key(id)).is_some()
+        self.revoke_hash(&ticket_key(id))
+    }
+
+    /// Removes one ticket by its key hash, returning `true` if it existed.
+    pub fn revoke_hash(&self, key_hash: &[u8; 32]) -> bool {
+        self.lock().entries.remove(key_hash).is_some()
     }
 
     /// Removes every ticket owned by `holder`, returning how many were removed.

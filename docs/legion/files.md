@@ -147,7 +147,9 @@ reader. On SSH connections:
 - **Slots and fair waiting**: at most 8 active content channels run on one SSH connection (strictly
   below OpenSSH's default `MaxSessions` of 10, leaving room for RPC). When all 8 slots are actively
   reading, further opens wait fairly in FIFO order up to the SSH connect timeout before returning a
-  retryable `busy` error; a permit is held until `sshd` confirms channel close (`SSH_MSG_CHANNEL_CLOSE`).
+  retryable `busy` error; on teardown or parking, `legion-link` sends stdin EOF and holds the permit
+  until `sshd` confirms channel close (`SSH_MSG_CHANNEL_CLOSE`), falling back to a local channel
+  close after 2 seconds if a remote ignores stdin EOF.
 - **Parking and transparent reopening**: a stream holds an SSH channel and slot only while actively
   read. After ~2 seconds of reader inactivity, `ContentStream` parks its channel — closing the SSH
   channel and freeing its slot while keeping already-buffered bytes (within a bounded per-channel
@@ -169,24 +171,41 @@ interface's origin. So content is served from a **content address**: a URL holdi
 - A ticket is 256 random bits, made for one principal, one machine, and one bounded path (at most
   4 KiB; `POST /v1/content` bodies are capped at 16 KiB). It is checked as `fs.read` when made, on
   every request, and while a response streams: an independent 1-second liveness watcher per active
-  stream (not tied to client read speed or body polling) re-checks the bearer token, `policy.toml`,
-  and the 6-hour hard cap, and whenever a write resumes after socket backpressure the body re-checks
-  liveness before yielding another 64 KiB frame. Each active content socket requests `SO_SNDBUF =
+  stream (not tied to client read speed or body polling) re-checks the door's own bearer token,
+  local `policy.toml` (principals and paths), and the 6-hour hard cap, and whenever a write resumes
+  after socket backpressure the body re-checks liveness before yielding another 64 KiB frame.
+  Revoking a token or removing a principal revokes every ticket of that holder; a per-ticket failure
+  (a narrowed path, expiry, or crossing the 6-hour cap) ends only that ticket and leaves the
+  holder's other still-allowed tickets serving. Each active content socket requests `SO_SNDBUF =
   128 KiB` before sending the response (the effective kernel buffer varies by OS: Linux doubles it
   to 256 KiB for bookkeeping; macOS sets ~128–147 KiB; Windows sets 128 KiB), and as soon as
   revocation is detected the server cancels the connection first (before flushing audit records to
   disk), hands no further bytes to the socket, discards its own buffered bytes, releases its remote
   pipe, and resets the TCP connection (`SO_LINGER(0)`) to drop the server's unsent kernel send
-  queue. What this guarantees: server-side cutoff within ~2 seconds even for slow (e.g. 20 KB/s) or
-  completely stalled readers, at most the kernel's effective send buffer plus one 64 KiB write
-  handed to the socket between revocation and cutoff, and zero bytes handed to the socket after the
-  cutoff decision. What the server cannot guarantee: bytes already transmitted and accepted into
-  the peer's own TCP receive buffer (or in flight on the network) before revocation cannot be
-  recalled, so a reader may still drain whatever its OS had already buffered (which varies by OS
-  and receive-buffer autotuning, e.g. ~128–256 KiB on Linux loopback and ~384–650 KiB on macOS
-  loopback). Expiry uses a suspend-safe clock (the maximum of wall-clock and monotonic elapsed
-  time): 15 minutes after its last use and 6 hours at most, capped per holder (128, LRU eviction)
-  and globally.
+  queue. What this guarantees for what the door itself decides (its bearer tokens, local principals
+  and paths, and ticket lifetime):
+  1. **Time**: server-side cutoff within 2 seconds of revocation even for slow (e.g. 20 KB/s) or
+     completely stalled readers.
+  2. **Zero bytes after cutoff**: once cutoff is reached, zero further bytes are handed to the
+     socket and the connection closes (EOF or reset).
+  3. **Physical byte ceiling between revocation and cutoff**: at most the socket's effective
+     `SO_SNDBUF` plus the client's effective `SO_RCVBUF` plus whatever bytes the client actually
+     reads during that window plus one 64 KiB write chunk (collapsing to `SO_SNDBUF + SO_RCVBUF +
+     64 KiB` for a stalled reader).
+  What lies outside those bounds:
+  - **Remote machine policy changes**: the door does not watch another machine's `policy.toml`. For
+    a file served from a remote machine, tightening policy on that machine takes effect at that
+    machine's next check of the stream (the next window open/reopen), which a slow reader delays,
+    with the slow-reader timeout as the backstop.
+  - **Proxies and client receive buffers**: the `SO_SNDBUF` bound (256 KiB effective on Linux)
+    applies to the loopback hop only; behind Tailscale Serve (or another reverse proxy), its own
+    buffers sit beyond it. Bytes already transmitted and accepted into the peer's own TCP receive
+    buffer (or in flight on the network) before revocation cannot be recalled, so a reader may still
+    drain whatever its OS had already buffered (which varies by OS and receive-buffer autotuning,
+    e.g. ~128–256 KiB on Linux loopback and ~384–650 KiB on macOS loopback).
+  Expiry uses a suspend-safe clock (the maximum of wall-clock and monotonic elapsed time): 15
+  minutes after its last use and 6 hours at most, capped per holder (128, LRU eviction) and
+  globally.
 - The address answers `GET` and `HEAD` with single-range support (`Range`, `If-Range`, a strong
   `ETag` from size, modification time, and Unix file identity, `206` and `416` done properly),
   streaming with backpressure and never reading a file into memory.
@@ -216,9 +235,11 @@ interface's origin. So content is served from a **content address**: a URL holdi
 - **Lifetime and browser history**: a content address stays usable for up to 6 hours while in active
   use and will appear in browser history if opened directly in a tab. Damage is bounded because the
   ticket is read-only to one file, expires after 15 minutes of idleness (and 6 hours unconditionally),
-  cuts off active readers within ~2 seconds when the bearer token or `fs.read` policy is revoked,
-  carries `Cache-Control: private, no-store` and `Referrer-Policy: no-referrer`, and renders only in
-  a sandboxed opaque origin with `frame-ancestors 'none'`. If a third-party page somehow obtains a
+  cuts off active readers within 2 seconds when the door revokes the bearer token, removes the
+  principal, or tightens local `fs.read` policy (changes to a remote machine's `policy.toml` take
+  effect at that machine's next check of the stream, backed by the slow-reader timeout), carries
+  `Cache-Control: private, no-store` and `Referrer-Policy: no-referrer`, and renders only in a
+  sandboxed opaque origin with `frame-ancestors 'none'`. If a third-party page somehow obtains a
   ticket, `Origin` checks block cross-origin `fetch()` unless explicitly listed,
   `Cross-Origin-Resource-Policy: same-origin` blocks no-cors subresource embedding,
   `frame-ancestors 'none'` blocks framing, and `sandbox; default-src 'none'` isolates any top-level

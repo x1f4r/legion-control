@@ -3792,9 +3792,9 @@ paths = [\"~/projects/**\"]
     );
     // Client-side post-revocation reads include whatever bytes the client OS already accepted into
     // its own TCP receive buffer before revocation (e.g. ~650 KiB on macOS loopback autotuning).
-    // The tight server-side post-revocation socket-write bound (<= SO_SNDBUF + 1 write) is
-    // asserted directly in `legion_doors::http::tests`; keep a loose OS-independent sanity bound
-    // here.
+    // The server-side cutoff time, post-cutoff zero-byte window, and physical socket-write ceiling
+    // (effective SO_SNDBUF + client SO_RCVBUF + client post-revoke reads + 64 KiB) are asserted
+    // directly in `legion_doors::http::tests`; keep a loose OS-independent sanity bound here.
     assert!(
         bytes_after_revoke < 4 * 1024 * 1024,
         "expected slow reader to stop well short of the 16 MiB file after revocation, drained {bytes_after_revoke} bytes (server cut at {server_cut_elapsed:?})"

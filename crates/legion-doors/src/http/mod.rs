@@ -1684,17 +1684,11 @@ allow = [\"effect:read\"]
             effective_sndbuf > 0,
             "expected getsockopt(SO_SNDBUF) to be recorded when content stream started"
         );
-        // Server-side bound on bytes handed to the socket between revocation and cutoff:
-        // at most the kernel-reported effective SO_SNDBUF plus one 64 KiB frame write, and zero
-        // bytes after the abort decision.
-        let max_post_revoke_socket_bytes = (effective_sndbuf + 64 * 1024) as u64;
-        eprintln!(
-            "content revocation SO_SNDBUF ({}): requested={} effective={} bound={}",
-            std::env::consts::OS,
-            CONTENT_SOCKET_SNDBUF,
-            effective_sndbuf,
-            max_post_revoke_socket_bytes
-        );
+        const ONE_CHUNK: usize = 64 * 1024;
+        // Time bound: the 1 s liveness watcher cuts within 2 s in production; allow the 50 ms test
+        // polling step plus loaded-runner scheduling margin.
+        let max_cut_elapsed = Duration::from_millis(2500);
+        let post_cut_quiet_window = Duration::from_secs(1);
 
         node.call(legion_core::Call::new(
             legion_core::Door::Cli,
@@ -1705,61 +1699,103 @@ allow = [\"effect:read\"]
         .unwrap();
         let revoked_at = Instant::now();
         let written_at_revoke = socket_bytes.load(Ordering::Acquire);
+        let slow_rcvbuf_at_revoke = socket2::SockRef::from(&slow_conn)
+            .recv_buffer_size()
+            .unwrap();
 
         let mut server_cut_at = None;
-        let mut client_after_revoke = 0usize;
+        let mut client_read_before_cut = 0usize;
+        let mut next_read_at = revoked_at;
         while revoked_at.elapsed() < Duration::from_secs(4) {
-            if server_cut_at.is_none() && audit_has_read("slow") {
+            if audit_has_read("slow") {
                 server_cut_at = Some(revoked_at.elapsed());
                 break;
             }
-            match tokio::time::timeout(Duration::from_millis(200), slow_conn.read(&mut chunk)).await
-            {
-                Ok(Ok(0)) | Ok(Err(_)) => {
-                    server_cut_at.get_or_insert(revoked_at.elapsed());
-                    break;
+            if Instant::now() >= next_read_at {
+                match tokio::time::timeout(Duration::from_millis(50), slow_conn.read(&mut chunk))
+                    .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) => {
+                        server_cut_at = Some(revoked_at.elapsed());
+                        break;
+                    }
+                    Ok(Ok(n)) => {
+                        client_read_before_cut += n;
+                        next_read_at = Instant::now() + Duration::from_millis(200);
+                    }
+                    Err(_) => {}
                 }
-                Ok(Ok(n)) => {
-                    client_after_revoke += n;
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-                Err(_) => {}
+            } else {
+                let wait = next_read_at
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(50));
+                tokio::time::sleep(wait).await;
             }
         }
         let server_cut_elapsed = server_cut_at.expect("watcher must cut slow reader within 4s");
+        let cut_observed_at = Instant::now();
         let written_at_cut = socket_bytes.load(Ordering::Acquire);
+        let slow_rcvbuf_at_cut = socket2::SockRef::from(&slow_conn)
+            .recv_buffer_size()
+            .unwrap();
+        let slow_client_rcvbuf = slow_rcvbuf_at_revoke.max(slow_rcvbuf_at_cut);
+
+        // 1. Time bound: server stops handing bytes to the socket within 2 s (+ polling/load margin).
         assert!(
-            server_cut_elapsed <= Duration::from_secs(3),
-            "expected slow reader cutoff within ~2s, took {server_cut_elapsed:?}"
+            server_cut_elapsed <= max_cut_elapsed,
+            "expected slow reader cutoff within 2s (+ margin), took {server_cut_elapsed:?}"
         );
-        // Drain any bytes already in the client's OS receive buffer, then verify nothing further
-        // was handed to the socket by the server after the abort decision.
+
+        // 2. Nothing after the cut: connection closes (EOF or reset, never full file) and zero
+        //    further bytes are handed to the socket for a full 1 s after cutoff.
         let mut tail = Vec::new();
-        let _ =
+        let drain_res =
             tokio::time::timeout(Duration::from_secs(2), slow_conn.read_to_end(&mut tail)).await;
-        client_after_revoke += tail.len();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let written_final = socket_bytes.load(Ordering::Acquire);
+        assert!(
+            drain_res.is_ok(),
+            "expected slow reader connection to close (EOF or reset) after cutoff, timed out after draining {} bytes",
+            tail.len()
+        );
+        let remaining_quiet = post_cut_quiet_window.saturating_sub(cut_observed_at.elapsed());
+        if !remaining_quiet.is_zero() {
+            tokio::time::sleep(remaining_quiet).await;
+        }
+        let written_after_1s = socket_bytes.load(Ordering::Acquire);
+        let bytes_after_cut = written_after_1s.saturating_sub(written_at_cut);
         assert_eq!(
-            written_final, written_at_cut,
-            "server must hand zero bytes to socket after abort decision"
+            bytes_after_cut, 0,
+            "server must hand zero bytes to socket during the 1s after slow-reader cutoff (saw {bytes_after_cut} extra bytes)"
         );
-        let written_after_revoke = written_final.saturating_sub(written_at_revoke);
+
+        // 3. Physical ceiling between revocation and cutoff: effective SO_SNDBUF + client's
+        //    effective SO_RCVBUF + bytes the client actually read after revocation + one 64 KiB
+        //    write chunk.
+        let written_after_revoke = written_after_1s.saturating_sub(written_at_revoke);
+        let slow_ceiling =
+            (effective_sndbuf + slow_client_rcvbuf + client_read_before_cut + ONE_CHUNK) as u64;
+        let slow_total_client_read = chunk.len() + client_read_before_cut + tail.len();
         eprintln!(
-            "slow reader ({}): effective_sndbuf={} written_after_revoke={} cut={:?} client_drained={}",
+            "slow reader ({}): requested_sndbuf={} effective_sndbuf={} client_rcvbuf={} (revoke={} cut={}) client_read_before_cut={} written_after_revoke={} ceiling={} after_cut_1s={} cut={:?} client_drained={}",
             std::env::consts::OS,
+            CONTENT_SOCKET_SNDBUF,
             effective_sndbuf,
+            slow_client_rcvbuf,
+            slow_rcvbuf_at_revoke,
+            slow_rcvbuf_at_cut,
+            client_read_before_cut,
             written_after_revoke,
+            slow_ceiling,
+            bytes_after_cut,
             server_cut_elapsed,
-            client_after_revoke
+            client_read_before_cut + tail.len()
         );
         assert!(
-            written_after_revoke <= max_post_revoke_socket_bytes,
-            "server handed too many bytes to socket after revocation for slow reader: {written_after_revoke} > {max_post_revoke_socket_bytes} (effective SO_SNDBUF={effective_sndbuf}, cut at {server_cut_elapsed:?}, client drained {client_after_revoke})"
+            written_after_revoke <= slow_ceiling,
+            "server handed too many bytes to socket after revocation for slow reader: {written_after_revoke} > {slow_ceiling} (effective_sndbuf={effective_sndbuf}, client_rcvbuf={slow_client_rcvbuf}, client_read_before_cut={client_read_before_cut}, chunk={ONE_CHUNK}, cut={server_cut_elapsed:?})"
         );
         assert!(
-            client_after_revoke < 4 * 1024 * 1024,
-            "client drained unreasonably large tail after slow-reader revocation: {client_after_revoke} bytes"
+            slow_total_client_read < big_len,
+            "slow reader must not receive the full 16 MiB file after revocation (received {slow_total_client_read} / {big_len} bytes)"
         );
 
         // 2. Completely stalled reader (never reads again after initial 16 KiB).
@@ -1773,6 +1809,11 @@ allow = [\"effect:read\"]
         let mut initial = [0u8; 16 * 1024];
         stalled_conn.read_exact(&mut initial).await.unwrap();
         wait_for_buffer_settle(&socket_bytes).await;
+        let stalled_effective_sndbuf = socket_sndbuf.load(Ordering::Acquire);
+        assert!(
+            stalled_effective_sndbuf > 0,
+            "expected getsockopt(SO_SNDBUF) to be recorded for stalled content stream"
+        );
 
         node.call(legion_core::Call::new(
             legion_core::Door::Cli,
@@ -1783,6 +1824,9 @@ allow = [\"effect:read\"]
         .unwrap();
         let stalled_revoked_at = Instant::now();
         let stalled_written_at_revoke = socket_bytes.load(Ordering::Acquire);
+        let stalled_rcvbuf_at_revoke = socket2::SockRef::from(&stalled_conn)
+            .recv_buffer_size()
+            .unwrap();
 
         let mut stalled_cut_at = None;
         while stalled_revoked_at.elapsed() < Duration::from_secs(4) {
@@ -1794,41 +1838,306 @@ allow = [\"effect:read\"]
         }
         let stalled_cut_elapsed =
             stalled_cut_at.expect("watcher must cut stalled reader within 4s");
+        let stalled_cut_observed_at = Instant::now();
         let stalled_written_at_cut = socket_bytes.load(Ordering::Acquire);
+        let stalled_rcvbuf_at_cut = socket2::SockRef::from(&stalled_conn)
+            .recv_buffer_size()
+            .unwrap();
+        let stalled_client_rcvbuf = stalled_rcvbuf_at_revoke.max(stalled_rcvbuf_at_cut);
+
+        // 1. Time bound for stalled reader.
         assert!(
-            stalled_cut_elapsed <= Duration::from_secs(3),
-            "expected stalled reader cutoff within ~2s, took {stalled_cut_elapsed:?}"
+            stalled_cut_elapsed <= max_cut_elapsed,
+            "expected stalled reader cutoff within 2s (+ margin), took {stalled_cut_elapsed:?}"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let stalled_written_final = socket_bytes.load(Ordering::Acquire);
-        assert_eq!(
-            stalled_written_final, stalled_written_at_cut,
-            "server must hand zero bytes to stalled socket after abort decision"
-        );
-        let stalled_written_after_revoke =
-            stalled_written_final.saturating_sub(stalled_written_at_revoke);
+
+        // 2. Nothing after the cut: connection closes (EOF or reset) and zero further bytes are
+        //    handed to the socket for a full 1 s after cutoff.
         let mut stalled_tail = Vec::new();
-        let _ = tokio::time::timeout(
+        let stalled_drain_res = tokio::time::timeout(
             Duration::from_secs(2),
             stalled_conn.read_to_end(&mut stalled_tail),
         )
         .await;
+        assert!(
+            stalled_drain_res.is_ok(),
+            "expected stalled reader connection to close (EOF or reset) after cutoff, timed out after draining {} bytes",
+            stalled_tail.len()
+        );
+        let stalled_remaining_quiet =
+            post_cut_quiet_window.saturating_sub(stalled_cut_observed_at.elapsed());
+        if !stalled_remaining_quiet.is_zero() {
+            tokio::time::sleep(stalled_remaining_quiet).await;
+        }
+        let stalled_written_after_1s = socket_bytes.load(Ordering::Acquire);
+        let stalled_bytes_after_cut =
+            stalled_written_after_1s.saturating_sub(stalled_written_at_cut);
+        assert_eq!(
+            stalled_bytes_after_cut, 0,
+            "server must hand zero bytes to stalled socket during the 1s after cutoff (saw {stalled_bytes_after_cut} extra bytes)"
+        );
+
+        // 3. Physical ceiling for a stalled reader collapses strictly to effective SO_SNDBUF +
+        //    client effective SO_RCVBUF + one 64 KiB write chunk (no client-read term).
+        let stalled_written_after_revoke =
+            stalled_written_after_1s.saturating_sub(stalled_written_at_revoke);
+        let stalled_ceiling = (stalled_effective_sndbuf + stalled_client_rcvbuf + ONE_CHUNK) as u64;
         eprintln!(
-            "stalled reader ({}): effective_sndbuf={} written_after_revoke={} cut={:?} client_drained={}",
+            "stalled reader ({}): requested_sndbuf={} effective_sndbuf={} client_rcvbuf={} (revoke={} cut={}) written_after_revoke={} ceiling={} after_cut_1s={} cut={:?} client_drained={}",
             std::env::consts::OS,
-            effective_sndbuf,
+            CONTENT_SOCKET_SNDBUF,
+            stalled_effective_sndbuf,
+            stalled_client_rcvbuf,
+            stalled_rcvbuf_at_revoke,
+            stalled_rcvbuf_at_cut,
             stalled_written_after_revoke,
+            stalled_ceiling,
+            stalled_bytes_after_cut,
             stalled_cut_elapsed,
             stalled_tail.len()
         );
         assert!(
-            stalled_written_after_revoke <= max_post_revoke_socket_bytes,
-            "server handed too many bytes to socket after revocation for stalled reader: {stalled_written_after_revoke} > {max_post_revoke_socket_bytes} (effective SO_SNDBUF={effective_sndbuf}, cut at {stalled_cut_elapsed:?})"
+            stalled_written_after_revoke <= stalled_ceiling,
+            "server handed too many bytes to socket after revocation for stalled reader: {stalled_written_after_revoke} > {stalled_ceiling} (effective_sndbuf={stalled_effective_sndbuf}, client_rcvbuf={stalled_client_rcvbuf}, chunk={ONE_CHUNK}, cut={stalled_cut_elapsed:?})"
         );
         assert!(
-            stalled_tail.len() < 4 * 1024 * 1024,
-            "stalled client drained unreasonably large tail: {} bytes",
-            stalled_tail.len()
+            initial.len() + stalled_tail.len() < big_len,
+            "stalled reader must not receive the full 16 MiB file after revocation (received {} / {big_len} bytes)",
+            initial.len() + stalled_tail.len()
+        );
+
+        shutdown.cancel();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn narrowing_role_cuts_disallowed_stream_without_revoking_allowed_ticket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("legion");
+        let projects = dir.path().join("user").join("projects");
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::create_dir_all(home.join("state")).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+
+        let big_len = 16 * 1024 * 1024usize;
+        let big_file = projects.join("big.bin");
+        std::fs::write(&big_file, vec![b'B'; big_len]).unwrap();
+
+        let photo_bytes: Vec<u8> = (0..(64 * 1024)).map(|i| (i % 251) as u8).collect();
+        let photo_file = projects.join("photo.png");
+        std::fs::write(&photo_file, &photo_bytes).unwrap();
+
+        let paths = legion_core::Paths::under(&home);
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+        let projects_toml = serde_json::to_string(&projects.to_string_lossy()).unwrap();
+        let photo_toml = serde_json::to_string(&photo_file.to_string_lossy()).unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            format!(
+                "\
+[principals.phone]
+role = \"observer\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+paths = [{projects_toml}]
+"
+            ),
+        )
+        .unwrap();
+
+        let node = Node::new(paths.clone(), legion_tools::registry());
+        let token = node
+            .call(legion_core::Call::new(
+                legion_core::Door::Cli,
+                "token.add",
+                serde_json::json!({ "name": "phone-tok", "principal": "phone" }),
+            ))
+            .await
+            .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let door = HttpDoor::new(node.clone(), Arc::new(legion_core::Local)).unwrap();
+        let socket_bytes = door.content_socket_bytes();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = door.serve(listener, stop.cancelled()).await;
+        });
+
+        async fn mint(port: u16, token: &str, path: &std::path::Path) -> String {
+            let body = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
+            let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let req = format!(
+                "POST /v1/content HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.unwrap();
+            let text = String::from_utf8(resp).unwrap();
+            let (_, json_body) = text.split_once("\r\n\r\n").unwrap();
+            serde_json::from_str::<serde_json::Value>(json_body).unwrap()["url"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+
+        async fn raw_get(port: u16, url: &str, extra_headers: &str) -> (String, Vec<u8>) {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let req = format!(
+                "GET {url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{extra_headers}Connection: close\r\n\r\n"
+            );
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.unwrap();
+            let sep = resp
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("HTTP response header separator");
+            let head = String::from_utf8_lossy(&resp[..sep]).into_owned();
+            let body = resp[sep + 4..].to_vec();
+            (head, body)
+        }
+
+        // Mint two tickets under the same token: big.bin and photo.png.
+        let big_url = mint(port, &token, &big_file).await;
+        let photo_url = mint(port, &token, &photo_file).await;
+
+        let (initial_head, initial_body) = raw_get(port, &photo_url, "").await;
+        assert!(initial_head.starts_with("HTTP/1.1 200 "), "{initial_head}");
+        assert_eq!(initial_body, photo_bytes);
+
+        // Start streaming big.bin, read headers and 4 KiB, then let loopback buffers fill.
+        let mut big_conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let get_big = format!(
+            "GET {big_url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        );
+        big_conn.write_all(get_big.as_bytes()).await.unwrap();
+        let mut header_buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !header_buf.ends_with(b"\r\n\r\n") {
+            big_conn.read_exact(&mut byte).await.unwrap();
+            header_buf.push(byte[0]);
+        }
+        let big_head = String::from_utf8_lossy(&header_buf);
+        assert!(big_head.starts_with("HTTP/1.1 200 "), "{big_head}");
+        let mut first_chunk = [0u8; 4096];
+        big_conn.read_exact(&mut first_chunk).await.unwrap();
+        let settle_deadline = Instant::now() + Duration::from_millis(600);
+        let mut prev_bytes = socket_bytes.load(Ordering::Acquire);
+        while Instant::now() < settle_deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let cur = socket_bytes.load(Ordering::Acquire);
+            if cur == prev_bytes && cur > 0 {
+                break;
+            }
+            prev_bytes = cur;
+        }
+
+        // Narrow the role so only photo.png remains allowed while big.bin is disallowed.
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            format!(
+                "\
+[principals.phone]
+role = \"observer\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+paths = [{photo_toml}]
+"
+            ),
+        )
+        .unwrap();
+        let narrowed_at = Instant::now();
+
+        let big_path_str = big_file.to_string_lossy().into_owned();
+        let audit_flushed_big = || {
+            std::fs::read_to_string(paths.audit_log())
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .any(|e| {
+                    e["tool"] == "content.read"
+                        && e["principal"] == "phone"
+                        && e["args"]["path"] == big_path_str
+                })
+        };
+
+        let mut cut_at = None;
+        while narrowed_at.elapsed() < Duration::from_secs(4) {
+            if audit_flushed_big() {
+                cut_at = Some(narrowed_at.elapsed());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let cut_elapsed = cut_at.expect("watcher must cut disallowed big.bin stream within 4s");
+        assert!(
+            cut_elapsed <= Duration::from_millis(2500),
+            "expected disallowed stream cutoff within 2s (+ margin), took {cut_elapsed:?}"
+        );
+
+        let mut big_tail = Vec::new();
+        let big_drain =
+            tokio::time::timeout(Duration::from_secs(2), big_conn.read_to_end(&mut big_tail)).await;
+        assert!(
+            big_drain.is_ok(),
+            "expected disallowed big.bin stream to close after cutoff"
+        );
+        assert!(
+            first_chunk.len() + big_tail.len() < big_len,
+            "disallowed big.bin stream must stop well short of 16 MiB"
+        );
+
+        // Disallowed big.bin ticket ended itself.
+        let (big_after_head, _) = raw_get(port, &big_url, "").await;
+        assert!(
+            big_after_head.starts_with("HTTP/1.1 404 "),
+            "expected disallowed ticket to have ended with 404, got: {big_after_head}"
+        );
+
+        // The sibling photo.png ticket under the same token must still serve full and Range GETs.
+        let (photo_full_head, photo_full_body) = raw_get(port, &photo_url, "").await;
+        assert!(
+            photo_full_head.starts_with("HTTP/1.1 200 "),
+            "allowed sibling ticket must keep serving 200, got: {photo_full_head}"
+        );
+        assert_eq!(photo_full_body, photo_bytes);
+
+        let (photo_range_head, photo_range_body) =
+            raw_get(port, &photo_url, "Range: bytes=1024-2047\r\n").await;
+        assert!(
+            photo_range_head.starts_with("HTTP/1.1 206 "),
+            "allowed sibling ticket must serve new Range request with 206, got: {photo_range_head}"
+        );
+        assert!(
+            photo_range_head
+                .to_ascii_lowercase()
+                .contains("content-range: bytes 1024-2047/65536"),
+            "{photo_range_head}"
+        );
+        assert_eq!(photo_range_body, &photo_bytes[1024..2048]);
+
+        // Revoking the token itself must still revoke the whole holder, including photo.png.
+        node.call(legion_core::Call::new(
+            legion_core::Door::Cli,
+            "token.remove",
+            serde_json::json!({ "name": "phone-tok" }),
+        ))
+        .await
+        .unwrap();
+        let (after_revoke_head, _) = raw_get(port, &photo_url, "").await;
+        assert!(
+            after_revoke_head.starts_with("HTTP/1.1 404 "),
+            "revoking the token must revoke remaining tickets of the holder, got: {after_revoke_head}"
         );
 
         shutdown.cancel();

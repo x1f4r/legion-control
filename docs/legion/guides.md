@@ -1023,18 +1023,28 @@ Security and lifecycle guarantees:
   are capped at 16 KiB). Permissions are checked as `fs.read` when the ticket is minted, on every
   `GET` or `HEAD`, on an independent 1-second liveness timer per active stream (not tied to body
   polling or client read speed), and immediately before yielding another 64 KiB frame after socket
-  backpressure. Active content sockets request `SO_SNDBUF = 128 KiB` before sending the response
-  (effective kernel buffer varies by OS: 256 KiB on Linux due to kernel doubling, ~128–147 KiB on
-  macOS, 128 KiB on Windows), and revoking a token, tightening `policy.toml`, or crossing the
-  6-hour hard limit cancels the connection first (before flushing audit records), stops handing
-  bytes to the socket, discards server buffers, releases any remote pipe, and sends TCP RST
-  (`SO_LINGER(0)`). That guarantees server-side cutoff within ~2 seconds even for slow (20 KB/s) or
-  completely stalled readers, with at most the kernel's effective send buffer plus one 64 KiB write
-  handed to the socket between revocation and cutoff and zero bytes after cutoff; bytes already
-  received into the client OS's own TCP receive buffer before revocation cannot be taken back and
-  stay drainable by the client (varying by OS, e.g. ~128–256 KiB on Linux loopback and ~384–650 KiB
-  on macOS loopback). Tickets expire using a suspend-safe clock (15 minutes after last use, 6 hours
-  absolute maximum), are capped at 128 per token (evicting the oldest), and are never logged.
+  backpressure. Revoking a token or removing a principal revokes every ticket of that holder; a
+  narrowed path, expiry, or crossing the 6-hour hard limit ends only that ticket and leaves the
+  holder's other still-allowed tickets serving. Active content sockets request `SO_SNDBUF = 128 KiB`
+  before sending the response (effective kernel buffer varies by OS: 256 KiB on Linux due to kernel
+  doubling, ~128–147 KiB on macOS, 128 KiB on Windows), and for what the door itself decides (its
+  bearer tokens, local principals and paths in `policy.toml`, and ticket lifetime) detecting a
+  revocation cancels the connection first (before flushing audit records), stops handing bytes to
+  the socket, discards server buffers, releases any remote pipe, and sends TCP RST
+  (`SO_LINGER(0)`). That guarantees server-side cutoff within 2 seconds even for slow (20 KB/s) or
+  completely stalled readers, zero bytes handed to the socket after cutoff with the connection
+  closed, and at most the physical ceiling (`effective SO_SNDBUF + client effective SO_RCVBUF +
+  bytes the client reads before cutoff + 64 KiB`, collapsing to `effective SO_SNDBUF + client
+  effective SO_RCVBUF + 64 KiB` for a stalled reader) handed to the socket between revocation and
+  cutoff. For a file on a remote machine, the door does not watch that machine's `policy.toml`: a
+  policy change on the remote machine takes effect at that machine's next check of the stream, which
+  a slow reader delays, and the slow-reader timeout is the backstop. The send-buffer bound (256 KiB
+  effective on Linux) applies to the loopback hop only; behind Tailscale Serve (or another reverse
+  proxy), its own buffers sit beyond it. Bytes already received into the client OS's own TCP receive
+  buffer before revocation cannot be taken back and stay drainable by the client (varying by OS and
+  receive-buffer autotuning, e.g. ~128–256 KiB on Linux loopback and ~384–650 KiB on macOS
+  loopback). Tickets expire using a suspend-safe clock (15 minutes after last use, 6 hours absolute
+  maximum), are capped at 128 per token (evicting the oldest), and are never logged.
   Minting writes one durable `content.ticket` entry; the first `GET` or `HEAD` on a ticket writes
   one durable `content.open` entry immediately so every access survives `SIGKILL` or power loss;
   ongoing reads coalesce to at most one `content.read` summary per ticket per minute (and
