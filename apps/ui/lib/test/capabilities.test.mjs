@@ -64,7 +64,7 @@ const NEW_TOOLS = [
   {
     name: 'fs.transfer',
     effect: 'write',
-    input_schema: { properties: { from: {}, to: {}, dry_run: {}, background: {}, move: {}, if_exists: {} } },
+    input_schema: { properties: { from: {}, to: {}, dry_run: {}, background: {}, if_exists: {} } },
   },
   { name: 'fav.list', effect: 'read', input_schema: { properties: {} } },
   { name: 'fav.add', effect: 'write', input_schema: { properties: { machine: {}, path: {} } } },

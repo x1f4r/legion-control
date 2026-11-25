@@ -1203,6 +1203,22 @@ export function createMockFilesState({
           continue;
         }
         if (t.bytes_done >= t.bytes_total) {
+          if (t._mockPendingUpload) {
+            const { target, normDir, destPath, size, sampleMedia } = t._mockPendingUpload;
+            delete t._mockPendingUpload;
+            if (trees[target]?.has(normDir)) {
+              const destList = trees[target].get(normDir);
+              if (!destList.some((e) => e.path === destPath)) {
+                destList.push(
+                  makeEntry(destPath, {
+                    size,
+                    mtime: new Date().toISOString(),
+                    sampleMedia,
+                  }),
+                );
+              }
+            }
+          }
           t.state = 'done';
           t.rate = 0;
           t.finished = new Date().toISOString();
@@ -1229,6 +1245,32 @@ export function createMockFilesState({
           job.progress.rate = step * 3;
           job.duration_s = (job.duration_s || 0) + 0.35;
           if (job.progress.bytes_done >= total) {
+            if (job._mockPendingTransfer) {
+              const pt = job._mockPendingTransfer;
+              delete job._mockPendingTransfer;
+              if (trees[pt.destMachine]?.has(pt.destParent)) {
+                const destList = trees[pt.destMachine].get(pt.destParent);
+                if (!destList.some((e) => e.path === pt.destPath)) {
+                  destList.push(
+                    makeEntry(pt.destPath, {
+                      kind: pt.kind,
+                      size: pt.totalBytes,
+                      mtime: new Date().toISOString(),
+                      palette: pt.palette,
+                      sampleMedia: pt.sampleMedia,
+                    }),
+                  );
+                }
+              }
+              if (pt.move && trees[pt.srcMachine]) {
+                const srcParent = parentFilePath(pt.srcPath);
+                const srcList = trees[pt.srcMachine].get(srcParent);
+                if (srcList) {
+                  const sIdx = srcList.findIndex((e) => e.path === pt.srcPath);
+                  if (sIdx !== -1) srcList.splice(sIdx, 1);
+                }
+              }
+            }
             job.state = 'succeeded';
             job.exit_code = 0;
             job.finished = new Date().toISOString();
@@ -1660,23 +1702,7 @@ export function createMockFilesState({
         const verb = args?.move ? 'Moving' : 'Copying';
         const title = `${verb} ${baseName} to ${destMachine}`;
 
-        // Add copied entry to destination directory in mock tree so browsing dest shows it.
         const destParent = parentFilePath(destPath);
-        if (!args?.dry_run && trees[destMachine]?.has(destParent)) {
-          const destList = trees[destMachine].get(destParent);
-          if (!destList.some((e) => e.path === destPath)) {
-            destList.push(
-              makeEntry(destPath, {
-                kind: srcEntry?.kind || 'file',
-                size: totalBytes,
-                mtime: new Date().toISOString(),
-                palette: srcEntry?.palette || null,
-                sampleMedia: srcEntry?.sampleMedia || null,
-              }),
-            );
-          }
-        }
-
         if (!oldMachine && args?.background && !args?.dry_run) {
           const id = `j-xfer-${transferSeq++}`;
           const job = {
@@ -1701,10 +1727,46 @@ export function createMockFilesState({
             },
             logs: `Started ${title}\n`,
             _mockLive: true,
+            _mockPendingTransfer: {
+              srcMachine,
+              srcPath,
+              destMachine,
+              destPath,
+              destParent,
+              move: Boolean(args?.move),
+              kind: srcEntry?.kind || 'file',
+              totalBytes,
+              palette: srcEntry?.palette || null,
+              sampleMedia: srcEntry?.sampleMedia || null,
+            },
           };
           machines[machineName].jobs.unshift(job);
           ensureTransferPump();
           return { job: { id, machine: machineName }, title };
+        }
+
+        // Synchronous transfer: apply destination mutation immediately.
+        if (!args?.dry_run && trees[destMachine]?.has(destParent)) {
+          const destList = trees[destMachine].get(destParent);
+          if (!destList.some((e) => e.path === destPath)) {
+            destList.push(
+              makeEntry(destPath, {
+                kind: srcEntry?.kind || 'file',
+                size: totalBytes,
+                mtime: new Date().toISOString(),
+                palette: srcEntry?.palette || null,
+                sampleMedia: srcEntry?.sampleMedia || null,
+              }),
+            );
+          }
+          if (args?.move && trees[srcMachine]) {
+            const srcParent = parentFilePath(srcPath);
+            const srcList = trees[srcMachine].get(srcParent);
+            if (srcList) {
+              const sIdx = srcList.findIndex((e) => e.path === srcPath);
+              if (sIdx !== -1) srcList.splice(sIdx, 1);
+            }
+          }
         }
 
         return {
@@ -2070,16 +2132,14 @@ export function createMockFilesState({
               finished: null,
               hash: null,
               canOpen: false,
+              _mockPendingUpload: {
+                target,
+                normDir,
+                destPath,
+                size: f.size || 2_000_000,
+                sampleMedia: categoryFromName(fileName) === 'image' ? 'image' : null,
+              },
             });
-            if (trees[target]?.has(normDir)) {
-              trees[target].get(normDir).push(
-                makeEntry(destPath, {
-                  size: f.size || 2_000_000,
-                  mtime: new Date().toISOString(),
-                  sampleMedia: categoryFromName(fileName) === 'image' ? 'image' : null,
-                }),
-              );
-            }
             ids.push(id);
           }
           emitTransfers();
@@ -2222,6 +2282,7 @@ export function createMockFilesState({
               ensureTransferPump();
             }
           } else if (action === 'cancel') {
+            delete item._mockPendingUpload;
             item.state = 'cancelled';
             item.rate = 0;
             item.finished = new Date().toISOString();
@@ -2246,6 +2307,86 @@ export function createMockFilesState({
           };
         },
       };
+
+  if (typeof window !== 'undefined') {
+    window.__LEGION_MOCK__ = {
+      addExternalFile(machineName, dirPath, name, opts = {}) {
+        const normDir = normalizePath(dirPath || '~');
+        const list = trees[machineName]?.get(normDir);
+        if (!list) return null;
+        const full = joinFilePath(normDir, name);
+        if (list.some((e) => e.path === full)) return full;
+        list.push(
+          makeEntry(full, {
+            kind: opts.kind || 'file',
+            size: opts.size ?? 4096,
+            mtime: opts.mtime || new Date().toISOString(),
+            sampleMedia: opts.sampleMedia || null,
+          }),
+        );
+        if (opts.kind === 'dir' && !trees[machineName].has(full)) {
+          trees[machineName].set(full, []);
+        }
+        return full;
+      },
+      addExternalJob(machineName, job) {
+        const m = machines[machineName];
+        if (!m) return null;
+        const entry = {
+          id: job.id || `j-ext-${Date.now()}`,
+          kind: job.kind || 'exec',
+          name: job.name || 'External task',
+          state: job.state || 'succeeded',
+          created: job.created || new Date().toISOString(),
+          finished: job.finished || new Date().toISOString(),
+          exit_code: job.exit_code ?? 0,
+          command: job.command || job.name || 'echo ok',
+          ...job,
+        };
+        m.jobs.unshift(entry);
+        return entry;
+      },
+      simulateUploadTransition(machineName, dirPath, name, states) {
+        const normDir = normalizePath(dirPath || '~');
+        const destPath = joinFilePath(normDir, name);
+        const id = `dt-sim-${transferSeq++}`;
+        const item = {
+          id,
+          direction: 'upload',
+          machine: machineName,
+          path: destPath,
+          name,
+          localPath: `Device/${name}`,
+          mime: mimeFromName(name),
+          state: 'queued',
+          bytes_done: 0,
+          bytes_total: 1024,
+          rate: 0,
+          error: null,
+          created: new Date().toISOString(),
+          finished: null,
+          hash: null,
+          canOpen: false,
+        };
+        deviceTransfers.unshift(item);
+        for (const st of states || []) {
+          item.state = st;
+          if (st === 'done') {
+            item.bytes_done = item.bytes_total;
+            item.finished = new Date().toISOString();
+            const list = trees[machineName]?.get(normDir);
+            if (list && !list.some((e) => e.path === destPath)) {
+              list.push(makeEntry(destPath, { size: item.bytes_total, mtime: item.finished }));
+            }
+          } else if (st === 'cancelled' || st === 'failed') {
+            item.finished = new Date().toISOString();
+          }
+          emitTransfers();
+        }
+        return id;
+      },
+    };
+  }
 
   return {
     isOld,

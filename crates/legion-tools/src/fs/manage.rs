@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    OwnDirFilter, Progress, cancelled_error, check_fs_path, check_not_protected_tree,
-    is_same_or_descendant, is_strict_ancestor, map_io_error, map_os_error, path_to_string,
-    paths_equal, platform, run_blocking,
+    OwnDirFilter, Progress, cancelled_error, check_fs_path, check_move_paths,
+    check_not_protected_tree, is_same_or_descendant, is_strict_ancestor, map_io_error,
+    map_os_error, path_to_string, paths_equal, platform, run_blocking,
 };
 
 const REMOVE_SAMPLE_LIMIT: usize = 50;
@@ -62,10 +62,7 @@ struct MoveResult {
 }
 
 async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> {
-    let from = check_fs_path(ctx.grant(), &args.from, Access::Write)?;
-    let to = check_fs_path(ctx.grant(), &args.to, Access::Write)?;
-    check_not_protected_tree(ctx.grant(), &from)?;
-    check_not_protected_tree(ctx.grant(), &to)?;
+    let (from, to) = check_move_paths(ctx.grant(), &args.from, &args.to)?;
     let grant = ctx.grant().clone();
     let own_dirs = OwnDirFilter::for_ctx(ctx);
     let allows_destroy = ctx.grant().allows_effect(Effect::Destroy);

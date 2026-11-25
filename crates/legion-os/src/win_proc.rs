@@ -28,8 +28,10 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, MOVE_FILE_FLAGS, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GetFileInformationByHandle, MOVE_FILE_FLAGS, MoveFileExW, OPEN_ALWAYS,
+    OPEN_EXISTING, SYNCHRONIZE,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
@@ -589,6 +591,120 @@ pub(crate) fn move_file_no_replace(from: &Path, to: &Path) -> std::io::Result<()
         Ok(()) => Ok(()),
         Err(_) => Err(std::io::Error::last_os_error()),
     }
+}
+
+/// Queries `(volume_serial, file_index, link_count)` for an already-open file handle via
+/// `GetFileInformationByHandle`.
+pub(crate) fn file_identity_by_handle(file: &std::fs::File) -> std::io::Result<(u64, u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    let handle = HANDLE(file.as_raw_handle());
+    query_file_identity_raw(handle)
+}
+
+/// Queries `(volume_serial, file_index, link_count)` for `path` (regular file, directory, or
+/// reparse point when `follow_symlinks` is `false`).
+pub(crate) fn file_identity_by_path(
+    path: &Path,
+    follow_symlinks: bool,
+) -> std::io::Result<(u64, u64, u64)> {
+    let wide = to_wide_null(path.as_os_str());
+    let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+    if !follow_symlinks {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path; access 0 queries metadata only so it works
+    // on files and directories without requiring read/write data permissions.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(wide.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            flags,
+            None,
+        )
+    }
+    .map_err(|_| std::io::Error::last_os_error())?;
+    let owned = OwnedHandle(handle);
+    query_file_identity_raw(owned.0)
+}
+
+fn filetime_to_unix(ft: FILETIME) -> Option<(i64, u32)> {
+    let ticks = (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
+    if ticks == 0 {
+        return None;
+    }
+    const WINDOWS_EPOCH_DIFF_SECS: i64 = 11_644_473_600;
+    let total_secs = (ticks / 10_000_000) as i64 - WINDOWS_EPOCH_DIFF_SECS;
+    let nanos = ((ticks % 10_000_000) * 100) as u32;
+    Some((total_secs, nanos))
+}
+
+fn query_file_identity_raw(handle: HANDLE) -> std::io::Result<(u64, u64, u64)> {
+    let (dev, ino, nlink, _, _, _, _) = query_file_claim_identity_raw(handle)?;
+    Ok((dev, ino, nlink))
+}
+
+type WinClaimIdentity = (u64, u64, u64, i64, u32, Option<i64>, Option<u32>);
+
+/// Queries `(dev, ino, nlink, ctime_secs, ctime_nanos, btime_secs, btime_nanos)` for an open file.
+pub(crate) fn file_claim_identity_by_handle(
+    file: &std::fs::File,
+) -> std::io::Result<WinClaimIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    let handle = HANDLE(file.as_raw_handle());
+    query_file_claim_identity_raw(handle)
+}
+
+/// Queries `(dev, ino, nlink, ctime_secs, ctime_nanos, btime_secs, btime_nanos)` for `path`.
+pub(crate) fn file_claim_identity_by_path(
+    path: &Path,
+    follow_symlinks: bool,
+) -> std::io::Result<WinClaimIdentity> {
+    let wide = to_wide_null(path.as_os_str());
+    let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+    if !follow_symlinks {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path; access 0 queries metadata only.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(wide.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            flags,
+            None,
+        )
+    }
+    .map_err(|_| std::io::Error::last_os_error())?;
+    let owned = OwnedHandle(handle);
+    query_file_claim_identity_raw(owned.0)
+}
+
+fn query_file_claim_identity_raw(handle: HANDLE) -> std::io::Result<WinClaimIdentity> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is an open file or directory handle and `info` is valid writable storage.
+    unsafe { GetFileInformationByHandle(handle, &mut info) }
+        .map_err(|_| std::io::Error::last_os_error())?;
+    let dev = u64::from(info.dwVolumeSerialNumber);
+    let ino = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    let nlink = u64::from(info.nNumberOfLinks);
+    let (ctime_secs, ctime_nanos) = filetime_to_unix(info.ftLastWriteTime).ok_or_else(|| {
+        std::io::Error::other("Windows file information missing last-write timestamp")
+    })?;
+    let btime = filetime_to_unix(info.ftCreationTime);
+    Ok((
+        dev,
+        ino,
+        nlink,
+        ctime_secs,
+        ctime_nanos,
+        btime.map(|(s, _)| s),
+        btime.map(|(_, ns)| ns),
+    ))
 }
 
 fn open_non_inheritable_nul(access: u32) -> Result<OwnedHandle> {

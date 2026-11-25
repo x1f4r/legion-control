@@ -11,15 +11,28 @@
 //! tree is listed at both ends, [`legion_xfer::plan::plan`] decides what differs, and only that is
 //! packed at the source and unpacked at the destination, so a second run sends nothing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::{OsStr, OsString};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use legion_core::{BoxFuture, Ctx, Registry, Tool, ToolError, input_schema, parse_args};
+use legion_core::policy::Policy;
+use legion_core::{
+    Access, BoxFuture, Call, CancellationToken, Ctx, Door, EventSink, Node, Paths, Registry, Tool,
+    ToolError, input_schema, parse_args,
+};
+use legion_os::atomic::{FileIdentity, WriteOptions, write_atomic};
+use legion_os::detach::{DetachOptions, spawn_detached};
+use legion_os::shell::CommandSpec;
 use legion_proto::{Effect, ErrorBody, ErrorCode, EventKind, ToolSpec};
+use legion_tools::job::{self as transfer_job, JobProgress, TransferJobSpec};
 use legion_xfer::{
-    CaseCollision, Entry, EntryKind, Manifest, Plan, PlanConflict, PlanOptions, SkippedEntry,
+    CaseCollision, Entry, EntryKind, Hash, IfExists, Manifest, Plan, PlanConflict, PlanOptions,
+    RenamedEntry, SkippedEntry, Timestamp,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -36,8 +49,10 @@ use crate::config::{FleetFile, validate_machine_name};
 use crate::connector::PipeHandle;
 use crate::pool::Fleet;
 use crate::stream::{
-    self, DeleteDone, GetReady, Host, ManifestDone, PackReady, Planned, PutDone, PutReady,
-    StatReply, UnpackDone, UnpackReady,
+    self, CAP_IF_EXISTS, CAP_LOCK, CAP_MOVE, CAP_PROBE, CAP_RENAME, DeleteDone, FsNameBehavior,
+    GetReady, Host, LockEntry, LockReady, LockRenewReply, ManifestDone, PackReady, Planned,
+    ProbeConfirm, ProbeFsLocality, ProbeReply, PutDone, PutReady, RenameDone, SameEntryDecision,
+    StatReply, UnpackDone, UnpackReady, classify_same_entry,
 };
 
 /// How many bytes the relay and the in-process pipes hold at once: memory stays bounded however
@@ -56,6 +71,9 @@ const MOST_NOISE_BYTES: usize = 64 * 1024;
 /// below what a stream reads and a huge tree goes in several rounds.
 const BATCH_NAMES: usize = 20_000;
 const BATCH_BYTES: usize = 4 * 1024 * 1024;
+/// Per-round caps for tree moves so verified source files are removed incrementally batch by batch.
+const MOVE_BATCH_FILES: usize = 256;
+const MOVE_BATCH_CONTENT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The shortest time between two `progress` events.
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
@@ -103,14 +121,34 @@ const MOST_LISTING_BYTES: usize = 512 * 1024 * 1024;
 /// How many paths a result lists in each of its lists; the counts are always whole.
 const MOST_LISTED: usize = 100;
 
+/// Message returned when `fs.transfer` is called with `move: true` while moving between places is
+/// disabled.
+#[cfg(not(feature = "move-between-places"))]
+const MOVE_BETWEEN_PLACES_UNSUPPORTED: &str =
+    "Moving is not available yet. Copy it, check the copy, then delete the original.";
+
+fn transfer_input_schema() -> Value {
+    #[allow(unused_mut)]
+    let mut schema = input_schema::<TransferArgs>();
+    #[cfg(not(feature = "move-between-places"))]
+    if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        props.remove("move");
+    }
+    schema
+}
+
 /// Adds `fs.transfer`, which holds the fleet's session pool to reach the other ends.
 pub fn register(registry: &mut Registry, fleet: Fleet) {
+    #[cfg(feature = "move-between-places")]
+    let description = "Copy or move a file or a directory tree between machines, or within one. Each of from and to is machine:/path or a path on this node; to names the destination itself, except that a file sent to an existing directory (or to a path ending in /) lands inside it under its own name. A file resumes where an interrupted transfer stopped and is renamed into place only once its BLAKE3 hash matches. A tree sends only what differs (size and modification time, or hash with checksum), so a second run sends nothing; if_exists chooses fail, skip, replace (default) or rename (name (2).ext); move removes each source file only after its destination copy is verified by hash (refused up front unless the caller may fs.remove the source); background runs the transfer as a detached job on this node under the caller's principal and grant, returning {job: {id, machine}} immediately (track with job.list, job.status, job.wait, and job.cancel); delete removes what the source no longer has, exclude leaves paths out at both ends, and dry_run reports what would be sent, deleted and removed without changing anything.".to_owned();
+    #[cfg(not(feature = "move-between-places"))]
+    let description = "Copy a file or a directory tree between machines, or within one. Each of from and to is machine:/path or a path on this node; to names the destination itself, except that a file sent to an existing directory (or to a path ending in /) lands inside it under its own name. A file resumes where an interrupted transfer stopped and is renamed into place only once its BLAKE3 hash matches. A tree sends only what differs (size and modification time, or hash with checksum), so a second run sends nothing; if_exists chooses fail, skip, replace (default) or rename (name (2).ext); background runs the transfer as a detached job on this node under the caller's principal and grant, returning {job: {id, machine}} immediately (track with job.list, job.status, job.wait, and job.cancel); delete removes what the source no longer has, exclude leaves paths out at both ends, and dry_run reports what would be sent and deleted without changing anything.".to_owned();
     registry.add(TransferTool {
         spec: ToolSpec {
             name: "fs.transfer".to_owned(),
-            description: "Copy a file or a directory tree between machines, or within one. Each of from and to is machine:/path or a path on this node; to names the destination itself, except that a file sent to an existing directory (or to a path ending in /) lands inside it under its own name. A file resumes where an interrupted transfer stopped and is renamed into place only once its BLAKE3 hash matches. A tree sends only what differs (size and modification time, or hash with checksum), so a second run sends nothing; delete removes what the source no longer has, exclude leaves paths out at both ends, and dry_run reports what would be sent and deleted without changing anything.".to_owned(),
+            description,
             effect: Effect::Write,
-            input_schema: input_schema::<TransferArgs>(),
+            input_schema: transfer_input_schema(),
         },
         fleet,
     });
@@ -129,6 +167,16 @@ impl Tool for TransferTool {
     fn call<'a>(&'a self, ctx: &'a Ctx, args: Value) -> BoxFuture<'a, Result<Value, ToolError>> {
         Box::pin(async move {
             let args = parse_args::<TransferArgs>(&self.spec.name, args)?;
+            #[cfg(not(feature = "move-between-places"))]
+            if args.move_source {
+                return Err(ErrorBody::new(
+                    ErrorCode::Unsupported,
+                    MOVE_BETWEEN_PLACES_UNSUPPORTED,
+                ));
+            }
+            if args.background {
+                return start_background(ctx, args).await;
+            }
             let report = transfer(&self.fleet, ctx, args).await?;
             serde_json::to_value(&report).map_err(|error| {
                 ErrorBody::new(
@@ -142,42 +190,104 @@ impl Tool for TransferTool {
     }
 }
 
+/// How `fs.transfer` behaves when a destination entry already exists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IfExistsArg {
+    /// Overwrite the destination entry atomically (default).
+    #[default]
+    Replace,
+    /// Refuse with `exists` before overwriting anything.
+    Fail,
+    /// Keep the existing destination entry untouched and skip sending.
+    Skip,
+    /// Write beside the existing entry as `name (2).ext`, counting up atomically at the destination.
+    Rename,
+}
+
+impl IfExistsArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            IfExistsArg::Replace => "replace",
+            IfExistsArg::Fail => "fail",
+            IfExistsArg::Skip => "skip",
+            IfExistsArg::Rename => "rename",
+        }
+    }
+}
+
+impl From<IfExistsArg> for IfExists {
+    fn from(value: IfExistsArg) -> Self {
+        match value {
+            IfExistsArg::Replace => IfExists::Replace,
+            IfExistsArg::Fail => IfExists::Fail,
+            IfExistsArg::Skip => IfExists::Skip,
+            IfExistsArg::Rename => IfExists::Rename,
+        }
+    }
+}
+
 /// Arguments of `fs.transfer`.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct TransferArgs {
+pub(crate) struct TransferArgs {
     /// What to send: `machine:/path`, or a path on this node (absolute or starting with `~`).
-    from: String,
+    pub(crate) from: String,
     /// Where it goes, in the same form. It names the destination itself; a file sent to an
     /// existing directory lands inside it.
-    to: String,
+    pub(crate) to: String,
     /// Remove from the destination tree what the source no longer has.
     #[serde(default)]
-    delete: bool,
+    pub(crate) delete: bool,
     /// Compare files by BLAKE3 hash instead of size and modification time, which reads them all.
     #[serde(default)]
-    checksum: bool,
+    pub(crate) checksum: bool,
     /// Globs of paths to leave out at both ends, relative to the tree; a trailing `/` matches
     /// directories only. What is left out at the destination is never deleted.
     #[serde(default)]
-    exclude: Vec<String>,
-    /// List and plan, and report what would be sent and deleted, without changing anything.
+    pub(crate) exclude: Vec<String>,
+    /// List and plan, and report what would be sent, deleted and removed, without changing anything.
     #[serde(default)]
-    dry_run: bool,
+    pub(crate) dry_run: bool,
+    /// What to do when a destination entry already exists: `replace` (default), `fail`, `skip`, or
+    /// `rename` (`name (2).ext`, decided atomically at the destination).
+    #[serde(default)]
+    pub(crate) if_exists: IfExistsArg,
+    /// Remove each source file after its destination copy is verified by BLAKE3 hash (requires
+    /// `fs.remove` permission on the source; refused up front otherwise).
+    #[serde(default, rename = "move")]
+    pub(crate) move_source: bool,
+    /// Run the transfer as a detached job on this node and return `{job: {id, machine}}` at once.
+    /// The job runs under the caller's principal and grant, survives the caller disconnecting, and
+    /// finishes with the same result object a foreground transfer returns.
+    #[serde(default)]
+    pub(crate) background: bool,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// What `fs.transfer` returns.
 #[derive(Debug, Default, Serialize)]
-struct TransferReport {
+pub(crate) struct TransferReport {
     from: String,
     to: String,
     kind: &'static str,
     files_sent: u64,
     bytes_sent: u64,
     files_unchanged: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    files_skipped: u64,
     deleted: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    moved: bool,
+    #[serde(skip_serializing_if = "is_zero")]
+    source_removed: u64,
     conflicts: Vec<PlanConflict>,
     skipped: Vec<SkippedEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    renamed: Vec<RenamedEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resumed_from: Option<u64>,
     duration_ms: u64,
@@ -186,6 +296,8 @@ struct TransferReport {
     would_send: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     would_delete: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    would_remove: Option<Vec<String>>,
     /// Whether a list above was cut at its first entries; the counts are whole.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     truncated: bool,
@@ -419,6 +531,578 @@ impl Drop for Owned {
     }
 }
 
+/// Hidden CLI subcommand invoked by `fs.transfer` (`background: true`) to supervise a detached
+/// transfer job.
+const TRANSFER_SUPERVISE_SUBCOMMAND: &str = "transfer-supervise";
+const STATE_DIR_FLAG: &str = "--state-dir";
+const CONFIG_DIR_FLAG: &str = "--config-dir";
+const HOME_DIR_FLAG: &str = "--home";
+const TRANSFER_REQUEST_FILE: &str = "transfer.json";
+const TRANSFER_CANCEL_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TransferJobRequest {
+    args: TransferArgs,
+    principal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pairing_id: Option<String>,
+    door: Door,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_expires: Option<String>,
+    to_machine: String,
+}
+
+fn initial_transfer_title(from: &End, to: &End, move_source: bool) -> String {
+    let verb = if move_source { "Move" } else { "Copy" };
+    let item = file_name(&from.path);
+    let label = if item.is_empty() { &from.path } else { item };
+    format!("{verb} {label} to {}", to.machine)
+}
+
+fn initial_transfer_name(from: &End, move_source: bool) -> String {
+    let prefix = if move_source { "move" } else { "copy" };
+    let item = file_name(&from.path);
+    if item.is_empty() {
+        prefix.to_owned()
+    } else {
+        let raw = format!("{prefix}-{item}");
+        match raw.char_indices().nth(60) {
+            Some((end, _)) => format!("{}…", &raw[..end]),
+            None => raw,
+        }
+    }
+}
+
+async fn start_background(ctx: &Ctx, mut args: TransferArgs) -> Result<Value, ErrorBody> {
+    let from = resolve(ctx, &args.from)?;
+    let to = resolve(ctx, &args.to)?;
+
+    // Enforce local policy checks up front so obvious denials fail before spawning a job; the
+    // detached supervisor also runs through `Node::call` under `pinned: Some(principal)` so every
+    // local and remote check runs under the caller's exact grant.
+    if !from.remote {
+        ctx.grant().check_path(&from.path, Access::Read)?;
+    }
+    if !to.remote {
+        ctx.grant().check_path(&to.path, Access::Write)?;
+    }
+    if args.move_source {
+        let policy = ctx.config().get::<Policy>()?;
+        policy
+            .authorize_name(
+                ctx.principal(),
+                "fs.remove",
+                Some(Effect::Destroy),
+                ctx.paths(),
+            )
+            .map_err(|err| err.with_machine(ctx.node_name()))?;
+        if !from.remote {
+            ctx.grant().check_path(&from.path, Access::Write)?;
+        }
+    }
+
+    let title = initial_transfer_title(&from, &to, args.move_source);
+    let name = initial_transfer_name(&from, args.move_source);
+    let state_dir = ctx.paths().state_dir().to_path_buf();
+    let config_dir = ctx.paths().config_dir().to_path_buf();
+    let home_dir = ctx.paths().home().map(Path::to_path_buf);
+
+    let mut local_paths = Vec::new();
+    if !from.remote {
+        local_paths.push(from.path.clone());
+    }
+    if !to.remote {
+        local_paths.push(to.path.clone());
+    }
+    let created = transfer_job::create_transfer_job(
+        &state_dir,
+        TransferJobSpec {
+            name,
+            title: title.clone(),
+            principal: ctx.principal().to_owned(),
+            device: ctx.device().map(str::to_owned),
+            pairing_id: ctx.pairing_id().map(str::to_owned),
+            transfer_paths: local_paths,
+            transfer_has_remote: from.remote || to.remote,
+            transfer_local_from: (!from.remote).then(|| from.path.clone()),
+            transfer_local_to: (!to.remote).then(|| to.path.clone()),
+            transfer_move: args.move_source,
+            exclusive: false,
+        },
+    )
+    .await?;
+
+    args.background = false;
+    let request = TransferJobRequest {
+        args,
+        principal: ctx.principal().to_owned(),
+        device: ctx.device().map(str::to_owned),
+        pairing_id: ctx.pairing_id().map(str::to_owned),
+        door: ctx.door(),
+        credential_expires: ctx
+            .credential_expires()
+            .map(|ts| ts.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()),
+        to_machine: to.machine.clone(),
+    };
+    let request_path = created.dir.join(TRANSFER_REQUEST_FILE);
+    let req_bytes = serde_json::to_vec_pretty(&request).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("Cannot serialize background transfer request: {err}."),
+        )
+    })?;
+    let initial_progress = JobProgress {
+        bytes_done: 0,
+        bytes_total: None,
+        files_done: 0,
+        files_total: None,
+        current: None,
+        rate: 0,
+        attempt: None,
+    };
+    let job_dir_for_write = created.dir.clone();
+    if let Err(err) = tokio::task::spawn_blocking(move || {
+        write_atomic(&request_path, &req_bytes, WriteOptions::with_mode(0o600)).map_err(|e| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Cannot write transfer request {}: {e}.",
+                    request_path.display()
+                ),
+            )
+        })?;
+        transfer_job::write_transfer_progress(&job_dir_for_write, &initial_progress, None)
+    })
+    .await
+    .map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("fs.transfer stopped unexpectedly while preparing job files: {err}."),
+        )
+    })? {
+        transfer_job::record_transfer_start_failure(&state_dir, &created.id, &err.message).await;
+        return Err(err);
+    }
+
+    let exe = match legion_core::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            transfer_job::record_transfer_start_failure(&state_dir, &created.id, &err.message)
+                .await;
+            return Err(err);
+        }
+    };
+
+    let mut argv = vec![
+        TRANSFER_SUPERVISE_SUBCOMMAND.to_owned(),
+        created.id.clone(),
+        STATE_DIR_FLAG.to_owned(),
+        state_dir.to_string_lossy().into_owned(),
+        CONFIG_DIR_FLAG.to_owned(),
+        config_dir.to_string_lossy().into_owned(),
+    ];
+    if let Some(ref home) = home_dir {
+        argv.push(HOME_DIR_FLAG.to_owned());
+        argv.push(home.to_string_lossy().into_owned());
+    }
+    let supervisor_cmd = CommandSpec::argv(exe, argv);
+    let handle = match spawn_detached(DetachOptions::new(supervisor_cmd).name(&created.id)).await {
+        Ok(handle) => handle,
+        Err(err) => {
+            let message = format!("Could not launch the detached transfer supervisor: {err}.");
+            transfer_job::record_transfer_start_failure(&state_dir, &created.id, &message).await;
+            return Err(ErrorBody::new(ErrorCode::Failed, message)
+                .with_hint("Check `job.status` for the recorded failure details."));
+        }
+    };
+
+    transfer_job::attach_transfer_detach(&state_dir, &created.id, handle.clone()).await?;
+    let _state =
+        transfer_job::wait_transfer_supervisor_ready(&state_dir, &created.id, &handle).await?;
+
+    Ok(json!({
+        "job": {
+            "id": created.id,
+            "machine": ctx.node_name(),
+        }
+    }))
+}
+
+/// Runs the hidden `transfer-supervise` subcommand when `args` starts with `"transfer-supervise"`.
+///
+/// Returns `None` for any other command line so callers (such as `legion-cli`'s `main`) can
+/// dispatch normally without adding the subcommand to user-facing help.
+pub fn try_supervise_cli(args: impl IntoIterator<Item = OsString>) -> Option<ExitCode> {
+    let mut iter = args.into_iter();
+    let first = iter.next()?;
+    if first != OsStr::new(TRANSFER_SUPERVISE_SUBCOMMAND) {
+        return None;
+    }
+    let rest: Vec<OsString> = iter.collect();
+    Some(run_transfer_supervise_cli(&rest))
+}
+
+struct SuperviseArgs {
+    id: String,
+    state_dir: Option<PathBuf>,
+    config_dir: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+}
+
+fn parse_supervise_args(rest: &[OsString]) -> Result<SuperviseArgs, String> {
+    let mut id: Option<String> = None;
+    let mut state_dir: Option<PathBuf> = None;
+    let mut config_dir: Option<PathBuf> = None;
+    let mut home_dir: Option<PathBuf> = None;
+    let mut index = 0usize;
+
+    while index < rest.len() {
+        let arg = &rest[index];
+        if arg == OsStr::new(STATE_DIR_FLAG) {
+            let value = rest
+                .get(index + 1)
+                .ok_or_else(|| format!("{STATE_DIR_FLAG} needs a path."))?;
+            if state_dir.replace(PathBuf::from(value)).is_some() {
+                return Err(format!("{STATE_DIR_FLAG} was given twice."));
+            }
+            index += 2;
+            continue;
+        }
+        if arg == OsStr::new(CONFIG_DIR_FLAG) {
+            let value = rest
+                .get(index + 1)
+                .ok_or_else(|| format!("{CONFIG_DIR_FLAG} needs a path."))?;
+            if config_dir.replace(PathBuf::from(value)).is_some() {
+                return Err(format!("{CONFIG_DIR_FLAG} was given twice."));
+            }
+            index += 2;
+            continue;
+        }
+        if arg == OsStr::new(HOME_DIR_FLAG) {
+            let value = rest
+                .get(index + 1)
+                .ok_or_else(|| format!("{HOME_DIR_FLAG} needs a path."))?;
+            if home_dir.replace(PathBuf::from(value)).is_some() {
+                return Err(format!("{HOME_DIR_FLAG} was given twice."));
+            }
+            index += 2;
+            continue;
+        }
+        let text = arg
+            .to_str()
+            .ok_or_else(|| "job id must be valid Unicode.".to_owned())?;
+        if id.replace(text.to_owned()).is_some() {
+            return Err(format!("unexpected argument {text:?}."));
+        }
+        index += 1;
+    }
+
+    let id = id.ok_or_else(|| "missing job id.".to_owned())?;
+    Ok(SuperviseArgs {
+        id,
+        state_dir,
+        config_dir,
+        home_dir,
+    })
+}
+
+fn run_transfer_supervise_cli(rest: &[OsString]) -> ExitCode {
+    let parsed = match parse_supervise_args(rest) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "legion {TRANSFER_SUPERVISE_SUBCOMMAND}: {message}"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(error) = transfer_job::validate_transfer_job_id(&parsed.id) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "legion {TRANSFER_SUPERVISE_SUBCOMMAND}: {}",
+            error.message
+        );
+        return ExitCode::from(2);
+    }
+    let paths = match (parsed.config_dir, parsed.state_dir) {
+        (Some(cfg), Some(st)) => match Paths::from_explicit_dirs(cfg, st) {
+            Ok(p) => match parsed.home_dir {
+                Some(home) => p.with_home(home),
+                None => p,
+            },
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "legion {TRANSFER_SUPERVISE_SUBCOMMAND}: {}",
+                    error.message
+                );
+                return ExitCode::from(1);
+            }
+        },
+        _ => match Paths::from_env() {
+            Ok(p) => match parsed.home_dir {
+                Some(home) => p.with_home(home),
+                None => p,
+            },
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "legion {TRANSFER_SUPERVISE_SUBCOMMAND}: {}",
+                    error.message
+                );
+                return ExitCode::from(1);
+            }
+        },
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "legion {TRANSFER_SUPERVISE_SUBCOMMAND}: failed to start async runtime: {error}"
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    match runtime.block_on(supervise_transfer(paths, &parsed.id)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "legion {TRANSFER_SUPERVISE_SUBCOMMAND}: {message}"
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn supervise_transfer(paths: Paths, id: &str) -> Result<(), String> {
+    let dir = transfer_job::transfer_job_dir(paths.state_dir(), id).map_err(|err| err.message)?;
+    let Some(lock) = transfer_job::acquire_transfer_supervisor_lock(&dir).await? else {
+        return Ok(());
+    };
+
+    if transfer_job::transfer_exit_exists(&dir) {
+        let _ = std::fs::remove_file(dir.join(TRANSFER_REQUEST_FILE));
+        transfer_job::remove_transfer_exit_reserve(&dir);
+        let _ = lock.unlock();
+        return Ok(());
+    }
+
+    if transfer_job::transfer_cancel_requested(&dir) {
+        let _ = std::fs::remove_file(dir.join(TRANSFER_REQUEST_FILE));
+        let _ = transfer_job::finish_transfer_job_cancelled(
+            &dir,
+            "Cancelled before the transfer started.",
+        );
+        let _ = lock.unlock();
+        return Ok(());
+    }
+
+    transfer_job::prepare_transfer_exit_reserve(&dir);
+
+    let req_path = dir.join(TRANSFER_REQUEST_FILE);
+    let req_bytes = match std::fs::read(&req_path) {
+        Ok(bytes) => {
+            let _ = std::fs::remove_file(&req_path);
+            bytes
+        }
+        Err(err) => {
+            let _ = transfer_job::finish_transfer_job_err(
+                &dir,
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Cannot read transfer request {}: {err}.",
+                        req_path.display()
+                    ),
+                ),
+            );
+            let _ = lock.unlock();
+            return Ok(());
+        }
+    };
+    let req: TransferJobRequest = match serde_json::from_slice(&req_bytes) {
+        Ok(req) => req,
+        Err(err) => {
+            let _ = transfer_job::finish_transfer_job_err(
+                &dir,
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Transfer request {} is not valid JSON: {err}.",
+                        req_path.display()
+                    ),
+                ),
+            );
+            let _ = lock.unlock();
+            return Ok(());
+        }
+    };
+
+    transfer_job::append_transfer_log(
+        &dir,
+        &format!(
+            "{} {} -> {} (principal: {})",
+            if req.args.move_source { "move" } else { "copy" },
+            req.args.from,
+            req.args.to,
+            req.principal
+        ),
+    );
+
+    let fleet = Fleet::new(&paths);
+    let mut registry = legion_tools::registry();
+    crate::register(&mut registry, fleet.clone());
+    let paths_for_watcher = paths.clone();
+    let id_for_watcher = id.to_owned();
+    let node = Node::new(paths, registry);
+
+    let cancel_token = CancellationToken::new();
+    let watcher_stop = CancellationToken::new();
+    let revoked_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dir_for_watcher = dir.clone();
+    let watcher = tokio::spawn({
+        let cancel_token = cancel_token.clone();
+        let watcher_stop = watcher_stop.clone();
+        let revoked_flag = Arc::clone(&revoked_flag);
+        async move {
+            let mut ticks: u32 = 0;
+            loop {
+                if transfer_job::transfer_cancel_requested(&dir_for_watcher) {
+                    cancel_token.cancel();
+                    break;
+                }
+                if ticks.is_multiple_of(5)
+                    && !transfer_job::is_transfer_job_authorized_async(
+                        &paths_for_watcher,
+                        &id_for_watcher,
+                    )
+                    .await
+                {
+                    revoked_flag.store(true, Ordering::Relaxed);
+                    cancel_token.cancel();
+                    break;
+                }
+                ticks = ticks.wrapping_add(1);
+                tokio::select! {
+                    biased;
+                    () = watcher_stop.cancelled() => break,
+                    () = tokio::time::sleep(TRANSFER_CANCEL_POLL) => {}
+                }
+            }
+        }
+    });
+
+    struct MonotonicProgress {
+        bytes_done: u64,
+        files_done: u64,
+        attempt: u32,
+        title: Option<String>,
+    }
+
+    let state = Arc::new(Mutex::new(MonotonicProgress {
+        bytes_done: 0,
+        files_done: 0,
+        attempt: 1,
+        title: None,
+    }));
+    let dir_for_events = dir.clone();
+    let move_source = req.args.move_source;
+    let to_machine = req.to_machine.clone();
+    let events = EventSink::new(move |kind, data| {
+        if kind != EventKind::Progress {
+            return;
+        }
+        let Ok(mut progress) = serde_json::from_value::<JobProgress>(data) else {
+            return;
+        };
+        let title_update = {
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let attempt = progress.attempt.unwrap_or(1);
+            if attempt > guard.attempt {
+                guard.attempt = attempt;
+                guard.bytes_done = progress.bytes_done;
+            } else {
+                progress.bytes_done = progress.bytes_done.max(guard.bytes_done);
+                guard.bytes_done = progress.bytes_done;
+            }
+            progress.files_done = progress.files_done.max(guard.files_done);
+            guard.files_done = progress.files_done;
+            if guard.title.is_none()
+                && let Some(total) = progress.files_total
+                && total > 1
+            {
+                let verb = if move_source { "Move" } else { "Copy" };
+                guard.title = Some(format!("{verb} {total} items to {to_machine}"));
+            }
+            guard.title.clone()
+        };
+        let _ = transfer_job::write_transfer_progress(&dir_for_events, &progress, title_update);
+    });
+
+    let mut foreground_args = req.args;
+    foreground_args.background = false;
+    let args_value = serde_json::to_value(&foreground_args).unwrap_or(Value::Null);
+    let credential_expires = req
+        .credential_expires
+        .as_deref()
+        .and_then(|s| s.parse::<jiff::Timestamp>().ok());
+
+    let call = Call {
+        tool: "fs.transfer".to_owned(),
+        args: args_value,
+        as_principal: None,
+        door: req.door,
+        // Pin to the caller's principal so the detached job NEVER escalates to `owner` or
+        // `policy.default` and always evaluates live `policy.toml` for that exact principal.
+        pinned: Some(req.principal),
+        device: req.device,
+        pairing_id: req.pairing_id,
+        cancel: cancel_token.clone(),
+        events,
+        hops: 0,
+        credential_expires,
+    };
+
+    let outcome = node.call(call).await;
+    fleet.close().await;
+    watcher_stop.cancel();
+    let _ = watcher.await;
+
+    let write_res = match outcome {
+        Ok(result) => {
+            transfer_job::append_transfer_log(&dir, "transfer completed");
+            transfer_job::finish_transfer_job_ok(&dir, result)
+        }
+        Err(error) if error.code == ErrorCode::Cancelled || cancel_token.is_cancelled() => {
+            let detail = if revoked_flag.load(Ordering::Relaxed) {
+                "Cancelled because permissions or device access were revoked.".to_owned()
+            } else {
+                error.message
+            };
+            transfer_job::append_transfer_log(&dir, &format!("transfer cancelled: {detail}"));
+            transfer_job::finish_transfer_job_cancelled(&dir, &detail)
+        }
+        Err(error) => {
+            transfer_job::append_transfer_log(&dir, &format!("transfer failed: {}", error.message));
+            transfer_job::finish_transfer_job_err(&dir, error)
+        }
+    };
+    let _ = lock.unlock();
+    write_res.map_err(|err| err.message)
+}
+
 async fn transfer(
     fleet: &Fleet,
     ctx: &Ctx,
@@ -476,6 +1160,128 @@ struct Transfer<'a> {
     sent: &'a Sent,
 }
 
+/// Result of probing whether two directories (one on `from`, one on `to`) are distinct.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DirPairProof {
+    /// Marker created in `to_dir` was confirmed absent in `from_dir`.
+    ProvenDistinct,
+    /// Marker created in `to_dir` appeared in `from_dir` (same directory, bind mount,
+    /// symlinked directory, fleet alias, or shared network mount).
+    SameDirectory,
+    /// The probe could not conclude; callers must refuse removal by default and keep both copies.
+    Inconclusive(String),
+}
+
+struct LockRenewalHandle {
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+/// Active exclusive move locks held across one or two endpoints in deterministic `(machine, path)`
+/// order, renewed asynchronously every `lease / 3` by an independent background task that tracks
+/// whether either lock was lost.
+struct HeldMoveLocks {
+    handles: Vec<LockRenewalHandle>,
+    from_lock_id: String,
+    from_entries: HashMap<String, LockEntry>,
+    to_entries: HashMap<String, LockEntry>,
+    lost: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HeldMoveLocks {
+    fn spawn_renewer(
+        mut conn: Conn,
+        lease_ms: u64,
+        lost: Arc<std::sync::atomic::AtomicBool>,
+    ) -> LockRenewalHandle {
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let effective_lease_ms = if lease_ms == 0 { 10_000 } else { lease_ms };
+        let interval = Duration::from_millis((effective_lease_ms / 3).max(20));
+        let reply_timeout = Duration::from_millis((effective_lease_ms / 2).clamp(200, 5_000));
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut stop_rx => {
+                        let _ = conn.write(b"release\n").await;
+                        conn.close().await;
+                        return;
+                    }
+                    () = tokio::time::sleep(interval) => {
+                        if conn.write(b"renew\n").await.is_err() {
+                            lost.store(true, Ordering::SeqCst);
+                            conn.abort().await;
+                            return;
+                        }
+                        match tokio::time::timeout(reply_timeout, conn.first::<LockRenewReply>()).await {
+                            Ok(Ok(reply)) if reply.status == "held" => {}
+                            _ => {
+                                lost.store(true, Ordering::SeqCst);
+                                conn.abort().await;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        LockRenewalHandle {
+            stop_tx: Some(stop_tx),
+            task,
+        }
+    }
+
+    fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+
+    fn source_lock_id(&self) -> Option<&str> {
+        (!self.from_lock_id.is_empty()).then_some(self.from_lock_id.as_str())
+    }
+
+    async fn release(mut self) {
+        for mut handle in self.handles.drain(..).rev() {
+            if let Some(tx) = handle.stop_tx.take() {
+                let _ = tx.send(());
+            }
+            let _ = handle.task.await;
+        }
+    }
+}
+
+impl Drop for HeldMoveLocks {
+    fn drop(&mut self) {
+        for mut handle in self.handles.drain(..).rev() {
+            // Dropping `stop_tx` signals the background renewer to send `"release\n"` and close.
+            handle.stop_tx.take();
+        }
+    }
+}
+
+/// One candidate file or symlink eligible to be removed from `from` after its destination copy is
+/// re-verified under exclusive locks on both source and destination.
+struct MoveRemovalCandidate {
+    /// Relative path under `from` (empty for single-file root).
+    rel: String,
+    /// Full path on `from`.
+    from_path: String,
+    /// Actual full path placed on `to` (accounting for `if_exists=rename`).
+    to_path: String,
+    kind: EntryKind,
+    expected_hash: Option<Hash>,
+    expected_size: u64,
+    expected_link_target: Option<String>,
+    /// Post-commit `(file_id, size, mtime)` recorded when the file was placed; if missing or
+    /// mismatched under the held locks, the destination is re-hashed before removing the source.
+    recorded_dest: Option<(Option<FileIdentity>, u64, Option<Timestamp>)>,
+    /// Whether `from` and `to` share a machine or directory (requires `src_id != dst_id`).
+    same_machine_or_dir: bool,
+}
+
+/// Maximum number of candidate files locked together in one tree-move verification round (at most
+/// 128 source+destination paths per `lock` call, well under the 256-path cap).
+const MOVE_LOCK_BATCH: usize = 64;
+
 impl Transfer<'_> {
     async fn run(
         &self,
@@ -483,15 +1289,16 @@ impl Transfer<'_> {
         to: &End,
         args: &TransferArgs,
     ) -> Result<TransferReport, ErrorBody> {
-        let source: StatReply = self
-            .request(
+        let (source, from_caps): (StatReply, HashSet<String>) = self
+            .request_with_caps(
                 from,
                 json!({"op": "stat", "path": from.path, "checksum": true}),
+                &[],
             )
             .await?;
         match source.kind.as_str() {
-            "file" => self.file(from, to, &source, args).await,
-            "dir" => self.tree(from, to, args).await,
+            "file" => self.file(from, to, &source, &from_caps, args).await,
+            "dir" => self.tree(from, to, &source, &from_caps, args).await,
             "missing" => Err(ErrorBody::new(
                 ErrorCode::NotFound,
                 format!("{} does not exist on {}.", from.path, from.machine),
@@ -514,11 +1321,802 @@ impl Transfer<'_> {
         }
     }
 
+    /// Verifies that the caller is allowed `fs.remove` on `from` (including protected-tree checks)
+    /// before any byte moves.
+    async fn check_move_permission(&self, from: &End) -> Result<(), ErrorBody> {
+        let _: DeleteDone = self
+            .request_required(
+                from,
+                json!({
+                    "op": "delete",
+                    "root": from.path,
+                    "names": [],
+                    "dry_run": true,
+                    "remove_root": true,
+                }),
+                &[CAP_MOVE],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Ensures both endpoints advertise the stream capabilities required for `if_exists` and
+    /// `move`, refusing older peers before any bytes move.
+    fn check_peer_capabilities(
+        from: &End,
+        from_caps: &HashSet<String>,
+        to: &End,
+        to_caps: &HashSet<String>,
+        if_exists: IfExists,
+        args: &TransferArgs,
+    ) -> Result<(), ErrorBody> {
+        if if_exists != IfExists::Replace && !to_caps.contains(CAP_IF_EXISTS) {
+            return Err(missing_peer_capability(
+                &to.machine,
+                &format!("if_exists={}", args.if_exists.as_str()),
+            ));
+        }
+        if args.move_source {
+            if !from_caps.contains(CAP_MOVE)
+                || !from_caps.contains(CAP_PROBE)
+                || !from_caps.contains(CAP_LOCK)
+            {
+                return Err(missing_peer_capability(&from.machine, "move"));
+            }
+            if !to_caps.contains(CAP_MOVE)
+                || !to_caps.contains(CAP_PROBE)
+                || !to_caps.contains(CAP_LOCK)
+            {
+                return Err(missing_peer_capability(&to.machine, "move"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves the case-sensitivity and Unicode-normalization behavior of the parent directory
+    /// holding `from` and `to` (never inspecting inside a directory being renamed). When read-only
+    /// `stat` left either property unknown and `same_file` holds on one parent, asks the node to
+    /// run `probe_dir_name_behavior` via `probe_write` (`action = "behavior"`) instead of assuming
+    /// case-sensitivity.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_parent_fs_behavior(
+        &self,
+        from: &End,
+        source_stat: &StatReply,
+        to_path: &str,
+        there_stat: &StatReply,
+        same_file: bool,
+        dry_run: bool,
+    ) -> FsNameBehavior {
+        // Prefer the parent-directory fields from `stat`, falling back to the legacy fields only
+        // for non-directories (where `stat` already inspected the parent) or older peers.
+        let mut ci = there_stat
+            .parent_case_insensitive
+            .or(source_stat.parent_case_insensitive);
+        let mut norm = there_stat
+            .parent_unicode_normalizing
+            .or(source_stat.parent_unicode_normalizing);
+        if source_stat.kind != "dir" {
+            ci = ci
+                .or(there_stat.case_insensitive)
+                .or(source_stat.case_insensitive);
+            norm = norm
+                .or(there_stat.unicode_normalizing)
+                .or(source_stat.unicode_normalizing);
+        }
+
+        let same_parent = source_stat
+            .parent_id
+            .zip(there_stat.parent_id)
+            .is_some_and(|(a, b)| a.same_file(&b));
+        let either_symlink = source_stat.is_symlink || there_stat.is_symlink;
+        let from_name = OsStr::new(file_name(&from.path));
+        let to_name = OsStr::new(file_name(to_path));
+        let needs_probe = (ci.is_none() || norm.is_none())
+            && same_file
+            && same_parent
+            && !either_symlink
+            && from_name.as_encoded_bytes() != to_name.as_encoded_bytes();
+
+        if needs_probe {
+            if !dry_run {
+                let parent = parent_dir_of(&from.path);
+                if let Ok(reply) = self
+                    .request_required::<ProbeReply>(
+                        from,
+                        json!({
+                            "op": "probe_write",
+                            "action": "behavior",
+                            "dir": parent,
+                        }),
+                        &[CAP_PROBE],
+                    )
+                    .await
+                {
+                    if let Some(probed_ci) = reply.case_insensitive {
+                        ci = Some(probed_ci);
+                    }
+                    if let Some(probed_norm) = reply.unicode_normalizing {
+                        norm = Some(probed_norm);
+                    }
+                }
+            } else if source_stat.kind == "dir"
+                || source_stat.file_id.is_some_and(|id| id.nlink == 1)
+            {
+                // Dry-run must not write probe files. Directories cannot be hardlinked and
+                // `nlink == 1` files have no hardlink aliases, so a same-file same-parent entry
+                // with a differing name can only be a folding alias.
+                let fold_ci = stream::names_fold_equivalent(
+                    from_name,
+                    to_name,
+                    FsNameBehavior {
+                        case_insensitive: true,
+                        unicode_normalizing: false,
+                    },
+                );
+                let fold_norm = stream::names_fold_equivalent(
+                    from_name,
+                    to_name,
+                    FsNameBehavior {
+                        case_insensitive: false,
+                        unicode_normalizing: true,
+                    },
+                );
+                let fold_both = stream::names_fold_equivalent(
+                    from_name,
+                    to_name,
+                    FsNameBehavior {
+                        case_insensitive: true,
+                        unicode_normalizing: true,
+                    },
+                );
+                if ci.is_none() && (fold_ci || (fold_both && !fold_norm)) {
+                    ci = Some(true);
+                }
+                if norm.is_none() && (fold_norm || (fold_both && !fold_ci)) {
+                    norm = Some(true);
+                }
+            }
+        }
+
+        FsNameBehavior {
+            case_insensitive: ci.unwrap_or(false),
+            unicode_normalizing: norm.unwrap_or(false),
+        }
+    }
+
+    /// Confirms with a held `probe_write` stream that its marker stayed intact on disk for the
+    /// entire duration of `probe_read`, then closes the stream (which deletes the marker).
+    async fn confirm_held_probe(mut probe_conn: Conn) -> bool {
+        let confirmed = if probe_conn.write(b"confirm\n").await.is_ok() {
+            matches!(
+                probe_conn.first::<ProbeConfirm>().await,
+                Ok(ProbeConfirm { held: true })
+            )
+        } else {
+            false
+        };
+        probe_conn.close().await;
+        confirmed
+    }
+
+    /// Formats a non-local filesystem locality into an inconclusive probe reason, returning `None`
+    /// only when the directory is provably [`ProbeFsLocality::Local`].
+    fn non_local_reason(dir: &str, machine: &str, locality: &ProbeFsLocality) -> Option<String> {
+        match locality {
+            ProbeFsLocality::Local => None,
+            ProbeFsLocality::Network(fs_kind) => Some(format!(
+                "{dir} on {machine} is on a network file system ({fs_kind}), so source and destination could not be proven distinct"
+            )),
+            ProbeFsLocality::Unknown(reason) => Some(format!(
+                "{dir} on {machine} could not be proven to sit on a local file system ({reason}), so source and destination could not be proven distinct"
+            )),
+        }
+    }
+
+    /// Always probes `(from_dir, to_dir)` by creating a unique marker in `to_dir` and checking
+    /// whether it appears in `from_dir`, caching conclusive results for the transfer.
+    ///
+    /// Keeps the `probe_write` stream open with `hold: true` for as long as `probe_read` runs,
+    /// confirms after `probe_read` that the marker remained held the whole time, and concludes
+    /// distinctness or sameness **only** when both directories are provably [`ProbeFsLocality::Local`].
+    /// Never treats an error, network FS, unknown FS, or unconfirmed marker as distinct: returns
+    /// [`DirPairProof::Inconclusive`] so callers complete the copy and keep the source.
+    async fn prove_dir_pair(
+        &self,
+        from: &End,
+        from_dir: &str,
+        to: &End,
+        to_dir: &str,
+        cache: &mut HashMap<(String, String), DirPairProof>,
+    ) -> DirPairProof {
+        let key = (from_dir.to_owned(), to_dir.to_owned());
+        if let Some(cached) = cache.get(&key) {
+            return cached.clone();
+        }
+        let mut probe_conn = match self
+            .open_with_caps(
+                to,
+                json!({
+                    "op": "probe_write",
+                    "action": "create",
+                    "dir": to_dir,
+                    "nearest_ancestor": false,
+                    "hold": true,
+                }),
+                &[CAP_PROBE],
+            )
+            .await
+        {
+            Ok(conn) => conn,
+            Err(err) => {
+                return DirPairProof::Inconclusive(format!(
+                    "could not probe {} on {}: {}",
+                    to_dir, to.machine, err.message
+                ));
+            }
+        };
+        let created: ProbeReply = match probe_conn.first().await {
+            Ok(reply) => reply,
+            Err(err) => {
+                probe_conn.abort().await;
+                return DirPairProof::Inconclusive(format!(
+                    "could not probe {} on {}: {}",
+                    to_dir, to.machine, err.message
+                ));
+            }
+        };
+        let to_locality = created.effective_locality();
+        let (Some(_probe_dir), Some(marker)) = (created.dir, created.marker) else {
+            probe_conn.close().await;
+            return DirPairProof::Inconclusive(format!(
+                "{} on {} could not be probed for directory distinctness",
+                to_dir, to.machine
+            ));
+        };
+        let check_res: Result<ProbeReply, ErrorBody> = self
+            .request_required(
+                from,
+                json!({
+                    "op": "probe_read",
+                    "dir": from_dir,
+                    "marker": marker,
+                    "subdirs": [],
+                }),
+                &[CAP_PROBE],
+            )
+            .await;
+        let held_confirmed = Self::confirm_held_probe(probe_conn).await;
+        if !held_confirmed {
+            return DirPairProof::Inconclusive(format!(
+                "probe marker in {} on {} was not confirmed held for the entire directory check",
+                to_dir, to.machine
+            ));
+        }
+        match check_res {
+            Ok(reply) => {
+                let from_locality = reply.effective_locality();
+                let proof = if let Some(reason) =
+                    Self::non_local_reason(to_dir, &to.machine, &to_locality)
+                {
+                    DirPairProof::Inconclusive(reason)
+                } else if let Some(reason) =
+                    Self::non_local_reason(from_dir, &from.machine, &from_locality)
+                {
+                    DirPairProof::Inconclusive(reason)
+                } else if reply.exists {
+                    DirPairProof::SameDirectory
+                } else {
+                    DirPairProof::ProvenDistinct
+                };
+                cache.insert(key, proof.clone());
+                proof
+            }
+            Err(err) => DirPairProof::Inconclusive(format!(
+                "could not check directory probe in {} on {}: {}",
+                from_dir, from.machine, err.message
+            )),
+        }
+    }
+
+    /// Up-front tree-move probe checking whether `to_dir` (or its nearest existing ancestor when
+    /// `to_dir` does not exist yet) aliases `from_dir` or any subdirectory of `from_dir`.
+    #[allow(clippy::too_many_arguments)]
+    async fn probe_tree_root_upfront(
+        &self,
+        from: &End,
+        from_dir: &str,
+        from_subdirs: &[String],
+        to: &End,
+        to_dir: &str,
+        to_exists: bool,
+        cache: &mut HashMap<(String, String), DirPairProof>,
+    ) -> Result<bool, ErrorBody> {
+        let mut probe_conn = match self
+            .open_with_caps(
+                to,
+                json!({
+                    "op": "probe_write",
+                    "action": "create",
+                    "dir": to_dir,
+                    "nearest_ancestor": !to_exists,
+                    "hold": true,
+                }),
+                &[CAP_PROBE],
+            )
+            .await
+        {
+            Ok(conn) => conn,
+            Err(_) => return Ok(false),
+        };
+        let created: ProbeReply = match probe_conn.first().await {
+            Ok(reply) => reply,
+            Err(_) => {
+                probe_conn.abort().await;
+                return Ok(false);
+            }
+        };
+        let to_locality = created.effective_locality();
+        let (Some(_probe_dir), Some(marker)) = (created.dir, created.marker) else {
+            probe_conn.close().await;
+            return Ok(false);
+        };
+        let check_res: Result<ProbeReply, ErrorBody> = self
+            .request_required(
+                from,
+                json!({
+                    "op": "probe_read",
+                    "dir": from_dir,
+                    "marker": marker,
+                    "subdirs": from_subdirs,
+                }),
+                &[CAP_PROBE],
+            )
+            .await;
+        let held_confirmed = Self::confirm_held_probe(probe_conn).await;
+        if !held_confirmed {
+            return Ok(false);
+        }
+        match check_res {
+            Ok(reply) => {
+                let from_locality = reply.effective_locality();
+                if let Some(reason) = Self::non_local_reason(to_dir, &to.machine, &to_locality) {
+                    if to_exists {
+                        cache.insert(
+                            (from_dir.to_owned(), to_dir.to_owned()),
+                            DirPairProof::Inconclusive(reason),
+                        );
+                    }
+                    return Ok(false);
+                }
+                if let Some(reason) =
+                    Self::non_local_reason(from_dir, &from.machine, &from_locality)
+                {
+                    if to_exists {
+                        cache.insert(
+                            (from_dir.to_owned(), to_dir.to_owned()),
+                            DirPairProof::Inconclusive(reason),
+                        );
+                    }
+                    return Ok(false);
+                }
+                if !reply.exists && to_exists {
+                    cache.insert(
+                        (from_dir.to_owned(), to_dir.to_owned()),
+                        DirPairProof::ProvenDistinct,
+                    );
+                }
+                Ok(reply.exists)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Acquires exclusive move locks on `from_paths` (on `from`) and `to_paths` (on `to`) in a
+    /// fixed global order by `(machine, path)`. Returns a clean retryable `conflict` when busy.
+    async fn acquire_move_locks(
+        &self,
+        from: &End,
+        from_paths: &[String],
+        to: &End,
+        to_paths: &[String],
+    ) -> Result<HeldMoveLocks, ErrorBody> {
+        if from.machine == to.machine {
+            let mut combined = Vec::with_capacity(from_paths.len() + to_paths.len());
+            let mut seen = HashSet::new();
+            for p in from_paths.iter().chain(to_paths.iter()) {
+                if seen.insert(p.clone()) {
+                    combined.push(p.clone());
+                }
+            }
+            let mut conn = self
+                .open_with_caps(from, json!({"op": "lock", "paths": combined}), &[CAP_LOCK])
+                .await?;
+            let ready: LockReady = match conn.first().await {
+                Ok(ready) => ready,
+                Err(err) => {
+                    conn.abort().await;
+                    return Err(err);
+                }
+            };
+            let mut by_path: HashMap<String, LockEntry> = ready
+                .entries
+                .into_iter()
+                .map(|e| (e.path.clone(), e))
+                .collect();
+            let mut from_entries = HashMap::with_capacity(from_paths.len());
+            let mut to_entries = HashMap::with_capacity(to_paths.len());
+            for p in from_paths {
+                if let Some(entry) = by_path.get(p) {
+                    from_entries.insert(p.clone(), entry.clone());
+                }
+            }
+            for p in to_paths {
+                if let Some(entry) = by_path.remove(p) {
+                    to_entries.insert(p.clone(), entry);
+                }
+            }
+            let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let handle = HeldMoveLocks::spawn_renewer(conn, ready.lease_ms, Arc::clone(&lost));
+            return Ok(HeldMoveLocks {
+                handles: vec![handle],
+                from_lock_id: ready.lock_id,
+                from_entries,
+                to_entries,
+                lost,
+            });
+        }
+
+        // Different machines: always lock the lexicographically smaller machine first so two
+        // crossing moves (`a -> b` and `b -> a`) acquire locks in the exact same order.
+        let from_first = from.machine < to.machine;
+        let (first_end, first_paths, second_end, second_paths) = if from_first {
+            (from, from_paths, to, to_paths)
+        } else {
+            (to, to_paths, from, from_paths)
+        };
+        let mut conn1 = self
+            .open_with_caps(
+                first_end,
+                json!({"op": "lock", "paths": first_paths}),
+                &[CAP_LOCK],
+            )
+            .await?;
+        let ready1: LockReady = match conn1.first().await {
+            Ok(ready) => ready,
+            Err(err) => {
+                conn1.abort().await;
+                return Err(err);
+            }
+        };
+        let mut conn2 = match self
+            .open_with_caps(
+                second_end,
+                json!({"op": "lock", "paths": second_paths}),
+                &[CAP_LOCK],
+            )
+            .await
+        {
+            Ok(conn) => conn,
+            Err(err) => {
+                conn1.close().await;
+                return Err(err);
+            }
+        };
+        let ready2: LockReady = match conn2.first().await {
+            Ok(ready) => ready,
+            Err(err) => {
+                conn2.abort().await;
+                conn1.close().await;
+                return Err(err);
+            }
+        };
+        let map1: HashMap<String, LockEntry> = ready1
+            .entries
+            .into_iter()
+            .map(|e| (e.path.clone(), e))
+            .collect();
+        let map2: HashMap<String, LockEntry> = ready2
+            .entries
+            .into_iter()
+            .map(|e| (e.path.clone(), e))
+            .collect();
+        let (from_entries, to_entries, from_lock_id) = if from_first {
+            (map1, map2, ready1.lock_id)
+        } else {
+            (map2, map1, ready2.lock_id)
+        };
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle1 = HeldMoveLocks::spawn_renewer(conn1, ready1.lease_ms, Arc::clone(&lost));
+        let handle2 = HeldMoveLocks::spawn_renewer(conn2, ready2.lease_ms, Arc::clone(&lost));
+        Ok(HeldMoveLocks {
+            handles: vec![handle1, handle2],
+            from_lock_id,
+            from_entries,
+            to_entries,
+            lost,
+        })
+    }
+
+    fn move_lock_lost_error(machine: &str) -> ErrorBody {
+        ErrorBody::new(
+            ErrorCode::Conflict,
+            "The copy finished and the source was kept because the move lock expired or was lost before removal.",
+        )
+        .with_hint("Run the transfer again to finish the move.")
+        .with_machine(machine.to_owned())
+    }
+
+    /// Wraps a busy-lock `Conflict` during move finalization so the caller is clearly told that the
+    /// copy finished, the source was kept, and running the transfer again will finish the move.
+    fn explain_busy_move_lock(err: ErrorBody) -> ErrorBody {
+        if err.code != ErrorCode::Conflict {
+            return err;
+        }
+        let mut wrapped = ErrorBody::new(
+            ErrorCode::Conflict,
+            format!(
+                "The copy finished and the source was kept because another move is currently finalizing these paths ({})",
+                err.message
+            ),
+        )
+        .with_hint("Run the transfer again to finish the move.");
+        if let Some(machine) = err.machine {
+            wrapped = wrapped.with_machine(machine);
+        }
+        if let Some(details) = err.details {
+            wrapped = wrapped.with_details(details);
+        }
+        wrapped
+    }
+
+    /// Re-verifies one candidate's destination copy while holding exclusive locks on both source
+    /// and destination. Returns `Ok(true)` if the source is safe to delete, `Ok(false)` with an
+    /// explanatory reason in `Err(reason)` if the destination disappeared, changed, or aliases the
+    /// source.
+    async fn verify_candidate_under_locks(
+        &self,
+        to: &End,
+        cand: &MoveRemovalCandidate,
+        from_entries: &HashMap<String, LockEntry>,
+        to_entries: &HashMap<String, LockEntry>,
+    ) -> Result<bool, String> {
+        let Some(src_entry) = from_entries.get(&cand.from_path) else {
+            return Err("source metadata was unavailable under lock".to_owned());
+        };
+        if !src_entry.exists {
+            return Ok(false);
+        }
+        let Some(dst_entry) = to_entries.get(&cand.to_path) else {
+            return Err("destination metadata was unavailable under lock".to_owned());
+        };
+        if !dst_entry.exists {
+            return Err(format!(
+                "destination {} on {} disappeared before the source was removed, so the source was kept",
+                cand.to_path, to.machine
+            ));
+        }
+        if cand.same_machine_or_dir {
+            match (src_entry.file_id, dst_entry.file_id) {
+                (Some(src_id), Some(dst_id)) if !src_id.same_file(&dst_id) => {}
+                _ => {
+                    return Err(
+                        "source and destination could not be proven to be distinct files under lock, so the source was kept"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        match cand.kind {
+            EntryKind::Symlink => {
+                if dst_entry.kind != "symlink" || dst_entry.link_target != cand.expected_link_target
+                {
+                    return Err(format!(
+                        "destination symlink {} on {} changed before the source was removed, so the source was kept",
+                        cand.to_path, to.machine
+                    ));
+                }
+                Ok(true)
+            }
+            EntryKind::File => {
+                if dst_entry.kind != "file" || dst_entry.size != cand.expected_size {
+                    return Err(format!(
+                        "destination {} on {} changed before the source was removed, so the source was kept",
+                        cand.to_path, to.machine
+                    ));
+                }
+                let fast_match = cand
+                    .recorded_dest
+                    .is_some_and(|(rec_id, rec_size, rec_mtime)| {
+                        rec_id.is_some()
+                            && rec_mtime.is_some()
+                            && dst_entry.file_id == rec_id
+                            && dst_entry.size == rec_size
+                            && dst_entry.mtime == rec_mtime
+                    });
+                if fast_match {
+                    return Ok(true);
+                }
+                // Metadata was not recorded (e.g. `files_unchanged`) or changed since copy:
+                // re-hash the destination file right now while holding both locks.
+                let mut stat_req = json!({
+                    "op": "stat",
+                    "path": cand.to_path,
+                    "checksum": true,
+                    "if_size": cand.expected_size,
+                });
+                if let Some(h) = cand.expected_hash {
+                    stat_req["if_hash"] = json!(h);
+                }
+                let dst_stat: StatReply = self.request(to, stat_req).await.map_err(|err| {
+                    format!(
+                        "could not re-verify destination {} on {}: {}",
+                        cand.to_path, to.machine, err.message
+                    )
+                })?;
+                if dst_entry.kind != "file"
+                    || dst_stat.kind != "file"
+                    || dst_stat.size != cand.expected_size
+                    || cand.expected_hash.is_none()
+                    || dst_stat.hash != cand.expected_hash
+                {
+                    return Err(format!(
+                        "destination {} on {} no longer matches the source hash, so the source was kept",
+                        cand.to_path, to.machine
+                    ));
+                }
+                Ok(true)
+            }
+            EntryKind::Dir => Ok(false),
+        }
+    }
+
+    /// Acquires exclusive locks on a single-file move's `(from, target)`, re-verifies the
+    /// destination under those locks, removes `from` while holding them, and releases them.
+    #[allow(clippy::too_many_arguments)]
+    async fn lock_verify_and_remove_single_file(
+        &self,
+        from: &End,
+        to: &End,
+        actual_to_path: &str,
+        expected_hash: Hash,
+        expected_size: u64,
+        recorded_dest: Option<(Option<FileIdentity>, u64, Option<Timestamp>)>,
+        same_machine_or_dir: bool,
+        skipped: &mut Vec<SkippedEntry>,
+    ) -> Result<u64, ErrorBody> {
+        let from_paths = vec![from.path.clone()];
+        let to_paths = vec![actual_to_path.to_owned()];
+        let locks = self
+            .acquire_move_locks(from, &from_paths, to, &to_paths)
+            .await
+            .map_err(Self::explain_busy_move_lock)?;
+        let cand = MoveRemovalCandidate {
+            rel: String::new(),
+            from_path: from.path.clone(),
+            to_path: actual_to_path.to_owned(),
+            kind: EntryKind::File,
+            expected_hash: Some(expected_hash),
+            expected_size,
+            expected_link_target: None,
+            recorded_dest,
+            same_machine_or_dir,
+        };
+        let verified = self
+            .verify_candidate_under_locks(to, &cand, &locks.from_entries, &locks.to_entries)
+            .await;
+        let result = if locks.is_lost() {
+            Err(Self::move_lock_lost_error(&from.machine))
+        } else {
+            match verified {
+                Ok(true) => {
+                    let forbid = same_machine_or_dir
+                        .then(|| {
+                            locks
+                                .to_entries
+                                .get(actual_to_path)
+                                .and_then(|e| e.file_id)
+                                .map(|id| (id.dev, id.ino))
+                        })
+                        .flatten();
+                    self.remove_source_root(
+                        from,
+                        Some(expected_hash),
+                        forbid,
+                        locks.source_lock_id(),
+                        skipped,
+                    )
+                    .await
+                }
+                Ok(false) => Ok(0),
+                Err(reason) => Err(ErrorBody::new(ErrorCode::Conflict, reason)
+                    .with_hint(
+                        "Run the transfer again once no other move is modifying these paths.",
+                    )
+                    .with_machine(from.machine.clone())),
+            }
+        };
+        locks.release().await;
+        result
+    }
+
+    /// Acquires exclusive locks on batches of tree-move candidates in fixed `(machine, path)`
+    /// order, re-verifies every destination file under those locks, deletes only the verified
+    /// source files while holding the locks, and returns `(removed_count, any_kept)`.
+    async fn lock_verify_and_delete_tree_candidates(
+        &self,
+        from: &End,
+        to: &End,
+        candidates: &[MoveRemovalCandidate],
+        skipped: &mut Vec<SkippedEntry>,
+    ) -> Result<(u64, bool), ErrorBody> {
+        let mut total_removed = 0u64;
+        let mut any_kept = false;
+        for chunk in candidates.chunks(MOVE_LOCK_BATCH) {
+            let from_paths: Vec<String> = chunk.iter().map(|c| c.from_path.clone()).collect();
+            let to_paths: Vec<String> = chunk.iter().map(|c| c.to_path.clone()).collect();
+            let locks = self
+                .acquire_move_locks(from, &from_paths, to, &to_paths)
+                .await
+                .map_err(Self::explain_busy_move_lock)?;
+            let mut to_delete: Vec<String> = Vec::with_capacity(chunk.len());
+            let mut hashes: HashMap<String, Hash> = HashMap::new();
+            for cand in chunk {
+                if locks.is_lost() {
+                    locks.release().await;
+                    return Err(Self::move_lock_lost_error(&from.machine));
+                }
+                match self
+                    .verify_candidate_under_locks(to, cand, &locks.from_entries, &locks.to_entries)
+                    .await
+                {
+                    Ok(true) => {
+                        to_delete.push(cand.rel.clone());
+                        if let Some(h) = cand.expected_hash {
+                            hashes.insert(cand.rel.clone(), h);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(reason) => {
+                        any_kept = true;
+                        skipped.push(SkippedEntry {
+                            path: cand.rel.clone(),
+                            reason,
+                        });
+                    }
+                }
+            }
+            let delete_res = if locks.is_lost() {
+                Err(Self::move_lock_lost_error(&from.machine))
+            } else if to_delete.is_empty() {
+                Ok(0)
+            } else {
+                self.delete_verified(
+                    from,
+                    &to_delete,
+                    &hashes,
+                    false,
+                    locks.source_lock_id(),
+                    skipped,
+                )
+                .await
+            };
+            locks.release().await;
+            let removed = delete_res?;
+            if removed < to_delete.len() as u64 {
+                any_kept = true;
+            }
+            total_removed += removed;
+        }
+        Ok((total_removed, any_kept))
+    }
+
     async fn file(
         &self,
         from: &End,
         to: &End,
         source: &StatReply,
+        from_caps: &HashSet<String>,
         args: &TransferArgs,
     ) -> Result<TransferReport, ErrorBody> {
         let hash = source.hash.ok_or_else(|| {
@@ -529,11 +2127,13 @@ impl Transfer<'_> {
             .with_machine(from.machine.clone())
         })?;
         let size = source.size;
+        let if_exists = IfExists::from(args.if_exists);
         let mut target = to.clone();
-        let mut there: StatReply = self
-            .request(
+        let (mut there, to_caps): (StatReply, HashSet<String>) = self
+            .request_with_caps(
                 to,
-                json!({"op": "stat", "path": to.path, "checksum": true, "if_size": size}),
+                json!({"op": "stat", "path": to.path, "checksum": true, "if_size": size, "if_hash": hash}),
+                &[],
             )
             .await?;
         if there.kind == "dir" || ends_in_separator(&to.path) {
@@ -541,38 +2141,210 @@ impl Transfer<'_> {
             there = self
                 .request(
                     &target,
-                    json!({"op": "stat", "path": target.path, "checksum": true, "if_size": size}),
+                    json!({"op": "stat", "path": target.path, "checksum": true, "if_size": size, "if_hash": hash}),
                 )
                 .await?;
+        }
+        Self::check_peer_capabilities(from, from_caps, &target, &to_caps, if_exists, args)?;
+        let mut proof_cache: HashMap<(String, String), DirPairProof> = HashMap::new();
+        let from_parent = parent_dir_of(&from.path);
+        let to_parent = parent_dir_of(&target.path);
+        let mut upfront_proof: Option<DirPairProof> = None;
+        if args.move_source {
+            self.check_move_permission(from).await?;
+            // On one node, classify same-entry vs folding rename vs alias using parent
+            // identities, exact caller entry names, file identity, and the host filesystem's
+            // case/Unicode-normalization behavior.
+            if from.machine == target.machine {
+                let same_file = source
+                    .file_id
+                    .zip(there.file_id)
+                    .is_some_and(|(a, b)| a.same_file(&b));
+                let fs_behavior = self
+                    .resolve_parent_fs_behavior(
+                        from,
+                        source,
+                        &target.path,
+                        &there,
+                        same_file,
+                        args.dry_run,
+                    )
+                    .await;
+                match classify_same_entry(
+                    source.parent_id,
+                    there.parent_id,
+                    OsStr::new(file_name(&from.path)),
+                    OsStr::new(file_name(&target.path)),
+                    same_file,
+                    source.is_symlink || there.is_symlink,
+                    fs_behavior,
+                ) {
+                    SameEntryDecision::CaseOrNormalizationRename => {
+                        if !from_caps.contains(CAP_RENAME) {
+                            return Err(missing_peer_capability(&from.machine, "rename"));
+                        }
+                        if !args.dry_run {
+                            let _: RenameDone = self
+                                .request_required(
+                                    from,
+                                    json!({
+                                        "op": "rename",
+                                        "from": from.path,
+                                        "to": target.path,
+                                    }),
+                                    &[CAP_RENAME],
+                                )
+                                .await?;
+                        }
+                        return Ok(TransferReport {
+                            from: from.named(),
+                            to: target.named(),
+                            kind: "file",
+                            moved: true,
+                            renamed: vec![RenamedEntry {
+                                from: from.path.clone(),
+                                to: target.path.clone(),
+                            }],
+                            ..TransferReport::default()
+                        });
+                    }
+                    SameEntryDecision::SameEntryNoOp | SameEntryDecision::RefuseSameFileAlias => {
+                        return Err(same_file_move_error(from, &target));
+                    }
+                    SameEntryDecision::DistinctEntries => {}
+                }
+            }
+            check_not_same_or_subtree(from, &target, source, &there, false)?;
+
+            // Always probe `(from_parent, to_parent)` regardless of machine names, devices, or
+            // mounts so fleet aliases, bind mounts, and shared network folders are caught up front.
+            if !args.dry_run {
+                let proof = self
+                    .prove_dir_pair(from, &from_parent, &target, &to_parent, &mut proof_cache)
+                    .await;
+                if proof == DirPairProof::SameDirectory && there.kind != "missing" {
+                    let proven_distinct_same_dev = source
+                        .file_id
+                        .zip(there.file_id)
+                        .is_some_and(|(a, b)| a.dev == b.dev && a.ino != b.ino);
+                    if !proven_distinct_same_dev
+                        && (if_exists != IfExists::Rename || from.machine == target.machine)
+                    {
+                        return Err(same_file_move_error(from, &target));
+                    }
+                }
+                upfront_proof = Some(proof);
+            }
         }
         let mut report = TransferReport {
             from: from.named(),
             to: target.named(),
             kind: "file",
+            moved: args.move_source,
             ..TransferReport::default()
         };
-        match there.kind.as_str() {
-            "file" if there.size == size && there.hash == Some(hash) => {
-                report.files_unchanged = 1;
-                return Ok(report);
-            }
-            "file" | "missing" | "symlink" => {}
-            other => {
-                let what = if other == "dir" {
-                    "a directory"
-                } else {
-                    "a special file"
-                };
+        match if_exists {
+            IfExists::Fail if there.kind != "missing" => {
                 return Err(ErrorBody::new(
-                    ErrorCode::Conflict,
-                    format!(
-                        "{} on {} is {what}, and a file cannot replace it.",
-                        target.path, target.machine
-                    ),
+                    ErrorCode::Exists,
+                    format!("{} already exists on {}.", target.path, target.machine),
                 )
-                .with_hint("Name a different path.")
+                .with_hint(
+                    "Pass if_exists=\"replace\", \"skip\", or \"rename\", or choose another destination.",
+                )
                 .with_machine(target.machine.clone()));
             }
+            IfExists::Skip if there.kind != "missing" => {
+                report.files_skipped = 1;
+                return Ok(report);
+            }
+            IfExists::Replace => match there.kind.as_str() {
+                "file"
+                    if there.size == size
+                        && there.hash == Some(hash)
+                        && !(args.move_source
+                            && from.machine != target.machine
+                            && source
+                                .file_id
+                                .zip(there.file_id)
+                                .is_some_and(|(a, b)| a.same_file(&b))) =>
+                {
+                    report.files_unchanged = 1;
+                    if args.move_source {
+                        if args.dry_run {
+                            report.source_removed = 1;
+                            report.would_remove = Some(vec![from.path.clone()]);
+                        } else {
+                            let dir_proof = match upfront_proof {
+                                Some(DirPairProof::ProvenDistinct) => DirPairProof::ProvenDistinct,
+                                Some(DirPairProof::SameDirectory) => DirPairProof::SameDirectory,
+                                _ => {
+                                    self.prove_dir_pair(
+                                        from,
+                                        &from_parent,
+                                        &target,
+                                        &to_parent,
+                                        &mut proof_cache,
+                                    )
+                                    .await
+                                }
+                            };
+                            match dir_proof {
+                                DirPairProof::Inconclusive(reason) => {
+                                    report.skipped.push(SkippedEntry {
+                                        path: from.path.clone(),
+                                        reason: format!(
+                                            "kept source because {} on {} and {} on {} could not be proven distinct ({reason})",
+                                            from_parent, from.machine, to_parent, target.machine
+                                        ),
+                                    });
+                                }
+                                DirPairProof::SameDirectory if from.machine != target.machine => {
+                                    return Err(same_file_move_error(from, &target));
+                                }
+                                DirPairProof::ProvenDistinct | DirPairProof::SameDirectory => {
+                                    let same_machine_or_dir = from.machine == target.machine
+                                        || dir_proof == DirPairProof::SameDirectory;
+                                    let mut skipped = Vec::new();
+                                    let removed = self
+                                        .lock_verify_and_remove_single_file(
+                                            from,
+                                            &target,
+                                            &target.path,
+                                            hash,
+                                            size,
+                                            None,
+                                            same_machine_or_dir,
+                                            &mut skipped,
+                                        )
+                                        .await?;
+                                    report.source_removed = removed;
+                                    report.skipped = report.list(skipped);
+                                }
+                            }
+                        }
+                    }
+                    return Ok(report);
+                }
+                "file" | "missing" | "symlink" => {}
+                other => {
+                    let what = if other == "dir" {
+                        "a directory"
+                    } else {
+                        "a special file"
+                    };
+                    return Err(ErrorBody::new(
+                        ErrorCode::Conflict,
+                        format!(
+                            "{} on {} is {what}, and a file cannot replace it.",
+                            target.path, target.machine
+                        ),
+                    )
+                    .with_hint("Name a different path.")
+                    .with_machine(target.machine.clone()));
+                }
+            },
+            IfExists::Fail | IfExists::Skip | IfExists::Rename => {}
         }
         let partial = there.partial.filter(|len| *len <= size);
         if args.dry_run {
@@ -580,30 +2352,104 @@ impl Transfer<'_> {
             report.bytes_sent = size - partial.unwrap_or(0);
             report.resumed_from = partial;
             report.would_send = Some(vec![target.path.clone()]);
+            if args.move_source {
+                report.source_removed = 1;
+                report.would_remove = Some(vec![from.path.clone()]);
+            }
             return Ok(report);
         }
-        let (resumed, sent) = match self.send_file(from, &target, source, partial).await {
+        let (resumed, sent, done) = match self
+            .send_file(from, &target, source, partial, if_exists, 1)
+            .await
+        {
             Err(error) if partial.is_some() && error.code == ErrorCode::Conflict => {
                 // What an earlier attempt left was not a prefix of this file (it changed since):
-                // the destination dropped it when the hash did not match, so start over once.
-                self.send_file(from, &target, source, None).await?
+                // the destination dropped it when the hash did not match, so start over once on
+                // attempt 2 with honest per-attempt byte progress.
+                self.sent.bytes.store(0, Ordering::Relaxed);
+                self.send_file(from, &target, source, None, if_exists, 2)
+                    .await?
             }
             other => other?,
+        };
+        if done.skipped {
+            report.files_skipped = 1;
+            return Ok(report);
+        }
+        let actual_target_path = if let Some(ref actual_path) = done.path
+            && if_exists == IfExists::Rename
+        {
+            let chosen_name = file_name(actual_path);
+            let reported_path = replace_path_filename(&target.path, chosen_name);
+            report.to = format!("{}:{reported_path}", target.machine);
+            reported_path
+        } else {
+            target.path.clone()
         };
         report.files_sent = 1;
         report.bytes_sent = sent;
         report.resumed_from = (resumed > 0).then_some(resumed);
+        if args.move_source {
+            let actual_to_parent = parent_dir_of(&actual_target_path);
+            let dir_proof = self
+                .prove_dir_pair(
+                    from,
+                    &from_parent,
+                    &target,
+                    &actual_to_parent,
+                    &mut proof_cache,
+                )
+                .await;
+            match dir_proof {
+                DirPairProof::Inconclusive(reason) => {
+                    report.skipped.push(SkippedEntry {
+                        path: from.path.clone(),
+                        reason: format!(
+                            "kept source because {} on {} and {} on {} could not be proven distinct ({reason})",
+                            from_parent, from.machine, actual_to_parent, target.machine
+                        ),
+                    });
+                }
+                DirPairProof::SameDirectory
+                    if file_name(&from.path) == file_name(&actual_target_path) =>
+                {
+                    return Err(same_file_move_error(from, &target));
+                }
+                DirPairProof::ProvenDistinct | DirPairProof::SameDirectory => {
+                    let same_machine_or_dir =
+                        from.machine == target.machine || dir_proof == DirPairProof::SameDirectory;
+                    let mut skipped = Vec::new();
+                    let removed = self
+                        .lock_verify_and_remove_single_file(
+                            from,
+                            &target,
+                            &actual_target_path,
+                            hash,
+                            size,
+                            Some((done.file_id, done.size, done.mtime)),
+                            same_machine_or_dir,
+                            &mut skipped,
+                        )
+                        .await?;
+                    report.source_removed = removed;
+                    report.skipped = report.list(skipped);
+                }
+            }
+        }
         Ok(report)
     }
 
-    /// Sends one file, returning the offset it continued from and the bytes it sent.
+    /// Sends one file, returning the offset it continued from, the bytes it sent, and the
+    /// destination's `PutDone`.
     async fn send_file(
         &self,
         from: &End,
         to: &End,
         source_file: &StatReply,
         hint: Option<u64>,
-    ) -> Result<(u64, u64), ErrorBody> {
+        if_exists: IfExists,
+        attempt: u32,
+    ) -> Result<(u64, u64, PutDone), ErrorBody> {
         let size = source_file.size;
         let Some(hash) = source_file.hash else {
             return Err(changed(from));
@@ -623,7 +2469,12 @@ impl Transfer<'_> {
         if let Some(mtime) = source_file.mtime {
             header["mtime"] = json!(mtime);
         }
-        let mut dest = self.open(to, header).await?;
+        let mut req_caps: Vec<&str> = Vec::new();
+        if if_exists != IfExists::Replace {
+            header["if_exists"] = json!(if_exists);
+            req_caps.push(CAP_IF_EXISTS);
+        }
+        let mut dest = self.open_with_caps(to, header, &req_caps).await?;
         let started: PutReady = match dest.first().await {
             Ok(ready) => ready,
             Err(error) => {
@@ -650,7 +2501,16 @@ impl Transfer<'_> {
             }
             source = again;
         }
-        let mut meter = Meter::new(self.ctx, self.sent, size - offset, 1, false);
+        let mut meter = Meter::new(
+            self.ctx,
+            self.sent,
+            size,
+            offset,
+            1,
+            Some(file_name(&from.path).to_owned()),
+            false,
+            attempt,
+        );
         let relayed = relay(
             &mut source,
             &mut dest,
@@ -665,12 +2525,14 @@ impl Transfer<'_> {
         source.close().await;
         dest.close().await;
         let done = done?;
-        if done.hash != hash {
+        if !done.skipped && done.hash != hash {
             return Err(changed(from));
         }
-        self.sent.files.fetch_add(1, Ordering::Relaxed);
+        if !done.skipped {
+            self.sent.files.fetch_add(1, Ordering::Relaxed);
+        }
         meter.emit(true);
-        Ok((offset, size - offset))
+        Ok((offset, size - offset, done))
     }
 
     async fn get(&self, from: &End, offset: u64) -> Result<(Conn, GetReady), ErrorBody> {
@@ -693,11 +2555,91 @@ impl Transfer<'_> {
         &self,
         from: &End,
         to: &End,
+        source_stat: &StatReply,
+        from_caps: &HashSet<String>,
         args: &TransferArgs,
     ) -> Result<TransferReport, ErrorBody> {
-        let there: StatReply = self
-            .request(to, json!({"op": "stat", "path": to.path}))
+        let if_exists = IfExists::from(args.if_exists);
+        let (there, to_caps): (StatReply, HashSet<String>) = self
+            .request_with_caps(to, json!({"op": "stat", "path": to.path}), &[])
             .await?;
+        Self::check_peer_capabilities(from, from_caps, to, &to_caps, if_exists, args)?;
+        if args.move_source {
+            self.check_move_permission(from).await?;
+            if from.machine == to.machine {
+                let same_file = source_stat
+                    .file_id
+                    .zip(there.file_id)
+                    .is_some_and(|(a, b)| a.same_file(&b));
+                let fs_behavior = self
+                    .resolve_parent_fs_behavior(
+                        from,
+                        source_stat,
+                        &to.path,
+                        &there,
+                        same_file,
+                        args.dry_run,
+                    )
+                    .await;
+                match classify_same_entry(
+                    source_stat.parent_id,
+                    there.parent_id,
+                    OsStr::new(file_name(&from.path)),
+                    OsStr::new(file_name(&to.path)),
+                    same_file,
+                    source_stat.is_symlink || there.is_symlink,
+                    fs_behavior,
+                ) {
+                    SameEntryDecision::CaseOrNormalizationRename => {
+                        if !from_caps.contains(CAP_RENAME) {
+                            return Err(missing_peer_capability(&from.machine, "rename"));
+                        }
+                        if !args.dry_run {
+                            let _: RenameDone = self
+                                .request_required(
+                                    from,
+                                    json!({
+                                        "op": "rename",
+                                        "from": from.path,
+                                        "to": to.path,
+                                    }),
+                                    &[CAP_RENAME],
+                                )
+                                .await?;
+                        }
+                        return Ok(TransferReport {
+                            from: from.named(),
+                            to: to.named(),
+                            kind: "tree",
+                            moved: true,
+                            renamed: vec![RenamedEntry {
+                                from: from.path.clone(),
+                                to: to.path.clone(),
+                            }],
+                            ..TransferReport::default()
+                        });
+                    }
+                    SameEntryDecision::SameEntryNoOp | SameEntryDecision::RefuseSameFileAlias => {
+                        return Err(same_file_move_error(from, to));
+                    }
+                    SameEntryDecision::DistinctEntries => {}
+                }
+                if let Some(src_id) = source_stat.file_id
+                    && there.ancestor_ids.iter().any(|anc| anc.same_file(&src_id))
+                {
+                    return Err(ErrorBody::new(
+                        ErrorCode::InvalidArgs,
+                        format!(
+                            "Cannot move {} on {} into its own subdirectory {}.",
+                            from.path, from.machine, to.path
+                        ),
+                    )
+                    .with_hint("Choose a destination outside the source directory.")
+                    .with_machine(from.machine.clone()));
+                }
+            }
+            check_not_same_or_subtree(from, to, source_stat, &there, true)?;
+        }
         let missing = match there.kind.as_str() {
             "missing" => true,
             "dir" => false,
@@ -713,21 +2655,76 @@ impl Transfer<'_> {
                 .with_machine(to.machine.clone()));
             }
         };
-        let source = self.manifest(from, args).await?;
+        // A move always verifies every file by BLAKE3 hash so no source file is removed without a
+        // hash-verified copy at the destination.
+        let effective_checksum = args.checksum || args.move_source;
+        let source = self
+            .manifest(from, effective_checksum, &args.exclude)
+            .await?;
+        let mut proof_cache: HashMap<(String, String), DirPairProof> = HashMap::new();
+        if args.move_source && !args.dry_run {
+            let source_subdirs: Vec<String> = source
+                .entries
+                .iter()
+                .filter(|e| e.kind == EntryKind::Dir)
+                .map(|e| e.path.clone())
+                .collect();
+            let same_or_subtree = self
+                .probe_tree_root_upfront(
+                    from,
+                    &from.path,
+                    &source_subdirs,
+                    to,
+                    &to.path,
+                    !missing,
+                    &mut proof_cache,
+                )
+                .await?;
+            if same_or_subtree {
+                return Err(same_file_move_error(from, to));
+            }
+        }
         let dest = if missing {
             Manifest::default()
         } else {
-            self.manifest(to, args).await?
+            self.manifest(to, effective_checksum, &args.exclude).await?
         };
         let mut plan = legion_xfer::plan::plan(
             &source,
             &dest,
             &PlanOptions {
-                checksum: args.checksum,
+                checksum: effective_checksum,
                 delete: args.delete,
+                if_exists,
             },
         );
+        if if_exists == IfExists::Fail && !plan.existing.is_empty() {
+            let first = &plan.existing[0];
+            let count = plan.existing.len();
+            let more = if count > 1 {
+                format!(" (and {} more)", count - 1)
+            } else {
+                String::new()
+            };
+            return Err(ErrorBody::new(
+                ErrorCode::Exists,
+                format!(
+                    "{first} already exists under {} on {}{more}.",
+                    to.path, to.machine
+                ),
+            )
+            .with_hint(
+                "Pass if_exists=\"replace\", \"skip\", or \"rename\", or choose an empty destination.",
+            )
+            .with_details(json!({"existing": plan.existing.iter().take(MOST_LISTED).collect::<Vec<_>>(), "count": count}))
+            .with_machine(to.machine.clone()));
+        }
         let listed: HashMap<&str, &Entry> = source
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect();
+        let dest_listed: HashMap<&str, &Entry> = dest
             .entries
             .iter()
             .map(|entry| (entry.path.as_str(), entry))
@@ -745,17 +2742,59 @@ impl Transfer<'_> {
             to: to.named(),
             kind: "tree",
             files_unchanged: plan.totals.files_unchanged,
+            files_skipped: plan.totals.files_skipped,
+            moved: args.move_source,
             ..TransferReport::default()
         };
         let mut skipped: Vec<SkippedEntry> = Vec::new();
         skipped.extend(on(&from.machine, source.skipped));
         skipped.extend(on(&to.machine, dest.skipped));
+
+        // Entries already verified identical at the destination (from an earlier interrupted move
+        // or prior copy under `replace`) can safely be removed from the source once the rest lands.
+        let already_verified: Vec<String> = if args.move_source && if_exists == IfExists::Replace {
+            source
+                .entries
+                .iter()
+                .filter(|src| {
+                    dest_listed.get(src.path.as_str()).is_some_and(|dst| {
+                        match (src.kind, dst.kind) {
+                            (EntryKind::File, EntryKind::File) => {
+                                src.hash.is_some() && src.hash == dst.hash
+                            }
+                            (EntryKind::Symlink, EntryKind::Symlink) => {
+                                src.link_target == dst.link_target
+                            }
+                            _ => false,
+                        }
+                    })
+                })
+                .map(|src| src.path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         if args.dry_run {
             report.files_sent = plan.totals.files_to_send;
             report.bytes_sent = plan.totals.bytes_to_send;
             report.deleted = plan.totals.entries_to_delete;
             report.would_send = Some(report.list(plan.send.clone()));
             report.would_delete = Some(report.list(plan.delete.clone()));
+            if args.move_source {
+                let mut remove_list = planned_source_removals(
+                    &source.entries,
+                    &plan.send,
+                    &already_verified,
+                    &listed,
+                    &conflicts,
+                    &skipped,
+                    args.exclude.is_empty() && report.files_skipped == 0,
+                    &from.path,
+                );
+                report.source_removed = remove_list.len() as u64;
+                report.would_remove = Some(report.list(std::mem::take(&mut remove_list)));
+            }
             report.conflicts = report.list(conflicts);
             report.skipped = report.list(skipped);
             return Ok(report);
@@ -774,15 +2813,25 @@ impl Transfer<'_> {
             self.ctx,
             self.sent,
             plan.totals.bytes_to_send,
+            0,
             plan.totals.files_to_send,
+            None,
             true,
+            1,
         );
         // A destination that does not exist yet is made even when there is nothing to put in it,
         // so an empty tree arrives as an empty directory.
-        let mut rounds = batches(&plan.send);
+        let mut rounds = if args.move_source {
+            move_batches(&plan.send, &listed)
+        } else {
+            batches(&plan.send)
+        };
         if rounds.is_empty() && missing {
             rounds.push(&[]);
         }
+        let mut renamed: Vec<RenamedEntry> = Vec::new();
+        let mut unsafe_dirs: HashSet<String> = HashSet::new();
+        let mut any_source_kept = false;
         for names in rounds {
             let budget = archive_budget(names, &listed);
             let done = self
@@ -793,7 +2842,8 @@ impl Transfer<'_> {
                         names,
                         budget,
                         listed: &listed,
-                        checksum: args.checksum,
+                        checksum: effective_checksum,
+                        if_exists,
                     },
                     &mut meter,
                     &mut skipped,
@@ -802,17 +2852,244 @@ impl Transfer<'_> {
                 .map_err(|error| left_in_place(error, extras.len(), &to.machine))?;
             report.files_sent += done.files;
             report.bytes_sent += done.bytes;
+            report.files_skipped += done.files_skipped;
+            let round_renamed: HashMap<String, String> = done
+                .renamed
+                .iter()
+                .map(|r| (r.from.clone(), r.to.clone()))
+                .collect();
+            renamed.extend(done.renamed);
             skipped.extend(on(&to.machine, done.skipped));
             if caseless {
                 conflicts.extend(case_conflicts(&done.case_collisions, &to.machine));
+            }
+            // Only remove source files/symlinks after:
+            // 1. Proving their `(from_sub, to_sub)` directory pair distinct (cached per pair);
+            // 2. Re-verifying the destination copy under exclusive locks on both source and dest.
+            if args.move_source {
+                let mut verified =
+                    Vec::with_capacity(done.verified_files.len() + done.verified_symlinks.len());
+                verified.extend(done.verified_files);
+                verified.extend(done.verified_symlinks);
+                if !verified.is_empty() {
+                    let mut safe_candidates: Vec<MoveRemovalCandidate> = Vec::new();
+                    for rel in verified {
+                        let sub = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+                        let from_sub = if sub.is_empty() {
+                            from.path.clone()
+                        } else {
+                            join(&from.path, sub)
+                        };
+                        let to_sub = if sub.is_empty() {
+                            to.path.clone()
+                        } else {
+                            join(&to.path, sub)
+                        };
+                        let proof = self
+                            .prove_dir_pair(from, &from_sub, to, &to_sub, &mut proof_cache)
+                            .await;
+                        match proof {
+                            DirPairProof::ProvenDistinct => {
+                                let Some(entry) = listed.get(rel.as_str()) else {
+                                    continue;
+                                };
+                                let dest_rel = round_renamed.get(&rel).unwrap_or(&rel);
+                                let recorded_dest = done
+                                    .placed_meta
+                                    .get(&rel)
+                                    .map(|m| (m.file_id, m.size, m.mtime));
+                                safe_candidates.push(MoveRemovalCandidate {
+                                    rel: rel.clone(),
+                                    from_path: join(&from.path, &rel),
+                                    to_path: join(&to.path, dest_rel),
+                                    kind: entry.kind,
+                                    expected_hash: entry.hash,
+                                    expected_size: entry.size,
+                                    expected_link_target: entry.link_target.clone(),
+                                    recorded_dest,
+                                    same_machine_or_dir: from.machine == to.machine,
+                                });
+                            }
+                            DirPairProof::SameDirectory => {
+                                any_source_kept = true;
+                                if unsafe_dirs.insert(sub.to_owned()) {
+                                    skipped.push(SkippedEntry {
+                                        path: if sub.is_empty() {
+                                            from.path.clone()
+                                        } else {
+                                            sub.to_owned()
+                                        },
+                                        reason: format!(
+                                            "kept source because {} on {} and {} on {} refer to the same directory",
+                                            from_sub, from.machine, to_sub, to.machine
+                                        ),
+                                    });
+                                }
+                            }
+                            DirPairProof::Inconclusive(reason) => {
+                                any_source_kept = true;
+                                if unsafe_dirs.insert(sub.to_owned()) {
+                                    skipped.push(SkippedEntry {
+                                        path: if sub.is_empty() {
+                                            from.path.clone()
+                                        } else {
+                                            sub.to_owned()
+                                        },
+                                        reason: format!(
+                                            "kept source because {} on {} and {} on {} could not be proven distinct ({reason})",
+                                            from_sub, from.machine, to_sub, to.machine
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if !safe_candidates.is_empty() {
+                        let (removed, kept) = self
+                            .lock_verify_and_delete_tree_candidates(
+                                from,
+                                to,
+                                &safe_candidates,
+                                &mut skipped,
+                            )
+                            .await?;
+                        report.source_removed += removed;
+                        any_source_kept |= kept;
+                    }
+                }
             }
         }
         meter.emit(true);
         conflicts.sort();
         conflicts.dedup();
         report.deleted += self.delete(to, &extras, &mut skipped).await?;
+        if args.move_source {
+            if !already_verified.is_empty() {
+                let mut safe_candidates: Vec<MoveRemovalCandidate> = Vec::new();
+                for rel in &already_verified {
+                    let sub = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+                    let from_sub = if sub.is_empty() {
+                        from.path.clone()
+                    } else {
+                        join(&from.path, sub)
+                    };
+                    let to_sub = if sub.is_empty() {
+                        to.path.clone()
+                    } else {
+                        join(&to.path, sub)
+                    };
+                    let proof = self
+                        .prove_dir_pair(from, &from_sub, to, &to_sub, &mut proof_cache)
+                        .await;
+                    match proof {
+                        DirPairProof::ProvenDistinct => {
+                            let Some(entry) = listed.get(rel.as_str()) else {
+                                continue;
+                            };
+                            safe_candidates.push(MoveRemovalCandidate {
+                                rel: rel.clone(),
+                                from_path: join(&from.path, rel),
+                                to_path: join(&to.path, rel),
+                                kind: entry.kind,
+                                expected_hash: entry.hash,
+                                expected_size: entry.size,
+                                expected_link_target: entry.link_target.clone(),
+                                recorded_dest: None,
+                                same_machine_or_dir: from.machine == to.machine,
+                            });
+                        }
+                        DirPairProof::SameDirectory => {
+                            any_source_kept = true;
+                            if unsafe_dirs.insert(sub.to_owned()) {
+                                skipped.push(SkippedEntry {
+                                    path: if sub.is_empty() {
+                                        from.path.clone()
+                                    } else {
+                                        sub.to_owned()
+                                    },
+                                    reason: format!(
+                                        "kept source because {} on {} and {} on {} refer to the same directory",
+                                        from_sub, from.machine, to_sub, to.machine
+                                    ),
+                                });
+                            }
+                        }
+                        DirPairProof::Inconclusive(reason) => {
+                            any_source_kept = true;
+                            if unsafe_dirs.insert(sub.to_owned()) {
+                                skipped.push(SkippedEntry {
+                                    path: if sub.is_empty() {
+                                        from.path.clone()
+                                    } else {
+                                        sub.to_owned()
+                                    },
+                                    reason: format!(
+                                        "kept source because {} on {} and {} on {} could not be proven distinct ({reason})",
+                                        from_sub, from.machine, to_sub, to.machine
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                if !safe_candidates.is_empty() {
+                    let (removed, kept) = self
+                        .lock_verify_and_delete_tree_candidates(
+                            from,
+                            to,
+                            &safe_candidates,
+                            &mut skipped,
+                        )
+                        .await?;
+                    report.source_removed += removed;
+                    any_source_kept |= kept;
+                }
+            }
+            // Remove source directories deepest-first only once every verified file has been
+            // removed; any directory that could not be proven distinct (or still holds excluded,
+            // skipped, or conflicted files) stays.
+            let dir_is_unsafe = |dir: &str| {
+                unsafe_dirs.contains("")
+                    || unsafe_dirs.iter().any(|u| {
+                        u == dir
+                            || u.strip_prefix(dir)
+                                .is_some_and(|rest| rest.starts_with('/'))
+                    })
+            };
+            let dirs: Vec<String> = source
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::Dir && !dir_is_unsafe(&entry.path))
+                .map(|entry| entry.path.clone())
+                .collect();
+            let remove_root = args.exclude.is_empty()
+                && conflicts.is_empty()
+                && report.files_skipped == 0
+                && skipped.is_empty()
+                && !any_source_kept
+                && unsafe_dirs.is_empty();
+            if !dirs.is_empty() || remove_root {
+                let mut dir_skipped = Vec::new();
+                report.source_removed += self
+                    .delete_verified(
+                        from,
+                        &dirs,
+                        &HashMap::new(),
+                        remove_root,
+                        None,
+                        &mut dir_skipped,
+                    )
+                    .await?;
+                // Leaving a directory that still holds excluded/skipped entries is expected; only
+                // surface unexpected directory errors when nothing was intentionally left behind.
+                if remove_root {
+                    skipped.extend(dir_skipped);
+                }
+            }
+        }
         report.conflicts = report.list(conflicts);
         report.skipped = report.list(skipped);
+        report.renamed = report.list(renamed);
         Ok(report)
     }
 
@@ -835,6 +3112,92 @@ impl Transfer<'_> {
         Ok(removed)
     }
 
+    /// Removes a single source root file (verifying its BLAKE3 hash and active move lock first)
+    /// after a move succeeds.
+    async fn remove_source_root(
+        &self,
+        from: &End,
+        expect_hash: Option<Hash>,
+        forbid_file_id: Option<(u64, u64)>,
+        lock_id: Option<&str>,
+        skipped: &mut Vec<SkippedEntry>,
+    ) -> Result<u64, ErrorBody> {
+        let mut header = json!({
+            "op": "delete",
+            "root": from.path,
+            "names": [],
+            "remove_root": true,
+        });
+        if let Some(hash) = expect_hash {
+            header["expect_root_hash"] = json!(hash);
+        }
+        if let Some((dev, ino)) = forbid_file_id {
+            header["forbid_file_id"] = json!([dev, ino]);
+        }
+        if let Some(lid) = lock_id {
+            header["lock_id"] = json!(lid);
+        }
+        let done: DeleteDone = self.request_required(from, header, &[CAP_MOVE]).await?;
+        skipped.extend(on(&from.machine, done.skipped));
+        Ok(done.removed)
+    }
+
+    /// Removes verified source entries under `from`, verifying each regular file's hash and active
+    /// move lock still match immediately before unlinking, and optionally removes the source root
+    /// directory once empty.
+    async fn delete_verified(
+        &self,
+        from: &End,
+        names: &[String],
+        hashes: &HashMap<String, Hash>,
+        remove_root: bool,
+        lock_id: Option<&str>,
+        skipped: &mut Vec<SkippedEntry>,
+    ) -> Result<u64, ErrorBody> {
+        let mut removed = 0;
+        let chunks = batches(names);
+        if chunks.is_empty() {
+            if remove_root {
+                let mut header = json!({
+                    "op": "delete",
+                    "root": from.path,
+                    "names": [],
+                    "remove_root": true,
+                });
+                if let Some(lid) = lock_id {
+                    header["lock_id"] = json!(lid);
+                }
+                let done: DeleteDone = self.request_required(from, header, &[CAP_MOVE]).await?;
+                removed += done.removed;
+                skipped.extend(on(&from.machine, done.skipped));
+            }
+            return Ok(removed);
+        }
+        let last_idx = chunks.len() - 1;
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            let chunk_hashes: HashMap<&str, Hash> = chunk
+                .iter()
+                .filter_map(|name| hashes.get(name).map(|h| (name.as_str(), *h)))
+                .collect();
+            let mut header = json!({
+                "op": "delete",
+                "root": from.path,
+                "names": chunk,
+                "remove_root": remove_root && idx == last_idx,
+            });
+            if !chunk_hashes.is_empty() {
+                header["expect_hashes"] = json!(chunk_hashes);
+            }
+            if let Some(lid) = lock_id {
+                header["lock_id"] = json!(lid);
+            }
+            let done: DeleteDone = self.request_required(from, header, &[CAP_MOVE]).await?;
+            removed += done.removed;
+            skipped.extend(on(&from.machine, done.skipped));
+        }
+        Ok(removed)
+    }
+
     async fn pack_unpack(
         &self,
         from: &End,
@@ -848,6 +3211,7 @@ impl Transfer<'_> {
             budget,
             listed,
             checksum,
+            if_exists,
         } = round;
         let mut source = self
             .open(
@@ -878,13 +3242,13 @@ impl Transfer<'_> {
             })
             .collect();
         skipped.extend(on(&from.machine, ready.skipped));
-        let mut dest = match self
-            .open(
-                to,
-                json!({"op": "unpack", "root": to.path, "entries": entries}),
-            )
-            .await
-        {
+        let mut unpack_header = json!({"op": "unpack", "root": to.path, "entries": entries});
+        let mut req_caps: Vec<&str> = Vec::new();
+        if if_exists != IfExists::Replace {
+            unpack_header["if_exists"] = json!(if_exists);
+            req_caps.push(CAP_IF_EXISTS);
+        }
+        let mut dest = match self.open_with_caps(to, unpack_header, &req_caps).await {
             Ok(dest) => dest,
             Err(error) => {
                 source.abort().await;
@@ -910,11 +3274,16 @@ impl Transfer<'_> {
         done.map_err(|error| blame(error, from))
     }
 
-    async fn manifest(&self, end: &End, args: &TransferArgs) -> Result<Manifest, ErrorBody> {
+    async fn manifest(
+        &self,
+        end: &End,
+        checksum: bool,
+        exclude: &[String],
+    ) -> Result<Manifest, ErrorBody> {
         let mut conn = self
             .open(
                 end,
-                json!({"op": "manifest", "root": end.path, "checksum": args.checksum, "exclude": args.exclude}),
+                json!({"op": "manifest", "root": end.path, "checksum": checksum, "exclude": exclude}),
             )
             .await?;
         let listed = conn.manifest().await;
@@ -932,14 +3301,47 @@ impl Transfer<'_> {
 
     /// One operation that answers with one line.
     async fn request<T: DeserializeOwned>(&self, end: &End, header: Value) -> Result<T, ErrorBody> {
-        let mut conn = self.open(end, header).await?;
+        let (reply, _) = self.request_with_caps(end, header, &[]).await?;
+        Ok(reply)
+    }
+
+    /// One operation that answers with one line and requires the peer to advertise `required_caps`.
+    async fn request_required<T: DeserializeOwned>(
+        &self,
+        end: &End,
+        header: Value,
+        required_caps: &[&str],
+    ) -> Result<T, ErrorBody> {
+        let (reply, _) = self.request_with_caps(end, header, required_caps).await?;
+        Ok(reply)
+    }
+
+    /// One operation that answers with one line, also returning the peer's advertised stream
+    /// capabilities from its handshake.
+    async fn request_with_caps<T: DeserializeOwned>(
+        &self,
+        end: &End,
+        header: Value,
+        required_caps: &[&str],
+    ) -> Result<(T, HashSet<String>), ErrorBody> {
+        let mut conn = self.open_with_caps(end, header, required_caps).await?;
         let answer = conn.first::<T>().await;
+        let caps = conn.capabilities.clone();
         conn.close().await;
-        answer
+        answer.map(|reply| (reply, caps))
     }
 
     async fn open(&self, end: &End, header: Value) -> Result<Conn, ErrorBody> {
-        Conn::open(self.fleet, self.ctx, self.sent, end, header).await
+        self.open_with_caps(end, header, &[]).await
+    }
+
+    async fn open_with_caps(
+        &self,
+        end: &End,
+        header: Value,
+        required_caps: &[&str],
+    ) -> Result<Conn, ErrorBody> {
+        Conn::open(self.fleet, self.ctx, self.sent, end, header, required_caps).await
     }
 }
 
@@ -1043,12 +3445,163 @@ fn left_in_place(error: ErrorBody, extras: usize, machine: &str) -> ErrorBody {
 }
 
 /// One archive's worth of a tree: its names, the most bytes the archive may take, what the source
-/// listed for each, and whether their hashes are checked.
+/// listed for each, whether their hashes are checked, and the `if_exists` policy.
 struct Round<'a> {
     names: &'a [String],
     budget: u64,
     listed: &'a HashMap<&'a str, &'a Entry>,
     checksum: bool,
+    if_exists: IfExists,
+}
+
+/// Refuses moving a path onto itself or moving a directory into its own subtree on the same machine.
+fn check_not_same_or_subtree(
+    from: &End,
+    to: &End,
+    from_stat: &StatReply,
+    to_stat: &StatReply,
+    check_subtree: bool,
+) -> Result<(), ErrorBody> {
+    if from.machine != to.machine {
+        return Ok(());
+    }
+    let from_path = from_stat.resolved_path.as_deref().unwrap_or(&from.path);
+    let to_path = to_stat.resolved_path.as_deref().unwrap_or(&to.path);
+    let caseless = to_stat
+        .case_insensitive
+        .or(from_stat.case_insensitive)
+        .unwrap_or(false)
+        || is_windows_drive_path(from_path)
+        || is_windows_drive_path(to_path);
+    let from_norm = normalize_compare_path(from_path, caseless);
+    let to_norm = normalize_compare_path(to_path, caseless);
+    if from_norm == to_norm {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Cannot move {} on {} onto itself.", from.path, from.machine),
+        )
+        .with_hint("Choose a different destination path.")
+        .with_machine(from.machine.clone()));
+    }
+    if check_subtree {
+        let is_subtree = if from_norm == "/" {
+            to_norm.starts_with('/') && to_norm.len() > 1
+        } else {
+            to_norm
+                .strip_prefix(&from_norm)
+                .is_some_and(|rest| rest.starts_with('/'))
+        };
+        if is_subtree {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "Cannot move {} on {} into its own subdirectory {}.",
+                    from.path, from.machine, to.path
+                ),
+            )
+            .with_hint("Choose a destination outside the source directory.")
+            .with_machine(from.machine.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn is_windows_drive_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+fn normalize_compare_path(path: &str, caseless: bool) -> String {
+    let mut s = path.replace('\\', "/");
+    while s.len() > 1 && s.ends_with('/') {
+        // Keep `C:/` as `C:/` rather than `C:`.
+        if s.len() == 3 && s.as_bytes()[1] == b':' {
+            break;
+        }
+        s.pop();
+    }
+    if caseless {
+        s.make_ascii_lowercase();
+    }
+    s
+}
+
+/// Computes the source paths that `dry_run` with `move: true` would remove from the source tree.
+#[allow(clippy::too_many_arguments)]
+fn planned_source_removals(
+    source_entries: &[Entry],
+    sending: &[String],
+    already_verified: &[String],
+    listed: &HashMap<&str, &Entry>,
+    conflicts: &[PlanConflict],
+    skipped: &[SkippedEntry],
+    whole_tree_eligible: bool,
+    source_root: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in sending {
+        if listed
+            .get(name.as_str())
+            .is_some_and(|e| e.kind != EntryKind::Dir)
+        {
+            out.push(name.clone());
+        }
+    }
+    out.extend(already_verified.iter().cloned());
+    if whole_tree_eligible && conflicts.is_empty() && skipped.is_empty() {
+        let mut dirs: Vec<String> = source_entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::Dir)
+            .map(|e| e.path.clone())
+            .collect();
+        dirs.sort_by(|a, b| {
+            b.matches('/')
+                .count()
+                .cmp(&a.matches('/').count())
+                .then_with(|| b.cmp(a))
+        });
+        out.extend(dirs);
+        out.push(source_root.to_owned());
+    }
+    out
+}
+
+/// Splits `names` into smaller move batches so verified source files are removed incrementally.
+fn move_batches<'a>(names: &'a [String], listed: &HashMap<&str, &Entry>) -> Vec<&'a [String]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut name_bytes = 0usize;
+    let mut content_bytes = 0u64;
+    let mut file_count = 0usize;
+    for (at, name) in names.iter().enumerate() {
+        let entry_size = listed.get(name.as_str()).map_or(0, |e| e.size);
+        let is_file = listed
+            .get(name.as_str())
+            .is_some_and(|e| e.kind == EntryKind::File);
+        let would_exceed = at > start
+            && (at - start >= BATCH_NAMES
+                || name_bytes + name.len() > BATCH_BYTES
+                || (is_file && file_count >= MOVE_BATCH_FILES)
+                || (is_file
+                    && content_bytes > 0
+                    && content_bytes + entry_size > MOVE_BATCH_CONTENT_BYTES));
+        if would_exceed {
+            out.push(&names[start..at]);
+            start = at;
+            name_bytes = 0;
+            content_bytes = 0;
+            file_count = 0;
+        }
+        name_bytes += name.len() + 4;
+        if is_file {
+            content_bytes = content_bytes.saturating_add(entry_size);
+            file_count += 1;
+        }
+    }
+    if start < names.len() {
+        out.push(&names[start..]);
+    }
+    out
 }
 
 /// A destination that refused an archive for not being what was planned says which entry and
@@ -1129,6 +3682,77 @@ fn file_name(path: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
+/// Builds the refusal returned when a peer runs an older Legion that does not advertise a
+/// required stream capability.
+fn missing_peer_capability(machine: &str, feature: &str) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Unsupported,
+        format!("{machine} runs an older legion that does not support {feature}."),
+    )
+    .with_hint(format!(
+        "Update legion on {machine} so it can honour {feature} safely."
+    ))
+    .with_machine(machine.to_owned())
+}
+
+/// Builds the refusal returned when a move's source and destination resolve to the same file or
+/// directory (whether via alias, bind mount, network share, or hard link).
+fn same_file_move_error(from: &End, to: &End) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::InvalidArgs,
+        format!(
+            "Cannot move {} to {}: both paths refer to the same file or directory.",
+            from.named(),
+            to.named()
+        ),
+    )
+    .with_hint("Choose a different destination path, or rename within one machine.")
+    .with_machine(from.machine.clone())
+}
+
+/// Returns the parent directory of `path` in the path syntax the caller wrote.
+fn parent_dir_of(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    if let Some(pos) = trimmed.rfind(['/', '\\']) {
+        let prefix = &trimmed[..pos];
+        if prefix.is_empty() {
+            return "/".to_owned();
+        }
+        // Preserve Windows drive root `C:\` or `C:/`.
+        if prefix.len() == 2 && prefix.as_bytes()[1] == b':' {
+            let sep = trimmed.as_bytes()[pos] as char;
+            return format!("{prefix}{sep}");
+        }
+        return prefix.to_owned();
+    }
+    if trimmed == "~" {
+        "~".to_owned()
+    } else {
+        ".".to_owned()
+    }
+}
+
+/// Replaces only the final filename segment of `path` with `new_name`, preserving the caller's
+/// prefix (`~/...`, `/...`, or Windows drive path). For `~` paths, always uses forward slashes so
+/// reported paths are identical across Unix and Windows.
+fn replace_path_filename(path: &str, new_name: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    if trimmed.starts_with("~/") || trimmed.starts_with("~\\") {
+        let normalized = trimmed.replace('\\', "/");
+        return match normalized.rfind('/') {
+            Some(pos) => format!("{}/{new_name}", &normalized[..pos]),
+            None => format!("~/{new_name}"),
+        };
+    }
+    match trimmed.rfind(['/', '\\']) {
+        Some(pos) => {
+            let sep = trimmed.as_bytes()[pos] as char;
+            format!("{}{sep}{new_name}", &trimmed[..pos])
+        }
+        None => new_name.to_owned(),
+    }
+}
+
 /// `dir` and `name` joined with the separator `dir` already uses.
 fn join(dir: &str, name: &str) -> String {
     if ends_in_separator(dir) {
@@ -1156,12 +3780,25 @@ struct Conn {
     noise_bytes: usize,
     /// Whether the other end has said, on its first line, that it speaks this protocol.
     greeted: bool,
+    /// Capabilities advertised by the other end in its greeting line.
+    capabilities: HashSet<String>,
+    /// Capabilities this operation requires the other end to advertise.
+    required_caps: Vec<String>,
     /// The longest reply line taken once the other end has answered.
     longest: usize,
     /// How many bytes of lines have been read, which bounds a listing as a whole.
     received: usize,
     /// When the pipe was opened, which the first reply's time limit counts from.
     opened: tokio::time::Instant,
+    /// Cancelled by a local in-process stream's auth watchdog if permissions/device are revoked
+    /// while the stream is stalled.
+    revoke_token: Option<CancellationToken>,
+    /// Complete control lines read from `reader` during a relay (e.g. an early `{"ok": ...}` or
+    /// mid-stream `{"error": ...}`) so [`Self::first`] receives them intact afterward.
+    pending_lines: VecDeque<Vec<u8>>,
+    /// Any incomplete control line already consumed from `reader` while watching for heartbeats or
+    /// errors during a relay, continued seamlessly by [`Self::line`].
+    partial_line: Vec<u8>,
 }
 
 /// How much a listing from another node may hold: entries, bytes in all, and bytes in one line.
@@ -1196,9 +3833,15 @@ impl Conn {
         sent: &Sent,
         end: &End,
         mut header: Value,
+        required_caps: &[&str],
     ) -> Result<Conn, ErrorBody> {
         header["protocol"] = json!(stream::STREAM_PROTOCOL);
-        let (reader, writer, process): (BoxRead, BoxWrite, Process) = if end.remote {
+        let (reader, writer, process, revoke_token): (
+            BoxRead,
+            BoxWrite,
+            Process,
+            Option<CancellationToken>,
+        ) = if end.remote {
             let op = header
                 .get("op")
                 .and_then(Value::as_str)
@@ -1229,21 +3872,40 @@ impl Conn {
                 )
                 .await?;
             let (stdin, stdout, handle) = pipe.into_parts();
-            (Box::new(stdout), Box::new(stdin), Process::Remote(handle))
+            (
+                Box::new(stdout),
+                Box::new(stdin),
+                Process::Remote(handle),
+                None,
+            )
         } else {
             let (client_out, server_in) = tokio::io::duplex(CHUNK);
             let (server_out, client_in) = tokio::io::duplex(CHUNK);
             let host = Host::new(ctx.paths().clone(), ctx.node_name());
             let principal = ctx.principal().to_owned();
+            let device = ctx.device().map(str::to_owned);
+            let pairing_id = ctx.pairing_id().map(str::to_owned);
+            let revoke_token = CancellationToken::new();
+            let revoke_for_server = revoke_token.clone();
             let input = SyncIoBridge::new(server_in);
             let output = SyncIoBridge::new(server_out);
             let task = tokio::task::spawn_blocking(move || {
-                stream::serve(&host, Some(&principal), input, output)
+                stream::serve_with_cancel(
+                    &host,
+                    Some(&principal),
+                    Door::Stream,
+                    device.as_deref(),
+                    pairing_id.as_deref(),
+                    Some(revoke_for_server),
+                    input,
+                    output,
+                )
             });
             (
                 Box::new(client_in),
                 Box::new(client_out),
                 Process::Local(Some(task)),
+                Some(revoke_token),
             )
         };
         let mut conn = Conn {
@@ -1258,9 +3920,14 @@ impl Conn {
             noise_lines: 0,
             noise_bytes: 0,
             greeted: false,
+            capabilities: HashSet::new(),
+            required_caps: required_caps.iter().map(|c| (*c).to_owned()).collect(),
             longest: LONGEST_REPLY,
             received: 0,
             opened: tokio::time::Instant::now(),
+            revoke_token,
+            pending_lines: VecDeque::new(),
+            partial_line: Vec::new(),
         };
         let mut line = header.to_string().into_bytes();
         line.push(b'\n');
@@ -1316,8 +3983,20 @@ impl Conn {
                                 stream::STREAM_PROTOCOL
                             )));
                         }
+                        if let Some(caps) = fields.get("capabilities").and_then(Value::as_array) {
+                            for cap in caps.iter().filter_map(Value::as_str) {
+                                self.capabilities.insert(cap.to_owned());
+                            }
+                        }
                         self.greeted = true;
                         self.answered = true;
+                        if let Some(missing) = self
+                            .required_caps
+                            .iter()
+                            .find(|cap| !self.capabilities.contains(*cap))
+                        {
+                            return Err(missing_peer_capability(&self.machine, missing));
+                        }
                         continue;
                     }
                     if looks_like_a_reply(&fields) {
@@ -1386,6 +4065,10 @@ impl Conn {
     /// reply, a byte that cannot be in a line of text ends the read at once: it is data from a
     /// node that speaks another protocol, which may never send a newline.
     async fn line(&mut self) -> Result<Vec<u8>, ErrorBody> {
+        if let Some(line) = self.pending_lines.pop_front() {
+            self.received += line.len();
+            return Ok(line);
+        }
         // A reply is a JSON object however long it is; only other text, a banner, is held to
         // what noise may take before the first reply.
         let (wait, noise) = if self.answered {
@@ -1396,7 +4079,7 @@ impl Conn {
                 MOST_NOISE_BYTES.saturating_sub(self.noise_bytes),
             )
         };
-        let mut line = Vec::new();
+        let mut line = std::mem::take(&mut self.partial_line);
         let binary_is_foreign = !self.answered;
         let read = tokio::time::timeout(
             wait,
@@ -1744,6 +4427,7 @@ fn with_machine(error: ErrorBody, machine: &str) -> ErrorBody {
 }
 
 /// Where a relay broke.
+#[derive(Debug)]
 enum Broken {
     /// This end moved no bytes for [`IDLE_TIMEOUT`]: the source sent none, or the destination
     /// took none.
@@ -1821,6 +4505,79 @@ enum Amount {
     AtMost(u64),
 }
 
+async fn wait_revoked(token: &Option<CancellationToken>) {
+    match token {
+        Some(t) => t.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn write_once_opt(writer: &mut Option<BoxWrite>, bytes: &[u8]) -> std::io::Result<usize> {
+    let Some(w) = writer.as_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "the input was already closed",
+        ));
+    };
+    w.write(bytes).await
+}
+
+async fn flush_opt(writer: &mut Option<BoxWrite>) -> std::io::Result<()> {
+    let Some(w) = writer.as_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "the input was already closed",
+        ));
+    };
+    w.flush().await
+}
+
+/// Drains whatever control bytes are already buffered in `dest.reader` into `dest.partial_line`
+/// and classifies each complete newline-terminated line:
+/// - `{"busy": true}\n` heartbeats are discarded so the relay keeps watching for later errors.
+/// - `{"error": ...}\n` or malformed/oversized lines are queued on `dest.pending_lines` and stop
+///   the relay immediately with [`Broken::Destination`].
+/// - Any other JSON reply (e.g. an early `{"ok": true, ...}\n`) is queued on `dest.pending_lines`
+///   and sets `*dest_replied_ok = true` so [`Conn::first`] reads it intact once the relay ends.
+fn drain_dest_control(dest: &mut Conn, dest_replied_ok: &mut bool) -> Result<(), Broken> {
+    while !*dest_replied_ok {
+        let avail = dest.reader.buffer();
+        if avail.is_empty() {
+            break;
+        }
+        let (chunk_len, found) = match avail.iter().position(|byte| *byte == b'\n') {
+            Some(end) => (end + 1, true),
+            None => (avail.len(), false),
+        };
+        if dest.partial_line.len() + chunk_len > dest.longest {
+            return Err(Broken::Destination("while it received".to_owned()));
+        }
+        dest.partial_line.extend_from_slice(&avail[..chunk_len]);
+        dest.reader.consume(chunk_len);
+        if !found {
+            break;
+        }
+        let line = std::mem::take(&mut dest.partial_line);
+        match serde_json::from_slice::<Value>(&line) {
+            Ok(Value::Object(ref fields))
+                if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) => {}
+            Ok(Value::Object(ref fields)) if fields.contains_key("error") => {
+                dest.pending_lines.push_back(line);
+                return Err(Broken::Destination("while it received".to_owned()));
+            }
+            Ok(Value::Object(_)) => {
+                dest.pending_lines.push_back(line);
+                *dest_replied_ok = true;
+            }
+            _ => {
+                dest.pending_lines.push_back(line);
+                return Err(Broken::Destination("while it received".to_owned()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Copies the source's output to the destination's input in fixed chunks, never more than
 /// `amount` allows: a source that sends more is stopped before the excess reaches the destination.
 async fn relay(
@@ -1829,11 +4586,35 @@ async fn relay(
     amount: Amount,
     meter: &mut Meter<'_>,
 ) -> Result<(), Broken> {
+    relay_with_timeout(source, dest, amount, meter, IDLE_TIMEOUT).await
+}
+
+/// Cancellation-safe core of [`relay`] with a configurable per-hop stall timeout.
+///
+/// Every `tokio::select!` branch operates on single-step, cancellation-safe futures (`read`,
+/// `write`, `flush`, `fill_buf`), while all partial state (`buf`, `written`, `dest.partial_line`,
+/// `dest.pending_lines`) lives outside `select!`. A heartbeat or early reply arriving on
+/// `dest.reader` mid-chunk can therefore never discard or duplicate bytes already written.
+async fn relay_with_timeout(
+    source: &mut Conn,
+    dest: &mut Conn,
+    amount: Amount,
+    meter: &mut Meter<'_>,
+    idle_timeout: Duration,
+) -> Result<(), Broken> {
     let mut buf = vec![0u8; CHUNK];
     let mut copied = 0u64;
     let limit = match amount {
         Amount::Exactly(total) | Amount::AtMost(total) => total,
     };
+    let source_revoke = source.revoke_token.clone();
+    let dest_revoke = dest.revoke_token.clone();
+    // Once `dest` sends a non-error, non-busy reply (e.g. `UnpackDone` right before `source` sends
+    // EOF), stop polling `dest.reader` so we do not mistake a normal early reply for an error.
+    let mut dest_replied_ok = false;
+    // Drain anything already buffered in `dest.reader` before entering the transfer loop.
+    drain_dest_control(dest, &mut dest_replied_ok)?;
+
     loop {
         // An archive is read one byte past its limit, to tell an archive that ends there from one
         // that goes on.
@@ -1845,10 +4626,36 @@ async fn relay(
         if want == 0 {
             break;
         }
-        let read = tokio::time::timeout(IDLE_TIMEOUT, source.reader.read(&mut buf[..want]))
-            .await
-            .map_err(|_| Broken::Stalled { source: true })?
-            .map_err(|error| Broken::Source(format!("while it sent ({error})")))?;
+        let read = {
+            let idle = tokio::time::sleep(idle_timeout);
+            tokio::pin!(idle);
+            loop {
+                tokio::select! {
+                    res = source.reader.read(&mut buf[..want]) => match res {
+                        Ok(n) => break n,
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            return Err(Broken::Source(format!("while it sent ({error})")));
+                        }
+                    },
+                    res = dest.reader.fill_buf(), if !dest_replied_ok => match res {
+                        Ok([]) | Err(_) => {
+                            return Err(Broken::Destination("while it received".to_owned()));
+                        }
+                        Ok(_) => drain_dest_control(dest, &mut dest_replied_ok)?,
+                    },
+                    () = wait_revoked(&source_revoke) => {
+                        return Err(Broken::Source("because access was revoked".to_owned()));
+                    }
+                    () = wait_revoked(&dest_revoke) => {
+                        return Err(Broken::Destination("because access was revoked".to_owned()));
+                    }
+                    () = &mut idle => {
+                        return Err(Broken::Stalled { source: true });
+                    }
+                }
+            }
+        };
         if read == 0 {
             if let Amount::Exactly(_) = amount {
                 return Err(Broken::Source(format!(
@@ -1860,10 +4667,83 @@ async fn relay(
         if copied + read as u64 > limit {
             return Err(Broken::Excess(limit));
         }
-        tokio::time::timeout(IDLE_TIMEOUT, dest.write(&buf[..read]))
-            .await
-            .map_err(|_| Broken::Stalled { source: false })?
-            .map_err(|error| Broken::Destination(format!("while it received ({error})")))?;
+
+        // Write `buf[..read]` with an explicit offset owned outside `select!`: each `select!` only
+        // polls a single cancellation-safe `write(&buf[written..read])`, never `write_all`.
+        let mut written = 0usize;
+        {
+            let idle = tokio::time::sleep(idle_timeout);
+            tokio::pin!(idle);
+            while written < read {
+                tokio::select! {
+                    res = write_once_opt(&mut dest.writer, &buf[written..read]) => match res {
+                        Ok(0) => {
+                            return Err(Broken::Destination(
+                                "while it received (write zero)".to_owned(),
+                            ));
+                        }
+                        Ok(n) => {
+                            written += n;
+                            idle.as_mut()
+                                .reset(tokio::time::Instant::now() + idle_timeout);
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            return Err(Broken::Destination(format!(
+                                "while it received ({error})"
+                            )));
+                        }
+                    },
+                    res = dest.reader.fill_buf(), if !dest_replied_ok => match res {
+                        Ok([]) | Err(_) => {
+                            return Err(Broken::Destination("while it received".to_owned()));
+                        }
+                        Ok(_) => drain_dest_control(dest, &mut dest_replied_ok)?,
+                    },
+                    () = wait_revoked(&source_revoke) => {
+                        return Err(Broken::Source("because access was revoked".to_owned()));
+                    }
+                    () = wait_revoked(&dest_revoke) => {
+                        return Err(Broken::Destination("because access was revoked".to_owned()));
+                    }
+                    () = &mut idle => {
+                        return Err(Broken::Stalled { source: false });
+                    }
+                }
+            }
+        }
+        {
+            let idle = tokio::time::sleep(idle_timeout);
+            tokio::pin!(idle);
+            loop {
+                tokio::select! {
+                    res = flush_opt(&mut dest.writer) => match res {
+                        Ok(()) => break,
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            return Err(Broken::Destination(format!(
+                                "while it received ({error})"
+                            )));
+                        }
+                    },
+                    res = dest.reader.fill_buf(), if !dest_replied_ok => match res {
+                        Ok([]) | Err(_) => {
+                            return Err(Broken::Destination("while it received".to_owned()));
+                        }
+                        Ok(_) => drain_dest_control(dest, &mut dest_replied_ok)?,
+                    },
+                    () = wait_revoked(&source_revoke) => {
+                        return Err(Broken::Source("because access was revoked".to_owned()));
+                    }
+                    () = wait_revoked(&dest_revoke) => {
+                        return Err(Broken::Destination("because access was revoked".to_owned()));
+                    }
+                    () = &mut idle => {
+                        return Err(Broken::Stalled { source: false });
+                    }
+                }
+            }
+        }
         copied += read as u64;
         meter.add(&buf[..read]);
     }
@@ -1907,34 +4787,82 @@ struct Meter<'a> {
     ctx: Option<&'a Ctx>,
     sent: &'a Sent,
     bytes_total: u64,
+    /// Bytes already on disk before this attempt started (for resumed single files).
+    bytes_base: u64,
+    /// Bytes transferred in this attempt (tracks reality even when a stale partial restarts from 0).
+    attempt_bytes: u64,
     files_total: u64,
+    current: Option<String>,
     tar: Option<TarCounter>,
+    started: Instant,
     last: Instant,
+    last_bytes_done: u64,
+    last_files_done: u64,
+    attempt: u32,
 }
 
 impl<'a> Meter<'a> {
+    #[cfg(test)]
+    fn quiet(sent: &'a Sent) -> Meter<'a> {
+        let now = Instant::now();
+        Meter {
+            ctx: None,
+            sent,
+            bytes_total: 0,
+            bytes_base: 0,
+            attempt_bytes: 0,
+            files_total: 0,
+            current: None,
+            tar: None,
+            started: now,
+            last: now,
+            last_bytes_done: 0,
+            last_files_done: 0,
+            attempt: 1,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ctx: &'a Ctx,
         sent: &'a Sent,
         bytes_total: u64,
+        bytes_base: u64,
         files_total: u64,
+        current: Option<String>,
         tar: bool,
+        attempt: u32,
     ) -> Meter<'a> {
+        let now = Instant::now();
         Meter {
             ctx: Some(ctx),
             sent,
             bytes_total,
+            bytes_base,
+            attempt_bytes: 0,
             files_total,
+            current,
             tar: tar.then(TarCounter::default),
-            last: Instant::now(),
+            started: now,
+            last: now,
+            last_bytes_done: bytes_base.min(bytes_total),
+            last_files_done: 0,
+            attempt,
         }
     }
 
     fn add(&mut self, chunk: &[u8]) {
         let (bytes, files) = match &mut self.tar {
-            Some(tar) => tar.feed(chunk),
+            Some(tar) => {
+                let res = tar.feed(chunk);
+                if let Some(name) = tar.current_name() {
+                    self.current = Some(name.to_owned());
+                }
+                res
+            }
             None => (chunk.len() as u64, 0),
         };
+        self.attempt_bytes = self.attempt_bytes.saturating_add(bytes);
         self.sent.bytes.fetch_add(bytes, Ordering::Relaxed);
         self.sent.files.fetch_add(files, Ordering::Relaxed);
         self.emit(false);
@@ -1948,30 +4876,68 @@ impl<'a> Meter<'a> {
         let Some(ctx) = self.ctx else {
             return;
         };
-        ctx.emit(
-            EventKind::Progress,
-            json!({
-                "bytes": self.sent.bytes.load(Ordering::Relaxed),
-                "bytes_total": self.bytes_total,
-                "files": self.sent.files.load(Ordering::Relaxed),
-                "files_total": self.files_total,
-            }),
-        );
+        let transferred = self.attempt_bytes;
+        let raw_bytes = self.bytes_base.saturating_add(transferred);
+        let clamped_bytes = if self.bytes_total > 0 {
+            raw_bytes.min(self.bytes_total)
+        } else {
+            raw_bytes
+        };
+        let bytes_done = clamped_bytes.max(self.last_bytes_done);
+        self.last_bytes_done = bytes_done;
+
+        let raw_files = self.sent.files.load(Ordering::Relaxed);
+        let clamped_files = if self.files_total > 0 {
+            raw_files.min(self.files_total)
+        } else {
+            raw_files
+        };
+        let files_done = clamped_files.max(self.last_files_done);
+        self.last_files_done = files_done;
+
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.001 && transferred > 0 {
+            (transferred as f64 / elapsed).round() as u64
+        } else {
+            0
+        };
+        let mut payload = json!({
+            "bytes_done": bytes_done,
+            "bytes_total": self.bytes_total,
+            "files_done": files_done,
+            "files_total": self.files_total,
+            "rate": rate,
+        });
+        if let Some(ref current) = self.current {
+            payload["current"] = json!(current);
+        }
+        if self.attempt > 1 {
+            payload["attempt"] = json!(self.attempt);
+        }
+        ctx.emit(EventKind::Progress, payload);
     }
 }
 
-/// Follows a tar stream's headers as it passes, so progress counts the files' own bytes and each
-/// file once all of it has gone, whatever the archive adds around them.
+/// Follows a tar stream's headers as it passes, so progress counts the files' own bytes, each
+/// file once all of it has gone, and the current entry name, whatever the archive adds around them.
 #[derive(Default)]
 struct TarCounter {
     header: Vec<u8>,
     data_left: u64,
     pad_left: u64,
     regular: bool,
+    pending_long_name: Option<Vec<u8>>,
+    reading_long_name: bool,
+    long_name_buf: Vec<u8>,
+    current: Option<String>,
 }
 
 impl TarCounter {
     const BLOCK: usize = 512;
+
+    fn current_name(&self) -> Option<&str> {
+        self.current.as_deref()
+    }
 
     /// Takes the next bytes of the archive; says how many were file content and how many files
     /// they completed.
@@ -1985,11 +4951,20 @@ impl TarCounter {
                     .min(chunk.len());
                 if self.regular {
                     content += take as u64;
+                } else if self.reading_long_name && self.long_name_buf.len() < 4096 {
+                    let room = 4096 - self.long_name_buf.len();
+                    self.long_name_buf
+                        .extend_from_slice(&chunk[..take.min(room)]);
                 }
                 self.data_left -= take as u64;
                 chunk = &chunk[take..];
-                if self.data_left == 0 && self.regular {
-                    files += 1;
+                if self.data_left == 0 {
+                    if self.regular {
+                        files += 1;
+                    } else if self.reading_long_name {
+                        self.reading_long_name = false;
+                        self.pending_long_name = Some(std::mem::take(&mut self.long_name_buf));
+                    }
                 }
                 continue;
             }
@@ -2012,7 +4987,26 @@ impl TarCounter {
                 continue;
             }
             let size = Self::size(&header[124..136]);
-            self.regular = matches!(header[156], b'0' | 0 | b'7');
+            let typeflag = header[156];
+            self.regular = matches!(typeflag, b'0' | 0 | b'7');
+            self.reading_long_name = typeflag == b'L';
+            if self.reading_long_name {
+                self.long_name_buf.clear();
+            } else if matches!(typeflag, b'0' | 0 | b'7' | b'5' | b'2') {
+                let raw_name = match self.pending_long_name.take() {
+                    Some(long) => long,
+                    None => Self::header_name(&header),
+                };
+                let end = raw_name
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(raw_name.len());
+                if let Ok(name) = std::str::from_utf8(&raw_name[..end])
+                    && !name.is_empty()
+                {
+                    self.current = Some(name.to_owned());
+                }
+            }
             self.data_left = size;
             self.pad_left = (Self::BLOCK as u64 - size % Self::BLOCK as u64) % Self::BLOCK as u64;
             if self.regular && size == 0 {
@@ -2020,6 +5014,24 @@ impl TarCounter {
             }
         }
         (content, files)
+    }
+
+    fn header_name(header: &[u8]) -> Vec<u8> {
+        fn trim(slice: &[u8]) -> &[u8] {
+            let end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+            &slice[..end]
+        }
+        let name = trim(&header[0..100]);
+        let prefix = trim(&header[345..500]);
+        if !prefix.is_empty() {
+            let mut full = Vec::with_capacity(prefix.len() + 1 + name.len());
+            full.extend_from_slice(prefix);
+            full.push(b'/');
+            full.extend_from_slice(name);
+            full
+        } else {
+            name.to_vec()
+        }
     }
 
     /// A header's size field: octal digits, or big-endian binary when its first bit is set.
@@ -2203,9 +5215,14 @@ mod tests {
             noise_lines: 0,
             noise_bytes: 0,
             greeted: false,
+            capabilities: HashSet::new(),
+            required_caps: Vec::new(),
             longest: LONGEST_REPLY,
             received: 0,
             opened: tokio::time::Instant::now(),
+            revoke_token: None,
+            pending_lines: VecDeque::new(),
+            partial_line: Vec::new(),
         };
         (conn, peer_out, peer_in)
     }
@@ -2270,9 +5287,16 @@ mod tests {
             ctx: None,
             sent: &sent,
             bytes_total: 1000,
+            bytes_base: 0,
             files_total: 1,
+            current: None,
             tar: None,
+            started: Instant::now(),
             last: Instant::now(),
+            last_bytes_done: 0,
+            last_files_done: 0,
+            attempt: 1,
+            attempt_bytes: 0,
         };
         let started = tokio::time::Instant::now();
         let broken = relay(&mut source, &mut dest, Amount::Exactly(1000), &mut meter)
@@ -2463,5 +5487,536 @@ mod tests {
             }
             assert_eq!((content, files), (71_000, 3), "chunk {chunk}");
         }
+    }
+
+    #[test]
+    fn replace_path_filename_preserves_caller_form_across_unix_and_windows() {
+        // Caller gave `~/…`: always reports `~/…` with forward slashes regardless of remote OS.
+        assert_eq!(
+            replace_path_filename("~/doc.txt", "doc (2).txt"),
+            "~/doc (2).txt"
+        );
+        assert_eq!(
+            replace_path_filename("~/sub/dir/doc.txt", "doc (2).txt"),
+            "~/sub/dir/doc (2).txt"
+        );
+        assert_eq!(
+            replace_path_filename(r"~\sub\doc.txt", "doc (2).txt"),
+            "~/sub/doc (2).txt"
+        );
+
+        // Combining with `file_name` on a Windows absolute path returned by a Windows peer:
+        let win_actual = r"C:\Users\runneradmin\AppData\Local\Temp\.tmpfBCY6H\home\doc (2).txt";
+        assert_eq!(
+            replace_path_filename("~/doc.txt", file_name(win_actual)),
+            "~/doc (2).txt"
+        );
+
+        // Absolute Unix and Windows paths keep their original directory and separator style.
+        assert_eq!(
+            replace_path_filename("/srv/data/doc.txt", "doc (2).txt"),
+            "/srv/data/doc (2).txt"
+        );
+        assert_eq!(
+            replace_path_filename(r"C:\Work\doc.txt", "doc (2).txt"),
+            r"C:\Work\doc (2).txt"
+        );
+        assert_eq!(
+            replace_path_filename("C:/Work/doc.txt", "doc (2).txt"),
+            "C:/Work/doc (2).txt"
+        );
+
+        // Parent dir extraction handles Unix, tilde, and Windows drive roots.
+        assert_eq!(parent_dir_of("~/doc.txt"), "~");
+        assert_eq!(parent_dir_of("~/a/b.txt"), "~/a");
+        assert_eq!(parent_dir_of("/doc.txt"), "/");
+        assert_eq!(parent_dir_of(r"C:\doc.txt"), r"C:\");
+        assert_eq!(parent_dir_of(r"C:\Work\doc.txt"), r"C:\Work");
+    }
+
+    #[derive(Clone)]
+    struct Rng64(u64);
+
+    impl Rng64 {
+        fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9e37_79b9_7f4a_7c15)
+        }
+
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn range(&mut self, upper: usize) -> usize {
+            if upper <= 1 {
+                0
+            } else {
+                (self.next() as usize) % upper
+            }
+        }
+    }
+
+    /// Deterministic adversarial `AsyncRead` that yields 1-byte or random short chunks, injects
+    /// `Poll::Pending` wakeups and `Interrupted` errors, and never relies on wall-clock timing.
+    struct AdversarialAsyncRead {
+        data: Vec<u8>,
+        pos: usize,
+        rng: Rng64,
+        single_byte: bool,
+        inject_interrupted: bool,
+        pending_every: usize,
+        polls: usize,
+    }
+
+    impl AsyncRead for AdversarialAsyncRead {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.polls += 1;
+            if self.pending_every > 0 && self.polls.is_multiple_of(self.pending_every) {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            if self.inject_interrupted && self.rng.range(9) == 0 {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "adversarial eintr",
+                )));
+            }
+            let remaining = self.data.len() - self.pos;
+            if remaining == 0 || buf.remaining() == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let max_take = remaining.min(buf.remaining());
+            let take = if self.single_byte {
+                1
+            } else {
+                1 + self.rng.range(max_take.min(4096))
+            };
+            let take = take.min(max_take);
+            buf.put_slice(&self.data[self.pos..self.pos + take]);
+            self.pos += take;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Deterministic adversarial `AsyncWrite` that performs 1-byte or random short writes, injects
+    /// `Poll::Pending` wakeups on write and flush, injects `Interrupted`, and records every byte
+    /// written into a shared buffer for exact byte-for-byte verification.
+    struct AdversarialAsyncWrite {
+        out: Arc<Mutex<Vec<u8>>>,
+        rng: Rng64,
+        single_byte: bool,
+        inject_interrupted: bool,
+        pending_every: usize,
+        polls: usize,
+        on_write_step: Option<Box<dyn FnMut(usize) + Send>>,
+    }
+
+    impl AsyncWrite for AdversarialAsyncWrite {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.polls += 1;
+            if self.pending_every > 0 && self.polls.is_multiple_of(self.pending_every) {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            if self.inject_interrupted && self.rng.range(9) == 0 {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "adversarial eintr",
+                )));
+            }
+            if buf.is_empty() {
+                return std::task::Poll::Ready(Ok(0));
+            }
+            let take = if self.single_byte {
+                1
+            } else {
+                1 + self.rng.range(buf.len().min(4096))
+            };
+            let take = take.min(buf.len());
+            let total = {
+                let mut guard = self.out.lock().unwrap();
+                guard.extend_from_slice(&buf[..take]);
+                guard.len()
+            };
+            if let Some(ref mut cb) = self.on_write_step {
+                cb(total);
+            }
+            std::task::Poll::Ready(Ok(take))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.polls += 1;
+            if self.pending_every > 0 && self.polls.is_multiple_of(self.pending_every) {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            if self.inject_interrupted && self.rng.range(11) == 0 {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "adversarial eintr flush",
+                )));
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn custom_conn(machine: &str, reader: BoxRead, writer: BoxWrite) -> Conn {
+        Conn {
+            machine: machine.to_owned(),
+            reader: BufReader::with_capacity(CHUNK, reader),
+            writer: Some(writer),
+            process: Owned {
+                process: Some(Process::Local(None)),
+                ends: Ends::default(),
+            },
+            answered: true,
+            noise_lines: 0,
+            noise_bytes: 0,
+            greeted: true,
+            capabilities: HashSet::new(),
+            required_caps: Vec::new(),
+            longest: LONGEST_REPLY,
+            received: 0,
+            opened: tokio::time::Instant::now(),
+            revoke_token: None,
+            pending_lines: VecDeque::new(),
+            partial_line: Vec::new(),
+        }
+    }
+
+    fn make_payload(seed: u64, len: usize) -> Vec<u8> {
+        let mut rng = Rng64::new(seed);
+        let mut out = vec![0u8; len];
+        for chunk in out.chunks_mut(8) {
+            let bytes = rng.next().to_le_bytes();
+            let n = chunk.len();
+            chunk.copy_from_slice(&bytes[..n]);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn relay_regression_busy_heartbeat_mid_partial_write_never_duplicates_bytes() {
+        // Reproduces the exact macOS failure deterministically without wall-clock timing:
+        // `dest.writer` accepts a partial prefix of a 64 KiB chunk, then yields `Poll::Pending`
+        // while `dest.reader` delivers `{"busy": true}\n` — cancelling the active write arm of
+        // `tokio::select!`. The relay must resume at `written`, never from offset 0.
+        struct MidChunkStallWriter {
+            out: Arc<Mutex<Vec<u8>>>,
+            busy_tx: Option<tokio::sync::oneshot::Sender<()>>,
+            resume_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+            stalled_once: bool,
+        }
+
+        impl AsyncWrite for MidChunkStallWriter {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                if !self.stalled_once {
+                    let prefix = buf.len().min(17 * 1024);
+                    self.out.lock().unwrap().extend_from_slice(&buf[..prefix]);
+                    self.stalled_once = true;
+                    if let Some(tx) = self.busy_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    return std::task::Poll::Ready(Ok(prefix));
+                }
+                if let Some(rx) = self.resume_rx.as_mut() {
+                    match std::pin::Pin::new(rx).poll(cx) {
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
+                        std::task::Poll::Ready(_) => {
+                            self.resume_rx = None;
+                        }
+                    }
+                }
+                self.out.lock().unwrap().extend_from_slice(buf);
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let payload = make_payload(0xfeed_face, 256 * 1024 + 137);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let (dest_ctrl_in, mut dest_ctrl_out) = tokio::io::duplex(4096);
+        let (_src_sink, src_writer) = tokio::io::duplex(64);
+
+        let ctrl_task = tokio::spawn(async move {
+            busy_rx.await.unwrap();
+            // Deliver three `{"busy": true}\n` heartbeats (one fragmented byte by byte) while
+            // `MidChunkStallWriter` is parked mid-chunk, then release the writer and send `ok`.
+            dest_ctrl_out.write_all(b"{\"busy\":true}\n").await.unwrap();
+            for &b in b"{\"busy\": true}\n" {
+                dest_ctrl_out.write_all(&[b]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            let _ = resume_tx.send(());
+            dest_ctrl_out
+                .write_all(b"{\"ok\":true,\"size\":262281}\n")
+                .await
+                .unwrap();
+            dest_ctrl_out.shutdown().await.unwrap();
+        });
+
+        let mut source = custom_conn(
+            "src",
+            Box::new(std::io::Cursor::new(payload.clone())),
+            Box::new(src_writer),
+        );
+        let mut dest = custom_conn(
+            "dst",
+            Box::new(dest_ctrl_in),
+            Box::new(MidChunkStallWriter {
+                out: Arc::clone(&received),
+                busy_tx: Some(busy_tx),
+                resume_rx: Some(resume_rx),
+                stalled_once: false,
+            }),
+        );
+        let sent = Sent::default();
+        let mut meter = Meter::quiet(&sent);
+        relay(
+            &mut source,
+            &mut dest,
+            Amount::Exactly(payload.len() as u64),
+            &mut meter,
+        )
+        .await
+        .unwrap();
+        ctrl_task.await.unwrap();
+
+        let got = received.lock().unwrap().clone();
+        assert_eq!(got.len(), payload.len());
+        assert_eq!(
+            got, payload,
+            "bytes must match payload byte for byte after mid-chunk busy heartbeats"
+        );
+        let reply: Value = dest.first().await.unwrap();
+        assert_eq!(reply["ok"], Value::Bool(true));
+        assert_eq!(reply["size"], json!(262281));
+    }
+
+    #[tokio::test]
+    async fn relay_is_cancellation_safe_under_adversarial_io_and_heartbeats() {
+        // 64 deterministic seeds exercising 1-byte and random short reads/writes, `Poll::Pending`
+        // wakeups at every await point, `Interrupted` errors, and fragmented `{"busy": true}\n`
+        // plus trailing `{"ok": true}\n` lines across both `Amount::Exactly` and `Amount::AtMost`.
+        for seed in 0u64..64 {
+            let single_byte = seed % 8 == 0;
+            let len = if single_byte {
+                3_000 + (seed as usize) * 37
+            } else {
+                70_000 + (seed as usize) * 1_913
+            };
+            let payload = make_payload(seed + 1, len);
+            let received = Arc::new(Mutex::new(Vec::new()));
+
+            let mut ctrl_bytes = Vec::new();
+            let heartbeats = 2 + (seed as usize % 6);
+            for _ in 0..heartbeats {
+                ctrl_bytes.extend_from_slice(b"{\"busy\":true}\n");
+            }
+            let ok_line = format!("{{\"ok\":true,\"seed\":{seed}}}\n");
+            ctrl_bytes.extend_from_slice(ok_line.as_bytes());
+
+            let source_reader = AdversarialAsyncRead {
+                data: payload.clone(),
+                pos: 0,
+                rng: Rng64::new(seed * 3 + 11),
+                single_byte,
+                inject_interrupted: true,
+                pending_every: 2 + (seed as usize % 3),
+                polls: 0,
+            };
+            let dest_ctrl_reader = AdversarialAsyncRead {
+                data: ctrl_bytes,
+                pos: 0,
+                rng: Rng64::new(seed * 5 + 29),
+                single_byte: true,
+                inject_interrupted: false,
+                pending_every: 2 + (seed as usize % 4),
+                polls: 0,
+            };
+            let dest_writer = AdversarialAsyncWrite {
+                out: Arc::clone(&received),
+                rng: Rng64::new(seed * 7 + 43),
+                single_byte,
+                inject_interrupted: true,
+                pending_every: 2 + (seed as usize % 3),
+                polls: 0,
+                on_write_step: None,
+            };
+            let (_src_sink, src_writer) = tokio::io::duplex(64);
+            let mut source = custom_conn("src", Box::new(source_reader), Box::new(src_writer));
+            let mut dest = custom_conn("dst", Box::new(dest_ctrl_reader), Box::new(dest_writer));
+
+            let sent = Sent::default();
+            let mut meter = Meter::quiet(&sent);
+            let amount = if seed % 2 == 0 {
+                Amount::Exactly(payload.len() as u64)
+            } else {
+                Amount::AtMost(payload.len() as u64 + 1024)
+            };
+            relay(&mut source, &mut dest, amount, &mut meter)
+                .await
+                .unwrap_or_else(|_| panic!("relay failed on seed {seed}"));
+
+            let got = received.lock().unwrap().clone();
+            assert_eq!(got.len(), payload.len(), "length mismatch on seed {seed}");
+            assert_eq!(got, payload, "byte mismatch on seed {seed}");
+
+            let reply: Value = dest.first().await.unwrap();
+            assert_eq!(reply["ok"], Value::Bool(true), "reply on seed {seed}");
+            assert_eq!(reply["seed"], json!(seed), "reply seed on seed {seed}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_detects_destination_error_after_busy_heartbeats_and_detects_stalls() {
+        // 1. Multiple `{"busy": true}\n` heartbeats followed by a mid-stream `{"error": ...}\n`
+        // while `dest.writer` is backpressured must immediately fail with that exact `ErrorBody`.
+        struct NeverReadyWriter;
+        impl AsyncWrite for NeverReadyWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Pending
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let payload = make_payload(77, 128 * 1024);
+        let (dest_ctrl_in, mut dest_ctrl_out) = tokio::io::duplex(4096);
+        let (_src_sink, src_writer) = tokio::io::duplex(64);
+        let mut source = custom_conn(
+            "src",
+            Box::new(std::io::Cursor::new(payload.clone())),
+            Box::new(src_writer),
+        );
+        let mut dest = custom_conn("dst", Box::new(dest_ctrl_in), Box::new(NeverReadyWriter));
+
+        let sender = tokio::spawn(async move {
+            dest_ctrl_out.write_all(b"{\"busy\":true}\n").await.unwrap();
+            dest_ctrl_out
+                .write_all(b"{\"busy\": true}\n")
+                .await
+                .unwrap();
+            let err_line =
+                b"{\"error\":{\"code\":\"denied\",\"message\":\"revoked after heartbeat\"}}\n";
+            for &b in err_line {
+                dest_ctrl_out.write_all(&[b]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let sent = Sent::default();
+        let mut meter = Meter::quiet(&sent);
+        let broken = relay_with_timeout(
+            &mut source,
+            &mut dest,
+            Amount::Exactly(payload.len() as u64),
+            &mut meter,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("mid-stream destination error after busy heartbeats must fail relay");
+        sender.await.unwrap();
+        let explained = broken.explain(source, dest).await;
+        assert_eq!(explained.code, ErrorCode::Denied, "{explained:?}");
+        assert!(
+            explained.message.contains("revoked after heartbeat"),
+            "{explained:?}"
+        );
+
+        // 2. A stalled destination still times out within `idle_timeout` even if `{"busy": true}`
+        // heartbeats keep arriving every second.
+        let (dest_ctrl_in2, mut dest_ctrl_out2) = tokio::io::duplex(4096);
+        let (_src_sink2, src_writer2) = tokio::io::duplex(64);
+        let mut source2 = custom_conn(
+            "src",
+            Box::new(std::io::Cursor::new(payload.clone())),
+            Box::new(src_writer2),
+        );
+        let mut dest2 = custom_conn("dst", Box::new(dest_ctrl_in2), Box::new(NeverReadyWriter));
+        let hb_task = tokio::spawn(async move {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if dest_ctrl_out2
+                    .write_all(b"{\"busy\":true}\n")
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let mut meter2 = Meter::quiet(&sent);
+        let stalled = relay_with_timeout(
+            &mut source2,
+            &mut dest2,
+            Amount::Exactly(payload.len() as u64),
+            &mut meter2,
+            Duration::from_secs(4),
+        )
+        .await
+        .expect_err("stalled writer must time out despite busy heartbeats");
+        assert!(
+            matches!(stalled, Broken::Stalled { source: false }),
+            "expected destination stall"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+        hb_task.abort();
     }
 }

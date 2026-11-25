@@ -133,7 +133,12 @@ impl Ran {
 fn after_protocol(output: &[u8]) -> &[u8] {
     let end = output.iter().position(|b| *b == b'\n').expect("a line");
     let opening: Value = serde_json::from_slice(&output[..end]).unwrap();
-    assert_eq!(opening, json!({"protocol": STREAM_PROTOCOL}));
+    assert_eq!(opening["protocol"], json!(STREAM_PROTOCOL), "{opening}");
+    assert_eq!(
+        opening["capabilities"],
+        json!(legion_net::stream::STREAM_CAPABILITIES),
+        "{opening}"
+    );
     &output[end + 1..]
 }
 
@@ -404,10 +409,10 @@ fn put_says_where_to_start_verifies_and_renames() {
     let ran = node.run(None, &header(0), &data[7..]);
     let lines = ran.ok().lines();
     assert_eq!(lines[0], json!({"offset": 7}));
-    assert_eq!(
-        lines[1],
-        json!({"ok": true, "size": data.len(), "hash": hash(&data)})
-    );
+    assert_eq!(lines[1]["ok"], json!(true), "{}", lines[1]);
+    assert_eq!(lines[1]["size"], json!(data.len()), "{}", lines[1]);
+    assert_eq!(lines[1]["hash"], json!(hash(&data)), "{}", lines[1]);
+    assert!(lines[1].get("file_id").is_some(), "{}", lines[1]);
     assert_eq!(fs::read(&target).unwrap(), data);
     let audit = node.last_audit();
     assert_eq!(
@@ -762,9 +767,17 @@ fn a_partial_file_beside_a_target_is_checked_like_the_target() {
     assert_eq!(fs::read(&outside).unwrap(), b"not yours");
     assert!(!node.home().join("sandbox").exists());
 
-    // Inside the root, a partial file is used as before.
+    // Inside the root, a partial file with a matching state-dir metadata sidecar is resumed.
     fs::create_dir_all(node.home().join("sandbox")).unwrap();
+    let target_f = node.home().join("sandbox/f.bin");
     fs::write(node.home().join("sandbox/f.bin.legion-part"), b"ab").unwrap();
+    legion_xfer::write_partial_meta_in_state(
+        &node.dir.path().join("legion/state"),
+        &target_f,
+        3,
+        legion_xfer::hash::hash_bytes(b"abc"),
+    )
+    .unwrap();
     let ran = node.run(
         Some("boxed"),
         &json!({"op": "stat", "path": "~/sandbox/f.bin"}),
@@ -1119,20 +1132,797 @@ fn unpack_takes_each_planned_entry_once_as_planned_and_nothing_else() {
 
 #[test]
 fn a_refused_unpack_reads_nothing_of_what_follows() {
+    use std::sync::{Arc, Mutex};
+    struct SharedCursor(Arc<Mutex<Cursor<Vec<u8>>>>);
+    impl Read for SharedCursor {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().read(buf)
+        }
+    }
+
     let node = Node::new();
     node.policy(CONFINED);
     let mut input =
         b"{\"op\":\"unpack\",\"root\":\"~/projects/x\",\"entries\":[],\"protocol\":1}\n".to_vec();
     input.extend(std::iter::repeat_n(0u8, 1 << 20));
-    let mut cursor = Cursor::new(input);
+    let shared = Arc::new(Mutex::new(Cursor::new(input)));
     let mut output = Vec::new();
-    let error = serve(&node.host, Some("reader"), &mut cursor, &mut output).unwrap_err();
+    let error = serve(
+        &node.host,
+        Some("reader"),
+        SharedCursor(Arc::clone(&shared)),
+        &mut output,
+    )
+    .unwrap_err();
     assert_eq!(error.code, ErrorCode::Denied);
     // It answered and returned instead of draining its input; dropping that input is what tells
     // a sender to stop.
     let mut rest = Vec::new();
-    cursor.read_to_end(&mut rest).unwrap();
+    shared.lock().unwrap().read_to_end(&mut rest).unwrap();
     assert!(rest.len() > 900_000, "{}", rest.len());
+}
+
+#[test]
+fn stream_rename_is_limited_to_same_file_case_or_normalization_and_honours_fs_move_protection() {
+    let node = Node::new();
+    node.policy(
+        r#"
+[principals.unrestricted_nonadmin]
+role = "power_user"
+
+[roles.power_user]
+allow = ["effect:read", "effect:write", "effect:destroy"]
+"#,
+    );
+    fs::create_dir_all(node.home().join(".config")).unwrap();
+    fs::write(node.home().join(".config/policy.toml"), b"keep").unwrap();
+    fs::write(node.home().join("projects/a.txt"), b"alpha").unwrap();
+
+    // 1. Non-admin with read+write+destroy CANNOT rename `~/.config` or `~` or Legion's config dir.
+    node.run(
+        Some("unrestricted_nonadmin"),
+        &json!({"op": "rename", "from": "~/.config", "to": "~/.config2"}),
+        b"",
+    )
+    .refused(ErrorCode::Denied);
+    assert!(node.home().join(".config/policy.toml").exists());
+
+    let parent_escape = node
+        .home()
+        .parent()
+        .unwrap()
+        .join("home2")
+        .to_string_lossy()
+        .into_owned();
+    node.run(
+        Some("unrestricted_nonadmin"),
+        &json!({"op": "rename", "from": "~", "to": parent_escape}),
+        b"",
+    )
+    .refused(ErrorCode::Denied);
+    assert!(node.home().exists());
+
+    let cfg_dir = node.config().to_string_lossy().into_owned();
+    let cfg_dir2 = format!("{cfg_dir}2");
+    node.run(
+        Some("unrestricted_nonadmin"),
+        &json!({"op": "rename", "from": cfg_dir, "to": cfg_dir2}),
+        b"",
+    )
+    .refused(ErrorCode::Denied);
+
+    // 2. Arbitrary rename of distinct entries (`a.txt -> b.txt`) is refused with `invalid_args`
+    //    even for owner: stream `rename` is ONLY for same-file case/normalization renames.
+    node.run(
+        None,
+        &json!({"op": "rename", "from": "~/projects/a.txt", "to": "~/projects/b.txt"}),
+        b"",
+    )
+    .refused(ErrorCode::InvalidArgs);
+    assert!(node.home().join("projects/a.txt").exists());
+    assert!(!node.home().join("projects/b.txt").exists());
+
+    // 3. `probe_write remove` never unlinks non-empty or unowned empty files even if named like a
+    //    probe marker, and DOES unlink markers it created with a matching ownership record.
+    #[cfg(feature = "move-between-places")]
+    {
+        let fake_probe = node.home().join("projects/.legion-move-probe-fake.tmp");
+        fs::write(&fake_probe, b"non-empty-user-data").unwrap();
+        node.run(
+            None,
+            &json!({
+                "op": "probe_write",
+                "action": "remove",
+                "dir": "~/projects",
+                "marker": ".legion-move-probe-fake.tmp"
+            }),
+            b"",
+        )
+        .ok();
+        assert_eq!(
+            fs::read(&fake_probe).unwrap(),
+            b"non-empty-user-data",
+            "probe_write remove must never delete non-empty files"
+        );
+
+        let unowned_empty = node.home().join("projects/.legion-move-probe-unowned.tmp");
+        fs::write(&unowned_empty, b"").unwrap();
+        node.run(
+            None,
+            &json!({
+                "op": "probe_write",
+                "action": "remove",
+                "dir": "~/projects",
+                "marker": ".legion-move-probe-unowned.tmp"
+            }),
+            b"",
+        )
+        .ok();
+        assert!(
+            unowned_empty.exists(),
+            "probe_write remove must never delete an unowned 0-byte file by name"
+        );
+
+        let created = node
+            .run(
+                None,
+                &json!({
+                    "op": "probe_write",
+                    "action": "create",
+                    "dir": "~/projects"
+                }),
+                b"",
+            )
+            .ok()
+            .first()
+            .0;
+        let marker_name = created["marker"].as_str().unwrap();
+        assert!(node.home().join("projects").join(marker_name).exists());
+        node.run(
+            None,
+            &json!({
+                "op": "probe_write",
+                "action": "remove",
+                "dir": "~/projects",
+                "marker": marker_name
+            }),
+            b"",
+        )
+        .ok();
+        assert!(
+            !node.home().join("projects").join(marker_name).exists(),
+            "probe_write remove should unlink its own recorded probe marker"
+        );
+    }
+}
+
+#[cfg(not(feature = "move-between-places"))]
+#[test]
+fn move_only_stream_ops_are_refused_and_capabilities_omitted() {
+    let node = Node::new();
+    fs::write(node.home().join("projects/keep.txt"), b"keep").unwrap();
+
+    // Greeting advertises `if_exists` and `rename`, and omits `lock`, `move`, and `probe`.
+    let stat_ran = node.run(
+        None,
+        &json!({"op": "stat", "path": "~/projects/keep.txt"}),
+        b"",
+    );
+    stat_ran.ok();
+    let nl = stat_ran.output.iter().position(|&b| b == b'\n').unwrap();
+    let greeting: Value = serde_json::from_slice(&stat_ran.output[..nl]).unwrap();
+    let caps = greeting["capabilities"].as_array().unwrap();
+    assert!(caps.contains(&json!("if_exists")), "{greeting}");
+    assert!(caps.contains(&json!("rename")), "{greeting}");
+    assert!(!caps.contains(&json!("lock")), "{greeting}");
+    assert!(!caps.contains(&json!("move")), "{greeting}");
+    assert!(!caps.contains(&json!("probe")), "{greeting}");
+
+    // Move-only operations and move-only `delete` fields are all refused with `unsupported`.
+    let keep_hash = hash(b"keep");
+    for header in [
+        json!({"op": "lock", "paths": ["~/projects/keep.txt"]}),
+        json!({"op": "probe_write", "action": "create", "dir": "~/projects"}),
+        json!({"op": "probe_write", "action": "behavior", "dir": "~/projects"}),
+        json!({"op": "probe_read", "dir": "~/projects", "marker": ".legion-move-probe-x.tmp"}),
+        json!({"op": "delete", "root": "~/projects/keep.txt", "names": [], "remove_root": true}),
+        json!({"op": "delete", "root": "~/projects/keep.txt", "names": [], "dry_run": true}),
+        json!({"op": "delete", "root": "~/projects/keep.txt", "names": [], "expect_root_hash": keep_hash}),
+        json!({"op": "delete", "root": "~/projects", "names": ["keep.txt"], "expect_hashes": {"keep.txt": keep_hash}}),
+        json!({"op": "delete", "root": "~/projects/keep.txt", "names": [], "forbid_file_id": [1, 2]}),
+        json!({"op": "delete", "root": "~/projects", "names": ["keep.txt"], "lock_id": "0123456789abcdef0123456789abcdef"}),
+    ] {
+        node.run(None, &header, b"").refused(ErrorCode::Unsupported);
+    }
+    assert_eq!(
+        fs::read(node.home().join("projects/keep.txt")).unwrap(),
+        b"keep",
+        "refused move-only delete must never touch files"
+    );
+
+    // Plain `delete` (syncing extra entries in a destination tree) still works.
+    let done = node
+        .run(
+            None,
+            &json!({"op": "delete", "root": "~/projects", "names": ["keep.txt"]}),
+            b"",
+        )
+        .ok()
+        .first()
+        .0;
+    assert_eq!(done["removed"], json!(1), "{done}");
+    assert!(!node.home().join("projects/keep.txt").exists());
+}
+
+#[test]
+fn stat_and_manifest_never_mutate_pending_renames() {
+    let node = Node::new();
+    let dir = node.home().join("projects/rec");
+    fs::create_dir_all(&dir).unwrap();
+    let temp_name = "legion-renaming-42-1-Draft.txt";
+    fs::write(dir.join(temp_name), b"payload").unwrap();
+    let renames_dir = node
+        .dir
+        .path()
+        .join("legion")
+        .join("state")
+        .join("xfer")
+        .join("renames");
+    fs::create_dir_all(&renames_dir).unwrap();
+    let intent_path = renames_dir.join("pending.json");
+    fs::write(
+        &intent_path,
+        serde_json::to_vec(&json!({
+            "parent": dir.to_string_lossy(),
+            "from_name": "Draft.txt",
+            "temp_name": temp_name,
+            "to_name": "draft.txt",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // `stat` and `manifest` are reads and must touch nothing.
+    let st = node
+        .run(
+            None,
+            &json!({"op": "stat", "path": "~/projects/rec/draft.txt"}),
+            b"",
+        )
+        .ok()
+        .first()
+        .0;
+    assert_eq!(st["kind"], json!("missing"), "{st}");
+    assert!(dir.join(temp_name).exists());
+    assert!(!dir.join("draft.txt").exists());
+    assert!(intent_path.exists());
+
+    node.run(
+        None,
+        &json!({"op": "manifest", "root": "~/projects/rec"}),
+        b"",
+    )
+    .ok();
+    assert!(dir.join(temp_name).exists());
+    assert!(!dir.join("draft.txt").exists());
+    assert!(intent_path.exists());
+
+    // A write operation (`put`) in the same folder DOES recover the pending rename.
+    let body = b"other";
+    node.run(
+        None,
+        &json!({
+            "op": "put",
+            "path": "~/projects/rec/other.txt",
+            "size": body.len(),
+            "hash": hash(body),
+        }),
+        body,
+    )
+    .ok();
+    assert_eq!(fs::read(dir.join("draft.txt")).unwrap(), b"payload");
+    assert!(!dir.join(temp_name).exists());
+    assert!(!intent_path.exists());
+}
+
+#[cfg(feature = "move-between-places")]
+#[test]
+fn stream_lock_is_exclusive_and_returns_conflict_while_held() {
+    use std::sync::mpsc;
+
+    let node = Node::new();
+    fs::write(node.home().join("projects/x.txt"), b"hello").unwrap();
+
+    struct HoldAfterHeader {
+        header: Cursor<Vec<u8>>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Read for HoldAfterHeader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.header.read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            let _ = self.release.recv();
+            Ok(0)
+        }
+    }
+
+    struct NotifyWriter {
+        tx: mpsc::Sender<Vec<u8>>,
+    }
+    impl std::io::Write for NotifyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.tx.send(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (rel_tx, rel_rx) = mpsc::channel();
+    let (out_tx, out_rx) = mpsc::channel();
+    let host = node.host.clone();
+    let mut header =
+        json!({"protocol": STREAM_PROTOCOL, "op": "lock", "paths": ["~/projects/x.txt"]})
+            .to_string()
+            .into_bytes();
+    header.push(b'\n');
+    let handle = std::thread::spawn(move || {
+        serve(
+            &host,
+            None,
+            HoldAfterHeader {
+                header: Cursor::new(header),
+                release: rel_rx,
+            },
+            NotifyWriter { tx: out_tx },
+        )
+    });
+
+    let mut gathered = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while gathered.iter().filter(|b| **b == b'\n').count() < 2 {
+        assert!(std::time::Instant::now() < deadline);
+        if let Ok(chunk) = out_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            gathered.extend_from_slice(&chunk);
+        }
+    }
+    let reply_bytes = after_protocol(&gathered);
+    let ready: Value = serde_json::from_slice(reply_bytes).unwrap();
+    assert_eq!(ready["locked"], true, "{ready}");
+    assert_eq!(ready["entries"][0]["exists"], true, "{ready}");
+    assert_eq!(ready["entries"][0]["size"], 5, "{ready}");
+
+    node.run(
+        None,
+        &json!({"op": "lock", "paths": ["~/projects/x.txt"]}),
+        b"",
+    )
+    .refused(ErrorCode::Conflict);
+
+    let _ = rel_tx.send(());
+    handle.join().unwrap().unwrap();
+
+    let after = node
+        .run(
+            None,
+            &json!({"op": "lock", "paths": ["~/projects/x.txt"]}),
+            b"",
+        )
+        .ok()
+        .first()
+        .0;
+    assert_eq!(after["locked"], true, "{after}");
+}
+
+#[cfg(feature = "move-between-places")]
+#[test]
+fn stream_lock_lease_expiry_quota_cleanup_metadata_privacy_and_holder_visibility() {
+    use std::sync::mpsc;
+
+    let node = Node::new();
+    fs::write(node.home().join("projects/secret.txt"), b"top-secret").unwrap();
+    node.policy(
+        r#"
+default = "owner"
+
+[principals.confined]
+role = "confined"
+
+[principals.writeonly]
+role = "writeonly"
+
+[roles.confined]
+allow = ["effect:read", "effect:write"]
+paths = ["~/projects"]
+
+[roles.writeonly]
+allow = ["fs.write"]
+paths = ["~/projects"]
+"#,
+    );
+
+    struct FeedLines {
+        header: Cursor<Vec<u8>>,
+        lines: mpsc::Receiver<Vec<u8>>,
+        buf: Cursor<Vec<u8>>,
+    }
+    impl Read for FeedLines {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.header.read(out)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            let n = self.buf.read(out)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            match self.lines.recv() {
+                Ok(next) if !next.is_empty() => {
+                    self.buf = Cursor::new(next);
+                    self.buf.read(out)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    struct NotifyWriter {
+        tx: mpsc::Sender<Vec<u8>>,
+    }
+    impl std::io::Write for NotifyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.tx.send(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let wait_ready = |rx: &mpsc::Receiver<Vec<u8>>| -> Value {
+        let mut gathered = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while gathered.iter().filter(|b| **b == b'\n').count() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for lock ready reply; got so far: {:?}",
+                String::from_utf8_lossy(&gathered)
+            );
+            if let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                gathered.extend_from_slice(&chunk);
+            }
+        }
+        serde_json::from_slice(after_protocol(&gathered)).unwrap()
+    };
+
+    // 1. Write-only role (`writeonly`) acquires a lock cleanly, learns ZERO metadata (`entries: []`),
+    //    and leaves ZERO `.lock` files behind on release.
+    let wo_reply = node
+        .run(
+            Some("writeonly"),
+            &json!({"op": "lock", "paths": ["~/projects/secret.txt", "~/projects/nope.txt"]}),
+            b"",
+        )
+        .ok()
+        .first()
+        .0;
+    assert_eq!(wo_reply["locked"], true, "{wo_reply}");
+    assert_eq!(
+        wo_reply["entries"].as_array().unwrap().len(),
+        0,
+        "write-only role must not receive file existence/size/mtime/inode via lock: {wo_reply}"
+    );
+    let lock_dir = node.dir.path().join("legion/state/xfer/move-lock");
+    let remaining_locks: Vec<_> = fs::read_dir(&lock_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+    assert!(
+        remaining_locks.is_empty(),
+        "lock files must be removed on release: {remaining_locks:?}"
+    );
+
+    // 2. Active lock returns an unguessable `lock_id` + `lease_ms`, answers `"renew\n"` with
+    //    `{"status":"held"}`, shows holder details to unconfined owner (including on Windows via
+    //    unlocked sibling `.meta`), authorizes `delete` ONLY for its covered path while live, and
+    //    refuses `delete` with `Conflict` once released (leaving the file intact).
+    //    Uses a generous 10 s lease so loaded CI runners never flake on wall-clock timing;
+    //    lease expiry without wall-clock sleeps is verified in `stream::tests` via an injected clock.
+    let (line_tx, line_rx) = mpsc::channel();
+    let (out_tx, out_rx) = mpsc::channel();
+    let host = node.host.clone();
+    let mut hdr = json!({
+        "protocol": STREAM_PROTOCOL,
+        "op": "lock",
+        "paths": ["~/projects/secret.txt"],
+        "lease_ms": 10_000,
+    })
+    .to_string()
+    .into_bytes();
+    hdr.push(b'\n');
+    let holder = std::thread::spawn(move || {
+        serve(
+            &host,
+            Some("confined"),
+            FeedLines {
+                header: Cursor::new(hdr),
+                lines: line_rx,
+                buf: Cursor::new(Vec::new()),
+            },
+            NotifyWriter { tx: out_tx },
+        )
+    });
+    let mut gathered = Vec::new();
+    let read_next_json =
+        |buf: &mut Vec<u8>, rx: &mpsc::Receiver<Vec<u8>>, skip_lines: usize| -> Value {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while buf.iter().filter(|&&b| b == b'\n').count() <= skip_lines {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for stream reply line {}: {:?}",
+                    skip_lines + 1,
+                    String::from_utf8_lossy(buf)
+                );
+                if let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                    buf.extend_from_slice(&chunk);
+                }
+            }
+            let line = String::from_utf8_lossy(buf)
+                .lines()
+                .nth(skip_lines)
+                .unwrap()
+                .to_owned();
+            serde_json::from_str(&line).unwrap()
+        };
+    let ready = read_next_json(&mut gathered, &out_rx, 1);
+    assert_eq!(ready["locked"], true, "{ready}");
+    let lock_id = ready["lock_id"].as_str().unwrap().to_owned();
+    assert_eq!(lock_id.len(), 32, "lock_id must be 128-bit hex: {ready}");
+    assert_eq!(ready["lease_ms"], 10_000, "{ready}");
+
+    // While held: owner (unconfined) sees the holder principal in the conflict error.
+    let owner_conflict = node
+        .run(
+            Some("owner"),
+            &json!({"op": "lock", "paths": ["~/projects/secret.txt"]}),
+            b"",
+        )
+        .refused(ErrorCode::Conflict);
+    assert!(
+        owner_conflict["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("confined")),
+        "unconfined owner should see who holds the lock: {owner_conflict:?}"
+    );
+
+    // Explicit `"renew\n"` replies `{"status":"held"}` immediately.
+    line_tx.send(b"renew\n".to_vec()).unwrap();
+    let renew_reply = read_next_json(&mut gathered, &out_rx, 2);
+    assert_eq!(renew_reply["status"], "held", "{renew_reply}");
+
+    // `delete` carrying a forged `lock_id` or another principal's `lock_id` is refused with
+    // `Conflict` and removes nothing.
+    let forged_delete = node
+        .run(
+            Some("owner"),
+            &json!({
+                "op": "delete",
+                "root": "~/projects/secret.txt",
+                "names": [],
+                "remove_root": true,
+                "lock_id": "00000000000000000000000000000000",
+            }),
+            b"",
+        )
+        .refused(ErrorCode::Conflict);
+    assert!(
+        forged_delete["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("source was kept"),
+        "{forged_delete:?}"
+    );
+    assert!(node.home().join("projects/secret.txt").exists());
+
+    // Even `owner` cannot reuse `confined`'s `lock_id` (principal mismatch -> `Conflict`).
+    let wrong_principal_delete = node
+        .run(
+            Some("owner"),
+            &json!({
+                "op": "delete",
+                "root": "~/projects/secret.txt",
+                "names": [],
+                "remove_root": true,
+                "lock_id": &lock_id,
+            }),
+            b"",
+        )
+        .refused(ErrorCode::Conflict);
+    assert!(
+        wrong_principal_delete["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("source was kept"),
+        "{wrong_principal_delete:?}"
+    );
+    assert!(node.home().join("projects/secret.txt").exists());
+
+    // Release cleanly -> lock files are gone, owner can now lock, and `delete` with the released
+    // `lock_id` is refused with `Conflict` without removing `secret.txt`.
+    line_tx.send(b"release\n".to_vec()).unwrap();
+    holder.join().unwrap().unwrap();
+    drop(line_tx);
+
+    let after_release_delete = node
+        .run(
+            Some("owner"),
+            &json!({
+                "op": "delete",
+                "root": "~/projects/secret.txt",
+                "names": [],
+                "remove_root": true,
+                "lock_id": &lock_id,
+            }),
+            b"",
+        )
+        .refused(ErrorCode::Conflict);
+    assert!(
+        after_release_delete["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("source was kept"),
+        "{after_release_delete:?}"
+    );
+    assert!(node.home().join("projects/secret.txt").exists());
+
+    let after_expiry = node
+        .run(
+            Some("owner"),
+            &json!({"op": "lock", "paths": ["~/projects/secret.txt"]}),
+            b"",
+        )
+        .ok()
+        .first()
+        .0;
+    assert_eq!(after_expiry["locked"], true, "{after_expiry}");
+
+    // 3. Busy lock holder visibility + uncovered-path refusal for same principal: when `owner`
+    //    holds a lock on `secret.txt`, a confined role hitting it must NOT learn `owner`'s
+    //    principal name or job id, AND `owner` cannot delete an uncovered `other.txt` using that
+    //    `lock_id`.
+    let (o_tx, o_rx) = mpsc::channel();
+    let (oo_tx, oo_rx) = mpsc::channel();
+    let host2 = node.host.clone();
+    let mut ohdr = json!({
+        "protocol": STREAM_PROTOCOL,
+        "op": "lock",
+        "paths": ["~/projects/secret.txt"],
+        "lease_ms": 10_000,
+    })
+    .to_string()
+    .into_bytes();
+    ohdr.push(b'\n');
+    let owner_holder = std::thread::spawn(move || {
+        serve(
+            &host2,
+            Some("owner"),
+            FeedLines {
+                header: Cursor::new(ohdr),
+                lines: o_rx,
+                buf: Cursor::new(Vec::new()),
+            },
+            NotifyWriter { tx: oo_tx },
+        )
+    });
+    let owner_ready = wait_ready(&oo_rx);
+    assert_eq!(owner_ready["locked"], true);
+    let owner_lock_id = owner_ready["lock_id"].as_str().unwrap().to_owned();
+
+    fs::write(node.home().join("projects/other.txt"), "untouched").unwrap();
+    let uncovered_delete = node
+        .run(
+            Some("owner"),
+            &json!({
+                "op": "delete",
+                "root": "~/projects/other.txt",
+                "names": [],
+                "remove_root": true,
+                "lock_id": &owner_lock_id,
+            }),
+            b"",
+        )
+        .refused(ErrorCode::Conflict);
+    assert!(
+        uncovered_delete["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("source was kept"),
+        "{uncovered_delete:?}"
+    );
+    assert!(node.home().join("projects/other.txt").exists());
+
+    let conf_conflict = node
+        .run(
+            Some("confined"),
+            &json!({"op": "lock", "paths": ["~/projects/secret.txt"]}),
+            b"",
+        )
+        .refused(ErrorCode::Conflict);
+    assert!(
+        !conf_conflict["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("owner"),
+        "confined role must not see owner holder identity: {conf_conflict:?}"
+    );
+    assert!(
+        conf_conflict.get("details").is_none(),
+        "confined role must not receive holder details: {conf_conflict:?}"
+    );
+    let _ = o_tx.send(b"release\n".to_vec());
+    owner_holder.join().unwrap().unwrap();
+
+    // 4. Per-principal active lock limit (256): holding 256 locks blocks a 257th lock with `busy`,
+    //    and releasing them frees the quota and removes all lock files.
+    let (q_tx, q_rx) = mpsc::channel();
+    let (qo_tx, qo_rx) = mpsc::channel();
+    let host3 = node.host.clone();
+    let paths_256: Vec<String> = (0..256)
+        .map(|i| format!("~/projects/q-{i:03}.txt"))
+        .collect();
+    let mut qhdr = json!({
+        "protocol": STREAM_PROTOCOL,
+        "op": "lock",
+        "paths": paths_256,
+        "lease_ms": 10_000,
+    })
+    .to_string()
+    .into_bytes();
+    qhdr.push(b'\n');
+    let quota_holder = std::thread::spawn(move || {
+        serve(
+            &host3,
+            Some("confined"),
+            FeedLines {
+                header: Cursor::new(qhdr),
+                lines: q_rx,
+                buf: Cursor::new(Vec::new()),
+            },
+            NotifyWriter { tx: qo_tx },
+        )
+    });
+    assert_eq!(wait_ready(&qo_rx)["locked"], true);
+
+    let over_quota = node
+        .run(
+            Some("confined"),
+            &json!({"op": "lock", "paths": ["~/projects/q-256.txt"]}),
+            b"",
+        )
+        .refused(ErrorCode::Busy);
+    assert!(
+        over_quota["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("256")),
+        "quota error should state the lock limit: {over_quota:?}"
+    );
+
+    let _ = q_tx.send(b"release\n".to_vec());
+    quota_holder.join().unwrap().unwrap();
+    let remaining_after_256: Vec<_> = fs::read_dir(&lock_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+    assert!(
+        remaining_after_256.is_empty(),
+        "releasing 256 locks must remove all lock files: {}",
+        remaining_after_256.len()
+    );
 }
 
 #[test]
@@ -1403,7 +2193,6 @@ fn mid_stream_policy_revocation_stops_long_get() {
     fs::create_dir_all(&projects).unwrap();
     let payload = vec![0x5Au8; 512 * 1024];
     fs::write(projects.join("big.bin"), &payload).unwrap();
-
     node.policy(
         r#"
 default = "owner"

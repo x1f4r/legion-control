@@ -55,6 +55,8 @@ pub(super) const MAX_LOG_FILE_BYTES: u64 = 256 * 1024 * 1024;
 pub(super) const LOCK_FILE: &str = "lock";
 /// Cancel request marker file polled by the supervisor.
 pub(super) const CANCEL_FILE: &str = "cancel";
+/// Atomic progress snapshot written by transfer job supervisors.
+pub(super) const PROGRESS_FILE: &str = "progress.json";
 /// Prefix used for atomic tombstone renames when pruning expired or excess job directories.
 /// Leading `.` cannot occur in any validated job id.
 const TOMBSTONE_PREFIX: &str = ".deleting-";
@@ -133,11 +135,61 @@ pub(super) struct LaunchingState {
     pub deadline: String,
 }
 
+/// What kind of work a background job runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    /// A command started by `job.start`.
+    #[default]
+    Exec,
+    /// A file or tree transfer started by `fs.transfer` with `background: true`.
+    Transfer,
+}
+
+/// Progress snapshot reported for a transfer job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JobProgress {
+    /// Bytes moved so far (monotonic within one attempt; resets if a stale partial restarts from
+    /// offset 0 on a new attempt).
+    pub bytes_done: u64,
+    /// Total bytes expected across the transfer, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_total: Option<u64>,
+    /// Files completed so far (monotonic within one run).
+    pub files_done: u64,
+    /// Total files expected across the transfer, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_total: Option<u64>,
+    /// Path currently being transferred, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    /// Recent transfer rate in bytes per second.
+    pub rate: u64,
+    /// 1-based attempt number, included when a file transfer restarted from offset 0 (such as
+    /// after a stale partial failed hash verification).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+}
+
+/// On-disk progress snapshot stored in `<state dir>/jobs/<id>/progress.json`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ProgressFile {
+    #[serde(flatten)]
+    pub progress: JobProgress,
+    /// Refined human-readable title once the transfer knows the item count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
 /// On-disk record stored in `<state dir>/jobs/<id>/job.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct JobRecord {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub kind: JobKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +203,18 @@ pub(super) struct JobRecord {
     pub principal: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transfer_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transfer_has_remote: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_local_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_local_to: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transfer_move: bool,
     pub created: String,
     pub boot_id: String,
     #[serde(default)]
@@ -177,6 +241,12 @@ pub(super) struct ExitRecord {
     pub startup_failed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Tool result payload when the job returns structured data (such as a transfer report).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    /// Structured error returned by a failing tool job (such as a background transfer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorBody>,
 }
 
 /// Status derived on read from `job.json`, `exit.json`, `lock`, `detached_active`, and
@@ -192,6 +262,8 @@ pub(super) struct DerivedStatus {
     pub duration_s: Option<f64>,
     pub output_bytes: u64,
     pub detail: Option<String>,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<ErrorBody>,
 }
 
 /// An exclusive background job that is currently starting or running on this node.
@@ -327,7 +399,13 @@ pub(super) fn default_job_name(
 }
 
 /// Formats a job's command for `job.list`, cut at 200 characters on a character boundary.
-pub(super) fn command_summary(record: &JobRecord) -> String {
+pub(super) fn command_summary(record: &JobRecord, title_override: Option<&str>) -> String {
+    if record.kind == JobKind::Transfer {
+        let title = title_override
+            .or(record.title.as_deref())
+            .unwrap_or(&record.name);
+        return cut_chars(title, COMMAND_SUMMARY_CHARS);
+    }
     let full = match (&record.cmd, &record.argv) {
         (Some(cmd), _) => cmd.clone(),
         (None, Some(argv)) => argv.join(" "),
@@ -344,18 +422,23 @@ pub(super) fn cut_chars(text: &str, max: usize) -> String {
     }
 }
 
+/// Returns the standard `not_found` error for a missing or hidden job id.
+pub(super) fn not_found_job(id: &str) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::NotFound,
+        format!("There is no job with id {id:?} on this machine."),
+    )
+    .with_hint("Run `job.list` to see the jobs recorded on this node.")
+    .with_details(json!({"id": id}))
+}
+
 /// Reads `<job_dir>/job.json`, returning `not_found` with a hint to `job.list` when absent.
 pub(super) fn read_job_record(dir: &Path, id: &str) -> Result<JobRecord, ErrorBody> {
     let path = dir.join(JOB_FILE);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Err(ErrorBody::new(
-                ErrorCode::NotFound,
-                format!("There is no job with id {id:?} on this machine."),
-            )
-            .with_hint("Run `job.list` to see the jobs recorded on this node.")
-            .with_details(json!({"id": id})));
+            return Err(not_found_job(id));
         }
         Err(err) => {
             return Err(ErrorBody::new(
@@ -376,6 +459,29 @@ pub(super) fn read_job_record(dir: &Path, id: &str) -> Result<JobRecord, ErrorBo
 pub(super) fn read_exit_record(dir: &Path) -> Option<ExitRecord> {
     let bytes = fs::read(dir.join(EXIT_FILE)).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Reads `<job_dir>/progress.json` if it exists and parses.
+pub(super) fn read_progress_file(dir: &Path) -> Option<ProgressFile> {
+    let bytes = fs::read(dir.join(PROGRESS_FILE)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Atomically writes `<job_dir>/progress.json` with owner-only permissions.
+pub(super) fn write_progress_file(dir: &Path, progress: &ProgressFile) -> Result<(), ErrorBody> {
+    let path = dir.join(PROGRESS_FILE);
+    let bytes = serde_json::to_vec(progress).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("Cannot serialize job progress: {err}."),
+        )
+    })?;
+    write_atomic(&path, &bytes, WriteOptions::with_mode(0o600)).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Cannot write job progress {}: {err}.", path.display()),
+        )
+    })
 }
 
 /// Reads `<job_dir>/env.json` if present; returns an empty map when absent.
@@ -684,6 +790,8 @@ fn inspect_local(
             duration_s,
             output_bytes,
             detail: None,
+            result: None,
+            error: None,
         });
     }
 
@@ -714,6 +822,8 @@ fn inspect_local(
             duration_s: None,
             output_bytes,
             detail: Some(detail),
+            result: None,
+            error: None,
         });
     }
 
@@ -741,6 +851,8 @@ fn inspect_local(
             duration_s,
             output_bytes,
             detail: None,
+            result: None,
+            error: None,
         });
     }
 
@@ -755,6 +867,8 @@ fn inspect_local(
         duration_s: None,
         output_bytes,
         detail: Some(detail),
+        result: None,
+        error: None,
     })
 }
 
@@ -784,6 +898,8 @@ fn finish_same_boot_unlocked(
             duration_s,
             output_bytes,
             detail: None,
+            result: None,
+            error: None,
         };
     }
 
@@ -804,6 +920,8 @@ fn finish_same_boot_unlocked(
                 "The job supervisor is gone, so output is no longer captured; the command is still running and `job.cancel` will stop it."
                     .to_owned(),
             ),
+            result: None,
+            error: None,
         };
     }
 
@@ -818,6 +936,8 @@ fn finish_same_boot_unlocked(
         duration_s: None,
         output_bytes,
         detail: Some(detail),
+        result: None,
+        error: None,
     }
 }
 
@@ -839,6 +959,8 @@ fn derived_from_exit(
         duration_s,
         output_bytes,
         detail: exit.detail,
+        result: exit.result,
+        error: exit.error,
     }
 }
 
@@ -1114,12 +1236,14 @@ pub(super) fn exclusive_running_jobs_in(state_dir: &Path) -> Result<Vec<Exclusiv
 }
 
 /// Returns the IDs of active (`starting` or `running`) background jobs under `state_dir` that
-/// were started by paired device `device` (or without a device tag under `principal`).
+/// were started by paired device `device` / `pairing_id` (or without a device tag under
+/// `principal`).
 ///
 /// Pure read: never creates, modifies, or stops any job.
 pub(super) fn running_job_ids_for_device_in(
     state_dir: &Path,
     device: &str,
+    pairing_id: Option<&str>,
     principal: &str,
 ) -> Vec<String> {
     let Ok(records) = load_all_records(state_dir) else {
@@ -1129,11 +1253,7 @@ pub(super) fn running_job_ids_for_device_in(
     let now = jiff::Timestamp::now();
     let mut active: Vec<(String, String)> = Vec::new();
     for (dir, record) in records {
-        let matches = match record.device.as_deref() {
-            Some(recorded_device) => recorded_device == device,
-            None => record.principal == principal,
-        };
-        if !matches {
+        if !job_matches_device(&record, device, pairing_id, principal) {
             continue;
         }
         let status = derive_status(&dir, &record, current_boot.as_deref(), now);
@@ -1145,6 +1265,21 @@ pub(super) fn running_job_ids_for_device_in(
     active.into_iter().map(|(_, id)| id).collect()
 }
 
+pub(super) fn job_matches_device(
+    record: &JobRecord,
+    device: &str,
+    pairing_id: Option<&str>,
+    principal: &str,
+) -> bool {
+    match (pairing_id, record.pairing_id.as_deref()) {
+        (Some(want), Some(got)) => want == got,
+        _ => match record.device.as_deref() {
+            Some(recorded_device) => recorded_device == device,
+            None => record.principal == principal,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1153,6 +1288,8 @@ mod tests {
         JobRecord {
             id: id.to_owned(),
             name: "sample".to_owned(),
+            kind: JobKind::Exec,
+            title: None,
             key: None,
             cmd: Some("echo hi".to_owned()),
             argv: None,
@@ -1160,6 +1297,12 @@ mod tests {
             env_names: Vec::new(),
             principal: "owner".to_owned(),
             device: None,
+            pairing_id: None,
+            transfer_paths: Vec::new(),
+            transfer_has_remote: false,
+            transfer_local_from: None,
+            transfer_local_to: None,
+            transfer_move: false,
             created: created.to_owned(),
             boot_id: boot_id.to_owned(),
             exclusive: false,
@@ -1257,7 +1400,7 @@ mod tests {
 
         let mut rec = sample_record("id1", "2026-01-01T00:00:00.000Z", "b");
         rec.cmd = Some("é".repeat(250));
-        let summary = command_summary(&rec);
+        let summary = command_summary(&rec, None);
         assert_eq!(summary.chars().count(), 201);
         assert!(summary.ends_with('…'));
     }
