@@ -469,16 +469,9 @@ async fn real_sshd_pairing_with_legion_link_enrol_stream_and_revoke() {
 
 #[tokio::test]
 async fn real_sshd_late_enrolment_confirmation_and_retry_recover_cleanly() {
-    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!(
-            "skipping real_sshd_late_enrolment_confirmation_and_retry_recover_cleanly: sshd/ssh-keygen unavailable"
-        );
-        return;
-    }
-    let Some(legion_bin) = find_legion_bin() else {
-        eprintln!(
-            "skipping real_sshd_late_enrolment_confirmation_and_retry_recover_cleanly: built `legion` binary not found"
-        );
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "pairing::real_sshd_late_enrolment_confirmation_and_retry_recover_cleanly",
+    ) else {
         return;
     };
 
@@ -693,16 +686,9 @@ async fn real_sshd_late_enrolment_confirmation_and_retry_recover_cleanly() {
 
 #[tokio::test]
 async fn real_sshd_refused_single_use_key_recovers_only_for_device_principals() {
-    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!(
-            "skipping real_sshd_refused_single_use_key_recovers_only_for_device_principals: sshd/ssh-keygen unavailable"
-        );
-        return;
-    }
-    let Some(legion_bin) = find_legion_bin() else {
-        eprintln!(
-            "skipping real_sshd_refused_single_use_key_recovers_only_for_device_principals: built `legion` binary not found"
-        );
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "pairing::real_sshd_refused_single_use_key_recovers_only_for_device_principals",
+    ) else {
         return;
     };
 
@@ -862,16 +848,9 @@ async fn real_sshd_refused_single_use_key_recovers_only_for_device_principals() 
 
 #[tokio::test]
 async fn real_sshd_cancel_before_and_after_send_behaves_honestly() {
-    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!(
-            "skipping real_sshd_cancel_before_and_after_send_behaves_honestly: sshd/ssh-keygen unavailable"
-        );
-        return;
-    }
-    let Some(legion_bin) = find_legion_bin() else {
-        eprintln!(
-            "skipping real_sshd_cancel_before_and_after_send_behaves_honestly: built `legion` binary not found"
-        );
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "pairing::real_sshd_cancel_before_and_after_send_behaves_honestly",
+    ) else {
         return;
     };
 
@@ -991,16 +970,9 @@ async fn real_sshd_cancel_before_and_after_send_behaves_honestly() {
 
 #[tokio::test]
 async fn real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat() {
-    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!(
-            "skipping real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat: sshd/ssh-keygen unavailable"
-        );
-        return;
-    }
-    let Some(legion_bin) = find_legion_bin() else {
-        eprintln!(
-            "skipping real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat: built `legion` binary not found"
-        );
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "pairing::real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat",
+    ) else {
         return;
     };
 
@@ -1425,16 +1397,18 @@ async fn wait_sshd_accepted(sshd: &ThrowawaySshd, target_count: usize) {
 #[cfg(unix)]
 #[tokio::test]
 async fn real_sshd_shared_principal_post_send_not_found_does_not_recover() {
-    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() || find_tool("flock").is_none() {
-        eprintln!(
-            "skipping real_sshd_shared_principal_post_send_not_found_does_not_recover: sshd/ssh-keygen/flock unavailable"
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "pairing::real_sshd_shared_principal_post_send_not_found_does_not_recover",
+    ) else {
+        return;
+    };
+    if find_tool("flock").is_none() {
+        assert!(
+            !common::require_real_binary(),
+            "pairing::real_sshd_shared_principal_post_send_not_found_does_not_recover: flock unavailable"
         );
         return;
     }
-    let Some(legion_bin) = find_legion_bin() else {
-        eprintln!("skipping: built `legion` binary not found");
-        return;
-    };
 
     let root = strict_tempdir();
     let user_home = root.path().join("home");
@@ -1581,16 +1555,18 @@ async fn real_sshd_shared_principal_post_send_not_found_does_not_recover() {
 #[cfg(unix)]
 #[tokio::test]
 async fn real_sshd_cancel_before_machine_commits_stays_honest_and_retry_picks_up_pairing() {
-    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() || find_tool("flock").is_none() {
-        eprintln!(
-            "skipping real_sshd_cancel_before_machine_commits_stays_honest_and_retry_picks_up_pairing: sshd/ssh-keygen/flock unavailable"
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "pairing::real_sshd_cancel_before_machine_commits_stays_honest_and_retry_picks_up_pairing",
+    ) else {
+        return;
+    };
+    if find_tool("flock").is_none() {
+        assert!(
+            !common::require_real_binary(),
+            "pairing::real_sshd_cancel_before_machine_commits_stays_honest_and_retry_picks_up_pairing: flock unavailable"
         );
         return;
     }
-    let Some(legion_bin) = find_legion_bin() else {
-        eprintln!("skipping: built `legion` binary not found");
-        return;
-    };
 
     let root = strict_tempdir();
     let user_home = root.path().join("home");
@@ -1776,14 +1752,9 @@ fn forced_enrol_raw(
 #[cfg(unix)]
 #[tokio::test]
 async fn real_sshd_unauthenticated_invite_cannot_take_over_unconfirmed_device() {
-    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!(
-            "skipping real_sshd_unauthenticated_invite_cannot_take_over_unconfirmed_device: sshd/ssh-keygen unavailable"
-        );
-        return;
-    }
-    let Some(legion_bin) = find_legion_bin() else {
-        eprintln!("skipping: built `legion` binary not found");
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "pairing::real_sshd_unauthenticated_invite_cannot_take_over_unconfirmed_device",
+    ) else {
         return;
     };
 
@@ -1944,14 +1915,9 @@ async fn real_sshd_mixed_versions_and_restore_pairing_probe() {
     // verifies normal pairing, spent-invite refusal, confirmed duplicate-key conflict offering
     // Restore pairing (even when the machine omits `details`), restoring cleanly, and malformed
     // key refusal — all completing promptly with zero hangs.
-    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!(
-            "skipping real_sshd_mixed_versions_and_restore_pairing_probe: sshd/ssh-keygen unavailable"
-        );
-        return;
-    }
-    let Some(legion_bin) = find_legion_bin() else {
-        eprintln!("skipping: built `legion` binary not found");
+    let Some(legion_bin) =
+        real_legion_bin_with_sshd("pairing::real_sshd_mixed_versions_and_restore_pairing_probe")
+    else {
         return;
     };
 
@@ -2125,14 +2091,9 @@ fn ssh_keygen_sign_proof(key: &DeviceKey, namespace: &str, msg: &[u8]) -> String
 #[cfg(unix)]
 #[tokio::test]
 async fn real_sshd_pre_upgrade_invite_and_invalid_proof_denied_not_absent() {
-    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!(
-            "skipping real_sshd_pre_upgrade_invite_and_invalid_proof_denied_not_absent: sshd/ssh-keygen unavailable"
-        );
-        return;
-    }
-    let Some(legion_bin) = find_legion_bin() else {
-        eprintln!("skipping: built `legion` binary not found");
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "pairing::real_sshd_pre_upgrade_invite_and_invalid_proof_denied_not_absent",
+    ) else {
         return;
     };
 
@@ -2404,16 +2365,18 @@ async fn real_sshd_pre_upgrade_invite_and_invalid_proof_denied_not_absent() {
 #[cfg(unix)]
 #[tokio::test]
 async fn real_sshd_concurrent_pair_same_machine_refuses_second_and_keeps_consistent_state() {
-    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!(
-            "skipping real_sshd_concurrent_pair_same_machine_refuses_second_and_keeps_consistent_state: sshd/ssh-keygen unavailable"
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "pairing::real_sshd_concurrent_pair_same_machine_refuses_second_and_keeps_consistent_state",
+    ) else {
+        return;
+    };
+    if find_tool("flock").is_none() {
+        assert!(
+            !common::require_real_binary(),
+            "pairing::real_sshd_concurrent_pair_same_machine_refuses_second_and_keeps_consistent_state: flock unavailable"
         );
         return;
     }
-    let Some(legion_bin) = find_legion_bin() else {
-        eprintln!("skipping: built `legion` binary not found");
-        return;
-    };
 
     let root = strict_tempdir();
     let user_home = root.path().join("home");
@@ -2541,14 +2504,9 @@ async fn real_sshd_concurrent_pair_same_machine_refuses_second_and_keeps_consist
 #[cfg(unix)]
 #[tokio::test]
 async fn real_sshd_kill_point_recovery_same_invite_fresh_and_replacement() {
-    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!(
-            "skipping real_sshd_kill_point_recovery_same_invite_fresh_and_replacement: sshd/ssh-keygen unavailable"
-        );
-        return;
-    }
-    let Some(legion_bin) = find_legion_bin() else {
-        eprintln!("skipping: built `legion` binary not found");
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "pairing::real_sshd_kill_point_recovery_same_invite_fresh_and_replacement",
+    ) else {
         return;
     };
 
