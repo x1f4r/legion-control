@@ -735,7 +735,8 @@ test('createThumbQueue batches at most 32 paths and retries busy errors with exp
   let updates3 = 0;
   const fakeCapsStore = {
     isKnown: () => capsKnown,
-    hasTool: (_m, tool) => capsKnown && tool === 'fs.thumb',
+    hasTool: (_m, tool) => capsKnown && (tool === 'fs.thumb' || tool === 'fs.tags'),
+    fileCapabilities: () => ({ hasThumb: capsKnown, hasAudioThumb: capsKnown }),
     async ensure() {
       ensureAttempts += 1;
       if (ensureAttempts === 1) throw { code: 'unreachable', message: 'Timed out.' };
@@ -773,13 +774,17 @@ test('createThumbQueue batches at most 32 paths and retries busy errors with exp
   assert.equal(thumbCalls, 0);
   assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late.png', '', 128)), null);
 
-  // Capabilities arrive later; re-enqueueing fetches the thumbnail.
+  // Capabilities arrive later; re-enqueueing fetches both picture and song cover thumbnails.
+  assert.equal(isThumbEligible({ name: 'late-song.flac', kind: 'file' }, { allowAudio: false }), false);
+  assert.equal(isThumbEligible({ name: 'late-song.flac', kind: 'file' }, { allowAudio: true }), true);
   capsKnown = true;
   q3.enqueue({ path: '/home/me/late.png', mtime: '' });
+  q3.enqueue({ path: '/home/me/late-song.flac', mtime: '' });
   await runAllTimers();
   assert.equal(thumbCalls, 1);
   assert.equal(updates3, 1);
   assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late.png', '', 128))?.url, 'data:image/png;base64,T0s=');
+  assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late-song.flac', '', 128))?.url, 'data:image/png;base64,T0s=');
   q3.dispose();
 
   // Audio covers go through createThumbQueue on nodes with hasAudioThumb, retry busy covers,

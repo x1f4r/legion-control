@@ -125,6 +125,8 @@ const PASSIVE_REFRESH_TOOLS = new Set([
   'fs.stat',
   'fs.read',
   'fs.search',
+  'fs.tags',
+  'fs.thumb',
   'fav.list',
   'sync.list',
 ]);
@@ -309,17 +311,26 @@ function App() {
   const folderChanges = useMemo(() => createFolderChangesStore(), []);
   useEffect(() => () => capsStore.dispose(), [capsStore]);
   useEffect(() => () => folderChanges.dispose(), [folderChanges]);
+
+  // Reset any leftover native immersive or screen-on state once on page boot / reload.
+  useEffect(() => {
+    Promise.resolve(link?.immersive?.(false)).catch(() => {});
+    Promise.resolve(link?.keepScreenOn?.(false)).catch(() => {});
+  }, [link]);
   const shellRef = useRef(null);
   const mainRef = useRef(null);
   const refreshAbortRef = useRef(null);
   const refreshInFlightRef = useRef(false);
   const resumingRef = useRef(false);
   const screenRefreshRef = useRef(null);
+  const popStateInterceptorRef = useRef(null);
   const swipeRef = useRef(null);
   const touchSwipeRef = useRef(null);
   const scrollByFolderRef = useRef(new Map());
   const pendingScrollRestoreKeyRef = useRef(null);
   const filesHistoryDepthRef = useRef(0);
+  const viewerHistoryPushedRef = useRef(false);
+  const pendingReplaceAfterPopRef = useRef(null);
   const filesSheetHistoryRef = useRef(false);
   const filesSelectHistoryRef = useRef(false);
   const lastHashRef = useRef(window.location.hash);
@@ -879,6 +890,14 @@ function App() {
         scrollByFolderRef.current.set(`${prevRoute.machine || ''}\0${prevRoute.path || '~'}`, mainRef.current.scrollTop);
       }
       const next = parseRoute(window.location.hash);
+      if (next.section !== 'files') {
+        filesHistoryDepthRef.current = 0;
+        viewerHistoryPushedRef.current = false;
+      } else if (!next.viewer) {
+        viewerHistoryPushedRef.current = false;
+      } else if (window.history.state?.legionViewerOverlay) {
+        viewerHistoryPushedRef.current = true;
+      }
       if (
         (prevRoute?.section === 'files' && (next.section !== 'files' || next.machine !== prevRoute.machine || next.path !== prevRoute.path)) ||
         (prevRoute?.section === 'machines' && (next.section !== 'machines' || next.machine !== prevRoute.machine || next.tab !== prevRoute.tab))
@@ -894,6 +913,13 @@ function App() {
       });
     }
     function onPopState() {
+      if (pendingReplaceAfterPopRef.current) {
+        const nextHref = pendingReplaceAfterPopRef.current;
+        pendingReplaceAfterPopRef.current = null;
+        window.history.replaceState(null, '', nextHref);
+        syncRoute();
+        return;
+      }
       const st = window.history.state;
       if (sheetHistoryRef.current && !st?.legionSheet) {
         sheetHistoryRef.current = false;
@@ -909,6 +935,10 @@ function App() {
         filesSelectHistoryRef.current = false;
         setFilesSelecting(false);
         setFilesSelectedPaths(new Set());
+        return;
+      }
+      if (popStateInterceptorRef.current?.()) {
+        lastHashRef.current = window.location.hash;
         return;
       }
       if (window.location.hash !== lastHashRef.current) {
@@ -1718,6 +1748,15 @@ function App() {
     };
   }, [link, capsStore, linkState?.ready, nodeInfo, refreshFleet, settings.refreshSeconds, checkUpdatesQuietly]);
 
+  const registerPopStateInterceptor = useCallback((fn) => {
+    popStateInterceptorRef.current = typeof fn === 'function' ? fn : null;
+    return () => {
+      if (popStateInterceptorRef.current === fn) {
+        popStateInterceptorRef.current = null;
+      }
+    };
+  }, []);
+
   const openConfirm = useCallback((req) => {
     if (!sheetHistoryRef.current) {
       window.history.pushState({ legionSheet: true }, '');
@@ -1908,8 +1947,18 @@ function App() {
             scrollByFolderRef.current.set(`${cur.machine || ''}\0${cur.path || '~'}`, mainRef.current.scrollTop);
           }
           if (targetHref && targetHref !== window.location.hash) {
+            const parsedTarget = parseRoute(targetHref);
+            const sameUnderlyingRoute =
+              Boolean(parsedTarget.viewer) &&
+              !cur?.viewer &&
+              parsedTarget.section === cur?.section &&
+              parsedTarget.view === cur?.view &&
+              parsedTarget.machine === cur?.machine &&
+              parsedTarget.path === cur?.path;
             filesHistoryDepthRef.current += 1;
-            window.location.hash = targetHref;
+            viewerHistoryPushedRef.current = sameUnderlyingRoute;
+            window.history.pushState(sameUnderlyingRoute ? { legionViewerOverlay: true } : null, '', targetHref);
+            window.dispatchEvent(new HashChangeEvent('hashchange'));
           }
         };
         if (href) {
@@ -1932,12 +1981,31 @@ function App() {
         pushDirect(href);
       },
       closeViewer() {
-        if (filesHistoryDepthRef.current > 0) {
-          window.history.back();
-        } else {
-          const cur = routeRef.current;
-          window.location.hash = routeHref({ ...cur, viewer: null });
+        const cur = routeRef.current;
+        const folderHref = routeHref({ ...cur, viewer: null });
+        const hadSheet = sheetHistoryRef.current;
+        if (hadSheet) {
+          sheetHistoryRef.current = false;
+          setConfirmRequest(null);
         }
+        if (viewerHistoryPushedRef.current) {
+          viewerHistoryPushedRef.current = false;
+          if (hadSheet) {
+            window.history.go(-2);
+          } else {
+            window.history.back();
+          }
+          return;
+        }
+        if (hadSheet) {
+          // Deep-linked or cross-route viewer behind a confirm sheet: pop the sheet entry and
+          // replace the viewer entry in place so no history entry points at the deleted file.
+          pendingReplaceAfterPopRef.current = folderHref;
+          window.history.back();
+          return;
+        }
+        window.history.replaceState(null, '', folderHref);
+        window.dispatchEvent(new HashChangeEvent('hashchange'));
       },
       openSheet(nextSheet) {
         if (!filesSheetHistoryRef.current) {
@@ -2984,6 +3052,7 @@ function App() {
                             capsStore=${capsStore}
                             folderChanges=${folderChanges}
                             onRegisterRefresh=${registerScreenRefresh}
+                            onRegisterPopState=${registerPopStateInterceptor}
                             nodeInfo=${nodeInfo}
                             tools=${tools}
                             allowedSet=${allowedSet}

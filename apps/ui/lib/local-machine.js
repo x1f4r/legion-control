@@ -2,6 +2,8 @@
 //
 // The word "local" names a connection pipe, never a machine shown to a person.
 
+import { createResumeStore, RESUME_STORAGE_KEY } from './player.js';
+
 export const LOCAL_PIPE_CONNECTION = 'local';
 export const PENDING_LOCAL_MACHINE_NAME = 'This computer';
 
@@ -294,7 +296,19 @@ export function migrateLocalMachineStorage(realNodeName, { localStorage = null, 
       }
     }
 
-    // 6. Thumbnail cache keys (`legion.thumb.v1.local\0...`) and any resume-position storage keys
+    // 5b. Player resume positions (`legion.player.resume.v1`)
+    const resumeStore = createResumeStore(localStorage);
+    let resumeMigrated = false;
+    for (const from of MIGRATE_FROM_NAMES) {
+      if (resumeStore.renameMachine(from, target)) {
+        resumeMigrated = true;
+      }
+    }
+    if (resumeMigrated) {
+      touched.push(RESUME_STORAGE_KEY);
+    }
+
+    // 6. Thumbnail cache keys (`legion.thumb.v1.local\0...`) and any other resume-position storage keys
     const allKeys = listStorageKeys(localStorage);
     for (const key of allKeys) {
       for (const from of MIGRATE_FROM_NAMES) {
@@ -314,7 +328,7 @@ export function migrateLocalMachineStorage(realNodeName, { localStorage = null, 
           break;
         }
       }
-      if (/^legion\.(?:files\.|player\.)?resume/i.test(key)) {
+      if (key !== RESUME_STORAGE_KEY && /^legion\.(?:files\.|player\.)?resume/i.test(key)) {
         const parsed = readJsonRaw(localStorage, key);
         if (parsed.exists) {
           const res = migrateResumeValue(parsed.value, target);

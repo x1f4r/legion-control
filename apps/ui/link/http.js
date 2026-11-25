@@ -1,5 +1,6 @@
 // HTTP link: talks to /v1/* on the origin that served the page, with a bearer token.
 
+import { createBrowserImmersive } from '../lib/immersive-browser.js';
 import { isFanOut } from '../lib/result.js';
 import { createSseParser } from '../lib/sse.js';
 
@@ -603,6 +604,8 @@ export function createHttpLink() {
     return { id };
   }
 
+  const browserImmersive = createBrowserImmersive();
+
   return {
     kind: 'http',
     get supportsContent() {
@@ -617,5 +620,9 @@ export function createHttpLink() {
     forget,
     contentUrl,
     download,
+    immersive: browserImmersive.immersive,
+    canImmersive: browserImmersive.canImmersive,
+    onImmersiveChange: browserImmersive.onImmersiveChange,
+    keepScreenOn: browserImmersive.keepScreenOn,
   };
 }

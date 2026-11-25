@@ -54,14 +54,26 @@ export const FILES_EXTRA_TOOLS = [
   {
     name: 'fs.thumb',
     effect: 'read',
-    description: 'Generate cached thumbnails for pictures and videos.',
+    description: 'Generate cached thumbnails for pictures, videos, and audio covers.',
     input_schema: {
       type: 'object',
       required: ['paths'],
       properties: {
         paths: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32 },
-        size: { type: 'integer', default: 256, minimum: 96, maximum: 512 },
+        size: { type: 'integer', default: 256, minimum: 96, maximum: 1024 },
         fit: { type: 'string', enum: ['cover', 'contain'], default: 'cover' },
+      },
+    },
+  },
+  {
+    name: 'fs.tags',
+    effect: 'read',
+    description: 'Read tags and cover presence from audio files.',
+    input_schema: {
+      type: 'object',
+      required: ['paths'],
+      properties: {
+        paths: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32 },
       },
     },
   },
@@ -320,6 +332,7 @@ function makeEntry(path, opts = {}) {
     duration_s: opts.duration_s ?? undefined,
     palette: opts.palette || null,
     sampleMedia: opts.sampleMedia || null, // 'video' | 'audio' | 'unplayable' | 'image'
+    tags: opts.tags || null,
     thumbFail: Boolean(opts.thumbFail),
     mockContentStatus: opts.mockContentStatus || null,
     mockMintError: opts.mockMintError || null,
@@ -358,6 +371,9 @@ export function createMockFilesState({
   const isEmpty = flags.has('empty');
   const isSlowUpload = flags.has('slow-upload');
   const isFailUpload = flags.has('fail-upload');
+  const isBigMusic = flags.has('big-music') || isLarge;
+  const isSlowCover = flags.has('slow-cover');
+  const isSlowContent = flags.has('slow-content');
   const isFormats = flags.has('formats');
   const isNoHandler = flags.has('no-handler');
   const isLongNames = flags.has('longnames');
@@ -378,6 +394,7 @@ export function createMockFilesState({
         '/home/me',
         [
           makeEntry('/home/me/Videos', { kind: 'dir', mtime: isoAgo(day * 3) }),
+          makeEntry('/home/me/Music', { kind: 'dir', mtime: isoAgo(day * 2) }),
           makeEntry('/home/me/Pictures', { kind: 'dir', mtime: isoAgo(day * 2) }),
           makeEntry('/home/me/Documents', { kind: 'dir', mtime: isoAgo(day * 5) }),
           makeEntry('/home/me/projects', { kind: 'dir', mtime: isoAgo(1200) }),
@@ -387,6 +404,85 @@ export function createMockFilesState({
           makeEntry('/home/me/.profile', { kind: 'file', size: 280, mtime: isoAgo(day * 40) }),
           ...(isLarge ? [makeEntry('/home/me/Archive5000', { kind: 'dir', mtime: isoAgo(day) })] : []),
           ...(isFormats ? [makeEntry('/home/me/Formats', { kind: 'dir', mtime: isoAgo(day) })] : []),
+        ],
+      ],
+      [
+        '/home/me/Music',
+        [
+          makeEntry('/home/me/Music/Album', { kind: 'dir', mtime: isoAgo(day * 2) }),
+          ...(isBigMusic ? [makeEntry('/home/me/Music/Library300', { kind: 'dir', mtime: isoAgo(day * 2) })] : []),
+        ],
+      ],
+      [
+        '/home/me/Music/Album',
+        [
+          makeEntry('/home/me/Music/Album/01 - Morning Light.flac', {
+            size: 28_400_000,
+            mtime: isoAgo(day * 5),
+            duration_s: 214,
+            palette: PALETTES[0],
+            sampleMedia: 'audio',
+            tags: {
+              title: 'Morning Light',
+              artist: 'Klara',
+              album: 'Early Hours',
+              track: 1,
+              disc: 1,
+              year: 2025,
+              duration_s: 214,
+              cover: true,
+            },
+          }),
+          makeEntry('/home/me/Music/Album/02 - Rain on Glass.mp3', {
+            size: 6_400_000,
+            mtime: isoAgo(day * 5),
+            duration_s: 198,
+            palette: PALETTES[3],
+            sampleMedia: 'audio',
+            tags: {
+              title: 'Rain on Glass',
+              artist: 'Klara',
+              album: 'Early Hours',
+              track: 2,
+              disc: 1,
+              year: 2025,
+              duration_s: 198,
+              cover: true,
+            },
+          }),
+          makeEntry('/home/me/Music/Album/03 - Sketch.ogg', {
+            size: 3_200_000,
+            mtime: isoAgo(day * 4),
+            duration_s: 142,
+            sampleMedia: 'audio',
+            tags: {
+              title: 'Sketch',
+              artist: 'Klara',
+              duration_s: 142,
+              cover: false,
+            },
+          }),
+          makeEntry('/home/me/Music/Album/field_recording_untagged.wav', {
+            size: 14_800_000,
+            mtime: isoAgo(day * 3),
+            duration_s: 84,
+            sampleMedia: 'audio',
+            tags: { cover: false },
+          }),
+          makeEntry('/home/me/Music/Album/Episode 12.mp3', {
+            size: 34_600_000,
+            mtime: isoAgo(day * 2),
+            duration_s: 1440,
+            palette: PALETTES[6],
+            sampleMedia: 'audio',
+            tags: {
+              title: 'Episode 12: North Ridge',
+              artist: 'Field Notes',
+              album: 'Season 2',
+              duration_s: 1440,
+              cover: true,
+            },
+          }),
         ],
       ],
       [
@@ -708,6 +804,32 @@ export function createMockFilesState({
       );
     }
     trees.studio.set('/home/me/BigFolder', big);
+  }
+
+  if (isBigMusic) {
+    const songs = [];
+    for (let i = 1; i <= 300; i += 1) {
+      const idx = String(i).padStart(3, '0');
+      const hasCover = i % 5 !== 0;
+      songs.push(
+        makeEntry(`/home/me/Music/Library300/Track-${idx}.mp3`, {
+          size: 4_000_000 + i * 10_000,
+          mtime: isoAgo(day + i * 60),
+          duration_s: 180 + (i % 90),
+          palette: hasCover ? PALETTES[i % PALETTES.length] : null,
+          sampleMedia: 'audio',
+          tags: {
+            title: `Track ${idx}`,
+            artist: `Artist ${((i - 1) % 12) + 1}`,
+            album: `Album ${Math.ceil(i / 20)}`,
+            track: ((i - 1) % 20) + 1,
+            duration_s: 180 + (i % 90),
+            cover: hasCover,
+          },
+        }),
+      );
+    }
+    trees.tower.set('/home/me/Music/Library300', songs);
   }
 
   if (isLarge) {
@@ -1601,6 +1723,32 @@ export function createMockFilesState({
         };
       }
 
+      case 'fs.tags': {
+        if (oldMachine) {
+          throw { code: 'unknown_tool', message: 'Unknown tool: fs.tags', hint: null, machine: machineName };
+        }
+        const paths = Array.isArray(args?.paths) ? args.paths.slice(0, 32) : [];
+        const results = paths.map((p) => {
+          const norm = normalizePath(p);
+          const entry = findEntryOnMachine(machineName, norm);
+          if (!entry || entry.kind !== 'file') {
+            return { path: p, error: { code: 'not_found', message: 'File not found.' } };
+          }
+          if (categoryFromName(entry.name) !== 'audio') {
+            return { path: p, error: { code: 'unsupported', message: 'Not an audio file.' } };
+          }
+          const rawTags = entry.tags || {};
+          const ok = { cover: Boolean(rawTags.cover) };
+          for (const key of ['title', 'artist', 'album', 'album_artist', 'track', 'disc', 'year', 'duration_s']) {
+            if (rawTags[key] !== undefined && rawTags[key] !== null && rawTags[key] !== '') {
+              ok[key] = rawTags[key];
+            }
+          }
+          return { path: p, ok };
+        });
+        return { results };
+      }
+
       case 'fs.thumb': {
         if (oldMachine) {
           throw { code: 'unknown_tool', message: 'Unknown tool: fs.thumb', hint: null, machine: machineName };
@@ -1614,6 +1762,7 @@ export function createMockFilesState({
             machine: machineName,
           };
         }
+        const reqSize = Number.isInteger(args?.size) ? Math.max(96, Math.min(1024, args.size)) : 128;
         const results = [];
         for (const p of paths) {
           const norm = normalizePath(p);
@@ -1635,7 +1784,12 @@ export function createMockFilesState({
             }
           }
           const cat = categoryFromName(entry.name);
-          if (cat !== 'image' && cat !== 'video' && !entry.palette) {
+          if (cat === 'audio') {
+            if (!entry.tags?.cover) {
+              results.push({ path: p, error: { code: 'not_found', message: 'No cover image.' } });
+              continue;
+            }
+          } else if (cat !== 'image' && cat !== 'video' && !entry.palette) {
             results.push({ path: p, error: { code: 'unsupported', message: 'No thumbnail for this kind.' } });
             continue;
           }
@@ -1644,11 +1798,14 @@ export function createMockFilesState({
             path: p,
             ok: {
               mime: 'image/svg+xml',
-              content: makeSampleImageBase64({ ...pal, w: 128, h: 128 }),
-              width: 128,
-              height: 128,
+              content: makeSampleImageBase64({ ...pal, w: reqSize, h: reqSize }),
+              width: reqSize,
+              height: reqSize,
             },
           });
+        }
+        if (isSlowCover && paths.some((p) => categoryFromName(p) === 'audio')) {
+          return new Promise((resolve) => setTimeout(() => resolve({ results }), 280));
         }
         return { results };
       }
@@ -2084,6 +2241,22 @@ export function createMockFilesState({
           if (signal?.aborted) {
             throw { code: 'cancelled', message: 'Loading was stopped.', hint: null, machine: machine || null };
           }
+          if (isSlowContent) {
+            await new Promise((resolve, reject) => {
+              const tid = setTimeout(resolve, 400);
+              signal?.addEventListener?.(
+                'abort',
+                () => {
+                  clearTimeout(tid);
+                  reject({ code: 'cancelled', message: 'Loading was stopped.', hint: null, machine: machine || null });
+                },
+                { once: true },
+              );
+            });
+            if (signal?.aborted) {
+              throw { code: 'cancelled', message: 'Loading was stopped.', hint: null, machine: machine || null };
+            }
+          }
           if (!isAuthedRef()) {
             throw {
               code: 'denied',
@@ -2145,6 +2318,19 @@ export function createMockFilesState({
               url,
               expires_in: 900,
             };
+          }
+          if (typeof window !== 'undefined' && typeof window.__LEGION_MOCK_OVERRIDE_CONTENT_URL__ === 'function') {
+            const override = await window.__LEGION_MOCK_OVERRIDE_CONTENT_URL__({
+              machine: target,
+              path: norm,
+              name,
+              entry,
+            });
+            if (override?.url) {
+              revokedMockUrls.delete(override.url);
+              mockStatusByUrl.delete(override.url);
+              return override;
+            }
           }
           if (cat === 'video') {
             return { url: `${getVideoUrl()}#mock-${mockUrlSeq++}`, expires_in: 900 };
@@ -2309,6 +2495,9 @@ export function createMockFilesState({
               window.__LEGION_MOCK_REVOKED_URLS__ = [];
             }
             window.__LEGION_MOCK_REVOKED_URLS__.push(key);
+            if (typeof window.__LEGION_MOCK_ON_REVOKE_CONTENT_URL__ === 'function') {
+              window.__LEGION_MOCK_ON_REVOKE_CONTENT_URL__(key);
+            }
           }
           const existing = mockStatusByUrl.get(key);
           if (existing) {

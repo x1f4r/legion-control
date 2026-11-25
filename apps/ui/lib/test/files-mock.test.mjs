@@ -181,3 +181,67 @@ test('mock link with thumb-retry returns retryable busy error once then succeeds
   assert.equal(second.results[0].ok.mime, 'image/svg+xml');
   assert.equal(extractThumbMap(second)['/home/me/Videos/Holiday/IMG_2042.jpg'].mime, 'image/svg+xml');
 });
+
+test('mock link serves fs.tags, audio covers via fs.thumb up to 1024px, and records immersive calls', async () => {
+  const link = createMockLink();
+  const tools = await link.tools({ on: 'tower' });
+  const caps = detectFileCapabilities({ tools, link });
+  assert.equal(caps.hasTags, true);
+  assert.equal(caps.hasAudioThumb, true);
+  assert.equal(caps.thumbMaxSize, 1024);
+
+  const tags = await link.call(
+    'fs.tags',
+    {
+      paths: [
+        '/home/me/Music/Album/01 - Morning Light.flac',
+        '/home/me/Music/Album/field_recording_untagged.wav',
+        '/home/me/notes.txt',
+      ],
+    },
+    { on: 'tower' },
+  );
+  assert.equal(tags.results.length, 3);
+  assert.equal(tags.results[0].ok.title, 'Morning Light');
+  assert.equal(tags.results[0].ok.artist, 'Klara');
+  assert.equal(tags.results[0].ok.album, 'Early Hours');
+  assert.equal(tags.results[0].ok.cover, true);
+  assert.deepEqual(tags.results[1].ok, { cover: false });
+  assert.equal(tags.results[2].error.code, 'unsupported');
+
+  const cover = await link.call(
+    'fs.thumb',
+    {
+      paths: [
+        '/home/me/Music/Album/01 - Morning Light.flac',
+        '/home/me/Music/Album/field_recording_untagged.wav',
+      ],
+      size: 1024,
+      fit: 'contain',
+    },
+    { on: 'tower' },
+  );
+  assert.equal(cover.results[0].ok.width, 1024);
+  assert.equal(cover.results[1].error.code, 'not_found');
+
+  assert.equal(link.canImmersive(), true);
+  await link.immersive(true, { orientation: 'landscape' });
+  await link.keepScreenOn(true);
+  await link.immersive(false);
+  await link.keepScreenOn(false);
+  assert.equal(link.immersiveCalls.length, 2);
+  assert.equal(link.immersiveCalls[0].on, true);
+  assert.equal(link.immersiveCalls[0].orientation, 'landscape');
+  assert.equal(link.immersiveCalls[1].on, false);
+  assert.equal(link.keepScreenOnCalls.length, 2);
+
+  // Old machine omits fs.tags and audio covers; no-fullscreen disables canImmersive.
+  const oldLink = createMockLink('old');
+  const oldCaps = detectFileCapabilities({ tools: await oldLink.tools({ on: 'tower' }), link: oldLink });
+  assert.equal(oldCaps.hasTags, false);
+  assert.equal(oldCaps.hasAudioThumb, false);
+  await assert.rejects(() => oldLink.call('fs.tags', { paths: ['/home/me/Music/Album/01 - Morning Light.flac'] }, { on: 'tower' }));
+
+  const noFsLink = createMockLink('no-fullscreen');
+  assert.equal(noFsLink.canImmersive(), false);
+});

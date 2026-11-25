@@ -269,9 +269,10 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
-    // 9. Royalty-free Opus Ogg audio playback loads cleanly.
+    // 9. Royalty-free Opus Ogg audio playback loads cleanly in the music player.
     await page.locator('.list a.row', { hasText: 'Voice note.ogg' }).click();
-    await page.locator('.viewer audio').waitFor();
+    await page.locator('.viewer .music-screen').waitFor();
+    await page.locator('.viewer audio').waitFor({ state: 'attached' });
     await page.waitForFunction(
       () => {
         const a = document.querySelector('.viewer audio');
@@ -1061,17 +1062,19 @@ test('Files viewer: honest media errors, in-place Open in another app progress/c
     // 6. "Open in another app" shows visible in-place "Getting it ready… X of Y" progress + Cancel,
     // and closing the viewer immediately revokes the minted content URL.
     await page.locator('.list a.row', { hasText: 'studio-master.flac' }).click();
-    const flacAudio = page.locator('.viewer audio');
-    await flacAudio.waitFor();
+    await page.locator('.viewer .music-screen').waitFor();
+    const flacAudio = page.locator('.viewer audio[src]');
+    await flacAudio.waitFor({ state: 'attached' });
     const flacUrl = await flacAudio.getAttribute('src');
     assert.ok(flacUrl, 'expected minted audio content URL');
-    await page.locator('.viewer-bar button', { hasText: 'Open in…' }).click();
+    await page.locator('.music-top button[aria-label="More options"]').click();
+    await page.locator('.sheet button', { hasText: 'Open in another app' }).click();
     const banner = page.locator('.viewer-open-banner');
     await banner.waitFor();
     await banner.getByText(/Getting it ready…/).waitFor();
     await banner.getByRole('button', { name: 'Cancel' }).click();
     await banner.waitFor({ state: 'hidden' });
-    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.music-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
     const revokedAfterClose = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
     assert.ok(
