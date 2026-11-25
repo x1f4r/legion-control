@@ -171,13 +171,33 @@ test('legion-app.yml covers every platform with timeouts, credential-free checko
       `legion-app.yml:${id} must include new-start.log in self-update diagnostics`,
     );
     assert.match(
-      body.slice(diagStart, diagStart + 1400),
+      body.slice(diagStart, diagStart + 1600),
       /rollback-ps\.txt/,
       `legion-app.yml:${id} must include rollback-ps.txt in self-update diagnostics`,
+    );
+    assert.match(
+      body.slice(diagStart, diagStart + 1600),
+      /update\.lock/,
+      `legion-app.yml:${id} must include update.lock in self-update diagnostics`,
+    );
+    assert.match(
+      body.slice(diagStart, diagStart + 1600),
+      /deferred-\*\.json/,
+      `legion-app.yml:${id} must include deferred-*.json in self-update diagnostics`,
+    );
+    assert.match(
+      body,
+      /Phase 2: concurrent second start/,
+      `legion-app.yml:${id} must verify a concurrent second start during an update`,
     );
   }
   {
     const winBody = appJobs.get('windows-desktop').join('\n');
+    assert.match(
+      winBody,
+      /cargo test --manifest-path apps\/legion-app\/src-tauri\/Cargo\.toml --locked/,
+      'legion-app.yml:windows-desktop must run Rust unit tests on Windows',
+    );
     const finallyStart = winBody.lastIndexOf('} finally {');
     assert.ok(finallyStart !== -1, 'legion-app.yml:windows-desktop missing self-update finally block');
     assert.match(
@@ -194,6 +214,21 @@ test('legion-app.yml covers every platform with timeouts, credential-free checko
       winBody,
       /rollback-ps\.txt/,
       'legion-app.yml:windows-desktop must include rollback-ps.txt in self-update diagnostics',
+    );
+    assert.match(
+      winBody,
+      /update\.lock/,
+      'legion-app.yml:windows-desktop must include update.lock in self-update diagnostics',
+    );
+    assert.match(
+      winBody,
+      /deferred-\*\.json/,
+      'legion-app.yml:windows-desktop must include deferred-*.json in self-update diagnostics',
+    );
+    assert.match(
+      winBody,
+      /Phase 2: concurrent second start/,
+      'legion-app.yml:windows-desktop must verify a concurrent second start during an update',
     );
   }
 
