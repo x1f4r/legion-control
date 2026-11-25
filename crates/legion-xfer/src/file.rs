@@ -16,15 +16,9 @@ use crate::platform;
 /// Suffix appended to a target filename while a single-file [`put`] is in progress.
 pub const PART_SUFFIX: &str = ".legion-part";
 
-/// Sidecar suffix recording the expected `(size, hash)` of a resumable `.legion-part` file.
-pub const PART_META_SUFFIX: &str = ".legion-part.meta";
-
-/// Dedicated lockfile suffix coordinating exclusive access to a resumable `.legion-part` file.
-///
-/// Locking a dedicated file (never renamed) ensures the exclusive lock stays held across
-/// `sync_all`, closing the data handle (required on Windows before rename), final hashing, and
-/// atomic placement.
-pub const PART_LOCK_SUFFIX: &str = ".legion-part.lock";
+/// Maximum retry attempts when a state-dir lock file is swept between `create_new` and `open` or
+/// fails the live-inode check.
+const LOCK_RETRY_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct PartialMeta {
@@ -32,8 +26,64 @@ struct PartialMeta {
     hash: Hash,
 }
 
+/// Default state directory used when callers invoke [`PutSession::open`] or [`resume_offset`]
+/// without specifying a node state directory (primarily tests).
+pub fn default_xfer_state_dir() -> PathBuf {
+    std::env::temp_dir().join("legion-xfer-state")
+}
+
+/// Computes a deterministic 64-hex-character key for `target` by canonicalizing its existing
+/// parent directory (so aliases like `dir/../dir/a.txt` hash identically) while preserving the
+/// exact final filename bytes.
+fn target_state_key(target: &Path) -> String {
+    let normalized = match (target.parent(), target.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            let resolved_parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+            resolved_parent.join(name)
+        }
+        _ => fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf()),
+    };
+    blake3::hash(normalized.as_os_str().as_encoded_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// Returns the state-directory metadata path (`<state_dir>/xfer/part/<key>.meta`) for `target`.
+pub fn part_meta_state_path(state_dir: &Path, target: &Path) -> PathBuf {
+    state_dir
+        .join("xfer")
+        .join("part")
+        .join(format!("{}.meta", target_state_key(target)))
+}
+
+/// Returns the state-directory lock path (`<state_dir>/xfer/part/<key>.lock`) for `target`.
+pub fn part_lock_state_path(state_dir: &Path, target: &Path) -> PathBuf {
+    state_dir
+        .join("xfer")
+        .join("part")
+        .join(format!("{}.lock", target_state_key(target)))
+}
+
+/// Returns the state-directory exclusive move-lock path (`<state_dir>/xfer/move-lock/<key>.lock`)
+/// for `target`, used to serialize crossing moves of the same source/destination files.
+pub fn move_lock_state_path(state_dir: &Path, target: &Path) -> PathBuf {
+    state_dir
+        .join("xfer")
+        .join("move-lock")
+        .join(format!("{}.lock", target_state_key(target)))
+}
+
+fn claim_state_paths(state_dir: &Path, target: &Path) -> (PathBuf, PathBuf) {
+    let key = target_state_key(target);
+    let dir = state_dir.join("xfer").join("claims");
+    (
+        dir.join(format!("{key}.lock")),
+        dir.join(format!("{key}.claim")),
+    )
+}
+
 /// Default age threshold after which abandoned `.legion-put-*` / `.legion-unpack-*` temporary
-/// files are swept opportunistically.
+/// files and state-directory sidecars are swept opportunistically.
 pub const STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Fixed copy buffer size so large transfers run in constant memory.
@@ -123,11 +173,12 @@ pub(crate) fn numbered_filename(name: &str, n: u32) -> String {
 /// [`IfExists::Skip`], and [`IfExists::Rename`], placement first attempts the kernel's atomic
 /// no-replace rename (`renameat2(RENAME_NOREPLACE)`, `renamex_np(RENAME_EXCL)`, or `MoveFileExW`
 /// without `MOVEFILE_REPLACE_EXISTING`). When the filesystem does not support no-replace rename
-/// (such as FAT, exFAT, some SMB/FUSE mounts), it falls back to atomically claiming the candidate
-/// name with `O_CREAT | O_EXCL` (`CREATE_NEW`) and renaming the verified `temp` over the claim we
-/// own, removing the claim if the rename fails. Two concurrent transfers racing for the same name
-/// never overwrite each other and no temporary file ever shares an inode with a placed file.
-pub(crate) fn place_file<F>(
+/// (such as FAT, exFAT, some SMB/FUSE mounts), it falls back to recording a claim in `state_dir`,
+/// atomically claiming the candidate name with `O_CREAT | O_EXCL` (`CREATE_NEW`), and renaming the
+/// verified `temp` over the claim we own. A stale empty claim left by a crash between the two
+/// steps is recognized from `state_dir` and cleaned up on the next attempt.
+pub(crate) fn place_file_with_state<F>(
+    state_dir: &Path,
     temp: &Path,
     target: &Path,
     if_exists: IfExists,
@@ -137,6 +188,7 @@ where
     F: FnMut(&Path) -> Result<()>,
 {
     place_file_with_ops(
+        state_dir,
         temp,
         target,
         if_exists,
@@ -147,7 +199,9 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn place_file_with_ops<F, RN, CL, RP>(
+    state_dir: &Path,
     temp: &Path,
     target: &Path,
     if_exists: IfExists,
@@ -169,6 +223,7 @@ where
         }
         IfExists::Fail => {
             if place_one_no_replace(
+                state_dir,
                 temp,
                 target,
                 &mut rename_no_replace,
@@ -185,6 +240,7 @@ where
         }
         IfExists::Skip => {
             if place_one_no_replace(
+                state_dir,
                 temp,
                 target,
                 &mut rename_no_replace,
@@ -206,6 +262,7 @@ where
                     cand
                 };
                 if place_one_no_replace(
+                    state_dir,
                     temp,
                     &candidate,
                     &mut rename_no_replace,
@@ -223,11 +280,107 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimRecord {
+    /// Claim creation was about to run (`unix_secs` when started).
+    Pending(u64),
+    /// Empty claim file was created with this `(dev, ino)` identity.
+    Claimed { dev: u64, ino: u64 },
+}
+
+fn write_claim_record(path: &Path, record: ClaimRecord) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let text = match record {
+        ClaimRecord::Pending(ts) => format!("pending {ts}\n"),
+        ClaimRecord::Claimed { dev, ino } => format!("claimed {dev} {ino}\n"),
+    };
+    legion_os::atomic::write_atomic(
+        path,
+        text.as_bytes(),
+        legion_os::atomic::WriteOptions::with_mode(0o600),
+    )
+    .map_err(|err| Error::Io {
+        path: Some(path.to_path_buf()),
+        source: io::Error::other(err),
+    })
+}
+
+fn read_claim_record(path: &Path) -> Option<ClaimRecord> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut parts = text.split_whitespace();
+    match parts.next()? {
+        "pending" => {
+            let ts: u64 = parts.next()?.parse().ok()?;
+            Some(ClaimRecord::Pending(ts))
+        }
+        "claimed" => {
+            let dev: u64 = parts.next()?.parse().ok()?;
+            let ino: u64 = parts.next()?.parse().ok()?;
+            Some(ClaimRecord::Claimed { dev, ino })
+        }
+        _ => None,
+    }
+}
+
+/// Checks whether `candidate` is an abandoned 0-byte claim left by a crashed claim-then-rename
+/// fallback (recorded under `state_dir` and whose claim lock is free). Removes the stale empty
+/// claim file and its record, returning `true` if a stale claim was cleaned up.
+///
+/// Never removes a non-empty file or a file without a matching unlocked claim record.
+pub fn reclaim_stale_claim(state_dir: &Path, candidate: &Path) -> bool {
+    let (lock_path, claim_path) = claim_state_paths(state_dir, candidate);
+    if fs::symlink_metadata(&claim_path).is_err() {
+        return false;
+    }
+    let Ok(Some(_lock)) = try_lock_state_file(&lock_path) else {
+        return false;
+    };
+    reclaim_stale_claim_locked(&claim_path, candidate)
+}
+
+fn reclaim_stale_claim_locked(claim_path: &Path, candidate: &Path) -> bool {
+    let Some(record) = read_claim_record(claim_path) else {
+        let _ = fs::remove_file(claim_path);
+        return false;
+    };
+    let Ok(meta) = fs::symlink_metadata(candidate) else {
+        let _ = fs::remove_file(claim_path);
+        return false;
+    };
+    if !meta.file_type().is_file() || meta.len() != 0 {
+        let _ = fs::remove_file(claim_path);
+        return false;
+    }
+    let matches = match record {
+        ClaimRecord::Claimed { dev, ino } => platform::symlink_file_identity(candidate)
+            .is_ok_and(|id| id.dev == dev && id.ino == ino && id.nlink == 1),
+        ClaimRecord::Pending(started_secs) => {
+            let mtime_secs = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            platform::symlink_file_identity(candidate).is_ok_and(|id| id.nlink == 1)
+                && mtime_secs + 2 >= started_secs
+        }
+    };
+    let _ = fs::remove_file(claim_path);
+    if matches {
+        fs::remove_file(candidate).is_ok()
+    } else {
+        false
+    }
+}
+
 /// Attempts to place `temp` at `candidate` without replacing an existing entry.
 ///
 /// Returns `Ok(true)` when placed, `Ok(false)` when `candidate` already existed (untouched), or
 /// `Err` on any I/O failure (removing any newly created claim before returning).
 fn place_one_no_replace<RN, CL, RP>(
+    state_dir: &Path,
     temp: &Path,
     candidate: &Path,
     rename_no_replace: &mut RN,
@@ -241,36 +394,90 @@ where
 {
     match rename_no_replace(temp, candidate) {
         Ok(()) => Ok(true),
-        Err(RenameNoReplaceError::AlreadyExists) => Ok(false),
+        Err(RenameNoReplaceError::AlreadyExists) => {
+            if reclaim_stale_claim(state_dir, candidate) {
+                match rename_no_replace(temp, candidate) {
+                    Ok(()) => return Ok(true),
+                    Err(RenameNoReplaceError::AlreadyExists) => return Ok(false),
+                    Err(RenameNoReplaceError::Io(err)) => return Err(classify_io(candidate, err)),
+                    Err(RenameNoReplaceError::Unsupported) => {}
+                }
+            } else {
+                return Ok(false);
+            }
+            place_via_claim(state_dir, temp, candidate, claim_new, replace_over)
+        }
         Err(RenameNoReplaceError::Io(err)) => Err(classify_io(candidate, err)),
         Err(RenameNoReplaceError::Unsupported) => {
-            // Claim `candidate` atomically with `O_CREAT | O_EXCL` (`CREATE_NEW`), then rename
-            // `temp` over the claim we own. Never touches any pre-existing file at `candidate`.
-            match claim_new(candidate) {
-                Ok(claim_file) => {
-                    drop(claim_file);
-                    if let Err(err) = replace_over(temp, candidate) {
-                        let _ = fs::remove_file(candidate);
-                        return Err(err);
-                    }
-                    Ok(true)
-                }
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-                Err(err) => Err(classify_io(candidate, err)),
-            }
+            place_via_claim(state_dir, temp, candidate, claim_new, replace_over)
         }
     }
 }
 
-/// An opened single-file receive session holding either an exclusive lock on the canonical
-/// resumable partial (identified by its `.legion-part.meta` `(size, hash)`) or a private unique
-/// ephemeral partial so concurrent transfers to the same target path never see each other's bytes.
+fn place_via_claim<CL, RP>(
+    state_dir: &Path,
+    temp: &Path,
+    candidate: &Path,
+    claim_new: &mut CL,
+    replace_over: &mut RP,
+) -> Result<bool>
+where
+    CL: FnMut(&Path) -> io::Result<File>,
+    RP: FnMut(&Path, &Path) -> Result<()>,
+{
+    let (lock_path, claim_path) = claim_state_paths(state_dir, candidate);
+    let Some(_claim_lock) = try_lock_state_file(&lock_path)? else {
+        return Ok(false);
+    };
+    if fs::symlink_metadata(&claim_path).is_ok() {
+        reclaim_stale_claim_locked(&claim_path, candidate);
+    }
+    let now_secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_claim_record(&claim_path, ClaimRecord::Pending(now_secs))?;
+    match claim_new(candidate) {
+        Ok(claim_file) => {
+            if let Ok(id) = platform::open_file_identity(&claim_file) {
+                let _ = write_claim_record(
+                    &claim_path,
+                    ClaimRecord::Claimed {
+                        dev: id.dev,
+                        ino: id.ino,
+                    },
+                );
+            }
+            drop(claim_file);
+            if let Err(err) = replace_over(temp, candidate) {
+                let _ = fs::remove_file(candidate);
+                let _ = fs::remove_file(&claim_path);
+                return Err(err);
+            }
+            let _ = fs::remove_file(&claim_path);
+            Ok(true)
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&claim_path);
+            Ok(false)
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&claim_path);
+            Err(classify_io(candidate, err))
+        }
+    }
+}
+
+/// An opened single-file receive session holding either an exclusive lock in the node's state
+/// directory for the canonical resumable partial (identified by its state-directory metadata
+/// `(size, hash)`) or a private unique ephemeral partial so concurrent transfers to the same
+/// target path never see each other's bytes.
 #[derive(Debug)]
 pub struct PutSession {
+    state_dir: PathBuf,
     target: PathBuf,
     partial: PathBuf,
     meta_path: Option<PathBuf>,
-    lock_path: Option<PathBuf>,
     part_lock: Option<File>,
     file: Option<File>,
     size: u64,
@@ -296,20 +503,34 @@ impl Drop for PutSession {
 
 impl PutSession {
     /// Prepares to receive a file of `size` bytes with BLAKE3 digest `expected_hash` at `target`
-    /// under `if_exists`.
-    ///
-    /// Acquires an exclusive lock on `<name>.legion-part.lock` when free. Resumes from
-    /// `<name>.legion-part` ONLY when `<name>.legion-part.meta` records the exact same `(size,
-    /// expected_hash)` and the partial is a single-linked regular file no longer than `size`.
-    /// When another concurrent transfer holds the lock (or an unrelated partial exists under a
-    /// non-replacing `if_exists` mode), opens a private unique sibling partial at offset 0 so
-    /// concurrent transfers never share or corrupt each other's bytes.
+    /// under `if_exists`, storing lock, partial metadata, and claim records under the default
+    /// transfer state directory.
     pub fn open(
         target: &Path,
         size: u64,
         expected_hash: Hash,
         if_exists: IfExists,
     ) -> Result<Self> {
+        Self::open_with_state(
+            &default_xfer_state_dir(),
+            target,
+            size,
+            expected_hash,
+            if_exists,
+        )
+    }
+
+    /// Prepares to receive a file of `size` bytes with BLAKE3 digest `expected_hash` at `target`
+    /// under `if_exists`, storing lock, partial metadata, and claim records under `state_dir` so
+    /// only the partial file itself lives beside `target`.
+    pub fn open_with_state(
+        state_dir: &Path,
+        target: &Path,
+        size: u64,
+        expected_hash: Hash,
+        if_exists: IfExists,
+    ) -> Result<Self> {
+        reclaim_stale_claim(state_dir, target);
         if let Ok(meta) = fs::symlink_metadata(target) {
             if if_exists == IfExists::Fail {
                 return Err(Error::Exists {
@@ -328,10 +549,11 @@ impl PutSession {
         if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
             let _ = sweep_stale_temps(parent, STALE_TEMP_AGE);
         }
+        let _ = sweep_stale_state(state_dir, STALE_TEMP_AGE);
 
         let canonical_partial = part_path(target)?;
-        let meta_path = part_meta_path(target)?;
-        let lock_path = part_lock_path(target)?;
+        let meta_path = part_meta_state_path(state_dir, target);
+        let lock_path = part_lock_state_path(state_dir, target);
         match try_open_locked_partial(
             &canonical_partial,
             &meta_path,
@@ -341,10 +563,10 @@ impl PutSession {
             if_exists,
         )? {
             Some((part_lock, file, offset)) => Ok(Self {
+                state_dir: state_dir.to_path_buf(),
                 target: target.to_path_buf(),
                 partial: canonical_partial,
                 meta_path: Some(meta_path),
-                lock_path: Some(lock_path),
                 part_lock: Some(part_lock),
                 file: Some(file),
                 size,
@@ -357,10 +579,10 @@ impl PutSession {
             None => {
                 let (partial, file) = create_unique_partial(target)?;
                 Ok(Self {
+                    state_dir: state_dir.to_path_buf(),
                     target: target.to_path_buf(),
                     partial,
                     meta_path: None,
-                    lock_path: None,
                     part_lock: None,
                     file: Some(file),
                     size,
@@ -384,22 +606,9 @@ impl PutSession {
         if remove_meta && let Some(ref meta_path) = self.meta_path {
             let _ = fs::remove_file(meta_path);
         }
-        #[cfg(unix)]
-        {
-            // Unlink the lock file while still holding the exclusive lock so no new opener can
-            // collide on the same inode before cleanup completes.
-            if let Some(ref lock_path) = self.lock_path {
-                let _ = fs::remove_file(lock_path);
-            }
-            self.part_lock.take();
-        }
-        #[cfg(not(unix))]
-        {
-            self.part_lock.take();
-            if let Some(ref lock_path) = self.lock_path {
-                let _ = fs::remove_file(lock_path);
-            }
-        }
+        // Leave the state-directory lock file in place (swept opportunistically by age when idle)
+        // so concurrent openers never race with lock-file unlinking.
+        self.part_lock.take();
     }
 
     /// Reads the remaining `size - offset` bytes from `reader`, verifies `expected_hash`, applies
@@ -500,7 +709,13 @@ impl PutSession {
             return Err(err);
         }
 
-        let outcome = match place_file(&self.partial, &self.target, self.if_exists, check_target) {
+        let outcome = match place_file_with_state(
+            &self.state_dir,
+            &self.partial,
+            &self.target,
+            self.if_exists,
+            check_target,
+        ) {
             Ok(outcome) => outcome,
             Err(err) => {
                 if self.ephemeral
@@ -554,9 +769,8 @@ impl PutSession {
     }
 }
 
-/// Removes abandoned temporary files (`.legion-put-*.legion-part`, `.legion-unpack-*.tmp`,
-/// `.legion-link-*.tmp`, `.legion-move-probe-*.tmp`) in `dir` whose modification time is older
-/// than `max_age` and that are not locked by a live transfer.
+/// Removes abandoned temporary files matching [`platform::is_sweepable_temp_name`] in `dir` whose
+/// modification time is older than `max_age` and that are not locked by a live transfer.
 pub fn sweep_stale_temps(dir: &Path, max_age: Duration) -> usize {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
@@ -568,12 +782,7 @@ pub fn sweep_stale_temps(dir: &Path, max_age: Duration) -> usize {
         let Some(name) = name_os.to_str() else {
             continue;
         };
-        let is_sweepable = (name.starts_with(".legion-put-") && name.ends_with(PART_SUFFIX))
-            || ((name.starts_with(".legion-unpack-")
-                || name.starts_with(".legion-link-")
-                || name.starts_with(".legion-move-probe-"))
-                && name.ends_with(".tmp"));
-        if !is_sweepable {
+        if !platform::is_sweepable_temp_name(name) {
             continue;
         }
         let path = entry.path();
@@ -610,7 +819,67 @@ pub fn sweep_stale_temps(dir: &Path, max_age: Duration) -> usize {
     removed
 }
 
+/// Removes abandoned lock, partial metadata, and claim files under `<state_dir>/xfer/` whose
+/// modification time is older than `max_age` and that are not currently locked.
+pub fn sweep_stale_state(state_dir: &Path, max_age: Duration) -> usize {
+    let base = state_dir.join("xfer");
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    for sub in ["part", "move-lock", "claims"] {
+        let dir = base.join(sub);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.file_type().is_file() {
+                continue;
+            }
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let Ok(age) = now.duration_since(modified) else {
+                continue;
+            };
+            if age < max_age {
+                continue;
+            }
+            let lockable = match OpenOptions::new().write(true).open(&path) {
+                Ok(file) => match file.try_lock() {
+                    Ok(()) => {
+                        drop(file);
+                        true
+                    }
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+            if lockable && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+/// Writes the partial metadata record (`{size} {hash}\n`) for `target` under `state_dir`.
+pub fn write_partial_meta_in_state(
+    state_dir: &Path,
+    target: &Path,
+    size: u64,
+    hash: Hash,
+) -> Result<()> {
+    let meta_path = part_meta_state_path(state_dir, target);
+    write_partial_meta(&meta_path, size, hash)
+}
+
 fn write_partial_meta(meta_path: &Path, size: u64, hash: Hash) -> Result<()> {
+    if let Some(parent) = meta_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| classify_io(parent, e))?;
+    }
     let text = format!("{size} {hash}\n");
     legion_os::atomic::write_atomic(
         meta_path,
@@ -634,40 +903,58 @@ fn read_partial_meta(meta_path: &Path) -> Option<PartialMeta> {
     Some(PartialMeta { size, hash })
 }
 
-fn try_lock_canonical_path(lock_path: &Path) -> Result<Option<File>> {
-    let lock_file = match platform::create_new_private(lock_path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            let meta = fs::symlink_metadata(lock_path).map_err(|e| classify_io(lock_path, e))?;
-            if !meta.file_type().is_file() {
-                return Ok(None);
+/// Non-blocking exclusive lock acquisition on a state-directory lock file.
+///
+/// Retries cleanly if another process or opportunistic sweep unlinks the lock file between
+/// `create_new` and `symlink_metadata`/`open`, or if the locked file descriptor no longer matches
+/// the live directory entry. Returns `Ok(Some(file))` when acquired, `Ok(None)` when another live
+/// holder owns the lock (`WouldBlock`), or `Err` on unexpected I/O errors.
+pub fn try_lock_state_file(lock_path: &Path) -> Result<Option<File>> {
+    if let Some(parent) = lock_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| classify_io(parent, e))?;
+    }
+    for _ in 0..LOCK_RETRY_LIMIT {
+        let lock_file = match platform::create_new_private(lock_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                let meta = match fs::symlink_metadata(lock_path) {
+                    Ok(meta) => meta,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(classify_io(lock_path, e)),
+                };
+                if !meta.file_type().is_file() {
+                    return Ok(None);
+                }
+                match OpenOptions::new().write(true).open(lock_path) {
+                    Ok(file) => file,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(classify_io(lock_path, e)),
+                }
             }
-            match OpenOptions::new().write(true).open(lock_path) {
-                Ok(file) => file,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(err) => return Err(classify_io(lock_path, err)),
-            }
+            Err(err) => return Err(classify_io(lock_path, err)),
+        };
+
+        match lock_file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Error(err)) => return Err(classify_io(lock_path, err)),
         }
-        Err(err) => return Err(classify_io(lock_path, err)),
-    };
 
-    match lock_file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Ok(None),
-        Err(TryLockError::Error(err)) => return Err(classify_io(lock_path, err)),
+        // Verify the locked inode is still the live entry at `lock_path` so an opener that raced
+        // with an age sweep never proceeds on an unlinked lock inode.
+        let same_live_inode = platform::open_file_identity(&lock_file)
+            .ok()
+            .zip(platform::symlink_file_identity(lock_path).ok())
+            .is_some_and(|(a, b)| a.same_file(&b));
+        if !same_live_inode {
+            continue;
+        }
+
+        return Ok(Some(lock_file));
     }
-
-    // Verify the locked inode is still the live entry at `lock_path` so an opener that raced with
-    // another session's unlink never proceeds on an unlinked lock inode.
-    let same_live_inode = platform::open_file_identity(&lock_file)
-        .ok()
-        .zip(platform::symlink_file_identity(lock_path).ok())
-        .is_some_and(|(a, b)| a.same_file(&b));
-    if !same_live_inode {
-        return Ok(None);
-    }
-
-    Ok(Some(lock_file))
+    Ok(None)
 }
 
 fn try_open_locked_partial(
@@ -678,7 +965,7 @@ fn try_open_locked_partial(
     expected_hash: Hash,
     if_exists: IfExists,
 ) -> Result<Option<(File, File, u64)>> {
-    let Some(part_lock) = try_lock_canonical_path(lock_path)? else {
+    let Some(part_lock) = try_lock_state_file(lock_path)? else {
         return Ok(None);
     };
 
@@ -713,7 +1000,7 @@ fn try_open_locked_partial(
                     .map_err(|e| classify_io(partial, e))?;
                 return Ok(Some((part_lock, file, existing_len)));
             }
-            // Existing partial belongs to a different transfer (missing or mismatched sidecar) or
+            // Existing partial belongs to a different transfer (missing or mismatched metadata) or
             // exceeds `size`. Under non-replacing modes, leave it alone and use a private partial;
             // under Replace, reset it cleanly for this transfer.
             if if_exists != IfExists::Replace {
@@ -776,33 +1063,17 @@ pub fn part_path(target: &Path) -> Result<PathBuf> {
     })
 }
 
-/// Computes the sibling partial metadata path (`<name>.legion-part.meta`) for `target`.
-pub fn part_meta_path(target: &Path) -> Result<PathBuf> {
-    let file_name = validate_target_filename(target)?;
-    let mut name = file_name.to_os_string();
-    name.push(PART_META_SUFFIX);
-    Ok(match target.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
-        _ => PathBuf::from(name),
-    })
-}
-
-/// Computes the sibling partial lock path (`<name>.legion-part.lock`) for `target`.
-pub fn part_lock_path(target: &Path) -> Result<PathBuf> {
-    let file_name = validate_target_filename(target)?;
-    let mut name = file_name.to_os_string();
-    name.push(PART_LOCK_SUFFIX);
-    Ok(match target.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
-        _ => PathBuf::from(name),
-    })
+/// Returns the resumable byte offset for `target` using the default transfer state directory.
+pub fn resume_offset(target: &Path) -> Result<u64> {
+    resume_offset_with_state(&default_xfer_state_dir(), target)
 }
 
 /// Returns the resumable byte offset for `target`: the partial file's current length, or `0` if no
-/// safe single-linked regular partial file exists yet or another transfer currently holds its lock.
-pub fn resume_offset(target: &Path) -> Result<u64> {
+/// safe single-linked regular partial file exists yet or another transfer currently holds its lock
+/// in `state_dir`.
+pub fn resume_offset_with_state(state_dir: &Path, target: &Path) -> Result<u64> {
     let partial = part_path(target)?;
-    let lock_path = part_lock_path(target)?;
+    let lock_path = part_lock_state_path(state_dir, target);
     if let Ok(lock_file) = OpenOptions::new().write(true).open(&lock_path)
         && matches!(lock_file.try_lock(), Err(TryLockError::WouldBlock))
     {
@@ -826,19 +1097,36 @@ pub fn resume_offset(target: &Path) -> Result<u64> {
     }
 }
 
-/// Returns the resumable byte offset for `target` ONLY when `<name>.legion-part` is unlocked,
-/// single-linked, no longer than `expected_size`, and `<name>.legion-part.meta` records the exact
-/// same `expected_size` and `expected_hash` (when given). Returns `0` otherwise.
+/// Returns the resumable byte offset for `target` using the default transfer state directory,
+/// checking the recorded `(expected_size, expected_hash)`.
 pub fn resume_offset_for(
     target: &Path,
     expected_size: u64,
     expected_hash: Option<Hash>,
 ) -> Result<u64> {
-    let offset = resume_offset(target)?;
+    resume_offset_for_with_state(
+        &default_xfer_state_dir(),
+        target,
+        expected_size,
+        expected_hash,
+    )
+}
+
+/// Returns the resumable byte offset for `target` ONLY when `<name>.legion-part` is unlocked,
+/// single-linked, no longer than `expected_size`, and its state-directory metadata under
+/// `state_dir` records the exact same `expected_size` and `expected_hash` (when given). Returns
+/// `0` otherwise.
+pub fn resume_offset_for_with_state(
+    state_dir: &Path,
+    target: &Path,
+    expected_size: u64,
+    expected_hash: Option<Hash>,
+) -> Result<u64> {
+    let offset = resume_offset_with_state(state_dir, target)?;
     if offset == 0 || offset > expected_size {
         return Ok(0);
     }
-    let meta_path = part_meta_path(target)?;
+    let meta_path = part_meta_state_path(state_dir, target);
     let Some(recorded) = read_partial_meta(&meta_path) else {
         return Ok(0);
     };
@@ -1722,6 +2010,7 @@ mod tests {
         use std::sync::{Arc, Barrier};
 
         let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
         let existing = dir.path().join("photo.jpg");
         fs::write(&existing, b"original-200kb-content").unwrap();
 
@@ -1730,6 +2019,7 @@ mod tests {
         let tmp_fail = dir.path().join(".tmp-fail");
         fs::write(&tmp_fail, b"new-fail").unwrap();
         let err = place_file_with_ops(
+            state.path(),
             &tmp_fail,
             &existing,
             IfExists::Fail,
@@ -1746,6 +2036,7 @@ mod tests {
         let tmp_skip = dir.path().join(".tmp-skip");
         fs::write(&tmp_skip, b"new-skip").unwrap();
         let skipped = place_file_with_ops(
+            state.path(),
             &tmp_skip,
             &existing,
             IfExists::Skip,
@@ -1765,6 +2056,7 @@ mod tests {
         let tmp_crash = dir.path().join(".tmp-crash");
         fs::write(&tmp_crash, b"fresh-data").unwrap();
         let err = place_file_with_ops(
+            state.path(),
             &tmp_crash,
             &fresh,
             IfExists::Fail,
@@ -1785,6 +2077,53 @@ mod tests {
         assert!(!fresh.exists(), "failed claim must be cleaned up");
         assert!(tmp_crash.exists(), "partial stays intact for retry");
 
+        // Simulate a hard SIGKILL crash between `create_new` and `replace_over` that leaves BOTH
+        // the 0-byte claim file at `crashed.bin` AND its `.claim` record in `state_dir` (lock
+        // released by OS on process death). Subsequent `IfExists::Fail` and `IfExists::Skip` must
+        // recognize and remove the stale claim instead of failing or skipping forever, while a
+        // genuine user-created 0-byte file with NO claim record is NEVER removed!
+        for mode in [IfExists::Fail, IfExists::Skip] {
+            let crashed = dir.path().join(format!("crashed-{mode:?}.bin"));
+            let claim_file = platform::create_new_private(&crashed).unwrap();
+            let id = platform::open_file_identity(&claim_file).unwrap();
+            drop(claim_file);
+            let (_, claim_path) = claim_state_paths(state.path(), &crashed);
+            write_claim_record(
+                &claim_path,
+                ClaimRecord::Claimed {
+                    dev: id.dev,
+                    ino: id.ino,
+                },
+            )
+            .unwrap();
+
+            let payload = b"recovered-after-crash";
+            let hash = crate::hash::hash_bytes(payload);
+            let session = PutSession::open_with_state(
+                state.path(),
+                &crashed,
+                payload.len() as u64,
+                hash,
+                mode,
+            )
+            .unwrap();
+            let out = session
+                .finish(hash, io::Cursor::new(payload), None, |_| Ok(()))
+                .unwrap();
+            assert!(!out.skipped, "stale claim must be reclaimed under {mode:?}");
+            assert_eq!(out.path, Some(crashed.clone()));
+            assert_eq!(fs::read(&crashed).unwrap(), payload);
+        }
+
+        // A genuine user 0-byte file (no claim record in state_dir) must NEVER be removed by Fail.
+        let real_empty = dir.path().join("real-empty.txt");
+        fs::write(&real_empty, b"").unwrap();
+        let hash = crate::hash::hash_bytes(b"overwrite");
+        let err = PutSession::open_with_state(state.path(), &real_empty, 9, hash, IfExists::Fail)
+            .unwrap_err();
+        assert!(matches!(err, Error::Exists { .. }), "{err:?}");
+        assert!(real_empty.exists());
+
         // Concurrent Rename race under claim-then-rename fallback (no `rename_no_replace`, no
         // hard links): 4 racing threads all land at distinct numbered files with distinct inodes.
         let race_target = dir.path().join("exfat.bin");
@@ -1792,6 +2131,7 @@ mod tests {
         let mut threads = Vec::new();
         for i in 0u8..4 {
             let race_target = race_target.clone();
+            let state_path = state.path().to_path_buf();
             let barrier = Arc::clone(&barrier);
             let tmp = dir.path().join(format!(".tmp-race-{i}"));
             let payload = vec![b'0' + i; 4096];
@@ -1799,6 +2139,7 @@ mod tests {
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
                 let placed = place_file_with_ops(
+                    &state_path,
                     &tmp,
                     &race_target,
                     IfExists::Rename,
@@ -1925,8 +2266,17 @@ mod tests {
         assert_eq!(fs::read(dir.path().join("ord1.bin")).unwrap(), bytes_b);
         assert_eq!(fs::read(dir.path().join("ord1 (2).bin")).unwrap(), bytes_a);
         assert!(!part_path(&ord1).unwrap().exists());
-        assert!(!part_meta_path(&ord1).unwrap().exists());
-        assert!(!part_lock_path(&ord1).unwrap().exists());
+        // No `.lock` or `.meta` sidecars are ever created in the user's folder.
+        let user_entries: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            user_entries
+                .iter()
+                .all(|n| !n.ends_with(".lock") && !n.ends_with(".meta")),
+            "sidecars must live in state_dir, not user dir: {user_entries:?}"
+        );
 
         // Order 2: Put A opens, Put B opens while A is open, Put A finishes FIRST (takes
         // `ord2.bin`), then Put B finishes SECOND (takes `ord2 (2).bin`).
@@ -2021,5 +2371,138 @@ mod tests {
         assert!(locked.exists(), "actively locked temp must remain");
         assert!(user_file.exists(), "unrelated user file must remain");
         drop(held);
+    }
+
+    #[test]
+    fn every_legion_created_user_folder_name_is_on_the_authoritative_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("notes.txt");
+        let part_name = part_path(&target)
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let (ephemeral_path, ephemeral_file) = create_unique_partial(&target).unwrap();
+        drop(ephemeral_file);
+        let ephemeral_name = ephemeral_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = fs::remove_file(&ephemeral_path);
+
+        let all_internal_names = [
+            part_name,
+            ephemeral_name,
+            ".legion-unpack-42-0.tmp".to_owned(),
+            ".legion-link-42-1.tmp".to_owned(),
+            ".legion-CaseProbe-42-2.tmp".to_owned(),
+            ".legion-NormProbe-e\u{0301}-42-3.tmp".to_owned(),
+            ".legion-move-probe-42-abcd-4.tmp".to_owned(),
+            ".notes.txt.legion-tmp-42-5-999".to_owned(),
+        ];
+        for name in &all_internal_names {
+            assert!(
+                platform::is_legion_internal_name(name),
+                "internal name {name:?} must be recognized by is_legion_internal_name"
+            );
+        }
+
+        // Visible recovery intermediates for two-step case renames and normal user files MUST NOT
+        // be hidden as internal names.
+        for visible in [
+            "notes.txt",
+            ".gitignore",
+            "legion-renaming-01234567-Report.txt",
+            "report.legion-part.bak",
+        ] {
+            assert!(
+                !platform::is_legion_internal_name(visible),
+                "visible name {visible:?} must NOT be hidden as internal"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_put_leaves_only_partial_in_user_folder_and_sidecars_in_state_dir() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let target = user_dir.path().join("clip.bin");
+        let payload = vec![b'X'; 32 * 1024];
+        let hash = crate::hash::hash_bytes(&payload);
+
+        let sess = PutSession::open_with_state(
+            state_dir.path(),
+            &target,
+            payload.len() as u64,
+            hash,
+            IfExists::Replace,
+        )
+        .unwrap();
+        let err = sess
+            .finish(hash, io::Cursor::new(&payload[..8192]), None, |_| Ok(()))
+            .unwrap_err();
+        assert!(matches!(err, Error::Io { .. }));
+
+        // User folder holds ONLY `clip.bin.legion-part` — zero `.lock` or `.meta` files!
+        let user_entries: Vec<String> = fs::read_dir(user_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(user_entries, vec!["clip.bin.legion-part"]);
+
+        // State dir holds the lock and metadata, and resume works across restart.
+        assert!(part_meta_state_path(state_dir.path(), &target).exists());
+        assert!(part_lock_state_path(state_dir.path(), &target).exists());
+        assert_eq!(
+            resume_offset_for_with_state(
+                state_dir.path(),
+                &target,
+                payload.len() as u64,
+                Some(hash),
+            )
+            .unwrap(),
+            8192
+        );
+
+        // Age-sweeping state dir removes old unlocked sidecars cleanly.
+        let lock_path = part_lock_state_path(state_dir.path(), &target);
+        let old = fs::FileTimes::new()
+            .set_modified(SystemTime::now() - Duration::from_secs(48 * 60 * 60));
+        fs::set_times(&lock_path, old).unwrap();
+        assert!(sweep_stale_state(state_dir.path(), STALE_TEMP_AGE) >= 1);
+    }
+
+    #[test]
+    fn try_lock_state_file_retries_cleanly_when_lock_file_is_unlinked_under_contention() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let lock_path = state_dir.path().join("xfer/part/race.lock");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_sweeper = Arc::clone(&stop);
+        let lock_sweeper = lock_path.clone();
+
+        // Simulate an aggressive sweeper unlinking the lock file while workers lock/unlock it.
+        let sweeper = std::thread::spawn(move || {
+            while !stop_sweeper.load(Ordering::Relaxed) {
+                let _ = fs::remove_file(&lock_sweeper);
+                std::thread::yield_now();
+            }
+        });
+
+        for _ in 0..200 {
+            let res = try_lock_state_file(&lock_path);
+            assert!(
+                res.is_ok(),
+                "try_lock_state_file must retry on NotFound instead of failing: {res:?}"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        sweeper.join().unwrap();
     }
 }

@@ -6,15 +6,32 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use legion_os::atomic::FileIdentity;
 use serde::{Deserialize, Serialize};
 use tar::{Archive, Builder, EntryType, Header};
 
 use crate::error::{Error, Result, classify_io};
-use crate::file::{IfExists, MAX_RENAME_ATTEMPTS, PlaceOutcome, numbered_candidate, place_file};
+use crate::file::{
+    IfExists, MAX_RENAME_ATTEMPTS, PlaceOutcome, default_xfer_state_dir, numbered_candidate,
+    place_file_with_state,
+};
 use crate::hash::{Hash, hash_file};
 use crate::manifest::{CaseCollision, EntryKind, SkippedEntry, Timestamp};
 use crate::path::parse_relative_path_bytes;
 use crate::platform;
+
+/// Verified destination metadata captured immediately after an archive file is placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacedFileMeta {
+    /// Filesystem identity `(dev, ino, nlink)` of the placed file, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<FileIdentity>,
+    /// Final byte length of the placed file.
+    pub size: u64,
+    /// Modification timestamp of the placed file, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<Timestamp>,
+}
 
 /// An entry placed under a numbered sibling name because its original path already existed under
 /// [`IfExists::Rename`].
@@ -62,6 +79,10 @@ pub struct UnpackReport {
     /// Entries in the archive whose paths differed only in letter case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub case_collisions: Vec<CaseCollision>,
+    /// Verified destination metadata captured immediately after each placed file, keyed by the
+    /// actual destination relative path (including any `IfExists::Rename` suffix).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub placed_meta: BTreeMap<String, PlacedFileMeta>,
 }
 
 /// Writes a tar stream containing the exact relative `names` under `root` into `writer`.
@@ -159,7 +180,9 @@ where
 ///
 /// Convenience wrapper over [`unpack_filtered`] that accepts every valid entry.
 pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
+    let state_dir = default_xfer_state_dir();
     unpack_impl(
+        &state_dir,
         root,
         reader,
         IfExists::Replace,
@@ -186,7 +209,9 @@ where
     R: Read,
     F: FnMut(&str, EntryKind) -> bool,
 {
+    let state_dir = default_xfer_state_dir();
     unpack_impl(
+        &state_dir,
         root,
         reader,
         IfExists::Replace,
@@ -211,9 +236,17 @@ where
     F: FnMut(&str, EntryKind) -> bool,
     C: FnMut(&Path, EntryKind) -> Result<()>,
 {
-    unpack_impl(root, reader, if_exists, true, filter, check_target, |_| {
-        None
-    })
+    let state_dir = default_xfer_state_dir();
+    unpack_impl(
+        &state_dir,
+        root,
+        reader,
+        if_exists,
+        true,
+        filter,
+        check_target,
+        |_| None,
+    )
 }
 
 /// Like [`unpack_with_options`], also re-reading and verifying each regular file's stored bytes on
@@ -232,7 +265,9 @@ where
     C: FnMut(&Path, EntryKind) -> Result<()>,
     H: FnMut(&str) -> Option<Hash>,
 {
+    let state_dir = default_xfer_state_dir();
     unpack_impl(
+        &state_dir,
         root,
         reader,
         if_exists,
@@ -243,7 +278,38 @@ where
     )
 }
 
+/// Like [`unpack_with_options_and_hashes`], storing claim and partial-cleanup state under
+/// `state_dir` so no sidecars live in user folders.
+pub fn unpack_with_options_hashes_and_state<R, F, C, H>(
+    state_dir: &Path,
+    root: &Path,
+    reader: R,
+    if_exists: IfExists,
+    filter: F,
+    check_target: C,
+    expected_hash: H,
+) -> Result<UnpackReport>
+where
+    R: Read,
+    F: FnMut(&str, EntryKind) -> bool,
+    C: FnMut(&Path, EntryKind) -> Result<()>,
+    H: FnMut(&str) -> Option<Hash>,
+{
+    unpack_impl(
+        state_dir,
+        root,
+        reader,
+        if_exists,
+        true,
+        filter,
+        check_target,
+        expected_hash,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn unpack_impl<R, F, C, H>(
+    state_dir: &Path,
     root: &Path,
     reader: R,
     if_exists: IfExists,
@@ -457,15 +523,15 @@ where
                         .map_err(|e| classify_io(guard.path(), e))?;
                 }
 
-                match place_file(guard.path(), &dest, if_exists, |cand| {
+                match place_file_with_state(state_dir, guard.path(), &dest, if_exists, |cand| {
                     check_target(cand, EntryKind::File)
                 })? {
                     PlaceOutcome::Placed(chosen) => {
                         guard.disarm();
-                        remove_stale_part_file(&chosen);
+                        remove_stale_part_file(state_dir, &chosen);
                         dirs_to_sync.insert(parent);
 
-                        if chosen != dest
+                        let placed_rel = if chosen != dest
                             && let Some(chosen_name) =
                                 chosen.file_name().and_then(|name| name.to_str())
                         {
@@ -473,11 +539,22 @@ where
                             record_written(&mut written_exact, &mut written_ancestors, &chosen_rel);
                             report.renamed.push(RenamedEntry {
                                 from: rel.clone(),
-                                to: chosen_rel,
+                                to: chosen_rel.clone(),
                             });
+                            chosen_rel
                         } else {
                             record_written(&mut written_exact, &mut written_ancestors, &rel);
-                        }
+                            rel.clone()
+                        };
+                        let placed_meta = fs::symlink_metadata(&chosen).ok();
+                        report.placed_meta.insert(
+                            placed_rel,
+                            PlacedFileMeta {
+                                file_id: platform::symlink_file_identity(&chosen).ok(),
+                                size: placed_meta.as_ref().map_or(written, fs::Metadata::len),
+                                mtime: placed_meta.as_ref().map(Timestamp::from_metadata),
+                            },
+                        );
                         report.files.push(rel);
                         report.bytes += written;
                     }
@@ -530,7 +607,7 @@ where
                     check_target(cand, EntryKind::Symlink)
                 })? {
                     SymlinkPlace::Placed(chosen) => {
-                        remove_stale_part_file(&chosen);
+                        remove_stale_part_file(state_dir, &chosen);
                         dirs_to_sync.insert(parent);
                         if chosen != dest
                             && let Some(chosen_name) =
@@ -748,16 +825,16 @@ fn parse_pax_mtime(raw: &str) -> Option<SystemTime> {
     }
 }
 
-/// Removes a stale `<name>.legion-part` file beside `dest` when `unpack` replaces `dest`.
-fn remove_stale_part_file(dest: &Path) {
+/// Removes a stale `<name>.legion-part` file beside `dest` and its state-directory metadata when
+/// `unpack` replaces `dest`.
+fn remove_stale_part_file(state_dir: &Path, dest: &Path) {
     if let Ok(partial) = crate::file::part_path(dest)
         && let Ok(meta) = fs::symlink_metadata(&partial)
         && meta.file_type().is_file()
     {
         let _ = fs::remove_file(&partial);
-        if let Ok(meta_path) = crate::file::part_meta_path(dest) {
-            let _ = fs::remove_file(&meta_path);
-        }
+        let meta_path = crate::file::part_meta_state_path(state_dir, dest);
+        let _ = fs::remove_file(&meta_path);
     }
 }
 

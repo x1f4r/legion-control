@@ -20,14 +20,16 @@ pub mod plan;
 mod platform;
 
 pub use archive::{
-    PackReport, RenamedEntry, UnpackReport, pack, unpack, unpack_filtered, unpack_with_options,
-    unpack_with_options_and_hashes,
+    PackReport, PlacedFileMeta, RenamedEntry, UnpackReport, pack, unpack, unpack_filtered,
+    unpack_with_options, unpack_with_options_and_hashes, unpack_with_options_hashes_and_state,
 };
 pub use error::{Error, Result};
 pub use file::{
-    GetStream, IfExists, PART_LOCK_SUFFIX, PART_META_SUFFIX, PART_SUFFIX, PlaceOutcome, PutOutcome,
-    PutReport, PutSession, STALE_TEMP_AGE, get, numbered_candidate, open_get, part_lock_path,
-    part_meta_path, part_path, put, resume_offset, resume_offset_for, sweep_stale_temps,
+    GetStream, IfExists, PART_SUFFIX, PlaceOutcome, PutOutcome, PutReport, PutSession,
+    STALE_TEMP_AGE, default_xfer_state_dir, get, move_lock_state_path, numbered_candidate,
+    open_get, part_lock_state_path, part_meta_state_path, part_path, put, reclaim_stale_claim,
+    resume_offset, resume_offset_for, resume_offset_for_with_state, resume_offset_with_state,
+    sweep_stale_state, sweep_stale_temps, try_lock_state_file, write_partial_meta_in_state,
 };
 pub use hash::{Hash, HashingReader, HashingWriter};
 pub use manifest::{
@@ -35,3 +37,4 @@ pub use manifest::{
 };
 pub use path::{resolve_relative_path, validate_relative_path};
 pub use plan::{Plan, PlanConflict, PlanOptions, PlanTotals};
+pub use platform::{is_legion_internal_name, is_sweepable_temp_name};

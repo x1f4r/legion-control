@@ -29,15 +29,38 @@ pub(crate) fn next_temp_id() -> u64 {
     TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Returns `true` when `name` matches one of this crate's own temporary file patterns.
-pub(crate) fn is_internal_temp_name(name: &str) -> bool {
+/// Single authoritative predicate for names Legion itself creates in user folders.
+///
+/// Used by manifests, transfers, deletion, sweeps, and sync so internal temporaries and partials
+/// are never mistaken for user files. Visible recovery intermediates for two-step case renames
+/// (`legion-renaming-*`) are intentionally excluded so an interrupted rename stays visible and
+/// recoverable rather than disappearing from listings.
+pub fn is_legion_internal_name(name: &str) -> bool {
     name.ends_with(".legion-part")
         || ((name.starts_with(".legion-unpack-")
             || name.starts_with(".legion-link-")
             || name.starts_with(".legion-CaseProbe-")
-            || name.starts_with(".legion-move-probe-")
-            || name.starts_with(".legion-rename-"))
+            || name.starts_with(".legion-NormProbe-")
+            || name.starts_with(".legion-move-probe-"))
             && name.ends_with(".tmp"))
+        || (name.starts_with('.') && name.contains(".legion-tmp-"))
+}
+
+/// Returns `true` when `name` is an ephemeral Legion temporary in a user folder that is safe to
+/// remove opportunistically once older than `STALE_TEMP_AGE` and unlocked.
+pub fn is_sweepable_temp_name(name: &str) -> bool {
+    (name.starts_with(".legion-put-") && name.ends_with(".legion-part"))
+        || ((name.starts_with(".legion-unpack-")
+            || name.starts_with(".legion-link-")
+            || name.starts_with(".legion-CaseProbe-")
+            || name.starts_with(".legion-NormProbe-")
+            || name.starts_with(".legion-move-probe-"))
+            && name.ends_with(".tmp"))
+}
+
+/// Returns `true` when `name` matches one of this crate's own temporary file patterns.
+pub(crate) fn is_internal_temp_name(name: &str) -> bool {
+    is_legion_internal_name(name)
 }
 
 /// Replaces `to` with `from` using the shared platform-aware atomic rename (including Windows
