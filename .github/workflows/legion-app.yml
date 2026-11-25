@@ -138,7 +138,10 @@ jobs:
           fi
       - name: Build Android debug APK (arm64 + x86_64)
         working-directory: apps/legion-app
-        run: cargo tauri android build --debug --apk --target aarch64 --target x86_64
+        run: |
+          set -euo pipefail
+          export LEGION_BUILD_SEQUENCE="$(date -u +%Y%m%d%H%M)"
+          cargo tauri android build --debug --apk --target aarch64 --target x86_64
       - name: Enable KVM for the Android emulator
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -257,7 +260,10 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf src-tauri/target/release/bundle
-          cargo tauri build --bundles deb,appimage
+          export LEGION_BUILD_SEQUENCE="$(date -u +%Y%m%d%H%M)"
+          BASE_VER="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' src-tauri/Cargo.toml)"
+          CFG="$(node ../../scripts/make-update-set.mjs tauri-config --os linux --version "$BASE_VER" --sequence "$LEGION_BUILD_SEQUENCE")"
+          cargo tauri build --bundles deb,appimage --config "$CFG"
       - name: Verify deb package metadata does not collide with node package
         run: |
           set -euo pipefail
@@ -341,6 +347,7 @@ jobs:
         working-directory: apps/legion-app
         run: |
           set -euo pipefail
+          export LEGION_BUILD_SEQUENCE="$(date -u +%Y%m%d%H%M)"
           cargo tauri ios build --target aarch64-sim --no-sign --ci
           find src-tauri/gen/apple/build -maxdepth 4 -name '*.app'
       - name: Boot iPhone and iPad simulators, verify ready marker and capture screenshots
@@ -501,6 +508,7 @@ jobs:
         working-directory: apps/legion-app
         run: |
           set -euo pipefail
+          export LEGION_BUILD_SEQUENCE="$(date -u +%Y%m%d%H%M)"
           cargo tauri ios build --target aarch64 --no-sign --ci
           IPA_PATH="$(find src-tauri/gen/apple/build -maxdepth 4 -name '*.ipa' | head -n 1)"
           test -s "$IPA_PATH"
@@ -550,7 +558,10 @@ jobs:
         working-directory: apps/legion-app
         run: |
           set -euo pipefail
-          cargo tauri build --bundles app,dmg
+          export LEGION_BUILD_SEQUENCE="$(date -u +%Y%m%d%H%M)"
+          BASE_VER="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' src-tauri/Cargo.toml)"
+          CFG="$(node ../../scripts/make-update-set.mjs tauri-config --os macos --version "$BASE_VER" --sequence "$LEGION_BUILD_SEQUENCE")"
+          cargo tauri build --bundles app,dmg --config "$CFG"
           ls -lh src-tauri/target/release/bundle/macos/ src-tauri/target/release/bundle/dmg/
       - name: Launch macOS app, verify window and ready marker
         run: |
@@ -639,8 +650,9 @@ jobs:
           cp "$WORK/node-target/release/legion" "$WORK/bin/legion"
           chmod 755 "$WORK/bin/legion"
 
-          SEQ1=202611250501
-          SEQ2=202611250502
+          SEQ1="$(node -e 'import("./scripts/make-update-set.mjs").then(m => console.log(m.currentSequence(new Date(Date.now() - 10 * 60_000))))')"
+          SEQ2="$(node scripts/make-update-set.mjs sequence)"
+          if [ "$SEQ2" -le "$SEQ1" ]; then SEQ2="$((SEQ1 + 1))"; fi
 
           CFG1="$(node scripts/make-update-set.mjs tauri-config --os macos --version 0.1.0 --sequence "$SEQ1")"
           (
@@ -759,7 +771,13 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cargo tauri build --bundles nsis
+          $seq = (node ..\..\scripts\make-update-set.mjs sequence).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:LEGION_BUILD_SEQUENCE = $seq
+          $baseVer = ((Get-Content -LiteralPath src-tauri\Cargo.toml) | Where-Object { $_ -match '^version\s*=' } | Select-Object -First 1) -replace '^[^"]*"([^"]+)".*$', '$1'
+          $cfg = (node ..\..\scripts\make-update-set.mjs tauri-config --os windows --version $baseVer --sequence $seq)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo tauri build --bundles nsis --config $cfg
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem src-tauri\target\release\bundle\nsis\
       - name: Silently install NSIS package, launch app and verify ready marker
@@ -839,7 +857,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $work = Join-Path $env:RUNNER_TEMP 'windows-update-test'
-          $appUpdates = Join-Path $env:APPDATA 'com.x1f4r.legion\updates'
+          $appUpdates = Join-Path $env:LOCALAPPDATA 'com.x1f4r.legion\updates'
           Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item -LiteralPath $appUpdates -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Path (Join-Path $work 'bin'), (Join-Path $work 'install'), (Join-Path $work 'node') -Force | Out-Null
@@ -857,8 +875,9 @@ jobs:
           Copy-Item -LiteralPath (Join-Path $work 'node-target\release\legion.exe') -Destination $legionBin -Force
           Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
 
-          $seq1 = 202611250501
-          $seq2 = 202611250502
+          $seq1 = [int64](node -e 'import("./scripts/make-update-set.mjs").then(m => console.log(m.currentSequence(new Date(Date.now() - 10 * 60_000))))').Trim()
+          $seq2 = [int64](node scripts/make-update-set.mjs sequence).Trim()
+          if ($seq2 -le $seq1) { $seq2 = $seq1 + 1 }
 
           $cfg1 = (node scripts/make-update-set.mjs tauri-config --os windows --version 0.1.0 --sequence $seq1)
           Push-Location apps/legion-app

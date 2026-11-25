@@ -38,6 +38,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      sequence: ${{ steps.version.outputs.sequence }}
       is_release: ${{ steps.version.outputs.is_release }}
       is_prerelease: ${{ steps.version.outputs.is_prerelease }}
     steps:
@@ -87,8 +88,10 @@ jobs:
           else
             is_prerelease="false"
           fi
+          build_sequence="$(date -u +%Y%m%d%H%M)"
           echo "version=${workspace_version}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "sequence=${build_sequence}" >> "$GITHUB_OUTPUT"
           echo "is_release=${is_release}" >> "$GITHUB_OUTPUT"
           echo "is_prerelease=${is_prerelease}" >> "$GITHUB_OUTPUT"
 
@@ -166,6 +169,7 @@ jobs:
         shell: bash
         env:
           LEGION_BUILD_REV: ${{ github.sha }}
+          LEGION_BUILD_SEQUENCE: ${{ needs.prepare.outputs.sequence }}
         run: |
           set -euo pipefail
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
@@ -177,6 +181,7 @@ jobs:
         shell: bash
         env:
           LEGION_BUILD_REV: ${{ github.sha }}
+          LEGION_BUILD_SEQUENCE: ${{ needs.prepare.outputs.sequence }}
         run: |
           set -euo pipefail
           win_home="$(cygpath -w "${USERPROFILE:-$HOME}")"
@@ -192,6 +197,7 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           LEGION_BUILD_REV: ${{ github.sha }}
+          LEGION_BUILD_SEQUENCE: ${{ needs.prepare.outputs.sequence }}
         run: |
           set -euo pipefail
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
