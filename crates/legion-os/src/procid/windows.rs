@@ -8,12 +8,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::win_proc::{self, OpenPinnedOutcome, PinnedProcess, TerminateOutcome};
+use crate::win_proc::{
+    self, GracefulStopOutcome, OpenPinnedOutcome, PinnedProcess, TerminateOutcome,
+};
 use crate::{OsError, Result};
 
 use super::{
-    EnvMarkerCheck, KillTreeReport, ProcessId, WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
-    child_not_older_than_parent, is_alive, windows_child_causally_valid,
+    EnvMarkerCheck, KillTreeReport, ProcessId, SignalOutcome,
+    WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME, child_not_older_than_parent, is_alive,
+    windows_child_causally_valid,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -66,6 +69,90 @@ pub(super) fn is_protected(identity: &ProcessId) -> Option<&'static str> {
         return Some("ancestor of current process");
     }
     win_proc::check_protected_system_process(identity)
+}
+
+pub(super) fn self_and_ancestors() -> HashSet<u32> {
+    let own_pid = std::process::id();
+    let mut seen = HashSet::new();
+    seen.insert(own_pid);
+
+    let OpenPinnedOutcome::Pinned(self_proc) = win_proc::open_pinned_query_only(own_pid, false)
+    else {
+        return seen;
+    };
+    let mut parent_pid = self_proc.parent_pid;
+    let mut child_start = self_proc.id.start_time;
+    let mut child_start_key = self_proc.start_key;
+    drop(self_proc);
+
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        if parent_pid == 0 || parent_pid == 4 || !seen.insert(parent_pid) {
+            break;
+        }
+        match win_proc::open_pinned_query_only(parent_pid, false) {
+            OpenPinnedOutcome::Pinned(parent_proc) => {
+                let valid_order = match (child_start_key, parent_proc.start_key) {
+                    (Some(ck), Some(pk)) => ck > pk,
+                    _ => child_not_older_than_parent(
+                        child_start,
+                        parent_proc.id.start_time,
+                        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                    ),
+                };
+                if !valid_order {
+                    seen.remove(&parent_pid);
+                    break;
+                }
+                child_start = parent_proc.id.start_time;
+                child_start_key = parent_proc.start_key;
+                parent_pid = parent_proc.parent_pid;
+            }
+            OpenPinnedOutcome::AccessDenied => break,
+            OpenPinnedOutcome::Gone | OpenPinnedOutcome::Failed => {
+                seen.remove(&parent_pid);
+                break;
+            }
+        }
+    }
+    seen
+}
+
+pub(super) async fn signal_process(identity: &ProcessId, force: bool) -> Result<SignalOutcome> {
+    let identity = *identity;
+    if force {
+        let outcome =
+            tokio::task::spawn_blocking(move || win_proc::open_verify_terminate(&identity))
+                .await
+                .map_err(|err| OsError::Platform {
+                    detail: format!("signal_process worker task failed: {err}"),
+                })??;
+        return match outcome {
+            TerminateOutcome::Terminated => Ok(SignalOutcome::Signaled),
+            TerminateOutcome::AlreadyGone => Ok(SignalOutcome::AlreadyGone),
+            TerminateOutcome::IdentityMismatch => Ok(SignalOutcome::IdentityMismatch),
+            TerminateOutcome::AccessDenied => Err(OsError::PermissionDenied {
+                detail: format!("permission denied terminating process {}", identity.pid),
+                source: None,
+            }),
+        };
+    }
+
+    let outcome =
+        tokio::task::spawn_blocking(move || win_proc::open_verify_request_close(&identity))
+            .await
+            .map_err(|err| OsError::Platform {
+                detail: format!("signal_process worker task failed: {err}"),
+            })??;
+    match outcome {
+        GracefulStopOutcome::Requested => Ok(SignalOutcome::Signaled),
+        GracefulStopOutcome::CannotAskGracefully => Ok(SignalOutcome::CannotAskGracefully),
+        GracefulStopOutcome::AlreadyGone => Ok(SignalOutcome::AlreadyGone),
+        GracefulStopOutcome::IdentityMismatch => Ok(SignalOutcome::IdentityMismatch),
+        GracefulStopOutcome::AccessDenied => Err(OsError::PermissionDenied {
+            detail: format!("permission denied signaling process {}", identity.pid),
+            source: None,
+        }),
+    }
 }
 
 fn windows_info_is_same_account_sshd(info: &win_proc::WindowsProcSshdInfo) -> bool {
@@ -275,10 +362,50 @@ pub(super) async fn tree_is_active(identity: &ProcessId, marker: Option<&str>) -
 
 pub(super) async fn kill_process(
     identity: &ProcessId,
-    _force: bool,
+    force: bool,
     grace: Duration,
 ) -> Result<bool> {
     let identity = *identity;
+
+    if !force && !grace.is_zero() {
+        let ask =
+            tokio::task::spawn_blocking(move || win_proc::open_verify_request_close(&identity))
+                .await
+                .map_err(|err| OsError::Platform {
+                    detail: format!("kill_process worker task failed: {err}"),
+                })??;
+        match ask {
+            GracefulStopOutcome::AlreadyGone | GracefulStopOutcome::IdentityMismatch => {
+                return Ok(true);
+            }
+            GracefulStopOutcome::AccessDenied => {
+                return Err(OsError::PermissionDenied {
+                    detail: format!("permission denied stopping process {}", identity.pid),
+                    source: None,
+                });
+            }
+            GracefulStopOutcome::Requested => {
+                let grace_deadline = Instant::now() + grace;
+                loop {
+                    let alive = tokio::task::spawn_blocking(move || is_alive(&identity))
+                        .await
+                        .map_err(|err| OsError::Platform {
+                            detail: format!("kill_process grace poll failed: {err}"),
+                        })?;
+                    if !alive {
+                        return Ok(true);
+                    }
+                    let now = Instant::now();
+                    if now >= grace_deadline {
+                        break;
+                    }
+                    let remaining = grace_deadline.saturating_duration_since(now);
+                    tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+                }
+            }
+            GracefulStopOutcome::CannotAskGracefully => {}
+        }
+    }
 
     let outcome = tokio::task::spawn_blocking(move || win_proc::open_verify_terminate(&identity))
         .await

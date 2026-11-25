@@ -24,6 +24,8 @@ use crate::stderr::StderrTail;
 
 /// Stream protocol version spoken by `legion stream`.
 const STREAM_PROTOCOL: u32 = 1;
+/// Stream capability name advertised by nodes whose `put` supports atomic `no_replace: true`.
+pub const CAP_PUT_NO_REPLACE: &str = "put.no_replace";
 /// Maximum reply line length accepted during the `put` handshake and verification reply.
 const MAX_REPLY_LINE: usize = 1024 * 1024;
 /// Maximum pre-protocol noise lines skipped before `{"protocol": 1}` (login banners, shell noise).
@@ -56,6 +58,11 @@ pub struct PutRequest {
     pub mode: Option<u32>,
     /// Optional file modification timestamp to apply once verified.
     pub mtime: Option<ContentTime>,
+    /// When `true`, sends `"no_replace": true` in the `put` header so machines advertising
+    /// [`CAP_PUT_NO_REPLACE`] refuse to overwrite an existing destination (returning
+    /// [`ErrorCode::Exists`]) both on open and on final atomic placement. Older machines ignore
+    /// this field and do not confirm it.
+    pub no_replace: bool,
 }
 
 /// Verified upload outcome returned by [`PutStream::finish`].
@@ -109,6 +116,8 @@ pub struct PutStream {
     expected_hash: String,
     offset: u64,
     remaining: u64,
+    no_replace_confirmed: bool,
+    stream_capabilities: Vec<String>,
     timeout: Duration,
     cancel: CancellationToken,
     channel_cancel: CancellationToken,
@@ -130,6 +139,18 @@ impl PutStream {
     /// Remaining bytes that must still be written before calling [`PutStream::finish`].
     pub fn remaining(&self) -> u64 {
         self.remaining
+    }
+
+    /// Returns `true` when the remote machine confirmed atomic no-replace enforcement for this
+    /// upload (via `"no_replace": true` in its ready reply or [`CAP_PUT_NO_REPLACE`] in its stream
+    /// greeting when requested).
+    pub fn no_replace_confirmed(&self) -> bool {
+        self.no_replace_confirmed
+    }
+
+    /// Stream capabilities advertised by the remote machine on this stream channel.
+    pub fn stream_capabilities(&self) -> &[String] {
+        &self.stream_capabilities
     }
 
     /// Cancels this upload stream and closes its underlying SSH channel or child process
@@ -321,6 +342,8 @@ impl AsyncWrite for PutStream {
 #[derive(Debug, Deserialize)]
 struct PutReadyReply {
     offset: u64,
+    #[serde(default)]
+    no_replace: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,6 +361,7 @@ pub(crate) async fn handshake_put(
     as_principal: Option<&str>,
     timeout: Duration,
     cancel: CancellationToken,
+    on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
 ) -> Result<PutStream, ErrorBody> {
     let RawStream {
         reader,
@@ -361,6 +385,9 @@ pub(crate) async fn handshake_put(
     if let Some(mtime) = request.mtime {
         header["mtime"] = json!({ "secs": mtime.secs, "nanos": mtime.nanos });
     }
+    if request.no_replace {
+        header["no_replace"] = json!(true);
+    }
     if let Some(principal) = as_principal {
         header["as"] = json!(principal);
     }
@@ -377,10 +404,10 @@ pub(crate) async fn handshake_put(
             .flush()
             .await
             .map_err(|err| put_io_error(machine, "flushing stream put header", &err, &stderr))?;
-        read_put_ready(&mut buf_reader, machine, &stderr).await
+        read_put_ready(&mut buf_reader, machine, &stderr, on_greeting_capabilities).await
     };
 
-    let ready = tokio::select! {
+    let (ready, mut stream_capabilities) = tokio::select! {
         biased;
         () = cancel.cancelled() => {
             channel_cancel.cancel();
@@ -429,6 +456,14 @@ pub(crate) async fn handshake_put(
         .with_machine(machine));
     }
 
+    let no_replace_confirmed = ready.no_replace == Some(true)
+        || (request.no_replace && stream_capabilities.iter().any(|c| c == CAP_PUT_NO_REPLACE));
+    if ready.no_replace == Some(true)
+        && !stream_capabilities.iter().any(|c| c == CAP_PUT_NO_REPLACE)
+    {
+        stream_capabilities.push(CAP_PUT_NO_REPLACE.to_owned());
+    }
+
     let stream_cancel = cancel.child_token();
     let active_cancel = channel_cancel.clone();
     let watch_cancel = stream_cancel.clone();
@@ -449,6 +484,8 @@ pub(crate) async fn handshake_put(
         expected_hash: request.hash.clone(),
         offset: ready.offset,
         remaining: request.size - ready.offset,
+        no_replace_confirmed,
+        stream_capabilities,
         timeout,
         cancel: stream_cancel,
         channel_cancel,
@@ -461,8 +498,10 @@ async fn read_put_ready<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     machine: &str,
     stderr: &Option<Arc<StderrTail>>,
-) -> Result<PutReadyReply, ErrorBody> {
+    on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
+) -> Result<(PutReadyReply, Vec<String>), ErrorBody> {
     let mut greeted = false;
+    let mut greeting_caps = Vec::new();
     let mut noise_lines = 0usize;
     let mut noise_bytes = 0usize;
     let mut busy_heartbeats = 0usize;
@@ -501,6 +540,10 @@ async fn read_put_ready<R: AsyncRead + Unpin>(
                         .with_hint("Update legion so both sides speak the same stream protocol.")
                         .with_machine(machine));
                     }
+                    greeting_caps = parse_greeting_capabilities(&fields);
+                    if let Some(cb) = on_greeting_capabilities {
+                        cb(greeting_caps.clone());
+                    }
                     greeted = true;
                     continue;
                 }
@@ -524,7 +567,7 @@ async fn read_put_ready<R: AsyncRead + Unpin>(
                     return Err(crate::strip_remote_sent(body).with_machine(machine));
                 }
                 if let Ok(ready) = serde_json::from_value::<PutReadyReply>(Value::Object(fields)) {
-                    return Ok(ready);
+                    return Ok((ready, greeting_caps));
                 }
                 return Err(ErrorBody::new(
                     ErrorCode::Failed,
@@ -557,6 +600,21 @@ async fn read_put_ready<R: AsyncRead + Unpin>(
             .with_details(json!({ "reason": crate::REASON_NON_PROTOCOL_OUTPUT })));
         }
     }
+}
+
+pub(crate) fn parse_greeting_capabilities(fields: &serde_json::Map<String, Value>) -> Vec<String> {
+    fields
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn read_put_done<R: AsyncRead + Unpin>(
@@ -1024,6 +1082,7 @@ mod tests {
                     hash: TEST_HASH.to_owned(),
                     mode: None,
                     mtime: None,
+                    no_replace: false,
                 },
             )
             .await
@@ -1040,6 +1099,7 @@ mod tests {
                     hash: "sha256:deadbeef".to_owned(),
                     mode: None,
                     mtime: None,
+                    no_replace: false,
                 },
             )
             .await
@@ -1056,6 +1116,7 @@ mod tests {
                     hash: TEST_HASH.to_owned(),
                     mode: None,
                     mtime: None,
+                    no_replace: false,
                 },
             )
             .await
@@ -1075,6 +1136,7 @@ mod tests {
                         secs: 1_700_000_000,
                         nanos: 0,
                     }),
+                    no_replace: false,
                 },
             )
             .await
@@ -1121,6 +1183,7 @@ mod tests {
                         hash: TEST_HASH.to_owned(),
                         mode: None,
                         mtime: None,
+                        no_replace: false,
                     },
                 )
                 .await
@@ -1152,6 +1215,7 @@ mod tests {
                         hash: TEST_HASH.to_owned(),
                         mode: None,
                         mtime: None,
+                        no_replace: false,
                     },
                 )
                 .await
@@ -1184,6 +1248,7 @@ mod tests {
                     hash: TEST_HASH.to_owned(),
                     mode: None,
                     mtime: None,
+                    no_replace: false,
                 },
             )
             .await
@@ -1202,6 +1267,7 @@ mod tests {
                     hash: TEST_HASH.to_owned(),
                     mode: None,
                     mtime: None,
+                    no_replace: false,
                 },
                 cancel_token.clone(),
             )
@@ -1269,5 +1335,217 @@ mod tests {
         assert_eq!(err2.code, ErrorCode::Timeout);
         drop(reader2);
         let _ = producer2.await;
+    }
+
+    struct CapabilityPutOpener {
+        greeting_caps: Option<Vec<String>>,
+        reply_no_replace: Option<bool>,
+        reject_exists: Arc<AtomicBool>,
+        seen_headers: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    impl StreamOpener for CapabilityPutOpener {
+        fn open_stream(
+            &self,
+            _cancel: CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>> {
+            let greeting_caps = self.greeting_caps.clone();
+            let reply_no_replace = self.reply_no_replace;
+            let reject_exists = Arc::clone(&self.reject_exists);
+            let seen_headers = Arc::clone(&self.seen_headers);
+            Box::pin(async move {
+                let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                let stream_cancel = CancellationToken::new();
+
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(server_in);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let req: Value = serde_json::from_str(&line).unwrap();
+                    seen_headers.lock().unwrap().push(req.clone());
+
+                    let mut greeting = json!({ "protocol": 1 });
+                    if let Some(caps) = greeting_caps {
+                        greeting["capabilities"] = json!(caps);
+                    }
+                    let _ = server_out
+                        .write_all(format!("{greeting}\n").as_bytes())
+                        .await;
+
+                    if reject_exists.load(Ordering::SeqCst) {
+                        let err = json!({
+                            "error": ErrorBody::new(ErrorCode::Exists, "destination already exists")
+                        });
+                        let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                        let _ = server_out.shutdown().await;
+                        return;
+                    }
+
+                    let mut ready = json!({ "offset": 0 });
+                    if let Some(nr) = reply_no_replace {
+                        ready["no_replace"] = json!(nr);
+                    }
+                    let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+
+                    let size = req["size"].as_u64().unwrap();
+                    let hash = req["hash"].as_str().unwrap().to_owned();
+                    let mut drain = Vec::new();
+                    let _ = reader.read_to_end(&mut drain).await;
+                    let done = json!({ "ok": true, "size": size, "hash": hash });
+                    let _ = server_out.write_all(format!("{done}\n").as_bytes()).await;
+                    let _ = server_out.shutdown().await;
+                });
+
+                Ok(RawStream {
+                    reader: Box::new(client_in),
+                    writer: Box::new(client_out),
+                    stderr: None,
+                    cancel: stream_cancel,
+                    park: None,
+                    guard: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn open_put_tracks_no_replace_capability_across_greeting_reply_and_exists_errors() {
+        // 1. Machine advertising `put.no_replace` in greeting caches support even when the first
+        //    upload collides with ErrorCode::Exists.
+        let reject_exists = Arc::new(AtomicBool::new(true));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link = make_mock_link(
+            "tower",
+            "tower",
+            Arc::new(CapabilityPutOpener {
+                greeting_caps: Some(vec![CAP_PUT_NO_REPLACE.to_owned()]),
+                reply_no_replace: Some(true),
+                reject_exists: Arc::clone(&reject_exists),
+                seen_headers: Arc::clone(&seen),
+            }),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(link.stream_supports("tower", CAP_PUT_NO_REPLACE), None);
+
+        let err = link
+            .open_put(
+                "tower",
+                PutRequest {
+                    path: "/home/me/report.pdf".to_owned(),
+                    size: 4,
+                    hash: TEST_HASH.to_owned(),
+                    mode: None,
+                    mtime: None,
+                    no_replace: true,
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code, ErrorCode::Exists);
+        assert_eq!(
+            link.stream_supports("tower", CAP_PUT_NO_REPLACE),
+            Some(true)
+        );
+        assert_eq!(seen.lock().unwrap()[0]["no_replace"], Value::Bool(true));
+
+        reject_exists.store(false, Ordering::SeqCst);
+        let mut put = link
+            .open_put(
+                "tower",
+                PutRequest {
+                    path: "/home/me/report (2).pdf".to_owned(),
+                    size: 4,
+                    hash: TEST_HASH.to_owned(),
+                    mode: None,
+                    mtime: None,
+                    no_replace: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(put.no_replace_confirmed());
+        assert!(
+            put.stream_capabilities()
+                .contains(&CAP_PUT_NO_REPLACE.to_owned())
+        );
+        put.write_all(b"abcd").await.unwrap();
+        put.finish().await.unwrap();
+
+        // 2. Machine advertising `no_replace: true` only on PutReady (no greeting list) still
+        //    confirms and caches `put.no_replace`.
+        let seen2 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link2 = make_mock_link(
+            "tower",
+            "tower",
+            Arc::new(CapabilityPutOpener {
+                greeting_caps: None,
+                reply_no_replace: Some(true),
+                reject_exists: Arc::new(AtomicBool::new(false)),
+                seen_headers: Arc::clone(&seen2),
+            }),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mut put2 = link2
+            .open_put(
+                "tower",
+                PutRequest {
+                    path: "/home/me/a.bin".to_owned(),
+                    size: 4,
+                    hash: TEST_HASH.to_owned(),
+                    mode: None,
+                    mtime: None,
+                    no_replace: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(put2.no_replace_confirmed());
+        assert_eq!(
+            link2.stream_supports("tower", CAP_PUT_NO_REPLACE),
+            Some(true)
+        );
+        put2.write_all(b"abcd").await.unwrap();
+        put2.finish().await.unwrap();
+
+        // 3. Older machine omitting both greeting capabilities and PutReady.no_replace caches
+        //    Some(false) and omits `no_replace` when requested with `no_replace: false`.
+        let seen3 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link3 = make_mock_link(
+            "tower",
+            "tower",
+            Arc::new(CapabilityPutOpener {
+                greeting_caps: None,
+                reply_no_replace: None,
+                reject_exists: Arc::new(AtomicBool::new(false)),
+                seen_headers: Arc::clone(&seen3),
+            }),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mut put3 = link3
+            .open_put(
+                "tower",
+                PutRequest {
+                    path: "/home/me/old.bin".to_owned(),
+                    size: 4,
+                    hash: TEST_HASH.to_owned(),
+                    mode: None,
+                    mtime: None,
+                    no_replace: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!put3.no_replace_confirmed());
+        assert_eq!(
+            link3.stream_supports("tower", CAP_PUT_NO_REPLACE),
+            Some(false)
+        );
+        assert!(seen3.lock().unwrap()[0].get("no_replace").is_none());
+        put3.write_all(b"abcd").await.unwrap();
+        put3.finish().await.unwrap();
     }
 }

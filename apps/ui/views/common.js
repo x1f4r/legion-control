@@ -2,7 +2,7 @@
 
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
-import { clampPct, meterLevel, tokenizeCode } from '../lib/format.js';
+import { clampPct, formatElapsed, meterLevel, tokenizeCode } from '../lib/format.js';
 import { classifyRowSwipe } from '../lib/gestures.js';
 import { qrSvgData } from '../lib/qr.js';
 import { classifyResult, fanOutEntries, isFanOut } from '../lib/result.js';
@@ -311,6 +311,62 @@ export function Sheet({ title, onClose, children }) {
         ${children}
       </div>
     </div>
+  `;
+}
+
+/**
+ * Shared "Wake it and continue" sheet across every starting point.
+ */
+export function WakeSheet({ sheet, onConfirm, onRetry, onDismiss }) {
+  if (!sheet) return null;
+  const { machineName, phase, elapsedS, error, continueText } = sheet;
+
+  if (phase === 'waking') {
+    return html`
+      <${Sheet} title=${`Waking ${machineName}…`} onClose=${onDismiss}>
+        <p class="wake-elapsed">${formatElapsed(elapsedS || 0)}</p>
+        <div class="actions">
+          <button type="button" class="btn full" onClick=${onDismiss}>Stop waiting</button>
+        </div>
+        <p class="wake-note">The wake signal has already been sent.</p>
+      <//>
+    `;
+  }
+
+  if (phase === 'timeout') {
+    return html`
+      <${Sheet} title=${`${machineName} did not answer`} onClose=${onDismiss}>
+        <p>It has been 3 minutes. It may need longer to start, or waking it may not be working.</p>
+        <div class="actions">
+          <button type="button" class="btn" onClick=${onDismiss}>Not now</button>
+          <button type="button" class="btn primary full" onClick=${onRetry}>Try again</button>
+        </div>
+      <//>
+    `;
+  }
+
+  if (phase === 'error') {
+    return html`
+      <${Sheet} title=${`Could not wake ${machineName}`} onClose=${onDismiss}>
+        <${Notice} error=${error} />
+        <div class="actions">
+          <button type="button" class="btn" onClick=${onDismiss}>Not now</button>
+          <button type="button" class="btn primary full" onClick=${onRetry}>Try again</button>
+        </div>
+      <//>
+    `;
+  }
+
+  return html`
+    <${Sheet} title=${`${machineName} is off.`} onClose=${onDismiss}>
+      ${continueText ? html`<p class="wake-then">${continueText}</p>` : null}
+      <div class="actions">
+        <button type="button" class="btn" onClick=${onDismiss}>Not now</button>
+        <button type="button" class="btn primary full" onClick=${onConfirm}>
+          Wake it and continue
+        </button>
+      </div>
+    <//>
   `;
 }
 
