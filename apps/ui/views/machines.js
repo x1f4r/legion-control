@@ -94,6 +94,8 @@ export function MachinesView({
   tools,
   allowedSet,
   settings,
+  deviceNoun,
+  thumbCache,
   wakePendingSet,
   onWakeMachine,
   onWakeSent,
@@ -212,6 +214,8 @@ export function MachinesView({
                   tools=${tools}
                   allowedSet=${allowedSet}
                   settings=${settings}
+                  deviceNoun=${deviceNoun}
+                  thumbCache=${thumbCache}
                   wakePending=${Boolean(wakePendingSet?.has(selectedMachine.name))}
                   onWakeMachine=${onWakeMachine}
                   onWakeSent=${onWakeSent}
@@ -239,6 +243,8 @@ export function MachinesView({
         tools=${tools}
         allowedSet=${allowedSet}
         settings=${settings}
+        deviceNoun=${deviceNoun}
+        thumbCache=${thumbCache}
         wakePending=${Boolean(wakePendingSet?.has(selectedMachine.name))}
         onWakeMachine=${onWakeMachine}
         onWakeSent=${onWakeSent}
