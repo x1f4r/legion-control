@@ -60,6 +60,10 @@ globset = "0.4.22"
 ignore = "0.4.35"
 # Pure-Rust QR encoder (no image/svg features) for terminal pairing codes in `legion pair`.
 qrcode = { version = "0.15.0", default-features = false }
+# Pure-Rust ACID copy-on-write B+tree store for the sync folder index (no C toolchain needed).
+redb = "5.0.0"
+# Property-based testing for sync version-vector laws.
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 regex = "1.13.2"
 legion-doors = { path = "crates/legion-doors" }
 # The official MCP SDK; it speaks the revisions with and without the initialize handshake.
