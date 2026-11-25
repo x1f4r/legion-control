@@ -522,6 +522,10 @@ pub struct FolderMeta {
     /// resurrecting deletions.
     #[serde(default)]
     pub join_mode: bool,
+    /// Highest local sequence number of any record still carrying `from_join = true` that has not
+    /// yet been confirmed live across every current member (`0` when none are pending).
+    #[serde(default)]
+    pub unconfirmed_join_until_seq: u64,
     /// Chained fingerprint at `local_seq` (commits to the full sequence history `1..=local_seq`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_fingerprint: Option<Hash>,
@@ -570,6 +574,7 @@ impl FolderMeta {
             paused: false,
             pending_brake: None,
             join_mode: true,
+            unconfirmed_join_until_seq: 0,
             head_fingerprint: None,
             rollback_claims_by_peer: BTreeMap::new(),
             kept_deleted_dirs: BTreeSet::new(),

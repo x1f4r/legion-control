@@ -825,6 +825,29 @@ fn reconcile_concurrent(
                 update_disk_metadata,
             };
         }
+        if local.from_join && remote.from_join {
+            // Both sides hold join-origin copies of identical content (for example two joiners
+            // meeting before an offline deleter, or a member rebuilding while a third member is
+            // offline). Pick one deterministic canonical winner WITHOUT merging their join-scan
+            // incarnation keys so repeated rebuilds without edits never grow the version vector,
+            // while preserving `from_join = true` so any later deletion still dominates.
+            let cmp = compare_live_winner(local, remote)
+                .then_with(|| remote.version.iter().cmp(local.version.iter()));
+            if cmp != Ordering::Less {
+                return ReconcileDecision::Keep;
+            }
+            let mut adopted = sanitize_remote(remote, clean_path, meta);
+            adopted.version = remote.version.clone();
+            adopted.disk_mtime = local.disk_mtime;
+            adopted.disk_change_id = local.disk_change_id;
+            adopted.from_join = true;
+            adopted.conflict_of = derive_conflict_of(&adopted, meta);
+            let update_disk_metadata = local.mtime != adopted.mtime || local.mode != adopted.mode;
+            return ReconcileDecision::MetadataOnly {
+                record: adopted,
+                update_disk_metadata,
+            };
+        }
         let winner = if compare_live_winner(local, remote) != Ordering::Less {
             local
         } else {

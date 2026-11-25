@@ -2139,6 +2139,9 @@ fn flush_group_commit_records<F: SyncFs, S: IndexStore>(
     for (remote_seq, mut rec) in drained {
         let seq = meta.next_seq();
         meta.record_change_mark(seq, rec.mtime);
+        if rec.from_join {
+            meta.unconfirmed_join_until_seq = meta.unconfirmed_join_until_seq.max(seq);
+        }
         rec.seq = seq;
         rec.conflict_of = derive_conflict_of(&rec, &meta);
         let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
@@ -6550,6 +6553,9 @@ fn commit_records_and_clear_pending<F: SyncFs, S: IndexStore>(
         }
         let seq = meta.next_seq();
         meta.record_change_mark(seq, rec.mtime);
+        if rec.from_join {
+            meta.unconfirmed_join_until_seq = meta.unconfirmed_join_until_seq.max(seq);
+        }
         rec.seq = seq;
         rec.conflict_of = derive_conflict_of(&rec, &meta);
         let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());

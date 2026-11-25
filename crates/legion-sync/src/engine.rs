@@ -1652,7 +1652,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     self.persist_peer_cursor_and_clear_rejoin(&peer_id, cursor, clear_rejoin)?;
                 }
                 self.active_progress.remove(&peer_id);
-                if ack_advanced || hs_ack_advanced {
+                if ack_advanced || hs_ack_advanced || local_meta.unconfirmed_join_until_seq > 0 {
                     self.prune_acknowledged_metadata_inner()?;
                 }
                 break;
@@ -3570,6 +3570,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         new_meta.local_seq = 0;
         new_meta.local_clock = 0;
         new_meta.join_mode = true;
+        new_meta.unconfirmed_join_until_seq = 0;
         new_meta.head_fingerprint = None;
         new_meta.pending_deletions.clear();
         new_meta.unacked_change_marks.clear();
@@ -3734,10 +3735,36 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             return Ok(());
         }
 
+        let all_peers_pulled = other_members.iter().all(|m| {
+            cursors.get(*m).is_some_and(|c| {
+                c.incarnation != 0
+                    && c.last_synced_at.is_some()
+                    && c.applied_ack_seq >= c.last_seen_snapshot_seq
+            })
+        });
         let mut meta_for_marks = meta;
-        let marks_changed = meta_for_marks.prune_change_marks_through(min_direct_ack);
+        let mut meta_changed = meta_for_marks.prune_change_marks_through(min_direct_ack);
+        let mut confirmed_join_records = Vec::new();
+        if meta_for_marks.unconfirmed_join_until_seq > 0
+            && all_peers_pulled
+            && self.store.held_back_count()? == 0
+            && self.store.list_deferrals()?.is_empty()
+        {
+            self.store.scan_records_in_order(&mut |mut rec| {
+                if rec.from_join && rec.seq <= min_direct_ack {
+                    rec.from_join = false;
+                    confirmed_join_records.push(rec);
+                }
+                Ok(true)
+            })?;
+            if min_direct_ack >= meta_for_marks.unconfirmed_join_until_seq {
+                meta_for_marks.unconfirmed_join_until_seq = 0;
+                meta_changed = true;
+            }
+        }
         let batch = StoreBatch {
-            folder_meta: marks_changed.then_some(meta_for_marks),
+            folder_meta: meta_changed.then_some(meta_for_marks),
+            upsert_records: confirmed_join_records,
             prune_seq_fingerprints_below: Some(min_direct_ack),
             ..StoreBatch::default()
         };

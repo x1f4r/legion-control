@@ -6707,9 +6707,11 @@ fn run_lifetime_rotations_and_vv_pruning_seed(root_seed: u64, seed: u64, _record
             }
         };
     sync_rounds(&mut es, t0, 2);
+    let initial_f0_vv = es[0].store().get_record("f0.txt").unwrap().unwrap().version;
+    let initial_f2_vv = es[0].store().get_record("f2.txt").unwrap().unwrap().version;
 
-    // Run 6 consecutive index wipes + rebuilds of m1 so deterministic VV pruning exercises
-    // multi-generation retirement across all members while keeping 50M-seed runs fast.
+    // Run 6 consecutive index wipes + rebuilds of m1: untouched files (`f0.txt`, `f2.txt`) must
+    // keep their exact version vectors without growing, while edited `f1.txt` retains every key.
     for rot in 1..=6i64 {
         let now = Timestamp::new(t0.secs + rot * 100, 0);
         let snap = es[1].fs().snapshot();
@@ -6768,6 +6770,22 @@ fn run_lifetime_rotations_and_vv_pruning_seed(root_seed: u64, seed: u64, _record
             "seed={root_seed} rot={rot}: expected whole VV retaining all m1 keys, got {m1_keys}"
         );
         assert_eq!(rec0.version, rec1.version);
+        // Untouched files MUST NOT grow their version vectors across rebuilds!
+        for (untouched, expected_vv) in [("f0.txt", &initial_f0_vv), ("f2.txt", &initial_f2_vv)] {
+            for idx in 0..n {
+                let got_vv = es[idx]
+                    .store()
+                    .get_record(untouched)
+                    .unwrap()
+                    .unwrap()
+                    .version;
+                assert_eq!(
+                    &got_vv, expected_vv,
+                    "seed={root_seed} rot={rot}: rebuild grew untouched {untouched} version vector on {} (before={expected_vv}, after={got_vv})",
+                    names[idx]
+                );
+            }
+        }
     }
 }
 

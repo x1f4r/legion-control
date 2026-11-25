@@ -908,6 +908,11 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             .as_ref()
             .is_some_and(|p| !p.deleted && !is_kind_change && p.conflict_dismissed);
 
+        let from_join = prev.is_none() && join_mode_active;
+        if from_join {
+            meta.unconfirmed_join_until_seq = meta.unconfirmed_join_until_seq.max(seq);
+        }
+
         let mut rec = IndexRecord {
             path,
             kind: fmeta.kind,
@@ -927,7 +932,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             modified_by: meta.local_member.clone(),
             seq,
             recent_hashes,
-            from_join: prev.is_none() && join_mode_active,
+            from_join,
             conflict_of: None,
             conflict_dismissed,
         };
