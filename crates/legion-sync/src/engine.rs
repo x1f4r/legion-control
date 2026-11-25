@@ -529,6 +529,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
 
         let new_inc = choose_fresh_incarnation(None, old_incarnation)?;
+        self.may_have_retired_vv_keys = true;
         self.fs.ensure_internal_dirs()?;
         let marker = FolderMarker::new(
             self.config.id.clone(),
@@ -595,6 +596,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             },
         )?;
         reissue_carried_deletions(&self.fs, &mut self.store, carried_deletions)?;
+        self.may_have_retired_vv_keys = true;
         Ok(report)
     }
 
@@ -1370,8 +1372,9 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             self.observe_peer_incarnation_with(&peer_id, hs.incarnation, initial_cursors)?;
         let mut cursor_dirty = false;
 
-        // Record which active `(member -> incarnation)` pairs this peer directly knows about so
-        // deterministic VV pruning can verify all members have left retired incarnations.
+        // Record which active `(member -> incarnation)` pairs, membership set, and unsettled
+        // retired VV keys this peer reported so deterministic VV pruning satisfies 2-phase causal
+        // stability before dropping any retired key.
         let mut filtered_known = BTreeMap::new();
         for (m, &inc) in &hs.known_incarnations {
             if inc != 0 && meta.is_known_member(m) {
@@ -1381,6 +1384,27 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         filtered_known.insert(peer_id.clone(), hs.incarnation);
         if observed_cursor.peer_known_incarnations != filtered_known {
             observed_cursor.peer_known_incarnations = filtered_known;
+            cursor_dirty = true;
+        }
+        let filtered_members: BTreeSet<MemberId> = hs
+            .known_members
+            .iter()
+            .filter(|m| meta.is_known_member(m))
+            .cloned()
+            .collect();
+        if observed_cursor.peer_known_members != filtered_members {
+            observed_cursor.peer_known_members = filtered_members;
+            cursor_dirty = true;
+        }
+        let filtered_unsettled: BTreeSet<VersionKey> = hs
+            .unsettled_vv_keys
+            .iter()
+            .filter(|k| k.incarnation != 0 && meta.is_known_member(&k.member))
+            .take(MAX_PRUNED_INCARNATIONS)
+            .cloned()
+            .collect();
+        if observed_cursor.peer_unsettled_vv_keys != filtered_unsettled {
+            observed_cursor.peer_unsettled_vv_keys = filtered_unsettled;
             cursor_dirty = true;
         }
 
@@ -2442,6 +2466,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             None => (None, None),
         };
         let all_cursors = self.store.load_peer_cursors()?;
+        let unsettled_vv_keys = self.local_unsettled_retired_vv_keys(meta, &all_cursors)?;
         let hello = HandshakeHello {
             folder_id: meta.folder_id.clone(),
             member_id: meta.local_member.clone(),
@@ -2455,6 +2480,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             refused_from_peer: self.refusal_summary_for_peer(peer_id)?,
             pruned_incarnations: meta.pruned_incarnations.iter().cloned().collect(),
             known_incarnations: local_known_incarnations(meta, &all_cursors),
+            known_members: meta.members.clone(),
+            unsettled_vv_keys,
         };
         let hs = match peer.handshake(&hello) {
             Ok(hs) => {
@@ -3553,6 +3580,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         )?;
 
         reissue_carried_deletions(&self.fs, &mut self.store, carried_deletions)?;
+        self.may_have_retired_vv_keys = true;
 
         // Report the forced rotation durably (Item 9).
         self.record_peer_problem(
@@ -3756,9 +3784,109 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         Ok(None)
     }
 
+    /// Returns every non-active, unpruned `(member, incarnation)` key that still appears in any
+    /// local record with `seq > min_direct_ack` (i.e. not yet directly acknowledged by every
+    /// other current member), in any local held-back peer record, or in any pending local
+    /// deletion.
+    ///
+    /// Runs in `O(1)` on steady-state folders when no retired keys exist and `O(unacked)` via the
+    /// sequence index otherwise.
+    fn local_unsettled_retired_vv_keys(
+        &self,
+        meta: &FolderMeta,
+        cursors: &BTreeMap<MemberId, PeerCursor>,
+    ) -> Result<Vec<VersionKey>> {
+        let held_count = self.store.held_back_count()?;
+        if !self.may_have_retired_vv_keys && held_count == 0 && meta.pending_deletions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let own_key = meta.version_key();
+        let is_non_active = |k: &VersionKey| -> bool {
+            !meta.pruned_incarnations.contains(k)
+                && *k != own_key
+                && !(meta.members.contains(&k.member)
+                    && cursors
+                        .get(&k.member)
+                        .is_some_and(|c| c.incarnation == k.incarnation))
+        };
+
+        let other_members: Vec<&MemberId> = meta
+            .members
+            .iter()
+            .filter(|m| *m != &meta.local_member)
+            .collect();
+        let min_direct_ack = if other_members.is_empty() {
+            meta.local_seq
+        } else {
+            let mut floor = u64::MAX;
+            for member in &other_members {
+                match cursors.get(*member) {
+                    Some(c) if c.acked_local_incarnation == meta.incarnation => {
+                        floor = floor.min(c.acked_local_seq);
+                    }
+                    _ => {
+                        floor = 0;
+                        break;
+                    }
+                }
+            }
+            floor
+        };
+
+        let mut unsettled = BTreeSet::new();
+        if self.may_have_retired_vv_keys && min_direct_ack < meta.local_seq {
+            let mut since_seq = min_direct_ack;
+            loop {
+                let page = self.store.records_since(
+                    &meta.local_member,
+                    meta.incarnation,
+                    since_seq,
+                    MAX_PAGE_RECORDS,
+                )?;
+                if page.records.is_empty() {
+                    break;
+                }
+                for rec in &page.records {
+                    for (k, _) in rec.version.iter() {
+                        if is_non_active(k) {
+                            unsettled.insert(k.clone());
+                        }
+                    }
+                }
+                let last_seq = page.records.last().map_or(since_seq, |r| r.seq);
+                if !page.has_more || last_seq <= since_seq {
+                    break;
+                }
+                since_seq = last_seq;
+            }
+        }
+        if held_count > 0 {
+            for hb in self.store.list_held_back()? {
+                for (k, _) in hb.record.version.iter() {
+                    if is_non_active(k) {
+                        unsettled.insert(k.clone());
+                    }
+                }
+            }
+        }
+        for pd in meta.pending_deletions.values() {
+            for (k, _) in pd.old_record.version.iter() {
+                if is_non_active(k) {
+                    unsettled.insert(k.clone());
+                }
+            }
+        }
+        Ok(unsettled.into_iter().collect())
+    }
+
     /// Deterministically prunes retired `(member, incarnation)` keys from stored version vectors
-    /// once every other current member has directly acknowledged applied state past every local
-    /// record mentioning that key and every member has moved past that incarnation.
+    /// once two-phase causal stability holds:
+    /// 1. Every other current member has directly acknowledged applied state past every local
+    ///    record mentioning `k`, and `k` does not appear in local held-back records or pending
+    ///    deletions;
+    /// 2. Every other current member agrees `k` is retired (removed from `known_members` or moved
+    ///    to a newer incarnation) AND reported in its latest handshake that `k` is no longer in
+    ///    its own `unsettled_vv_keys`.
     fn prune_retired_incarnations_inner(&mut self) -> Result<usize> {
         if !self.may_have_retired_vv_keys {
             return Ok(0);
@@ -3821,13 +3949,39 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             return Ok(0);
         }
 
+        let mut local_blocked_keys = BTreeSet::new();
+        if self.store.held_back_count()? > 0 {
+            for hb in self.store.list_held_back()? {
+                for (k, _) in hb.record.version.iter() {
+                    local_blocked_keys.insert(k.clone());
+                }
+            }
+        }
+        for pd in meta.pending_deletions.values() {
+            for (k, _) in pd.old_record.version.iter() {
+                local_blocked_keys.insert(k.clone());
+            }
+        }
+
         let mut candidates = BTreeSet::new();
         for (k, max_seq) in max_seq_by_key {
-            if k == own_key || max_seq > min_direct_ack {
+            if k == own_key || max_seq > min_direct_ack || local_blocked_keys.contains(&k) {
+                continue;
+            }
+            let all_peers_settled = other_members.iter().all(|other| {
+                cursors.get(*other).is_some_and(|cy| {
+                    !cy.peer_known_members.is_empty() && !cy.peer_unsettled_vv_keys.contains(&k)
+                })
+            });
+            if !all_peers_settled {
                 continue;
             }
             let globally_retired = if !meta.members.contains(&k.member) {
-                true
+                other_members.iter().all(|other| {
+                    cursors
+                        .get(*other)
+                        .is_some_and(|cy| !cy.peer_known_members.contains(&k.member))
+                })
             } else if k.member == meta.local_member {
                 // `min_direct_ack > 0` guarantees every active member already acked our current
                 // incarnation and moved past `k`.
@@ -3888,8 +4042,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     }
 
     /// Adopts retired `(member, incarnation)` keys already pruned by `peer_id`, validating each
-    /// against our own active incarnation, directly observed peer incarnations, and non-empty
-    /// version-vector survival.
+    /// against our own active incarnation, directly observed peer incarnations, local causal
+    /// stability (`local_unsettled_retired_vv_keys`), and non-empty version-vector survival.
     fn adopt_peer_pruned_incarnations(
         &mut self,
         peer_id: &str,
@@ -3903,12 +4057,17 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             return Ok(0);
         }
         let cursors = self.store.load_peer_cursors()?;
+        let local_unsettled: BTreeSet<VersionKey> = self
+            .local_unsettled_retired_vv_keys(&meta, &cursors)?
+            .into_iter()
+            .collect();
         let own_key = meta.version_key();
         let mut candidates = BTreeSet::new();
         for k in peer_pruned {
             if k.incarnation == 0
                 || *k == own_key
                 || meta.pruned_incarnations.contains(k)
+                || local_unsettled.contains(k)
                 || !meta.is_known_member(&k.member)
             {
                 continue;
@@ -4078,6 +4237,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         let refused_from_caller = self.refusal_summary_for_peer(caller_member)?;
         let pruned_incarnations = meta.pruned_incarnations.iter().cloned().collect();
         let known_incarnations = local_known_incarnations(&meta, &cursors);
+        let unsettled_vv_keys = self.local_unsettled_retired_vv_keys(&meta, &cursors)?;
+        let known_members = meta.members.clone();
         Ok(PeerHandshake {
             folder_id: meta.folder_id,
             member_id: meta.local_member,
@@ -4093,6 +4254,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             refused_from_caller,
             pruned_incarnations,
             known_incarnations,
+            known_members,
+            unsettled_vv_keys,
         })
     }
 
@@ -4293,6 +4456,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         meta,
                         marker.incarnation,
                     )?;
+                    self.may_have_retired_vv_keys = true;
                     self.folder_problem = None;
                     return self.meta();
                 }

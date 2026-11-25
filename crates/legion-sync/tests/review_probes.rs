@@ -541,6 +541,8 @@ impl Peer for FakePeer {
             refused_from_caller: None,
             pruned_incarnations: Vec::new(),
             known_incarnations: BTreeMap::new(),
+            known_members: std::collections::BTreeSet::new(),
+            unsettled_vv_keys: Vec::new(),
         })
     }
 
@@ -1829,6 +1831,8 @@ fn item_k_ranged_resumable_fetch_and_cancellation() {
                 refused_from_caller: None,
                 pruned_incarnations: Vec::new(),
                 known_incarnations: BTreeMap::new(),
+                known_members: std::collections::BTreeSet::new(),
+                unsettled_vv_keys: Vec::new(),
             })
         }
 

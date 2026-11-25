@@ -511,9 +511,11 @@ always-on machine) simply makes that happen sooner for everyone.
   reconciles its disk by the join rule above; peer-forced rotations are rate-limited to at most
   once per day per peer and three times per week in total, after which further claims are ignored
   and reported as a problem naming the peer. Retired `(member, incarnation)` keys are pruned
-  deterministically from version vectors once every current member has moved past that incarnation
-  and directly acknowledged applied state past every local record mentioning it (this projection
-  commutes with version-vector merging and preserves convergence), with a safety cap of 64
+  deterministically from version vectors via two-phase causal stability once every current member
+  agrees the key is retired (removed from membership or replaced by a newer incarnation), has
+  directly acknowledged applied state past every local record mentioning it, and reports no
+  unacknowledged, held-back, or pending records still referencing it (this projection commutes with
+  version-vector merging and preserves convergence), with a safety cap of 64
   incarnations per member reported durably on both sides (recoverable by removing and re-adding the
   member). Two live machines using the same member id (alternating incarnations or diverging at the
   same sequence) are detected and reported as a problem rather than synced.

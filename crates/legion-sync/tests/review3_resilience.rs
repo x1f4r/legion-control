@@ -3227,6 +3227,8 @@ impl Peer for ManyOversizedPeer {
             refused_from_caller: None,
             pruned_incarnations: Vec::new(),
             known_incarnations: BTreeMap::new(),
+            known_members: BTreeSet::new(),
+            unsettled_vv_keys: Vec::new(),
         })
     }
     fn records_since(

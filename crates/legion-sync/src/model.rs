@@ -710,6 +710,15 @@ pub struct PeerCursor {
     /// incarnation before originating version-vector pruning.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub peer_known_incarnations: BTreeMap<MemberId, u64>,
+    /// Current folder membership set this peer reported during its latest handshake, used to
+    /// ensure every active member agrees a removed member has left before pruning its keys.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub peer_known_members: BTreeSet<MemberId>,
+    /// Non-active `(member, incarnation)` keys still appearing in this peer's unacknowledged
+    /// records, held-back records, or pending deletions at its latest handshake, preventing any
+    /// peer from pruning a retired key while causal ordering still depends on it in flight.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub peer_unsettled_vv_keys: BTreeSet<VersionKey>,
 }
 
 /// Compact summary carried in handshakes informing the remote peer that this member could not
@@ -761,6 +770,13 @@ pub struct HandshakeHello {
     /// Active `(member -> incarnation)` pairs directly observed by the caller.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub known_incarnations: BTreeMap<MemberId, u64>,
+    /// Current folder membership set known to the caller.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub known_members: BTreeSet<MemberId>,
+    /// Non-active `(member, incarnation)` keys still appearing in the caller's unacknowledged
+    /// records, held-back records, or pending local deletions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsettled_vv_keys: Vec<VersionKey>,
 }
 
 /// Handshake summary returned by a peer before pulling records or files.
@@ -808,6 +824,13 @@ pub struct PeerHandshake {
     /// Active `(member -> incarnation)` pairs directly observed by the callee.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub known_incarnations: BTreeMap<MemberId, u64>,
+    /// Current folder membership set known to the callee.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub known_members: BTreeSet<MemberId>,
+    /// Non-active `(member, incarnation)` keys still appearing in the callee's unacknowledged
+    /// records, held-back records, or pending local deletions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsettled_vv_keys: Vec<VersionKey>,
 }
 
 /// Per-fetch transfer options supporting ranged resume, idle timeouts, and cooperative cancellation.
