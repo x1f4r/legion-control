@@ -71,6 +71,14 @@ fn main() -> ExitCode {
             "relay_shutdown_is_labelled_with_relay_machine",
             relay_shutdown_is_labelled_with_relay_machine,
         ),
+        (
+            "relayed_move_source_removal_is_refused_in_default_build",
+            relayed_move_source_removal_is_refused_in_default_build,
+        ),
+        (
+            "relayed_put_if_exists_fail_refuses_existing_file_and_preserves_fields",
+            relayed_put_if_exists_fail_refuses_existing_file_and_preserves_fields,
+        ),
     ];
 
     let mut passed = 0usize;
@@ -350,6 +358,46 @@ fn helper(args: &[String]) -> ExitCode {
             let mut buf = vec![0u8; 64 * 1024];
             let _ = stdin.read_exact(&mut buf);
             std::process::exit(9);
+        }
+        Some("echo-put-header") => {
+            // Records the exact stream header line received from the relay and refuses with
+            // `exists` when `if_exists == "fail"` or `no_replace == true`.
+            let seen_file = PathBuf::from(&args[1]);
+            let mut out = std::io::stdout().lock();
+            writeln!(
+                out,
+                "{}",
+                json!({
+                    "protocol": 1,
+                    "capabilities": ["if_exists", "put.no_replace", "stream.relay"]
+                })
+            )
+            .unwrap();
+            out.flush().unwrap();
+            let mut line = String::new();
+            let mut stdin = BufReader::new(std::io::stdin());
+            if stdin.read_line(&mut line).unwrap_or(0) == 0 {
+                return ExitCode::from(1);
+            }
+            fs::write(&seen_file, &line).unwrap();
+            let req: Value = serde_json::from_str(&line).unwrap();
+            if req.get("no_replace") == Some(&Value::Bool(true))
+                || req.get("if_exists").and_then(Value::as_str) == Some("fail")
+            {
+                let err = json!({
+                    "error": {
+                        "code": "exists",
+                        "message": "Target file already exists.",
+                        "machine": "echoput"
+                    }
+                });
+                writeln!(out, "{err}").unwrap();
+                out.flush().unwrap();
+                return ExitCode::from(1);
+            }
+            writeln!(out, "{}", json!({ "offset": 0 })).unwrap();
+            out.flush().unwrap();
+            ExitCode::SUCCESS
         }
         other => {
             eprintln!("unknown relay helper mode: {other:?}");
@@ -1834,4 +1882,322 @@ fn relay_shutdown_is_labelled_with_relay_machine() {
             "target process lingered after relay shutdown"
         );
     }
+}
+
+fn relayed_move_source_removal_is_refused_in_default_build() {
+    let tower = node("tower");
+    let studio = node("studio");
+    tower.write_config("fleet.toml", &fleet_entry_for_node("studio", &studio));
+    let allow_all = "allow = [\"fs.read\", \"fs.write\", \"fs.remove\", \"fs.move\"]\n";
+    write_device_policy(&tower, allow_all);
+    write_device_policy(&studio, allow_all);
+
+    write_home_file(&studio, "keep.txt", b"original-source");
+    write_home_file(&tower, "keep.txt", b"original-tower");
+
+    let send_one = |node_home: &Home, header: &Value| -> (Value, Value) {
+        let mut child = spawn_stream(node_home, Some("device"));
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let greeting = read_greeting(&mut stdout);
+        write_json_line(&mut stdin, header);
+        drop(stdin);
+        let reply = read_json_line(&mut stdout);
+        let _ = child.wait().unwrap();
+        (greeting, reply)
+    };
+
+    #[cfg(not(feature = "move-between-places"))]
+    {
+        let move_headers = [
+            json!({
+                "protocol": 1,
+                "op": "delete",
+                "root": "~/keep.txt",
+                "names": [],
+                "remove_root": true,
+            }),
+            json!({
+                "protocol": 1,
+                "op": "delete",
+                "root": "~/keep.txt",
+                "names": [],
+                "expect_root_hash": legion_core::tokens::hash("original-source"),
+            }),
+            json!({
+                "protocol": 1,
+                "op": "delete",
+                "root": "~",
+                "names": ["keep.txt"],
+                "dry_run": true,
+            }),
+            json!({
+                "protocol": 1,
+                "op": "delete",
+                "root": "~",
+                "names": ["keep.txt"],
+                "lock_id": "fake-move-lock",
+            }),
+            json!({
+                "protocol": 1,
+                "op": "lock",
+                "paths": ["~/keep.txt"],
+            }),
+            json!({
+                "protocol": 1,
+                "op": "probe_write",
+                "action": "create",
+                "dir": "~",
+            }),
+            json!({
+                "protocol": 1,
+                "op": "probe_read",
+                "dir": "~",
+                "marker": ".legion-move-probe-x.tmp",
+            }),
+        ];
+
+        for inner in &move_headers {
+            let (direct_greeting, direct_reply) = send_one(&studio, inner);
+            assert_eq!(
+                direct_reply["error"]["code"],
+                json!("unsupported"),
+                "direct must refuse in default build: {direct_reply}"
+            );
+            let caps = direct_greeting["capabilities"].as_array().unwrap();
+            assert!(caps.contains(&json!("if_exists")), "{direct_greeting}");
+            assert!(caps.contains(&json!("rename")), "{direct_greeting}");
+            assert!(caps.contains(&json!("stream.relay")), "{direct_greeting}");
+            assert!(!caps.contains(&json!("lock")), "{direct_greeting}");
+            assert!(!caps.contains(&json!("move")), "{direct_greeting}");
+            assert!(!caps.contains(&json!("probe")), "{direct_greeting}");
+
+            for target in ["studio", "tower"] {
+                let (_, relayed_reply) = send_one(
+                    &tower,
+                    &json!({
+                        "protocol": 1,
+                        "op": "relay",
+                        "on": target,
+                        "request": inner,
+                    }),
+                );
+                assert_eq!(
+                    relayed_reply["error"]["code"], direct_reply["error"]["code"],
+                    "relayed refusal code to {target} must match direct for {inner}: relayed={relayed_reply} direct={direct_reply}"
+                );
+                assert_eq!(
+                    relayed_reply["error"]["message"], direct_reply["error"]["message"],
+                    "relayed refusal sentence to {target} must match direct for {inner}: relayed={relayed_reply} direct={direct_reply}"
+                );
+            }
+        }
+
+        assert_eq!(
+            fs::read(studio.home().join("keep.txt")).unwrap(),
+            b"original-source",
+            "refused relayed move source removal must leave studio's file untouched"
+        );
+        assert_eq!(
+            fs::read(tower.home().join("keep.txt")).unwrap(),
+            b"original-tower",
+            "refused self-relayed move source removal must leave tower's file untouched"
+        );
+    }
+
+    #[cfg(feature = "move-between-places")]
+    {
+        let digest = legion_core::tokens::hash("original-source");
+        let (greeting, reply) = send_one(
+            &tower,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "request": {
+                    "protocol": 1,
+                    "op": "delete",
+                    "root": "~/keep.txt",
+                    "names": [],
+                    "remove_root": true,
+                    "expect_root_hash": digest,
+                },
+            }),
+        );
+        let caps = greeting["capabilities"].as_array().unwrap();
+        for cap in [
+            "if_exists",
+            "lock",
+            "move",
+            "probe",
+            "rename",
+            "stream.relay",
+        ] {
+            assert!(caps.contains(&json!(cap)), "missing {cap} in {greeting}");
+        }
+        assert_eq!(reply["removed"], json!(1), "reply={reply}");
+        assert!(!studio.home().join("keep.txt").exists());
+
+        // Interactive multi-turn `lock` is still rejected cleanly rather than panicking.
+        let (_, lock_reply) = send_one(
+            &tower,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "request": {
+                    "protocol": 1,
+                    "op": "lock",
+                    "paths": ["~/keep.txt"],
+                },
+            }),
+        );
+        assert_eq!(lock_reply["error"]["code"], json!("unsupported"));
+    }
+}
+
+fn relayed_put_if_exists_fail_refuses_existing_file_and_preserves_fields() {
+    let tower = node("tower");
+    let studio = node("studio");
+    let seen_header = tower.home().join("seen-put-header.json");
+    tower.write_config(
+        "fleet.toml",
+        &format!(
+            "{}{}",
+            fleet_entry_for_node("studio", &studio),
+            fleet_entry_for_helper(
+                "echoput",
+                "echo-put-header",
+                &[&seen_header.to_string_lossy()]
+            ),
+        ),
+    );
+    write_device_policy(&tower, "allow = [\"fs.read\", \"fs.write\"]\n");
+    write_device_policy(&studio, "allow = [\"fs.read\", \"fs.write\"]\n");
+
+    let original = b"precious-original-contents";
+    let replacement = b"do-not-overwrite-existing";
+    let replacement_hash = legion_core::tokens::hash(std::str::from_utf8(replacement).unwrap());
+    write_home_file(&studio, "existing.txt", original);
+
+    // 1. Relayed `put` with `if_exists: "fail"` onto an existing file on `studio` is refused by
+    //    `studio` with `exists` and leaves the existing file untouched.
+    {
+        let mut child = spawn_stream(&tower, Some("device"));
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "request": {
+                    "protocol": 1,
+                    "op": "put",
+                    "path": "~/existing.txt",
+                    "size": replacement.len(),
+                    "hash": replacement_hash,
+                    "if_exists": "fail",
+                }
+            }),
+        );
+        drop(stdin);
+        let reply = read_json_line(&mut stdout);
+        assert_eq!(reply["error"]["code"], json!("exists"), "reply={reply}");
+        assert_eq!(
+            reply["error"]["machine"],
+            json!("studio"),
+            "exists refusal must come from target studio: {reply}"
+        );
+        let status = child.wait().unwrap();
+        assert!(!status.success());
+    }
+    assert_eq!(
+        fs::read(studio.home().join("existing.txt")).unwrap(),
+        original,
+        "existing file on studio must remain untouched after if_exists=fail refusal"
+    );
+    assert!(
+        !studio.home().join(".existing.txt.legion-part").exists(),
+        "refused put must not leave a partial file"
+    );
+
+    // 2. Relayed `put` with `if_exists: "skip"` skips cleanly without modifying the existing file.
+    {
+        let mut child = spawn_stream(&tower, Some("device"));
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "request": {
+                    "protocol": 1,
+                    "op": "put",
+                    "path": "~/existing.txt",
+                    "size": replacement.len(),
+                    "hash": replacement_hash,
+                    "if_exists": "skip",
+                }
+            }),
+        );
+        drop(stdin);
+        let ready = read_json_line(&mut stdout);
+        assert_eq!(ready["offset"], json!(replacement.len()), "ready={ready}");
+        let done = read_json_line(&mut stdout);
+        assert_eq!(done["ok"], json!(true), "done={done}");
+        assert_eq!(done["skipped"], json!(true), "done={done}");
+        assert!(child.wait().unwrap().success());
+    }
+    assert_eq!(
+        fs::read(studio.home().join("existing.txt")).unwrap(),
+        original,
+        "existing file on studio must remain untouched after if_exists=skip"
+    );
+
+    // 3. Relayed `put` preserves both `if_exists` and `no_replace: true` verbatim in the forwarded
+    //    header while supplying the relay-resolved `"as"` principal.
+    {
+        let mut child = spawn_stream(&tower, Some("device"));
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "echoput",
+                "request": {
+                    "protocol": 1,
+                    "op": "put",
+                    "path": "~/existing.txt",
+                    "size": replacement.len(),
+                    "hash": replacement_hash,
+                    "if_exists": "fail",
+                    "no_replace": true,
+                    "as": "admin",
+                }
+            }),
+        );
+        drop(stdin);
+        let reply = read_json_line(&mut stdout);
+        assert_eq!(reply["error"]["code"], json!("exists"), "reply={reply}");
+        assert_eq!(reply["error"]["machine"], json!("echoput"), "reply={reply}");
+        let _ = child.wait().unwrap();
+    }
+    let forwarded: Value =
+        serde_json::from_str(&fs::read_to_string(&seen_header).unwrap()).unwrap();
+    assert_eq!(forwarded["if_exists"], json!("fail"), "{forwarded}");
+    assert_eq!(forwarded["no_replace"], json!(true), "{forwarded}");
+    assert_eq!(
+        forwarded["as"],
+        json!("device"),
+        "relay must replace inner `as` with pinned principal: {forwarded}"
+    );
 }
