@@ -14,10 +14,11 @@
 pub mod android;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod desktop;
+pub mod file_policy;
 #[cfg(target_os = "ios")]
 pub mod ios;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -37,13 +38,26 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::{AppError, Backend, BoxFuture, ContentTarget, ErrorCode};
+pub use crate::transfers::file_policy::{
+    REFUSED_OPEN_HINT, REFUSED_OPEN_MESSAGE, is_refused_open_file_name, mime_for_file_name,
+    place_file_without_overwrite, sanitize_file_name, validate_child_in_dir,
+};
 
 /// Default maximum concurrent transfers running at once.
 pub const DEFAULT_MAX_CONCURRENT: usize = 2;
 
 /// Default size threshold above which a transfer counts as "large" for the Wi-Fi-only rule
-/// (50 MiB).
-pub const DEFAULT_LARGE_THRESHOLD_BYTES: u64 = 50 * 1024 * 1024;
+/// (50 MB, matching the interface's SI byte units).
+pub const DEFAULT_LARGE_THRESHOLD_BYTES: u64 = 50 * 1000 * 1000;
+
+/// Default progress stall timeout when a connected machine stops sending or accepting bytes.
+pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Maximum session-scoped upload handles retained in memory at once.
+const MAX_PICKED_UPLOAD_HANDLES: usize = 128;
+
+/// Maximum live UI progress watchers retained at once.
+const MAX_PROGRESS_WATCHERS: usize = 64;
 
 /// Bounded streaming buffer size used for downloads, uploads, and BLAKE3 hashing (64 KiB).
 const COPY_BUF_BYTES: usize = 64 * 1024;
@@ -118,6 +132,8 @@ pub enum PauseReason {
     Background,
     /// Automatically paused when Android's `dataSync` foreground-service time limit fired.
     FgsTimeout,
+    /// Automatically paused after the peer stopped making transfer progress within the stall timeout.
+    Stalled,
 }
 
 /// Action accepted by `transfer_control`.
@@ -197,9 +213,20 @@ pub struct DeviceTransfer {
     /// Verified BLAKE3 digest (`blake3:<64 hex>`) once computed/verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
-    /// True when tapping the finished row opens the local file.
+    /// True when tapping the finished row opens the local file directly.
     #[serde(rename = "canOpen")]
     pub can_open: bool,
+    /// True when the finished download can be revealed in its folder (offered for saved files
+    /// including refused executable/installer types).
+    #[serde(rename = "canShowInFolder", default)]
+    pub can_show_in_folder: bool,
+    /// Plain explanation when opening the saved file directly is refused by policy.
+    #[serde(
+        rename = "openBlockedReason",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub open_blocked_reason: Option<String>,
     /// Reason this transfer is paused, when `state == Paused`.
     #[serde(
         rename = "pausedReason",
@@ -250,7 +277,9 @@ pub struct OpenExternallyResult {
     pub ok: bool,
 }
 
-/// Pre-selected upload file optionally supplied by tests or internal callers.
+/// Pre-selected upload file accepted ONLY in debug builds compiled with the `test-upload-paths`
+/// feature (and Rust unit tests).
+#[cfg(any(test, all(debug_assertions, feature = "test-upload-paths")))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadFileInput {
     /// File display name.
@@ -267,6 +296,20 @@ pub struct UploadFileInput {
     /// Optional MIME type.
     #[serde(default)]
     pub mime: Option<String>,
+}
+
+/// Opaque session-only handle returned to the page after the user selects a file via the native
+/// picker (`transfer_pick_uploads`). Never exposes a local path or Android `content://` URI.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickedUploadHandle {
+    /// Opaque random token valid only for this app session and consumed when enqueued.
+    pub handle: String,
+    /// Sanitized file display name with its real extension.
+    pub name: String,
+    /// File size in bytes when known (0 if unknown until read).
+    pub size: u64,
+    /// Device-derived MIME type from the file's real extension.
+    pub mime: String,
 }
 
 /// File returned by the platform's native upload picker.
@@ -424,6 +467,21 @@ pub trait TransferPlatform: Send + Sync + 'static {
         true
     }
 
+    /// True when this platform implements "Open in another app".
+    fn supports_open_externally(&self) -> bool {
+        true
+    }
+
+    /// True when this platform can open finished downloads directly in a viewer/chooser.
+    fn supports_open_downloads(&self) -> bool {
+        true
+    }
+
+    /// True when this platform can reveal a finished download in its folder.
+    fn supports_show_in_folder(&self) -> bool {
+        true
+    }
+
     /// Opens the platform's native file picker and returns chosen upload files (empty if cancelled).
     fn pick_upload_files(&self) -> BoxFuture<'_, Result<Vec<PickedUploadFile>, AppError>>;
 
@@ -461,6 +519,16 @@ pub trait TransferPlatform: Send + Sync + 'static {
         mime: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), AppError>>;
 
+    /// Reveals a finished download in its folder (never executes the file).
+    fn show_in_folder<'a>(&'a self, _local_path: &'a str) -> BoxFuture<'a, Result<(), AppError>> {
+        Box::pin(async {
+            Err(AppError::new(
+                ErrorCode::Unsupported,
+                "Showing a file in its folder is not supported on this platform.",
+            ))
+        })
+    }
+
     /// Called whenever queue summary changes (drives Android foreground notification and desktop
     /// hidden-window completion exit).
     fn on_queue_updated(&self, _summary: QueueNotificationSummary) {}
@@ -473,8 +541,20 @@ pub trait TransferPlatform: Send + Sync + 'static {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TransferRecord {
     pub transfer: DeviceTransfer,
-    #[serde(default)]
+    /// Session-only intent to launch the external chooser once this download finishes. Never
+    /// persisted across app restarts so restarted queues never launch apps unexpectedly.
+    #[serde(skip)]
     pub open_after_done: bool,
+    /// Set once `finalize_download` has already saved the verified bytes so resuming after a
+    /// pause-during-save race is idempotent and never runs `finalize_download` a second time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalized_local_path: Option<String>,
+    /// Verified BLAKE3 hash recorded alongside `finalized_local_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalized_hash: Option<String>,
+    /// True once an upload has chosen its collision-free remote path so retries resume it.
+    #[serde(default)]
+    pub remote_path_resolved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_mtime_secs: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -510,12 +590,21 @@ impl Default for PersistedQueue {
     }
 }
 
+#[derive(Clone)]
+struct RunningWorker {
+    worker_id: u64,
+    cancel: CancellationToken,
+}
+
 struct QueueState {
     settings: TransferSettings,
     next_seq: u64,
+    next_worker_id: u64,
+    next_watcher_id: u64,
     items: Vec<TransferRecord>,
-    running: HashMap<String, CancellationToken>,
-    watchers: Vec<IpcChannel<Vec<DeviceTransfer>>>,
+    running: HashMap<String, RunningWorker>,
+    watchers: HashMap<u64, IpcChannel<Vec<DeviceTransfer>>>,
+    picked_uploads: HashMap<String, PickedUploadFile>,
     last_ui_broadcast: Instant,
     last_notify_broadcast: Instant,
 }
@@ -544,7 +633,10 @@ pub struct TransferManager {
     platform: Arc<dyn TransferPlatform>,
     max_concurrent: usize,
     retry_window: Duration,
+    stall_timeout: Duration,
     state: Mutex<QueueState>,
+    persist_seq: AtomicU64,
+    persist_lock: Mutex<u64>,
     schedule_notify: Notify,
     scheduler_started: AtomicBool,
     shutdown_token: CancellationToken,
@@ -561,12 +653,13 @@ impl TransferManager {
         backend: Arc<dyn Backend>,
         platform: Arc<dyn TransferPlatform>,
     ) -> Arc<Self> {
-        Self::with_options(
+        Self::with_timeouts(
             data_dir,
             backend,
             platform,
             DEFAULT_MAX_CONCURRENT,
             DEFAULT_RETRY_WINDOW,
+            DEFAULT_STALL_TIMEOUT,
         )
     }
 
@@ -577,6 +670,25 @@ impl TransferManager {
         platform: Arc<dyn TransferPlatform>,
         max_concurrent: usize,
         retry_window: Duration,
+    ) -> Arc<Self> {
+        Self::with_timeouts(
+            data_dir,
+            backend,
+            platform,
+            max_concurrent,
+            retry_window,
+            DEFAULT_STALL_TIMEOUT,
+        )
+    }
+
+    /// Constructs a manager with explicit concurrency, retry window, and progress stall timeout.
+    pub fn with_timeouts(
+        data_dir: impl AsRef<Path>,
+        backend: Arc<dyn Backend>,
+        platform: Arc<dyn TransferPlatform>,
+        max_concurrent: usize,
+        retry_window: Duration,
+        stall_timeout: Duration,
     ) -> Arc<Self> {
         let transfers_dir = data_dir.as_ref().join("transfers");
         let parts_dir = transfers_dir.join("parts");
@@ -596,16 +708,49 @@ impl TransferManager {
         // - Background-paused (iOS) or FGS-timeout-paused transfers become `queued` on next start.
         // - WifiOnly-paused transfers resume if we are now on unmetered Wi-Fi.
         // - Sync `bytes_done` for downloads with the actual `.part` size on disk.
+        // - Enforce sanitized names and device-derived MIME / refused-open flags on persisted rows.
         let mut changed = false;
+        let mut live_download_ids = std::collections::HashSet::new();
         for rec in &mut loaded.items {
+            rec.open_after_done = false;
+            let safe_name = sanitize_file_name(&rec.transfer.name);
+            if rec.transfer.name != safe_name {
+                rec.transfer.name = safe_name;
+                changed = true;
+            }
+            if rec.transfer.direction == TransferDirection::Download {
+                let device_mime = mime_for_file_name(&rec.transfer.name).to_owned();
+                if rec.transfer.mime.as_deref() != Some(device_mime.as_str()) {
+                    rec.transfer.mime = Some(device_mime);
+                    changed = true;
+                }
+                if rec.transfer.state == TransferState::Done {
+                    let refused = is_refused_open_file_name(&rec.transfer.name);
+                    let want_open = platform.supports_open_downloads() && !refused;
+                    let want_show = platform.supports_show_in_folder();
+                    let want_reason = refused.then(|| REFUSED_OPEN_MESSAGE.to_owned());
+                    if rec.transfer.can_open != want_open
+                        || rec.transfer.can_show_in_folder != want_show
+                        || rec.transfer.open_blocked_reason != want_reason
+                    {
+                        rec.transfer.can_open = want_open;
+                        rec.transfer.can_show_in_folder = want_show;
+                        rec.transfer.open_blocked_reason = want_reason;
+                        changed = true;
+                    }
+                }
+            }
             if rec.transfer.direction == TransferDirection::Download
                 && !rec.transfer.state.is_terminal()
             {
-                let part = parts_dir.join(format!("{}.part", rec.transfer.id));
-                let on_disk = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-                if rec.transfer.bytes_done != on_disk {
-                    rec.transfer.bytes_done = on_disk;
-                    changed = true;
+                live_download_ids.insert(rec.transfer.id.clone());
+                if rec.finalized_local_path.is_none() {
+                    let part = parts_dir.join(format!("{}.part", rec.transfer.id));
+                    let on_disk = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+                    if rec.transfer.bytes_done != on_disk {
+                        rec.transfer.bytes_done = on_disk;
+                        changed = true;
+                    }
                 }
             }
             rec.transfer.rate = None;
@@ -634,6 +779,9 @@ impl TransferManager {
             }
         }
 
+        // Sweep any orphaned `.part` files whose transfer id is no longer active or paused.
+        sweep_orphaned_parts(&parts_dir, &live_download_ids);
+
         let salt = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -645,15 +793,21 @@ impl TransferManager {
             platform,
             max_concurrent: max_concurrent.max(1),
             retry_window,
+            stall_timeout,
             state: Mutex::new(QueueState {
                 settings: loaded.settings,
                 next_seq: loaded.next_seq.max(1),
+                next_worker_id: 1,
+                next_watcher_id: 1,
                 items: loaded.items,
                 running: HashMap::new(),
-                watchers: Vec::new(),
+                watchers: HashMap::new(),
+                picked_uploads: HashMap::new(),
                 last_ui_broadcast: Instant::now() - UI_PROGRESS_INTERVAL,
                 last_notify_broadcast: Instant::now() - NOTIFY_PROGRESS_INTERVAL,
             }),
+            persist_seq: AtomicU64::new(0),
+            persist_lock: Mutex::new(0),
             schedule_notify: Notify::new(),
             scheduler_started: AtomicBool::new(false),
             shutdown_token: CancellationToken::new(),
@@ -690,7 +844,7 @@ impl TransferManager {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.running.values().cloned().collect()
+            guard.running.values().map(|w| w.cancel.clone()).collect()
         };
         for tok in tokens {
             tok.cancel();
@@ -756,8 +910,8 @@ impl TransferManager {
                         rec.transfer.state = TransferState::Paused;
                         rec.transfer.paused_reason = Some(PauseReason::WifiOnly);
                         rec.transfer.rate = None;
-                        if let Some(tok) = state.running.get(&rec.transfer.id) {
-                            to_cancel.push(tok.clone());
+                        if let Some(worker) = state.running.get(&rec.transfer.id) {
+                            to_cancel.push(worker.cancel.clone());
                         }
                     }
                 }
@@ -814,8 +968,8 @@ impl TransferManager {
                         rec.transfer.paused_reason = Some(PauseReason::WifiOnly);
                         rec.transfer.rate = None;
                         changed = true;
-                        if let Some(tok) = state.running.get(&rec.transfer.id) {
-                            to_cancel.push(tok.clone());
+                        if let Some(worker) = state.running.get(&rec.transfer.id) {
+                            to_cancel.push(worker.cancel.clone());
                         }
                     }
                 }
@@ -849,8 +1003,8 @@ impl TransferManager {
                     rec.transfer.paused_reason = Some(reason);
                     rec.transfer.rate = None;
                     changed = true;
-                    if let Some(tok) = state.running.get(&rec.transfer.id) {
-                        to_cancel.push(tok.clone());
+                    if let Some(worker) = state.running.get(&rec.transfer.id) {
+                        to_cancel.push(worker.cancel.clone());
                     }
                 }
             }
@@ -924,18 +1078,37 @@ impl TransferManager {
     }
 
     /// Subscribes an IPC channel to live transfer queue snapshots, immediately sending the current
-    /// snapshot.
-    pub fn watch(&self, channel: IpcChannel<Vec<DeviceTransfer>>) {
-        let snapshot = {
+    /// snapshot, and returns a stable watcher id for explicit removal via [`Self::unwatch`].
+    pub fn watch(&self, channel: IpcChannel<Vec<DeviceTransfer>>) -> u64 {
+        let (watcher_id, snapshot) = {
             let mut guard = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let id = guard.next_watcher_id;
+            guard.next_watcher_id = guard.next_watcher_id.saturating_add(1);
+            if guard.watchers.len() >= MAX_PROGRESS_WATCHERS
+                && let Some(&oldest_id) = guard.watchers.keys().min()
+            {
+                guard.watchers.remove(&oldest_id);
+            }
             let snap = snapshot_transfers(&guard.items);
-            guard.watchers.push(channel.clone());
-            snap
+            guard.watchers.insert(id, channel.clone());
+            (id, snap)
         };
-        let _ = channel.send(snapshot);
+        if channel.send(snapshot).is_err() {
+            self.unwatch(watcher_id);
+        }
+        watcher_id
+    }
+
+    /// Removes a previously registered progress watcher by its identity.
+    pub fn unwatch(&self, watcher_id: u64) {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.watchers.remove(&watcher_id);
     }
 
     /// Enqueues a non-blocking download (either to Downloads or to open-externally cache) and
@@ -946,7 +1119,7 @@ impl TransferManager {
         path: String,
         name: Option<String>,
         size: Option<u64>,
-        mime: Option<String>,
+        _untrusted_mime: Option<String>,
         open_after_done: bool,
     ) -> Result<String, AppError> {
         let machine_trimmed = machine.trim().to_owned();
@@ -965,12 +1138,27 @@ impl TransferManager {
         let inferred_name = extract_file_name(&path).map_err(AppError::from)?;
         let display_name = name
             .as_deref()
-            .map(sanitize_file_name)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| sanitize_file_name(&inferred_name));
-        let resolved_mime = mime
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| guess_mime_from_name(&display_name).map(str::to_owned));
+            .map(sanitize_file_name)
+            .unwrap_or_else(|| sanitize_file_name(&inferred_name));
+
+        if open_after_done {
+            if !self.platform.supports_open_externally() {
+                return Err(AppError::new(
+                    ErrorCode::Unsupported,
+                    "Opening files directly in another app is not yet supported on this platform.",
+                )
+                .with_hint("Download the file to save it instead."));
+            }
+            if is_refused_open_file_name(&display_name) {
+                return Err(AppError::new(ErrorCode::Denied, REFUSED_OPEN_MESSAGE)
+                    .with_hint(REFUSED_OPEN_HINT));
+            }
+        }
+
+        // Always derive MIME on the device from the sanitized file's real extension, never from the
+        // remote machine's listing.
+        let resolved_mime = Some(mime_for_file_name(&display_name).to_owned());
 
         // Verify the machine is paired before enqueueing.
         let _ = self.backend.content_target(&machine_trimmed)?;
@@ -1002,22 +1190,28 @@ impl TransferManager {
                 finished: None,
                 hash: None,
                 can_open: false,
+                can_show_in_folder: false,
+                open_blocked_reason: None,
                 paused_reason,
             },
             open_after_done,
+            finalized_local_path: None,
+            finalized_hash: None,
+            remote_path_resolved: false,
             remote_mtime_secs: None,
             remote_mtime_nanos: None,
             remote_file_id: None,
         };
 
-        {
+        let pruned = {
             let mut guard = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.items.push(record);
-            prune_terminal_locked(&mut guard.items);
-        }
+            prune_terminal_locked(&mut guard.items)
+        };
+        self.cleanup_pruned_records(pruned).await;
 
         self.start();
         self.persist_locked_snapshot();
@@ -1026,14 +1220,145 @@ impl TransferManager {
         Ok(id)
     }
 
-    /// Picks files using the native picker (unless pre-supplied in `files`) and enqueues non-blocking
-    /// bulk-pipe `put` uploads into `machine:dir`. Returns `Ok(None)` if the picker was cancelled.
+    /// Opens the platform's native file picker and registers each selected file under a fresh
+    /// session-only opaque handle so the web view never receives or supplies device paths/URIs.
+    pub async fn pick_uploads(&self) -> Result<Vec<PickedUploadHandle>, AppError> {
+        let chosen = self.platform.pick_upload_files().await?;
+        if chosen.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut handles = Vec::with_capacity(chosen.len());
+        let mut to_release = Vec::new();
+        {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for mut file in chosen {
+                file.name = sanitize_file_name(&file.name);
+                let mime = mime_for_file_name(&file.name).to_owned();
+                file.mime = Some(mime.clone());
+                let token = random_opaque_handle()?;
+                if guard.picked_uploads.len() >= MAX_PICKED_UPLOAD_HANDLES
+                    && let Some(evict_key) = guard.picked_uploads.keys().next().cloned()
+                    && let Some(evicted) = guard.picked_uploads.remove(&evict_key)
+                {
+                    to_release.push(evicted.local_path);
+                }
+                handles.push(PickedUploadHandle {
+                    handle: token.clone(),
+                    name: file.name.clone(),
+                    size: file.size,
+                    mime,
+                });
+                guard.picked_uploads.insert(token, file);
+            }
+        }
+        for old_path in to_release {
+            self.platform.release_upload_source(&old_path).await;
+        }
+        Ok(handles)
+    }
+
+    /// Enqueues non-blocking bulk-pipe `put` uploads into `machine:dir`.
+    ///
+    /// When `handles` is `None` or empty, opens the native system file picker directly inside Rust
+    /// (returning `Ok(None)` if cancelled). When `handles` is supplied, accepts ONLY opaque
+    /// session handles previously returned by [`Self::pick_uploads`]; arbitrary device paths or
+    /// URIs are always refused.
     pub async fn enqueue_upload(
         self: &Arc<Self>,
         machine: String,
         dir: String,
-        files: Option<Vec<UploadFileInput>>,
+        handles: Option<Vec<String>>,
     ) -> Result<Option<UploadEnqueueResult>, AppError> {
+        let (machine_trimmed, dir_trimmed) = self.validate_upload_target(&machine, &dir)?;
+
+        let picked: Vec<PickedUploadFile> = match handles {
+            Some(supplied) if !supplied.is_empty() => {
+                let mut guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Verify every handle exists BEFORE consuming any so a partial/forged list never
+                // leaks or mutates session state.
+                for raw in &supplied {
+                    if !guard.picked_uploads.contains_key(raw.trim()) {
+                        return Err(AppError::new(
+                            ErrorCode::Denied,
+                            "Upload handle is invalid or expired.",
+                        )
+                        .with_hint("Select files again using the device's system file picker."));
+                    }
+                }
+                let mut out = Vec::with_capacity(supplied.len());
+                for raw in supplied {
+                    if let Some(file) = guard.picked_uploads.remove(raw.trim()) {
+                        out.push(file);
+                    }
+                }
+                out
+            }
+            _ => {
+                let chosen = self.platform.pick_upload_files().await?;
+                if chosen.is_empty() {
+                    return Ok(None);
+                }
+                chosen
+            }
+        };
+
+        self.enqueue_picked_uploads(machine_trimmed, dir_trimmed, picked)
+            .await
+    }
+
+    /// Debug/test-only upload entrypoint accepting pre-selected local file paths. Compiled ONLY
+    /// in unit tests or debug builds explicitly enabling the `test-upload-paths` feature.
+    #[cfg(any(test, all(debug_assertions, feature = "test-upload-paths")))]
+    pub async fn enqueue_upload_paths_for_test(
+        self: &Arc<Self>,
+        machine: String,
+        dir: String,
+        files: Vec<UploadFileInput>,
+    ) -> Result<Option<UploadEnqueueResult>, AppError> {
+        let (machine_trimmed, dir_trimmed) = self.validate_upload_target(&machine, &dir)?;
+        if files.is_empty() {
+            return Ok(None);
+        }
+        let mut picked = Vec::with_capacity(files.len());
+        for item in files {
+            let local_path = item
+                .path
+                .or(item.uri)
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::new(
+                        ErrorCode::InvalidArgs,
+                        "Supplied upload file is missing a local path or URI.",
+                    )
+                })?;
+            let safe_name = sanitize_file_name(&item.name);
+            let size = item
+                .size
+                .unwrap_or_else(|| fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0));
+            let mime = Some(mime_for_file_name(&safe_name).to_owned());
+            picked.push(PickedUploadFile {
+                local_path,
+                name: safe_name,
+                size,
+                mime,
+            });
+        }
+        self.enqueue_picked_uploads(machine_trimmed, dir_trimmed, picked)
+            .await
+    }
+
+    fn validate_upload_target(
+        &self,
+        machine: &str,
+        dir: &str,
+    ) -> Result<(String, String), AppError> {
         let machine_trimmed = machine.trim().to_owned();
         if machine_trimmed.is_empty() {
             return Err(
@@ -1051,60 +1376,21 @@ impl TransferManager {
         }
         // Verify machine is paired before opening the file picker.
         let _ = self.backend.content_target(&machine_trimmed)?;
+        Ok((machine_trimmed, dir_trimmed))
+    }
 
-        let picked: Vec<PickedUploadFile> = match files {
-            Some(supplied) if !supplied.is_empty() => {
-                let mut out = Vec::with_capacity(supplied.len());
-                for item in supplied {
-                    let local_path = item
-                        .path
-                        .or(item.uri)
-                        .map(|s| s.trim().to_owned())
-                        .filter(|s| !s.is_empty())
-                        .ok_or_else(|| {
-                            AppError::new(
-                                ErrorCode::InvalidArgs,
-                                "Supplied upload file is missing a local path or URI.",
-                            )
-                        })?;
-                    let safe_name = sanitize_file_name(&item.name);
-                    if safe_name.is_empty() {
-                        return Err(AppError::new(
-                            ErrorCode::InvalidArgs,
-                            "Supplied upload file has an empty file name.",
-                        ));
-                    }
-                    let size = item
-                        .size
-                        .unwrap_or_else(|| fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0));
-                    let mime = item
-                        .mime
-                        .filter(|s| !s.trim().is_empty())
-                        .or_else(|| guess_mime_from_name(&safe_name).map(str::to_owned));
-                    out.push(PickedUploadFile {
-                        local_path,
-                        name: safe_name,
-                        size,
-                        mime,
-                    });
-                }
-                out
-            }
-            _ => {
-                let chosen = self.platform.pick_upload_files().await?;
-                if chosen.is_empty() {
-                    return Ok(None);
-                }
-                chosen
-            }
-        };
-
+    async fn enqueue_picked_uploads(
+        self: &Arc<Self>,
+        machine_trimmed: String,
+        dir_trimmed: String,
+        picked: Vec<PickedUploadFile>,
+    ) -> Result<Option<UploadEnqueueResult>, AppError> {
         // Ask Android notification permission lazily on first user-initiated transfer.
         let _ = self.platform.before_user_transfer().await;
 
         let mut ids = Vec::with_capacity(picked.len());
         let created = now_rfc3339_utc();
-        {
+        let pruned = {
             let mut guard = self
                 .state
                 .lock()
@@ -1115,9 +1401,6 @@ impl TransferManager {
 
             for file in picked {
                 let safe_name = sanitize_file_name(&file.name);
-                if safe_name.is_empty() {
-                    continue;
-                }
                 let seq = guard.next_seq;
                 guard.next_seq = guard.next_seq.saturating_add(1);
                 let salt = self.id_salt.load(Ordering::Relaxed) & 0xFFFF;
@@ -1130,10 +1413,7 @@ impl TransferManager {
                 };
                 let paused_reason =
                     (initial_state == TransferState::Paused).then_some(PauseReason::WifiOnly);
-                let mime = file
-                    .mime
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| guess_mime_from_name(&safe_name).map(str::to_owned));
+                let mime = Some(mime_for_file_name(&safe_name).to_owned());
                 guard.items.push(TransferRecord {
                     transfer: DeviceTransfer {
                         id: id.clone(),
@@ -1152,17 +1432,23 @@ impl TransferManager {
                         finished: None,
                         hash: None,
                         can_open: false,
+                        can_show_in_folder: false,
+                        open_blocked_reason: None,
                         paused_reason,
                     },
                     open_after_done: false,
+                    finalized_local_path: None,
+                    finalized_hash: None,
+                    remote_path_resolved: false,
                     remote_mtime_secs: None,
                     remote_mtime_nanos: None,
                     remote_file_id: None,
                 });
                 ids.push(id);
             }
-            prune_terminal_locked(&mut guard.items);
-        }
+            prune_terminal_locked(&mut guard.items)
+        };
+        self.cleanup_pruned_records(pruned).await;
 
         let Some(first_id) = ids.first().cloned() else {
             return Ok(None);
@@ -1189,6 +1475,7 @@ impl TransferManager {
         let mut cancel_token: Option<CancellationToken> = None;
         let mut delete_part = false;
         let mut release_upload_uri: Option<String> = None;
+        let mut pruned = Vec::new();
 
         let snapshot = {
             let mut guard = self
@@ -1208,7 +1495,7 @@ impl TransferManager {
                         guard.items[pos].transfer.state = TransferState::Paused;
                         guard.items[pos].transfer.paused_reason = Some(PauseReason::User);
                         guard.items[pos].transfer.rate = None;
-                        cancel_token = guard.running.get(id).cloned();
+                        cancel_token = guard.running.get(id).map(|w| w.cancel.clone());
                     }
                 }
                 TransferControlAction::Resume => {
@@ -1226,16 +1513,30 @@ impl TransferManager {
                         guard.items[pos].transfer.rate = None;
                         guard.items[pos].transfer.error = None;
                         guard.items[pos].transfer.finished = Some(now_rfc3339_utc());
-                        cancel_token = guard.running.get(id).cloned();
+                        guard.items[pos].open_after_done = false;
+                        guard.items[pos].finalized_local_path = None;
+                        guard.items[pos].finalized_hash = None;
+                        cancel_token = guard.running.get(id).map(|w| w.cancel.clone());
                         delete_part =
                             guard.items[pos].transfer.direction == TransferDirection::Download;
                         if guard.items[pos].transfer.direction == TransferDirection::Upload {
                             release_upload_uri = guard.items[pos].transfer.local_path.clone();
                         }
+                        pruned = prune_terminal_locked(&mut guard.items);
                     }
                 }
             }
-            guard.items[pos].transfer.clone()
+            guard
+                .items
+                .iter()
+                .find(|r| r.transfer.id == id)
+                .map(|r| r.transfer.clone())
+                .ok_or_else(|| {
+                    AppError::new(
+                        ErrorCode::NotFound,
+                        format!("No transfer found with id `{id}`."),
+                    )
+                })?
         };
 
         if let Some(tok) = cancel_token {
@@ -1247,6 +1548,7 @@ impl TransferManager {
         if let Some(uri) = release_upload_uri {
             self.platform.release_upload_source(&uri).await;
         }
+        self.cleanup_pruned_records(pruned).await;
 
         if action == TransferControlAction::Resume {
             self.start();
@@ -1258,8 +1560,19 @@ impl TransferManager {
     }
 
     /// Opens a finished downloaded file on this device using the platform viewer / chooser.
+    ///
+    /// Refuses executable, installer, script, shortcut, and disk-image extensions regardless of
+    /// what MIME type the remote machine advertised, and derives the viewer MIME type strictly on
+    /// this device from the saved filename's real extension.
     pub async fn open_transfer(&self, id: &str) -> Result<OpenTransferResult, AppError> {
-        let (local_path, mime) = {
+        if !self.platform.supports_open_downloads() {
+            return Err(AppError::new(
+                ErrorCode::Unsupported,
+                "Opening downloaded files directly is not yet supported on this platform.",
+            )
+            .with_hint("Find the saved file in the Files app under Legion."));
+        }
+        let (local_path, file_name) = {
             let guard = self
                 .state
                 .lock()
@@ -1283,18 +1596,77 @@ impl TransferManager {
                     "Only downloaded files can be opened from device transfers.",
                 ));
             }
+            if is_refused_open_file_name(&rec.transfer.name) {
+                return Err(AppError::new(ErrorCode::Denied, REFUSED_OPEN_MESSAGE)
+                    .with_hint(REFUSED_OPEN_HINT));
+            }
             let Some(path) = rec.transfer.local_path.clone() else {
                 return Err(AppError::new(
                     ErrorCode::NotFound,
                     "The downloaded file path is no longer recorded.",
                 ));
             };
-            (path, rec.transfer.mime.clone())
+            (path, rec.transfer.name.clone())
         };
+        let device_mime = mime_for_file_name(&file_name);
         self.platform
-            .open_local_file(&local_path, mime.as_deref())
+            .open_local_file(&local_path, Some(device_mime))
             .await?;
         Ok(OpenTransferResult { ok: true })
+    }
+
+    /// Reveals a finished downloaded file in the device's file manager / Downloads folder.
+    ///
+    /// Looks up the path by transfer `id`; the page never supplies a device filesystem path.
+    pub async fn show_transfer_in_folder(&self, id: &str) -> Result<OpenTransferResult, AppError> {
+        if !self.platform.supports_show_in_folder() {
+            return Err(AppError::new(
+                ErrorCode::Unsupported,
+                "Showing files in a folder is not supported on this platform.",
+            ));
+        }
+        let local_path = {
+            let guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(rec) = guard.items.iter().find(|r| r.transfer.id == id) else {
+                return Err(AppError::new(
+                    ErrorCode::NotFound,
+                    format!("No transfer found with id `{id}`."),
+                ));
+            };
+            if rec.transfer.state != TransferState::Done {
+                return Err(AppError::new(
+                    ErrorCode::Conflict,
+                    "This transfer is not finished yet.",
+                ));
+            }
+            if rec.transfer.direction != TransferDirection::Download {
+                return Err(AppError::new(
+                    ErrorCode::Unsupported,
+                    "Only downloaded files can be revealed in a folder.",
+                ));
+            }
+            rec.transfer.local_path.clone().ok_or_else(|| {
+                AppError::new(
+                    ErrorCode::NotFound,
+                    "The downloaded file path is no longer recorded.",
+                )
+            })?
+        };
+        self.platform.show_in_folder(&local_path).await?;
+        Ok(OpenTransferResult { ok: true })
+    }
+
+    async fn cleanup_pruned_records(&self, pruned: Vec<TransferRecord>) {
+        for rec in pruned {
+            if rec.transfer.direction == TransferDirection::Download {
+                let _ = tokio::fs::remove_file(self.part_path(&rec.transfer.id)).await;
+            } else if let Some(uri) = rec.transfer.local_path.as_deref() {
+                self.platform.release_upload_source(uri).await;
+            }
+        }
     }
 
     fn allocate_id(&self) -> String {
@@ -1329,19 +1701,30 @@ impl TransferManager {
     }
 
     fn persist_locked_snapshot(&self) {
-        let payload = {
+        let (seq, payload) = {
             let guard = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            PersistedQueue {
+            let seq = self.persist_seq.fetch_add(1, Ordering::AcqRel) + 1;
+            let payload = PersistedQueue {
                 version: QUEUE_FILE_VERSION,
                 settings: guard.settings,
                 next_seq: guard.next_seq,
                 items: guard.items.clone(),
-            }
+            };
+            (seq, payload)
         };
-        let _ = save_queue_file(&self.queue_file_path(), &payload);
+        let mut last_written = self
+            .persist_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if seq <= *last_written {
+            return;
+        }
+        if save_queue_file(&self.queue_file_path(), &payload).is_ok() {
+            *last_written = seq;
+        }
     }
 
     fn broadcast_state_change(&self) {
@@ -1355,7 +1738,11 @@ impl TransferManager {
             guard.last_notify_broadcast = now;
             let snap = snapshot_transfers(&guard.items);
             let sum = build_notification_summary(&guard.items);
-            let watchers = guard.watchers.clone();
+            let watchers: Vec<(u64, IpcChannel<Vec<DeviceTransfer>>)> = guard
+                .watchers
+                .iter()
+                .map(|(&id, ch)| (id, ch.clone()))
+                .collect();
             (snap, sum, watchers)
         };
         self.platform.on_queue_updated(summary);
@@ -1372,7 +1759,12 @@ impl TransferManager {
             let ui =
                 if now.saturating_duration_since(guard.last_ui_broadcast) >= UI_PROGRESS_INTERVAL {
                     guard.last_ui_broadcast = now;
-                    Some((snapshot_transfers(&guard.items), guard.watchers.clone()))
+                    let watchers: Vec<(u64, IpcChannel<Vec<DeviceTransfer>>)> = guard
+                        .watchers
+                        .iter()
+                        .map(|(&id, ch)| (id, ch.clone()))
+                        .collect();
+                    Some((snapshot_transfers(&guard.items), watchers))
                 } else {
                     None
                 };
@@ -1396,29 +1788,26 @@ impl TransferManager {
 
     fn send_to_watchers(
         &self,
-        watchers: &[IpcChannel<Vec<DeviceTransfer>>],
+        watchers: &[(u64, IpcChannel<Vec<DeviceTransfer>>)],
         snapshot: &[DeviceTransfer],
     ) {
         if watchers.is_empty() {
             return;
         }
-        let mut dead_indices = HashSet::new();
-        for (idx, ch) in watchers.iter().enumerate() {
+        let mut dead_ids = Vec::new();
+        for (watcher_id, ch) in watchers {
             if ch.send(snapshot.to_vec()).is_err() {
-                dead_indices.insert(idx);
+                dead_ids.push(*watcher_id);
             }
         }
-        if !dead_indices.is_empty() {
+        if !dead_ids.is_empty() {
             let mut guard = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut keep_idx = 0usize;
-            guard.watchers.retain(|_| {
-                let keep = !dead_indices.contains(&keep_idx);
-                keep_idx += 1;
-                keep
-            });
+            for id in dead_ids {
+                guard.watchers.remove(&id);
+            }
         }
     }
 
@@ -1428,7 +1817,7 @@ impl TransferManager {
                 return;
             }
 
-            let to_spawn: Vec<(String, CancellationToken)> = {
+            let to_spawn: Vec<(String, u64, CancellationToken)> = {
                 let mut guard = self
                     .state
                     .lock()
@@ -1440,10 +1829,12 @@ impl TransferManager {
                 let mut wifi_paused_any = false;
 
                 while guard.running.len() < self.max_concurrent {
-                    let next_pos = guard
-                        .items
-                        .iter()
-                        .position(|r| r.transfer.state == TransferState::Queued);
+                    // Never spawn a second worker while an earlier worker for the same transfer id
+                    // still holds its slot (e.g. pause -> resume during final save).
+                    let next_pos = guard.items.iter().position(|r| {
+                        r.transfer.state == TransferState::Queued
+                            && !guard.running.contains_key(&r.transfer.id)
+                    });
                     let Some(pos) = next_pos else {
                         break;
                     };
@@ -1458,9 +1849,17 @@ impl TransferManager {
                     guard.items[pos].transfer.state = TransferState::Running;
                     guard.items[pos].transfer.paused_reason = None;
                     guard.items[pos].transfer.error = None;
+                    let worker_id = guard.next_worker_id;
+                    guard.next_worker_id = guard.next_worker_id.saturating_add(1);
                     let tok = self.shutdown_token.child_token();
-                    guard.running.insert(id.clone(), tok.clone());
-                    spawned.push((id, tok));
+                    guard.running.insert(
+                        id.clone(),
+                        RunningWorker {
+                            worker_id,
+                            cancel: tok.clone(),
+                        },
+                    );
+                    spawned.push((id, worker_id, tok));
                 }
 
                 if wifi_paused_any || !spawned.is_empty() {
@@ -1471,10 +1870,10 @@ impl TransferManager {
                 spawned
             };
 
-            for (id, cancel) in to_spawn {
+            for (id, worker_id, cancel) in to_spawn {
                 let mgr = Arc::clone(&self);
                 tokio::spawn(async move {
-                    mgr.run_worker(&id, cancel).await;
+                    mgr.run_worker(&id, worker_id, cancel).await;
                 });
             }
 
@@ -1486,7 +1885,7 @@ impl TransferManager {
         }
     }
 
-    async fn run_worker(self: Arc<Self>, id: &str, cancel: CancellationToken) {
+    async fn run_worker(self: Arc<Self>, id: &str, worker_id: u64, cancel: CancellationToken) {
         let record = {
             let guard = self
                 .state
@@ -1496,7 +1895,7 @@ impl TransferManager {
         };
 
         let Some(record) = record else {
-            self.finish_worker_slot(id);
+            self.finish_worker_slot(id, worker_id);
             return;
         };
 
@@ -1505,74 +1904,156 @@ impl TransferManager {
             TransferDirection::Upload => self.execute_upload(&record, &cancel).await,
         };
 
-        // Check whether an external state transition (pause / cancel / shutdown) stopped us.
-        let external_state = {
-            let guard = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard
-                .items
-                .iter()
-                .find(|r| r.transfer.id == id)
-                .map(|r| r.transfer.state)
-        };
-
         match result {
             Ok(outcome) => {
-                if external_state == Some(TransferState::Cancelled) {
-                    if record.transfer.direction == TransferDirection::Download {
-                        let _ = tokio::fs::remove_file(self.part_path(id)).await;
-                    }
-                    self.finish_worker_slot(id);
-                    return;
+                enum PostFinalize {
+                    Cancelled {
+                        saved_local_path: Option<String>,
+                        release_upload_uri: Option<String>,
+                    },
+                    DeferredUntilResume,
+                    Completed {
+                        done: Box<DeviceTransfer>,
+                        open_after_done: bool,
+                        pruned: Vec<TransferRecord>,
+                    },
                 }
-                let completed = {
+
+                let action = {
                     let mut guard = self
                         .state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    guard.running.remove(id);
-                    let mut done_snap = None;
-                    if let Some(rec) = guard.items.iter_mut().find(|r| r.transfer.id == id) {
-                        rec.transfer.state = TransferState::Done;
-                        rec.transfer.bytes_done = outcome.bytes_total;
-                        rec.transfer.bytes_total = outcome.bytes_total;
-                        rec.transfer.rate = None;
-                        rec.transfer.error = None;
-                        rec.transfer.paused_reason = None;
-                        rec.transfer.finished = Some(now_rfc3339_utc());
-                        rec.transfer.hash = Some(outcome.hash);
-                        if let Some(local_path) = outcome.local_path {
-                            rec.transfer.local_path = Some(local_path);
+                    clear_own_worker_slot(&mut guard, id, worker_id);
+
+                    match guard.items.iter_mut().find(|r| r.transfer.id == id) {
+                        None => PostFinalize::Cancelled {
+                            saved_local_path: outcome.local_path,
+                            release_upload_uri: (record.transfer.direction
+                                == TransferDirection::Upload)
+                                .then(|| record.transfer.local_path.clone())
+                                .flatten(),
+                        },
+                        Some(rec) if rec.transfer.state == TransferState::Cancelled => {
+                            rec.open_after_done = false;
+                            rec.finalized_local_path = None;
+                            rec.finalized_hash = None;
+                            PostFinalize::Cancelled {
+                                saved_local_path: outcome.local_path,
+                                release_upload_uri: (rec.transfer.direction
+                                    == TransferDirection::Upload)
+                                    .then(|| rec.transfer.local_path.clone())
+                                    .flatten(),
+                            }
                         }
-                        rec.transfer.can_open =
-                            rec.transfer.direction == TransferDirection::Download;
-                        done_snap = Some(rec.transfer.clone());
+                        Some(rec)
+                            if matches!(
+                                rec.transfer.state,
+                                TransferState::Paused | TransferState::Queued
+                            ) =>
+                        {
+                            // A pause (or pause -> resume) arrived while the final save / put.finish
+                            // was running. Record the already-finalized output so resume finishes
+                            // idempotently without duplicating files, and honor the pause state
+                            // without opening or firing completion notifications prematurely.
+                            rec.finalized_local_path = outcome.local_path;
+                            rec.finalized_hash = Some(outcome.hash);
+                            rec.transfer.bytes_done = outcome.bytes_total;
+                            rec.transfer.bytes_total = outcome.bytes_total;
+                            rec.transfer.rate = None;
+                            PostFinalize::DeferredUntilResume
+                        }
+                        Some(rec) => {
+                            rec.transfer.state = TransferState::Done;
+                            rec.transfer.bytes_done = outcome.bytes_total;
+                            rec.transfer.bytes_total = outcome.bytes_total;
+                            rec.transfer.rate = None;
+                            rec.transfer.error = None;
+                            rec.transfer.paused_reason = None;
+                            rec.transfer.finished = Some(now_rfc3339_utc());
+                            rec.transfer.hash = Some(outcome.hash);
+                            if let Some(local_path) = outcome.local_path {
+                                rec.transfer.local_path = Some(local_path);
+                            }
+                            if rec.transfer.direction == TransferDirection::Download {
+                                let device_mime = mime_for_file_name(&rec.transfer.name);
+                                let refused = is_refused_open_file_name(&rec.transfer.name);
+                                rec.transfer.mime = Some(device_mime.to_owned());
+                                rec.transfer.can_open =
+                                    self.platform.supports_open_downloads() && !refused;
+                                rec.transfer.can_show_in_folder =
+                                    self.platform.supports_show_in_folder();
+                                rec.transfer.open_blocked_reason =
+                                    refused.then(|| REFUSED_OPEN_MESSAGE.to_owned());
+                            } else {
+                                rec.transfer.can_open = false;
+                                rec.transfer.can_show_in_folder = false;
+                                rec.transfer.open_blocked_reason = None;
+                            }
+                            let open_after_done = std::mem::take(&mut rec.open_after_done);
+                            rec.finalized_local_path = None;
+                            rec.finalized_hash = None;
+                            let done = rec.transfer.clone();
+                            let pruned = prune_terminal_locked(&mut guard.items);
+                            PostFinalize::Completed {
+                                done: Box::new(done),
+                                open_after_done,
+                                pruned,
+                            }
+                        }
                     }
-                    prune_terminal_locked(&mut guard.items);
-                    done_snap
                 };
-                self.persist_locked_snapshot();
-                self.broadcast_state_change();
-                if let Some(done) = completed {
-                    if done.direction == TransferDirection::Upload
-                        && let Some(uri) = done.local_path.as_deref()
-                    {
-                        self.platform.release_upload_source(uri).await;
+
+                match action {
+                    PostFinalize::Cancelled {
+                        saved_local_path,
+                        release_upload_uri,
+                    } => {
+                        if record.transfer.direction == TransferDirection::Download {
+                            let _ = tokio::fs::remove_file(self.part_path(id)).await;
+                            if let Some(saved) = saved_local_path
+                                && !saved.starts_with("content://")
+                            {
+                                let _ = tokio::fs::remove_file(&saved).await;
+                            }
+                        }
+                        if let Some(uri) = release_upload_uri {
+                            self.platform.release_upload_source(&uri).await;
+                        }
+                        self.persist_locked_snapshot();
+                        self.broadcast_state_change();
+                        self.schedule_notify.notify_one();
                     }
-                    if record.open_after_done
-                        && let Some(path) = done.local_path.as_deref()
-                    {
-                        let _ = self
-                            .platform
-                            .open_local_file(path, done.mime.as_deref())
-                            .await;
-                    } else {
-                        self.platform.on_transfer_completed(&done);
+                    PostFinalize::DeferredUntilResume => {
+                        self.persist_locked_snapshot();
+                        self.broadcast_state_change();
+                        self.schedule_notify.notify_one();
+                    }
+                    PostFinalize::Completed {
+                        done,
+                        open_after_done,
+                        pruned,
+                    } => {
+                        self.cleanup_pruned_records(pruned).await;
+                        self.persist_locked_snapshot();
+                        self.broadcast_state_change();
+                        if done.direction == TransferDirection::Upload
+                            && let Some(uri) = done.local_path.as_deref()
+                        {
+                            self.platform.release_upload_source(uri).await;
+                        }
+                        if open_after_done
+                            && done.can_open
+                            && let Some(path) = done.local_path.as_deref()
+                        {
+                            let device_mime = mime_for_file_name(&done.name);
+                            let _ = self.platform.open_local_file(path, Some(device_mime)).await;
+                        } else {
+                            self.platform.on_transfer_completed(&done);
+                        }
+                        self.schedule_notify.notify_one();
                     }
                 }
-                self.schedule_notify.notify_one();
             }
             Err(WorkerStop::WifiOnlyPause) => {
                 {
@@ -1580,7 +2061,7 @@ impl TransferManager {
                         .state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    guard.running.remove(id);
+                    clear_own_worker_slot(&mut guard, id, worker_id);
                     if let Some(rec) = guard.items.iter_mut().find(|r| r.transfer.id == id)
                         && rec.transfer.state == TransferState::Running
                     {
@@ -1593,33 +2074,68 @@ impl TransferManager {
                 self.broadcast_state_change();
                 self.schedule_notify.notify_one();
             }
-            Err(WorkerStop::Interrupted) => {
-                self.finish_worker_slot(id);
-            }
-            Err(WorkerStop::Failed(err)) => {
-                if self.shutdown_token.is_cancelled()
-                    || matches!(
-                        external_state,
-                        Some(TransferState::Paused | TransferState::Cancelled)
-                    )
-                {
-                    self.finish_worker_slot(id);
-                    return;
-                }
+            Err(WorkerStop::Stalled(err)) => {
                 {
                     let mut guard = self
                         .state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    guard.running.remove(id);
-                    if let Some(rec) = guard.items.iter_mut().find(|r| r.transfer.id == id) {
+                    clear_own_worker_slot(&mut guard, id, worker_id);
+                    if let Some(rec) = guard.items.iter_mut().find(|r| r.transfer.id == id)
+                        && rec.transfer.state == TransferState::Running
+                    {
+                        rec.transfer.state = TransferState::Paused;
+                        rec.transfer.paused_reason = Some(PauseReason::Stalled);
+                        rec.transfer.rate = None;
+                        rec.transfer.error = Some(TransferError::from(&err));
+                    }
+                }
+                self.persist_locked_snapshot();
+                self.broadcast_state_change();
+                self.schedule_notify.notify_one();
+            }
+            Err(WorkerStop::Interrupted) => {
+                self.finish_worker_slot(id, worker_id);
+            }
+            Err(WorkerStop::Failed(err)) => {
+                let mut delete_part = false;
+                let mut release_upload_uri: Option<String> = None;
+                let mut pruned = Vec::new();
+                let mut should_mark_failed = false;
+
+                {
+                    let mut guard = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    clear_own_worker_slot(&mut guard, id, worker_id);
+                    if !self.shutdown_token.is_cancelled()
+                        && let Some(rec) = guard.items.iter_mut().find(|r| r.transfer.id == id)
+                        && rec.transfer.state == TransferState::Running
+                    {
+                        should_mark_failed = true;
                         rec.transfer.state = TransferState::Failed;
                         rec.transfer.paused_reason = None;
                         rec.transfer.rate = None;
                         rec.transfer.finished = Some(now_rfc3339_utc());
                         rec.transfer.error = Some(TransferError::from(&err));
+                        rec.open_after_done = false;
+                        delete_part = rec.transfer.direction == TransferDirection::Download;
+                        if rec.transfer.direction == TransferDirection::Upload {
+                            release_upload_uri = rec.transfer.local_path.clone();
+                        }
+                        pruned = prune_terminal_locked(&mut guard.items);
                     }
-                    prune_terminal_locked(&mut guard.items);
+                }
+
+                if should_mark_failed {
+                    if delete_part {
+                        let _ = tokio::fs::remove_file(self.part_path(id)).await;
+                    }
+                    if let Some(uri) = release_upload_uri {
+                        self.platform.release_upload_source(&uri).await;
+                    }
+                    self.cleanup_pruned_records(pruned).await;
                 }
                 self.persist_locked_snapshot();
                 self.broadcast_state_change();
@@ -1628,13 +2144,13 @@ impl TransferManager {
         }
     }
 
-    fn finish_worker_slot(&self, id: &str) {
+    fn finish_worker_slot(&self, id: &str, worker_id: u64) {
         {
             let mut guard = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.running.remove(id);
+            clear_own_worker_slot(&mut guard, id, worker_id);
         }
         self.persist_locked_snapshot();
         self.broadcast_state_change();
@@ -1648,6 +2164,25 @@ impl TransferManager {
     ) -> Result<WorkerOutcome, WorkerStop> {
         let id = &initial.transfer.id;
         let part_path = self.part_path(id);
+
+        // Idempotent completion: if a previous worker already finalized the verified file while a
+        // pause intervened, reuse that saved destination instead of re-downloading or duplicating.
+        if let (Some(saved_path), Some(saved_hash)) = (
+            initial.finalized_local_path.as_deref(),
+            initial.finalized_hash.as_deref(),
+        ) {
+            let exists = saved_path.starts_with("content://")
+                || tokio::fs::try_exists(saved_path).await.unwrap_or(false);
+            if exists {
+                let _ = tokio::fs::remove_file(&part_path).await;
+                return Ok(WorkerOutcome {
+                    bytes_total: initial.transfer.bytes_total,
+                    hash: saved_hash.to_owned(),
+                    local_path: Some(saved_path.to_owned()),
+                });
+            }
+        }
+
         let mut expected_meta = (
             initial.transfer.bytes_total,
             initial.remote_mtime_secs,
@@ -1829,7 +2364,21 @@ impl TransferManager {
                         let _ = file.flush().await;
                         return Err(WorkerStop::Interrupted);
                     }
-                    res = stream.read(&mut buf) => res,
+                    timed = tokio::time::timeout(self.stall_timeout, stream.read(&mut buf)) => {
+                        match timed {
+                            Ok(res) => res,
+                            Err(_) => {
+                                let _ = file.flush().await;
+                                return Err(WorkerStop::Stalled(
+                                    AppError::new(
+                                        ErrorCode::Timeout,
+                                        "Download paused: the machine stopped sending data.",
+                                    )
+                                    .with_hint("Resume the download once the connection recovers."),
+                                ));
+                            }
+                        }
+                    }
                 };
                 match read_res {
                     Ok(0) => break None,
@@ -1922,13 +2471,14 @@ impl TransferManager {
             return Err(WorkerStop::Interrupted);
         }
 
+        let device_mime = mime_for_file_name(&initial.transfer.name);
         let final_path = self
             .platform
             .finalize_download(
                 id,
                 &part_path,
                 &initial.transfer.name,
-                initial.transfer.mime.as_deref(),
+                Some(device_mime),
                 initial.open_after_done,
             )
             .await
@@ -2000,12 +2550,137 @@ impl TransferManager {
         }
     }
 
+    async fn resolve_unique_remote_path(
+        &self,
+        machine: &str,
+        requested_path: &str,
+        requested_name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(String, String), WorkerStop> {
+        let (dir_prefix, sep) = split_remote_dir(requested_path);
+        let safe_base = sanitize_file_name(requested_name);
+        let path_ref = Path::new(&safe_base);
+        let stem = path_ref
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&safe_base)
+            .to_owned();
+        let ext = path_ref
+            .extension()
+            .and_then(|e| e.to_str())
+            .filter(|e| !e.is_empty())
+            .map(str::to_owned);
+
+        let mut retry_started: Option<Instant> = None;
+        let mut attempt: u32 = 0;
+
+        for n in 1..=9999u32 {
+            let candidate_name = if n == 1 {
+                safe_base.clone()
+            } else {
+                match ext.as_deref() {
+                    Some(e) => format!("{stem} ({n}).{e}"),
+                    None => format!("{stem} ({n})"),
+                }
+            };
+            let candidate_path = join_remote_with_sep(&dir_prefix, sep, &candidate_name);
+
+            loop {
+                if cancel.is_cancelled() {
+                    return Err(WorkerStop::Interrupted);
+                }
+                let target = self
+                    .backend
+                    .content_target(machine)
+                    .map_err(WorkerStop::Failed)?;
+                let call_fut = target.link.call_machine(
+                    &target.link_node,
+                    "fs.stat",
+                    json!({ "path": candidate_path }),
+                    |_| {},
+                );
+                let res = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(WorkerStop::Interrupted),
+                    timed = tokio::time::timeout(self.stall_timeout, call_fut) => {
+                        match timed {
+                            Ok(res) => res,
+                            Err(_) => {
+                                return Err(WorkerStop::Stalled(
+                                    AppError::new(
+                                        ErrorCode::Timeout,
+                                        "Upload paused: the machine stopped responding.",
+                                    )
+                                    .with_hint("Resume the upload once the connection recovers."),
+                                ));
+                            }
+                        }
+                    }
+                };
+                match res {
+                    Ok(_) => {
+                        // A file or directory already occupies this remote path; try the next
+                        // numbered sibling (`name (2).ext`) rather than overwriting it.
+                        retry_started = None;
+                        attempt = 0;
+                        break;
+                    }
+                    Err(err) => {
+                        let app_err = AppError::from(err);
+                        if app_err.code == ErrorCode::NotFound {
+                            return Ok((candidate_path, candidate_name));
+                        }
+                        if self
+                            .should_retry(&app_err, &mut retry_started, &mut attempt, cancel)
+                            .await?
+                        {
+                            continue;
+                        }
+                        return Err(WorkerStop::Failed(app_err));
+                    }
+                }
+            }
+        }
+
+        let fallback_name = match ext.as_deref() {
+            Some(e) => format!("{stem}-{}.{e}", now_unix_secs()),
+            None => format!("{stem}-{}", now_unix_secs()),
+        };
+        let fallback_path = join_remote_with_sep(&dir_prefix, sep, &fallback_name);
+        Ok((fallback_path, fallback_name))
+    }
+
+    fn lock_resolved_upload_path(&self, id: &str, remote_path: &str, name: &str) {
+        {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(rec) = guard.items.iter_mut().find(|r| r.transfer.id == id) {
+                rec.transfer.path = remote_path.to_owned();
+                rec.transfer.name = name.to_owned();
+                rec.remote_path_resolved = true;
+            }
+        }
+        self.persist_locked_snapshot();
+        self.broadcast_state_change();
+    }
+
     async fn execute_upload(
         &self,
         initial: &TransferRecord,
         cancel: &CancellationToken,
     ) -> Result<WorkerOutcome, WorkerStop> {
         let id = &initial.transfer.id;
+        if let Some(saved_hash) = initial.finalized_hash.as_deref() {
+            return Ok(WorkerOutcome {
+                bytes_total: initial.transfer.bytes_total,
+                hash: saved_hash.to_owned(),
+                local_path: None,
+            });
+        }
+
         let Some(local_path) = initial.transfer.local_path.as_deref() else {
             return Err(WorkerStop::Failed(AppError::new(
                 ErrorCode::InvalidArgs,
@@ -2020,6 +2695,27 @@ impl TransferManager {
         if self.should_wifi_pause(total_size) {
             return Err(WorkerStop::WifiOnlyPause);
         }
+
+        // Resolve a non-colliding remote destination path once and lock it on the transfer record
+        // so uploads never silently overwrite an existing remote file while still resuming into
+        // the same chosen path across pauses or restarts.
+        //
+        // Future wire hook: once the remote `put` protocol supports `if_exists: "rename"`, pass it
+        // on the `PutRequest` as well to close any concurrent multi-client race on the node.
+        let remote_path = if initial.remote_path_resolved {
+            initial.transfer.path.clone()
+        } else {
+            let (resolved_path, resolved_name) = self
+                .resolve_unique_remote_path(
+                    &initial.transfer.machine,
+                    &initial.transfer.path,
+                    &initial.transfer.name,
+                    cancel,
+                )
+                .await?;
+            self.lock_resolved_upload_path(id, &resolved_path, &resolved_name);
+            resolved_path
+        };
 
         let mut retry_started: Option<Instant> = None;
         let mut attempt: u32 = 0;
@@ -2038,7 +2734,7 @@ impl TransferManager {
                 .map_err(WorkerStop::Failed)?;
 
             let req = PutRequest {
-                path: initial.transfer.path.clone(),
+                path: remote_path.clone(),
                 size: total_size,
                 hash: local_hash.clone(),
                 mode: Some(0o644),
@@ -2106,7 +2802,24 @@ impl TransferManager {
                         put.cancel();
                         return Err(WorkerStop::Interrupted);
                     }
-                    res = source.read_chunk(&mut buf[..max_read]) => res.map_err(WorkerStop::Failed)?,
+                    timed = tokio::time::timeout(
+                        self.stall_timeout,
+                        source.read_chunk(&mut buf[..max_read]),
+                    ) => {
+                        match timed {
+                            Ok(res) => res.map_err(WorkerStop::Failed)?,
+                            Err(_) => {
+                                put.cancel();
+                                return Err(WorkerStop::Stalled(
+                                    AppError::new(
+                                        ErrorCode::Timeout,
+                                        "Upload paused: reading the source file stopped responding.",
+                                    )
+                                    .with_hint("Resume the upload once the file is accessible."),
+                                ));
+                            }
+                        }
+                    }
                 };
                 if read_n == 0 {
                     put.cancel();
@@ -2125,7 +2838,24 @@ impl TransferManager {
                         put.cancel();
                         return Err(WorkerStop::Interrupted);
                     }
-                    res = put.write_all(&buf[..read_n]) => res,
+                    timed = tokio::time::timeout(
+                        self.stall_timeout,
+                        put.write_all(&buf[..read_n]),
+                    ) => {
+                        match timed {
+                            Ok(res) => res,
+                            Err(_) => {
+                                put.cancel();
+                                return Err(WorkerStop::Stalled(
+                                    AppError::new(
+                                        ErrorCode::Timeout,
+                                        "Upload paused: the machine stopped accepting data.",
+                                    )
+                                    .with_hint("Resume the upload once the connection recovers."),
+                                ));
+                            }
+                        }
+                    }
                 };
                 if let Err(err) = write_res {
                     if cancel.is_cancelled() {
@@ -2308,6 +3038,16 @@ impl TransferManager {
     }
 }
 
+fn clear_own_worker_slot(guard: &mut QueueState, id: &str, worker_id: u64) {
+    if guard
+        .running
+        .get(id)
+        .is_some_and(|w| w.worker_id == worker_id)
+    {
+        guard.running.remove(id);
+    }
+}
+
 struct WorkerOutcome {
     bytes_total: u64,
     hash: String,
@@ -2317,6 +3057,7 @@ struct WorkerOutcome {
 enum WorkerStop {
     Interrupted,
     WifiOnlyPause,
+    Stalled(AppError),
     Failed(AppError),
 }
 
@@ -2325,6 +3066,43 @@ fn is_transient_error(err: &AppError) -> bool {
         err.code,
         ErrorCode::Unreachable | ErrorCode::Timeout | ErrorCode::Busy
     )
+}
+
+fn random_opaque_handle() -> Result<String, AppError> {
+    let mut bytes = [0u8; 24];
+    getrandom::fill(&mut bytes).map_err(|err| {
+        AppError::new(
+            ErrorCode::Internal,
+            format!("Could not generate upload handle: {err}."),
+        )
+    })?;
+    let mut out = String::with_capacity("up-".len() + bytes.len() * 2);
+    out.push_str("up-");
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    Ok(out)
+}
+
+fn sweep_orphaned_parts(parts_dir: &Path, live_download_ids: &std::collections::HashSet<String>) {
+    let Ok(entries) = fs::read_dir(parts_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if let Some(stem) = name.strip_suffix(".part")
+            && !live_download_ids.contains(stem)
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 async fn open_part_file_for_append(path: &Path, offset: u64) -> Result<AsyncFile, AppError> {
@@ -2407,23 +3185,27 @@ fn snapshot_transfers(items: &[TransferRecord]) -> Vec<DeviceTransfer> {
     items.iter().rev().map(|r| r.transfer.clone()).collect()
 }
 
-fn prune_terminal_locked(items: &mut Vec<TransferRecord>) {
+fn prune_terminal_locked(items: &mut Vec<TransferRecord>) -> Vec<TransferRecord> {
     let terminal_count = items
         .iter()
         .filter(|r| r.transfer.state.is_terminal())
         .count();
     if terminal_count <= MAX_RETAINED_TERMINAL {
-        return;
+        return Vec::new();
     }
     let mut to_drop = terminal_count - MAX_RETAINED_TERMINAL;
-    items.retain(|r| {
-        if to_drop > 0 && r.transfer.state.is_terminal() {
+    let mut pruned = Vec::with_capacity(to_drop);
+    let mut kept = Vec::with_capacity(items.len() - to_drop);
+    for rec in items.drain(..) {
+        if to_drop > 0 && rec.transfer.state.is_terminal() {
             to_drop -= 1;
-            false
+            pruned.push(rec);
         } else {
-            true
+            kept.push(rec);
         }
-    });
+    }
+    *items = kept;
+    pruned
 }
 
 fn build_notification_summary(items: &[TransferRecord]) -> QueueNotificationSummary {
@@ -2450,12 +3232,12 @@ fn build_notification_summary(items: &[TransferRecord]) -> QueueNotificationSumm
 
     let (title, detail, primary_transfer_id) = if active.len() == 1 {
         let t = active[0];
-        let verb = match t.direction {
-            TransferDirection::Download => "Downloading",
-            TransferDirection::Upload => "Uploading",
+        let heading = match t.direction {
+            TransferDirection::Download => format!("Downloading {}", t.name),
+            TransferDirection::Upload => format!("Uploading {} to {}", t.name, t.machine),
         };
         let detail = format_progress_line(t.bytes_done, t.bytes_total);
-        (format!("{verb} {}", t.name), detail, Some(t.id.clone()))
+        (heading, detail, Some(t.id.clone()))
     } else if active.len() > 1 {
         let detail = format_progress_line(bytes_done, bytes_total);
         (
@@ -2467,7 +3249,8 @@ fn build_notification_summary(items: &[TransferRecord]) -> QueueNotificationSumm
         let t = paused[0];
         let reason = match t.paused_reason {
             Some(PauseReason::WifiOnly) => "Waiting for Wi-Fi",
-            Some(PauseReason::FgsTimeout) => "Paused at Android limit",
+            Some(PauseReason::FgsTimeout) => "Paused by Android",
+            Some(PauseReason::Stalled) => "Stopped responding",
             _ => "Paused",
         };
         (
@@ -2505,73 +3288,61 @@ fn format_progress_line(done: u64, total: u64) -> String {
         return format_bytes(done);
     }
     let pct = ((done.min(total) as u128 * 100) / (total as u128)) as u64;
-    format!("{} of {} ({pct}%)", format_bytes(done), format_bytes(total))
+    format!("{} ({pct}%)", format_byte_pair(done, total))
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = 1024.0 * 1024.0;
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let b = bytes as f64;
-    if b >= GIB {
-        format!("{:.1} GiB", b / GIB)
-    } else if b >= MIB {
-        format!("{:.1} MiB", b / MIB)
-    } else if b >= KIB {
-        format!("{:.0} KiB", b / KIB)
+fn format_decimal_value(v: f64) -> String {
+    if v >= 10.0 {
+        format!("{}", v.round() as u64)
     } else {
-        format!("{bytes} B")
-    }
-}
-
-/// Sanitizes a filename to a safe single path component with no separators or control chars.
-pub fn sanitize_file_name(raw: &str) -> String {
-    let base = raw.rsplit(['/', '\\']).next().unwrap_or("").trim();
-    let cleaned: String = base
-        .chars()
-        .filter(|c| !c.is_control() && *c != '/' && *c != '\\' && *c != '\0')
-        .collect();
-    let trimmed = cleaned.trim_matches('.');
-    if trimmed.is_empty() {
-        if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
-            String::new()
+        let tenths = (v * 10.0).round() as u64;
+        if tenths.is_multiple_of(10) {
+            format!("{}", tenths / 10)
         } else {
-            cleaned
+            format!("{}.{}", tenths / 10, tenths % 10)
         }
-    } else {
-        cleaned
     }
 }
 
-/// Allocates a unique path inside `dir` for `file_name` (`name (2).ext` if `name.ext` exists).
-pub fn unique_dest_path(dir: &Path, file_name: &str) -> PathBuf {
-    let safe = sanitize_file_name(file_name);
-    let safe = if safe.is_empty() {
-        "download".to_owned()
-    } else {
-        safe
-    };
-    let candidate = dir.join(&safe);
-    if !candidate.exists() {
-        return candidate;
+/// Formats a byte count using the same SI decimal units (`B`, `KB`, `MB`, `GB`, `TB`, `PB`) as
+/// `apps/ui/lib/format.js`.
+pub fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
     }
-    let path_ref = Path::new(&safe);
-    let stem = path_ref
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&safe);
-    let ext = path_ref.extension().and_then(|e| e.to_str());
-    for n in 2..=9999u32 {
-        let next = match ext {
-            Some(ext) => dir.join(format!("{stem} ({n}).{ext}")),
-            None => dir.join(format!("{stem} ({n})")),
-        };
-        if !next.exists() {
-            return next;
-        }
+    const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
+    let mut value = bytes as f64;
+    let mut index = 0usize;
+    value /= 1000.0;
+    while value >= 1000.0 && index < UNITS.len() - 1 {
+        value /= 1000.0;
+        index += 1;
     }
-    dir.join(format!("{safe}-{}", now_unix_secs()))
+    format!("{} {}", format_decimal_value(value), UNITS[index])
+}
+
+/// Formats a completed/total byte pair using the same SI decimal rules as `formatBytePair` in
+/// `apps/ui/lib/format.js`.
+pub fn format_byte_pair(used: u64, total: u64) -> String {
+    if total == 0 {
+        return "0 B".to_owned();
+    }
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut scale = 1.0_f64;
+    let mut unit = 0usize;
+    while (total as f64) / scale >= 1000.0 && unit < UNITS.len() - 1 {
+        scale *= 1000.0;
+        unit += 1;
+    }
+    if (used as f64) / scale < 1.0 && unit > 0 {
+        return format!("{} of {}", format_bytes(used), format_bytes(total));
+    }
+    format!(
+        "{} of {} {}",
+        format_decimal_value((used as f64) / scale),
+        format_decimal_value((total as f64) / scale),
+        UNITS[unit]
+    )
 }
 
 /// Joins a remote destination folder and filename without creating duplicate separators.
@@ -2581,47 +3352,30 @@ fn join_remote_path(dir: &str, name: &str) -> String {
     } else {
         '/'
     };
-    if dir.ends_with('/') || dir.ends_with('\\') {
+    join_remote_with_sep(dir, sep, name)
+}
+
+fn split_remote_dir(full_path: &str) -> (String, char) {
+    let sep = if full_path.contains('\\') && !full_path.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    match full_path.rfind(['/', '\\']) {
+        Some(0) => (sep.to_string(), sep),
+        Some(idx) => (full_path[..idx].to_owned(), sep),
+        None => (String::new(), sep),
+    }
+}
+
+fn join_remote_with_sep(dir: &str, sep: char, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_owned()
+    } else if dir.ends_with('/') || dir.ends_with('\\') {
         format!("{dir}{name}")
     } else {
         format!("{dir}{sep}{name}")
     }
-}
-
-/// Maps common file extensions to MIME types when the UI did not supply one.
-pub fn guess_mime_from_name(name: &str) -> Option<&'static str> {
-    let ext = Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())?
-        .to_ascii_lowercase();
-    let mime = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "avif" => "image/avif",
-        "bmp" => "image/bmp",
-        "svg" => "image/svg+xml",
-        "mp4" | "m4v" => "video/mp4",
-        "webm" => "video/webm",
-        "mov" => "video/quicktime",
-        "mkv" => "video/x-matroska",
-        "mp3" => "audio/mpeg",
-        "m4a" | "aac" => "audio/mp4",
-        "flac" => "audio/flac",
-        "ogg" | "opus" => "audio/ogg",
-        "wav" => "audio/wav",
-        "pdf" => "application/pdf",
-        "txt" | "md" | "log" | "csv" | "toml" | "yaml" | "yml" => "text/plain",
-        "json" => "application/json",
-        "html" | "htm" => "text/html",
-        "zip" => "application/zip",
-        "tar" => "application/x-tar",
-        "gz" => "application/gzip",
-        "7z" => "application/x-7z-compressed",
-        _ => "application/octet-stream",
-    };
-    Some(mime)
 }
 
 fn load_queue_file(path: &Path) -> PersistedQueue {
@@ -2705,54 +3459,6 @@ fn now_rfc3339_utc() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-/// Copies `src` to `dst`, falling back from `rename` to copy+delete across filesystems.
-pub async fn move_file_across_fs(src: &Path, dst: &Path) -> Result<(), AppError> {
-    if tokio::fs::rename(src, dst).await.is_ok() {
-        return Ok(());
-    }
-    let mut input = AsyncFile::open(src).await.map_err(|err| {
-        AppError::new(
-            ErrorCode::Failed,
-            format!("Could not read staged download {}: {err}.", src.display()),
-        )
-    })?;
-    let mut output = AsyncFile::create(dst).await.map_err(|err| {
-        AppError::new(
-            ErrorCode::Failed,
-            format!(
-                "Could not create destination file {}: {err}.",
-                dst.display()
-            ),
-        )
-    })?;
-    let mut buf = vec![0u8; COPY_BUF_BYTES];
-    loop {
-        let n = input.read(&mut buf).await.map_err(|err| {
-            AppError::new(
-                ErrorCode::Failed,
-                format!("Could not read staged download: {err}."),
-            )
-        })?;
-        if n == 0 {
-            break;
-        }
-        output.write_all(&buf[..n]).await.map_err(|err| {
-            AppError::new(
-                ErrorCode::Failed,
-                format!("Could not write destination file: {err}."),
-            )
-        })?;
-    }
-    output.flush().await.map_err(|err| {
-        AppError::new(
-            ErrorCode::Failed,
-            format!("Could not flush destination file: {err}."),
-        )
-    })?;
-    let _ = tokio::fs::remove_file(src).await;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -2804,6 +3510,8 @@ mod tests {
         override_hash: HashMap<String, String>,
         per_chunk_delay_ms: u64,
         fail_first_gets: usize,
+        stall_get: bool,
+        stall_put: bool,
         active_streams: AtomicUsize,
         max_concurrent_observed: AtomicUsize,
     }
@@ -2841,7 +3549,7 @@ mod tests {
                             .and_then(Value::as_u64)
                             .map(|n| n as usize);
 
-                        let (payload, delay_ms, fail_now) = {
+                        let (payload, delay_ms, fail_now, stall_get) = {
                             let mut st = remote.lock().unwrap();
                             let fail_now = if st.fail_first_gets > 0 && req_len != Some(0) {
                                 st.fail_first_gets -= 1;
@@ -2853,6 +3561,7 @@ mod tests {
                                 st.files.get(&path).cloned(),
                                 st.per_chunk_delay_ms,
                                 fail_now,
+                                st.stall_get,
                             )
                         };
                         if fail_now {
@@ -2892,6 +3601,19 @@ mod tests {
                                 .max_concurrent_observed
                                 .fetch_max(cur, Ordering::SeqCst);
                         }
+                        if stall_get && len > 0 {
+                            // Hold the stream open without sending bytes until cancelled or dropped.
+                            tokio::select! {
+                                () = watch_cancel.cancelled() => {}
+                                () = tokio::time::sleep(Duration::from_secs(30)) => {}
+                            }
+                            remote
+                                .lock()
+                                .unwrap()
+                                .active_streams
+                                .fetch_sub(1, Ordering::SeqCst);
+                            return;
+                        }
                         let mut pos = offset;
                         let end = offset + len;
                         while pos < end {
@@ -2922,9 +3644,12 @@ mod tests {
                         let path = req["path"].as_str().unwrap_or("").to_owned();
                         let size = req["size"].as_u64().unwrap() as usize;
                         let expected_hash = req["hash"].as_str().unwrap_or("").to_owned();
-                        let mut existing = {
+                        let (mut existing, stall_put) = {
                             let st = remote.lock().unwrap();
-                            st.partial_uploads.get(&path).cloned().unwrap_or_default()
+                            (
+                                st.partial_uploads.get(&path).cloned().unwrap_or_default(),
+                                st.stall_put,
+                            )
                         };
                         if existing.len() > size {
                             existing.clear();
@@ -2933,6 +3658,15 @@ mod tests {
                         let _ = server_out
                             .write_all(format!("{{\"offset\":{resume_off}}}\n").as_bytes())
                             .await;
+                        if stall_put {
+                            // Stop reading from the upload duplex so the writer back-pressures
+                            // and stalls cleanly.
+                            tokio::select! {
+                                () = watch_cancel.cancelled() => {}
+                                () = tokio::time::sleep(Duration::from_secs(30)) => {}
+                            }
+                            return;
+                        }
                         let mut buf = vec![0u8; 16 * 1024];
                         let mut got = existing;
                         while got.len() < size {
@@ -3021,13 +3755,32 @@ mod tests {
                                     .unwrap(),
                                 )
                             } else if req.method == "call" {
+                                let tool =
+                                    req.params.get("tool").and_then(Value::as_str).unwrap_or("");
                                 let path = req
                                     .params
                                     .pointer("/args/path")
                                     .and_then(Value::as_str)
                                     .unwrap_or("");
                                 let st = remote.lock().unwrap();
-                                if let Some(forced) = st.override_hash.get(path) {
+                                if tool == "fs.stat" {
+                                    if let Some(data) =
+                                        st.files.get(path).or_else(|| st.uploaded.get(path))
+                                    {
+                                        ProtoResp::ok(
+                                            req.id,
+                                            json!({ "kind": "file", "size": data.len() }),
+                                        )
+                                    } else {
+                                        ProtoResp::error(
+                                            req.id,
+                                            legion_link::proto::RpcError::new(
+                                                -32000,
+                                                ErrorBody::new(ProtoCode::NotFound, "not found"),
+                                            ),
+                                        )
+                                    }
+                                } else if let Some(forced) = st.override_hash.get(path) {
                                     ProtoResp::ok(
                                         req.id,
                                         json!({ "path": path, "size": 0, "hash": forced }),
@@ -3162,11 +3915,23 @@ mod tests {
         }
     }
 
+    type OpenedLog = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
     struct MockPlatform {
         downloads_dir: PathBuf,
         unmetered_wifi: Arc<AtomicBool>,
-        opened: Arc<Mutex<Vec<String>>>,
+        opened: OpenedLog,
+        shown_in_folder: Arc<Mutex<Vec<String>>>,
+        released_uris: Arc<Mutex<Vec<String>>>,
         completed_notifications: Arc<Mutex<Vec<String>>>,
+        picked_files: Arc<Mutex<Vec<PickedUploadFile>>>,
+        finalize_calls: Arc<AtomicUsize>,
+        finalize_entered: Arc<Notify>,
+        finalize_release: Arc<Notify>,
+        gate_finalize: Arc<AtomicBool>,
+        supports_open_externally: bool,
+        supports_open_downloads: bool,
+        supports_show_in_folder: bool,
     }
 
     impl MockPlatform {
@@ -3177,18 +3942,49 @@ mod tests {
                 downloads_dir,
                 unmetered_wifi: Arc::new(AtomicBool::new(true)),
                 opened: Arc::new(Mutex::new(Vec::new())),
+                shown_in_folder: Arc::new(Mutex::new(Vec::new())),
+                released_uris: Arc::new(Mutex::new(Vec::new())),
                 completed_notifications: Arc::new(Mutex::new(Vec::new())),
+                picked_files: Arc::new(Mutex::new(Vec::new())),
+                finalize_calls: Arc::new(AtomicUsize::new(0)),
+                finalize_entered: Arc::new(Notify::new()),
+                finalize_release: Arc::new(Notify::new()),
+                gate_finalize: Arc::new(AtomicBool::new(false)),
+                supports_open_externally: true,
+                supports_open_downloads: true,
+                supports_show_in_folder: true,
             }
         }
     }
 
     impl TransferPlatform for MockPlatform {
+        fn supports_open_externally(&self) -> bool {
+            self.supports_open_externally
+        }
+
+        fn supports_open_downloads(&self) -> bool {
+            self.supports_open_downloads
+        }
+
+        fn supports_show_in_folder(&self) -> bool {
+            self.supports_show_in_folder
+        }
+
         fn is_unmetered_wifi(&self) -> bool {
             self.unmetered_wifi.load(Ordering::Acquire)
         }
 
         fn pick_upload_files(&self) -> BoxFuture<'_, Result<Vec<PickedUploadFile>, AppError>> {
-            Box::pin(async { Ok(Vec::new()) })
+            let files = self.picked_files.lock().unwrap().clone();
+            Box::pin(async move { Ok(files) })
+        }
+
+        fn release_upload_source<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, ()> {
+            self.released_uris
+                .lock()
+                .unwrap()
+                .push(local_path.to_owned());
+            Box::pin(async {})
         }
 
         fn finalize_download<'a>(
@@ -3200,8 +3996,14 @@ mod tests {
             _open_after_done: bool,
         ) -> BoxFuture<'a, Result<String, AppError>> {
             Box::pin(async move {
-                let dst = unique_dest_path(&self.downloads_dir, file_name);
-                move_file_across_fs(part_path, &dst).await?;
+                self.finalize_calls.fetch_add(1, Ordering::SeqCst);
+                if self.gate_finalize.load(Ordering::SeqCst) {
+                    self.finalize_entered.notify_waiters();
+                    self.finalize_release.notified().await;
+                }
+                let dst =
+                    place_file_without_overwrite(part_path, &self.downloads_dir, file_name, false)
+                        .await?;
                 Ok(dst.to_string_lossy().into_owned())
             })
         }
@@ -3209,10 +4011,27 @@ mod tests {
         fn open_local_file<'a>(
             &'a self,
             local_path: &'a str,
-            _mime: Option<&'a str>,
+            mime: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<(), AppError>> {
+            let mime = mime.map(str::to_owned);
+            Box::pin(async move {
+                self.opened
+                    .lock()
+                    .unwrap()
+                    .push((local_path.to_owned(), mime));
+                Ok(())
+            })
+        }
+
+        fn show_in_folder<'a>(
+            &'a self,
+            local_path: &'a str,
         ) -> BoxFuture<'a, Result<(), AppError>> {
             Box::pin(async move {
-                self.opened.lock().unwrap().push(local_path.to_owned());
+                self.shown_in_folder
+                    .lock()
+                    .unwrap()
+                    .push(local_path.to_owned());
                 Ok(())
             })
         }
@@ -3254,11 +4073,11 @@ mod tests {
         {
             let mut st = remote.lock().unwrap();
             st.files
-                .insert("/home/me/movie.bin".to_owned(), data.clone());
+                .insert("/home/me/movie.mp4".to_owned(), data.clone());
             st.files
-                .insert("/home/me/tampered.bin".to_owned(), data.clone());
+                .insert("/home/me/tampered.mp4".to_owned(), data.clone());
             st.override_hash.insert(
-                "/home/me/tampered.bin".to_owned(),
+                "/home/me/tampered.mp4".to_owned(),
                 "blake3:0000000000000000000000000000000000000000000000000000000000000000"
                     .to_owned(),
             );
@@ -3275,11 +4094,10 @@ mod tests {
             Duration::from_secs(10),
         );
 
-        // Pre-seed a valid partial file after enqueueing by pausing first or writing `.part`.
         let id = mgr
             .enqueue_download(
                 "tower".to_owned(),
-                "/home/me/movie.bin".to_owned(),
+                "/home/me/movie.mp4".to_owned(),
                 None,
                 Some(data.len() as u64),
                 None,
@@ -3292,6 +4110,8 @@ mod tests {
         assert_eq!(done.bytes_total, data.len() as u64);
         assert_eq!(done.hash.as_deref(), Some(expected_hash.as_str()));
         assert!(done.can_open);
+        assert!(done.can_show_in_folder);
+        assert_eq!(done.mime.as_deref(), Some("video/mp4"));
         let saved_bytes = fs::read(done.local_path.as_deref().unwrap()).unwrap();
         assert_eq!(saved_bytes, data);
 
@@ -3299,7 +4119,7 @@ mod tests {
         let bad_id = mgr
             .enqueue_download(
                 "tower".to_owned(),
-                "/home/me/tampered.bin".to_owned(),
+                "/home/me/tampered.mp4".to_owned(),
                 None,
                 None,
                 None,
@@ -3320,7 +4140,7 @@ mod tests {
         let remote = Arc::new(Mutex::new(MockRemoteState::default()));
         {
             let mut st = remote.lock().unwrap();
-            for name in ["a.bin", "b.bin", "c.bin"] {
+            for name in ["a.dat", "b.dat", "c.dat"] {
                 st.files.insert(format!("/home/me/{name}"), data.clone());
             }
             st.per_chunk_delay_ms = 25;
@@ -3333,7 +4153,7 @@ mod tests {
         let id1 = mgr
             .enqueue_download(
                 "tower".into(),
-                "/home/me/a.bin".into(),
+                "/home/me/a.dat".into(),
                 None,
                 None,
                 None,
@@ -3344,7 +4164,7 @@ mod tests {
         let id2 = mgr
             .enqueue_download(
                 "tower".into(),
-                "/home/me/b.bin".into(),
+                "/home/me/b.dat".into(),
                 None,
                 None,
                 None,
@@ -3355,7 +4175,7 @@ mod tests {
         let id3 = mgr
             .enqueue_download(
                 "tower".into(),
-                "/home/me/c.bin".into(),
+                "/home/me/c.dat".into(),
                 None,
                 None,
                 None,
@@ -3385,13 +4205,13 @@ mod tests {
             .lock()
             .unwrap()
             .files
-            .insert("/home/me/resume.bin".into(), data.clone());
+            .insert("/home/me/resume.dat".into(), data.clone());
         remote.lock().unwrap().per_chunk_delay_ms = 40;
         let mgr2 = TransferManager::load_or_new(dir.path(), Arc::clone(&backend), platform.clone());
         let rid = mgr2
             .enqueue_download(
                 "tower".into(),
-                "/home/me/resume.bin".into(),
+                "/home/me/resume.dat".into(),
                 None,
                 None,
                 None,
@@ -3437,19 +4257,19 @@ mod tests {
             .lock()
             .unwrap()
             .files
-            .insert("/home/me/small.bin".into(), small.clone());
+            .insert("/home/me/small.dat".into(), small.clone());
         remote
             .lock()
             .unwrap()
             .files
-            .insert("/home/me/large.bin".into(), vec![2u8; 64 * 1024]);
+            .insert("/home/me/large.dat".into(), vec![2u8; 64 * 1024]);
 
         let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
         let platform = Arc::new(MockPlatform::new(dir.path()));
         platform.unmetered_wifi.store(false, Ordering::Release);
 
         let mgr = TransferManager::load_or_new(dir.path(), backend, platform.clone());
-        // Lower threshold to 32 KiB in queue settings to test without allocating 50 MiB in RAM.
+        // Lower threshold to 32 KiB in queue settings to test without allocating 50 MB in RAM.
         {
             let mut guard = mgr.state.lock().unwrap();
             guard.settings.large_threshold_bytes = 32 * 1024;
@@ -3462,7 +4282,7 @@ mod tests {
         let small_id = mgr
             .enqueue_download(
                 "tower".into(),
-                "/home/me/small.bin".into(),
+                "/home/me/small.dat".into(),
                 None,
                 Some(small.len() as u64),
                 None,
@@ -3476,7 +4296,7 @@ mod tests {
         let large_id = mgr
             .enqueue_download(
                 "tower".into(),
-                "/home/me/large.bin".into(),
+                "/home/me/large.dat".into(),
                 None,
                 Some(64 * 1024),
                 None,
@@ -3511,31 +4331,39 @@ mod tests {
                 upload_bytes[..20_000].to_vec(),
             );
             st.files
-                .insert("/home/me/slow1.bin".into(), vec![7u8; 256 * 1024]);
+                .insert("/home/me/slow1.dat".into(), vec![7u8; 256 * 1024]);
             st.files
-                .insert("/home/me/slow2.bin".into(), vec![8u8; 256 * 1024]);
+                .insert("/home/me/slow2.dat".into(), vec![8u8; 256 * 1024]);
             st.files
-                .insert("/home/me/slow3.bin".into(), vec![9u8; 256 * 1024]);
+                .insert("/home/me/slow3.dat".into(), vec![9u8; 256 * 1024]);
             st.per_chunk_delay_ms = 30;
         }
 
         let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
         let platform = Arc::new(MockPlatform::new(dir.path()));
+        platform
+            .picked_files
+            .lock()
+            .unwrap()
+            .push(PickedUploadFile {
+                local_path: local_src.to_string_lossy().into_owned(),
+                name: "photo.jpg".into(),
+                size: upload_bytes.len() as u64,
+                mime: Some("image/jpeg".into()),
+            });
         let mgr =
             TransferManager::with_options(dir.path(), backend, platform, 2, Duration::from_secs(2));
 
-        // 1) Upload with pre-seeded remote partial resumes cleanly and arrives with exact bytes.
+        // 1) Upload via opaque picker handle with pre-seeded remote partial resumes cleanly.
+        let picked = mgr.pick_uploads().await.unwrap();
+        assert_eq!(picked.len(), 1);
+        assert!(picked[0].handle.starts_with("up-"));
+        assert!(!picked[0].handle.contains("photo.jpg"));
         let up = mgr
             .enqueue_upload(
                 "tower".into(),
                 "/home/me/uploads".into(),
-                Some(vec![UploadFileInput {
-                    name: "photo.jpg".into(),
-                    path: Some(local_src.to_string_lossy().into_owned()),
-                    uri: None,
-                    size: Some(upload_bytes.len() as u64),
-                    mime: Some("image/jpeg".into()),
-                }]),
+                Some(vec![picked[0].handle.clone()]),
             )
             .await
             .unwrap()
@@ -3562,7 +4390,7 @@ mod tests {
         let r1 = mgr
             .enqueue_download(
                 "tower".into(),
-                "/home/me/slow1.bin".into(),
+                "/home/me/slow1.dat".into(),
                 None,
                 None,
                 None,
@@ -3573,7 +4401,7 @@ mod tests {
         let r2 = mgr
             .enqueue_download(
                 "tower".into(),
-                "/home/me/slow2.bin".into(),
+                "/home/me/slow2.dat".into(),
                 None,
                 None,
                 None,
@@ -3584,7 +4412,7 @@ mod tests {
         let q3 = mgr
             .enqueue_download(
                 "tower".into(),
-                "/home/me/slow3.bin".into(),
+                "/home/me/slow3.dat".into(),
                 None,
                 None,
                 None,
@@ -3626,7 +4454,7 @@ mod tests {
         let missing = mgr
             .enqueue_download(
                 "tower".into(),
-                "/home/me/missing.bin".into(),
+                "/home/me/missing.dat".into(),
                 None,
                 None,
                 None,
@@ -3645,7 +4473,7 @@ mod tests {
         let bg = mgr
             .enqueue_download(
                 "tower".into(),
-                "/home/me/slow1.bin".into(),
+                "/home/me/slow1.dat".into(),
                 None,
                 None,
                 None,
@@ -3661,6 +4489,806 @@ mod tests {
         mgr.resume_paused_for(PauseReason::Background);
         let _ = wait_for_state(&mgr, &bg, |s| s == TransferState::Done).await;
 
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn opaque_upload_handles_reject_raw_paths_forged_handles_and_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let local_src = dir.path().join("secret.txt");
+        fs::write(&local_src, b"confidential").unwrap();
+
+        let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        platform
+            .picked_files
+            .lock()
+            .unwrap()
+            .push(PickedUploadFile {
+                local_path: local_src.to_string_lossy().into_owned(),
+                name: "secret.txt".into(),
+                size: 12,
+                mime: Some("text/plain".into()),
+            });
+
+        let mgr =
+            TransferManager::with_options(dir.path(), backend, platform, 2, Duration::from_secs(2));
+
+        // Raw device paths and content URIs supplied directly by the page must be refused.
+        for hostile in [
+            local_src.to_string_lossy().into_owned(),
+            "/etc/passwd".to_owned(),
+            "content://com.android.providers.downloads.documents/document/1".to_owned(),
+            "C:\\Users\\me\\.ssh\\id_ed25519".to_owned(),
+        ] {
+            let err = mgr
+                .enqueue_upload(
+                    "tower".into(),
+                    "/home/me/uploads".into(),
+                    Some(vec![hostile]),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied);
+        }
+
+        // Valid handle + forged handle fails atomically without consuming the valid handle.
+        let picked = mgr.pick_uploads().await.unwrap();
+        let handle = picked[0].handle.clone();
+        let mixed_err = mgr
+            .enqueue_upload(
+                "tower".into(),
+                "/home/me/uploads".into(),
+                Some(vec![handle.clone(), "up-forged".into()]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(mixed_err.code, ErrorCode::Denied);
+
+        // The unconsumed valid handle still works once, and cannot be replayed a second time.
+        let enq = mgr
+            .enqueue_upload(
+                "tower".into(),
+                "/home/me/uploads".into(),
+                Some(vec![handle.clone()]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = wait_for_state(&mgr, &enq.id, |s| s == TransferState::Done).await;
+
+        let replay_err = mgr
+            .enqueue_upload(
+                "tower".into(),
+                "/home/me/uploads".into(),
+                Some(vec![handle]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(replay_err.code, ErrorCode::Denied);
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pause_resume_and_cancel_during_finalize_stay_single_worker_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"verified-payload-for-finalize-race".to_vec();
+        let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+        {
+            let mut st = remote.lock().unwrap();
+            st.files.insert("/home/me/race1.txt".into(), data.clone());
+            st.files.insert("/home/me/race2.txt".into(), data.clone());
+            st.files.insert("/home/me/race3.txt".into(), data.clone());
+        }
+
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        platform.gate_finalize.store(true, Ordering::SeqCst);
+
+        let mgr = TransferManager::with_options(
+            dir.path(),
+            backend,
+            platform.clone(),
+            2,
+            Duration::from_secs(2),
+        );
+
+        // Case 1: Pause -> Resume WHILE finalize_download is in flight.
+        let entered = platform.finalize_entered.notified();
+        let id1 = mgr
+            .enqueue_download(
+                "tower".into(),
+                "/home/me/race1.txt".into(),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        entered.await;
+
+        let paused = mgr
+            .control(&id1, TransferControlAction::Pause)
+            .await
+            .unwrap();
+        assert_eq!(paused.state, TransferState::Paused);
+        let resumed = mgr
+            .control(&id1, TransferControlAction::Resume)
+            .await
+            .unwrap();
+        assert_eq!(resumed.state, TransferState::Queued);
+
+        // Give the scheduler a chance to wake — it MUST NOT spawn a second worker while worker 1
+        // still owns the slot inside finalize_download.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(platform.finalize_calls.load(Ordering::SeqCst), 1);
+
+        // Release finalize_download -> completes cleanly once without duplicating files.
+        platform.finalize_release.notify_waiters();
+        let done1 = wait_for_state(&mgr, &id1, |s| s == TransferState::Done).await;
+        assert_eq!(platform.finalize_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read(done1.local_path.as_deref().unwrap()).unwrap(),
+            data
+        );
+        assert!(!platform.downloads_dir.join("race1 (2).txt").exists());
+
+        // Case 2: Pause WITHOUT resuming while finalize_download is in flight -> MUST remain Paused
+        // and not notify until the user explicitly resumes, then finish idempotently.
+        platform.finalize_calls.store(0, Ordering::SeqCst);
+        let entered2 = platform.finalize_entered.notified();
+        let id2 = mgr
+            .enqueue_download(
+                "tower".into(),
+                "/home/me/race2.txt".into(),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        entered2.await;
+
+        mgr.control(&id2, TransferControlAction::Pause)
+            .await
+            .unwrap();
+        platform.finalize_release.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let still_paused = mgr.list().into_iter().find(|t| t.id == id2).unwrap();
+        assert_eq!(still_paused.state, TransferState::Paused);
+        assert!(
+            !platform
+                .completed_notifications
+                .lock()
+                .unwrap()
+                .contains(&id2)
+        );
+
+        // Now resume -> finishes idempotently with zero second finalize_download call.
+        mgr.control(&id2, TransferControlAction::Resume)
+            .await
+            .unwrap();
+        let done2 = wait_for_state(&mgr, &id2, |s| s == TransferState::Done).await;
+        assert_eq!(platform.finalize_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read(done2.local_path.as_deref().unwrap()).unwrap(),
+            data
+        );
+        assert!(
+            platform
+                .completed_notifications
+                .lock()
+                .unwrap()
+                .contains(&id2)
+        );
+
+        // Case 3: Cancel while finalize_download is in flight -> stays Cancelled and deletes output.
+        platform.finalize_calls.store(0, Ordering::SeqCst);
+        let entered3 = platform.finalize_entered.notified();
+        let id3 = mgr
+            .enqueue_download(
+                "tower".into(),
+                "/home/me/race3.txt".into(),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        entered3.await;
+
+        mgr.control(&id3, TransferControlAction::Cancel)
+            .await
+            .unwrap();
+        platform.finalize_release.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let cancelled = mgr.list().into_iter().find(|t| t.id == id3).unwrap();
+        assert_eq!(cancelled.state, TransferState::Cancelled);
+        assert!(!platform.downloads_dir.join("race3.txt").exists());
+        assert!(
+            !platform
+                .completed_notifications
+                .lock()
+                .unwrap()
+                .contains(&id3)
+        );
+
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pause_resume_cancel_loop_across_download_stages_keeps_invariants() {
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..96 * 1024usize).map(|i| (i % 251) as u8).collect();
+        let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+        {
+            let mut st = remote.lock().unwrap();
+            st.per_chunk_delay_ms = 5;
+            for i in 0..8 {
+                st.files
+                    .insert(format!("/home/me/loop-{i}.txt"), data.clone());
+            }
+        }
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        let mgr = TransferManager::with_options(
+            dir.path(),
+            backend,
+            platform.clone(),
+            2,
+            Duration::from_secs(2),
+        );
+
+        for i in 0..8usize {
+            let id = mgr
+                .enqueue_download(
+                    "tower".into(),
+                    format!("/home/me/loop-{i}.txt"),
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis((i as u64) * 6)).await;
+            let _ = mgr.control(&id, TransferControlAction::Pause).await;
+            let _ = mgr.control(&id, TransferControlAction::Resume).await;
+            if i % 3 == 0 {
+                let _ = mgr.control(&id, TransferControlAction::Cancel).await;
+                let final_row = wait_for_state(&mgr, &id, |s| {
+                    matches!(s, TransferState::Cancelled | TransferState::Done)
+                })
+                .await;
+                if final_row.state == TransferState::Cancelled {
+                    assert!(!mgr.part_path(&id).exists());
+                }
+            } else {
+                let done = wait_for_state(&mgr, &id, |s| s == TransferState::Done).await;
+                assert_eq!(fs::read(done.local_path.as_deref().unwrap()).unwrap(), data);
+            }
+        }
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn refused_open_extensions_device_mime_and_session_only_open_after_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+        {
+            let mut st = remote.lock().unwrap();
+            st.files
+                .insert("/home/me/holiday.jpg".into(), b"jpeg-bytes".to_vec());
+            st.files
+                .insert("/home/me/evil.apk".into(), b"apk-bytes".to_vec());
+            st.files
+                .insert("/home/me/setup.exe".into(), b"exe-bytes".to_vec());
+        }
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        let mgr = TransferManager::with_options(
+            dir.path(),
+            Arc::clone(&backend),
+            platform.clone(),
+            2,
+            Duration::from_secs(2),
+        );
+
+        // Remote claims holiday.jpg is an APK -> device derives image/jpeg and opens as image/jpeg.
+        let img_id = mgr
+            .enqueue_download(
+                "tower".into(),
+                "/home/me/holiday.jpg".into(),
+                None,
+                None,
+                Some("application/vnd.android.package-archive".into()),
+                false,
+            )
+            .await
+            .unwrap();
+        let img_done = wait_for_state(&mgr, &img_id, |s| s == TransferState::Done).await;
+        assert_eq!(img_done.mime.as_deref(), Some("image/jpeg"));
+        assert!(img_done.can_open);
+        assert!(img_done.can_show_in_folder);
+        assert!(img_done.open_blocked_reason.is_none());
+        mgr.open_transfer(&img_id).await.unwrap();
+        assert_eq!(
+            platform.opened.lock().unwrap().last().unwrap().1.as_deref(),
+            Some("image/jpeg")
+        );
+
+        // Refused open_after_done on executable / installer extensions immediately returns Denied.
+        let open_ext_err = mgr
+            .enqueue_download(
+                "tower".into(),
+                "/home/me/evil.apk".into(),
+                None,
+                None,
+                Some("image/jpeg".into()),
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(open_ext_err.code, ErrorCode::Denied);
+
+        // Regular download of evil.apk and setup.exe succeeds, but canOpen=false, canShowInFolder=true,
+        // open_transfer refuses with Denied, and show_transfer_in_folder works.
+        for path in ["/home/me/evil.apk", "/home/me/setup.exe"] {
+            let id = mgr
+                .enqueue_download(
+                    "tower".into(),
+                    path.into(),
+                    None,
+                    None,
+                    Some("image/jpeg".into()),
+                    false,
+                )
+                .await
+                .unwrap();
+            let done = wait_for_state(&mgr, &id, |s| s == TransferState::Done).await;
+            assert!(!done.can_open, "{path} must not be openable directly");
+            assert!(done.can_show_in_folder);
+            assert!(done.open_blocked_reason.is_some());
+            let open_err = mgr.open_transfer(&id).await.unwrap_err();
+            assert_eq!(open_err.code, ErrorCode::Denied);
+            mgr.show_transfer_in_folder(&id).await.unwrap();
+            assert!(
+                platform
+                    .shown_in_folder
+                    .lock()
+                    .unwrap()
+                    .contains(&done.local_path.unwrap())
+            );
+        }
+
+        // Verify open_after_done is session-only and never written to queue.json.
+        let queue_json = fs::read_to_string(mgr.queue_file_path()).unwrap();
+        assert!(!queue_json.contains("open_after_done"));
+
+        // Platform without open support (iOS) returns Unsupported instead of no-op Ok.
+        let mut ios_plat = MockPlatform::new(dir.path());
+        ios_plat.supports_open_externally = false;
+        ios_plat.supports_open_downloads = false;
+        ios_plat.supports_show_in_folder = false;
+        let ios_dir = tempfile::tempdir().unwrap();
+        let ios_mgr = TransferManager::with_options(
+            ios_dir.path(),
+            backend,
+            Arc::new(ios_plat),
+            2,
+            Duration::from_secs(2),
+        );
+        let ios_ext_err = ios_mgr
+            .enqueue_download(
+                "tower".into(),
+                "/home/me/holiday.jpg".into(),
+                None,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(ios_ext_err.code, ErrorCode::Unsupported);
+
+        let ios_dl = ios_mgr
+            .enqueue_download(
+                "tower".into(),
+                "/home/me/holiday.jpg".into(),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let ios_done = wait_for_state(&ios_mgr, &ios_dl, |s| s == TransferState::Done).await;
+        assert!(!ios_done.can_open);
+        assert!(!ios_done.can_show_in_folder);
+        assert_eq!(
+            ios_mgr.open_transfer(&ios_dl).await.unwrap_err().code,
+            ErrorCode::Unsupported
+        );
+        assert_eq!(
+            ios_mgr
+                .show_transfer_in_folder(&ios_dl)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Unsupported
+        );
+        ios_mgr.shutdown();
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn progress_stall_timeout_pauses_download_and_upload_with_stalled_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = vec![0x42u8; 256 * 1024];
+        let local_src = dir.path().join("big-upload.dat");
+        fs::write(&local_src, &payload).unwrap();
+
+        let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+        {
+            let mut st = remote.lock().unwrap();
+            st.files
+                .insert("/home/me/stalled.dat".into(), payload.clone());
+            st.stall_get = true;
+            st.stall_put = true;
+        }
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        platform
+            .picked_files
+            .lock()
+            .unwrap()
+            .push(PickedUploadFile {
+                local_path: local_src.to_string_lossy().into_owned(),
+                name: "big-upload.dat".into(),
+                size: payload.len() as u64,
+                mime: None,
+            });
+
+        let mgr = TransferManager::with_timeouts(
+            dir.path(),
+            backend,
+            platform,
+            2,
+            Duration::from_secs(2),
+            Duration::from_millis(120),
+        );
+
+        // Stalled download pauses with PauseReason::Stalled and visible reason, then finishes on resume.
+        let dl_id = mgr
+            .enqueue_download(
+                "tower".into(),
+                "/home/me/stalled.dat".into(),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let dl_paused = wait_for_state(&mgr, &dl_id, |s| s == TransferState::Paused).await;
+        assert_eq!(dl_paused.paused_reason, Some(PauseReason::Stalled));
+        assert!(dl_paused.error.is_some());
+
+        remote.lock().unwrap().stall_get = false;
+        mgr.control(&dl_id, TransferControlAction::Resume)
+            .await
+            .unwrap();
+        let _ = wait_for_state(&mgr, &dl_id, |s| s == TransferState::Done).await;
+
+        // Stalled upload pauses with PauseReason::Stalled and finishes cleanly after unstall + resume.
+        let picked = mgr.pick_uploads().await.unwrap();
+        let up = mgr
+            .enqueue_upload(
+                "tower".into(),
+                "/home/me/uploads".into(),
+                Some(vec![picked[0].handle.clone()]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let up_paused = wait_for_state(&mgr, &up.id, |s| s == TransferState::Paused).await;
+        assert_eq!(up_paused.paused_reason, Some(PauseReason::Stalled));
+        assert!(up_paused.error.is_some());
+
+        remote.lock().unwrap().stall_put = false;
+        mgr.control(&up.id, TransferControlAction::Resume)
+            .await
+            .unwrap();
+        let _ = wait_for_state(&mgr, &up.id, |s| s == TransferState::Done).await;
+        assert_eq!(
+            remote
+                .lock()
+                .unwrap()
+                .uploaded
+                .get("/home/me/uploads/big-upload.dat")
+                .unwrap(),
+            &payload
+        );
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_collision_renames_remote_path_without_overwriting_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing_bytes = b"do-not-overwrite-original".to_vec();
+        let new_bytes = b"fresh-upload-payload".to_vec();
+        let local_src = dir.path().join("report.pdf");
+        fs::write(&local_src, &new_bytes).unwrap();
+
+        let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+        remote
+            .lock()
+            .unwrap()
+            .files
+            .insert("/home/me/uploads/report.pdf".into(), existing_bytes.clone());
+
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        platform
+            .picked_files
+            .lock()
+            .unwrap()
+            .push(PickedUploadFile {
+                local_path: local_src.to_string_lossy().into_owned(),
+                name: "report.pdf".into(),
+                size: new_bytes.len() as u64,
+                mime: None,
+            });
+        let mgr =
+            TransferManager::with_options(dir.path(), backend, platform, 2, Duration::from_secs(2));
+
+        let picked = mgr.pick_uploads().await.unwrap();
+        let up = mgr
+            .enqueue_upload(
+                "tower".into(),
+                "/home/me/uploads".into(),
+                Some(vec![picked[0].handle.clone()]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let done = wait_for_state(&mgr, &up.id, |s| s == TransferState::Done).await;
+        assert_eq!(done.path, "/home/me/uploads/report (2).pdf");
+        assert_eq!(done.name, "report (2).pdf");
+        let st = remote.lock().unwrap();
+        assert_eq!(
+            st.files.get("/home/me/uploads/report.pdf").unwrap(),
+            &existing_bytes
+        );
+        assert_eq!(
+            st.uploaded.get("/home/me/uploads/report (2).pdf").unwrap(),
+            &new_bytes
+        );
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn startup_sweeps_orphaned_parts_and_pruning_cleans_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let parts_dir = dir.path().join("transfers").join("parts");
+        fs::create_dir_all(&parts_dir).unwrap();
+        let orphan = parts_dir.join("orphan-999.part");
+        fs::write(&orphan, b"stale").unwrap();
+
+        let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        let mgr = TransferManager::load_or_new(dir.path(), backend, platform.clone());
+
+        assert!(
+            !orphan.exists(),
+            "startup must sweep orphaned .part files not referenced by live transfers"
+        );
+
+        // Verify pruning past MAX_RETAINED_TERMINAL releases pruned upload URIs and deletes .part files.
+        let mut pruned_part = parts_dir.join("tr-old-dl.part");
+        fs::write(&pruned_part, b"leftover").unwrap();
+        let pruned_records = {
+            let mut guard = mgr.state.lock().unwrap();
+            guard.items.push(TransferRecord {
+                transfer: DeviceTransfer {
+                    id: "tr-old-dl".into(),
+                    direction: TransferDirection::Download,
+                    machine: "tower".into(),
+                    path: "/home/me/old.txt".into(),
+                    name: "old.txt".into(),
+                    local_path: None,
+                    mime: None,
+                    state: TransferState::Failed,
+                    bytes_done: 0,
+                    bytes_total: 10,
+                    rate: None,
+                    error: None,
+                    created: "2026-01-01T00:00:00Z".into(),
+                    finished: Some("2026-01-01T00:00:01Z".into()),
+                    hash: None,
+                    can_open: false,
+                    can_show_in_folder: false,
+                    open_blocked_reason: None,
+                    paused_reason: None,
+                },
+                open_after_done: false,
+                finalized_local_path: None,
+                finalized_hash: None,
+                remote_path_resolved: false,
+                remote_mtime_secs: None,
+                remote_mtime_nanos: None,
+                remote_file_id: None,
+            });
+            guard.items.push(TransferRecord {
+                transfer: DeviceTransfer {
+                    id: "tr-old-up".into(),
+                    direction: TransferDirection::Upload,
+                    machine: "tower".into(),
+                    path: "/home/me/up.txt".into(),
+                    name: "up.txt".into(),
+                    local_path: Some("content://example/old-upload".into()),
+                    mime: None,
+                    state: TransferState::Failed,
+                    bytes_done: 0,
+                    bytes_total: 10,
+                    rate: None,
+                    error: None,
+                    created: "2026-01-01T00:00:00Z".into(),
+                    finished: Some("2026-01-01T00:00:01Z".into()),
+                    hash: None,
+                    can_open: false,
+                    can_show_in_folder: false,
+                    open_blocked_reason: None,
+                    paused_reason: None,
+                },
+                open_after_done: false,
+                finalized_local_path: None,
+                finalized_hash: None,
+                remote_path_resolved: true,
+                remote_mtime_secs: None,
+                remote_mtime_nanos: None,
+                remote_file_id: None,
+            });
+            for i in 0..MAX_RETAINED_TERMINAL {
+                guard.items.push(TransferRecord {
+                    transfer: DeviceTransfer {
+                        id: format!("tr-keep-{i}"),
+                        direction: TransferDirection::Download,
+                        machine: "tower".into(),
+                        path: format!("/home/me/f{i}.txt"),
+                        name: format!("f{i}.txt"),
+                        local_path: None,
+                        mime: None,
+                        state: TransferState::Done,
+                        bytes_done: 1,
+                        bytes_total: 1,
+                        rate: None,
+                        error: None,
+                        created: "2026-01-01T00:00:00Z".into(),
+                        finished: Some("2026-01-01T00:00:01Z".into()),
+                        hash: None,
+                        can_open: false,
+                        can_show_in_folder: false,
+                        open_blocked_reason: None,
+                        paused_reason: None,
+                    },
+                    open_after_done: false,
+                    finalized_local_path: None,
+                    finalized_hash: None,
+                    remote_path_resolved: false,
+                    remote_mtime_secs: None,
+                    remote_mtime_nanos: None,
+                    remote_file_id: None,
+                });
+            }
+            prune_terminal_locked(&mut guard.items)
+        };
+        assert_eq!(pruned_records.len(), 2);
+        mgr.cleanup_pruned_records(pruned_records).await;
+        assert!(!pruned_part.exists());
+        assert!(
+            platform
+                .released_uris
+                .lock()
+                .unwrap()
+                .contains(&"content://example/old-upload".to_owned())
+        );
+        pruned_part.clear();
+        mgr.shutdown();
+    }
+
+    #[test]
+    fn si_byte_formatting_and_notification_wording_match_ui() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1500), "1.5 KB");
+        assert_eq!(format_bytes(45_000_000), "45 MB");
+        assert_eq!(format_bytes(1_500_000_000), "1.5 GB");
+        assert_eq!(format_byte_pair(45_000_000, 120_000_000), "45 of 120 MB");
+        assert_eq!(
+            format_byte_pair(29_600_000, 1_500_000_000),
+            "30 MB of 1.5 GB"
+        );
+        assert_eq!(
+            format_progress_line(45_000_000, 100_000_000),
+            "45 of 100 MB (45%)"
+        );
+
+        let upload_rec = TransferRecord {
+            transfer: DeviceTransfer {
+                id: "tr-1".into(),
+                direction: TransferDirection::Upload,
+                machine: "tower".into(),
+                path: "/home/me/clip.mp4".into(),
+                name: "clip.mp4".into(),
+                local_path: Some("/tmp/clip.mp4".into()),
+                mime: Some("video/mp4".into()),
+                state: TransferState::Running,
+                bytes_done: 50_000_000,
+                bytes_total: 100_000_000,
+                rate: None,
+                error: None,
+                created: "2026-01-01T00:00:00Z".into(),
+                finished: None,
+                hash: None,
+                can_open: false,
+                can_show_in_folder: false,
+                open_blocked_reason: None,
+                paused_reason: None,
+            },
+            open_after_done: false,
+            finalized_local_path: None,
+            finalized_hash: None,
+            remote_path_resolved: true,
+            remote_mtime_secs: None,
+            remote_mtime_nanos: None,
+            remote_file_id: None,
+        };
+        let summary = build_notification_summary(&[upload_rec]);
+        assert_eq!(summary.title, "Uploading clip.mp4 to tower");
+        assert_eq!(summary.detail, "50 of 100 MB (50%)");
+        assert!(!summary.detail.contains("MiB"));
+    }
+
+    #[test]
+    fn monotonic_persistence_discards_older_sequence_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(remote));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        let mgr = TransferManager::load_or_new(dir.path(), backend, platform);
+
+        // Simulate a newer sequence already written to disk while a stale sequence tries to write.
+        {
+            let mut guard = mgr.state.lock().unwrap();
+            guard.settings.wifi_only_large = true;
+        }
+        mgr.persist_locked_snapshot();
+        assert!(
+            load_queue_file(&mgr.queue_file_path())
+                .settings
+                .wifi_only_large
+        );
+
+        // Hold persist_lock at a higher sequence number than the next snapshot's seq to prove
+        // out-of-order writes cannot clobber newer disk state.
+        *mgr.persist_lock.lock().unwrap() = u64::MAX - 1;
+        {
+            let mut guard = mgr.state.lock().unwrap();
+            guard.settings.wifi_only_large = false;
+        }
+        mgr.persist_locked_snapshot();
+        assert!(
+            load_queue_file(&mgr.queue_file_path())
+                .settings
+                .wifi_only_large,
+            "stale sequence write must be discarded instead of overwriting newer queue.json"
+        );
         mgr.shutdown();
     }
 }

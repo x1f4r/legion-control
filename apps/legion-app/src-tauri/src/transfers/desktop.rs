@@ -1,9 +1,13 @@
 //! Desktop transfer platform (Linux, macOS, Windows):
-//! - Downloads land in the user's Downloads folder (`name (2).ext` on collision).
-//! - "Open in another app" stages into the app cache and launches the system opener (`open`).
+//! - Downloads land in the user's Downloads folder with atomic no-overwrite placement
+//!   (`name (2).ext` on collision) and OS download safety marks (Windows Zone.Identifier /
+//!   macOS quarantine).
+//! - "Open in another app" stages into a size- and age-bounded app cache and launches the system
+//!   opener (`open`), refusing executable and installer extensions.
 //! - Uploads use the native OS file dialog (`rfd`).
 //! - Closing the window while transfers are running hides the window, sends a system notification,
-//!   and exits automatically once the queue empties; quitting outright prompts for confirmation.
+//!   and exits automatically once no active transfers remain; quitting outright prompts for
+//!   confirmation.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,10 +18,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Manager};
 
 use crate::backend::{AppError, BoxFuture, ErrorCode};
-use crate::transfers::{
-    PickedUploadFile, QueueNotificationSummary, TransferPlatform, guess_mime_from_name,
-    move_file_across_fs, sanitize_file_name, unique_dest_path,
+use crate::transfers::file_policy::{
+    MAX_OPEN_EXTERNALLY_CACHE_AGE, MAX_OPEN_EXTERNALLY_CACHE_BYTES,
+    MAX_OPEN_EXTERNALLY_CACHE_FILES, REFUSED_OPEN_HINT, REFUSED_OPEN_MESSAGE,
+    is_refused_open_file_name, mime_for_file_name, place_file_without_overwrite, prune_cache_dir,
+    sanitize_file_name,
 };
+use crate::transfers::{PickedUploadFile, QueueNotificationSummary, TransferPlatform};
 
 /// Desktop implementation of [`TransferPlatform`].
 pub struct DesktopTransferPlatform {
@@ -28,7 +35,7 @@ pub struct DesktopTransferPlatform {
 }
 
 impl DesktopTransferPlatform {
-    /// Creates the desktop transfer platform bound to `app`.
+    /// Creates the desktop transfer platform bound to `app` and prunes stale cache files.
     pub fn new(app: AppHandle, data_dir: &Path) -> Self {
         let downloads_dir = app
             .path()
@@ -41,6 +48,12 @@ impl DesktopTransferPlatform {
             .ok()
             .unwrap_or_else(|| data_dir.join("cache"))
             .join("open-externally");
+        prune_cache_dir(
+            &cache_dir,
+            MAX_OPEN_EXTERNALLY_CACHE_FILES,
+            MAX_OPEN_EXTERNALLY_CACHE_AGE,
+            MAX_OPEN_EXTERNALLY_CACHE_BYTES,
+        );
         Self {
             app,
             downloads_dir,
@@ -88,10 +101,9 @@ impl TransferPlatform for DesktopTransferPlatform {
                     .file_name()
                     .and_then(|s| s.to_str())
                     .map(sanitize_file_name)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "file".to_owned());
+                    .unwrap_or_else(|| "download".to_owned());
                 let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                let mime = guess_mime_from_name(&name).map(str::to_owned);
+                let mime = Some(mime_for_file_name(&name).to_owned());
                 out.push(PickedUploadFile {
                     local_path: path.to_string_lossy().into_owned(),
                     name,
@@ -113,29 +125,24 @@ impl TransferPlatform for DesktopTransferPlatform {
     ) -> BoxFuture<'a, Result<String, AppError>> {
         Box::pin(async move {
             let dir = if open_after_done {
+                prune_cache_dir(
+                    &self.cache_dir,
+                    MAX_OPEN_EXTERNALLY_CACHE_FILES.saturating_sub(1),
+                    MAX_OPEN_EXTERNALLY_CACHE_AGE,
+                    MAX_OPEN_EXTERNALLY_CACHE_BYTES,
+                );
                 &self.cache_dir
             } else {
                 &self.downloads_dir
             };
-            tokio::fs::create_dir_all(dir).await.map_err(|err| {
-                AppError::new(
-                    ErrorCode::Failed,
-                    format!("Could not create download folder {}: {err}.", dir.display()),
-                )
-            })?;
             let safe = sanitize_file_name(file_name);
             let target_name = if open_after_done {
                 format!("{id}-{safe}")
             } else {
                 safe
             };
-            let dst = unique_dest_path(dir, &target_name);
-            move_file_across_fs(part_path, &dst).await?;
-            #[cfg(unix)]
-            if !open_after_done {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o644));
-            }
+            let dst =
+                place_file_without_overwrite(part_path, dir, &target_name, open_after_done).await?;
             Ok(dst.to_string_lossy().into_owned())
         })
     }
@@ -147,6 +154,14 @@ impl TransferPlatform for DesktopTransferPlatform {
     ) -> BoxFuture<'a, Result<(), AppError>> {
         Box::pin(async move {
             let path = PathBuf::from(local_path);
+            let file_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if is_refused_open_file_name(file_name) {
+                return Err(AppError::new(ErrorCode::Denied, REFUSED_OPEN_MESSAGE)
+                    .with_hint(REFUSED_OPEN_HINT));
+            }
             if !path.is_file() {
                 return Err(AppError::new(
                     ErrorCode::NotFound,
@@ -166,9 +181,71 @@ impl TransferPlatform for DesktopTransferPlatform {
         })
     }
 
+    fn show_in_folder<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, Result<(), AppError>> {
+        Box::pin(async move {
+            let path = PathBuf::from(local_path);
+            if !path.exists() {
+                return Err(AppError::new(
+                    ErrorCode::NotFound,
+                    format!("Downloaded file is no longer at {}.", path.display()),
+                )
+                .with_hint("Download the file again if it was moved or removed."));
+            }
+            #[cfg(target_os = "macos")]
+            {
+                Command::new("open")
+                    .arg("-R")
+                    .arg(&path)
+                    .spawn()
+                    .map_err(|err| {
+                        AppError::new(
+                            ErrorCode::Failed,
+                            format!("Could not show {} in Finder: {err}.", path.display()),
+                        )
+                    })?;
+                return Ok(());
+            }
+            #[cfg(target_os = "windows")]
+            {
+                Command::new("explorer.exe")
+                    .arg(format!("/select,{}", path.display()))
+                    .spawn()
+                    .map_err(|err| {
+                        AppError::new(
+                            ErrorCode::Failed,
+                            format!("Could not show {} in Explorer: {err}.", path.display()),
+                        )
+                    })?;
+                return Ok(());
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                let parent = path.parent().ok_or_else(|| {
+                    AppError::new(ErrorCode::NotFound, "Downloaded file has no parent folder.")
+                })?;
+                open::that_detached(parent).map_err(|err| {
+                    AppError::new(
+                        ErrorCode::Failed,
+                        format!("Could not open folder {}: {err}.", parent.display()),
+                    )
+                })
+            }
+        })
+    }
+
     fn on_queue_updated(&self, summary: QueueNotificationSummary) {
         if summary.active_count == 0 && self.hidden_while_draining.swap(false, Ordering::SeqCst) {
-            notify_background_transfer("Transfers finished", "All Legion transfers have finished.");
+            if summary.paused_count > 0 {
+                notify_background_transfer(
+                    "Transfers paused",
+                    "Remaining transfers are paused. Open Legion again to resume.",
+                );
+            } else {
+                notify_background_transfer(
+                    "Transfers finished",
+                    "All Legion transfers have finished.",
+                );
+            }
             let app = self.app.clone();
             crate::transfers::spawn_bg(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -181,7 +258,9 @@ impl TransferPlatform for DesktopTransferPlatform {
 /// Shows a native confirmation dialog before quitting outright while transfers are still active.
 /// Returns `true` when the user confirmed quitting.
 pub fn confirm_quit_with_active_transfers() -> bool {
-    // Allow automated headless tests to inspect quit handling without blocking on a modal dialog.
+    // Allow automated headless debug tests to inspect quit handling without blocking on a modal
+    // dialog. Completely absent in release builds.
+    #[cfg(debug_assertions)]
     if let Ok(mode) = std::env::var("LEGION_APP_TEST_QUIT_CONFIRM") {
         return mode == "allow";
     }

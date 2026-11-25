@@ -210,124 +210,109 @@ pub fn run() {
         Ok(())
     });
 
+    macro_rules! legion_invoke_handler {
+        ($($extra:path),* $(,)?) => {
+            tauri::generate_handler![
+                commands::state,
+                commands::tools,
+                commands::call,
+                commands::cancel,
+                commands::pair,
+                commands::unpair,
+                commands::select_node,
+                commands::repair_store,
+                commands::invalidate_sessions,
+                commands::learn,
+                commands::accept_identity_change,
+                commands::dismiss_identity_change,
+                commands::device_name,
+                commands::ready,
+                commands::content_url,
+                commands::transfer_download,
+                commands::transfer_pick_uploads,
+                commands::transfer_upload,
+                commands::transfer_open_externally,
+                commands::transfers,
+                commands::transfer_control,
+                commands::open_transfer,
+                commands::show_transfer_in_folder,
+                commands::transfer_watch,
+                commands::transfer_unwatch,
+                commands::transfer_settings,
+                commands::transfer_set_settings,
+                commands::update_state,
+                commands::update_watch,
+                commands::update_check,
+                commands::update_install,
+                commands::update_set_auto,
+                commands::update_dismiss_notice,
+                commands::update_maybe_auto_install,
+                $($extra,)*
+            ]
+        };
+    }
+
     #[cfg(target_os = "android")]
     let builder = builder
         .plugin(android_barcode_scanner_plugin())
         .plugin(android_app_updater_plugin())
-        .plugin(android_files_transfer_plugin())
-        .invoke_handler(tauri::generate_handler![
-            commands::state,
-            commands::tools,
-            commands::call,
-            commands::cancel,
-            commands::pair,
-            commands::unpair,
-            commands::select_node,
-            commands::repair_store,
-            commands::invalidate_sessions,
-            commands::learn,
-            commands::accept_identity_change,
-            commands::dismiss_identity_change,
-            commands::device_name,
-            commands::ready,
-            commands::media_check_spec,
-            commands::media_check_report,
-            commands::content_url,
-            commands::transfer_download,
-            commands::transfer_upload,
-            commands::transfer_open_externally,
-            commands::transfers,
-            commands::transfer_control,
-            commands::open_transfer,
-            commands::transfer_watch,
-            commands::transfer_settings,
-            commands::transfer_set_settings,
-            commands::scan_invite,
-            commands::update_state,
-            commands::update_watch,
-            commands::update_check,
-            commands::update_install,
-            commands::update_set_auto,
-            commands::update_dismiss_notice,
-            commands::update_maybe_auto_install,
-        ]);
+        .plugin(android_files_transfer_plugin());
 
     #[cfg(target_os = "ios")]
-    let builder = builder
-        .plugin(tauri_plugin_barcode_scanner::init())
-        .invoke_handler(tauri::generate_handler![
-            commands::state,
-            commands::tools,
-            commands::call,
-            commands::cancel,
-            commands::pair,
-            commands::unpair,
-            commands::select_node,
-            commands::repair_store,
-            commands::invalidate_sessions,
-            commands::learn,
-            commands::accept_identity_change,
-            commands::dismiss_identity_change,
-            commands::device_name,
-            commands::ready,
-            commands::media_check_spec,
-            commands::media_check_report,
-            commands::content_url,
-            commands::transfer_download,
-            commands::transfer_upload,
-            commands::transfer_open_externally,
-            commands::transfers,
-            commands::transfer_control,
-            commands::open_transfer,
-            commands::transfer_watch,
-            commands::transfer_settings,
-            commands::transfer_set_settings,
-            commands::scan_invite,
-            commands::update_state,
-            commands::update_watch,
-            commands::update_check,
-            commands::update_install,
-            commands::update_set_auto,
-            commands::update_dismiss_notice,
-            commands::update_maybe_auto_install,
-        ]);
+    let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let builder = builder.invoke_handler(tauri::generate_handler![
-        commands::state,
-        commands::tools,
-        commands::call,
-        commands::cancel,
-        commands::pair,
-        commands::unpair,
-        commands::select_node,
-        commands::repair_store,
-        commands::invalidate_sessions,
-        commands::learn,
-        commands::accept_identity_change,
-        commands::dismiss_identity_change,
-        commands::device_name,
-        commands::ready,
+    #[cfg(all(
+        any(target_os = "android", target_os = "ios"),
+        debug_assertions,
+        feature = "test-upload-paths"
+    ))]
+    let builder = builder.invoke_handler(legion_invoke_handler!(
+        commands::scan_invite,
         commands::media_check_spec,
         commands::media_check_report,
-        commands::content_url,
-        commands::transfer_download,
-        commands::transfer_upload,
-        commands::transfer_open_externally,
-        commands::transfers,
-        commands::transfer_control,
-        commands::open_transfer,
-        commands::transfer_watch,
-        commands::transfer_settings,
-        commands::transfer_set_settings,
-        commands::update_state,
-        commands::update_watch,
-        commands::update_check,
-        commands::update_install,
-        commands::update_set_auto,
-        commands::update_dismiss_notice,
-        commands::update_maybe_auto_install,
-    ]);
+        commands::transfer_upload_test_files,
+    ));
+
+    #[cfg(all(
+        any(target_os = "android", target_os = "ios"),
+        debug_assertions,
+        not(feature = "test-upload-paths")
+    ))]
+    let builder = builder.invoke_handler(legion_invoke_handler!(
+        commands::scan_invite,
+        commands::media_check_spec,
+        commands::media_check_report,
+    ));
+
+    #[cfg(all(any(target_os = "android", target_os = "ios"), not(debug_assertions)))]
+    let builder = builder.invoke_handler(legion_invoke_handler!(commands::scan_invite));
+
+    #[cfg(all(
+        not(any(target_os = "android", target_os = "ios")),
+        debug_assertions,
+        feature = "test-upload-paths"
+    ))]
+    let builder = builder.invoke_handler(legion_invoke_handler!(
+        commands::media_check_spec,
+        commands::media_check_report,
+        commands::transfer_upload_test_files,
+    ));
+
+    #[cfg(all(
+        not(any(target_os = "android", target_os = "ios")),
+        debug_assertions,
+        not(feature = "test-upload-paths")
+    ))]
+    let builder = builder.invoke_handler(legion_invoke_handler!(
+        commands::media_check_spec,
+        commands::media_check_report,
+    ));
+
+    #[cfg(all(
+        not(any(target_os = "android", target_os = "ios")),
+        not(debug_assertions)
+    ))]
+    let builder = builder.invoke_handler(legion_invoke_handler!());
 
     #[allow(clippy::expect_used)]
     // Fatal startup failure before any UI can render; Tauri applications terminate here.
@@ -379,6 +364,7 @@ pub fn run() {
             event: WindowEvent::Resumed,
             ..
         } => {
+            app_handle.state::<SharedContentServer>().0.on_app_resumed();
             app_handle
                 .state::<SharedTransfers>()
                 .0
@@ -445,6 +431,12 @@ mod tests {
             "https://example.com/",
             "http://localhost:8080/",
             "http://127.0.0.1/",
+            "http://127.0.0.1:45123/v1/content/tok/evil.html",
+            "http://127.0.0.1:45123/v1/content/tok/evil.svg",
+            "http://legion-content.localhost/v1/content/tok/evil.html",
+            "http://legion-content.localhost/v1/content/tok/evil.svg",
+            "legion-content://localhost/v1/content/tok/evil.html",
+            "legion-content://localhost/v1/content/tok/evil.svg",
             "http://tauri.localhost:9999/",
             "http://user@tauri.localhost/",
             "tauri://evil.example/",

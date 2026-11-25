@@ -18,10 +18,11 @@ use crate::backend::{
     RepairResult, UnpairResult,
 };
 use crate::content::{ContentUrlResult, SharedContentServer};
+#[cfg(all(debug_assertions, feature = "test-upload-paths"))]
+use crate::transfers::UploadFileInput;
 use crate::transfers::{
-    DeviceTransfer, OpenExternallyResult, OpenTransferResult, SharedTransfers,
+    DeviceTransfer, OpenExternallyResult, OpenTransferResult, PickedUploadHandle, SharedTransfers,
     TransferControlAction, TransferIdResult, TransferSettings, UploadEnqueueResult,
-    UploadFileInput,
 };
 #[cfg(target_os = "android")]
 use crate::updater::android::AndroidUpdaterHandle;
@@ -34,12 +35,16 @@ pub const INTERFACE_READY_MARKER: &str = "legion-app: interface ready";
 pub const READY_FILE_ENV: &str = "LEGION_APP_READY_FILE";
 
 /// Optional environment variable naming a JSON spec file for the CI content-media smoke check.
+/// Compiled ONLY in debug builds so release binaries ship with zero test hooks.
+#[cfg(debug_assertions)]
 pub const MEDIA_CHECK_FILE_ENV: &str = "LEGION_APP_MEDIA_CHECK_FILE";
 
 /// Log line emitted when the opt-in CI content-media smoke check decodes both image and video.
+#[cfg(debug_assertions)]
 pub const MEDIA_CHECK_OK_MARKER: &str = "legion-app: media check ok";
 
 /// Log line emitted when the opt-in CI content-media smoke check fails.
+#[cfg(debug_assertions)]
 pub const MEDIA_CHECK_FAILED_MARKER: &str = "legion-app: media check failed";
 
 /// Maximum accepted pairing invite length at the command seam (8 KiB).
@@ -286,17 +291,55 @@ pub async fn transfer_download(
     Ok(TransferIdResult { id })
 }
 
-/// Picks local files (unless `files` is pre-supplied) and enqueues non-blocking bulk-pipe `put`
-/// uploads into `machine:dir`. Returns `None` if the user cancelled the file picker.
+/// Opens the device's native file picker and returns session-only opaque handles for the chosen
+/// files. The web view never receives or supplies device filesystem paths or URIs.
+#[tauri::command]
+pub async fn transfer_pick_uploads(
+    transfers: State<'_, SharedTransfers>,
+) -> Result<Vec<PickedUploadHandle>, AppError> {
+    transfers.0.pick_uploads().await
+}
+
+/// Picks local files via the native picker (unless opaque `handles` from [`transfer_pick_uploads`]
+/// are supplied) and enqueues non-blocking bulk-pipe `put` uploads into `machine:dir`. Returns
+/// `None` if the user cancelled the file picker.
 #[tauri::command]
 pub async fn transfer_upload(
     transfers: State<'_, SharedTransfers>,
     machine: String,
     dir: String,
-    files: Option<Vec<UploadFileInput>>,
+    handles: Option<Vec<String>>,
 ) -> Result<Option<UploadEnqueueResult>, AppError> {
     validate_label_size("Machine name", &machine)?;
-    transfers.0.enqueue_upload(machine, dir, files).await
+    if let Some(ref list) = handles {
+        if list.len() > 128 {
+            return Err(AppError::new(
+                ErrorCode::InvalidArgs,
+                "Too many upload handles supplied.",
+            ));
+        }
+        for h in list {
+            validate_label_size("Upload handle", h)?;
+        }
+    }
+    transfers.0.enqueue_upload(machine, dir, handles).await
+}
+
+/// Debug/test-only upload command accepting pre-selected local file paths. Compiled ONLY when
+/// BOTH `debug_assertions` AND the `test-upload-paths` Cargo feature are enabled.
+#[cfg(all(debug_assertions, feature = "test-upload-paths"))]
+#[tauri::command]
+pub async fn transfer_upload_test_files(
+    transfers: State<'_, SharedTransfers>,
+    machine: String,
+    dir: String,
+    files: Vec<UploadFileInput>,
+) -> Result<Option<UploadEnqueueResult>, AppError> {
+    validate_label_size("Machine name", &machine)?;
+    transfers
+        .0
+        .enqueue_upload_paths_for_test(machine, dir, files)
+        .await
 }
 
 /// Enqueues a download to the app cache that opens in another app once verified.
@@ -346,13 +389,33 @@ pub async fn open_transfer(
     transfers.0.open_transfer(&id).await
 }
 
-/// Subscribes `on_event` to throttled live snapshots of the transfer queue.
+/// Reveals a finished downloaded file in the device's file manager / Downloads folder.
+#[tauri::command]
+pub async fn show_transfer_in_folder(
+    transfers: State<'_, SharedTransfers>,
+    id: String,
+) -> Result<OpenTransferResult, AppError> {
+    validate_label_size("Transfer id", &id)?;
+    transfers.0.show_transfer_in_folder(&id).await
+}
+
+/// Subscribes `on_event` to throttled live snapshots of the transfer queue and returns the
+/// watcher's opaque subscription id for removal via [`transfer_unwatch`].
 #[tauri::command]
 pub fn transfer_watch(
     transfers: State<'_, SharedTransfers>,
     on_event: Channel<Vec<DeviceTransfer>>,
+) -> Result<u64, AppError> {
+    Ok(transfers.0.watch(on_event))
+}
+
+/// Removes a previously registered progress watcher by its subscription id.
+#[tauri::command]
+pub fn transfer_unwatch(
+    transfers: State<'_, SharedTransfers>,
+    watcher_id: u64,
 ) -> Result<(), AppError> {
-    transfers.0.watch(on_event);
+    transfers.0.unwatch(watcher_id);
     Ok(())
 }
 
@@ -387,7 +450,9 @@ pub fn device_name() -> String {
     default_device_name()
 }
 
-/// Host-provided specification for the opt-in content-media smoke check (`LEGION_APP_MEDIA_CHECK_FILE`).
+/// Host-provided specification for the opt-in debug CI content-media smoke check
+/// (`LEGION_APP_MEDIA_CHECK_FILE`). Compiled ONLY in debug builds.
+#[cfg(debug_assertions)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MediaCheckSpec {
     /// Target machine name (e.g. `"tower"`).
@@ -402,12 +467,22 @@ pub struct MediaCheckSpec {
     /// Optional timestamp (seconds) to seek the video to after initial metadata loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seek_to: Option<f64>,
+    /// Optional remote HTML path to verify content-origin IPC isolation (framed & top-level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_path: Option<String>,
+    /// Optional remote SVG path to verify content-origin IPC isolation (framed & top-level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg_path: Option<String>,
+    /// Optional flag asking the page to also re-verify media decode after an iOS resume event.
+    #[serde(default)]
+    pub verify_resume: bool,
     /// Optional host path where [`media_check_report`] writes the JSON result. Never read from JS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out_file: Option<String>,
 }
 
 /// Public subset of [`MediaCheckSpec`] exposed to the web view (omits host `out_file` path).
+#[cfg(debug_assertions)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PublicMediaCheckSpec {
     /// Target machine name.
@@ -422,9 +497,19 @@ pub struct PublicMediaCheckSpec {
     /// Optional timestamp (seconds) to seek the video to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seek_to: Option<f64>,
+    /// Optional remote HTML path for IPC isolation verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_path: Option<String>,
+    /// Optional remote SVG path for IPC isolation verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg_path: Option<String>,
+    /// Whether to also wait for an app resume and re-verify media loading.
+    #[serde(default)]
+    pub verify_resume: bool,
 }
 
 /// Decoded media verification report submitted by the web view after loading content URLs.
+#[cfg(debug_assertions)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MediaCheckReport {
     /// True when both the image and video decoded with non-zero dimensions.
@@ -449,11 +534,18 @@ pub struct MediaCheckReport {
     /// Origin/scheme prefix of the minted video content URL (ticket redacted).
     #[serde(default)]
     pub video_origin: String,
+    /// Result of HTML/SVG content-origin IPC isolation check when requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_isolation_ok: Option<bool>,
+    /// Result of post-resume loopback media reload check when requested (iOS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_ok: Option<bool>,
     /// Failure description when `ok` is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
+#[cfg(debug_assertions)]
 fn load_media_check_spec(app: &tauri::AppHandle) -> Result<Option<MediaCheckSpec>, AppError> {
     let spec_path = if let Some(p) = std::env::var_os(MEDIA_CHECK_FILE_ENV)
         .filter(|val| !val.is_empty())
@@ -461,7 +553,7 @@ fn load_media_check_spec(app: &tauri::AppHandle) -> Result<Option<MediaCheckSpec
     {
         Some(p)
     } else {
-        #[cfg(all(target_os = "android", debug_assertions))]
+        #[cfg(target_os = "android")]
         {
             use tauri::Manager as _;
             app.path()
@@ -470,7 +562,7 @@ fn load_media_check_spec(app: &tauri::AppHandle) -> Result<Option<MediaCheckSpec
                 .map(|d| d.join("media-check.json"))
                 .filter(|p| p.is_file())
         }
-        #[cfg(not(all(target_os = "android", debug_assertions)))]
+        #[cfg(not(target_os = "android"))]
         {
             let _ = app;
             None
@@ -495,7 +587,9 @@ fn load_media_check_spec(app: &tauri::AppHandle) -> Result<Option<MediaCheckSpec
     Ok(Some(spec))
 }
 
-/// Returns the active opt-in CI content-media smoke check specification, or `None` in normal runs.
+/// Returns the active opt-in debug CI content-media smoke check specification, or `None` in
+/// normal runs. Compiled ONLY in debug builds.
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub fn media_check_spec(app: tauri::AppHandle) -> Result<Option<PublicMediaCheckSpec>, AppError> {
     let Some(spec) = load_media_check_spec(&app)? else {
@@ -507,11 +601,16 @@ pub fn media_check_spec(app: tauri::AppHandle) -> Result<Option<PublicMediaCheck
         image_path: spec.image_path,
         video_path: spec.video_path,
         seek_to: spec.seek_to,
+        html_path: spec.html_path,
+        svg_path: spec.svg_path,
+        verify_resume: spec.verify_resume,
     }))
 }
 
-/// Records the result of the opt-in CI content-media smoke check (logs marker + writes configured
-/// `out_file` if any). Refuses calls when no host media-check spec is active.
+/// Records the result of the opt-in debug CI content-media smoke check (logs marker + writes
+/// configured `out_file` if any). Refuses calls when no host media-check spec is active.
+/// Compiled ONLY in debug builds.
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub fn media_check_report(app: tauri::AppHandle, report: MediaCheckReport) -> Result<(), AppError> {
     let Some(spec) = load_media_check_spec(&app)? else {

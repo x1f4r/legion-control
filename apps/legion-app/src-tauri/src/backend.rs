@@ -356,9 +356,22 @@ pub struct TransferCapabilities {
     pub background: bool,
     /// True when the OS pauses transfers while the app is in the background (iOS and iPadOS).
     pub pauses_in_background: bool,
+    /// True when native device-to-machine file picking and upload is implemented on this platform.
+    #[serde(default = "default_true")]
+    pub can_upload: bool,
+    /// True when native "Open in another app" is implemented on this platform.
+    #[serde(default = "default_true")]
+    pub can_open_externally: bool,
+    /// True when tapping a finished download can open it directly in a viewer/chooser.
+    #[serde(default = "default_true")]
+    pub can_open_downloads: bool,
     /// Plain-language note explaining background behaviour on this platform, when relevant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_note: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl TransferCapabilities {
@@ -369,6 +382,9 @@ impl TransferCapabilities {
             Self {
                 background: false,
                 pauses_in_background: true,
+                can_upload: false,
+                can_open_externally: false,
+                can_open_downloads: false,
                 background_note: Some(
                     "Transfers pause when you leave Legion on iPhone and iPad, and resume when you open it again."
                         .to_owned(),
@@ -380,6 +396,9 @@ impl TransferCapabilities {
             Self {
                 background: true,
                 pauses_in_background: false,
+                can_upload: true,
+                can_open_externally: true,
+                can_open_downloads: true,
                 background_note: None,
             }
         }

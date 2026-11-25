@@ -740,6 +740,16 @@ impl TransferPlatform for AndroidTransferPlatform {
         })
     }
 
+    fn show_in_folder<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, Result<(), AppError>> {
+        Box::pin(async move {
+            let client = self.wait_for_client().await?;
+            let _ = client
+                .call("showInFolder", json!({ "uriOrPath": local_path }))
+                .await?;
+            Ok(())
+        })
+    }
+
     fn on_queue_updated(&self, summary: QueueNotificationSummary) {
         let seq = self.summary_seq.fetch_add(1, Ordering::AcqRel) + 1;
         *self
@@ -761,7 +771,9 @@ impl TransferPlatform for AndroidTransferPlatform {
                 "direction": transfer.direction,
                 "name": transfer.name,
                 "localUri": transfer.local_path,
-                "mime": transfer.mime.as_deref().unwrap_or("application/octet-stream"),
+                "mime": crate::transfers::mime_for_file_name(&transfer.name),
+                "canOpen": transfer.can_open,
+                "openBlockedReason": transfer.open_blocked_reason,
             });
             crate::transfers::spawn_bg(async move {
                 let _ = client.call("notifyComplete", payload).await;
