@@ -22,6 +22,7 @@ use crate::transfers::file_policy::{
     MAX_OPEN_EXTERNALLY_CACHE_AGE, MAX_OPEN_EXTERNALLY_CACHE_BYTES,
     MAX_OPEN_EXTERNALLY_CACHE_FILES, REFUSED_OPEN_HINT, REFUSED_OPEN_MESSAGE, can_open_file_name,
     mime_for_file_name, place_file_without_overwrite, prune_cache_dir, sanitize_file_name,
+    validate_child_in_dir,
 };
 use crate::transfers::{PickedUploadFile, QueueNotificationSummary, TransferPlatform};
 
@@ -146,6 +147,29 @@ impl TransferPlatform for DesktopTransferPlatform {
         })
     }
 
+    fn cached_file_exists<'a>(
+        &'a self,
+        local_path: &'a str,
+        expected_size: u64,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let path = PathBuf::from(local_path);
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                return false;
+            };
+            let Ok(expected) = validate_child_in_dir(&self.cache_dir, name) else {
+                return false;
+            };
+            if expected != path {
+                return false;
+            }
+            tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.is_file() && m.len() == expected_size)
+                .unwrap_or(false)
+        })
+    }
+
     fn open_local_file<'a>(
         &'a self,
         local_path: &'a str,
@@ -171,11 +195,9 @@ impl TransferPlatform for DesktopTransferPlatform {
             open::that_detached(&path).map_err(|err| {
                 AppError::new(
                     ErrorCode::Failed,
-                    format!(
-                        "Could not open {} in the system viewer: {err}.",
-                        path.display()
-                    ),
+                    format!("Could not open {} in another app: {err}.", path.display()),
                 )
+                .with_hint("Download the file to save it instead.")
             })
         })
     }

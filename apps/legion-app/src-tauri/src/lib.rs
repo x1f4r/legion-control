@@ -149,18 +149,6 @@ pub fn run() {
 
     let builder = tauri::Builder::default();
 
-    #[cfg(target_os = "android")]
-    let builder = builder.register_asynchronous_uri_scheme_protocol(
-        content::CUSTOM_SCHEME_NAME,
-        |ctx, request, responder| {
-            let content_server = Arc::clone(&ctx.app_handle().state::<SharedContentServer>().0);
-            tauri::async_runtime::spawn(async move {
-                let response = content_server.handle_custom_scheme(request).await;
-                responder.respond(response);
-            });
-        },
-    );
-
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
         if let Some(desktop) = app.try_state::<SharedDesktopTransferPlatform>() {
@@ -283,6 +271,8 @@ pub fn run() {
                 commands::device_name,
                 commands::ready,
                 commands::content_url,
+                commands::content_status,
+                commands::content_revoke,
                 commands::transfer_download,
                 commands::transfer_pick_uploads,
                 commands::transfer_upload,
@@ -497,6 +487,7 @@ mod tests {
             "http://localhost:8080/",
             "http://127.0.0.1/",
             "http://127.0.0.1:45123/v1/content/tok/evil.html",
+            "http://127.0.0.1:45123/v1/content/tok/evil.html?download=1",
             "http://127.0.0.1:45123/v1/content/tok/evil.svg",
             "http://legion-content.localhost/v1/content/tok/evil.html",
             "http://legion-content.localhost/v1/content/tok/evil.svg",
@@ -504,12 +495,20 @@ mod tests {
             "legion-content://localhost/v1/content/tok/evil.svg",
             "http://tauri.localhost:9999/",
             "http://user@tauri.localhost/",
+            "http://tauri.localhost.evil.example/",
             "tauri://evil.example/",
             "tauri://localhost:1234/",
+            "tauri://localhost.evil.example/",
             "file:///etc/passwd",
             "data:text/html,<h1>hi</h1>",
             "javascript:alert(1)",
             "about:blank",
+            "chrome-error://chromewebdata/",
+            "blob:http://127.0.0.1:45123/00000000-0000-0000-0000-000000000000",
+            "blob:http://tauri.localhost/00000000-0000-0000-0000-000000000000",
+            "blob:tauri://localhost/00000000-0000-0000-0000-000000000000",
+            "view-source:http://127.0.0.1:45123/v1/content/tok/evil.html",
+            "ws://127.0.0.1:45123/v1/content/tok/evil.html",
         ];
 
         for raw in blocked {

@@ -319,15 +319,28 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
       true,
     );
 
-    // 6. `N` moves to next video (`Beach.mp4`) in folder order.
+    // 6. `N` moves to next video (`Beach.mp4`) in folder order and revokes the previous content URL.
+    const firstVideoUrl = await page.evaluate(() => document.querySelector('.viewer video.viewer-video')?.getAttribute('src') || '');
+    assert.ok(firstVideoUrl.length > 0);
     await page.keyboard.press('n');
     await page.locator('.viewer-top .name', { hasText: 'Beach.mp4' }).waitFor();
+    const afterNextRevoked = await page.evaluate((prev) => ({
+      revokedPrev: Array.isArray(window.__LEGION_MOCK_REVOKED_URLS__) && window.__LEGION_MOCK_REVOKED_URLS__.includes(prev),
+      nextUrl: document.querySelector('.viewer video.viewer-video')?.getAttribute('src') || '',
+    }), firstVideoUrl);
+    assert.equal(afterNextRevoked.revokedPrev, true, 'Switching to next video must revoke previous content URL');
+    assert.notEqual(afterNextRevoked.nextUrl, firstVideoUrl);
     assert.equal(await page.locator('.viewer button[aria-label="Previous video"]').count(), 1);
     assert.equal(await page.locator('.viewer button[aria-label="Next video"]').count(), 1);
 
-    // `Esc` closes the viewer when not in fullscreen.
+    // `Esc` closes the viewer when not in fullscreen and revokes the active video URL.
     await page.keyboard.press('Escape');
     await page.locator('.viewer').waitFor({ state: 'hidden' });
+    assert.equal(
+      await page.evaluate((u) => Array.isArray(window.__LEGION_MOCK_REVOKED_URLS__) && window.__LEGION_MOCK_REVOKED_URLS__.includes(u), afterNextRevoked.nextUrl),
+      true,
+      'Closing viewer must revoke active video content URL',
+    );
 
     // 6b. Resume chip ("Resumed at ... · Start over") appears when a >= 10 min file has a saved position, and Start over resets it.
     await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FMusic%2FAlbum`, {
@@ -506,11 +519,19 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
     );
     await page.locator('.sheet button', { hasText: 'Done' }).click();
 
-    // Ending a song auto-advances to the next track (`02 - Rain on Glass.mp3`).
+    // Ending a song auto-advances to the next track (`02 - Rain on Glass.mp3`) and revokes the previous URL.
+    const firstSongUrl = await page.evaluate(() => document.querySelector('.viewer audio')?.getAttribute('src') || '');
+    assert.ok(firstSongUrl.length > 0);
     await page.evaluate(() => {
       document.querySelector('.viewer audio').dispatchEvent(new Event('ended'));
     });
     await page.locator('.music-title', { hasText: 'Rain on Glass' }).waitFor({ timeout: 5000 });
+    const afterAutoNext = await page.evaluate((prev) => ({
+      revokedPrev: Array.isArray(window.__LEGION_MOCK_REVOKED_URLS__) && window.__LEGION_MOCK_REVOKED_URLS__.includes(prev),
+      nextUrl: document.querySelector('.viewer audio')?.getAttribute('src') || '',
+    }), firstSongUrl);
+    assert.equal(afterAutoNext.revokedPrev, true, 'Auto-advancing to next song must revoke previous content URL');
+    assert.notEqual(afterAutoNext.nextUrl, firstSongUrl);
 
     // Close and open untagged song: title is filename without extension, no subtitle, no "Unknown artist", plain bg.
     await page.locator('.music-top button[aria-label="Close"]').click();

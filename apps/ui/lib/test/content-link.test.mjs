@@ -205,6 +205,189 @@ test('createHttpLink reads content support from /v1/health and remembers unsuppo
   }
 });
 
+test('createHttpLink clears remembered unsupported state when capabilities refresh', async () => {
+  const prevWindow = globalThis.window;
+  globalThis.window = { location: { origin: 'http://127.0.0.1:4433' } };
+  let doorHasContent = false;
+  let legacyUpgraded = false;
+
+  const restore = withMockEnv(async (url, init) => {
+    const jsonHeaders = { get: () => 'application/json' };
+    if (url === '/v1/health') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { ok: true, node: 'tower', version: '0.2.0', content: doorHasContent };
+        },
+      };
+    }
+    if (url === '/v1/tools?all=1') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { tools: [{ name: 'meta.version' }] };
+        },
+      };
+    }
+    if (url === '/v1/call') {
+      const req = JSON.parse(init.body);
+      if (req.tool === 'meta.whoami') {
+        return {
+          ok: true,
+          status: 200,
+          headers: jsonHeaders,
+          async json() {
+            return { node: req.on || 'tower', principal: 'ui', role: 'operator' };
+          },
+        };
+      }
+      if (req.tool === 'meta.version') {
+        if (req.on === 'all') {
+          return {
+            ok: true,
+            status: 200,
+            headers: jsonHeaders,
+            async json() {
+              return {
+                results: {
+                  legacy: { ok: { version: '0.2.0', protocol: 1 } },
+                  other_old: { error: { code: 'unreachable', message: 'offline' } },
+                },
+              };
+            },
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: jsonHeaders,
+          async json() {
+            return { version: '0.2.0', protocol: 1 };
+          },
+        };
+      }
+      if (req.tool === 'fs.list') {
+        return {
+          ok: true,
+          status: 200,
+          headers: jsonHeaders,
+          async json() {
+            return { entries: [] };
+          },
+        };
+      }
+    }
+    if (url === '/v1/content') {
+      const req = JSON.parse(init.body);
+      if ((req.on === 'legacy' && !legacyUpgraded) || req.on === 'other_old') {
+        return {
+          ok: false,
+          status: 501,
+          async json() {
+            return {
+              code: 'unsupported',
+              message: `${req.on} does not support ranged content streams.`,
+              machine: req.on,
+            };
+          },
+        };
+      }
+      if (req.on === 'flaky') {
+        return {
+          ok: false,
+          status: 503,
+          async json() {
+            return { code: 'busy', message: 'Too many open streams.', machine: 'flaky' };
+          },
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { url: '/v1/content/tok/pic.png', expires_in: 900 };
+        },
+      };
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  });
+
+  try {
+    const link = createHttpLink();
+    let notifications = 0;
+    const unsub = link.onContentSupportChange(() => {
+      notifications += 1;
+    });
+
+    // 1. Door initially reports content: false, then upgrades behind /v1/health.
+    await link.state();
+    assert.equal(link.supportsContent, false);
+    assert.equal(link.supportsContentFor('tower'), false);
+
+    doorHasContent = true;
+    await link.state();
+    assert.equal(link.supportsContent, true);
+    assert.equal(link.supportsContentFor('tower'), true);
+    assert.equal(notifications, 1);
+
+    // 2. Transient errors (busy/503) do not mark a machine unsupported.
+    await assert.rejects(() => link.contentUrl({ machine: 'flaky', path: '~/pic.png' }), {
+      code: 'busy',
+    });
+    assert.equal(link.supportsContentFor('flaky'), true);
+
+    // 3. Unsupported remote machines are remembered across ordinary non-capability calls (fs.list).
+    await assert.rejects(() => link.contentUrl({ machine: 'legacy', path: '~/pic.png' }), {
+      code: 'unsupported',
+    });
+    await assert.rejects(() => link.contentUrl({ machine: 'other_old', path: '~/pic.png' }), {
+      code: 'unsupported',
+    });
+    assert.equal(link.supportsContentFor('legacy'), false);
+    assert.equal(link.supportsContentFor('other_old'), false);
+
+    await link.call('fs.list', { path: '~' }, { on: 'legacy' });
+    assert.equal(
+      link.supportsContentFor('legacy'),
+      false,
+      'ordinary non-capability calls must not clear remembered unsupported state',
+    );
+
+    // 4. Fan-out capability refresh clears only machines that answered ok, leaving failing ones marked.
+    await link.call('meta.version', {}, { on: 'all' });
+    assert.equal(link.supportsContentFor('legacy'), true);
+    assert.equal(link.supportsContentFor('other_old'), false);
+
+    // After upgrade, contentUrl succeeds without reloading the page.
+    legacyUpgraded = true;
+    const res = await link.contentUrl({ machine: 'legacy', path: '~/pic.png' });
+    assert.equal(res.url, '/v1/content/tok/pic.png');
+
+    // 5. Single-machine capability call clears unsupported for that machine too.
+    await link.call('meta.whoami', {}, { on: 'other_old' });
+    assert.equal(link.supportsContentFor('other_old'), true);
+
+    // 6. Door-local unsupported state clears on tools() or /v1/health.
+    legacyUpgraded = false;
+    await assert.rejects(() => link.contentUrl({ machine: 'legacy', path: '~/pic.png' }), {
+      code: 'unsupported',
+    });
+    assert.equal(link.supportsContentFor('legacy'), false);
+    legacyUpgraded = true;
+    // Direct successful contentUrl also clears unsupported.
+    await link.contentUrl({ machine: 'legacy', path: '~/pic.png' });
+    assert.equal(link.supportsContentFor('legacy'), true);
+
+    unsub();
+  } finally {
+    restore();
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+  }
+});
+
 test('createMockLink contentUrl serves built-in samples and enforces auth, reachability, and read policy', async () => {
   const link = createMockLink();
 

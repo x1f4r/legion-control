@@ -327,6 +327,7 @@ export function VideoPlayer({
   entry,
   name,
   mediaUrl,
+  mediaRef = null,
   siblings = [],
   link,
   viewerRef,
@@ -334,10 +335,21 @@ export function VideoPlayer({
   onOpenMore,
   onClose,
   onNavigateSibling,
+  onMediaLoadedMetadata,
+  onMediaTime,
+  onMediaPlay,
+  onMediaPause,
   onMediaError,
   onFullscreenStateChange,
 }) {
   const videoRef = useRef(null);
+  const bindVideoRef = useCallback(
+    (el) => {
+      videoRef.current = el;
+      if (mediaRef) mediaRef.current = el;
+    },
+    [mediaRef],
+  );
   const overlayRef = useRef(null);
   const stageTapRef = useRef(null);
   const resumeStore = useMemo(() => createResumeStore(safeStorage()), []);
@@ -447,6 +459,7 @@ export function VideoPlayer({
     setDuration(entry?.duration_s > 0 ? entry.duration_s : 0);
     setBufferedEnd(0);
     setSpeedOpen(false);
+    controller.setError(false);
     controller.setLoading(true);
     controller.dismissResumeChip();
   }, [machine, path, mediaUrl, controller]);
@@ -893,7 +906,7 @@ export function VideoPlayer({
       }}
     >
       <video
-        ref=${videoRef}
+        ref=${bindVideoRef}
         class="viewer-video"
         src=${mediaUrl}
         playsinline
@@ -905,7 +918,8 @@ export function VideoPlayer({
           if (dur > 0) setDuration(dur);
           setBufferedEnd(readBufferedEnd(v));
           v.playbackRate = playbackRate;
-          if (!resumedAppliedRef.current && dur > 0) {
+          const recovered = Boolean(onMediaLoadedMetadata?.(v));
+          if (!recovered && !resumedAppliedRef.current && dur > 0) {
             resumedAppliedRef.current = true;
             const saved = resumeStore.load(identityRef.current, dur);
             if (saved != null) {
@@ -928,13 +942,18 @@ export function VideoPlayer({
           setBufferedEnd(readBufferedEnd(e.currentTarget));
           controller.onCanPlay();
         }}
-        onPlay=${() => controller.setPlaying(true)}
-        onPlaying=${() => {
+        onPlay=${(e) => {
+          onMediaPlay?.(e.currentTarget);
+          controller.setPlaying(true);
+        }}
+        onPlaying=${(e) => {
+          onMediaPlay?.(e.currentTarget);
           controller.setPlaying(true);
           controller.onCanPlay();
         }}
         onPause=${(e) => {
           const v = e.currentTarget;
+          onMediaPause?.(v);
           if (Number.isFinite(v.duration) && v.duration > 0) {
             resumeStore.save(identityRef.current, v.currentTime, v.duration);
           }
@@ -944,6 +963,7 @@ export function VideoPlayer({
         onStalled=${() => controller.onWaiting()}
         onSeeked=${(e) => {
           const v = e.currentTarget;
+          onMediaTime?.(v);
           setCurrentTime(Number.isFinite(v.currentTime) ? v.currentTime : 0);
           setBufferedEnd(readBufferedEnd(v));
           controller.onSeeked(activeSeekSeqRef.current);
@@ -953,6 +973,7 @@ export function VideoPlayer({
         }}
         onTimeUpdate=${(e) => {
           const v = e.currentTarget;
+          onMediaTime?.(v);
           if (controller.getState().pendingSeekTime != null) return;
           const t = Number.isFinite(v.currentTime) ? v.currentTime : 0;
           setCurrentTime(t);
@@ -964,13 +985,14 @@ export function VideoPlayer({
           }
         }}
         onProgress=${(e) => setBufferedEnd(readBufferedEnd(e.currentTarget))}
-        onEnded=${() => {
+        onEnded=${(e) => {
+          onMediaPause?.(e.currentTarget);
           resumeStore.clear(identityRef.current);
           controller.setEnded(true);
         }}
-        onError=${() => {
+        onError=${(e) => {
           controller.setError(true);
-          if (onMediaError) onMediaError();
+          if (onMediaError) onMediaError(e.currentTarget);
         }}
       />
 
@@ -1199,6 +1221,8 @@ export function MusicPlayer({
   entry,
   name,
   mediaUrl,
+  mediaRef = null,
+  autoPlayNextRef: externalAutoPlayRef = null,
   siblings = [],
   link,
   capsStore = null,
@@ -1209,9 +1233,20 @@ export function MusicPlayer({
   onOpenMore,
   onClose,
   onNavigateSibling,
+  onMediaLoadedMetadata,
+  onMediaTime,
+  onMediaPlay,
+  onMediaPause,
   onMediaError,
 }) {
   const audioRef = useRef(null);
+  const bindAudioRef = useCallback(
+    (el) => {
+      audioRef.current = el;
+      if (mediaRef) mediaRef.current = el;
+    },
+    [mediaRef],
+  );
   const resumeStore = useMemo(() => createResumeStore(safeStorage()), []);
   const identity = useMemo(
     () => ({ machine, path, size: entry?.size, mtime: entry?.mtime }),
@@ -1246,7 +1281,8 @@ export function MusicPlayer({
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
 
-  const autoPlayNextRef = useRef(false);
+  const localAutoPlayNextRef = useRef(null);
+  const autoPlayNextRef = externalAutoPlayRef || localAutoPlayNextRef;
   const resumedAppliedRef = useRef(false);
   const lastSavedAtRef = useRef(0);
   const stallTimerRef = useRef(null);
@@ -1451,18 +1487,18 @@ export function MusicPlayer({
       return;
     }
     if (queueRef.current.prev && onNavigateSibling) {
-      autoPlayNextRef.current = !a?.paused;
+      autoPlayNextRef.current = !a?.paused ? { path: queueRef.current.prev.path, play: true } : null;
       onNavigateSibling(queueRef.current.prev);
     }
-  }, [pendingSeekTime, commitSeek, onNavigateSibling]);
+  }, [pendingSeekTime, commitSeek, onNavigateSibling, autoPlayNextRef]);
 
   const handleNext = useCallback(() => {
     const a = audioRef.current;
     if (queueRef.current.next && onNavigateSibling) {
-      autoPlayNextRef.current = !a?.paused;
+      autoPlayNextRef.current = !a?.paused ? { path: queueRef.current.next.path, play: true } : null;
       onNavigateSibling(queueRef.current.next);
     }
-  }, [onNavigateSibling]);
+  }, [onNavigateSibling, autoPlayNextRef]);
 
   const handleStartOver = useCallback(() => {
     resumeStore.clear(identityRef.current);
@@ -1733,7 +1769,7 @@ export function MusicPlayer({
       </div>
 
       <audio
-        ref=${audioRef}
+        ref=${bindAudioRef}
         src=${mediaUrl}
         preload="metadata"
         aria-label=${display.title}
@@ -1743,7 +1779,8 @@ export function MusicPlayer({
           if (dur > 0) setDuration(dur);
           setBufferedEnd(readBufferedEnd(a));
           a.playbackRate = playbackRate;
-          if (!resumedAppliedRef.current && dur > 0) {
+          const recovered = Boolean(onMediaLoadedMetadata?.(a));
+          if (!recovered && !resumedAppliedRef.current && dur > 0) {
             resumedAppliedRef.current = true;
             const saved = resumeStore.load(identityRef.current, dur);
             if (saved != null) {
@@ -1760,18 +1797,24 @@ export function MusicPlayer({
               }, 5000);
             }
           }
-          if (autoPlayNextRef.current) {
-            autoPlayNextRef.current = false;
+          const pendingAuto = autoPlayNextRef.current;
+          if (!recovered && pendingAuto?.play && (!pendingAuto.path || pendingAuto.path === path)) {
+            autoPlayNextRef.current = null;
             a.play().catch(() => {});
           }
         }}
-        onPlay=${() => setPlaying(true)}
-        onPlaying=${() => {
+        onPlay=${(e) => {
+          onMediaPlay?.(e.currentTarget);
+          setPlaying(true);
+        }}
+        onPlaying=${(e) => {
+          onMediaPlay?.(e.currentTarget);
           setPlaying(true);
           clearStallTimer();
         }}
         onPause=${(e) => {
           const a = e.currentTarget;
+          onMediaPause?.(a);
           if (Number.isFinite(a.duration) && a.duration > 0) {
             resumeStore.save(identityRef.current, a.currentTime, a.duration);
           }
@@ -1784,6 +1827,7 @@ export function MusicPlayer({
         }}
         onSeeked=${(e) => {
           const a = e.currentTarget;
+          onMediaTime?.(a);
           setPendingSeekTime(null);
           setCurrentTime(Number.isFinite(a.currentTime) ? a.currentTime : 0);
           setBufferedEnd(readBufferedEnd(a));
@@ -1794,6 +1838,7 @@ export function MusicPlayer({
         }}
         onTimeUpdate=${(e) => {
           const a = e.currentTarget;
+          onMediaTime?.(a);
           if (pendingSeekTime != null) return;
           const t = Number.isFinite(a.currentTime) ? a.currentTime : 0;
           setCurrentTime(t);
@@ -1805,20 +1850,21 @@ export function MusicPlayer({
           }
         }}
         onProgress=${(e) => setBufferedEnd(readBufferedEnd(e.currentTarget))}
-        onEnded=${() => {
+        onEnded=${(e) => {
+          onMediaPause?.(e.currentTarget);
           resumeStore.clear(identityRef.current);
           clearStallTimer();
           if (queueRef.current.next && onNavigateSibling) {
-            autoPlayNextRef.current = true;
+            autoPlayNextRef.current = { path: queueRef.current.next.path, play: true };
             onNavigateSibling(queueRef.current.next);
           } else {
             setPlaying(false);
           }
         }}
-        onError=${() => {
+        onError=${(e) => {
           clearStallTimer();
           setPlaying(false);
-          if (onMediaError) onMediaError();
+          if (onMediaError) onMediaError(e.currentTarget);
         }}
       />
     </div>
