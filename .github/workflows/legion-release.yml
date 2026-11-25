@@ -172,6 +172,7 @@ jobs:
           LEGION_BUILD_SEQUENCE: ${{ needs.prepare.outputs.sequence }}
         run: |
           set -euo pipefail
+          unset LEGION_PREVIEW_UPDATE_KEY LEGION_PREVIEW_UPDATE_PUBKEY
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
           workspace="$(pwd -P)"
           export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=${HOME}=/build/home --remap-path-prefix=${cargo_home}=/cargo --remap-path-prefix=${workspace}=/build"
@@ -184,6 +185,7 @@ jobs:
           LEGION_BUILD_SEQUENCE: ${{ needs.prepare.outputs.sequence }}
         run: |
           set -euo pipefail
+          unset LEGION_PREVIEW_UPDATE_KEY LEGION_PREVIEW_UPDATE_PUBKEY
           win_home="$(cygpath -w "${USERPROFILE:-$HOME}")"
           win_cargo_home="$(cygpath -w "${CARGO_HOME:-${win_home}\\.cargo}")"
           win_workspace="$(cygpath -w "$PWD")"
@@ -200,6 +202,7 @@ jobs:
           LEGION_BUILD_SEQUENCE: ${{ needs.prepare.outputs.sequence }}
         run: |
           set -euo pipefail
+          unset LEGION_PREVIEW_UPDATE_KEY LEGION_PREVIEW_UPDATE_PUBKEY
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
           workspace="$(pwd -P)"
           export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=${HOME}=/build/home --remap-path-prefix=${cargo_home}=/cargo --remap-path-prefix=${workspace}=/build"
