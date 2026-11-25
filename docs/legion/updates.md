@@ -42,10 +42,22 @@ A directory containing:
 - `SHA256SUMS` listing `update.json` and every artifact, and `SHA256SUMS.sig`.
 
 `scripts/make-update-set.mjs create` refuses sequences more than 24 hours ahead of UTC now and
-inspects each artifact's embedded sequence or version metadata (APK binary AXML `versionCode`,
-macOS `Info.plist` `CFBundleVersion`, `.deb` `Version` / binary marker, NSIS `+seq<N>` version
-string, AppImage SquashFS marker, and node binary `LEGION_UPDATE_SEQUENCE=<N>` marker) without
-executing any artifact, refusing to sign if the embedded sequence does not match `--sequence`.
+inspects both packaging metadata and every compiled binary inside each artifact without executing
+anything:
+
+- APK: binary AXML `versionCode` plus every `lib/*/liblegion_app_lib.so`
+- macOS `app-tar` / `.app`: `Info.plist` `CFBundleVersion` plus `Contents/MacOS/<executable>`
+- Linux AppImage: SquashFS `usr/bin/*` compiled binaries plus `.desktop` `X-AppImage-Version`
+  (desktop metadata alone is refused)
+- Linux `.deb`: `control` `Version` plus `data.tar.*` `usr/bin/*` compiled binaries
+- Windows NSIS: PE `+seq<N>` version string plus the compiled `.exe` inside the NSIS payload
+- Standalone node binary: raw `LEGION_UPDATE_SEQUENCE=<N>` marker
+
+Every compiled marker found must agree with `--sequence` (conflicting markers are refused). Release
+build scripts (`apps/legion-app/build-android.sh`, `packaging/deb/build-deb.sh`) and CI workflows
+also run `scripts/make-update-set.mjs check-artifact --forbid-preview-key`, which requires each
+shipped binary to contain literally one `LEGION_UPDATE_SEQUENCE=<N>` marker, `LEGION_UPDATE_PREVIEW_KEY=none`
+(zero preview key fingerprints), and no preview-key build log notice.
 
 Crate `legion-update` holds what both the node and the app need: parsing and checking a set,
 strict Ed25519 SPKI public key parsing, sequence floor recovery, sequence plausibility checks, and
@@ -88,11 +100,26 @@ or fleet machine may read them; they are not secret, and the reader checks the s
   pulls, verifies, and stores the set for itself. An offline peer can pull it later with
   `update.publish from_peer=<peer> channel=<channel> sequence=<seq>`.
 
-When checking for updates, the app queries every reachable paired machine, caps candidates and
-metadata bytes per machine, enforces overall deadlines and minimum download progress rates, and
-automatically falls back to another paired machine if one machine serves corrupted data, wrong
-offsets, truncated reads, or stalls. Manual checks and manual installs immediately cancel any
-in-flight background check.
+When checking for updates, the app queries every reachable paired machine **concurrently**, with
+separate per-node listing budgets (10 s for healthy nodes, 3 s for previously deprioritized nodes)
+and per-node/per-candidate metadata budgets (8 s per call, 15 s per candidate, 20 s per node, with
+a 4 KiB/s metadata rate floor after a 2 s grace window). Candidates are capped per node before being
+merged round-robin across answering nodes so flooding nodes cannot crowd out an honest peer. Nodes
+that time out or serve unverifiable sets are deprioritized across checks and automatically forgotten
+after 20 minutes (or sooner once they succeed). If a check finishes with timeouts or unverifiable
+candidates and no verified newer update is found, Legion never claims "Up to date"; instead it
+reports that it could not check right now (keeping raw details under Technical details) and retries
+automatically on resume or after 5 minutes while visible.
+
+The download deadline applies only to artifact transfer (never shared with listing or metadata) and
+scales with the artifact's signed remaining byte length and the 16 KiB/s rate floor (clamped to
+3 min .. 10 hours) so an honest slow link can complete cleanly. Partial downloads (`.part`) carry a
+sibling provenance file (`.part.meta.json`) recording which node wrote each byte range. Timeouts,
+disconnects, stalls, and protocol errors never discard verified partial progress, so slow links
+resume across nodes and across checks; only a failed final SHA-256 verification discards `.part`,
+deprioritizes the contributing nodes, and immediately retries a resuming node once from byte 0 so a
+corrupted prefix from an earlier node never permanently blames an honest peer. Manual checks and
+manual installs immediately cancel any in-flight background check.
 
 On metered connections (reported on Android via `ConnectivityManager`), automatic background
 downloads pause when an artifact is larger than 5 MiB; tapping **Update now** downloads it anyway.
@@ -106,9 +133,9 @@ and scheduled daily node update timers are **planned** and not yet implemented.
 | Install | Current behaviour |
 | --- | --- |
 | Android app (APK) | Downloads the verified APK from a paired machine and installs it through Android's `PackageInstaller`. Android enforces that the new APK is signed with the same app signing key and carries a higher `versionCode`. The first time, Android opens **Install unknown apps** once so the person allows Legion to install updates. On Android 12 and later, Legion declares `UPDATE_PACKAGES_WITHOUT_USER_ACTION` and requests `USER_ACTION_NOT_REQUIRED`, so Android can apply updates without prompting when no competing store owns the package and Android's 30-second silent-update throttle is not active; otherwise Android shows its standard confirmation dialog (and background updates defer silently without bringing Legion forward). Unlike desktop swaps, Android replaces the APK atomically via `PackageInstaller` rather than keeping a separate `.prev` copy on disk; if installation fails or the next start does not match the expected sequence, Legion records the failure and stops auto-retrying that sequence until a newer one arrives or the person taps **Try again**. |
-| macOS app (`.app`) | Copies-while-hashing the verified `app-tar` into a private `0700` directory, unpacks it safely without following symlinks or preserving setuid/setgid bits, swaps the bundle atomically while keeping `.prev`, and restarts under a detached minimal-environment supervisor. If the new copy does not confirm startup, the supervisor restores `.prev`, relaunches it, and records a rollback notice. |
-| Windows app (NSIS) | Copies-while-hashing the verified per-user NSIS installer into a private folder under `%LOCALAPPDATA%`, backs up the existing install directory, and runs a detached System32 PowerShell supervisor (`-EncodedCommand`, breaking out of the parent job object when permitted) that executes `/S /UPDATE /D=<install_dir>` and verifies startup. If the installer exits non-zero or the new build fails to start, the supervisor restores the backup and records a rollback notice. |
-| Linux app (AppImage) | Copies-while-hashing the verified AppImage beside the running file (`0755`), swaps atomically with `.prev` under a detached `/bin/sh` supervisor with a cleared environment (stripping all `$APPDIR` and temporary paths and resolving system utilities from fixed directories), and rolls back automatically if startup is not confirmed. |
+| macOS app (`.app`) | Copies-while-hashing the verified `app-tar` into a private `0700` directory, unpacks it safely without following symlinks, leaving the bundle root, or preserving setuid/setgid bits, swaps the bundle atomically while keeping `.prev`, and restarts under a detached supervisor with an allow-listed session environment. If the new copy does not confirm startup, the supervisor restores `.prev`, relaunches it, and records a rollback notice. |
+| Windows app (NSIS) | Copies-while-hashing the verified per-user NSIS installer into a private folder under `%LOCALAPPDATA%`, backs up the existing install directory, and runs a detached System32 PowerShell supervisor (`-EncodedCommand`, breaking out of the parent job object when permitted) with an allow-listed environment (`PATHEXT`, `ProgramW6432`, proxies, and core Windows variables preserved) that executes `/S /UPDATE /D=<install_dir>` and verifies startup. Each rollback step is individually guarded so even a partial restore failure records the rollback notice and relaunches whatever executable is in place. |
+| Linux app (AppImage) | Copies-while-hashing the verified AppImage beside the running file (`0755`), swaps atomically with `.prev` under a detached `/bin/sh` supervisor with a fixed allow-list of session, input-method, and proxy variables (stripping all `$APPDIR` and temporary paths and resolving system utilities from fixed directories), and rolls back automatically if startup is not confirmed. |
 | Linux app from `.deb` | Never replaces files `dpkg` owns. Downloads and verifies the `.deb` into a private `0700` folder, displays the verified SHA-256 digest and the exact `sudo apt-get install …` command to run. |
 | Linux app from `pacman` or standalone build | Checks for updates and reports when a newer version is available, without downloading artifacts it cannot install. |
 | Node (`legion`), standalone | `meta.update`, with its existing preflight, `.prev` backup and automatic restore. Automatic node self-update (`[update] auto` in `node.toml`) and a daily GitHub timer unit are **planned** and not yet implemented. |
@@ -133,18 +160,22 @@ Settings > About shows **Updates**:
   asks before restarting.
 - **Update automatically** (on by default on self-updating installs): downloads when a newer version
   is seen (pausing downloads over 5 MiB on metered connections) and installs only at two safe
-  moments — at app start before the person interacts (showing a brief "Updating…" screen) or when
-  leaving the app (closing the last desktop window, which verifies startup silently without opening
-  a window, or backgrounding Legion on Android when silent self-update is available). There is no
-  idle timer that interrupts an open session.
+  moments — at app start within a few seconds of launch before the first full screen renders and
+  before any interaction (showing a brief "Updating…" screen), or when leaving the app (closing the
+  last desktop window, which verifies startup silently without opening a window and without racing
+  against a concurrent reopen, or backgrounding Legion on Android when silent self-update is
+  available). The native shell enforces every safety check itself (startup window, first-screen
+  latch, in-flight native calls/transfers/pairing, and request rate limiting); there is no idle
+  timer that interrupts an open session.
 - **What is new** with the set's notes, and after an update a quiet one-time unbordered row on the
   first screen: `Updated to 0.2.0 · What is new` with a subtle `×` dismiss button.
 - With Technical details enabled: channel, build, sequence (`0 (updates disabled)` on sequence-0
   builds), install kind, signer key fingerprint, source machine, checked machines, failed sequence
   info, and any raw diagnostic error detail.
 
-The app checks when it starts, when it returns to the foreground after an hour or more, and every
-six hours while open. A check that finds no machine reachable stays quiet.
+The app checks when it starts, when it returns to the foreground after an hour or more (or after 5
+minutes if the last check failed with a timeout or unverifiable candidate), and every six hours
+while open. A check that finds no machine reachable stays quiet.
 
 **Planned UI additions (not yet implemented):** showing an "Update" row on individual machine
 screens when a remote node is behind the fleet's newest set.
