@@ -81,7 +81,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata};
-use std::io::{Cursor, Read as _};
+use std::io::{Cursor, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -96,7 +96,7 @@ use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageFormat, ImageReader};
 use legion_core::media::{Category, classify_path};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
-use legion_core::{Access, CancellationToken, Ctx, Registry, ToolError};
+use legion_core::{Access, CancellationToken, Ctx, Grant, Registry, ToolError};
 use legion_os::OsError;
 use legion_os::file_id::{self, FileId};
 use legion_os::mem_limit::effective_memory_bytes;
@@ -107,32 +107,44 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::task::JoinSet;
 
-use super::thumb_cache::{CachedThumb, ThumbCache, bad_cache_key, cache_key, temp_dir_in_cache};
+use super::audio_tags::{
+    AudioFormat, CoverExtractMode, audio_format_for_path, mp4_has_video_track, parse_audio,
+};
+use super::tags::find_folder_cover;
+use super::thumb_cache::{
+    CachedThumb, ThumbCache, bad_cache_key, cache_key, tags_cache_key, temp_dir_in_cache,
+};
 use super::thumb_limit::{AcquireError, FairPool, compute_image_in_flight_budget};
 use super::thumb_probe::{
     ImageProfile, MAX_IMAGE_DECODE_BYTES, image_limits, is_mpeg_ts_file, peek_image_file,
-    probe_image_profile, too_large_error,
+    probe_image_profile, target_output_overhead_bytes, too_large_error,
 };
 use super::thumb_worker::{
-    WorkerOutcome, compute_worker_limits, effective_decode_timeout, heap_cap_from_estimate,
-    minimal_system_env, run_thumb_worker, worker_baseline_rss_bytes, worker_enabled,
+    AudioCoverWorkerOutcome, WorkerOutcome, compute_worker_limits, effective_decode_timeout,
+    heap_cap_from_estimate, minimal_system_env, run_audio_cover_worker, run_thumb_worker,
+    worker_baseline_rss_bytes, worker_enabled,
 };
 use super::{
     cancelled_error, check_fs_path, check_regular_file, map_io_error, open_regular_file, platform,
 };
 
-const MIN_PATHS: usize = 1;
-const MAX_PATHS: usize = 32;
+pub(super) const MIN_PATHS: usize = 1;
+pub(super) const MAX_PATHS: usize = 32;
 const MIN_THUMB_SIZE: u32 = 96;
 const DEFAULT_THUMB_SIZE: u32 = 256;
-const MAX_THUMB_SIZE: u32 = 512;
+const MAX_THUMB_SIZE: u32 = 1024;
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+/// Initial live-heap cap for `--audio-cover` workers (112 MiB: extracts up to 16 MiB tag/cover
+/// data and decodes standard covers up to ~70 MiB estimated peak in a single launch, tightening
+/// down to the exact cover probe estimate before decoding and retrying once with a larger pool
+/// reservation only when an embedded cover legitimately needs more).
+const AUDIO_COVER_INITIAL_HEAP_CAP_BYTES: u64 = 112 * 1024 * 1024;
 const MAX_IN_FLIGHT_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 const MIN_IN_FLIGHT_IMAGES: usize = 8;
 const MAX_IN_FLIGHT_IMAGES_CAP: usize = 16;
 const MAX_IN_FLIGHT_VIDEOS: usize = 2;
-const IMAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
-const IMAGE_DECODE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const IMAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const IMAGE_DECODE_TIMEOUT: Duration = Duration::from_secs(10);
 const VIDEO_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const JPEG_QUALITY: u8 = 82;
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(15);
@@ -197,7 +209,7 @@ struct TimeoutEntry {
 ///
 /// Timeouts are intentionally NOT written to the on-disk bad-file cache; this short in-memory
 /// back-off keeps a spinning file from monopolizing worker slots on repeated folder reopens.
-struct TimeoutBackoff {
+pub(super) struct TimeoutBackoff {
     entries: Mutex<HashMap<String, TimeoutEntry>>,
 }
 
@@ -208,7 +220,7 @@ impl TimeoutBackoff {
         }
     }
 
-    fn active_remaining(&self, bad_key: &str) -> Option<Duration> {
+    pub(super) fn active_remaining(&self, bad_key: &str) -> Option<Duration> {
         let now = Instant::now();
         let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         let entry = guard.get(bad_key)?;
@@ -221,7 +233,7 @@ impl TimeoutBackoff {
         None
     }
 
-    fn record_timeout(&self, bad_key: &str) {
+    pub(super) fn record_timeout(&self, bad_key: &str) {
         let now = Instant::now();
         let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         if guard.len() >= MAX_TIMEOUT_BACKOFF_ENTRIES {
@@ -256,11 +268,11 @@ static IMAGE_POOL: OnceLock<Arc<FairPool>> = OnceLock::new();
 static VIDEO_POOL: OnceLock<Arc<FairPool>> = OnceLock::new();
 static TIMEOUT_BACKOFF: OnceLock<TimeoutBackoff> = OnceLock::new();
 
-fn timeout_backoff() -> &'static TimeoutBackoff {
+pub(super) fn timeout_backoff() -> &'static TimeoutBackoff {
     TIMEOUT_BACKOFF.get_or_init(TimeoutBackoff::new)
 }
 
-fn machine_in_flight_image_budget() -> u64 {
+pub(super) fn machine_in_flight_image_budget() -> u64 {
     let effective_ram = effective_memory_bytes();
     compute_image_in_flight_budget(
         effective_ram,
@@ -298,7 +310,7 @@ fn max_in_flight_images() -> usize {
     })
 }
 
-fn image_pool() -> Arc<FairPool> {
+pub(super) fn image_pool() -> Arc<FairPool> {
     Arc::clone(
         IMAGE_POOL.get_or_init(|| {
             FairPool::new(machine_in_flight_image_budget(), max_in_flight_images())
@@ -316,7 +328,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.add_fn(
         "fs.thumb",
         Effect::Read,
-        "Generate thumbnails for 1 to 32 image or video paths on this node (64 MiB source cap, 256 MiB estimated decode memory per image with EXIF/MPF preview fallback for larger JPEGs, out-of-process memory-bounded workers, in-flight budget capped at min(512 MiB, effective RAM/8)), returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory.",
+        "Generate thumbnails for 1 to 32 image, audio or video paths on this node (size 96 to 1024; 64 MiB image source cap, 256 MiB estimated decode memory per image with EXIF/MPF preview fallback for larger JPEGs, audio embedded cover or folder cover fallback with 16 MiB tag cap, out-of-process memory-bounded workers, in-flight budget capped at min(512 MiB, effective RAM/8)), returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory.",
         thumb,
     );
 }
@@ -338,9 +350,9 @@ pub(crate) enum ThumbFit {
 struct ThumbArgs {
     /// One to 32 file paths to thumbnail (absolute or starting with `~`).
     paths: Vec<String>,
-    /// Target thumbnail dimension in pixels, from 96 to 512 (default 256).
+    /// Target thumbnail dimension in pixels, from 96 to 1024 (default 256).
     #[serde(default = "default_thumb_size")]
-    #[schemars(range(min = 96, max = 512))]
+    #[schemars(range(min = 96, max = 1024))]
     size: u32,
     /// Fitting mode (`contain` or `cover`, default `contain`).
     #[serde(default)]
@@ -401,10 +413,10 @@ struct ThumbResult {
 
 /// Metadata + OS identity snapshot used for cache keys and TOCTOU checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileStamp {
-    size: u64,
-    mtime_nanos: Option<i128>,
-    file_id: Option<FileId>,
+pub(super) struct FileStamp {
+    pub(super) size: u64,
+    pub(super) mtime_nanos: Option<i128>,
+    pub(super) file_id: Option<FileId>,
 }
 
 impl FileStamp {
@@ -421,11 +433,11 @@ impl FileStamp {
         }
     }
 
-    fn from_open_file(file: &File, meta: &Metadata) -> FileStamp {
+    pub(super) fn from_open_file(file: &File, meta: &Metadata) -> FileStamp {
         Self::from_meta_and_id(meta, file_id::from_file(file))
     }
 
-    fn from_path(path: &Path, meta: &Metadata) -> FileStamp {
+    pub(super) fn from_path(path: &Path, meta: &Metadata) -> FileStamp {
         Self::from_meta_and_id(meta, file_id::from_path(path))
     }
 }
@@ -462,7 +474,7 @@ async fn thumb(ctx: &Ctx, args: ThumbArgs) -> Result<ThumbResult, ToolError> {
                 args.size
             ),
         )
-        .with_hint("Choose a thumbnail size between 96 and 512 pixels."));
+        .with_hint("Choose a thumbnail size between 96 and 1024 pixels."));
     }
 
     let cache_dir = ctx.paths().thumb_cache_dir();
@@ -621,11 +633,39 @@ async fn thumb_one(
         if is_video_ts {
             category = Category::Video;
         }
+    } else if category == Category::Video
+        && resolved
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+    {
+        let resolved_sniff = resolved.clone();
+        let is_audio_only_mp4 = tokio::task::spawn_blocking(move || {
+            let Ok((mut file, meta)) = open_regular_file(
+                &resolved_sniff,
+                "thumbnail",
+                "Pass a regular file path to fs.thumb; directories cannot be thumbnailed.",
+            ) else {
+                return false;
+            };
+            mp4_has_video_track(&mut file, meta.len()) == Some(false)
+        })
+        .await
+        .unwrap_or(false);
+        if is_audio_only_mp4 {
+            category = Category::Audio;
+        }
     }
 
     match category {
         Category::Image => {
             thumb_image(principal, cache, raw_path, resolved, size, fit, cancel).await
+        }
+        Category::Audio => {
+            thumb_audio(
+                grant, principal, cache, raw_path, resolved, size, fit, cancel,
+            )
+            .await
         }
         Category::Video => {
             thumb_video(
@@ -662,9 +702,481 @@ async fn thumb_one(
                         category
                     ),
                 )
-                .with_hint("fs.thumb supports raster images (JPEG, PNG, GIF, WebP, BMP) and videos (when ffmpeg is on PATH)."),
+                .with_hint("fs.thumb supports raster images (JPEG, PNG, GIF, WebP, BMP), audio covers (embedded or folder picture), and videos (when ffmpeg is on PATH)."),
             ))
         }
+    }
+}
+
+enum AudioCoverPrep {
+    CacheHit(CachedThumb),
+    CachedBad(ErrorBody),
+    /// Cached tags already confirmed this audio file has no embedded cover; jump straight to
+    /// folder cover lookup.
+    NoEmbeddedCover,
+    Ready {
+        key: String,
+        bad_key: String,
+        tags_key: String,
+        open_stamp: FileStamp,
+        file: File,
+        format: AudioFormat,
+    },
+}
+
+fn prepare_audio_cover_open_once(
+    path: &Path,
+    cache: &ThumbCache,
+    target_size: u32,
+    fit: ThumbFit,
+) -> Result<AudioCoverPrep, ErrorBody> {
+    let pre_meta = check_regular_file(
+        path,
+        "thumbnail",
+        "Pass a regular file path to fs.thumb; directories cannot be thumbnailed.",
+    )?;
+    let pre_stamp = FileStamp::from_path(path, &pre_meta);
+
+    let (file, open_meta) = open_regular_file(
+        path,
+        "read",
+        "Pass a regular file path to fs.thumb; directories cannot be thumbnailed.",
+    )?;
+    let open_stamp = FileStamp::from_open_file(&file, &open_meta);
+    if open_stamp != pre_stamp {
+        return Err(changed_while_reading(path));
+    }
+
+    if open_stamp.size == 0 {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "{} is empty and cannot be read as an audio file.",
+                path.display()
+            ),
+        ));
+    }
+
+    let key = cache_key(
+        path,
+        open_stamp.size,
+        open_stamp.mtime_nanos,
+        open_stamp.file_id,
+        target_size,
+        fit,
+    );
+    if let Some(hit) = cache.get(&key) {
+        return Ok(AudioCoverPrep::CacheHit(hit));
+    }
+
+    let bad_key = bad_cache_key(
+        path,
+        open_stamp.size,
+        open_stamp.mtime_nanos,
+        open_stamp.file_id,
+        target_size,
+        fit,
+    );
+    if let Some(bad) = cache.get_bad(&bad_key) {
+        return Ok(AudioCoverPrep::CachedBad(bad));
+    }
+
+    let tags_key = tags_cache_key(
+        path,
+        open_stamp.size,
+        open_stamp.mtime_nanos,
+        open_stamp.file_id,
+    );
+    if let Some(cached_tags) = cache.get_tags(&tags_key)
+        && !cached_tags.has_embedded_cover
+    {
+        return Ok(AudioCoverPrep::NoEmbeddedCover);
+    }
+
+    let format = audio_format_for_path(path).unwrap_or(AudioFormat::GenericAudio);
+    Ok(AudioCoverPrep::Ready {
+        key,
+        bad_key,
+        tags_key,
+        open_stamp,
+        file,
+        format,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn thumb_audio(
+    grant: &Grant,
+    principal: &str,
+    cache: &ThumbCache,
+    raw_path: String,
+    resolved: PathBuf,
+    size: u32,
+    fit: ThumbFit,
+    cancel: CancellationToken,
+) -> Result<ThumbItem, ToolError> {
+    let cache_prep = cache.clone();
+    let resolved_prep = resolved.clone();
+    let prep = tokio::task::spawn_blocking(move || {
+        prepare_audio_cover_open_once(&resolved_prep, &cache_prep, size, fit)
+    })
+    .await
+    .map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("fs.thumb audio open stopped unexpectedly: {err}."),
+        )
+    })?;
+
+    let (key, bad_key, tags_key, open_stamp, mut file, format) = match prep {
+        Ok(AudioCoverPrep::CacheHit(hit)) => return Ok(ThumbItem::from_cached(raw_path, hit)),
+        Ok(AudioCoverPrep::CachedBad(err)) => return Ok(ThumbItem::from_error(raw_path, err)),
+        Ok(AudioCoverPrep::NoEmbeddedCover) => {
+            return thumb_audio_folder_cover(
+                grant, principal, cache, raw_path, resolved, size, fit, cancel,
+            )
+            .await;
+        }
+        Ok(AudioCoverPrep::Ready {
+            key,
+            bad_key,
+            tags_key,
+            open_stamp,
+            file,
+            format,
+        }) => (key, bad_key, tags_key, open_stamp, file, format),
+        Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
+    };
+
+    if let Some(remaining) = timeout_backoff().active_remaining(&bad_key) {
+        return Ok(ThumbItem::from_error(
+            raw_path,
+            ErrorBody::new(
+                ErrorCode::Timeout,
+                format!(
+                    "Decoding cover art for {} timed out repeatedly and is in a temporary back-off ({} s remaining).",
+                    resolved.display(),
+                    remaining.as_secs().max(1)
+                ),
+            )
+            .with_hint(
+                "Timeouts are not cached permanently; retry after the short back-off expires.",
+            ),
+        ));
+    }
+
+    let decode_timeout = effective_decode_timeout(IMAGE_DECODE_TIMEOUT);
+
+    if worker_enabled() {
+        let mut requested_heap_cap = AUDIO_COVER_INITIAL_HEAP_CAP_BYTES;
+        for attempt in 0..2u8 {
+            let allow_needs_cap = attempt == 0;
+            let budget = machine_in_flight_image_budget();
+            let baseline = worker_baseline_rss_bytes();
+            let (heap_cap_bytes, rss_limit_bytes, baseline_rss_bytes) =
+                compute_worker_limits(requested_heap_cap, budget, baseline);
+
+            let permit = match image_pool()
+                .acquire(principal, rss_limit_bytes, IMAGE_WAIT_TIMEOUT, &cancel)
+                .await
+            {
+                Ok(permit) => permit,
+                Err(AcquireError::Cancelled) => return Err(cancelled_error("fs.thumb")),
+                Err(AcquireError::TimedOut) => {
+                    return Ok(ThumbItem::from_error(
+                        raw_path,
+                        ErrorBody::new(
+                            ErrorCode::Busy,
+                            format!(
+                                "Timed out waiting for thumbnail decode capacity for {}.",
+                                resolved.display()
+                            ),
+                        )
+                        .with_hint(
+                            "Thumbnail decoding is busy on this node; retry fs.thumb shortly.",
+                        ),
+                    ));
+                }
+            };
+
+            let worker_file = match file.try_clone() {
+                Ok(mut cloned) => {
+                    if attempt > 0
+                        && let Err(err) = cloned.seek(SeekFrom::Start(0))
+                    {
+                        drop(permit);
+                        return Ok(ThumbItem::from_error(
+                            raw_path,
+                            map_io_error("read", &resolved, err),
+                        ));
+                    }
+                    cloned
+                }
+                Err(err) => {
+                    drop(permit);
+                    return Ok(ThumbItem::from_error(
+                        raw_path,
+                        map_io_error("read", &resolved, err),
+                    ));
+                }
+            };
+
+            let worker_res = run_audio_cover_worker(
+                &resolved,
+                worker_file,
+                format,
+                size,
+                fit,
+                heap_cap_bytes,
+                allow_needs_cap,
+                rss_limit_bytes,
+                baseline_rss_bytes,
+                decode_timeout,
+                cancel.clone(),
+            )
+            .await;
+            drop(permit);
+
+            let worker_outcome = match worker_res {
+                Ok(outcome) => outcome,
+                Err(err) if err.code == ErrorCode::Cancelled => return Err(err),
+                Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
+            };
+
+            match worker_outcome {
+                AudioCoverWorkerOutcome::Ok(thumb) => {
+                    let resolved_check = resolved.clone();
+                    let stamp_ok = tokio::task::spawn_blocking(move || {
+                        verify_post_read_stamp(&resolved_check, &file, open_stamp)
+                    })
+                    .await
+                    .map_err(|err| {
+                        ErrorBody::new(
+                            ErrorCode::Internal,
+                            format!("fs.thumb post-read check stopped unexpectedly: {err}."),
+                        )
+                    })?;
+                    if let Err(err) = stamp_ok {
+                        return Ok(ThumbItem::from_error(raw_path, err));
+                    }
+                    let cache_put = cache.clone();
+                    let thumb_put = thumb.clone();
+                    let _ =
+                        tokio::task::spawn_blocking(move || cache_put.put(&key, &thumb_put)).await;
+                    return Ok(ThumbItem::from_cached(raw_path, thumb));
+                }
+                AudioCoverWorkerOutcome::NoEmbeddedCover(parsed_tags) => {
+                    let resolved_check = resolved.clone();
+                    let cache_put = cache.clone();
+                    let tags_key_put = tags_key.clone();
+                    let stamp_ok = tokio::task::spawn_blocking(move || {
+                        verify_post_read_stamp(&resolved_check, &file, open_stamp)?;
+                        cache_put.put_tags(&tags_key_put, &parsed_tags);
+                        Ok::<(), ErrorBody>(())
+                    })
+                    .await
+                    .map_err(|err| {
+                        ErrorBody::new(
+                            ErrorCode::Internal,
+                            format!("fs.thumb post-read check stopped unexpectedly: {err}."),
+                        )
+                    })?;
+                    if let Err(err) = stamp_ok {
+                        return Ok(ThumbItem::from_error(raw_path, err));
+                    }
+                    return thumb_audio_folder_cover(
+                        grant, principal, cache, raw_path, resolved, size, fit, cancel,
+                    )
+                    .await;
+                }
+                AudioCoverWorkerOutcome::NeedsCap(needed) if attempt == 0 => {
+                    requested_heap_cap = needed;
+                    continue;
+                }
+                AudioCoverWorkerOutcome::NeedsCap(_) => {
+                    return Ok(ThumbItem::from_error(
+                        raw_path,
+                        ErrorBody::new(
+                            ErrorCode::Failed,
+                            format!(
+                                "Embedded cover in {} exceeded the allowed thumbnail decode memory budget.",
+                                resolved.display()
+                            ),
+                        )
+                        .with_details(json!({"reason": "too_large"})),
+                    ));
+                }
+                AudioCoverWorkerOutcome::Rejected(err)
+                | AudioCoverWorkerOutcome::TransientFailure(err) => {
+                    return Ok(ThumbItem::from_error(raw_path, err));
+                }
+                AudioCoverWorkerOutcome::TimedOut { error, cpu_busy } => {
+                    if cpu_busy {
+                        timeout_backoff().record_timeout(&bad_key);
+                    }
+                    return Ok(ThumbItem::from_error(raw_path, error));
+                }
+                AudioCoverWorkerOutcome::MemoryLimitExceeded { error, .. } => {
+                    let resolved_check = resolved.clone();
+                    let cache_bad = cache.clone();
+                    let err_bad = error.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if verify_post_read_stamp(&resolved_check, &file, open_stamp).is_ok() {
+                            cache_bad.put_bad(&bad_key, &err_bad);
+                        }
+                    })
+                    .await;
+                    return Ok(ThumbItem::from_error(raw_path, error));
+                }
+            }
+        }
+    }
+
+    // In-process fallback (standard unit/integration test binaries without `__thumb-worker`).
+    let budget = machine_in_flight_image_budget();
+    let baseline = worker_baseline_rss_bytes();
+    let (_, reserve_bytes, _) =
+        compute_worker_limits(AUDIO_COVER_INITIAL_HEAP_CAP_BYTES, budget, baseline);
+    let permit = match image_pool()
+        .acquire(principal, reserve_bytes, IMAGE_WAIT_TIMEOUT, &cancel)
+        .await
+    {
+        Ok(permit) => permit,
+        Err(AcquireError::Cancelled) => return Err(cancelled_error("fs.thumb")),
+        Err(AcquireError::TimedOut) => {
+            return Ok(ThumbItem::from_error(
+                raw_path,
+                ErrorBody::new(
+                    ErrorCode::Busy,
+                    format!(
+                        "Timed out waiting for thumbnail decode capacity for {}.",
+                        resolved.display()
+                    ),
+                )
+                .with_hint("Thumbnail decoding is busy on this node; retry fs.thumb shortly."),
+            ));
+        }
+    };
+
+    let abort_flag = Arc::new(AtomicBool::new(false));
+    let abort_worker = Arc::clone(&abort_flag);
+    let resolved_decode = resolved.clone();
+    let mut handle = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let extracted = parse_audio(
+            &mut file,
+            open_stamp.size,
+            format,
+            CoverExtractMode::ExtractBytes,
+            &resolved_decode,
+        )?;
+        verify_post_read_stamp(&resolved_decode, &file, open_stamp)?;
+        match extracted.cover {
+            Some(cover_bytes) => {
+                let (decode_bytes, profile, override_orientation) =
+                    select_decode_source(&resolved_decode, cover_bytes)?;
+                let thumb = decode_and_render_image_checked(
+                    &resolved_decode,
+                    decode_bytes,
+                    profile,
+                    override_orientation,
+                    size,
+                    fit,
+                    &abort_worker,
+                )?;
+                Ok::<Result<CachedThumb, super::audio_tags::ParsedAudioTags>, ErrorBody>(Ok(thumb))
+            }
+            None => Ok(Err(extracted.tags)),
+        }
+    });
+
+    let sleep = tokio::time::sleep(decode_timeout);
+    tokio::pin!(sleep);
+
+    let outcome = tokio::select! {
+        joined = &mut handle => {
+            joined.map_err(|err| {
+                ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!("fs.thumb audio cover decode stopped unexpectedly: {err}."),
+                )
+            })?
+        }
+        () = cancel.cancelled() => {
+            abort_flag.store(true, Ordering::Release);
+            return Err(cancelled_error("fs.thumb"));
+        }
+        () = &mut sleep => {
+            abort_flag.store(true, Ordering::Release);
+            Err(ErrorBody::new(
+                ErrorCode::Timeout,
+                format!(
+                    "Decoding cover art for {} exceeded the {}-second time limit.",
+                    resolved.display(),
+                    decode_timeout.as_secs().max(1)
+                ),
+            )
+            .with_hint("The audio file or cover image may be malformed or too expensive to decode quickly."))
+        }
+    };
+
+    match outcome {
+        Ok(Ok(thumb)) => {
+            let cache_put = cache.clone();
+            let thumb_put = thumb.clone();
+            let _ = tokio::task::spawn_blocking(move || cache_put.put(&key, &thumb_put)).await;
+            Ok(ThumbItem::from_cached(raw_path, thumb))
+        }
+        Ok(Err(parsed_tags)) => {
+            let cache_put = cache.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || cache_put.put_tags(&tags_key, &parsed_tags))
+                    .await;
+            thumb_audio_folder_cover(
+                grant, principal, cache, raw_path, resolved, size, fit, cancel,
+            )
+            .await
+        }
+        Err(err) if err.code == ErrorCode::Cancelled => Err(err),
+        Err(err) => Ok(ThumbItem::from_error(raw_path, err)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn thumb_audio_folder_cover(
+    grant: &Grant,
+    principal: &str,
+    cache: &ThumbCache,
+    raw_path: String,
+    resolved: PathBuf,
+    size: u32,
+    fit: ThumbFit,
+    cancel: CancellationToken,
+) -> Result<ThumbItem, ToolError> {
+    let grant_cover = grant.clone();
+    let resolved_cover = resolved.clone();
+    let folder_cover =
+        tokio::task::spawn_blocking(move || find_folder_cover(&grant_cover, &resolved_cover))
+            .await
+            .map_err(|err| {
+                ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!("fs.thumb folder cover lookup stopped unexpectedly: {err}."),
+                )
+            })?;
+
+    match folder_cover {
+        Some(cover_path) => {
+            thumb_image(principal, cache, raw_path, cover_path, size, fit, cancel).await
+        }
+        None => Ok(ThumbItem::from_error(
+            raw_path,
+            ErrorBody::new(
+                ErrorCode::NotFound,
+                format!("No embedded or folder cover found for {}.", resolved.display()),
+            )
+            .with_hint("Add an embedded cover image or place a cover, folder, front, or album picture (.jpg, .jpeg, .png, or .webp) in the same folder."),
+        )),
     }
 }
 
@@ -1260,10 +1772,15 @@ where
     // peaks at <= ~70% of its cap, then reserve the exact watchdog resident limit
     // (`baseline + heap_cap + max(6 MiB, 10%)`) from the shared in-flight pool so `CappedAlloc` is
     // the exact limit, backstops never falsely kill honest images, and `sum(live limits) <= budget`.
+    let output_overhead = target_output_overhead_bytes(target_size);
     let requested_heap_cap = if peek.uncertain_frame_bounds {
         heap_cap_from_estimate(MAX_IMAGE_DECODE_BYTES)
     } else if peek.profile.fits_cap() {
-        heap_cap_from_estimate(peek.profile.estimated_peak_bytes)
+        heap_cap_from_estimate(
+            peek.profile
+                .estimated_peak_bytes
+                .saturating_add(output_overhead),
+        )
     } else {
         // Over-cap JPEG with EXIF/MPF marker: reserve 2x source + preview headroom and cap the
         // worker tightly so it can only decode an embedded preview, never the full over-cap frame.
@@ -1272,6 +1789,7 @@ where
                 .size
                 .saturating_mul(2)
                 .saturating_add(32 * 1024 * 1024)
+                .saturating_add(output_overhead)
                 .min(MAX_IMAGE_DECODE_BYTES),
         )
     };
@@ -1293,7 +1811,7 @@ where
     })
 }
 
-fn verify_post_read_stamp(
+pub(super) fn verify_post_read_stamp(
     path: &Path,
     file: &File,
     open_stamp: FileStamp,
@@ -1339,7 +1857,7 @@ fn read_open_file_verified(
     Ok(bytes)
 }
 
-fn changed_while_reading(path: &Path) -> ErrorBody {
+pub(super) fn changed_while_reading(path: &Path) -> ErrorBody {
     ErrorBody::new(
         ErrorCode::Conflict,
         format!(
@@ -1925,11 +2443,18 @@ fn encode_thumbnail(img: &DynamicImage) -> Result<CachedThumb, ErrorBody> {
     let height = img.height();
 
     if img.color().has_alpha() {
-        let rgba = img.to_rgba8();
+        let owned_rgba;
+        let rgba = match img.as_rgba8() {
+            Some(existing) => existing,
+            None => {
+                owned_rgba = img.to_rgba8();
+                &owned_rgba
+            }
+        };
         if rgba.pixels().any(|pixel| pixel.0[3] < 255) {
             let mut buf = Vec::new();
             PngEncoder::new(&mut buf)
-                .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
+                .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
                 .map_err(|err| {
                     ErrorBody::new(
                         ErrorCode::Internal,
@@ -1945,10 +2470,17 @@ fn encode_thumbnail(img: &DynamicImage) -> Result<CachedThumb, ErrorBody> {
         }
     }
 
-    let rgb = img.to_rgb8();
+    let owned_rgb;
+    let rgb = match img.as_rgb8() {
+        Some(existing) => existing,
+        None => {
+            owned_rgb = img.to_rgb8();
+            &owned_rgb
+        }
+    };
     let mut buf = Vec::new();
     JpegEncoder::new_with_quality(&mut buf, JPEG_QUALITY)
-        .encode(&rgb, width, height, image::ExtendedColorType::Rgb8)
+        .encode(rgb, width, height, image::ExtendedColorType::Rgb8)
         .map_err(|err| {
             ErrorBody::new(
                 ErrorCode::Internal,

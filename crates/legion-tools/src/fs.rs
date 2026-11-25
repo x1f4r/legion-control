@@ -5,10 +5,12 @@
 //! `legion-os::atomic`, and long walks or reads run on Tokio's blocking pool while watching
 //! cancellation and emitting `progress` events.
 
+mod audio_tags;
 mod manage;
 mod platform;
 mod read;
 mod search;
+mod tags;
 mod thumb;
 mod thumb_cache;
 mod thumb_limit;
@@ -18,7 +20,8 @@ mod write;
 
 pub use thumb_worker::{
     THUMB_WORKER_MODE, enable_thumb_worker_self, measured_worker_baseline_bytes_for_test,
-    set_thumb_decode_timeout_for_test, set_thumb_timeout_cpu_busy_for_test, try_thumb_worker_cli,
+    peak_worker_rss_for_test, reset_peak_worker_rss_for_test, set_thumb_decode_timeout_for_test,
+    set_thumb_timeout_cpu_busy_for_test, try_thumb_worker_cli,
 };
 
 use std::cmp::Ordering;
@@ -47,6 +50,7 @@ pub fn register(registry: &mut Registry) {
     write::register(registry);
     manage::register(registry);
     search::register(registry);
+    tags::register(registry);
     thumb::register(registry);
 }
 

@@ -51,6 +51,32 @@ pub fn set_memory_cap(bytes: usize) {
     LIMIT_BYTES.store(bytes, Ordering::Release);
 }
 
+/// Lowers an already-armed heap cap to `bytes` without resetting [`live_bytes`] or [`peak_bytes`].
+///
+/// Used by multi-stage workers (such as audio cover extraction followed by image decoding) to
+/// tighten the allocator cap to the probed image's exact per-image bound before decoding pixels.
+/// If the cap is already lower than `bytes`, it is left unchanged; if live heap bytes already
+/// exceed `bytes` (or `bytes == 0`), the process terminates immediately with
+/// [`CAP_EXCEEDED_EXIT_CODE`].
+pub fn tighten_memory_cap(bytes: usize) {
+    if bytes == 0 {
+        exit_cap_exceeded();
+    }
+    let mut cur = LIMIT_BYTES.load(Ordering::Acquire);
+    loop {
+        if cur != 0 && cur <= bytes {
+            break;
+        }
+        match LIMIT_BYTES.compare_exchange_weak(cur, bytes, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
+    if LIVE_BYTES.load(Ordering::Acquire) > LIMIT_BYTES.load(Ordering::Acquire) {
+        exit_cap_exceeded();
+    }
+}
+
 /// Returns the currently configured heap cap in bytes (`0` when unlimited).
 pub fn memory_cap() -> usize {
     LIMIT_BYTES.load(Ordering::Acquire)
@@ -306,6 +332,19 @@ mod tests {
         }
         assert_eq!(live_bytes(), 0);
         assert!(peak_bytes() >= 4096 + 8192);
+
+        // tighten_memory_cap lowers the cap monotonically without resetting live_bytes.
+        let p4 = unsafe { alloc.alloc(l1) };
+        assert!(!p4.is_null());
+        assert_eq!(live_bytes(), 1024);
+        tighten_memory_cap(2 * 1024 * 1024);
+        assert_eq!(memory_cap(), 2 * 1024 * 1024);
+        assert_eq!(live_bytes(), 1024);
+        // Asking for a larger cap must never raise an already-lower limit.
+        tighten_memory_cap(8 * 1024 * 1024);
+        assert_eq!(memory_cap(), 2 * 1024 * 1024);
+        unsafe { alloc.dealloc(p4, l1) };
+        assert_eq!(live_bytes(), 0);
 
         // Disarm back to 0 so sibling unit tests in the same process run unlimited.
         set_memory_cap(0);

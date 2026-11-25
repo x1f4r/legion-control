@@ -2990,13 +2990,24 @@ async fn thumb_decodes_supported_formats_fit_modes_and_validates_args() {
     assert_eq!(cover["results"][0]["ok"]["width"], json!(96));
     assert_eq!(cover["results"][0]["ok"]["height"], json!(96));
 
+    // `size: 1024` is admitted (max thumbnail size raised for the player).
+    let large = f
+        .call(
+            "fs.thumb",
+            json!({"paths": [f.p(&jpg_path)], "size": 1024, "fit": "cover"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(large["results"][0]["ok"]["width"], json!(1024));
+    assert_eq!(large["results"][0]["ok"]["height"], json!(1024));
+
     // Argument validation rejects out-of-range counts and sizes.
     let too_many: Vec<String> = (0..33).map(|i| format!("~/projects/p{i}.jpg")).collect();
     for bad in [
         json!({"paths": []}),
         json!({"paths": too_many}),
         json!({"paths": [f.p(&jpg_path)], "size": 95}),
-        json!({"paths": [f.p(&jpg_path)], "size": 513}),
+        json!({"paths": [f.p(&jpg_path)], "size": 1025}),
     ] {
         let err = f.call("fs.thumb", bad.clone()).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgs, "{bad}");
