@@ -41,7 +41,7 @@ use legion_content::{
 };
 use legion_link::proto::{ErrorBody as ProtoErrorBody, ErrorCode as ProtoErrorCode};
 use serde::{Deserialize, Serialize};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -190,6 +190,26 @@ pub struct SharedContentServer(pub Arc<AppContentServer>);
 struct ListenerHandle {
     port: u16,
     shutdown: CancellationToken,
+    accept_alive: Arc<AtomicBool>,
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl ListenerHandle {
+    fn is_alive(&self) -> bool {
+        !self.shutdown.is_cancelled()
+            && self.accept_alive.load(Ordering::Acquire)
+            && !self.accept_task.is_finished()
+    }
+}
+
+struct AcceptAliveGuard {
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for AcceptAliveGuard {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+    }
 }
 
 struct ActivityState {
@@ -633,40 +653,37 @@ impl AppContentServer {
         });
     }
 
-    /// Verifies that an active loopback listener still accepts TCP connections; if the OS
-    /// reclaimed the socket while suspended, tears it down cleanly and rebinds (trying the
-    /// previous port first so existing media URLs continue working when possible).
+    /// Verifies from our own listener state that an active loopback accept loop is still running;
+    /// if it has stopped or been cancelled while live tickets remain, tears down the stale handle
+    /// and binds a fresh OS-chosen port on `127.0.0.1:0` (never probing via TCP connect and never
+    /// reusing the previous port).
     pub async fn probe_or_recover_loopback(self: &Arc<Self>) -> Result<Option<u16>, AppError> {
         if self.mode != ContentMountMode::Loopback {
             return Ok(None);
         }
         let _guard = self.listener_lock.lock().await;
-        let Some(port) = self.loopback_port() else {
+        let state = {
+            let slot = self
+                .listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.as_ref().map(|h| (h.port, h.is_alive()))
+        };
+        let Some((port, alive)) = state else {
             return Ok(None);
         };
-        if Self::loopback_port_alive(port).await {
+        if alive {
             return Ok(Some(port));
         }
 
-        // Listener did not answer on localhost: tear down the dead handle and rebind if live
-        // tickets remain.
+        // Accept task is no longer live: tear down the stale handle and bind a fresh OS-chosen
+        // port if live tickets remain.
         self.teardown_listener_if_port(port);
         if self.tickets.is_empty() {
             return Ok(None);
         }
-        let new_port = self.bind_loopback_listener_locked(Some(port)).await?;
+        let new_port = self.bind_loopback_listener_locked().await?;
         Ok(Some(new_port))
-    }
-
-    async fn loopback_port_alive(port: u16) -> bool {
-        matches!(
-            tokio::time::timeout(
-                Duration::from_millis(500),
-                TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
-            )
-            .await,
-            Ok(Ok(_))
-        )
     }
 
     /// Returns the peak concurrent custom-scheme response bytes buffered so far.
@@ -778,52 +795,45 @@ impl AppContentServer {
         }
     }
 
-    /// Ensures a loopback listener is bound and accepting TCP connections before returning a
-    /// freshly minted URL. Serialized under `listener_lock` with `probe_or_recover_loopback` so
-    /// concurrent post-resume mints never hand out a dead port or double-bind.
+    /// Ensures a loopback listener owned by this server is alive before returning a freshly minted
+    /// URL. Decides liveness strictly from Legion's own accept-task state (never via a TCP connect
+    /// to the old port) and always binds a fresh OS-chosen port on recovery.
     async fn ensure_live_loopback_listener(self: &Arc<Self>) -> Result<u16, AppError> {
         let _guard = self.listener_lock.lock().await;
-        if let Some(port) = self.loopback_port() {
-            if Self::loopback_port_alive(port).await {
+        let state = {
+            let slot = self
+                .listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.as_ref().map(|h| (h.port, h.is_alive()))
+        };
+        if let Some((port, alive)) = state {
+            if alive {
                 return Ok(port);
             }
             self.teardown_listener_if_port(port);
-            return self.bind_loopback_listener_locked(Some(port)).await;
         }
-        self.bind_loopback_listener_locked(None).await
+        self.bind_loopback_listener_locked().await
     }
 
-    async fn bind_loopback_listener_locked(
-        self: &Arc<Self>,
-        preferred_port: Option<u16>,
-    ) -> Result<u16, AppError> {
-        if let Some(port) = self.loopback_port() {
+    async fn bind_loopback_listener_locked(self: &Arc<Self>) -> Result<u16, AppError> {
+        if let Some(port) = {
+            let slot = self
+                .listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.as_ref().filter(|h| h.is_alive()).map(|h| h.port)
+        } {
             return Ok(port);
         }
 
-        let tcp = if let Some(prev_port) = preferred_port {
-            let preferred_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, prev_port));
-            match TcpListener::bind(preferred_addr).await {
-                Ok(l) => l,
-                Err(_) => {
-                    let fallback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-                    TcpListener::bind(fallback).await.map_err(|err| {
-                        AppError::new(
-                            ErrorCode::Internal,
-                            format!("Could not bind local content listener on 127.0.0.1: {err}"),
-                        )
-                    })?
-                }
-            }
-        } else {
-            let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-            TcpListener::bind(bind_addr).await.map_err(|err| {
-                AppError::new(
-                    ErrorCode::Internal,
-                    format!("Could not bind local content listener on 127.0.0.1: {err}"),
-                )
-            })?
-        };
+        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        let tcp = TcpListener::bind(bind_addr).await.map_err(|err| {
+            AppError::new(
+                ErrorCode::Internal,
+                format!("Could not bind local content listener on 127.0.0.1: {err}"),
+            )
+        })?;
         let port = tcp
             .local_addr()
             .map_err(|err| {
@@ -835,6 +845,15 @@ impl AppContentServer {
             .port();
 
         let shutdown = CancellationToken::new();
+        let accept_alive = Arc::new(AtomicBool::new(true));
+        let server = Arc::clone(self);
+        let accept_shutdown = shutdown.clone();
+        let accept_flag = Arc::clone(&accept_alive);
+        let accept_task = tokio::spawn(async move {
+            server
+                .run_accept_loop(tcp, port, accept_shutdown, accept_flag)
+                .await;
+        });
         {
             let mut slot = self
                 .listener
@@ -843,15 +862,11 @@ impl AppContentServer {
             *slot = Some(ListenerHandle {
                 port,
                 shutdown: shutdown.clone(),
+                accept_alive,
+                accept_task,
             });
         }
         self.touch_activity();
-
-        let server = Arc::clone(self);
-        let accept_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            server.run_accept_loop(tcp, port, accept_shutdown).await;
-        });
 
         let reaper_server = Arc::clone(self);
         tokio::spawn(async move {
@@ -866,7 +881,11 @@ impl AppContentServer {
         tcp: TcpListener,
         port: u16,
         shutdown: CancellationToken,
+        accept_alive: Arc<AtomicBool>,
     ) {
+        let _alive_guard = AcceptAliveGuard {
+            alive: accept_alive,
+        };
         let guard = Arc::new(HostOriginGuard {
             port,
             allowed_hosts: Vec::new(),
@@ -3525,6 +3544,112 @@ mod tests {
             ContentUrlStatus::default()
         );
 
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn loopback_recovery_ignores_port_squatter_and_binds_new_os_port() {
+        let secret = b"private-audio-bytes-never-for-squatter".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/home/me/secret.flac".to_owned(), secret.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let _initial = server
+            .mint_url("tower", "/home/me/secret.flac", false)
+            .await
+            .unwrap();
+        let old_port = server.loopback_port().unwrap();
+
+        // Simulate Legion's listening socket dying while its stale ListenerHandle still names
+        // `old_port`.
+        {
+            let guard = server.listener.lock().unwrap();
+            if let Some(h) = guard.as_ref() {
+                h.shutdown.cancel();
+            }
+        }
+        // Wait until Legion's accept task exits and releases `old_port`.
+        let squatter = {
+            let mut bound = None;
+            for _ in 0..40 {
+                if let Ok(l) = TcpListener::bind(("127.0.0.1", old_port)).await {
+                    bound = Some(l);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            bound.expect("squatter should bind the released old port")
+        };
+
+        let squatter_hits = Arc::new(AtomicUsize::new(0));
+        let squatter_stop = CancellationToken::new();
+        let hits_clone = Arc::clone(&squatter_hits);
+        let stop_clone = squatter_stop.clone();
+        let squatter_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = stop_clone.cancelled() => break,
+                    res = squatter.accept() => {
+                        if let Ok((_sock, _)) = res {
+                            hits_clone.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Minting a new URL must detect from Legion's own state that the old listener is dead,
+        // never probe the squatter port, and bind a fresh OS-chosen port.
+        let fresh = server
+            .mint_url("tower", "/home/me/secret.flac", false)
+            .await
+            .unwrap();
+        let new_port = server.loopback_port().unwrap();
+        assert_ne!(
+            new_port, old_port,
+            "recovery must bind a new OS-chosen port rather than trusting a squatter on {old_port}"
+        );
+        assert!(
+            fresh
+                .url
+                .starts_with(&format!("http://127.0.0.1:{new_port}/v1/content/")),
+            "minted URL must point at new port {new_port}, got {}",
+            fresh.url
+        );
+
+        let path = fresh
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{new_port}"))
+            .unwrap();
+        let (status, head, body) = raw_http(
+            new_port,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{new_port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{head}");
+        assert_eq!(body, secret);
+
+        // Give the squatter task a moment in case anything tried to connect asynchronously.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            squatter_hits.load(Ordering::SeqCst),
+            0,
+            "nothing may connect to a squatter listening on the old port"
+        );
+
+        squatter_stop.cancel();
+        let _ = squatter_task.await;
         server.shutdown();
     }
 }
