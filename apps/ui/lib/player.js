@@ -11,6 +11,7 @@ export const TURN_LEAVE_GUARD_MS = 600;
 export const RESUME_MIN_DURATION_S = 600; // 10 minutes
 export const RESUME_END_THRESHOLD = 0.95; // last 5%
 export const RESUME_CHIP_DURATION_MS = 5000;
+export const RESUME_SAVE_INTERVAL_MS = 10_000;
 export const RESUME_MAX_ENTRIES = 200;
 export const MUSIC_RESTART_THRESHOLD_S = 3;
 export const SEEK_STEP_S = 10;
@@ -191,7 +192,13 @@ export function computeResumePosition(savedPosition, durationSeconds) {
   return Math.max(0, Math.min(durationSeconds, savedPosition));
 }
 
-export function createResumeStore(storage, { maxEntries = RESUME_MAX_ENTRIES } = {}) {
+export function createResumeStore(
+  storage,
+  { maxEntries = RESUME_MAX_ENTRIES, saveIntervalMs = RESUME_SAVE_INTERVAL_MS } = {},
+) {
+  let lastWriteKey = null;
+  let lastWriteAt = -Infinity;
+
   function readAll() {
     if (!storage) return {};
     try {
@@ -236,6 +243,8 @@ export function createResumeStore(storage, { maxEntries = RESUME_MAX_ENTRIES } =
     if (!identity?.machine || !identity?.path) return false;
     if (!isResumeEligible(durationSeconds)) return false;
     const key = resumeEntryKey(identity);
+    lastWriteKey = key;
+    lastWriteAt = nowMs;
     const map = readAll();
     if (!Number.isFinite(positionSeconds) || positionSeconds <= 1 || isNearEnd(positionSeconds, durationSeconds)) {
       if (Object.prototype.hasOwnProperty.call(map, key)) {
@@ -252,9 +261,23 @@ export function createResumeStore(storage, { maxEntries = RESUME_MAX_ENTRIES } =
     return true;
   }
 
+  function savePeriodic(identity, positionSeconds, durationSeconds, nowMs = Date.now()) {
+    if (!identity?.machine || !identity?.path) return false;
+    if (!isResumeEligible(durationSeconds)) return false;
+    const key = resumeEntryKey(identity);
+    if (lastWriteKey === key && nowMs - lastWriteAt < saveIntervalMs) {
+      return false;
+    }
+    return save(identity, positionSeconds, durationSeconds, nowMs);
+  }
+
   function clear(identity) {
     if (!identity?.machine || !identity?.path) return;
     const key = resumeEntryKey(identity);
+    if (lastWriteKey === key) {
+      lastWriteKey = null;
+      lastWriteAt = -Infinity;
+    }
     const map = readAll();
     if (Object.prototype.hasOwnProperty.call(map, key)) {
       delete map[key];
@@ -266,7 +289,7 @@ export function createResumeStore(storage, { maxEntries = RESUME_MAX_ENTRIES } =
     return Object.keys(readAll()).length;
   }
 
-  return { load, save, clear, count };
+  return { load, save, savePeriodic, clear, count };
 }
 
 // ── Controlled-clock video overlay, tap/double-tap, pending-seek, and stall controller ───────

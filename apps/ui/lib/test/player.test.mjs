@@ -32,6 +32,7 @@ import {
   RESUME_CHIP_DURATION_MS,
   RESUME_MAX_ENTRIES,
   RESUME_MIN_DURATION_S,
+  RESUME_SAVE_INTERVAL_MS,
   shouldMusicPrevRestart,
   STALL_SPINNER_DELAY_MS,
   stripFileExtension,
@@ -358,6 +359,61 @@ test('resume store honors 10 min threshold, skips last 5%, keys by machine/path/
     store.load({ machine: 'tower', path: `/home/me/Videos/v-${RESUME_MAX_ENTRIES + 15}.mp4`, size: 1000 + RESUME_MAX_ENTRIES + 15, mtime: '2026-11-20T00:00:00Z' }, 900),
     120,
   );
+});
+
+test('resume store throttles periodic writes to at most every 10 s while pause, file change, and close write immediately', () => {
+  const map = new Map();
+  let reads = 0;
+  let writes = 0;
+  const countingStorage = {
+    getItem(k) {
+      reads += 1;
+      return map.has(k) ? map.get(k) : null;
+    },
+    setItem(k, v) {
+      writes += 1;
+      map.set(k, String(v));
+    },
+    removeItem(k) {
+      map.delete(k);
+    },
+  };
+
+  assert.equal(RESUME_SAVE_INTERVAL_MS, 10_000);
+  const clock = createFakeClock(100_000);
+  const store = createResumeStore(countingStorage);
+  const idA = { machine: 'tower', path: '/Videos/Long.mp4', size: 10_000, mtime: '2026-11-20T10:00:00Z' };
+  const idB = { machine: 'tower', path: '/Videos/Next.mp4', size: 20_000, mtime: '2026-11-20T11:00:00Z' };
+
+  // Short files never touch storage at all.
+  assert.equal(store.savePeriodic(idA, 30, 300, clock.now()), false);
+  assert.equal(reads, 0);
+  assert.equal(writes, 0);
+
+  // Calling savePeriodic every second for 25 seconds writes only at t=0, t=10s, and t=20s (3 writes).
+  for (let sec = 0; sec <= 25; sec += 1) {
+    store.savePeriodic(idA, 20 + sec, 1200, clock.now());
+    clock.advance(1000);
+  }
+  assert.equal(writes, 3);
+  assert.equal(reads, 3);
+  assert.equal(store.load(idA, 1200), 40);
+
+  // Immediate save on pause / close writes right away even inside the 10-second window.
+  clock.advance(1000); // 7s since last periodic write
+  assert.equal(store.save(idA, 47, 1200, clock.now()), true);
+  assert.equal(writes, 4);
+  assert.equal(store.load(idA, 1200), 47);
+
+  // Immediate write resets the 10s periodic window for the same file.
+  clock.advance(5000);
+  assert.equal(store.savePeriodic(idA, 52, 1200, clock.now()), false);
+  assert.equal(writes, 4);
+
+  // Switching to a different file writes immediately without waiting for the previous file's window.
+  assert.equal(store.savePeriodic(idB, 15, 1200, clock.now()), true);
+  assert.equal(writes, 5);
+  assert.equal(store.load(idB, 1200), 15);
 });
 
 // ── Queue, Music metadata, formatting, wire extractors, and keys ─────────────────────────────

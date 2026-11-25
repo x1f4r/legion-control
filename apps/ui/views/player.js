@@ -404,7 +404,6 @@ export function VideoPlayer({
   const turnWatcherRef = useRef(null);
   const prevIsFullscreenRef = useRef(isFullscreen);
   const activeSeekSeqRef = useRef(0);
-  const lastSavedAtRef = useRef(0);
   const resumedAppliedRef = useRef(false);
   const lastKeyNavRef = useRef(false);
   const moreOpenRef = useRef(moreOpen);
@@ -476,7 +475,6 @@ export function VideoPlayer({
       prevIdentityRef.current = identityRef.current;
     }
     resumedAppliedRef.current = false;
-    lastSavedAtRef.current = 0;
     setCurrentTime(0);
     setDuration(entry?.duration_s > 0 ? entry.duration_s : 0);
     setBufferedEnd(0);
@@ -1018,10 +1016,9 @@ export function VideoPlayer({
           const t = Number.isFinite(v.currentTime) ? v.currentTime : 0;
           setCurrentTime(t);
           setBufferedEnd(readBufferedEnd(v));
-          const now = Date.now();
-          if (now - lastSavedAtRef.current >= 2000 && Number.isFinite(v.duration) && v.duration > 0) {
-            lastSavedAtRef.current = now;
-            resumeStore.save(identityRef.current, t, v.duration, now);
+          if (Number.isFinite(v.duration) && v.duration > 0) {
+            const now = getPlayerClock()?.now?.() ?? Date.now();
+            resumeStore.savePeriodic(identityRef.current, t, v.duration, now);
           }
         }}
         onProgress=${(e) => {
@@ -1333,7 +1330,6 @@ export function MusicPlayer({
   const localAutoPlayNextRef = useRef(null);
   const autoPlayNextRef = externalAutoPlayRef || localAutoPlayNextRef;
   const resumedAppliedRef = useRef(false);
-  const lastSavedAtRef = useRef(0);
   const stallTimerRef = useRef(null);
   const chipTimerRef = useRef(null);
   const durationRef = useRef(duration);
@@ -1389,7 +1385,6 @@ export function MusicPlayer({
       prevIdentityRef.current = identityRef.current;
     }
     resumedAppliedRef.current = false;
-    lastSavedAtRef.current = 0;
     setTags(null);
     setCurrentTime(0);
     setDuration(entry?.duration_s > 0 ? entry.duration_s : 0);
@@ -1959,10 +1954,9 @@ export function MusicPlayer({
           const t = Number.isFinite(a.currentTime) ? a.currentTime : 0;
           setCurrentTime(t);
           setBufferedEnd(readBufferedEnd(a));
-          const now = Date.now();
-          if (now - lastSavedAtRef.current >= 2000 && Number.isFinite(a.duration) && a.duration > 0) {
-            lastSavedAtRef.current = now;
-            resumeStore.save(identityRef.current, t, a.duration, now);
+          if (Number.isFinite(a.duration) && a.duration > 0) {
+            const now = getPlayerClock()?.now?.() ?? Date.now();
+            resumeStore.savePeriodic(identityRef.current, t, a.duration, now);
           }
         }}
         onProgress=${(e) => {
