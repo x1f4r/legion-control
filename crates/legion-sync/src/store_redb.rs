@@ -135,10 +135,31 @@ impl RedbIndexStore {
 
         catch_redb(&path_label, || {
             let mut db = if existed {
-                Database::builder()
-                    .set_cache_size(DEFAULT_REDB_CACHE_BYTES)
-                    .open(path)
-                    .map_err(|err| damaged_err(&path_label, err))?
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    match Database::builder()
+                        .set_cache_size(DEFAULT_REDB_CACHE_BYTES)
+                        .open(path)
+                    {
+                        Ok(db) => break db,
+                        Err(redb::DatabaseError::DatabaseAlreadyOpen)
+                            if std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                            return Err(SyncError::Storage {
+                                context: format!("open redb index at {path_label}"),
+                                detail: "index database is currently open by another process"
+                                    .to_string(),
+                            });
+                        }
+                        Err(redb::DatabaseError::Storage(redb::StorageError::Io(io_err))) => {
+                            return Err(SyncError::from_io(Some(path_label.clone()), io_err));
+                        }
+                        Err(err) => return Err(damaged_err(&path_label, err)),
+                    }
+                }
             } else {
                 Database::builder()
                     .set_cache_size(DEFAULT_REDB_CACHE_BYTES)

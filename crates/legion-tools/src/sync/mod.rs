@@ -3002,9 +3002,12 @@ fn verify_or_init_marker(
             ));
         }
         None => {
-            let inc = legion_sync::model::random_incarnation_id().map_err(sync_error_to_body)?;
-            let marker = FolderMarker::new(folder_id.to_owned(), member_id.to_owned(), inc);
-            real_fs.write_marker(&marker).map_err(|err| {
+            // Probe writability inside `.legion-sync` without writing `marker.json` prematurely:
+            // `SyncEngine::open` writes `marker.json` together with the initial `redb` metadata
+            // so creating a folder on an existing non-empty directory is never mistaken for a
+            // missing or damaged index.
+            let probe = root.join(SYNC_META_DIR).join(&probe_name);
+            legion_core::config::write_atomically(&probe, b"ok").map_err(|err| {
                 ErrorBody::new(
                     ErrorCode::Denied,
                     format!(
@@ -3014,6 +3017,7 @@ fn verify_or_init_marker(
                 )
                 .with_hint("Check directory permissions and mount options, then try again.")
             })?;
+            let _ = fs::remove_file(&probe);
         }
     }
 

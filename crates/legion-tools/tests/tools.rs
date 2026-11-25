@@ -125,13 +125,14 @@ async fn doctor_checks_the_directories_and_every_configuration_file() {
         .map(|c| c["name"].as_str().unwrap())
         .collect();
     assert_eq!(
-        &names[..8],
+        &names[..9],
         &[
             "configuration directory",
             "state directory",
             "node.toml",
             "policy.toml",
             "projects.toml",
+            "sync.toml",
             "tokens.toml",
             "devices.toml",
             "tools.d"

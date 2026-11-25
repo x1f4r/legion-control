@@ -958,8 +958,97 @@ pub struct RecordsPage {
     pub head_fingerprint: Option<Hash>,
     /// Chained fingerprints for sequence numbers referenced by this page (`r.seq`, `r.seq - 1`, and
     /// `snapshot_seq`) so receivers can record exact pull and applied-ack fingerprints.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        with = "u64_key_map"
+    )]
     pub chain_fingerprints: BTreeMap<u64, Hash>,
+}
+
+/// Serialises and deserialises `BTreeMap<u64, V>` cleanly across both direct JSON and buffered
+/// `serde` internally-tagged / untagged enums (where `serde::__private::de::Content` hands map keys
+/// back as strings rather than integers).
+mod u64_key_map {
+    use std::collections::BTreeMap;
+    use std::fmt;
+
+    use serde::de::{Deserialize, Deserializer, Error as DeError, MapAccess, Visitor};
+    use serde::ser::{Serialize, SerializeMap, Serializer};
+
+    struct U64Key(u64);
+
+    impl<'de> Deserialize<'de> for U64Key {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct KeyVisitor;
+            impl Visitor<'_> for KeyVisitor {
+                type Value = U64Key;
+
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a u64 integer or decimal u64 string")
+                }
+
+                fn visit_u64<E: DeError>(self, v: u64) -> Result<Self::Value, E> {
+                    Ok(U64Key(v))
+                }
+
+                fn visit_i64<E: DeError>(self, v: i64) -> Result<Self::Value, E> {
+                    u64::try_from(v)
+                        .map(U64Key)
+                        .map_err(|_| E::custom(format!("negative key {v}")))
+                }
+
+                fn visit_str<E: DeError>(self, v: &str) -> Result<Self::Value, E> {
+                    v.parse::<u64>()
+                        .map(U64Key)
+                        .map_err(|err| E::custom(format!("invalid u64 key {v:?}: {err}")))
+                }
+            }
+            deserializer.deserialize_any(KeyVisitor)
+        }
+    }
+
+    pub fn serialize<S: Serializer, V: Serialize>(
+        map: &BTreeMap<u64, V>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let human_readable = serializer.is_human_readable();
+        let mut s = serializer.serialize_map(Some(map.len()))?;
+        if human_readable {
+            for (k, v) in map {
+                s.serialize_entry(&k.to_string(), v)?;
+            }
+        } else {
+            for (k, v) in map {
+                s.serialize_entry(k, v)?;
+            }
+        }
+        s.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>, V: Deserialize<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<u64, V>, D::Error> {
+        struct MapVisitor<V>(std::marker::PhantomData<V>);
+
+        impl<'de, V: Deserialize<'de>> Visitor<'de> for MapVisitor<V> {
+            type Value = BTreeMap<u64, V>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a map keyed by u64 sequence numbers")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+                let mut out = BTreeMap::new();
+                while let Some((U64Key(k), v)) = access.next_entry::<U64Key, V>()? {
+                    out.insert(k, v);
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_map(MapVisitor(std::marker::PhantomData))
+    }
 }
 
 /// Why an entry was moved into `.legion-sync/bin`.
@@ -1492,4 +1581,50 @@ pub struct SyncProgress {
     pub files_left: u64,
     /// Bytes remaining to transfer.
     pub bytes_left: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_page_chain_fingerprints_roundtrip_inside_tagged_and_untagged_json() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum TaggedEnvelope {
+            Records { page: RecordsPage },
+        }
+
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(untagged)]
+        enum UntaggedEnvelope {
+            Page { page: RecordsPage },
+        }
+
+        let mut fps = BTreeMap::new();
+        fps.insert(1, legion_xfer::hash::hash_bytes(b"seq1"));
+        fps.insert(42, legion_xfer::hash::hash_bytes(b"seq42"));
+        let page = RecordsPage {
+            incarnation: 7,
+            records: Vec::new(),
+            snapshot_seq: 42,
+            has_more: false,
+            caller_acked: Some((3, 10)),
+            caller_acked_fingerprint: Some(legion_xfer::hash::hash_bytes(b"ack")),
+            head_fingerprint: Some(legion_xfer::hash::hash_bytes(b"seq42")),
+            chain_fingerprints: fps,
+        };
+
+        let tagged_json = serde_json::to_string(&TaggedEnvelope::Records { page: page.clone() })
+            .expect("serialize tagged");
+        let tagged_back: TaggedEnvelope =
+            serde_json::from_str(&tagged_json).expect("deserialize tagged");
+        assert_eq!(tagged_back, TaggedEnvelope::Records { page: page.clone() });
+
+        let untagged_json = serde_json::to_string(&UntaggedEnvelope::Page { page: page.clone() })
+            .expect("serialize untagged");
+        let untagged_back: UntaggedEnvelope =
+            serde_json::from_str(&untagged_json).expect("deserialize untagged");
+        assert_eq!(untagged_back, UntaggedEnvelope::Page { page });
+    }
 }
