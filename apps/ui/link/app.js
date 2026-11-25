@@ -1127,8 +1127,11 @@ export function createAppLink() {
     }
   }
 
-  async function installUpdate() {
+  async function installUpdate(options = {}) {
     try {
+      if (options?.confirmInterrupt) {
+        return await invoke('update_install', { confirmInterrupt: true });
+      }
       return await invoke('update_install');
     } catch (err) {
       throw normalizeError(err);

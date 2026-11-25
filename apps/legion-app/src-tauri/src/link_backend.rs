@@ -5,8 +5,8 @@
 //! [`AppStore`] without ever logging keys or invites.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use legion_link::proto::Target;
@@ -16,7 +16,7 @@ use legion_link::{
 };
 use serde_json::Value;
 use tauri::ipc::Channel;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::backend::{
     AppError, AppState, Backend, BoxFuture, CallId, CallRequest, CancelResult,
@@ -42,6 +42,39 @@ const PREFERRED_RELAY_TTL: Duration = Duration::from_secs(5 * 60);
 /// etc.) must name its machine in `on`.
 fn is_any_node_tool(tool: &str) -> bool {
     matches!(tool, "fleet.list" | "fleet.ping" | "device.endpoint")
+}
+
+/// Read-only background refresh tools that match `PASSIVE_REFRESH_TOOLS` in `apps/ui/app.js`.
+///
+/// Non-streaming calls to these tools (such as the Machine Overview 5-second `sys.info` /
+/// `sys.procs` poll) do not count as user-started active work blocking automatic updates, and are
+/// instead tracked separately so an update waits briefly for any mid-call refresh to finish before
+/// installing between ticks. Every other tool (commands, process stop, power actions, filesystem
+/// mutations, device/config/update mutations, unknown tools) and every streaming call counts as
+/// user-started work that blocks updates.
+pub fn is_background_refresh_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "fleet.list"
+            | "fleet.ping"
+            | "sys.info"
+            | "sys.procs"
+            | "power.status"
+            | "job.list"
+            | "meta.whoami"
+            | "meta.version"
+            | "fs.list"
+            | "fs.stat"
+            | "fs.read"
+            | "fs.search"
+            | "fav.list"
+            | "sync.list"
+    )
+}
+
+/// Returns `true` only when a tool invocation is a non-streaming passive background refresh.
+pub fn is_background_refresh_call(tool: &str, has_stream: bool) -> bool {
+    !has_stream && is_background_refresh_tool(tool)
 }
 
 fn now_rfc3339_utc() -> String {
@@ -106,6 +139,104 @@ fn allow_loopback_endpoints_for_store(store: &AppStore) -> bool {
     }
 }
 
+/// RAII guard tracking one in-flight user-started or state-mutating native operation (effectful or
+/// streaming tool call, pairing, unpairing, learning, or identity change) so automatic updates
+/// never restart mid-operation.
+pub struct OperationGuard(Arc<AtomicUsize>);
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Tracks in-flight passive background refresh calls so updates never permanently block while
+/// polling screens (such as Machine Overview) are open, yet wait briefly for any mid-call refresh
+/// to finish before proceeding between poll ticks.
+#[derive(Default)]
+struct BackgroundRefreshTracker {
+    in_flight: Mutex<usize>,
+    condvar: Condvar,
+    notify: Notify,
+}
+
+impl BackgroundRefreshTracker {
+    fn count(&self) -> usize {
+        *self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wait_sync(&self, timeout: Duration) -> bool {
+        let mut count = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *count == 0 {
+            return true;
+        }
+        let deadline = Instant::now() + timeout;
+        while *count > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, res) = self
+                .condvar
+                .wait_timeout(count, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            count = next;
+            if *count == 0 {
+                return true;
+            }
+            if res.timed_out() {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn wait_async(&self, timeout: Duration) -> bool {
+        if self.count() == 0 {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register as a waiter before reading `in_flight` so a concurrent drop can never lose
+            // a wakeup.
+            notified.as_mut().enable();
+            if self.count() == 0 {
+                return true;
+            }
+            match tokio::time::timeout_at(deadline, notified).await {
+                Ok(()) => continue,
+                Err(_) => return self.count() == 0,
+            }
+        }
+    }
+}
+
+/// RAII guard tracking one in-flight passive background refresh call.
+pub struct BackgroundRefreshGuard(Arc<BackgroundRefreshTracker>);
+
+impl Drop for BackgroundRefreshGuard {
+    fn drop(&mut self) {
+        let mut count = self
+            .0
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.0.condvar.notify_all();
+            self.0.notify.notify_waiters();
+        }
+    }
+}
+
 /// Production backend implementation over [`legion_link::Link`].
 pub struct LinkBackend {
     store: AppStore,
@@ -114,6 +245,10 @@ pub struct LinkBackend {
     /// and store writes never race.
     mutate_lock: AsyncMutex<()>,
     next_call_seq: AtomicU64,
+    /// Count of currently active user-started or state-mutating native operations.
+    in_flight_ops: Arc<AtomicUsize>,
+    /// Tracker for currently active passive non-streaming background refresh calls.
+    bg_refreshes: Arc<BackgroundRefreshTracker>,
 }
 
 struct BackendState {
@@ -312,7 +447,29 @@ impl LinkBackend {
             state: Mutex::new(state),
             mutate_lock: AsyncMutex::new(()),
             next_call_seq: AtomicU64::new(1),
+            in_flight_ops: Arc::new(AtomicUsize::new(0)),
+            bg_refreshes: Arc::new(BackgroundRefreshTracker::default()),
         }
+    }
+
+    /// Marks one user-started or state-mutating native operation as in flight until the returned
+    /// [`OperationGuard`] is dropped.
+    pub fn track_operation(&self) -> OperationGuard {
+        self.in_flight_ops.fetch_add(1, Ordering::SeqCst);
+        OperationGuard(Arc::clone(&self.in_flight_ops))
+    }
+
+    /// Marks one passive non-streaming background refresh call as in flight until the returned
+    /// [`BackgroundRefreshGuard`] is dropped.
+    pub fn track_background_refresh(&self) -> BackgroundRefreshGuard {
+        let mut count = self
+            .bg_refreshes
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *count = count.saturating_add(1);
+        drop(count);
+        BackgroundRefreshGuard(Arc::clone(&self.bg_refreshes))
     }
 
     fn require_healthy_store(&self) -> Result<(), AppError> {
@@ -435,6 +592,7 @@ impl Backend for LinkBackend {
 
     fn tools(&self, on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
         Box::pin(async move {
+            let _refresh = self.track_background_refresh();
             let (link, route_hint) = self.active_link_and_route_hint()?;
             if route_hint.is_none() {
                 return Err(AppError::not_paired());
@@ -466,6 +624,11 @@ impl Backend for LinkBackend {
         on_event: Option<Channel<Value>>,
     ) -> BoxFuture<'_, Result<Value, AppError>> {
         Box::pin(async move {
+            let (_op, _refresh) = if is_background_refresh_call(&request.tool, on_event.is_some()) {
+                (None, Some(self.track_background_refresh()))
+            } else {
+                (Some(self.track_operation()), None)
+            };
             let (link, route_hint) = self.active_link_and_route_hint()?;
             let Some(hint_name) = route_hint else {
                 return Err(AppError::not_paired());
@@ -573,6 +736,7 @@ impl Backend for LinkBackend {
 
     fn pair(&self, invite: String, name: String) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async move {
+            let _op = self.track_operation();
             self.require_healthy_store()?;
             let trimmed_invite = invite.trim();
             if trimmed_invite.is_empty() {
@@ -664,6 +828,7 @@ impl Backend for LinkBackend {
 
     fn unpair(&self, node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
         Box::pin(async move {
+            let _op = self.track_operation();
             self.require_healthy_store()?;
             let trimmed = node.trim();
             if trimmed.is_empty() {
@@ -809,6 +974,7 @@ impl Backend for LinkBackend {
 
     fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
         Box::pin(async move {
+            let _op = self.track_operation();
             let _mutation = self.mutate_lock.lock().await;
             {
                 let guard = self
@@ -886,6 +1052,7 @@ impl Backend for LinkBackend {
 
     fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
         Box::pin(async move {
+            let _op = self.track_operation();
             self.require_healthy_store()?;
             // Hold `mutate_lock` across the whole learn call so an `unpair` during `learn` can
             // never be undone when learned routes are persisted.
@@ -981,6 +1148,7 @@ impl Backend for LinkBackend {
         fingerprints: Vec<String>,
     ) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async move {
+            let _op = self.track_operation();
             self.require_healthy_store()?;
             let trimmed = node.trim();
             if trimmed.is_empty() {
@@ -1022,6 +1190,7 @@ impl Backend for LinkBackend {
 
     fn dismiss_identity_change(&self, node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async move {
+            let _op = self.track_operation();
             self.require_healthy_store()?;
             let trimmed = node.trim();
             if trimmed.is_empty() {
@@ -1075,6 +1244,22 @@ impl Backend for LinkBackend {
             }
         }
         Ok(Some((guard.link.clone(), nodes)))
+    }
+
+    fn active_operations(&self) -> usize {
+        self.in_flight_ops.load(Ordering::SeqCst)
+    }
+
+    fn background_refreshes(&self) -> usize {
+        self.bg_refreshes.count()
+    }
+
+    fn wait_for_background_refreshes(&self, timeout: Duration) -> BoxFuture<'_, bool> {
+        Box::pin(async move { self.bg_refreshes.wait_async(timeout).await })
+    }
+
+    fn wait_for_background_refreshes_sync(&self, timeout: Duration) -> bool {
+        self.bg_refreshes.wait_sync(timeout)
     }
 
     fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
@@ -3064,6 +3249,314 @@ mod tests {
             summary.not_synced[0].reason.as_deref(),
             Some("live device changes refused")
         );
+    }
+
+    #[tokio::test]
+    async fn active_operations_tracks_in_flight_calls_and_guards_and_releases_on_drop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let backend = LinkBackend::with_local_program(store, None);
+        assert_eq!(backend.active_operations(), 0);
+
+        {
+            let _g1 = backend.track_operation();
+            assert_eq!(backend.active_operations(), 1);
+            {
+                let _g2 = backend.track_operation();
+                assert_eq!(backend.active_operations(), 2);
+            }
+            assert_eq!(backend.active_operations(), 1);
+        }
+        assert_eq!(backend.active_operations(), 0);
+
+        // Even a failing `call` / `pair` releases its counter cleanly when it returns.
+        let _ = backend
+            .call(
+                CallRequest {
+                    id: None,
+                    tool: "exec.run".to_owned(),
+                    args: serde_json::json!({ "cmd": "true" }),
+                    on: Some(serde_json::json!("tower")),
+                },
+                None,
+            )
+            .await;
+        let _ = backend.pair(String::new(), "phone".to_owned()).await;
+        assert_eq!(backend.active_operations(), 0);
+        assert_eq!(backend.background_refreshes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn background_refresh_classification_separates_passive_polls_from_user_started_work() {
+        // Passive non-streaming refresh reads (including Machine Overview's 5s sys.info/sys.procs).
+        for tool in [
+            "fleet.list",
+            "fleet.ping",
+            "sys.info",
+            "sys.procs",
+            "power.status",
+            "job.list",
+            "meta.whoami",
+            "meta.version",
+            "fs.list",
+            "fs.stat",
+            "fs.read",
+            "fs.search",
+            "fav.list",
+            "sync.list",
+        ] {
+            assert!(
+                is_background_refresh_call(tool, false),
+                "expected non-streaming {tool} to be classified as a background refresh"
+            );
+            assert!(
+                !is_background_refresh_call(tool, true),
+                "streaming {tool} must always count as user-started active work"
+            );
+        }
+
+        // User-started / effectful calls and unknown tools always block updates (fail-closed).
+        for tool in [
+            "exec.run",
+            "sys.kill",
+            "power.sleep",
+            "power.reboot",
+            "power.shutdown",
+            "power.wake",
+            "power.boot",
+            "job.start",
+            "job.cancel",
+            "service.restart",
+            "project.run",
+            "fs.write",
+            "fs.delete",
+            "fs.move",
+            "fs.copy",
+            "fs.mkdir",
+            "device.invite",
+            "device.remove",
+            "config.write",
+            "update.publish",
+            "meta.update",
+            "unknown.future_tool",
+        ] {
+            assert!(
+                !is_background_refresh_call(tool, false),
+                "expected {tool} to count as user-started active work"
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn passive_overview_polls_do_not_increment_active_operations_and_drain_cleanly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use legion_link::proto::{HelloResult, PROTOCOL, Request, Response, method};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let call_seen = Arc::new(AtomicUsize::new(0));
+        let call_started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        let seen_tx = Arc::clone(&call_seen);
+        let started_tx = Arc::clone(&call_started);
+        let release_rx = Arc::clone(&release);
+
+        let opener: legion_link::SessionOpener = Arc::new(move |entry, _, cancel| {
+            let seen_tx = Arc::clone(&seen_tx);
+            let started_tx = Arc::clone(&started_tx);
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap_or_else(|_| {
+                            Request::new(legion_link::proto::Id::Number(0), "", Value::Null)
+                        });
+                        if req.method == method::HELLO {
+                            let reply = Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap_or(Value::Null),
+                            );
+                            let mut out = serde_json::to_string(&reply).unwrap_or_default();
+                            out.push('\n');
+                            if server_w.write_all(out.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            let _ = server_w.flush().await;
+                        } else {
+                            // Hold each tool call until `release` fires so we can assert live
+                            // counters mid-call.
+                            seen_tx.fetch_add(1, Ordering::SeqCst);
+                            started_tx.notify_waiters();
+                            release_rx.notified().await;
+                            let reply = Response::ok(req.id, serde_json::json!({ "ok": true }));
+                            let mut out = serde_json::to_string(&reply).unwrap_or_default();
+                            out.push('\n');
+                            if server_w.write_all(out.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            let _ = server_w.flush().await;
+                        }
+                    }
+                });
+                legion_link::Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let backend = Arc::new(LinkBackend::with_opener(
+            store,
+            Some("/usr/bin/legion".to_owned()),
+            opener,
+        ));
+
+        // 1. Machine Overview polling `sys.info` + `sys.procs` concurrently:
+        //    `active_operations()` stays 0 while `background_refreshes()` tracks both calls.
+        let b1 = Arc::clone(&backend);
+        let sys_task = tokio::spawn(async move {
+            b1.call(
+                CallRequest {
+                    id: None,
+                    tool: "sys.info".to_owned(),
+                    args: serde_json::json!({}),
+                    on: Some(Value::String("local".to_owned())),
+                },
+                None,
+            )
+            .await
+        });
+        let b2 = Arc::clone(&backend);
+        let procs_task = tokio::spawn(async move {
+            b2.call(
+                CallRequest {
+                    id: None,
+                    tool: "sys.procs".to_owned(),
+                    args: serde_json::json!({ "group": true, "limit": 12 }),
+                    on: Some(Value::String("local".to_owned())),
+                },
+                None,
+            )
+            .await
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while backend.background_refreshes() < 2 || call_seen.load(Ordering::SeqCst) < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for Overview polls to enter flight"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            backend.active_operations(),
+            0,
+            "Overview sys.info/sys.procs refreshes must not mark active_operations > 0"
+        );
+        assert_eq!(backend.background_refreshes(), 2);
+
+        // Waiting with a short timeout while refreshes are still mid-call returns false cleanly
+        // rather than proceeding mid-call or hanging.
+        assert!(
+            !backend
+                .wait_for_background_refreshes(Duration::from_millis(30))
+                .await
+        );
+        let b_sync = Arc::clone(&backend);
+        assert!(
+            !tokio::task::spawn_blocking(move || {
+                b_sync.wait_for_background_refreshes_sync(Duration::from_millis(30))
+            })
+            .await?
+        );
+
+        // Once the in-flight refreshes finish, both async and sync waiters unblock immediately.
+        let b_wait = Arc::clone(&backend);
+        let wait_async_task = tokio::spawn(async move {
+            b_wait
+                .wait_for_background_refreshes(Duration::from_secs(2))
+                .await
+        });
+        let b_sync_wait = Arc::clone(&backend);
+        let wait_sync_task = tokio::task::spawn_blocking(move || {
+            b_sync_wait.wait_for_background_refreshes_sync(Duration::from_secs(2))
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Release both queued calls (the duplex server processes requests sequentially).
+        for _ in 0..4 {
+            release.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if backend.background_refreshes() == 0 {
+                break;
+            }
+        }
+        assert!(wait_async_task.await?);
+        assert!(wait_sync_task.await?);
+        assert!(sys_task.await?.is_ok());
+        assert!(procs_task.await?.is_ok());
+        assert_eq!(backend.background_refreshes(), 0);
+        assert_eq!(backend.active_operations(), 0);
+
+        // 2. A user-started action (`sys.kill`) DOES increment `active_operations()` while in
+        //    flight and leaves `background_refreshes()` at 0.
+        call_seen.store(0, Ordering::SeqCst);
+        let b3 = Arc::clone(&backend);
+        let kill_task = tokio::spawn(async move {
+            b3.call(
+                CallRequest {
+                    id: None,
+                    tool: "sys.kill".to_owned(),
+                    args: serde_json::json!({ "pid": 4242 }),
+                    on: Some(Value::String("local".to_owned())),
+                },
+                None,
+            )
+            .await
+        });
+        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(3);
+        while call_seen.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline2,
+                "timed out waiting for sys.kill to enter flight"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            backend.active_operations(),
+            1,
+            "user-started sys.kill must increment active_operations()"
+        );
+        assert_eq!(backend.background_refreshes(), 0);
+        release.notify_waiters();
+        assert!(kill_task.await?.is_ok());
+        assert_eq!(backend.active_operations(), 0);
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]

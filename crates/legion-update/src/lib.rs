@@ -33,8 +33,8 @@ pub use manifest::{
 };
 pub use trust::{
     CHECKSUMS_FILENAME, MANIFEST_FILENAME, PREVIEW_PUBLIC_KEY, RELEASE_PUBLIC_KEY,
-    SIGNATURE_FILENAME, SignerKind, TrustAnchors, VerifiedSignature, encode_signature_bytes,
-    key_fingerprint, verify_release_signature, verify_signature_with_key,
+    SIGNATURE_FILENAME, SignerKind, TrustAnchors, VerifiedSignature, compiled_preview_key_marker,
+    encode_signature_bytes, key_fingerprint, verify_release_signature, verify_signature_with_key,
 };
 pub use verify::{
     MAX_SIG_BYTES, VerifiedSetMeta, select_verified_artifact, verify_artifact_file,
@@ -737,10 +737,17 @@ mod tests {
     }
 
     #[test]
-    fn compiled_sequence_marker_has_expected_format() {
+    fn compiled_sequence_and_preview_markers_have_expected_format() {
         let marker = compiled_sequence_marker();
         let expected = format!("LEGION_UPDATE_SEQUENCE={}\0", compiled_sequence());
         assert_eq!(marker, expected.as_bytes());
+
+        let preview_marker = compiled_preview_key_marker();
+        let expected_preview = match TrustAnchors::compiled_in().preview_fingerprint() {
+            Some(fp) => format!("LEGION_UPDATE_PREVIEW_KEY={fp}\0"),
+            None => "LEGION_UPDATE_PREVIEW_KEY=none\0".to_owned(),
+        };
+        assert_eq!(preview_marker, expected_preview.as_bytes());
     }
 
     #[test]

@@ -1073,6 +1073,11 @@ impl AppContentServer {
         self.prune_dead_ticket_cancels();
     }
 
+    /// Returns the number of content response streams currently being served.
+    pub fn active_streams(&self) -> usize {
+        self.active_streams.load(Ordering::Acquire)
+    }
+
     /// Revokes every issued content ticket (used on store repair and app exit).
     pub fn revoke_all(&self) {
         let _ = self.tickets.retain_holders(|_| false);
