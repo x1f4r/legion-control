@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "legion-app",
+  "bundle": {
+    "longDescription": "Desktop controller for Legion nodes and fleets.",
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/legion-app.desktop"
+      }
+    }
+  }
+}

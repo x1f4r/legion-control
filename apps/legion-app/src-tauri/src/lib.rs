@@ -209,4 +209,38 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn linux_deb_package_name_does_not_collide_with_node_package()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let raw = std::fs::read_to_string(manifest_dir.join("tauri.linux.conf.json"))?;
+        let conf: serde_json::Value = serde_json::from_str(&raw)?;
+
+        assert_eq!(
+            conf.get("productName").and_then(|v| v.as_str()),
+            Some("legion-app"),
+            "Linux productName must be legion-app so the .deb Package field does not collide with the legion node package"
+        );
+
+        let long_desc = conf
+            .pointer("/bundle/longDescription")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            !long_desc.trim().is_empty(),
+            "Linux bundle.longDescription should be set so DEBIAN/control does not emit (none)"
+        );
+
+        let template_rel = conf
+            .pointer("/bundle/linux/deb/desktopTemplate")
+            .and_then(|v| v.as_str())
+            .ok_or("missing bundle.linux.deb.desktopTemplate in tauri.linux.conf.json")?;
+        let desktop = std::fs::read_to_string(manifest_dir.join(template_rel))?;
+        assert!(
+            desktop.lines().any(|line| line.trim() == "Name=Legion"),
+            "desktop template should keep Name=Legion for application launchers"
+        );
+        Ok(())
+    }
 }

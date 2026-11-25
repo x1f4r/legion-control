@@ -199,6 +199,28 @@ The interface's content security policy grows by exactly what this needs: `img-s
 - **Add from this device** (app): the system's file picker, then the bulk pipe's `put`, with the
   same resume and hash check.
 
+Nothing here makes a person wait. Starting a download, an upload or a transfer returns at once;
+the interface stays free to browse, play something else or leave Files, and the work shows in
+Activity. A viewer can be closed while it is still loading, which stops the loading.
+
+Transfers to and from the device run in a queue on the app's native side, not in the web view,
+so they do not depend on a screen being open:
+
+- **Android**: a foreground service of the data-sync kind with one ongoing notification (what is
+  moving, how far, Pause and Cancel). It keeps going when the person switches apps, locks the
+  screen or swipes Legion away. The queue is written to disk; after the process is killed, the
+  phone restarts or the connection drops, each transfer resumes from its partial file the next
+  time the service can run, and a finished one leaves a notification that opens the file.
+- **Desktop**: the same queue. Closing the window while it is working leaves the app running
+  without a window until the queue is empty, and says so; quitting outright asks first. What was
+  unfinished resumes on the next start.
+- **iPhone and iPad**: the system gives an app only a short time in the background, so a transfer
+  pauses when the app is left and resumes when it is opened again. The interface says that
+  instead of pretending otherwise.
+
+A few transfers run at once (two by default), the rest wait their turn, and a setting keeps large
+transfers for Wi-Fi.
+
 ## The interface
 
 The reference screens are `apps/ui/design/files.html`. The rules of the second pass still hold:
