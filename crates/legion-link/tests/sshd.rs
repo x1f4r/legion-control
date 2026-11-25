@@ -22,6 +22,7 @@ use legion_link::{
     ssh,
 };
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 
 struct TestEnv {
     host: String,
@@ -32,6 +33,8 @@ struct TestEnv {
     mismatch_host: Option<String>,
     auth_keys_path: Option<String>,
     enrol_script: Option<String>,
+    sample_file: Option<String>,
+    legion_bin: Option<String>,
     key: DeviceKey,
     node: String,
 }
@@ -54,6 +57,12 @@ fn env_target() -> Option<TestEnv> {
     let enrol_script = env::var("LEGION_LINK_ENROL_SCRIPT")
         .ok()
         .filter(|s| !s.trim().is_empty());
+    let sample_file = env::var("LEGION_LINK_SAMPLE_FILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let legion_bin = env::var("LEGION_LINK_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     let key_file = env::var("LEGION_LINK_KEY_FILE").ok()?;
     let key_pem = fs::read_to_string(&key_file).unwrap();
     let key = DeviceKey::from_openssh(&key_pem).unwrap();
@@ -67,6 +76,8 @@ fn env_target() -> Option<TestEnv> {
         mismatch_host,
         auth_keys_path,
         enrol_script,
+        sample_file,
+        legion_bin,
         key,
         node,
     })
@@ -334,6 +345,256 @@ async fn real_sshd_session_and_security_checks() {
         "{info_after}"
     );
 
+    // 6b. `Link::open_content` over the live SSH session: full read, ranged read, concurrent
+    //     channels on one connection, mid-stream cancellation without harming the parent session,
+    //     and routing/error checks.
+    if let Some(sample_file) = &env.sample_file {
+        let expected = fs::read(sample_file).unwrap();
+        assert!(
+            expected.len() >= 100_000,
+            "sample file should be >= 100 KiB"
+        );
+
+        // Concurrent ranges on the same SSH connection.
+        let mut s1 = link
+            .open_content(&env.node, sample_file, 1024, Some(32_768))
+            .await
+            .unwrap();
+        let mut s2 = link
+            .open_content(&env.node, sample_file, 65_536, Some(16_384))
+            .await
+            .unwrap();
+        let mut s3 = link
+            .open_content(&env.node, sample_file, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(s1.size(), expected.len() as u64);
+        assert_eq!(s1.offset(), 1024);
+        assert_eq!(s1.length(), 32_768);
+        assert!(s1.mtime().secs > 0);
+
+        // Cancel s3 mid-stream after reading 128 bytes.
+        let mut head = [0u8; 128];
+        s3.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head[..], &expected[..128]);
+        s3.cancel();
+        drop(s3);
+
+        // s1 and s2 still finish cleanly on the same SSH connection.
+        let (mut b1, mut b2) = (Vec::new(), Vec::new());
+        let (r1, r2) = tokio::join!(s1.read_to_end(&mut b1), s2.read_to_end(&mut b2));
+        r1.unwrap();
+        r2.unwrap();
+        assert_eq!(b1, &expected[1024..1024 + 32_768]);
+        assert_eq!(b2, &expected[65_536..65_536 + 16_384]);
+
+        // RPC on the same SSH connection keeps working after stream cancellation.
+        let still_alive = link.hello(&env.node).await.unwrap();
+        assert_eq!(still_alive["node"], json!(env.node));
+
+        // Unread large stream (> 4 MiB, exceeding russh's 2 MiB window and channel buffer) must
+        // never stall RPC calls or other streams on the same SSH connection; resuming it later
+        // yields the exact bytes.
+        assert!(
+            expected.len() >= 4 * 1024 * 1024,
+            "sample file should be >= 4 MiB to exercise SSH backpressure"
+        );
+        let mut paused = link
+            .open_content(&env.node, sample_file, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(paused.size(), expected.len() as u64);
+        assert_eq!(paused.length(), expected.len() as u64);
+        // Leave `paused` completely unread while the remote pushes its first window.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let quick_hello = tokio::time::timeout(Duration::from_secs(3), link.hello(&env.node))
+            .await
+            .expect("hello stalled behind unread content stream")
+            .unwrap();
+        assert_eq!(quick_hello["node"], json!(env.node));
+
+        let quick_info = tokio::time::timeout(
+            Duration::from_secs(3),
+            link.call(&env.node, "sys.info", json!({}), None, |_| {}),
+        )
+        .await
+        .expect("sys.info stalled behind unread content stream")
+        .unwrap();
+        assert!(quick_info.get("os").is_some());
+
+        // A second stream on the exact same SSH connection flows freely while the first is paused.
+        let mut second = tokio::time::timeout(
+            Duration::from_secs(3),
+            link.open_content(&env.node, sample_file, 2 * 1024 * 1024, Some(512 * 1024)),
+        )
+        .await
+        .expect("second stream open stalled behind unread content stream")
+        .unwrap();
+        let mut second_buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), second.read_to_end(&mut second_buf))
+            .await
+            .expect("second stream read stalled behind unread content stream")
+            .unwrap();
+        assert_eq!(
+            second_buf,
+            &expected[2 * 1024 * 1024..2 * 1024 * 1024 + 512 * 1024]
+        );
+
+        // Resuming the unread first stream delivers every byte accurately across windows.
+        let mut paused_buf = Vec::with_capacity(expected.len());
+        tokio::time::timeout(Duration::from_secs(15), paused.read_to_end(&mut paused_buf))
+            .await
+            .expect("resumed stream timed out")
+            .unwrap();
+        assert_eq!(paused_buf, expected);
+
+        // Unread stream paused in the middle of a window (after consuming past window 0 so
+        // read-ahead is active) must also never stall RPC calls or sibling streams on the same
+        // SSH connection.
+        let mut mid_paused = link
+            .open_content(&env.node, sample_file, 0, None)
+            .await
+            .unwrap();
+        let mut mid_prefix = vec![0u8; 400 * 1024];
+        mid_paused.read_exact(&mut mid_prefix).await.unwrap();
+        assert_eq!(mid_prefix, &expected[..mid_prefix.len()]);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mid_hello = tokio::time::timeout(Duration::from_secs(3), link.hello(&env.node))
+            .await
+            .expect("hello stalled behind mid-window unread content stream")
+            .unwrap();
+        assert_eq!(mid_hello["node"], json!(env.node));
+
+        let mut mid_sibling = tokio::time::timeout(
+            Duration::from_secs(3),
+            link.open_content(&env.node, sample_file, 1024 * 1024, Some(256 * 1024)),
+        )
+        .await
+        .expect("sibling stream open stalled behind mid-window unread stream")
+        .unwrap();
+        let mut mid_sibling_buf = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            mid_sibling.read_to_end(&mut mid_sibling_buf),
+        )
+        .await
+        .expect("sibling stream read stalled behind mid-window unread stream")
+        .unwrap();
+        assert_eq!(
+            mid_sibling_buf,
+            &expected[1024 * 1024..1024 * 1024 + 256 * 1024]
+        );
+
+        let mut mid_rest = Vec::with_capacity(expected.len() - mid_prefix.len());
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            mid_paused.read_to_end(&mut mid_rest),
+        )
+        .await
+        .expect("resumed mid-window stream timed out")
+        .unwrap();
+        assert_eq!(mid_rest, &expected[mid_prefix.len()..]);
+
+        // Opening 12 concurrent streams (exceeding sshd's default MaxSessions of 10) queues
+        // cleanly without discarding the healthy SSH connection.
+        let mut concurrent = tokio::task::JoinSet::new();
+        for i in 0..12usize {
+            let link_clone = link.clone();
+            let node_name = env.node.clone();
+            let path = sample_file.clone();
+            let off = (i * 65_536) as u64;
+            let len = 32_768u64;
+            concurrent.spawn(async move {
+                let mut s = link_clone
+                    .open_content(&node_name, &path, off, Some(len))
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                s.read_to_end(&mut out).await.unwrap();
+                (off as usize, out)
+            });
+        }
+        while let Some(res) = concurrent.join_next().await {
+            let (off, bytes) = res.unwrap();
+            assert_eq!(bytes, &expected[off..off + 32_768]);
+        }
+
+        // Twenty streams held open at once on a single SSH connection (far above the 8 active
+        // channel cap and sshd's MaxSessions = 10): unread streams park after ~2s to release their
+        // channel slots so the rest can open and active readers + RPC keep flowing, and every
+        // parked stream resumes cleanly with exact bytes.
+        let mut twenty = Vec::with_capacity(20);
+        for i in 0..20usize {
+            let off = (i * 65_536) as u64;
+            let len = 512 * 1024u64; // > initial 256 KiB window so reopening is exercised
+            let mut s = tokio::time::timeout(
+                Duration::from_secs(12),
+                link.open_content(&env.node, sample_file, off, Some(len)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("20-stream open #{i} timed out"))
+            .unwrap();
+            // Read only a small prefix on the first 4 streams; leave the rest completely unread.
+            let mut prefix = Vec::new();
+            if i < 4 {
+                prefix.resize(64 * 1024, 0);
+                s.read_exact(&mut prefix).await.unwrap();
+                assert_eq!(prefix, &expected[off as usize..off as usize + prefix.len()]);
+            }
+            twenty.push((off as usize, len as usize, prefix, s));
+        }
+        let hello_with_20 = tokio::time::timeout(Duration::from_secs(3), link.hello(&env.node))
+            .await
+            .expect("hello stalled with 20 open streams")
+            .unwrap();
+        assert_eq!(hello_with_20["node"], json!(env.node));
+        for (i, (off, len, mut buf, mut stream)) in twenty.into_iter().enumerate() {
+            tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("resuming stream #{i} of 20 timed out"))
+                .unwrap();
+            assert_eq!(buf, &expected[off..off + len], "stream #{i} byte mismatch");
+        }
+
+        // Error cases: offset past EOF and unknown machine.
+        let bad_off = link
+            .open_content(&env.node, sample_file, expected.len() as u64 + 1, Some(10))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(bad_off.code, ErrorCode::Conflict);
+
+        let unknown = link
+            .open_content("no-such-machine", sample_file, 0, Some(10))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(unknown.code, ErrorCode::NotFound);
+
+        // Local child pipe (`NodeLink::local`) when both `local` feature and binary are present.
+        #[cfg(feature = "local")]
+        if let Some(legion_bin) = &env.legion_bin {
+            let local_link = Link::new(LinkConfig {
+                nodes: vec![NodeLink::local("local-node", legion_bin)],
+                ..LinkConfig::default()
+            });
+            let mut ls = local_link
+                .open_content("local-node", sample_file, 512, Some(4096))
+                .await
+                .unwrap();
+            assert_eq!(ls.size(), expected.len() as u64);
+            assert_eq!(ls.length(), 4096);
+            let mut lbuf = Vec::new();
+            ls.read_to_end(&mut lbuf).await.unwrap();
+            assert_eq!(lbuf, &expected[512..512 + 4096]);
+            local_link.close().await;
+        }
+        #[cfg(not(feature = "local"))]
+        let _ = &env.legion_bin;
+    }
+
     link.close().await;
 
     // 7. In-place `Link::pair` starting from an empty `LinkConfig`, live tool call without
@@ -449,4 +710,86 @@ async fn real_sshd_session_and_security_checks() {
 
         pair_link.close().await;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires LEGION_LINK_SSHD... and LEGION_LINK_LONG_PAUSE=1 (sleeps 130s)"]
+async fn real_sshd_paused_stream_resumes_after_130s() {
+    if env::var("LEGION_LINK_LONG_PAUSE").ok().as_deref() != Some("1") {
+        eprintln!("skipping 130s pause test (set LEGION_LINK_LONG_PAUSE=1 to run)");
+        return;
+    }
+    let Some(env) = env_target() else {
+        panic!(
+            "Set LEGION_LINK_SSHD, LEGION_LINK_USER, LEGION_LINK_HOST_KEY, LEGION_LINK_KEY_FILE."
+        );
+    };
+    let sample_file = env
+        .sample_file
+        .as_deref()
+        .expect("LEGION_LINK_SAMPLE_FILE required");
+    let expected = fs::read(sample_file).unwrap();
+    assert!(expected.len() >= 4 * 1024 * 1024);
+
+    let target = SshTarget {
+        hosts: vec![env.host.clone()],
+        port: env.port,
+        user: env.user.clone(),
+        host_keys: vec![env.ed25519_host_key.clone()],
+    };
+    let link = Link::new(LinkConfig {
+        device_key: Some(env.key.to_openssh().unwrap()),
+        nodes: vec![NodeLink::ssh(&env.node, target, Some("phone".to_owned()))],
+        ..LinkConfig::default()
+    });
+
+    // Open three streams and advance them to three distinct positions before pausing 130 seconds
+    // (past remote `legion stream`'s 120s idle timeout):
+    //   1. Unread at offset 0.
+    //   2. Mid-window after reading 400 KiB.
+    //   3. Mid-file after reading 2 MiB.
+    let s_start = link
+        .open_content(&env.node, sample_file, 0, None)
+        .await
+        .unwrap();
+    let mut s_mid = link
+        .open_content(&env.node, sample_file, 0, None)
+        .await
+        .unwrap();
+    let mut mid_buf = vec![0u8; 400 * 1024];
+    s_mid.read_exact(&mut mid_buf).await.unwrap();
+    assert_eq!(mid_buf, &expected[..mid_buf.len()]);
+
+    let mut s_late = link
+        .open_content(&env.node, sample_file, 0, None)
+        .await
+        .unwrap();
+    let mut late_buf = vec![0u8; 2 * 1024 * 1024];
+    s_late.read_exact(&mut late_buf).await.unwrap();
+    assert_eq!(late_buf, &expected[..late_buf.len()]);
+
+    eprintln!("Pausing 3 streams for 130s (past remote 120s idle timeout)...");
+    tokio::time::sleep(Duration::from_secs(130)).await;
+
+    for (label, mut stream, mut got) in [
+        ("start (0 B)", s_start, Vec::with_capacity(expected.len())),
+        ("mid-window (400 KiB)", s_mid, mid_buf),
+        ("mid-file (2 MiB)", s_late, late_buf),
+    ] {
+        let t0 = std::time::Instant::now();
+        let mut rest = Vec::with_capacity(expected.len() - got.len());
+        tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut rest))
+            .await
+            .unwrap_or_else(|_| panic!("{label} timed out after 130s pause"))
+            .unwrap();
+        let elapsed = t0.elapsed();
+        got.extend_from_slice(&rest);
+        assert_eq!(got, expected, "{label} byte mismatch after 130s pause");
+        eprintln!(
+            "resumed {label} cleanly in {:.1} ms",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+
+    link.close().await;
 }

@@ -70,6 +70,12 @@ pub trait TransportHandle: Send + 'static {
     /// Closes the transport gracefully within `grace` after stdin EOF, terminating it if it
     /// lingers.
     fn close(self: Box<Self>, grace: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    /// Returns a factory for opening independent `legion stream` channels over this transport
+    /// (for example a new exec channel on an existing SSH connection or a local child process).
+    fn stream_opener(&self) -> Option<Arc<dyn crate::content::StreamOpener>> {
+        None
+    }
 }
 
 /// Identity learned during the `hello` handshake.
@@ -152,6 +158,7 @@ pub struct Session {
     stderr: Option<Arc<StderrTail>>,
     death_error: Arc<Mutex<Option<ErrorBody>>>,
     transport: Arc<tokio::sync::Mutex<Option<BoxHandle>>>,
+    stream_opener: Option<Arc<dyn crate::content::StreamOpener>>,
     reader_task: Mutex<Option<JoinHandle<()>>>,
     tools_cache: tokio::sync::Mutex<Option<HashMap<String, Effect>>>,
 }
@@ -339,6 +346,7 @@ impl Session {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let death_error = Arc::new(Mutex::new(None));
+        let stream_opener = handle.as_ref().and_then(|h| h.stream_opener());
         let transport_arc = Arc::new(tokio::sync::Mutex::new(handle));
 
         let reader_handle = tokio::spawn(reader_loop(
@@ -365,6 +373,7 @@ impl Session {
             stderr,
             death_error,
             transport: transport_arc,
+            stream_opener,
             reader_task: Mutex::new(Some(reader_handle)),
             tools_cache: tokio::sync::Mutex::new(None),
         })
@@ -378,6 +387,11 @@ impl Session {
     /// Whether the session's pipe is still believed to be open.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// Returns the transport's stream opener when supported (SSH and local pipes).
+    pub(crate) fn stream_opener(&self) -> Option<Arc<dyn crate::content::StreamOpener>> {
+        self.stream_opener.clone()
     }
 
     /// Sends a live `hello` request over an already-open session to verify connectivity and

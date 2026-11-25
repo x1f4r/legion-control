@@ -7,8 +7,10 @@ use std::fs;
 use std::io::{BufRead, Cursor, Read};
 use std::path::{Path, PathBuf};
 
-use legion_core::Paths;
-use legion_net::stream::{Host, STREAM_PROTOCOL, serve};
+use std::io;
+
+use legion_core::{Door, Paths};
+use legion_net::stream::{Host, STREAM_PROTOCOL, StreamServeOptions, serve, serve_with_options};
 use legion_proto::ErrorCode;
 use serde_json::{Value, json};
 
@@ -292,24 +294,88 @@ fn the_line_that_ends_a_listing_stays_short_however_much_could_not_be_read() {
 fn get_sends_the_size_then_the_bytes_from_the_offset() {
     let node = Node::new();
     let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-    fs::write(node.home().join("projects/big.bin"), &data).unwrap();
+    let file = node.home().join("projects/big.bin");
+    fs::write(&file, &data).unwrap();
+    let expected_mtime =
+        legion_xfer::Timestamp::from_system_time(fs::metadata(&file).unwrap().modified().unwrap());
 
+    // Legacy caller omitting `length` still receives offset..EOF and gets full metadata.
     let ran = node.run(
         None,
         &json!({"op": "get", "path": "~/projects/big.bin", "offset": 1000}),
         b"",
     );
     let (line, rest) = ran.ok().first();
-    assert_eq!(line, json!({"size": 200_000}));
+    assert_eq!(line["size"], json!(200_000));
+    assert_eq!(line["offset"], json!(1000));
+    assert_eq!(line["length"], json!(199_000));
+    assert_eq!(
+        line["mtime"],
+        json!({"secs": expected_mtime.secs, "nanos": expected_mtime.nanos})
+    );
+    #[cfg(unix)]
+    assert!(line["file_id"].as_u64().is_some(), "{line}");
     assert_eq!(rest, &data[1000..]);
     assert_eq!(node.last_audit()["tool"], "stream.get");
 
+    // Bounded slice with explicit `length`.
+    let ran = node.run(
+        None,
+        &json!({"op": "get", "path": "~/projects/big.bin", "offset": 4096, "length": 1234}),
+        b"",
+    );
+    let (line, rest) = ran.ok().first();
+    assert_eq!(line["size"], json!(200_000));
+    assert_eq!(line["offset"], json!(4096));
+    assert_eq!(line["length"], json!(1234));
+    assert_eq!(
+        line["mtime"],
+        json!({"secs": expected_mtime.secs, "nanos": expected_mtime.nanos})
+    );
+    assert_eq!(rest, &data[4096..4096 + 1234]);
+
+    // `length` extending past EOF clamps to the remaining bytes.
+    let ran = node.run(
+        None,
+        &json!({"op": "get", "path": "~/projects/big.bin", "offset": 199_900, "length": 500}),
+        b"",
+    );
+    let (line, rest) = ran.ok().first();
+    assert_eq!(line["length"], json!(100));
+    assert_eq!(rest, &data[199_900..]);
+
+    // `length: 0` returns metadata and zero bytes (useful for HEAD / range probes).
+    let ran = node.run(
+        None,
+        &json!({"op": "get", "path": "~/projects/big.bin", "offset": 0, "length": 0}),
+        b"",
+    );
+    let (line, rest) = ran.ok().first();
+    assert_eq!(line["size"], json!(200_000));
+    assert_eq!(line["offset"], json!(0));
+    assert_eq!(line["length"], json!(0));
+    assert!(rest.is_empty());
+
+    // `offset == size` succeeds with `length: 0`.
+    let ran = node.run(
+        None,
+        &json!({"op": "get", "path": "~/projects/big.bin", "offset": 200_000, "length": 10}),
+        b"",
+    );
+    let (line, rest) = ran.ok().first();
+    assert_eq!(line["length"], json!(0));
+    assert!(rest.is_empty());
+
+    // `offset > size` fails with Conflict and carries `requested` / `actual`.
     let ran = node.run(
         None,
         &json!({"op": "get", "path": "~/projects/big.bin", "offset": 300_000}),
         b"",
     );
-    ran.refused(ErrorCode::Conflict);
+    let err = ran.refused(ErrorCode::Conflict);
+    assert_eq!(err["details"]["requested"], json!(300_000));
+    assert_eq!(err["details"]["actual"], json!(200_000));
+
     let ran = node.run(None, &json!({"op": "get", "path": "~/projects/none"}), b"");
     ran.refused(ErrorCode::NotFound);
     assert_eq!(node.last_audit()["outcome"], "not_found");
@@ -1067,4 +1133,353 @@ fn a_refused_unpack_reads_nothing_of_what_follows() {
     let mut rest = Vec::new();
     cursor.read_to_end(&mut rest).unwrap();
     assert!(rest.len() > 900_000, "{}", rest.len());
+}
+
+#[test]
+fn keep_open_get_serves_multiple_ranges_frames_done_and_coalesces_audit() {
+    let node = Node::new();
+    fs::create_dir_all(node.home().join("projects/src")).unwrap();
+    let file = node.home().join("projects/src/clip.bin");
+    fs::write(&file, b"0123456789abcdefghijklmnopqrstuvwxyz").unwrap();
+
+    let mut input = Vec::new();
+    for req in [
+        json!({"protocol": 1, "op": "get", "path": "~/projects/src/clip.bin", "offset": 0, "length": 10, "keep_open": true}),
+        json!({"protocol": 1, "op": "get", "path": "~/projects/src/clip.bin", "offset": 10, "length": 6, "keep_open": true}),
+        json!({"protocol": 1, "op": "get", "path": "~/projects/src/clip.bin", "offset": 999, "length": 4, "keep_open": true}),
+        json!({"protocol": 1, "op": "get", "path": "~/projects/src/clip.bin", "offset": 20, "length": 5, "keep_open": true}),
+    ] {
+        input.extend_from_slice(req.to_string().as_bytes());
+        input.push(b'\n');
+    }
+
+    let mut output = Vec::new();
+    serve(&node.host, None, Cursor::new(input), &mut output).unwrap();
+
+    // Parse protocol greeting, then 4 framed replies.
+    let mut rest = after_protocol(&output);
+
+    let take_line = |slice: &mut &[u8]| -> Value {
+        let pos = slice.iter().position(|&b| b == b'\n').unwrap();
+        let line = &slice[..pos];
+        *slice = &slice[pos + 1..];
+        serde_json::from_slice(line).unwrap()
+    };
+
+    // Frame 1: 10 bytes
+    let r1 = take_line(&mut rest);
+    assert_eq!(r1["size"], 36);
+    assert_eq!(r1["offset"], 0);
+    assert_eq!(r1["length"], 10);
+    assert_eq!(r1["keep_open"], true);
+    #[cfg(unix)]
+    assert!(r1["file_id"].as_u64().is_some());
+    assert_eq!(&rest[..10], b"0123456789");
+    rest = &rest[10..];
+    assert_eq!(take_line(&mut rest), json!({"done": true}));
+
+    // Frame 2: 6 bytes
+    let r2 = take_line(&mut rest);
+    assert_eq!(r2["offset"], 10);
+    assert_eq!(r2["length"], 6);
+    assert_eq!(&rest[..6], b"abcdef");
+    rest = &rest[6..];
+    assert_eq!(take_line(&mut rest), json!({"done": true}));
+
+    // Frame 3: out of range error does not break the persistent pipe
+    let r3 = take_line(&mut rest);
+    assert_eq!(r3["error"]["code"], "conflict");
+
+    // Frame 4: 5 bytes still succeed on the same pipe
+    let r4 = take_line(&mut rest);
+    assert_eq!(r4["offset"], 20);
+    assert_eq!(r4["length"], 5);
+    assert_eq!(&rest[..5], b"klmno");
+    rest = &rest[5..];
+    assert_eq!(take_line(&mut rest), json!({"done": true}));
+    assert!(rest.is_empty());
+
+    // Audit: 3 successful range reads coalesced into 1 ok `stream.get` line (21 bytes total) plus
+    // 1 error line for the out-of-range request.
+    let audit = node.audit();
+    let ok_gets: Vec<&Value> = audit
+        .iter()
+        .filter(|e| e["tool"] == "stream.get" && e["outcome"] == "ok")
+        .collect();
+    assert_eq!(
+        ok_gets.len(),
+        1,
+        "expected 1 coalesced ok audit line: {audit:?}"
+    );
+    assert_eq!(ok_gets[0]["args"]["requests"], 3);
+    assert_eq!(ok_gets[0]["args"]["bytes_served"], 21);
+    let err_gets: Vec<&Value> = audit
+        .iter()
+        .filter(|e| e["tool"] == "stream.get" && e["outcome"] != "ok")
+        .collect();
+    assert_eq!(err_gets.len(), 1, "expected 1 error audit line: {audit:?}");
+}
+
+/// Blocking byte reader fed by an `mpsc` channel so tests can keep a `keep_open` stream open and
+/// idle across timer expirations without OS pipe portability issues.
+struct ChannelReader {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        while self.pos >= self.buf.len() {
+            match self.rx.recv() {
+                Ok(chunk) => {
+                    self.buf = chunk;
+                    self.pos = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+#[test]
+fn keep_open_idle_audit_flushes_on_timer_and_session_exits_on_idle_timeout() {
+    use std::time::{Duration, Instant};
+
+    let node = Node::new();
+    fs::create_dir_all(node.home().join("projects/src")).unwrap();
+    fs::write(
+        node.home().join("projects/src/clip.bin"),
+        b"0123456789abcdefghijklmnopqrstuvwxyz",
+    )
+    .unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let host = node.host.clone();
+    let options = StreamServeOptions {
+        audit_coalesce_window: Duration::from_millis(120),
+        keep_open_idle_timeout: Duration::from_millis(450),
+        ..StreamServeOptions::default()
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let res = serve_with_options(
+            &host,
+            None,
+            Door::Stream,
+            None,
+            options,
+            ChannelReader {
+                rx,
+                buf: Vec::new(),
+                pos: 0,
+            },
+            &mut output,
+        );
+        let _ = done_tx.send(res);
+    });
+
+    // Send two ranged gets, then hold stdin open and idle.
+    for (offset, length) in [(0, 10), (10, 6)] {
+        let line = format!(
+            "{}\n",
+            json!({
+                "protocol": 1,
+                "op": "get",
+                "path": "~/projects/src/clip.bin",
+                "offset": offset,
+                "length": length,
+                "keep_open": true,
+            })
+        );
+        tx.send(line.into_bytes()).unwrap();
+    }
+
+    // Before idle timeout fires, the periodic audit flush writes the coalesced entry while the
+    // stream is still open and idle.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let ok_gets: Vec<Value> = node
+            .audit()
+            .into_iter()
+            .filter(|e| e["tool"] == "stream.get" && e["outcome"] == "ok")
+            .collect();
+        if !ok_gets.is_empty() {
+            assert_eq!(ok_gets.len(), 1, "{ok_gets:?}");
+            assert_eq!(ok_gets[0]["args"]["requests"], 2);
+            assert_eq!(ok_gets[0]["args"]["bytes_served"], 16);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "coalesced stream.get audit was not flushed on timer while idle"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Even while `tx` stays open, the server-side idle timeout exits cleanly.
+    let result = done_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("keep_open stream did not exit after keep_open_idle_timeout");
+    assert!(result.is_ok(), "{result:?}");
+    drop(tx);
+    server.join().unwrap();
+}
+
+#[test]
+fn keep_open_flushes_pending_audit_on_shutdown() {
+    use std::time::Duration;
+
+    let node = Node::new();
+    fs::create_dir_all(node.home().join("projects/src")).unwrap();
+    fs::write(node.home().join("projects/src/a.bin"), b"abcdefghij").unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let shutdown = legion_core::CancellationToken::new();
+    let host = node.host.clone();
+    let options = StreamServeOptions {
+        audit_coalesce_window: Duration::from_secs(60),
+        keep_open_idle_timeout: Duration::from_secs(120),
+        shutdown: Some(shutdown.clone()),
+        ..StreamServeOptions::default()
+    };
+    let server = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        serve_with_options(
+            &host,
+            None,
+            Door::Stream,
+            None,
+            options,
+            ChannelReader {
+                rx,
+                buf: Vec::new(),
+                pos: 0,
+            },
+            &mut output,
+        )
+    });
+
+    let line = format!(
+        "{}\n",
+        json!({
+            "protocol": 1,
+            "op": "get",
+            "path": "~/projects/src/a.bin",
+            "offset": 0,
+            "length": 10,
+            "keep_open": true,
+        })
+    );
+    tx.send(line.into_bytes()).unwrap();
+    std::thread::sleep(Duration::from_millis(80));
+    // Trigger shutdown while stdin is still open and audit window has not elapsed.
+    shutdown.cancel();
+    let res = server.join().unwrap();
+    assert!(res.is_ok(), "{res:?}");
+    drop(tx);
+
+    let ok_gets: Vec<Value> = node
+        .audit()
+        .into_iter()
+        .filter(|e| e["tool"] == "stream.get" && e["outcome"] == "ok")
+        .collect();
+    assert_eq!(ok_gets.len(), 1, "{ok_gets:?}");
+    assert_eq!(ok_gets[0]["args"]["requests"], 1);
+    assert_eq!(ok_gets[0]["args"]["bytes_served"], 10);
+}
+
+#[test]
+fn mid_stream_policy_revocation_stops_long_get() {
+    use std::time::Duration;
+
+    let node = Node::new();
+    let projects = node.home().join("projects/src");
+    fs::create_dir_all(&projects).unwrap();
+    let payload = vec![0x5Au8; 512 * 1024];
+    fs::write(projects.join("big.bin"), &payload).unwrap();
+
+    node.policy(
+        r#"
+default = "owner"
+
+[principals.reader]
+role = "reader"
+
+[roles.reader]
+allow = ["fs.read"]
+paths = ["~/projects/**"]
+"#,
+    );
+
+    // Writer that revokes `reader`'s policy once 128 KiB have been streamed out.
+    struct RevokingWriter {
+        policy_path: PathBuf,
+        written: usize,
+        revoked: bool,
+        sink: Vec<u8>,
+    }
+
+    impl io::Write for RevokingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.sink.extend_from_slice(buf);
+            self.written += buf.len();
+            if !self.revoked && self.written >= 128 * 1024 {
+                self.revoked = true;
+                fs::write(
+                    &self.policy_path,
+                    "default = \"owner\"\n\n[principals.reader]\nrole = \"none\"\n\n[roles.none]\nallow = []\n",
+                )?;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let req = format!(
+        "{}\n",
+        json!({
+            "protocol": 1,
+            "op": "get",
+            "path": "~/projects/src/big.bin",
+            "offset": 0,
+            "keep_open": true,
+        })
+    );
+    let mut writer = RevokingWriter {
+        policy_path: node.config().join("policy.toml"),
+        written: 0,
+        revoked: false,
+        sink: Vec::new(),
+    };
+    let options = StreamServeOptions {
+        recheck_bytes: 128 * 1024,
+        recheck_interval: Duration::from_secs(60),
+        ..StreamServeOptions::default()
+    };
+    let err = serve_with_options(
+        &node.host,
+        Some("reader"),
+        Door::Stream,
+        None,
+        options,
+        Cursor::new(req.into_bytes()),
+        &mut writer,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Denied, "{err}");
+    assert!(
+        writer.written < payload.len(),
+        "expected get to stop before full payload ({} bytes), wrote {}",
+        payload.len(),
+        writer.written
+    );
 }

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, classify_io};
 use crate::hash::{Hash, hash_file};
+use crate::manifest::Timestamp;
 use crate::path::validate_target_filename;
 use crate::platform;
 
@@ -58,21 +59,45 @@ pub fn resume_offset(target: &Path) -> Result<u64> {
     }
 }
 
-/// Open handle to a source file ready to stream from a validated byte offset.
+/// Open handle to a source file ready to stream a bounded byte range from a validated offset.
 ///
-/// Splitting open from stream lets callers inspect [`Self::size`] (captured via `fstat` on the
-/// opened descriptor) and emit a response header before writing raw file bytes onto a pipe.
+/// Splitting open from stream lets callers inspect [`Self::size`], [`Self::length`], and
+/// [`Self::mtime`] (captured via `fstat` on the opened descriptor) and emit a response header
+/// before writing raw file bytes onto a pipe.
 #[derive(Debug)]
 pub struct GetStream {
     path: PathBuf,
     file: File,
     size: u64,
     offset: u64,
+    length: u64,
+    mtime: Timestamp,
+    file_id: Option<u64>,
+}
+
+/// Failure returned by [`GetStream::stream_to_checked`].
+#[derive(Debug)]
+pub enum StreamCheckedError<E> {
+    /// Underlying file or transfer I/O error.
+    Xfer(Error),
+    /// Caller's periodic check aborted the stream before completion.
+    Aborted(E),
 }
 
 impl GetStream {
-    /// Opens `path`, verifies it is a regular file with `offset <= size`, and seeks to `offset`.
+    /// Opens `path`, verifies it is a regular file with `offset <= size`, and seeks to `offset`,
+    /// streaming through the end of the file.
     pub fn open(path: &Path, offset: u64) -> Result<Self> {
+        Self::open_range(path, offset, None)
+    }
+
+    /// Opens `path` as a regular file, validates `offset <= size`, clamps `length` (when given) to
+    /// `size - offset`, and seeks to `offset`.
+    ///
+    /// Returns [`Error::BadOffset`] when `offset > size` and [`Error::Conflict`] when `path` is
+    /// not a regular file. A `length` of `Some(0)` with `offset <= size` succeeds and streams zero
+    /// bytes, allowing callers to inspect `size` and `mtime` without transferring file data.
+    pub fn open_range(path: &Path, offset: u64, length: Option<u64>) -> Result<Self> {
         let mut file = File::open(path).map_err(|e| classify_io(path, e))?;
         let meta = file.metadata().map_err(|e| classify_io(path, e))?;
         if !meta.is_file() {
@@ -91,6 +116,14 @@ impl GetStream {
             });
         }
 
+        let available = size - offset;
+        let actual_length = match length {
+            Some(requested) => requested.min(available),
+            None => available,
+        };
+        let mtime = Timestamp::from_metadata(&meta);
+        let file_id = platform::file_id(&meta);
+
         if offset > 0 {
             file.seek(SeekFrom::Start(offset))
                 .map_err(|e| classify_io(path, e))?;
@@ -101,6 +134,9 @@ impl GetStream {
             file,
             size,
             offset,
+            length: actual_length,
+            mtime,
+            file_id,
         })
     }
 
@@ -114,50 +150,102 @@ impl GetStream {
         self.offset
     }
 
-    /// Returns the exact number of bytes [`Self::stream_to`] will emit (`size - offset`).
-    pub fn remaining(&self) -> u64 {
-        self.size - self.offset
+    /// Returns the exact number of bytes [`Self::stream_to`] will emit.
+    pub fn length(&self) -> u64 {
+        self.length
     }
 
-    /// Streams exactly `size - offset` bytes into `writer` and returns the byte count written.
+    /// Returns the file's modification time captured via `fstat` when opened.
+    pub fn mtime(&self) -> Timestamp {
+        self.mtime
+    }
+
+    /// Returns a platform file identity (derived from device and inode on Unix) when available.
+    pub fn file_id(&self) -> Option<u64> {
+        self.file_id
+    }
+
+    /// Returns the exact number of bytes [`Self::stream_to`] will emit.
+    pub fn remaining(&self) -> u64 {
+        self.length
+    }
+
+    /// Streams exactly [`Self::length`] bytes into `writer` and returns the byte count written.
     ///
-    /// If the file grows after opening, reads stop at `size` so framed protocols stay aligned. If
-    /// the file shrinks before `size - offset` bytes are read, returns [`Error::Conflict`].
-    pub fn stream_to<W: Write>(self, mut writer: W) -> Result<u64> {
-        let remaining = self.remaining();
+    /// If the file grows after opening, reads stop at `length` so framed protocols stay aligned. If
+    /// the file shrinks before `length` bytes are read, returns [`Error::Conflict`].
+    pub fn stream_to<W: Write>(self, writer: W) -> Result<u64> {
+        match self.stream_to_checked(writer, |_| Ok::<(), std::convert::Infallible>(())) {
+            Ok(written) => Ok(written),
+            Err(StreamCheckedError::Xfer(err)) => Err(err),
+            Err(StreamCheckedError::Aborted(never)) => match never {},
+        }
+    }
+
+    /// Streams [`Self::length`] bytes into `writer`, invoking `check(bytes_written)` before each
+    /// chunk after the first so callers can re-verify authorization or cancellation during long
+    /// reads and stop streaming immediately on failure.
+    pub fn stream_to_checked<W, E, F>(
+        self,
+        mut writer: W,
+        mut check: F,
+    ) -> std::result::Result<u64, StreamCheckedError<E>>
+    where
+        W: Write,
+        F: FnMut(u64) -> std::result::Result<(), E>,
+    {
+        let remaining = self.length;
+        if remaining == 0 {
+            writer
+                .flush()
+                .map_err(|e| StreamCheckedError::Xfer(e.into()))?;
+            return Ok(0);
+        }
         let mut limited = self.file.take(remaining);
         let mut buf = vec![0u8; STREAM_BUFFER_SIZE];
         let mut written = 0u64;
 
         loop {
+            if written > 0 {
+                check(written).map_err(StreamCheckedError::Aborted)?;
+            }
             let n = limited
                 .read(&mut buf)
-                .map_err(|e| classify_io(&self.path, e))?;
+                .map_err(|e| StreamCheckedError::Xfer(classify_io(&self.path, e)))?;
             if n == 0 {
                 break;
             }
-            writer.write_all(&buf[..n])?;
+            writer
+                .write_all(&buf[..n])
+                .map_err(|e| StreamCheckedError::Xfer(e.into()))?;
             written += n as u64;
         }
-        writer.flush()?;
+        writer
+            .flush()
+            .map_err(|e| StreamCheckedError::Xfer(e.into()))?;
 
         if written < remaining {
-            return Err(Error::Conflict {
+            return Err(StreamCheckedError::Xfer(Error::Conflict {
                 path: self.path,
                 reason: format!(
                     "file shrank while streaming: expected {remaining} bytes from offset {}, read {written}",
                     self.offset
                 ),
-            });
+            }));
         }
 
         Ok(written)
     }
 }
 
-/// Opens `path` at `offset` for two-phase size inspection and bounded streaming.
+/// Opens `path` at `offset` for two-phase size inspection and bounded streaming to the end.
 pub fn open_get(path: &Path, offset: u64) -> Result<GetStream> {
     GetStream::open(path, offset)
+}
+
+/// Opens `path` at `offset` for up to `length` bytes (or to the end when `None`).
+pub fn open_get_range(path: &Path, offset: u64, length: Option<u64>) -> Result<GetStream> {
+    GetStream::open_range(path, offset, length)
 }
 
 /// Streams the bytes of `path` starting at `offset` into `writer` and returns the total file size.
@@ -626,6 +714,75 @@ mod tests {
 
         let mut sink = Vec::new();
         let err = handle.stream_to(&mut sink).unwrap_err();
+        assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn open_get_range_slices_clamps_handles_zero_and_shrinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range.bin");
+        let data: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+        fs::write(&path, &data).unwrap();
+        let expected_mtime = Timestamp::from_metadata(&fs::metadata(&path).unwrap());
+
+        // Bounded middle slice.
+        let stream = open_get_range(&path, 100, Some(250)).unwrap();
+        assert_eq!(stream.size(), 1024);
+        assert_eq!(stream.offset(), 100);
+        assert_eq!(stream.length(), 250);
+        assert_eq!(stream.remaining(), 250);
+        assert_eq!(stream.mtime(), expected_mtime);
+        let mut out = Vec::new();
+        assert_eq!(stream.stream_to(&mut out).unwrap(), 250);
+        assert_eq!(out, &data[100..350]);
+
+        // Length extending past EOF clamps to available bytes.
+        let stream = open_get_range(&path, 900, Some(500)).unwrap();
+        assert_eq!(stream.size(), 1024);
+        assert_eq!(stream.offset(), 900);
+        assert_eq!(stream.length(), 124);
+        let mut out = Vec::new();
+        assert_eq!(stream.stream_to(&mut out).unwrap(), 124);
+        assert_eq!(out, &data[900..]);
+
+        // Length 0 succeeds without transferring bytes, even at offset == size.
+        let stream = open_get_range(&path, 0, Some(0)).unwrap();
+        assert_eq!(stream.size(), 1024);
+        assert_eq!(stream.length(), 0);
+        let mut out = Vec::new();
+        assert_eq!(stream.stream_to(&mut out).unwrap(), 0);
+        assert!(out.is_empty());
+
+        let stream = open_get_range(&path, 1024, Some(10)).unwrap();
+        assert_eq!(stream.offset(), 1024);
+        assert_eq!(stream.length(), 0);
+        let mut out = Vec::new();
+        assert_eq!(stream.stream_to(&mut out).unwrap(), 0);
+
+        // Offset past EOF returns BadOffset even when length is 0.
+        let err = open_get_range(&path, 1025, Some(0)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::BadOffset {
+                    requested: 1025,
+                    actual: 1024,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        // Shrinking inside the requested range fails with Conflict.
+        let stream = open_get_range(&path, 100, Some(300)).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(200)
+            .unwrap();
+        let mut sink = Vec::new();
+        let err = stream.stream_to(&mut sink).unwrap_err();
         assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
     }
 

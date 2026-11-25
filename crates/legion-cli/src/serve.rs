@@ -14,7 +14,7 @@ pub const HELP: &str = "\
 Usage: legion serve [--listen ADDRESS]
 
 Serves the Legion web interface at / and this machine's tools over HTTP to anything holding a \
-token from `legion token add`: GET /v1/tools, POST /v1/call and MCP at /mcp. Set `[serve] ui = false` \
+token from `legion token add`: GET /v1/tools, POST /v1/call, POST /v1/content and MCP at /mcp. Set `[serve] ui = false` \
 in node.toml to turn off the web interface.
 It listens on a loopback address only (127.0.0.1:7117 unless --listen says otherwise), and \
 refuses any other, so nothing beyond this machine can reach it on its own.
