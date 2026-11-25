@@ -30,8 +30,11 @@ code disagree, the code is wrong or this document is out of date; fix one of the
   holds the file, as today. Sync is pull-only: a node fetches what it lacks from a peer that
   agrees the folder is shared with it.
 - **Nothing is lost quietly.** Moving removes the source only after the destination's hash
-  matches. Sync never deletes; it moves to the folder's bin. Two versions of one file are both
-  kept.
+  matches. Sync never deletes bytes it did not write itself: anything moved out of a person's tree
+  is identified by hash and either moved to the folder's bin (when it matches the indexed version)
+  or kept as a conflict copy beside its path (when it is an unseen local save). Only staged
+  downloads proven by a write-ahead record are unlinked from `.legion-sync/tmp`. Two versions of
+  one file are both kept.
 - **Plain words.** Folder, picture, video, music, document, bin, "kept in sync". Paths, hashes
   and tool names appear only with Technical details on.
 
@@ -267,16 +270,23 @@ always-on machine) simply makes that happen sooner for everyone.
   on to B when B comes on while A is off.
 - A file deleted on one member is moved to the bin on the others, not erased. The bin
   (`.legion-sync/bin` inside the folder) uses random per-entry ids unique across restarts and is
-  emptied after 30 days by default, never expiring while the local clock is implausible.
+  emptied after 30 days by default, never expiring while the local clock is implausible. If two
+  members pick opposite sides of a conflict while apart, one version wins the filename and the
+  other moves to the bin on both machines, where it remains recoverable.
 - If two members changed the same file while apart, both versions are kept: the newer keeps the
   name, the other becomes `name (changed on <machine> <date>, <hash6>).ext` as a new, independent
   file, and the folder says it has a file with two versions until someone picks. Sync never
   replaces a live conflict copy with different content without a person acting.
 - A file deleted on one member and changed on another comes back changed.
-- A member that was off for months does not bring deleted files back.
+- A deletion is remembered as long as one member that saw it still has its index or its folder's
+  `.legion-sync`. A member that was off for months does not bring deleted files back while any
+  member remembers the deletion.
 - Scanning never invents deletions for unreadable directories, an unmounted or replaced folder
-  (checked via `.legion-sync/marker.json`), or a sudden mass disappearance (which pauses under a
-  deletion brake and asks whether the files are really deleted or should be rescanned).
+  (checked via `.legion-sync/marker.json`), a damaged or missing index beside an existing folder
+  (which stops cleanly with `"This folder's sync record is damaged. Nothing was changed."` until
+  rebuilt explicitly from disk), or a mass disappearance (outbound moves are recognized, unmatched
+  deletions settle and are counted over a rolling window, and both outbound and inbound mass
+  deletions pause under a deletion brake to ask a person how to proceed).
 - Joining with files already on disk (a new member with an old copy, a restored backup, a
   reinstall with files kept, or a removed-and-re-added member) never lets stale files silently
   win or resurrect deletions: equal content merges quietly, known stale versions are replaced and
@@ -286,23 +296,38 @@ always-on machine) simply makes that happen sooner for everyone.
 ### How
 
 - **Records and incarnations.** Each member keeps a versioned index of the folder (refusing newer
-  index schema versions cleanly): per path a record of kind, size, modification time, BLAKE3 hash,
-  whether it is deleted, a short ancestry of recent content hashes (up to 16; deletion records keep
-  the hash they deleted), and a version vector keyed by `(member, incarnation)`. Each index has a
-  random non-zero incarnation id exchanged on every handshake and page; counters and sequence
-  numbers are per `(member, incarnation)`. A local change bumps this member's counter. Comparing
-  two records gives newer, older, equal or concurrent; concurrent with equal content merges
-  quietly, concurrent with different content is the two-versions case above. If a member detects
-  that it rolled back or reinstalled (a peer reports having seen a higher or diverging sequence
-  for its incarnation, or its marker and index disagree), it starts a fresh incarnation rather
-  than reusing counters and reconciles its disk by the join rule above. Two live machines using
-  the same member id (alternating incarnations or diverging at the same sequence) are detected and
-  reported as a problem rather than synced.
-- **Direct acknowledgements.** Each member reports only what it has itself pulled from the caller
-  (never third-party hearsay about another member). A deletion record is discarded only after
-  every other current member has directly acknowledged this member's `(incarnation, seq)` past it.
-  Deleted content hashes are also kept in a durable deleted-history table so a later re-added
-  member with an old copy cannot resurrect a file whose tombstone was already collected.
+  index schema versions cleanly, running an integrity check on open, and catching storage panics at
+  the engine boundary): per path a record of kind, size, modification time, BLAKE3 hash, whether it
+  is deleted, a short ancestry of recent content hashes (up to 16; deletion records keep the hash
+  they deleted), and a version vector keyed by `(member, incarnation)`. Opening a missing or empty
+  index beside an existing folder marker and non-empty folder (or non-empty deletion log) stops in
+  a damaged-index state without touching disk until an explicit rebuild-from-disk recreates the
+  index, restores bin sidecars, and replays `.legion-sync/deletions.log`. Each index has a random
+  non-zero incarnation id; counters and sequence numbers are per `(member, incarnation)`. A local
+  change bumps this member's counter. Comparing two records gives newer, older, equal or
+  concurrent; concurrent with equal content merges quietly, concurrent with different content is
+  the two-versions case above. Every pull begins with a bidirectional handshake carrying
+  `(incarnation, seq, chained_fingerprint)` in both directions before any page moves, backed by a
+  dense per-sequence chained digest table pruned only below the minimum direct acknowledgement
+  across other members (a peer asking about a pruned sequence is detected as having rolled back).
+  If a member detects that it rolled back or reinstalled, it starts a fresh incarnation (carrying
+  existing tombstones and `.legion-sync/deletions.log` forward) rather than reusing counters and
+  reconciles its disk by the join rule above; peer-forced rotations are rate-limited to at most
+  once per hour per peer and reported as problems. Two live machines using the same member id
+  (alternating incarnations or diverging at the same sequence) are detected and reported as a
+  problem rather than synced.
+- **Direct acknowledgements.** Each member tracks two numbers per peer: its pull position (`seq`)
+  and its applied acknowledgement (`applied_ack_seq`), which never advances past the oldest
+  unapplied record (whether held back, deferred, invalid, or waiting on an unknown member). Each
+  member reports only what it has itself pulled and applied from the caller (never third-party
+  hearsay about another member). Unapplied records, deferrals, and problems are durable across
+  restarts; a syntactically valid member name not yet in the local member list is treated as "not
+  yet" (held back unacknowledged and retried on open, membership changes, and pulls) rather than
+  discarded as invalid. A deletion record is discarded — and `.legion-sync/deletions.log` compacted
+  — only after every other current member has directly acknowledged applied state past this
+  member's `(incarnation, seq)`. Deleted content hashes are also kept in a durable deleted-history
+  table so a later re-added member with an old copy cannot resurrect a file whose tombstone was
+  already collected.
 - **Scanning and the deletion brake.** Before every scan and apply, the engine checks
   `.legion-sync/marker.json` (folder id, member id, incarnation); a missing or mismatched marker
   with a non-empty index stops that member with a readable problem and records no deletions. A
@@ -310,25 +335,41 @@ always-on machine) simply makes that happen sooner for everyone.
   `ReadDirectoryChangesW`, rescanned incrementally by subtree) and by a full scan on start and
   every so often (with an optional full-checksum pass). A file still being written (changing
   between two looks) waits. Nothing under an unreadable or skipped path is ever recorded as
-  deleted, and sync of that subtree waits. If one scan would delete more than 50 files and more
-  than a quarter of the folder's live files, the member pauses and asks a person either to confirm
-  the deletions or to rescan.
+  deleted, and sync of that subtree waits. The outbound deletion brake is move-aware: same-scan and
+  cross-scan moves matched by content hash do not count as deletions, unmatched deletions on
+  brake-eligible folders wait 30 seconds to settle before emitting tombstones, and distinct
+  deletions are counted across a 10-minute rolling window (catching mass deletions split across
+  subtree scans). If the window crosses more than 50 files and more than a quarter of the folder's
+  live files, the member pauses and asks a person either to confirm the deletions or to rescan. A
+  matching inbound peer deletion brake checks incoming deletions over the same rolling window
+  before touching local disk: if one peer's changes would delete above the threshold, only that
+  peer is paused while a person chooses whether to apply the deletions or keep this machine's files
+  (re-asserting them as newer).
 - **Pulling and safe replacement.** A member handshakes and asks a peer for the records it has not
-  seen (`sync.index`, by `(incarnation, seq)`), validates and bounds every page and record (one
-  bad record is skipped and reported without stalling the peer; conflict copy member names come
-  strictly from the folder's member list; conflict status is derived locally rather than trusted
-  from peers), and fetches each file through the bulk pipe into `.legion-sync/tmp` with timeouts,
-  cancellation, ranged resume, and a hard read cap of declared size plus one byte. A delete plus
-  create sharing an already-local hash is applied as a local rename with no download; clean new
-  files in a page are group-committed per page. Every replace or delete uses non-replacing renames
-  or atomic swaps (`renameat2` with `RENAME_NOREPLACE`/`RENAME_EXCHANGE`, `renamex_np`,
-  `ReplaceFileW`/`MoveFileExW`, with a claim-then-rename fallback), verifies the displaced file's
-  hash before moving it to `.legion-sync/bin`, and brackets mutations — including bin restore and
-  conflict resolution — with write-ahead records. Mid-apply errors recover immediately. A deleted
-  directory holding only fixed OS litter (`.DS_Store`, `Thumbs.db`, `desktop.ini`) moves that
-  litter to the bin and removes the directory; one holding folder-ignored or held-back files stays,
-  is reported once, and the cursor advances. Deferrals are bounded and visible in status. Only
-  pulling means a node never writes to another node's disk.
+  seen (`sync.index`, by `(incarnation, seq)`), validates and bounds every page and record (invalid
+  or unauthorized records — including a peer forging this member's own counter above its local
+  clock or counters above `2^62` — are refused, reported durably, and never acknowledged; conflict
+  copy member names come strictly from the folder's member list; conflict status is derived locally
+  rather than trusted from peers), and fetches each file through the bulk pipe into
+  `.legion-sync/tmp` (proven by a write-ahead record before creation) with timeouts, cancellation,
+  ranged resume, and a hard read cap of declared size plus one byte. If the durable held-back list
+  reaches its cap (4,096 entries), pulling from that peer stops with a durable problem rather than
+  dropping entries; deferrals reaching their retry limit are promoted to durable unapplied
+  held-back records rather than dropped or acknowledged. A delete plus create sharing an
+  already-local hash is applied as a local rename with no download; clean new files in a page are
+  group-committed per page. Target timestamps and permissions are set on the staged file in
+  `.legion-sync/tmp` before placement. Every replace or delete uses non-replacing renames or atomic
+  swaps (`renameat2` with `RENAME_NOREPLACE`/`RENAME_EXCHANGE`, `renamex_np`,
+  `ReplaceFileW`/`MoveFileExW`, with a claim-then-rename fallback) with no blind swap-back: any
+  displaced file is verified by hash and moved to `.legion-sync/bin` if it matches the indexed
+  version or kept as a conflict copy beside its path if it is an unseen save. Post-placement file
+  stats are recorded only when live file identity still matches the staged file (otherwise the path
+  is marked for mandatory re-hashing on the next scan). Every mutation — including bin restore and
+  conflict resolution — is bracketed with write-ahead records, and mid-apply errors recover
+  immediately without deleting unknown bytes from `.legion-sync/tmp`. A deleted directory holding
+  only fixed OS litter (`.DS_Store`, `Thumbs.db`, `desktop.ini`) moves that litter to the bin and
+  removes the directory; one holding folder-ignored or held-back files stays, is reported once, and
+  the cursor advances. Only pulling means a node never writes to another node's disk.
 - **Serving.** A node serves a sync folder's records and files only to a fleet machine that the
   folder's definition lists as a member, only inside that folder's path, only while its folder
   marker is valid, and never the bin or the temporary directory.
@@ -347,25 +388,30 @@ always-on machine) simply makes that happen sooner for everyone.
   (under case folding and Unicode NFKC normalization), OS litter (`.DS_Store`, `Thumbs.db`,
   `desktop.ini`), and files Legion itself is still writing (`*.legion-part`, `.legion-*.tmp`).
   `.git` and editor or download temporary files are not fixed-ignored; put them in the folder's
-  own `ignore` globs when desired. Symbolic links are copied as links between Unix members and
-  held back on Windows. A name the destination cannot hold (case or Unicode normalization clash,
-  Windows reserved names or forbidden characters, over-long paths) is held back and listed as a
-  problem instead of being mangled, and the same path checks apply to bin restore and conflict
-  resolution destinations.
+  own `ignore` globs when desired. Only relative symbolic links whose resolved target stays
+  strictly inside the sync folder (and outside `.legion-sync`) are synced between Unix members;
+  absolute, escaping, or internal-targeting symbolic links — and all symbolic links on Windows —
+  are held back and listed as problems both outbound and inbound. A name the destination cannot
+  hold (case or Unicode normalization clash, Windows reserved names or forbidden characters,
+  over-long paths) is held back and listed as a problem instead of being mangled, and the same path
+  checks apply to bin restore and conflict resolution destinations.
 - **Limits and caveats said plainly.** Whole files are sent, not changed blocks. A phone is not a
-  member in this version; it browses, plays and downloads from the members. Because tombstone
-  collection requires direct acknowledgements from every current member, in topologies where two
-  members never connect directly (for example a strict chain where A and C only ever talk through
-  B) their deletion records remain in the index until they meet or a member is removed. Per-path
-  ancestry keeps the last 16 content hashes, so a joining member carrying a copy more than 16
-  edits behind a live file treats it as unknown content and preserves both as a conflict copy
-  rather than silently overwriting anything. On filesystems without an atomic file-exchange call,
-  the claim-then-rename fallback briefly leaves the replaced path absent between claiming the old
-  file and renaming the new one into place (a concurrent creation in that gap is caught by
-  non-replacing rename without data loss). Restoring a full machine backup and making more than
-  64 local sequence changes before reconnecting to any peer can outrun the rolling sequence
-  fingerprint window; rotating the folder marker or index when restoring backups guarantees
-  immediate detection.
+  member in this version; it browses, plays and downloads from the members. If two members resolve
+  the same conflict to opposite choices while apart, one version wins the filename and the other
+  moves to `.legion-sync/bin` on both machines (still recoverable from the bin). A deletion is
+  remembered as long as one member that saw it still has its index or its folder's `.legion-sync`;
+  if every member loses both, a later re-added member with an old copy can re-introduce the file.
+  Peer-forced incarnation rotations are rate-limited to at most once per hour per peer so a
+  misbehaving peer cannot trigger unbounded rotations. Because tombstone collection requires direct
+  applied acknowledgements from every current member, in topologies where two members never connect
+  directly (for example a strict chain where A and C only ever talk through B) their deletion
+  records remain in the index until they meet or a member is removed. Per-path ancestry keeps the
+  last 16 content hashes, so a joining member carrying a copy more than 16 edits behind a live file
+  treats it as unknown content and preserves both as a conflict copy rather than silently
+  overwriting anything. On filesystems without an atomic file-exchange call, the claim-then-rename
+  fallback briefly leaves the replaced path absent between claiming the old file and renaming the
+  new one into place (a concurrent creation in that gap is caught by non-replacing rename without
+  data loss).
 
 The engine is its own crate, `legion-sync`, with the file system and the peer behind traits, so
 it can be driven by a simulator: many members, mixed OS rules (case-insensitive and Unicode
