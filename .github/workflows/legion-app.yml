@@ -29,6 +29,14 @@ on:
           - ios
           - macos-desktop
           - windows-desktop
+      preview:
+        description: 'Also build preview desktop bundles and node binaries using vars.LEGION_PREVIEW_UPDATE_PUBKEY'
+        type: boolean
+        default: false
+      sequence:
+        description: '12-digit UTC YYYYMMDDHHMM build sequence (required when preview is true)'
+        type: string
+        default: ''
 permissions:
   contents: read
 # A newer push to a pull request or feature branch supersedes the run still going on it; every push
@@ -255,11 +263,21 @@ jobs:
     name: Linux desktop bundles
     if: github.event_name != 'workflow_dispatch' || inputs.job == 'all' || inputs.job == 'linux-desktop'
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Validate Linux preview build inputs
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.preview }}
+        env:
+          LEGION_PREVIEW_UPDATE_PUBKEY: ${{ vars.LEGION_PREVIEW_UPDATE_PUBKEY }}
+          LEGION_PREVIEW_SEQUENCE: ${{ inputs.sequence }}
+        run: |
+          node scripts/build-desktop-preview.mjs \
+            --check-only \
+            --os linux \
+            --sequence "$LEGION_PREVIEW_SEQUENCE"
       - name: Install Rust
         run: rustup toolchain install
       - name: Install Linux Tauri bundle and headless display dependencies
@@ -843,6 +861,26 @@ jobs:
           name: legion-linux-self-update-diag
           path: ci-diag/linux-self-update/
           if-no-files-found: ignore
+      - name: Build Linux preview bundles and node binary
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.preview }}
+        env:
+          LEGION_PREVIEW_UPDATE_PUBKEY: ${{ vars.LEGION_PREVIEW_UPDATE_PUBKEY }}
+          LEGION_PREVIEW_SEQUENCE: ${{ inputs.sequence }}
+          LEGION_PREVIEW_COMMIT: ${{ github.sha }}
+        run: |
+          node scripts/build-desktop-preview.mjs \
+            --os linux \
+            --sequence "$LEGION_PREVIEW_SEQUENCE" \
+            --commit "$LEGION_PREVIEW_COMMIT" \
+            --out ci-preview/linux \
+            --node-target-dir "$RUNNER_TEMP/linux-preview-node-target"
+      - name: Upload Linux preview artifact
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.preview }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: legion-linux-preview
+          path: ci-preview/linux/
+          if-no-files-found: error
 
   ios:
     name: iOS and iPadOS
@@ -1201,11 +1239,21 @@ jobs:
     name: macOS desktop bundle
     if: github.event_name != 'workflow_dispatch' || inputs.job == 'all' || inputs.job == 'macos-desktop'
     runs-on: macos-latest
-    timeout-minutes: 55
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Validate macOS preview build inputs
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.preview }}
+        env:
+          LEGION_PREVIEW_UPDATE_PUBKEY: ${{ vars.LEGION_PREVIEW_UPDATE_PUBKEY }}
+          LEGION_PREVIEW_SEQUENCE: ${{ inputs.sequence }}
+        run: |
+          node scripts/build-desktop-preview.mjs \
+            --check-only \
+            --os macos \
+            --sequence "$LEGION_PREVIEW_SEQUENCE"
       - name: Install Rust
         run: rustup toolchain install
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1687,16 +1735,49 @@ jobs:
           name: legion-macos-self-update-diag
           path: ci-diag/macos-self-update/
           if-no-files-found: ignore
+      - name: Build macOS preview bundle and node binary
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.preview }}
+        env:
+          LEGION_PREVIEW_UPDATE_PUBKEY: ${{ vars.LEGION_PREVIEW_UPDATE_PUBKEY }}
+          LEGION_PREVIEW_SEQUENCE: ${{ inputs.sequence }}
+          LEGION_PREVIEW_COMMIT: ${{ github.sha }}
+        run: |
+          node scripts/build-desktop-preview.mjs \
+            --os macos \
+            --sequence "$LEGION_PREVIEW_SEQUENCE" \
+            --commit "$LEGION_PREVIEW_COMMIT" \
+            --out ci-preview/macos \
+            --node-target-dir "$RUNNER_TEMP/macos-preview-node-target"
+      - name: Upload macOS preview artifact
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.preview }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: legion-macos-preview
+          path: ci-preview/macos/
+          if-no-files-found: error
 
   windows-desktop:
     name: Windows desktop installer
     if: github.event_name != 'workflow_dispatch' || inputs.job == 'all' || inputs.job == 'windows-desktop'
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Validate Windows preview build inputs
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.preview }}
+        shell: pwsh
+        env:
+          LEGION_PREVIEW_UPDATE_PUBKEY: ${{ vars.LEGION_PREVIEW_UPDATE_PUBKEY }}
+          LEGION_PREVIEW_SEQUENCE: ${{ inputs.sequence }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node scripts/build-desktop-preview.mjs `
+            --check-only `
+            --os windows `
+            --sequence "$env:LEGION_PREVIEW_SEQUENCE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Install Rust
         run: rustup toolchain install
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -2232,3 +2313,26 @@ jobs:
           name: legion-windows-self-update-diag
           path: ci-diag/windows-self-update/
           if-no-files-found: ignore
+      - name: Build Windows preview installer and node binary
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.preview }}
+        shell: pwsh
+        env:
+          LEGION_PREVIEW_UPDATE_PUBKEY: ${{ vars.LEGION_PREVIEW_UPDATE_PUBKEY }}
+          LEGION_PREVIEW_SEQUENCE: ${{ inputs.sequence }}
+          LEGION_PREVIEW_COMMIT: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node scripts/build-desktop-preview.mjs `
+            --os windows `
+            --sequence "$env:LEGION_PREVIEW_SEQUENCE" `
+            --commit "$env:LEGION_PREVIEW_COMMIT" `
+            --out ci-preview/windows `
+            --node-target-dir (Join-Path $env:RUNNER_TEMP 'windows-preview-node-target')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload Windows preview artifact
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.preview }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: legion-windows-preview
+          path: ci-preview/windows/
+          if-no-files-found: error
