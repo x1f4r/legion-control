@@ -51,6 +51,7 @@ jobs:
         run: rustup toolchain install
       - name: Install Linux WebKitGTK and GTK build dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends \
             libwebkit2gtk-4.1-dev \
@@ -61,6 +62,13 @@ jobs:
             libxdo-dev \
             patchelf \
             build-essential
+          if [ ! -x /usr/sbin/sshd ] && ! command -v sshd >/dev/null 2>&1; then
+            # Keep the system sshd service stopped; tests spawn throwaway loopback instances.
+            printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+            sudo chmod 755 /usr/sbin/policy-rc.d
+            sudo apt-get install -y -q --no-install-recommends openssh-server
+            sudo rm -f /usr/sbin/policy-rc.d
+          fi
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -68,10 +76,19 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             apps/legion-app/src-tauri/target/
-          key: legion-app-check-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'apps/legion-app/src-tauri/Cargo.lock') }}
-          restore-keys: legion-app-check-${{ runner.os }}-
+            target/
+          key: legion-app-check-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'apps/legion-app/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            legion-app-check-${{ runner.os }}-
+            cargo-${{ runner.os }}-
+      - name: Build legion binary for real-binary app tests
+        run: cargo build --locked --bin legion
       - name: Format, clippy and unit tests
+        env:
+          LEGION_BIN: ${{ github.workspace }}/target/debug/legion
+          LEGION_REQUIRE_REAL_BINARY: '1'
         run: |
+          set -euo pipefail
           cargo fmt --manifest-path apps/legion-app/src-tauri/Cargo.toml -- --check
           cargo clippy --manifest-path apps/legion-app/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
           cargo test --manifest-path apps/legion-app/src-tauri/Cargo.toml --locked

@@ -49,6 +49,12 @@ impl Home {
         let dir = if let Some(base) = option_env!("CARGO_TARGET_TMPDIR") {
             let base_path = PathBuf::from(base);
             std::fs::create_dir_all(&base_path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&base_path, std::fs::Permissions::from_mode(0o700));
+            }
             tempfile::tempdir_in(&base_path).unwrap()
         } else {
             tempfile::tempdir().unwrap()
@@ -272,4 +278,20 @@ impl Drop for Session {
 pub fn ends_with(path: &str, parts: &[&str]) -> bool {
     let tail: PathBuf = parts.iter().collect();
     Path::new(path).ends_with(tail)
+}
+
+/// Returns `true` when `LEGION_REQUIRE_REAL_BINARY` is set to a truthy value so CI turns skipped
+/// real-binary / `sshd` tests into failures.
+pub fn require_real_binary() -> bool {
+    let Some(raw) = std::env::var_os("LEGION_REQUIRE_REAL_BINARY") else {
+        return false;
+    };
+    let Some(text) = raw.to_str() else {
+        return false;
+    };
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && !trimmed.eq_ignore_ascii_case("0")
+        && !trimmed.eq_ignore_ascii_case("false")
+        && !trimmed.eq_ignore_ascii_case("no")
 }
