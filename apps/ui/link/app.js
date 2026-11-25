@@ -93,12 +93,38 @@ function isIosPlatform() {
   return navigator.platform === 'MacIntel' && Number(navigator.maxTouchPoints || 0) > 1;
 }
 
+function isAndroidPlatform() {
+  if (typeof navigator === 'undefined') return false;
+  return /Android/i.test(String(navigator.userAgent || ''));
+}
+
+/**
+ * Reports the real immersive implementation available on the current app platform.
+ * Returns `{ supported: false, mode: 'none' }` on mobile platforms whenever the native bridge is
+ * absent rather than falling through to the desktop Tauri command.
+ */
+export function detectAppImmersiveCapability({
+  hasAndroidBridge = false,
+  isAndroid = false,
+  hasIosHandler = false,
+  isIos = false,
+  hasTauriCore = false,
+} = {}) {
+  if (hasAndroidBridge) return { supported: true, mode: 'android' };
+  if (isAndroid) return { supported: false, mode: 'none' };
+  if (hasIosHandler) return { supported: true, mode: 'ios' };
+  if (isIos) return { supported: false, mode: 'none' };
+  if (hasTauriCore) return { supported: true, mode: 'desktop' };
+  return { supported: false, mode: 'none' };
+}
+
 export function createAppLink() {
   const callPrefix = randomCallPrefix();
   let nextCallId = 1;
   let readySent = false;
   let selectedNode = '';
   const iosPlatform = isIosPlatform();
+  const androidPlatform = isAndroidPlatform();
   const unsupportedContentMachines = new Set();
   const contentSupportListeners = new Set();
 
@@ -1289,25 +1315,33 @@ export function createAppLink() {
     return handler && typeof handler.postMessage === 'function' ? handler : null;
   }
 
+  function currentImmersiveCap() {
+    return detectAppImmersiveCapability({
+      hasAndroidBridge: Boolean(androidBridge()),
+      isAndroid: androidPlatform,
+      hasIosHandler: Boolean(iosImmersiveHandler()),
+      isIos: iosPlatform,
+      hasTauriCore: Boolean(tauriCore()),
+    });
+  }
+
   function canImmersive() {
-    if (androidBridge()) return true;
-    if (iosImmersiveHandler()) return true;
-    if (iosPlatform) return false;
-    return Boolean(tauriCore());
+    return currentImmersiveCap().supported;
   }
 
   async function immersive(on, options = {}) {
     const active = Boolean(on);
     const orientation = typeof options?.orientation === 'string' ? options.orientation : 'none';
+    const cap = currentImmersiveCap();
 
-    const android = androidBridge();
-    if (android) {
+    if (cap.mode === 'android') {
+      const android = androidBridge();
       const ok = await Promise.resolve(android.setImmersive(active, orientation)).catch(() => false);
       return { active: Boolean(ok), mode: 'android' };
     }
 
-    const ios = iosImmersiveHandler();
-    if (ios) {
+    if (cap.mode === 'ios') {
+      const ios = iosImmersiveHandler();
       try {
         ios.postMessage({ type: 'immersive', on: active, orientation });
         return { active, mode: 'ios' };
@@ -1316,8 +1350,8 @@ export function createAppLink() {
       }
     }
 
-    if (iosPlatform) {
-      return { active: false, mode: 'ios' };
+    if (cap.mode !== 'desktop') {
+      return { active: false, mode: 'none' };
     }
 
     try {
@@ -1337,7 +1371,7 @@ export function createAppLink() {
   function onImmersiveChange(listener) {
     if (typeof listener !== 'function') return () => {};
     immersiveListeners.add(listener);
-    const isDesktop = !androidBridge() && !iosPlatform;
+    const isDesktop = currentImmersiveCap().mode === 'desktop';
     let onResize = null;
     if (isDesktop && typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
       onResize = () => {
@@ -1364,28 +1398,33 @@ export function createAppLink() {
 
   async function keepScreenOn(on) {
     const active = Boolean(on);
-    const android = androidBridge();
-    if (android && typeof android.setKeepScreenOn === 'function') {
-      try {
-        android.setKeepScreenOn(active);
-      } catch {
-        // Ignore bridge errors.
+    const cap = currentImmersiveCap();
+    if (cap.mode === 'android') {
+      const android = androidBridge();
+      if (typeof android?.setKeepScreenOn === 'function') {
+        try {
+          android.setKeepScreenOn(active);
+        } catch {
+          // Ignore bridge errors.
+        }
+        return active;
       }
-      return active;
+      return false;
     }
-    const ios = iosImmersiveHandler();
-    if (ios) {
+    if (cap.mode === 'ios') {
+      const ios = iosImmersiveHandler();
       try {
         ios.postMessage({ type: 'keep_screen_on', on: active });
+        return active;
       } catch {
-        // Ignore bridge errors.
+        return false;
       }
+    }
+    if (cap.mode === 'desktop') {
+      await invoke('set_keep_screen_on', { on: active }).catch(() => {});
       return active;
     }
-    if (!iosPlatform && tauriCore()) {
-      await invoke('set_keep_screen_on', { on: active }).catch(() => {});
-    }
-    return active;
+    return false;
   }
 
   const link = {

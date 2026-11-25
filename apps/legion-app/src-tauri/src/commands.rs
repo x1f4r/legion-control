@@ -189,6 +189,15 @@ pub struct ImmersiveResult {
     pub fullscreen: bool,
 }
 
+/// Result returned on mobile targets where desktop window full-screen is a no-op; a no-op must
+/// never claim `active: true`.
+pub fn mobile_noop_immersive_result() -> ImmersiveResult {
+    ImmersiveResult {
+        active: false,
+        fullscreen: false,
+    }
+}
+
 pub use crate::keep_screen_on::DesktopKeepScreenOn;
 
 /// Resets desktop immersive state when the page reloads, crashes, or the window closes/hides.
@@ -248,11 +257,8 @@ pub fn window_set_immersive(
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
-        let _ = (window, state);
-        Ok(ImmersiveResult {
-            active: on,
-            fullscreen: on,
-        })
+        let _ = (window, state, on);
+        Ok(mobile_noop_immersive_result())
     }
 }
 
@@ -1334,5 +1340,12 @@ mod tests {
         assert!(state.sync_external_fullscreen(false));
         assert!(!state.is_active());
         assert!(!state.leave());
+    }
+
+    #[test]
+    fn mobile_noop_immersive_always_reports_inactive() {
+        let res = mobile_noop_immersive_result();
+        assert!(!res.active);
+        assert!(!res.fullscreen);
     }
 }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { canBrowserImmersive, createBrowserImmersive } from '../immersive-browser.js';
+import { createAppLink, detectAppImmersiveCapability } from '../../link/app.js';
 import {
   buildMediaQueue,
   clampVolume,
@@ -723,4 +724,66 @@ test('createFullscreenController owns state, history entry, and external platfor
   assert.equal(idx, 0);
 
   ctrl.dispose();
+});
+
+test('detectAppImmersiveCapability and createAppLink report true only when a working implementation exists', async () => {
+  // Android without __LEGION_ANDROID__ must NEVER fall through to Tauri desktop core.
+  assert.deepEqual(
+    detectAppImmersiveCapability({ isAndroid: true, hasAndroidBridge: false, hasTauriCore: true }),
+    { supported: false, mode: 'none' },
+  );
+  assert.deepEqual(
+    detectAppImmersiveCapability({ isAndroid: true, hasAndroidBridge: true, hasTauriCore: true }),
+    { supported: true, mode: 'android' },
+  );
+  // iOS without message handler must NEVER fall through to Tauri desktop core.
+  assert.deepEqual(
+    detectAppImmersiveCapability({ isIos: true, hasIosHandler: false, hasTauriCore: true }),
+    { supported: false, mode: 'none' },
+  );
+  assert.deepEqual(
+    detectAppImmersiveCapability({ isIos: true, hasIosHandler: true, hasTauriCore: true }),
+    { supported: true, mode: 'ios' },
+  );
+  // Desktop needs Tauri core.
+  assert.deepEqual(
+    detectAppImmersiveCapability({ hasTauriCore: true }),
+    { supported: true, mode: 'desktop' },
+  );
+  assert.deepEqual(
+    detectAppImmersiveCapability({ hasTauriCore: false }),
+    { supported: false, mode: 'none' },
+  );
+
+  // Verify createAppLink on Android without bridge returns canImmersive() === false and
+  // immersive(true) === { active: false, mode: 'none' } without invoking desktop commands.
+  const prevWindow = globalThis.window;
+  const prevNavDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const invoked = [];
+  try {
+    globalThis.window = {
+      __TAURI__: {
+        core: {
+          invoke: async (cmd) => {
+            invoked.push(cmd);
+            return { active: false, fullscreen: false };
+          },
+        },
+      },
+    };
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36' },
+    });
+    const link = createAppLink();
+    assert.equal(link.canImmersive(), false);
+    const res = await link.immersive(true, { orientation: 'landscape' });
+    assert.deepEqual(res, { active: false, mode: 'none' });
+    assert.deepEqual(invoked, []);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevNavDesc) Object.defineProperty(globalThis, 'navigator', prevNavDesc);
+    else delete globalThis.navigator;
+  }
 });
