@@ -455,6 +455,105 @@ fn helper(args: &[String]) -> ExitCode {
             }
             exit_of(child.wait().unwrap())
         }
+        // Makes `probe_write` (create) inject `fs_locality: {"kind":"unknown",...}` (e.g. an
+        // unverified FUSE mount like `fuse.mergerfs`) so moves treat the directory pair as
+        // inconclusive instead of assuming local.
+        "unknown-fs-peer" if subcommand == "stream" => {
+            let mut input = BufReader::new(std::io::stdin());
+            let mut header = Vec::new();
+            input.read_until(b'\n', &mut header).unwrap();
+            let header_val: Value = serde_json::from_slice(&header).unwrap_or(Value::Null);
+            let is_probe_create = header_val["op"].as_str() == Some("probe_write")
+                && header_val["action"].as_str() == Some("create");
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(if is_probe_create {
+                    Stdio::piped()
+                } else {
+                    Stdio::inherit()
+                })
+                .spawn()
+                .unwrap();
+            let mut child_in = child.stdin.take().unwrap();
+            child_in.write_all(&header).unwrap();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut input, &mut child_in);
+            });
+            if is_probe_create {
+                let mut child_out = BufReader::new(child.stdout.take().unwrap());
+                let mut stdout = std::io::stdout().lock();
+                let mut line = String::new();
+                let mut idx = 0usize;
+                while child_out.read_line(&mut line).unwrap() > 0 {
+                    if idx == 1
+                        && let Ok(mut reply) = serde_json::from_str::<Value>(&line)
+                    {
+                        if let Some(obj) = reply.as_object_mut() {
+                            obj.remove("network_fs");
+                            obj.insert(
+                                "fs_locality".into(),
+                                json!({
+                                    "kind": "unknown",
+                                    "detail": "unverified FUSE filesystem (fuse.mergerfs)"
+                                }),
+                            );
+                        }
+                        writeln!(stdout, "{reply}").unwrap();
+                    } else {
+                        stdout.write_all(line.as_bytes()).unwrap();
+                    }
+                    stdout.flush().unwrap();
+                    line.clear();
+                    idx += 1;
+                }
+            }
+            exit_of(child.wait().unwrap())
+        }
+        // Drops a held `probe_write` connection right after sending the marker reply, before
+        // answering `"confirm\n"` with `{"held":true}` (simulating a marker disappearing or the
+        // peer crashing mid-probe). Move MUST treat this as inconclusive and keep the source.
+        "unconfirmed-probe-peer" if subcommand == "stream" => {
+            let mut input = BufReader::new(std::io::stdin());
+            let mut header = Vec::new();
+            input.read_until(b'\n', &mut header).unwrap();
+            let header_val: Value = serde_json::from_slice(&header).unwrap_or(Value::Null);
+            let is_held_probe = header_val["op"].as_str() == Some("probe_write")
+                && header_val["action"].as_str() == Some("create")
+                && header_val["hold"].as_bool() == Some(true);
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(if is_held_probe {
+                    Stdio::piped()
+                } else {
+                    Stdio::inherit()
+                })
+                .spawn()
+                .unwrap();
+            let mut child_in = child.stdin.take().unwrap();
+            child_in.write_all(&header).unwrap();
+            child_in.flush().unwrap();
+            if is_held_probe {
+                let mut child_out = BufReader::new(child.stdout.take().unwrap());
+                let mut stdout = std::io::stdout().lock();
+                // Forward greeting + ProbeReply, then immediately close the child's stdin and exit
+                // without sending any ProbeConfirm line.
+                for _ in 0..2 {
+                    let mut line = String::new();
+                    if child_out.read_line(&mut line).unwrap() == 0 {
+                        break;
+                    }
+                    stdout.write_all(line.as_bytes()).unwrap();
+                    stdout.flush().unwrap();
+                }
+                drop(child_in);
+                let _ = child.wait();
+                return ExitCode::SUCCESS;
+            }
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut input, &mut child_in);
+            });
+            exit_of(child.wait().unwrap())
+        }
         // Makes `probe_write` return `{dir: null, marker: null, exists: false}` so directory
         // distinctness cannot be proven (proving move fails safe and keeps both copies).
         "inconclusive-probe" if subcommand == "stream" => {
@@ -591,9 +690,16 @@ fn helper(args: &[String]) -> ExitCode {
         }
         // A source that does not keep to the protocol, in the way `extra[0]` names.
         "evil" if subcommand == "stream" => evil(&extra[0], Path::new(home), command),
-        "cut" | "cut-op" | "slow" | "evil" | "legacy-v1" | "hold-put" => {
-            exit_of(command.status().unwrap())
-        }
+        "cut"
+        | "cut-op"
+        | "slow"
+        | "evil"
+        | "legacy-v1"
+        | "hold-put"
+        | "network-fs-peer"
+        | "unknown-fs-peer"
+        | "unconfirmed-probe-peer"
+        | "inconclusive-probe" => exit_of(command.status().unwrap()),
         other => {
             eprintln!("unknown helper mode {other}");
             ExitCode::from(2)
@@ -4703,6 +4809,74 @@ fn move_tree_shared_subfolder_and_inconclusive_probe_keep_source() {
             r.contains("network file system") && r.contains("nfs")
         }),
         "expected network file system reason on identical-content move: {nfs_same}"
+    );
+
+    // 2c. Unknown filesystem locality (`fs_locality: {"kind":"unknown",...}`, e.g. `fuse.mergerfs`):
+    //     only proven-local filesystems may conclude distinctness; `Unknown` keeps the source and
+    //     states the reason.
+    let pi_unk = node("pi_unk");
+    fleet(&laptop, &[("pi_unk", &pi_unk, "unknown-fs-peer", vec![])]);
+    fs::write(laptop.home().join("unk_copy.txt"), b"unknown-fs-payload").unwrap();
+    let unk_moved = ok(&transfer(
+        &laptop,
+        json!({"from": "~/unk_copy.txt", "to": "pi_unk:~/unk_copy.txt", "move": true}),
+        &[],
+    ));
+    assert_eq!(unk_moved["files_sent"], 1, "{unk_moved}");
+    assert_eq!(
+        unk_moved["source_removed"].as_u64().unwrap_or(0),
+        0,
+        "unknown fs move must keep source: {unk_moved}"
+    );
+    assert_eq!(
+        fs::read(laptop.home().join("unk_copy.txt")).unwrap(),
+        b"unknown-fs-payload"
+    );
+    assert_eq!(
+        fs::read(pi_unk.home().join("unk_copy.txt")).unwrap(),
+        b"unknown-fs-payload"
+    );
+    assert!(
+        unk_moved["skipped"].as_array().unwrap().iter().any(|e| {
+            let r = e["reason"].as_str().unwrap_or("");
+            r.contains("fuse.mergerfs") && r.contains("local file system")
+        }),
+        "expected unknown fs reason in skipped: {unk_moved}"
+    );
+
+    // 2d. Unconfirmed held probe marker (peer exits without replying `{"held":true}` to
+    //     `"confirm\n"`): move treats the pair as inconclusive and keeps the source.
+    let pi_unconf = node("pi_unconf");
+    fleet(
+        &laptop,
+        &[("pi_unconf", &pi_unconf, "unconfirmed-probe-peer", vec![])],
+    );
+    fs::write(laptop.home().join("unconf_copy.txt"), b"unconfirmed-payload").unwrap();
+    let unconf_moved = ok(&transfer(
+        &laptop,
+        json!({"from": "~/unconf_copy.txt", "to": "pi_unconf:~/unconf_copy.txt", "move": true}),
+        &[],
+    ));
+    assert_eq!(unconf_moved["files_sent"], 1, "{unconf_moved}");
+    assert_eq!(
+        unconf_moved["source_removed"].as_u64().unwrap_or(0),
+        0,
+        "unconfirmed held probe must keep source: {unconf_moved}"
+    );
+    assert_eq!(
+        fs::read(laptop.home().join("unconf_copy.txt")).unwrap(),
+        b"unconfirmed-payload"
+    );
+    assert_eq!(
+        fs::read(pi_unconf.home().join("unconf_copy.txt")).unwrap(),
+        b"unconfirmed-payload"
+    );
+    assert!(
+        unconf_moved["skipped"].as_array().unwrap().iter().any(|e| {
+            let r = e["reason"].as_str().unwrap_or("");
+            r.contains("probe marker") && r.contains("not confirmed held")
+        }),
+        "expected unconfirmed probe reason in skipped: {unconf_moved}"
     );
 
     // 3. Real OS read-only destination subfolder (Unix): `already_verified` matches the file in

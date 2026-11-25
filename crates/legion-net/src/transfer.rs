@@ -50,9 +50,9 @@ use crate::connector::PipeHandle;
 use crate::pool::Fleet;
 use crate::stream::{
     self, CAP_IF_EXISTS, CAP_LOCK, CAP_MOVE, CAP_PROBE, CAP_RENAME, DeleteDone, FsNameBehavior,
-    GetReady, Host, LockEntry, LockReady, ManifestDone, PackReady, Planned, ProbeReply, PutDone,
-    PutReady, RenameDone, SameEntryDecision, StatReply, UnpackDone, UnpackReady,
-    classify_same_entry,
+    GetReady, Host, LockEntry, LockReady, ManifestDone, PackReady, Planned, ProbeConfirm,
+    ProbeFsLocality, ProbeReply, PutDone, PutReady, RenameDone, SameEntryDecision, StatReply,
+    UnpackDone, UnpackReady, classify_same_entry,
 };
 
 /// How many bytes the relay and the in-process pipes hold at once: memory stays bounded however
@@ -1400,13 +1400,40 @@ impl Transfer<'_> {
         }
     }
 
+    /// Confirms with a held `probe_write` stream that its marker stayed intact on disk for the
+    /// entire duration of `probe_read`, then closes the stream (which deletes the marker).
+    async fn confirm_held_probe(mut probe_conn: Conn) -> bool {
+        let confirmed = if probe_conn.write(b"confirm\n").await.is_ok() {
+            matches!(probe_conn.first::<ProbeConfirm>().await, Ok(ProbeConfirm { held: true }))
+        } else {
+            false
+        };
+        probe_conn.close().await;
+        confirmed
+    }
+
+    /// Formats a non-local filesystem locality into an inconclusive probe reason, returning `None`
+    /// only when the directory is provably [`ProbeFsLocality::Local`].
+    fn non_local_reason(dir: &str, machine: &str, locality: &ProbeFsLocality) -> Option<String> {
+        match locality {
+            ProbeFsLocality::Local => None,
+            ProbeFsLocality::Network(fs_kind) => Some(format!(
+                "{dir} on {machine} is on a network file system ({fs_kind}), so source and destination could not be proven distinct"
+            )),
+            ProbeFsLocality::Unknown(reason) => Some(format!(
+                "{dir} on {machine} could not be proven to sit on a local file system ({reason}), so source and destination could not be proven distinct"
+            )),
+        }
+    }
+
     /// Always probes `(from_dir, to_dir)` by creating a unique marker in `to_dir` and checking
     /// whether it appears in `from_dir`, caching conclusive results for the transfer.
     ///
-    /// Keeps the `probe_write` stream open with `hold: true` while `probe_read` runs so the marker
-    /// is removed automatically on close and tracked by an ownership flock if either process is
-    /// killed. Never treats an error or missing directory as distinct: returns
-    /// [`DirPairProof::Inconclusive`] so callers keep both the copy and the source.
+    /// Keeps the `probe_write` stream open with `hold: true` for as long as `probe_read` runs,
+    /// confirms after `probe_read` that the marker remained held the whole time, and concludes
+    /// distinctness or sameness **only** when both directories are provably [`ProbeFsLocality::Local`].
+    /// Never treats an error, network FS, unknown FS, or unconfirmed marker as distinct: returns
+    /// [`DirPairProof::Inconclusive`] so callers complete the copy and keep the source.
     async fn prove_dir_pair(
         &self,
         from: &End,
@@ -1451,6 +1478,7 @@ impl Transfer<'_> {
                 ));
             }
         };
+        let to_locality = created.effective_locality();
         let (Some(_probe_dir), Some(marker)) = (created.dir, created.marker) else {
             probe_conn.close().await;
             return DirPairProof::Inconclusive(format!(
@@ -1470,23 +1498,26 @@ impl Transfer<'_> {
                 &[CAP_PROBE],
             )
             .await;
-        // Closing the held `probe_write` stream signals it to unlink the marker and exit cleanly.
-        probe_conn.close().await;
-        let to_network_fs = created.network_fs;
+        let held_confirmed = Self::confirm_held_probe(probe_conn).await;
+        if !held_confirmed {
+            return DirPairProof::Inconclusive(format!(
+                "probe marker in {} on {} was not confirmed held for the entire directory check",
+                to_dir, to.machine
+            ));
+        }
         match check_res {
             Ok(reply) => {
-                let proof = if reply.exists {
+                let from_locality = reply.effective_locality();
+                let proof = if let Some(reason) =
+                    Self::non_local_reason(to_dir, &to.machine, &to_locality)
+                {
+                    DirPairProof::Inconclusive(reason)
+                } else if let Some(reason) =
+                    Self::non_local_reason(from_dir, &from.machine, &from_locality)
+                {
+                    DirPairProof::Inconclusive(reason)
+                } else if reply.exists {
                     DirPairProof::SameDirectory
-                } else if let Some(fs_kind) = to_network_fs {
-                    DirPairProof::Inconclusive(format!(
-                        "{to_dir} on {} is on a network file system ({fs_kind}), so source and destination could not be proven distinct",
-                        to.machine
-                    ))
-                } else if let Some(fs_kind) = reply.network_fs {
-                    DirPairProof::Inconclusive(format!(
-                        "{from_dir} on {} is on a network file system ({fs_kind}), so source and destination could not be proven distinct",
-                        from.machine
-                    ))
                 } else {
                     DirPairProof::ProvenDistinct
                 };
@@ -1537,6 +1568,7 @@ impl Transfer<'_> {
                 return Ok(false);
             }
         };
+        let to_locality = created.effective_locality();
         let (Some(_probe_dir), Some(marker)) = (created.dir, created.marker) else {
             probe_conn.close().await;
             return Ok(false);
@@ -1553,25 +1585,37 @@ impl Transfer<'_> {
                 &[CAP_PROBE],
             )
             .await;
-        probe_conn.close().await;
-        let to_network_fs = created.network_fs;
+        let held_confirmed = Self::confirm_held_probe(probe_conn).await;
+        if !held_confirmed {
+            return Ok(false);
+        }
         match check_res {
             Ok(reply) => {
+                let from_locality = reply.effective_locality();
+                if let Some(reason) = Self::non_local_reason(to_dir, &to.machine, &to_locality) {
+                    if to_exists {
+                        cache.insert(
+                            (from_dir.to_owned(), to_dir.to_owned()),
+                            DirPairProof::Inconclusive(reason),
+                        );
+                    }
+                    return Ok(false);
+                }
+                if let Some(reason) = Self::non_local_reason(from_dir, &from.machine, &from_locality)
+                {
+                    if to_exists {
+                        cache.insert(
+                            (from_dir.to_owned(), to_dir.to_owned()),
+                            DirPairProof::Inconclusive(reason),
+                        );
+                    }
+                    return Ok(false);
+                }
                 if !reply.exists && to_exists {
-                    let cached = if let Some(fs_kind) = to_network_fs {
-                        DirPairProof::Inconclusive(format!(
-                            "{to_dir} on {} is on a network file system ({fs_kind}), so source and destination could not be proven distinct",
-                            to.machine
-                        ))
-                    } else if let Some(fs_kind) = reply.network_fs {
-                        DirPairProof::Inconclusive(format!(
-                            "{from_dir} on {} is on a network file system ({fs_kind}), so source and destination could not be proven distinct",
-                            from.machine
-                        ))
-                    } else {
-                        DirPairProof::ProvenDistinct
-                    };
-                    cache.insert((from_dir.to_owned(), to_dir.to_owned()), cached);
+                    cache.insert(
+                        (from_dir.to_owned(), to_dir.to_owned()),
+                        DirPairProof::ProvenDistinct,
+                    );
                 }
                 Ok(reply.exists)
             }

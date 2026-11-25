@@ -507,6 +507,25 @@ pub(crate) struct DeleteDone {
     pub skipped: Vec<SkippedEntry>,
 }
 
+/// Serialized three-valued filesystem locality reported by `probe_write` and `probe_read`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
+pub(crate) enum ProbeFsLocality {
+    Local,
+    Network(String),
+    Unknown(String),
+}
+
+impl From<legion_os::fs_kind::FsLocality> for ProbeFsLocality {
+    fn from(value: legion_os::fs_kind::FsLocality) -> Self {
+        match value {
+            legion_os::fs_kind::FsLocality::Local => Self::Local,
+            legion_os::fs_kind::FsLocality::Network(name) => Self::Network(name),
+            legion_os::fs_kind::FsLocality::Unknown(reason) => Self::Unknown(reason),
+        }
+    }
+}
+
 /// The line that answers a `probe_write` or `probe_read`.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct ProbeReply {
@@ -522,6 +541,33 @@ pub(crate) struct ProbeReply {
     pub unicode_normalizing: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_fs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fs_locality: Option<ProbeFsLocality>,
+}
+
+impl ProbeReply {
+    /// Returns the effective three-valued filesystem locality reported by this probe reply.
+    ///
+    /// Errs toward [`ProbeFsLocality::Unknown`] when neither `fs_locality` nor `network_fs` was
+    /// supplied so an unverified or older peer can never be mistaken for provably local.
+    pub(crate) fn effective_locality(&self) -> ProbeFsLocality {
+        if let Some(ref net) = self.network_fs {
+            return ProbeFsLocality::Network(net.clone());
+        }
+        match self.fs_locality {
+            Some(ref loc) => loc.clone(),
+            None => ProbeFsLocality::Unknown(
+                "peer did not report filesystem locality".to_owned(),
+            ),
+        }
+    }
+}
+
+/// Confirmation reply sent by a held `probe_write` (`hold: true`) when the caller sends
+/// `"confirm\n"` after completing its `probe_read`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) struct ProbeConfirm {
+    pub held: bool,
 }
 
 /// The line that answers a same-node `rename`.
@@ -2224,7 +2270,14 @@ fn probe_write<R: Read + Send + 'static, W: Write>(
                 grant.check_create(&marker_path, CreateKind::File, true)?;
                 match create_private_marker(&marker_path) {
                     Ok(file) => {
+                        let locality =
+                            ProbeFsLocality::from(legion_os::fs_kind::detect_fs_locality(&probe_dir));
+                        let network_fs = match &locality {
+                            ProbeFsLocality::Network(name) => Some(name.clone()),
+                            _ => None,
+                        };
                         if hold {
+                            let marker_id = symlink_file_identity(&marker_path).ok();
                             let owned =
                                 legion_xfer::register_owned_temp(state_dir, &marker_path, &file);
                             drop(file);
@@ -2234,23 +2287,39 @@ fn probe_write<R: Read + Send + 'static, W: Write>(
                                     dir: Some(probe_dir.to_string_lossy().into_owned()),
                                     marker: Some(name),
                                     exists: true,
-                                    network_fs: legion_os::fs_kind::detect_network_fs(&probe_dir),
+                                    network_fs,
+                                    fs_locality: Some(locality),
                                     ..ProbeReply::default()
                                 },
                             );
+                            let mut confirm_requested = false;
                             if res.is_ok()
-                                && let Some(mut reader) = input.take()
+                                && let Some(reader) = input.as_mut()
                             {
-                                let (tx, rx) = mpsc::channel::<()>();
-                                let _ = std::thread::Builder::new()
-                                    .name("legion-probe-hold".into())
-                                    .spawn(move || {
-                                        let mut line = String::new();
-                                        let _ = reader.read_line(&mut line);
-                                        let _ = tx.send(());
-                                    });
-                                let _ = rx.recv_timeout(legion_xfer::PROBE_SWEEP_AGE);
+                                // Hold the marker for as long as the probe's pipe stays open.
+                                // Never self-expire on a wall-clock timeout: the caller sends
+                                // `"confirm\n"` after its `probe_read` finishes, or closes stdin
+                                // on abort.
+                                let mut line = String::new();
+                                if let Ok(n) = reader.read_line(&mut line)
+                                    && n > 0
+                                    && line.trim() == "confirm"
+                                {
+                                    confirm_requested = true;
+                                }
                             }
+                            let still_held = match (
+                                marker_id,
+                                fs::symlink_metadata(&marker_path),
+                                symlink_file_identity(&marker_path),
+                            ) {
+                                (Some(orig), Ok(meta), Ok(now)) => {
+                                    meta.file_type().is_file()
+                                        && meta.len() == 0
+                                        && orig.same_file(&now)
+                                }
+                                _ => false,
+                            };
                             if let Ok(meta) = fs::symlink_metadata(&marker_path)
                                 && meta.file_type().is_file()
                                 && meta.len() == 0
@@ -2258,6 +2327,9 @@ fn probe_write<R: Read + Send + 'static, W: Write>(
                                 let _ = fs::remove_file(&marker_path);
                             }
                             drop(owned);
+                            if res.is_ok() && confirm_requested {
+                                return reply(output, &ProbeConfirm { held: still_held });
+                            }
                             return res;
                         }
                         legion_xfer::record_probe_marker(state_dir, &marker_path, &file);
@@ -2268,7 +2340,8 @@ fn probe_write<R: Read + Send + 'static, W: Write>(
                                 dir: Some(probe_dir.to_string_lossy().into_owned()),
                                 marker: Some(name),
                                 exists: true,
-                                network_fs: legion_os::fs_kind::detect_network_fs(&probe_dir),
+                                network_fs,
+                                fs_locality: Some(locality),
                                 ..ProbeReply::default()
                             },
                         );
@@ -2356,11 +2429,17 @@ fn probe_read<W: Write>(
             }
         }
     }
+    let locality = ProbeFsLocality::from(legion_os::fs_kind::detect_fs_locality(&checked_dir));
+    let network_fs = match &locality {
+        ProbeFsLocality::Network(name) => Some(name.clone()),
+        _ => None,
+    };
     reply(
         output,
         &ProbeReply {
             exists,
-            network_fs: legion_os::fs_kind::detect_network_fs(&checked_dir),
+            network_fs,
+            fs_locality: Some(locality),
             ..ProbeReply::default()
         },
     )
@@ -2636,25 +2715,30 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn write_lock_meta(file: &mut fs::File, meta: &MoveLockMeta) {
-    use std::io::{Seek, SeekFrom};
-    if let Ok(bytes) = serde_json::to_vec(meta)
-        && file.set_len(0).is_ok()
-        && file.seek(SeekFrom::Start(0)).is_ok()
-    {
-        let _ = file.write_all(&bytes);
-        let _ = file.flush();
+/// Sibling metadata file (`<key>.meta`) paired with a move-lock `<key>.lock` file. Stored
+/// separately from the locked file because Windows enforces mandatory byte-range locks that
+/// prevent other processes from reading a locked `.lock` file.
+fn move_lock_meta_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_extension("meta")
+}
+
+fn write_lock_meta(lock_path: &Path, meta: &MoveLockMeta) {
+    if let Ok(bytes) = serde_json::to_vec(meta) {
+        let _ = write_atomic(
+            move_lock_meta_path(lock_path),
+            &bytes,
+            WriteOptions::with_mode(0o600),
+        );
     }
 }
 
-fn read_lock_meta(path: &Path) -> Option<MoveLockMeta> {
-    let bytes = fs::read(path).ok()?;
+fn read_lock_meta(lock_path: &Path) -> Option<MoveLockMeta> {
+    let bytes = fs::read(move_lock_meta_path(lock_path)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Drops acquired move locks cleanly by unlinking each `.lock` file while still holding its
-/// exclusive flock, so normal release, lease expiry, or partial-acquisition failure leaves zero
-/// stale lock files behind.
+/// Drops acquired move locks cleanly by removing each sibling `.meta` and `.lock` file so normal
+/// release, lease expiry, or partial-acquisition failure leaves zero stale lock files behind.
 struct HeldLockFiles {
     files: Vec<(PathBuf, fs::File)>,
 }
@@ -2676,8 +2760,8 @@ impl HeldLockFiles {
             job_id: job_id.map(str::to_owned),
             expires_at_ms,
         };
-        for (_, file) in &mut self.files {
-            write_lock_meta(file, &meta);
+        for (path, _) in &self.files {
+            write_lock_meta(path, &meta);
         }
     }
 }
@@ -2685,13 +2769,14 @@ impl HeldLockFiles {
 impl Drop for HeldLockFiles {
     fn drop(&mut self) {
         for (path, file) in self.files.drain(..).rev() {
+            let _ = fs::remove_file(move_lock_meta_path(&path));
             legion_xfer::unlink_held_lock(&path, file);
         }
     }
 }
 
-/// Sweeps any unlocked `.lock` files in `<state_dir>/xfer/move-lock/` immediately and counts how
-/// many currently live locks are held by `principal`.
+/// Sweeps any unlocked `.lock` files (and orphaned `.meta` files) in `<state_dir>/xfer/move-lock/`
+/// immediately and counts how many currently live locks are held by `principal`.
 fn sweep_and_count_principal_locks(state_dir: &Path, principal: &str) -> usize {
     let dir = state_dir.join("xfer").join("move-lock");
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -2699,10 +2784,16 @@ fn sweep_and_count_principal_locks(state_dir: &Path, principal: &str) -> usize {
     };
     let now_ms = now_unix_ms();
     let mut held_by_principal = 0usize;
+    let mut meta_candidates = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(OsStr::to_str) != Some("lock") {
-            continue;
+        match path.extension().and_then(OsStr::to_str) {
+            Some("meta") => {
+                meta_candidates.push(path);
+                continue;
+            }
+            Some("lock") => {}
+            _ => continue,
         }
         let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&path) else {
             continue;
@@ -2710,10 +2801,12 @@ fn sweep_and_count_principal_locks(state_dir: &Path, principal: &str) -> usize {
         match file.try_lock() {
             Ok(()) => {
                 // Unlocked leftover (for example after SIGKILL): remove cleanly.
+                let _ = fs::remove_file(move_lock_meta_path(&path));
                 legion_xfer::unlink_held_lock(&path, file);
             }
             Err(_) => {
-                // Actively held by another process: count toward `principal`'s quota if valid.
+                // Actively held by another process: read unlocked sibling `.meta` and count toward
+                // `principal`'s quota if valid.
                 if let Some(meta) = read_lock_meta(&path)
                     && meta.principal == principal
                     && meta.expires_at_ms > now_ms
@@ -2721,6 +2814,11 @@ fn sweep_and_count_principal_locks(state_dir: &Path, principal: &str) -> usize {
                     held_by_principal += 1;
                 }
             }
+        }
+    }
+    for meta_path in meta_candidates {
+        if !meta_path.with_extension("lock").exists() {
+            let _ = fs::remove_file(&meta_path);
         }
     }
     held_by_principal
@@ -2797,8 +2895,8 @@ fn lock_paths<R: Read + Send + 'static, W: Write>(
     for target in &lock_targets {
         let lock_path = legion_xfer::move_lock_state_path(state_dir, target);
         match legion_xfer::try_lock_state_file(&lock_path) {
-            Ok(Some(mut file)) => {
-                write_lock_meta(&mut file, &meta);
+            Ok(Some(file)) => {
+                write_lock_meta(&lock_path, &meta);
                 locks.push(lock_path, file);
             }
             Ok(None) => {

@@ -1048,6 +1048,13 @@ pub fn sweep_stale_state(state_dir: &Path, max_age: Duration) -> usize {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            if sub == "move-lock"
+                && path.extension().and_then(|s| s.to_str()) == Some("meta")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                && dir.join(format!("{stem}.lock")).exists()
+            {
+                continue;
+            }
             if sub == "renames" {
                 // Never delete pending `.json` rename intent records; only sweep orphaned `.lock`
                 // files whose matching `.json` intent no longer exists.
@@ -1078,6 +1085,11 @@ pub fn sweep_stale_state(state_dir: &Path, max_age: Duration) -> usize {
             let lockable = match OpenOptions::new().write(true).open(&path) {
                 Ok(file) => match file.try_lock() {
                     Ok(()) => {
+                        if sub == "move-lock"
+                            && path.extension().and_then(|s| s.to_str()) == Some("lock")
+                        {
+                            let _ = fs::remove_file(path.with_extension("meta"));
+                        }
                         #[cfg(unix)]
                         let ok = {
                             let ok = fs::remove_file(&path).is_ok();
