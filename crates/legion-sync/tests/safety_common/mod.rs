@@ -19,7 +19,10 @@ use legion_xfer::{Hash, Timestamp};
 pub fn scratch() -> tempfile::TempDir {
     let base = PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/legion-sync-tests");
     fs::create_dir_all(&base).unwrap();
-    tempfile::Builder::new().prefix("t").tempdir_in(base).unwrap()
+    tempfile::Builder::new()
+        .prefix("t")
+        .tempdir_in(base)
+        .unwrap()
 }
 
 pub struct EnginePeer<'a, F: SyncFs, S: IndexStore> {
@@ -43,7 +46,10 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
     fn member_id(&self) -> &str {
         &self.member_id
     }
-    fn handshake(&self, caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+    fn handshake(
+        &self,
+        caller: &legion_sync::HandshakeHello,
+    ) -> legion_sync::Result<PeerHandshake> {
         self.engine.serve_handshake(&self.caller, caller)
     }
     fn records_since(
@@ -105,7 +111,13 @@ impl HookFs {
             no_exchange: false,
         }
     }
-    pub fn add(&self, op: &'static str, when: When, nth: usize, action: impl FnMut() -> Act + 'static) {
+    pub fn add(
+        &self,
+        op: &'static str,
+        when: When,
+        nth: usize,
+        action: impl FnMut() -> Act + 'static,
+    ) {
         self.hooks.borrow_mut().push(Hook {
             op,
             when,
@@ -126,7 +138,9 @@ impl HookFs {
         for h in hooks.iter_mut() {
             if h.op == op && h.when == when && h.nth == n && !h.fired {
                 h.fired = true;
-                self.log.borrow_mut().push(format!("HOOK {op} {when:?} #{n}"));
+                self.log
+                    .borrow_mut()
+                    .push(format!("HOOK {op} {when:?} #{n}"));
                 if let Act::Crash = (h.action)() {
                     return Err(SyncError::Fs {
                         path: Some(op.to_string()),
@@ -138,7 +152,12 @@ impl HookFs {
         }
         Ok(())
     }
-    fn w<T>(&self, op: &'static str, arg: &str, f: impl FnOnce(&RealFs) -> legion_sync::Result<T>) -> legion_sync::Result<T> {
+    fn w<T>(
+        &self,
+        op: &'static str,
+        arg: &str,
+        f: impl FnOnce(&RealFs) -> legion_sync::Result<T>,
+    ) -> legion_sync::Result<T> {
         let n = {
             let mut c = self.counts.borrow_mut();
             let e = c.entry(op).or_insert(0);
@@ -183,8 +202,14 @@ impl SyncFs for HookFs {
     fn walk(&self, ignore: &IgnoreMatcher) -> legion_sync::Result<FsWalkResult> {
         self.w("walk", "", |f| f.walk(ignore))
     }
-    fn walk_subtree(&self, rel_root: &str, ignore: &IgnoreMatcher) -> legion_sync::Result<FsWalkResult> {
-        self.w("walk_subtree", rel_root, |f| f.walk_subtree(rel_root, ignore))
+    fn walk_subtree(
+        &self,
+        rel_root: &str,
+        ignore: &IgnoreMatcher,
+    ) -> legion_sync::Result<FsWalkResult> {
+        self.w("walk_subtree", rel_root, |f| {
+            f.walk_subtree(rel_root, ignore)
+        })
     }
     fn stat_live(&self, p: &str) -> legion_sync::Result<Option<FsMeta>> {
         self.w("stat_live", p, |f| f.stat_live(p))
@@ -205,16 +230,27 @@ impl SyncFs for HookFs {
         self.w("remove_empty_dir_live", p, |f| f.remove_empty_dir_live(p))
     }
     fn create_symlink_live(&self, p: &str, target: &str) -> legion_sync::Result<()> {
-        self.w("create_symlink_live", p, |f| f.create_symlink_live(p, target))
+        self.w("create_symlink_live", p, |f| {
+            f.create_symlink_live(p, target)
+        })
     }
     fn remove_symlink_live(&self, p: &str) -> legion_sync::Result<()> {
         self.w("remove_symlink_live", p, |f| f.remove_symlink_live(p))
     }
-    fn set_live_metadata(&self, p: &str, mtime: Timestamp, mode: Option<u32>) -> legion_sync::Result<()> {
-        self.w("set_live_metadata", p, |f| f.set_live_metadata(p, mtime, mode))
+    fn set_live_metadata(
+        &self,
+        p: &str,
+        mtime: Timestamp,
+        mode: Option<u32>,
+    ) -> legion_sync::Result<()> {
+        self.w("set_live_metadata", p, |f| {
+            f.set_live_metadata(p, mtime, mode)
+        })
     }
     fn rename_live_to_live_no_replace(&self, a: &str, b: &str) -> legion_sync::Result<()> {
-        self.w("rename_live_to_live_no_replace", a, |f| f.rename_live_to_live_no_replace(a, b))
+        self.w("rename_live_to_live_no_replace", a, |f| {
+            f.rename_live_to_live_no_replace(a, b)
+        })
     }
     fn sync_parent_dir_live(&self, p: &str) {
         self.inner.sync_parent_dir_live(p)
@@ -231,8 +267,15 @@ impl SyncFs for HookFs {
     fn stat_tmp(&self, t: &str) -> legion_sync::Result<Option<FsMeta>> {
         self.w("stat_tmp", t, |f| f.stat_tmp(t))
     }
-    fn set_tmp_metadata(&self, t: &str, mtime: Timestamp, mode: Option<u32>) -> legion_sync::Result<()> {
-        self.w("set_tmp_metadata", t, |f| f.set_tmp_metadata(t, mtime, mode))
+    fn set_tmp_metadata(
+        &self,
+        t: &str,
+        mtime: Timestamp,
+        mode: Option<u32>,
+    ) -> legion_sync::Result<()> {
+        self.w("set_tmp_metadata", t, |f| {
+            f.set_tmp_metadata(t, mtime, mode)
+        })
     }
     fn hash_tmp(&self, t: &str) -> legion_sync::Result<(Hash, u64)> {
         self.w("hash_tmp", t, |f| f.hash_tmp(t))
@@ -244,9 +287,15 @@ impl SyncFs for HookFs {
         self.w("list_tmp", "", |f| f.list_tmp())
     }
     fn commit_tmp_to_live_no_replace(&self, t: &str, p: &str) -> legion_sync::Result<()> {
-        self.w("commit_tmp_to_live_no_replace", p, |f| f.commit_tmp_to_live_no_replace(t, p))
+        self.w("commit_tmp_to_live_no_replace", p, |f| {
+            f.commit_tmp_to_live_no_replace(t, p)
+        })
     }
-    fn commit_tmp_to_live_no_replace_deferred_dir_sync(&self, t: &str, p: &str) -> legion_sync::Result<()> {
+    fn commit_tmp_to_live_no_replace_deferred_dir_sync(
+        &self,
+        t: &str,
+        p: &str,
+    ) -> legion_sync::Result<()> {
         self.w("commit_tmp_to_live_no_replace_deferred", p, |f| {
             f.commit_tmp_to_live_no_replace_deferred_dir_sync(t, p)
         })
@@ -255,19 +304,27 @@ impl SyncFs for HookFs {
         if self.no_exchange {
             return Ok(false);
         }
-        self.w("exchange_tmp_with_live", p, |f| f.exchange_tmp_with_live(t, p))
+        self.w("exchange_tmp_with_live", p, |f| {
+            f.exchange_tmp_with_live(t, p)
+        })
     }
     fn replace_live_with_tmp_backup(&self, t: &str, p: &str, b: &str) -> legion_sync::Result<bool> {
         self.inner.replace_live_with_tmp_backup(t, p, b)
     }
     fn move_live_to_tmp_no_replace(&self, p: &str, t: &str) -> legion_sync::Result<()> {
-        self.w("move_live_to_tmp_no_replace", p, |f| f.move_live_to_tmp_no_replace(p, t))
+        self.w("move_live_to_tmp_no_replace", p, |f| {
+            f.move_live_to_tmp_no_replace(p, t)
+        })
     }
     fn move_tmp_to_bin_no_replace(&self, t: &str, b: &str) -> legion_sync::Result<()> {
-        self.w("move_tmp_to_bin_no_replace", t, |f| f.move_tmp_to_bin_no_replace(t, b))
+        self.w("move_tmp_to_bin_no_replace", t, |f| {
+            f.move_tmp_to_bin_no_replace(t, b)
+        })
     }
     fn move_live_to_bin_no_replace(&self, p: &str, b: &str) -> legion_sync::Result<()> {
-        self.w("move_live_to_bin_no_replace", p, |f| f.move_live_to_bin_no_replace(p, b))
+        self.w("move_live_to_bin_no_replace", p, |f| {
+            f.move_live_to_bin_no_replace(p, b)
+        })
     }
     fn write_bin_meta(&self, m: &str, bytes: &[u8]) -> legion_sync::Result<()> {
         self.w("write_bin_meta", m, |f| f.write_bin_meta(m, bytes))
@@ -296,7 +353,12 @@ pub fn cfg(member: &str, members: &[&str]) -> FolderConfig {
     FolderConfig::new("docs", member, members.iter().map(|s| (*s).to_string()))
 }
 
-pub fn open_real(root: &Path, db: &Path, member: &str, members: &[&str]) -> SyncEngine<RealFs, RedbIndexStore> {
+pub fn open_real(
+    root: &Path,
+    db: &Path,
+    member: &str,
+    members: &[&str],
+) -> SyncEngine<RealFs, RedbIndexStore> {
     SyncEngine::open(
         cfg(member, members),
         RealFs::open(root).unwrap(),
@@ -305,8 +367,18 @@ pub fn open_real(root: &Path, db: &Path, member: &str, members: &[&str]) -> Sync
     .unwrap()
 }
 
-pub fn open_hook(root: &Path, db: &Path, member: &str, members: &[&str]) -> SyncEngine<HookFs, RedbIndexStore> {
-    SyncEngine::open(cfg(member, members), HookFs::new(root), RedbIndexStore::open(db).unwrap()).unwrap()
+pub fn open_hook(
+    root: &Path,
+    db: &Path,
+    member: &str,
+    members: &[&str],
+) -> SyncEngine<HookFs, RedbIndexStore> {
+    SyncEngine::open(
+        cfg(member, members),
+        HookFs::new(root),
+        RedbIndexStore::open(db).unwrap(),
+    )
+    .unwrap()
 }
 
 /// Every regular file's bytes under `root` (live tree, bin and tmp), keyed by where it lives.
@@ -320,7 +392,9 @@ pub fn all_bytes(root: &Path) -> Vec<(String, Vec<u8>)> {
             if ft.is_dir() {
                 rec(base, &p, out);
             } else if ft.is_file() {
-                if p.extension().is_some_and(|x| x == "json") && p.to_string_lossy().contains(".legion-sync/bin") {
+                if p.extension().is_some_and(|x| x == "json")
+                    && p.to_string_lossy().contains(".legion-sync/bin")
+                {
                     continue;
                 }
                 if p.to_string_lossy().ends_with("marker.json") {
@@ -337,17 +411,66 @@ pub fn all_bytes(root: &Path) -> Vec<(String, Vec<u8>)> {
 
 /// Returns where `content` survives under `root` (live, bin or tmp paths).
 pub fn where_is(root: &Path, content: &[u8]) -> Vec<String> {
-    all_bytes(root)
-        .into_iter()
-        .filter(|(_, b)| b == content)
-        .map(|(p, _)| p)
-        .collect()
+    let mut out = Vec::new();
+    let target_len = content.len() as u64;
+    let prefix_len = content.len().min(64);
+    let prefix = &content[..prefix_len];
+    fn rec(
+        base: &Path,
+        dir: &Path,
+        content: &[u8],
+        target_len: u64,
+        prefix: &[u8],
+        out: &mut Vec<String>,
+    ) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                rec(base, &p, content, target_len, prefix, out);
+            } else if ft.is_file() {
+                if p.extension().is_some_and(|x| x == "json")
+                    && p.to_string_lossy().contains(".legion-sync/bin")
+                {
+                    continue;
+                }
+                if p.to_string_lossy().ends_with("marker.json") {
+                    continue;
+                }
+                let Ok(meta) = e.metadata() else { continue };
+                if meta.len() != target_len {
+                    continue;
+                }
+                if !prefix.is_empty() {
+                    let Ok(mut f) = fs::File::open(&p) else {
+                        continue;
+                    };
+                    let mut head = [0u8; 64];
+                    if f.read_exact(&mut head[..prefix.len()]).is_err()
+                        || &head[..prefix.len()] != prefix
+                    {
+                        continue;
+                    }
+                }
+                if fs::read(&p).is_ok_and(|b| b == content) {
+                    let rel = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                    out.push(rel);
+                }
+            }
+        }
+    }
+    rec(root, root, content, target_len, prefix, &mut out);
+    out
 }
 
 pub fn dump(root: &Path) -> String {
     let mut s = String::new();
     for (p, b) in all_bytes(root) {
-        s.push_str(&format!("  {p} = {:?}\n", String::from_utf8_lossy(&b[..b.len().min(60)])));
+        s.push_str(&format!(
+            "  {p} = {:?}\n",
+            String::from_utf8_lossy(&b[..b.len().min(60)])
+        ));
     }
     s
 }

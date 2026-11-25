@@ -930,7 +930,10 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
         &self.member_id
     }
 
-    fn handshake(&self, caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+    fn handshake(
+        &self,
+        caller: &legion_sync::HandshakeHello,
+    ) -> legion_sync::Result<PeerHandshake> {
         self.engine.serve_handshake(&self.caller, caller)
     }
 

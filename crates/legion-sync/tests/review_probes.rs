@@ -63,7 +63,10 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
         &self.member_id
     }
 
-    fn handshake(&self, caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+    fn handshake(
+        &self,
+        caller: &legion_sync::HandshakeHello,
+    ) -> legion_sync::Result<PeerHandshake> {
         self.engine.serve_handshake(&self.caller, caller)
     }
 
@@ -519,7 +522,10 @@ impl Peer for FakePeer {
         &self.id
     }
 
-    fn handshake(&self, _caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+    fn handshake(
+        &self,
+        _caller: &legion_sync::HandshakeHello,
+    ) -> legion_sync::Result<PeerHandshake> {
         Ok(PeerHandshake {
             folder_id: "docs".to_string(),
             member_id: self.id.clone(),
@@ -1020,10 +1026,7 @@ fn item_b3_mass_deletion_brake_pauses_and_handles_rescan_and_confirm() {
     assert_eq!(confirmed.deleted, 55);
     // Item 8: matching inbound peer deletion brake pauses `b`'s pull from `a` before deleting 55/60
     // files, until `b` chooses `ApplyDeletions` (or `KeepLocalFiles`).
-    assert!(matches!(
-        pull(&mut b, &a),
-        Err(SyncError::Paused { .. })
-    ));
+    assert!(matches!(pull(&mut b, &a), Err(SyncError::Paused { .. })));
     let b_st = b.status().unwrap();
     assert_eq!(b_st.inbound_brakes.len(), 1);
     assert_eq!(b_st.inbound_brakes[0].deleted_count, 55);
@@ -1262,7 +1265,12 @@ fn item_f_path_safety_restore_destinations_and_held_back_bound() {
         MAX_HELD_BACK_ENTRIES
     );
     // Item 4: stopped pulling at the cap instead of dropping records, with a visible problem.
-    let evil_cursor = win.store().load_peer_cursors().unwrap().remove("evil").unwrap();
+    let evil_cursor = win
+        .store()
+        .load_peer_cursors()
+        .unwrap()
+        .remove("evil")
+        .unwrap();
     assert_eq!(evil_cursor.seq, MAX_HELD_BACK_ENTRIES as u64);
     assert_eq!(evil_cursor.applied_ack_seq, 0);
     match win.status().unwrap().state {
@@ -1793,7 +1801,10 @@ fn item_k_ranged_resumable_fetch_and_cancellation() {
             &self.id
         }
 
-        fn handshake(&self, _caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+        fn handshake(
+            &self,
+            _caller: &legion_sync::HandshakeHello,
+        ) -> legion_sync::Result<PeerHandshake> {
             Ok(PeerHandshake {
                 folder_id: "docs".into(),
                 member_id: self.id.clone(),

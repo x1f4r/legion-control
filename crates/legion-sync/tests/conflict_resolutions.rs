@@ -38,7 +38,10 @@ fn sync_all(es: &mut [E], t0: i64, rounds: i64) {
 }
 
 fn live(dir: &Path) -> BTreeSet<(String, Vec<u8>)> {
-    all_bytes(dir).into_iter().filter(|(p, _)| !p.starts_with(".legion-sync")).collect()
+    all_bytes(dir)
+        .into_iter()
+        .filter(|(p, _)| !p.starts_with(".legion-sync"))
+        .collect()
 }
 
 fn run(choices: [Option<ConflictChoice>; 3], edit_copy_on: Option<usize>) {
@@ -56,7 +59,11 @@ fn run(choices: [Option<ConflictChoice>; 3], edit_copy_on: Option<usize>) {
     fs::write(t.join("pi/doc.txt"), b"pi's edit!!").unwrap();
     fs::write(t.join("nas/doc.txt"), b"nas's edit???").unwrap();
     sync_all(&mut es, 10, 3);
-    let mut versions = vec![b"tower's edit".to_vec(), b"pi's edit!!".to_vec(), b"nas's edit???".to_vec()];
+    let mut versions = vec![
+        b"tower's edit".to_vec(),
+        b"pi's edit!!".to_vec(),
+        b"nas's edit???".to_vec(),
+    ];
     for (i, c) in choices.iter().enumerate() {
         let conflicts = es[i].list_conflicts().unwrap();
         println!("{} sees {} conflicts", names[i], conflicts.len());
@@ -64,7 +71,10 @@ fn run(choices: [Option<ConflictChoice>; 3], edit_copy_on: Option<usize>) {
             && let Some(first) = conflicts.first()
         {
             let r = es[i].resolve_conflict(&first.conflict_path, *c, ts(20));
-            println!("{} resolves {:?} on {}: {r:?}", names[i], c, first.conflict_path);
+            println!(
+                "{} resolves {:?} on {}: {r:?}",
+                names[i], c, first.conflict_path
+            );
         }
     }
     if let Some(i) = edit_copy_on {
@@ -81,19 +91,34 @@ fn run(choices: [Option<ConflictChoice>; 3], edit_copy_on: Option<usize>) {
     let l0 = live(&t.join("tower"));
     for (i, n) in names.iter().enumerate() {
         let l = live(&t.join(n));
-        println!("{n} live: {:?}", l.iter().map(|(p, b)| format!("{p}={}", String::from_utf8_lossy(b))).collect::<Vec<_>>());
+        println!(
+            "{n} live: {:?}",
+            l.iter()
+                .map(|(p, b)| format!("{p}={}", String::from_utf8_lossy(b)))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(l, l0, "{n} differs from tower");
         let _ = i;
     }
     for v in versions {
-        let found: Vec<_> = names.iter().flat_map(|n| where_is(&t.join(n), &v)).collect();
+        let found: Vec<_> = names
+            .iter()
+            .flat_map(|n| where_is(&t.join(n), &v))
+            .collect();
         assert!(!found.is_empty(), "{:?} lost", String::from_utf8_lossy(&v));
     }
 }
 
 #[test]
 fn c1_three_way_resolved_differently() {
-    run([Some(ConflictChoice::KeepOriginal), Some(ConflictChoice::KeepConflict), Some(ConflictChoice::KeepBoth)], None);
+    run(
+        [
+            Some(ConflictChoice::KeepOriginal),
+            Some(ConflictChoice::KeepConflict),
+            Some(ConflictChoice::KeepBoth),
+        ],
+        None,
+    );
 }
 
 #[test]
@@ -103,5 +128,12 @@ fn c2_resolve_while_other_edits_copy() {
 
 #[test]
 fn c3_both_promote_different_copies() {
-    run([Some(ConflictChoice::KeepConflict), Some(ConflictChoice::KeepConflict), Some(ConflictChoice::KeepOriginal)], Some(1));
+    run(
+        [
+            Some(ConflictChoice::KeepConflict),
+            Some(ConflictChoice::KeepConflict),
+            Some(ConflictChoice::KeepOriginal),
+        ],
+        Some(1),
+    );
 }

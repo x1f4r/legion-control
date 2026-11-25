@@ -141,7 +141,14 @@ fn forged_own_counter_and_huge_counter_are_refused_unacked_and_durable() {
     let mut forged_own_vv = VersionVector::new();
     forged_own_vv.set(VersionKey::new("tower", tower_inc), tower_clock + 50);
     forged_own_vv.set(VersionKey::new("evil", 7), 1);
-    let rec1 = file_record("doc.txt", b"poisoned own clock", forged_own_vv, "evil", 1, ts(5));
+    let rec1 = file_record(
+        "doc.txt",
+        b"poisoned own clock",
+        forged_own_vv,
+        "evil",
+        1,
+        ts(5),
+    );
 
     // 2. Lying peer sends a counter above `2^62` for its own key.
     let mut huge_vv = VersionVector::new();
@@ -179,7 +186,10 @@ fn forged_own_counter_and_huge_counter_are_refused_unacked_and_durable() {
 
     let rep = tower.pull_from_peer(&peer, ts(10)).unwrap();
     assert_eq!(rep.invalid_skipped, 2);
-    assert_eq!(fs::read(t.join("tower/doc.txt")).unwrap(), b"tower original");
+    assert_eq!(
+        fs::read(t.join("tower/doc.txt")).unwrap(),
+        b"tower original"
+    );
     assert!(!t.join("tower/huge.txt").exists());
     assert_eq!(fs::read(t.join("tower/good.txt")).unwrap(), b"valid bytes");
 
@@ -202,7 +212,11 @@ fn forged_own_counter_and_huge_counter_are_refused_unacked_and_durable() {
                 .iter()
                 .filter(|p| p.kind == ProblemKind::InvalidPeerRecord)
                 .collect();
-            assert_eq!(invalid.len(), 2, "both forged records must stay reported after restart");
+            assert_eq!(
+                invalid.len(),
+                2,
+                "both forged records must stay reported after restart"
+            );
         }
         other => panic!("expected durable InvalidPeerRecord problems after restart, got {other:?}"),
     }
@@ -237,7 +251,10 @@ fn peer_forced_rotation_is_rate_limited_to_once_per_hour_and_reported() {
     };
     tower.pull_from_peer(&liar1, ts(100)).unwrap();
     let inc2 = tower.meta().unwrap().incarnation;
-    assert_ne!(inc2, inc1, "first rollback signal should rotate incarnation");
+    assert_ne!(
+        inc2, inc1,
+        "first rollback signal should rotate incarnation"
+    );
     match tower.status().unwrap().state {
         MemberState::Problem { problems, .. } => {
             assert!(

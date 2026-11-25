@@ -15,12 +15,21 @@ use safety_common::*;
 fn b1_renaming_a_large_folder_trips_the_brake() {
     let tmp = scratch();
     let t = tmp.path();
-    let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &["tower", "pi"]);
+    let mut tower = open_real(
+        &t.join("tower"),
+        &t.join("tower.redb"),
+        "tower",
+        &["tower", "pi"],
+    );
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &["tower", "pi"]);
     fs::create_dir_all(t.join("tower/Photos")).unwrap();
     fs::create_dir_all(t.join("tower/Docs")).unwrap();
     for i in 0..300 {
-        fs::write(t.join(format!("tower/Photos/p{i}.jpg")), format!("photo {i}")).unwrap();
+        fs::write(
+            t.join(format!("tower/Photos/p{i}.jpg")),
+            format!("photo {i}"),
+        )
+        .unwrap();
     }
     for i in 0..100 {
         fs::write(t.join(format!("tower/Docs/d{i}.txt")), format!("doc {i}")).unwrap();
@@ -55,7 +64,12 @@ fn b1_renaming_a_large_folder_trips_the_brake() {
 fn b2_subtree_scans_split_a_wipe_under_the_brake() {
     let tmp = scratch();
     let t = tmp.path();
-    let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &["tower", "pi"]);
+    let mut tower = open_real(
+        &t.join("tower"),
+        &t.join("tower.redb"),
+        "tower",
+        &["tower", "pi"],
+    );
     for d in 0..5 {
         fs::create_dir_all(t.join(format!("tower/d{d}"))).unwrap();
         for i in 0..100 {
@@ -76,7 +90,10 @@ fn b2_subtree_scans_split_a_wipe_under_the_brake() {
     println!(
         "whole folder wiped dir by dir: deleted {total_deleted} records, brake tripped: {tripped}"
     );
-    assert!(tripped, "split wipe across subtree scans must trip the brake");
+    assert!(
+        tripped,
+        "split wipe across subtree scans must trip the brake"
+    );
     assert_eq!(
         total_deleted, 0,
         "no deletions may leak to peers before the settle period and rolling window check"
@@ -209,7 +226,11 @@ fn b4_inbound_deletion_brake_pauses_peer_and_supports_keep_local_or_apply() {
     // Branch A: pi chooses KeepLocalFiles -> re-asserts all 60 files as newer so tower gets them
     // back!
     let reasserted = pi
-        .resolve_inbound_deletion_brake("tower", InboundDeletionBrakeDecision::KeepLocalFiles, ts(25))
+        .resolve_inbound_deletion_brake(
+            "tower",
+            InboundDeletionBrakeDecision::KeepLocalFiles,
+            ts(25),
+        )
         .unwrap();
     assert_eq!(reasserted, 60);
     pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(26))
@@ -239,7 +260,11 @@ fn b4_inbound_deletion_brake_pauses_peer_and_supports_keep_local_or_apply() {
         Err(SyncError::Paused { .. })
     ));
     laptop
-        .resolve_inbound_deletion_brake("tower", InboundDeletionBrakeDecision::ApplyDeletions, ts(43))
+        .resolve_inbound_deletion_brake(
+            "tower",
+            InboundDeletionBrakeDecision::ApplyDeletions,
+            ts(43),
+        )
         .unwrap();
     laptop
         .pull_from_peer(&EnginePeer::new(&tower, "laptop"), ts(44))

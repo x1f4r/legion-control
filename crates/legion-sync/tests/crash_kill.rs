@@ -39,11 +39,16 @@ fn setup(root: &Path, seed: u64) -> Vec<Vec<u8>> {
     for i in 0..n {
         let d = tw.join(format!("d{}", i % 8));
         fs::create_dir_all(&d).unwrap();
-        let body = if i % 17 == 0 { big(&format!("tower-v1-{i}"), 600_000) } else { format!("tower-v1-{i}").into_bytes() };
+        let body = if i % 17 == 0 {
+            big(&format!("tower-v1-{i}"), 600_000)
+        } else {
+            format!("tower-v1-{i}").into_bytes()
+        };
         fs::write(d.join(format!("f{i}.txt")), body).unwrap();
     }
     tower.scan(ts(0)).unwrap();
-    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1)).unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1))
+        .unwrap();
 
     let mut ledger: Vec<Vec<u8>> = Vec::new();
     let mut tower_touched = BTreeSet::new();
@@ -54,7 +59,11 @@ fn setup(root: &Path, seed: u64) -> Vec<Vec<u8>> {
         let p = tw.join(format!("d{}/f{i}.txt", i % 8));
         match next() % 6 {
             0 | 1 => {
-                let body = if i % 5 == 0 { big(&format!("tower-v2-{i}"), 800_000) } else { format!("tower-v2-{i}").into_bytes() };
+                let body = if i % 5 == 0 {
+                    big(&format!("tower-v2-{i}"), 800_000)
+                } else {
+                    format!("tower-v2-{i}").into_bytes()
+                };
                 fs::write(&p, &body).unwrap();
                 ledger.push(body);
                 tower_touched.insert(i);
@@ -97,7 +106,11 @@ fn setup(root: &Path, seed: u64) -> Vec<Vec<u8>> {
     // while pi left it alone (that v1 legitimately goes to pi's bin, so it still counts).
     for i in 0..n {
         if !(tower_touched.contains(&i) && pi_touched.contains(&i)) {
-            let body = if i % 17 == 0 { big(&format!("tower-v1-{i}"), 600_000) } else { format!("tower-v1-{i}").into_bytes() };
+            let body = if i % 17 == 0 {
+                big(&format!("tower-v1-{i}"), 600_000)
+            } else {
+                format!("tower-v1-{i}").into_bytes()
+            };
             ledger.push(body);
         }
     }
@@ -112,9 +125,14 @@ fn sync_round(root: &Path, t: i64) -> Result<(), String> {
     let mut pi = SyncEngineHolder::open(root, "pi")?;
     tower.0.scan(ts(t)).map_err(|e| format!("tower scan {e}"))?;
     pi.0.scan(ts(t)).map_err(|e| format!("pi scan {e}"))?;
-    pi.0.pull_from_peer(&EnginePeer::new(&tower.0, "pi"), ts(t + 1)).map_err(|e| format!("pi pull {e}"))?;
-    tower.0.pull_from_peer(&EnginePeer::new(&pi.0, "tower"), ts(t + 2)).map_err(|e| format!("tower pull {e}"))?;
-    pi.0.pull_from_peer(&EnginePeer::new(&tower.0, "pi"), ts(t + 3)).map_err(|e| format!("pi pull2 {e}"))?;
+    pi.0.pull_from_peer(&EnginePeer::new(&tower.0, "pi"), ts(t + 1))
+        .map_err(|e| format!("pi pull {e}"))?;
+    tower
+        .0
+        .pull_from_peer(&EnginePeer::new(&pi.0, "tower"), ts(t + 2))
+        .map_err(|e| format!("tower pull {e}"))?;
+    pi.0.pull_from_peer(&EnginePeer::new(&tower.0, "pi"), ts(t + 3))
+        .map_err(|e| format!("pi pull2 {e}"))?;
     Ok(())
 }
 
@@ -124,7 +142,8 @@ impl SyncEngineHolder {
         let e = legion_sync::SyncEngine::open(
             cfg(m, MEMBERS),
             legion_sync::RealFs::open(root.join(m)).map_err(|e| e.to_string())?,
-            legion_sync::RedbIndexStore::open(root.join(format!("{m}.redb"))).map_err(|e| e.to_string())?,
+            legion_sync::RedbIndexStore::open(root.join(format!("{m}.redb")))
+                .map_err(|e| e.to_string())?,
         )
         .map_err(|e| format!("open {m}: {e}"))?;
         Ok(Self(e))
@@ -134,19 +153,27 @@ impl SyncEngineHolder {
 #[test]
 #[ignore]
 fn kill_child_entry() {
-    let Ok(root) = std::env::var("REVIEW_ROOT") else { return };
+    let Ok(root) = std::env::var("REVIEW_ROOT") else {
+        return;
+    };
     sync_round(Path::new(&root), 200).unwrap();
     println!("CHILD-DONE");
 }
 
 fn live_tree(dir: &Path) -> BTreeSet<(String, Vec<u8>)> {
-    all_bytes(dir).into_iter().filter(|(p, _)| !p.starts_with(".legion-sync")).collect()
+    all_bytes(dir)
+        .into_iter()
+        .filter(|(p, _)| !p.starts_with(".legion-sync"))
+        .collect()
 }
 
 #[test]
 #[ignore]
 fn kill_at_random_moments() {
-    let iters: u64 = std::env::var("REVIEW_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let iters: u64 = std::env::var("REVIEW_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     let exe = std::env::current_exe().unwrap();
     // Measure an uncrashed child run.
     let mut est = Duration::from_millis(500);
@@ -159,7 +186,11 @@ fn kill_at_random_moments() {
             .env("REVIEW_ROOT", tmp.path())
             .output()
             .unwrap();
-        assert!(String::from_utf8_lossy(&out.stdout).contains("CHILD-DONE"), "{}", String::from_utf8_lossy(&out.stdout));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("CHILD-DONE"),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
         est = est.max(st.elapsed());
         println!("uncrashed child run: {:?}", st.elapsed());
     }
@@ -171,7 +202,8 @@ fn kill_at_random_moments() {
         let mut kills = 0;
         // Up to three kills per iteration, each at a random point.
         for k in 0..3 {
-            let delay = Duration::from_micros((it * 104_729 + k * 7_727) % (est.as_micros() as u64).max(1));
+            let delay =
+                Duration::from_micros((it * 104_729 + k * 7_727) % (est.as_micros() as u64).max(1));
             let mut child = Command::new(&exe)
                 .args(["kill_child_entry", "--ignored", "--exact", "--nocapture"])
                 .env("REVIEW_ROOT", &root)
@@ -197,7 +229,10 @@ fn kill_at_random_moments() {
         for v in &ledger {
             let a = where_is(&root.join("tower"), v);
             let b = where_is(&root.join("pi"), v);
-            if a.iter().chain(b.iter()).all(|p| p.starts_with(".legion-sync/tmp")) {
+            if a.iter()
+                .chain(b.iter())
+                .all(|p| p.starts_with(".legion-sync/tmp"))
+            {
                 missing.push(String::from_utf8_lossy(&v[..v.len().min(20)]).into_owned());
             }
         }
@@ -205,8 +240,14 @@ fn kill_at_random_moments() {
         let lp = live_tree(&root.join("pi"));
         let diverged = lt != lp;
         if !missing.is_empty() || diverged || last_err.is_some() {
-            let diff: Vec<_> = lt.symmetric_difference(&lp).map(|(p, b)| format!("{p}={}", String::from_utf8_lossy(&b[..b.len().min(20)]))).take(8).collect();
-            println!("iter {it} (kills {kills}): missing {missing:?} diverged {diverged} {diff:?} err {last_err:?}");
+            let diff: Vec<_> = lt
+                .symmetric_difference(&lp)
+                .map(|(p, b)| format!("{p}={}", String::from_utf8_lossy(&b[..b.len().min(20)])))
+                .take(8)
+                .collect();
+            println!(
+                "iter {it} (kills {kills}): missing {missing:?} diverged {diverged} {diff:?} err {last_err:?}"
+            );
             failures.push((it, missing, diverged, last_err));
             std::mem::forget(tmp);
         }

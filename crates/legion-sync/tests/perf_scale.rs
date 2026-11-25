@@ -381,7 +381,10 @@ impl Peer for BenchPeer {
         &self.member_id
     }
 
-    fn handshake(&self, _caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+    fn handshake(
+        &self,
+        _caller: &legion_sync::HandshakeHello,
+    ) -> legion_sync::Result<PeerHandshake> {
         Ok(PeerHandshake {
             folder_id: self.folder_id.clone(),
             member_id: self.member_id.clone(),

@@ -43,7 +43,10 @@ impl<F: SyncFs, S: IndexStore> Peer for EnginePeer<'_, F, S> {
         &self.member_id
     }
 
-    fn handshake(&self, caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+    fn handshake(
+        &self,
+        caller: &legion_sync::HandshakeHello,
+    ) -> legion_sync::Result<PeerHandshake> {
         self.engine.serve_handshake(&self.caller, caller)
     }
 
@@ -945,7 +948,10 @@ impl Peer for SyntheticLinuxPeer {
         &self.member_id
     }
 
-    fn handshake(&self, _caller: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+    fn handshake(
+        &self,
+        _caller: &legion_sync::HandshakeHello,
+    ) -> legion_sync::Result<PeerHandshake> {
         Ok(PeerHandshake {
             folder_id: "docs".to_string(),
             member_id: self.member_id.clone(),
@@ -1277,7 +1283,12 @@ fn real_disk_syncs_symlinks_between_unix_members_and_refuses_symlink_escape() {
     let scan = a.scan(t0).unwrap();
     assert_eq!(scan.held_back_problems.len(), 2);
 
-    assert!(a.store().get_record("link_dir/secret.txt").unwrap().is_none());
+    assert!(
+        a.store()
+            .get_record("link_dir/secret.txt")
+            .unwrap()
+            .is_none()
+    );
     assert!(a.store().get_record("link_dir").unwrap().is_none());
     assert!(a.store().get_record("escape_link").unwrap().is_none());
     let rec = a.store().get_record("sub/rel_link").unwrap().unwrap();

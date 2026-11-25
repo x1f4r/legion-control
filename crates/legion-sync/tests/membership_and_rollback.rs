@@ -22,23 +22,57 @@ fn m1_member_learned_late_never_receives_files() {
     fs::create_dir_all(t.join("nas")).unwrap();
     fs::write(t.join("nas/photo.jpg"), b"nas photo").unwrap();
     nas.scan(ts(0)).unwrap();
-    tower.pull_from_peer(&EnginePeer::new(&nas, "tower"), ts(1)).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&nas, "tower"), ts(1))
+        .unwrap();
     assert!(t.join("tower/photo.jpg").exists());
 
-    let r = pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(2)).unwrap();
+    let r = pi
+        .pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(2))
+        .unwrap();
     println!("pi pull before learning nas: {r:?}");
     pi.add_member("nas").unwrap();
-    let r = pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(3)).unwrap();
+    let r = pi
+        .pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(3))
+        .unwrap();
     println!("pi pull after learning nas: {r:?}");
     let st = pi.status().unwrap();
-    println!("pi status problems: {:?}", (&st.state, st.members.iter().map(|m| format!("{:?}", m)).collect::<Vec<_>>()));
+    println!(
+        "pi status problems: {:?}",
+        (
+            &st.state,
+            st.members
+                .iter()
+                .map(|m| format!("{:?}", m))
+                .collect::<Vec<_>>()
+        )
+    );
     drop(pi);
-    let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &["tower", "pi", "nas"]);
-    let r = pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(4)).unwrap();
+    let mut pi = open_real(
+        &t.join("pi"),
+        &t.join("pi.redb"),
+        "pi",
+        &["tower", "pi", "nas"],
+    );
+    let r = pi
+        .pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(4))
+        .unwrap();
     println!("pi pull after restart: {r:?}");
     let st = pi.status().unwrap();
-    println!("pi status problems after restart: {:?}", (&st.state, st.members.iter().map(|m| format!("{:?}", m)).collect::<Vec<_>>()));
-    assert!(t.join("pi/photo.jpg").exists(), "pi never receives nas's file from tower");
+    println!(
+        "pi status problems after restart: {:?}",
+        (
+            &st.state,
+            st.members
+                .iter()
+                .map(|m| format!("{:?}", m))
+                .collect::<Vec<_>>()
+        )
+    );
+    assert!(
+        t.join("pi/photo.jpg").exists(),
+        "pi never receives nas's file from tower"
+    );
 }
 
 /// A deletion pi skipped (version names a member pi did not know yet) is acknowledged anyway,
@@ -55,28 +89,50 @@ fn m2_skipped_deletion_acknowledged_then_resurrected() {
     fs::create_dir_all(t.join("tower")).unwrap();
     fs::write(t.join("tower/report.txt"), b"report v1").unwrap();
     tower.scan(ts(0)).unwrap();
-    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1)).unwrap();
-    nas.pull_from_peer(&EnginePeer::new(&tower, "nas"), ts(1)).unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1))
+        .unwrap();
+    nas.pull_from_peer(&EnginePeer::new(&tower, "nas"), ts(1))
+        .unwrap();
     // nas edits; tower takes it; then tower deletes the file.
     fs::write(t.join("nas/report.txt"), b"report v2 by nas").unwrap();
     nas.scan(ts(10)).unwrap();
-    tower.pull_from_peer(&EnginePeer::new(&nas, "tower"), ts(11)).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&nas, "tower"), ts(11))
+        .unwrap();
     fs::remove_file(t.join("tower/report.txt")).unwrap();
     tower.scan(ts(20)).unwrap();
-    let r = pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(21)).unwrap();
+    let r = pi
+        .pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(21))
+        .unwrap();
     println!("pi pull of the deletion: {r:?}");
-    nas.pull_from_peer(&EnginePeer::new(&tower, "nas"), ts(21)).unwrap();
+    nas.pull_from_peer(&EnginePeer::new(&tower, "nas"), ts(21))
+        .unwrap();
     // Exchange acknowledgements.
-    tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(22)).unwrap();
-    tower.pull_from_peer(&EnginePeer::new(&nas, "tower"), ts(22)).unwrap();
-    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(23)).unwrap();
-    nas.pull_from_peer(&EnginePeer::new(&tower, "nas"), ts(23)).unwrap();
-    let r = tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(24)).unwrap();
-    let r2 = tower.pull_from_peer(&EnginePeer::new(&nas, "tower"), ts(24)).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(22))
+        .unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&nas, "tower"), ts(22))
+        .unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(23))
+        .unwrap();
+    nas.pull_from_peer(&EnginePeer::new(&tower, "nas"), ts(23))
+        .unwrap();
+    let r = tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(24))
+        .unwrap();
+    let r2 = tower
+        .pull_from_peer(&EnginePeer::new(&nas, "tower"), ts(24))
+        .unwrap();
     println!("tower gc: {} {}", r.tombstones_gc, r2.tombstones_gc);
     let tomb = tower.store().get_record("report.txt").unwrap();
     println!("tower record for report.txt after acks: {tomb:?}");
-    println!("pi still has: {:?}", fs::read(t.join("pi/report.txt")).ok().map(|b| String::from_utf8_lossy(&b).into_owned()));
+    println!(
+        "pi still has: {:?}",
+        fs::read(t.join("pi/report.txt"))
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    );
 
     // pi learns nas; later a new laptop joins everyone and first meets pi.
     pi.add_member("nas").unwrap();
@@ -84,21 +140,45 @@ fn m2_skipped_deletion_acknowledged_then_resurrected() {
         e.add_member("laptop").unwrap();
     }
     pi.add_member("laptop").unwrap();
-    let mut laptop = open_real(&t.join("laptop"), &t.join("laptop.redb"), "laptop", &["tower", "pi", "nas", "laptop"]);
-    laptop.pull_from_peer(&EnginePeer::new(&pi, "laptop"), ts(30)).unwrap();
-    tower.pull_from_peer(&EnginePeer::new(&laptop, "tower"), ts(31)).unwrap();
-    nas.pull_from_peer(&EnginePeer::new(&tower, "nas"), ts(32)).unwrap();
+    let mut laptop = open_real(
+        &t.join("laptop"),
+        &t.join("laptop.redb"),
+        "laptop",
+        &["tower", "pi", "nas", "laptop"],
+    );
+    laptop
+        .pull_from_peer(&EnginePeer::new(&pi, "laptop"), ts(30))
+        .unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&laptop, "tower"), ts(31))
+        .unwrap();
+    nas.pull_from_peer(&EnginePeer::new(&tower, "nas"), ts(32))
+        .unwrap();
     println!(
         "tower: {:?} nas: {:?} laptop: {:?}",
-        fs::read(t.join("tower/report.txt")).ok().map(|b| String::from_utf8_lossy(&b).into_owned()),
-        fs::read(t.join("nas/report.txt")).ok().map(|b| String::from_utf8_lossy(&b).into_owned()),
-        fs::read(t.join("laptop/report.txt")).ok().map(|b| String::from_utf8_lossy(&b).into_owned()),
+        fs::read(t.join("tower/report.txt"))
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned()),
+        fs::read(t.join("nas/report.txt"))
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned()),
+        fs::read(t.join("laptop/report.txt"))
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned()),
     );
-    assert!(!t.join("tower/report.txt").exists(), "deleted report.txt came back on tower");
+    assert!(
+        !t.join("tower/report.txt").exists(),
+        "deleted report.txt came back on tower"
+    );
 }
 
 fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
-    let st = std::process::Command::new("cp").arg("-a").arg(src).arg(dst).status().unwrap();
+    let st = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(src)
+        .arg(dst)
+        .status()
+        .unwrap();
     assert!(st.success());
 }
 
@@ -116,8 +196,11 @@ fn m3_restored_backup_few_changes_silently_lost() {
         fs::write(t.join(format!("pi/f{i}.txt")), format!("base {i}")).unwrap();
     }
     pi.scan(ts(0)).unwrap();
-    tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(1)).unwrap();
-    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1)).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(1))
+        .unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1))
+        .unwrap();
     // Backup of pi (folder + index) taken now.
     drop(pi);
     fs::create_dir_all(t.join("backup")).unwrap();
@@ -129,8 +212,11 @@ fn m3_restored_backup_few_changes_silently_lost() {
         fs::write(t.join(format!("pi/f{i}.txt")), format!("after backup {i}")).unwrap();
     }
     pi.scan(ts(10)).unwrap();
-    tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(11)).unwrap();
-    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(11)).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(11))
+        .unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(11))
+        .unwrap();
     // Disk dies; the person restores pi from the backup.
     drop(pi);
     fs::remove_dir_all(t.join("pi")).unwrap();
@@ -139,18 +225,27 @@ fn m3_restored_backup_few_changes_silently_lost() {
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     // The person writes 15 new documents before the machines meet.
     for i in 0..15 {
-        fs::write(t.join(format!("pi/new{i}.txt")), format!("new after restore {i}")).unwrap();
+        fs::write(
+            t.join(format!("pi/new{i}.txt")),
+            format!("new after restore {i}"),
+        )
+        .unwrap();
     }
     pi.scan(ts(20)).unwrap();
     let r1 = tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(21));
     println!("tower pull: {r1:?}");
     let r2 = pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(22));
-    println!("pi pull: {r2:?} incarnation now {:x}", pi.meta().unwrap().incarnation);
+    println!(
+        "pi pull: {r2:?} incarnation now {:x}",
+        pi.meta().unwrap().incarnation
+    );
     for k in 0..3 {
         let _ = tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(30 + k));
         let _ = pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(30 + k));
     }
-    let missing: Vec<_> = (0..15).filter(|i| !t.join(format!("tower/new{i}.txt")).exists()).collect();
+    let missing: Vec<_> = (0..15)
+        .filter(|i| !t.join(format!("tower/new{i}.txt")).exists())
+        .collect();
     println!("new files missing on tower: {missing:?}");
     println!("tower status: {:?}", tower.status().unwrap().state);
     println!("pi status: {:?}", pi.status().unwrap().state);
@@ -167,11 +262,19 @@ fn m4_reinstall_while_other_member_off_resurrects() {
     let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
     let mut laptop = open_real(&t.join("laptop"), &t.join("laptop.redb"), "laptop", &all);
     fs::create_dir_all(t.join("tower")).unwrap();
-    fs::write(t.join("tower/old-tax-return.pdf"), b"private, deleted on purpose").unwrap();
+    fs::write(
+        t.join("tower/old-tax-return.pdf"),
+        b"private, deleted on purpose",
+    )
+    .unwrap();
     fs::write(t.join("tower/keep.txt"), b"keep").unwrap();
     tower.scan(ts(0)).unwrap();
-    laptop.pull_from_peer(&EnginePeer::new(&tower, "laptop"), ts(1)).unwrap();
-    tower.pull_from_peer(&EnginePeer::new(&laptop, "tower"), ts(1)).unwrap();
+    laptop
+        .pull_from_peer(&EnginePeer::new(&tower, "laptop"), ts(1))
+        .unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&laptop, "tower"), ts(1))
+        .unwrap();
     // Laptop goes off for weeks. Tower deletes the file.
     fs::remove_file(t.join("tower/old-tax-return.pdf")).unwrap();
     tower.scan(ts(10)).unwrap();
@@ -198,8 +301,14 @@ fn m4_reinstall_while_other_member_off_resurrects() {
         t.join("tower/old-tax-return.pdf").exists(),
         t.join("laptop/old-tax-return.pdf").exists()
     );
-    assert!(!t.join("tower/old-tax-return.pdf").exists(), "deleted file came back on tower");
-    assert!(!t.join("laptop/old-tax-return.pdf").exists(), "deleted file was not deleted on laptop");
+    assert!(
+        !t.join("tower/old-tax-return.pdf").exists(),
+        "deleted file came back on tower"
+    );
+    assert!(
+        !t.join("laptop/old-tax-return.pdf").exists(),
+        "deleted file was not deleted on laptop"
+    );
 }
 
 /// After the restore, the person edits files that had also changed after the backup.
@@ -215,8 +324,11 @@ fn m5_restored_backup_new_edits_replaced_by_old() {
         fs::write(t.join(format!("pi/f{i}.txt")), format!("base {i}")).unwrap();
     }
     pi.scan(ts(0)).unwrap();
-    tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(1)).unwrap();
-    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1)).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(1))
+        .unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1))
+        .unwrap();
     drop(pi);
     fs::create_dir_all(t.join("backup")).unwrap();
     copy_tree(&t.join("pi"), &t.join("backup/pi"));
@@ -224,12 +336,19 @@ fn m5_restored_backup_new_edits_replaced_by_old() {
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     for round in 0..3 {
         for i in 0..5 {
-            fs::write(t.join(format!("pi/f{i}.txt")), format!("after backup {i} r{round}")).unwrap();
+            fs::write(
+                t.join(format!("pi/f{i}.txt")),
+                format!("after backup {i} r{round}"),
+            )
+            .unwrap();
         }
         pi.scan(ts(10 + round)).unwrap();
     }
-    tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(14)).unwrap();
-    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(14)).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(14))
+        .unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(14))
+        .unwrap();
     drop(pi);
     fs::remove_dir_all(t.join("pi")).unwrap();
     copy_tree(&t.join("backup/pi"), &t.join("pi"));
@@ -242,13 +361,29 @@ fn m5_restored_backup_new_edits_replaced_by_old() {
     for k in 0..3 {
         let a = tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(30 + k));
         let b = pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(30 + k));
-        println!("round {k}: tower {:?} / pi {:?}", a.map(|r| (r.applied, r.kept)), b.map(|r| (r.applied, r.kept)));
+        println!(
+            "round {k}: tower {:?} / pi {:?}",
+            a.map(|r| (r.applied, r.kept)),
+            b.map(|r| (r.applied, r.kept))
+        );
     }
     for i in 0..5 {
         let want = format!("TODAY's work {i}");
-        let live_pi = fs::read_dir(t.join("pi")).unwrap().flatten().filter(|e| e.file_type().unwrap().is_file()).any(|e| fs::read(e.path()).unwrap() == want.as_bytes());
-        let live_tower = fs::read_dir(t.join("tower")).unwrap().flatten().filter(|e| e.file_type().unwrap().is_file()).any(|e| fs::read(e.path()).unwrap() == want.as_bytes());
-        println!("f{i}: today's work live on pi {live_pi}, on tower {live_tower}, anywhere {:?}; pi f{i} now {:?}", where_is(&t.join("pi"), want.as_bytes()), String::from_utf8_lossy(&fs::read(t.join(format!("pi/f{i}.txt"))).unwrap()));
+        let live_pi = fs::read_dir(t.join("pi"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().unwrap().is_file())
+            .any(|e| fs::read(e.path()).unwrap() == want.as_bytes());
+        let live_tower = fs::read_dir(t.join("tower"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().unwrap().is_file())
+            .any(|e| fs::read(e.path()).unwrap() == want.as_bytes());
+        println!(
+            "f{i}: today's work live on pi {live_pi}, on tower {live_tower}, anywhere {:?}; pi f{i} now {:?}",
+            where_is(&t.join("pi"), want.as_bytes()),
+            String::from_utf8_lossy(&fs::read(t.join(format!("pi/f{i}.txt"))).unwrap())
+        );
         assert!(live_pi, "TODAY's work {i} must stay live on pi");
         assert!(live_tower, "TODAY's work {i} must reach tower as live");
     }
@@ -267,8 +402,11 @@ fn m6_restored_backup_more_changes_than_gap() {
         fs::write(t.join(format!("pi/f{i}.txt")), format!("base {i}")).unwrap();
     }
     pi.scan(ts(0)).unwrap();
-    tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(1)).unwrap();
-    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1)).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(1))
+        .unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1))
+        .unwrap();
     drop(pi);
     fs::create_dir_all(t.join("backup")).unwrap();
     copy_tree(&t.join("pi"), &t.join("backup/pi"));
@@ -276,12 +414,19 @@ fn m6_restored_backup_more_changes_than_gap() {
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     for round in 0..3 {
         for i in 0..5 {
-            fs::write(t.join(format!("pi/f{i}.txt")), format!("after backup {i} r{round}")).unwrap();
+            fs::write(
+                t.join(format!("pi/f{i}.txt")),
+                format!("after backup {i} r{round}"),
+            )
+            .unwrap();
         }
         pi.scan(ts(10 + round)).unwrap();
     }
-    tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(14)).unwrap();
-    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(14)).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(14))
+        .unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(14))
+        .unwrap();
     drop(pi);
     fs::remove_dir_all(t.join("pi")).unwrap();
     copy_tree(&t.join("backup/pi"), &t.join("pi"));
@@ -298,13 +443,29 @@ fn m6_restored_backup_more_changes_than_gap() {
     for k in 0..3 {
         let a = tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(30 + k));
         let b = pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(30 + k));
-        println!("round {k}: tower {:?} / pi {:?}", a.map(|r| (r.applied, r.kept)), b.map(|r| (r.applied, r.kept)));
+        println!(
+            "round {k}: tower {:?} / pi {:?}",
+            a.map(|r| (r.applied, r.kept)),
+            b.map(|r| (r.applied, r.kept))
+        );
     }
     for i in 0..5 {
         let want = format!("TODAY's work {i}");
-        let live_pi = fs::read_dir(t.join("pi")).unwrap().flatten().filter(|e| e.file_type().unwrap().is_file()).any(|e| fs::read(e.path()).unwrap() == want.as_bytes());
-        let live_tower = fs::read_dir(t.join("tower")).unwrap().flatten().filter(|e| e.file_type().unwrap().is_file()).any(|e| fs::read(e.path()).unwrap() == want.as_bytes());
-        println!("f{i}: today's work live on pi {live_pi}, on tower {live_tower}, anywhere {:?}; pi f{i} now {:?}", where_is(&t.join("pi"), want.as_bytes()), String::from_utf8_lossy(&fs::read(t.join(format!("pi/f{i}.txt"))).unwrap()));
+        let live_pi = fs::read_dir(t.join("pi"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().unwrap().is_file())
+            .any(|e| fs::read(e.path()).unwrap() == want.as_bytes());
+        let live_tower = fs::read_dir(t.join("tower"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().unwrap().is_file())
+            .any(|e| fs::read(e.path()).unwrap() == want.as_bytes());
+        println!(
+            "f{i}: today's work live on pi {live_pi}, on tower {live_tower}, anywhere {:?}; pi f{i} now {:?}",
+            where_is(&t.join("pi"), want.as_bytes()),
+            String::from_utf8_lossy(&fs::read(t.join(format!("pi/f{i}.txt"))).unwrap())
+        );
         assert!(live_pi, "TODAY's work {i} must stay live on pi");
         assert!(live_tower, "TODAY's work {i} must reach tower as live");
     }
@@ -323,8 +484,11 @@ fn m7_restored_backup_edit_first_then_more() {
         fs::write(t.join(format!("pi/f{i}.txt")), format!("base {i}")).unwrap();
     }
     pi.scan(ts(0)).unwrap();
-    tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(1)).unwrap();
-    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1)).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(1))
+        .unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1))
+        .unwrap();
     drop(pi);
     fs::create_dir_all(t.join("backup")).unwrap();
     copy_tree(&t.join("pi"), &t.join("backup/pi"));
@@ -332,12 +496,19 @@ fn m7_restored_backup_edit_first_then_more() {
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     for round in 0..3 {
         for i in 0..5 {
-            fs::write(t.join(format!("pi/f{i}.txt")), format!("after backup {i} r{round}")).unwrap();
+            fs::write(
+                t.join(format!("pi/f{i}.txt")),
+                format!("after backup {i} r{round}"),
+            )
+            .unwrap();
         }
         pi.scan(ts(10 + round)).unwrap();
     }
-    tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(14)).unwrap();
-    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(14)).unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(14))
+        .unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(14))
+        .unwrap();
     drop(pi);
     fs::remove_dir_all(t.join("pi")).unwrap();
     copy_tree(&t.join("backup/pi"), &t.join("pi"));
@@ -354,13 +525,29 @@ fn m7_restored_backup_edit_first_then_more() {
     for k in 0..3 {
         let a = tower.pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(30 + k));
         let b = pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(30 + k));
-        println!("round {k}: tower {:?} / pi {:?}", a.map(|r| (r.applied, r.kept)), b.map(|r| (r.applied, r.kept)));
+        println!(
+            "round {k}: tower {:?} / pi {:?}",
+            a.map(|r| (r.applied, r.kept)),
+            b.map(|r| (r.applied, r.kept))
+        );
     }
     for i in 0..5 {
         let want = format!("TODAY's work {i}");
-        let live_pi = fs::read_dir(t.join("pi")).unwrap().flatten().filter(|e| e.file_type().unwrap().is_file()).any(|e| fs::read(e.path()).unwrap() == want.as_bytes());
-        let live_tower = fs::read_dir(t.join("tower")).unwrap().flatten().filter(|e| e.file_type().unwrap().is_file()).any(|e| fs::read(e.path()).unwrap() == want.as_bytes());
-        println!("f{i}: today's work live on pi {live_pi}, on tower {live_tower}, anywhere {:?}; pi f{i} now {:?}", where_is(&t.join("pi"), want.as_bytes()), String::from_utf8_lossy(&fs::read(t.join(format!("pi/f{i}.txt"))).unwrap()));
+        let live_pi = fs::read_dir(t.join("pi"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().unwrap().is_file())
+            .any(|e| fs::read(e.path()).unwrap() == want.as_bytes());
+        let live_tower = fs::read_dir(t.join("tower"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().unwrap().is_file())
+            .any(|e| fs::read(e.path()).unwrap() == want.as_bytes());
+        println!(
+            "f{i}: today's work live on pi {live_pi}, on tower {live_tower}, anywhere {:?}; pi f{i} now {:?}",
+            where_is(&t.join("pi"), want.as_bytes()),
+            String::from_utf8_lossy(&fs::read(t.join(format!("pi/f{i}.txt"))).unwrap())
+        );
         assert!(live_pi, "TODAY's work {i} must stay live on pi");
         assert!(live_tower, "TODAY's work {i} must reach tower as live");
     }

@@ -47,13 +47,57 @@ fn i1_truncated_or_torn_index() {
     let orig = fs::read(t.join("tower.redb")).unwrap();
     let orig_marker = fs::read(t.join("tower/.legion-sync/marker.json")).unwrap();
     let cases: Vec<(&str, Box<dyn Fn(&std::path::Path)>)> = vec![
-        ("truncate to 0", Box::new(|p| { fs::File::create(p).unwrap(); })),
-        ("truncate to 10%", Box::new(|p| { let f = fs::OpenOptions::new().write(true).open(p).unwrap(); f.set_len((fs::metadata(p).unwrap().len()) / 10).unwrap(); })),
-        ("truncate to 50%", Box::new(|p| { let f = fs::OpenOptions::new().write(true).open(p).unwrap(); f.set_len((fs::metadata(p).unwrap().len()) / 2).unwrap(); })),
-        ("truncate to 90%", Box::new(|p| { let f = fs::OpenOptions::new().write(true).open(p).unwrap(); f.set_len((fs::metadata(p).unwrap().len()) * 9 / 10).unwrap(); })),
-        ("zero first 4 KiB", Box::new(|p| { let mut f = fs::OpenOptions::new().write(true).open(p).unwrap(); f.write_all(&[0u8; 4096]).unwrap(); })),
-        ("zero 64 KiB at middle", Box::new(|p| { let n = fs::metadata(p).unwrap().len(); let mut f = fs::OpenOptions::new().write(true).open(p).unwrap(); f.seek(SeekFrom::Start(n / 2)).unwrap(); f.write_all(&vec![0u8; 65536]).unwrap(); })),
-        ("garbage tail", Box::new(|p| { let mut f = fs::OpenOptions::new().append(true).open(p).unwrap(); f.write_all(&[0xAB; 9999]).unwrap(); })),
+        (
+            "truncate to 0",
+            Box::new(|p| {
+                fs::File::create(p).unwrap();
+            }),
+        ),
+        (
+            "truncate to 10%",
+            Box::new(|p| {
+                let f = fs::OpenOptions::new().write(true).open(p).unwrap();
+                f.set_len((fs::metadata(p).unwrap().len()) / 10).unwrap();
+            }),
+        ),
+        (
+            "truncate to 50%",
+            Box::new(|p| {
+                let f = fs::OpenOptions::new().write(true).open(p).unwrap();
+                f.set_len((fs::metadata(p).unwrap().len()) / 2).unwrap();
+            }),
+        ),
+        (
+            "truncate to 90%",
+            Box::new(|p| {
+                let f = fs::OpenOptions::new().write(true).open(p).unwrap();
+                f.set_len((fs::metadata(p).unwrap().len()) * 9 / 10)
+                    .unwrap();
+            }),
+        ),
+        (
+            "zero first 4 KiB",
+            Box::new(|p| {
+                let mut f = fs::OpenOptions::new().write(true).open(p).unwrap();
+                f.write_all(&[0u8; 4096]).unwrap();
+            }),
+        ),
+        (
+            "zero 64 KiB at middle",
+            Box::new(|p| {
+                let n = fs::metadata(p).unwrap().len();
+                let mut f = fs::OpenOptions::new().write(true).open(p).unwrap();
+                f.seek(SeekFrom::Start(n / 2)).unwrap();
+                f.write_all(&vec![0u8; 65536]).unwrap();
+            }),
+        ),
+        (
+            "garbage tail",
+            Box::new(|p| {
+                let mut f = fs::OpenOptions::new().append(true).open(p).unwrap();
+                f.write_all(&[0xAB; 9999]).unwrap();
+            }),
+        ),
     ];
     for (name, damage) in cases {
         fs::write(t.join("tower.redb"), &orig).unwrap();
