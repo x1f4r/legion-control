@@ -1,18 +1,29 @@
 //! Bounded on-disk LRU cache for `fs.thumb` inside the node's state directory.
 //!
-//! Entries live under `<state_dir>/thumb-cache/` as atomic `<key>.thumb` files alongside an
-//! `index.v1` manifest ordered by a monotonic sequence number. A kernel file lock (`cache.lock`)
-//! serializes index updates and eviction across concurrent calls and processes without ever being
-//! held while an image or video is decoded. Because the cache resides under the node's state
-//! directory, non-admin roles cannot read or modify it through `fs.*` tools.
+//! Design properties:
+//! - **Directory is the truth**: there is no separate index file to drift or rewrite. Every
+//!   `.thumb` file in `<state_dir>/thumb-cache/` is written atomically (`0o600` on Unix) and
+//!   counted during reconciliation, so entries left behind by crashes or killed processes are
+//!   always accounted for and evicted.
+//! - **Cheap lock-free hits**: [`ThumbCache::get`] reads `<key>.thumb` directly without taking
+//!   any lock or calling `fsync`, and updates LRU recency with a best-effort mtime touch on that
+//!   single file only. Lock contention or eviction races never turn a valid cache hit into a miss.
+//! - **Bounded cap & temp cleanup**: [`ThumbCache::put`] reconciles on first write, periodically,
+//!   and whenever approximate usage approaches the 256 MiB cap under an exclusive `cache.lock`,
+//!   evicting least-recently-used `.thumb` files strictly down to the cap and sweeping stale
+//!   temporary files and `tmp/` frame directories left by interrupted processes.
+//! - **Protected by state dir**: because the cache lives under `state_dir`, non-admin roles cannot
+//!   read or modify it through `fs.*` tools.
 
-use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use legion_os::atomic::{WriteOptions, write_atomic};
+use legion_os::file_id::FileId;
 use legion_os::lock::{FileLock, LockMode};
 
 use super::platform;
@@ -21,15 +32,17 @@ use super::thumb::ThumbFit;
 /// Default maximum total size of cached thumbnail files on disk (256 MiB).
 pub(crate) const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
-const CACHE_VERSION: &str = "legion-thumb-v1";
+const CACHE_VERSION: &str = "legion-thumb-v2";
 const ENTRY_MAGIC: &[u8; 4] = b"LGTH";
 const ENTRY_VERSION: u8 = 1;
 const MIME_JPEG_TAG: u8 = 1;
 const MIME_PNG_TAG: u8 = 2;
 const ENTRY_HEADER_LEN: usize = 14;
-const INDEX_FILE: &str = "index.v1";
 const LOCK_FILE: &str = "cache.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const RECONCILE_EVERY_PUTS: u64 = 16;
+const DEFAULT_STALE_TMP_AGE: Duration = Duration::from_secs(5 * 60);
 
 /// Decoded/encoded thumbnail payload stored in and retrieved from the cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,11 +55,15 @@ pub(crate) struct CachedThumb {
 
 /// Computes the deterministic BLAKE3 cache key for one thumbnail request.
 ///
-/// Every component is length- or fixed-width-delimited so two distinct inputs can never collide.
+/// Includes the resolved path, source byte length, modification time, OS file identity (`dev`/`ino`
+/// or Windows volume+file index) and metadata change time (`ctime` / NTFS `ChangeTime`), plus
+/// thumbnail parameters, so a file swapped with identical size and mtime never serves a stale
+/// thumbnail.
 pub(crate) fn cache_key(
     resolved_path: &Path,
     source_size: u64,
     mtime_nanos: Option<i128>,
+    file_id: Option<FileId>,
     thumb_size: u32,
     fit: ThumbFit,
 ) -> String {
@@ -65,6 +82,25 @@ pub(crate) fn cache_key(
             hasher.update(&[0]);
         }
     }
+    match file_id {
+        Some(id) => {
+            hasher.update(&[1]);
+            hasher.update(&id.volume.to_le_bytes());
+            hasher.update(&id.index.to_le_bytes());
+            match id.change_time {
+                Some(ct) => {
+                    hasher.update(&[1]);
+                    hasher.update(&ct.to_le_bytes());
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            }
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
     hasher.update(&thumb_size.to_le_bytes());
     hasher.update(&[match fit {
         ThumbFit::Contain => 0,
@@ -73,11 +109,36 @@ pub(crate) fn cache_key(
     hasher.finalize().to_hex().to_string()
 }
 
+/// Process-local hints used to avoid rescanning a huge cache directory on every single miss while
+/// still reconciling on startup, periodically, and whenever usage approaches `max_bytes`.
+#[derive(Debug)]
+struct CacheHints {
+    reconciled_once: AtomicBool,
+    puts_since_reconcile: AtomicU64,
+    approx_bytes: AtomicU64,
+    last_reconcile: Mutex<Option<Instant>>,
+    last_touch: Mutex<SystemTime>,
+}
+
+impl Default for CacheHints {
+    fn default() -> Self {
+        Self {
+            reconciled_once: AtomicBool::new(false),
+            puts_since_reconcile: AtomicU64::new(0),
+            approx_bytes: AtomicU64::new(0),
+            last_reconcile: Mutex::new(None),
+            last_touch: Mutex::new(UNIX_EPOCH),
+        }
+    }
+}
+
 /// On-disk LRU thumbnail cache rooted in a single directory.
 #[derive(Clone, Debug)]
 pub(crate) struct ThumbCache {
     dir: PathBuf,
     max_bytes: u64,
+    stale_tmp_age: Duration,
+    hints: Arc<CacheHints>,
 }
 
 impl ThumbCache {
@@ -86,59 +147,40 @@ impl ThumbCache {
         ThumbCache {
             dir,
             max_bytes: MAX_CACHE_BYTES,
+            stale_tmp_age: DEFAULT_STALE_TMP_AGE,
+            hints: Arc::new(CacheHints::default()),
         }
     }
 
-    /// Opens a cache at `dir` with an explicit byte cap (used in tests).
+    /// Opens a cache at `dir` with an explicit byte cap and stale-temp threshold (used in tests).
     #[cfg(test)]
-    pub(crate) fn with_max_bytes(dir: PathBuf, max_bytes: u64) -> ThumbCache {
-        ThumbCache { dir, max_bytes }
+    pub(crate) fn with_limits(dir: PathBuf, max_bytes: u64, stale_tmp_age: Duration) -> ThumbCache {
+        ThumbCache {
+            dir,
+            max_bytes,
+            stale_tmp_age,
+            hints: Arc::new(CacheHints::default()),
+        }
     }
 
-    /// Looks up `key` in the cache, updating its LRU recency on hit.
+    /// Looks up `key` without taking any lock, rewriting any index, or calling `fsync`.
     ///
-    /// Returns `None` on miss, corruption, or lock contention so cache errors never fail a
-    /// thumbnail call.
+    /// On hit, updates the entry file's modification time best-effort so LRU eviction keeps hot
+    /// thumbnails. Any error touching mtime is ignored and never turns a hit into a miss.
     pub(crate) fn get(&self, key: &str) -> Option<CachedThumb> {
-        if !self.dir.exists() {
-            return None;
-        }
-        let _lock = self.acquire_lock().ok()?;
         let entry_path = self.entry_path(key);
-        let raw = match fs::read(&entry_path) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                // Keep the index clean if the entry file disappeared externally.
-                let mut index = self.load_or_rebuild_index();
-                if index.entries.remove(key).is_some() {
-                    let _ = self.save_index(&index);
-                }
-                return None;
-            }
-        };
+        let raw = fs::read(&entry_path).ok()?;
         let Some(thumb) = decode_entry(&raw) else {
             let _ = fs::remove_file(&entry_path);
-            let mut index = self.load_or_rebuild_index();
-            if index.entries.remove(key).is_some() {
-                let _ = self.save_index(&index);
-            }
             return None;
         };
-        let mut index = self.load_or_rebuild_index();
-        let seq = index.bump_seq();
-        index.entries.insert(
-            key.to_owned(),
-            IndexEntry {
-                size: raw.len() as u64,
-                last_used: seq,
-            },
-        );
-        let _ = self.save_index(&index);
+        let _ = self.touch_recency(&entry_path);
         Some(thumb)
     }
 
-    /// Stores `thumb` under `key` and evicts least-recently-used entries until the total cached
-    /// bytes fit within `self.max_bytes`.
+    /// Stores `thumb` atomically under `key`, then reconciles and evicts least-recently-used
+    /// entries when needed so the directory stays within `self.max_bytes` and free of stale
+    /// temporaries.
     pub(crate) fn put(&self, key: &str, thumb: &CachedThumb) {
         let Some(encoded) = encode_entry(thumb) else {
             return;
@@ -150,24 +192,162 @@ impl ThumbCache {
         if self.ensure_dir().is_err() {
             return;
         }
-        let Ok(_lock) = self.acquire_lock() else {
-            return;
-        };
         let entry_path = self.entry_path(key);
         if write_atomic(&entry_path, &encoded, WriteOptions::with_mode(0o600)).is_err() {
             return;
         }
-        let mut index = self.load_or_rebuild_index();
-        let seq = index.bump_seq();
-        index.entries.insert(
-            key.to_owned(),
-            IndexEntry {
-                size: entry_size,
-                last_used: seq,
-            },
-        );
-        self.evict_to_cap(&mut index, key);
-        let _ = self.save_index(&index);
+        let _ = self.touch_recency(&entry_path);
+
+        let approx = self
+            .hints
+            .approx_bytes
+            .fetch_add(entry_size, Ordering::Relaxed)
+            .saturating_add(entry_size);
+        let puts = self
+            .hints
+            .puts_since_reconcile
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+
+        let need_reconcile = !self.hints.reconciled_once.load(Ordering::Relaxed)
+            || self.max_bytes <= 1024 * 1024
+            || approx > (self.max_bytes / 10).saturating_mul(9)
+            || puts >= RECONCILE_EVERY_PUTS
+            || self
+                .hints
+                .last_reconcile
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none_or(|t| t.elapsed() >= RECONCILE_INTERVAL);
+
+        if need_reconcile {
+            self.reconcile(Some(key));
+        }
+    }
+
+    /// Scans the cache directory as the source of truth under `cache.lock`: counts every `.thumb`
+    /// file (including any orphaned entries from killed processes), evicts oldest-mtime entries
+    /// down to `self.max_bytes`, and removes stale temporary files and `tmp/` subdirectories.
+    pub(crate) fn reconcile(&self, keep_key: Option<&str>) {
+        if !self.dir.exists() {
+            return;
+        }
+        let Ok(_lock) = self.acquire_lock() else {
+            return;
+        };
+
+        let now = SystemTime::now();
+        let mut entries: Vec<(SystemTime, String, PathBuf, u64)> = Vec::new();
+        let mut total: u64 = 0;
+
+        if let Ok(read_dir) = fs::read_dir(&self.dir) {
+            for item in read_dir.flatten() {
+                let path = item.path();
+                let name = item.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str == LOCK_FILE || name_str == "tmp" {
+                    continue;
+                }
+                let Ok(meta) = item.metadata() else {
+                    continue;
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                if let Some(key) = name_str.strip_suffix(".thumb")
+                    && is_valid_key(key)
+                {
+                    let size = meta.len();
+                    let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+                    total = total.saturating_add(size);
+                    entries.push((mtime, key.to_owned(), path, size));
+                } else {
+                    // Clean up legacy index files or stale staging files left by interrupted writes.
+                    let is_stale = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| now.duration_since(t).ok())
+                        .is_some_and(|age| age >= self.stale_tmp_age);
+                    if name_str == "index.v1" || is_stale {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+
+        if total > self.max_bytes {
+            entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            for (_, key, path, size) in entries {
+                if total <= self.max_bytes {
+                    break;
+                }
+                if keep_key.is_some_and(|k| k == key) {
+                    continue;
+                }
+                if fs::remove_file(&path).is_ok() {
+                    total = total.saturating_sub(size);
+                }
+            }
+        }
+
+        self.cleanup_stale_tmp(now);
+
+        self.hints.approx_bytes.store(total, Ordering::Relaxed);
+        self.hints.puts_since_reconcile.store(0, Ordering::Relaxed);
+        self.hints.reconciled_once.store(true, Ordering::Relaxed);
+        *self
+            .hints
+            .last_reconcile
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+    }
+
+    fn cleanup_stale_tmp(&self, now: SystemTime) {
+        let tmp_root = self.dir.join("tmp");
+        let Ok(read_dir) = fs::read_dir(&tmp_root) else {
+            return;
+        };
+        for item in read_dir.flatten() {
+            let path = item.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let stale = meta
+                .modified()
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_some_and(|age| age >= self.stale_tmp_age);
+            if !stale {
+                continue;
+            }
+            if meta.is_dir() {
+                let _ = fs::remove_dir_all(&path);
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+
+    /// Monotonically advances the entry file's modification time without locking or fsyncing,
+    /// guaranteeing strict LRU ordering even when multiple cache accesses happen within the same
+    /// filesystem timestamp tick.
+    fn touch_recency(&self, path: &Path) -> io::Result<()> {
+        let stamp = {
+            let mut last = self
+                .hints
+                .last_touch
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let now = SystemTime::now();
+            let next = match last.checked_add(Duration::from_millis(10)) {
+                Some(bumped) if bumped > now => bumped,
+                _ => now,
+            };
+            *last = next;
+            next
+        };
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_modified(stamp)
     }
 
     fn ensure_dir(&self) -> io::Result<()> {
@@ -186,154 +366,6 @@ impl ThumbCache {
     fn entry_path(&self, key: &str) -> PathBuf {
         self.dir.join(format!("{key}.thumb"))
     }
-
-    fn index_path(&self) -> PathBuf {
-        self.dir.join(INDEX_FILE)
-    }
-
-    fn load_or_rebuild_index(&self) -> CacheIndex {
-        let path = self.index_path();
-        if let Ok(text) = fs::read_to_string(&path)
-            && let Some(index) = CacheIndex::parse(&text)
-        {
-            return index;
-        }
-        self.rebuild_index()
-    }
-
-    fn rebuild_index(&self) -> CacheIndex {
-        let mut discovered: Vec<(String, u64, u128)> = Vec::new();
-        if let Ok(read_dir) = fs::read_dir(&self.dir) {
-            for item in read_dir.flatten() {
-                let name = item.file_name();
-                let Some(name_str) = name.to_str() else {
-                    continue;
-                };
-                let Some(key) = name_str.strip_suffix(".thumb") else {
-                    continue;
-                };
-                if !is_valid_key(key) {
-                    continue;
-                }
-                let Ok(meta) = item.metadata() else {
-                    continue;
-                };
-                if !meta.is_file() {
-                    continue;
-                }
-                let stamp = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_nanos());
-                discovered.push((key.to_owned(), meta.len(), stamp));
-            }
-        }
-        discovered.sort_by_key(|(_, _, stamp)| *stamp);
-        let mut index = CacheIndex::default();
-        for (key, size, _) in discovered {
-            let seq = index.bump_seq();
-            index.entries.insert(
-                key,
-                IndexEntry {
-                    size,
-                    last_used: seq,
-                },
-            );
-        }
-        index
-    }
-
-    fn evict_to_cap(&self, index: &mut CacheIndex, keep_key: &str) {
-        let mut total: u64 = index.entries.values().map(|e| e.size).sum();
-        if total <= self.max_bytes {
-            return;
-        }
-        let mut candidates: Vec<(u64, String, u64)> = index
-            .entries
-            .iter()
-            .filter(|(k, _)| k.as_str() != keep_key)
-            .map(|(k, e)| (e.last_used, k.clone(), e.size))
-            .collect();
-        candidates.sort_by_key(|(last_used, _, _)| *last_used);
-
-        for (_, key, size) in candidates {
-            if total <= self.max_bytes {
-                break;
-            }
-            index.entries.remove(&key);
-            let _ = fs::remove_file(self.entry_path(&key));
-            total = total.saturating_sub(size);
-        }
-    }
-
-    fn save_index(&self, index: &CacheIndex) -> io::Result<()> {
-        let serialized = index.serialize();
-        write_atomic(
-            self.index_path(),
-            serialized.as_bytes(),
-            WriteOptions::with_mode(0o600),
-        )
-        .map_err(|err| io::Error::other(err.to_string()))
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct IndexEntry {
-    size: u64,
-    last_used: u64,
-}
-
-#[derive(Debug, Default)]
-struct CacheIndex {
-    next_seq: u64,
-    entries: HashMap<String, IndexEntry>,
-}
-
-impl CacheIndex {
-    fn bump_seq(&mut self) -> u64 {
-        self.next_seq = self.next_seq.saturating_add(1);
-        self.next_seq
-    }
-
-    fn parse(text: &str) -> Option<CacheIndex> {
-        let mut lines = text.lines();
-        let header = lines.next()?;
-        let next_seq = header.strip_prefix("v1 ")?.parse::<u64>().ok()?;
-        let mut entries = HashMap::new();
-        for line in lines {
-            if line.is_empty() {
-                continue;
-            }
-            let mut parts = line.split(' ');
-            let key = parts.next()?;
-            let size = parts.next()?.parse::<u64>().ok()?;
-            let last_used = parts.next()?.parse::<u64>().ok()?;
-            if parts.next().is_some() || !is_valid_key(key) {
-                return None;
-            }
-            entries.insert(key.to_owned(), IndexEntry { size, last_used });
-        }
-        Some(CacheIndex { next_seq, entries })
-    }
-
-    fn serialize(&self) -> String {
-        let mut out = String::with_capacity(self.entries.len().saturating_mul(84) + 32);
-        let _ = writeln_str(&mut out, &format!("v1 {}", self.next_seq));
-        for (key, entry) in &self.entries {
-            let _ = writeln_str(
-                &mut out,
-                &format!("{key} {} {}", entry.size, entry.last_used),
-            );
-        }
-        out
-    }
-}
-
-fn writeln_str(buf: &mut String, line: &str) -> io::Result<()> {
-    buf.push_str(line);
-    buf.push('\n');
-    Ok(())
 }
 
 fn is_valid_key(key: &str) -> bool {
@@ -381,22 +413,14 @@ fn decode_entry(raw: &[u8]) -> Option<CachedThumb> {
     })
 }
 
-/// Helper to create a throwaway directory for temporary `ffmpeg` frame output inside the cache
-/// directory (keeping large scratch out of small memory-backed `/tmp`).
+/// Creates a throwaway directory for temporary `ffmpeg` frame output inside the cache directory
+/// (keeping scratch out of small memory-backed `/tmp`).
 pub(crate) fn temp_dir_in_cache(cache_dir: &Path) -> io::Result<tempfile::TempDir> {
     let tmp_root = cache_dir.join("tmp");
     fs::create_dir_all(&tmp_root)?;
     let _ = platform::set_unix_mode(cache_dir, 0o700);
     let _ = platform::set_unix_mode(&tmp_root, 0o700);
     tempfile::tempdir_in(&tmp_root)
-}
-
-/// Touches a file to verify writeability during tests (unused outside tests).
-#[cfg(test)]
-fn _touch_corrupt(path: &Path, data: &[u8]) {
-    use std::io::Write as _;
-    let mut f = fs::File::create(path).unwrap();
-    f.write_all(data).unwrap();
 }
 
 #[cfg(test)]
@@ -412,18 +436,48 @@ mod tests {
         }
     }
 
+    fn fid(vol: u64, idx: u64, ct: i128) -> Option<FileId> {
+        Some(FileId {
+            volume: vol,
+            index: idx,
+            change_time: Some(ct),
+        })
+    }
+
     #[test]
     fn cache_evicts_least_recently_used_and_honors_cap() {
         let dir = tempfile::tempdir().unwrap();
-        // Each entry with 100-byte payload is 114 bytes on disk; cap of 250 bytes holds at most 2.
-        let cache = ThumbCache::with_max_bytes(dir.path().join("thumb-cache"), 250);
-        let k1 = cache_key(Path::new("/a.jpg"), 10, Some(1), 256, ThumbFit::Contain);
-        let k2 = cache_key(Path::new("/b.jpg"), 10, Some(1), 256, ThumbFit::Contain);
-        let k3 = cache_key(Path::new("/c.jpg"), 10, Some(1), 256, ThumbFit::Contain);
+        // Each 100-byte payload is 114 bytes on disk; cap of 250 bytes holds at most 2.
+        let cache =
+            ThumbCache::with_limits(dir.path().join("thumb-cache"), 250, DEFAULT_STALE_TMP_AGE);
+        let k1 = cache_key(
+            Path::new("/a.jpg"),
+            10,
+            Some(1),
+            fid(1, 1, 1),
+            256,
+            ThumbFit::Contain,
+        );
+        let k2 = cache_key(
+            Path::new("/b.jpg"),
+            10,
+            Some(1),
+            fid(1, 2, 1),
+            256,
+            ThumbFit::Contain,
+        );
+        let k3 = cache_key(
+            Path::new("/c.jpg"),
+            10,
+            Some(1),
+            fid(1, 3, 1),
+            256,
+            ThumbFit::Contain,
+        );
 
         cache.put(&k1, &sample(1, 100));
         cache.put(&k2, &sample(2, 100));
-        // Touch k1 so k2 becomes the least recently used entry.
+        // Hit k1 so k2 becomes the least recently used entry.
         assert_eq!(cache.get(&k1), Some(sample(1, 100)));
 
         // Inserting k3 must evict k2 while keeping k1 and k3.
@@ -434,51 +488,204 @@ mod tests {
     }
 
     #[test]
-    fn cache_recovers_from_corrupt_index_and_entry_files() {
+    fn cache_hit_succeeds_without_taking_cache_lock() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("thumb-cache");
-        let cache = ThumbCache::with_max_bytes(root.clone(), 4096);
-        let k1 = cache_key(Path::new("/ok.png"), 5, Some(2), 128, ThumbFit::Cover);
-        let k2 = cache_key(Path::new("/bad.png"), 5, Some(2), 128, ThumbFit::Cover);
+        let cache = ThumbCache::with_limits(root.clone(), 4096, DEFAULT_STALE_TMP_AGE);
+        let k1 = cache_key(
+            Path::new("/hot.jpg"),
+            10,
+            Some(1),
+            fid(1, 1, 1),
+            256,
+            ThumbFit::Contain,
+        );
+        cache.put(&k1, &sample(9, 64));
 
-        cache.put(&k1, &sample(7, 64));
-        _touch_corrupt(&root.join(INDEX_FILE), b"corrupt index\n");
-        _touch_corrupt(&root.join(format!("{k2}.thumb")), b"garbage");
-
-        assert_eq!(cache.get(&k1), Some(sample(7, 64)));
-        assert_eq!(cache.get(&k2), None);
-        assert!(!root.join(format!("{k2}.thumb")).exists());
+        // Hold an exclusive lock on `cache.lock` as if another writer is reconciling.
+        let _held = FileLock::acquire(root.join(LOCK_FILE), LockMode::Exclusive).unwrap();
+        // `get` must STILL succeed immediately without waiting on or failing for the lock.
+        assert_eq!(cache.get(&k1), Some(sample(9, 64)));
     }
 
     #[test]
-    fn cache_key_changes_with_every_parameter() {
-        let base = cache_key(Path::new("/a.jpg"), 100, Some(500), 256, ThumbFit::Contain);
-        assert_ne!(
-            base,
-            cache_key(Path::new("/b.jpg"), 100, Some(500), 256, ThumbFit::Contain)
+    fn reconcile_counts_orphaned_files_and_sweeps_stale_tmp_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("thumb-cache");
+        let cache = ThumbCache::with_limits(root.clone(), 250, Duration::from_secs(60));
+        fs::create_dir_all(root.join("tmp")).unwrap();
+
+        // Drop an "orphaned" `.thumb` file directly on disk (simulating a kill after write) with
+        // an old mtime so reconciliation sees it and evicts it once the cap is exceeded.
+        let orphan_key = cache_key(
+            Path::new("/orphan.jpg"),
+            10,
+            Some(1),
+            fid(1, 99, 1),
+            256,
+            ThumbFit::Contain,
+        );
+        let orphan_path = root.join(format!("{orphan_key}.thumb"));
+        let encoded_orphan = encode_entry(&sample(4, 150)).unwrap();
+        fs::write(&orphan_path, &encoded_orphan).unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(3600);
+        OpenOptions::new()
+            .write(true)
+            .open(&orphan_path)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
+        // Create a stale `tmp/dead` file and a fresh `tmp/live` directory.
+        let stale_tmp = root.join("tmp").join("dead.png");
+        fs::write(&stale_tmp, b"partial").unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&stale_tmp)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        let fresh_tmp = root.join("tmp").join("live-dir");
+        fs::create_dir_all(&fresh_tmp).unwrap();
+
+        // Putting a new 150-byte entry pushes total past 250 bytes -> orphan is evicted and stale
+        // tmp is removed while fresh tmp stays.
+        let fresh_key = cache_key(
+            Path::new("/fresh.jpg"),
+            10,
+            Some(1),
+            fid(1, 100, 1),
+            256,
+            ThumbFit::Contain,
+        );
+        cache.put(&fresh_key, &sample(5, 150));
+
+        assert!(!orphan_path.exists(), "orphaned entry was not evicted");
+        assert!(cache.get(&fresh_key).is_some());
+        assert!(!stale_tmp.exists(), "stale tmp file was not swept");
+        assert!(
+            fresh_tmp.exists(),
+            "fresh tmp directory was swept too early"
+        );
+    }
+
+    #[test]
+    fn cache_removes_corrupt_entry_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("thumb-cache");
+        let cache = ThumbCache::with_limits(root.clone(), 4096, DEFAULT_STALE_TMP_AGE);
+        fs::create_dir_all(&root).unwrap();
+        let k = cache_key(
+            Path::new("/bad.png"),
+            5,
+            Some(2),
+            fid(1, 2, 3),
+            128,
+            ThumbFit::Cover,
+        );
+        let p = root.join(format!("{k}.thumb"));
+        fs::write(&p, b"garbage").unwrap();
+
+        assert_eq!(cache.get(&k), None);
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn cache_key_changes_with_every_parameter_including_identity_and_ctime() {
+        let base = cache_key(
+            Path::new("/a.jpg"),
+            100,
+            Some(500),
+            fid(1, 42, 1000),
+            256,
+            ThumbFit::Contain,
         );
         assert_ne!(
             base,
-            cache_key(Path::new("/a.jpg"), 101, Some(500), 256, ThumbFit::Contain)
+            cache_key(
+                Path::new("/b.jpg"),
+                100,
+                Some(500),
+                fid(1, 42, 1000),
+                256,
+                ThumbFit::Contain
+            )
         );
         assert_ne!(
             base,
-            cache_key(Path::new("/a.jpg"), 100, Some(501), 256, ThumbFit::Contain)
+            cache_key(
+                Path::new("/a.jpg"),
+                101,
+                Some(500),
+                fid(1, 42, 1000),
+                256,
+                ThumbFit::Contain
+            )
         );
         assert_ne!(
             base,
-            cache_key(Path::new("/a.jpg"), 100, Some(500), 128, ThumbFit::Contain)
+            cache_key(
+                Path::new("/a.jpg"),
+                100,
+                Some(501),
+                fid(1, 42, 1000),
+                256,
+                ThumbFit::Contain
+            )
         );
         assert_ne!(
             base,
-            cache_key(Path::new("/a.jpg"), 100, Some(500), 256, ThumbFit::Cover)
+            cache_key(
+                Path::new("/a.jpg"),
+                100,
+                Some(500),
+                fid(1, 43, 1000),
+                256,
+                ThumbFit::Contain
+            ),
+            "different inode/file index with identical path, size and mtime must miss cache"
+        );
+        assert_ne!(
+            base,
+            cache_key(
+                Path::new("/a.jpg"),
+                100,
+                Some(500),
+                fid(1, 42, 1001),
+                256,
+                ThumbFit::Contain
+            ),
+            "different ctime with identical path, size and mtime must miss cache"
+        );
+        assert_ne!(
+            base,
+            cache_key(
+                Path::new("/a.jpg"),
+                100,
+                Some(500),
+                fid(1, 42, 1000),
+                128,
+                ThumbFit::Contain
+            )
+        );
+        assert_ne!(
+            base,
+            cache_key(
+                Path::new("/a.jpg"),
+                100,
+                Some(500),
+                fid(1, 42, 1000),
+                256,
+                ThumbFit::Cover
+            )
         );
     }
 
     #[test]
     fn cache_is_safe_under_concurrent_reads_and_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = ThumbCache::with_max_bytes(dir.path().join("thumb-cache"), 4096);
+        let cache =
+            ThumbCache::with_limits(dir.path().join("thumb-cache"), 4096, DEFAULT_STALE_TMP_AGE);
         std::thread::scope(|scope| {
             for worker in 0..8u8 {
                 let c = cache.clone();
@@ -488,6 +695,7 @@ mod tests {
                             Path::new(&format!("/img_{}_{}.jpg", worker, i % 4)),
                             100,
                             Some(1),
+                            fid(1, u64::from(worker) * 10 + u64::from(i % 4), 1),
                             256,
                             ThumbFit::Contain,
                         );
@@ -497,7 +705,6 @@ mod tests {
                 });
             }
         });
-        // Total size of surviving `.thumb` files never exceeds the cap.
         let total: u64 = fs::read_dir(dir.path().join("thumb-cache"))
             .unwrap()
             .filter_map(Result::ok)

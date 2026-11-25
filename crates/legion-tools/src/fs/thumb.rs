@@ -359,7 +359,14 @@ async fn thumb_one(
         }
     }
 
-    let key = cache_key(&resolved, stamp.size, stamp.mtime_nanos, size, fit);
+    let key = cache_key(
+        &resolved,
+        stamp.size,
+        stamp.mtime_nanos,
+        legion_os::file_id::from_path(&resolved),
+        size,
+        fit,
+    );
     let cache_get = cache.clone();
     let key_get = key.clone();
     let cached = tokio::task::spawn_blocking(move || cache_get.get(&key_get))
