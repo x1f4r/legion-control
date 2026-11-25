@@ -60,7 +60,13 @@ test('categoryFromName and entryCategory map all design categories case-insensit
   assert.equal(categoryFromName('Arrival.mp4'), 'video');
   assert.equal(categoryFromName('Concert.MKV'), 'video');
   assert.equal(categoryFromName('Voice note.m4a'), 'audio');
+  assert.equal(categoryFromName('Chapter.m4b'), 'audio');
   assert.equal(categoryFromName('track.FLAC'), 'audio');
+  assert.equal(categoryFromName('master.aif'), 'audio');
+  assert.equal(categoryFromName('master.AIFF'), 'audio');
+  assert.equal(mimeFromName('Chapter.m4b'), 'audio/mp4');
+  assert.equal(mimeFromName('master.aif'), 'audio/aiff');
+  assert.equal(mimeFromName('master.AIFF'), 'audio/aiff');
   assert.equal(categoryFromName('Tickets.pdf'), 'document');
   assert.equal(categoryFromName('budget.xlsx'), 'document');
   assert.equal(categoryFromName('notes.txt'), 'text');
@@ -114,6 +120,9 @@ test('detectFileCapabilities cleanly degrades against old nodes and limited role
   assert.equal(oldCaps.hasListSort, false);
   assert.equal(oldCaps.hasListOffset, false);
   assert.equal(oldCaps.hasThumb, false);
+  assert.equal(oldCaps.hasTags, false);
+  assert.equal(oldCaps.hasAudioThumb, false);
+  assert.equal(oldCaps.thumbMaxSize, 0);
   assert.equal(oldCaps.hasFav, false);
   assert.equal(oldCaps.hasSync, false);
   assert.equal(oldCaps.hasFindEnhanced, false);
@@ -154,7 +163,8 @@ test('detectFileCapabilities cleanly degrades against old nodes and limited role
     { name: 'fs.list', effect: 'read', input_schema: { properties: { path: {}, sort: {}, order: {}, offset: {}, categories: {} } } },
     { name: 'fs.read', effect: 'read', input_schema: { properties: { path: {} } } },
     { name: 'fs.find', effect: 'read', input_schema: { properties: { path: {}, name: {}, categories: {} } } },
-    { name: 'fs.thumb', effect: 'read', input_schema: { properties: { paths: {} } } },
+    { name: 'fs.thumb', effect: 'read', input_schema: { properties: { paths: {}, size: { maximum: 1024 } } } },
+    { name: 'fs.tags', effect: 'read', input_schema: { properties: { paths: {} } } },
     { name: 'fs.mkdir', effect: 'write', input_schema: { properties: { path: {} } } },
     { name: 'fs.move', effect: 'write', input_schema: { properties: { from: {}, to: {} } } },
     { name: 'fs.remove', effect: 'destroy', input_schema: { properties: { path: {} } } },
@@ -179,6 +189,9 @@ test('detectFileCapabilities cleanly degrades against old nodes and limited role
   assert.equal(fullCaps.hasListSort, true);
   assert.equal(fullCaps.hasListOffset, true);
   assert.equal(fullCaps.hasThumb, true);
+  assert.equal(fullCaps.hasTags, true);
+  assert.equal(fullCaps.hasAudioThumb, true);
+  assert.equal(fullCaps.thumbMaxSize, 1024);
   assert.equal(fullCaps.hasFav, true);
   assert.equal(fullCaps.hasFavWrite, true);
   assert.equal(fullCaps.hasSync, true);
@@ -200,6 +213,22 @@ test('detectFileCapabilities cleanly degrades against old nodes and limited role
   assert.equal(obsCaps.hasFavWrite, false);
   assert.equal(obsCaps.hasRemove, false);
   assert.equal(obsCaps.hasTransfer, false);
+  assert.equal(obsCaps.hasTags, false);
+  assert.equal(obsCaps.hasAudioThumb, true);
+
+  // Older node with fs.thumb (size max 512) and without fs.tags lacks tags and audio covers.
+  const preAudioThumbCaps = detectFileCapabilities({
+    tools: [
+      { name: 'fs.list', effect: 'read', input_schema: { properties: { path: {}, offset: {} } } },
+      { name: 'fs.read', effect: 'read', input_schema: { properties: { path: {} } } },
+      { name: 'fs.thumb', effect: 'read', input_schema: { properties: { paths: {}, size: { maximum: 512 } } } },
+    ],
+    allowedSet: new Set(['fs.list', 'fs.read', 'fs.thumb']),
+  });
+  assert.equal(preAudioThumbCaps.hasThumb, true);
+  assert.equal(preAudioThumbCaps.hasTags, false);
+  assert.equal(preAudioThumbCaps.hasAudioThumb, false);
+  assert.equal(preAudioThumbCaps.thumbMaxSize, 512);
 });
 
 test('sortEntries keeps directories first and sorts by name, modified, and size', () => {

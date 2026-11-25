@@ -158,7 +158,7 @@ pub fn classify_extension(ext: &str) -> MediaInfo {
 
         // Audio
         "mp3" | "mpga" => (Category::Audio, "audio/mpeg"),
-        "m4a" | "mp4a" | "alac" => (Category::Audio, "audio/mp4"),
+        "m4a" | "m4b" | "mp4a" | "alac" => (Category::Audio, "audio/mp4"),
         "aac" => (Category::Audio, "audio/aac"),
         "flac" => (Category::Audio, "audio/flac"),
         "ogg" | "oga" | "spx" => (Category::Audio, "audio/ogg"),
@@ -350,11 +350,14 @@ mod tests {
             // Audio
             ("song.mp3", Category::Audio, "audio/mpeg"),
             ("track.m4a", Category::Audio, "audio/mp4"),
+            ("book.m4b", Category::Audio, "audio/mp4"),
             ("stream.aac", Category::Audio, "audio/aac"),
             ("album.FLAC", Category::Audio, "audio/flac"),
             ("voice.ogg", Category::Audio, "audio/ogg"),
             ("call.opus", Category::Audio, "audio/opus"),
             ("sample.wav", Category::Audio, "audio/wav"),
+            ("studio.aif", Category::Audio, "audio/aiff"),
+            ("studio.AIFF", Category::Audio, "audio/aiff"),
             // Document
             ("report.pdf", Category::Document, "application/pdf"),
             ("book.epub", Category::Document, "application/epub+zip"),

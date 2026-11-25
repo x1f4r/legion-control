@@ -37,6 +37,7 @@ const EXTENSION_CATEGORY = {
   // audio
   mp3: 'audio',
   m4a: 'audio',
+  m4b: 'audio',
   aac: 'audio',
   flac: 'audio',
   ogg: 'audio',
@@ -150,11 +151,14 @@ const EXTENSION_MIME = {
   avi: 'video/x-msvideo',
   mp3: 'audio/mpeg',
   m4a: 'audio/mp4',
+  m4b: 'audio/mp4',
   aac: 'audio/aac',
   flac: 'audio/flac',
   ogg: 'audio/ogg',
   opus: 'audio/opus',
   wav: 'audio/wav',
+  aif: 'audio/aiff',
+  aiff: 'audio/aiff',
   pdf: 'application/pdf',
   epub: 'application/epub+zip',
   txt: 'text/plain',
@@ -305,6 +309,11 @@ export function detectFileCapabilities({ tools = [], allowedSet = null, link = n
   const hasRead = map.size === 0 ? true : hasTool('fs.read');
   const hasFind = hasTool('fs.find');
   const hasThumb = hasTool('fs.thumb');
+  const hasTags = hasTool('fs.tags');
+  const thumbMaxSize = hasThumb
+    ? Number(map.get('fs.thumb')?.input_schema?.properties?.size?.maximum) || 0
+    : 0;
+  const hasAudioThumb = hasThumb && (map.has('fs.tags') || thumbMaxSize >= 1024);
   const hasFav = hasTool('fav.list');
   const hasFavWrite = hasFav && hasTool('fav.add') && hasTool('fav.remove');
   const hasSync = hasTool('sync.list');
@@ -344,6 +353,9 @@ export function detectFileCapabilities({ tools = [], allowedSet = null, link = n
     hasFind,
     hasFindEnhanced: hasFind && (propOf('fs.find', 'name') || propOf('fs.find', 'categories')),
     hasThumb,
+    hasTags,
+    hasAudioThumb,
+    thumbMaxSize,
     hasFav,
     hasFavWrite,
     hasSync,

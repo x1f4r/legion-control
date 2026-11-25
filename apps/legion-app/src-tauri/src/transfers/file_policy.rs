@@ -309,11 +309,14 @@ pub const ALLOWED_OPEN_MIME_BY_EXT: &[(&str, &str)] = &[
     // Audio
     ("mp3", "audio/mpeg"),
     ("m4a", "audio/mp4"),
+    ("m4b", "audio/mp4"),
     ("aac", "audio/mp4"),
     ("flac", "audio/flac"),
     ("ogg", "audio/ogg"),
     ("opus", "audio/ogg"),
     ("wav", "audio/wav"),
+    ("aif", "audio/aiff"),
+    ("aiff", "audio/aiff"),
     // Video
     ("mp4", "video/mp4"),
     ("m4v", "video/mp4"),

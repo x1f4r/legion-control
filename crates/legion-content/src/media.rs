@@ -70,12 +70,13 @@ pub fn classify_filename(file_name: &str) -> ContentPolicy {
 
         // Audio
         "mp3" => inline("audio/mpeg"),
-        "m4a" => inline("audio/mp4"),
+        "m4a" | "m4b" => inline("audio/mp4"),
         "aac" => inline("audio/aac"),
         "flac" => inline("audio/flac"),
         "ogg" | "oga" => inline("audio/ogg"),
         "opus" => inline("audio/opus"),
         "wav" => inline("audio/wav"),
+        "aif" | "aiff" => inline("audio/aiff"),
         "weba" => inline("audio/webm"),
 
         // WebVTT subtitles for `<track>` elements (browsers require `text/vtt`).
@@ -194,6 +195,27 @@ mod tests {
             classify_filename("song.flac"),
             ContentPolicy {
                 content_type: "audio/flac",
+                attachment: false,
+            }
+        );
+        assert_eq!(
+            classify_filename("book.m4b"),
+            ContentPolicy {
+                content_type: "audio/mp4",
+                attachment: false,
+            }
+        );
+        assert_eq!(
+            classify_filename("studio.aif"),
+            ContentPolicy {
+                content_type: "audio/aiff",
+                attachment: false,
+            }
+        );
+        assert_eq!(
+            classify_filename("studio.AIFF"),
+            ContentPolicy {
+                content_type: "audio/aiff",
                 attachment: false,
             }
         );

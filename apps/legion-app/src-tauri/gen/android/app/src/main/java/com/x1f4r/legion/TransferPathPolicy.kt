@@ -42,11 +42,14 @@ object TransferPathPolicy {
     // Audio
     "mp3" to "audio/mpeg",
     "m4a" to "audio/mp4",
+    "m4b" to "audio/mp4",
     "aac" to "audio/mp4",
     "flac" to "audio/flac",
     "ogg" to "audio/ogg",
     "opus" to "audio/ogg",
     "wav" to "audio/wav",
+    "aif" to "audio/aiff",
+    "aiff" to "audio/aiff",
     // Video
     "mp4" to "video/mp4",
     "m4v" to "video/mp4",
