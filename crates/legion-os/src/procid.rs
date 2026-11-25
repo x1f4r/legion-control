@@ -204,9 +204,9 @@ pub fn of_pid(pid: u32) -> Result<Option<ProcessId>> {
 /// Look up the [`ProcessId`] of `pid`, including a zombie that has not yet been reaped.
 ///
 /// Detached launchers call this immediately after `spawn` while still holding the unreaped
-/// child handle so a fast-exiting process still yields its exact start time.
-#[allow(dead_code)]
-pub(crate) fn of_pid_including_zombie(pid: u32) -> Result<Option<ProcessId>> {
+/// child handle so a fast-exiting process still yields its exact start time; callers that need to
+/// tell an unreaped zombie apart from a hidden or absent process also use this.
+pub fn of_pid_including_zombie(pid: u32) -> Result<Option<ProcessId>> {
     if pid == 0 {
         return Ok(None);
     }
@@ -305,20 +305,25 @@ pub fn self_and_ancestors() -> std::collections::HashSet<u32> {
     set
 }
 
-/// Outcome of delivering a single verified signal to one process without waiting or escalating.
+/// Outcome of delivering a single verified signal or close request to one process without waiting
+/// or escalating.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SignalOutcome {
-    /// The signal was delivered to the exact verified process.
+    /// The signal or close request was delivered to the exact verified process.
     Signaled,
     /// The process had already exited before the signal could be delivered.
     AlreadyGone,
     /// A different process now holds the PID (start time did not match); nothing was signaled.
     IdentityMismatch,
+    /// No graceful stop mechanism applies to this process on this platform (for example, a
+    /// windowless process outside an accessible console group on Windows); caller should report
+    /// `still_running` immediately and require `force`.
+    CannotAskGracefully,
 }
 
-/// Deliver one signal (`SIGTERM` when `!force`, `SIGKILL` when `force` on Unix; `TerminateProcess`
-/// through a creation-time-verified handle on Windows) to a single process without waiting for it
-/// to exit or escalating.
+/// Deliver one stop request (`SIGTERM` when `!force`, `SIGKILL` when `force` on Unix; `WM_CLOSE` /
+/// `CTRL_BREAK_EVENT` when `!force`, `TerminateProcess` when `force` on Windows) to a single
+/// verified process without waiting for it to exit or escalating.
 pub async fn signal_process(identity: &ProcessId, force: bool) -> Result<SignalOutcome> {
     if identity.pid == 0 {
         return Err(OsError::InvalidArgument {
@@ -976,6 +981,20 @@ fn is_valid_unix_sshd_session_title(rest: &str) -> bool {
             false
         }
     }
+}
+
+/// Parse the thread group id (`Tgid:`) from Linux `/proc/<pid>/status`.
+///
+/// On Linux, a thread-group leader (real process) has `Tgid == pid`, whereas a non-main thread
+/// reports its owning process's PID in `Tgid` (`Tgid != tid`).
+#[allow(dead_code)]
+pub(crate) fn parse_linux_proc_status_tgid(contents: &str) -> Option<u32> {
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:") {
+            return rest.split_ascii_whitespace().next()?.parse::<u32>().ok();
+        }
+    }
+    None
 }
 
 /// Parse `(real_uid, effective_uid)` from the `Uid:` line of Linux `/proc/<pid>/status`.
@@ -1733,6 +1752,11 @@ mod tests {
         }
 
         // Parsers.
+        assert_eq!(
+            parse_linux_proc_status_tgid("Name:\tworker\nTgid:\t4200\nPid:\t4205\n"),
+            Some(4200)
+        );
+        assert_eq!(parse_linux_proc_status_tgid("Name:\tworker\n"), None);
         assert_eq!(
             parse_linux_proc_status_uids("Name:\tsshd\nUid:\t1000\t1000\t1000\t1000\n"),
             Some((1000, 1000))

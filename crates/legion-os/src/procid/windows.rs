@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::win_proc::{self, OpenPinnedOutcome, PinnedProcess, TerminateOutcome};
+use crate::win_proc::{
+    self, GracefulStopOutcome, OpenPinnedOutcome, PinnedProcess, TerminateOutcome,
+};
 use crate::{OsError, Result};
 
 use super::{
@@ -115,19 +117,39 @@ pub(super) fn self_and_ancestors() -> HashSet<u32> {
     seen
 }
 
-pub(super) async fn signal_process(identity: &ProcessId, _force: bool) -> Result<SignalOutcome> {
+pub(super) async fn signal_process(identity: &ProcessId, force: bool) -> Result<SignalOutcome> {
     let identity = *identity;
-    let outcome = tokio::task::spawn_blocking(move || win_proc::open_verify_terminate(&identity))
-        .await
-        .map_err(|err| OsError::Platform {
-            detail: format!("signal_process worker task failed: {err}"),
-        })??;
+    if force {
+        let outcome =
+            tokio::task::spawn_blocking(move || win_proc::open_verify_terminate(&identity))
+                .await
+                .map_err(|err| OsError::Platform {
+                    detail: format!("signal_process worker task failed: {err}"),
+                })??;
+        return match outcome {
+            TerminateOutcome::Terminated => Ok(SignalOutcome::Signaled),
+            TerminateOutcome::AlreadyGone => Ok(SignalOutcome::AlreadyGone),
+            TerminateOutcome::IdentityMismatch => Ok(SignalOutcome::IdentityMismatch),
+            TerminateOutcome::AccessDenied => Err(OsError::PermissionDenied {
+                detail: format!("permission denied terminating process {}", identity.pid),
+                source: None,
+            }),
+        };
+    }
+
+    let outcome =
+        tokio::task::spawn_blocking(move || win_proc::open_verify_request_close(&identity))
+            .await
+            .map_err(|err| OsError::Platform {
+                detail: format!("signal_process worker task failed: {err}"),
+            })??;
     match outcome {
-        TerminateOutcome::Terminated => Ok(SignalOutcome::Signaled),
-        TerminateOutcome::AlreadyGone => Ok(SignalOutcome::AlreadyGone),
-        TerminateOutcome::IdentityMismatch => Ok(SignalOutcome::IdentityMismatch),
-        TerminateOutcome::AccessDenied => Err(OsError::PermissionDenied {
-            detail: format!("permission denied terminating process {}", identity.pid),
+        GracefulStopOutcome::Requested => Ok(SignalOutcome::Signaled),
+        GracefulStopOutcome::CannotAskGracefully => Ok(SignalOutcome::CannotAskGracefully),
+        GracefulStopOutcome::AlreadyGone => Ok(SignalOutcome::AlreadyGone),
+        GracefulStopOutcome::IdentityMismatch => Ok(SignalOutcome::IdentityMismatch),
+        GracefulStopOutcome::AccessDenied => Err(OsError::PermissionDenied {
+            detail: format!("permission denied signaling process {}", identity.pid),
             source: None,
         }),
     }
@@ -340,10 +362,50 @@ pub(super) async fn tree_is_active(identity: &ProcessId, marker: Option<&str>) -
 
 pub(super) async fn kill_process(
     identity: &ProcessId,
-    _force: bool,
+    force: bool,
     grace: Duration,
 ) -> Result<bool> {
     let identity = *identity;
+
+    if !force && !grace.is_zero() {
+        let ask =
+            tokio::task::spawn_blocking(move || win_proc::open_verify_request_close(&identity))
+                .await
+                .map_err(|err| OsError::Platform {
+                    detail: format!("kill_process worker task failed: {err}"),
+                })??;
+        match ask {
+            GracefulStopOutcome::AlreadyGone | GracefulStopOutcome::IdentityMismatch => {
+                return Ok(true);
+            }
+            GracefulStopOutcome::AccessDenied => {
+                return Err(OsError::PermissionDenied {
+                    detail: format!("permission denied stopping process {}", identity.pid),
+                    source: None,
+                });
+            }
+            GracefulStopOutcome::Requested => {
+                let grace_deadline = Instant::now() + grace;
+                loop {
+                    let alive = tokio::task::spawn_blocking(move || is_alive(&identity))
+                        .await
+                        .map_err(|err| OsError::Platform {
+                            detail: format!("kill_process grace poll failed: {err}"),
+                        })?;
+                    if !alive {
+                        return Ok(true);
+                    }
+                    let now = Instant::now();
+                    if now >= grace_deadline {
+                        break;
+                    }
+                    let remaining = grace_deadline.saturating_duration_since(now);
+                    tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+                }
+            }
+            GracefulStopOutcome::CannotAskGracefully => {}
+        }
+    }
 
     let outcome = tokio::task::spawn_blocking(move || win_proc::open_verify_terminate(&identity))
         .await

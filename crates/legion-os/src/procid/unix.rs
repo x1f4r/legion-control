@@ -390,6 +390,33 @@ pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>
     use std::fs;
     use std::io;
 
+    // On Linux `/proc/<tid>/stat` reads like a process even for non-main threads, so verify that
+    // `pid` is actually a thread-group leader (`Tgid == pid` in `/proc/<pid>/status`) before
+    // accepting it as a process identity.
+    let status_path = format!("/proc/{pid}/status");
+    let status = match fs::read_to_string(&status_path) {
+        Ok(text) => text,
+        Err(err)
+            if err.kind() == io::ErrorKind::NotFound
+                || err.raw_os_error() == Some(libc_esrch()) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(OsError::from_io(
+                format!("failed reading {status_path}"),
+                err,
+            ));
+        }
+    };
+    if let Some(tgid) = super::parse_linux_proc_status_tgid(&status)
+        && tgid != pid
+    {
+        return Err(OsError::InvalidArgument {
+            detail: format!("id {pid} is a thread of process {tgid}, not a process"),
+        });
+    }
+
     let stat_path = format!("/proc/{pid}/stat");
     let contents = match fs::read_to_string(&stat_path) {
         Ok(text) => text,
@@ -998,7 +1025,14 @@ mod linux_pidfd {
     pub(super) enum VerifiedOpen {
         Pinned(PidFd),
         GoneOrMismatch,
-        FallbackToPid,
+        /// `pidfd_open` returned `EINVAL` (e.g. non-leader thread ID) or `of_pid` saw `Tgid != pid`.
+        NotAProcess,
+        /// `pidfd_open` failed with an unexpected kernel/limit/permission error; never fall back
+        /// to bare-PID `kill()`.
+        Refused(Errno),
+        /// Kernel does not implement `pidfd_open` (`ENOSYS`): the sole case where a verified
+        /// bare-PID fallback is permitted.
+        Unsupported,
     }
 
     impl PidFd {
@@ -1034,6 +1068,10 @@ mod linux_pidfd {
     /// Once verified, `PidFd::send_signal` is immune to PID reuse: if the original process exits
     /// and another process reuses its PID number, the pidfd still refers to the exited instance
     /// and `pidfd_send_signal` returns `ESRCH`.
+    ///
+    /// `EINVAL` (returned by the kernel for non-thread-group-leader thread IDs) is treated as
+    /// [`VerifiedOpen::NotAProcess`], never as a fallback to `kill()`. Only `ENOSYS` permits a
+    /// bare-PID fallback.
     pub(super) fn open_verified(identity: &ProcessId) -> VerifiedOpen {
         let Ok(raw_pid) = libc::c_int::try_from(identity.pid) else {
             return VerifiedOpen::GoneOrMismatch;
@@ -1044,15 +1082,23 @@ mod linux_pidfd {
         if fd < 0 {
             let raw_err = io::Error::last_os_error().raw_os_error();
             return match raw_err {
-                Some(libc::ESRCH) => VerifiedOpen::GoneOrMismatch,
-                _ => VerifiedOpen::FallbackToPid,
+                Some(libc::ESRCH | libc::ENOENT) => match crate::procid::of_pid(identity.pid) {
+                    Err(crate::OsError::InvalidArgument { .. }) => VerifiedOpen::NotAProcess,
+                    _ => VerifiedOpen::GoneOrMismatch,
+                },
+                Some(libc::EINVAL) => VerifiedOpen::NotAProcess,
+                Some(libc::ENOSYS) => VerifiedOpen::Unsupported,
+                Some(code) => VerifiedOpen::Refused(Errno::from_raw(code)),
+                None => VerifiedOpen::Refused(Errno::EINVAL),
             };
         }
 
         let pidfd = PidFd(fd as libc::c_int);
         match crate::procid::of_pid(identity.pid) {
             Ok(Some(observed)) if identity.matches(&observed) => VerifiedOpen::Pinned(pidfd),
-            _ => VerifiedOpen::GoneOrMismatch,
+            Err(crate::OsError::InvalidArgument { .. }) => VerifiedOpen::NotAProcess,
+            Err(crate::OsError::PermissionDenied { .. }) => VerifiedOpen::Refused(Errno::EPERM),
+            Ok(Some(_)) | Ok(None) | Err(_) => VerifiedOpen::GoneOrMismatch,
         }
     }
 }
@@ -1068,7 +1114,9 @@ fn signal_verified_once(identity: &ProcessId, sig: Signal) -> std::result::Resul
             };
         }
         linux_pidfd::VerifiedOpen::GoneOrMismatch => return Ok(true),
-        linux_pidfd::VerifiedOpen::FallbackToPid => {}
+        linux_pidfd::VerifiedOpen::NotAProcess => return Err(Errno::EINVAL),
+        linux_pidfd::VerifiedOpen::Refused(err) => return Err(err),
+        linux_pidfd::VerifiedOpen::Unsupported => {}
     }
 
     if !is_alive(identity) {
@@ -1113,12 +1161,28 @@ pub(super) async fn signal_process(identity: &ProcessId, force: bool) -> Result<
                 };
             }
             linux_pidfd::VerifiedOpen::GoneOrMismatch => {
-                return match super::of_pid(identity.pid) {
-                    Ok(Some(_)) => Ok(SignalOutcome::IdentityMismatch),
-                    Ok(None) | Err(_) => Ok(SignalOutcome::AlreadyGone),
+                return match super::of_pid(identity.pid)? {
+                    Some(_) => Ok(SignalOutcome::IdentityMismatch),
+                    None => Ok(SignalOutcome::AlreadyGone),
                 };
             }
-            linux_pidfd::VerifiedOpen::FallbackToPid => {}
+            linux_pidfd::VerifiedOpen::NotAProcess => {
+                return Err(OsError::InvalidArgument {
+                    detail: format!("id {} is a thread, not a process", identity.pid),
+                });
+            }
+            linux_pidfd::VerifiedOpen::Refused(Errno::EPERM | Errno::EACCES) => {
+                return Err(OsError::PermissionDenied {
+                    detail: format!("permission denied opening process {}", identity.pid),
+                    source: None,
+                });
+            }
+            linux_pidfd::VerifiedOpen::Refused(err) => {
+                return Err(OsError::Platform {
+                    detail: format!("pidfd_open failed for process {}: {err}", identity.pid),
+                });
+            }
+            linux_pidfd::VerifiedOpen::Unsupported => {}
         }
 
         match super::of_pid(identity.pid)? {
@@ -1182,9 +1246,22 @@ pub(super) async fn kill_process(
                     }
                 }
                 linux_pidfd::VerifiedOpen::GoneOrMismatch => Ok((true, None)),
-                linux_pidfd::VerifiedOpen::FallbackToPid => {
-                    if !is_alive(&identity) {
-                        return Ok((true, None));
+                linux_pidfd::VerifiedOpen::NotAProcess => Err(OsError::InvalidArgument {
+                    detail: format!("id {} is a thread, not a process", identity.pid),
+                }),
+                linux_pidfd::VerifiedOpen::Refused(Errno::EPERM | Errno::EACCES) => {
+                    Err(OsError::PermissionDenied {
+                        detail: format!("permission denied opening process {}", identity.pid),
+                        source: None,
+                    })
+                }
+                linux_pidfd::VerifiedOpen::Refused(err) => Err(OsError::Platform {
+                    detail: format!("pidfd_open failed for process {}: {err}", identity.pid),
+                }),
+                linux_pidfd::VerifiedOpen::Unsupported => {
+                    match super::of_pid(identity.pid)? {
+                        Some(observed) if identity.matches(&observed) => {}
+                        _ => return Ok((true, None)),
                     }
                     match kill(nix_pid, initial_sig) {
                         Ok(()) => Ok((false, None)),
@@ -1271,8 +1348,9 @@ pub(super) async fn kill_process(
                 };
             }
 
-            if !is_alive(&identity) {
-                return Ok(true);
+            match super::of_pid(identity.pid)? {
+                Some(observed) if identity.matches(&observed) => {}
+                _ => return Ok(true),
             }
             match kill(nix_pid, Signal::SIGKILL) {
                 Ok(()) => Ok(false),
@@ -1343,18 +1421,42 @@ pub(super) async fn kill_tree(
         HashMap<u32, ProcessId>,
         Option<Pid>,
         RootPin,
-    ) = tokio::task::spawn_blocking(move || {
+    ) = tokio::task::spawn_blocking(move || -> Result<_> {
         #[cfg(target_os = "linux")]
         let (root_alive, root_recycled, root_pidfd) = match linux_pidfd::open_verified(&identity) {
             linux_pidfd::VerifiedOpen::Pinned(fd) => (true, false, Some(Arc::new(fd))),
+            linux_pidfd::VerifiedOpen::NotAProcess => {
+                return Err(OsError::InvalidArgument {
+                    detail: format!("id {} is a thread, not a process", identity.pid),
+                });
+            }
+            linux_pidfd::VerifiedOpen::Refused(Errno::EPERM | Errno::EACCES) => {
+                return Err(OsError::PermissionDenied {
+                    detail: format!("permission denied opening process {}", identity.pid),
+                    source: None,
+                });
+            }
+            linux_pidfd::VerifiedOpen::Refused(err) => {
+                return Err(OsError::Platform {
+                    detail: format!("pidfd_open failed for process {}: {err}", identity.pid),
+                });
+            }
             linux_pidfd::VerifiedOpen::GoneOrMismatch => match super::of_pid(identity.pid) {
-                Ok(Some(_)) | Err(_) => (false, true, None),
+                Ok(Some(_)) => (false, true, None),
                 Ok(None) => (false, false, None),
+                Err(OsError::InvalidArgument { detail }) => {
+                    return Err(OsError::InvalidArgument { detail });
+                }
+                Err(_) => (false, true, None),
             },
-            linux_pidfd::VerifiedOpen::FallbackToPid => match super::of_pid(identity.pid) {
+            linux_pidfd::VerifiedOpen::Unsupported => match super::of_pid(identity.pid) {
                 Ok(Some(observed)) if identity.matches(&observed) => (true, false, None),
-                Ok(Some(_)) | Err(_) => (false, true, None),
+                Ok(Some(_)) => (false, true, None),
                 Ok(None) => (false, false, None),
+                Err(OsError::InvalidArgument { detail }) => {
+                    return Err(OsError::InvalidArgument { detail });
+                }
+                Err(_) => (false, true, None),
             },
         };
         #[cfg(not(target_os = "linux"))]
@@ -1415,7 +1517,7 @@ pub(super) async fn kill_tree(
             #[cfg(not(target_os = "linux"))]
             let skip_pid = None;
             signal_tracked(&tracked, Signal::SIGTERM, own_pid, skip_pid);
-            return (tracked, unverified, target_pgid, root_pidfd);
+            return Ok((tracked, unverified, target_pgid, root_pidfd));
         }
 
         // Root is already gone. Never kill by session/group alone: require the detach environment
@@ -1451,12 +1553,12 @@ pub(super) async fn kill_tree(
             }
         }
 
-        (tracked, unverified, None, None)
+        Ok((tracked, unverified, None, None))
     })
     .await
     .map_err(|err| OsError::Platform {
         detail: format!("kill_tree worker task failed: {err}"),
-    })?;
+    })??;
 
     if tracked.is_empty() {
         let unverified_survivors = filter_live_sorted(unverified, &tracked).await?;
@@ -1979,6 +2081,7 @@ fn bfs_descendants(
 }
 
 #[cfg(all(test, target_os = "linux"))]
+#[allow(unsafe_code, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1990,10 +2093,12 @@ mod tests {
                 // Signal 0 validates the pidfd without delivering a signal.
                 assert!(pidfd.send_raw(0).is_ok());
             }
-            linux_pidfd::VerifiedOpen::FallbackToPid => {
-                // Permitted only on kernels/sandboxes where `pidfd_open` is unavailable.
+            linux_pidfd::VerifiedOpen::Unsupported => {
+                // Permitted only on kernels where `pidfd_open` returns ENOSYS.
             }
-            linux_pidfd::VerifiedOpen::GoneOrMismatch => {
+            linux_pidfd::VerifiedOpen::GoneOrMismatch
+            | linux_pidfd::VerifiedOpen::NotAProcess
+            | linux_pidfd::VerifiedOpen::Refused(_) => {
                 panic!("pidfd_open unexpectedly rejected current process {me}");
             }
         }
@@ -2001,14 +2106,65 @@ mod tests {
         let mismatched = ProcessId::new(me.pid, me.start_time.wrapping_add(1));
         assert!(matches!(
             linux_pidfd::open_verified(&mismatched),
-            linux_pidfd::VerifiedOpen::GoneOrMismatch | linux_pidfd::VerifiedOpen::FallbackToPid
+            linux_pidfd::VerifiedOpen::GoneOrMismatch | linux_pidfd::VerifiedOpen::Unsupported
         ));
 
         let absent = ProcessId::new(i32::MAX as u32, 1);
         assert!(matches!(
             linux_pidfd::open_verified(&absent),
-            linux_pidfd::VerifiedOpen::GoneOrMismatch | linux_pidfd::VerifiedOpen::FallbackToPid
+            linux_pidfd::VerifiedOpen::GoneOrMismatch | linux_pidfd::VerifiedOpen::Unsupported
         ));
+    }
+
+    #[tokio::test]
+    async fn linux_refuses_non_leader_thread_id_of_current_process() {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // SAFETY: `SYS_gettid` takes no arguments and returns the calling thread's kernel TID.
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+            let _ = tid_tx.send(tid);
+            let _ = done_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        assert_ne!(
+            tid,
+            std::process::id(),
+            "worker thread must have distinct TID"
+        );
+
+        // `of_pid` refuses the thread ID as InvalidArgument, not None.
+        assert!(matches!(
+            crate::procid::of_pid(tid),
+            Err(OsError::InvalidArgument { .. })
+        ));
+
+        // Even if a caller fabricates a ProcessId with the thread's start_ticks from /proc/<tid>/stat,
+        // `pidfd_open`, `signal_process`, `kill_process`, and `kill_tree` all refuse it without
+        // signaling our own process.
+        let stat = std::fs::read_to_string(format!("/proc/{tid}/stat")).unwrap();
+        let (_, start_ticks) = crate::procid::parse_linux_proc_stat(&stat).unwrap();
+        let forged = ProcessId::new(tid, start_ticks);
+
+        assert!(matches!(
+            linux_pidfd::open_verified(&forged),
+            linux_pidfd::VerifiedOpen::NotAProcess | linux_pidfd::VerifiedOpen::Unsupported
+        ));
+        assert!(matches!(
+            crate::procid::signal_process(&forged, false).await,
+            Err(OsError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            crate::procid::kill_process(&forged, false, Duration::from_millis(50)).await,
+            Err(OsError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            crate::procid::kill_tree(&forged, Duration::from_millis(50)).await,
+            Err(OsError::InvalidArgument { .. })
+        ));
+
+        let _ = done_tx.send(());
+        worker.join().unwrap();
     }
 }
 
