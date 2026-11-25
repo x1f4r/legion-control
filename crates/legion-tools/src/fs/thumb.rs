@@ -113,7 +113,7 @@ use tokio::task::JoinSet;
 use super::audio_tags::{
     AudioFormat, CoverExtractMode, audio_format_for_path, mp4_has_video_track, parse_audio,
 };
-use super::tags::find_folder_cover;
+use super::tags::find_folder_covers;
 use super::thumb_cache::{
     CachedThumb, ThumbCache, bad_cache_key, cache_key, tags_cache_key, temp_dir_in_cache,
 };
@@ -962,10 +962,24 @@ async fn thumb_audio(
 
     let (key, bad_key, tags_key, open_stamp, mut file, format) = match prep {
         Ok(AudioCoverPrep::CacheHit(hit)) => return Ok(ThumbOutcome::Ok(hit)),
-        Ok(AudioCoverPrep::CachedBad(err)) => return Ok(ThumbOutcome::Error(err)),
+        Ok(AudioCoverPrep::CachedBad(err)) => {
+            return thumb_audio_folder_cover(
+                grant,
+                principal,
+                cache,
+                resolved,
+                size,
+                fit,
+                Some(err),
+                cancel,
+            )
+            .await;
+        }
         Ok(AudioCoverPrep::NoEmbeddedCover) => {
-            return thumb_audio_folder_cover(grant, principal, cache, resolved, size, fit, cancel)
-                .await;
+            return thumb_audio_folder_cover(
+                grant, principal, cache, resolved, size, fit, None, cancel,
+            )
+            .await;
         }
         Ok(AudioCoverPrep::Ready {
             key,
@@ -1115,7 +1129,7 @@ async fn thumb_audio(
                         return Ok(ThumbOutcome::Error(err));
                     }
                     return thumb_audio_folder_cover(
-                        grant, principal, cache, resolved, size, fit, cancel,
+                        grant, principal, cache, resolved, size, fit, None, cancel,
                     )
                     .await;
                 }
@@ -1133,11 +1147,31 @@ async fn thumb_audio(
                     )
                     .with_details(json!({"reason": "too_large"}));
                     record_bad_audio_cover(cache, &resolved, file, open_stamp, bad_key, &err).await;
-                    return Ok(ThumbOutcome::Error(err));
+                    return thumb_audio_folder_cover(
+                        grant,
+                        principal,
+                        cache,
+                        resolved,
+                        size,
+                        fit,
+                        Some(err),
+                        cancel,
+                    )
+                    .await;
                 }
                 AudioCoverWorkerOutcome::Rejected(err) => {
                     record_bad_audio_cover(cache, &resolved, file, open_stamp, bad_key, &err).await;
-                    return Ok(ThumbOutcome::Error(err));
+                    return thumb_audio_folder_cover(
+                        grant,
+                        principal,
+                        cache,
+                        resolved,
+                        size,
+                        fit,
+                        Some(err),
+                        cancel,
+                    )
+                    .await;
                 }
                 AudioCoverWorkerOutcome::TransientFailure(err) => {
                     return Ok(ThumbOutcome::Error(err));
@@ -1151,7 +1185,17 @@ async fn thumb_audio(
                 AudioCoverWorkerOutcome::MemoryLimitExceeded { error, .. } => {
                     record_bad_audio_cover(cache, &resolved, file, open_stamp, bad_key, &error)
                         .await;
-                    return Ok(ThumbOutcome::Error(error));
+                    return thumb_audio_folder_cover(
+                        grant,
+                        principal,
+                        cache,
+                        resolved,
+                        size,
+                        fit,
+                        Some(error),
+                        cancel,
+                    )
+                    .await;
                 }
             }
         }
@@ -1266,19 +1310,32 @@ async fn thumb_audio(
             let _ =
                 tokio::task::spawn_blocking(move || cache_put.put_tags(&tags_key, &parsed_tags))
                     .await;
-            thumb_audio_folder_cover(grant, principal, cache, resolved, size, fit, cancel).await
+            thumb_audio_folder_cover(grant, principal, cache, resolved, size, fit, None, cancel)
+                .await
         }
         Err(err) if err.code == ErrorCode::Cancelled => Err(err),
         Err(err) => {
-            if !matches!(
+            if matches!(
                 err.code,
                 ErrorCode::Timeout | ErrorCode::Busy | ErrorCode::Conflict
-            ) && let Some(check_file) = handle_check
-            {
+            ) {
+                return Ok(ThumbOutcome::Error(err));
+            }
+            if let Some(check_file) = handle_check {
                 record_bad_audio_cover(cache, &resolved, check_file, open_stamp, bad_key, &err)
                     .await;
             }
-            Ok(ThumbOutcome::Error(err))
+            thumb_audio_folder_cover(
+                grant,
+                principal,
+                cache,
+                resolved,
+                size,
+                fit,
+                Some(err),
+                cancel,
+            )
+            .await
         }
     }
 }
@@ -1291,12 +1348,13 @@ async fn thumb_audio_folder_cover(
     resolved: PathBuf,
     size: u32,
     fit: ThumbFit,
+    embedded_failure: Option<ErrorBody>,
     cancel: CancellationToken,
 ) -> Result<ThumbOutcome, ToolError> {
     let grant_cover = grant.clone();
     let resolved_cover = resolved.clone();
-    let folder_cover =
-        tokio::task::spawn_blocking(move || find_folder_cover(&grant_cover, &resolved_cover))
+    let folder_covers =
+        tokio::task::spawn_blocking(move || find_folder_covers(&grant_cover, &resolved_cover))
             .await
             .map_err(|err| {
                 ErrorBody::new(
@@ -1305,16 +1363,33 @@ async fn thumb_audio_folder_cover(
                 )
             })?;
 
-    match folder_cover {
-        Some(cover_path) => thumb_image(principal, cache, cover_path, size, fit, cancel).await,
-        None => Ok(ThumbOutcome::Error(
-            ErrorBody::new(
-                ErrorCode::NotFound,
-                format!("No embedded or folder cover found for {}.", resolved.display()),
-            )
-            .with_hint("Add an embedded cover image or place a cover, folder, front, or album picture (.jpg, .jpeg, .png, or .webp) in the same folder."),
-        )),
+    for cover_path in folder_covers {
+        match thumb_image(principal, cache, cover_path, size, fit, cancel.clone()).await? {
+            ThumbOutcome::Ok(thumb) => return Ok(ThumbOutcome::Ok(thumb)),
+            ThumbOutcome::Error(err) => {
+                if matches!(
+                    err.code,
+                    ErrorCode::Busy | ErrorCode::Timeout | ErrorCode::Conflict
+                ) {
+                    return Ok(ThumbOutcome::Error(err));
+                }
+                // Undecodable folder candidate: try the next candidate in priority order.
+            }
+        }
     }
+
+    let mut not_found = ErrorBody::new(
+        ErrorCode::NotFound,
+        format!(
+            "No decodable embedded or folder cover found for {}.",
+            resolved.display()
+        ),
+    )
+    .with_hint("Add a valid embedded cover image or place a cover, folder, front, or album picture (.jpg, .jpeg, .png, or .webp) in the same folder.");
+    if let Some(details) = embedded_failure.and_then(|err| err.details) {
+        not_found = not_found.with_details(details);
+    }
+    Ok(ThumbOutcome::Error(not_found))
 }
 
 /// Prepared image file opened non-blockingly once, verified against TOCTOU swaps, checked against

@@ -2134,7 +2134,7 @@ async fn test_audio_tags_and_covers_through_real_worker_and_benchmarks() {
         .await
         .unwrap();
     let r_oom = &oom_res["results"][0];
-    assert_eq!(r_oom["error"]["code"], json!("failed"), "oom: {r_oom}");
+    assert_eq!(r_oom["error"]["code"], json!("not_found"), "oom: {r_oom}");
     assert_eq!(
         r_oom["error"]["details"]["enforced_by"],
         json!("allocator_cap"),
@@ -2720,9 +2720,10 @@ async fn test_failed_embedded_cover_caches_expiring_bad_entry_while_timeouts_sta
         ))
         .await
         .unwrap();
-    assert!(
-        res1["results"][0].get("error").is_some(),
-        "lying FLAC cover must fail: {}",
+    assert_eq!(
+        res1["results"][0]["error"]["code"],
+        json!("not_found"),
+        "lying FLAC cover without folder fallback must return not_found: {}",
         res1["results"][0]
     );
     assert!(
@@ -2760,8 +2761,9 @@ async fn test_failed_embedded_cover_caches_expiring_bad_entry_while_timeouts_sta
         0,
         "second request for cached bad embedded cover must not spawn a worker"
     );
-    assert!(
-        res2["results"][0].get("error").is_some(),
+    assert_eq!(
+        res2["results"][0]["error"]["code"],
+        json!("not_found"),
         "{}",
         res2["results"][0]
     );
@@ -2771,7 +2773,42 @@ async fn test_failed_embedded_cover_caches_expiring_bad_entry_while_timeouts_sta
         t0.elapsed()
     );
 
+    // 2b. Adding a valid `folder.jpg` beside the cached-bad FLAC immediately falls back to
+    //     `folder.jpg`, and subsequent calls hit BOTH caches with ZERO worker spawns!
+    let folder_jpg = home.join("folder.jpg");
+    fs::write(&folder_jpg, af::encode_solid_jpeg(160, 160, [20, 180, 60])).unwrap();
+    let res_fallback = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": [bad_flac.to_string_lossy()], "size": 256, "fit": "contain"}),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        res_fallback["results"][0].get("ok").is_some(),
+        "cached-bad embedded cover must fall back to folder.jpg: {}",
+        res_fallback["results"][0]
+    );
+    legion_tools::fs::reset_peak_worker_rss_for_test();
+    let res_fallback_cached = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": [bad_flac.to_string_lossy()], "size": 256, "fit": "contain"}),
+        ))
+        .await
+        .unwrap();
+    assert!(res_fallback_cached["results"][0].get("ok").is_some());
+    assert_eq!(
+        legion_tools::fs::peak_worker_rss_for_test(),
+        0,
+        "subsequent fallback call must hit cached bad embedded + cached folder cover with 0 workers"
+    );
+    fs::remove_file(&folder_jpg).unwrap();
+
     // 3. Different (size, fit) is keyed independently (runs worker and creates its own entry).
+    let before_other = count_cache();
     legion_tools::fs::reset_peak_worker_rss_for_test();
     let _res3 = node
         .call(Call::new(
@@ -2785,7 +2822,7 @@ async fn test_failed_embedded_cover_caches_expiring_bad_entry_while_timeouts_sta
         legion_tools::fs::peak_worker_rss_for_test() > 0,
         "different (size, fit) must not share (256, contain) bad entry"
     );
-    assert_eq!(count_cache(), 2);
+    assert_eq!(count_cache(), before_other + 1);
 
     // 4. Replacing the FLAC with a valid embedded cover changes identity and immediately succeeds.
     let valid_jpg = af::encode_solid_jpeg(160, 160, [40, 180, 90]);

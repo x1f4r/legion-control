@@ -4596,9 +4596,11 @@ async fn tags_and_audio_thumb_enforce_policy_and_handle_hostile_fixtures() {
     );
     assert_eq!(ht["album"], json!("CleanAlbum"));
 
-    // Embedded PNG bomb reports tags cleanly via `fs.tags`, and fails with `too_large` in `fs.thumb`
-    // while `good_mp3` still succeeds.
+    // Embedded PNG bomb reports tags cheaply (`cover: true`) via `fs.tags`, and falls back to
+    // `not_found` in `fs.thumb` when no decodable folder cover exists (preserving `reason:
+    // too_large` in details) while `good_mp3` still succeeds.
     assert_eq!(items[11]["ok"]["title"], json!("Bomb song"));
+    assert_eq!(items[11]["ok"]["cover"], json!(true));
     let thumb_bomb = f
         .call(
             "fs.thumb",
@@ -4606,7 +4608,10 @@ async fn tags_and_audio_thumb_enforce_policy_and_handle_hostile_fixtures() {
         )
         .await
         .unwrap();
-    assert_eq!(thumb_bomb["results"][0]["error"]["code"], json!("failed"));
+    assert_eq!(
+        thumb_bomb["results"][0]["error"]["code"],
+        json!("not_found")
+    );
     assert_eq!(
         thumb_bomb["results"][0]["error"]["details"]["reason"],
         json!("too_large")
@@ -4657,4 +4662,86 @@ paths = ["~/projects/**"]
         let err = f.call("fs.tags", bad).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgs);
     }
+}
+
+#[tokio::test]
+async fn audio_thumb_falls_back_from_corrupt_embedded_and_corrupt_folder_covers_before_not_found() {
+    use audio_fixtures as af;
+
+    let f = Fixture::new();
+    let album_dir = f.work.join("fallback_album");
+    std::fs::create_dir_all(&album_dir).unwrap();
+
+    // Valid JPEG magic bytes followed by truncated/corrupt data so `fs.tags` cheaply sees an
+    // embedded cover (`cover: true`) while decoding it fails.
+    let corrupt_jpg =
+        b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xFF\xDA\x00";
+    let song = album_dir.join("song.mp3");
+    std::fs::write(
+        &song,
+        af::build_mp3_with_raw_cover("Fallback song", "image/jpeg", corrupt_jpg),
+    )
+    .unwrap();
+
+    // 1. Corrupt embedded cover + NO folder cover -> fs.tags reports `cover: true` cheaply,
+    //    fs.thumb returns `not_found`.
+    let tags1 = f
+        .call("fs.tags", json!({"paths": [f.p(&song)]}))
+        .await
+        .unwrap();
+    assert_eq!(tags1["results"][0]["ok"]["cover"], json!(true));
+    let th_none = f
+        .call("fs.thumb", json!({"paths": [f.p(&song)], "size": 128}))
+        .await
+        .unwrap();
+    assert_eq!(
+        th_none["results"][0]["error"]["code"],
+        json!("not_found"),
+        "{th_none}"
+    );
+
+    // 2. Add a corrupt `cover.jpg` and an over-cap bomb `folder.png`, PLUS a valid blue `ALBUM.JPG`:
+    //    `fs.thumb` must skip the cached-bad embedded cover, skip corrupt `cover.jpg`, skip
+    //    over-cap `folder.png`, and succeed with blue `ALBUM.JPG`.
+    let cover_jpg = album_dir.join("cover.jpg");
+    let folder_png = album_dir.join("folder.png");
+    let album_jpg = album_dir.join("ALBUM.JPG");
+    std::fs::write(&cover_jpg, corrupt_jpg).unwrap();
+    std::fs::write(&folder_png, af::build_png_decompression_bomb()).unwrap();
+    std::fs::write(&album_jpg, af::encode_solid_jpeg(160, 160, [20, 40, 220])).unwrap();
+
+    let th_album = f
+        .call("fs.thumb", json!({"paths": [f.p(&song)], "size": 128}))
+        .await
+        .unwrap();
+    assert!(
+        th_album["results"][0].get("ok").is_some(),
+        "must fall back through corrupt cover.jpg and bomb folder.png to ALBUM.JPG: {th_album}"
+    );
+    let px_album = decode_thumb_rgb(&th_album["results"][0]);
+    assert!(px_album.0[2] > 180 && px_album.0[0] < 80, "{px_album:?}");
+
+    // 3. Replace `folder.png` with a valid green PNG -> higher priority than `ALBUM.JPG`, still
+    //    skipping corrupt `cover.jpg`.
+    std::fs::write(&folder_png, af::encode_solid_png(160, 160, [20, 200, 40])).unwrap();
+    let th_folder = f
+        .call("fs.thumb", json!({"paths": [f.p(&song)], "size": 128}))
+        .await
+        .unwrap();
+    let px_folder = decode_thumb_rgb(&th_folder["results"][0]);
+    assert!(px_folder.0[1] > 160 && px_folder.0[0] < 80, "{px_folder:?}");
+
+    // 4. Remove valid folder covers leaving ONLY corrupt `cover.jpg` -> `fs.tags` still cheaply
+    //    reports `cover: true`, and `fs.thumb` returns `not_found`.
+    std::fs::remove_file(&folder_png).unwrap();
+    std::fs::remove_file(&album_jpg).unwrap();
+    let th_all_bad = f
+        .call("fs.thumb", json!({"paths": [f.p(&song)], "size": 128}))
+        .await
+        .unwrap();
+    assert_eq!(
+        th_all_bad["results"][0]["error"]["code"],
+        json!("not_found"),
+        "{th_all_bad}"
+    );
 }

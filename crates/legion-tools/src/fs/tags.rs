@@ -62,7 +62,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.add_fn(
         "fs.tags",
         Effect::Read,
-        "Read audio metadata tags and cover presence for 1 to 32 audio file paths on this node (ID3v2/ID3v1 in MP3, WAV and AIFF, FLAC blocks, Ogg Vorbis/Opus comments, and MP4 items in M4A, M4B and MP4; parsed in an out-of-process memory-bounded worker capped at 16 MiB of tag data per file), returning per-path tags or per-path errors in input order, cached alongside thumbnails in the state directory.",
+        "Read audio metadata tags and cover presence for 1 to 32 audio file paths on this node (ID3v2/ID3v1 in MP3, WAV and AIFF, FLAC blocks, Ogg Vorbis/Opus comments, and MP4 items in M4A, M4B and MP4; parsed in an out-of-process memory-bounded worker capped at 16 MiB of tag data per file), returning per-path tags or per-path errors in input order, cached alongside thumbnails in the state directory. The cover flag reports cheaply that an embedded or folder picture was found, not that it decodes; callers should show their placeholder if fs.thumb later fails.",
         tags,
     );
 }
@@ -142,13 +142,59 @@ struct TagsResult {
     results: Vec<TagsItem>,
 }
 
-/// Finds the highest-priority folder cover picture in `audio_path`'s parent directory that is a
-/// non-empty regular file the caller's [`Grant`] is allowed to `fs.read`.
+/// Finds all candidate folder cover pictures in `audio_path`'s parent directory in priority order
+/// that are non-empty regular files the caller's [`Grant`] is allowed to `fs.read`.
 ///
 /// Matches `<stem>.<ext>` (ASCII case-insensitive) where `stem` is one of `cover`, `folder`,
 /// `front`, `album` (in that priority order) and `ext` is one of `jpg`, `jpeg`, `png`, `webp`.
 /// Directories, FIFOs, sockets, broken symlinks, and files outside the caller's allowed paths are
 /// skipped without blocking.
+pub(super) fn find_folder_covers(grant: &Grant, audio_path: &Path) -> Vec<PathBuf> {
+    let Some(parent) = audio_path.parent() else {
+        return Vec::new();
+    };
+    let Ok(read_dir) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<(usize, usize, std::ffi::OsString, PathBuf)> = Vec::new();
+
+    for entry in read_dir.flatten() {
+        let file_name = entry.file_name();
+        let Some(name_str) = file_name.to_str() else {
+            continue;
+        };
+        let Some((stem_rank, ext_rank)) = match_folder_cover_name(name_str) else {
+            continue;
+        };
+        candidates.push((stem_rank, ext_rank, file_name, entry.path()));
+    }
+
+    candidates.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+
+    let mut allowed = Vec::new();
+    for (_, _, _, cand_path) in candidates {
+        let Ok(resolved) = check_fs_path(grant, &path_to_string(&cand_path), Access::Read) else {
+            continue;
+        };
+        if let Ok((_file, meta)) = open_regular_file(
+            &resolved,
+            "read",
+            "Folder cover candidate must be a regular file.",
+        ) && meta.len() > 0
+        {
+            allowed.push(resolved);
+        }
+    }
+    allowed
+}
+
+/// Finds the highest-priority folder cover picture in `audio_path`'s parent directory that is a
+/// non-empty regular file the caller's [`Grant`] is allowed to `fs.read` (stops on the first match
+/// so `fs.tags` stays cheap).
 pub(super) fn find_folder_cover(grant: &Grant, audio_path: &Path) -> Option<PathBuf> {
     let parent = audio_path.parent()?;
     let read_dir = fs::read_dir(parent).ok()?;

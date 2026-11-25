@@ -562,7 +562,7 @@ Return metadata for a path (kind, size, modification time, Unix mode, readonly f
 
 Effect: `read`
 
-Read audio metadata tags and cover presence for 1 to 32 audio file paths on this node (ID3v2/ID3v1 in MP3, WAV and AIFF, FLAC blocks, Ogg Vorbis/Opus comments, and MP4 items in M4A, M4B and MP4; parsed in an out-of-process memory-bounded worker capped at 16 MiB of tag data per file), returning per-path tags or per-path errors in input order, cached alongside thumbnails in the state directory.
+Read audio metadata tags and cover presence for 1 to 32 audio file paths on this node (ID3v2/ID3v1 in MP3, WAV and AIFF, FLAC blocks, Ogg Vorbis/Opus comments, and MP4 items in M4A, M4B and MP4; parsed in an out-of-process memory-bounded worker capped at 16 MiB of tag data per file), returning per-path tags or per-path errors in input order, cached alongside thumbnails in the state directory. The cover flag reports cheaply that an embedded or folder picture was found, not that it decodes; callers should show their placeholder if fs.thumb later fails.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
