@@ -341,6 +341,152 @@ fn file_identity_handle_impl(_file: &File) -> io::Result<FileIdentity> {
     ))
 }
 
+/// Strong filesystem identity for claim and temporary-file ownership verification.
+///
+/// Extends `(dev, ino, nlink)` with the file's status-change time (`ctime`) and, where the
+/// filesystem reports it, creation/birth time (`btime`) so an inode number reused by a different
+/// user file can never match an abandoned claim or temporary ownership record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FileClaimIdentity {
+    /// Device or volume identifier.
+    pub dev: u64,
+    /// Inode number or 64-bit Windows file index.
+    pub ino: u64,
+    /// Hard-link count reported by the filesystem.
+    pub nlink: u64,
+    /// Status-change timestamp seconds relative to Unix epoch (last-write on Windows).
+    pub ctime_secs: i64,
+    /// Status-change timestamp subsecond nanoseconds (`0..1_000_000_000`).
+    pub ctime_nanos: u32,
+    /// Birth/creation timestamp seconds relative to Unix epoch when available.
+    pub btime_secs: Option<i64>,
+    /// Birth/creation timestamp subsecond nanoseconds when available.
+    pub btime_nanos: Option<u32>,
+}
+
+impl FileClaimIdentity {
+    /// Returns `true` when `self` matches an unmodified 0-byte claim or probe recorded as
+    /// `recorded`: same `(dev, ino)`, same `ctime`, and same `btime`.
+    pub fn matches_unmodified(&self, recorded: &Self) -> bool {
+        self.dev == recorded.dev
+            && self.ino == recorded.ino
+            && self.ctime_secs == recorded.ctime_secs
+            && self.ctime_nanos == recorded.ctime_nanos
+            && self.btime_secs == recorded.btime_secs
+            && self.btime_nanos == recorded.btime_nanos
+    }
+
+    /// Returns `true` when `self` matches a writable owned temporary recorded at creation time as
+    /// `recorded`: same `(dev, ino)`, identical `btime` (both `Some` and equal, or both `None`),
+    /// and `ctime` never earlier than when Legion created the temporary.
+    pub fn matches_written_temp(&self, recorded: &Self) -> bool {
+        self.dev == recorded.dev
+            && self.ino == recorded.ino
+            && self.btime_secs == recorded.btime_secs
+            && self.btime_nanos == recorded.btime_nanos
+            && (self.ctime_secs, self.ctime_nanos) >= (recorded.ctime_secs, recorded.ctime_nanos)
+    }
+}
+
+/// Returns the [`FileClaimIdentity`] of `path` without following a final symbolic link.
+pub fn symlink_claim_identity(path: impl AsRef<Path>) -> io::Result<FileClaimIdentity> {
+    claim_identity_path_impl(path.as_ref())
+}
+
+/// Returns the [`FileClaimIdentity`] of an already-open [`File`] handle.
+pub fn claim_identity_from_file(file: &File) -> io::Result<FileClaimIdentity> {
+    claim_identity_handle_impl(file)
+}
+
+#[cfg(unix)]
+fn system_time_to_unix_pair(t: SystemTime) -> (i64, u32) {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (i64::try_from(d.as_secs()).unwrap_or(i64::MAX), d.subsec_nanos()),
+        Err(err) => {
+            let d = err.duration();
+            let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+            if d.subsec_nanos() == 0 {
+                (-secs, 0)
+            } else {
+                (-secs - 1, 1_000_000_000 - d.subsec_nanos())
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn claim_identity_from_unix_meta(meta: &Metadata) -> FileClaimIdentity {
+    use std::os::unix::fs::MetadataExt;
+    let btime = meta.created().ok().map(system_time_to_unix_pair);
+    FileClaimIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        nlink: meta.nlink(),
+        ctime_secs: meta.ctime(),
+        ctime_nanos: u32::try_from(meta.ctime_nsec()).unwrap_or(0),
+        btime_secs: btime.map(|(s, _)| s),
+        btime_nanos: btime.map(|(_, ns)| ns),
+    }
+}
+
+#[cfg(unix)]
+fn claim_identity_path_impl(path: &Path) -> io::Result<FileClaimIdentity> {
+    let meta = fs::symlink_metadata(path)?;
+    Ok(claim_identity_from_unix_meta(&meta))
+}
+
+#[cfg(unix)]
+fn claim_identity_handle_impl(file: &File) -> io::Result<FileClaimIdentity> {
+    let meta = file.metadata()?;
+    Ok(claim_identity_from_unix_meta(&meta))
+}
+
+#[cfg(windows)]
+fn claim_identity_path_impl(path: &Path) -> io::Result<FileClaimIdentity> {
+    let (dev, ino, nlink, ctime_secs, ctime_nanos, btime_secs, btime_nanos) =
+        crate::win_proc::file_claim_identity_by_path(path, false)?;
+    Ok(FileClaimIdentity {
+        dev,
+        ino,
+        nlink,
+        ctime_secs,
+        ctime_nanos,
+        btime_secs,
+        btime_nanos,
+    })
+}
+
+#[cfg(windows)]
+fn claim_identity_handle_impl(file: &File) -> io::Result<FileClaimIdentity> {
+    let (dev, ino, nlink, ctime_secs, ctime_nanos, btime_secs, btime_nanos) =
+        crate::win_proc::file_claim_identity_by_handle(file)?;
+    Ok(FileClaimIdentity {
+        dev,
+        ino,
+        nlink,
+        ctime_secs,
+        ctime_nanos,
+        btime_secs,
+        btime_nanos,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn claim_identity_path_impl(_path: &Path) -> io::Result<FileClaimIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "file claim identity is not supported on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn claim_identity_handle_impl(_file: &File) -> io::Result<FileClaimIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "file claim identity is not supported on this platform",
+    ))
+}
+
 /// Outcome of a kernel exclusive-rename attempt ([`rename_no_replace`]).
 #[derive(Debug)]
 pub enum RenameNoReplaceError {

@@ -5,7 +5,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use legion_os::atomic::RenameNoReplaceError;
+use legion_os::atomic::{FileClaimIdentity, RenameNoReplaceError};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, classify_io};
@@ -282,11 +282,51 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimRecord {
-    /// Legacy pending marker written by older builds; never authorizes unlinking a file because it
-    /// is not bound to the created file's identity.
-    Pending,
-    /// Empty claim file created by Legion with this exact `(dev, ino)` identity.
-    Claimed { dev: u64, ino: u64 },
+    /// Legacy pending or v1 `(dev, ino)` marker without `ctime`/`btime`; never authorizes
+    /// unlinking a file because it cannot guard against inode reuse.
+    LegacyUnverified,
+    /// Empty claim file created by Legion with this exact `(dev, ino, ctime, btime)` identity.
+    Claimed(FileClaimIdentity),
+}
+
+fn format_claim_identity(id: &FileClaimIdentity) -> String {
+    let btime_s = id
+        .btime_secs
+        .map_or_else(|| "-".to_owned(), |v| v.to_string());
+    let btime_ns = id
+        .btime_nanos
+        .map_or_else(|| "-".to_owned(), |v| v.to_string());
+    format!(
+        "{} {} {} {} {} {}",
+        id.dev, id.ino, id.ctime_secs, id.ctime_nanos, btime_s, btime_ns
+    )
+}
+
+fn parse_claim_identity<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<FileClaimIdentity> {
+    let dev: u64 = parts.next()?.parse().ok()?;
+    let ino: u64 = parts.next()?.parse().ok()?;
+    let ctime_secs: i64 = parts.next()?.parse().ok()?;
+    let ctime_nanos: u32 = parts.next()?.parse().ok()?;
+    let btime_secs = match parts.next()? {
+        "-" => None,
+        s => Some(s.parse().ok()?),
+    };
+    let btime_nanos = match parts.next()? {
+        "-" => None,
+        s => Some(s.parse().ok()?),
+    };
+    if btime_secs.is_some() != btime_nanos.is_some() {
+        return None;
+    }
+    Some(FileClaimIdentity {
+        dev,
+        ino,
+        nlink: 1,
+        ctime_secs,
+        ctime_nanos,
+        btime_secs,
+        btime_nanos,
+    })
 }
 
 fn write_claim_record(path: &Path, record: ClaimRecord) -> Result<()> {
@@ -294,8 +334,8 @@ fn write_claim_record(path: &Path, record: ClaimRecord) -> Result<()> {
         let _ = fs::create_dir_all(parent);
     }
     let text = match record {
-        ClaimRecord::Pending => return Ok(()),
-        ClaimRecord::Claimed { dev, ino } => format!("claimed {dev} {ino}\n"),
+        ClaimRecord::LegacyUnverified => return Ok(()),
+        ClaimRecord::Claimed(id) => format!("claimed2 {}\n", format_claim_identity(&id)),
     };
     legion_os::atomic::write_atomic(
         path,
@@ -312,12 +352,8 @@ fn read_claim_record(path: &Path) -> Option<ClaimRecord> {
     let text = fs::read_to_string(path).ok()?;
     let mut parts = text.split_whitespace();
     match parts.next()? {
-        "pending" => Some(ClaimRecord::Pending),
-        "claimed" => {
-            let dev: u64 = parts.next()?.parse().ok()?;
-            let ino: u64 = parts.next()?.parse().ok()?;
-            Some(ClaimRecord::Claimed { dev, ino })
-        }
+        "pending" | "claimed" => Some(ClaimRecord::LegacyUnverified),
+        "claimed2" => parse_claim_identity(&mut parts).map(ClaimRecord::Claimed),
         _ => None,
     }
 }
@@ -326,8 +362,8 @@ fn read_claim_record(path: &Path) -> Option<ClaimRecord> {
 /// fallback (recorded under `state_dir` and whose claim lock is free). Removes the stale empty
 /// claim file and its record, returning `true` if a stale claim was cleaned up.
 ///
-/// Never removes a non-empty file, a file whose `(dev, ino)` identity does not match the recorded
-/// claim, or a file backed only by an unbound pending record.
+/// Never removes a non-empty file, a file with `nlink != 1`, a file whose
+/// `(dev, ino, ctime, btime)` identity does not match the recorded claim, or a legacy record.
 pub fn reclaim_stale_claim(state_dir: &Path, candidate: &Path) -> bool {
     let (lock_path, claim_path) = claim_state_paths(state_dir, candidate);
     if fs::symlink_metadata(&claim_path).is_err() {
@@ -355,10 +391,10 @@ fn reclaim_stale_claim_locked(claim_path: &Path, candidate: &Path) -> bool {
         return false;
     }
     let matches = match record {
-        ClaimRecord::Claimed { dev, ino } => platform::symlink_file_identity(candidate)
-            .is_ok_and(|id| id.dev == dev && id.ino == ino && id.nlink == 1),
-        // Never delete a file whose identity was not explicitly bound to the claim record.
-        ClaimRecord::Pending => false,
+        ClaimRecord::Claimed(recorded) => platform::symlink_claim_identity(candidate)
+            .is_ok_and(|id| id.nlink == 1 && id.matches_unmodified(&recorded)),
+        // Never delete a file whose full `(dev, ino, ctime, btime)` identity was not recorded.
+        ClaimRecord::LegacyUnverified => false,
     };
     let _ = fs::remove_file(claim_path);
     if matches {
@@ -427,14 +463,8 @@ where
     }
     let res = match claim_new(candidate) {
         Ok(claim_file) => {
-            if let Ok(id) = platform::open_file_identity(&claim_file) {
-                let _ = write_claim_record(
-                    &claim_path,
-                    ClaimRecord::Claimed {
-                        dev: id.dev,
-                        ino: id.ino,
-                    },
-                );
+            if let Ok(id) = platform::open_claim_identity(&claim_file) {
+                let _ = write_claim_record(&claim_path, ClaimRecord::Claimed(id));
             }
             drop(claim_file);
             if let Err(err) = replace_over(temp, candidate) {
@@ -451,6 +481,26 @@ where
     };
     let _ = fs::remove_file(&lock_path);
     res
+}
+
+/// Atomically moves `src` to `dst` via the exclusive-create claim path (`O_CREAT | O_EXCL` +
+/// recorded claim identity -> replace own claim), failing with `AlreadyExists` if `dst` is taken.
+pub(crate) fn place_one_via_claim(state_dir: &Path, src: &Path, dst: &Path) -> io::Result<()> {
+    match place_via_claim(
+        state_dir,
+        src,
+        dst,
+        &mut platform::create_new_private,
+        &mut platform::replace_file,
+    ) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination already exists",
+        )),
+        Err(Error::Io { source, .. }) => Err(source),
+        Err(other) => Err(io::Error::other(other.to_string())),
+    }
 }
 
 /// An opened single-file receive session holding either an exclusive lock in the node's state
@@ -535,9 +585,8 @@ impl PutSession {
             }
         }
 
-        if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let _ = sweep_stale_temps(parent, STALE_TEMP_AGE);
-        }
+        // Only sweep abandoned temporaries that carry an explicit ownership record under
+        // `state_dir`. Never delete files in user folders by filename pattern and age alone.
         let _ = sweep_abandoned_temps(state_dir, PROBE_SWEEP_AGE);
         let _ = sweep_stale_state(state_dir, STALE_TEMP_AGE);
 
@@ -763,56 +812,6 @@ impl PutSession {
     }
 }
 
-/// Removes abandoned temporary files matching [`platform::is_sweepable_temp_name`] in `dir` whose
-/// modification time is older than `max_age` and that are not locked by a live transfer.
-pub fn sweep_stale_temps(dir: &Path, max_age: Duration) -> usize {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
-    };
-    let now = SystemTime::now();
-    let mut removed = 0usize;
-    for entry in entries.flatten() {
-        let name_os = entry.file_name();
-        let Some(name) = name_os.to_str() else {
-            continue;
-        };
-        if !platform::is_sweepable_temp_name(name) {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !meta.file_type().is_file() {
-            continue;
-        }
-        let Ok(modified) = meta.modified() else {
-            continue;
-        };
-        let Ok(age) = now.duration_since(modified) else {
-            continue;
-        };
-        if age < max_age {
-            continue;
-        }
-        // Only remove if no active transfer holds a lock on the file.
-        let lockable = match OpenOptions::new().write(true).open(&path) {
-            Ok(file) => match file.try_lock() {
-                Ok(()) => {
-                    drop(file);
-                    true
-                }
-                Err(_) => false,
-            },
-            Err(_) => false,
-        };
-        if lockable && fs::remove_file(&path).is_ok() {
-            removed += 1;
-        }
-    }
-    removed
-}
-
 /// Default age threshold after which unheld probe marker records under `<state_dir>/xfer/probes/`
 /// are swept opportunistically.
 pub const PROBE_SWEEP_AGE: Duration = Duration::from_secs(30);
@@ -827,8 +826,8 @@ const SHORT_LOCK_SWEEP_AGE: Duration = Duration::from_secs(30);
 ///
 /// While the owning transfer is alive, the kernel holds the exclusive flock on `owner_path`. If
 /// the process is killed (`SIGKILL`), the kernel releases the flock immediately, allowing the very
-/// next transfer on this node to sweep the abandoned temporary after verifying its `(dev, ino)`
-/// identity.
+/// next transfer on this node to sweep the abandoned temporary after verifying its full
+/// `(dev, ino, ctime, btime)` identity.
 #[derive(Debug)]
 pub struct OwnedTempGuard {
     owner_path: PathBuf,
@@ -861,16 +860,21 @@ fn probe_marker_state_path(state_dir: &Path, marker_path: &Path) -> PathBuf {
 }
 
 /// Registers an ephemeral temporary file under `<state_dir>/xfer/temps/`, binding it to its
-/// `(dev, ino)` identity and holding an exclusive flock for the lifetime of the returned guard.
+/// `(dev, ino, ctime, btime)` identity and holding an exclusive flock for the lifetime of the
+/// returned guard.
 pub fn register_owned_temp(
     state_dir: &Path,
     temp_path: &Path,
     file: &File,
 ) -> Option<OwnedTempGuard> {
-    let id = platform::open_file_identity(file).ok()?;
+    let id = platform::open_claim_identity(file).ok()?;
     let owner_path = owned_temp_state_path(state_dir, temp_path);
     let mut lock_file = try_lock_state_file(&owner_path).ok()??;
-    let payload = format!("{} {}\n{}\n", id.dev, id.ino, temp_path.to_string_lossy());
+    let payload = format!(
+        "v2 {}\n{}\n",
+        format_claim_identity(&id),
+        temp_path.to_string_lossy()
+    );
     if lock_file.set_len(0).is_ok()
         && lock_file.seek(SeekFrom::Start(0)).is_ok()
         && lock_file.write_all(payload.as_bytes()).is_ok()
@@ -887,9 +891,10 @@ pub fn register_owned_temp(
 }
 
 /// Records an unheld `.legion-move-probe-*.tmp` marker under `<state_dir>/xfer/probes/` bound to
-/// its `(dev, ino)` identity so a crashed probe is swept promptly on a subsequent transfer.
+/// its `(dev, ino, ctime, btime)` identity so a crashed probe is swept promptly on a subsequent
+/// transfer.
 pub fn record_probe_marker(state_dir: &Path, marker_path: &Path, file: &File) {
-    let Ok(id) = platform::open_file_identity(file) else {
+    let Ok(id) = platform::open_claim_identity(file) else {
         return;
     };
     let record_path = probe_marker_state_path(state_dir, marker_path);
@@ -901,9 +906,8 @@ pub fn record_probe_marker(state_dir: &Path, marker_path: &Path, file: &File) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let text = format!(
-        "{} {} {now_secs}\n{}\n",
-        id.dev,
-        id.ino,
+        "v2 {} {now_secs}\n{}\n",
+        format_claim_identity(&id),
         marker_path.to_string_lossy()
     );
     let _ = legion_os::atomic::write_atomic(
@@ -923,7 +927,8 @@ pub fn forget_probe_marker(state_dir: &Path, marker_path: &Path) {
 /// `<state_dir>/xfer/probes/` older than `probe_max_age`.
 ///
 /// Only unlinks a target when its filename satisfies [`platform::is_sweepable_temp_name`] AND its
-/// on-disk `(dev, ino)` matches the recorded identity.
+/// on-disk `(dev, ino, nlink == 1, ctime, btime)` matches the recorded identity. Files without a
+/// matching ownership record (including leftovers from older versions) are never touched.
 pub fn sweep_abandoned_temps(state_dir: &Path, probe_max_age: Duration) -> usize {
     let mut removed = 0usize;
 
@@ -948,17 +953,27 @@ pub fn sweep_abandoned_temps(state_dir: &Path, probe_max_age: Duration) -> usize
                 let mut lines = text.lines();
                 if let (Some(header), Some(path_line)) = (lines.next(), lines.next()) {
                     let mut parts = header.split_whitespace();
-                    if let (Some(dev_s), Some(ino_s)) = (parts.next(), parts.next())
-                        && let (Ok(dev), Ok(ino)) = (dev_s.parse::<u64>(), ino_s.parse::<u64>())
+                    if parts.next() == Some("v2")
+                        && let Some(recorded) = parse_claim_identity(&mut parts)
                     {
                         let temp_path = Path::new(path_line);
-                        let name_ok = temp_path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .is_some_and(platform::is_sweepable_temp_name);
-                        let id_matches = platform::symlink_file_identity(temp_path)
-                            .is_ok_and(|id| id.dev == dev && id.ino == ino && id.nlink == 1);
-                        if name_ok && id_matches && fs::remove_file(temp_path).is_ok() {
+                        let file_name = temp_path.file_name().and_then(|s| s.to_str());
+                        let name_ok = file_name.is_some_and(platform::is_sweepable_temp_name);
+                        let is_probe =
+                            file_name.is_some_and(|n| n.starts_with(".legion-move-probe-"));
+                        let meta_ok = fs::symlink_metadata(temp_path).is_ok_and(|m| {
+                            m.file_type().is_file() && (!is_probe || m.len() == 0)
+                        });
+                        let id_matches =
+                            platform::symlink_claim_identity(temp_path).is_ok_and(|id| {
+                                id.nlink == 1
+                                    && if is_probe {
+                                        id.matches_unmodified(&recorded)
+                                    } else {
+                                        id.matches_written_temp(&recorded)
+                                    }
+                            });
+                        if name_ok && meta_ok && id_matches && fs::remove_file(temp_path).is_ok() {
                             removed += 1;
                         }
                     }
@@ -969,7 +984,7 @@ pub fn sweep_abandoned_temps(state_dir: &Path, probe_max_age: Duration) -> usize
     }
 
     // 2. Unheld probe markers older than `probe_max_age`: must be 0-byte, sweepable, and match
-    //    `(dev, ino)` before unlinking.
+    //    exact `(dev, ino, nlink == 1, ctime, btime)` before unlinking.
     let probes_dir = state_dir.join("xfer").join("probes");
     if let Ok(entries) = fs::read_dir(&probes_dir) {
         let now_secs = SystemTime::now()
@@ -992,17 +1007,15 @@ pub fn sweep_abandoned_temps(state_dir: &Path, probe_max_age: Duration) -> usize
                 continue;
             };
             let mut parts = header.split_whitespace();
-            let (Some(dev_s), Some(ino_s), Some(created_s)) =
-                (parts.next(), parts.next(), parts.next())
-            else {
+            let Some("v2") = parts.next() else {
                 let _ = fs::remove_file(&record_path);
                 continue;
             };
-            let (Ok(dev), Ok(ino), Ok(created_secs)) = (
-                dev_s.parse::<u64>(),
-                ino_s.parse::<u64>(),
-                created_s.parse::<u64>(),
-            ) else {
+            let Some(recorded) = parse_claim_identity(&mut parts) else {
+                let _ = fs::remove_file(&record_path);
+                continue;
+            };
+            let Some(Ok(created_secs)) = parts.next().map(str::parse::<u64>) else {
                 let _ = fs::remove_file(&record_path);
                 continue;
             };
@@ -1016,8 +1029,8 @@ pub fn sweep_abandoned_temps(state_dir: &Path, probe_max_age: Duration) -> usize
                 .is_some_and(platform::is_sweepable_temp_name);
             let meta_ok = fs::symlink_metadata(marker_path)
                 .is_ok_and(|m| m.file_type().is_file() && m.len() == 0);
-            let id_matches = platform::symlink_file_identity(marker_path)
-                .is_ok_and(|id| id.dev == dev && id.ino == ino && id.nlink == 1);
+            let id_matches = platform::symlink_claim_identity(marker_path)
+                .is_ok_and(|id| id.nlink == 1 && id.matches_unmodified(&recorded));
             if name_ok && meta_ok && id_matches && fs::remove_file(marker_path).is_ok() {
                 removed += 1;
             }
@@ -2344,17 +2357,10 @@ mod tests {
         for mode in [IfExists::Fail, IfExists::Skip] {
             let crashed = dir.path().join(format!("crashed-{mode:?}.bin"));
             let claim_file = platform::create_new_private(&crashed).unwrap();
-            let id = platform::open_file_identity(&claim_file).unwrap();
+            let id = platform::open_claim_identity(&claim_file).unwrap();
             drop(claim_file);
             let (_, claim_path) = claim_state_paths(state.path(), &crashed);
-            write_claim_record(
-                &claim_path,
-                ClaimRecord::Claimed {
-                    dev: id.dev,
-                    ino: id.ino,
-                },
-            )
-            .unwrap();
+            write_claim_record(&claim_path, ClaimRecord::Claimed(id)).unwrap();
 
             let payload = b"recovered-after-crash";
             let hash = crate::hash::hash_bytes(payload);
@@ -2604,32 +2610,45 @@ mod tests {
     }
 
     #[test]
-    fn sweeps_stale_put_temporaries_by_age_and_preserves_locked_ones() {
-        let dir = tempfile::tempdir().unwrap();
-        let stale = dir.path().join(".legion-put-123-0.legion-part");
-        let fresh = dir.path().join(".legion-put-123-1.legion-part");
-        let locked = dir.path().join(".legion-put-123-2.legion-part");
-        let user_file = dir.path().join("keep.txt");
-        fs::write(&stale, b"old").unwrap();
-        fs::write(&fresh, b"new").unwrap();
-        fs::write(&locked, b"active").unwrap();
-        fs::write(&user_file, b"user").unwrap();
+    fn unowned_legion_named_user_files_are_never_deleted_by_age() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let thesis_put = user_dir.path().join(".legion-put-thesis.legion-part");
+        let old_unpack = user_dir.path().join(".legion-unpack-old-1.tmp");
+        fs::write(&thesis_put, b"two-day-old user notes").unwrap();
+        fs::write(&old_unpack, b"legacy leftover").unwrap();
 
         let old_time = SystemTime::now() - Duration::from_secs(48 * 60 * 60);
         let old_times = fs::FileTimes::new().set_modified(old_time);
-        fs::set_times(&stale, old_times).unwrap();
-        fs::set_times(&locked, old_times).unwrap();
+        fs::set_times(&thesis_put, old_times).unwrap();
+        fs::set_times(&old_unpack, old_times).unwrap();
 
-        let held = OpenOptions::new().write(true).open(&locked).unwrap();
-        held.try_lock().unwrap();
-
-        let removed = sweep_stale_temps(dir.path(), STALE_TEMP_AGE);
-        assert_eq!(removed, 1);
-        assert!(!stale.exists(), "stale unlocked temp must be removed");
-        assert!(fresh.exists(), "recent temp must remain");
-        assert!(locked.exists(), "actively locked temp must remain");
-        assert!(user_file.exists(), "unrelated user file must remain");
-        drop(held);
+        // Opening a PutSession in the same folder and sweeping abandoned temps must NEVER touch
+        // files without an ownership record in `state_dir`.
+        let target = user_dir.path().join("other.bin");
+        let payload = b"fresh-upload";
+        let hash = crate::hash::hash_bytes(payload);
+        let sess = PutSession::open_with_state(
+            state_dir.path(),
+            &target,
+            payload.len() as u64,
+            hash,
+            IfExists::Replace,
+        )
+        .unwrap();
+        sess.finish(hash, io::Cursor::new(payload), None, |_| Ok(()))
+            .unwrap();
+        assert_eq!(sweep_abandoned_temps(state_dir.path(), Duration::ZERO), 0);
+        assert_eq!(
+            fs::read(&thesis_put).unwrap(),
+            b"two-day-old user notes",
+            "unowned .legion-put-* file must never be deleted by name and age"
+        );
+        assert_eq!(
+            fs::read(&old_unpack).unwrap(),
+            b"legacy leftover",
+            "unowned .legion-unpack-* file must never be deleted by name and age"
+        );
     }
 
     #[test]
@@ -2774,51 +2793,48 @@ mod tests {
         let (claim_lock_path, claim_path) = claim_state_paths(state_dir.path(), &user_empty);
         fs::create_dir_all(claim_path.parent().unwrap()).unwrap();
 
-        // 1. A legacy `pending` claim record must NEVER delete an existing 0-byte user file.
-        fs::write(&claim_path, "pending 12345\n").unwrap();
-        reclaim_stale_claim(state_dir.path(), &user_empty);
-        assert!(
-            user_empty.exists(),
-            "legacy pending claim record must never delete a user's empty file"
-        );
-        assert!(
-            !claim_path.exists(),
-            "stale pending claim record should be removed"
-        );
+        // 1. Legacy `pending` and v1 `claimed <dev> <ino>` records (without ctime/btime) must
+        //    NEVER delete an existing 0-byte user file.
+        let real_id = platform::symlink_claim_identity(&user_empty).unwrap();
+        for legacy in [
+            "pending 12345\n".to_owned(),
+            format!("claimed {} {}\n", real_id.dev, real_id.ino),
+        ] {
+            fs::write(&claim_path, &legacy).unwrap();
+            reclaim_stale_claim(state_dir.path(), &user_empty);
+            assert!(
+                user_empty.exists(),
+                "legacy claim record {legacy:?} must never delete a user's empty file"
+            );
+            assert!(!claim_path.exists());
+        }
 
-        // 2. A `claimed` record whose `(dev, ino)` does NOT match the file on disk must NEVER
-        //    delete the user's empty file.
-        let real_id = platform::symlink_file_identity(&user_empty).unwrap();
-        let wrong_ino = real_id.ino.wrapping_add(99_999);
-        write_claim_record(
-            &claim_path,
-            ClaimRecord::Claimed {
-                dev: real_id.dev,
-                ino: wrong_ino,
-            },
-        )
-        .unwrap();
-        reclaim_stale_claim(state_dir.path(), &user_empty);
-        assert!(
-            user_empty.exists(),
-            "mismatched (dev, ino) claim record must never delete a user's empty file"
-        );
-        assert!(!claim_path.exists());
+        // 2. Mismatched `ino`, mismatched `ctime`, or mismatched `btime` must NEVER delete the
+        //    user's empty file (defends against inode reuse).
+        let mut wrong_ino = real_id;
+        wrong_ino.ino = real_id.ino.wrapping_add(99_999);
+        let mut wrong_ctime = real_id;
+        wrong_ctime.ctime_secs = real_id.ctime_secs.wrapping_sub(5);
+        let mut wrong_btime = real_id;
+        wrong_btime.btime_secs = Some(real_id.btime_secs.unwrap_or(0).wrapping_sub(5));
+        wrong_btime.btime_nanos = Some(0);
+        for bad in [wrong_ino, wrong_ctime, wrong_btime] {
+            write_claim_record(&claim_path, ClaimRecord::Claimed(bad)).unwrap();
+            reclaim_stale_claim(state_dir.path(), &user_empty);
+            assert!(
+                user_empty.exists(),
+                "mismatched claim identity {bad:?} must never delete a user's empty file"
+            );
+            assert!(!claim_path.exists());
+        }
 
-        // 3. A `claimed` record whose `(dev, ino)` DOES match a 0-byte single-link claim file DOES
-        //    reclaim it and cleans up both `.claim` and `.lock`.
-        write_claim_record(
-            &claim_path,
-            ClaimRecord::Claimed {
-                dev: real_id.dev,
-                ino: real_id.ino,
-            },
-        )
-        .unwrap();
+        // 3. A `claimed2` record whose full `(dev, ino, ctime, btime)` matches a 0-byte
+        //    single-link claim file DOES reclaim it and cleans up both `.claim` and `.lock`.
+        write_claim_record(&claim_path, ClaimRecord::Claimed(real_id)).unwrap();
         reclaim_stale_claim(state_dir.path(), &user_empty);
         assert!(
             !user_empty.exists(),
-            "matching (dev, ino) 0-byte claim file should be reclaimed"
+            "matching (dev, ino, ctime, btime) 0-byte claim file should be reclaimed"
         );
         assert!(!claim_path.exists());
         assert!(!claim_lock_path.exists());
@@ -2829,14 +2845,18 @@ mod tests {
         let state_dir = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
 
-        // 1. Abandoned `.legion-unpack-*.tmp` and `.legion-put-*` with unlocked ownership records
-        //    (as left after SIGKILL) are swept immediately regardless of age.
+        // 1. Abandoned `.legion-unpack-*.tmp` and `.legion-put-*` with unlocked v2 ownership
+        //    records (as left after SIGKILL, including after bytes were written) are swept
+        //    immediately regardless of age.
         let dead_unpack = dir.path().join(".legion-unpack-999-1.tmp");
         let dead_put = dir.path().join(".legion-put-999-2.legion-part");
-        let dead_unpack_f = File::create(&dead_unpack).unwrap();
+        let mut dead_unpack_f = File::create(&dead_unpack).unwrap();
         let dead_put_f = File::create(&dead_put).unwrap();
-        let id_u = platform::open_file_identity(&dead_unpack_f).unwrap();
-        let id_p = platform::open_file_identity(&dead_put_f).unwrap();
+        let id_u = platform::open_claim_identity(&dead_unpack_f).unwrap();
+        let id_p = platform::open_claim_identity(&dead_put_f).unwrap();
+        // Writing to an owned temp after creation updates ctime; sweep must still recognize it via
+        // matching `(dev, ino, btime)` and non-decreasing `ctime`.
+        dead_unpack_f.write_all(b"partial-bytes").unwrap();
         drop(dead_unpack_f);
         drop(dead_put_f);
 
@@ -2844,12 +2864,20 @@ mod tests {
         fs::create_dir_all(&temps_dir).unwrap();
         fs::write(
             owned_temp_state_path(state_dir.path(), &dead_unpack),
-            format!("{} {}\n{}\n", id_u.dev, id_u.ino, dead_unpack.display()),
+            format!(
+                "v2 {}\n{}\n",
+                format_claim_identity(&id_u),
+                dead_unpack.display()
+            ),
         )
         .unwrap();
         fs::write(
             owned_temp_state_path(state_dir.path(), &dead_put),
-            format!("{} {}\n{}\n", id_p.dev, id_p.ino, dead_put.display()),
+            format!(
+                "v2 {}\n{}\n",
+                format_claim_identity(&id_p),
+                dead_put.display()
+            ),
         )
         .unwrap();
 
@@ -2859,14 +2887,34 @@ mod tests {
         let _live_guard = register_owned_temp(state_dir.path(), &live_unpack, &live_f).unwrap();
         drop(live_f);
 
-        // 3. A user file whose path was spoofed into an ownership record must NEVER be deleted.
+        // 3. A user file whose path was spoofed into an ownership record, or a temp whose recorded
+        //    `ctime`/`btime` does not match, must NEVER be deleted.
         let user_file = dir.path().join("precious.txt");
         let user_f = File::create(&user_file).unwrap();
-        let id_user = platform::open_file_identity(&user_f).unwrap();
+        let id_user = platform::open_claim_identity(&user_f).unwrap();
         drop(user_f);
         fs::write(
             owned_temp_state_path(state_dir.path(), &user_file),
-            format!("{} {}\n{}\n", id_user.dev, id_user.ino, user_file.display()),
+            format!(
+                "v2 {}\n{}\n",
+                format_claim_identity(&id_user),
+                user_file.display()
+            ),
+        )
+        .unwrap();
+
+        let reused_probe = dir.path().join(".legion-move-probe-999-reused-1.tmp");
+        let reused_f = File::create(&reused_probe).unwrap();
+        let mut bad_probe_id = platform::open_claim_identity(&reused_f).unwrap();
+        bad_probe_id.ctime_secs = bad_probe_id.ctime_secs.wrapping_sub(10);
+        drop(reused_f);
+        fs::write(
+            owned_temp_state_path(state_dir.path(), &reused_probe),
+            format!(
+                "v2 {}\n{}\n",
+                format_claim_identity(&bad_probe_id),
+                reused_probe.display()
+            ),
         )
         .unwrap();
 
@@ -2884,6 +2932,10 @@ mod tests {
         assert!(!dead_probe.exists());
         assert!(live_unpack.exists(), "live locked temp must not be swept");
         assert!(user_file.exists(), "user file must never be swept");
+        assert!(
+            reused_probe.exists(),
+            "probe with mismatched ctime must never be swept"
+        );
 
         // 5. Orphaned `xfer/renames/*.lock` (with no matching `.json` intent) is swept by both
         //    `recover_pending_renames` and `sweep_stale_state`, while a live `.json` + `.lock`

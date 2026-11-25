@@ -66,7 +66,7 @@ pub use legion_xfer::recover_pending_renames;
 use legion_xfer::{
     CaseCollision, Entry, EntryKind, Hash, IfExists, ManifestOptions, PlacedFileMeta, PutSession,
     RenameRecoveryScope, RenamedEntry, SkippedEntry, Timestamp, case_insensitive,
-    case_insensitive_in_dir, directory_contains_exact_name, move_no_replace_raw,
+    case_insensitive_in_dir, directory_contains_exact_name, move_no_replace_safe,
     pending_renames_dir, probe_dir_name_behavior, recover_pending_renames_checked,
     rename_intent_key, resolve_relative_path, unicode_normalizing, unicode_normalizing_in_dir,
     visible_rename_temp_name,
@@ -2590,17 +2590,29 @@ fn perform_recoverable_two_step_rename(
         ))
     })?;
 
-    if let Err(err) = move_no_replace_raw(&from_path, &temp_path) {
+    if let Err(err) = move_no_replace_safe(state_dir, &from_path, &temp_path) {
         let _ = fs::remove_file(&intent_path);
         legion_xfer::unlink_held_lock(&lock_path, intent_lock);
         return Err(Failure::Reply(io_error("rename", &temp_path, &err)));
     }
-    if let Err(err) = move_no_replace_raw(&temp_path, &to_path) {
-        if fs::rename(&temp_path, &from_path).is_ok() {
+    if let Err(err) = move_no_replace_safe(state_dir, &temp_path, &to_path) {
+        // Never use a replacing rename for rollback: if a new entry appeared at `from_path`, keep
+        // `temp_path` and the pending rename intent intact and report where the original entry is.
+        if move_no_replace_safe(state_dir, &temp_path, &from_path).is_ok() {
             let _ = fs::remove_file(&intent_path);
             legion_xfer::unlink_held_lock(&lock_path, intent_lock);
+            return Err(Failure::Reply(io_error("rename", &to_path, &err)));
         }
-        return Err(Failure::Reply(io_error("rename", &to_path, &err)));
+        return Err(Failure::Reply(ErrorBody::new(
+            ErrorCode::Conflict,
+            format!(
+                "Could not finish renaming {} to {} ({err}), and {} could not be restored without overwriting an existing entry; the original entry was kept at {}.",
+                from_path.display(),
+                to_path.display(),
+                from_path.display(),
+                temp_path.display(),
+            ),
+        )));
     }
     let _ = fs::remove_file(&intent_path);
     legion_xfer::unlink_held_lock(&lock_path, intent_lock);

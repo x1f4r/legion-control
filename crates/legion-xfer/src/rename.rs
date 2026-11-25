@@ -463,17 +463,53 @@ fn parent_matches_scope(scope: RenameRecoveryScope<'_>, parent: &Path) -> bool {
     }
 }
 
-/// Renames `src` to `dst` without replacing an existing entry when the kernel supports it.
-pub fn move_no_replace_raw(src: &Path, dst: &Path) -> io::Result<()> {
+/// Renames `src` to `dst` without replacing an existing entry.
+///
+/// First attempts the kernel's atomic no-replace rename (`renameat2(RENAME_NOREPLACE)`,
+/// `renamex_np(RENAME_EXCL)`, or `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`). When the
+/// filesystem returns [`RenameNoReplaceError::Unsupported`], falls back ONLY to atomic
+/// no-replace primitives — never to a plain replacing `fs::rename` onto an unclaimed name:
+/// - for regular files: `hard_link(src, dst)` + `remove_file(src)`, falling back to the
+///   exclusive-create claim path (`O_CREAT | O_EXCL` + recorded identity claim -> replace own
+///   claim) when hard links are also unsupported;
+/// - for symbolic links: the exclusive-create claim path;
+/// - for directories: atomic `create_dir(dst)` claim followed by renaming `src` over the empty
+///   claimed directory (cleaning up the empty directory on failure).
+pub fn move_no_replace_safe(state_dir: &Path, src: &Path, dst: &Path) -> io::Result<()> {
     match legion_os::atomic::rename_no_replace(src, dst) {
         Ok(()) => Ok(()),
-        Err(legion_os::atomic::RenameNoReplaceError::Unsupported) => fs::rename(src, dst),
         Err(legion_os::atomic::RenameNoReplaceError::AlreadyExists) => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "destination already exists",
         )),
         Err(legion_os::atomic::RenameNoReplaceError::Io(err)) => Err(err),
+        Err(legion_os::atomic::RenameNoReplaceError::Unsupported) => {
+            move_no_replace_fallback(state_dir, src, dst)
+        }
     }
+}
+
+fn move_no_replace_fallback(state_dir: &Path, src: &Path, dst: &Path) -> io::Result<()> {
+    let src_meta = fs::symlink_metadata(src)?;
+    if src_meta.file_type().is_dir() {
+        fs::create_dir(dst)?;
+        if let Err(err) = fs::rename(src, dst) {
+            let _ = fs::remove_dir(dst);
+            return Err(err);
+        }
+        return Ok(());
+    }
+    if src_meta.file_type().is_file() {
+        match fs::hard_link(src, dst) {
+            Ok(()) => {
+                let _ = fs::remove_file(src);
+                return Ok(());
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => return Err(err),
+            Err(_) => {}
+        }
+    }
+    crate::file::place_one_via_claim(state_dir, src, dst)
 }
 
 /// Removes a lock file cleanly across platforms (unlinking while locked on Unix; dropping the
@@ -589,7 +625,7 @@ pub fn recover_pending_renames_checked(
                 true
             }
             PendingRenameRecovery::CompleteToFinal => {
-                if move_no_replace_raw(&temp_path, &to_path).is_ok()
+                if move_no_replace_safe(state_dir, &temp_path, &to_path).is_ok()
                     && directory_contains_exact_name(&parent, to_name).unwrap_or(false)
                 {
                     #[cfg(unix)]
@@ -603,7 +639,7 @@ pub fn recover_pending_renames_checked(
                 }
             }
             PendingRenameRecovery::ReverseToOriginal => {
-                if move_no_replace_raw(&temp_path, &from_path).is_ok()
+                if move_no_replace_safe(state_dir, &temp_path, &from_path).is_ok()
                     && directory_contains_exact_name(&parent, from_name).unwrap_or(false)
                 {
                     #[cfg(unix)]
@@ -635,5 +671,55 @@ pub fn recover_pending_renames_checked(
         if let Ok(Some(lock_file)) = crate::try_lock_state_file(&lock_path) {
             unlink_held_lock(&lock_path, lock_file);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_no_replace_safe_and_fallback_never_overwrite_existing_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+
+        // 1. Existing destination file is never overwritten by `move_no_replace_safe` or fallback.
+        let src = dir.path().join("src.txt");
+        let dst = dir.path().join("dst.txt");
+        fs::write(&src, b"source").unwrap();
+        fs::write(&dst, b"keep-destination").unwrap();
+
+        let err1 = move_no_replace_safe(state_dir.path(), &src, &dst).unwrap_err();
+        assert_eq!(err1.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&dst).unwrap(), b"keep-destination");
+        assert_eq!(fs::read(&src).unwrap(), b"source");
+
+        let err2 = move_no_replace_fallback(state_dir.path(), &src, &dst).unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&dst).unwrap(), b"keep-destination");
+        assert_eq!(fs::read(&src).unwrap(), b"source");
+
+        // 2. Fallback succeeds when destination is free (file and directory).
+        let free_file = dir.path().join("free.txt");
+        move_no_replace_fallback(state_dir.path(), &src, &free_file).unwrap();
+        assert!(!src.exists());
+        assert_eq!(fs::read(&free_file).unwrap(), b"source");
+
+        let src_dir = dir.path().join("src_dir");
+        let existing_dir = dir.path().join("existing_dir");
+        fs::create_dir(&src_dir).unwrap();
+        fs::write(src_dir.join("inside.txt"), b"dir-body").unwrap();
+        fs::create_dir(&existing_dir).unwrap();
+        fs::write(existing_dir.join("keep.txt"), b"keep-dir").unwrap();
+
+        let err3 = move_no_replace_fallback(state_dir.path(), &src_dir, &existing_dir).unwrap_err();
+        assert_eq!(err3.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(existing_dir.join("keep.txt")).unwrap(), b"keep-dir");
+        assert_eq!(fs::read(src_dir.join("inside.txt")).unwrap(), b"dir-body");
+
+        let free_dir = dir.path().join("free_dir");
+        move_no_replace_fallback(state_dir.path(), &src_dir, &free_dir).unwrap();
+        assert!(!src_dir.exists());
+        assert_eq!(fs::read(free_dir.join("inside.txt")).unwrap(), b"dir-body");
     }
 }

@@ -6,8 +6,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use legion_os::atomic::{
-    FileIdentity, RenameNoReplaceError, file_identity_from_file,
-    rename_no_replace as os_rename_no_replace, replace_file as os_replace_file,
+    FileClaimIdentity, FileIdentity, RenameNoReplaceError, claim_identity_from_file,
+    file_identity_from_file, rename_no_replace as os_rename_no_replace,
+    replace_file as os_replace_file, symlink_claim_identity as os_symlink_claim_identity,
     symlink_file_identity as os_symlink_file_identity,
 };
 
@@ -86,8 +87,20 @@ pub(crate) fn symlink_file_identity(path: &Path) -> io::Result<FileIdentity> {
 }
 
 /// Returns the filesystem identity `(dev, ino, nlink)` of an open [`File`].
+#[allow(dead_code)]
 pub(crate) fn open_file_identity(file: &File) -> io::Result<FileIdentity> {
     file_identity_from_file(file)
+}
+
+/// Returns the strong claim/temp identity `(dev, ino, nlink, ctime, btime)` of `path` without
+/// following symlinks.
+pub(crate) fn symlink_claim_identity(path: &Path) -> io::Result<FileClaimIdentity> {
+    os_symlink_claim_identity(path)
+}
+
+/// Returns the strong claim/temp identity `(dev, ino, nlink, ctime, btime)` of an open [`File`].
+pub(crate) fn open_claim_identity(file: &File) -> io::Result<FileClaimIdentity> {
+    claim_identity_from_file(file)
 }
 
 /// Flushes directory metadata to durable storage on Unix after a rename or entry creation.
