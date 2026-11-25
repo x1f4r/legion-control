@@ -1426,3 +1426,266 @@ test('content URLs isolate HTML and SVG from the interface origin and allow <vid
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('real Files tab opens pictures and plays/seeks video on local and remote nodes, with graceful older-node fallback', async () => {
+  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+  const root = makeWorkRoot();
+  const towerHome = path.join(root, 'tower-legion');
+  const towerUser = path.join(root, 'tower-user');
+  const piHome = path.join(root, 'pi-legion');
+  const piUser = path.join(root, 'pi-user');
+  const legacyHome = path.join(root, 'legacy-legion');
+  const legacyUser = path.join(root, 'legacy-user');
+
+  const samplePng = fs.readFileSync(path.join(REPO_ROOT, 'apps', 'ui', 'icons', 'icon-512.png'));
+  const sampleWebm = fs.readFileSync(path.join(TEST_DIR, 'fixtures', 'sample.webm'));
+
+  for (const [home, user] of [
+    [towerHome, towerUser],
+    [piHome, piUser],
+    [legacyHome, legacyUser],
+  ]) {
+    fs.mkdirSync(path.join(home, 'config'), { recursive: true });
+    fs.mkdirSync(path.join(home, 'state'), { recursive: true });
+    const mediaDir = path.join(user, 'media');
+    fs.mkdirSync(mediaDir, { recursive: true });
+    fs.writeFileSync(path.join(mediaDir, 'icon.png'), samplePng);
+    fs.writeFileSync(path.join(mediaDir, 'sample.webm'), sampleWebm);
+  }
+
+  const policy = [
+    'default = "owner"',
+    '',
+    '[principals.ui]',
+    'role = "observer"',
+    '',
+    '[roles.observer]',
+    'allow = ["effect:read"]',
+    '',
+  ].join('\n');
+
+  for (const [name, home] of [
+    ['tower', towerHome],
+    ['pi', piHome],
+    ['legacy', legacyHome],
+  ]) {
+    fs.writeFileSync(path.join(home, 'config', 'node.toml'), `name = "${name}"\nsystem = "linux"\n`);
+    fs.writeFileSync(path.join(home, 'config', 'policy.toml'), policy);
+  }
+
+  const piCmd = [process.execPath, path.join(TEST_DIR, 'rpc-helper.mjs'), LEGION_BIN, piHome, piUser, 'rpc'];
+  const legacyCmd = [
+    process.execPath,
+    path.join(TEST_DIR, 'legacy-node-helper.mjs'),
+    LEGION_BIN,
+    legacyHome,
+    legacyUser,
+    'rpc',
+  ];
+  fs.writeFileSync(
+    path.join(towerHome, 'config', 'fleet.toml'),
+    [
+      '[machines.tower]',
+      'ssh = "tower.example"',
+      '',
+      '[machines.pi]',
+      `command = ${JSON.stringify(piCmd)}`,
+      '',
+      '[machines.legacy]',
+      `command = ${JSON.stringify(legacyCmd)}`,
+      '',
+    ].join('\n'),
+  );
+
+  const tokenOut = JSON.parse(
+    runLegion(['token.add', 'name=ui', 'principal=ui', '--json'], towerHome, towerUser),
+  );
+  const server = await startServer(towerHome, towerUser);
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+
+  try {
+    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
+    const page = await ctx.newPage();
+    const consoleErrors = [];
+    const pageErrors = [];
+    const contentPostsByMachine = new Map();
+    const contentGetStatuses = [];
+
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    page.on('request', (req) => {
+      if (req.method() === 'POST' && new URL(req.url()).pathname === '/v1/content') {
+        try {
+          const parsed = JSON.parse(req.postData() || '{}');
+          const m = parsed.on || 'tower';
+          contentPostsByMachine.set(m, (contentPostsByMachine.get(m) || 0) + 1);
+        } catch {
+          // Ignore parse issues.
+        }
+      }
+    });
+    page.on('response', (res) => {
+      if (res.request().method() === 'GET' && new URL(res.url()).pathname.startsWith('/v1/content/')) {
+        contentGetStatuses.push(res.status());
+      }
+    });
+
+    // Connect to the real UI (no ?mock) with a real bearer token.
+    await page.goto(`${server.url}/#token=${encodeURIComponent(tokenOut.token)}`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.getByText('3 are on').waitFor({ timeout: 15_000 });
+
+    async function openMachineMedia(machine) {
+      await page.locator('nav.nav a', { hasText: 'Files' }).click();
+      await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
+      await page.locator('.list a.row', { hasText: machine }).first().click();
+      await page.locator('a.row, a.cell', { hasText: 'media' }).waitFor({ timeout: 10_000 });
+      await page.locator('a.row, a.cell', { hasText: 'media' }).click();
+      await page.locator('a.row, a.cell', { hasText: 'icon.png' }).waitFor({ timeout: 10_000 });
+    }
+
+    async function verifyPictureAndVideo(machine) {
+      contentGetStatuses.length = 0;
+      await openMachineMedia(machine);
+
+      // Picture opens through real /v1/content and decodes cleanly.
+      await page.locator('a.row, a.cell', { hasText: 'icon.png' }).click();
+      const img = page.locator('.viewer img.viewer-img');
+      await img.waitFor({ timeout: 10_000 });
+      await page.waitForFunction(
+        () => {
+          const el = document.querySelector('.viewer img.viewer-img');
+          return Boolean(el && el.complete && el.naturalWidth > 0);
+        },
+        null,
+        { timeout: 10_000 },
+      );
+      const imgInfo = await img.evaluate((el) => ({
+        src: el.getAttribute('src') || '',
+        w: el.naturalWidth,
+        h: el.naturalHeight,
+      }));
+      assert.ok(imgInfo.src.startsWith('/v1/content/'), `${machine}: expected /v1/content img src, got ${imgInfo.src}`);
+      assert.equal(imgInfo.w, 512, `${machine}: expected 512px PNG width`);
+      assert.equal(imgInfo.h, 512, `${machine}: expected 512px PNG height`);
+      await page.locator('.viewer-top button[aria-label="Close"]').click();
+      await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+      // Video opens through real /v1/content, decodes VP8 WebM, and seeks cleanly with 206 ranges.
+      await page.locator('a.row, a.cell', { hasText: 'sample.webm' }).click();
+      const video = page.locator('.viewer video.viewer-video');
+      await video.waitFor({ timeout: 10_000 });
+      const videoCheck = await video.evaluate(async (el) => {
+        el.muted = true;
+        if (el.readyState < 2) {
+          el.preload = 'auto';
+          el.load();
+          await new Promise((resolve, reject) => {
+            const t = setTimeout(() => reject(new Error('timed out waiting for loadeddata')), 10_000);
+            el.addEventListener('loadeddata', () => { clearTimeout(t); resolve(); }, { once: true });
+            el.addEventListener('error', () => { clearTimeout(t); reject(new Error(`video error ${el.error?.code}`)); }, { once: true });
+          });
+        }
+        try {
+          await el.play();
+          el.pause();
+        } catch {
+          // Headless autoplay policy may still allow seeking without play.
+        }
+        const seeked = new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('timed out waiting for seeked')), 10_000);
+          el.addEventListener('seeked', () => { clearTimeout(t); resolve(); }, { once: true });
+          el.addEventListener('error', () => { clearTimeout(t); reject(new Error(`seek error ${el.error?.code}`)); }, { once: true });
+        });
+        el.currentTime = 1.5;
+        await seeked;
+        return {
+          src: el.getAttribute('src') || '',
+          readyState: el.readyState,
+          duration: el.duration,
+          width: el.videoWidth,
+          height: el.videoHeight,
+          currentTime: el.currentTime,
+          hasError: el.error !== null,
+        };
+      });
+      assert.ok(videoCheck.src.startsWith('/v1/content/'), `${machine}: expected /v1/content video src`);
+      assert.ok(videoCheck.readyState >= 2, `${machine}: expected readyState >= 2, got ${videoCheck.readyState}`);
+      assert.ok(videoCheck.duration > 2.0, `${machine}: expected duration > 2s, got ${videoCheck.duration}`);
+      assert.equal(videoCheck.width, 64, `${machine}: videoWidth`);
+      assert.equal(videoCheck.height, 64, `${machine}: videoHeight`);
+      assert.ok(
+        videoCheck.currentTime >= 1.2 && videoCheck.currentTime <= 2.0,
+        `${machine}: seeked currentTime ${videoCheck.currentTime}`,
+      );
+      assert.equal(videoCheck.hasError, false, `${machine}: video error`);
+      assert.ok(
+        contentGetStatuses.includes(206),
+        `${machine}: expected 206 Partial Content for video range requests, got ${JSON.stringify(contentGetStatuses)}`,
+      );
+      await page.locator('.viewer-top button[aria-label="Close"]').click();
+      await page.locator('.viewer').waitFor({ state: 'hidden' });
+    }
+
+    // 1. Door's own machine (tower) and second remote node (pi).
+    await verifyPictureAndVideo('tower');
+    await verifyPictureAndVideo('pi');
+
+    // 2. Older node (legacy): graceful fallback on first unsupported response, remembered for the
+    //    rest of the session so the second file does not retry POST /v1/content.
+    await openMachineMedia('legacy');
+    await page.locator('a.row, a.cell', { hasText: 'icon.png' }).click();
+    await page.locator('.viewer .said', { hasText: "Can't show this picture here" }).waitFor({ timeout: 10_000 });
+    await page.locator('.viewer .said', { hasText: "doesn't serve picture previews yet" }).waitFor();
+    assert.equal(await page.locator('.viewer img.viewer-img').count(), 0);
+    assert.equal(await page.locator('.viewer button', { hasText: 'Download' }).count(), 0);
+    assert.equal(contentPostsByMachine.get('legacy') || 0, 1, 'expected exactly one POST /v1/content probe for legacy');
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    await page.locator('a.row, a.cell', { hasText: 'sample.webm' }).click();
+    await page.locator('.viewer .said', { hasText: "Video playback isn't available from legacy yet" }).waitFor({ timeout: 10_000 });
+    assert.equal(await page.locator('.viewer video.viewer-video').count(), 0);
+    assert.equal(
+      contentPostsByMachine.get('legacy') || 0,
+      1,
+      'legacy unsupported state must be remembered for the session without retrying POST /v1/content',
+    );
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    // 3. Supported remote machine still opens pictures after legacy was remembered unsupported.
+    await openMachineMedia('pi');
+    await page.locator('a.row, a.cell', { hasText: 'icon.png' }).click();
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector('.viewer img.viewer-img');
+        return Boolean(el && el.complete && el.naturalWidth === 512);
+      },
+      null,
+      { timeout: 10_000 },
+    );
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    // Only the single expected 501 network log from probing the older legacy node is allowed.
+    const unexpectedConsole = consoleErrors.filter(
+      (msg) => !msg.includes('status of 501'),
+    );
+    assert.deepEqual(unexpectedConsole, [], `Unexpected console/CSP errors: ${unexpectedConsole.join('\n')}`);
+    assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
+
+    await ctx.close();
+  } finally {
+    await browser.close();
+    await server.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -13,7 +13,7 @@
 //!
 //! Paths:
 //!
-//! - `GET /v1/health`: `{ok, node, version}`, without a token.
+//! - `GET /v1/health`: `{ok, node, version, content}`, without a token.
 //! - `GET /v1/tools`: `{tools: [ToolSpec]}`, the tools the principal may use.
 //! - `POST /v1/call`: `{tool, args, on?}` runs a call. The tool's result comes back with 200, a
 //!   failure as the error object with a status that fits its code. With
@@ -561,8 +561,7 @@ impl MonitoredTcpStream {
             return write_op(&mut self.inner, cx);
         }
         if !self.sndbuf_applied {
-            let _ = socket2::SockRef::from(&self.inner)
-                .set_send_buffer_size(CONTENT_SOCKET_SNDBUF);
+            let _ = socket2::SockRef::from(&self.inner).set_send_buffer_size(CONTENT_SOCKET_SNDBUF);
             self.sndbuf_applied = true;
         }
         self.monitoring_active = true;

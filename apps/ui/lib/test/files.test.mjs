@@ -124,6 +124,32 @@ test('detectFileCapabilities cleanly degrades against old nodes and limited role
   assert.equal(oldCaps.hasOpenExternally, false);
   assert.equal(oldCaps.hasUpload, false);
 
+  // Per-machine content support via `supportsContentFor(machine)` enables real `legion serve`
+  // even without `fs.thumb`, while disabling only machines remembered as unsupported.
+  const perMachineLink = {
+    kind: 'http',
+    supportsContent: true,
+    supportsContentFor: (m) => m !== 'legacy',
+    contentUrl: async () => ({ url: '' }),
+    download: async () => ({ id: '1' }),
+  };
+  const liveCaps = detectFileCapabilities({
+    tools: oldTools,
+    allowedSet: new Set(oldTools.map((t) => t.name)),
+    link: perMachineLink,
+    machine: 'pi',
+  });
+  assert.equal(liveCaps.hasContentUrl, true);
+  assert.equal(liveCaps.hasDownload, true);
+  const legacyCaps = detectFileCapabilities({
+    tools: oldTools,
+    allowedSet: new Set(oldTools.map((t) => t.name)),
+    link: perMachineLink,
+    machine: 'legacy',
+  });
+  assert.equal(legacyCaps.hasContentUrl, false);
+  assert.equal(legacyCaps.hasDownload, false);
+
   const newTools = [
     { name: 'fs.list', effect: 'read', input_schema: { properties: { path: {}, sort: {}, order: {}, offset: {}, categories: {} } } },
     { name: 'fs.read', effect: 'read', input_schema: { properties: { path: {} } } },

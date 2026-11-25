@@ -620,7 +620,7 @@ fn health_needs_no_token() {
     assert_eq!(health.status, 200);
     assert_eq!(
         health.json(),
-        json!({"ok": true, "node": "laptop", "version": env!("CARGO_PKG_VERSION")})
+        json!({"ok": true, "node": "laptop", "version": env!("CARGO_PKG_VERSION"), "content": true})
     );
 }
 
@@ -3835,8 +3835,8 @@ paths = [\"~/projects/**\"]
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let stalled_cut_elapsed = stalled_cut_at
-        .expect("expected server liveness watcher to abort stalled reader within 4s");
+    let stalled_cut_elapsed =
+        stalled_cut_at.expect("expected server liveness watcher to abort stalled reader within 4s");
     assert!(
         stalled_cut_elapsed <= Duration::from_secs(3),
         "stalled reader was not aborted promptly after revocation: {stalled_cut_elapsed:?}"

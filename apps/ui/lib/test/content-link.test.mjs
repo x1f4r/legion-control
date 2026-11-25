@@ -108,6 +108,103 @@ test('createHttpLink contentUrl surfaces auth, argument, server, and network err
   }
 });
 
+test('createHttpLink reads content support from /v1/health and remembers unsupported remote machines', async () => {
+  const prevWindow = globalThis.window;
+  globalThis.window = { location: { origin: 'http://127.0.0.1:4433' } };
+  const restore = withMockEnv(async (url, init) => {
+    if (url === '/v1/health') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { ok: true, node: 'tower', version: '0.1.0', content: true };
+        },
+      };
+    }
+    if (url === '/v1/call') {
+      const req = JSON.parse(init.body);
+      const headers = { get: () => 'application/json' };
+      if (req.tool === 'meta.whoami') {
+        return {
+          ok: true,
+          status: 200,
+          headers,
+          async json() {
+            return { node: 'tower', principal: 'ui', role: 'operator' };
+          },
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers,
+        async json() {
+          return { version: '0.1.0', protocol: 1 };
+        },
+      };
+    }
+    if (url === '/v1/content') {
+      const req = JSON.parse(init.body);
+      if (req.on === 'legacy') {
+        return {
+          ok: false,
+          status: 501,
+          async json() {
+            return {
+              code: 'unsupported',
+              message: 'legacy answered stream get without modification time.',
+              machine: 'legacy',
+            };
+          },
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { url: '/v1/content/tok/pic.png', expires_in: 900 };
+        },
+      };
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  });
+
+  try {
+    const link = createHttpLink();
+    let notifications = 0;
+    const unsub = link.onContentSupportChange(() => {
+      notifications += 1;
+    });
+    assert.equal(link.supportsContent, false);
+    assert.equal(link.supportsContentFor('tower'), false);
+
+    const st = await link.state();
+    assert.equal(st.ready, true);
+    assert.equal(link.supportsContent, true);
+    assert.equal(link.supportsContentFor('tower'), true);
+    assert.equal(link.supportsContentFor('pi'), true);
+    assert.equal(link.supportsContentFor('legacy'), true);
+    assert.equal(notifications, 1);
+
+    await assert.rejects(
+      () => link.contentUrl({ machine: 'legacy', path: '~/media/pic.png' }),
+      { code: 'unsupported', status: 501, machine: 'legacy' },
+    );
+    assert.equal(link.supportsContentFor('legacy'), false);
+    assert.equal(link.supportsContentFor('tower'), true);
+    assert.equal(link.supportsContentFor('pi'), true);
+    assert.equal(notifications, 2);
+
+    await link.forget();
+    assert.equal(link.supportsContentFor('legacy'), true);
+    unsub();
+  } finally {
+    restore();
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+  }
+});
+
 test('createMockLink contentUrl serves built-in samples and enforces auth, reachability, and read policy', async () => {
   const link = createMockLink();
 

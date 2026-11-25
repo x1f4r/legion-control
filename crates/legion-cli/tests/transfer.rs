@@ -2129,7 +2129,11 @@ fn concurrent_same_machine_and_crossed_transfers_never_deadlock() {
     let mut crossed = Vec::new();
     for i in 0..8usize {
         fs::write(pi_cross.join(format!("p{i}.bin")), format!("pi-to-nas-{i}")).unwrap();
-        fs::write(nas_cross.join(format!("n{i}.bin")), format!("nas-to-pi-{i}")).unwrap();
+        fs::write(
+            nas_cross.join(format!("n{i}.bin")),
+            format!("nas-to-pi-{i}"),
+        )
+        .unwrap();
         crossed.push(json!({
             "id": format!("p2n-{i}"),
             "method": "call",

@@ -286,7 +286,7 @@ export function isHiddenName(name) {
  * Feature detection from a machine's tool catalogue, caller's allowed tool set, and link surface.
  * Nothing in the UI may break when a node lacks the newer Files tools or fields.
  */
-export function detectFileCapabilities({ tools = [], allowedSet = null, link = null } = {}) {
+export function detectFileCapabilities({ tools = [], allowedSet = null, link = null, machine = null } = {}) {
   const map = new Map();
   for (const t of tools || []) {
     if (t && typeof t.name === 'string') map.set(t.name, t);
@@ -319,13 +319,16 @@ export function detectFileCapabilities({ tools = [], allowedSet = null, link = n
   const hasTransferMove = hasTransfer && propOf('fs.transfer', 'move') && hasRemove;
   const hasTransferIfExists = hasTransfer && propOf('fs.transfer', 'if_exists');
 
-  // Content URLs are supported when the link exposes `contentUrl` and (for HTTP against older
-  // nodes) the node supports the new file capabilities or the link explicitly advertises content.
+  // Content URLs are supported when the link exposes `contentUrl` and either reports per-machine
+  // content support (from `/v1/health` + session-scoped `unsupported` memory), runs in mock mode,
+  // or talks to a node advertising newer file tools.
   const linkHasContent = typeof link?.contentUrl === 'function';
   const nodeSupportsContent =
-    link?.kind === 'mock'
-      ? linkHasContent
-      : linkHasContent && (link?.supportsContent === true || hasThumb || propOf('fs.list', 'offset'));
+    typeof link?.supportsContentFor === 'function'
+      ? linkHasContent && Boolean(link.supportsContentFor(machine))
+      : link?.kind === 'mock'
+        ? linkHasContent
+        : linkHasContent && (link?.supportsContent === true || hasThumb || propOf('fs.list', 'offset'));
 
   const hasDownload = typeof link?.download === 'function' && (link?.kind !== 'http' || nodeSupportsContent);
   const hasOpenExternally = typeof link?.openExternally === 'function';
