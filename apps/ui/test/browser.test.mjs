@@ -1101,8 +1101,8 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
 
 test('content URLs isolate HTML and SVG from the interface origin and allow <video> seeking', async () => {
   assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
-  const sampleMp4 = path.join(TEST_DIR, 'fixtures', 'sample.mp4');
-  assert.ok(fs.existsSync(sampleMp4), `Sample MP4 fixture not found at ${sampleMp4}`);
+  const sampleVideo = path.join(TEST_DIR, 'fixtures', 'sample.webm');
+  assert.ok(fs.existsSync(sampleVideo), `Sample video fixture not found at ${sampleVideo}`);
 
   const root = makeWorkRoot();
   const fleet = setupFleet(root);
@@ -1131,7 +1131,7 @@ test('content URLs isolate HTML and SVG from the interface origin and allow <vid
       '</svg>',
     ].join('\n'),
   );
-  fs.copyFileSync(sampleMp4, path.join(docsDir, 'sample.mp4'));
+  fs.copyFileSync(sampleVideo, path.join(docsDir, 'sample.webm'));
 
   const server = await startServer(fleet.towerHome, fleet.towerUser);
   const browser = await chromium.launch({
@@ -1170,19 +1170,19 @@ test('content URLs isolate HTML and SVG from the interface origin and allow <vid
       const [html, svg, video] = await Promise.all([
         link.contentUrl({ path: '~/docs/xss.html' }),
         link.contentUrl({ path: '~/docs/xss.svg' }),
-        link.contentUrl({ path: '~/docs/sample.mp4' }),
+        link.contentUrl({ path: '~/docs/sample.webm' }),
       ]);
       return { html, svg, video };
     });
     assert.match(urls.html.url, /^\/v1\/content\/[^/]+\/xss\.html$/);
     assert.match(urls.svg.url, /^\/v1\/content\/[^/]+\/xss\.svg$/);
-    assert.match(urls.video.url, /^\/v1\/content\/[^/]+\/sample\.mp4$/);
+    assert.match(urls.video.url, /^\/v1\/content\/[^/]+\/sample\.webm$/);
 
     // 2. Verify <video> seeking and <img> loading directly on the real Legion UI page
     //    (proving the UI CSP's `img-src 'self'` and `media-src 'self'` allow them with zero errors).
     const rangeStatuses = [];
     uiPage.on('response', (res) => {
-      if (res.url().endsWith('/sample.mp4')) {
+      if (res.url().endsWith('/sample.webm')) {
         rangeStatuses.push(res.status());
       }
     });
