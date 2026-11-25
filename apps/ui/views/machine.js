@@ -276,8 +276,10 @@ function OverviewTab({
   technical,
   wide,
   wakePending,
+  onRegisterRefresh = null,
   onEnsureAwake,
   onStopJob,
+  onRefreshFleet,
   onUpdateMachineSys,
 }) {
   const [, setCapsRev] = useState(0);
@@ -361,6 +363,16 @@ function OverviewTab({
       }
     };
   }, [machine.name, machine.reachable, link, capsStore, on]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function' || wide) return undefined;
+    return onRegisterRefresh(async () => {
+      await Promise.all([
+        pollerRef.current ? pollerRef.current.refreshNow() : Promise.resolve(),
+        onRefreshFleet ? onRefreshFleet() : Promise.resolve(),
+      ]);
+    });
+  }, [onRegisterRefresh, wide, onRefreshFleet, machine.name, machine.reachable]);
 
   if (machine.status === 'asking' || machine.asking) {
     return html`<div class="empty">Checking ${machine.name}…</div>`;
@@ -953,6 +965,8 @@ function MachineActivityTab({
   allowedSet,
   technical,
   jobId,
+  onObserveTransferJobs = null,
+  onRegisterRefresh = null,
   onRefreshFleet,
 }) {
   const [jobs, setJobs] = useState(null);
@@ -972,6 +986,9 @@ function MachineActivityTab({
         ? res.jobs.map((j) => ({ ...j, machine: machine.name }))
         : [];
       setJobs(list);
+      if (onObserveTransferJobs && list.length > 0) {
+        onObserveTransferJobs(list);
+      }
     } catch (err) {
       setError(err);
     }
@@ -980,6 +997,11 @@ function MachineActivityTab({
   useEffect(() => {
     load();
   }, [machine.name, machine.reachable, jobId]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function' || jobId) return undefined;
+    return onRegisterRefresh(() => load());
+  }, [onRegisterRefresh, jobId, machine.name, machine.reachable]);
 
   async function handleStop(job) {
     setError(null);
@@ -1001,6 +1023,8 @@ function MachineActivityTab({
         link=${link}
         allowedSet=${allowedSet}
         technical=${technical}
+        onObserveTransferJobs=${onObserveTransferJobs}
+        onRegisterRefresh=${onRegisterRefresh}
         onChanged=${() => {
           load();
           if (onRefreshFleet) onRefreshFleet();
@@ -1028,7 +1052,7 @@ function MachineActivityTab({
 
 // ── Services tab ─────────────────────────────────────────────────────────────────────────────
 
-function ServicesTab({ machine, nodeInfo, link, allowedSet }) {
+function ServicesTab({ machine, nodeInfo, link, allowedSet, onRegisterRefresh = null }) {
   const [services, setServices] = useState(null);
   const [filter, setFilter] = useState('');
   const [selected, setSelected] = useState(null);
@@ -1036,6 +1060,10 @@ function ServicesTab({ machine, nodeInfo, link, allowedSet }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const on = targetFor(machine.name, nodeInfo?.node);
+  const filterRef = useRef(filter);
+  filterRef.current = filter;
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
 
   async function load(q = filter) {
     if (!machine.reachable) {
@@ -1058,6 +1086,17 @@ function ServicesTab({ machine, nodeInfo, link, allowedSet }) {
     setLogs(null);
     load('');
   }, [machine.name, machine.reachable]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function') return undefined;
+    return onRegisterRefresh(async () => {
+      if (selectedRef.current) {
+        await openService(selectedRef.current);
+      } else {
+        await load(filterRef.current);
+      }
+    });
+  }, [onRegisterRefresh, machine.name, machine.reachable]);
 
   async function openService(svc) {
     setSelected(svc);
@@ -1211,7 +1250,7 @@ ${logs === null
 
 // ── Projects tab ─────────────────────────────────────────────────────────────────────────────
 
-function ProjectsTab({ machine, nodeInfo, link, allowedSet }) {
+function ProjectsTab({ machine, nodeInfo, link, allowedSet, onRegisterRefresh = null }) {
   const [projects, setProjects] = useState(null);
   const [output, setOutput] = useState('');
   const [busyKey, setBusyKey] = useState('');
@@ -1244,6 +1283,11 @@ function ProjectsTab({ machine, nodeInfo, link, allowedSet }) {
     setOutput('');
     load();
   }, [machine.name, machine.reachable]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function') return undefined;
+    return onRegisterRefresh(() => load());
+  }, [onRegisterRefresh, machine.name, machine.reachable]);
 
   async function pull(project) {
     setBusyKey(`pull:${project.name}`);
@@ -1389,6 +1433,7 @@ function PowerTab({
   allowedSet,
   technical,
   wakePending,
+  onRegisterRefresh = null,
   onEnsureAwake,
   onWakeSent,
   onRequestConfirm,
@@ -1418,6 +1463,13 @@ function PowerTab({
     setResult(null);
     load();
   }, [machine.name, machine.reachable]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function') return undefined;
+    return onRegisterRefresh(async () => {
+      await Promise.all([load(), onRefreshFleet ? onRefreshFleet() : Promise.resolve()]);
+    });
+  }, [onRegisterRefresh, onRefreshFleet, machine.name, machine.reachable]);
 
   async function runAction(tool, args, target, hasDry) {
     setError(null);
@@ -1683,6 +1735,9 @@ export function MachineDetail({
   wide,
   link,
   capsStore = null,
+  folderChanges = null,
+  onObserveTransferJobs = null,
+  onRegisterRefresh = null,
   nodeInfo,
   tools,
   allowedSet,
@@ -1784,8 +1839,10 @@ export function MachineDetail({
               wide=${wide}
               wakePending=${wakePending}
               capsStore=${capsStore}
+              onRegisterRefresh=${onRegisterRefresh}
               onEnsureAwake=${onEnsureAwake}
               onStopJob=${handleStopJob}
+              onRefreshFleet=${onRefreshFleet}
               onUpdateMachineSys=${onUpdateMachineSys}
             />
           `
@@ -1833,6 +1890,9 @@ export function MachineDetail({
                     allowedSet=${allowedSet}
                     link=${link}
                     capsStore=${capsStore}
+                    folderChanges=${folderChanges}
+                    onRegisterRefresh=${onRegisterRefresh}
+                    onRefreshFleet=${onRefreshFleet}
                     settings=${settings}
                     deviceNoun=${deviceNoun}
                     thumbCache=${thumbCache}
@@ -1851,6 +1911,8 @@ export function MachineDetail({
                       allowedSet=${allowedSet}
                       technical=${technical}
                       jobId=${jobId}
+                      onObserveTransferJobs=${onObserveTransferJobs}
+                      onRegisterRefresh=${onRegisterRefresh}
                       onRefreshFleet=${onRefreshFleet}
                     />
                   `
@@ -1861,6 +1923,7 @@ export function MachineDetail({
                         nodeInfo=${nodeInfo}
                         link=${link}
                         allowedSet=${allowedSet}
+                        onRegisterRefresh=${onRegisterRefresh}
                       />
                     `
                   : effectiveTab === 'projects'
@@ -1870,6 +1933,7 @@ export function MachineDetail({
                           nodeInfo=${nodeInfo}
                           link=${link}
                           allowedSet=${allowedSet}
+                          onRegisterRefresh=${onRegisterRefresh}
                         />
                       `
                     : html`
@@ -1880,6 +1944,7 @@ export function MachineDetail({
                           allowedSet=${allowedSet}
                           technical=${technical}
                           wakePending=${wakePending}
+                          onRegisterRefresh=${onRegisterRefresh}
                           onEnsureAwake=${onEnsureAwake}
                           onWakeSent=${onWakeSent}
                           onRequestConfirm=${onRequestConfirm}

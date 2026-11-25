@@ -2164,9 +2164,20 @@ fn authorize_principal_with_policy(
     tool_name: &str,
 ) -> Result<ForwardAuth, ErrorBody> {
     if let Some(tool) = node.registry().get(tool_name) {
-        policy
-            .authorize(principal, tool.spec(), node.paths())
-            .map_err(|err| err.with_machine(here))?;
+        if let Err(err) = policy.authorize(principal, tool.spec(), node.paths()) {
+            // A caller without `effect:exec` may still cancel a transfer job they started on the
+            // target machine. Allow forwarding `job.cancel` when this node does not explicitly deny
+            // `job.cancel` by name and allows `fs.transfer`; the target node verifies that the job
+            // exists, has `kind: "transfer"`, and belongs to `principal`.
+            let may_cancel_own_transfer = tool_name == "job.cancel"
+                && !policy.is_denied_by_name(principal, tool_name)
+                && policy
+                    .authorize_name(principal, "fs.transfer", Some(Effect::Write), node.paths())
+                    .is_ok();
+            if !may_cancel_own_transfer {
+                return Err(err.with_machine(here));
+            }
+        }
         return Ok(ForwardAuth::Authorized {
             principal: principal.to_owned(),
         });

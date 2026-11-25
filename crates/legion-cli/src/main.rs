@@ -47,6 +47,9 @@ fn main() -> ExitCode {
     if let Some(code) = legion_tools::job::try_supervise_cli(std::env::args_os().skip(1)) {
         return code;
     }
+    if let Some(code) = legion_net::transfer::try_supervise_cli(std::env::args_os().skip(1)) {
+        return code;
+    }
     if let Some(code) = legion_tools::power::try_delay_cli(std::env::args_os().skip(1)) {
         return code;
     }
@@ -223,7 +226,7 @@ async fn run(command: Command) -> ExitCode {
         }
         Command::Stream { pinned } => {
             let shutdown = install_shutdown_token();
-            let code = serve_stream(&node, fleet, pinned, Door::Stream, None, shutdown).await;
+            let code = serve_stream(&node, fleet, pinned, Door::Stream, None, None, shutdown).await;
             router.shutdown().await;
             code
         }
@@ -300,6 +303,7 @@ async fn serve_stream(
     pinned: Option<String>,
     door: Door,
     device: Option<String>,
+    pairing_id: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
     let host = Host::new(node.paths().clone(), node.name());
@@ -330,7 +334,10 @@ async fn serve_stream(
         None
     };
 
+    let revoke_abort = CancellationToken::new();
     let mut stream_options = legion_net::stream::StreamServeOptions {
+        pairing_id,
+        abort_on_revoke: Some(revoke_abort.clone()),
         shutdown: Some(shutdown.clone()),
         client_gone: Some(client_gone),
         fleet: Some(fleet),
@@ -358,6 +365,11 @@ async fn serve_stream(
     });
     let outcome = tokio::select! {
         result = &mut served => Some(result),
+        () = revoke_abort.cancelled() => {
+            tokio::time::timeout(Duration::from_millis(200), served)
+                .await
+                .ok()
+        }
         () = shutdown.cancelled() => {
             // Give an operation that is already finishing a short window to tear down downstream
             // processes and audit cleanly without hanging if stdin stays open.
@@ -381,7 +393,11 @@ async fn serve_stream(
             ExitCode::from(FAILED)
         }
         None => {
-            err("legion stream: stopped by signal\n");
+            if revoke_abort.is_cancelled() {
+                err("legion stream: permissions or device access were revoked mid-stream\n");
+            } else {
+                err("legion stream: stopped by signal\n");
+            }
             ExitCode::from(FAILED)
         }
     }
@@ -504,7 +520,16 @@ async fn gate(
             .await
         }
         Subcommand::Stream => {
-            let code = serve_stream(&node, fleet, Some(pinned), Door::Ssh, device, shutdown).await;
+            let code = serve_stream(
+                &node,
+                fleet,
+                Some(pinned),
+                Door::Ssh,
+                device,
+                pairing,
+                shutdown,
+            )
+            .await;
             router.shutdown().await;
             code
         }

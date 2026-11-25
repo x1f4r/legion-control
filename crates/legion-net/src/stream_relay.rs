@@ -8,7 +8,7 @@
 //! `studio` authorises the same caller principal, and streams bytes in both directions with fixed
 //! bounded buffers and backpressure.
 
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -26,9 +26,9 @@ use crate::config::validate_machine_name;
 use crate::connector::{PipeHandle, StderrTail};
 use crate::pool::{Fleet, MAX_HOPS, RelayPipe};
 use crate::stream::{
-    CAP_STREAM_RELAY, GetAuditBucket, GetReady, Header, Host, NextHeader, OUTPUT_BUFFER, Op,
-    PutReady, QUEUED_CHUNKS, STREAM_PROTOCOL, StreamServeOptions, gone, machine_or, op_tool,
-    read_next_header, record_for_target, reply_error, unsupported,
+    CAP_STREAM_RELAY, GetAuditBucket, GetReady, Header, Host, NextHeader, OPS, OUTPUT_BUFFER, Op,
+    PutReady, QUEUED_CHUNKS, STREAM_PROTOCOL, StreamServeOptions, check_pairing_not_revoked, gone,
+    machine_or, read_next_header, record_for_target, reply_error, unsupported, validate_op_enabled,
 };
 
 /// Maximum time to wait for a downstream node's opening `{"protocol": 1}` greeting line.
@@ -52,6 +52,7 @@ enum DownstreamWait<T> {
     Ready(T),
     Shutdown,
     ClientGone,
+    Revoked,
     TimedOut,
 }
 
@@ -90,11 +91,20 @@ fn relay_shutdown_error(relay: &str) -> ErrorBody {
     .with_machine(relay)
 }
 
+fn relay_revoked_error(relay: &str) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Denied,
+        "Permissions or device access were revoked mid-stream.",
+    )
+    .with_machine(relay)
+}
+
 async fn wait_downstream<F, T>(
     fut: F,
     timeout: Duration,
     shutdown: Option<&CancellationToken>,
     client_gone: Option<&CancellationToken>,
+    abort_on_revoke: Option<&CancellationToken>,
     progress: Option<&Notify>,
     external_timeout: Option<&CancellationToken>,
 ) -> DownstreamWait<T>
@@ -113,6 +123,12 @@ where
                     None => std::future::pending().await,
                 }
             } => return DownstreamWait::Shutdown,
+            () = async {
+                match abort_on_revoke {
+                    Some(tok) => tok.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => return DownstreamWait::Revoked,
             () = async {
                 match client_gone {
                     Some(tok) => tok.cancelled().await,
@@ -193,18 +209,20 @@ pub(crate) fn parse_relay_inner(
             .with_hint("Set `on` to the final target machine instead of nesting relay headers.")
             .with_machine(host.name()));
         }
-        Some(op) if op_tool(op).is_some() => {}
+        Some(op) if OPS.contains(&op) => {}
         Some(op) => {
             return Err(unsupported(format!(
-                "This node cannot relay the unknown stream operation {op}."
+                "This node does not know the stream operation {op}; it knows {}.",
+                OPS.join(", ")
             ))
             .with_machine(host.name()));
         }
         None => {
-            return Err(
-                unsupported("The relayed request names no stream operation.".to_owned())
-                    .with_machine(host.name()),
-            );
+            return Err(unsupported(format!(
+                "The stream's header names no operation; this node knows {}.",
+                OPS.join(", ")
+            ))
+            .with_machine(host.name()));
         }
     }
     let inner_op: Op = serde_json::from_value(request.clone()).map_err(|error| {
@@ -214,6 +232,17 @@ pub(crate) fn parse_relay_inner(
         )
         .with_machine(host.name())
     })?;
+    validate_op_enabled(&inner_op).map_err(|error| error.with_machine(host.name()))?;
+    if matches!(
+        &inner_op,
+        Op::Lock { .. } | Op::ProbeWrite { hold: true, .. }
+    ) {
+        return Err(unsupported(format!(
+            "This node cannot relay the interactive stream operation {}.",
+            inner_op.name()
+        ))
+        .with_machine(host.name()));
+    }
     let mut sanitized = fields.clone();
     sanitized.remove("as");
     Ok((inner_op, sanitized))
@@ -223,9 +252,15 @@ fn authorise_relay(
     host: &Host,
     config: &ConfigStore,
     pinned: Option<&str>,
+    pairing_id: Option<&str>,
     as_principal: Option<&str>,
     inner_op: &Op,
 ) -> Result<String, (Option<String>, ErrorBody)> {
+    if let Some(pid) = pairing_id
+        && let Err(error) = check_pairing_not_revoked(config, pid)
+    {
+        return Err((pinned.map(str::to_owned), machine_or(error, host.name())));
+    }
     let policy = config
         .get::<Policy>()
         .map_err(|error| (pinned.map(str::to_owned), machine_or(error, host.name())))?;
@@ -244,10 +279,14 @@ fn recheck_relay_access(
     host: &Host,
     config: &ConfigStore,
     pinned: Option<&str>,
+    pairing_id: Option<&str>,
     as_principal: Option<&str>,
     tool: &str,
     effect: Effect,
 ) -> Result<(), ErrorBody> {
+    if let Some(pid) = pairing_id {
+        check_pairing_not_revoked(config, pid).map_err(|err| machine_or(err, host.name()))?;
+    }
     let policy = config
         .get::<Policy>()
         .map_err(|err| machine_or(err, host.name()))?;
@@ -414,8 +453,14 @@ pub(crate) fn serve_relay_remote_spawned<R: Read + Send + 'static, W: Write>(
         return Err(error);
     }
 
-    let principal = match authorise_relay(host, &config, pinned, as_principal.as_deref(), &inner_op)
-    {
+    let principal = match authorise_relay(
+        host,
+        &config,
+        pinned,
+        options.pairing_id.as_deref(),
+        as_principal.as_deref(),
+        &inner_op,
+    ) {
         Ok(principal) => principal,
         Err((principal, error)) => {
             let _ = reply_error(&mut output, &error);
@@ -498,6 +543,10 @@ pub(crate) fn serve_relay_remote_spawned<R: Read + Send + 'static, W: Write>(
                             .as_ref()
                             .is_some_and(CancellationToken::is_cancelled)
                             || options
+                                .abort_on_revoke
+                                .as_ref()
+                                .is_some_and(CancellationToken::is_cancelled)
+                            || options
                                 .client_gone
                                 .as_ref()
                                 .is_some_and(CancellationToken::is_cancelled)
@@ -525,7 +574,10 @@ pub(crate) fn serve_relay_remote_spawned<R: Read + Send + 'static, W: Write>(
                             })
                             .unwrap_or(until_idle);
                         let mut wait = until_idle.min(until_flush);
-                        if options.shutdown.is_some() || options.client_gone.is_some() {
+                        if options.shutdown.is_some()
+                            || options.abort_on_revoke.is_some()
+                            || options.client_gone.is_some()
+                        {
                             wait = wait.min(SHUTDOWN_POLL_SLICE);
                         }
                         match rx.recv_timeout(wait) {
@@ -617,222 +669,6 @@ pub(crate) fn serve_relay_remote_spawned<R: Read + Send + 'static, W: Write>(
     })
 }
 
-/// Serves a remote `op: "relay"` stream when `input` is not `Send + 'static` (`serve` and
-/// `serve_with_door`).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn serve_relay_remote_scoped<R: BufRead, W: Write>(
-    host: &Host,
-    pinned: Option<&str>,
-    door: Door,
-    device: Option<&str>,
-    options: &StreamServeOptions,
-    as_principal: Option<String>,
-    on: String,
-    request: Value,
-    hops: u32,
-    recorded: Value,
-    started: Instant,
-    input: &mut R,
-    mut output: BufWriter<W>,
-) -> Result<(), ErrorBody> {
-    let config = ConfigStore::new(host.paths().config_dir());
-    let (inner_op, inner_map) = match validate_relay_header(host, &on, &request) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            let _ = reply_error(&mut output, &error);
-            record_for_target(
-                host,
-                &on,
-                pinned.map(str::to_owned),
-                door,
-                device,
-                "stream.relay",
-                recorded,
-                started,
-                &Err(error.clone()),
-            );
-            return Err(error);
-        }
-    };
-    let audit_tool = format!("stream.{}", inner_op.name());
-    let next_hops = hops.saturating_add(1);
-    if next_hops > MAX_HOPS {
-        let error = ErrorBody::new(
-            ErrorCode::Failed,
-            format!(
-                "Relaying stream.{} to {on} exceeded the maximum of {MAX_HOPS} hops (possible routing loop).",
-                inner_op.name()
-            ),
-        )
-        .with_hint(
-            "Check fleet.toml and node.toml on the machines along the path so they do not forward to each other in a cycle.",
-        )
-        .with_machine(host.name());
-        let _ = reply_error(&mut output, &error);
-        record_for_target(
-            host,
-            &on,
-            pinned.map(str::to_owned),
-            door,
-            device,
-            &audit_tool,
-            recorded,
-            started,
-            &Err(error.clone()),
-        );
-        return Err(error);
-    }
-
-    let principal = match authorise_relay(host, &config, pinned, as_principal.as_deref(), &inner_op)
-    {
-        Ok(principal) => principal,
-        Err((principal, error)) => {
-            let _ = reply_error(&mut output, &error);
-            record_for_target(
-                host,
-                &on,
-                principal,
-                door,
-                device,
-                &audit_tool,
-                recorded,
-                started,
-                &Err(error.clone()),
-            );
-            return Err(error);
-        }
-    };
-
-    let rt = match RuntimeChoice::acquire(options, host) {
-        Ok(rt) => rt,
-        Err(error) => {
-            let _ = reply_error(&mut output, &error);
-            record_for_target(
-                host,
-                &on,
-                Some(principal),
-                door,
-                device,
-                &audit_tool,
-                recorded,
-                started,
-                &Err(error.clone()),
-            );
-            return Err(error);
-        }
-    };
-    let relay_fleet = RelayFleet::acquire(host, options);
-    let handle = rt.handle().clone();
-
-    if matches!(
-        inner_op,
-        Op::Get {
-            keep_open: true,
-            ..
-        }
-    ) {
-        return handle.block_on(async move {
-            let res = relay_keep_open_gets(
-                host,
-                &config,
-                &relay_fleet.fleet,
-                pinned,
-                door,
-                device,
-                options,
-                &on,
-                as_principal,
-                principal,
-                inner_op,
-                inner_map,
-                next_hops,
-                recorded,
-                started,
-                &mut output,
-                |_| match read_next_header(input) {
-                    Ok(Some(pair)) => NextHeader::Header(pair),
-                    Ok(None) => NextHeader::Eof,
-                    Err(err) => NextHeader::Error(err),
-                },
-            )
-            .await;
-            relay_fleet.finish().await;
-            res
-        });
-    }
-
-    handle.block_on(async move {
-        let res = match &inner_op {
-            Op::Put { size, .. } => {
-                let size = *size;
-                relay_write_scoped(
-                    host,
-                    &config,
-                    &relay_fleet.fleet,
-                    door,
-                    device,
-                    options,
-                    &on,
-                    principal,
-                    &audit_tool,
-                    Some(size),
-                    inner_map,
-                    next_hops,
-                    recorded,
-                    started,
-                    input,
-                    &mut output,
-                )
-                .await
-            }
-            Op::Unpack { .. } => {
-                relay_write_scoped(
-                    host,
-                    &config,
-                    &relay_fleet.fleet,
-                    door,
-                    device,
-                    options,
-                    &on,
-                    principal,
-                    &audit_tool,
-                    None,
-                    inner_map,
-                    next_hops,
-                    recorded,
-                    started,
-                    input,
-                    &mut output,
-                )
-                .await
-            }
-            _ => {
-                relay_read_or_control(
-                    host,
-                    &config,
-                    &relay_fleet.fleet,
-                    pinned,
-                    as_principal.as_deref(),
-                    door,
-                    device,
-                    options,
-                    &on,
-                    principal,
-                    inner_op,
-                    inner_map,
-                    next_hops,
-                    recorded,
-                    started,
-                    &mut output,
-                )
-                .await
-            }
-        };
-        relay_fleet.finish().await;
-        res
-    })
-}
-
 struct OpenedDownstream {
     stdin: ChildStdin,
     stdout: AsyncBufReader<ChildStdout>,
@@ -862,6 +698,15 @@ async fn open_and_greet_downstream(
             return Err(relay_shutdown_error(host.name()));
         }
         () = async {
+            match options.abort_on_revoke.as_ref() {
+                Some(tok) => tok.cancelled().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            pipe_cancel.cancel();
+            return Err(relay_revoked_error(host.name()));
+        }
+        () = async {
             match options.client_gone.as_ref() {
                 Some(tok) => tok.cancelled().await,
                 None => std::future::pending().await,
@@ -887,6 +732,7 @@ async fn open_and_greet_downstream(
         greet_timeout,
         options.shutdown.as_ref(),
         options.client_gone.as_ref(),
+        options.abort_on_revoke.as_ref(),
         None,
         None,
     )
@@ -894,6 +740,7 @@ async fn open_and_greet_downstream(
     {
         DownstreamWait::Ready(inner) => inner,
         DownstreamWait::Shutdown => Err(relay_shutdown_error(host.name())),
+        DownstreamWait::Revoked => Err(relay_revoked_error(host.name())),
         DownstreamWait::ClientGone => Err(client_gone_error(host.name())),
         DownstreamWait::TimedOut => {
             let mut err = ErrorBody::new(
@@ -1047,6 +894,7 @@ async fn read_downstream_reply_forwarding_busy<W: Write>(
             options.downstream_read_timeout,
             options.shutdown.as_ref(),
             options.client_gone.as_ref(),
+            options.abort_on_revoke.as_ref(),
             progress,
             external_timeout,
         )
@@ -1055,6 +903,9 @@ async fn read_downstream_reply_forwarding_busy<W: Write>(
             DownstreamWait::Ready(res) => res,
             DownstreamWait::Shutdown => {
                 return Err(relay_shutdown_error(host.name()));
+            }
+            DownstreamWait::Revoked => {
+                return Err(relay_revoked_error(host.name()));
             }
             DownstreamWait::ClientGone => {
                 return Err(client_gone_error(host.name()));
@@ -1196,6 +1047,7 @@ async fn relay_read_or_control<W: Write>(
         options.downstream_read_timeout,
         options.shutdown.as_ref(),
         options.client_gone.as_ref(),
+        options.abort_on_revoke.as_ref(),
         None,
         None,
     )
@@ -1213,6 +1065,7 @@ async fn relay_read_or_control<W: Write>(
             .with_machine(&next_hop),
         ),
         DownstreamWait::Shutdown => Some(relay_shutdown_error(host.name())),
+        DownstreamWait::Revoked => Some(relay_revoked_error(host.name())),
         DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
         DownstreamWait::TimedOut => Some(downstream_timeout_error(
             target,
@@ -1314,7 +1167,11 @@ async fn relay_read_or_control<W: Write>(
     };
 
     let outcome: Result<(), ErrorBody> = match inner_op {
-        Op::Stat { .. } | Op::Delete { .. } => output
+        Op::Stat { .. }
+        | Op::Delete { .. }
+        | Op::Rename { .. }
+        | Op::ProbeRead { .. }
+        | Op::ProbeWrite { .. } => output
             .write_all(&first_raw)
             .and_then(|()| output.flush())
             .map_err(|err| machine_or(gone(&err), host.name())),
@@ -1371,7 +1228,7 @@ async fn relay_read_or_control<W: Write>(
                 pump_bytes_to_eof(&mut stdout, host, target, options, output).await
             }
         }
-        Op::Put { .. } | Op::Unpack { .. } | Op::Relay { .. } => unreachable!(),
+        Op::Put { .. } | Op::Unpack { .. } | Op::Relay { .. } | Op::Lock { .. } => unreachable!(),
     };
 
     drop(stdout);
@@ -1411,6 +1268,7 @@ async fn pump_manifest_lines<W: Write>(
             options.downstream_read_timeout,
             options.shutdown.as_ref(),
             options.client_gone.as_ref(),
+            options.abort_on_revoke.as_ref(),
             None,
             None,
         )
@@ -1419,6 +1277,11 @@ async fn pump_manifest_lines<W: Write>(
             DownstreamWait::Ready(res) => res,
             DownstreamWait::Shutdown => {
                 let err = relay_shutdown_error(host.name());
+                let _ = reply_error(output, &err);
+                return Err(err);
+            }
+            DownstreamWait::Revoked => {
+                let err = relay_revoked_error(host.name());
                 let _ = reply_error(output, &err);
                 return Err(err);
             }
@@ -1504,6 +1367,13 @@ async fn pump_exact_bytes<W: Write>(
             .with_machine(host.name()));
         }
         if options
+            .abort_on_revoke
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(relay_revoked_error(host.name()));
+        }
+        if options
             .client_gone
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
@@ -1518,6 +1388,7 @@ async fn pump_exact_bytes<W: Write>(
             options.downstream_read_timeout,
             options.shutdown.as_ref(),
             options.client_gone.as_ref(),
+            options.abort_on_revoke.as_ref(),
             None,
             None,
         )
@@ -1530,6 +1401,9 @@ async fn pump_exact_bytes<W: Write>(
                     "The stream stopped because the node is shutting down.",
                 )
                 .with_machine(host.name()));
+            }
+            DownstreamWait::Revoked => {
+                return Err(relay_revoked_error(host.name()));
             }
             DownstreamWait::ClientGone => {
                 return Err(client_gone_error(host.name()));
@@ -1569,7 +1443,15 @@ async fn pump_exact_bytes<W: Write>(
         {
             last_checked_bytes = written;
             last_checked_at = Instant::now();
-            recheck_relay_access(host, config, pinned, as_principal, tool, effect)?;
+            recheck_relay_access(
+                host,
+                config,
+                pinned,
+                options.pairing_id.as_deref(),
+                as_principal,
+                tool,
+                effect,
+            )?;
         }
     }
     Ok(())
@@ -1589,6 +1471,7 @@ async fn pump_bytes_to_eof<W: Write>(
             options.downstream_read_timeout,
             options.shutdown.as_ref(),
             options.client_gone.as_ref(),
+            options.abort_on_revoke.as_ref(),
             None,
             None,
         )
@@ -1597,6 +1480,9 @@ async fn pump_bytes_to_eof<W: Write>(
             DownstreamWait::Ready(res) => res,
             DownstreamWait::Shutdown => {
                 return Err(relay_shutdown_error(host.name()));
+            }
+            DownstreamWait::Revoked => {
+                return Err(relay_revoked_error(host.name()));
             }
             DownstreamWait::ClientGone => {
                 return Err(client_gone_error(host.name()));
@@ -1828,6 +1714,7 @@ async fn relay_keep_open_gets<W: Write>(
                         host,
                         config,
                         pinned,
+                        options.pairing_id.as_deref(),
                         hdr.as_principal.as_deref(),
                         &inner_op,
                     ) {
@@ -1887,6 +1774,7 @@ async fn relay_keep_open_gets<W: Write>(
             options.downstream_read_timeout,
             options.shutdown.as_ref(),
             options.client_gone.as_ref(),
+            options.abort_on_revoke.as_ref(),
             None,
             None,
         )
@@ -1907,6 +1795,7 @@ async fn relay_keep_open_gets<W: Write>(
                 )
                 .with_machine(host.name()),
             ),
+            DownstreamWait::Revoked => Some(relay_revoked_error(host.name())),
             DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
             DownstreamWait::TimedOut => Some(downstream_timeout_error(
                 target,
@@ -2082,6 +1971,7 @@ async fn relay_keep_open_gets<W: Write>(
                 options.downstream_read_timeout,
                 options.shutdown.as_ref(),
                 options.client_gone.as_ref(),
+                options.abort_on_revoke.as_ref(),
                 None,
                 None,
             )
@@ -2105,6 +1995,7 @@ async fn relay_keep_open_gets<W: Write>(
                     )
                     .with_machine(host.name()),
                 ),
+                DownstreamWait::Revoked => Some(relay_revoked_error(host.name())),
                 DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
                 DownstreamWait::TimedOut => Some(downstream_timeout_error(
                     target,
@@ -2258,6 +2149,7 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
         options.downstream_read_timeout,
         options.shutdown.as_ref(),
         options.client_gone.as_ref(),
+        options.abort_on_revoke.as_ref(),
         None,
         None,
     )
@@ -2272,6 +2164,7 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
             .with_machine(&next_hop),
         ),
         DownstreamWait::Shutdown => Some(relay_shutdown_error(host.name())),
+        DownstreamWait::Revoked => Some(relay_revoked_error(host.name())),
         DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
         DownstreamWait::TimedOut => Some(downstream_timeout_error(
             target,
@@ -2432,6 +2325,7 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
     let writer_stop = stop_writing.clone();
     let writer_shutdown = options.shutdown.clone();
     let writer_client_gone = options.client_gone.clone();
+    let writer_revoke = options.abort_on_revoke.clone();
     let write_timeout = options.downstream_read_timeout;
     let write_progress = Arc::new(Notify::new());
     let writer_progress = Arc::clone(&write_progress);
@@ -2469,6 +2363,12 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
                     }
                 } => None,
                 () = async {
+                    match writer_revoke.as_ref() {
+                        Some(tok) => tok.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => None,
+                () = async {
                     match writer_client_gone.as_ref() {
                         Some(tok) => tok.cancelled().await,
                         None => std::future::pending().await,
@@ -2483,6 +2383,7 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
                         write_timeout,
                         writer_shutdown.as_ref(),
                         writer_client_gone.as_ref(),
+                        writer_revoke.as_ref(),
                         None,
                         Some(&writer_stop),
                     )
@@ -2499,6 +2400,7 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
                         }
                         DownstreamWait::Ready(Err(_))
                         | DownstreamWait::Shutdown
+                        | DownstreamWait::Revoked
                         | DownstreamWait::ClientGone => {
                             break;
                         }
@@ -2531,341 +2433,6 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
 
     let outcome = match final_reply {
         Ok(ReplyLine::Json(raw, _fields)) => output
-            .write_all(&raw)
-            .and_then(|()| output.flush())
-            .map_err(|err| machine_or(gone(&err), host.name())),
-        Ok(ReplyLine::RemoteError(error)) => {
-            let _ = reply_error(output, &error);
-            Err(error)
-        }
-        Ok(ReplyLine::Eof) => {
-            let mut error = ErrorBody::new(
-                ErrorCode::Failed,
-                format!("The upload stream to {target} ended before finishing."),
-            )
-            .with_machine(target);
-            let text = stderr.text();
-            if !text.is_empty() {
-                error = error.with_hint(format!("Remote stderr: {text}"));
-            }
-            let _ = reply_error(output, &error);
-            Err(error)
-        }
-        Err(error) => {
-            let error = machine_or(error, host.name());
-            let _ = reply_error(output, &error);
-            Err(error)
-        }
-    };
-
-    drop(stdout);
-    let close_grace = if outcome.is_ok() {
-        DOWNSTREAM_CLOSE_GRACE
-    } else {
-        DOWNSTREAM_ABORT_GRACE
-    };
-    handle.close(close_grace).await;
-    record_for_target(
-        host,
-        target,
-        Some(principal),
-        door,
-        device,
-        audit_tool,
-        recorded,
-        started,
-        &outcome,
-    );
-    outcome
-}
-
-/// Relays a `put` or `unpack` when `input` is not `Send + 'static` (`serve` and `serve_with_door`).
-#[allow(clippy::too_many_arguments)]
-async fn relay_write_scoped<R: BufRead, W: Write>(
-    host: &Host,
-    config: &ConfigStore,
-    fleet: &Fleet,
-    door: Door,
-    device: Option<&str>,
-    options: &StreamServeOptions,
-    target: &str,
-    principal: String,
-    audit_tool: &str,
-    declared_size: Option<u64>,
-    inner_map: Map<String, Value>,
-    next_hops: u32,
-    recorded: Value,
-    started: Instant,
-    input: &mut R,
-    output: &mut BufWriter<W>,
-) -> Result<(), ErrorBody> {
-    let opened = match open_and_greet_downstream(fleet, config, host, target, options).await {
-        Ok(opened) => opened,
-        Err(error) => {
-            let error = machine_or(error, host.name());
-            let _ = reply_error(output, &error);
-            record_for_target(
-                host,
-                target,
-                Some(principal),
-                door,
-                device,
-                audit_tool,
-                recorded,
-                started,
-                &Err(error.clone()),
-            );
-            return Err(error);
-        }
-    };
-
-    let OpenedDownstream {
-        mut stdin,
-        mut stdout,
-        handle,
-        stderr,
-        next_hop,
-        chained,
-    } = opened;
-
-    let header_bytes = build_downstream_header(&inner_map, &principal, target, chained, next_hops);
-    let header_err = match wait_downstream(
-        async {
-            stdin.write_all(&header_bytes).await?;
-            stdin.flush().await
-        },
-        options.downstream_read_timeout,
-        options.shutdown.as_ref(),
-        options.client_gone.as_ref(),
-        None,
-        None,
-    )
-    .await
-    {
-        DownstreamWait::Ready(Ok(())) => None,
-        DownstreamWait::Ready(Err(err)) => Some(
-            ErrorBody::new(
-                ErrorCode::Unreachable,
-                format!("Could not send stream request to {next_hop}: {err}."),
-            )
-            .with_machine(&next_hop),
-        ),
-        DownstreamWait::Shutdown => Some(relay_shutdown_error(host.name())),
-        DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
-        DownstreamWait::TimedOut => Some(downstream_timeout_error(
-            target,
-            options.downstream_read_timeout,
-        )),
-    };
-    if let Some(error) = header_err {
-        drop(stdin);
-        drop(stdout);
-        handle.close(DOWNSTREAM_ABORT_GRACE).await;
-        let _ = reply_error(output, &error);
-        record_for_target(
-            host,
-            target,
-            Some(principal),
-            door,
-            device,
-            audit_tool,
-            recorded,
-            started,
-            &Err(error.clone()),
-        );
-        return Err(error);
-    }
-
-    let first_reply = read_downstream_reply_forwarding_busy(
-        &mut stdout,
-        host,
-        target,
-        options,
-        None,
-        None,
-        output,
-    )
-    .await;
-    let (ready_raw, ready_fields) = match first_reply {
-        Ok(ReplyLine::Json(raw, fields)) => (raw, fields),
-        Ok(ReplyLine::RemoteError(error)) => {
-            drop(stdin);
-            drop(stdout);
-            handle.close(DOWNSTREAM_CLOSE_GRACE).await;
-            let _ = reply_error(output, &error);
-            record_for_target(
-                host,
-                target,
-                Some(principal),
-                door,
-                device,
-                audit_tool,
-                recorded,
-                started,
-                &Err(error.clone()),
-            );
-            return Err(error);
-        }
-        Ok(ReplyLine::Eof) => {
-            drop(stdin);
-            drop(stdout);
-            handle.close(DOWNSTREAM_CLOSE_GRACE).await;
-            let error = ErrorBody::new(
-                ErrorCode::Unreachable,
-                format!("The stream to {target} closed before answering."),
-            )
-            .with_machine(target);
-            let _ = reply_error(output, &error);
-            record_for_target(
-                host,
-                target,
-                Some(principal),
-                door,
-                device,
-                audit_tool,
-                recorded,
-                started,
-                &Err(error.clone()),
-            );
-            return Err(error);
-        }
-        Err(error) => {
-            drop(stdin);
-            drop(stdout);
-            handle.close(DOWNSTREAM_CLOSE_GRACE).await;
-            let error = machine_or(error, host.name());
-            let _ = reply_error(output, &error);
-            record_for_target(
-                host,
-                target,
-                Some(principal),
-                door,
-                device,
-                audit_tool,
-                recorded,
-                started,
-                &Err(error.clone()),
-            );
-            return Err(error);
-        }
-    };
-
-    let body_limit = match declared_size {
-        Some(size) => {
-            let ready = match serde_json::from_value::<PutReady>(Value::Object(ready_fields)) {
-                Ok(ready) if ready.offset <= size => ready,
-                _ => {
-                    drop(stdin);
-                    drop(stdout);
-                    handle.close(DOWNSTREAM_CLOSE_GRACE).await;
-                    let error = ErrorBody::new(
-                        ErrorCode::Failed,
-                        format!("{target} answered relayed put with an invalid resume offset."),
-                    )
-                    .with_machine(target);
-                    let _ = reply_error(output, &error);
-                    record_for_target(
-                        host,
-                        target,
-                        Some(principal),
-                        door,
-                        device,
-                        audit_tool,
-                        recorded,
-                        started,
-                        &Err(error.clone()),
-                    );
-                    return Err(error);
-                }
-            };
-            Some(size - ready.offset)
-        }
-        None => None,
-    };
-
-    if let Err(err) = output.write_all(&ready_raw).and_then(|()| output.flush()) {
-        drop(stdin);
-        drop(stdout);
-        handle.close(DOWNSTREAM_CLOSE_GRACE).await;
-        let error = machine_or(gone(&err), host.name());
-        record_for_target(
-            host,
-            target,
-            Some(principal),
-            door,
-            device,
-            audit_tool,
-            recorded,
-            started,
-            &Err(error.clone()),
-        );
-        return Err(error);
-    }
-
-    let mut left = body_limit.unwrap_or(u64::MAX);
-    let mut buf = vec![0u8; OUTPUT_BUFFER];
-    let mut body_abort: Option<ErrorBody> = None;
-    while left > 0 {
-        let want = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
-        match input.read(&mut buf[..want]) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                match wait_downstream(
-                    stdin.write_all(&buf[..n]),
-                    options.downstream_read_timeout,
-                    options.shutdown.as_ref(),
-                    options.client_gone.as_ref(),
-                    None,
-                    None,
-                )
-                .await
-                {
-                    DownstreamWait::Ready(Ok(())) => {
-                        left -= n as u64;
-                    }
-                    DownstreamWait::Ready(Err(_)) => break,
-                    DownstreamWait::Shutdown => {
-                        body_abort = Some(relay_shutdown_error(host.name()));
-                        break;
-                    }
-                    DownstreamWait::ClientGone => {
-                        body_abort = Some(client_gone_error(host.name()));
-                        break;
-                    }
-                    DownstreamWait::TimedOut => {
-                        body_abort = Some(downstream_timeout_error(
-                            target,
-                            options.downstream_read_timeout,
-                        ));
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    if body_abort.is_none() {
-        let _ = tokio::time::timeout(DOWNSTREAM_ABORT_GRACE, stdin.flush()).await;
-    }
-    drop(stdin);
-
-    let final_reply = match body_abort {
-        Some(err) => Err(err),
-        None => {
-            read_downstream_reply_forwarding_busy(
-                &mut stdout,
-                host,
-                target,
-                options,
-                None,
-                None,
-                output,
-            )
-            .await
-        }
-    };
-
-    let outcome = match final_reply {
-        Ok(ReplyLine::Json(raw, _)) => output
             .write_all(&raw)
             .and_then(|()| output.flush())
             .map_err(|err| machine_or(gone(&err), host.name())),

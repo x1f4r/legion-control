@@ -2,6 +2,9 @@
 
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { CodeText, Notice, ResultView } from './common.js';
+import { ScrollContainer } from './scroll-container.js';
+import { parentFilePath } from '../lib/files.js';
+import { parseTransferTarget } from '../lib/folder-changes.js';
 import { splitFirstSentence } from '../lib/format.js';
 import { routeHref } from '../lib/route.js';
 import {
@@ -156,6 +159,7 @@ export function ToolDetail({
   machines,
   runningJobs,
   link,
+  folderChanges = null,
   technical = true,
   onRequestConfirm,
   onEnsureAwake,
@@ -313,6 +317,24 @@ export function ToolDetail({
         },
       });
       setResult(out);
+      if (folderChanges && !args?.dry_run && typeof on === 'string' && on !== 'all') {
+        const machine = on;
+        if ((tool.name === 'fs.mkdir' || tool.name === 'fs.remove' || tool.name === 'fs.write') && args?.path) {
+          folderChanges.changed(machine, parentFilePath(args.path) || '~', { reason: tool.name });
+        } else if ((tool.name === 'fs.move' || tool.name === 'fs.copy') && args?.to) {
+          folderChanges.changed(machine, parentFilePath(args.to) || '~', { reason: tool.name });
+          if (tool.name === 'fs.move' && args?.from) {
+            folderChanges.changed(machine, parentFilePath(args.from) || '~', { reason: tool.name });
+          }
+        } else if (tool.name === 'fs.transfer' && args?.to && !out?.job?.id) {
+          const dest = parseTransferTarget(args.to, machine);
+          if (dest) folderChanges.changed(dest.machine, dest.dir, { reason: 'transfer' });
+          if (args?.move && args?.from) {
+            const src = parseTransferTarget(args.from, machine);
+            if (src) folderChanges.changed(src.machine, src.dir, { reason: 'transfer' });
+          }
+        }
+      }
       return out;
     } catch (err) {
       setError(err);
@@ -596,6 +618,7 @@ export function ToolsView({
   nodeInfo,
   snapshot,
   link,
+  folderChanges = null,
   wide,
   technical = true,
   onRequestConfirm,
@@ -676,8 +699,10 @@ export function ToolsView({
   if (wide) {
     return html`
       <div class="split">
-        ${listPane}
-        <section>
+        <${ScrollContainer} as="section">
+          ${listPane}
+        <//>
+        <${ScrollContainer} as="section">
           ${selectedTool
             ? html`
                 <h2 class="pane-title">
@@ -692,13 +717,14 @@ export function ToolsView({
                   machines=${snapshot?.machines || []}
                   runningJobs=${snapshot?.runningJobs || []}
                   link=${link}
+                  folderChanges=${folderChanges}
                   technical=${technical}
                   onRequestConfirm=${onRequestConfirm}
                   onEnsureAwake=${onEnsureAwake}
                 />
               `
             : html`<div class="empty">Select a tool to run it.</div>`}
-        </section>
+        <//>
       </div>
     `;
   }
@@ -713,6 +739,7 @@ export function ToolsView({
         machines=${snapshot?.machines || []}
         runningJobs=${snapshot?.runningJobs || []}
         link=${link}
+        folderChanges=${folderChanges}
         technical=${technical}
         onRequestConfirm=${onRequestConfirm}
         onEnsureAwake=${onEnsureAwake}

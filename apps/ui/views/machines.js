@@ -8,6 +8,7 @@ import { machineAttentionLabel } from '../lib/machine-monitor.js';
 import { routeHref } from '../lib/route.js';
 import { formatPairSyncNotice } from '../lib/settings.js';
 import { MachineDetail } from './machine.js';
+import { ScrollContainer } from './scroll-container.js';
 
 function OnlineMachineCard({ machine, selected, showMetrics }) {
   const metrics = machineMetrics(machine.sys);
@@ -127,6 +128,9 @@ export function MachinesView({
   route,
   link,
   capsStore = null,
+  folderChanges = null,
+  onObserveTransferJobs = null,
+  onRegisterRefresh = null,
   nodeInfo,
   tools,
   allowedSet,
@@ -275,8 +279,10 @@ export function MachinesView({
   if (wide) {
     return html`
       <div class="split">
-        ${listColumn}
-        <section>
+        <${ScrollContainer} as="section" onRefresh=${onRefresh}>
+          ${listColumn}
+        <//>
+        <${ScrollContainer} as="section">
           ${selectedMachine
             ? html`
                 <${MachineDetail}
@@ -286,6 +292,9 @@ export function MachinesView({
                   wide=${true}
                   link=${link}
                   capsStore=${capsStore}
+                  folderChanges=${folderChanges}
+                  onObserveTransferJobs=${onObserveTransferJobs}
+                  onRegisterRefresh=${null}
                   nodeInfo=${nodeInfo}
                   tools=${tools}
                   allowedSet=${allowedSet}
@@ -305,7 +314,7 @@ export function MachinesView({
                 />
               `
             : html`<div class="empty">Select a machine to inspect it.</div>`}
-        </section>
+        <//>
       </div>
     `;
   }
@@ -319,6 +328,9 @@ export function MachinesView({
         wide=${false}
         link=${link}
         capsStore=${capsStore}
+        folderChanges=${folderChanges}
+        onObserveTransferJobs=${onObserveTransferJobs}
+        onRegisterRefresh=${onRegisterRefresh}
         nodeInfo=${nodeInfo}
         tools=${tools}
         allowedSet=${allowedSet}
