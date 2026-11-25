@@ -132,8 +132,19 @@ where
         let mut header = Header::new_gnu();
 
         if ft.is_file() {
-            let file = File::open(&full_path).map_err(|e| classify_io(&full_path, e))?;
-            let file_meta = file.metadata().map_err(|e| classify_io(&full_path, e))?;
+            let (file, file_meta) = legion_os::open_regular::open_regular_read(&full_path)
+                .map_err(|err| match err {
+                    legion_os::open_regular::OpenRegularError::IsDirectory
+                    | legion_os::open_regular::OpenRegularError::NotRegularFile => {
+                        Error::Conflict {
+                            path: full_path.clone(),
+                            reason: "source path is not a regular file".to_string(),
+                        }
+                    }
+                    legion_os::open_regular::OpenRegularError::Io(io_err) => {
+                        classify_io(&full_path, io_err)
+                    }
+                })?;
             let len = file_meta.len();
             let file_mtime = Timestamp::from_metadata(&file_meta);
             set_header_mtime(&mut builder, &mut header, file_mtime)?;

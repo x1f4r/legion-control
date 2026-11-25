@@ -34,8 +34,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use legion_os::file_id::PathIdentity;
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
-use same_file::Handle;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -940,17 +940,16 @@ impl Grant {
         }
         // Only a path that exists has an identity to find among a place's ancestors.
         let identity = if resolved.missing.is_empty() {
-            Handle::from_path(&resolved.existing).ok()
+            PathIdentity::from_path(&resolved.existing)
         } else {
             None
         };
         let holds = |place: &Resolved| {
             within(place, &resolved, Platform::HOST)
                 || identity.as_ref().is_some_and(|identity| {
-                    place
-                        .existing
-                        .ancestors()
-                        .any(|ancestor| Handle::from_path(ancestor).is_ok_and(|h| h == *identity))
+                    place.existing.ancestors().any(|ancestor| {
+                        PathIdentity::from_path(ancestor).is_some_and(|h| h == *identity)
+                    })
                 })
         };
         if let Some(home) = self.paths.home() {
@@ -1080,7 +1079,7 @@ impl Grant {
                          is_parent: bool|
          -> Result<(), ErrorBody> {
             let identity = if candidate.missing.is_empty() && candidate.link.is_none() {
-                Handle::from_path(&candidate.existing).ok()
+                PathIdentity::from_path(&candidate.existing)
             } else {
                 None
             };
@@ -1090,7 +1089,7 @@ impl Grant {
                         place
                             .existing
                             .ancestors()
-                            .any(|anc| Handle::from_path(anc).is_ok_and(|h| h == *id))
+                            .any(|anc| PathIdentity::from_path(anc).is_some_and(|h| h == *id))
                     })
             };
             let at_or_above_home = home_resolved.as_ref().is_some_and(&holds);
@@ -1304,7 +1303,7 @@ impl Grant {
             .iter()
             .map(|root| {
                 let id = if root.missing.is_empty() {
-                    Handle::from_path(&root.existing).ok().map(Arc::new)
+                    PathIdentity::from_path(&root.existing).map(Arc::new)
                 } else {
                     None
                 };
@@ -1483,10 +1482,10 @@ impl Grant {
             places.push(Cow::Owned(target));
         }
         for place in &places {
-            let ancestors: Vec<Handle> = place
+            let ancestors: Vec<PathIdentity> = place
                 .existing
                 .ancestors()
-                .filter_map(|ancestor| Handle::from_path(ancestor).ok())
+                .filter_map(PathIdentity::from_path)
                 .collect();
             for secret in secrets {
                 let inside_secret = within_protected(place, &secret.resolved, Platform::HOST)
@@ -1557,7 +1556,7 @@ impl Grant {
         .map(|(place, dir)| {
             let resolved = resolve(dir).map_err(|error| (place, dir.to_path_buf(), error))?;
             let identity = if resolved.missing.is_empty() {
-                Handle::from_path(&resolved.existing).ok().map(Arc::new)
+                PathIdentity::from_path(&resolved.existing).map(Arc::new)
             } else {
                 None
             };
@@ -1630,10 +1629,10 @@ impl Grant {
             places.push(Cow::Owned(target));
         }
         for place in &places {
-            let ancestors: Vec<Handle> = place
+            let ancestors: Vec<PathIdentity> = place
                 .existing
                 .ancestors()
-                .filter_map(|ancestor| Handle::from_path(ancestor).ok())
+                .filter_map(PathIdentity::from_path)
                 .collect();
             for dir in &own {
                 let inside = within_protected(place, &dir.resolved, Platform::HOST)
@@ -1664,7 +1663,7 @@ struct OwnDir {
     dir: PathBuf,
     resolved: Resolved,
     /// Which directory it is, when it exists, so a second name for it is known for what it is.
-    identity: Option<Arc<Handle>>,
+    identity: Option<Arc<PathIdentity>>,
     #[cfg(unix)]
     dev_ino: Option<(u64, u64)>,
 }
@@ -1675,7 +1674,7 @@ struct SecretPlace {
     label: String,
     raw_path: PathBuf,
     resolved: Resolved,
-    identity: Option<Arc<Handle>>,
+    identity: Option<Arc<PathIdentity>>,
     #[cfg(unix)]
     dev_ino: Option<(u64, u64)>,
 }
@@ -1688,7 +1687,7 @@ struct SecretPrefix {
     reason: String,
     raw_dir: PathBuf,
     dir: Resolved,
-    dir_identity: Option<Arc<Handle>>,
+    dir_identity: Option<Arc<PathIdentity>>,
     file_prefix: String,
 }
 
@@ -1735,7 +1734,7 @@ impl SecretPrefix {
         }
         self.dir_identity.as_deref().is_some_and(|id| {
             parent_resolved.missing.is_empty()
-                && Handle::from_path(&parent_resolved.existing).ok().as_ref() == Some(id)
+                && PathIdentity::from_path(&parent_resolved.existing).as_ref() == Some(id)
         })
     }
 
@@ -1755,7 +1754,7 @@ impl SecretPrefix {
             || self
                 .dir_identity
                 .as_deref()
-                .is_some_and(|id| Handle::from_path(parent).ok().as_ref() == Some(id))
+                .is_some_and(|id| PathIdentity::from_path(parent).as_ref() == Some(id))
     }
 }
 
@@ -1802,7 +1801,7 @@ fn push_auth_keys_secret(
         .or_else(|_| resolve_keeping_last(parent))
         .unwrap_or_else(|_| raw_fallback_resolved(parent));
     let dir_identity = if dir_resolved.missing.is_empty() && dir_resolved.link.is_none() {
-        Handle::from_path(&dir_resolved.existing).ok().map(Arc::new)
+        PathIdentity::from_path(&dir_resolved.existing).map(Arc::new)
     } else {
         None
     };
@@ -1820,7 +1819,7 @@ fn push_auth_keys_secret(
 
 fn build_secret_place(label: String, raw_path: PathBuf, resolved: Resolved) -> SecretPlace {
     let identity = if resolved.missing.is_empty() && resolved.link.is_none() {
-        Handle::from_path(&resolved.existing).ok().map(Arc::new)
+        PathIdentity::from_path(&resolved.existing).map(Arc::new)
     } else {
         None
     };
@@ -1865,7 +1864,7 @@ pub struct ProtectedFilter {
 #[derive(Debug)]
 struct ExplicitRoot {
     resolved: Resolved,
-    identity: Option<Arc<Handle>>,
+    identity: Option<Arc<PathIdentity>>,
     #[cfg(unix)]
     dev_ino: Option<(u64, u64)>,
 }
@@ -1876,7 +1875,7 @@ struct ProtectedEntry {
     reason: String,
     raw_path: PathBuf,
     resolved: Resolved,
-    identity: Option<Arc<Handle>>,
+    identity: Option<Arc<PathIdentity>>,
     #[cfg(unix)]
     dev_ino: Option<(u64, u64)>,
 }
@@ -1961,17 +1960,17 @@ impl ProtectedFilter {
             };
             let target_id = if target.missing.is_empty() && self.has_identities {
                 *fs_calls += 1;
-                Handle::from_path(&target.existing).ok()
+                PathIdentity::from_path(&target.existing)
             } else {
                 None
             };
-            let target_ancestors: Vec<Handle> = if self.has_identities {
+            let target_ancestors: Vec<PathIdentity> = if self.has_identities {
                 target
                     .existing
                     .ancestors()
                     .filter_map(|anc| {
                         *fs_calls += 1;
-                        Handle::from_path(anc).ok()
+                        PathIdentity::from_path(anc)
                     })
                     .collect()
             } else {
@@ -2011,7 +2010,7 @@ impl ProtectedFilter {
         #[cfg(not(unix))]
         let entry_handle = if self.has_identities {
             *fs_calls += 1;
-            Handle::from_path(path).ok()
+            PathIdentity::from_path(path)
         } else {
             None
         };
@@ -2094,8 +2093,8 @@ impl ProtectedFilter {
         &self,
         entry: &ProtectedEntry,
         target: &Resolved,
-        target_id: Option<&Handle>,
-        target_ancestors: &[Handle],
+        target_id: Option<&PathIdentity>,
+        target_ancestors: &[PathIdentity],
     ) -> bool {
         self.explicit_roots.iter().any(|root| {
             if !root_is_within_secret(&root.resolved, &entry.resolved, entry.identity.as_deref()) {
@@ -2120,7 +2119,7 @@ impl ProtectedFilter {
 fn root_is_within_secret(
     root: &Resolved,
     secret_resolved: &Resolved,
-    secret_identity: Option<&Handle>,
+    secret_identity: Option<&PathIdentity>,
 ) -> bool {
     if within(root, secret_resolved, Platform::HOST) {
         return true;
@@ -2128,7 +2127,7 @@ fn root_is_within_secret(
     secret_identity.is_some_and(|id| {
         root.existing
             .ancestors()
-            .any(|ancestor| Handle::from_path(ancestor).is_ok_and(|h| h == *id))
+            .any(|ancestor| PathIdentity::from_path(ancestor).is_some_and(|h| h == *id))
     })
 }
 
@@ -2138,7 +2137,7 @@ fn secret_explicitly_opted_in_whole(secret: &SecretPlace, resolved_roots: &[Reso
         let same_path = within_protected(root, &secret.resolved, Platform::HOST)
             && within_protected(&secret.resolved, root, Platform::HOST);
         let same_handle = secret.identity.as_deref().is_some_and(|sid| {
-            root.missing.is_empty() && Handle::from_path(&root.existing).ok().as_ref() == Some(sid)
+            root.missing.is_empty() && PathIdentity::from_path(&root.existing).as_ref() == Some(sid)
         });
         same_path || same_handle
     })
@@ -2149,7 +2148,7 @@ fn secret_explicitly_opted_in_whole(secret: &SecretPlace, resolved_roots: &[Reso
 fn secret_explicitly_opted_in_for_place(
     secret: &SecretPlace,
     place: &Resolved,
-    place_ancestors: &[Handle],
+    place_ancestors: &[PathIdentity],
     resolved_roots: &[Resolved],
 ) -> bool {
     resolved_roots.iter().any(|root| {
@@ -2158,8 +2157,7 @@ fn secret_explicitly_opted_in_for_place(
         }
         within_protected(place, root, Platform::HOST)
             || (root.missing.is_empty()
-                && Handle::from_path(&root.existing)
-                    .ok()
+                && PathIdentity::from_path(&root.existing)
                     .is_some_and(|rid| place_ancestors.contains(&rid)))
     })
 }

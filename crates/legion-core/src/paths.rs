@@ -155,6 +155,11 @@ impl Paths {
     pub fn audit_lock(&self) -> PathBuf {
         self.state.join("audit.lock")
     }
+
+    /// Where cached file thumbnails live inside the node's state directory.
+    pub fn thumb_cache_dir(&self) -> PathBuf {
+        self.state.join("thumb-cache")
+    }
 }
 
 fn env_home(var: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {

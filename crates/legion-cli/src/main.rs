@@ -38,6 +38,10 @@ const USAGE_ERROR: u8 = 2;
 /// Bounded wait for a cancelled call to stop and audit after a termination signal.
 const SHUTDOWN_GRACE: Duration = CANCEL_GRACE.saturating_add(Duration::from_secs(4));
 
+#[global_allocator]
+static ALLOCATOR: legion_os::capped_alloc::CappedAlloc =
+    legion_os::capped_alloc::CappedAlloc::new();
+
 fn main() -> ExitCode {
     legion_core::record_current_exe();
     if let Some(code) = legion_tools::job::try_supervise_cli(std::env::args_os().skip(1)) {
@@ -49,6 +53,10 @@ fn main() -> ExitCode {
     if let Some(code) = legion_tools::power::try_delay_cli(std::env::args_os().skip(1)) {
         return code;
     }
+    if let Some(code) = legion_tools::fs::try_thumb_worker_cli(std::env::args_os().skip(1)) {
+        return code;
+    }
+    legion_tools::fs::enable_thumb_worker_self();
     legion_tools::update::cleanup_old_binary();
     let command = match args::parse(std::env::args_os().skip(1)) {
         Ok(command) => command,

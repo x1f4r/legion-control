@@ -347,8 +347,12 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
 
     await sendSheet.getByRole('button', { name: 'Copy to pi' }).click();
     await sendSheet.waitFor({ state: 'hidden' });
-    // Non-blocking toast confirms transfer started while user remains free to browse.
-    await page.locator('.toast-banner', { hasText: /Copying 2 items to pi/ }).waitFor();
+    // Non-blocking toast confirms transfer started while user remains free to browse (no em-dash).
+    const copyToast = page.locator('.toast-banner', {
+      hasText: 'Copying 2 items to pi. Watch progress in Activity.',
+    });
+    await copyToast.waitFor();
+    assert.ok(!(await copyToast.innerText()).includes('—'), 'Toast wording must not contain an em-dash');
 
     // 10b. Same-machine Copy uses `fs.copy` instantaneously (no background job).
     await dispatchSwipe(page, '.swipe-row:has-text("notes.txt")', { startX: 310, startY: 220, endX: 140, endY: 222 });
@@ -635,6 +639,181 @@ test('Files tab degrades cleanly against an old node with none of the new tools 
 
     assert.deepEqual(pageErrors, [], `Uncaught page errors (old node): ${pageErrors.join('\n')}`);
     assert.deepEqual(consoleErrors, [], `Console/CSP errors (old node): ${consoleErrors.join('\n')}`);
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});
+
+async function assertToastDoesNotCoverFirstRow(page, label) {
+  const toastBox = await page.locator('.toast-banner').boundingBox();
+  const rowBox = await page.locator('main .list .row').first().boundingBox();
+  assert.ok(toastBox, `${label}: expected visible .toast-banner bounding box`);
+  assert.ok(rowBox, `${label}: expected visible first list row bounding box`);
+  assert.ok(
+    toastBox.y + toastBox.height <= rowBox.y + 0.5,
+    `${label}: toast (${toastBox.y}..${toastBox.y + toastBox.height}) must not overlap first row (${rowBox.y}..${rowBox.y + rowBox.height})`,
+  );
+}
+
+test('Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses on finish or failure', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const ctx = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      colorScheme: 'dark',
+    });
+    const page = await ctx.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    // Case 1: Started from Files -> dash-free wording, never overlaps the top row,
+    // and its Activity button navigates to Activity and clears the banner.
+    await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
+    await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
+
+    await page.locator('.dock button[aria-label="More"]').click();
+    await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
+
+    const uploadToast = page.locator('.toast-banner');
+    await uploadToast.waitFor();
+    const uploadText = await uploadToast.innerText();
+    assert.ok(
+      uploadText.includes('Uploading to tower. Watch progress in Activity.'),
+      `Unexpected upload toast text: ${uploadText}`,
+    );
+    assert.ok(!uploadText.includes('—'), `Upload toast must not contain an em-dash: ${uploadText}`);
+    await assertToastDoesNotCoverFirstRow(page, 'narrow upload toast');
+
+    await uploadToast.locator('a', { hasText: 'Activity' }).click();
+    await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
+    assert.equal(await page.locator('.toast-banner').count(), 0, 'Toast must dismiss when opening Activity');
+    await page.locator('.row', { hasText: /Upload-\d+\.jpg/ }).first().waitFor();
+
+    // Download wording (no em-dash) + navigating via bottom nav Activity tab also clears the banner.
+    await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
+    await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
+    await dispatchSwipe(page, '.swipe-row:has-text("README.md")', {
+      startX: 310,
+      startY: 220,
+      endX: 140,
+      endY: 222,
+    });
+    await page.locator('.swipe-row:has-text("README.md") .swipe-action', { hasText: 'Send to' }).click();
+    const dlSheet = page.locator('.sheet');
+    await dlSheet.locator('button[role="radio"]', { hasText: 'This phone' }).click();
+    await dlSheet.getByRole('button', { name: /Download to this phone/ }).click();
+    await dlSheet.waitFor({ state: 'hidden' });
+
+    const dlToast = page.locator('.toast-banner');
+    await dlToast.waitFor();
+    const dlText = await dlToast.innerText();
+    assert.ok(
+      dlText.includes('Downloading README.md. Watch progress in Activity.'),
+      `Unexpected download toast text: ${dlText}`,
+    );
+    assert.ok(!dlText.includes('—'), `Download toast must not contain an em-dash: ${dlText}`);
+    await assertToastDoesNotCoverFirstRow(page, 'narrow download toast');
+
+    await page.locator('nav.nav a', { hasText: 'Activity' }).click();
+    await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
+    assert.equal(
+      await page.locator('.toast-banner').count(),
+      0,
+      'Transfer-started toast must dismiss when switching to Activity via nav',
+    );
+
+    // Case 2: Started while already on Activity -> no transfer-started toast is shown.
+    await page.goto(`${server.url}/?mock=slow-upload#/files/tower//home/me/Documents`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
+    await page.locator('.dock button[aria-label="More"]').click();
+    await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
+    // Switch to Activity before the async upload picker finishes queuing the transfer.
+    await page.locator('nav.nav a', { hasText: 'Activity' }).click();
+    await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
+    await page.locator('.row', { hasText: /Upload-\d+\.jpg/ }).first().waitFor({ timeout: 5000 });
+    await page.waitForTimeout(200);
+    assert.equal(
+      await page.locator('.toast-banner').count(),
+      0,
+      'Transfer-started toast must not be shown when already on Activity',
+    );
+
+    // Resuming a failed transfer on Activity also shows no started toast.
+    await page.goto(`${server.url}/?mock=transfers#/activity`, { waitUntil: 'domcontentloaded' });
+    const failedRow = page.locator('.row', { hasText: 'photos-backup.zip' });
+    await failedRow.getByRole('button', { name: 'Resume' }).click();
+    await failedRow.locator('.state.running').waitFor();
+    assert.equal(await page.locator('.toast-banner').count(), 0);
+
+    // Case 3: Transfer finishes on its own -> toast goes away by itself without clicking Dismiss,
+    // well before the 8s fallback timeout.
+    await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
+    await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
+    const startedAt = Date.now();
+    await page.locator('.dock button[aria-label="More"]').click();
+    await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
+    await page.locator('.toast-banner', { hasText: 'Uploading to tower. Watch progress in Activity.' }).waitFor();
+    await page.locator('.toast-banner').waitFor({ state: 'hidden', timeout: 5000 });
+    const elapsedMs = Date.now() - startedAt;
+    assert.ok(
+      elapsedMs < 5500,
+      `Expected toast to auto-dismiss as soon as transfer finished (~2.1s), took ${elapsedMs}ms`,
+    );
+
+    // Case 3b: Transfer fails -> started toast goes away and is replaced by its own failure message.
+    await page.goto(`${server.url}/?mock=fail-upload#/files/tower//home/me/Documents`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
+    await page.locator('.dock button[aria-label="More"]').click();
+    await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
+    await page.locator('.toast-banner', { hasText: 'Uploading to tower. Watch progress in Activity.' }).waitFor();
+    const failToast = page.locator('.toast-banner.error', {
+      hasText: /Upload of Upload-\d+\.jpg failed\. Connection dropped\./,
+    });
+    await failToast.waitFor({ timeout: 5000 });
+    await assertToastDoesNotCoverFirstRow(page, 'narrow failure toast');
+
+    await ctx.close();
+
+    // Wide desktop check: toast sits in its own row above main and never overlaps the first row.
+    const wideCtx = await browser.newContext({
+      viewport: { width: 1100, height: 720 },
+      colorScheme: 'dark',
+    });
+    const widePage = await wideCtx.newPage();
+    widePage.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    widePage.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    await widePage.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await widePage.locator('.list a.row', { hasText: 'README.md' }).waitFor();
+    await widePage.locator('.files-wide-tools button[aria-label="More"]').click();
+    await widePage.locator('.sheet button.row', { hasText: /Add from this/ }).click();
+    await widePage
+      .locator('.toast-banner', { hasText: 'Uploading to tower. Watch progress in Activity.' })
+      .waitFor();
+    await assertToastDoesNotCoverFirstRow(widePage, 'wide upload toast');
+    await wideCtx.close();
+
+    assert.deepEqual(pageErrors, [], `Uncaught page errors (toast rules): ${pageErrors.join('\n')}`);
+    assert.deepEqual(consoleErrors, [], `Console/CSP errors (toast rules): ${consoleErrors.join('\n')}`);
   } finally {
     await browser.close();
     await server.stop();

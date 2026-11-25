@@ -65,7 +65,7 @@ impl Fixture {
 }
 
 #[test]
-fn all_twelve_fs_tools_are_registered_with_their_effects() {
+fn all_thirteen_fs_tools_are_registered_with_their_effects() {
     let registry = legion_tools::registry();
     let expected = [
         ("fs.copy", Effect::Write),
@@ -79,6 +79,7 @@ fn all_twelve_fs_tools_are_registered_with_their_effects() {
         ("fs.read", Effect::Read),
         ("fs.remove", Effect::Destroy),
         ("fs.stat", Effect::Read),
+        ("fs.thumb", Effect::Read),
         ("fs.write", Effect::Write),
     ];
     for (name, effect) in expected {
@@ -2361,6 +2362,19 @@ async fn non_regular_files_are_refused_before_opening() {
         assert_eq!(err.code, ErrorCode::InvalidArgs, "{tool}: {err}");
     }
 
+    // `fs.thumb` refuses a FIFO with a per-path `invalid_args` immediately without blocking.
+    let thumb_fifo = tokio::time::timeout(
+        Duration::from_secs(2),
+        f.call("fs.thumb", json!({"paths": [f.p(&fifo)]})),
+    )
+    .await
+    .expect("fs.thumb blocked on FIFO")
+    .unwrap();
+    assert_eq!(
+        thumb_fifo["results"][0]["error"]["code"],
+        json!("invalid_args")
+    );
+
     // Grepping a directory containing a FIFO skips it without blocking and still matches regular files.
     let dir_grep = tokio::time::timeout(
         Duration::from_secs(2),
@@ -2373,4 +2387,1768 @@ async fn non_regular_files_are_refused_before_opening() {
     .expect("directory fs.grep blocked on FIFO")
     .unwrap();
     assert_eq!(dir_grep["matches"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn list_find_and_stat_report_category_and_mime_for_regular_files_only() {
+    let f = Fixture::new();
+    let subdir = f.work.join("folder.jpg");
+    std::fs::create_dir_all(&subdir).unwrap();
+    let photo = f.work.join("holiday.JPG");
+    let clip = f.work.join("clip.mp4");
+    let unknown = f.work.join("mystery.unknownext");
+    std::fs::write(&photo, "not opened").unwrap();
+    std::fs::write(&clip, "not opened").unwrap();
+    std::fs::write(&unknown, "not opened").unwrap();
+
+    // `fs.stat` classifies regular files by extension and omits category/mime for directories.
+    let st_photo = f
+        .call("fs.stat", json!({"path": f.p(&photo)}))
+        .await
+        .unwrap();
+    assert_eq!(st_photo["kind"], json!("file"));
+    assert_eq!(st_photo["category"], json!("image"));
+    assert_eq!(st_photo["mime"], json!("image/jpeg"));
+
+    let st_unknown = f
+        .call("fs.stat", json!({"path": f.p(&unknown)}))
+        .await
+        .unwrap();
+    assert_eq!(st_unknown["kind"], json!("file"));
+    assert_eq!(st_unknown["category"], json!("other"));
+    assert_eq!(st_unknown["mime"], json!("application/octet-stream"));
+
+    let st_dir = f
+        .call("fs.stat", json!({"path": f.p(&subdir)}))
+        .await
+        .unwrap();
+    assert_eq!(st_dir["kind"], json!("dir"));
+    assert!(st_dir.get("category").is_none());
+    assert!(st_dir.get("mime").is_none());
+
+    // `fs.list` reports category/mime on files and omits them on directories.
+    let listed = f
+        .call("fs.list", json!({"path": f.p(&f.work)}))
+        .await
+        .unwrap();
+    let entries = listed["entries"].as_array().unwrap();
+    let dir_entry = entries
+        .iter()
+        .find(|e| e["name"] == json!("folder.jpg"))
+        .unwrap();
+    assert_eq!(dir_entry["kind"], json!("dir"));
+    assert!(dir_entry.get("category").is_none());
+    assert!(dir_entry.get("mime").is_none());
+    let clip_entry = entries
+        .iter()
+        .find(|e| e["name"] == json!("clip.mp4"))
+        .unwrap();
+    assert_eq!(clip_entry["kind"], json!("file"));
+    assert_eq!(clip_entry["category"], json!("video"));
+    assert_eq!(clip_entry["mime"], json!("video/mp4"));
+
+    // `fs.find` reports category/mime on files and omits them on directories.
+    let found = f
+        .call("fs.find", json!({"path": f.p(&f.work)}))
+        .await
+        .unwrap();
+    let matches = found["matches"].as_array().unwrap();
+    let found_dir = matches.iter().find(|m| m["kind"] == json!("dir")).unwrap();
+    assert!(found_dir.get("category").is_none());
+    assert!(found_dir.get("mime").is_none());
+    let found_photo = matches
+        .iter()
+        .find(|m| m["path"].as_str().unwrap().ends_with("holiday.JPG"))
+        .unwrap();
+    assert_eq!(found_photo["category"], json!("image"));
+    assert_eq!(found_photo["mime"], json!("image/jpeg"));
+
+    // On Unix, symlinks keep `kind: "symlink"` and omit category/mime.
+    #[cfg(unix)]
+    {
+        let link = f.work.join("link.png");
+        std::os::unix::fs::symlink(&photo, &link).unwrap();
+        let st_link = f
+            .call("fs.stat", json!({"path": f.p(&link)}))
+            .await
+            .unwrap();
+        assert_eq!(st_link["kind"], json!("symlink"));
+        assert!(st_link.get("category").is_none());
+        assert!(st_link.get("mime").is_none());
+    }
+}
+
+#[tokio::test]
+async fn list_supports_natural_sort_modified_size_categories_and_paging() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let f = Fixture::new();
+    std::fs::create_dir_all(f.work.join("dir10")).unwrap();
+    std::fs::create_dir_all(f.work.join("dir2")).unwrap();
+    std::fs::create_dir_all(f.work.join("AlphaDir")).unwrap();
+
+    let write_with_mtime = |name: &str, bytes: &[u8], secs: u64| {
+        let p = f.work.join(name);
+        let file = std::fs::File::create(&p).unwrap();
+        std::io::Write::write_all(&mut &file, bytes).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    };
+    write_with_mtime("file10.jpg", &[0u8; 50], 1_700_000_100);
+    write_with_mtime("file2.png", &[0u8; 200], 1_700_000_300);
+    write_with_mtime("Beta.txt", &[0u8; 10], 1_700_000_200);
+    write_with_mtime("alpha.mp4", &[0u8; 500], 1_700_000_050);
+
+    // Default natural case-insensitive name order, directories first.
+    let natural = f
+        .call("fs.list", json!({"path": "~/projects"}))
+        .await
+        .unwrap();
+    let names = |v: &Value| -> Vec<String> {
+        v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        names(&natural),
+        vec![
+            "AlphaDir",
+            "dir2",
+            "dir10",
+            "alpha.mp4",
+            "Beta.txt",
+            "file2.png",
+            "file10.jpg"
+        ]
+    );
+    assert_eq!(natural["total"], json!(7));
+    assert_eq!(natural["truncated"], json!(false));
+
+    // Descending name order still keeps directories first.
+    let desc_name = f
+        .call("fs.list", json!({"path": "~/projects", "order": "desc"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&desc_name),
+        vec![
+            "dir10",
+            "dir2",
+            "AlphaDir",
+            "file10.jpg",
+            "file2.png",
+            "Beta.txt",
+            "alpha.mp4"
+        ]
+    );
+
+    // Sort by size descending: directories still first, files largest to smallest.
+    let by_size = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "sort": "size", "order": "desc"}),
+        )
+        .await
+        .unwrap();
+    let file_names_size: Vec<&str> = by_size["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == json!("file"))
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        file_names_size,
+        vec!["alpha.mp4", "file2.png", "file10.jpg", "Beta.txt"]
+    );
+    // First 3 entries are still directories.
+    assert!(
+        by_size["entries"].as_array().unwrap()[..3]
+            .iter()
+            .all(|e| e["kind"] == json!("dir"))
+    );
+
+    // Sort by modified descending: newest files first.
+    let by_mtime = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "sort": "modified", "order": "desc"}),
+        )
+        .await
+        .unwrap();
+    let file_names_mtime: Vec<&str> = by_mtime["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == json!("file"))
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        file_names_mtime,
+        vec!["file2.png", "Beta.txt", "file10.jpg", "alpha.mp4"]
+    );
+
+    // Category filter keeps directories and only matching files.
+    let images = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "categories": ["image"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&images),
+        vec!["AlphaDir", "dir2", "dir10", "file2.png", "file10.jpg"]
+    );
+    assert_eq!(images["total"], json!(5));
+    assert_eq!(images["truncated"], json!(false));
+
+    // Paging with `offset` and `limit` reports accurate `total` and `truncated`.
+    let page1 = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "offset": 0, "limit": 3}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(names(&page1), vec!["AlphaDir", "dir2", "dir10"]);
+    assert_eq!(page1["total"], json!(7));
+    assert_eq!(page1["truncated"], json!(true));
+
+    let page2 = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "offset": 3, "limit": 3}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(names(&page2), vec!["alpha.mp4", "Beta.txt", "file2.png"]);
+    assert_eq!(page2["total"], json!(7));
+    assert_eq!(page2["truncated"], json!(true));
+
+    let page3 = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "offset": 6, "limit": 3}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(names(&page3), vec!["file10.jpg"]);
+    assert_eq!(page3["total"], json!(7));
+    assert_eq!(page3["truncated"], json!(false));
+
+    let past_end = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "offset": 20, "limit": 3}),
+        )
+        .await
+        .unwrap();
+    assert!(past_end["entries"].as_array().unwrap().is_empty());
+    assert_eq!(past_end["total"], json!(7));
+    assert_eq!(past_end["truncated"], json!(false));
+}
+
+#[tokio::test]
+async fn find_supports_words_categories_size_time_hidden_sort_and_unicode() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let f = Fixture::new();
+    std::fs::write(f.work.join(".gitignore"), "ignored_pic.jpg\n").unwrap();
+    std::fs::create_dir_all(f.work.join("sub")).unwrap();
+
+    let write_file = |rel: &str, size: usize, secs: u64| {
+        let p = f.work.join(rel);
+        let file = std::fs::File::create(&p).unwrap();
+        std::io::Write::write_all(&mut &file, &vec![b'x'; size]).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    };
+
+    write_file("Holiday_Beach_2.jpg", 100, 1_700_000_100);
+    write_file("holiday_beach_10.PNG", 500, 1_700_000_300);
+    write_file("sub/Übung_Sommer_2026.pdf", 250, 1_700_000_200);
+    write_file("ignored_pic.jpg", 400, 1_700_000_400);
+    write_file(".hidden_pic.jpg", 300, 1_700_000_500);
+    write_file("notes.txt", 50, 1_700_000_150);
+
+    // Multi-word name filter (case-insensitive, any word order) + machine name in result.
+    let by_words = f
+        .call(
+            "fs.find",
+            json!({"path": "~/projects", "name": "BEACH holiday", "sort": "name"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_words["machine"], json!(f.node.name()));
+    assert_eq!(by_words["truncated"], json!(false));
+    assert!(by_words.get("reason").is_none());
+    let word_names: Vec<&str> = by_words["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    // Natural ordering puts 2 before 10.
+    assert_eq!(
+        word_names,
+        vec!["Holiday_Beach_2.jpg", "holiday_beach_10.PNG"]
+    );
+
+    // Unicode case-insensitive word matching.
+    let unicode = f
+        .call(
+            "fs.find",
+            json!({"path": "~/projects", "name": "übung 2026", "categories": ["document"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unicode["matches"].as_array().unwrap().len(), 1);
+    assert!(
+        unicode["matches"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("Übung_Sommer_2026.pdf")
+    );
+    assert_eq!(unicode["matches"][0]["category"], json!("document"));
+
+    // Size bounds filter regular files inclusively.
+    let by_size = f
+        .call(
+            "fs.find",
+            json!({
+                "path": "~/projects",
+                "min_size": 100,
+                "max_size": 300,
+                "sort": "size",
+                "order": "desc"
+            }),
+        )
+        .await
+        .unwrap();
+    let sized: Vec<&str> = by_size["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(sized, vec!["Übung_Sommer_2026.pdf", "Holiday_Beach_2.jpg"]);
+
+    // Modification time bounds using the same RFC 3339 format returned by fs.stat.
+    let t_after = jiff::Timestamp::from_second(1_700_000_150)
+        .unwrap()
+        .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    let t_before = jiff::Timestamp::from_second(1_700_000_250)
+        .unwrap()
+        .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    let by_time = f
+        .call(
+            "fs.find",
+            json!({
+                "path": "~/projects",
+                "kind": "file",
+                "modified_after": t_after,
+                "modified_before": t_before,
+                "sort": "modified",
+                "order": "asc"
+            }),
+        )
+        .await
+        .unwrap();
+    let timed: Vec<&str> = by_time["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(timed, vec!["notes.txt", "Übung_Sommer_2026.pdf"]);
+
+    // `hidden` is separate from `ignore`:
+    // `ignore: false, hidden: false` includes gitignored files while skipping dotfiles.
+    let no_ignore_no_hidden = f
+        .call(
+            "fs.find",
+            json!({
+                "path": "~/projects",
+                "categories": ["image"],
+                "ignore": false,
+                "hidden": false,
+                "sort": "name"
+            }),
+        )
+        .await
+        .unwrap();
+    let imgs_no_hidden: Vec<&str> = no_ignore_no_hidden["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        imgs_no_hidden,
+        vec![
+            "Holiday_Beach_2.jpg",
+            "holiday_beach_10.PNG",
+            "ignored_pic.jpg"
+        ]
+    );
+
+    // `ignore: true, hidden: true` respects `.gitignore` while still finding dotfiles.
+    let ignore_with_hidden = f
+        .call(
+            "fs.find",
+            json!({
+                "path": "~/projects",
+                "categories": ["image"],
+                "ignore": true,
+                "hidden": true,
+                "sort": "name"
+            }),
+        )
+        .await
+        .unwrap();
+    let imgs_with_hidden: Vec<&str> = ignore_with_hidden["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        imgs_with_hidden,
+        vec![
+            ".hidden_pic.jpg",
+            "Holiday_Beach_2.jpg",
+            "holiday_beach_10.PNG"
+        ]
+    );
+
+    // Sorted top-K with `limit` returns the true top items and reports `reason: "limit"`.
+    let top_two = f
+        .call(
+            "fs.find",
+            json!({
+                "path": "~/projects",
+                "categories": ["image"],
+                "ignore": false,
+                "hidden": true,
+                "sort": "size",
+                "order": "desc",
+                "limit": 2
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(top_two["truncated"], json!(true));
+    assert_eq!(top_two["reason"], json!("limit"));
+    let top_names: Vec<&str> = top_two["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(top_names, vec!["holiday_beach_10.PNG", "ignored_pic.jpg"]);
+
+    // Invalid bounds and timestamps are rejected cleanly.
+    for bad in [
+        json!({"path": "~/projects", "budget_ms": 0}),
+        json!({"path": "~/projects", "budget_ms": 60001}),
+        json!({"path": "~/projects", "min_size": 500, "max_size": 100}),
+        json!({"path": "~/projects", "modified_after": "not-a-timestamp"}),
+        json!({
+            "path": "~/projects",
+            "modified_after": "2026-11-25T00:00:00Z",
+            "modified_before": "2026-11-24T00:00:00Z"
+        }),
+    ] {
+        let err = f.call("fs.find", bad.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{bad}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn find_never_follows_symlinks_out_of_allowed_roots() {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    f.write_config(
+        "policy.toml",
+        r#"
+[principals.jailed]
+role = "jailed"
+
+[roles.jailed]
+allow = ["effect:read"]
+paths = ["~/projects/**"]
+"#,
+    );
+    let outside = f.home.join("outside_secret_dir");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret_needle.txt"), "secret").unwrap();
+    std::fs::write(f.work.join("inside_needle.txt"), "ok").unwrap();
+    symlink(&outside, f.work.join("escape_dir")).unwrap();
+
+    let res = f
+        .call_as(
+            "jailed",
+            "fs.find",
+            json!({"path": "~/projects", "name": "needle"}),
+        )
+        .await
+        .unwrap();
+    let paths: Vec<&str> = res["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths.len(), 1, "{paths:?}");
+    assert!(paths[0].ends_with("inside_needle.txt"));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn list_and_find_respect_windows_hidden_attribute() {
+    let f = Fixture::new();
+    let visible = f.work.join("visible.txt");
+    let hidden = f.work.join("win_hidden.txt");
+    std::fs::write(&visible, "ok").unwrap();
+    std::fs::write(&hidden, "secret").unwrap();
+    let status = std::process::Command::new("attrib")
+        .args(["+H", hidden.to_str().unwrap()])
+        .status()
+        .expect("attrib should run on Windows");
+    assert!(status.success(), "attrib +H failed: {status}");
+
+    let listed = f
+        .call("fs.list", json!({"path": "~/projects", "hidden": false}))
+        .await
+        .unwrap();
+    let list_names: Vec<&str> = listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(list_names, vec!["visible.txt"]);
+
+    let found = f
+        .call(
+            "fs.find",
+            json!({"path": "~/projects", "ignore": false, "hidden": false}),
+        )
+        .await
+        .unwrap();
+    let found_names: Vec<&str> = found["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(found_names, vec!["visible.txt"]);
+}
+
+#[tokio::test]
+async fn find_large_directory_cuts_off_within_budget() {
+    use std::time::{Duration, Instant};
+
+    let f = Fixture::new();
+    let big = f.work.join("huge");
+    std::fs::create_dir_all(&big).unwrap();
+
+    // 200,000 files on Unix; use a smaller count on Windows CI where Defender scans each newly
+    // created file on NTFS so the fixture setup itself stays fast.
+    #[cfg(not(windows))]
+    const TOTAL_FILES: usize = 200_000;
+    #[cfg(windows)]
+    const TOTAL_FILES: usize = 10_000;
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 8))
+        .unwrap_or(4);
+    let per_worker = TOTAL_FILES.div_ceil(workers);
+    std::thread::scope(|scope| {
+        for w in 0..workers {
+            let dir = big.clone();
+            scope.spawn(move || {
+                let start = w * per_worker;
+                let end = (start + per_worker).min(TOTAL_FILES);
+                for idx in start..end {
+                    let _ = std::fs::File::create(dir.join(format!("f_{idx:06}.txt")));
+                }
+            });
+        }
+    });
+
+    let started = Instant::now();
+    let res = f
+        .call(
+            "fs.find",
+            json!({
+                "path": f.p(&big),
+                "name": "does_not_match_any_file",
+                "ignore": false,
+                // The smallest budget there is: no machine walks this directory in a millisecond,
+                // so the cut-off does not depend on how fast the runner happens to be.
+                "budget_ms": 1,
+            }),
+        )
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(
+        res["truncated"],
+        json!(true),
+        "expected time truncation: {res}"
+    );
+    assert_eq!(res["reason"], json!("time"));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "fs.find took {elapsed:?} for a 1ms budget"
+    );
+}
+
+fn make_rgb_image(width: u32, height: u32, color: [u8; 3]) -> image::DynamicImage {
+    image::DynamicImage::ImageRgb8(image::ImageBuffer::from_pixel(
+        width,
+        height,
+        image::Rgb(color),
+    ))
+}
+
+#[tokio::test]
+async fn thumb_decodes_supported_formats_fit_modes_and_validates_args() {
+    use image::codecs::gif::GifEncoder;
+    use image::{Frame, ImageBuffer, ImageFormat, Rgba};
+
+    let f = Fixture::new();
+
+    // Create valid JPEG, opaque PNG, transparent PNG, animated GIF (2 frames), WebP, BMP.
+    let jpg_path = f.work.join("wide.jpg");
+    make_rgb_image(400, 200, [200, 40, 40])
+        .save_with_format(&jpg_path, ImageFormat::Jpeg)
+        .unwrap();
+
+    let png_opaque_path = f.work.join("opaque.png");
+    make_rgb_image(300, 150, [40, 200, 40])
+        .save_with_format(&png_opaque_path, ImageFormat::Png)
+        .unwrap();
+
+    let png_alpha_path = f.work.join("alpha.png");
+    let mut alpha_img =
+        ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(160, 160, Rgba([40, 40, 200, 255]));
+    alpha_img.put_pixel(10, 10, Rgba([40, 40, 200, 0]));
+    image::DynamicImage::ImageRgba8(alpha_img)
+        .save_with_format(&png_alpha_path, ImageFormat::Png)
+        .unwrap();
+
+    let gif_path = f.work.join("anim.gif");
+    {
+        let file = std::fs::File::create(&gif_path).unwrap();
+        let mut enc = GifEncoder::new(file);
+        let frame1 =
+            ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(120, 80, Rgba([220, 20, 20, 255]));
+        let frame2 =
+            ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(120, 80, Rgba([20, 220, 20, 255]));
+        enc.encode_frame(Frame::new(frame1)).unwrap();
+        enc.encode_frame(Frame::new(frame2)).unwrap();
+    }
+
+    let webp_path = f.work.join("pic.webp");
+    make_rgb_image(320, 240, [200, 200, 40])
+        .save_with_format(&webp_path, ImageFormat::WebP)
+        .unwrap();
+
+    let bmp_path = f.work.join("scan.bmp");
+    make_rgb_image(300, 300, [40, 200, 200])
+        .save_with_format(&bmp_path, ImageFormat::Bmp)
+        .unwrap();
+
+    let res = f
+        .call(
+            "fs.thumb",
+            json!({
+                "paths": [
+                    f.p(&jpg_path),
+                    f.p(&png_opaque_path),
+                    f.p(&png_alpha_path),
+                    f.p(&gif_path),
+                    f.p(&webp_path),
+                    f.p(&bmp_path),
+                ],
+                "size": 128,
+                "fit": "contain"
+            }),
+        )
+        .await
+        .unwrap();
+
+    let items = res["results"].as_array().unwrap();
+    assert_eq!(items.len(), 6);
+
+    // JPEG 400x200 -> contain 128 -> 128x64 JPEG.
+    assert_eq!(items[0]["ok"]["mime"], json!("image/jpeg"));
+    assert_eq!(items[0]["ok"]["width"], json!(128));
+    assert_eq!(items[0]["ok"]["height"], json!(64));
+    let decoded0 = BASE64
+        .decode(items[0]["ok"]["content"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(&decoded0[..2], &[0xFF, 0xD8]);
+
+    // Opaque PNG -> JPEG; transparent PNG -> PNG.
+    assert_eq!(items[1]["ok"]["mime"], json!("image/jpeg"));
+    assert_eq!(items[2]["ok"]["mime"], json!("image/png"));
+    let decoded2 = BASE64
+        .decode(items[2]["ok"]["content"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(&decoded2[..4], &[137, 80, 78, 71]);
+
+    // Animated GIF decodes first frame (red, 120x80 not upscaled).
+    assert_eq!(items[3]["ok"]["width"], json!(120));
+    assert_eq!(items[3]["ok"]["height"], json!(80));
+    let gif_bytes = BASE64
+        .decode(items[3]["ok"]["content"].as_str().unwrap())
+        .unwrap();
+    let gif_img = image::load_from_memory(&gif_bytes).unwrap().to_rgb8();
+    let px = gif_img.get_pixel(60, 40);
+    assert!(
+        px.0[0] > 180 && px.0[1] < 80,
+        "expected first (red) GIF frame, got {px:?}"
+    );
+
+    // WebP and BMP both produce valid JPEG thumbnails.
+    assert_eq!(items[4]["ok"]["mime"], json!("image/jpeg"));
+    assert_eq!(items[4]["ok"]["width"], json!(128));
+    assert_eq!(items[4]["ok"]["height"], json!(96));
+    assert_eq!(items[5]["ok"]["mime"], json!("image/jpeg"));
+    assert_eq!(items[5]["ok"]["width"], json!(128));
+    assert_eq!(items[5]["ok"]["height"], json!(128));
+
+    // `fit: "cover"` crops to exact square dimensions.
+    let cover = f
+        .call(
+            "fs.thumb",
+            json!({"paths": [f.p(&jpg_path)], "size": 96, "fit": "cover"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cover["results"][0]["ok"]["width"], json!(96));
+    assert_eq!(cover["results"][0]["ok"]["height"], json!(96));
+
+    // Argument validation rejects out-of-range counts and sizes.
+    let too_many: Vec<String> = (0..33).map(|i| format!("~/projects/p{i}.jpg")).collect();
+    for bad in [
+        json!({"paths": []}),
+        json!({"paths": too_many}),
+        json!({"paths": [f.p(&jpg_path)], "size": 95}),
+        json!({"paths": [f.p(&jpg_path)], "size": 513}),
+    ] {
+        let err = f.call("fs.thumb", bad.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn thumb_handles_hostile_images_without_panicking_or_exhausting_memory() {
+    let f = Fixture::new();
+
+    // 1. Valid image in the same batch must still succeed alongside hostile inputs.
+    let good = f.work.join("good.jpg");
+    make_rgb_image(200, 150, [10, 120, 220])
+        .save_with_format(&good, image::ImageFormat::Jpeg)
+        .unwrap();
+
+    // 2. Truncated JPEG.
+    let mut full_jpg = std::fs::read(&good).unwrap();
+    full_jpg.truncate(full_jpg.len() / 3);
+    let truncated = f.work.join("truncated.jpg");
+    std::fs::write(&truncated, &full_jpg).unwrap();
+
+    // 3. Zero-byte PNG.
+    let empty = f.work.join("empty.png");
+    std::fs::write(&empty, b"").unwrap();
+
+    // 4. Wrong extension: text content named .png, and valid JPEG bytes named .txt.
+    let fake_png = f.work.join("not_an_image.png");
+    std::fs::write(&fake_png, b"just plain text, definitely not a PNG").unwrap();
+    let jpeg_as_txt = f.work.join("actually_jpeg.txt");
+    std::fs::copy(&good, &jpeg_as_txt).unwrap();
+
+    // 5. Decompression bomb: tiny PNG declaring 25000 x 25000 pixels (625 MP > 100 MP).
+    let bomb = f.work.join("bomb.png");
+    {
+        let crc32 = |bytes: &[u8]| -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in bytes {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        };
+        let mut data = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        let mut ihdr = b"IHDR".to_vec();
+        ihdr.extend_from_slice(&25_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&25_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        data.extend_from_slice(&13u32.to_be_bytes());
+        data.extend_from_slice(&ihdr);
+        data.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+        let idat_payload = [
+            0x78u8, 0x01, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01,
+        ];
+        let mut idat = b"IDAT".to_vec();
+        idat.extend_from_slice(&idat_payload);
+        data.extend_from_slice(&(idat_payload.len() as u32).to_be_bytes());
+        data.extend_from_slice(&idat);
+        data.extend_from_slice(&crc32(&idat).to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(b"IEND");
+        data.extend_from_slice(&crc32(b"IEND").to_be_bytes());
+        std::fs::write(&bomb, data).unwrap();
+    }
+
+    // 6. Oversized source (> 64 MiB sparse file).
+    let oversized = f.work.join("huge.png");
+    {
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len(65 * 1024 * 1024).unwrap();
+    }
+
+    // 7. Unsupported image format (.svg) and directory.
+    let svg = f.work.join("icon.svg");
+    std::fs::write(&svg, b"<svg xmlns='http://www.w3.org/2000/svg'/>").unwrap();
+    let dir = f.work.join("subdir");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let res = f
+        .call(
+            "fs.thumb",
+            json!({
+                "paths": [
+                    f.p(&good),
+                    f.p(&truncated),
+                    f.p(&empty),
+                    f.p(&fake_png),
+                    f.p(&jpeg_as_txt),
+                    f.p(&bomb),
+                    f.p(&oversized),
+                    f.p(&svg),
+                    f.p(&dir),
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let items = res["results"].as_array().unwrap();
+    assert_eq!(items.len(), 9);
+    assert!(
+        items[0].get("ok").is_some(),
+        "good image failed: {}",
+        items[0]
+    );
+    assert_eq!(
+        items[1]["error"]["code"],
+        json!("failed"),
+        "truncated: {}",
+        items[1]
+    );
+    assert_eq!(
+        items[2]["error"]["code"],
+        json!("failed"),
+        "empty: {}",
+        items[2]
+    );
+    assert_eq!(
+        items[3]["error"]["code"],
+        json!("failed"),
+        "fake_png: {}",
+        items[3]
+    );
+    assert_eq!(
+        items[4]["error"]["code"],
+        json!("unsupported"),
+        "jpeg_as_txt: {}",
+        items[4]
+    );
+    assert_eq!(
+        items[5]["error"]["code"],
+        json!("failed"),
+        "bomb: {}",
+        items[5]
+    );
+    assert_eq!(
+        items[6]["error"]["code"],
+        json!("failed"),
+        "oversized: {}",
+        items[6]
+    );
+    assert_eq!(
+        items[7]["error"]["code"],
+        json!("unsupported"),
+        "svg: {}",
+        items[7]
+    );
+    assert_eq!(
+        items[8]["error"]["code"],
+        json!("invalid_args"),
+        "dir: {}",
+        items[8]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn thumb_cache_hits_invalidates_is_protected_from_non_admin_and_safe_under_concurrency() {
+    let f = Fixture::new();
+    f.write_config(
+        "policy.toml",
+        r#"
+[principals.viewer]
+role = "viewer"
+
+[principals.no_read]
+role = "no_read"
+
+[principals.jailed]
+role = "jailed"
+
+[roles.viewer]
+allow = ["effect:read", "effect:write", "effect:destroy"]
+
+[roles.no_read]
+allow = ["fs.thumb", "fs.list"]
+deny = ["fs.read"]
+
+[roles.jailed]
+allow = ["effect:read"]
+paths = ["~/projects/**"]
+"#,
+    );
+
+    let pic = f.work.join("cached.png");
+    make_rgb_image(200, 200, [240, 20, 20])
+        .save_with_format(&pic, image::ImageFormat::Png)
+        .unwrap();
+    let outside = f.home.join("private.png");
+    make_rgb_image(150, 150, [20, 240, 20])
+        .save_with_format(&outside, image::ImageFormat::Png)
+        .unwrap();
+
+    // First call populates the cache under state/thumb-cache.
+    let first = f
+        .call("fs.thumb", json!({"paths": [f.p(&pic)], "size": 128}))
+        .await
+        .unwrap();
+    let first_content = first["results"][0]["ok"]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cache_dir = f.dir.path().join("state").join("thumb-cache");
+    let count_thumbs = || {
+        std::fs::read_dir(&cache_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".thumb"))
+            .count()
+    };
+    assert_eq!(count_thumbs(), 1);
+
+    // Second call hits the cache and returns identical content without creating another entry.
+    let second = f
+        .call("fs.thumb", json!({"paths": [f.p(&pic)], "size": 128}))
+        .await
+        .unwrap();
+    assert_eq!(
+        second["results"][0]["ok"]["content"].as_str().unwrap(),
+        first_content
+    );
+    assert_eq!(count_thumbs(), 1);
+
+    // Modifying the file invalidates the cache and returns a fresh thumbnail with different bytes.
+    make_rgb_image(300, 150, [20, 20, 240])
+        .save_with_format(&pic, image::ImageFormat::Png)
+        .unwrap();
+    let updated = f
+        .call("fs.thumb", json!({"paths": [f.p(&pic)], "size": 128}))
+        .await
+        .unwrap();
+    assert_eq!(updated["results"][0]["ok"]["width"], json!(128));
+    assert_eq!(updated["results"][0]["ok"]["height"], json!(64));
+    assert_ne!(
+        updated["results"][0]["ok"]["content"].as_str().unwrap(),
+        first_content
+    );
+    assert_eq!(count_thumbs(), 2);
+
+    // Non-admin role cannot read, list, write, remove or thumbnail anything in the cache directory.
+    let thumb_file = std::fs::read_dir(&cache_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with(".thumb"))
+        .unwrap()
+        .path();
+    for (tool, args) in [
+        ("fs.list", json!({"path": f.p(&cache_dir)})),
+        ("fs.read", json!({"path": f.p(&thumb_file)})),
+        (
+            "fs.write",
+            json!({"path": f.p(&cache_dir.join("injected.thumb")), "content": "x"}),
+        ),
+        ("fs.remove", json!({"path": f.p(&thumb_file)})),
+    ] {
+        let err = f.call_as("viewer", tool, args).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied, "viewer {tool}: {err}");
+    }
+    let thumb_cache_attempt = f
+        .call_as("viewer", "fs.thumb", json!({"paths": [f.p(&thumb_file)]}))
+        .await
+        .unwrap();
+    assert_eq!(
+        thumb_cache_attempt["results"][0]["error"]["code"],
+        json!("denied")
+    );
+
+    // Role denied `fs.read` is denied `fs.thumb` even when `fs.thumb` itself is allowed.
+    let no_read_err = f
+        .call_as("no_read", "fs.thumb", json!({"paths": [f.p(&pic)]}))
+        .await
+        .unwrap_err();
+    assert_eq!(no_read_err.code, ErrorCode::Denied);
+
+    // Owner caches a thumbnail for a file outside `jailed`'s `paths`; `jailed` must still get
+    // `denied` (never a cache hit!), and symlink escapes are refused too.
+    let owner_outside = f
+        .call("fs.thumb", json!({"paths": [f.p(&outside)], "size": 128}))
+        .await
+        .unwrap();
+    assert!(owner_outside["results"][0].get("ok").is_some());
+
+    let jailed_outside = f
+        .call_as(
+            "jailed",
+            "fs.thumb",
+            json!({"paths": [f.p(&outside)], "size": 128}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        jailed_outside["results"][0]["error"]["code"],
+        json!("denied")
+    );
+
+    #[cfg(unix)]
+    {
+        let escape_link = f.work.join("escape_pic.png");
+        std::os::unix::fs::symlink(&outside, &escape_link).unwrap();
+        let jailed_link = f
+            .call_as(
+                "jailed",
+                "fs.thumb",
+                json!({"paths": [f.p(&escape_link)], "size": 128}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(jailed_link["results"][0]["error"]["code"], json!("denied"));
+    }
+
+    // Concurrent `fs.thumb` calls across threads all succeed cleanly.
+    let mut handles = Vec::new();
+    for i in 0..12 {
+        let node = f.node.clone();
+        let path = f.p(&pic);
+        let size = if i % 2 == 0 { 128 } else { 192 };
+        handles.push(tokio::spawn(async move {
+            node.call(Call::new(
+                Door::Cli,
+                "fs.thumb",
+                json!({"paths": [path], "size": size}),
+            ))
+            .await
+        }));
+    }
+    for h in handles {
+        let out = h.await.unwrap().unwrap();
+        assert!(out["results"][0].get("ok").is_some(), "{out}");
+    }
+}
+
+#[tokio::test]
+async fn thumb_extracts_video_posters_when_ffmpeg_is_installed() {
+    // Only run the positive ffmpeg extraction check when `ffmpeg` is present on PATH.
+    let has_ffmpeg = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !has_ffmpeg {
+        return;
+    }
+
+    let f = Fixture::new();
+    let clip = f.work.join("sample.mp4");
+    let short_clip = f.work.join("short.mp4");
+    for (path, duration) in [(&clip, "2"), (&short_clip, "0.2")] {
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc=duration={duration}:size=320x180:rate=10"),
+                "-pix_fmt",
+                "yuv420p",
+                path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "ffmpeg fixture failed for {path:?}");
+    }
+
+    let res = f
+        .call(
+            "fs.thumb",
+            json!({"paths": [f.p(&clip), f.p(&short_clip)], "size": 160, "fit": "contain"}),
+        )
+        .await
+        .unwrap();
+    let items = res["results"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    for item in items {
+        assert_eq!(item["ok"]["mime"], json!("image/jpeg"), "{item}");
+        assert_eq!(item["ok"]["width"], json!(160), "{item}");
+        assert_eq!(item["ok"]["height"], json!(90), "{item}");
+    }
+}
+
+#[tokio::test]
+async fn list_bounds_recursive_counting_by_limit_while_keeping_depth_one_exact() {
+    let f = Fixture::new();
+    let deep = f.work.join("deep_tree");
+    for d in 0..40 {
+        let sub = deep.join(format!("dir_{d:02}"));
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 0..30 {
+            std::fs::write(sub.join(format!("file_{i:02}.txt")), "x").unwrap();
+        }
+    }
+
+    // `depth: 1` always counts every direct child accurately and sets `total_exact: true`.
+    let shallow = f
+        .call(
+            "fs.list",
+            json!({"path": f.p(&deep), "depth": 1, "limit": 5}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shallow["entries"].as_array().unwrap().len(), 5);
+    assert_eq!(shallow["total"], json!(40));
+    assert_eq!(shallow["total_exact"], json!(true));
+    assert_eq!(shallow["truncated"], json!(true));
+
+    // `depth: 3, limit: 5` on a 1,240-entry tree stops promptly instead of walking all 1,240
+    // entries, reporting `total_exact: false` and a bounded lower-bound `total`.
+    let bounded = f
+        .call(
+            "fs.list",
+            json!({"path": f.p(&deep), "depth": 3, "limit": 5}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bounded["entries"].as_array().unwrap().len(), 5);
+    assert_eq!(bounded["total_exact"], json!(false), "{bounded}");
+    assert_eq!(bounded["truncated"], json!(true));
+    let lower_bound = bounded["total"].as_u64().unwrap();
+    assert!(
+        (6..=50).contains(&lower_bound),
+        "expected limit-bounded lower bound, got {lower_bound}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn find_checks_budget_even_when_directories_are_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Skip if running as root, since root ignores 0o000 directory permissions.
+    let f = Fixture::new();
+    let root = f.work.join("unreadable_tree");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut locked_dirs = Vec::new();
+    for i in 0..200 {
+        let sub = root.join(format!("d_{i:03}"));
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("hidden_inside.txt"), "x").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        locked_dirs.push(sub);
+    }
+
+    // Confirm permissions actually deny reading (non-root check).
+    let actually_denied = std::fs::read_dir(&locked_dirs[0]).is_err();
+    let res = f
+        .call(
+            "fs.find",
+            json!({
+                "path": f.p(&root),
+                "ignore": false,
+                "budget_ms": 1,
+            }),
+        )
+        .await;
+
+    // Always restore permissions before asserting so TempDir cleans up cleanly.
+    for sub in &locked_dirs {
+        let _ = std::fs::set_permissions(sub, std::fs::Permissions::from_mode(0o755));
+    }
+
+    if !actually_denied {
+        return;
+    }
+    let val = res.unwrap();
+    // Either completed fast or cut off with `reason: "time"` — never hung or failed.
+    if val["truncated"] == json!(true) {
+        assert_eq!(val["reason"], json!("time"));
+    }
+}
+
+#[tokio::test]
+async fn thumb_blocks_ffmpeg_manifest_playlist_symlink_and_http_attacks() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let has_ffmpeg = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !has_ffmpeg {
+        return;
+    }
+
+    let f = Fixture::new();
+    f.write_config(
+        "policy.toml",
+        r#"
+[principals.jailed]
+role = "jailed"
+
+[roles.jailed]
+allow = ["fs.*"]
+paths = ["~/projects/**"]
+"#,
+    );
+
+    // Create a real secret video outside `~/projects` and a real legitimate video inside.
+    let outside_dir = f.home.join("outside");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    let secret_mp4 = outside_dir.join("secret.mp4");
+    let legit_mp4 = f.work.join("legit.mp4");
+    for (path, color) in [(&secret_mp4, "red"), (&legit_mp4, "blue")] {
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color=c={color}:s=160x90:d=1:r=10"),
+                "-pix_fmt",
+                "yuv420p",
+                path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "ffmpeg fixture failed for {path:?}");
+    }
+
+    // Forward-slash representation works inside manifests/playlists on both Unix and Windows.
+    let secret_fwd = secret_mp4.to_string_lossy().replace('\\', "/");
+    let secret_file_url = if secret_fwd.starts_with('/') {
+        format!("file://{secret_fwd}")
+    } else {
+        format!("file:///{secret_fwd}")
+    };
+
+    // 1. DASH `.mpd` manifest renamed to `.mp4` pointing at the outside secret video.
+    let evil_dash = f.work.join("evil_dash.mp4");
+    std::fs::write(
+        &evil_dash,
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT1S" minBufferTime="PT1S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4">
+      <Representation id="1" bandwidth="100000" width="160" height="90">
+        <BaseURL>{secret_file_url}</BaseURL>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>
+"#
+        ),
+    )
+    .unwrap();
+
+    // 2. `ffconcat` playlist renamed to `.mp4` pointing through a relative symlink (or relative
+    // path on platforms without unprivileged symlinks) to the outside video.
+    let evil_concat_sym = f.work.join("evil_concat_sym.mp4");
+    let concat_rel_target = {
+        #[cfg(unix)]
+        {
+            let link_dir = f.work.join("link_inside");
+            std::os::unix::fs::symlink(&outside_dir, &link_dir).unwrap();
+            "link_inside/secret.mp4".to_owned()
+        }
+        #[cfg(not(unix))]
+        {
+            "../outside/secret.mp4".to_owned()
+        }
+    };
+    std::fs::write(
+        &evil_concat_sym,
+        format!("ffconcat version 1.0\nfile '{concat_rel_target}'\n"),
+    )
+    .unwrap();
+
+    // 3. HLS `.m3u8` playlist renamed to `.mp4` referencing the outside video.
+    let evil_hls = f.work.join("evil_hls.mp4");
+    std::fs::write(
+        &evil_hls,
+        format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXTINF:1.0,\n{secret_fwd}\n#EXT-X-ENDLIST\n"
+        ),
+    )
+    .unwrap();
+
+    // 4. `ffconcat` playlist renamed to `.mp4` naming the absolute path to the outside video.
+    let evil_abs = f.work.join("evil_abs.mp4");
+    std::fs::write(
+        &evil_abs,
+        format!("ffconcat version 1.0\nfile '{secret_fwd}'\n"),
+    )
+    .unwrap();
+
+    // 5. Playlist renamed to `.mp4` referencing an `http://127.0.0.1:<port>/secret.mp4` endpoint.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let http_hit = Arc::new(AtomicBool::new(false));
+    let http_stop = Arc::new(AtomicBool::new(false));
+    let http_hit_srv = Arc::clone(&http_hit);
+    let http_stop_srv = Arc::clone(&http_stop);
+    let server = std::thread::spawn(move || {
+        while !http_stop_srv.load(Ordering::Relaxed) {
+            if listener.accept().is_ok() {
+                http_hit_srv.store(true, Ordering::SeqCst);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let evil_http = f.work.join("evil_http.mp4");
+    std::fs::write(
+        &evil_http,
+        format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXTINF:1.0,\nhttp://{addr}/secret.mp4\n#EXT-X-ENDLIST\n"
+        ),
+    )
+    .unwrap();
+
+    // Sanity check: without our `-format_whitelist` / `-protocol_whitelist`, raw `ffmpeg` WOULD
+    // follow `evil_concat_sym.mp4` on Unix (confirming the attack fixture is genuine and fails
+    // loudly if the restrictions in `fs.thumb` are removed).
+    #[cfg(unix)]
+    {
+        let probe_out = f.dir.path().join("probe_without_whitelist.jpg");
+        let probe_status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                &format!("file:{}", evil_concat_sym.to_string_lossy()),
+                "-frames:v",
+                "1",
+                "-y",
+                probe_out.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            probe_status.success() && probe_out.exists(),
+            "expected unrestricted ffmpeg to follow ffconcat symlink fixture"
+        );
+    }
+
+    // Call `fs.thumb` as the jailed role on all 5 attack files plus the legitimate video.
+    let res = f
+        .call_as(
+            "jailed",
+            "fs.thumb",
+            json!({
+                "paths": [
+                    f.p(&evil_dash),
+                    f.p(&evil_concat_sym),
+                    f.p(&evil_hls),
+                    f.p(&evil_abs),
+                    f.p(&evil_http),
+                    f.p(&legit_mp4),
+                ],
+                "size": 128,
+            }),
+        )
+        .await
+        .unwrap();
+    http_stop.store(true, Ordering::SeqCst);
+    let _ = server.join();
+
+    let items = res["results"].as_array().unwrap();
+    assert_eq!(items.len(), 6);
+    for (idx, label) in [
+        (0, "DASH .mpd renamed to .mp4"),
+        (1, "ffconcat via symlink"),
+        (2, "HLS .m3u8 renamed to .mp4"),
+        (3, "ffconcat with absolute path"),
+        (4, "HLS playlist with http:// URL"),
+    ] {
+        assert!(
+            items[idx].get("ok").is_none(),
+            "{label} must be rejected, got: {}",
+            items[idx]
+        );
+        assert!(
+            items[idx].get("error").is_some(),
+            "{label} must return a per-path error, got: {}",
+            items[idx]
+        );
+    }
+    assert!(
+        !http_hit.load(Ordering::SeqCst),
+        "ffmpeg must never connect to an http:// URL referenced in a playlist"
+    );
+    // Legitimate video inside `~/projects` still succeeds under the strict whitelists.
+    assert!(
+        items[5].get("ok").is_some(),
+        "legitimate mp4 should still thumbnail: {}",
+        items[5]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn jailed_role_refuses_symlink_in_middle_path_component() {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    f.write_config(
+        "policy.toml",
+        r#"
+[principals.jailed]
+role = "jailed"
+
+[roles.jailed]
+allow = ["fs.*"]
+paths = ["~/projects/**"]
+"#,
+    );
+
+    let outside = f.home.join("outside_secret");
+    std::fs::create_dir_all(&outside).unwrap();
+    let secret_pic = outside.join("photo.png");
+    make_rgb_image(128, 128, [220, 40, 40])
+        .save_with_format(&secret_pic, image::ImageFormat::Png)
+        .unwrap();
+
+    // Middle-component symlink inside `~/projects` pointing outside the jail.
+    let mid_link = f.work.join("mid_link");
+    symlink(&outside, &mid_link).unwrap();
+    let escaped_photo = mid_link.join("photo.png");
+
+    let thumb_res = f
+        .call_as(
+            "jailed",
+            "fs.thumb",
+            json!({"paths": [f.p(&escaped_photo)], "size": 128}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        thumb_res["results"][0]["error"]["code"],
+        json!("denied"),
+        "fs.thumb must refuse middle-component symlink: {thumb_res}"
+    );
+
+    let list_err = f
+        .call_as("jailed", "fs.list", json!({"path": f.p(&mid_link)}))
+        .await
+        .unwrap_err();
+    assert_eq!(list_err.code, ErrorCode::Denied);
+
+    let find_err = f
+        .call_as("jailed", "fs.find", json!({"path": f.p(&mid_link)}))
+        .await
+        .unwrap_err();
+    assert_eq!(find_err.code, ErrorCode::Denied);
+}
+
+#[tokio::test]
+async fn thumb_cache_invalidates_on_same_size_same_mtime_rename_swap() {
+    use std::time::{Duration, SystemTime};
+
+    let f = Fixture::new();
+    let target = f.work.join("swapped.bmp");
+    let replacement = f.work.join("replacement.bmp");
+
+    // Two solid-color BMPs of identical dimensions always have the exact same byte length.
+    make_rgb_image(128, 128, [240, 10, 10])
+        .save_with_format(&target, image::ImageFormat::Bmp)
+        .unwrap();
+    make_rgb_image(128, 128, [10, 10, 240])
+        .save_with_format(&replacement, image::ImageFormat::Bmp)
+        .unwrap();
+
+    // Pin both files to the exact same modification timestamp.
+    let fixed_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&target)
+        .unwrap()
+        .set_modified(fixed_mtime)
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(fixed_mtime)
+        .unwrap();
+
+    let meta_before = std::fs::metadata(&target).unwrap();
+
+    // First call caches the red thumbnail.
+    let first = f
+        .call("fs.thumb", json!({"paths": [f.p(&target)], "size": 96}))
+        .await
+        .unwrap();
+    let first_b64 = first["results"][0]["ok"]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let first_img = image::load_from_memory(&BASE64.decode(&first_b64).unwrap())
+        .unwrap()
+        .to_rgb8();
+    let first_px = first_img.get_pixel(48, 48).0;
+    assert!(
+        first_px[0] > 180 && first_px[2] < 60,
+        "expected red: {first_px:?}"
+    );
+
+    // Atomically rename `replacement` (blue) over `target` (red) keeping identical size and mtime.
+    std::fs::rename(&replacement, &target).unwrap();
+    let meta_after = std::fs::metadata(&target).unwrap();
+    assert_eq!(meta_before.len(), meta_after.len());
+    assert_eq!(
+        meta_before.modified().unwrap(),
+        meta_after.modified().unwrap()
+    );
+
+    // Second call MUST miss the cache (different FileId / ctime) and return the blue thumbnail.
+    let second = f
+        .call("fs.thumb", json!({"paths": [f.p(&target)], "size": 96}))
+        .await
+        .unwrap();
+    let second_b64 = second["results"][0]["ok"]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(
+        first_b64, second_b64,
+        "cache returned stale thumbnail after same-size, same-mtime rename swap"
+    );
+    let second_img = image::load_from_memory(&BASE64.decode(&second_b64).unwrap())
+        .unwrap()
+        .to_rgb8();
+    let second_px = second_img.get_pixel(48, 48).0;
+    assert!(
+        second_px[2] > 180 && second_px[0] < 60,
+        "expected blue: {second_px:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn confined_role_does_not_hang_on_fifo_socket_or_device_in_any_fs_tool() {
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    let f = Fixture::new();
+    f.write_config(
+        "policy.toml",
+        r#"
+[principals.jailed]
+role = "jailed"
+
+[roles.jailed]
+allow = ["fs.*"]
+paths = ["~/projects/**"]
+"#,
+    );
+
+    // 1. Named FIFO inside the jailed root (opening it without O_NONBLOCK hangs forever!).
+    let fifo = f.work.join("pipe.png");
+    let mkfifo_status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(mkfifo_status.success(), "mkfifo failed");
+
+    // 2. Unix domain socket inside the jailed root.
+    let sock = f.work.join("sock.png");
+    let _listener = UnixListener::bind(&sock).unwrap();
+
+    // 3. Symlink to `/dev/zero` inside the jailed root.
+    let dev_link = f.work.join("zero.mp4");
+    std::os::unix::fs::symlink("/dev/zero", &dev_link).unwrap();
+
+    let copy_dst = f.work.join("copy_dst.bin");
+    let move_dst = f.work.join("move_dst.bin");
+    let timeout = Duration::from_secs(5);
+
+    for (label, target) in [("fifo", &fifo), ("socket", &sock), ("dev_zero", &dev_link)] {
+        let target_str = f.p(target);
+        let calls = [
+            ("fs.stat", json!({"path": target_str})),
+            ("fs.list", json!({"path": target_str})),
+            ("fs.read", json!({"path": target_str})),
+            ("fs.hash", json!({"path": target_str})),
+            ("fs.write", json!({"path": target_str, "content": "hi"})),
+            (
+                "fs.edit",
+                json!({"path": target_str, "old": "a", "new": "b"}),
+            ),
+            ("fs.mkdir", json!({"path": target_str})),
+            ("fs.copy", json!({"from": target_str, "to": f.p(&copy_dst)})),
+            ("fs.find", json!({"path": target_str})),
+            ("fs.grep", json!({"path": target_str, "pattern": "x"})),
+            ("fs.thumb", json!({"paths": [target_str], "size": 128})),
+        ];
+
+        for (tool, args) in calls {
+            let res = tokio::time::timeout(timeout, f.call_as("jailed", tool, args))
+                .await
+                .unwrap_or_else(|_| panic!("{tool} hung on {label} as jailed role"));
+            match (tool, label, res) {
+                // `fs.stat` succeeds on FIFO/socket (reports kind="other") and on symlink (reports
+                // kind="symlink" or denied for symlink escaping to /dev/zero).
+                ("fs.stat", "fifo" | "socket", Ok(val)) => {
+                    assert_eq!(val["kind"], json!("other"), "{tool} {label}: {val}");
+                }
+                ("fs.stat", "dev_zero", Err(err)) => {
+                    assert_eq!(err.code, ErrorCode::Denied, "{tool} {label}: {err}");
+                }
+                ("fs.thumb", _, Ok(val)) => {
+                    assert!(
+                        val["results"][0].get("error").is_some(),
+                        "fs.thumb must report per-path error on {label}: {val}"
+                    );
+                }
+                (_, _, Err(err)) => {
+                    assert!(
+                        matches!(
+                            err.code,
+                            ErrorCode::InvalidArgs
+                                | ErrorCode::Denied
+                                | ErrorCode::Exists
+                                | ErrorCode::Failed
+                                | ErrorCode::Unsupported
+                        ),
+                        "unexpected error code for {tool} on {label}: {err}"
+                    );
+                }
+                (_, _, Ok(val)) => {
+                    panic!("{tool} unexpectedly succeeded on {label}: {val}");
+                }
+            }
+        }
+    }
+
+    // `fs.move` and `fs.remove` on FIFO (separate so FIFO still exists for the earlier calls).
+    let mv = tokio::time::timeout(
+        timeout,
+        f.call_as(
+            "jailed",
+            "fs.move",
+            json!({"from": f.p(&fifo), "to": f.p(&move_dst)}),
+        ),
+    )
+    .await
+    .expect("fs.move hung on fifo as jailed role");
+    assert!(
+        mv.is_ok(),
+        "fs.move of fifo inside jail should complete: {mv:?}"
+    );
+
+    let rm = tokio::time::timeout(
+        timeout,
+        f.call_as("jailed", "fs.remove", json!({"path": f.p(&move_dst)})),
+    )
+    .await
+    .expect("fs.remove hung on fifo as jailed role");
+    assert!(
+        rm.is_ok(),
+        "fs.remove of fifo inside jail should complete: {rm:?}"
+    );
 }

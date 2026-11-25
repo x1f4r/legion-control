@@ -1102,7 +1102,9 @@ where
         "QT_QPA_PLATFORM",
         "MOZ_ENABLE_WAYLAND",
         "LEGION_HOME",
+        #[cfg(debug_assertions)]
         "LEGION_APP_READY_FILE",
+        #[cfg(debug_assertions)]
         "LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS",
     ];
     const FILTERED_PATH_LISTS: &[&str] =
@@ -1758,7 +1760,9 @@ pub fn stage_and_spawn_windows_nsis(
         "PROCESSOR_ARCHITECTURE",
         "OS",
         "LEGION_HOME",
+        #[cfg(debug_assertions)]
         "LEGION_APP_READY_FILE",
+        #[cfg(debug_assertions)]
         "LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS",
     ];
 
