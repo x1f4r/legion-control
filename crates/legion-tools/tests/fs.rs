@@ -3835,3 +3835,128 @@ async fn thumb_cache_invalidates_on_same_size_same_mtime_rename_swap() {
         "expected blue: {second_px:?}"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn confined_role_does_not_hang_on_fifo_socket_or_device_in_any_fs_tool() {
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    let f = Fixture::new();
+    f.write_config(
+        "policy.toml",
+        r#"
+[principals.jailed]
+role = "jailed"
+
+[roles.jailed]
+allow = ["fs.*"]
+paths = ["~/projects/**"]
+"#,
+    );
+
+    // 1. Named FIFO inside the jailed root (opening it without O_NONBLOCK hangs forever!).
+    let fifo = f.work.join("pipe.png");
+    let mkfifo_status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(mkfifo_status.success(), "mkfifo failed");
+
+    // 2. Unix domain socket inside the jailed root.
+    let sock = f.work.join("sock.png");
+    let _listener = UnixListener::bind(&sock).unwrap();
+
+    // 3. Symlink to `/dev/zero` inside the jailed root.
+    let dev_link = f.work.join("zero.mp4");
+    std::os::unix::fs::symlink("/dev/zero", &dev_link).unwrap();
+
+    let copy_dst = f.work.join("copy_dst.bin");
+    let move_dst = f.work.join("move_dst.bin");
+    let timeout = Duration::from_secs(5);
+
+    for (label, target) in [("fifo", &fifo), ("socket", &sock), ("dev_zero", &dev_link)] {
+        let target_str = f.p(target);
+        let calls = [
+            ("fs.stat", json!({"path": target_str})),
+            ("fs.list", json!({"path": target_str})),
+            ("fs.read", json!({"path": target_str})),
+            ("fs.hash", json!({"path": target_str})),
+            ("fs.write", json!({"path": target_str, "content": "hi"})),
+            (
+                "fs.edit",
+                json!({"path": target_str, "old": "a", "new": "b"}),
+            ),
+            ("fs.mkdir", json!({"path": target_str})),
+            ("fs.copy", json!({"from": target_str, "to": f.p(&copy_dst)})),
+            ("fs.find", json!({"path": target_str})),
+            ("fs.grep", json!({"path": target_str, "pattern": "x"})),
+            ("fs.thumb", json!({"paths": [target_str], "size": 128})),
+        ];
+
+        for (tool, args) in calls {
+            let res = tokio::time::timeout(timeout, f.call_as("jailed", tool, args))
+                .await
+                .unwrap_or_else(|_| panic!("{tool} hung on {label} as jailed role"));
+            match (tool, label, res) {
+                // `fs.stat` succeeds on FIFO/socket (reports kind="other") and on symlink (reports
+                // kind="symlink" or denied for symlink escaping to /dev/zero).
+                ("fs.stat", "fifo" | "socket", Ok(val)) => {
+                    assert_eq!(val["kind"], json!("other"), "{tool} {label}: {val}");
+                }
+                ("fs.stat", "dev_zero", Err(err)) => {
+                    assert_eq!(err.code, ErrorCode::Denied, "{tool} {label}: {err}");
+                }
+                ("fs.thumb", _, Ok(val)) => {
+                    assert!(
+                        val["results"][0].get("error").is_some(),
+                        "fs.thumb must report per-path error on {label}: {val}"
+                    );
+                }
+                (_, _, Err(err)) => {
+                    assert!(
+                        matches!(
+                            err.code,
+                            ErrorCode::InvalidArgs
+                                | ErrorCode::Denied
+                                | ErrorCode::Exists
+                                | ErrorCode::Failed
+                                | ErrorCode::Unsupported
+                        ),
+                        "unexpected error code for {tool} on {label}: {err}"
+                    );
+                }
+                (_, _, Ok(val)) => {
+                    panic!("{tool} unexpectedly succeeded on {label}: {val}");
+                }
+            }
+        }
+    }
+
+    // `fs.move` and `fs.remove` on FIFO (separate so FIFO still exists for the earlier calls).
+    let mv = tokio::time::timeout(
+        timeout,
+        f.call_as(
+            "jailed",
+            "fs.move",
+            json!({"from": f.p(&fifo), "to": f.p(&move_dst)}),
+        ),
+    )
+    .await
+    .expect("fs.move hung on fifo as jailed role");
+    assert!(
+        mv.is_ok(),
+        "fs.move of fifo inside jail should complete: {mv:?}"
+    );
+
+    let rm = tokio::time::timeout(
+        timeout,
+        f.call_as("jailed", "fs.remove", json!({"path": f.p(&move_dst)})),
+    )
+    .await
+    .expect("fs.remove hung on fifo as jailed role");
+    assert!(
+        rm.is_ok(),
+        "fs.remove of fifo inside jail should complete: {rm:?}"
+    );
+}
