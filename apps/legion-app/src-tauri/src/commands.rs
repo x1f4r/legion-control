@@ -178,6 +178,12 @@ pub async fn pair(
     backend.0.pair(invite, resolved_name).await
 }
 
+/// Cancels an in-flight device pairing operation.
+#[tauri::command]
+pub async fn cancel_pair(backend: State<'_, SharedBackend>) -> Result<CancelResult, AppError> {
+    backend.0.cancel_pair().await
+}
+
 /// Removes a paired node from this device and revokes any content tickets issued under it.
 #[tauri::command]
 pub async fn unpair(
@@ -541,6 +547,12 @@ pub struct PublicMediaCheckSpec {
 #[cfg(debug_assertions)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MediaCheckReport {
+    /// Current lifecycle stage (`"pairing"`, `"media"`, `"resume"`, or `"done"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// True once pairing completed (or was not required); false while pairing is in progress or failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_ok: Option<bool>,
     /// True when both the image and video decoded with non-zero dimensions.
     pub ok: bool,
     /// Decoded image natural width in pixels.
@@ -663,13 +675,22 @@ pub fn media_check_report(app: tauri::AppHandle, report: MediaCheckReport) -> Re
         let _ = std::io::stdout().flush();
         #[cfg(target_os = "android")]
         log::info!(target: "legion-app", "{line}");
-    } else {
-        let reason = report.error.as_deref().unwrap_or("unknown error");
-        let line = format!("{MEDIA_CHECK_FAILED_MARKER} ({summary}; error={reason})");
+    } else if let Some(reason) = report.error.as_deref() {
+        let stage = report.stage.as_deref().unwrap_or("unknown");
+        let line =
+            format!("{MEDIA_CHECK_FAILED_MARKER} (stage={stage}; {summary}; error={reason})");
         eprintln!("{line}");
         let _ = std::io::stderr().flush();
         #[cfg(target_os = "android")]
         log::error!(target: "legion-app", "{line}");
+    } else {
+        let stage = report.stage.as_deref().unwrap_or("progress");
+        let pair_ok = report.pair_ok.unwrap_or(false);
+        let line = format!("legion-app: media check progress (stage={stage}; pair_ok={pair_ok})");
+        println!("{line}");
+        let _ = std::io::stdout().flush();
+        #[cfg(target_os = "android")]
+        log::info!(target: "legion-app", "{line}");
     }
 
     if let Some(out_file) = spec.out_file.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -690,10 +711,28 @@ pub fn media_check_report(app: tauri::AppHandle, report: MediaCheckReport) -> Re
                 format!("Could not encode media check report: {err}"),
             )
         })?;
-        fs::write(out_path, format!("{encoded}\n")).map_err(|err| {
+        let tmp_name = format!(
+            ".{}.tmp-{}",
+            out_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("media-result.json"),
+            std::process::id()
+        );
+        let tmp_path = out_path.with_file_name(tmp_name);
+        fs::write(&tmp_path, format!("{encoded}\n")).map_err(|err| {
             AppError::new(
                 ErrorCode::Internal,
                 format!("Could not write media check report: {err}"),
+            )
+        })?;
+        #[cfg(windows)]
+        let _ = fs::remove_file(out_path);
+        fs::rename(&tmp_path, out_path).map_err(|err| {
+            let _ = fs::remove_file(&tmp_path);
+            AppError::new(
+                ErrorCode::Internal,
+                format!("Could not finalize media check report: {err}"),
             )
         })?;
     }

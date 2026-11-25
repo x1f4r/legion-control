@@ -526,6 +526,11 @@ pub trait Backend: Send + Sync {
     /// Enrols this device with a node using a pairing invite and returns the updated state.
     fn pair(&self, invite: String, name: String) -> BoxFuture<'_, Result<AppState, AppError>>;
 
+    /// Cancels any in-flight device pairing operation.
+    fn cancel_pair(&self) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+        Box::pin(async { Ok(CancelResult {}) })
+    }
+
     /// Removes a paired node from this device's local state.
     fn unpair(&self, node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>>;
 

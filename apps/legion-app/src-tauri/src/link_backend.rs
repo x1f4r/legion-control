@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use legion_link::proto::Target;
 use legion_link::{
-    DeviceKey, Invite, Link, LinkConfig, LinkOptions, MachineRouteStatus, NodeLink as LinkNode,
-    NodeOrigin, parse_optional_target, public_key_fingerprint,
+    CancellationToken, DeviceKey, Invite, Link, LinkConfig, LinkOptions, MachineRouteStatus,
+    NodeLink as LinkNode, NodeOrigin, parse_optional_target, public_key_fingerprint,
 };
 use serde_json::Value;
 use tauri::ipc::Channel;
@@ -236,6 +236,21 @@ impl Drop for BackgroundRefreshGuard {
     }
 }
 
+/// RAII guard unregistering an in-flight pairing cancellation token when pairing ends.
+struct ActivePairGuard {
+    active_pairs: Arc<Mutex<Vec<(u64, CancellationToken)>>>,
+    seq: u64,
+}
+
+impl Drop for ActivePairGuard {
+    fn drop(&mut self) {
+        self.active_pairs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(seq, _)| *seq != self.seq);
+    }
+}
+
 /// Production backend implementation over [`legion_link::Link`].
 pub struct LinkBackend {
     store: AppStore,
@@ -244,6 +259,8 @@ pub struct LinkBackend {
     /// and store writes never race.
     mutate_lock: AsyncMutex<()>,
     next_call_seq: AtomicU64,
+    /// In-flight pairing cancellation tokens, cleared via [`ActivePairGuard`] on exit.
+    active_pairs: Arc<Mutex<Vec<(u64, CancellationToken)>>>,
     /// Count of currently active user-started or state-mutating native operations.
     in_flight_ops: Arc<AtomicUsize>,
     /// Tracker for currently active passive non-streaming background refresh calls.
@@ -401,6 +418,7 @@ impl LinkBackend {
             state: Mutex::new(state),
             mutate_lock: AsyncMutex::new(()),
             next_call_seq: AtomicU64::new(1),
+            active_pairs: Arc::new(Mutex::new(Vec::new())),
             in_flight_ops: Arc::new(AtomicUsize::new(0)),
             bg_refreshes: Arc::new(BackgroundRefreshTracker::default()),
         }
@@ -688,6 +706,22 @@ impl Backend for LinkBackend {
         })
     }
 
+    fn cancel_pair(&self) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+        Box::pin(async move {
+            let tokens: Vec<CancellationToken> = self
+                .active_pairs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .map(|(_, tok)| tok.clone())
+                .collect();
+            for token in tokens {
+                token.cancel();
+            }
+            Ok(CancelResult {})
+        })
+    }
+
     fn pair(&self, invite: String, name: String) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async move {
             let _op = self.track_operation();
@@ -702,7 +736,8 @@ impl Backend for LinkBackend {
                 );
             }
 
-            let _parsed = Invite::parse(trimmed_invite).map_err(AppError::from)?;
+            let parsed = Invite::parse(trimmed_invite).map_err(AppError::from)?;
+            let target_node_name = parsed.node.clone();
             let device_label = {
                 let trimmed = name.trim();
                 if trimmed.is_empty() {
@@ -712,7 +747,29 @@ impl Backend for LinkBackend {
                 }
             };
 
-            let _mutation = self.mutate_lock.lock().await;
+            let pair_seq = self.next_call_seq.fetch_add(1, Ordering::Relaxed);
+            let cancel = CancellationToken::new();
+            {
+                self.active_pairs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((pair_seq, cancel.clone()));
+            }
+            let _pair_guard = ActivePairGuard {
+                active_pairs: Arc::clone(&self.active_pairs),
+                seq: pair_seq,
+            };
+
+            let _mutation = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(AppError::new(
+                        ErrorCode::Cancelled,
+                        format!("Pairing with {target_node_name} was cancelled."),
+                    ));
+                }
+                guard = self.mutate_lock.lock() => guard,
+            };
 
             // Ensure this device has a persisted Ed25519 key BEFORE enrolling so a failed store
             // save can never leave a node holding a public key whose private half was lost.
@@ -736,12 +793,19 @@ impl Backend for LinkBackend {
                 guard.link.clone()
             };
 
-            // Enrol in place via `Link::pair`, reusing the persisted device key and keeping any
-            // other live sessions and in-flight calls undisturbed.
+            // Enrol in place via `Link::pair_cancellable`, reusing the persisted device key and
+            // keeping any other live sessions and in-flight calls undisturbed.
             let enrolled = link
-                .pair(trimmed_invite, &device_label)
+                .pair_cancellable(trimmed_invite, &device_label, cancel.clone())
                 .await
                 .map_err(AppError::from)?;
+
+            if cancel.is_cancelled() {
+                return Err(AppError::new(
+                    ErrorCode::Cancelled,
+                    format!("Pairing with {target_node_name} was cancelled."),
+                ));
+            }
 
             let pair_summary = build_pair_summary(&enrolled);
             let node_entry = LinkNode::from(enrolled.clone());
@@ -3434,6 +3498,80 @@ mod tests {
         );
         assert!(fresh_backend.content_target("tower").is_err());
         assert_eq!(fresh_backend.content_target("local")?.link_node, "local");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_pair_stops_waiting_pair_without_persisting_node()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let backend = Arc::new(LinkBackend::with_local_program(store, None));
+
+        // Hold mutate_lock so `pair()` blocks deterministically before network I/O, then call
+        // `cancel_pair()` and verify `pair()` exits promptly with Cancelled and saves nothing.
+        let held = backend.mutate_lock.lock().await;
+        let invite = Invite {
+            v: 1,
+            id: "inv-cancel-1".to_owned(),
+            node: "tower".to_owned(),
+            hosts: vec!["192.0.2.1".to_owned()],
+            port: 22,
+            user: "me".to_owned(),
+            host_keys: vec![
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea"
+                    .to_owned(),
+            ],
+            key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            principal: "device:phone".to_owned(),
+            expires: "2026-11-26T12:00:00Z".to_owned(),
+        }
+        .encode()?;
+
+        let backend_pair = Arc::clone(&backend);
+        let pair_task =
+            tokio::spawn(async move { backend_pair.pair(invite, "phone".to_owned()).await });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let active = backend
+                .active_pairs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len();
+            if active > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            backend
+                .active_pairs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
+            1
+        );
+
+        backend.cancel_pair().await?;
+        let err = pair_task
+            .await?
+            .err()
+            .ok_or("expected pair to return cancelled error")?;
+        drop(held);
+
+        assert_eq!(err.code, ErrorCode::Cancelled);
+        assert_eq!(
+            backend
+                .active_pairs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
+            0
+        );
+        let st = backend.state().await?;
+        assert!(st.nodes.is_empty());
+        assert_eq!(st.needs, Some(Needs::Pairing));
         Ok(())
     }
 }

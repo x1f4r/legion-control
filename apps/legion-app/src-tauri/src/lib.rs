@@ -477,6 +477,7 @@ pub fn run() {
                 commands::call,
                 commands::cancel,
                 commands::pair,
+                commands::cancel_pair,
                 commands::unpair,
                 commands::select_node,
                 commands::repair_store,

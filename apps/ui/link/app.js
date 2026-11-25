@@ -836,6 +836,8 @@ export function createAppLink() {
     };
 
     const report = {
+      stage: spec.invite ? 'pairing' : 'media',
+      pair_ok: !spec.invite,
       ok: false,
       image_width: 0,
       image_height: 0,
@@ -856,16 +858,16 @@ export function createAppLink() {
         const alreadyPaired =
           Array.isArray(current?.nodes) && current.nodes.some((n) => n.node === spec.machine);
         if (!alreadyPaired) {
-          try {
-            await pair(spec.invite, 'ci-media');
-          } catch (pairErr) {
-            if (pairErr?.code !== 'timeout') throw pairErr;
-            // On a cold CI simulator runner, the initial SSH handshake can exceed 10s without
-            // consuming the invite; retry pairing once.
-            await new Promise((r) => window.setTimeout(r, 500));
-            await pair(spec.invite, 'ci-media');
-          }
+          await invoke('media_check_report', {
+            report: { ...report, stage: 'pairing', pair_ok: false },
+          }).catch(() => {});
+          await pair(spec.invite, 'ci-media');
         }
+        report.pair_ok = true;
+        report.stage = 'media';
+        await invoke('media_check_report', {
+          report: { ...report, stage: 'media', pair_ok: true },
+        }).catch(() => {});
       }
 
       const [imgTicket, vidTicket] = await Promise.all([
@@ -906,6 +908,7 @@ export function createAppLink() {
       report.ok = mediaPass;
 
       if (spec.verify_resume && mediaPass) {
+        report.stage = 'resume';
         // Register both native (`tauri://resumed`) and DOM resume listeners and await Tauri
         // listener registration before signaling the simulator harness.
         const resumeWaiter = createAppResumeWaiter();
@@ -925,6 +928,9 @@ export function createAppLink() {
         report.resume_ok =
           imgRes2.width > 0 && imgRes2.height > 0 && vidRes2.width > 0 && vidRes2.height > 0;
         report.ok = mediaPass && report.resume_ok;
+      }
+      if (report.ok) {
+        report.stage = 'done';
       }
     } catch (err) {
       report.ok = false;
@@ -1233,7 +1239,18 @@ export function createAppLink() {
     }
   }
 
-  async function pair(inviteText, name) {
+  async function pair(inviteText, name, options = {}) {
+    const { signal } = options || {};
+    const cancelledError = () => ({
+      code: 'cancelled',
+      message: 'Pairing was cancelled.',
+      hint: null,
+      machine: null,
+      details: null,
+    });
+    if (signal?.aborted) {
+      throw cancelledError();
+    }
     const granted = await ensureLocalNetworkPermission();
     if (!granted) {
       throw {
@@ -1243,6 +1260,15 @@ export function createAppLink() {
         machine: null,
         details: null,
       };
+    }
+    if (signal?.aborted) {
+      throw cancelledError();
+    }
+    const onAbort = () => {
+      invoke('cancel_pair').catch(() => {});
+    };
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
     }
     try {
       const paired = await invoke('pair', { invite: inviteText, name: name || null });
@@ -1254,6 +1280,8 @@ export function createAppLink() {
       };
     } catch (err) {
       throw normalizeError(err);
+    } finally {
+      if (signal) signal.removeEventListener('abort', onAbort);
     }
   }
 

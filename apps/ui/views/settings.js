@@ -164,12 +164,32 @@ function ThisDevicePage({
 
 // ── Connections subpages ─────────────────────────────────────────────────────────────────────
 
+function inviteTargetNode(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed.startsWith('legion-invite-1.')) return '';
+  try {
+    const b64 = trimmed.slice('legion-invite-1.'.length).replace(/-/g, '+').replace(/_/g, '/');
+    const pad = (4 - (b64.length % 4)) % 4;
+    const parsed = JSON.parse(atob(b64 + '='.repeat(pad)));
+    return typeof parsed?.node === 'string' && parsed.node.trim() ? parsed.node.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
 function PairMachineSubpage({ link, linkState, onConnected }) {
   const [invite, setInvite] = useState('');
   const [deviceName, setDeviceName] = useState('');
   const [busy, setBusy] = useState(false);
+  const [pairing, setPairing] = useState(false);
+  const [pairingNode, setPairingNode] = useState('');
   const [error, setError] = useState(null);
+  const pairAbortRef = useRef(null);
   const canScan = linkState?.can_scan !== false;
+
+  useEffect(() => () => {
+    pairAbortRef.current?.abort();
+  }, []);
 
   useEffect(() => {
     if (typeof link.deviceName !== 'function') return;
@@ -185,18 +205,47 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
     };
   }, [link]);
 
+  function cancelPairing() {
+    pairAbortRef.current?.abort();
+  }
+
+  async function runPair(inviteText, { clearInput = false } = {}) {
+    const controller = new AbortController();
+    pairAbortRef.current = controller;
+    setPairingNode(inviteTargetNode(inviteText));
+    setPairing(true);
+    try {
+      const next = await link.pair(inviteText, deviceName.trim() || undefined, {
+        signal: controller.signal,
+      });
+      if (clearInput) setInvite('');
+      window.location.hash = '#/settings/connections';
+      onConnected(next);
+    } catch (err) {
+      if (err?.code !== 'cancelled') {
+        setError(err);
+      }
+    } finally {
+      if (pairAbortRef.current === controller) {
+        pairAbortRef.current = null;
+      }
+      setPairing(false);
+      setPairingNode('');
+    }
+  }
+
   async function onScan() {
     setError(null);
     setBusy(true);
     try {
       const scanned = await link.scanInvite();
       if (scanned) {
-        const next = await link.pair(scanned, deviceName.trim() || undefined);
-        window.location.hash = '#/settings/connections';
-        onConnected(next);
+        await runPair(scanned);
       }
     } catch (err) {
-      setError(err);
+      if (err?.code !== 'cancelled') {
+        setError(err);
+      }
     } finally {
       setBusy(false);
     }
@@ -208,12 +257,7 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
     setError(null);
     setBusy(true);
     try {
-      const next = await link.pair(invite.trim(), deviceName.trim() || undefined);
-      setInvite('');
-      window.location.hash = '#/settings/connections';
-      onConnected(next);
-    } catch (err) {
-      setError(err);
+      await runPair(invite.trim(), { clearInput: true });
     } finally {
       setBusy(false);
     }
@@ -232,8 +276,20 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
           value=${deviceName}
           onInput=${(e) => setDeviceName(e.target.value)}
           placeholder="phone"
+          disabled=${busy}
         />
       </label>
+      ${pairing
+        ? html`
+            <div class="notice" role="status" aria-live="polite">
+              <strong>${pairingNode ? `Pairing with ${pairingNode}…` : 'Pairing…'}</strong>
+              <span>
+                Waiting for ${pairingNode || 'the machine'} to confirm. This can take up to 45
+                seconds on a slow connection.
+              </span>
+            </div>
+          `
+        : null}
       ${error ? html`<${Notice} error=${error} />` : null}
       ${canScan
         ? html`
@@ -251,6 +307,7 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
             value=${invite}
             onInput=${(e) => setInvite(e.target.value)}
             placeholder="Paste the invite line"
+            disabled=${busy}
             required
           ></textarea>
         </label>
@@ -258,6 +315,11 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
           <button type="submit" class=${canScan ? 'btn full' : 'btn primary full'} disabled=${busy}>
             ${busy ? 'Pairing…' : 'Pair machine'}
           </button>
+          ${pairing
+            ? html`
+                <button type="button" class="btn" onClick=${cancelPairing}>Cancel</button>
+              `
+            : null}
         </div>
       </form>
     </div>
