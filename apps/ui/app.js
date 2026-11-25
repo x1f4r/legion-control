@@ -792,6 +792,23 @@ function App() {
       });
   }, [link, mergeBackendState]);
 
+  // Refresh link route and learn-rejection state whenever Settings -> Connections opens so
+  // route changes caused by recent calls or streams (e.g. relay -> direct) appear immediately.
+  useEffect(() => {
+    if (link.kind !== 'app' || typeof link.state !== 'function') return;
+    if (route.section !== 'settings' || route.page !== 'connections') return;
+    let alive = true;
+    link
+      .state()
+      .then((st) => {
+        if (alive && st) mergeBackendState(st);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [link, route.section, route.page, mergeBackendState]);
+
   const checkUpdatesQuietly = useCallback(async () => {
     if (typeof link.checkUpdates !== 'function' || updateCheckInFlightRef.current) return;
     updateCheckInFlightRef.current = true;
