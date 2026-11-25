@@ -516,12 +516,25 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
                 continue;
             }
             let entry_path = entry.path();
-            let (category, mime) = if kind == EntryKind::File {
+            let (mut category, mut mime) = if kind == EntryKind::File {
                 let info = classify_path(entry_path);
                 (Some(info.category), Some(info.mime))
             } else {
                 (None, None)
             };
+            if kind == EntryKind::File
+                && entry_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("ts"))
+                && categories.as_deref().is_none_or(|wanted| {
+                    wanted.contains(&Category::Video) || wanted.contains(&Category::Text)
+                })
+                && super::thumb_probe::is_mpeg_ts_file(entry_path)
+            {
+                category = Some(Category::Video);
+                mime = Some("video/mp2t");
+            }
             if let Some(wanted) = categories.as_deref()
                 && !category.is_some_and(|cat| wanted.contains(&cat))
             {

@@ -15,13 +15,15 @@
 //! - **Protected by state dir**: because the cache lives under `state_dir`, non-admin roles cannot
 //!   read or modify it through `fs.*` tools.
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use legion_core::proto::ErrorBody;
 use legion_os::atomic::{WriteOptions, write_atomic};
 use legion_os::file_id::FileId;
 use legion_os::lock::{FileLock, LockMode};
@@ -33,16 +35,21 @@ use super::thumb::ThumbFit;
 pub(crate) const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 const CACHE_VERSION: &str = "legion-thumb-v2";
+const BAD_CACHE_VERSION: &str = "legion-thumb-bad-v1";
 const ENTRY_MAGIC: &[u8; 4] = b"LGTH";
 const ENTRY_VERSION: u8 = 1;
 const MIME_JPEG_TAG: u8 = 1;
 const MIME_PNG_TAG: u8 = 2;
+const BAD_ENTRY_TAG: u8 = 3;
+const MAX_BAD_ERROR_BYTES: usize = 16 * 1024;
 const ENTRY_HEADER_LEN: usize = 14;
 const LOCK_FILE: &str = "cache.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const RECONCILE_EVERY_PUTS: u64 = 16;
 const DEFAULT_STALE_TMP_AGE: Duration = Duration::from_secs(5 * 60);
+
+static CACHE_INSTANCES: OnceLock<Mutex<HashMap<PathBuf, ThumbCache>>> = OnceLock::new();
 
 /// Decoded/encoded thumbnail payload stored in and retrieved from the cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +116,52 @@ pub(crate) fn cache_key(
     hasher.finalize().to_hex().to_string()
 }
 
+/// Computes the deterministic BLAKE3 key for a negative bad-file cache entry tied to the source
+/// file's identity (independent of target `size` and `fit` so reopening a folder at any size does
+/// not repeatedly spawn and kill a worker on the same hostile/corrupt file).
+pub(crate) fn bad_cache_key(
+    resolved_path: &Path,
+    source_size: u64,
+    mtime_nanos: Option<i128>,
+    file_id: Option<FileId>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(BAD_CACHE_VERSION.as_bytes());
+    let path_bytes = resolved_path.as_os_str().as_encoded_bytes();
+    hasher.update(&(path_bytes.len() as u64).to_le_bytes());
+    hasher.update(path_bytes);
+    hasher.update(&source_size.to_le_bytes());
+    match mtime_nanos {
+        Some(nanos) => {
+            hasher.update(&[1]);
+            hasher.update(&nanos.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    match file_id {
+        Some(id) => {
+            hasher.update(&[1]);
+            hasher.update(&id.volume.to_le_bytes());
+            hasher.update(&id.index.to_le_bytes());
+            match id.change_time {
+                Some(ct) => {
+                    hasher.update(&[1]);
+                    hasher.update(&ct.to_le_bytes());
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            }
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 /// Process-local hints used to avoid rescanning a huge cache directory on every single miss while
 /// still reconciling on startup, periodically, and whenever usage approaches `max_bytes`.
 #[derive(Debug)]
@@ -142,7 +195,18 @@ pub(crate) struct ThumbCache {
 }
 
 impl ThumbCache {
-    /// Opens a cache at `dir` capped at [`MAX_CACHE_BYTES`] (256 MiB).
+    /// Returns the process-wide shared [`ThumbCache`] for `dir` so reconciliation hints persist
+    /// across `fs.thumb` calls instead of rescanning the cache directory on every write.
+    pub(crate) fn for_dir(dir: PathBuf) -> ThumbCache {
+        let map = CACHE_INSTANCES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .entry(dir.clone())
+            .or_insert_with(|| ThumbCache::new(dir))
+            .clone()
+    }
+
+    /// Opens an unshared cache handle at `dir` capped at [`MAX_CACHE_BYTES`] (256 MiB).
     pub(crate) fn new(dir: PathBuf) -> ThumbCache {
         ThumbCache {
             dir,
@@ -178,6 +242,18 @@ impl ThumbCache {
         Some(thumb)
     }
 
+    /// Looks up a cached negative bad-file entry by [`bad_cache_key`], lock-free.
+    pub(crate) fn get_bad(&self, key: &str) -> Option<ErrorBody> {
+        let entry_path = self.entry_path(key);
+        let raw = fs::read(&entry_path).ok()?;
+        let Some(err) = decode_bad_entry(&raw) else {
+            let _ = fs::remove_file(&entry_path);
+            return None;
+        };
+        let _ = self.touch_recency(&entry_path);
+        Some(err)
+    }
+
     /// Stores `thumb` atomically under `key`, then reconciles and evicts least-recently-used
     /// entries when needed so the directory stays within `self.max_bytes` and free of stale
     /// temporaries.
@@ -185,6 +261,20 @@ impl ThumbCache {
         let Some(encoded) = encode_entry(thumb) else {
             return;
         };
+        self.write_encoded(key, &encoded);
+    }
+
+    /// Stores a negative bad-file entry atomically under `key` (sharing the same LRU byte cap and
+    /// reconciliation as positive thumbnail entries) so reopening a folder with a file that killed
+    /// a worker returns the cached per-path error without re-spawning a worker.
+    pub(crate) fn put_bad(&self, key: &str, error: &ErrorBody) {
+        let Some(encoded) = encode_bad_entry(error) else {
+            return;
+        };
+        self.write_encoded(key, &encoded);
+    }
+
+    fn write_encoded(&self, key: &str, encoded: &[u8]) {
         let entry_size = encoded.len() as u64;
         if entry_size > self.max_bytes {
             return;
@@ -193,7 +283,7 @@ impl ThumbCache {
             return;
         }
         let entry_path = self.entry_path(key);
-        if write_atomic(&entry_path, &encoded, WriteOptions::with_mode(0o600)).is_err() {
+        if write_atomic(&entry_path, encoded, WriteOptions::with_mode(0o600)).is_err() {
             return;
         }
         let _ = self.touch_recency(&entry_path);
@@ -411,6 +501,33 @@ fn decode_entry(raw: &[u8]) -> Option<CachedThumb> {
         height,
         bytes: raw[ENTRY_HEADER_LEN..].to_vec(),
     })
+}
+
+fn encode_bad_entry(error: &ErrorBody) -> Option<Vec<u8>> {
+    let payload = serde_json::to_vec(error).ok()?;
+    if payload.is_empty() || payload.len() > MAX_BAD_ERROR_BYTES {
+        return None;
+    }
+    let mut out = Vec::with_capacity(ENTRY_HEADER_LEN + payload.len());
+    out.extend_from_slice(ENTRY_MAGIC);
+    out.push(ENTRY_VERSION);
+    out.push(BAD_ENTRY_TAG);
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&payload);
+    Some(out)
+}
+
+fn decode_bad_entry(raw: &[u8]) -> Option<ErrorBody> {
+    if raw.len() <= ENTRY_HEADER_LEN
+        || raw.len() > ENTRY_HEADER_LEN + MAX_BAD_ERROR_BYTES
+        || &raw[..4] != ENTRY_MAGIC
+        || raw[4] != ENTRY_VERSION
+        || raw[5] != BAD_ENTRY_TAG
+    {
+        return None;
+    }
+    serde_json::from_slice(&raw[ENTRY_HEADER_LEN..]).ok()
 }
 
 /// Creates a throwaway directory for temporary `ffmpeg` frame output inside the cache directory
@@ -712,5 +829,54 @@ mod tests {
             .map(|e| e.metadata().unwrap().len())
             .sum();
         assert!(total <= 4096, "cache exceeded cap: {total}");
+    }
+
+    #[test]
+    fn for_dir_shares_hints_across_calls_for_the_same_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("shared-cache");
+        let a = ThumbCache::for_dir(root.clone());
+        let b = ThumbCache::for_dir(root);
+        assert!(
+            Arc::ptr_eq(&a.hints, &b.hints),
+            "ThumbCache::for_dir must share CacheHints across calls"
+        );
+        let k = cache_key(
+            Path::new("/shared.jpg"),
+            10,
+            Some(1),
+            fid(1, 7, 1),
+            256,
+            ThumbFit::Contain,
+        );
+        a.put(&k, &sample(7, 64));
+        assert!(
+            b.hints.reconciled_once.load(Ordering::Relaxed),
+            "reconciliation state must survive across separate handles"
+        );
+    }
+
+    #[test]
+    fn negative_bad_file_entries_round_trip_and_invalidate_on_identity_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            ThumbCache::with_limits(dir.path().join("bad-cache"), 4096, DEFAULT_STALE_TMP_AGE);
+        let k1 = bad_cache_key(Path::new("/bomb.gif"), 123, Some(500), fid(1, 10, 100));
+        let k2 = bad_cache_key(Path::new("/bomb.gif"), 123, Some(500), fid(1, 11, 100));
+        assert_ne!(k1, k2);
+
+        let err = ErrorBody::new(
+            legion_core::proto::ErrorCode::Failed,
+            "Worker exceeded memory limit.",
+        )
+        .with_hint("File too large.");
+        cache.put_bad(&k1, &err);
+
+        let got = cache.get_bad(&k1).expect("expected cached bad entry");
+        assert_eq!(got.code, err.code);
+        assert_eq!(got.message, err.message);
+        assert_eq!(cache.get_bad(&k2), None);
+        // Positive lookup on the same key must not treat a bad entry as a valid thumbnail.
+        assert_eq!(cache.get(&k1), None);
     }
 }

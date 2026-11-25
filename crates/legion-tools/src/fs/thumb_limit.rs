@@ -15,10 +15,17 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use legion_core::CancellationToken;
 use tokio::sync::Notify;
+
+/// Maximum time a waiting head-of-queue request may be bypassed by smaller requests before the
+/// scheduler holds new admissions so in-flight capacity drains for it.
+const DEFAULT_STARVATION_AGE: Duration = Duration::from_millis(250);
+/// Maximum number of smaller requests allowed to jump ahead of a waiting head-of-queue request
+/// before the scheduler holds new admissions for it.
+const DEFAULT_MAX_BYPASSES: u32 = 4;
 
 /// Computes the image decode in-flight memory budget for this machine:
 /// `min(max_budget, total_ram_bytes / 8)`, clamped below to `per_image_cap` so a single admitted
@@ -47,6 +54,8 @@ pub(crate) enum AcquireError {
 struct Waiter {
     id: u64,
     cost: u64,
+    enqueued_at: Instant,
+    bypasses: u32,
     granted: Arc<AtomicBool>,
     notify: Arc<Notify>,
 }
@@ -64,6 +73,8 @@ struct PoolState {
 pub(crate) struct FairPool {
     max_units: u64,
     max_slots: usize,
+    starvation_age: Duration,
+    max_bypasses: u32,
     next_id: AtomicU64,
     state: Mutex<PoolState>,
 }
@@ -107,9 +118,25 @@ impl FairPool {
     /// Creates a new pool allowing up to `max_units` total units and `max_slots` simultaneous
     /// holders.
     pub(crate) fn new(max_units: u64, max_slots: usize) -> Arc<FairPool> {
+        Self::with_aging(
+            max_units,
+            max_slots,
+            DEFAULT_STARVATION_AGE,
+            DEFAULT_MAX_BYPASSES,
+        )
+    }
+
+    pub(crate) fn with_aging(
+        max_units: u64,
+        max_slots: usize,
+        starvation_age: Duration,
+        max_bypasses: u32,
+    ) -> Arc<FairPool> {
         Arc::new(FairPool {
             max_units: max_units.max(1),
             max_slots: max_slots.max(1),
+            starvation_age,
+            max_bypasses: max_bypasses.max(1),
             next_id: AtomicU64::new(1),
             state: Mutex::new(PoolState {
                 used_units: 0,
@@ -168,6 +195,8 @@ impl FairPool {
                 .push_back(Waiter {
                     id,
                     cost,
+                    enqueued_at: Instant::now(),
+                    bypasses: 0,
                     granted: Arc::clone(&granted),
                     notify: Arc::clone(&notify),
                 });
@@ -271,11 +300,48 @@ impl FairPool {
             if num_principals == 0 {
                 break;
             }
+            let now = Instant::now();
+
+            // Anti-starvation: find the oldest head-of-queue waiter that has been bypassed too
+            // many times or has waited past `starvation_age`. If it fits now, admit it first; if
+            // it cannot fit yet while other work is in flight, hold new admissions so in-flight
+            // capacity drains instead of letting continuous small requests starve it forever.
+            let mut oldest_starving: Option<(usize, Instant, bool)> = None;
+            for (pos, principal) in state.rr_order.iter().enumerate() {
+                if let Some(front) = state.queues.get(principal).and_then(VecDeque::front) {
+                    let starving = front.bypasses >= self.max_bypasses
+                        || now.saturating_duration_since(front.enqueued_at) >= self.starvation_age;
+                    if starving {
+                        let fits = state.used_units.saturating_add(front.cost) <= self.max_units
+                            && state.used_slots.saturating_add(1) <= self.max_slots;
+                        let better = match oldest_starving {
+                            None => true,
+                            Some((_, prev_t, prev_fits)) => {
+                                (fits && !prev_fits)
+                                    || (fits == prev_fits && front.enqueued_at < prev_t)
+                            }
+                        };
+                        if better {
+                            oldest_starving = Some((pos, front.enqueued_at, fits));
+                        }
+                    }
+                }
+            }
+
             let mut chosen_pos: Option<usize> = None;
+            if let Some((starve_pos, _, fits)) = oldest_starving {
+                if fits {
+                    chosen_pos = Some(starve_pos);
+                } else if state.used_units > 0 || state.used_slots > 0 {
+                    // Hold admissions so active permits drain and the starving waiter can run.
+                    break;
+                }
+            }
+
             let multiple_principals = num_principals > 1;
             let last_slot_left = state.used_slots.saturating_add(1) == self.max_slots;
 
-            if multiple_principals && last_slot_left {
+            if chosen_pos.is_none() && multiple_principals && last_slot_left {
                 for (pos, principal) in state.rr_order.iter().enumerate() {
                     if state
                         .active_by_principal
@@ -311,6 +377,20 @@ impl FairPool {
             let Some(pos) = chosen_pos else {
                 break;
             };
+
+            // Charge a bypass to every earlier principal's head waiter that was skipped over so
+            // large waiters age into anti-starvation priority promptly.
+            for skipped_pos in 0..pos {
+                if let Some(skipped_principal) = state.rr_order.get(skipped_pos)
+                    && let Some(front) = state
+                        .queues
+                        .get_mut(skipped_principal)
+                        .and_then(VecDeque::front_mut)
+                {
+                    front.bypasses = front.bypasses.saturating_add(1);
+                }
+            }
+
             let Some(principal) = state.rr_order.remove(pos) else {
                 break;
             };
@@ -544,5 +624,70 @@ mod tests {
             .acquire("carol", 1, Duration::from_secs(1), &hold_cancel)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn aged_large_request_is_not_starved_by_continuous_small_requests() {
+        let pool = FairPool::with_aging(300 * MIB, 8, Duration::from_secs(60), 2);
+        let cancel = CancellationToken::new();
+
+        // Seed 100 MiB in flight so a 250 MiB request cannot fit yet.
+        let initial_small = pool
+            .acquire("alice", 100 * MIB, Duration::from_secs(1), &cancel)
+            .await
+            .unwrap();
+
+        let large_granted = Arc::new(AtomicBool::new(false));
+        let large_pool = Arc::clone(&pool);
+        let large_cancel = cancel.clone();
+        let large_flag = Arc::clone(&large_granted);
+        let large_task = tokio::spawn(async move {
+            let _permit = large_pool
+                .acquire("bob", 250 * MIB, Duration::from_secs(2), &large_cancel)
+                .await
+                .unwrap();
+            large_flag.store(true, Ordering::SeqCst);
+        });
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // First two small requests bypass bob (hitting max_bypasses = 2).
+        let s1 = pool
+            .acquire("alice", 50 * MIB, Duration::from_secs(1), &cancel)
+            .await
+            .unwrap();
+        let s2 = pool
+            .acquire("alice", 50 * MIB, Duration::from_secs(1), &cancel)
+            .await
+            .unwrap();
+
+        // Third small request must be held back so bob is not starved!
+        let small3_done = Arc::new(AtomicBool::new(false));
+        let s3_pool = Arc::clone(&pool);
+        let s3_cancel = cancel.clone();
+        let s3_flag = Arc::clone(&small3_done);
+        let s3_task = tokio::spawn(async move {
+            let _permit = s3_pool
+                .acquire("carol", 50 * MIB, Duration::from_secs(2), &s3_cancel)
+                .await
+                .unwrap();
+            s3_flag.store(true, Ordering::SeqCst);
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !small3_done.load(Ordering::SeqCst),
+            "small request must not keep jumping ahead once large waiter hits anti-starvation threshold"
+        );
+        assert!(!large_granted.load(Ordering::SeqCst));
+
+        // Releasing active small permits lets bob's large request run first, then carol.
+        drop(initial_small);
+        drop(s1);
+        drop(s2);
+        large_task.await.unwrap();
+        assert!(large_granted.load(Ordering::SeqCst));
+        s3_task.await.unwrap();
+        assert!(small3_done.load(Ordering::SeqCst));
     }
 }

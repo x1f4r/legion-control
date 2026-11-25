@@ -373,6 +373,9 @@ mod tests {
             },
             timed_out: false,
             cancelled: false,
+            killed_for_memory: false,
+            peak_rss_bytes: 0,
+            stdout_bytes: Vec::new(),
             duration: Duration::from_millis(5),
         }
     }

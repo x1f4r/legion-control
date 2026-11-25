@@ -6,7 +6,8 @@
 //! and every extracted embedded image must pass the exact same header probe and decode limits as
 //! a top-level file.
 
-use std::io::Cursor;
+use std::fs::{self, File};
+use std::io::{Cursor, Read as _, Seek as _, SeekFrom};
 use std::path::Path;
 
 use image::metadata::Orientation;
@@ -20,6 +21,14 @@ pub(crate) const MAX_IMAGE_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const MAX_IMAGE_DIMENSION: u32 = 65_535;
 /// Hard cap on any single embedded EXIF IFD1 or MPF preview slice (16 MiB).
 pub(crate) const MAX_EMBEDDED_THUMB_BYTES: usize = 16 * 1024 * 1024;
+/// Initial header prefix read before reserving decode capacity from the fair pool (128 KiB).
+pub(crate) const HEADER_PEEK_BYTES: usize = 128 * 1024;
+/// Extended header prefix used only when a JPEG carries >128 KiB of metadata before SOF (512 KiB).
+const MAX_HEADER_PEEK_BYTES: usize = 512 * 1024;
+/// Maximum GIF extension/image blocks scanned while locating the first frame descriptor.
+const MAX_GIF_BLOCKS: usize = 128;
+/// Maximum WebP chunks scanned inside an extended (`VP8X`) or animated (`ANMF`) container.
+const MAX_WEBP_CHUNKS: usize = 64;
 /// Fixed allocator overhead covering decoder tables and small resize buffers (2 MiB).
 const BASE_DECODE_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
 /// Maximum JPEG marker segments scanned before SOS so crafted files cannot spin CPU.
@@ -192,14 +201,32 @@ impl ImageProfile {
 #[derive(Debug)]
 pub(crate) struct JpegScanMeta {
     pub(crate) subtype: Option<ImageSubtype>,
+    pub(crate) max_width: u32,
+    pub(crate) max_height: u32,
     pub(crate) orientation: Orientation,
+    /// True when an EXIF APP1 or MPF APP2 segment was observed in the scanned prefix, even if an
+    /// appended MPF preview starts past the prefix length.
+    pub(crate) saw_embedded_marker: bool,
     /// Validated `(start, end)` byte slices inside the JPEG file, ordered best-first
     /// (largest valid MPF preview first, then EXIF IFD1 thumbnail).
     pub(crate) embedded_thumbs: Vec<(usize, usize)>,
 }
 
+/// Outcome of peeking only the file header before reserving decode capacity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeaderPeek {
+    pub(crate) profile: ImageProfile,
+    /// True when an over-cap JPEG may still carry an embedded EXIF/MPF preview that the worker can
+    /// extract and decode within the 256 MiB cap.
+    pub(crate) may_have_embedded_preview: bool,
+}
+
 /// Estimates peak heap allocation in bytes for decoding an image of `width x height` pixels with
 /// `subtype` and compressed input size `source_bytes`.
+///
+/// Accounts for `2 * source_bytes` because `image::ImageReader::into_decoder` reads the compressed
+/// stream from `Cursor<Vec<u8>>` into the underlying codec's input buffer before dropping the
+/// caller's vector.
 pub(crate) fn estimate_peak_bytes(
     width: u32,
     height: u32,
@@ -209,7 +236,7 @@ pub(crate) fn estimate_peak_bytes(
     let pixels = u64::from(width).saturating_mul(u64::from(height));
     let decode_bytes = pixels.saturating_mul(subtype.bpp_x10()).saturating_add(9) / 10;
     decode_bytes
-        .saturating_add(source_bytes as u64)
+        .saturating_add((source_bytes as u64).saturating_mul(2))
         .saturating_add(BASE_DECODE_OVERHEAD_BYTES)
 }
 
@@ -239,6 +266,16 @@ pub(crate) fn image_limits() -> Limits {
 pub(crate) fn probe_image_profile(
     path: &Path,
     bytes: &[u8],
+) -> Result<(ImageProfile, Option<JpegScanMeta>), ErrorBody> {
+    probe_image_profile_with_source_size(path, bytes, bytes.len())
+}
+
+/// Same as [`probe_image_profile`], but accepts the true compressed `source_bytes` length when
+/// `bytes` is only a header prefix read from disk.
+pub(crate) fn probe_image_profile_with_source_size(
+    path: &Path,
+    bytes: &[u8],
+    source_bytes: usize,
 ) -> Result<(ImageProfile, Option<JpegScanMeta>), ErrorBody> {
     if bytes.is_empty() {
         return Err(ErrorBody::new(
@@ -282,7 +319,7 @@ pub(crate) fn probe_image_profile(
 
     let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
     reader.limits(image_limits());
-    let (w, h) = reader.into_dimensions().map_err(|err| {
+    let (mut w, mut h) = reader.into_dimensions().map_err(|err| {
         ErrorBody::new(
             ErrorCode::Failed,
             format!("Cannot read image header of {}: {err}.", path.display()),
@@ -300,20 +337,35 @@ pub(crate) fn probe_image_profile(
         ));
     }
 
+    // Cross-check container dimensions against every inner frame header so files whose outer
+    // header under-reports dimensions (fake JPEG SOF before real SOF, GIF frame larger than
+    // logical screen, WebP VP8/VP8L/ANMF larger than VP8X canvas) cannot slip past admission.
     let (subtype, jpeg_meta) = match format {
         ImageFormat::Jpeg => {
             let meta = scan_jpeg_metadata(bytes);
+            w = w.max(meta.max_width);
+            h = h.max(meta.max_height);
             let sub = meta.subtype.unwrap_or(ImageSubtype::JpegProgressiveOther);
             (sub, Some(meta))
         }
         ImageFormat::Png => (parse_png_subtype(bytes), None),
-        ImageFormat::Gif => (ImageSubtype::Gif, None),
-        ImageFormat::WebP => (parse_webp_subtype(bytes), None),
+        ImageFormat::Gif => {
+            let (gw, gh) = parse_gif_max_dimensions(bytes);
+            w = w.max(gw);
+            h = h.max(gh);
+            (ImageSubtype::Gif, None)
+        }
+        ImageFormat::WebP => {
+            let (sub, ww, wh) = parse_webp_info(bytes);
+            w = w.max(ww);
+            h = h.max(wh);
+            (sub, None)
+        }
         ImageFormat::Bmp => (ImageSubtype::Bmp, None),
         _ => (ImageSubtype::JpegProgressiveOther, None),
     };
 
-    let estimated_peak_bytes = estimate_peak_bytes(w, h, subtype, bytes.len());
+    let estimated_peak_bytes = estimate_peak_bytes(w, h, subtype, source_bytes);
     Ok((
         ImageProfile {
             format,
@@ -324,6 +376,75 @@ pub(crate) fn probe_image_profile(
         },
         jpeg_meta,
     ))
+}
+
+/// Peeks only the header prefix of an already-opened image file (never loading the full file into
+/// the parent process) and rewinds the file back to byte 0 so it can be handed directly to the
+/// decode worker.
+pub(crate) fn peek_image_file(
+    path: &Path,
+    file: &mut File,
+    file_size: u64,
+) -> Result<HeaderPeek, ErrorBody> {
+    let source_bytes = usize::try_from(file_size).unwrap_or(usize::MAX);
+    let mut prefix = Vec::with_capacity(source_bytes.min(HEADER_PEEK_BYTES));
+    file.take(HEADER_PEEK_BYTES as u64)
+        .read_to_end(&mut prefix)
+        .map_err(|err| super::map_io_error("read", path, err))?;
+
+    let mut probed = probe_image_profile_with_source_size(path, &prefix, source_bytes);
+
+    // Some camera JPEGs carry >128 KiB of XMP/ICC metadata before the first SOF marker. If the
+    // initial 128 KiB prefix was a JPEG that hit EOF before SOF, extend the peek up to 512 KiB
+    // while still never reading multi-megabyte bodies into the parent process.
+    let is_jpeg_magic = prefix.starts_with(&[0xFF, 0xD8]);
+    let need_more_jpeg = is_jpeg_magic
+        && prefix.len() == HEADER_PEEK_BYTES
+        && file_size > HEADER_PEEK_BYTES as u64
+        && (probed.is_err()
+            || matches!(
+                &probed,
+                Ok((_, Some(meta))) if meta.max_width == 0 || meta.max_height == 0
+            ));
+
+    if need_more_jpeg {
+        let extra_cap = (MAX_HEADER_PEEK_BYTES - HEADER_PEEK_BYTES) as u64;
+        file.take(extra_cap)
+            .read_to_end(&mut prefix)
+            .map_err(|err| super::map_io_error("read", path, err))?;
+        probed = probe_image_profile_with_source_size(path, &prefix, source_bytes);
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| super::map_io_error("seek", path, err))?;
+
+    let (profile, jpeg_meta) = match probed {
+        Ok(pair) => pair,
+        // If a large JPEG still has >512 KiB of metadata before SOF, reserve a conservative
+        // budget and let the memory-limited decode worker inspect the full stream.
+        Err(_) if is_jpeg_magic && file_size > prefix.len() as u64 => {
+            let conservative_est =
+                (file_size.saturating_add(64 * 1024 * 1024)).min(MAX_IMAGE_DECODE_BYTES);
+            return Ok(HeaderPeek {
+                profile: ImageProfile {
+                    format: ImageFormat::Jpeg,
+                    subtype: ImageSubtype::JpegProgressiveOther,
+                    width: 1,
+                    height: 1,
+                    estimated_peak_bytes: conservative_est,
+                },
+                may_have_embedded_preview: true,
+            });
+        }
+        Err(err) => return Err(err),
+    };
+
+    let may_have_embedded_preview =
+        jpeg_meta.is_some_and(|meta| meta.saw_embedded_marker || !meta.embedded_thumbs.is_empty());
+    Ok(HeaderPeek {
+        profile,
+        may_have_embedded_preview,
+    })
 }
 
 /// Builds the per-path `too_large` error returned when an image exceeds the 256 MiB decode memory
@@ -380,36 +501,185 @@ fn parse_png_subtype(bytes: &[u8]) -> ImageSubtype {
     }
 }
 
-fn parse_webp_subtype(bytes: &[u8]) -> ImageSubtype {
+fn parse_gif_max_dimensions(bytes: &[u8]) -> (u32, u32) {
+    // GIF87a / GIF89a header (6) + Logical Screen Descriptor (7) = 13 bytes.
+    if bytes.len() < 13 || (&bytes[0..6] != b"GIF87a" && &bytes[0..6] != b"GIF89a") {
+        return (0, 0);
+    }
+    let mut max_w = u32::from(u16::from_le_bytes([bytes[6], bytes[7]]));
+    let mut max_h = u32::from(u16::from_le_bytes([bytes[8], bytes[9]]));
+    let packed = bytes[10];
+    let mut pos = 13usize;
+    if (packed & 0x80) != 0 {
+        let gct_entries = 1usize << ((packed & 0x07) + 1);
+        pos = pos.saturating_add(gct_entries * 3);
+    }
+
+    for _ in 0..MAX_GIF_BLOCKS {
+        let Some(&introducer) = bytes.get(pos) else {
+            break;
+        };
+        match introducer {
+            0x21 => {
+                // Extension block: introducer (1) + label (1) + sub-blocks terminated by 0x00.
+                pos = pos.saturating_add(2);
+                while let Some(&sub_len) = bytes.get(pos) {
+                    pos = pos.saturating_add(1);
+                    if sub_len == 0 {
+                        break;
+                    }
+                    pos = pos.saturating_add(usize::from(sub_len));
+                }
+            }
+            0x2C => {
+                // Image Descriptor: 0x2C + left(2) + top(2) + width(2) + height(2) + packed(1).
+                if let Some(desc) = bytes.get(pos + 1..pos + 10) {
+                    let left = u32::from(u16::from_le_bytes([desc[0], desc[1]]));
+                    let top = u32::from(u16::from_le_bytes([desc[2], desc[3]]));
+                    let fw = u32::from(u16::from_le_bytes([desc[4], desc[5]]));
+                    let fh = u32::from(u16::from_le_bytes([desc[6], desc[7]]));
+                    max_w = max_w.max(fw).max(left.saturating_add(fw));
+                    max_h = max_h.max(fh).max(top.saturating_add(fh));
+                }
+                break;
+            }
+            0x3B => break,
+            _ => break,
+        }
+    }
+    (max_w, max_h)
+}
+
+fn parse_vp8_dims(payload: &[u8]) -> Option<(u32, u32)> {
+    if payload.len() < 10 || payload[3..6] != [0x9D, 0x01, 0x2A] {
+        return None;
+    }
+    let w = u32::from(u16::from_le_bytes([payload[6], payload[7]]) & 0x3FFF);
+    let h = u32::from(u16::from_le_bytes([payload[8], payload[9]]) & 0x3FFF);
+    Some((w, h))
+}
+
+fn parse_vp8l_dims(payload: &[u8]) -> Option<(u32, u32)> {
+    if payload.len() < 5 || payload[0] != 0x2F {
+        return None;
+    }
+    let bits = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    let w = (bits & 0x3FFF) + 1;
+    let h = ((bits >> 14) & 0x3FFF) + 1;
+    Some((w, h))
+}
+
+fn parse_webp_info(bytes: &[u8]) -> (ImageSubtype, u32, u32) {
     // RIFF (4) + size (4) + WEBP (4) + FourCC (4) = 16 bytes.
-    if bytes.len() < 16 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
-        return ImageSubtype::WebpLossless;
+    if bytes.len() < 20 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return (ImageSubtype::WebpLossless, 0, 0);
     }
     match &bytes[12..16] {
-        b"VP8 " => ImageSubtype::WebpLossy,
-        b"VP8L" => ImageSubtype::WebpLossless,
+        b"VP8 " => {
+            let (w, h) = parse_vp8_dims(&bytes[20..]).unwrap_or((0, 0));
+            (ImageSubtype::WebpLossy, w, h)
+        }
+        b"VP8L" => {
+            let (w, h) = parse_vp8l_dims(&bytes[20..]).unwrap_or((0, 0));
+            (ImageSubtype::WebpLossless, w, h)
+        }
         b"VP8X" => {
-            // Extended WebP: flags byte at offset 20 (bit 4 = alpha), followed by sub-chunks at
-            // offset 30. Scan at most 32 chunks for VP8L vs VP8.
+            // Extended WebP: flags byte at offset 20 (bit 4 = alpha), canvas width/height minus 1
+            // as 24-bit LE at offsets 24..30, followed by sub-chunks starting at offset 30.
             let has_alpha = bytes.get(20).is_some_and(|flags| (flags & 0x10) != 0);
+            let mut max_w = bytes
+                .get(24..27)
+                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], 0]) + 1);
+            let mut max_h = bytes
+                .get(27..30)
+                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], 0]) + 1);
+            let mut subtype: Option<ImageSubtype> = None;
+
+            let mut record_sub = |cand: ImageSubtype| {
+                subtype = Some(match subtype {
+                    Some(prev) if prev.bpp_x10() >= cand.bpp_x10() => prev,
+                    _ => cand,
+                });
+            };
+
             let mut pos = 30usize;
-            for _ in 0..32 {
+            for _ in 0..MAX_WEBP_CHUNKS {
                 let Some(header) = bytes.get(pos..pos + 8) else {
                     break;
                 };
                 let fourcc = &header[0..4];
                 let chunk_len =
                     u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-                if fourcc == b"VP8L" {
-                    return ImageSubtype::WebpLossless;
+                let payload_start = pos + 8;
+                let payload_end = payload_start.saturating_add(chunk_len).min(bytes.len());
+                let payload = bytes.get(payload_start..payload_end).unwrap_or(&[]);
+
+                match fourcc {
+                    b"VP8L" => {
+                        if let Some((w, h)) = parse_vp8l_dims(payload) {
+                            max_w = max_w.max(w);
+                            max_h = max_h.max(h);
+                        }
+                        record_sub(ImageSubtype::WebpLossless);
+                    }
+                    b"VP8 " => {
+                        if let Some((w, h)) = parse_vp8_dims(payload) {
+                            max_w = max_w.max(w);
+                            max_h = max_h.max(h);
+                        }
+                        record_sub(if has_alpha {
+                            ImageSubtype::WebpLossyAlpha
+                        } else {
+                            ImageSubtype::WebpLossy
+                        });
+                    }
+                    b"ANMF" if payload.len() >= 16 => {
+                        let fw = u32::from_le_bytes([payload[6], payload[7], payload[8], 0]) + 1;
+                        let fh = u32::from_le_bytes([payload[9], payload[10], payload[11], 0]) + 1;
+                        max_w = max_w.max(fw);
+                        max_h = max_h.max(fh);
+                        let mut sub_pos = 16usize;
+                        for _ in 0..4 {
+                            let Some(sh) = payload.get(sub_pos..sub_pos + 8) else {
+                                break;
+                            };
+                            let s_fcc = &sh[0..4];
+                            let s_len = u32::from_le_bytes([sh[4], sh[5], sh[6], sh[7]]) as usize;
+                            let s_start = sub_pos + 8;
+                            let s_end = s_start.saturating_add(s_len).min(payload.len());
+                            let s_pay = payload.get(s_start..s_end).unwrap_or(&[]);
+                            if s_fcc == b"VP8 " {
+                                if let Some((w, h)) = parse_vp8_dims(s_pay) {
+                                    max_w = max_w.max(w);
+                                    max_h = max_h.max(h);
+                                }
+                                record_sub(if has_alpha {
+                                    ImageSubtype::WebpLossyAlpha
+                                } else {
+                                    ImageSubtype::WebpLossy
+                                });
+                            } else if s_fcc == b"VP8L" {
+                                if let Some((w, h)) = parse_vp8l_dims(s_pay) {
+                                    max_w = max_w.max(w);
+                                    max_h = max_h.max(h);
+                                }
+                                record_sub(ImageSubtype::WebpLossless);
+                            }
+                            let s_pad = s_len.saturating_add(s_len & 1);
+                            let Some(s_next) =
+                                sub_pos.checked_add(8).and_then(|p| p.checked_add(s_pad))
+                            else {
+                                break;
+                            };
+                            if s_next <= sub_pos || s_next > payload.len() {
+                                break;
+                            }
+                            sub_pos = s_next;
+                        }
+                    }
+                    _ => {}
                 }
-                if fourcc == b"VP8 " {
-                    return if has_alpha {
-                        ImageSubtype::WebpLossyAlpha
-                    } else {
-                        ImageSubtype::WebpLossy
-                    };
-                }
+
                 let padded = chunk_len.saturating_add(chunk_len & 1);
                 let Some(next) = pos.checked_add(8).and_then(|p| p.checked_add(padded)) else {
                     break;
@@ -420,19 +690,22 @@ fn parse_webp_subtype(bytes: &[u8]) -> ImageSubtype {
                 pos = next;
             }
             // Unknown VP8X payload: conservatively assume lossless (highest factor).
-            ImageSubtype::WebpLossless
+            (subtype.unwrap_or(ImageSubtype::WebpLossless), max_w, max_h)
         }
-        _ => ImageSubtype::WebpLossless,
+        _ => (ImageSubtype::WebpLossless, 0, 0),
     }
 }
 
-/// Scans JPEG marker segments before `SOS` to determine the frame encoding subtype (baseline vs
-/// progressive, 4:2:0 vs 4:2:2 vs 4:4:4), the main image EXIF orientation, and validated byte
-/// ranges for any embedded MPF preview or EXIF IFD1 thumbnail.
+/// Scans JPEG marker segments before `SOS` to determine the worst-case frame encoding subtype and
+/// dimensions across every SOF segment encountered, the main image EXIF orientation, and validated
+/// byte ranges for any embedded MPF preview or EXIF IFD1 thumbnail.
 pub(crate) fn scan_jpeg_metadata(bytes: &[u8]) -> JpegScanMeta {
     let mut meta = JpegScanMeta {
         subtype: None,
+        max_width: 0,
+        max_height: 0,
         orientation: Orientation::NoTransforms,
+        saw_embedded_marker: false,
         embedded_thumbs: Vec::new(),
     };
     if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
@@ -486,9 +759,16 @@ pub(crate) fn scan_jpeg_metadata(bytes: &[u8]) -> JpegScanMeta {
 
         match marker {
             0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
-                if meta.subtype.is_none() {
-                    meta.subtype = Some(classify_jpeg_sof(marker, payload));
-                }
+                // Take the maximum dimensions and most memory-expensive subtype across ALL SOF
+                // markers before SOS so a tiny decoy SOF hidden behind a malformed marker cannot
+                // mask a real progressive/large SOF that zune-jpeg actually decodes.
+                let (cand, sof_w, sof_h) = parse_jpeg_sof(marker, payload);
+                meta.max_width = meta.max_width.max(sof_w);
+                meta.max_height = meta.max_height.max(sof_h);
+                meta.subtype = Some(match meta.subtype {
+                    Some(prev) if prev.bpp_x10() >= cand.bpp_x10() => prev,
+                    _ => cand,
+                });
             }
             0xE1 => {
                 if payload.starts_with(b"Exif\0\0") && payload.len() > 14 {
@@ -506,11 +786,13 @@ pub(crate) fn scan_jpeg_metadata(bytes: &[u8]) -> JpegScanMeta {
                             .get(s..e)
                             .is_some_and(|sl| sl.starts_with(&[0xFF, 0xD8]))
                     {
+                        meta.saw_embedded_marker = true;
                         exif_thumb = Some((s, e));
                     }
                 }
             }
             0xE2 if payload.starts_with(b"MPF\0") && payload.len() > 12 => {
+                meta.saw_embedded_marker = true;
                 let mpf_tiff_start = payload_start + 4;
                 let mpf_tiff = &payload[4..];
                 collect_mpf_candidates(
@@ -537,30 +819,44 @@ pub(crate) fn scan_jpeg_metadata(bytes: &[u8]) -> JpegScanMeta {
     meta
 }
 
-fn classify_jpeg_sof(marker: u8, payload: &[u8]) -> ImageSubtype {
+fn parse_jpeg_sof(marker: u8, payload: &[u8]) -> (ImageSubtype, u32, u32) {
     let progressive = matches!(marker, 0xC2 | 0xC6 | 0xCA | 0xCE);
     if payload.len() < 6 {
-        return if progressive {
-            ImageSubtype::JpegProgressiveOther
-        } else {
-            ImageSubtype::JpegBaselineOther
-        };
+        return (
+            if progressive {
+                ImageSubtype::JpegProgressiveOther
+            } else {
+                ImageSubtype::JpegBaselineOther
+            },
+            0,
+            0,
+        );
     }
+    let sof_h = u32::from(u16::from_be_bytes([payload[1], payload[2]]));
+    let sof_w = u32::from(u16::from_be_bytes([payload[3], payload[4]]));
     let num_components = usize::from(payload[5]);
     if num_components == 0 || payload.len() < 6 + num_components * 3 {
-        return if progressive {
-            ImageSubtype::JpegProgressiveOther
-        } else {
-            ImageSubtype::JpegBaselineOther
-        };
+        return (
+            if progressive {
+                ImageSubtype::JpegProgressiveOther
+            } else {
+                ImageSubtype::JpegBaselineOther
+            },
+            sof_w,
+            sof_h,
+        );
     }
 
     if num_components == 1 {
-        return if progressive {
-            ImageSubtype::JpegProgressive420
-        } else {
-            ImageSubtype::JpegBaseline420
-        };
+        return (
+            if progressive {
+                ImageSubtype::JpegProgressive420
+            } else {
+                ImageSubtype::JpegBaseline420
+            },
+            sof_w,
+            sof_h,
+        );
     }
     if num_components == 3 {
         let s0 = payload[7];
@@ -570,33 +866,108 @@ fn classify_jpeg_sof(marker: u8, payload: &[u8]) -> ImageSubtype {
         let (h1, v1) = (s1 >> 4, s1 & 0x0F);
         let (h2, v2) = (s2 >> 4, s2 & 0x0F);
         if (h0, v0) == (2, 2) && (h1, v1) == (1, 1) && (h2, v2) == (1, 1) {
-            return if progressive {
-                ImageSubtype::JpegProgressive420
-            } else {
-                ImageSubtype::JpegBaseline420
-            };
+            return (
+                if progressive {
+                    ImageSubtype::JpegProgressive420
+                } else {
+                    ImageSubtype::JpegBaseline420
+                },
+                sof_w,
+                sof_h,
+            );
         }
         if ((h0, v0) == (2, 1) || (h0, v0) == (1, 2)) && (h1, v1) == (1, 1) && (h2, v2) == (1, 1) {
-            return if progressive {
-                ImageSubtype::JpegProgressive422
-            } else {
-                ImageSubtype::JpegBaseline420
-            };
+            return (
+                if progressive {
+                    ImageSubtype::JpegProgressive422
+                } else {
+                    ImageSubtype::JpegBaseline420
+                },
+                sof_w,
+                sof_h,
+            );
         }
         if (h0, v0) == (1, 1) && (h1, v1) == (1, 1) && (h2, v2) == (1, 1) {
-            return if progressive {
-                ImageSubtype::JpegProgressive444
-            } else {
-                ImageSubtype::JpegBaseline444
-            };
+            return (
+                if progressive {
+                    ImageSubtype::JpegProgressive444
+                } else {
+                    ImageSubtype::JpegBaseline444
+                },
+                sof_w,
+                sof_h,
+            );
         }
     }
 
-    if progressive {
-        ImageSubtype::JpegProgressiveOther
-    } else {
-        ImageSubtype::JpegBaselineOther
+    (
+        if progressive {
+            ImageSubtype::JpegProgressiveOther
+        } else {
+            ImageSubtype::JpegBaselineOther
+        },
+        sof_w,
+        sof_h,
+    )
+}
+
+/// Returns `true` when `bytes` looks like an MPEG Transport Stream (188-byte packets starting with
+/// `0x47`, or 192-byte M2TS packets with `0x47` at offset 4) and is not plain UTF-8 source text.
+pub(crate) fn is_mpeg_ts_bytes(bytes: &[u8]) -> bool {
+    if looks_like_text(bytes) {
+        return false;
     }
+    let has_sync_stride = |offset: usize, stride: usize| {
+        if bytes.len() > offset + stride * 3 {
+            bytes[offset] == 0x47
+                && bytes[offset + stride] == 0x47
+                && bytes[offset + stride * 2] == 0x47
+                && bytes[offset + stride * 3] == 0x47
+        } else if bytes.len() > offset + stride {
+            bytes[offset] == 0x47 && bytes[offset + stride] == 0x47
+        } else {
+            false
+        }
+    };
+    has_sync_stride(0, 188) || has_sync_stride(4, 192)
+}
+
+fn looks_like_text(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    if std::str::from_utf8(bytes).is_err() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| matches!(b, b'\t' | b'\n' | b'\r' | 0x20..=0x7E | 0x80..=0xFF))
+}
+
+/// Sniffs whether a regular `.ts` file on disk is an MPEG-TS video recording rather than a
+/// TypeScript source file. Refuses special files before opening so FIFOs/devices cannot block.
+pub(crate) fn is_mpeg_ts_file(path: &Path) -> bool {
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("ts"))
+    {
+        return false;
+    }
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() < 189 {
+        return false;
+    }
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut buf = Vec::with_capacity(1024);
+    if file.take(1024).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    is_mpeg_ts_bytes(&buf)
 }
 
 #[derive(Clone, Copy)]
@@ -998,5 +1369,113 @@ pub(crate) mod tests {
         doc_overlap.extend_from_slice(&tiny_thumb);
         let scanned_ov = scan_jpeg_metadata(&doc_overlap);
         assert_eq!(scanned_ov.embedded_thumbs.len(), 1);
+    }
+
+    #[test]
+    fn lying_jpeg_with_decoy_sof0_before_real_progressive_sof2_is_rejected() {
+        // Reproduces `lie444.jpg`: FF D8, FF D0 00 0F, fake 16x16 1-component SOF0, then a real
+        // 9000x9000 3-component 4:4:4 progressive SOF2.
+        let mut lie = vec![
+            0xFF, 0xD8, 0xFF, 0xD0, 0x00, 0x0F, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00,
+            0x10, 0x01, 0x01, 0x11, 0x00,
+        ];
+        let real = minimal_jpeg_bytes(9000, 9000, true, false);
+        lie.extend_from_slice(&real[2..]);
+
+        let (profile, _) = probe_image_profile(Path::new("/lie444.jpg"), &lie).unwrap();
+        assert_eq!(profile.width, 9000);
+        assert_eq!(profile.height, 9000);
+        assert_eq!(profile.subtype, ImageSubtype::JpegProgressive444);
+        assert!(
+            !profile.fits_cap(),
+            "9000x9000 progressive 4:4:4 behind decoy SOF0 must exceed cap: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn lying_gif_with_tiny_logical_screen_and_huge_first_frame_is_rejected() {
+        // Reproduces `liegif.gif`: 64x64 logical screen + 8000x8000 first frame image descriptor.
+        let mut gif = Vec::new();
+        gif.extend_from_slice(b"GIF89a");
+        gif.extend_from_slice(&64u16.to_le_bytes());
+        gif.extend_from_slice(&64u16.to_le_bytes());
+        gif.extend_from_slice(&[0x80, 0x00, 0x00]); // 2-entry GCT (6 bytes)
+        gif.extend_from_slice(&[0x00; 6]);
+        // Image Descriptor (0x2C): left=0, top=0, w=8000, h=8000, packed=0
+        gif.push(0x2C);
+        gif.extend_from_slice(&0u16.to_le_bytes());
+        gif.extend_from_slice(&0u16.to_le_bytes());
+        gif.extend_from_slice(&8000u16.to_le_bytes());
+        gif.extend_from_slice(&8000u16.to_le_bytes());
+        gif.push(0x00);
+        gif.extend_from_slice(&[0x02, 0x00, 0x3B]);
+
+        let (profile, _) = probe_image_profile(Path::new("/liegif.gif"), &gif).unwrap();
+        assert_eq!(profile.width, 8000);
+        assert_eq!(profile.height, 8000);
+        assert!(
+            !profile.fits_cap(),
+            "8000x8000 GIF frame inside 64x64 logical screen must exceed cap: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn lying_webp_with_tiny_vp8x_canvas_and_huge_vp8_frame_is_rejected() {
+        // Reproduces `liewebp.webp`: 64x64 VP8X canvas wrapping a 12000x12000 VP8 keyframe.
+        let mut vp8 = vec![0x90, 0x01, 0x00, 0x9D, 0x01, 0x2A];
+        vp8.extend_from_slice(&12_000u16.to_le_bytes());
+        vp8.extend_from_slice(&12_000u16.to_le_bytes());
+        vp8.extend_from_slice(&[0u8; 16]);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"WEBP");
+        body.extend_from_slice(b"VP8X");
+        body.extend_from_slice(&10u32.to_le_bytes());
+        body.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // flags
+        body.extend_from_slice(&[63, 0, 0]); // canvas width - 1 = 63 (64 px)
+        body.extend_from_slice(&[63, 0, 0]); // canvas height - 1 = 63 (64 px)
+        body.extend_from_slice(b"VP8 ");
+        body.extend_from_slice(&(vp8.len() as u32).to_le_bytes());
+        body.extend_from_slice(&vp8);
+
+        let mut webp = Vec::new();
+        webp.extend_from_slice(b"RIFF");
+        webp.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        webp.extend_from_slice(&body);
+
+        let (profile, _) = probe_image_profile(Path::new("/liewebp.webp"), &webp).unwrap();
+        assert_eq!(profile.width, 12_000);
+        assert_eq!(profile.height, 12_000);
+        assert!(
+            !profile.fits_cap(),
+            "12000x12000 VP8 frame inside 64x64 VP8X canvas must exceed cap: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn mpeg_ts_sniffer_distinguishes_transport_streams_from_typescript() {
+        // Synthetic 4-packet MPEG-TS stream (188-byte stride starting with 0x47 + binary headers).
+        let mut ts_video = vec![0u8; 188 * 4];
+        for i in 0..4 {
+            ts_video[i * 188] = 0x47;
+            ts_video[i * 188 + 1] = 0x40;
+            ts_video[i * 188 + 2] = 0x00;
+            ts_video[i * 188 + 3] = 0x10;
+        }
+        assert!(is_mpeg_ts_bytes(&ts_video));
+
+        // Real TypeScript source (even starting with 'G' = 0x47!) must never match MPEG-TS.
+        let mut ts_code = String::from("G = 1;\n");
+        while ts_code.len() < 1000 {
+            ts_code.push_str("export const value: number = 42;\n");
+        }
+        assert!(!is_mpeg_ts_bytes(ts_code.as_bytes()));
+
+        // Even a pathological UTF-8 TypeScript file with 'G' placed at offsets 0, 188, 376, 564.
+        let mut crafted_text = vec![b'a'; 800];
+        for i in 0..4 {
+            crafted_text[i * 188] = b'G';
+        }
+        assert!(!is_mpeg_ts_bytes(&crafted_text));
     }
 }
