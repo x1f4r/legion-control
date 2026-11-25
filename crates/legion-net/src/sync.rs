@@ -105,7 +105,7 @@ pub(crate) fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add(SyncTool::<ConfigSetNameArgs, ConfigSetNameResult, _>::new(
         "config.set_name",
         Effect::Admin,
-        "Set `name = \"<name>\"` in this node's `node.toml` when `node.toml` does not exist or omits `name`, keeping every other byte in the file unchanged (preserving a UTF-8 BOM and line endings). When `node.toml` already sets `<name>`, changes nothing. Never writes through symbolic links (refuses with `conflict`, `details.kind = \"linked_config\"`), never overwrites a different explicit `name` (`conflict`, `details.kind = \"name_mismatch\"`), and refuses `caller` equal to `name` (`conflict`). Validates, prepares, and backs up both `projects.toml` and `node.toml` before writing (`projects.toml` first with its own audit entry, `node.toml` last) under lock, moving matching `[projects.<name>.on]` entries to the new name without overwriting existing entries or moving keys whose old name is listed as another machine in this node's own `fleet.toml` (reporting moved entries and conflicts). Atomic replacement requires write permission on the config directory rather than on `node.toml` or `projects.toml` itself, so a read-only regular file in a writable config directory is replaced.",
+        "Set `name = \"<name>\"` in this node's `node.toml` when `node.toml` does not exist or omits `name`, keeping every other byte in the file unchanged (preserving a UTF-8 BOM and line endings). When `node.toml` already sets `<name>`, changes nothing. Never writes through symbolic links (refuses with `conflict`, `details.kind = \"linked_config\"`), never overwrites a different explicit `name` (`conflict`, `details.kind = \"name_mismatch\"`), refuses `caller` equal to `name` (`conflict`), and refuses before writing anything if `fleet.toml` exists but cannot be read or parsed. Validates, prepares, and backs up both `projects.toml` and `node.toml` before writing (`projects.toml` first with its own audit entry, `node.toml` last) under lock, moving matching `[projects.<name>.on]` entries to the new name without overwriting existing entries or moving keys whose old name is listed as another machine in this node's own `fleet.toml` (reporting moved entries and conflicts). Atomic replacement requires write permission on the config directory rather than on `node.toml` or `projects.toml` itself, so a read-only regular file in a writable config directory is replaced.",
         fleet.clone(),
         |fleet, ctx, args| Box::pin(config_set_name(fleet, ctx, args)),
     ));
@@ -1803,13 +1803,27 @@ fn set_local_node_name_with_writer(
     // Never move `projects.toml` keys whose old name is listed in this node's own `fleet.toml` as
     // another machine.
     let fleet_path = config_dir.join(<FleetFile as legion_core::Document>::FILE);
-    let old_name_in_fleet = previous_node != target.as_str()
-        && match read_regular_file(&fleet_path)? {
-            Some(bytes) => parse::<FleetFile>(&fleet_path, &bytes)
-                .ok()
-                .is_some_and(|fleet_file| fleet_file.machines.contains_key(previous_node)),
+    let old_name_in_fleet = if previous_node != target.as_str() {
+        match read_regular_file(&fleet_path)? {
+            Some(bytes) => {
+                let fleet_file = parse::<FleetFile>(&fleet_path, &bytes).map_err(|err| {
+                    ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!(
+                            "Refusing to rename this node to {target} because {} could not be parsed ({}), so Legion cannot tell whether existing entries belong to another machine.",
+                            fleet_path.display(),
+                            err.message.trim_end_matches('.')
+                        ),
+                    )
+                    .with_hint("Fix fleet.toml before renaming this node.")
+                })?;
+                fleet_file.machines.contains_key(previous_node)
+            }
             None => false,
-        };
+        }
+    } else {
+        false
+    };
 
     let planned_projects = plan_projects_migration(
         &projects_path,
@@ -8065,6 +8079,48 @@ removed_on = \"box-a\"
                     .iter()
                     .any(|e| e["tool"] == json!("config.set_name.applied")),
                 "applied audit must not be recorded when node.toml write fails: {audit_entries:?}"
+            );
+        }
+
+        // 5. An unparseable `fleet.toml` refuses `config.set_name` before writing `node.toml`
+        //    or `projects.toml`.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            std::fs::create_dir_all(paths.state_dir()).unwrap();
+            std::fs::write(paths.config_file("fleet.toml"), "[machines.broken\n").unwrap();
+            let orig_node = "[svc]\nsudo = false\n";
+            let orig_proj =
+                format!("[projects.app]\n[projects.app.on]\n{host_name} = \"/work/app\"\n");
+            std::fs::write(paths.config_file("node.toml"), orig_node).unwrap();
+            std::fs::write(paths.config_file("projects.toml"), &orig_proj).unwrap();
+
+            let fleet = Fleet::new(&paths);
+            let mut reg = Registry::new();
+            register(&mut reg, fleet);
+            let node = Node::new(paths.clone(), reg);
+
+            let err = node
+                .call(Call::new(
+                    Door::Cli,
+                    "config.set_name",
+                    json!({"name": target_name}),
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Failed, "{err:?}");
+            assert!(
+                err.message.contains("fleet.toml") && err.message.contains("could not be parsed"),
+                "expected clear sentence naming fleet.toml: {err:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(paths.config_file("node.toml")).unwrap(),
+                orig_node
+            );
+            assert_eq!(
+                std::fs::read_to_string(paths.config_file("projects.toml")).unwrap(),
+                orig_proj
             );
         }
     }
