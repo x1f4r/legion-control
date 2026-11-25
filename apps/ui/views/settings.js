@@ -3,6 +3,7 @@
 
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { CodeText, CopyButton, Notice, QrCode, SwipeRow } from './common.js';
+import { ScrollContainer } from './scroll-container.js';
 import { ToolDetail } from './tools.js';
 import {
   describePlainPermissions,
@@ -1241,6 +1242,7 @@ function ConnectionsPage({
   route,
   link,
   capsStore = null,
+  onRegisterRefresh = null,
   linkState,
   nodeInfo,
   tools,
@@ -1290,6 +1292,11 @@ function ConnectionsPage({
   useEffect(() => {
     loadIncoming();
   }, [canListDevices, connectionsNode, route.sub]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function' || route.sub) return undefined;
+    return onRegisterRefresh(() => loadIncoming());
+  }, [onRegisterRefresh, route.sub, canListDevices, connectionsNode]);
 
   useEffect(() => {
     if (!canListDevices || !connectionsNode) return;
@@ -2119,6 +2126,7 @@ export function SettingsView({
   deviceNoun,
   link,
   capsStore = null,
+  onRegisterRefresh = null,
   linkState,
   nodeInfo,
   tools,
@@ -2268,6 +2276,7 @@ export function SettingsView({
           route=${route}
           link=${link}
           capsStore=${capsStore}
+          onRegisterRefresh=${wide ? null : onRegisterRefresh}
           linkState=${linkState}
           nodeInfo=${nodeInfo}
           tools=${tools}
@@ -2319,10 +2328,12 @@ export function SettingsView({
   if (wide) {
     return html`
       <div class="split">
-        ${indexPane}
-        <section>
+        <${ScrollContainer} as="section">
+          ${indexPane}
+        <//>
+        <${ScrollContainer} as="section">
           <div class="settings-pane">${renderPage(selectedPage)}</div>
-        </section>
+        <//>
       </div>
     `;
   }

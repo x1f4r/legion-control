@@ -336,8 +336,14 @@ textarea {
   grid-area: main;
   min-height: 0;
   overflow-y: auto;
+  overscroll-behavior-y: contain;
+  touch-action: pan-y;
   padding: 4px var(--pad) calc(28px + var(--safe-bottom));
   scrollbar-width: thin;
+}
+
+.scroll-container {
+  overscroll-behavior-y: contain;
 }
 
 .app.docked .main {
@@ -351,6 +357,15 @@ textarea {
 }
 
 .main.command-stream > :first-child {
+  margin-top: auto;
+}
+
+.main.command-stream > .pull-indicator {
+  margin-top: 0;
+  flex: 0 0 auto;
+}
+
+.main.command-stream > .pull-indicator + * {
   margin-top: auto;
 }
 
@@ -381,11 +396,60 @@ textarea {
   margin-top: 8px;
 }
 
-.pull-hint {
-  text-align: center;
+.pull-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 0;
+  opacity: 0;
+  overflow: hidden;
   color: var(--dim);
   font-size: var(--text-small);
-  padding: 4px 0 8px;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.pull-indicator + .label {
+  margin-top: 8px;
+}
+
+.pull-indicator.is-armed {
+  color: var(--accent);
+}
+
+.pull-indicator.is-refreshing {
+  color: var(--dim);
+}
+
+.pull-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  transform: rotate(calc(var(--pull-progress, 0) * 180deg));
+  transition: transform 120ms ease;
+}
+
+.pull-indicator.is-armed .pull-glyph {
+  transform: rotate(180deg);
+}
+
+.pull-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1.8px solid color-mix(in srgb, var(--dim) 28%, transparent);
+  border-top-color: var(--accent);
+  animation: pull-spin 0.75s linear infinite;
+}
+
+@keyframes pull-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .start-column {
@@ -508,6 +572,7 @@ textarea {
     top: 4px;
     max-height: calc(100dvh - 104px);
     overflow-y: auto;
+    overscroll-behavior-y: contain;
     scrollbar-width: thin;
   }
 }
@@ -1887,6 +1952,20 @@ button.row:active {
 
 .row.picked {
   background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.row.just-added,
+.cell.just-added {
+  animation: just-added-fade 1.4s ease-out;
+}
+
+@keyframes just-added-fade {
+  0% {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  100% {
+    background: transparent;
+  }
 }
 
 .row .check {
