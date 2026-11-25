@@ -31,8 +31,8 @@ use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL,
     FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo,
-    FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, MOVE_FILE_FLAGS,
-    MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, REPLACEFILE_IGNORE_ACL_ERRORS,
+    FileIdInfo, GetDiskFreeSpaceExW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    MOVE_FILE_FLAGS, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, REPLACEFILE_IGNORE_ACL_ERRORS,
     REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW, SYNCHRONIZE,
 };
 use windows::Win32::System::Com::{
@@ -703,6 +703,82 @@ pub(crate) fn ntfs_file_change_id(path: &Path) -> Option<u64> {
     }
 
     got_basic.then_some(h)
+}
+
+/// Returns free bytes available to the caller on the volume containing `dir`.
+pub(crate) fn available_space(dir: &Path) -> Result<u64> {
+    let dir_wide = to_wide_null(dir.as_os_str());
+    let mut free_for_caller = 0u64;
+    // SAFETY: `dir_wide` is a NUL-terminated UTF-16 path and `free_for_caller` is a valid stack
+    // `u64` output pointer.
+    unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR::from_raw(dir_wide.as_ptr()),
+            Some(&mut free_for_caller),
+            None,
+            None,
+        )
+    }
+    .map_err(|err| {
+        OsError::from_io(
+            format!("cannot query free space for {}", dir.display()),
+            win32_error_to_io(&err),
+        )
+    })?;
+    Ok(free_for_caller)
+}
+
+fn volume_serial(path: &Path) -> Result<u64> {
+    let path_wide = to_wide_null(path.as_os_str());
+    // SAFETY: `path_wide` is a NUL-terminated UTF-16 path; handle is wrapped in OwnedHandle.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(path_wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    }
+    .map_err(|err| {
+        OsError::from_io(
+            format!("cannot inspect volume for {}", path.display()),
+            win32_error_to_io(&err),
+        )
+    })?;
+    let owned = OwnedHandle(handle);
+
+    let mut file_id = FILE_ID_INFO::default();
+    // SAFETY: `file_id` is a properly sized out-buffer for `FileIdInfo`.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            owned.0,
+            FileIdInfo,
+            (&mut file_id as *mut FILE_ID_INFO).cast::<c_void>(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .is_ok()
+    {
+        return Ok(file_id.VolumeSerialNumber);
+    }
+
+    let mut by_handle = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `by_handle` is a properly sized out-buffer for `GetFileInformationByHandle`.
+    unsafe { GetFileInformationByHandle(owned.0, &mut by_handle) }.map_err(|err| {
+        OsError::from_io(
+            format!("cannot query volume serial for {}", path.display()),
+            win32_error_to_io(&err),
+        )
+    })?;
+    Ok(u64::from(by_handle.dwVolumeSerialNumber))
+}
+
+/// Returns `true` when existing directories `a` and `b` reside on the same Windows volume.
+pub(crate) fn same_device(a: &Path, b: &Path) -> Result<bool> {
+    Ok(volume_serial(a)? == volume_serial(b)?)
 }
 
 fn open_non_inheritable_nul(access: u32) -> Result<OwnedHandle> {

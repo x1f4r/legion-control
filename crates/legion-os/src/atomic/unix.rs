@@ -94,6 +94,19 @@ pub(super) fn file_change_id(_path: &Path, meta: &Metadata) -> Option<u64> {
     Some(h)
 }
 
+pub(super) fn available_space(dir: &Path) -> Result<u64> {
+    exclusive_rename::available_space(dir)
+}
+
+pub(super) fn same_device(a: &Path, b: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let ma = fs::metadata(a)
+        .map_err(|err| OsError::from_io(format!("cannot stat {}", a.display()), err))?;
+    let mb = fs::metadata(b)
+        .map_err(|err| OsError::from_io(format!("cannot stat {}", b.display()), err))?;
+    Ok(ma.dev() == mb.dev())
+}
+
 #[allow(unsafe_code)]
 mod exclusive_rename {
     use std::ffi::CString;
@@ -261,6 +274,32 @@ mod exclusive_rename {
         _to: &Path,
     ) -> std::result::Result<(), ExclusiveRenameError> {
         Err(ExclusiveRenameError::Unsupported)
+    }
+
+    pub(super) fn available_space(dir: &Path) -> crate::Result<u64> {
+        let dir_c = CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+            crate::OsError::InvalidArgument {
+                detail: format!("path contains interior NUL byte: {}", dir.display()),
+            }
+        })?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `dir_c` is a valid NUL-terminated C string and `stat` is a valid writable
+        // `libc::statvfs` struct.
+        let rc = unsafe { libc::statvfs(dir_c.as_ptr(), &mut stat) };
+        if rc != 0 {
+            return Err(crate::OsError::from_io(
+                format!("statvfs failed for {}", dir.display()),
+                io::Error::last_os_error(),
+            ));
+        }
+        #[allow(clippy::unnecessary_cast)]
+        let unit = if stat.f_frsize > 0 {
+            stat.f_frsize as u64
+        } else {
+            stat.f_bsize as u64
+        };
+        #[allow(clippy::unnecessary_cast)]
+        Ok((stat.f_bavail as u64).saturating_mul(unit))
     }
 }
 

@@ -322,6 +322,57 @@ pub fn file_change_id(path: impl AsRef<Path>, meta: &Metadata) -> Option<u64> {
     file_change_id_impl(path.as_ref(), meta)
 }
 
+/// Returns the available free space in bytes for the filesystem containing `path` (or its nearest
+/// existing ancestor directory), respecting per-user quotas where the OS reports them.
+pub fn available_space(path: impl AsRef<Path>) -> Result<u64> {
+    let target = nearest_existing_dir(path.as_ref())?;
+    available_space_impl(&target)
+}
+
+/// Returns `true` when `a` and `b` (resolved to their nearest existing ancestor directories)
+/// reside on the same filesystem / volume so atomic renames between them do not fail with
+/// cross-device errors (`EXDEV` / `ERROR_NOT_SAME_DEVICE`).
+pub fn same_device(a: impl AsRef<Path>, b: impl AsRef<Path>) -> Result<bool> {
+    let dir_a = nearest_existing_dir(a.as_ref())?;
+    let dir_b = nearest_existing_dir(b.as_ref())?;
+    same_device_impl(&dir_a, &dir_b)
+}
+
+fn nearest_existing_dir(path: &Path) -> Result<PathBuf> {
+    let mut cur = path;
+    loop {
+        match fs::metadata(cur) {
+            Ok(meta) if meta.is_dir() => return Ok(cur.to_path_buf()),
+            Ok(_) => {
+                if let Some(parent) = cur.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    return Ok(parent.to_path_buf());
+                }
+                return Ok(PathBuf::from("."));
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = cur.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    cur = parent;
+                    continue;
+                }
+                return Err(OsError::from_io(
+                    format!("cannot locate existing ancestor for {}", path.display()),
+                    err,
+                ));
+            }
+            Err(err) => {
+                return Err(OsError::from_io(
+                    format!("cannot inspect {}", cur.display()),
+                    err,
+                ));
+            }
+        }
+    }
+}
+
 /// RAII guard that unlinks the temporary sibling file unless [`TempFileGuard::disarm`] is called.
 struct TempFileGuard {
     path: PathBuf,
@@ -598,6 +649,28 @@ fn file_change_id_impl(path: &Path, meta: &Metadata) -> Option<u64> {
 #[cfg(not(any(unix, windows)))]
 fn file_change_id_impl(_path: &Path, _meta: &Metadata) -> Option<u64> {
     None
+}
+
+#[cfg(any(unix, windows))]
+fn available_space_impl(dir: &Path) -> Result<u64> {
+    platform::available_space(dir)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn available_space_impl(_dir: &Path) -> Result<u64> {
+    Err(OsError::Unsupported {
+        detail: "available_space is not supported on this platform".to_string(),
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn same_device_impl(a: &Path, b: &Path) -> Result<bool> {
+    platform::same_device(a, b)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_device_impl(_a: &Path, _b: &Path) -> Result<bool> {
+    Ok(true)
 }
 
 fn create_sibling_temp(

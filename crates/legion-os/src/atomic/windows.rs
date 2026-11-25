@@ -141,4 +141,12 @@ pub(super) fn file_change_id(path: &Path, _meta: &Metadata) -> Option<u64> {
     win_proc::ntfs_file_change_id(path)
 }
 
+pub(super) fn available_space(dir: &Path) -> Result<u64> {
+    win_proc::available_space(dir)
+}
+
+pub(super) fn same_device(a: &Path, b: &Path) -> Result<bool> {
+    win_proc::same_device(a, b)
+}
+
 pub(super) fn sync_parent_dir(_parent: &Path) {}
