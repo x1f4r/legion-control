@@ -152,10 +152,13 @@ function runResumeScript(envSetup, { frontmostTimeout = 5, waitSecs = 1, extraAr
   );
 }
 
-test('ios-sim-resume.sh has valid bash syntax and is wired into legion-app.yml', () => {
+test('ios-sim-resume.sh has valid bash syntax and is wired into legion-app.yml via ios-sim-check.sh', () => {
   execFileSync('bash', ['-n', SCRIPT], { encoding: 'utf8' });
   const workflow = fs.readFileSync(WORKFLOW, 'utf8');
-  assert.match(workflow, /bash scripts\/ios-sim-resume\.sh/);
+  const checkScript = fs.readFileSync(path.join(REPO_ROOT, 'scripts', 'ios-sim-check.sh'), 'utf8');
+  assert.match(workflow, /'scripts\/ios-sim-resume\.sh'/);
+  assert.match(workflow, /bash scripts\/ios-sim-check\.sh/);
+  assert.match(checkScript, /ios-sim-resume\.sh/);
   assert.doesNotMatch(workflow, /com\.apple\.Preferences[^\n]*\n\s*sleep 3\n\s*xcrun simctl launch/);
 });
 
