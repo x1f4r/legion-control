@@ -292,6 +292,7 @@ class TransferForegroundService : Service() {
         .setSmallIcon(R.mipmap.ic_launcher)
         .setContentTitle(title)
         .setContentText(name)
+        .setGroup("legion_complete_$requestCode")
         .setAutoCancel(true)
         .setContentIntent(pending)
         .build()

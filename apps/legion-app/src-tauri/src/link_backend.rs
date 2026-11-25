@@ -121,6 +121,7 @@ struct BackendState {
     local_program: Option<String>,
     /// Observed real node name (`hello.node` / `meta.whoami.node`) of the implicit desktop `local`
     /// pipe so content and transfer requests naming that machine resolve cleanly to `local`.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     local_node_name: Option<String>,
     active_node: Option<String>,
     /// Expiring route preference for door-level discovery reads when the user's preferred node is
@@ -150,6 +151,7 @@ impl BackendState {
     }
 
     fn sync_pairing_epochs(&mut self) {
+        #[allow(unused_mut)]
         let mut live: Vec<String> = self
             .data
             .link
@@ -246,13 +248,12 @@ impl LinkBackend {
         } else {
             None
         };
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        let initial_local_node_name: Option<String> = None;
 
         let mut state = BackendState {
             data,
             store_error,
             local_program,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_node_name: initial_local_node_name,
             active_node,
             preferred_relay: None,
@@ -1362,13 +1363,12 @@ fn read_local_node_name_hint() -> Option<String> {
         PathBuf::from(xdg).join("legion").join("node.toml")
     } else if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
         PathBuf::from(appdata).join("legion").join("node.toml")
-    } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+    } else {
+        let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
         PathBuf::from(home)
             .join(".config")
             .join("legion")
             .join("node.toml")
-    } else {
-        return None;
     };
     let text = std::fs::read_to_string(candidate).ok()?;
     for line in text.lines() {

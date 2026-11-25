@@ -427,23 +427,36 @@ impl AppContentServer {
         // full URI (`http://legion-content.localhost/...`). Enforce that the URI authority is
         // strictly our custom scheme host with no port or userinfo, and supply Host only if absent
         // so any mismatched explicit Host header is rejected by HostOriginGuard.
-        let authority_ok = uri
-            .authority()
-            .is_some_and(|a| a.as_str().eq_ignore_ascii_case(CUSTOM_SCHEME_HOST));
-        if !authority_ok {
+        let canonical_host = match (
+            uri.scheme_str().map(str::to_ascii_lowercase).as_deref(),
+            uri.authority().map(|a| a.as_str()),
+        ) {
+            // `wry` on Android rewrites `http://legion-content.localhost/...` to
+            // `legion-content://localhost/...` before invoking the custom-scheme handler.
+            (Some(CUSTOM_SCHEME_NAME), Some(auth)) if auth.eq_ignore_ascii_case("localhost") => {
+                Some("localhost")
+            }
+            (Some("http" | "https"), Some(auth))
+                if auth.eq_ignore_ascii_case(CUSTOM_SCHEME_HOST) =>
+            {
+                Some(CUSTOM_SCHEME_HOST)
+            }
+            _ => None,
+        };
+        let Some(expected_host) = canonical_host else {
             return collect_bounded_response(
                 guard_error_response(GuardRejection::MisdirectedHost, CorpPolicy::CrossOrigin),
                 MAX_CUSTOM_SCHEME_BODY_BYTES,
             )
             .await;
-        }
+        };
         if !headers.contains_key(HOST) {
-            headers.insert(HOST, HeaderValue::from_static(CUSTOM_SCHEME_HOST));
+            headers.insert(HOST, HeaderValue::from_static(expected_host));
         }
 
         let guard = HostOriginGuard {
             port: 0,
-            allowed_hosts: vec![CUSTOM_SCHEME_HOST.to_owned()],
+            allowed_hosts: vec![expected_host.to_owned()],
             allowed_origins: self.allowed_origins.clone(),
             allow_same_origin: false,
         };
@@ -721,7 +734,7 @@ impl AppContentServer {
         #[cfg(target_os = "android")]
         log::info!(
             target: "legion-content",
-            "{} {} range={} -> {} content-range={} len={}",
+            "legion-content: {} {} range={} -> {} content-range={} len={}",
             method.as_str(),
             file_name,
             range.as_deref().unwrap_or("none"),
@@ -1430,6 +1443,23 @@ mod tests {
             )
         );
 
+        // Android `wry` rewrites `http://legion-content.localhost/...` into
+        // `legion-content://localhost/...` before calling the custom-scheme handler.
+        let wry_rewritten = minted.url.replacen(
+            "http://legion-content.localhost",
+            "legion-content://localhost",
+            1,
+        );
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&wry_rewritten)
+            .header(RANGE, "bytes=0-1023")
+            .body(Vec::new())
+            .unwrap();
+        let resp = server.handle_custom_scheme(req).await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.body().len(), 1024);
+
         // Origin: null and evil origins are refused with 403.
         for bad_origin in ["null", "https://evil.example"] {
             let req = Request::builder()
@@ -1443,12 +1473,22 @@ mod tests {
         }
 
         // Wrong URI authority / Host spoofing is refused with 421.
-        let spoof = Request::builder()
-            .method(Method::GET)
-            .uri("http://evil.example/v1/content/abc/video.webm")
-            .body(Vec::new())
-            .unwrap();
-        let resp = server.handle_custom_scheme(spoof).await;
-        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+        for bad_uri in [
+            "http://evil.example/v1/content/abc/video.webm",
+            "legion-content://evil.example/v1/content/abc/video.webm",
+            "legion-content://localhost:8080/v1/content/abc/video.webm",
+        ] {
+            let spoof = Request::builder()
+                .method(Method::GET)
+                .uri(bad_uri)
+                .body(Vec::new())
+                .unwrap();
+            let resp = server.handle_custom_scheme(spoof).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "uri={bad_uri}"
+            );
+        }
     }
 }

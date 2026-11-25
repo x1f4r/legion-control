@@ -51,8 +51,9 @@ const COPY_BUF_BYTES: usize = 64 * 1024;
 /// Minimum interval between progress broadcasts sent to the UI over IPC channels.
 const UI_PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Minimum interval between progress updates pushed to the platform notification layer.
-const NOTIFY_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
+/// Minimum interval between progress updates pushed to the platform notification layer (1 Hz
+/// matches Android `NotificationManager` rate limits while keeping progress bars smooth).
+const NOTIFY_PROGRESS_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// How long a single transfer keeps retrying transient network drops without making progress
 /// before surfacing `failed` (enough to ride through a 20+ second `sshd` restart or brief

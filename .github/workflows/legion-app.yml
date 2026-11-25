@@ -165,7 +165,7 @@ jobs:
           node scripts/ci-media-fixture.mjs ssh --work "$MEDIA_WORK" --legion "$LEGION_BIN" --host 10.0.2.2 --no-out-file >/dev/null
           mkdir -p ci-shots/android
           adb install -r "$APK"
-          adb shell run-as com.x1f4r.legion.debug sh -c 'mkdir -p files && cat > files/media-check.json' < "$MEDIA_WORK/media-check.json"
+          adb shell "run-as com.x1f4r.legion.debug tee media-check.json >/dev/null" < "$MEDIA_WORK/media-check.json"
           adb logcat -c
           adb shell cmd uimode night yes
           adb shell am start -W -n com.x1f4r.legion.debug/com.x1f4r.legion.MainActivity
