@@ -95,6 +95,14 @@ fn main() -> ExitCode {
             fleet_tools_list_ping_add_remove_and_discover_permissions,
         ),
         (
+            "node_name_mismatch_detected_in_ping_list_doctor_and_device_forwards",
+            node_name_mismatch_detected_in_ping_list_doctor_and_device_forwards,
+        ),
+        (
+            "fleet_sync_repairs_host_derived_name_and_refuses_explicit_and_older_nodes",
+            fleet_sync_repairs_host_derived_name_and_refuses_explicit_and_older_nodes,
+        ),
+        (
             "pipe_handle_drop_is_non_blocking_and_kills_lingering_child",
             pipe_handle_drop_is_non_blocking_and_kills_lingering_child,
         ),
@@ -475,6 +483,102 @@ fn run_helper(args: &[String]) -> ExitCode {
                                     }
                                 }
                             })
+                        }
+                    }
+                    _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                };
+                writeln!(stdout, "{reply}").unwrap();
+                stdout.flush().unwrap();
+            }
+            ExitCode::SUCCESS
+        }
+        // older-node <reported_name> <call_log>
+        // Simulates an older node whose `hello` and `meta.version` omit `node_explicit` and which
+        // does not offer `config.set_name`.
+        "older-node" => {
+            let reported = &rest[0];
+            let call_log = Path::new(&rest[1]);
+            let mut stdout = std::io::stdout().lock();
+            for line in BufReader::new(std::io::stdin()).lines() {
+                let Ok(line) = line else { break };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let reply = match req["method"].as_str().unwrap_or_default() {
+                    "hello" => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "node": reported,
+                            "version": "0.1.0",
+                            "protocol": 1,
+                            "os": std::env::consts::OS,
+                            "arch": std::env::consts::ARCH,
+                            "systems": []
+                        }
+                    }),
+                    "call" => {
+                        let tool = req["params"]["tool"].as_str().unwrap_or_default();
+                        append_line(call_log, tool);
+                        match tool {
+                            "meta.version" => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "name": "legion",
+                                    "version": "0.1.0",
+                                    "install": "standalone",
+                                    "protocol": 1,
+                                    "node": reported,
+                                    "os": std::env::consts::OS,
+                                    "arch": std::env::consts::ARCH
+                                }
+                            }),
+                            "config.list" => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {"documents": []}
+                            }),
+                            "config.read" => {
+                                let doc = req["params"]["args"]["document"]
+                                    .as_str()
+                                    .unwrap_or_default();
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {
+                                        "document": doc,
+                                        "exists": false,
+                                        "hash": null,
+                                        "content": null
+                                    }
+                                })
+                            }
+                            "device.endpoint" => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "node": reported,
+                                    "hosts": ["legacy.example"],
+                                    "port": 22,
+                                    "user": "me",
+                                    "host_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]
+                                }
+                            }),
+                            _ => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32000,
+                                    "message": format!("There is no tool called {tool} on {reported}."),
+                                    "data": {
+                                        "code": "unknown_tool",
+                                        "message": format!("There is no tool called {tool} on {reported}."),
+                                        "machine": reported
+                                    }
+                                }
+                            }),
                         }
                     }
                     _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
@@ -1840,6 +1944,491 @@ allow = ["effect:read"]
             "{expected} lost during concurrent fleet.add: {listed_names:?}"
         );
     }
+}
+
+fn write_test_host_key(home: &Home) -> PathBuf {
+    let key_path = home.home().join("ssh_host_ed25519_key.pub");
+    fs::write(
+        &key_path,
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA host@example\n",
+    )
+    .unwrap();
+    key_path
+}
+
+fn node_name_mismatch_detected_in_ping_list_doctor_and_device_forwards() {
+    let tower = Home::new();
+    let studio = Home::new();
+    let explicit_box = Home::new();
+    let pi = Home::new();
+    let relay = Home::new();
+
+    let tower_key = write_test_host_key(&tower);
+    let studio_key = write_test_host_key(&studio);
+    let explicit_key = write_test_host_key(&explicit_box);
+    let studio_auth_keys = studio.home().join("authorized_keys");
+
+    // Pick a fleet name guaranteed not to equal this test runner's own host-derived name.
+    let host_derived = legion_core::config::NodeName::from_host().to_string();
+    let studio_fleet_name = if host_derived == "studio" {
+        "studio-peer"
+    } else {
+        "studio"
+    };
+
+    tower.write_config(
+        "node.toml",
+        &format!(
+            "name = \"tower\"\n[devices]\nhosts = [\"tower.example\"]\nhost_keys = [{}]\nuser = \"me\"\n",
+            serde_json::to_string(&tower_key.to_string_lossy().as_ref()).unwrap(),
+        ),
+    );
+    // `studio` has NO `name` in `node.toml`, so its name is host-derived.
+    studio.write_config(
+        "node.toml",
+        &format!(
+            "[devices]\nauthorized_keys = {}\nhosts = [\"studio.example\"]\nhost_keys = [{}]\nuser = \"me\"\n",
+            serde_json::to_string(&studio_auth_keys.to_string_lossy().as_ref()).unwrap(),
+            serde_json::to_string(&studio_key.to_string_lossy().as_ref()).unwrap(),
+        ),
+    );
+    explicit_box.write_config(
+        "node.toml",
+        &format!(
+            "name = \"someones-laptop\"\n[devices]\nhosts = [\"other.example\"]\nhost_keys = [{}]\nuser = \"me\"\n",
+            serde_json::to_string(&explicit_key.to_string_lossy().as_ref()).unwrap(),
+        ),
+    );
+    pi.write_config("node.toml", "name = \"pi\"\n");
+    relay.write_config("node.toml", "name = \"relay\"\n");
+
+    relay.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.behind]\ncommand = {}\n",
+            toml_argv(&run_argv(&explicit_box, None)),
+        ),
+    );
+    tower.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.{studio_fleet_name}]\ncommand = {}\n\n[machines.explicit-box]\ncommand = {}\n\n[machines.pi]\ncommand = {}\n\n[machines.relay]\ncommand = {}\n\n[machines.behind]\nvia = \"relay\"\n",
+            toml_argv(&run_argv(&studio, None)),
+            toml_argv(&run_argv(&explicit_box, None)),
+            toml_argv(&run_argv(&pi, None)),
+            toml_argv(&run_argv(&relay, None)),
+        ),
+    );
+
+    // 1. `fleet.ping` reports `name_mismatch` per machine (including relayed peers) and omits it when matching.
+    let ping = tower.run(&["fleet.ping"]);
+    assert_eq!(ping.code, 0, "{}", ping.stdout);
+    let results = ping.json()["results"].as_array().unwrap().clone();
+    let by_machine = |name: &str| {
+        results
+            .iter()
+            .find(|r| r["machine"] == json!(name))
+            .unwrap_or_else(|| panic!("missing {name} in {results:?}"))
+            .clone()
+    };
+
+    let studio_ping = by_machine(studio_fleet_name);
+    assert_eq!(studio_ping["reachable"], json!(true));
+    assert_eq!(studio_ping["node"], json!(host_derived));
+    assert_eq!(
+        studio_ping["name_mismatch"],
+        json!({"reported": host_derived, "explicit": false}),
+        "{studio_ping}"
+    );
+
+    let explicit_ping = by_machine("explicit-box");
+    assert_eq!(explicit_ping["reachable"], json!(true));
+    assert_eq!(
+        explicit_ping["name_mismatch"],
+        json!({"reported": "someones-laptop", "explicit": true}),
+        "{explicit_ping}"
+    );
+
+    let behind_ping = by_machine("behind");
+    assert_eq!(behind_ping["reachable"], json!(true));
+    assert_eq!(
+        behind_ping["name_mismatch"],
+        json!({"reported": "someones-laptop", "explicit": true}),
+        "{behind_ping}"
+    );
+
+    let pi_ping = by_machine("pi");
+    assert_eq!(pi_ping["reachable"], json!(true));
+    assert!(
+        pi_ping.get("name_mismatch").is_none(),
+        "matching machine must omit name_mismatch: {pi_ping}"
+    );
+
+    // 2. `fleet.list` reports the cached mismatch per machine without making network calls and omits it when matching.
+    let listed = tower.run(&["fleet.list"]);
+    assert_eq!(listed.code, 0, "{}", listed.stdout);
+    let machines = listed.json()["machines"].as_array().unwrap().clone();
+    let listed_by = |name: &str| {
+        machines
+            .iter()
+            .find(|m| m["name"] == json!(name))
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        listed_by(studio_fleet_name)["name_mismatch"],
+        json!({"reported": host_derived, "explicit": false})
+    );
+    assert_eq!(
+        listed_by("explicit-box")["name_mismatch"],
+        json!({"reported": "someones-laptop", "explicit": true})
+    );
+    assert!(listed_by("pi").get("name_mismatch").is_none());
+
+    // 3. Forwarded `device.endpoint` refuses mismatched machines with `name_mismatch`, the exact sentence, and a `fleet.sync` hint.
+    let ep_direct = tower.run(&["device.endpoint", "--on", "explicit-box"]);
+    assert_eq!(ep_direct.code, 1, "{}", ep_direct.stdout);
+    let err = ep_direct.json();
+    assert_eq!(err["code"], json!("name_mismatch"), "{err}");
+    assert_eq!(
+        err["message"],
+        json!("explicit-box calls itself someones-laptop."),
+        "{err}"
+    );
+    assert!(
+        err["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("fleet.sync")),
+        "{err}"
+    );
+    assert_eq!(err["machine"], json!("explicit-box"), "{err}");
+
+    // Relayed `device.endpoint` also refuses with `name_mismatch`.
+    let ep_relayed = tower.run(&["device.endpoint", "--on", "behind"]);
+    assert_eq!(ep_relayed.code, 1, "{}", ep_relayed.stdout);
+    let rel_err = ep_relayed.json();
+    assert_eq!(rel_err["code"], json!("name_mismatch"), "{rel_err}");
+    assert_eq!(
+        rel_err["message"],
+        json!("behind calls itself someones-laptop."),
+        "{rel_err}"
+    );
+    assert!(
+        rel_err["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("fleet.sync")),
+        "{rel_err}"
+    );
+
+    // Fan-out `device.endpoint --on all` keeps tower's own endpoint while returning `name_mismatch` for studio.
+    let ep_all = tower.run(&["device.endpoint", "--on", "all"]);
+    assert_eq!(ep_all.code, 0, "{}", ep_all.stdout);
+    let all_res = &ep_all.json()["results"];
+    assert_eq!(all_res["tower"]["ok"]["node"], json!("tower"), "{all_res}");
+    assert_eq!(
+        all_res[studio_fleet_name]["error"]["code"],
+        json!("name_mismatch"),
+        "{all_res}"
+    );
+    assert_eq!(
+        all_res[studio_fleet_name]["error"]["message"],
+        json!(format!("{studio_fleet_name} calls itself {host_derived}.")),
+        "{all_res}"
+    );
+
+    // 4. Forwarded `device.invite` refuses a mismatched machine BEFORE touching its `authorized_keys`.
+    let inv = tower.run(&[
+        "device.invite",
+        "name=pixel",
+        "role=observer",
+        "--on",
+        studio_fleet_name,
+    ]);
+    assert_eq!(inv.code, 1, "{}", inv.stdout);
+    assert_eq!(inv.json()["code"], json!("name_mismatch"), "{}", inv.stdout);
+    assert!(
+        !studio_auth_keys.exists(),
+        "refused device.invite must not write authorized_keys on remote"
+    );
+
+    // 5. `meta.doctor` on a node whose own name is not in its non-empty `fleet.toml` reports the problem.
+    studio.write_config(
+        "fleet.toml",
+        &format!("[machines.tower]\nssh = \"tower.example\"\n[machines.{studio_fleet_name}]\nssh = \"studio.example\"\n"),
+    );
+    let doc_bad = studio.run(&["meta.doctor", "quick=true"]);
+    assert_eq!(doc_bad.code, 0, "{}", doc_bad.stdout);
+    let bad_checks = doc_bad.json()["checks"].as_array().unwrap().clone();
+    let self_check = bad_checks
+        .iter()
+        .find(|c| c["name"] == json!("node name in fleet"))
+        .unwrap_or_else(|| panic!("expected `node name in fleet` check: {bad_checks:?}"));
+    assert_eq!(self_check["warning"], json!(true), "{self_check}");
+    assert!(
+        self_check["detail"]
+            .as_str()
+            .unwrap()
+            .contains(&host_derived),
+        "{self_check}"
+    );
+    assert!(
+        self_check["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("fleet.sync")),
+        "{self_check}"
+    );
+
+    // Once `studio` has `name = "<studio_fleet_name>"` in `node.toml`, the self-check clears.
+    let mut fixed_node = format!("name = \"{studio_fleet_name}\"\n");
+    fixed_node.push_str(
+        &fs::read_to_string(legion_home_of(&studio).join("config").join("node.toml")).unwrap(),
+    );
+    studio.write_config("node.toml", &fixed_node);
+    let doc_ok = studio.run(&["meta.doctor", "quick=true"]);
+    assert_eq!(doc_ok.code, 0, "{}", doc_ok.stdout);
+    assert!(
+        !doc_ok.json()["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == json!("node name in fleet")),
+        "self-check must disappear once node name is in fleet.toml"
+    );
+
+    // 6. `meta.doctor` on `tower` warns about mismatched peers from `fleet.ping`.
+    let tower_doc = tower.run(&["meta.doctor"]);
+    assert_eq!(tower_doc.code, 0, "{}", tower_doc.stdout);
+    let explicit_doc_check = tower_doc.json()["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == json!("fleet: explicit-box"))
+        .unwrap()
+        .clone();
+    assert_eq!(explicit_doc_check["warning"], json!(true));
+    assert!(
+        explicit_doc_check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("explicit-box calls itself someones-laptop"),
+        "{explicit_doc_check}"
+    );
+}
+
+fn fleet_sync_repairs_host_derived_name_and_refuses_explicit_and_older_nodes() {
+    let tower = Home::new();
+    let studio = Home::new();
+    let fixed = Home::new();
+    let legacy_log = tower.home().join("legacy-calls.log");
+
+    let host_derived = legion_core::config::NodeName::from_host().to_string();
+    let studio_fleet_name = if host_derived == "studio" {
+        "studio-peer"
+    } else {
+        "studio"
+    };
+    let studio_key = write_test_host_key(&studio);
+    let original_studio_node_toml = format!(
+        "# machine-local comment kept verbatim\n[svc]\nsudo = true\n\n[devices]\nhosts = [\"studio.example\"]\nhost_keys = [{}]\nuser = \"me\"\n",
+        serde_json::to_string(&studio_key.to_string_lossy().as_ref()).unwrap(),
+    );
+    let original_fixed_node_toml =
+        "# explicitly named\nname = \"someones-laptop\"\n[svc]\nsudo = false\n";
+
+    tower.write_config("node.toml", "name = \"tower\"\n");
+    tower.write_config(
+        "policy.toml",
+        "[principals.viewer]\nrole = \"observer\"\n[roles.observer]\nallow = [\"effect:read\"]\n",
+    );
+    studio.write_config("node.toml", &original_studio_node_toml);
+    fixed.write_config("node.toml", original_fixed_node_toml);
+
+    let legacy_argv = helper_argv(
+        "older-node",
+        &[
+            "someones-laptop".to_owned(),
+            legacy_log.to_string_lossy().into_owned(),
+        ],
+    );
+    tower.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.{studio_fleet_name}]\ncommand = {}\n\n[machines.fixed]\ncommand = {}\n\n[machines.legacy]\ncommand = {}\n",
+            toml_argv(&run_argv(&studio, None)),
+            toml_argv(&run_argv(&fixed, None)),
+            toml_argv(&legacy_argv),
+        ),
+    );
+
+    let studio_node_path = legion_home_of(&studio).join("config").join("node.toml");
+    let fixed_node_path = legion_home_of(&fixed).join("config").join("node.toml");
+
+    // 1. `fleet.sync direction=status` reports all three mismatches without modifying anything.
+    let status = tower.run(&["fleet.sync", "direction=status"]);
+    assert_eq!(status.code, 0, "{}", status.stdout);
+    let st_names = &status.json()["node_names"];
+    assert_eq!(
+        st_names[studio_fleet_name]["status"],
+        json!("name_mismatch")
+    );
+    assert_eq!(st_names[studio_fleet_name]["source"], json!("host"));
+    assert_eq!(st_names["fixed"]["status"], json!("name_mismatch"));
+    assert_eq!(st_names["fixed"]["source"], json!("explicit"));
+    assert_eq!(st_names["legacy"]["status"], json!("name_mismatch"));
+    assert_eq!(st_names["legacy"]["source"], json!("unknown"));
+    assert_eq!(
+        fs::read_to_string(&studio_node_path).unwrap(),
+        original_studio_node_toml
+    );
+
+    // 2. `fleet.sync direction=push dry_run=true` previews setting `studio` without writing anything.
+    let dry = tower.run(&["fleet.sync", "direction=push", "dry_run=true"]);
+    assert_eq!(dry.code, 0, "{}", dry.stdout);
+    assert_eq!(
+        dry.json()["node_names"][studio_fleet_name]["status"],
+        json!("set")
+    );
+    assert_eq!(
+        dry.json()["node_names"]["fixed"]["status"],
+        json!("name_mismatch")
+    );
+    assert_eq!(
+        dry.json()["node_names"]["legacy"]["status"],
+        json!("name_mismatch")
+    );
+    assert_eq!(
+        fs::read_to_string(&studio_node_path).unwrap(),
+        original_studio_node_toml
+    );
+
+    // 3. `fleet.sync direction=push` sets `studio`'s host-derived name (preserving other bytes verbatim),
+    //    and leaves `fixed` (explicit) and `legacy` (older/unknown) untouched.
+    let push = tower.run(&["fleet.sync", "direction=push"]);
+    assert_eq!(push.code, 0, "{}", push.stdout);
+    let push_names = &push.json()["node_names"];
+    assert_eq!(
+        push_names[studio_fleet_name]["status"],
+        json!("set"),
+        "{push_names}"
+    );
+    assert_eq!(
+        push_names[studio_fleet_name]["source"],
+        json!("host"),
+        "{push_names}"
+    );
+    assert!(
+        push_names[studio_fleet_name]["backup"].is_string(),
+        "{push_names}"
+    );
+    assert_eq!(
+        fs::read_to_string(&studio_node_path).unwrap(),
+        format!("name = \"{studio_fleet_name}\"\n{original_studio_node_toml}")
+    );
+
+    assert_eq!(
+        push_names["fixed"]["status"],
+        json!("name_mismatch"),
+        "{push_names}"
+    );
+    assert_eq!(
+        push_names["fixed"]["source"],
+        json!("explicit"),
+        "{push_names}"
+    );
+    assert_eq!(
+        push_names["fixed"]["error"]["code"],
+        json!("name_mismatch"),
+        "{push_names}"
+    );
+    assert_eq!(
+        fs::read_to_string(&fixed_node_path).unwrap(),
+        original_fixed_node_toml
+    );
+
+    assert_eq!(
+        push_names["legacy"]["status"],
+        json!("name_mismatch"),
+        "{push_names}"
+    );
+    assert_eq!(
+        push_names["legacy"]["source"],
+        json!("unknown"),
+        "{push_names}"
+    );
+    let legacy_calls = fs::read_to_string(&legacy_log).unwrap_or_default();
+    assert!(
+        !legacy_calls.contains("config.set_name"),
+        "older node must never receive config.set_name: {legacy_calls}"
+    );
+
+    // 4. After sync, `studio` answers under its fleet name, `fleet.list` clears its mismatch,
+    //    `device.endpoint --on studio` succeeds, and `fleet.sync` omits `node_names` for `studio`.
+    let listed = tower.run(&["fleet.list"]);
+    assert_eq!(listed.code, 0, "{}", listed.stdout);
+    let listed_machines = listed.json()["machines"].as_array().unwrap().clone();
+    let studio_listed = listed_machines
+        .iter()
+        .find(|m| m["name"] == json!(studio_fleet_name))
+        .unwrap();
+    assert!(
+        studio_listed.get("name_mismatch").is_none(),
+        "repaired machine must clear name_mismatch in fleet.list: {studio_listed}"
+    );
+    let legacy_listed = listed_machines
+        .iter()
+        .find(|m| m["name"] == json!("legacy"))
+        .unwrap();
+    assert_eq!(
+        legacy_listed["name_mismatch"],
+        json!({"reported": "someones-laptop"}),
+        "older node mismatch omits explicit: {legacy_listed}"
+    );
+
+    let ep_ok = tower.run(&["device.endpoint", "--on", studio_fleet_name]);
+    assert_eq!(ep_ok.code, 0, "{}", ep_ok.stdout);
+    assert_eq!(ep_ok.json()["node"], json!(studio_fleet_name));
+
+    let ep_legacy = tower.run(&["device.endpoint", "--on", "legacy"]);
+    assert_eq!(ep_legacy.code, 1, "{}", ep_legacy.stdout);
+    assert_eq!(ep_legacy.json()["code"], json!("name_mismatch"));
+    assert_eq!(
+        ep_legacy.json()["message"],
+        json!("legacy calls itself someones-laptop.")
+    );
+
+    let status_after = tower.run(&[
+        "fleet.sync",
+        "direction=status",
+        &format!("machines=[\"{studio_fleet_name}\"]"),
+    ]);
+    assert_eq!(status_after.code, 0, "{}", status_after.stdout);
+    assert!(
+        status_after.json().get("node_names").is_none(),
+        "matching machine must omit node_names: {}",
+        status_after.stdout
+    );
+
+    // 5. Direct `config.set_name` refusals: explicit mismatch and non-admin caller.
+    let refused_explicit = tower.run(&["config.set_name", "name=fixed", "--on", "fixed"]);
+    assert_eq!(refused_explicit.code, 1, "{}", refused_explicit.stdout);
+    assert_eq!(refused_explicit.json()["code"], json!("name_mismatch"));
+    assert_eq!(
+        fs::read_to_string(&fixed_node_path).unwrap(),
+        original_fixed_node_toml
+    );
+
+    let idempotent = tower.run(&[
+        "config.set_name",
+        &format!("name={studio_fleet_name}"),
+        "--on",
+        studio_fleet_name,
+    ]);
+    assert_eq!(idempotent.code, 0, "{}", idempotent.stdout);
+    assert_eq!(idempotent.json()["changed"], json!(false));
+
+    let refused_role = tower.run(&["config.set_name", "name=tower", "--as", "viewer"]);
+    assert_eq!(refused_role.code, 1, "{}", refused_role.stdout);
+    assert_eq!(refused_role.json()["code"], json!("denied"));
 }
 
 #[cfg(unix)]

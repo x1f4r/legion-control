@@ -64,7 +64,7 @@ next
   - Check that everything is configured and reachable with `legion meta.doctor`.
 ```
 
-List the tools built into the binary (82 tools across 16 families, plus any local extensions):
+List the tools built into the binary (83 tools across 16 families, plus any local extensions):
 
 ```sh
 legion tools
@@ -120,7 +120,10 @@ duration_ms       0
 ```
 
 Add a second machine to `fleet.toml` (replace `pi` with any host or alias `ssh` accepts) and check
-that it answers:
+that it answers. Each machine carries the name the fleet gives it: `fleet.install` writes
+`name = "<machine>"` into `node.toml` when missing or unset, `fleet.sync direction=push` repairs
+host-derived mismatches automatically while leaving explicit different names untouched and reporting
+`name_mismatch`, and `fleet.list`, `fleet.ping`, and `meta.doctor` surface any remaining mismatch:
 
 ```sh
 legion fleet.add name=pi ssh=pi
@@ -224,7 +227,7 @@ accounts.
 | --- | --- |
 | [Getting started](getting-started.md) | Installing on Linux, macOS, and Windows; first run; file locations (`LEGION_HOME`); adding machines, dual-boot systems, and `via` relays; troubleshooting real errors. |
 | [Permissions](permissions.md) | Principals, roles, rules, effects, `paths`, protected secret locations, how each door pins a principal, audit logging and redaction, and worked `policy.toml` recipes. |
-| [AI agents](agents.md) | `legion mcp` (compact and full mode), `legion agents add`, operating rules for agents, the 13 error codes, and adding extension tools safely. |
+| [AI agents](agents.md) | `legion mcp` (compact and full mode), `legion agents add`, operating rules for agents, the 14 error codes, and adding extension tools safely. |
 | [Guides](guides.md) | Task walk-throughs: file transfer, long jobs, projects, services, power and wake, device pairing, the HTTP door, extension tools, configuration sync, and updates. |
 | [Tool reference](tools.md) | Generated reference of every built-in tool, its effect, and its input schema. |
 | [Design](design.md) | Architecture, workspace crates, wire and stream protocols, platform rules, and milestones. |

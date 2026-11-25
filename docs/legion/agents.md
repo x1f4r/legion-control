@@ -158,7 +158,7 @@ Drop `--dry-run` to execute it. Common flags:
 
 ## Error codes
 
-Every door uses the same closed set of 13 error codes:
+Every door uses the same closed set of 14 error codes:
 
 | Code | Meaning | What to do |
 | --- | --- | --- |
@@ -167,6 +167,7 @@ Every door uses the same closed set of 13 error codes:
 | `not_found` | The named file, machine, job, project, service, token, or boot target does not exist. | Check the name (`fs.list`, `fleet.list`, `job.list`, `proj.list`, `svc.list`, `power.status`) and fix or create it. |
 | `exists` | The resource already exists (for example `ext.define` without `replace=true` or duplicate token name). | Choose a new name, or pass the tool's explicit replace/overwrite flag if intended. |
 | `conflict` | State changed since you last read it (`expect_hash` mismatch, `job.start` `key` reused with different arguments, `svc.*` name in both user and system scope, or `fleet.sync` divergence). | Re-read current state, disambiguate (`scope`), or inspect the diff before deciding whether to force. |
+| `name_mismatch` | The machine answered under a different node name than its name in `fleet.toml` (for example a host-derived name that was never written to `node.toml`, or a different explicit `name`). | Run `fleet.sync direction=push` to set a host-derived name, or align `name` in `node.toml` with `fleet.toml`. |
 | `denied` | Policy refused the principal, tool, path, or action on this node or a forwarding node. | Do not retry the same call. Check `meta.whoami`, adjust the path to an allowed root, or ask the owner to update `policy.toml`. |
 | `unreachable` | The target machine could not be reached or its session dropped mid-call. | Check `fleet.ping` or wake the machine (`power.wake`). Only retry idempotent calls or calls with a `key`. |
 | `timeout` | The command, probe, or wait exceeded its time limit. | Increase `timeout_s` if appropriate, or switch to `job.start` + `job.wait`. |

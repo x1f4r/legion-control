@@ -1309,7 +1309,16 @@ requiring `effect:admin`, built on `config.list`, `config.read`, and `config.wri
   `direction=push` sends local entries to peers and imports **only tombstones** back (never live
   peer entries), whereas `direction=pull from=<peer>` imports live devices from that named peer
   without writing back. `meta.doctor` warns if any reachable peer has a different `devices.toml`.
-- **Machine-local (never synced)**: `node.toml` and `tokens.toml`.
+- **Machine-local (never synced as whole files)**: `node.toml` and `tokens.toml`. However,
+  `fleet.sync` checks each machine's reported node name against its name in `fleet.toml`: when a
+  machine's name differs and is host-derived (no explicit `name` in `node.toml`), `direction=push`
+  writes `name = "<fleet name>"` via `config.set_name` (keeping all other bytes in `node.toml`
+  verbatim and saving a backup) and records the update in `node_names`. When a machine has a
+  different explicit `name` in `node.toml` — or is an older node that does not report whether its
+  name is explicit — `fleet.sync` leaves `node.toml` untouched and reports `name_mismatch` in
+  `node_names`. `fleet.list`, `fleet.ping`, and `meta.doctor` also flag name mismatches (including
+  when a node's own name is absent from a non-empty `fleet.toml`), and forwarded `device.endpoint`
+  and `device.invite` calls refuse mismatched nodes with `name_mismatch`.
 
 Inspect differences with `direction=status` (reporting per-document status `same`, `only_here`,
 `only_there`, `changed_here`, `changed_there`, or `both`):
@@ -1429,9 +1438,11 @@ the staged file, and save a one-generation `<exe>.prev` backup beside the destin
   uses an unsigned self-built binary you vouch for with `from=<local file>`, checks the downgrade
   floor and binary header locally, copies to a random temporary file over `scp`, runs `--version`
   preflight on the remote host before saving `<dest>.prev` and moving it into place, and opens a
-  fresh `legion rpc` session to confirm the installed version (reporting its `build` when present).
-  If the new session fails or reports a different version, `fleet.install` restores `<dest>.prev`
-  automatically.
+  fresh `legion rpc` session to confirm the installed version (reporting its `build` when present),
+  and writes `name = "<machine>"` to the target's `node.toml` when missing or unset (keeping every
+  other byte verbatim; a different explicit `name` is left untouched and reported in `problems`
+  without failing the install). If the new session fails or reports a different version,
+  `fleet.install` restores `<dest>.prev` automatically.
 
 ### Publishing a release (owner procedure)
 

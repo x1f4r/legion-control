@@ -312,8 +312,11 @@ Rosetta 2, and x86-64 under emulation on Windows ARM64 with a note), downloads t
 binary given with `from=/path/to/legion`), verifies the offline Ed25519 signature against the
 compiled-in public key and checks SHA-256, checks the downgrade floor, checks the binary format
 header, stages and runs `--version` on the remote host before saving a `.prev` backup and swapping
-into place, and opens a new `legion rpc` session (restoring `.prev` automatically if verification
-fails).
+into place, opens a new `legion rpc` session (restoring `.prev` automatically if verification
+fails), and writes `name = "<machine>"` into the target's `node.toml` when missing or unset
+(preserving every other byte in `node.toml`). If `node.toml` already sets a different explicit
+`name`, `fleet.install` leaves it untouched and reports the mismatch in `problems` without failing
+the install.
 
 ### Check reachability
 
