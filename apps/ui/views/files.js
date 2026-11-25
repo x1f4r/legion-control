@@ -37,6 +37,12 @@ import {
 import { plainErrorMessage } from '../lib/errors.js';
 import { createCoalescedRefetch, STALE_AFTER_MS } from '../lib/folder-changes.js';
 import { formatBytes, formatElapsed, formatRelativeTime, primaryDisk } from '../lib/format.js';
+import {
+  isRealMachineName,
+  migrateLocalFavouritesOnNode,
+  normalizeFavouritesMachine,
+  PENDING_LOCAL_MACHINE_NAME,
+} from '../lib/local-machine.js';
 import { routeHref } from '../lib/route.js';
 import { thumbCacheKey } from '../lib/thumb-cache.js';
 import { Notice, OlderMachineNote, ProgressBar, SwipeRow } from './common.js';
@@ -52,7 +58,7 @@ import {
   SyncConflictsSheet,
 } from './files-sheets.js';
 import { FilesViewer } from './files-viewer.js';
-import { ScrollContainer } from './scroll-container.js';
+import { SplitView } from './split-view.js';
 
 const PAGE_SIZE = 200;
 const RENDER_STEP = 120;
@@ -155,10 +161,11 @@ function safeStorage() {
 
 function freeSpaceSub(machine) {
   const disk = primaryDisk(machine?.sys?.disks);
-  if (disk?.disk?.available != null) {
-    return `${formatBytes(disk.disk.available)} free`;
+  const free = disk?.disk?.available != null ? `${formatBytes(disk.disk.available)} free` : '';
+  if (machine?.isLocalComputer && machine?.name !== PENDING_LOCAL_MACHINE_NAME) {
+    return free ? `This computer · ${free}` : 'This computer';
   }
-  return 'On';
+  return free || 'On';
 }
 
 function offlineMachineSub(machine) {
@@ -398,6 +405,9 @@ export function FilesHome({
   link,
   thumbCache,
   wide,
+  hideSearch = false,
+  hideFirstLabel = false,
+  activeView = null,
   activeMachine,
   activeSyncId,
   onNavigate,
@@ -405,6 +415,11 @@ export function FilesHome({
   onStartSearch,
 }) {
   const pinned = useMemo(() => (favourites || []).filter((f) => f.pinned), [favourites]);
+  const hasPinned = Boolean(caps?.hasFav && pinned.length > 0);
+  const hasSync = Boolean(caps?.hasSync && syncFolders.length > 0);
+  const firstSection = hasPinned ? 'pinned' : hasSync ? 'sync' : 'machines';
+  const onlineMachineCount = (machines || []).filter((m) => m.reachable).length;
+
   const pinnedByMachine = useMemo(() => {
     const map = new Map();
     for (const p of pinned) {
@@ -426,7 +441,7 @@ export function FilesHome({
 
   return html`
     <div>
-      ${wide
+      ${wide && !hideSearch
         ? html`
             <div class="search-row">
               <input
@@ -445,9 +460,9 @@ export function FilesHome({
           `
         : null}
 
-      ${caps?.hasFav && pinned.length > 0
+      ${hasPinned
         ? html`
-            <p class="label">Pinned</p>
+            ${!(hideFirstLabel && firstSection === 'pinned') ? html`<p class="label">Pinned</p>` : null}
             <div class="tiles">
               ${pinned.map((item) => {
                 const href =
@@ -488,9 +503,9 @@ export function FilesHome({
           `
         : null}
 
-      ${caps?.hasSync && syncFolders.length > 0
+      ${hasSync
         ? html`
-            <p class="label">Kept in sync</p>
+            ${!(hideFirstLabel && firstSection === 'sync') ? html`<p class="label">Kept in sync</p>` : null}
             <div class="list">
               ${syncFolders.map((sf) => {
                 const href = routeHref({ section: 'files', view: 'sync', syncId: sf.id });
@@ -518,7 +533,16 @@ export function FilesHome({
           `
         : null}
 
-      <p class="label">Machines</p>
+      ${!(hideFirstLabel && firstSection === 'machines')
+        ? wide && machines.length > 0
+          ? html`
+              <p class="label label-row">
+                <span>Machines</span>
+                <span class="label-fact">${onlineMachineCount} on</span>
+              </p>
+            `
+          : html`<p class="label">Machines</p>`
+        : null}
       <div class="list">
         ${machines.map((m) => {
           const href = routeHref({ section: 'files', view: 'folder', machine: m.name, path: '~' });
@@ -569,8 +593,9 @@ export function FilesHome({
         ${caps?.hasFav
           ? html`
               <a
-                class="row"
+                class=${wide && activeView === 'favourites' ? 'row selected' : 'row'}
                 href="#/files/@favourites"
+                aria-current=${wide && activeView === 'favourites' ? 'page' : undefined}
                 onClick=${(e) => {
                   e.preventDefault();
                   onNavigate('#/files/@favourites');
@@ -587,8 +612,9 @@ export function FilesHome({
             `
           : null}
         <a
-          class="row"
+          class=${wide && activeView === 'recent' ? 'row selected' : 'row'}
           href="#/files/@recent"
+          aria-current=${wide && activeView === 'recent' ? 'page' : undefined}
           onClick=${(e) => {
             e.preventDefault();
             onNavigate('#/files/@recent');
@@ -637,6 +663,7 @@ export function FolderBrowser({
   viewModeOverride,
   onViewModeResolved,
   onEntriesChange,
+  onTotalChange = null,
   onNavigateFolder,
   onOpenFile,
   onToggleSelect,
@@ -655,6 +682,7 @@ export function FolderBrowser({
   onOpenMore,
   embedded = false,
   wide = false,
+  hideWideChrome = false,
   reloadToken = 0,
 }) {
   const [resolvedPath, setResolvedPath] = useState(path || '~');
@@ -1137,6 +1165,16 @@ export function FolderBrowser({
     if (onEntriesChange) onEntriesChange(entries, resolvedPath);
   }, [entries, resolvedPath]);
 
+  useEffect(() => {
+    if (typeof onTotalChange === 'function') {
+      onTotalChange({
+        totalCount: reachable && !error ? totalCount : null,
+        totalExact,
+        resolvedPath,
+      });
+    }
+  }, [onTotalChange, totalCount, totalExact, resolvedPath, reachable, error]);
+
   const savedMode = readFolderViewMode(safeStorage(), machine, resolvedPath);
   const effectiveMode = viewModeOverride || savedMode || (shouldDefaultToGrid(rawEntries) ? 'grid' : 'list');
 
@@ -1419,12 +1457,12 @@ export function FolderBrowser({
     `;
   }
 
-  const inlineTools = wide && !selecting;
+  const inlineTools = wide && !selecting && !hideWideChrome;
   const atMachineFilesRoot = !path || path === '~' || isMachineFilesRoot(resolvedPath);
 
   return html`
     <div data-no-swipe="true">
-      ${wide && !embedded
+      ${wide && !embedded && !hideWideChrome
         ? html`
             <div class="files-wide-head">
               <h2>${folderDisplayName(resolvedPath, { technical })}</h2>
@@ -1477,28 +1515,32 @@ export function FolderBrowser({
           `
         : null}
 
-      <nav ref=${crumbsRef} class="where" aria-label="Where this folder is">
-        ${crumbs.flatMap((c, i) => {
-          const isLast = i === crumbs.length - 1;
-          const out = [];
-          if (i > 0) out.push(html`<i key=${`sep-${i}`} aria-hidden="true">›</i>`);
-          out.push(html`
-            <a
-              key=${`${c.label}-${i}`}
-              class=${isLast ? 'current' : undefined}
-              aria-current=${isLast ? 'page' : undefined}
-              href=${routeHref({ section: 'files', view: 'folder', machine, path: c.path })}
-              onClick=${(e) => {
-                e.preventDefault();
-                onNavigateFolder(machine, c.path);
-              }}
-            >
-              ${c.label}
-            </a>
-          `);
-          return out;
-        })}
-      </nav>
+      ${!hideWideChrome
+        ? html`
+            <nav ref=${crumbsRef} class="where" aria-label="Where this folder is">
+              ${crumbs.flatMap((c, i) => {
+                const isLast = i === crumbs.length - 1;
+                const out = [];
+                if (i > 0) out.push(html`<i key=${`sep-${i}`} aria-hidden="true">›</i>`);
+                out.push(html`
+                  <a
+                    key=${`${c.label}-${i}`}
+                    class=${isLast ? 'current' : undefined}
+                    aria-current=${isLast ? 'page' : undefined}
+                    href=${routeHref({ section: 'files', view: 'folder', machine, path: c.path })}
+                    onClick=${(e) => {
+                      e.preventDefault();
+                      onNavigateFolder(machine, c.path);
+                    }}
+                  >
+                    ${c.label}
+                  </a>
+                `);
+                return out;
+              })}
+            </nav>
+          `
+        : null}
 
       ${atMachineFilesRoot && missingFeatures?.length > 0
         ? html`
@@ -1642,11 +1684,14 @@ export function FilesSearchView({
   link,
   technical,
   thumbCache,
+  wide = false,
   onRegisterRefresh = null,
   onNavigateFolder,
   onOpenFile,
   onResultCountChange,
   onClearFilters,
+  onUpdateQuery = null,
+  onOpenFilters = null,
 }) {
   const scopeMachine = route.machine || null;
   const scopePath = route.path || null;
@@ -1926,13 +1971,54 @@ export function FilesSearchView({
     : onlineMachines.map((m) => m.name);
 
   const hasCriteria = Boolean(q.trim() || kinds.length > 0 || size || changed);
+  const activeKinds = new Set(kinds);
+  const hasMoreFilters = Boolean(size || changed);
+  const showMoreFilters = caps ? Boolean(caps.known && caps.hasFindFilters) : true;
+  const wideFilterBar =
+    wide && onUpdateQuery
+      ? html`
+          <div class="filters" role="group" aria-label="Kind" data-no-swipe="true">
+            ${SEARCH_KIND_CHIPS.map(
+              (chip) => html`
+                <button
+                  key=${chip.id}
+                  type="button"
+                  aria-pressed=${activeKinds.has(chip.id) ? 'true' : 'false'}
+                  onClick=${() => {
+                    const next = new Set(activeKinds);
+                    if (next.has(chip.id)) next.delete(chip.id);
+                    else next.add(chip.id);
+                    onUpdateQuery({ kinds: Array.from(next) });
+                  }}
+                >
+                  ${chip.label}
+                </button>
+              `,
+            )}
+            ${showMoreFilters && onOpenFilters
+              ? html`
+                  <button
+                    type="button"
+                    aria-pressed=${hasMoreFilters ? 'true' : 'false'}
+                    onClick=${onOpenFilters}
+                  >
+                    More filters
+                  </button>
+                `
+              : null}
+          </div>
+        `
+      : null;
 
   if (!hasCriteria) {
     return html`
-      <div class="empty">
-        ${scopeMachine
-          ? `Type a name or pick a kind below to search in ${folderDisplayName(scopePath, { technical })}.`
-          : 'Type a name or pick a kind below to search across your machines.'}
+      <div>
+        ${wideFilterBar}
+        <div class="empty">
+          ${scopeMachine
+            ? `Type a name or pick a kind ${wide ? 'above' : 'below'} to search in ${folderDisplayName(scopePath, { technical })}.`
+            : `Type a name or pick a kind ${wide ? 'above' : 'below'} to search across your machines.`}
+        </div>
       </div>
     `;
   }
@@ -1947,6 +2033,7 @@ export function FilesSearchView({
 
   return html`
     <div>
+      ${wideFilterBar}
       ${error ? html`<${Notice} error=${error} />` : null}
       ${searching && Object.keys(resultsByMachine).length === 0
         ? html`<div class="empty">Searching…</div>`
@@ -2410,10 +2497,10 @@ export function FilesView({
   const localNode = nodeInfo?.node || machines.find((m) => m.reachable)?.name || null;
 
   // Determine active machine/folder for wide split detail when on `#/files`.
-  const defaultWideMachine = useMemo(
-    () => machines.find((m) => m.reachable)?.name || machines[0]?.name || null,
-    [machines],
-  );
+  const defaultWideMachine = useMemo(() => {
+    if (link?.mockFlags?.has('emptyright')) return null;
+    return machines.find((m) => m.reachable)?.name || machines[0]?.name || null;
+  }, [machines, link]);
   const activeFolderMachine =
     route.view === 'folder' ? route.machine : wide && route.view === 'home' ? defaultWideMachine : null;
   const activeFolderPath = route.view === 'folder' ? route.path || '~' : '~';
@@ -2481,8 +2568,32 @@ export function FilesView({
   const [recentFiles, setRecentFiles] = useState(() => readRecentFiles(safeStorage()));
   const [folderEntries, setFolderEntries] = useState([]);
   const [resolvedFolderPath, setResolvedFolderPath] = useState(route.path || '~');
+  const [folderSummary, setFolderSummary] = useState({ totalCount: null, totalExact: true });
+  const [wideSearchSummary, setWideSearchSummary] = useState({ count: 0, machineCount: 0, searching: false });
+  const [wideSearchText, setWideSearchText] = useState(route.query?.q || '');
+  const wideCrumbsRef = useRef(null);
   const [reloadToken, setReloadToken] = useState(0);
   const [viewerEntryCache, setViewerEntryCache] = useState(null);
+  const migratedFavNodeRef = useRef(null);
+
+  useEffect(() => {
+    setResolvedFolderPath(activeFolderPath || '~');
+    setFolderSummary({ totalCount: null, totalExact: true });
+  }, [activeFolderMachine, activeFolderPath]);
+
+  useEffect(() => {
+    setWideSearchText(route.query?.q || '');
+  }, [route.query?.q, route.view]);
+
+  useEffect(() => {
+    if (wideCrumbsRef.current) {
+      wideCrumbsRef.current.scrollLeft = wideCrumbsRef.current.scrollWidth;
+    }
+  }, [resolvedFolderPath, activeFolderMachine]);
+
+  useEffect(() => {
+    setRecentFiles(readRecentFiles(safeStorage()));
+  }, [localNode]);
 
   const loadFavourites = useCallback(() => {
     if (!localCaps.hasFav || !localNode) {
@@ -2493,9 +2604,40 @@ export function FilesView({
       ? capsStore.call('fav.list', {}, { on: localNode }).then((r) => r.value)
       : link.call('fav.list', {}, { on: localNode });
     return req
-      .then((res) => setFavourites(Array.isArray(res?.entries) ? res.entries : []))
+      .then(async (res) => {
+        const rawEntries = Array.isArray(res?.entries) ? res.entries : [];
+        const normalized = isRealMachineName(localNode)
+          ? normalizeFavouritesMachine(rawEntries, localNode)
+          : rawEntries;
+        setFavourites(normalized);
+
+        if (
+          isRealMachineName(localNode) &&
+          localCaps.hasFavWrite &&
+          migratedFavNodeRef.current !== localNode &&
+          rawEntries.some((e) => e?.machine === 'local' || e?.machine === PENDING_LOCAL_MACHINE_NAME)
+        ) {
+          migratedFavNodeRef.current = localNode;
+          const outcome = await migrateLocalFavouritesOnNode({
+            entries: rawEntries,
+            realNodeName: localNode,
+            link,
+            localNode,
+            canWrite: true,
+          });
+          if (outcome.migrated) {
+            const refreshed = await (capsStore
+              ? capsStore.call('fav.list', {}, { on: localNode }).then((r) => r.value)
+              : link.call('fav.list', {}, { on: localNode })
+            ).catch(() => null);
+            if (Array.isArray(refreshed?.entries)) {
+              setFavourites(normalizeFavouritesMachine(refreshed.entries, localNode));
+            }
+          }
+        }
+      })
       .catch(() => setFavourites([]));
-  }, [localCaps.hasFav, capsStore, link, localNode]);
+  }, [localCaps.hasFav, localCaps.hasFavWrite, capsStore, link, localNode]);
 
   const loadSyncFolders = useCallback(() => {
     if (!localCaps.hasSync || !localNode) {
@@ -2845,6 +2987,14 @@ export function FilesView({
             setFolderEntries(list);
             setResolvedFolderPath(rPath);
           }}
+          onTotalChange=${({ totalCount, totalExact, resolvedPath: rPath }) => {
+            setFolderSummary((prev) =>
+              prev.totalCount === totalCount && prev.totalExact === totalExact
+                ? prev
+                : { totalCount, totalExact },
+            );
+            if (rPath) setResolvedFolderPath(rPath);
+          }}
           onNavigateFolder=${navigateFolder}
           onOpenFile=${openFile}
           onToggleSelect=${filesActions.toggleSelect}
@@ -2875,10 +3025,27 @@ export function FilesView({
           }}
           onOpenMore=${() => filesActions.openSheet({ kind: 'more', machine: activeFolderMachine, path: resolvedFolderPath })}
           wide=${wide}
+          hideWideChrome=${wide}
           reloadToken=${reloadToken}
         />
       `
     : null;
+
+  const updateWideSearchRoute = useCallback(
+    (patch) => {
+      const nextQuery = {
+        q: route.query?.q || '',
+        kinds: route.query?.kinds || [],
+        size: route.query?.size || '',
+        changed: route.query?.changed || '',
+        ...patch,
+      };
+      const href = routeHref({ ...route, query: nextQuery });
+      window.history.replaceState(window.history.state, '', href);
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    },
+    [route],
+  );
 
   function renderMainContent() {
     if (route.view === 'search') {
@@ -2892,18 +3059,19 @@ export function FilesView({
           link=${link}
           technical=${technical}
           thumbCache=${thumbCache}
+          wide=${wide}
           onRegisterRefresh=${wide ? null : onRegisterRefresh}
           onNavigateFolder=${navigateFolder}
           onOpenFile=${openFile}
-          onResultCountChange=${filesActions.setSearchSummary}
-          onClearFilters=${() => {
-            const href = routeHref({
-              ...route,
-              query: { q: route.query?.q || '', kinds: [], size: '', changed: '' },
-            });
-            window.history.replaceState(window.history.state, '', href);
-            window.dispatchEvent(new HashChangeEvent('hashchange'));
+          onResultCountChange=${(summary) => {
+            setWideSearchSummary(summary);
+            filesActions.setSearchSummary(summary);
           }}
+          onClearFilters=${() => {
+            updateWideSearchRoute({ kinds: [], size: '', changed: '' });
+          }}
+          onUpdateQuery=${wide ? updateWideSearchRoute : null}
+          onOpenFilters=${wide ? () => filesActions.openSheet({ kind: 'filters' }) : null}
         />
       `;
     }
@@ -2999,39 +3167,260 @@ export function FilesView({
 
   const sheet = filesState.sheet;
 
+  function renderWideSplit() {
+    const onlineCount = machines.filter((m) => m.reachable).length;
+    const hasPinned = Boolean(localCaps.hasFav && favourites.some((f) => f.pinned));
+    const hasSync = Boolean(localCaps.hasSync && syncFolders.length > 0);
+    const firstSection = hasPinned ? 'pinned' : hasSync ? 'sync' : 'machines';
+    const leftLabel = hasPinned ? 'Pinned' : hasSync ? 'Kept in sync' : 'Machines';
+    const leftLabelFact = firstSection === 'machines' && machines.length > 0 ? `${onlineCount} on` : null;
+
+    const leftTools = html`
+      <input
+        class="input plain"
+        type="search"
+        placeholder="Search all machines"
+        aria-label="Search all machines"
+        onKeyDown=${(e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            navigateHref(
+              routeHref({
+                section: 'files',
+                view: 'search',
+                query: { q: e.target.value, kinds: [], size: '', changed: '' },
+              }),
+            );
+          }
+        }}
+      />
+    `;
+
+    const leftBody = html`
+      <${FilesHome}
+        machines=${machines}
+        favourites=${favourites}
+        syncFolders=${syncFolders}
+        recentFiles=${recentFiles}
+        caps=${localCaps}
+        capsStore=${capsStore}
+        deviceNoun=${deviceNoun}
+        link=${link}
+        thumbCache=${thumbCache}
+        wide=${true}
+        hideSearch=${true}
+        hideFirstLabel=${true}
+        activeView=${route.view}
+        activeMachine=${activeFolderMachine}
+        activeSyncId=${route.view === 'sync' ? route.syncId : null}
+        onNavigate=${navigateHref}
+        onOpenFile=${openFile}
+        onStartSearch=${(q) =>
+          navigateHref(
+            routeHref({ section: 'files', view: 'search', query: { q: q || '', kinds: [], size: '', changed: '' } }),
+          )}
+      />
+    `;
+
+    let rightTitle = null;
+    let rightFact = null;
+    let rightTools = null;
+    let rightLabel = null;
+    let rightEmpty = null;
+    let rightBody = null;
+
+    const showingFolder = (route.view === 'folder' || route.view === 'home') && Boolean(activeFolderMachine);
+    if (route.view === 'home' && !activeFolderMachine) {
+      rightEmpty = 'Choose a place on the left.';
+    } else if (showingFolder) {
+      const folderName = folderDisplayName(resolvedFolderPath, { technical });
+      const isReachable = activeMachineObj ? activeMachineObj.reachable : true;
+      const crumbs = splitFileCrumbs(activeFolderMachine, resolvedFolderPath, { technical });
+      rightTitle = folderName;
+      rightFact =
+        isReachable && folderSummary.totalCount != null && folderSummary.totalCount > 0
+          ? formatFolderTotal(folderSummary.totalCount, folderSummary.totalExact)
+          : null;
+      if (!filesState.selecting && isReachable) {
+        rightTools = html`
+          <div class="files-wide-tools">
+            <input
+              class="input plain"
+              type="search"
+              placeholder=${`Search in ${folderName}`}
+              aria-label=${`Search in ${folderName}`}
+              onKeyDown=${(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  navigateHref(
+                    routeHref({
+                      section: 'files',
+                      view: 'search',
+                      machine: activeFolderMachine,
+                      path: resolvedFolderPath,
+                      query: { q: e.target.value, kinds: [], size: '', changed: '' },
+                    }),
+                  );
+                }
+              }}
+            />
+            <button
+              type="button"
+              class="btn icon"
+              aria-label=${filesState.kindFilter
+                ? `Sort: ${sortDescription(filesState.sortPref)}, showing ${KIND_FILTER_LABELS[filesState.kindFilter] || filesState.kindFilter}`
+                : `Sort: ${sortDescription(filesState.sortPref)}`}
+              aria-pressed=${filesState.kindFilter ? 'true' : 'false'}
+              onClick=${() => filesActions.openSheet({ kind: 'sort' })}
+            >
+              <${Icon} name="sort" />
+            </button>
+            <button
+              type="button"
+              class="btn icon"
+              aria-label=${filesState.resolvedViewMode === 'grid' ? 'Show as list' : 'Show as grid'}
+              aria-pressed=${filesState.resolvedViewMode === 'grid' ? 'true' : 'false'}
+              onClick=${() => {
+                const next = filesState.resolvedViewMode === 'grid' ? 'list' : 'grid';
+                writeFolderViewMode(safeStorage(), activeFolderMachine, resolvedFolderPath, next);
+                filesActions.setViewModeOverride(next);
+              }}
+            >
+              <${Icon} name="grid" />
+            </button>
+            <button
+              type="button"
+              class="btn icon"
+              aria-label="More"
+              onClick=${() =>
+                filesActions.openSheet({
+                  kind: 'more',
+                  machine: activeFolderMachine,
+                  path: resolvedFolderPath,
+                })}
+            >
+              <${Icon} name="more" />
+            </button>
+          </div>
+        `;
+      }
+      rightLabel = html`
+        <nav ref=${wideCrumbsRef} class="where" aria-label="Where this folder is">
+          ${crumbs.flatMap((c, i) => {
+            const isLast = i === crumbs.length - 1;
+            const out = [];
+            if (i > 0) out.push(html`<i key=${`sep-${i}`} aria-hidden="true">›</i>`);
+            out.push(html`
+              <a
+                key=${`${c.label}-${i}`}
+                class=${isLast ? 'current' : undefined}
+                aria-current=${isLast ? 'page' : undefined}
+                href=${routeHref({ section: 'files', view: 'folder', machine: activeFolderMachine, path: c.path })}
+                onClick=${(e) => {
+                  e.preventDefault();
+                  navigateFolder(activeFolderMachine, c.path);
+                }}
+              >
+                ${c.label}
+              </a>
+            `);
+            return out;
+          })}
+        </nav>
+      `;
+      rightBody = folderViewEl;
+    } else if (route.view === 'search') {
+      const placeholder = route.machine
+        ? `Search in ${folderDisplayName(route.path, { technical })}`
+        : 'Search all machines';
+      rightTitle = 'Search';
+      rightFact = wideSearchSummary.searching
+        ? 'Searching…'
+        : wideSearchSummary.count > 0
+          ? `${wideSearchSummary.count} found`
+          : null;
+      rightTools = html`
+        <div class="files-wide-tools">
+          <input
+            class="input plain"
+            type="search"
+            value=${wideSearchText}
+            placeholder=${placeholder}
+            aria-label=${placeholder}
+            onInput=${(e) => {
+              const val = e.target.value;
+              setWideSearchText(val);
+              updateWideSearchRoute({ q: val });
+            }}
+          />
+        </div>
+      `;
+      rightLabel = route.machine
+        ? html`
+            <nav class="where" aria-label="Search location">
+              <a
+                href=${routeHref({ section: 'files', view: 'folder', machine: route.machine, path: route.path || '~' })}
+                onClick=${(e) => {
+                  e.preventDefault();
+                  navigateFolder(route.machine, route.path || '~');
+                }}
+              >
+                ${route.machine}
+              </a>
+              <i aria-hidden="true">›</i>
+              <span class="current">${folderDisplayName(route.path, { technical })}</span>
+            </nav>
+          `
+        : 'All machines';
+      rightBody = renderMainContent();
+    } else if (route.view === 'favourites') {
+      rightTitle = 'Favourites';
+      rightFact =
+        favourites.length > 0
+          ? `${favourites.length} ${favourites.length === 1 ? 'item' : 'items'}`
+          : null;
+      rightLabel = 'Starred';
+      rightBody = renderMainContent();
+    } else if (route.view === 'recent') {
+      rightTitle = 'Recent';
+      rightFact =
+        recentFiles.length > 0
+          ? `${recentFiles.length} ${recentFiles.length === 1 ? 'item' : 'items'}`
+          : null;
+      rightLabel = `Opened on this ${deviceNoun}`;
+      rightBody = renderMainContent();
+    } else if (route.view === 'sync' && route.syncId) {
+      const sf = (syncFolders || []).find((f) => f.id === route.syncId);
+      const memberCount = sf?.members?.length || 0;
+      rightTitle = sf?.name || 'Synced folder';
+      rightFact = memberCount > 0 ? `${memberCount} machines` : null;
+      rightLabel = 'Kept in sync';
+      rightBody = renderMainContent();
+    } else {
+      rightEmpty = 'Choose a place on the left.';
+    }
+
+    return html`
+      <${SplitView}
+        leftTitle="Files"
+        leftTools=${leftTools}
+        leftLabel=${leftLabel}
+        leftLabelFact=${leftLabelFact}
+        leftBody=${leftBody}
+        onLeftRefresh=${refreshFilesHome}
+        rightTitle=${rightTitle}
+        rightFact=${rightFact}
+        rightTools=${rightTools}
+        rightLabel=${rightLabel}
+        rightEmpty=${rightEmpty}
+        rightBody=${rightBody}
+      />
+    `;
+  }
+
   return html`
     <div>
-      ${wide
-        ? html`
-            <div class="split">
-              <${ScrollContainer} as="section" onRefresh=${refreshFilesHome}>
-                <${FilesHome}
-                  machines=${machines}
-                  favourites=${favourites}
-                  syncFolders=${syncFolders}
-                  recentFiles=${recentFiles}
-                  caps=${localCaps}
-                  capsStore=${capsStore}
-                  deviceNoun=${deviceNoun}
-                  link=${link}
-                  thumbCache=${thumbCache}
-                  wide=${true}
-                  activeMachine=${activeFolderMachine}
-                  activeSyncId=${route.view === 'sync' ? route.syncId : null}
-                  onNavigate=${navigateHref}
-                  onOpenFile=${openFile}
-                  onStartSearch=${(q) =>
-                    navigateHref(
-                      routeHref({ section: 'files', view: 'search', query: { q: q || '', kinds: [], size: '', changed: '' } }),
-                    )}
-                />
-              <//>
-              <${ScrollContainer} as="section">
-                ${route.view === 'home' ? folderViewEl || html`<div class="empty">Choose a machine to browse its files.</div>` : renderMainContent()}
-              <//>
-            </div>
-          `
-        : renderMainContent()}
+      ${wide ? renderWideSplit() : renderMainContent()}
 
       ${viewer
         ? html`

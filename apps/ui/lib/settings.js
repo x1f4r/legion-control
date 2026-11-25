@@ -691,6 +691,16 @@ export function describeConnectionRoute(entry, technical = false) {
     };
   }
 
+  if (entry?.via === 'local' || entry?.isLocalComputer) {
+    return {
+      kind: 'direct',
+      label: 'This computer',
+      hint: null,
+      isWarning: false,
+      isIdentityChanged: false,
+    };
+  }
+
   return {
     kind: 'direct',
     label: 'directly',

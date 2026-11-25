@@ -549,7 +549,14 @@ export function SendToSheet({
                 }
                 const picked = dest === m.name;
                 const isSelf = m.name === sourceMachine;
-                const sub = isSelf ? 'Another folder on this machine' : freeDiskPhrase(m) || 'On';
+                const diskFree = freeDiskPhrase(m);
+                const sub = isSelf
+                  ? 'Another folder on this machine'
+                  : m.isLocalComputer && m.name !== 'This computer'
+                    ? diskFree
+                      ? `This computer · ${diskFree}`
+                      : 'This computer'
+                    : diskFree || 'On';
                 return html`
                   <button
                     key=${m.name}

@@ -2,13 +2,21 @@
 
 import { html } from '../vendor/preact-htm.js';
 import { Meter, Notice } from './common.js';
-import { formatMachineStatusPhrase } from '../lib/activity.js';
+import {
+  formatMachineDetailSubtitle,
+  formatMachineStatusPhrase,
+} from '../lib/activity.js';
 import { machineMetrics } from '../lib/format.js';
-import { machineAttentionLabel } from '../lib/machine-monitor.js';
-import { routeHref } from '../lib/route.js';
+import {
+  buildOverviewMeters,
+  formatOverviewStateLine,
+  isOverviewBusy,
+  machineAttentionLabel,
+} from '../lib/machine-monitor.js';
+import { routeHref, WIDE_MACHINE_TABS } from '../lib/route.js';
 import { formatPairSyncNotice } from '../lib/settings.js';
-import { MachineDetail } from './machine.js';
-import { ScrollContainer } from './scroll-container.js';
+import { MachineDetail, WIDE_TAB_LABELS } from './machine.js';
+import { SplitView } from './split-view.js';
 
 function OnlineMachineCard({ machine, selected, showMetrics }) {
   const metrics = machineMetrics(machine.sys);
@@ -164,6 +172,16 @@ export function MachinesView({
     ? route.machine || onlineMachines[0]?.name || machines[0]?.name || null
     : route.machine || null;
   const selectedMachine = machines.find((m) => m.name === selectedName) || null;
+  const hasTopBanner = Boolean(error || rolledBack || justUpdated || syncBanner);
+  const firstLeftGroup =
+    onlineMachines.length > 0
+      ? 'online'
+      : askingMachines.length > 0
+        ? 'asking'
+        : showOffline && offMachines.length > 0
+          ? 'off'
+          : 'empty';
+  const hideFirstLeftGroupLabel = wide && !hasTopBanner;
 
   const listColumn = html`
     <section>
@@ -237,7 +255,16 @@ export function MachinesView({
 
             ${askingMachines.length > 0
               ? html`
-                  ${onlineMachines.length > 0 ? html`<p class="label">Checking</p>` : null}
+                  ${onlineMachines.length > 0
+                    ? wide
+                      ? html`
+                          <p class="label label-row">
+                            <span>Checking</span>
+                            <span class="label-fact">${askingMachines.length}</span>
+                          </p>
+                        `
+                      : html`<p class="label">Checking</p>`
+                    : null}
                   <div class="list">
                     ${askingMachines.map(
                       (m) => html`
@@ -255,7 +282,16 @@ export function MachinesView({
 
             ${showOffline && offMachines.length > 0
               ? html`
-                  <p class="label">Off</p>
+                  ${!(hideFirstLeftGroupLabel && firstLeftGroup === 'off')
+                    ? wide
+                      ? html`
+                          <p class="label label-row">
+                            <span>Off</span>
+                            <span class="label-fact">${offMachines.length}</span>
+                          </p>
+                        `
+                      : html`<p class="label">Off</p>`
+                    : null}
                   <div class="list">
                     ${offMachines.map(
                       (m) => html`
@@ -277,45 +313,136 @@ export function MachinesView({
   `;
 
   if (wide) {
+    const leftLabel =
+      firstLeftGroup === 'online'
+        ? 'On'
+        : firstLeftGroup === 'asking'
+          ? 'Checking'
+          : firstLeftGroup === 'off'
+            ? 'Off'
+            : 'Machines';
+    const leftLabelFact =
+      firstLeftGroup === 'online'
+        ? String(onlineMachines.length)
+        : firstLeftGroup === 'asking'
+          ? String(askingMachines.length)
+          : firstLeftGroup === 'off'
+            ? String(offMachines.length)
+            : null;
+
+    const effectiveTab = route.tab && route.tab !== 'more' ? route.tab : 'overview';
+    const selectedWakePending = selectedMachine ? Boolean(wakePendingSet?.has(selectedMachine.name)) : false;
+    const dotClass = selectedMachine
+      ? selectedMachine.status === 'asking' || selectedMachine.asking
+        ? 'dot asking'
+        : !selectedMachine.reachable
+          ? 'dot off'
+          : selectedMachine.busy
+            ? 'dot busy'
+            : 'dot'
+      : 'dot off';
+
+    let rightLabel = null;
+    let rightLabelFact = null;
+    if (selectedMachine) {
+      if (effectiveTab === 'overview' && selectedMachine.reachable) {
+        const overviewMeters = buildOverviewMeters(selectedMachine.sys, {
+          technical: Boolean(settings?.technical),
+        });
+        const overviewBusy = isOverviewBusy(selectedMachine.sys);
+        const stateLine = formatOverviewStateLine(selectedMachine.sys);
+        rightLabel = overviewMeters.length > 0 ? 'Health' : 'Overview';
+        rightLabelFact = html`
+          <span class="machine-state">
+            <span class=${overviewBusy ? 'dot busy' : 'dot'} aria-hidden="true"></span>
+            <span>${stateLine}</span>
+          </span>
+        `;
+      } else {
+        rightLabel = selectedMachine.reachable ? WIDE_TAB_LABELS[effectiveTab] || 'Overview' : 'Status';
+        const detailSub = formatMachineDetailSubtitle(selectedMachine, Date.now(), {
+          wakePending: selectedWakePending,
+        });
+        rightLabelFact = detailSub
+          ? html`<span class="machine-state"><span>${detailSub}</span></span>`
+          : null;
+      }
+    }
+
     return html`
-      <div class="split">
-        <${ScrollContainer} as="section" onRefresh=${onRefresh}>
-          ${listColumn}
-        <//>
-        <${ScrollContainer} as="section">
-          ${selectedMachine
-            ? html`
-                <${MachineDetail}
-                  machine=${selectedMachine}
-                  tab=${route.tab || 'overview'}
-                  jobId=${route.jobId || null}
-                  wide=${true}
-                  link=${link}
-                  capsStore=${capsStore}
-                  folderChanges=${folderChanges}
-                  onObserveTransferJobs=${onObserveTransferJobs}
-                  onRegisterRefresh=${null}
-                  nodeInfo=${nodeInfo}
-                  tools=${tools}
-                  allowedSet=${allowedSet}
-                  settings=${settings}
-                  deviceNoun=${deviceNoun}
-                  thumbCache=${thumbCache}
-                  filesState=${filesState}
-                  filesActions=${filesActions}
-                  wakePending=${Boolean(wakePendingSet?.has(selectedMachine.name))}
-                  onEnsureAwake=${onEnsureAwake}
-                  onWakeSent=${onWakeSent}
-                  onRequestConfirm=${onRequestConfirm}
-                  onRefreshFleet=${onRefresh}
-                  onUpdateMachineSys=${onUpdateMachineSys}
-                  commandRuns=${commandRuns}
-                  onCommandRunsChange=${onCommandRunsChange}
-                />
-              `
-            : html`<div class="empty">Select a machine to inspect it.</div>`}
-        <//>
-      </div>
+      <${SplitView}
+        leftTitle="Machines"
+        leftLabel=${leftLabel}
+        leftLabelFact=${leftLabelFact || null}
+        leftBody=${listColumn}
+        onLeftRefresh=${onRefresh}
+        rightTitle=${selectedMachine
+          ? html`
+              <span class=${dotClass} aria-hidden="true"></span>
+              <span class="pane-title-text">${selectedMachine.name}</span>
+            `
+          : null}
+        rightTools=${selectedMachine
+          ? html`
+              <div class="tabs" role="tablist" aria-label=${`${selectedMachine.name} sections`}>
+                ${WIDE_MACHINE_TABS.map(
+                  (id) => html`
+                    <button
+                      type="button"
+                      key=${id}
+                      role="tab"
+                      aria-selected=${effectiveTab === id ? 'true' : 'false'}
+                      onClick=${() => {
+                        window.location.hash = routeHref({
+                          section: 'machines',
+                          machine: selectedMachine.name,
+                          tab: id,
+                        });
+                      }}
+                    >
+                      ${WIDE_TAB_LABELS[id]}
+                    </button>
+                  `,
+                )}
+              </div>
+            `
+          : null}
+        rightLabel=${rightLabel}
+        rightLabelFact=${rightLabelFact}
+        rightEmpty=${!selectedMachine ? 'Choose a machine on the left.' : null}
+        rightBody=${selectedMachine
+          ? html`
+              <${MachineDetail}
+                machine=${selectedMachine}
+                tab=${route.tab || 'overview'}
+                jobId=${route.jobId || null}
+                wide=${true}
+                hideWideChrome=${true}
+                link=${link}
+                capsStore=${capsStore}
+                folderChanges=${folderChanges}
+                onObserveTransferJobs=${onObserveTransferJobs}
+                onRegisterRefresh=${null}
+                nodeInfo=${nodeInfo}
+                tools=${tools}
+                allowedSet=${allowedSet}
+                settings=${settings}
+                deviceNoun=${deviceNoun}
+                thumbCache=${thumbCache}
+                filesState=${filesState}
+                filesActions=${filesActions}
+                wakePending=${selectedWakePending}
+                onEnsureAwake=${onEnsureAwake}
+                onWakeSent=${onWakeSent}
+                onRequestConfirm=${onRequestConfirm}
+                onRefreshFleet=${onRefresh}
+                onUpdateMachineSys=${onUpdateMachineSys}
+                commandRuns=${commandRuns}
+                onCommandRunsChange=${onCommandRunsChange}
+              />
+            `
+          : null}
+      />
     `;
   }
 
