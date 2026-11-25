@@ -140,6 +140,21 @@ pub struct Fleet {
     inner: Arc<PoolInner>,
 }
 
+impl std::fmt::Debug for Fleet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fleet").finish_non_exhaustive()
+    }
+}
+
+/// An opened downstream `legion stream` pipe for relaying a stream operation to `target`.
+pub(crate) struct RelayPipe {
+    pub pipe: Pipe,
+    /// Immediate next hop machine name (equals `target` when direct, or the `via` relay name).
+    pub next_hop: String,
+    /// True when `next_hop` is an intermediate `via` relay rather than the final target.
+    pub chained: bool,
+}
+
 struct PoolInner {
     slots: Mutex<HashMap<String, Arc<MachineSlot>>>,
     connect_permits: Arc<Semaphore>,
@@ -862,6 +877,47 @@ impl Fleet {
             ))
             .with_machine(here));
         }
+        self.spawn_direct_pipe(machine, entry, subcommand, cancel)
+            .await
+    }
+
+    /// Opens a downstream `legion stream` pipe for relaying a stream operation toward `target`,
+    /// following any configured `via` route in `fleet.toml`.
+    pub(crate) async fn open_relay_stream_pipe(
+        &self,
+        config: &ConfigStore,
+        here: &str,
+        target: &str,
+        cancel: CancellationToken,
+    ) -> Result<RelayPipe, ErrorBody> {
+        let fleet_file = config
+            .get::<FleetFile>()
+            .map_err(|err| ensure_machine(err, here))?;
+        let (direct_machine, direct_entry, relayed) = resolve_route(&fleet_file, target, here)?;
+        if relayed && direct_machine == here {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Machine {target} relays through {here}, which is this node."),
+            )
+            .with_machine(here));
+        }
+        let pipe = self
+            .spawn_direct_pipe(direct_machine, direct_entry, Subcommand::Stream, cancel)
+            .await?;
+        Ok(RelayPipe {
+            pipe,
+            next_hop: direct_machine.to_owned(),
+            chained: relayed,
+        })
+    }
+
+    async fn spawn_direct_pipe(
+        &self,
+        machine: &str,
+        entry: &MachineEntry,
+        subcommand: Subcommand,
+        cancel: CancellationToken,
+    ) -> Result<Pipe, ErrorBody> {
         let systems = entry.resolved_systems();
 
         // Reuse the verified active system and OS from an already-open session when available.
@@ -903,7 +959,7 @@ impl Fleet {
         };
 
         let _permit = acquire_connect_permit(&self.inner.connect_permits, machine, &cancel).await?;
-        let pipe = match &system.transport {
+        match &system.transport {
             Transport::Command { argv } => Pipe::spawn_command(argv, subcommand),
             Transport::Ssh {
                 target, program, ..
@@ -918,9 +974,7 @@ impl Fleet {
                 )
             }
         }
-        .map_err(|err| err.with_machine(machine))?;
-
-        Ok(pipe)
+        .map_err(|err| err.with_machine(machine))
     }
 
     /// Opens one fresh `legion stream` pipe for the dedicated content-read pool without consuming
@@ -3693,6 +3747,10 @@ fn unknown_machine_error(machine: &str, known: &[&str], here: &str) -> ErrorBody
     )
     .with_hint(hint)
     .with_machine(here)
+    .with_details(json!({
+        "reason": "unknown_machine",
+        "target": machine,
+    }))
 }
 
 fn ensure_machine(err: ErrorBody, machine: &str) -> ErrorBody {

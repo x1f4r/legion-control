@@ -2,11 +2,13 @@ package com.x1f4r.legion
 
 import android.app.Activity
 import android.Manifest
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
+import android.view.WindowManager
 import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.SystemBarStyle
@@ -34,6 +36,7 @@ class MainActivity : TauriActivity() {
   private lateinit var notificationPermissionLauncher: ActivityResultLauncher<String>
   private val pendingLocalNetworkRequests = mutableListOf<Int>()
   private val pendingNotificationCallbacks = mutableListOf<(Boolean) -> Unit>()
+  private val immersiveState = ImmersiveState()
 
   private val backCallback = object : OnBackPressedCallback(false) {
     override fun handleOnBackPressed() {
@@ -81,6 +84,9 @@ class MainActivity : TauriActivity() {
     when (msg.optString("type")) {
       "init" -> {
         bridgeReplyProxy = replyProxy
+        runOnUiThread {
+          resetPlayerWindowState()
+        }
         val payload = JSONObject().apply {
           put("type", "init")
           put("insets", latestInsets.toJsonArray())
@@ -108,7 +114,105 @@ class MainActivity : TauriActivity() {
           attachedWebView?.let { syncBackNavigation(it) }
         }
       }
+      "immersive" -> {
+        bridgeReplyProxy = replyProxy
+        val requestId = msg.optInt("id", -1)
+        val on = msg.optBoolean("on", false)
+        val orientation = msg.optString("orientation", ImmersiveState.ORIENTATION_NONE)
+        runOnUiThread {
+          applyImmersive(on, orientation)
+          if (requestId >= 0) {
+            val payload = JSONObject().apply {
+              put("type", "immersive_ack")
+              put("id", requestId)
+              put("active", immersiveState.active)
+            }
+            runCatching { replyProxy.postMessage(payload.toString()) }
+          }
+        }
+      }
+      "keep_screen_on" -> {
+        val requestId = msg.optInt("id", -1)
+        val on = msg.optBoolean("on", false)
+        runOnUiThread {
+          val active = applyKeepScreenOn(on)
+          if (requestId >= 0) {
+            val payload = JSONObject().apply {
+              put("type", "keep_screen_on_ack")
+              put("id", requestId)
+              put("active", active)
+            }
+            runCatching { replyProxy.postMessage(payload.toString()) }
+          }
+        }
+      }
     }
+  }
+
+  private fun applyImmersive(on: Boolean, orientation: String?) {
+    val transition = if (on) {
+      immersiveState.enter(orientation, window.attributes.layoutInDisplayCutoutMode)
+    } else {
+      immersiveState.leave()
+    }
+    applyImmersiveTransition(transition)
+  }
+
+  private fun applyImmersiveTransition(transition: ImmersiveState.Transition) {
+    if (transition.cutoutMode != null) {
+      val attrs = window.attributes
+      if (attrs.layoutInDisplayCutoutMode != transition.cutoutMode) {
+        attrs.layoutInDisplayCutoutMode = transition.cutoutMode
+        window.attributes = attrs
+      }
+    }
+    val controller = WindowInsetsControllerCompat(window, window.decorView)
+    if (transition.hideSystemBars) {
+      controller.systemBarsBehavior =
+        WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+      controller.hide(WindowInsetsCompat.Type.systemBars())
+      window.decorView.setBackgroundColor(Color.BLACK)
+      attachedWebView?.setBackgroundColor(Color.BLACK)
+    } else {
+      controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+      controller.show(WindowInsetsCompat.Type.systemBars())
+      applySystemBarStyle(resources.configuration)
+    }
+    if (requestedOrientation != transition.requestedOrientation) {
+      requestedOrientation = transition.requestedOrientation
+    }
+    ViewCompat.requestApplyInsets(window.decorView)
+  }
+
+  private fun reapplyImmersiveBarsIfActive() {
+    if (!immersiveState.active) return
+    val attrs = window.attributes
+    if (attrs.layoutInDisplayCutoutMode != WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS) {
+      attrs.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+      window.attributes = attrs
+    }
+    val controller = WindowInsetsControllerCompat(window, window.decorView)
+    controller.systemBarsBehavior =
+      WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    controller.hide(WindowInsetsCompat.Type.systemBars())
+    window.decorView.setBackgroundColor(Color.BLACK)
+    attachedWebView?.setBackgroundColor(Color.BLACK)
+  }
+
+  private fun applyKeepScreenOn(on: Boolean): Boolean {
+    val active = immersiveState.setKeepScreenOn(on)
+    if (active) {
+      window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    } else {
+      window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+    return active
+  }
+
+  private fun resetPlayerWindowState() {
+    val transition = immersiveState.resetAll()
+    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    applyImmersiveTransition(transition)
   }
 
   fun requestNotificationPermission(callback: (Boolean) -> Unit) {
@@ -163,6 +267,8 @@ class MainActivity : TauriActivity() {
         }
       }
     TransferBridge.setActiveActivity(this)
+    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     applySystemBarStyle(resources.configuration)
     super.onCreate(savedInstanceState)
     // If the process stayed alive for TransferForegroundService after the user swiped Legion away
@@ -195,7 +301,7 @@ class MainActivity : TauriActivity() {
     attachedWebView = webView
     bridgeReplyProxy = null
     rebindPluginsIfActivityRecreated(webView)
-    applySystemBarStyle(resources.configuration)
+    resetPlayerWindowState()
 
     // Android 17 WebView reports 0px for CSS env(safe-area-inset-*). Expose insets, device model,
     // and the local-network runtime permission prompt over an origin-restricted WebMessageListener
@@ -266,9 +372,12 @@ class MainActivity : TauriActivity() {
     PluginManager.activity = this
     TransferBridge.setActiveActivity(this)
     attachedWebView?.let { syncBackNavigation(it) }
+    reapplyImmersiveBarsIfActive()
   }
 
   override fun onDestroy() {
+    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    immersiveState.resetAll()
     if (TransferBridge.currentActivity() === this) {
       TransferBridge.setActiveActivity(null)
     }
@@ -278,6 +387,7 @@ class MainActivity : TauriActivity() {
   override fun onWindowFocusChanged(hasFocus: Boolean) {
     super.onWindowFocusChanged(hasFocus)
     if (hasFocus) {
+      reapplyImmersiveBarsIfActive()
       ViewCompat.requestApplyInsets(window.decorView)
       pushInsetsToWebView()
     }
@@ -285,11 +395,19 @@ class MainActivity : TauriActivity() {
 
   override fun onConfigurationChanged(newConfig: Configuration) {
     super.onConfigurationChanged(newConfig)
-    applySystemBarStyle(newConfig)
+    if (immersiveState.active) {
+      reapplyImmersiveBarsIfActive()
+    } else {
+      applySystemBarStyle(newConfig)
+    }
     ViewCompat.requestApplyInsets(window.decorView)
   }
 
   private fun applySystemBarStyle(config: Configuration) {
+    if (immersiveState.active) {
+      reapplyImmersiveBarsIfActive()
+      return
+    }
     val isDark = (config.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
     val barStyle = if (isDark) {
       SystemBarStyle.dark(Color.TRANSPARENT)
@@ -375,6 +493,12 @@ class MainActivity : TauriActivity() {
               delete pending[msg.id];
               resolve(granted);
             }
+          } else if (msg.type === 'immersive_ack' || msg.type === 'keep_screen_on_ack') {
+            var resolveAck = pending[msg.id];
+            if (resolveAck) {
+              delete pending[msg.id];
+              resolveAck(Boolean(msg.active));
+            }
           }
         };
 
@@ -395,6 +519,39 @@ class MainActivity : TauriActivity() {
               } catch (_) {
                 delete pending[id];
                 resolve(true);
+              }
+            });
+          },
+          setImmersive: function(on, orientation){
+            return new Promise(function(resolve){
+              var id = nextId++;
+              pending[id] = resolve;
+              try {
+                bridge.postMessage(JSON.stringify({
+                  type: 'immersive',
+                  id: id,
+                  on: Boolean(on),
+                  orientation: typeof orientation === 'string' ? orientation : 'none'
+                }));
+              } catch (_) {
+                delete pending[id];
+                resolve(false);
+              }
+            });
+          },
+          setKeepScreenOn: function(on){
+            return new Promise(function(resolve){
+              var id = nextId++;
+              pending[id] = resolve;
+              try {
+                bridge.postMessage(JSON.stringify({
+                  type: 'keep_screen_on',
+                  id: id,
+                  on: Boolean(on)
+                }));
+              } catch (_) {
+                delete pending[id];
+                resolve(false);
               }
             });
           }

@@ -62,6 +62,14 @@ rfd = { version = "0.15.4", default-features = false, features = ["gtk3"] }
 tar = "0.4.46"
 tauri-plugin-single-instance = "=2.5.5"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18.2"
+webkit2gtk = "2.0.2"
+zbus = "5.19.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+legion-os = { path = "../../../crates/legion-os", features = ["webview2"] }
+
 [dev-dependencies]
 ed25519-dalek = "3.0.0"
 tokio = { version = "1.54.1", features = ["test-util"] }

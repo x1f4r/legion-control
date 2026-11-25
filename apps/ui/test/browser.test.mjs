@@ -15,6 +15,7 @@ import { chromium } from 'playwright-core';
 import './files-browser.mjs';
 import './live-refresh-browser.mjs';
 import './machine-browser.mjs';
+import './player-browser.mjs';
 import './split-view-browser.mjs';
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -1124,6 +1125,23 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     await p.getByText('tower and pi describe studio differently; not connecting to it directly').waitFor();
     await p.getByText(/SHA256:studioTowerKey1111/).waitFor();
     await p.getByText(/SHA256:studioPiKey2222/).waitFor();
+
+    // 8b. Relayed machine (`nas`) with a learn rejection (`reject`): plain mode shows only one
+    //     short line ("Through tower") and hides the rejection reason; Technical details reveals
+    //     the learn rejection reason on that machine's row.
+    await p.goto(`${server.url}/?mock=fleet,reject#/settings/connections`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await p.locator('.row', { hasText: 'nas' }).getByText('Through tower').waitFor();
+    const plainRejectText = await p.locator('main.main').innerText();
+    assert.ok(
+      !plainRejectText.includes('name_mismatch') && !plainRejectText.includes('someones-nas'),
+      `Learn rejection reason must stay hidden when Technical details is off:\n${plainRejectText}`,
+    );
+    await p.goto(`${server.url}/?mock=fleet,reject,tech#/settings/connections`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await p.getByText(/Direct route skipped \(name_mismatch\): nas calls itself someones-nas\./).waitFor();
 
     // 9. Effectful tool run from Tools with target "all" expands to the explicit list of machine
     //    names shown in the confirmation sheet and sends that exact array (never literal "all").
@@ -2382,6 +2400,61 @@ function makeSolidPng(width, height, r, g, b) {
   ]);
 }
 
+function makeTaggedFlac({ title, artist, album, coverPng, durationSecs = 4 } = {}) {
+  const sampleRate = 44_100;
+  const totalSamples = sampleRate * durationSecs;
+  const streaminfo = Buffer.alloc(34);
+  streaminfo[10] = (sampleRate >> 12) & 0xff;
+  streaminfo[11] = (sampleRate >> 4) & 0xff;
+  streaminfo[12] = ((sampleRate & 0x0f) << 4) | 0x02;
+  streaminfo[13] = 0xf0 | (Math.floor(totalSamples / 2 ** 32) & 0x0f);
+  streaminfo.writeUInt32BE(totalSamples >>> 0, 14);
+
+  const blocks = [[0, streaminfo]];
+  const comments = [];
+  if (title) comments.push(`TITLE=${title}`);
+  if (artist) comments.push(`ARTIST=${artist}`);
+  if (album) comments.push(`ALBUM=${album}`);
+  if (comments.length > 0) {
+    const vendor = Buffer.from('legion-test', 'utf8');
+    const parts = [Buffer.alloc(4), vendor, Buffer.alloc(4)];
+    parts[0].writeUInt32LE(vendor.length, 0);
+    parts[2].writeUInt32LE(comments.length, 0);
+    for (const c of comments) {
+      const buf = Buffer.from(c, 'utf8');
+      const len = Buffer.alloc(4);
+      len.writeUInt32LE(buf.length, 0);
+      parts.push(len, buf);
+    }
+    blocks.push([4, Buffer.concat(parts)]);
+  }
+  if (coverPng) {
+    const mime = Buffer.from('image/png', 'ascii');
+    const desc = Buffer.from('cover', 'ascii');
+    const header = Buffer.alloc(8);
+    header.writeUInt32BE(3, 0);
+    header.writeUInt32BE(mime.length, 4);
+    const descLen = Buffer.alloc(4);
+    descLen.writeUInt32BE(desc.length, 0);
+    const dims = Buffer.alloc(16);
+    const imgLen = Buffer.alloc(4);
+    imgLen.writeUInt32BE(coverPng.length, 0);
+    blocks.push([6, Buffer.concat([header, mime, descLen, desc, dims, imgLen, coverPng])]);
+  }
+
+  const out = [Buffer.from('fLaC', 'ascii')];
+  for (let i = 0; i < blocks.length; i += 1) {
+    const [btype, payload] = blocks[i];
+    const hdr = Buffer.alloc(4);
+    hdr[0] = i === blocks.length - 1 ? btype | 0x80 : btype;
+    hdr[1] = (payload.length >> 16) & 0xff;
+    hdr[2] = (payload.length >> 8) & 0xff;
+    hdr[3] = payload.length & 0xff;
+    out.push(hdr, payload);
+  }
+  return Buffer.concat(out);
+}
+
 async function waitForLoadedThumb(locator, label) {
   const img = locator.locator('img').first();
   await img.waitFor({ timeout: 10_000 });
@@ -2568,8 +2641,14 @@ test('delayed capability replies still render thumbnails in pinned strip, folder
   fs.mkdirSync(piGallery, { recursive: true });
   const piAmberPath = path.join(piGallery, 'pi-amber.png');
   const piVioletPath = path.join(piGallery, 'pi-violet.png');
+  const piSongPath = path.join(piGallery, 'pi-song.flac');
+  const piSongCover = makeSolidPng(128, 128, 45, 175, 155);
   fs.writeFileSync(piAmberPath, makeSolidPng(160, 120, 225, 165, 35));
   fs.writeFileSync(piVioletPath, makeSolidPng(160, 120, 125, 70, 200));
+  fs.writeFileSync(
+    piSongPath,
+    makeTaggedFlac({ title: 'Pi Song', artist: 'Maren', album: 'Harbor', coverPng: piSongCover }),
+  );
 
   const legacyMedia = path.join(legacyUser, 'media');
   fs.mkdirSync(legacyMedia, { recursive: true });
@@ -2613,9 +2692,10 @@ test('delayed capability replies still render thumbnails in pinned strip, folder
     ].join('\n'),
   );
 
-  // Pin a picture that lives on `pi` so Files home renders the tile via tower's fav.list while
-  // pi's own capabilities are still held back.
+  // Pin a picture and a song that live on `pi` so Files home renders both tiles via tower's
+  // fav.list while pi's own capabilities are still held back.
   runLegion(['fav.add', 'machine=pi', `path=${piAmberPath}`, 'pinned=true', '--json'], towerHome, towerUser);
+  runLegion(['fav.add', 'machine=pi', `path=${piSongPath}`, 'pinned=true', '--json'], towerHome, towerUser);
   const tokenOut = JSON.parse(runLegion(['token.add', 'name=ui', 'principal=ui', '--json'], towerHome, towerUser));
 
   const server = await startServer(towerHome, towerUser);
@@ -2689,11 +2769,15 @@ test('delayed capability replies still render thumbnails in pinned strip, folder
     await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
 
     const pinnedTile = page.locator('.tiles a.tile', { hasText: 'pi-amber.png' });
+    const pinnedSongTile = page.locator('.tiles a.tile', { hasText: 'pi-song.flac' });
     await pinnedTile.waitFor({ timeout: 10_000 });
+    await pinnedSongTile.waitFor({ timeout: 10_000 });
     await piCapsGate.waitArrived();
     assert.equal(await pinnedTile.locator('img').count(), 0, 'Pinned tile should show icon while pi caps are held');
+    assert.equal(await pinnedSongTile.locator('img').count(), 0, 'Pinned song tile should show icon while pi caps are held');
     piCapsGate.release();
     await waitForLoadedThumb(pinnedTile, 'delayed-caps pinned pi-amber.png');
+    await waitForLoadedThumb(pinnedSongTile, 'delayed-caps pinned pi-song.flac');
 
     // 2. Folder listing mounts while pi's capability reply is held back on a fresh reload.
     piCapsGate = makeGate();
@@ -2703,13 +2787,17 @@ test('delayed capability replies still render thumbnails in pinned strip, folder
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.locator('header.top h1', { hasText: 'gallery' }).waitFor({ timeout: 10_000 });
     await piCapsGate.waitArrived();
-    assert.equal(await page.locator('.grid a.cell img').count(), 0, 'Listing should wait until pi caps arrive');
+    assert.equal(await page.locator('.grid a.cell img').count(), 0, 'Listing grid should wait until pi caps arrive');
+    assert.equal(await page.locator('.list a.row img').count(), 0, 'Listing song cover should wait until pi caps arrive');
     piCapsGate.release();
     for (const name of ['pi-amber.png', 'pi-violet.png']) {
       const cell = page.locator(`.grid a.cell[aria-label="${name}"]`);
       await cell.waitFor({ timeout: 10_000 });
       await waitForLoadedThumb(cell, `delayed-caps listing ${name}`);
     }
+    const songRow = page.locator('.list a.row', { hasText: 'pi-song.flac' });
+    await songRow.waitFor({ timeout: 10_000 });
+    await waitForLoadedThumb(songRow, 'delayed-caps listing pi-song.flac');
 
     // 3. Viewer renders while legacy's capability reply is held back; releasing loads the fs.thumb preview.
     legacyCapsGate = makeGate();

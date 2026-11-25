@@ -1,4 +1,5 @@
 import { formatBusyReasonLines } from '../lib/format.js';
+import { createBrowserImmersive } from '../lib/immersive-browser.js';
 import { createMockFilesState, FILES_EXTRA_TOOLS, OLD_FS_FIND_TOOL } from './mock-files.js';
 import {
   OLD_FIXTURE_BUILD,
@@ -579,6 +580,7 @@ export function createMockLink(mode = '') {
   const isPartial = flags.has('partial');
   const isPrimaryOffline = flags.has('aoff');
   const isDisagree = flags.has('disagree');
+  const isReject = flags.has('reject');
   const isAutoEnrol = flags.has('enrol');
   const isFirst = flags.has('first');
   const isRepair = flags.has('repair');
@@ -2065,6 +2067,16 @@ export function createMockLink(mode = '') {
           },
         ]
       : [];
+    const learn_rejections = isReject
+      ? [
+          {
+            machine: 'nas',
+            code: 'name_mismatch',
+            reason: 'nas calls itself someones-nas.',
+            reported_by: 'tower',
+          },
+        ]
+      : [];
     return {
       ready: true,
       needs: null,
@@ -2073,6 +2085,7 @@ export function createMockLink(mode = '') {
       nodes,
       routes,
       disagreements,
+      learn_rejections,
       last_paired: lastPaired,
     };
   }
@@ -2405,6 +2418,95 @@ export function createMockLink(mode = '') {
     return updateState();
   }
 
+  const isNoFullscreen = flags.has('no-fullscreen');
+  const isBrowserFs = flags.has('browser-fs');
+  const browserImmersive = isBrowserFs ? createBrowserImmersive() : null;
+  const immersiveCalls = [];
+  const keepScreenOnCalls = [];
+  const immersiveListeners = new Set();
+  const windowHiddenListeners = new Set();
+  let mockImmersiveActive = false;
+
+  if (typeof window !== 'undefined') {
+    window.__LEGION_MOCK_IMMERSIVE_CALLS__ = immersiveCalls;
+    window.__LEGION_MOCK_KEEP_SCREEN_ON_CALLS__ = keepScreenOnCalls;
+    window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__ = () => {
+      if (mockImmersiveActive) {
+        mockImmersiveActive = false;
+        for (const l of immersiveListeners) {
+          try {
+            l(false);
+          } catch {
+            // Keep notifying remaining listeners.
+          }
+        }
+      }
+      for (const l of windowHiddenListeners) {
+        try {
+          l();
+        } catch {
+          // Keep notifying remaining listeners.
+        }
+      }
+    };
+  }
+
+  function canImmersive(options = {}) {
+    if (isNoFullscreen) return false;
+    if (browserImmersive) return browserImmersive.canImmersive(options);
+    return true;
+  }
+
+  async function immersive(on, options = {}) {
+    const active = Boolean(on);
+    const orientation = typeof options?.orientation === 'string' ? options.orientation : 'none';
+    const record = {
+      on: active,
+      orientation,
+      hasElement: Boolean(options?.element),
+      hasVideo: Boolean(options?.video),
+      at: Date.now(),
+    };
+    immersiveCalls.push(record);
+    if (isNoFullscreen) {
+      mockImmersiveActive = false;
+      return { active: false, mode: 'none' };
+    }
+    if (browserImmersive) {
+      const res = await browserImmersive.immersive(active, options);
+      mockImmersiveActive = Boolean(res?.active);
+      return res;
+    }
+    mockImmersiveActive = active;
+    return { active: mockImmersiveActive, mode: 'mock' };
+  }
+
+  function onImmersiveChange(listener) {
+    if (typeof listener !== 'function') return () => {};
+    if (browserImmersive) return browserImmersive.onImmersiveChange(listener);
+    immersiveListeners.add(listener);
+    return () => {
+      immersiveListeners.delete(listener);
+    };
+  }
+
+  function onWindowHidden(listener) {
+    if (typeof listener !== 'function') return () => {};
+    windowHiddenListeners.add(listener);
+    return () => {
+      windowHiddenListeners.delete(listener);
+    };
+  }
+
+  async function keepScreenOn(on) {
+    const active = Boolean(on);
+    keepScreenOnCalls.push({ on: active, at: Date.now() });
+    if (browserImmersive) {
+      return browserImmersive.keepScreenOn(active);
+    }
+    return active;
+  }
+
   const baseApi = {
     kind,
     mockFlags: flags,
@@ -2424,6 +2526,13 @@ export function createMockLink(mode = '') {
     repairStore,
     scanInvite,
     initialFleetCache,
+    canImmersive,
+    immersive,
+    onImmersiveChange,
+    onWindowHidden,
+    keepScreenOn,
+    immersiveCalls,
+    keepScreenOnCalls,
     ...filesState.optionalLinkMethods,
   };
 

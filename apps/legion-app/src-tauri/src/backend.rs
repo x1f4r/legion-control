@@ -357,6 +357,21 @@ pub struct DisagreementView {
     pub reports: Vec<DisagreementEntryView>,
 }
 
+/// Structured reason why a learned `device.endpoint` answer was rejected during `learn`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearnRejectionView {
+    /// Fleet machine name whose direct endpoint was rejected.
+    pub machine: String,
+    /// Stable reason code (`"name_mismatch"`, `"malformed_endpoint"`, `"shared_host_keys"`,
+    /// or `"too_many"`).
+    pub code: String,
+    /// Technical explanation of why the endpoint was rejected.
+    pub reason: String,
+    /// Paired introducer that reported the rejected endpoint, if applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_by: Option<String>,
+}
+
 /// Platform background transfer capabilities reported in [`AppState`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferCapabilities {
@@ -413,19 +428,56 @@ impl TransferCapabilities {
     }
 }
 
+/// Cryptographic identity and pairing holder of a configured node (`Paired`, `Learned`, or desktop
+/// local pipe), used to pin a relayed content ticket to the exact relay machine that minted it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeRouteIdentity {
+    /// Configured node name (e.g. `"tower"`).
+    pub node: String,
+    /// True when this node is directly paired (or the local desktop pipe).
+    pub is_paired: bool,
+    /// Pairing epoch holder (`pairing:<node>:<epoch>`).
+    pub holder: String,
+    /// Canonical sorted SSH host keys (`<type> <base64>`), empty for local desktop pipes.
+    pub host_keys: Vec<String>,
+}
+
+/// Identity metadata for a learned direct entry, used to bind a relayed content ticket at most
+/// once to the exact learned machine identity introduced by the same paired relay that minted it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LearnedDirectIdentity {
+    /// Fleet pairing epoch during which this learned entry was added.
+    pub learned_fleet_epoch: u64,
+    /// True when `learned_from` names a currently directly paired introducer.
+    pub from_paired_introducer: bool,
+    /// Configured node name of the paired introducer that reported this entry (e.g. `"tower"`).
+    pub learned_from: Option<String>,
+    /// Pairing epoch holder of that introducer (`pairing:<introducer>:<epoch>`), when paired.
+    pub introducer_holder: Option<String>,
+    /// Canonical sorted SSH host keys of that introducer, when paired.
+    pub introducer_host_keys: Vec<String>,
+    /// Canonical sorted set of pinned SSH host keys (`<type> <base64>`).
+    pub host_keys: Vec<String>,
+}
+
 /// Resolved link handle and pairing holder identity for content serving and device transfers.
 #[derive(Clone)]
 pub struct ContentTarget {
-    /// Live `legion-link` handle holding the machine's session.
+    /// Live `legion-link` handle that routes direct or relayed streams for `machine`.
     pub link: legion_link::Link,
-    /// Node key configured on `link` (`"local"` for the desktop local pipe, or the SSH node name).
+    /// Target machine name passed to `link` (`"local"` for the desktop local pipe, or the machine
+    /// name routed directly or via relay).
     pub link_node: String,
     /// Machine name displayed to the user.
     pub machine: String,
     /// Principal name associated with this target.
     pub principal: String,
-    /// Opaque holder string bound to this specific pairing epoch (`pairing:<link_node>:<epoch>`).
+    /// Opaque holder string bound to this pairing epoch (`pairing:<link_node>:<epoch>` or
+    /// `fleet:<epoch>` for relayed-only machines).
     pub holder: String,
+    /// Populated only when this target resolves to a direct learned entry (never for directly
+    /// paired entries, local pipes, or unlearned relayed-only fleet machines).
+    pub learned_identity: Option<LearnedDirectIdentity>,
 }
 
 /// Snapshot returned by the `state` command.
@@ -449,6 +501,9 @@ pub struct AppState {
     /// New machines not pinned because paired introducers disagreed on their endpoints or keys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disagreements: Vec<DisagreementView>,
+    /// Machines whose `device.endpoint` answer was rejected during `learn`, with technical reasons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub learn_rejections: Vec<LearnRejectionView>,
     /// Fleet delivery summary from the most recent pairing in this session, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_paired: Option<PairSummary>,
@@ -601,6 +656,12 @@ pub trait Backend: Send + Sync {
     fn is_pairing_holder_live(&self, _holder: &str) -> bool {
         false
     }
+
+    /// Returns the live configured identity (pairing holder and pinned SSH host keys) of a
+    /// configured relay/direct node, if present.
+    fn node_route_identity(&self, _node: &str) -> Option<NodeRouteIdentity> {
+        None
+    }
 }
 
 /// Fallback backend returning honest unpaired responses.
@@ -618,6 +679,7 @@ impl Backend for Unpaired {
                 can_scan: cfg!(any(target_os = "android", target_os = "ios")),
                 routes: BTreeMap::new(),
                 disagreements: Vec::new(),
+                learn_rejections: Vec::new(),
                 last_paired: None,
                 transfer_capabilities: TransferCapabilities::current_platform(),
             })
@@ -740,6 +802,7 @@ mod tests {
             can_scan: true,
             routes: BTreeMap::new(),
             disagreements: Vec::new(),
+            learn_rejections: Vec::new(),
             last_paired: None,
             transfer_capabilities: TransferCapabilities::current_platform(),
         };
@@ -768,6 +831,7 @@ mod tests {
             can_scan: false,
             routes: BTreeMap::new(),
             disagreements: Vec::new(),
+            learn_rejections: Vec::new(),
             last_paired: None,
             transfer_capabilities: TransferCapabilities::current_platform(),
         };

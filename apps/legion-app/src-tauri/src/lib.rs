@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod commands;
 pub mod content;
+pub mod keep_screen_on;
 pub mod link_backend;
 pub mod store;
 pub mod transfers;
@@ -18,6 +19,13 @@ use std::time::Duration;
 /// bound rather than cutting it off.
 pub(crate) const BACKGROUND_REFRESH_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum time the desktop updater exit path waits for cancelled transfers, active relayed
+/// content streams, and SSH sessions to tear down cleanly before terminating the process for swap.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) const UPDATE_EXIT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use tauri::Emitter;
 use tauri::WindowEvent;
 use tauri::webview::NewWindowResponse;
 use tauri::{Manager, RunEvent, Url, WebviewWindowBuilder};
@@ -313,6 +321,32 @@ fn android_files_transfer_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
         .build()
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn reset_desktop_player_state(
+    app: &tauri::AppHandle,
+    window: Option<&tauri::WebviewWindow>,
+) {
+    if let Some(keep) = app.try_state::<commands::DesktopKeepScreenOn>() {
+        keep.release();
+    }
+    if let Some(immersive) = app.try_state::<commands::DesktopImmersiveState>() {
+        commands::reset_desktop_immersive(window, &immersive);
+    }
+}
+
+/// Notifies the page that the desktop window is hiding/closing (for drain, normal close, or an
+/// update restart) so playback pauses in place, then releases native screen hold and full screen.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn notify_hidden_and_reset_desktop_player(
+    app: &tauri::AppHandle,
+    window: Option<&tauri::WebviewWindow>,
+) {
+    if let Some(win) = window {
+        let _ = win.emit(commands::EVENT_WINDOW_HIDDEN, ());
+    }
+    reset_desktop_player_state(app, window);
+}
+
 /// Builds the main Legion WebView window from `tauri.conf.json` with our strict bundled-origin
 /// navigation guard and new-window denial.
 fn build_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<tauri::WebviewWindow> {
@@ -323,10 +357,67 @@ fn build_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<tauri::Web
         .first()
         .cloned()
         .ok_or_else(|| tauri::Error::Io(std::io::Error::other("missing main window config")))?;
-    WebviewWindowBuilder::from_config(app, &window_config)?
+    let window = WebviewWindowBuilder::from_config(app, &window_config)?
         .on_navigation(is_allowed_navigation_url)
         .on_new_window(|_, _| NewWindowResponse::Deny)
-        .build()
+        .build()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(gtk_win) = window.gtk_window() {
+            use gtk::prelude::WidgetExt;
+            if let Some(gdk_win) = gtk_win.window()
+                && let Some(immersive) = app.try_state::<commands::DesktopImmersiveState>()
+            {
+                immersive.set_initial_observed_fullscreen(
+                    gdk_win.state().contains(gtk::gdk::WindowState::FULLSCREEN),
+                );
+            }
+            let state_app = app.clone();
+            let state_label = window.label().to_owned();
+            gtk_win.connect_window_state_event(move |_, event| {
+                let is_fs = event
+                    .new_window_state()
+                    .contains(gtk::gdk::WindowState::FULLSCREEN);
+                let changed_fs = event
+                    .changed_mask()
+                    .contains(gtk::gdk::WindowState::FULLSCREEN);
+                if let Some(immersive) = state_app.try_state::<commands::DesktopImmersiveState>()
+                    && immersive.record_window_state_fullscreen(is_fs, changed_fs)
+                    && let Some(win) = state_app.get_webview_window(&state_label)
+                {
+                    let _ = win.emit(commands::EVENT_IMMERSIVE_CHANGED, false);
+                }
+                gtk::glib::Propagation::Proceed
+            });
+        }
+
+        let term_app = app.clone();
+        let term_label = window.label().to_owned();
+        let _ = window.with_webview(move |webview| {
+            use webkit2gtk::WebViewExt;
+            let wv = webview.inner();
+            wv.connect_web_process_terminated(move |_, _| {
+                let win = term_app.get_webview_window(&term_label);
+                reset_desktop_player_state(&term_app, win.as_ref());
+            });
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let term_app = app.clone();
+        let term_label = window.label().to_owned();
+        let _ = window.with_webview(move |webview| {
+            let controller = webview.controller();
+            let _ = legion_os::webview2::register_process_failed_handler(&controller, move || {
+                let win = term_app.get_webview_window(&term_label);
+                reset_desktop_player_state(&term_app, win.as_ref());
+            });
+        });
+    }
+
+    Ok(window)
 }
 
 /// Builds the main Legion WebView window from `tauri.conf.json` with our strict bundled-origin
@@ -369,6 +460,22 @@ pub fn run() {
     }
 
     let builder = tauri::Builder::default();
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = builder.on_page_load(|webview, payload| {
+        if payload.event() == tauri::webview::PageLoadEvent::Started {
+            let app = webview.app_handle();
+            let win = app.get_webview_window(webview.label());
+            reset_desktop_player_state(app, win.as_ref());
+        }
+    });
+
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_web_content_process_terminate(|webview| {
+        let app = webview.app_handle();
+        let win = app.get_webview_window(webview.label());
+        reset_desktop_player_state(app, win.as_ref());
+    });
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = if should_register_single_instance(verify_only) {
@@ -463,8 +570,33 @@ pub fn run() {
         app.manage(SharedContentServer(content_server));
         app.manage(SharedTransfers(transfers));
         app.manage(SharedUpdater(updater));
+        app.manage(commands::DesktopImmersiveState::default());
+        app.manage(commands::DesktopKeepScreenOn::default());
 
-        let _window = build_main_webview_window(app.handle())?;
+        let window = build_main_webview_window(app.handle())?;
+
+        #[cfg(all(
+            not(target_os = "linux"),
+            not(any(target_os = "android", target_os = "ios"))
+        ))]
+        {
+            let resize_app = app.handle().clone();
+            let resize_label = window.label().to_owned();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::Resized(_) = event
+                    && let Some(immersive) =
+                        resize_app.try_state::<commands::DesktopImmersiveState>()
+                    && immersive.is_active()
+                    && let Some(win) = resize_app.get_webview_window(&resize_label)
+                    && !commands::read_desktop_fullscreen(&win, &immersive).unwrap_or(true)
+                    && immersive.sync_external_fullscreen(false)
+                {
+                    let _ = win.emit(commands::EVENT_IMMERSIVE_CHANGED, false);
+                }
+            });
+        }
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "ios"))]
+        let _ = window;
 
         Ok(())
     });
@@ -508,6 +640,9 @@ pub fn run() {
                 commands::update_set_auto,
                 commands::update_dismiss_notice,
                 commands::update_maybe_auto_install,
+                commands::window_set_immersive,
+                commands::window_is_fullscreen,
+                commands::set_keep_screen_on,
                 $($extra,)*
             ]
         };
@@ -531,6 +666,7 @@ pub fn run() {
         commands::scan_invite,
         commands::media_check_spec,
         commands::media_check_report,
+        commands::debug_set_window_fullscreen,
         commands::transfer_upload_test_files,
     ));
 
@@ -543,6 +679,7 @@ pub fn run() {
         commands::scan_invite,
         commands::media_check_spec,
         commands::media_check_report,
+        commands::debug_set_window_fullscreen,
     ));
 
     #[cfg(all(any(target_os = "android", target_os = "ios"), not(debug_assertions)))]
@@ -556,6 +693,7 @@ pub fn run() {
     let builder = builder.invoke_handler(legion_invoke_handler!(
         commands::media_check_spec,
         commands::media_check_report,
+        commands::debug_set_window_fullscreen,
         commands::transfer_upload_test_files,
     ));
 
@@ -567,6 +705,7 @@ pub fn run() {
     let builder = builder.invoke_handler(legion_invoke_handler!(
         commands::media_check_spec,
         commands::media_check_report,
+        commands::debug_set_window_fullscreen,
     ));
 
     #[cfg(all(
@@ -591,6 +730,8 @@ pub fn run() {
             event: WindowEvent::CloseRequested { api, .. },
             ..
         } => {
+            let window = app_handle.get_webview_window(&label);
+            notify_hidden_and_reset_desktop_player(app_handle, window.as_ref());
             // Never spawn a close-time update once an app quit or OS session shutdown has begun.
             if app_handle
                 .try_state::<SharedExitRequested>()
@@ -606,7 +747,7 @@ pub fn run() {
                 match handle_desktop_close_request(&updater.0, backend.0.as_ref(), &transfers.0) {
                     DesktopCloseOutcome::HideForDrain => {
                         api.prevent_close();
-                        if let Some(window) = app_handle.get_webview_window(&label) {
+                        if let Some(window) = window {
                             let _ = window.hide();
                         }
                         if let Some(desktop) =
@@ -616,11 +757,23 @@ pub fn run() {
                         }
                     }
                     DesktopCloseOutcome::CloseWithUpdate => {
+                        if let Some(content) = app_handle.try_state::<SharedContentServer>() {
+                            content.0.shutdown();
+                        }
                         tauri_plugin_single_instance::destroy(app_handle);
                     }
                     DesktopCloseOutcome::CloseNormally => {}
                 }
             }
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::Destroyed,
+            ..
+        } => {
+            let window = app_handle.get_webview_window(&label);
+            notify_hidden_and_reset_desktop_player(app_handle, window.as_ref());
         }
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => {
@@ -707,8 +860,12 @@ pub fn run() {
         }
         RunEvent::Exit => {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            if let Some(flag) = app_handle.try_state::<SharedExitRequested>() {
-                flag.0.store(true, Ordering::SeqCst);
+            {
+                let window = app_handle.get_webview_window("main");
+                notify_hidden_and_reset_desktop_player(app_handle, window.as_ref());
+                if let Some(flag) = app_handle.try_state::<SharedExitRequested>() {
+                    flag.0.store(true, Ordering::SeqCst);
+                }
             }
             if let Some(transfers) = app_handle.try_state::<SharedTransfers>() {
                 transfers.0.shutdown();

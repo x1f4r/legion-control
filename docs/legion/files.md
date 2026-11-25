@@ -46,7 +46,7 @@ One table in `legion-core` (`media`) maps a file extension to a **category** and
 | --- | --- |
 | `image` | jpg, jpeg, png, gif, webp, avif, heic, bmp, svg, tif |
 | `video` | mp4, m4v, mov, webm, mkv, avi |
-| `audio` | mp3, m4a, aac, flac, ogg, opus, wav |
+| `audio` | mp3, m4a, m4b, aac, flac, ogg, opus, wav, aif, aiff |
 | `document` | pdf, epub, doc(x), xls(x), ppt(x), odt, ods, odp |
 | `text` | txt, md, log, csv, json, toml, yaml, xml, html, css, source code |
 | `archive` | zip, tar, gz, xz, zst, 7z, rar |
@@ -85,9 +85,30 @@ node.
   `on: "all"` it fans out concurrently across the fleet, returning `{"results": {"<machine>":
   {"ok": {machine, matches, truncated, reason?}} | {"error": {code, message, hint?, machine}}}}`
   so unreachable machines are reported per key rather than failing the search.
-- `fs.thumb` (read): `{paths: [1..32], size: 96..512 = 256, fit: "contain" | "cover"}` returns
+- `fs.tags` (read): `{paths: [1..32]}` returns one entry per input path in input order:
+  `{"results": [{path, ok: {title?, artist?, album?, album_artist?, track?, disc?, year?,
+  duration_s?, cover}} | {path, error}]}`. Reads ID3v2 (2.2/2.3/2.4 including unsynchronisation
+  and text encodings) and ID3v1 in MP3, ID3 chunks in WAV and AIFF, FLAC metadata blocks, Vorbis
+  comments in Ogg Vorbis and Opus (including `METADATA_BLOCK_PICTURE`), and MP4 items in M4A, M4B
+  and MP4, with container `duration_s` without decoding audio. Text fields are trimmed, stripped of
+  control/bidirectional/invisible/tag/noncharacter code points, capped at 512 characters on a
+  complete cluster boundary and omitted when empty; `cover` reports cheaply whether an embedded or
+  folder picture was found (not that it decodes; callers show their placeholder if `fs.thumb` later
+  fails); non-audio regular files report
+  per-path `unsupported`. Parsing runs inside the same out-of-process worker from the already-opened
+  file handle under the same memory cap, pool budget and time limit, reading at most 16 MiB of tag
+  data per file. Allowed exactly when `fs.read` of the file is (and folder cover detection checks
+  `fs.read` of the folder picture per caller); file-intrinsic tags share `thumb-cache/` and its
+  invalidation key.
+- `fs.thumb` (read): `{paths: [1..32], size: 96..1024 = 256, fit: "contain" | "cover"}` returns
   exactly one entry per input path in input order: `{"results": [{path, ok: {mime, content
-  (base64), width, height}} | {path, error}]}`. Regular files are opened non-blockingly once
+  (base64), width, height}} | {path, error}]}`. Total base64 `content` across a single reply is
+  capped at **12 MiB** (so the full JSON-RPC reply line always stays comfortably below the 16 MiB
+  link line limit while a single worst-case 1024×1024 thumbnail always fits). Results are committed
+  in input order; once adding the next thumbnail would exceed 12 MiB, that path and every later path
+  in the batch receive a retryable per-path `busy` error with `details.reason = "reply_budget"`
+  telling the caller to ask for those remaining paths in a follow-up `fs.thumb` call. Regular files
+  are opened non-blockingly once
   (`O_NONBLOCK | O_NOCTTY` plus `fstat` regular-file verification on Unix; disk file check on
   Windows) across `fs.*` and `legion-xfer` so swapping a regular file for a FIFO or special file
   cannot block a node thread. Pictures are header-peeked (`<= 128 KiB`, cross-checking inner frame
@@ -96,7 +117,17 @@ node.
   budget before reading the full file, and decoded out-of-process in a memory-bounded worker that
   receives the already-opened file handle on `stdin`, starts with a cleared minimal environment,
   validates its CLI arguments strictly before allocating, and opens nothing by path (JPEG, PNG, GIF
-  first frame, WebP, BMP; EXIF orientation applied). Admission caps source files at 64 MiB and
+  first frame, WebP, BMP; EXIF orientation applied; target sizes above 512 add 8 MiB of output
+  buffer headroom to admission sizing). Audio files (including audio-only MP4) extract their
+  embedded cover (front cover preferred, else first valid picture; at most 16 MiB of tag data)
+  inside the same worker and decode it through the exact same picture probe, tightened allocator
+  cap and limits; when no embedded cover exists or the embedded cover fails to decode (recorded as
+  an expiring 1-day bad-file entry keyed by file identity, `size` and `fit` so listings do not
+  re-spawn the worker), `fs.thumb` falls back through regular picture files in the same folder named
+  `cover`, `folder`, `front` or `album` (`jpg`, `jpeg`, `png` or `webp`, any case, allowed when
+  `fs.read` of that file is), advancing to the next candidate when a candidate fails to decode, and
+  returns per-path `not_found` only when none decodes.
+  Admission caps source image files at 64 MiB and
   estimated peak decode memory at 256 MiB per image (admitting 48–61 MP baseline JPEGs while
   capping heavier progressive/16-bit/interlaced encodings). Over-cap JPEGs fall back to a validated
   embedded MPF preview (preferred) or EXIF IFD1 thumbnail through the same limits with the main
@@ -375,21 +406,26 @@ mount it:
   per-holder fair sharing and a short acquire timeout (`503 Service Unavailable` with `Retry-After`).
 - **The app**: the native side mounts `legion-content` behind `content_url({machine, path,
   download})`, `content_status({url})`, and `content_revoke({url})`, reading through
-  `Link::open_content`. Every platform (Linux, macOS, Windows, iOS/iPadOS, and Android) mounts it
-  lazily on a streaming HTTP/1.1 listener bound strictly to `127.0.0.1:0` on a system-chosen port
-  (deciding liveness from both Legion's own accept-task state and a short loopback
-  proof-of-ownership probe using a per-listener random 256-bit secret that is never logged or
-  placed in any URL — run on mobile resume and before minting once the last verified proof is
-  older than 2 seconds, answering only keyed challenge/response probes with `Connection: close`
-  under unauthenticated connection limits and returning the same generic `404` to callers without
-  the secret — and always tearing down and binding a fresh OS-chosen port on failure; capped at 32
-  simultaneous connections with a 5-second header-read timeout, a 2-second header timeout for
-  connections that have not yet presented a valid ticket, `Connection: close` on `404` and guard
-  rejections, eviction of the oldest unauthenticated connection before refusing a new one at the
-  cap, status tracking strictly after ticket lookup succeeds, exponential backoff on accept errors,
-  mobile resume recovery, and stopping 60 seconds after no live tickets or active streams remain),
-  protected by `HostOriginGuard` (loopback host+port and only that platform's bundled page
-  origins, never `null`) and `Cross-Origin-Resource-Policy: cross-origin`. On Android, `res/xml/network_security_config.xml`
+  `Link::open_content`. Both `Link::open_content` and `Link::open_put` follow the same direct-first
+  routing with relay fallback as RPC calls: they stream directly when the device has a direct route
+  to `machine`, and relay through a paired node advertising `stream.relay` (`op: "relay"`)
+  otherwise — never silently failing over after bytes were sent — so viewing pictures, playing
+  media, downloading, uploading, and opening externally all work on any machine in the fleet. Every
+  platform (Linux, macOS, Windows, iOS/iPadOS, and Android) mounts `legion-content` lazily on a
+  streaming HTTP/1.1 listener bound strictly to `127.0.0.1:0` on a system-chosen port (deciding
+  liveness from both Legion's own accept-task state and a short loopback proof-of-ownership probe
+  using a per-listener random 256-bit secret that is never logged or placed in any URL — run on
+  mobile resume and before minting once the last verified proof is older than 2 seconds, answering
+  only keyed challenge/response probes with `Connection: close` under unauthenticated connection
+  limits and returning the same generic `404` to callers without the secret — and always tearing
+  down and binding a fresh OS-chosen port on failure; capped at 32 simultaneous connections with a
+  5-second header-read timeout, a 2-second header timeout for connections that have not yet
+  presented a valid ticket, `Connection: close` on `404` and guard rejections, eviction of the
+  oldest unauthenticated connection before refusing a new one at the cap, status tracking strictly
+  after ticket lookup succeeds, exponential backoff on accept errors, mobile resume recovery, and
+  stopping 60 seconds after no live tickets or active streams remain), protected by
+  `HostOriginGuard` (loopback host+port and only that platform's bundled page origins, never `null`)
+  and `Cross-Origin-Resource-Policy: cross-origin`. On Android, `res/xml/network_security_config.xml`
   denies cleartext traffic globally while exempting only the loopback literal `127.0.0.1`, allowing
   WebView to stream and seek arbitrarily large media with flat memory without permitting cleartext
   to any other host. On Android, any app on the phone can connect to `127.0.0.1` and send any
@@ -426,9 +462,10 @@ The interface's content security policy grows by exactly what this needs: `img-s
   (`ACTION_OPEN_DOCUMENT` with persistable read URI grants released on completion/failure/cancel on
   Android; native file dialog on desktop) and issues session-only opaque upload handles so the web
   view can never name an arbitrary device file. Pre-selected local upload paths exist only behind
-  the debug compile-time flag `test-upload-paths`. Files are hashed in 64 KiB chunks, checked with
-  `fs.stat` to choose a non-colliding `name (2).ext` remote target before starting, and uploaded
-  over the bulk pipe's `put` through `Link::open_put` with remote `.legion-part` resume and BLAKE3
+  the debug compile-time flag `test-upload-paths`. Files are hashed in 64 KiB chunks and uploaded
+  over the bulk pipe's `put` through `Link::open_put` with `"if_exists": "fail"` (stepping to a
+  numbered `name (2).ext` sibling on `exists` when the node advertises `if_exists`, and keeping an
+  `fs.stat` pre-check for older nodes that do not), remote `.legion-part` resume and BLAKE3
   verification.
 
 Nothing here makes a person wait. Starting a download, an upload or a transfer returns at once;

@@ -124,6 +124,8 @@ const PASSIVE_REFRESH_TOOLS = new Set([
   'fs.stat',
   'fs.read',
   'fs.search',
+  'fs.tags',
+  'fs.thumb',
   'fav.list',
   'sync.list',
 ]);
@@ -308,17 +310,26 @@ function App() {
   const folderChanges = useMemo(() => createFolderChangesStore(), []);
   useEffect(() => () => capsStore.dispose(), [capsStore]);
   useEffect(() => () => folderChanges.dispose(), [folderChanges]);
+
+  // Reset any leftover native immersive or screen-on state once on page boot / reload.
+  useEffect(() => {
+    Promise.resolve(link?.immersive?.(false)).catch(() => {});
+    Promise.resolve(link?.keepScreenOn?.(false)).catch(() => {});
+  }, [link]);
   const shellRef = useRef(null);
   const mainRef = useRef(null);
   const refreshAbortRef = useRef(null);
   const refreshInFlightRef = useRef(false);
   const resumingRef = useRef(false);
   const screenRefreshRef = useRef(null);
+  const popStateInterceptorRef = useRef(null);
   const swipeRef = useRef(null);
   const touchSwipeRef = useRef(null);
   const scrollByFolderRef = useRef(new Map());
   const pendingScrollRestoreKeyRef = useRef(null);
   const filesHistoryDepthRef = useRef(0);
+  const viewerHistoryPushedRef = useRef(false);
+  const pendingReplaceAfterPopRef = useRef(null);
   const filesSheetHistoryRef = useRef(false);
   const filesSelectHistoryRef = useRef(false);
   const lastHashRef = useRef(window.location.hash);
@@ -457,8 +468,12 @@ function App() {
       const item = failedList[0];
       const verb = item.direction === 'upload' ? 'Upload' : 'Download';
       const name = item.name || 'file';
-      const detailText = item.error
-        ? plainErrorMessage(item.error, '', { technical: Boolean(settingsRef.current?.technical), deviceNoun })
+      const errObj =
+        item.error && typeof item.error === 'object'
+          ? { ...item.error, machine: item.error.machine || item.machine || null }
+          : item.error;
+      const detailText = errObj
+        ? plainErrorMessage(errObj, '', { technical: Boolean(settingsRef.current?.technical), deviceNoun })
         : '';
       const detail = detailText ? ` ${detailText}` : '';
       return `${verb} of ${name} failed.${detail}`;
@@ -866,6 +881,14 @@ function App() {
         scrollByFolderRef.current.set(`${prevRoute.machine || ''}\0${prevRoute.path || '~'}`, mainRef.current.scrollTop);
       }
       const next = parseRoute(window.location.hash);
+      if (next.section !== 'files') {
+        filesHistoryDepthRef.current = 0;
+        viewerHistoryPushedRef.current = false;
+      } else if (!next.viewer) {
+        viewerHistoryPushedRef.current = false;
+      } else if (window.history.state?.legionViewerOverlay) {
+        viewerHistoryPushedRef.current = true;
+      }
       if (
         (prevRoute?.section === 'files' && (next.section !== 'files' || next.machine !== prevRoute.machine || next.path !== prevRoute.path)) ||
         (prevRoute?.section === 'machines' && (next.section !== 'machines' || next.machine !== prevRoute.machine || next.tab !== prevRoute.tab))
@@ -881,6 +904,13 @@ function App() {
       });
     }
     function onPopState() {
+      if (pendingReplaceAfterPopRef.current) {
+        const nextHref = pendingReplaceAfterPopRef.current;
+        pendingReplaceAfterPopRef.current = null;
+        window.history.replaceState(null, '', nextHref);
+        syncRoute();
+        return;
+      }
       const st = window.history.state;
       if (sheetHistoryRef.current && !st?.legionSheet) {
         sheetHistoryRef.current = false;
@@ -896,6 +926,10 @@ function App() {
         filesSelectHistoryRef.current = false;
         setFilesSelecting(false);
         setFilesSelectedPaths(new Set());
+        return;
+      }
+      if (popStateInterceptorRef.current?.()) {
+        lastHashRef.current = window.location.hash;
         return;
       }
       if (window.location.hash !== lastHashRef.current) {
@@ -962,6 +996,23 @@ function App() {
         learnInFlightRef.current = false;
       });
   }, [link, mergeBackendState]);
+
+  // Refresh link route and learn-rejection state whenever Settings -> Connections opens so
+  // route changes caused by recent calls or streams (e.g. relay -> direct) appear immediately.
+  useEffect(() => {
+    if (link.kind !== 'app' || typeof link.state !== 'function') return;
+    if (route.section !== 'settings' || route.page !== 'connections') return;
+    let alive = true;
+    link
+      .state()
+      .then((st) => {
+        if (alive && st) mergeBackendState(st);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [link, route.section, route.page, mergeBackendState]);
 
   const checkUpdatesQuietly = useCallback(async () => {
     if (typeof link.checkUpdates !== 'function' || updateCheckInFlightRef.current) return;
@@ -1110,32 +1161,86 @@ function App() {
       applyLocalNodeMigration(realName);
       setLinkState((prev) => {
         if (!prev || !Array.isArray(prev.nodes)) return prev;
-        const seen = new Set();
+        const isSelfName = (name) =>
+          name === realName || isLocalConnectionName(name) || isPendingLocalName(name);
+        const mapLocalHop = (name) =>
+          isLocalConnectionName(name) || isPendingLocalName(name) ? realName : name;
+        const indexByName = new Map();
         const nextNodes = [];
         for (const n of prev.nodes) {
           if (!n) continue;
           const isLocalEntry =
             n.isLocalComputer ||
             n.nodeNamePending ||
+            n.via === LOCAL_PIPE_CONNECTION ||
             isLocalConnectionName(n.node) ||
             isPendingLocalName(n.node);
           const nodeName = isLocalEntry ? realName : n.node;
-          if (!nodeName || seen.has(nodeName)) continue;
-          seen.add(nodeName);
-          if (isLocalEntry) {
-            nextNodes.push({
-              ...n,
-              node: realName,
-              isLocalComputer: true,
-              nodeNamePending: false,
-              reachable: true,
-              whoami: n.whoami ? { ...n.whoami, node: realName } : n.whoami,
-            });
-          } else {
-            nextNodes.push(n);
+          if (!nodeName) continue;
+          const entry = isLocalEntry
+            ? {
+                ...n,
+                node: realName,
+                via: LOCAL_PIPE_CONNECTION,
+                route: 'direct',
+                route_via: null,
+                learned_from: null,
+                identity_changed: null,
+                isLocalComputer: true,
+                nodeNamePending: false,
+                reachable: true,
+                whoami: n.whoami ? { ...n.whoami, node: realName } : n.whoami,
+              }
+            : {
+                ...n,
+                route_via: mapLocalHop(n.route_via),
+                learned_from: mapLocalHop(n.learned_from),
+              };
+          if (indexByName.has(nodeName)) {
+            if (isLocalEntry) nextNodes[indexByName.get(nodeName)] = entry;
+            continue;
           }
+          indexByName.set(nodeName, nextNodes.length);
+          nextNodes.push(entry);
         }
-        const nextState = { ...prev, nodes: nextNodes };
+        let nextRoutes = prev.routes;
+        if (prev.routes && typeof prev.routes === 'object') {
+          const hadLocal = Object.keys(prev.routes).some((k) => isSelfName(k));
+          const rebuilt = {};
+          for (const [k, info] of Object.entries(prev.routes)) {
+            if (!k || isSelfName(k)) continue;
+            rebuilt[k] =
+              info && typeof info === 'object'
+                ? { ...info, via: mapLocalHop(info.via), introducer: mapLocalHop(info.introducer) }
+                : info;
+          }
+          if (hadLocal) {
+            rebuilt[realName] = { kind: 'direct', via: null, introducer: null };
+          }
+          nextRoutes = rebuilt;
+        }
+        const nextRejections = Array.isArray(prev.learn_rejections)
+          ? prev.learn_rejections
+              .filter((r) => r && !isSelfName(r.machine))
+              .map((r) => ({ ...r, reported_by: mapLocalHop(r.reported_by) }))
+          : prev.learn_rejections;
+        const nextDisagreements = Array.isArray(prev.disagreements)
+          ? prev.disagreements
+              .filter((d) => d && !isSelfName(d.machine))
+              .map((d) => ({
+                ...d,
+                reports: Array.isArray(d.reports)
+                  ? d.reports.map((r) => (r ? { ...r, reported_by: mapLocalHop(r.reported_by) } : r))
+                  : d.reports,
+              }))
+          : prev.disagreements;
+        const nextState = {
+          ...prev,
+          nodes: nextNodes,
+          routes: nextRoutes,
+          learn_rejections: nextRejections,
+          disagreements: nextDisagreements,
+        };
         nodeInfoRef.current = nextNodes[0] || null;
         return nextState;
       });
@@ -1548,6 +1653,15 @@ function App() {
     };
   }, [link, capsStore, linkState?.ready, nodeInfo, refreshFleet, settings.refreshSeconds, checkUpdatesQuietly]);
 
+  const registerPopStateInterceptor = useCallback((fn) => {
+    popStateInterceptorRef.current = typeof fn === 'function' ? fn : null;
+    return () => {
+      if (popStateInterceptorRef.current === fn) {
+        popStateInterceptorRef.current = null;
+      }
+    };
+  }, []);
+
   const openConfirm = useCallback((req) => {
     if (!sheetHistoryRef.current) {
       window.history.pushState({ legionSheet: true }, '');
@@ -1738,8 +1852,18 @@ function App() {
             scrollByFolderRef.current.set(`${cur.machine || ''}\0${cur.path || '~'}`, mainRef.current.scrollTop);
           }
           if (targetHref && targetHref !== window.location.hash) {
+            const parsedTarget = parseRoute(targetHref);
+            const sameUnderlyingRoute =
+              Boolean(parsedTarget.viewer) &&
+              !cur?.viewer &&
+              parsedTarget.section === cur?.section &&
+              parsedTarget.view === cur?.view &&
+              parsedTarget.machine === cur?.machine &&
+              parsedTarget.path === cur?.path;
             filesHistoryDepthRef.current += 1;
-            window.location.hash = targetHref;
+            viewerHistoryPushedRef.current = sameUnderlyingRoute;
+            window.history.pushState(sameUnderlyingRoute ? { legionViewerOverlay: true } : null, '', targetHref);
+            window.dispatchEvent(new HashChangeEvent('hashchange'));
           }
         };
         if (href) {
@@ -1762,12 +1886,31 @@ function App() {
         pushDirect(href);
       },
       closeViewer() {
-        if (filesHistoryDepthRef.current > 0) {
-          window.history.back();
-        } else {
-          const cur = routeRef.current;
-          window.location.hash = routeHref({ ...cur, viewer: null });
+        const cur = routeRef.current;
+        const folderHref = routeHref({ ...cur, viewer: null });
+        const hadSheet = sheetHistoryRef.current;
+        if (hadSheet) {
+          sheetHistoryRef.current = false;
+          setConfirmRequest(null);
         }
+        if (viewerHistoryPushedRef.current) {
+          viewerHistoryPushedRef.current = false;
+          if (hadSheet) {
+            window.history.go(-2);
+          } else {
+            window.history.back();
+          }
+          return;
+        }
+        if (hadSheet) {
+          // Deep-linked or cross-route viewer behind a confirm sheet: pop the sheet entry and
+          // replace the viewer entry in place so no history entry points at the deleted file.
+          pendingReplaceAfterPopRef.current = folderHref;
+          window.history.back();
+          return;
+        }
+        window.history.replaceState(null, '', folderHref);
+        window.dispatchEvent(new HashChangeEvent('hashchange'));
       },
       openSheet(nextSheet) {
         if (!filesSheetHistoryRef.current) {
@@ -2798,6 +2941,7 @@ function App() {
                             capsStore=${capsStore}
                             folderChanges=${folderChanges}
                             onRegisterRefresh=${registerScreenRefresh}
+                            onRegisterPopState=${registerPopStateInterceptor}
                             nodeInfo=${nodeInfo}
                             tools=${tools}
                             allowedSet=${allowedSet}

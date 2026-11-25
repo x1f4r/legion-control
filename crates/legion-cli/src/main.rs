@@ -142,16 +142,14 @@ async fn run(command: Command) -> ExitCode {
         }
         _ => Paths::from_env(),
     };
-    let (node, router) = match paths_result {
+    let (node, fleet, router) = match paths_result {
         Ok(paths) => {
             legion_net::updates::cleanup_stale_staging(&paths);
             let fleet = Fleet::new(&paths);
             let mut registry = legion_tools::registry();
             legion_net::register(&mut registry, fleet.clone());
-            (
-                Node::new(paths, registry),
-                Arc::new(fleet) as Arc<dyn Router>,
-            )
+            let router = Arc::new(fleet.clone()) as Arc<dyn Router>;
+            (Node::new(paths, registry), fleet, router)
         }
         // The stdout of `legion rpc`, `legion mcp`, `legion stream` and `legion gate` carries
         // protocol messages and nothing else; stream and gate --enrol report startup errors as
@@ -228,7 +226,7 @@ async fn run(command: Command) -> ExitCode {
         }
         Command::Stream { pinned } => {
             let shutdown = install_shutdown_token();
-            let code = serve_stream(&node, pinned, Door::Stream, None, None, shutdown).await;
+            let code = serve_stream(&node, fleet, pinned, Door::Stream, None, None, shutdown).await;
             router.shutdown().await;
             code
         }
@@ -240,7 +238,10 @@ async fn run(command: Command) -> ExitCode {
             ..
         }) => {
             let shutdown = install_shutdown_token();
-            gate(node, router, pinned, device, pairing, account, shutdown).await
+            gate(
+                node, fleet, router, pinned, device, pairing, account, shutdown,
+            )
+            .await
         }
         Command::Gate(GateCommand::Enrol { id, account, .. }) => {
             let shutdown = install_shutdown_token();
@@ -298,6 +299,7 @@ async fn serve_rpc(
 /// fails, goes to stderr whether or not it could still be said on stdout.
 async fn serve_stream(
     node: &Node,
+    fleet: Fleet,
     pinned: Option<String>,
     door: Door,
     device: Option<String>,
@@ -305,13 +307,56 @@ async fn serve_stream(
     shutdown: CancellationToken,
 ) -> ExitCode {
     let host = Host::new(node.paths().clone(), node.name());
+    let client_gone = CancellationToken::new();
+    let watch_stop = CancellationToken::new();
+    let client_watcher = if legion_os::pipe::stdout_is_peer_stream() {
+        let gone_tok = client_gone.clone();
+        let stop_tok = watch_stop.clone();
+        let shut_tok = shutdown.clone();
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = stop_tok.cancelled() => break,
+                    () = shut_tok.cancelled() => break,
+                    _ = interval.tick() => {
+                        if legion_os::pipe::stdout_peer_closed() {
+                            gone_tok.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     let revoke_abort = CancellationToken::new();
+    #[cfg(debug_assertions)]
+    let downstream_read_timeout = std::env::var("LEGION_TEST_RELAY_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map_or(
+            legion_net::stream::DEFAULT_RELAY_READ_TIMEOUT,
+            Duration::from_millis,
+        );
+    #[cfg(not(debug_assertions))]
+    let downstream_read_timeout = legion_net::stream::DEFAULT_RELAY_READ_TIMEOUT;
     let stream_options = legion_net::stream::StreamServeOptions {
         pairing_id,
         abort_on_revoke: Some(revoke_abort.clone()),
         shutdown: Some(shutdown.clone()),
+        client_gone: Some(client_gone),
+        downstream_read_timeout,
+        fleet: Some(fleet),
+        runtime: Some(tokio::runtime::Handle::current()),
         ..legion_net::stream::StreamServeOptions::default()
     };
+
     let mut served = tokio::task::spawn_blocking(move || {
         legion_net::stream::serve_with_options(
             &host,
@@ -326,18 +371,22 @@ async fn serve_stream(
     let outcome = tokio::select! {
         result = &mut served => Some(result),
         () = revoke_abort.cancelled() => {
-            tokio::time::timeout(Duration::from_millis(200), served)
-                .await
-                .ok()
-        }
-        () = shutdown.cancelled() => {
-            // Give an operation that is already finishing a short window to audit cleanly
-            // without hanging if stdin stays open.
             tokio::time::timeout(Duration::from_millis(500), served)
                 .await
                 .ok()
         }
+        () = shutdown.cancelled() => {
+            // Give an operation that is already finishing a short window to tear down downstream
+            // processes and audit cleanly without hanging if stdin stays open.
+            tokio::time::timeout(Duration::from_millis(750), served)
+                .await
+                .ok()
+        }
     };
+    watch_stop.cancel();
+    if let Some(watcher) = client_watcher {
+        watcher.abort();
+    }
     match outcome {
         Some(Ok(Ok(()))) => ExitCode::SUCCESS,
         Some(Ok(Err(error))) => {
@@ -365,8 +414,10 @@ async fn serve_stream(
 /// live process under `state/device-sessions/` so `device.remove` ends it immediately. When
 /// `--account` is passed (on Windows's shared `administrators_authorized_keys`), refuses any other
 /// OS account.
+#[allow(clippy::too_many_arguments)]
 async fn gate(
     node: Node,
+    fleet: Fleet,
     router: Arc<dyn Router>,
     pinned: String,
     device: Option<String>,
@@ -474,8 +525,16 @@ async fn gate(
             .await
         }
         Subcommand::Stream => {
-            let code =
-                serve_stream(&node, Some(pinned), Door::Ssh, device, pairing, shutdown).await;
+            let code = serve_stream(
+                &node,
+                fleet,
+                Some(pinned),
+                Door::Ssh,
+                device,
+                pairing,
+                shutdown,
+            )
+            .await;
             router.shutdown().await;
             code
         }

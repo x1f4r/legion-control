@@ -221,7 +221,7 @@ fi
 
 say "Building WebView-debuggable x86_64 APK for emulator e2e"
 mkdir -p "$HERE/dist"
-( cd "$HERE" && cargo tauri android build --debug --apk --target x86_64 )
+( cd "$HERE" && cargo tauri android build --debug --apk --target x86_64 --features test-upload-paths )
 
 DEBUG_APK="$HERE/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk"
 if [ ! -f "$DEBUG_APK" ]; then
@@ -262,6 +262,33 @@ printf 'sample note\n' > "$FILES_A_DIR/notes.md"
 printf 'nested file\n' > "$FILES_A_DIR/subdir/item.txt"
 printf 'hello from pi\n' > "$FILES_B_DIR/pi.txt"
 printf 'nested on pi\n' > "$FILES_B_DIR/subdir/item.txt"
+# Seed a valid 4x4 PNG picture and a 128 KiB PCM WAV sample on pi for relayed & direct file e2e.
+node -e '
+const fs = require("node:fs");
+const path = require("node:path");
+const dir = process.argv[1];
+const png = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+  "base64",
+);
+fs.writeFileSync(path.join(dir, "photo.png"), png);
+const dataLen = 128 * 1024;
+const wav = Buffer.alloc(44 + dataLen);
+wav.write("RIFF", 0);
+wav.writeUInt32LE(36 + dataLen, 4);
+wav.write("WAVEfmt ", 8);
+wav.writeUInt32LE(16, 16);
+wav.writeUInt16LE(1, 20);
+wav.writeUInt16LE(1, 22);
+wav.writeUInt32LE(16000, 24);
+wav.writeUInt32LE(32000, 28);
+wav.writeUInt16LE(2, 32);
+wav.writeUInt16LE(16, 34);
+wav.write("data", 36);
+wav.writeUInt32LE(dataLen, 40);
+for (let i = 0; i < dataLen; i++) wav[44 + i] = (i * 13 + 7) & 0xff;
+fs.writeFileSync(path.join(dir, "clip.wav"), wav);
+' "$FILES_B_DIR"
 
 ssh-keygen -q -t ed25519 -N '' -C 'legion-e2e-host-a' -f "$HOST_KEY_A"
 ssh-keygen -q -t ed25519 -N '' -C 'legion-e2e-host-b' -f "$HOST_KEY_B"
@@ -272,9 +299,27 @@ ssh-keygen -q -t ed25519 -N '' -C 'legion-e2e-fleet' -f "$FLEET_KEY"
 chmod 600 "$AUTH_KEYS_A" "$AUTH_KEYS_B"
 
 FLEET_PUB="$(cat "$FLEET_KEY.pub")"
-printf 'command="env LEGION_HOME=%s %s rpc",restrict %s\n' "$NODE_A_HOME" "$LEGION_BIN" "$FLEET_PUB" > "$FLEET_AUTH_KEYS_A"
-printf 'command="env LEGION_HOME=%s %s rpc",restrict %s\n' "$NODE_B_HOME" "$LEGION_BIN" "$FLEET_PUB" > "$FLEET_AUTH_KEYS_B"
-chmod 600 "$FLEET_AUTH_KEYS_A" "$FLEET_AUTH_KEYS_B"
+write_fleet_auth_key() {
+	local out="$1"
+	local node_home="$2"
+	local dispatch
+	dispatch="$RUN_DIR/fleet-dispatch-$(basename "$node_home").sh"
+	cat > "$dispatch" <<EOF
+#!/usr/bin/env sh
+set -eu
+export LEGION_HOME="$node_home"
+case "\${SSH_ORIGINAL_COMMAND:-}" in
+	"legion rpc") exec "$LEGION_BIN" rpc ;;
+	"legion stream") exec "$LEGION_BIN" stream ;;
+	*) printf 'unexpected fleet command: %s\n' "\${SSH_ORIGINAL_COMMAND:-}" >&2; exit 2 ;;
+esac
+EOF
+	chmod 700 "$dispatch"
+	printf 'command="%s",restrict %s\n' "$dispatch" "$FLEET_PUB" > "$out"
+	chmod 600 "$out"
+}
+write_fleet_auth_key "$FLEET_AUTH_KEYS_A" "$NODE_A_HOME"
+write_fleet_auth_key "$FLEET_AUTH_KEYS_B" "$NODE_B_HOME"
 
 read -r PORT_A PORT_B <<< "$(node -e '
 const net = require("node:net");
@@ -354,10 +399,13 @@ authorized_keys = "$AUTH_KEYS_A"
 host_keys = ["$HOST_KEY_A.pub"]
 EOF
 
+# Start pi with an unlearnable endpoint (`0.0.0.0`) for the phone suite's initial relayed-only
+# phase ("second machine reached only through the fleet"); the driver switches pi to its real
+# loopback hosts after proving relayed view/media/download/upload and then runs learn().
 cat >> "$NODE_B_HOME/config/node.toml" <<EOF
 
 [devices]
-hosts = ["127.0.0.1", "10.0.2.2"]
+hosts = ["0.0.0.0"]
 port = $PORT_B
 user = "$CURRENT_USER"
 authorized_keys = "$AUTH_KEYS_B"
@@ -499,8 +547,10 @@ run_on_avd() {
 	# Enable the debug-only loopback endpoint switch so the two-node loopback harness
 	# (127.0.0.1 + 10.0.2.2) can learn peer endpoints. Release builds ignore this marker.
 	adb -s "$serial" shell "run-as '$APP_ID' touch allow-loopback-endpoints"
-	# Android 17 (API 37) Local Network Protection gates 10.0.2.2 behind ACCESS_LOCAL_NETWORK.
+	# Android 17 (API 37) Local Network Protection gates 10.0.2.2 behind ACCESS_LOCAL_NETWORK,
+	# and transfer downloads request POST_NOTIFICATIONS before starting on Android 13+.
 	adb -s "$serial" shell pm grant "$APP_ID" android.permission.ACCESS_LOCAL_NETWORK >/dev/null 2>&1 || true
+	adb -s "$serial" shell pm grant "$APP_ID" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
 	"$HERE/emulator.sh" --avd "$avd" launch
 
 	E2E_ADB_SERIAL="$serial" \
@@ -519,6 +569,10 @@ run_on_avd() {
 	E2E_SSHD_B_CFG="$SSHD_B_CFG" \
 	E2E_SSHD_B_LOG="$SSHD_B_LOG" \
 	E2E_SSHD_B_PIDFILE="$SSHD_B_PIDFILE" \
+	E2E_FILES_B_DIR="$FILES_B_DIR" \
+	E2E_CURRENT_USER="$CURRENT_USER" \
+	E2E_AUTH_KEYS_B="$AUTH_KEYS_B" \
+	E2E_HOST_KEY_B_PUB="$HOST_KEY_B.pub" \
 	E2E_MODE="$mode" \
 	node "$HERE/e2e-android-driver.mjs"
 }

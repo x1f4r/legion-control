@@ -82,6 +82,7 @@ object TransferPathPolicy {
     "mp3" to "audio/mpeg",
     "mpga" to "audio/mpeg",
     "m4a" to "audio/mp4",
+    "m4b" to "audio/mp4",
     "mp4a" to "audio/mp4",
     "alac" to "audio/mp4",
     "aac" to "audio/mp4",

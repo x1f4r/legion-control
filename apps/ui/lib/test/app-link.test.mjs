@@ -731,6 +731,185 @@ test('createAppLink advertises content support, remembers unsupported remote mac
   }
 });
 
+test('createAppLink routes immersive and keepScreenOn across Android, iOS, and desktop Tauri', async () => {
+  const prevWindow = globalThis.window;
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+
+  try {
+    // 1. Android bridge
+    const androidImmersive = [];
+    const androidKeep = [];
+    globalThis.window = {
+      __LEGION_ANDROID__: {
+        setImmersive: (on, orientation) => {
+          androidImmersive.push({ on, orientation });
+          return Promise.resolve(on);
+        },
+        setKeepScreenOn: (on) => {
+          androidKeep.push(on);
+          return Promise.resolve(Boolean(on));
+        },
+      },
+      __TAURI__: { core: { invoke: () => Promise.resolve({}) } },
+    };
+    const androidLink = createAppLink();
+    assert.equal(androidLink.canImmersive(), true);
+    assert.deepEqual(await androidLink.immersive(true, { orientation: 'landscape' }), { active: true, mode: 'android' });
+    assert.deepEqual(await androidLink.immersive(false), { active: false, mode: 'android' });
+    assert.equal(await androidLink.keepScreenOn(true), true);
+    assert.equal(await androidLink.keepScreenOn(false), false);
+    assert.deepEqual(androidImmersive, [
+      { on: true, orientation: 'landscape' },
+      { on: false, orientation: 'none' },
+    ]);
+    assert.deepEqual(androidKeep, [true, false]);
+
+    // 2. iOS bridge
+    const iosMessages = [];
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15' },
+    });
+    globalThis.window = {
+      webkit: {
+        messageHandlers: {
+          legionImmersive: {
+            postMessage: (msg) => iosMessages.push(msg),
+          },
+        },
+      },
+      __TAURI__: { core: { invoke: () => Promise.resolve({}) } },
+    };
+    const iosLink = createAppLink();
+    assert.equal(iosLink.canImmersive(), true);
+    await iosLink.immersive(true, { orientation: 'portrait' });
+    await iosLink.keepScreenOn(true);
+    await iosLink.immersive(false);
+    assert.deepEqual(iosMessages, [
+      { type: 'immersive', on: true, orientation: 'portrait' },
+      { type: 'keep_screen_on', on: true },
+      { type: 'immersive', on: false, orientation: 'none' },
+    ]);
+
+    // 3. Desktop Tauri commands
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15' },
+    });
+    const desktopCalls = [];
+    globalThis.window = {
+      __TAURI__: {
+        core: {
+          invoke(command, payload) {
+            desktopCalls.push({ command, payload });
+            if (command === 'window_set_immersive') {
+              return Promise.resolve({ active: payload.on, fullscreen: payload.on });
+            }
+            if (command === 'set_keep_screen_on') {
+              return Promise.resolve(Boolean(payload.on));
+            }
+            return Promise.resolve();
+          },
+        },
+      },
+    };
+    const desktopLink = createAppLink();
+    assert.equal(desktopLink.canImmersive(), true);
+    assert.deepEqual(await desktopLink.immersive(true, { orientation: 'landscape' }), {
+      active: true,
+      fullscreen: true,
+      mode: 'desktop',
+    });
+    assert.equal(await desktopLink.keepScreenOn(true), true);
+    await desktopLink.immersive(false);
+    assert.equal(await desktopLink.keepScreenOn(false), false);
+    assert.deepEqual(desktopCalls, [
+      { command: 'window_set_immersive', payload: { on: true } },
+      { command: 'set_keep_screen_on', payload: { on: true } },
+      { command: 'window_set_immersive', payload: { on: false } },
+      { command: 'set_keep_screen_on', payload: { on: false } },
+    ]);
+
+    // When desktop backend reports false (e.g. Linux without portal or ScreenSaver), keepScreenOn reports false honestly.
+    globalThis.window = {
+      __TAURI__: {
+        core: {
+          invoke(command) {
+            if (command === 'set_keep_screen_on') return Promise.resolve(false);
+            return Promise.resolve();
+          },
+        },
+      },
+    };
+    const unavailableDesktopLink = createAppLink();
+    assert.equal(await unavailableDesktopLink.keepScreenOn(true), false);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+    else delete globalThis.navigator;
+  }
+});
+
+test('createAppLink does not mark relay or target unsupported on relay_too_old and clears cache when learn adds direct routes', async () => {
+  const prevWindow = globalThis.window;
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          if (command === 'content_url') {
+            if (payload.machine === 'studio') {
+              return Promise.reject({
+                code: 'unsupported',
+                message: 'tower needs an update before it can pass files along from studio.',
+                machine: 'tower',
+                details: { reason: 'relay_too_old', relay: 'tower', target: 'studio' },
+              });
+            }
+            return Promise.reject({
+              code: 'unsupported',
+              message: 'legacy answered stream get without modification time.',
+              machine: 'legacy',
+            });
+          }
+          if (command === 'learn') {
+            return Promise.resolve({
+              report: { introducer: 'tower', added: ['legacy'], updated: [], identity_changed: [], skipped: [] },
+              state: { ready: true, nodes: [{ node: 'tower' }, { node: 'legacy' }] },
+            });
+          }
+          return Promise.resolve({});
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    await assert.rejects(() => link.contentUrl({ machine: 'studio', path: '/pic.png' }), {
+      code: 'unsupported',
+    });
+    // Neither the old relay nor the target should be falsely marked unsupported for direct content.
+    assert.equal(link.supportsContentFor('tower'), true);
+    assert.equal(link.supportsContentFor('studio'), true);
+
+    await assert.rejects(() => link.contentUrl({ machine: 'legacy', path: '/pic.png' }), {
+      code: 'unsupported',
+    });
+    assert.equal(link.supportsContentFor('legacy'), false);
+
+    // Learning new direct routes clears cached unsupported entries.
+    await link.learn();
+    assert.equal(link.supportsContentFor('legacy'), true);
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+});
+
 test('createAppLink onAppResume listens to native tauri://resumed and deduplicates focus fallback', async () => {
   const prevWindow = globalThis.window;
   const handlers = new Map();
@@ -1199,6 +1378,233 @@ test('createForegroundResumeController runs session invalidation on native resum
   assert.deepEqual(resumingStates, [true, false]);
 });
 
+test('createAppLink onImmersiveChange and debug verifyDesktopImmersive cover both WM full-screen sequences', async () => {
+  const prevWindow = globalThis.window;
+  const prevDocument = globalThis.document;
+  const prevImage = globalThis.Image;
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+
+  const tauriListeners = new Map();
+  let realFullscreen = false;
+  let immersiveActive = false;
+  let enteredByLegion = false;
+  let finalReport = null;
+  let resolveReport;
+  const reportSeen = new Promise((r) => {
+    resolveReport = r;
+  });
+
+  globalThis.Image = class FakeImage {
+    constructor() {
+      this.naturalWidth = 16;
+      this.naturalHeight = 16;
+      this.onload = null;
+    }
+    set src(_v) {
+      queueMicrotask(() => this.onload?.());
+    }
+    decode() {
+      return Promise.resolve();
+    }
+  };
+
+  globalThis.document = {
+    visibilityState: 'visible',
+    body: { appendChild() {} },
+    addEventListener() {},
+    removeEventListener() {},
+    createElement() {
+      const vListeners = new Map();
+      return {
+        style: {},
+        videoWidth: 64,
+        videoHeight: 64,
+        duration: 3,
+        currentTime: 0,
+        setAttribute() {},
+        removeAttribute() {},
+        pause() {},
+        load() {},
+        remove() {},
+        addEventListener(name, fn) {
+          if (!vListeners.has(name)) vListeners.set(name, new Set());
+          vListeners.get(name).add(fn);
+        },
+        removeEventListener(name, fn) {
+          vListeners.get(name)?.delete(fn);
+        },
+        set src(_v) {
+          queueMicrotask(() => {
+            for (const fn of [...(vListeners.get('loadeddata') || [])]) fn();
+          });
+        },
+      };
+    },
+  };
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { userAgent: 'Mozilla/5.0 (X11; Linux x86_64)', platform: 'Linux x86_64', maxTouchPoints: 0 },
+  });
+
+  globalThis.window = {
+    location: { origin: 'tauri://localhost' },
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    addEventListener() {},
+    removeEventListener() {},
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          if (command === 'state') return Promise.resolve({ ready: true, nodes: [{ node: 'tower' }] });
+          if (command === 'ready') return Promise.resolve();
+          if (command === 'media_check_spec') {
+            return Promise.resolve({
+              machine: 'tower',
+              image_path: '/home/me/a.png',
+              video_path: '/home/me/b.mp4',
+              verify_immersive: true,
+            });
+          }
+          if (command === 'content_url') {
+            return Promise.resolve({
+              url: `http://127.0.0.1:49999/v1/content/tok/${payload.path.split('/').pop()}`,
+              expires_in: 900,
+            });
+          }
+          if (command === 'window_is_fullscreen') {
+            return Promise.resolve(realFullscreen);
+          }
+          if (command === 'window_set_immersive') {
+            if (payload.on) {
+              if (!immersiveActive) {
+                immersiveActive = true;
+                enteredByLegion = !realFullscreen;
+              }
+              if (enteredByLegion) realFullscreen = true;
+              return Promise.resolve({ active: true, fullscreen: realFullscreen });
+            }
+            const shouldExit = immersiveActive && enteredByLegion;
+            immersiveActive = false;
+            enteredByLegion = false;
+            if (shouldExit) realFullscreen = false;
+            return Promise.resolve({ active: false, fullscreen: realFullscreen });
+          }
+          if (command === 'debug_set_window_fullscreen') {
+            // Simulates real WM toggle (GTK window.fullscreen()/unfullscreen() firing window-state-event).
+            realFullscreen = Boolean(payload.fullscreen);
+            if (!realFullscreen && immersiveActive) {
+              immersiveActive = false;
+              enteredByLegion = false;
+              const cb = tauriListeners.get('legion://immersive-changed');
+              if (cb) queueMicrotask(() => cb({ payload: false }));
+            }
+            return Promise.resolve(realFullscreen);
+          }
+          if (command === 'media_check_report') {
+            finalReport = payload.report;
+            resolveReport(payload.report);
+            return Promise.resolve();
+          }
+          return Promise.resolve({});
+        },
+      },
+      event: {
+        listen(name, cb) {
+          tauriListeners.set(name, cb);
+          return Promise.resolve(() => tauriListeners.delete(name));
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    await link.state();
+    await reportSeen;
+
+    assert.equal(finalReport.ok, true);
+    assert.equal(finalReport.immersive_check.ok, true);
+    assert.equal(finalReport.immersive_check.preFullscreen, true);
+    assert.equal(finalReport.immersive_check.afterPreFullscreen, true);
+    assert.equal(finalReport.immersive_check.duringSeqB, true);
+    assert.equal(finalReport.immersive_check.afterWmExit, false);
+    assert.equal(finalReport.immersive_check.wmExitNotified, true);
+    // Unsubscribe cleaned up the native listener.
+    assert.equal(tauriListeners.has('legion://immersive-changed'), false);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevDocument === undefined) delete globalThis.document;
+    else globalThis.document = prevDocument;
+    if (prevImage === undefined) delete globalThis.Image;
+    else globalThis.Image = prevImage;
+    if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+    else delete globalThis.navigator;
+  }
+});
+
+test('createAppLink onWindowHidden listens to legion://window-hidden, ends immersive, and cleans up', async () => {
+  const prevWindow = globalThis.window;
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const tauriListeners = new Map();
+  let unlistenCount = 0;
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { userAgent: 'Mozilla/5.0 (X11; Linux x86_64)', platform: 'Linux x86_64', maxTouchPoints: 0 },
+  });
+
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          if (command === 'window_set_immersive') {
+            return Promise.resolve({ active: payload.on, fullscreen: payload.on });
+          }
+          return Promise.resolve({});
+        },
+      },
+      event: {
+        listen(name, cb) {
+          tauriListeners.set(name, cb);
+          return Promise.resolve(() => {
+            unlistenCount += 1;
+            tauriListeners.delete(name);
+          });
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    const hiddenEvents = [];
+    const immersiveEvents = [];
+    const unsubHidden = link.onWindowHidden(() => hiddenEvents.push('hidden'));
+    const unsubImm = link.onImmersiveChange((active) => immersiveEvents.push(active));
+    await new Promise((r) => setTimeout(r, 0));
+
+    assert.ok(tauriListeners.has('legion://window-hidden'));
+    await link.immersive(true);
+    tauriListeners.get('legion://window-hidden')({});
+    assert.deepEqual(hiddenEvents, ['hidden']);
+    assert.deepEqual(immersiveEvents, [false]);
+
+    unsubHidden();
+    unsubImm();
+    assert.equal(unlistenCount, 2);
+    assert.equal(tauriListeners.size, 0);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+    else delete globalThis.navigator;
+  }
+});
+
 test('createAppLink resolves local pipe to the node name, routes calls through local pipe, and never exposes local', async () => {
   const prevWindow = globalThis.window;
   const calls = [];
@@ -1348,7 +1754,6 @@ test('createAppLink resolves local pipe to the node name, routes calls through l
     }
     const revokedUrls = calls.filter((c) => c.command === 'content_revoke').map((c) => c.payload.url);
     assert.deepEqual(revokedUrls, [localPic.url, localVid.url, remotePic.url, remoteVid.url]);
-
     // Remote machines still keep their own node name.
     await link.call('fs.list', { path: '~' }, { on: 'tower' });
     assert.equal(
@@ -1444,6 +1849,153 @@ test('createAppLink exposes This computer while local node name cannot be read y
     assert.equal(who.node, 'studio');
     assert.equal(calls.at(-1).payload.on, 'local');
     assert.equal(link.getLocalMachineName(), 'studio');
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+});
+
+test('createAppLink keeps local desktop machine direct, rewrites local relay hops, and strips self learn rejections', async () => {
+  const prevWindow = globalThis.window;
+  const calls = [];
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          calls.push({ command, payload });
+          if (command === 'state') {
+            return Promise.resolve({
+              ready: true,
+              // Even when `tower` is active and a duplicate SSH `studio` precedes `local`,
+              // the local pipe owns `studio`, stays direct, and rewrites all `local` hops.
+              nodes: [
+                {
+                  node: 'tower',
+                  principal: 'device:desktop',
+                  role: 'owner',
+                  via: 'ssh',
+                  origin: 'paired',
+                  route: 'direct',
+                  route_via: null,
+                  learned_from: null,
+                },
+                {
+                  node: 'studio',
+                  principal: 'device:desktop',
+                  role: 'owner',
+                  via: 'ssh',
+                  origin: 'learned',
+                  route: 'relay',
+                  route_via: 'tower',
+                  learned_from: 'tower',
+                },
+                {
+                  node: 'local',
+                  principal: 'local',
+                  role: 'owner',
+                  via: 'local',
+                  origin: 'paired',
+                  route: 'direct',
+                  route_via: null,
+                },
+              ],
+              routes: {
+                local: { kind: 'direct', via: null, introducer: null },
+                studio: { kind: 'relay', via: 'tower', introducer: null },
+                tower: { kind: 'direct', via: null, introducer: null },
+                pi: { kind: 'relay', via: 'local', introducer: 'local' },
+              },
+              learn_rejections: [
+                {
+                  machine: 'studio',
+                  code: 'loopback_host',
+                  reason: 'Loopback address ignored.',
+                  reported_by: 'local',
+                },
+                {
+                  machine: 'nas',
+                  code: 'name_mismatch',
+                  reason: 'nas answered as nas-backup.',
+                  reported_by: 'local',
+                },
+              ],
+              disagreements: [
+                {
+                  machine: 'studio',
+                  reports: [{ reported_by: 'tower', hosts: ['studio.example.net'], port: 22, user: 'me', fingerprints: [] }],
+                },
+                {
+                  machine: 'nas',
+                  reports: [
+                    { reported_by: 'local', hosts: ['nas-a.example.net'], port: 22, user: 'me', fingerprints: [] },
+                    { reported_by: 'tower', hosts: ['nas-b.example.net'], port: 22, user: 'me', fingerprints: [] },
+                  ],
+                },
+              ],
+            });
+          }
+          if (command === 'call' && payload.tool === 'meta.whoami') {
+            if (payload.on === 'local') {
+              return Promise.resolve({ node: 'studio', principal: 'local', role: 'owner', tools: [] });
+            }
+            return Promise.resolve({ node: 'tower', principal: 'device:desktop', role: 'owner', tools: [] });
+          }
+          if (command === 'call' && payload.tool === 'meta.version') {
+            return Promise.resolve({ version: '0.2.0', protocol: 1 });
+          }
+          if (command === 'content_url') {
+            return Promise.resolve({ url: 'http://127.0.0.1:42001/v1/content/tok/a.png', expires_in: 900 });
+          }
+          return Promise.resolve({});
+        },
+        Channel: class FakeChannel {
+          constructor() {
+            this.onmessage = null;
+          }
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    // Resolve local node name first (as happens when `meta.whoami` or `fleet.list` runs on local).
+    await link.state();
+    await link.call('meta.whoami', {}, { on: 'local' });
+    const st = await link.state();
+
+    assert.deepEqual(
+      st.nodes.map((n) => n.node),
+      ['tower', 'studio'],
+    );
+    const localNode = st.nodes.find((n) => n.node === 'studio');
+    assert.equal(localNode.via, 'local');
+    assert.equal(localNode.isLocalComputer, true);
+    assert.equal(localNode.route, 'direct');
+    assert.equal(localNode.route_via, null);
+
+    // Local computer is ALWAYS direct in `routes`; peer relayed through local names `studio`, not `local`.
+    assert.equal('local' in st.routes, false);
+    assert.deepEqual(st.routes.studio, { kind: 'direct', via: null, introducer: null });
+    assert.equal(st.routes.pi.via, 'studio');
+    assert.equal(st.routes.pi.introducer, 'studio');
+
+    // Learn rejections and disagreements never appear for this computer itself, and rewrite `local`.
+    assert.deepEqual(
+      st.learn_rejections.map((r) => [r.machine, r.reported_by]),
+      [['nas', 'studio']],
+    );
+    assert.deepEqual(
+      st.disagreements.map((d) => [d.machine, d.reports.map((r) => r.reported_by)]),
+      [['nas', ['studio', 'tower']]],
+    );
+
+    // Content URLs for the local computer route over the local pipe.
+    await link.contentUrl({ machine: 'studio', path: '/home/me/a.png' });
+    assert.equal(calls.find((c) => c.command === 'content_url')?.payload?.machine, 'local');
   } finally {
     if (prevWindow === undefined) {
       delete globalThis.window;

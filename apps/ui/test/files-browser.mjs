@@ -269,9 +269,10 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
-    // 9. Royalty-free Opus Ogg audio playback loads cleanly.
+    // 9. Royalty-free Opus Ogg audio playback loads cleanly in the music player.
     await page.locator('.list a.row', { hasText: 'Voice note.ogg' }).click();
-    await page.locator('.viewer audio').waitFor();
+    await page.locator('.viewer .music-screen').waitFor();
+    await page.locator('.viewer audio').waitFor({ state: 'attached' });
     await page.waitForFunction(
       () => {
         const a = document.querySelector('.viewer audio');
@@ -890,7 +891,7 @@ test('Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses
     await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
     await page.locator('.toast-banner', { hasText: 'Uploading to tower. Watch progress in Activity.' }).waitFor();
     const failToast = page.locator('.toast-banner.error', {
-      hasText: /Upload of Upload-\d+\.jpg failed\. Connection dropped\./,
+      hasText: /Upload of Upload-\d+\.jpg failed\. Can't reach tower right now\./,
     });
     await failToast.waitFor({ timeout: 5000 });
     await assertToastDoesNotCoverFirstRow(page, 'narrow failure toast');
@@ -957,8 +958,8 @@ test('Files viewer: honest media errors, in-place Open in another app progress/c
     // 1. Server 413, 502, mid-stream truncation, and unrouted mint errors NEVER claim "can't play".
     for (const [fileName, expectedText] of [
       ['fail-413.flac', 'This file is too large to open inline'],
-      ['fail-502.flac', "Couldn't reach this file"],
-      ['fail-truncated.flac', "Couldn't reach this file"],
+      ['fail-502.flac', "Can't reach tower right now."],
+      ['fail-truncated.flac', "Can't reach tower right now."],
       ['no-route.flac', 'Machine tower is not paired on this device.'],
     ]) {
       await page.locator('.list a.row', { hasText: fileName }).click();
@@ -968,9 +969,49 @@ test('Files viewer: honest media errors, in-place Open in another app progress/c
         !/can't play/i.test(text),
         `${fileName} must NEVER say "can't play": ${text}`,
       );
+      if (fileName === 'fail-truncated.flac') {
+        assert.ok(
+          !text.includes('stream_failed') && !text.includes('HTTP 206'),
+          `plain mode must hide stream_failed/HTTP status: ${text}`,
+        );
+      }
       await page.locator('.viewer-top button[aria-label="Close"]').click();
       await page.locator('.viewer').waitFor({ state: 'hidden' });
     }
+
+    // 1b. Relayed mid-stream failures (audio + picture) and old-relay errors on `studio` reach
+    // the viewer as the plain transport sentence — never "can't play" or "can't show".
+    await page.goto(`${server.url}/?mock=formats#/files/studio//home/me/Formats`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('header.top h1', { hasText: 'Formats' }).waitFor();
+    for (const [fileName, expectedSentence, forbiddenRe] of [
+      ['relay-mid-fail.flac', "Can't reach studio right now.", /can't play/i],
+      ['relay-mid-fail.png', "Can't reach studio right now.", /can't show/i],
+      [
+        'relay-too-old.flac',
+        'tower needs an update before it can pass files along from studio.',
+        /can't play|isn't available/i,
+      ],
+    ]) {
+      await page.locator('.list a.row', { hasText: fileName }).click();
+      await page.locator('.viewer').getByText(expectedSentence).first().waitFor({ timeout: 5000 });
+      const text = await page.locator('.viewer').innerText();
+      assert.ok(
+        !forbiddenRe.test(text),
+        `${fileName} must never show format/decode blame: ${text}`,
+      );
+      assert.ok(
+        !text.includes('stream_failed') && !text.includes('relay_too_old'),
+        `${fileName} must hide raw technical reasons in plain mode: ${text}`,
+      );
+      await page.locator('.viewer-top button[aria-label="Close"]').click();
+      await page.locator('.viewer').waitFor({ state: 'hidden' });
+    }
+    await page.goto(`${server.url}/?mock=formats#/files/tower//home/me/Formats`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('header.top h1', { hasText: 'Formats' }).waitFor();
 
     // 2. Known-unplayable formats (WMA, AVI) skip the media player and offer Open in another app.
     await page.locator('.list a.row', { hasText: 'legacy-track.wma' }).click();
@@ -1021,17 +1062,19 @@ test('Files viewer: honest media errors, in-place Open in another app progress/c
     // 6. "Open in another app" shows visible in-place "Getting it ready… X of Y" progress + Cancel,
     // and closing the viewer immediately revokes the minted content URL.
     await page.locator('.list a.row', { hasText: 'studio-master.flac' }).click();
-    const flacAudio = page.locator('.viewer audio');
-    await flacAudio.waitFor();
+    await page.locator('.viewer .music-screen').waitFor();
+    const flacAudio = page.locator('.viewer audio[src]');
+    await flacAudio.waitFor({ state: 'attached' });
     const flacUrl = await flacAudio.getAttribute('src');
     assert.ok(flacUrl, 'expected minted audio content URL');
-    await page.locator('.viewer-bar button', { hasText: 'Open in…' }).click();
+    await page.locator('.music-top button[aria-label="More options"]').click();
+    await page.locator('.sheet button', { hasText: 'Open in another app' }).click();
     const banner = page.locator('.viewer-open-banner');
     await banner.waitFor();
     await banner.getByText(/Getting it ready…/).waitFor();
     await banner.getByRole('button', { name: 'Cancel' }).click();
     await banner.waitFor({ state: 'hidden' });
-    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.music-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
     const revokedAfterClose = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
     assert.ok(

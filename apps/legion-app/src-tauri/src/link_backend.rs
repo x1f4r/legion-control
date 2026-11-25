@@ -21,8 +21,9 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use crate::backend::{
     AppError, AppState, Backend, BoxFuture, CallId, CallRequest, CancelResult,
     ConflictingIdentityInfo, ContentTarget, DisagreementEntryView, DisagreementView, ErrorCode,
-    IdentityChangedInfo, LearnResult, MachineRouteView, Needs, NodeLink, PairPendingPeer,
-    PairSummary, RepairInfo, RepairResult, TransferCapabilities, UnpairResult,
+    IdentityChangedInfo, LearnRejectionView, LearnResult, LearnedDirectIdentity, MachineRouteView,
+    Needs, NodeLink, NodeRouteIdentity, PairPendingPeer, PairSummary, RepairInfo, RepairResult,
+    TransferCapabilities, UnpairResult,
 };
 use crate::commands::default_device_name;
 use crate::store::{AppStore, AppStoreData, StoredNodeMeta};
@@ -149,22 +150,271 @@ impl Drop for OperationGuard {
     }
 }
 
+/// Wake callback invoked by a [`DrainClock`] when a synchronous refresh-drain wait expires.
+pub(crate) type SyncWakeFn = Arc<dyn Fn() + Send + Sync>;
+
+/// Monotonic clock and wait abstraction for [`BackgroundRefreshTracker`] so unit tests can drive
+/// refresh-drain timeouts and ordering deterministically without wall-clock sleeps.
+pub(crate) trait DrainClock: Send + Sync + 'static {
+    fn now(&self) -> Duration;
+    fn sleep_until(&self, deadline: Duration) -> BoxFuture<'static, ()>;
+    fn wait_condvar<'a>(
+        &self,
+        condvar: &Condvar,
+        guard: std::sync::MutexGuard<'a, usize>,
+        deadline: Duration,
+        wake: SyncWakeFn,
+    ) -> std::sync::MutexGuard<'a, usize>;
+}
+
+/// Production [`DrainClock`] backed by `std::time::Instant`, `Condvar::wait_timeout`, and
+/// `tokio::time::sleep_until`.
+pub(crate) struct RealDrainClock {
+    origin: Instant,
+}
+
+impl RealDrainClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl DrainClock for RealDrainClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    fn sleep_until(&self, deadline: Duration) -> BoxFuture<'static, ()> {
+        let target = tokio::time::Instant::from_std(self.origin + deadline);
+        Box::pin(tokio::time::sleep_until(target))
+    }
+
+    fn wait_condvar<'a>(
+        &self,
+        condvar: &Condvar,
+        guard: std::sync::MutexGuard<'a, usize>,
+        deadline: Duration,
+        _wake: SyncWakeFn,
+    ) -> std::sync::MutexGuard<'a, usize> {
+        let remaining = deadline.saturating_sub(self.now());
+        if remaining.is_zero() {
+            return guard;
+        }
+        condvar
+            .wait_timeout(guard, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0
+    }
+}
+
+#[cfg(test)]
+struct ManualDrainClockState {
+    now: Duration,
+    next_sync_id: u64,
+    async_waiters: Vec<(Duration, tokio::sync::oneshot::Sender<()>)>,
+    sync_waiters: Vec<(u64, Duration, SyncWakeFn)>,
+}
+
+/// Deterministic [`DrainClock`] for tests: virtual time advances only via [`Self::advance`], and
+/// [`Self::wait_for_waiter`] lets a test observe that an async or sync drain waiter has entered its
+/// wait before releasing an in-flight refresh or advancing past the timeout.
+#[cfg(test)]
+pub(crate) struct ManualDrainClock {
+    state: Mutex<ManualDrainClockState>,
+    waiter_added: Notify,
+}
+
+#[cfg(test)]
+impl ManualDrainClock {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ManualDrainClockState {
+                now: Duration::ZERO,
+                next_sync_id: 1,
+                async_waiters: Vec::new(),
+                sync_waiters: Vec::new(),
+            }),
+            waiter_added: Notify::new(),
+        })
+    }
+
+    pub(crate) fn advance(&self, delta: Duration) {
+        let (ready_async, ready_sync) = {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.now = guard.now.saturating_add(delta);
+            let now = guard.now;
+            let mut remaining_async = Vec::new();
+            let mut ready_async = Vec::new();
+            for (deadline, tx) in guard.async_waiters.drain(..) {
+                if tx.is_closed() {
+                    continue;
+                }
+                if deadline <= now {
+                    ready_async.push(tx);
+                } else {
+                    remaining_async.push((deadline, tx));
+                }
+            }
+            guard.async_waiters = remaining_async;
+
+            let mut remaining_sync = Vec::new();
+            let mut ready_sync = Vec::new();
+            for (id, deadline, wake) in guard.sync_waiters.drain(..) {
+                if deadline <= now {
+                    ready_sync.push(wake);
+                } else {
+                    remaining_sync.push((id, deadline, wake));
+                }
+            }
+            guard.sync_waiters = remaining_sync;
+            (ready_async, ready_sync)
+        };
+        for tx in ready_async {
+            let _ = tx.send(());
+        }
+        for wake in ready_sync {
+            wake();
+        }
+    }
+
+    pub(crate) fn pending_waiters(&self) -> usize {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.async_waiters.retain(|(_, tx)| !tx.is_closed());
+        guard.async_waiters.len() + guard.sync_waiters.len()
+    }
+
+    pub(crate) async fn wait_for_waiters(&self, expected: usize) {
+        loop {
+            let notified = self.waiter_added.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.pending_waiters() >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn wait_for_waiter(&self) {
+        self.wait_for_waiters(1).await;
+    }
+}
+
+#[cfg(test)]
+impl DrainClock for ManualDrainClock {
+    fn now(&self) -> Duration {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .now
+    }
+
+    fn sleep_until(&self, deadline: Duration) -> BoxFuture<'static, ()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard
+                .async_waiters
+                .retain(|(_, sender)| !sender.is_closed());
+            if deadline <= guard.now {
+                return Box::pin(async {});
+            }
+            guard.async_waiters.push((deadline, tx));
+        }
+        self.waiter_added.notify_waiters();
+        Box::pin(async move {
+            let _ = rx.await;
+        })
+    }
+
+    fn wait_condvar<'a>(
+        &self,
+        condvar: &Condvar,
+        guard: std::sync::MutexGuard<'a, usize>,
+        deadline: Duration,
+        wake: SyncWakeFn,
+    ) -> std::sync::MutexGuard<'a, usize> {
+        let id = {
+            let mut st = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if deadline <= st.now {
+                return guard;
+            }
+            let id = st.next_sync_id;
+            st.next_sync_id = st.next_sync_id.wrapping_add(1);
+            st.sync_waiters.push((id, deadline, wake));
+            id
+        };
+        self.waiter_added.notify_waiters();
+        let next = condvar
+            .wait(guard)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let mut st = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            st.sync_waiters.retain(|(entry_id, _, _)| *entry_id != id);
+        }
+        next
+    }
+}
+
 /// Tracks in-flight passive background refresh calls so updates never permanently block while
 /// polling screens (such as Machine Overview) are open, yet wait briefly for any mid-call refresh
 /// to finish before proceeding between poll ticks.
-#[derive(Default)]
 struct BackgroundRefreshTracker {
-    in_flight: Mutex<usize>,
-    condvar: Condvar,
+    in_flight: Arc<Mutex<usize>>,
+    condvar: Arc<Condvar>,
     notify: Notify,
+    clock: Arc<dyn DrainClock>,
+}
+
+impl Default for BackgroundRefreshTracker {
+    fn default() -> Self {
+        Self::with_clock(Arc::new(RealDrainClock::new()))
+    }
 }
 
 impl BackgroundRefreshTracker {
+    fn with_clock(clock: Arc<dyn DrainClock>) -> Self {
+        Self {
+            in_flight: Arc::new(Mutex::new(0)),
+            condvar: Arc::new(Condvar::new()),
+            notify: Notify::new(),
+            clock,
+        }
+    }
+
     fn count(&self) -> usize {
         *self
             .in_flight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn sync_waker(&self) -> SyncWakeFn {
+        let in_flight = Arc::clone(&self.in_flight);
+        let condvar = Arc::clone(&self.condvar);
+        Arc::new(move || {
+            let _guard = in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            condvar.notify_all();
+        })
     }
 
     fn wait_sync(&self, timeout: Duration) -> bool {
@@ -175,23 +425,15 @@ impl BackgroundRefreshTracker {
         if *count == 0 {
             return true;
         }
-        let deadline = Instant::now() + timeout;
+        let deadline = self.clock.now().saturating_add(timeout);
+        let wake = self.sync_waker();
         while *count > 0 {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            if self.clock.now() >= deadline {
                 return false;
             }
-            let (next, res) = self
-                .condvar
-                .wait_timeout(count, remaining)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            count = next;
-            if *count == 0 {
-                return true;
-            }
-            if res.timed_out() {
-                return false;
-            }
+            count = self
+                .clock
+                .wait_condvar(&self.condvar, count, deadline, Arc::clone(&wake));
         }
         true
     }
@@ -200,7 +442,9 @@ impl BackgroundRefreshTracker {
         if self.count() == 0 {
             return true;
         }
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = self.clock.now().saturating_add(timeout);
+        let timer = self.clock.sleep_until(deadline);
+        tokio::pin!(timer);
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -210,9 +454,10 @@ impl BackgroundRefreshTracker {
             if self.count() == 0 {
                 return true;
             }
-            match tokio::time::timeout_at(deadline, notified).await {
-                Ok(()) => continue,
-                Err(_) => return self.count() == 0,
+            tokio::select! {
+                biased;
+                _ = &mut notified => continue,
+                _ = &mut timer => return self.count() == 0,
             }
         }
     }
@@ -265,10 +510,18 @@ struct BackendState {
     preferred_relay: Option<(String, Instant)>,
     last_paired: Option<PairSummary>,
     disagreements: Vec<DisagreementView>,
+    learn_rejections: Vec<LearnRejectionView>,
     /// Monotonic pairing epoch per configured link node (`"local"` or node name). Bumped on pair
     /// / identity-change acceptance and removed on unpair / repair so content tickets issued under
     /// a removed or replaced pairing die immediately.
     pairing_epochs: HashMap<String, u64>,
+    /// Monotonic fleet epoch for tickets issued to relayed-only fleet machines (not directly
+    /// configured on this device). Bumped on pair, unpair, repair, or identity change so any new
+    /// or changed pairing invalidates previously minted fleet tickets immediately.
+    fleet_pairing_epoch: u64,
+    /// Fleet pairing epoch in which each learned direct node was added during this session, so a
+    /// `fleet:<epoch>` ticket can only upgrade to an entry learned during its own epoch.
+    learned_fleet_epochs: HashMap<String, u64>,
     next_pairing_epoch: u64,
     link: Link,
 }
@@ -278,6 +531,21 @@ impl BackendState {
         let next = self.next_pairing_epoch;
         self.next_pairing_epoch = self.next_pairing_epoch.saturating_add(1);
         next
+    }
+
+    fn bump_fleet_epoch(&mut self) -> u64 {
+        let epoch = self.alloc_epoch();
+        self.fleet_pairing_epoch = epoch;
+        epoch
+    }
+
+    fn prune_learned_fleet_epochs(&mut self) {
+        let link_cfg = &self.data.link;
+        self.learned_fleet_epochs.retain(|node, _| {
+            link_cfg
+                .node(node)
+                .is_some_and(|n| n.origin == NodeOrigin::Learned)
+        });
     }
 
     fn set_fresh_epoch(&mut self, node: &str) -> u64 {
@@ -314,6 +582,10 @@ fn format_pairing_holder(link_node: &str, epoch: u64) -> String {
     format!("pairing:{link_node}:{epoch}")
 }
 
+fn format_fleet_holder(epoch: u64) -> String {
+    format!("fleet:{epoch}")
+}
+
 fn parse_pairing_holder(holder: &str) -> Option<(&str, u64)> {
     let rest = holder.strip_prefix("pairing:")?;
     let (node, epoch_str) = rest.rsplit_once(':')?;
@@ -322,6 +594,21 @@ fn parse_pairing_holder(holder: &str) -> Option<(&str, u64)> {
     }
     let epoch = epoch_str.parse::<u64>().ok()?;
     Some((node, epoch))
+}
+
+fn parse_fleet_holder(holder: &str) -> Option<u64> {
+    holder.strip_prefix("fleet:")?.parse::<u64>().ok()
+}
+
+fn canonical_host_keys(keys: &[String]) -> Vec<String> {
+    let mut canonical = std::collections::BTreeSet::new();
+    for line in keys {
+        let mut parts = line.split_whitespace();
+        if let (Some(kind), Some(data)) = (parts.next(), parts.next()) {
+            canonical.insert(format!("{kind} {data}"));
+        }
+    }
+    canonical.into_iter().collect()
 }
 
 impl LinkBackend {
@@ -333,13 +620,13 @@ impl LinkBackend {
     /// explicitly archives the damaged file via [`Backend::repair_store`].
     pub fn from_store(store: AppStore) -> Self {
         let local_program = discover_local_legion();
-        Self::init(store, local_program, None)
+        Self::init(store, local_program, None, Arc::new(RealDrainClock::new()))
     }
 
     /// Creates a backend with an explicit local binary override (used in unit tests).
     #[cfg(test)]
     pub fn with_local_program(store: AppStore, local_program: Option<String>) -> Self {
-        Self::init(store, local_program, None)
+        Self::init(store, local_program, None, Arc::new(RealDrainClock::new()))
     }
 
     /// Creates a backend with a custom [`legion_link::SessionOpener`] for deterministic unit tests.
@@ -349,13 +636,31 @@ impl LinkBackend {
         local_program: Option<String>,
         opener: legion_link::SessionOpener,
     ) -> Self {
-        Self::init(store, local_program, Some(opener))
+        Self::init(
+            store,
+            local_program,
+            Some(opener),
+            Arc::new(RealDrainClock::new()),
+        )
+    }
+
+    /// Creates a backend with both a custom [`legion_link::SessionOpener`] and an injected
+    /// [`DrainClock`] so refresh-drain tests run deterministically without wall-clock sleeps.
+    #[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
+    pub(crate) fn with_opener_and_clock(
+        store: AppStore,
+        local_program: Option<String>,
+        opener: legion_link::SessionOpener,
+        clock: Arc<dyn DrainClock>,
+    ) -> Self {
+        Self::init(store, local_program, Some(opener), clock)
     }
 
     fn init(
         store: AppStore,
         local_program: Option<String>,
         opener: Option<legion_link::SessionOpener>,
+        drain_clock: Arc<dyn DrainClock>,
     ) -> Self {
         let (data, store_error) = match store.load() {
             Ok(data) => (data, None),
@@ -388,8 +693,11 @@ impl LinkBackend {
             preferred_relay: None,
             last_paired: None,
             disagreements: Vec::new(),
+            learn_rejections: Vec::new(),
             pairing_epochs: HashMap::new(),
-            next_pairing_epoch: 1,
+            fleet_pairing_epoch: 1,
+            learned_fleet_epochs: HashMap::new(),
+            next_pairing_epoch: 2,
             link,
         };
         if state.store_error.is_none() {
@@ -402,7 +710,7 @@ impl LinkBackend {
             mutate_lock: AsyncMutex::new(()),
             next_call_seq: AtomicU64::new(1),
             in_flight_ops: Arc::new(AtomicUsize::new(0)),
-            bg_refreshes: Arc::new(BackgroundRefreshTracker::default()),
+            bg_refreshes: Arc::new(BackgroundRefreshTracker::with_clock(drain_clock)),
         }
     }
 
@@ -561,7 +869,11 @@ impl Backend for LinkBackend {
                     "Pass `on: \"<machine>\"` to name the machine whose tool catalogue you want.",
                 ));
             };
-            let routed = link.tools_machine(&machine).await.map_err(AppError::from)?;
+            let resolved = self.resolve_link_node_for_call(&machine);
+            let routed = link
+                .tools_machine(&resolved)
+                .await
+                .map_err(AppError::from)?;
             let tools = routed
                 .value
                 .get("tools")
@@ -613,13 +925,16 @@ impl Backend for LinkBackend {
                         .map_err(AppError::from)?;
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if resolved == LOCAL_NODE_ID
-                        && request.tool == "meta.whoami"
+                        && matches!(
+                            request.tool.as_str(),
+                            "meta.whoami" | "sys.info" | "meta.version"
+                        )
                         && let Some(actual_name) = routed
                             .value
                             .get("node")
                             .and_then(Value::as_str)
                             .map(str::trim)
-                            .filter(|s| !s.is_empty())
+                            .filter(|s| !s.is_empty() && *s != LOCAL_NODE_ID)
                     {
                         let mut guard = self
                             .state
@@ -769,7 +1084,10 @@ impl Backend for LinkBackend {
                 guard.preferred_relay = None;
                 guard.last_paired = Some(pair_summary);
                 guard.disagreements.retain(|d| d.machine != node_name);
+                guard.learn_rejections.retain(|r| r.machine != node_name);
                 guard.set_fresh_epoch(&node_name);
+                guard.bump_fleet_epoch();
+                guard.learned_fleet_epochs.remove(&node_name);
                 build_app_state(&guard, self.store.path())
             };
 
@@ -849,6 +1167,8 @@ impl Backend for LinkBackend {
                 guard.active_node = resolve_active_node(&guard.data, local_program.as_deref());
                 guard.preferred_relay = None;
                 guard.sync_pairing_epochs();
+                guard.bump_fleet_epoch();
+                guard.prune_learned_fleet_epochs();
                 guard.disagreements.retain_mut(|d| {
                     if d.machine == trimmed {
                         return false;
@@ -856,6 +1176,9 @@ impl Backend for LinkBackend {
                     d.reports.retain(|r| r.reported_by != trimmed);
                     d.reports.len() >= 2
                 });
+                guard
+                    .learn_rejections
+                    .retain(|r| r.machine != trimmed && r.reported_by.as_deref() != Some(trimmed));
                 (device, guard.link.clone())
             };
 
@@ -960,7 +1283,10 @@ impl Backend for LinkBackend {
                 guard.preferred_relay = None;
                 guard.last_paired = None;
                 guard.disagreements.clear();
+                guard.learn_rejections.clear();
                 guard.pairing_epochs.clear();
+                guard.learned_fleet_epochs.clear();
+                guard.bump_fleet_epoch();
                 guard.sync_pairing_epochs();
                 (old, build_app_state(&guard, self.store.path()))
             };
@@ -1011,7 +1337,57 @@ impl Backend for LinkBackend {
                 guard.link.clone()
             };
 
-            let report = link.learn().await.map_err(AppError::from)?;
+            #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(unused_mut))]
+            let mut report = link.learn().await.map_err(AppError::from)?;
+
+            // On desktop, never persist a learned SSH route or surface a learn rejection/disagreement
+            // for this computer's own local-pipe machine name unless the user explicitly paired an
+            // SSH node with that name.
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let local_self_name: Option<String> = {
+                let guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if guard.local_program.is_some() {
+                    guard
+                        .attached_local_node
+                        .as_deref()
+                        .filter(|name| {
+                            !guard
+                                .data
+                                .link
+                                .node(name)
+                                .is_some_and(|n| n.origin == NodeOrigin::Paired)
+                        })
+                        .map(str::to_owned)
+                } else {
+                    None
+                }
+            };
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            if let Some(ref local_name) = local_self_name {
+                if link
+                    .config()
+                    .node(local_name)
+                    .is_some_and(|n| n.origin == NodeOrigin::Learned)
+                {
+                    let _ = link.remove_node(local_name).await;
+                }
+                let is_local_self = |m: &str| m == LOCAL_NODE_ID || m == local_name.as_str();
+                report.added.retain(|m| !is_local_self(m));
+                report.updated.retain(|m| !is_local_self(m));
+                report.identity_changed.retain(|m| !is_local_self(m));
+                report.disagreements.retain(|m| !is_local_self(m));
+                report
+                    .disagreement_details
+                    .retain(|d| !is_local_self(&d.machine));
+                report.unreachable.retain(|m| !is_local_self(m));
+                report.rejected.retain(|m| !is_local_self(m));
+                report
+                    .rejected_details
+                    .retain(|r| !is_local_self(&r.machine));
+            }
 
             let state = {
                 let mut guard = self
@@ -1031,6 +1407,20 @@ impl Backend for LinkBackend {
                     guard.data = updated;
                     guard.sync_pairing_epochs();
                 }
+                let current_fleet_epoch = guard.fleet_pairing_epoch;
+                for added in &report.added {
+                    if guard
+                        .data
+                        .link
+                        .node(added)
+                        .is_some_and(|n| n.origin == NodeOrigin::Learned)
+                    {
+                        guard
+                            .learned_fleet_epochs
+                            .insert(added.clone(), current_fleet_epoch);
+                    }
+                }
+                guard.prune_learned_fleet_epochs();
                 guard.disagreements = report
                     .disagreement_details
                     .iter()
@@ -1052,6 +1442,16 @@ impl Backend for LinkBackend {
                                     .collect(),
                             })
                             .collect(),
+                    })
+                    .collect();
+                guard.learn_rejections = report
+                    .rejected_details
+                    .iter()
+                    .map(|r| LearnRejectionView {
+                        machine: r.machine.clone(),
+                        code: r.code.clone(),
+                        reason: r.reason.clone(),
+                        reported_by: r.reported_by.clone(),
                     })
                     .collect();
                 build_app_state(&guard, self.store.path())
@@ -1099,6 +1499,8 @@ impl Backend for LinkBackend {
                     .map_err(AppError::from)?;
                 guard.data = updated;
                 guard.set_fresh_epoch(trimmed);
+                guard.learned_fleet_epochs.remove(trimmed);
+                guard.bump_fleet_epoch();
                 build_app_state(&guard, self.store.path())
             };
             Ok(state)
@@ -1203,6 +1605,50 @@ impl Backend for LinkBackend {
                 Some(ep) => ep,
                 None => guard.set_fresh_epoch(&entry.node),
             };
+            let learned_identity = if entry.origin == NodeOrigin::Learned {
+                let paired_introducer = entry.learned_from.as_deref().and_then(|intro| {
+                    guard
+                        .data
+                        .link
+                        .node(intro)
+                        .filter(|n| n.origin == NodeOrigin::Paired)
+                        .cloned()
+                });
+                let from_paired_introducer = paired_introducer.is_some();
+                let introducer_holder = paired_introducer.as_ref().and_then(|intro| {
+                    guard
+                        .pairing_epochs
+                        .get(&intro.node)
+                        .copied()
+                        .map(|ep| format_pairing_holder(&intro.node, ep))
+                });
+                let introducer_host_keys = paired_introducer
+                    .as_ref()
+                    .and_then(|intro| intro.target.as_ref())
+                    .map(|t| canonical_host_keys(&t.host_keys))
+                    .unwrap_or_default();
+                let learned_from = paired_introducer.map(|intro| intro.node);
+                let host_keys = entry
+                    .target
+                    .as_ref()
+                    .map(|t| canonical_host_keys(&t.host_keys))
+                    .unwrap_or_default();
+                guard
+                    .learned_fleet_epochs
+                    .get(&entry.node)
+                    .copied()
+                    .filter(|_| !host_keys.is_empty())
+                    .map(|learned_fleet_epoch| LearnedDirectIdentity {
+                        learned_fleet_epoch,
+                        from_paired_introducer,
+                        learned_from,
+                        introducer_holder,
+                        introducer_host_keys,
+                        host_keys,
+                    })
+            } else {
+                None
+            };
             let principal = entry.principal.unwrap_or_else(|| {
                 if entry.local_program.is_some() {
                     "local".to_owned()
@@ -1216,6 +1662,7 @@ impl Backend for LinkBackend {
                 machine: entry.node.clone(),
                 principal,
                 holder: format_pairing_holder(&entry.node, epoch),
+                learned_identity,
             });
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1232,23 +1679,26 @@ impl Backend for LinkBackend {
                 machine: trimmed.to_owned(),
                 principal: "local".to_owned(),
                 holder: format_pairing_holder(LOCAL_NODE_ID, epoch),
+                learned_identity: None,
             });
         }
         let any_configured = !guard.data.link.nodes.is_empty() || guard.local_program.is_some();
         if !any_configured {
             return Err(AppError::not_paired());
         }
-        Err(AppError::new(
-            ErrorCode::NotFound,
-            format!("Machine `{trimmed}` is not paired on this device."),
-        )
-        .with_hint("Pair with that machine or refresh learned fleet routes first."))
+        // Any fleet machine not directly configured on this device routes through `Link`
+        // (direct-first with relay fallback), matching RPC call routing without a separate path.
+        Ok(ContentTarget {
+            link,
+            link_node: trimmed.to_owned(),
+            machine: trimmed.to_owned(),
+            principal: "device".to_owned(),
+            holder: format_fleet_holder(guard.fleet_pairing_epoch),
+            learned_identity: None,
+        })
     }
 
     fn is_pairing_holder_live(&self, holder: &str) -> bool {
-        let Some((node, epoch)) = parse_pairing_holder(holder) else {
-            return false;
-        };
         let guard = self
             .state
             .lock()
@@ -1256,7 +1706,55 @@ impl Backend for LinkBackend {
         if guard.store_error.is_some() {
             return false;
         }
-        guard.pairing_epochs.get(node).copied() == Some(epoch)
+        if let Some((node, epoch)) = parse_pairing_holder(holder) {
+            return guard.pairing_epochs.get(node).copied() == Some(epoch);
+        }
+        if let Some(epoch) = parse_fleet_holder(holder) {
+            let any_configured = !guard.data.link.nodes.is_empty() || guard.local_program.is_some();
+            return any_configured && guard.fleet_pairing_epoch == epoch;
+        }
+        false
+    }
+
+    fn node_route_identity(&self, node: &str) -> Option<NodeRouteIdentity> {
+        let trimmed = node.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.store_error.is_some() {
+            return None;
+        }
+        if let Some(entry) = guard.data.link.node(trimmed) {
+            let epoch = guard.pairing_epochs.get(&entry.node).copied()?;
+            let host_keys = entry
+                .target
+                .as_ref()
+                .map(|t| canonical_host_keys(&t.host_keys))
+                .unwrap_or_default();
+            return Some(NodeRouteIdentity {
+                node: entry.node.clone(),
+                is_paired: entry.origin == NodeOrigin::Paired,
+                holder: format_pairing_holder(&entry.node, epoch),
+                host_keys,
+            });
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if guard.local_program.is_some()
+            && (trimmed == LOCAL_NODE_ID || guard.attached_local_node.as_deref() == Some(trimmed))
+        {
+            let epoch = guard.pairing_epochs.get(LOCAL_NODE_ID).copied()?;
+            return Some(NodeRouteIdentity {
+                node: LOCAL_NODE_ID.to_owned(),
+                is_paired: true,
+                holder: format_pairing_holder(LOCAL_NODE_ID, epoch),
+                host_keys: Vec::new(),
+            });
+        }
+        None
     }
 }
 
@@ -1364,6 +1862,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
             can_scan,
             routes: BTreeMap::new(),
             disagreements: Vec::new(),
+            learn_rejections: Vec::new(),
             last_paired: None,
             transfer_capabilities: TransferCapabilities::current_platform(),
         };
@@ -1526,6 +2025,30 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
 
     let ready = !nodes.is_empty();
     let needs = if ready { None } else { Some(Needs::Pairing) };
+    #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(unused_mut))]
+    let mut disagreements = state.disagreements.clone();
+    #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(unused_mut))]
+    let mut learn_rejections = state.learn_rejections.clone();
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if state.local_program.is_some() {
+        let own_local = state
+            .attached_local_node
+            .as_deref()
+            .filter(|name| state.data.link.node(name).is_none());
+        let is_own_local =
+            |name: &str| name == LOCAL_NODE_ID || own_local.is_some_and(|local| local == name);
+        if let Some(local_name) = own_local
+            && routes
+                .get(local_name)
+                .is_some_and(|view| view.kind != "direct")
+        {
+            routes.remove(local_name);
+        }
+        disagreements.retain(|d| !is_own_local(&d.machine));
+        learn_rejections.retain(|r| !is_own_local(&r.machine));
+    }
+
     AppState {
         ready,
         nodes,
@@ -1533,7 +2056,8 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
         repair: None,
         can_scan,
         routes,
-        disagreements: state.disagreements.clone(),
+        disagreements,
+        learn_rejections,
         last_paired: state.last_paired.clone(),
         transfer_capabilities: TransferCapabilities::current_platform(),
     }
@@ -3181,17 +3705,19 @@ mod tests {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn passive_overview_polls_do_not_increment_active_operations_and_drain_cleanly()
     -> Result<(), Box<dyn std::error::Error>> {
         use legion_link::proto::{HelloResult, PROTOCOL, Request, Response, method};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::sync::Semaphore;
 
         let dir = tempfile::tempdir()?;
         let store = AppStore::in_dir(dir.path());
         let call_seen = Arc::new(AtomicUsize::new(0));
         let call_started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let clock = ManualDrainClock::new();
 
         let seen_tx = Arc::clone(&call_seen);
         let started_tx = Arc::clone(&call_started);
@@ -3237,11 +3763,14 @@ mod tests {
                             }
                             let _ = server_w.flush().await;
                         } else {
-                            // Hold each tool call until `release` fires so we can assert live
-                            // counters mid-call.
+                            // Hold each tool call on a permit-storing semaphore so wakeups can
+                            // never be lost under load.
                             seen_tx.fetch_add(1, Ordering::SeqCst);
                             started_tx.notify_waiters();
-                            release_rx.notified().await;
+                            let Ok(permit) = release_rx.acquire().await else {
+                                break;
+                            };
+                            permit.forget();
                             let reply = Response::ok(req.id, serde_json::json!({ "ok": true }));
                             let mut out = serde_json::to_string(&reply).unwrap_or_default();
                             out.push('\n');
@@ -3264,11 +3793,28 @@ mod tests {
             })
         });
 
-        let backend = Arc::new(LinkBackend::with_opener(
+        let backend = Arc::new(LinkBackend::with_opener_and_clock(
             store,
             Some("/usr/bin/legion".to_owned()),
             opener,
+            Arc::clone(&clock) as Arc<dyn DrainClock>,
         ));
+
+        let wait_for_seen = |target: usize| {
+            let call_seen = Arc::clone(&call_seen);
+            let call_started = Arc::clone(&call_started);
+            async move {
+                loop {
+                    let notified = call_started.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if call_seen.load(Ordering::SeqCst) >= target {
+                        return;
+                    }
+                    notified.await;
+                }
+            }
+        };
 
         // 1. Machine Overview polling `sys.info` + `sys.procs` concurrently:
         //    `active_operations()` stays 0 while `background_refreshes()` tracks both calls.
@@ -3299,13 +3845,9 @@ mod tests {
             .await
         });
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while backend.background_refreshes() < 2 || call_seen.load(Ordering::SeqCst) < 1 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for Overview polls to enter flight"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        wait_for_seen(1).await;
+        while backend.background_refreshes() < 2 {
+            tokio::task::yield_now().await;
         }
         assert_eq!(
             backend.active_operations(),
@@ -3314,22 +3856,25 @@ mod tests {
         );
         assert_eq!(backend.background_refreshes(), 2);
 
-        // Waiting with a short timeout while refreshes are still mid-call returns false cleanly
-        // rather than proceeding mid-call or hanging.
-        assert!(
-            !backend
-                .wait_for_background_refreshes(Duration::from_millis(30))
+        // Waiting past the grace timeout while refreshes are still mid-call returns false cleanly
+        // rather than proceeding mid-call or hanging (driven deterministically via ManualDrainClock).
+        let b_timeout_async = Arc::clone(&backend);
+        let timeout_async_task = tokio::spawn(async move {
+            b_timeout_async
+                .wait_for_background_refreshes(Duration::from_secs(2))
                 .await
-        );
-        let b_sync = Arc::clone(&backend);
-        assert!(
-            !tokio::task::spawn_blocking(move || {
-                b_sync.wait_for_background_refreshes_sync(Duration::from_millis(30))
-            })
-            .await?
-        );
+        });
+        let b_timeout_sync = Arc::clone(&backend);
+        let timeout_sync_task = tokio::task::spawn_blocking(move || {
+            b_timeout_sync.wait_for_background_refreshes_sync(Duration::from_secs(2))
+        });
+        clock.wait_for_waiters(2).await;
+        clock.advance(Duration::from_secs(2));
+        assert!(!timeout_async_task.await?);
+        assert!(!timeout_sync_task.await?);
 
-        // Once the in-flight refreshes finish, both async and sync waiters unblock immediately.
+        // Once the in-flight refreshes finish, both async and sync waiters unblock immediately
+        // without advancing the clock.
         let b_wait = Arc::clone(&backend);
         let wait_async_task = tokio::spawn(async move {
             b_wait
@@ -3340,15 +3885,8 @@ mod tests {
         let wait_sync_task = tokio::task::spawn_blocking(move || {
             b_sync_wait.wait_for_background_refreshes_sync(Duration::from_secs(2))
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        // Release both queued calls (the duplex server processes requests sequentially).
-        for _ in 0..4 {
-            release.notify_waiters();
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            if backend.background_refreshes() == 0 {
-                break;
-            }
-        }
+        clock.wait_for_waiters(2).await;
+        release.add_permits(2);
         assert!(wait_async_task.await?);
         assert!(wait_sync_task.await?);
         assert!(sys_task.await?.is_ok());
@@ -3372,23 +3910,96 @@ mod tests {
             )
             .await
         });
-        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(3);
-        while call_seen.load(Ordering::SeqCst) == 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline2,
-                "timed out waiting for sys.kill to enter flight"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for_seen(1).await;
         assert_eq!(
             backend.active_operations(),
             1,
             "user-started sys.kill must increment active_operations()"
         );
         assert_eq!(backend.background_refreshes(), 0);
-        release.notify_waiters();
+        release.add_permits(1);
         assert!(kill_task.await?.is_ok());
         assert_eq!(backend.active_operations(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn background_refresh_tracker_real_clock_smoke() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Single real-time smoke test exercising `RealDrainClock` across both async and sync
+        // waiters with margins orders of magnitude apart (20 ms timeout vs 10 s unblock ceiling).
+        let tracker = Arc::new(BackgroundRefreshTracker::default());
+        {
+            let mut count = tracker
+                .in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *count = 1;
+        }
+        let guard = BackgroundRefreshGuard(Arc::clone(&tracker));
+
+        assert!(!tracker.wait_async(Duration::from_millis(20)).await);
+        let t_sync_timeout = Arc::clone(&tracker);
+        assert!(
+            !tokio::task::spawn_blocking(move || {
+                t_sync_timeout.wait_sync(Duration::from_millis(20))
+            })
+            .await?
+        );
+
+        let t_async = Arc::clone(&tracker);
+        let async_waiter =
+            tokio::spawn(async move { t_async.wait_async(Duration::from_secs(10)).await });
+        let t_sync = Arc::clone(&tracker);
+        let sync_waiter =
+            tokio::task::spawn_blocking(move || t_sync.wait_sync(Duration::from_secs(10)));
+        drop(guard);
+
+        assert!(async_waiter.await?);
+        assert!(sync_waiter.await?);
+        assert_eq!(tracker.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_refresh_tracker_manual_clock_unit() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Exercises `ManualDrainClock` on every target (including Android/iOS).
+        let clock = ManualDrainClock::new();
+        let tracker = Arc::new(BackgroundRefreshTracker::with_clock(
+            Arc::clone(&clock) as Arc<dyn DrainClock>
+        ));
+        {
+            let mut count = tracker
+                .in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *count = 1;
+        }
+        let guard = BackgroundRefreshGuard(Arc::clone(&tracker));
+
+        let t_async = Arc::clone(&tracker);
+        let async_timeout =
+            tokio::spawn(async move { t_async.wait_async(Duration::from_secs(2)).await });
+        clock.wait_for_waiter().await;
+        let t_sync = Arc::clone(&tracker);
+        let sync_timeout =
+            tokio::task::spawn_blocking(move || t_sync.wait_sync(Duration::from_secs(2)));
+        clock.wait_for_waiters(2).await;
+        clock.advance(Duration::from_secs(2));
+        assert!(!async_timeout.await?);
+        assert!(!sync_timeout.await?);
+
+        let t_async2 = Arc::clone(&tracker);
+        let async_ok =
+            tokio::spawn(async move { t_async2.wait_async(Duration::from_secs(2)).await });
+        let t_sync2 = Arc::clone(&tracker);
+        let sync_ok =
+            tokio::task::spawn_blocking(move || t_sync2.wait_sync(Duration::from_secs(2)));
+        clock.wait_for_waiters(2).await;
+        drop(guard);
+        assert!(async_ok.await?);
+        assert!(sync_ok.await?);
         Ok(())
     }
 
@@ -3426,14 +4037,434 @@ mod tests {
         assert!(local_target.holder.starts_with("pairing:local:"));
 
         // Without a live `meta.whoami` identity proof, an unpaired machine name is never guessed
-        // onto the local pipe.
+        // onto the local pipe: it routes as `"tower"` via the link (and an empty app with neither
+        // paired nodes nor a local binary still fails with `NotPaired`).
         let fresh_dir = tempfile::tempdir()?;
         let fresh_backend = LinkBackend::with_local_program(
             AppStore::in_dir(fresh_dir.path()),
             Some("/usr/bin/legion".to_owned()),
         );
-        assert!(fresh_backend.content_target("tower").is_err());
+        let relayed_target = fresh_backend.content_target("tower")?;
+        assert_eq!(relayed_target.link_node, "tower");
+        assert!(relayed_target.holder.starts_with("fleet:"));
+        assert!(fresh_backend.is_pairing_holder_live(&relayed_target.holder));
         assert_eq!(fresh_backend.content_target("local")?.link_node, "local");
+
+        let empty_dir = tempfile::tempdir()?;
+        let empty_backend =
+            LinkBackend::with_local_program(AppStore::in_dir(empty_dir.path()), None);
+        assert_eq!(
+            empty_backend
+                .content_target("tower")
+                .err()
+                .ok_or("expected NotPaired error")?
+                .code,
+            ErrorCode::NotPaired
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fleet_relayed_content_holder_revokes_on_unpair_and_learn_rejections_surface_in_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let mut initial = AppStoreData::default();
+        initial.link.upsert_node(sample_ssh_node("tower"));
+        store.save(&initial)?;
+
+        let backend = LinkBackend::with_local_program(store, None);
+
+        // Phone paired ONLY with `tower` can open content targets for fleet machine `studio`
+        // (never returning "not paired on this device").
+        let studio_target = backend.content_target("studio")?;
+        assert_eq!(studio_target.link_node, "studio");
+        assert!(studio_target.holder.starts_with("fleet:"));
+        assert!(backend.is_pairing_holder_live(&studio_target.holder));
+
+        // Recording learn rejections surfaces them in `AppState::learn_rejections`.
+        {
+            let mut guard = backend.state.lock().unwrap_or_else(|p| p.into_inner());
+            guard
+                .learn_rejections
+                .push(crate::backend::LearnRejectionView {
+                    machine: "studio".to_owned(),
+                    code: "name_mismatch".to_owned(),
+                    reason: "studio calls itself someones-laptop.".to_owned(),
+                    reported_by: Some("tower".to_owned()),
+                });
+        }
+        let st = backend.state().await?;
+        assert_eq!(st.learn_rejections.len(), 1);
+        assert_eq!(st.learn_rejections[0].machine, "studio");
+        assert_eq!(st.learn_rejections[0].code, "name_mismatch");
+        assert_eq!(
+            st.learn_rejections[0].reason,
+            "studio calls itself someones-laptop."
+        );
+        assert_eq!(st.learn_rejections[0].reported_by.as_deref(), Some("tower"));
+
+        // Unpairing `tower` bumps the fleet epoch (revoking the relayed holder) and prunes
+        // rejections reported by `tower`.
+        backend.unpair("tower".to_owned()).await?;
+        assert!(!backend.is_pairing_holder_live(&studio_target.holder));
+        let after = backend.state().await?;
+        assert!(after.learn_rejections.is_empty());
+        assert_eq!(
+            backend
+                .content_target("studio")
+                .err()
+                .ok_or("expected NotPaired error")?
+                .code,
+            ErrorCode::NotPaired
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pair_bumps_fleet_epoch_and_learn_stamps_learned_direct_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use legion_link::proto::{
+            HelloResult, PROTOCOL, Request as ProtoReq, Response as ProtoResp, VERSION,
+        };
+        use legion_link::{Session, SessionOpener, SshTarget};
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let studio_key = DeviceKey::from_seed([81u8; 32]).public_key_line("studio")?;
+        let mut initial = AppStoreData::default();
+        initial.link.device_key = Some(DeviceKey::from_seed([80u8; 32]).to_openssh()?);
+        initial.link.upsert_node(sample_ssh_node("tower"));
+        store.save(&initial)?;
+
+        let studio_key_for_opener = studio_key.clone();
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let node_name = entry.node.clone();
+            let studio_key = studio_key_for_opener.clone();
+            Box::pin(async move {
+                let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(server_in);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                        let Ok(req) = serde_json::from_str::<ProtoReq>(&line) else {
+                            break;
+                        };
+                        let reply = if req.method == "hello" {
+                            ProtoResp::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
+                                    version: VERSION.to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap_or_default(),
+                            )
+                        } else {
+                            ProtoResp::ok(
+                                req.id,
+                                serde_json::json!({
+                                    "results": {
+                                        "studio": {
+                                            "ok": {
+                                                "node": "studio",
+                                                "hosts": ["studio.example.net"],
+                                                "port": 22,
+                                                "user": "me",
+                                                "host_keys": [studio_key],
+                                            }
+                                        }
+                                    }
+                                }),
+                            )
+                        };
+                        if let Ok(encoded) = serde_json::to_string(&reply) {
+                            let _ = server_out
+                                .write_all(format!("{encoded}\n").as_bytes())
+                                .await;
+                        }
+                        line.clear();
+                    }
+                });
+                Session::open_io(
+                    client_in,
+                    client_out,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let backend = LinkBackend::with_opener(store, None, opener);
+        let before_learn = backend.content_target("studio")?;
+        assert!(before_learn.holder.starts_with("fleet:"));
+        assert!(before_learn.learned_identity.is_none());
+        let fleet_epoch =
+            parse_fleet_holder(&before_learn.holder).ok_or("expected fleet:<epoch> holder")?;
+
+        // Learning `studio` from paired introducer `tower` records learned_identity in the same
+        // fleet epoch without bumping `fleet_pairing_epoch`.
+        let learned = backend.learn().await?;
+        assert_eq!(learned.report.added, vec!["studio".to_owned()]);
+        assert!(backend.is_pairing_holder_live(&before_learn.holder));
+        let after_learn = backend.content_target("studio")?;
+        assert!(after_learn.holder.starts_with("pairing:studio:"));
+        let id = after_learn
+            .learned_identity
+            .ok_or("learned entry must carry learned_identity")?;
+        assert!(id.from_paired_introducer);
+        assert_eq!(id.learned_fleet_epoch, fleet_epoch);
+        assert_eq!(id.host_keys, canonical_host_keys(&[studio_key]));
+
+        // Simulating a direct `pair()` update bumps `fleet_pairing_epoch` and replaces `studio`
+        // with a Paired entry, revoking the old `fleet:` holder and clearing `learned_identity`.
+        {
+            let mut guard = backend.state.lock().unwrap_or_else(|p| p.into_inner());
+            let paired_studio = LinkNode::ssh(
+                "studio",
+                SshTarget {
+                    hosts: vec!["other-studio.example.net".to_owned()],
+                    port: 22,
+                    user: "me".to_owned(),
+                    host_keys: vec![DeviceKey::from_seed([82u8; 32]).public_key_line("studio")?],
+                },
+                Some("device:pixel".to_owned()),
+            );
+            guard.data.link.upsert_node(paired_studio);
+            guard.set_fresh_epoch("studio");
+            guard.bump_fleet_epoch();
+            guard.learned_fleet_epochs.remove("studio");
+        }
+        assert!(
+            !backend.is_pairing_holder_live(&before_learn.holder),
+            "pairing must invalidate prior fleet holders"
+        );
+        let after_pair = backend.content_target("studio")?;
+        assert!(
+            after_pair.learned_identity.is_none(),
+            "paired entry must never look like a learned upgrade target"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn desktop_local_pipe_never_learns_ssh_self_route_or_surfaces_self_rejection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use legion_link::proto::{HelloResult, PROTOCOL, Response as ProtoResp, VERSION};
+        use legion_link::{Session, SessionOpener};
+
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let mut initial = AppStoreData::default();
+        initial.link.upsert_node(sample_ssh_node("tower"));
+        store.save(&initial)?;
+
+        let workstation_key = DeviceKey::from_seed([83u8; 32]).public_key_line("workstation")?;
+        let studio_key = DeviceKey::from_seed([84u8; 32]).public_key_line("studio")?;
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let workstation_key = workstation_key.clone();
+            let studio_key = studio_key.clone();
+            Box::pin(async move {
+                let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                let is_local = entry.node == LOCAL_NODE_ID;
+                let hello_node = if is_local {
+                    "workstation".to_owned()
+                } else {
+                    entry.node.clone()
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                    let mut reader = BufReader::new(server_in);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                        let req: legion_link::proto::Request = match serde_json::from_str(&line) {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        };
+                        let reply = if req.method == "hello" {
+                            ProtoResp::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: hello_node.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
+                                    version: VERSION.to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap_or_default(),
+                            )
+                        } else if req.method == "tools" {
+                            ProtoResp::ok(
+                                req.id,
+                                serde_json::json!({
+                                    "tools": [{
+                                        "name": "fs.list",
+                                        "description": "List files",
+                                        "effect": "read",
+                                        "input_schema": { "type": "object" },
+                                    }]
+                                }),
+                            )
+                        } else if req.params["tool"] == "meta.whoami" {
+                            ProtoResp::ok(
+                                req.id,
+                                serde_json::json!({
+                                    "node": "workstation",
+                                    "principal": "local",
+                                    "role": "owner",
+                                }),
+                            )
+                        } else {
+                            // `device.endpoint` reports BOTH `studio` (a valid remote peer) and
+                            // `workstation` (this desktop computer itself — once as an SSH target
+                            // from `tower` and once as a loopback/unlearnable rejection from `local`).
+                            let workstation_entry = if is_local {
+                                serde_json::json!({
+                                    "ok": {
+                                        "node": "workstation",
+                                        "hosts": ["127.0.0.1"],
+                                        "port": 22,
+                                        "user": "me",
+                                        "host_keys": [workstation_key],
+                                    }
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "ok": {
+                                        "node": "workstation",
+                                        "hosts": ["workstation.example.net"],
+                                        "port": 22,
+                                        "user": "me",
+                                        "host_keys": [workstation_key],
+                                    }
+                                })
+                            };
+                            ProtoResp::ok(
+                                req.id,
+                                serde_json::json!({
+                                    "results": {
+                                        "workstation": workstation_entry,
+                                        "studio": {
+                                            "ok": {
+                                                "node": "studio",
+                                                "hosts": ["studio.example.net"],
+                                                "port": 22,
+                                                "user": "me",
+                                                "host_keys": [studio_key],
+                                            }
+                                        }
+                                    }
+                                }),
+                            )
+                        };
+                        if let Ok(encoded) = serde_json::to_string(&reply) {
+                            let _ = server_out
+                                .write_all(format!("{encoded}\n").as_bytes())
+                                .await;
+                        }
+                        line.clear();
+                    }
+                });
+                Session::open_io(
+                    client_in,
+                    client_out,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let backend = LinkBackend::with_opener(store, Some("/usr/bin/legion".to_owned()), opener);
+
+        // Resolving `meta.whoami` over `local` records `attached_local_node = "workstation"`.
+        let who = backend
+            .call(
+                CallRequest {
+                    id: None,
+                    tool: "meta.whoami".to_owned(),
+                    args: serde_json::json!({}),
+                    on: Some(serde_json::json!("local")),
+                },
+                None,
+            )
+            .await?;
+        assert_eq!(who["node"], "workstation");
+
+        // `tools` addressed to `"workstation"` routes over the local pipe directly.
+        let tools = backend
+            .tools(Some(serde_json::json!("workstation")))
+            .await?;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "fs.list");
+
+        // Running `learn()` learns `studio` (the peer) while refusing to persist a learned SSH
+        // shadow or surface a learn rejection/disagreement for `workstation` itself.
+        let learned = backend.learn().await?;
+        assert_eq!(learned.report.added, vec!["studio".to_owned()]);
+        assert!(
+            !learned
+                .report
+                .rejected_details
+                .iter()
+                .any(|r| r.machine == "workstation" || r.machine == "local"),
+            "learn report must not include rejections for this computer: {:?}",
+            learned.report.rejected_details
+        );
+        assert!(
+            !learned
+                .state
+                .nodes
+                .iter()
+                .any(|n| n.node == "workstation" && n.via == "ssh"),
+            "desktop local computer must never gain a learned SSH duplicate: {:?}",
+            learned.state.nodes
+        );
+        assert!(
+            !learned
+                .state
+                .learn_rejections
+                .iter()
+                .any(|r| r.machine == "workstation" || r.machine == "local"),
+            "state must not surface learn_rejections for this computer"
+        );
+        assert!(
+            !learned
+                .state
+                .routes
+                .get("workstation")
+                .is_some_and(|r| r.kind != "direct"),
+            "state must never mark this computer as relayed: {:?}",
+            learned.state.routes
+        );
+        let ct = backend.content_target("workstation")?;
+        assert_eq!(ct.link_node, LOCAL_NODE_ID);
+        assert_eq!(ct.principal, "local");
+        assert!(ct.holder.starts_with("pairing:local:"));
         Ok(())
     }
 }

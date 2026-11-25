@@ -57,8 +57,8 @@ One operation, `immersive(on)`, that each platform implements. The viewer calls 
 
 | Where | Entering does | Notes |
 | --- | --- | --- |
-| Android app | hides status and navigation bars (a swipe from the edge shows them briefly), draws into the cutout, turns to landscape for a wide video and portrait for a tall one | works with the phone's rotation lock on |
-| iOS and iPadOS app | hides the status bar and home indicator, turns the same way | |
+| Android app | hides status and navigation bars (a swipe from the edge shows them briefly), draws into the cutout, turns to landscape for a wide video and portrait for a tall one | works with the phone's rotation lock on; Android 16+ tablets keep the tablet's current orientation while still hiding the system bars |
+| iOS and iPadOS app | hides the status bar and home indicator, turns the same way | on iPadOS with multitasking, as on large Android screens, the bars hide and the video fills while the device is not turned for you |
 | Desktop app | makes the window full screen; leaving restores what it was | a window that was already full screen stays so |
 | Browser | full screen on the viewer, not on the video, so Legion's controls stay; turns to landscape where the browser allows | on a browser without it (iPhone Safari), the system's video full screen; where neither exists, no button |
 
@@ -90,8 +90,9 @@ A song opens on a screen made for listening:
 - in landscape and on wide windows: cover left, everything else right.
 
 Controls never hide here. When a song ends the next one in the folder starts; after the last
-one it stops. Previous restarts the song when more than 3 seconds in, else goes one back.
-Recordings of ten minutes or more resume like videos do.
+one it stops. Previous is always shown on the music screen: on the first song or more than 3
+seconds in it restarts the song, else it goes one back. Recordings of ten minutes or more resume
+like videos do.
 
 Where the platform has media keys or a lock-screen player (`navigator.mediaSession`), Legion
 gives it title, artist, album, cover, and play, pause, previous, next and seek.
@@ -102,12 +103,15 @@ In the folder listing a song shows its cover where a picture shows its thumbnail
 
 - **`fs.tags`** (read): `{paths: [1..32]}` returns one entry per path, in order:
   `{path, ok: {title?, artist?, album?, album_artist?, track?, disc?, year?, duration_s?,
-  cover}}` or `{path, error}`. `cover` says whether `fs.thumb` has a picture for it. Fields the
-  file does not carry are absent. A file that is not audio is `unsupported`, per path.
+  cover}}` or `{path, error}`. `cover` is a cheap check that a picture was found (embedded or in
+  the folder), not that it decodes; the caller shows its placeholder if `fs.thumb` then fails.
+  Fields the file does not carry are absent. A file that is not audio is `unsupported`, per path.
 - **`fs.thumb`** accepts audio files: the picture is the embedded cover (the front cover when
-  several, else the first), else a picture in the same folder named `cover`, `folder`, `front`
-  or `album` (jpg, jpeg, png, webp; any case). None: `not_found` for that path. `size` may now
-  be up to 1024, for the player.
+  several, else the first); when none exists or the embedded picture cannot be decoded, `fs.thumb`
+  falls back to a picture in the same folder named `cover`, `folder`, `front` or `album` (jpg,
+  jpeg, png, webp; any case), advancing to the next candidate if a candidate cannot be decoded.
+  Only when no embedded or folder candidate decodes does it return `not_found` for that path.
+  `size` may now be up to 1024, for the player.
 - Read from: ID3v2 and ID3v1 (mp3, also inside wav and aiff), FLAC blocks, Vorbis comments in
   Ogg Vorbis and Opus (including `METADATA_BLOCK_PICTURE`), and MP4 items (m4a, m4b, mp4).
 - These files are untrusted input. Tags and the cover are read inside the same out-of-process
