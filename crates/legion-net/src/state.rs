@@ -12,12 +12,16 @@ use crate::config::RemoteOs;
 
 const CACHE_FILE: &str = "fleet-cache.json";
 
-/// Last node name and explicitness reported by a peer machine.
+/// Last node name, explicitness, and identity reported by a peer machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ReportedNode {
     pub(crate) node: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) explicit: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) boot_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,15 +102,11 @@ impl StateStore {
         self.load().last_node.get(machine).cloned()
     }
 
-    pub(crate) fn record_node(&self, machine: &str, node: &str, explicit: Option<bool>) {
+    pub(crate) fn record_node(&self, machine: &str, entry: ReportedNode) {
         let _guard = self
             .lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = ReportedNode {
-            node: node.to_owned(),
-            explicit,
-        };
         let mut data = self.load();
         if data.last_node.get(machine) == Some(&entry) {
             return;
@@ -171,13 +171,23 @@ mod tests {
         );
 
         assert_eq!(reloaded.last_node("studio"), None);
-        reloaded.record_node("studio", "someones-laptop", Some(false));
+        reloaded.record_node(
+            "studio",
+            ReportedNode {
+                node: "someones-laptop".to_owned(),
+                explicit: Some(false),
+                node_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+                boot_id: Some("boot-1".to_owned()),
+            },
+        );
         let reloaded2 = StateStore::new(dir.path());
         assert_eq!(
             reloaded2.last_node("studio"),
             Some(ReportedNode {
                 node: "someones-laptop".to_owned(),
                 explicit: Some(false),
+                node_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+                boot_id: Some("boot-1".to_owned()),
             })
         );
         reloaded2.clear_node("studio");

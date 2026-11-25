@@ -528,11 +528,17 @@ pub fn insert_node_name(
             format!("{} is not UTF-8 text (line {line}).", path.display()),
         )
     })?;
+    const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+    let (bom, body) = match bytes.strip_prefix(UTF8_BOM) {
+        Some(rest) => (UTF8_BOM, rest),
+        None => (&[][..], bytes),
+    };
     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let prefix = format!("name = \"{}\"{eol}", target.as_str());
-    let mut updated = Vec::with_capacity(prefix.len() + bytes.len());
+    let mut updated = Vec::with_capacity(bom.len() + prefix.len() + body.len());
+    updated.extend_from_slice(bom);
     updated.extend_from_slice(prefix.as_bytes());
-    updated.extend_from_slice(bytes);
+    updated.extend_from_slice(body);
 
     let reparsed = parse::<NodeFile>(path, &updated)?;
     if reparsed.name.as_ref() != Some(target) {
@@ -1050,6 +1056,21 @@ verify = ["check-next-entry", "Other"]
             crlf_written,
             b"name = \"studio\"\r\n[svc]\r\nsudo = true\r\n"
         );
+
+        // UTF-8 BOM stays at byte 0 and the name line goes immediately after it.
+        let bom_crlf = b"\xEF\xBB\xBF[svc]\r\nsudo = true\r\n";
+        let InsertNodeName::Write(bom_written) =
+            insert_node_name(Some(bom_crlf), path, &studio).unwrap()
+        else {
+            panic!("expected Write for BOM");
+        };
+        assert_eq!(
+            bom_written,
+            b"\xEF\xBB\xBFname = \"studio\"\r\n[svc]\r\nsudo = true\r\n"
+        );
+        let bom_parsed = parse::<NodeFile>(path, &bom_written).unwrap();
+        assert_eq!(bom_parsed.name.as_ref(), Some(&studio));
+        assert!(bom_parsed.svc.sudo);
 
         // Matching explicit name is a no-op.
         assert_eq!(

@@ -1182,8 +1182,24 @@ impl Fleet {
                 Ok(Ok(value)) => {
                     let reported = value.get("node").and_then(Value::as_str).map(str::to_owned);
                     let explicit = value.get("node_explicit").and_then(Value::as_bool);
+                    let node_id = value
+                        .get("node_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let boot_id = value
+                        .get("boot_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
                     if let Some(ref rep) = reported {
-                        self.inner.state.record_node(machine, rep, explicit);
+                        self.inner.state.record_node(
+                            machine,
+                            ReportedNode {
+                                node: rep.clone(),
+                                explicit,
+                                node_id,
+                                boot_id,
+                            },
+                        );
                     }
                     let name_mismatch =
                         reported
@@ -1248,7 +1264,7 @@ impl Fleet {
                 Ok(hello) => {
                     self.inner
                         .state
-                        .record_node(machine, &hello.node, hello.node_explicit);
+                        .record_node(machine, reported_from_hello(&hello));
                     return ping_ok(machine, hello, live.session.info().system.clone(), started);
                 }
                 Err(CallError::Remote(err)) => {
@@ -1283,7 +1299,7 @@ impl Fleet {
                 let info = live.session.info();
                 self.inner
                     .state
-                    .record_node(machine, &info.hello.node, info.hello.node_explicit);
+                    .record_node(machine, reported_from_hello(&info.hello));
                 ping_ok(machine, info.hello.clone(), info.system.clone(), started)
             }
             Err(err) => ping_failed(machine, ensure_machine(err, machine)),
@@ -1309,19 +1325,15 @@ impl Fleet {
                 .current
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.as_ref().map(|live| {
-                let hello = &live.session.info().hello;
-                ReportedNode {
-                    node: hello.node.clone(),
-                    explicit: hello.node_explicit,
-                }
-            })
+            guard
+                .as_ref()
+                .map(|live| reported_from_hello(&live.session.info().hello))
         })
     }
 
-    /// Records the latest known node name and explicitness for `machine` in the fleet state cache.
-    pub(crate) fn record_reported_node(&self, machine: &str, node: &str, explicit: Option<bool>) {
-        self.inner.state.record_node(machine, node, explicit);
+    /// Records the latest known node identity for `machine` in the fleet state cache.
+    pub(crate) fn record_reported_node(&self, machine: &str, reported: ReportedNode) {
+        self.inner.state.record_node(machine, reported);
     }
 
     /// Removes any cached reported node name for `machine` (for example after `fleet.add` or
@@ -1351,12 +1363,14 @@ impl Fleet {
         });
     }
 
-    /// Probes the live node name and explicitness of `machine` (via `hello` for direct peers or
-    /// `meta.version` for relayed peers) and updates the fleet state cache.
-    pub(crate) async fn probe_identity(
+    /// Probes the live node name, explicitness, and identity of `machine` (via `hello` for direct
+    /// peers or `meta.version` for relayed peers), bounded by an optional timeout, and updates the
+    /// fleet state cache.
+    pub(crate) async fn probe_identity_with_timeout(
         &self,
         ctx: &Ctx,
         machine: &str,
+        timeout_override: Option<Duration>,
     ) -> Result<ReportedNode, ErrorBody> {
         let here = ctx.node_name();
         let fleet_file = ctx
@@ -1365,15 +1379,26 @@ impl Fleet {
             .map_err(|err| ensure_machine(err, here))?;
         let (direct_machine, direct_entry, relayed) = resolve_route(&fleet_file, machine, here)?;
         if relayed {
-            let value = self
-                .call_remote(
-                    ctx,
-                    machine,
-                    "meta.version",
-                    json!({}),
-                    EventSink::discard(),
-                )
-                .await?;
+            let fut = self.call_remote(
+                ctx,
+                machine,
+                "meta.version",
+                json!({}),
+                EventSink::discard(),
+            );
+            let value = match timeout_override {
+                Some(limit) => tokio::time::timeout(limit, fut).await.map_err(|_| {
+                    ErrorBody::new(
+                        ErrorCode::Timeout,
+                        format!(
+                            "Timed out probing {machine} after {:.1}s.",
+                            limit.as_secs_f64()
+                        ),
+                    )
+                    .with_machine(machine)
+                })??,
+                None => fut.await?,
+            };
             let node = value
                 .get("node")
                 .and_then(Value::as_str)
@@ -1386,8 +1411,22 @@ impl Fleet {
                 })?
                 .to_owned();
             let explicit = value.get("node_explicit").and_then(Value::as_bool);
-            self.inner.state.record_node(machine, &node, explicit);
-            return Ok(ReportedNode { node, explicit });
+            let node_id = value
+                .get("node_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let boot_id = value
+                .get("boot_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let reported = ReportedNode {
+                node,
+                explicit,
+                node_id,
+                boot_id,
+            };
+            self.inner.state.record_node(machine, reported.clone());
+            return Ok(reported);
         }
 
         let cancel = ctx.cancel_token().clone();
@@ -1403,20 +1442,22 @@ impl Fleet {
                 .is_some_and(|live| live.session.is_alive() && live.systems_fingerprint == systems)
         };
         let live = self
-            .get_or_open(direct_machine, direct_entry, None, cancel.clone())
+            .get_or_open(
+                direct_machine,
+                direct_entry,
+                timeout_override,
+                cancel.clone(),
+            )
             .await
             .map_err(|err| ensure_machine(err, machine))?;
+        let hello_timeout = timeout_override.unwrap_or(SINGLE_SYSTEM_TIMEOUT);
         let hello = if had_existing {
-            match live
-                .session
-                .hello(SINGLE_SYSTEM_TIMEOUT, cancel.clone())
-                .await
-            {
+            match live.session.hello(hello_timeout, cancel.clone()).await {
                 Ok(hello) => hello,
                 Err(CallError::NotWritten(_) | CallError::LostInFlight(_)) => {
                     self.invalidate_if_same(&slot, &live.session);
                     let fresh = self
-                        .get_or_open(direct_machine, direct_entry, None, cancel)
+                        .get_or_open(direct_machine, direct_entry, timeout_override, cancel)
                         .await
                         .map_err(|err| ensure_machine(err, machine))?;
                     fresh.session.info().hello.clone()
@@ -1426,13 +1467,9 @@ impl Fleet {
         } else {
             live.session.info().hello.clone()
         };
-        self.inner
-            .state
-            .record_node(machine, &hello.node, hello.node_explicit);
-        Ok(ReportedNode {
-            node: hello.node,
-            explicit: hello.node_explicit,
-        })
+        let reported = reported_from_hello(&hello);
+        self.inner.state.record_node(machine, reported.clone());
+        Ok(reported)
     }
 
     /// Closes and removes any cached session and idle stream pipes for `machine`, e.g. after
@@ -1649,34 +1686,100 @@ impl Fleet {
             .map_err(&label_error)?;
 
         // `device.invite` writes a temporary key to `authorized_keys` and bakes the node's own
-        // name into the invite string. Check the live name before forwarding on direct hops so a
-        // misnamed node is refused without mutating its `authorized_keys`.
-        if !relayed && tool == "device.invite" {
-            let hello = match live
-                .session
-                .hello(SINGLE_SYSTEM_TIMEOUT, cancel.clone())
-                .await
-            {
-                Ok(hello) => hello,
-                Err(CallError::NotWritten(_)) => {
-                    self.invalidate_if_same(&slot, &live.session);
-                    live = self
-                        .get_or_open(direct_machine, direct_entry, None, cancel.clone())
-                        .await
-                        .map_err(&label_error)?;
-                    live.session.info().hello.clone()
+        // name into the invite string. Check the target's live name before forwarding (via `hello`
+        // on direct hops, or via a read-only `meta.version` along the same route on relayed hops)
+        // so a misnamed node is refused without mutating its `authorized_keys`, even through an
+        // older relay.
+        if tool == "device.invite" {
+            if !relayed {
+                let hello = match live
+                    .session
+                    .hello(SINGLE_SYSTEM_TIMEOUT, cancel.clone())
+                    .await
+                {
+                    Ok(hello) => hello,
+                    Err(CallError::NotWritten(_)) => {
+                        self.invalidate_if_same(&slot, &live.session);
+                        live = self
+                            .get_or_open(direct_machine, direct_entry, None, cancel.clone())
+                            .await
+                            .map_err(&label_error)?;
+                        live.session.info().hello.clone()
+                    }
+                    Err(CallError::LostInFlight(err)) => {
+                        self.invalidate_if_same(&slot, &live.session);
+                        return Err(label_error(err));
+                    }
+                    Err(CallError::Remote(err)) => return Err(label_error(err)),
+                };
+                self.inner
+                    .state
+                    .record_node(target_machine, reported_from_hello(&hello));
+                if hello.node != target_machine {
+                    return Err(name_mismatch_error(target_machine, &hello.node));
                 }
-                Err(CallError::LostInFlight(err)) => {
-                    self.invalidate_if_same(&slot, &live.session);
-                    return Err(label_error(err));
+            } else {
+                let probe_params = CallParams {
+                    tool: "meta.version".to_owned(),
+                    args: json!({}),
+                    as_principal: params.as_principal.clone(),
+                    on: params.on.clone(),
+                    hops: params.hops,
+                };
+                let probe_val = match live
+                    .session
+                    .call(probe_params.clone(), cancel.clone(), EventSink::discard())
+                    .await
+                {
+                    Ok(val) => val,
+                    Err(CallError::NotWritten(_)) => {
+                        self.invalidate_if_same(&slot, &live.session);
+                        live = self
+                            .get_or_open(direct_machine, direct_entry, None, cancel.clone())
+                            .await
+                            .map_err(&label_error)?;
+                        match live
+                            .session
+                            .call(probe_params, cancel.clone(), EventSink::discard())
+                            .await
+                        {
+                            Ok(val) => val,
+                            Err(CallError::LostInFlight(err) | CallError::NotWritten(err)) => {
+                                self.invalidate_if_same(&slot, &live.session);
+                                return Err(label_error(err));
+                            }
+                            Err(CallError::Remote(err)) => return Err(label_error(err)),
+                        }
+                    }
+                    Err(CallError::LostInFlight(err)) => {
+                        self.invalidate_if_same(&slot, &live.session);
+                        return Err(label_error(err));
+                    }
+                    Err(CallError::Remote(err)) => return Err(label_error(err)),
+                };
+                if let Some(reported) = probe_val.get("node").and_then(Value::as_str) {
+                    let explicit = probe_val.get("node_explicit").and_then(Value::as_bool);
+                    let node_id = probe_val
+                        .get("node_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let boot_id = probe_val
+                        .get("boot_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    self.inner.state.record_node(
+                        target_machine,
+                        ReportedNode {
+                            node: reported.to_owned(),
+                            explicit,
+                            node_id,
+                            boot_id,
+                        },
+                    );
+                    if reported != target_machine {
+                        return Err(name_mismatch_error(target_machine, reported));
+                    }
                 }
-                Err(CallError::Remote(err)) => return Err(label_error(err)),
-            };
-            self.inner
-                .state
-                .record_node(target_machine, &hello.node, hello.node_explicit);
-            if hello.node != target_machine {
-                return Err(name_mismatch_error(target_machine, &hello.node));
             }
         }
 
@@ -1726,12 +1829,17 @@ impl Fleet {
         }
         if let Some(reported) = value.get("node").and_then(Value::as_str) {
             if reported != target_machine {
-                let explicit = (!relayed && live.session.info().hello.node == reported)
-                    .then_some(live.session.info().hello.node_explicit)
-                    .flatten();
-                self.inner
-                    .state
-                    .record_node(target_machine, reported, explicit);
+                let hello = &live.session.info().hello;
+                let direct_same = !relayed && hello.node == reported;
+                self.inner.state.record_node(
+                    target_machine,
+                    ReportedNode {
+                        node: reported.to_owned(),
+                        explicit: direct_same.then_some(hello.node_explicit).flatten(),
+                        node_id: direct_same.then_some(hello.node_id.clone()).flatten(),
+                        boot_id: direct_same.then_some(hello.boot_id.clone()).flatten(),
+                    },
+                );
                 return Err(name_mismatch_error(target_machine, reported));
             }
             return Ok(());
@@ -1741,7 +1849,7 @@ impl Fleet {
             if hello.node != target_machine {
                 self.inner
                     .state
-                    .record_node(target_machine, &hello.node, hello.node_explicit);
+                    .record_node(target_machine, reported_from_hello(hello));
                 return Err(name_mismatch_error(target_machine, &hello.node));
             }
         }
@@ -1856,7 +1964,7 @@ impl Fleet {
                     let hello = &session.info().hello;
                     self.inner
                         .state
-                        .record_node(machine, &hello.node, hello.node_explicit);
+                        .record_node(machine, reported_from_hello(hello));
                     if sys.explicit {
                         self.inner.state.record_system(machine, &sys.name);
                     }
@@ -1909,7 +2017,7 @@ impl Fleet {
                         let hello = &session.info().hello;
                         self.inner
                             .state
-                            .record_node(machine, &hello.node, hello.node_explicit);
+                            .record_node(machine, reported_from_hello(hello));
                         if sys.explicit {
                             self.inner.state.record_system(machine, &sys.name);
                         }
@@ -1953,7 +2061,7 @@ impl Fleet {
                     let hello = &session.info().hello;
                     self.inner
                         .state
-                        .record_node(machine, &hello.node, hello.node_explicit);
+                        .record_node(machine, reported_from_hello(hello));
                     if sys.explicit {
                         self.inner.state.record_system(machine, &sys.name);
                     }
@@ -3600,11 +3708,11 @@ fn ensure_machine(err: ErrorBody, machine: &str) -> ErrorBody {
     }
 }
 
-/// Builds the standard `name_mismatch` error when a machine answers under a different node name
-/// than its fleet name.
+/// Builds the standard `conflict` error (`details.kind = "name_mismatch"`) when a machine answers
+/// under a different node name than its fleet name.
 pub(crate) fn name_mismatch_error(expected: &str, reported: &str) -> ErrorBody {
     ErrorBody::new(
-        ErrorCode::NameMismatch,
+        ErrorCode::Conflict,
         format!("{expected} calls itself {reported}."),
     )
     .with_hint(format!(
@@ -3612,9 +3720,31 @@ pub(crate) fn name_mismatch_error(expected: &str, reported: &str) -> ErrorBody {
     ))
     .with_machine(expected)
     .with_details(json!({
+        "kind": "name_mismatch",
         "expected": expected,
         "reported": reported,
     }))
+}
+
+/// Whether `err` is a structured node name mismatch refusal (`conflict` with
+/// `details.kind == "name_mismatch"`).
+pub(crate) fn is_name_mismatch_error(err: &ErrorBody) -> bool {
+    err.code == ErrorCode::Conflict
+        && err
+            .details
+            .as_ref()
+            .and_then(|d| d.get("kind"))
+            .and_then(Value::as_str)
+            == Some("name_mismatch")
+}
+
+fn reported_from_hello(hello: &legion_proto::HelloResult) -> ReportedNode {
+    ReportedNode {
+        node: hello.node.clone(),
+        explicit: hello.node_explicit,
+        node_id: hello.node_id.clone(),
+        boot_id: hello.boot_id.clone(),
+    }
 }
 
 fn ping_ok(
@@ -3742,6 +3872,7 @@ mod tests {
                 serde_json::to_value(HelloResult {
                     node: "pi".to_owned(),
                     node_explicit: Some(true),
+                    node_id: None,
                     version: "0.1.0".to_owned(),
                     build: None,
                     protocol: PROTOCOL,
@@ -4035,6 +4166,7 @@ mod tests {
             serde_json::to_value(HelloResult {
                 node: "dual".to_owned(),
                 node_explicit: Some(true),
+                node_id: None,
                 version: "0.1.0".to_owned(),
                 build: None,
                 protocol: PROTOCOL,

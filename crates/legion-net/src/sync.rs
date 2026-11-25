@@ -24,13 +24,13 @@ use jiff::Timestamp;
 use legion_core::config::{
     InsertNodeName, NodeFile, NodeName, insert_node_name, parse, write_atomically,
 };
-use legion_core::policy::{OWNER, Policy};
+use legion_core::policy::{Access, Grant, OWNER, Place, Policy};
 use legion_core::{
     BoxFuture, Ctx, EventSink, NoArgs, Registry, Tool, ToolError, input_schema, parse_args,
 };
 use legion_os::OsError;
 use legion_os::lock::{FileLock, LockMode};
-use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use legion_proto::{Effect, ErrorBody, ErrorCode, MAX_HOPS, ToolSpec};
 use legion_tools::device::registry::{
     DEVICES_VERSION, DeviceRegistryPushAudit, DevicesFile, MergeApplyError, MergeChange,
     apply_devices_merge_blocking, merge_devices, preserve_local_confirmations,
@@ -46,9 +46,11 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use toml_edit::{DocumentMut, Item};
 
-use crate::config::FleetFile;
-use crate::pool::{Fleet, name_mismatch_error};
+use crate::config::{FleetFile, Transport};
+use crate::pool::{Fleet, is_name_mismatch_error, name_mismatch_error};
+use crate::state::ReportedNode;
 
 /// Fixed shared configuration documents synced across machines.
 pub const FIXED_SHARED_DOCUMENTS: [&str; 4] =
@@ -89,16 +91,17 @@ pub(crate) fn register(registry: &mut Registry, fleet: Fleet) {
         "Validate and atomically update one shared configuration document (devices.toml, fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing devices.toml directly requires the owner role on this node: it merges incoming entries with local paired devices (tombstones always win and rewrite identity fields from matching local entries), reconciles registry-owned device:* principals (marked with `device = \"<pairing id>\"` in policy.toml) without touching shared or unmarked principals, updates authorized_keys, and ends active sessions for newly removed devices. Writing policy.toml changes who may do what on this machine, so any role allowed to call config.write (including effect:admin) is as strong as owner. Refuses invalid documents before replacing anything, refuses mismatched expect_hash or expect_absent (when a file already exists) with conflict, and refuses machine-local files such as node.toml and tokens.toml.",
         config_write,
     );
-    registry.add_fn(
+    registry.add(SyncTool::<ConfigSetNameArgs, ConfigSetNameResult, _>::new(
         "config.set_name",
         Effect::Admin,
-        "Set `name = \"<name>\"` in this node's `node.toml` when `node.toml` does not exist or omits `name`, keeping every other byte in the file unchanged. Never overwrites a different explicit `name` (refuses with `name_mismatch`).",
-        config_set_name,
-    );
+        "Set `name = \"<name>\"` in this node's `node.toml` when `node.toml` does not exist or omits `name`, keeping every other byte in the file unchanged (preserving a UTF-8 BOM and updating a symlink's target atomically when it points inside directories this node may write). Never overwrites a different explicit `name`, refuses `caller` equal to `name`, and refuses a name that this node's own `fleet.toml` maps to a different machine it can tell apart (all with `conflict`). When renaming from a host-derived name, moves matching `[projects.<name>.on]` entries in `projects.toml` to the new name under lock without overwriting an existing entry under the new name (reporting moved entries and any conflicts).",
+        fleet.clone(),
+        |fleet, ctx, args| Box::pin(config_set_name(fleet, ctx, args)),
+    ));
     registry.add(SyncTool::<SyncArgs, SyncResult, _>::new(
         "fleet.sync",
         Effect::Admin,
-        "Compare, push, or pull shared configuration documents (devices.toml, fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts, and check each machine's reported node name against its fleet name. When a machine's name differs and is host-derived (no explicit `name` in node.toml), `direction=push` sets `name = \"<fleet name>\"` in its node.toml via `config.set_name` (keeping all other bytes unchanged) and reports the update in `node_names`; when the machine has a different explicit `name` or is an older node that does not say, `fleet.sync` reports `name_mismatch` in `node_names` and leaves `node.toml` untouched. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there without importing anything. Pushing or pulling devices.toml requires the owner role on the node doing the writing (for non-owner callers, fleet.sync syncs the other documents and reports devices.toml as skipped with the reason; propagation after local device tools runs node to node with the node's own authority). Paired devices (devices.toml) obey a strict one-way trust rule for live entries: push sends local entries to peers and imports ONLY tombstones back — never a peer's live devices. New or changed live devices from a peer are accepted only via an explicit `fleet.sync direction=pull from=<peer>` run by an owner, or when that peer pushes to this node with owner authority. Tombstones always win and may flow in every direction. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs whole node.toml or tokens.toml files.",
+        "Compare, push, or pull shared configuration documents (devices.toml, fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts, and check each machine's reported node name against its fleet name. Naming is decided only after every target machine has answered so two fleet entries pointing at the same node never race to rename it: any node reached under more than one fleet entry is left untouched and reported as `ambiguous` with the other entry names and a hint to remove the stale entry. For unambiguous machines whose name differs and is host-derived (no explicit `name` in node.toml), `direction=push` sets `name = \"<fleet name>\"` one machine at a time via `config.set_name` (keeping all other bytes unchanged and migrating matching `projects.toml` entries) and reports the update in `node_names`; when the machine has a different explicit `name` or is an older node that does not say, `fleet.sync` reports `name_mismatch` in `node_names` and leaves `node.toml` untouched. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there without importing anything. Pushing or pulling devices.toml requires the owner role on the node doing the writing (for non-owner callers, fleet.sync syncs the other documents and reports devices.toml as skipped with the reason; propagation after local device tools runs node to node with the node's own authority). Paired devices (devices.toml) obey a strict one-way trust rule for live entries: push sends local entries to peers and imports ONLY tombstones back — never a peer's live devices. New or changed live devices from a peer are accepted only via an explicit `fleet.sync direction=pull from=<peer>` run by an owner, or when that peer pushes to this node with owner authority. Tombstones always win and may flow in every direction. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs whole node.toml or tokens.toml files.",
         fleet,
         |fleet, ctx, args| Box::pin(fleet_sync(fleet, ctx, args)),
     ));
@@ -1298,6 +1301,19 @@ struct ConfigSetNameArgs {
     /// Node name to write into `node.toml` (lower-case letters, digits, `-` and `_`, starting with
     /// a letter or digit; not `all`).
     name: String,
+    /// Optional name of the calling machine (set automatically by `fleet.sync` and
+    /// `fleet.install`); refused if it equals `name`.
+    #[serde(default)]
+    caller: Option<String>,
+}
+
+/// A project entry in `projects.toml` that already had a path under the target node name, so the
+/// old node name's entry was kept untouched and reported instead of overwriting it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProjectRenameConflict {
+    pub(crate) project: String,
+    pub(crate) old_path: String,
+    pub(crate) new_path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1307,11 +1323,294 @@ pub(crate) struct ConfigSetNameResult {
     pub(crate) changed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) backup: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) moved: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) conflicts: Vec<ProjectRenameConflict>,
 }
 
+/// Resolves the concrete path to write for a config file (`node.toml` or `projects.toml`).
+///
+/// If `file_path` is a symbolic link, resolves it and verifies that the target is a regular file
+/// inside directories this node may write (its own `config_dir`, or `explicit_home` / `home`
+/// outside protected secret and state locations, plus any path confinement on `grant`), so atomic
+/// replacement updates the symlink's target while keeping the symlink intact.
+fn resolve_config_write_path(
+    file_path: &Path,
+    file_label: &str,
+    config_dir: &Path,
+    explicit_home: Option<&Path>,
+    home: Option<&Path>,
+    grant: &Grant,
+) -> Result<PathBuf, ErrorBody> {
+    let meta = match std::fs::symlink_metadata(file_path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(file_path.to_path_buf()),
+        Err(error) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be inspected: {error}.", file_path.display()),
+            ));
+        }
+    };
+    if !meta.file_type().is_symlink() {
+        if meta.is_dir() {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} is a directory, not a file.", file_path.display()),
+            ));
+        }
+        return Ok(file_path.to_path_buf());
+    }
+
+    let link_target = std::fs::read_link(file_path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unreadable>".to_owned());
+    let resolved = std::fs::canonicalize(file_path).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "Refusing to follow symbolic link {} -> {link_target}: {error}.",
+                file_path.display()
+            ),
+        )
+        .with_hint(format!(
+            "Point {file_label} at an existing regular file inside the configuration or home directory, or replace it with a regular file."
+        ))
+    })?;
+    if !resolved.is_file() {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "{} points to {}, which is not a regular file.",
+                file_path.display(),
+                resolved.display()
+            ),
+        ));
+    }
+
+    let in_config_dir = std::fs::canonicalize(config_dir)
+        .ok()
+        .is_some_and(|canon| resolved.starts_with(&canon));
+    if in_config_dir {
+        return Ok(resolved);
+    }
+
+    let in_explicit_home = explicit_home
+        .and_then(|dir| std::fs::canonicalize(dir).ok())
+        .is_some_and(|canon| resolved.starts_with(&canon));
+    let in_home = home
+        .and_then(|dir| std::fs::canonicalize(dir).ok())
+        .is_some_and(|canon| resolved.starts_with(&canon));
+    if in_explicit_home || in_home {
+        if let Ok(Some(Place::Secret | Place::State)) = grant.protected(&resolved) {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "Refusing to update {file_label} through symbolic link {} pointing to protected path {}.",
+                    file_path.display(),
+                    resolved.display()
+                ),
+            )
+            .with_hint(format!(
+                "Move the target of {file_label} out of protected secret/state locations, or edit it directly."
+            )));
+        }
+        if grant.roots().is_some() {
+            grant.check_path(&resolved, Access::Write).map_err(|_| {
+                ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Refusing to update {file_label} through symbolic link {} pointing to {}, which is outside the paths this role may write.",
+                        file_path.display(),
+                        resolved.display()
+                    ),
+                )
+                .with_hint(format!(
+                    "Move the target of {file_label} inside an allowed path, or edit it directly."
+                ))
+            })?;
+        }
+        return Ok(resolved);
+    }
+
+    Err(ErrorBody::new(
+        ErrorCode::Denied,
+        format!(
+            "Refusing to update {file_label} through symbolic link {} pointing to {}, which is outside the directories this node may write.",
+            file_path.display(),
+            resolved.display()
+        ),
+    )
+    .with_hint(format!(
+        "Move the target of {file_label} inside the configuration or home directory, or edit it directly."
+    )))
+}
+
+/// Moves `[projects.<name>.on]` entries keyed by `old_name` to `new_name` under `projects.lock`.
+/// Never overwrites an entry that already exists under `new_name`; reports those as conflicts.
+#[allow(clippy::too_many_arguments)]
+fn migrate_projects_node_name_blocking(
+    config_dir: &Path,
+    state_dir: &Path,
+    explicit_home: Option<&Path>,
+    home: Option<&Path>,
+    grant: &Grant,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(Vec<String>, Vec<ProjectRenameConflict>), ErrorBody> {
+    if old_name == new_name {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let projects_path = config_dir.join("projects.toml");
+    if matches!(
+        std::fs::symlink_metadata(&projects_path),
+        Err(ref err) if err.kind() == io::ErrorKind::NotFound
+    ) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let projects_lock = state_dir.join("projects.lock");
+    let _proj_held = acquire_lock(&projects_lock, "projects.toml")?;
+
+    let write_path = resolve_config_write_path(
+        &projects_path,
+        "projects.toml",
+        config_dir,
+        explicit_home,
+        home,
+        grant,
+    )?;
+    let bytes = match std::fs::read(&write_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        Err(error) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be read: {error}.", projects_path.display()),
+            ));
+        }
+    };
+    // Ensure the existing file parses cleanly before touching it.
+    let parsed = parse::<ProjectsFile>(&projects_path, &bytes)?;
+    let has_old = parsed
+        .projects
+        .values()
+        .any(|proj| proj.on.contains_key(old_name));
+    if !has_old {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} is not UTF-8 text: {error}.", projects_path.display()),
+        )
+    })?;
+    let (bom, body) = match text.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", text),
+    };
+    let mut doc: DocumentMut = body.parse().map_err(|error: toml_edit::TomlError| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "{} cannot be parsed for rename migration: {}.",
+                projects_path.display(),
+                error.message().trim_end_matches('.')
+            ),
+        )
+    })?;
+
+    let mut moved = Vec::new();
+    let mut conflicts = Vec::new();
+    if let Some(projects_table) = doc
+        .as_table_mut()
+        .get_mut("projects")
+        .and_then(Item::as_table_like_mut)
+    {
+        for (proj_key, proj_item) in projects_table.iter_mut() {
+            let proj_name = proj_key.get().to_owned();
+            let Some(on_table) = proj_item
+                .as_table_like_mut()
+                .and_then(|t| t.get_mut("on"))
+                .and_then(Item::as_table_like_mut)
+            else {
+                continue;
+            };
+            if !on_table.contains_key(old_name) {
+                continue;
+            }
+            if on_table.contains_key(new_name) {
+                let old_path = parsed
+                    .projects
+                    .get(&proj_name)
+                    .and_then(|p| p.on.get(old_name))
+                    .cloned()
+                    .unwrap_or_default();
+                let new_path = parsed
+                    .projects
+                    .get(&proj_name)
+                    .and_then(|p| p.on.get(new_name))
+                    .cloned()
+                    .unwrap_or_default();
+                conflicts.push(ProjectRenameConflict {
+                    project: proj_name,
+                    old_path,
+                    new_path,
+                });
+                continue;
+            }
+            if let Some(entry_item) = on_table.remove(old_name) {
+                on_table.insert(new_name, entry_item);
+                moved.push(format!("projects.{proj_name}.on: {old_name} -> {new_name}"));
+            }
+        }
+    }
+
+    if !moved.is_empty() {
+        let updated_text = format!("{bom}{doc}");
+        parse::<ProjectsFile>(&projects_path, updated_text.as_bytes())?;
+        let backup_path = state_dir
+            .join("sync")
+            .join("backups")
+            .join("projects.toml.bak");
+        if let Some(parent) = backup_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} cannot be created: {error}.", parent.display()),
+                )
+            })?;
+        }
+        write_atomically(&backup_path, &bytes).map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Backup {} cannot be written: {error}.",
+                    backup_path.display()
+                ),
+            )
+        })?;
+        write_atomically(&write_path, updated_text.as_bytes()).map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be written: {error}.", projects_path.display()),
+            )
+        })?;
+    }
+
+    Ok((moved, conflicts))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn set_local_node_name_blocking(
     config_dir: &Path,
     state_dir: &Path,
+    explicit_home: Option<&Path>,
+    home: Option<&Path>,
+    grant: &Grant,
     previous_node: &str,
     target: &NodeName,
 ) -> Result<ConfigSetNameResult, ErrorBody> {
@@ -1319,7 +1618,15 @@ fn set_local_node_name_blocking(
     let _held = acquire_lock(&lock_path, "node configuration")?;
 
     let node_path = config_dir.join("node.toml");
-    let existing = match std::fs::read(&node_path) {
+    let write_path = resolve_config_write_path(
+        &node_path,
+        "node.toml",
+        config_dir,
+        explicit_home,
+        home,
+        grant,
+    )?;
+    let existing = match std::fs::read(&write_path) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => {
@@ -1336,9 +1643,11 @@ fn set_local_node_name_blocking(
             previous: target.as_str().to_owned(),
             changed: false,
             backup: None,
+            moved: Vec::new(),
+            conflicts: Vec::new(),
         }),
         InsertNodeName::ExplicitMismatch(current) => Err(ErrorBody::new(
-            ErrorCode::NameMismatch,
+            ErrorCode::Conflict,
             format!(
                 "This node is already explicitly named {current} in node.toml, so it was not renamed to {target}."
             ),
@@ -1348,6 +1657,7 @@ fn set_local_node_name_blocking(
             node_path.display()
         ))
         .with_details(json!({
+            "kind": "name_mismatch",
             "expected": target.as_str(),
             "reported": current.as_str(),
             "explicit": true,
@@ -1376,29 +1686,59 @@ fn set_local_node_name_blocking(
             } else {
                 None
             };
-            std::fs::create_dir_all(config_dir).map_err(|error| {
-                ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!("{} cannot be created: {error}.", config_dir.display()),
-                )
-            })?;
-            write_atomically(&node_path, &updated).map_err(|error| {
+            if let Some(parent) = write_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!("{} cannot be created: {error}.", parent.display()),
+                    )
+                })?;
+            }
+            write_atomically(&write_path, &updated).map_err(|error| {
                 ErrorBody::new(
                     ErrorCode::Failed,
                     format!("{} cannot be written: {error}.", node_path.display()),
                 )
             })?;
+            let (moved, conflicts) = migrate_projects_node_name_blocking(
+                config_dir,
+                state_dir,
+                explicit_home,
+                home,
+                grant,
+                previous_node,
+                target.as_str(),
+            )?;
             Ok(ConfigSetNameResult {
                 node: target.as_str().to_owned(),
                 previous: previous_node.to_owned(),
                 changed: true,
                 backup,
+                moved,
+                conflicts,
             })
         }
     }
 }
 
+fn is_provably_different_machine(
+    reported: &ReportedNode,
+    self_node_id: Option<&str>,
+    self_boot_id: Option<&str>,
+    target: &str,
+    previous: &str,
+) -> bool {
+    if let (Some(other_id), Some(own_id)) = (reported.node_id.as_deref(), self_node_id) {
+        return other_id != own_id;
+    }
+    if let (Some(other_boot), Some(own_boot)) = (reported.boot_id.as_deref(), self_boot_id) {
+        return other_boot != own_boot;
+    }
+    reported.node == target && target != previous && reported.explicit == Some(true)
+}
+
 async fn config_set_name(
+    fleet: &Fleet,
     ctx: &Ctx,
     args: ConfigSetNameArgs,
 ) -> Result<ConfigSetNameResult, ToolError> {
@@ -1406,12 +1746,101 @@ async fn config_set_name(
         ErrorBody::new(ErrorCode::InvalidArgs, format!("name: {message}."))
             .with_hint("Use lower-case letters, digits, - and _, starting with a letter or digit.")
     })?;
+    if args.caller.as_deref() == Some(target.as_str()) {
+        return Err(ErrorBody::new(
+            ErrorCode::Conflict,
+            format!(
+                "Refusing to rename this node to {target}, which is the calling machine's own name."
+            ),
+        )
+        .with_hint(
+            "Check fleet.toml on the calling machine for a stale or misconfigured entry pointing at itself.",
+        )
+        .with_details(json!({
+            "kind": "caller_name_conflict",
+            "target": target.as_str(),
+            "caller": target.as_str(),
+        })));
+    }
+
+    let previous = ctx.node_name().to_owned();
+    if target.as_str() != previous
+        && let Ok(fleet_file) = ctx.config().get::<FleetFile>()
+        && fleet_file.machine(target.as_str()).is_some()
+    {
+        let self_node_id = ctx.node_id();
+        let self_boot_id = ctx.boot_id();
+        let mut provably_different = false;
+        let mut provably_same = false;
+
+        if let Some(cached) = fleet.last_reported_node(target.as_str()) {
+            if is_provably_different_machine(
+                &cached,
+                self_node_id.as_deref(),
+                self_boot_id.as_deref(),
+                target.as_str(),
+                &previous,
+            ) {
+                provably_different = true;
+            } else if let (Some(other_id), Some(own_id)) =
+                (cached.node_id.as_deref(), self_node_id.as_deref())
+                && other_id == own_id
+            {
+                provably_same = true;
+            }
+        }
+
+        if !provably_different
+            && !provably_same
+            && ctx.hops() < MAX_HOPS
+            && let Ok(probed) = fleet
+                .probe_identity_with_timeout(ctx, target.as_str(), Some(Duration::from_secs(2)))
+                .await
+        {
+            provably_different = is_provably_different_machine(
+                &probed,
+                self_node_id.as_deref(),
+                self_boot_id.as_deref(),
+                target.as_str(),
+                &previous,
+            );
+        }
+
+        if provably_different {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                format!(
+                    "Refusing to rename this node to {target}: this node's fleet.toml already maps {target} to a different machine."
+                ),
+            )
+            .with_hint(format!(
+                "Choose another name, or remove the stale `{target}` entry from fleet.toml first."
+            ))
+            .with_details(json!({
+                "kind": "fleet_name_conflict",
+                "target": target.as_str(),
+            })));
+        }
+    }
+
     let started = Instant::now();
     let config_dir = ctx.paths().config_dir().to_path_buf();
     let state_dir = ctx.paths().state_dir().to_path_buf();
-    let previous = ctx.node_name().to_owned();
+    let explicit_home = ctx.paths().explicit_home().map(Path::to_path_buf);
+    let home = ctx.paths().home().map(Path::to_path_buf);
+    let grant = ctx.grant().clone();
+    let previous_for_task = previous.clone();
+    let target_for_task = target.clone();
     let result = tokio::task::spawn_blocking(move || {
-        set_local_node_name_blocking(&config_dir, &state_dir, &previous, &target)
+        set_local_node_name_blocking(
+            &config_dir,
+            &state_dir,
+            explicit_home.as_deref(),
+            home.as_deref(),
+            &grant,
+            &previous_for_task,
+            &target_for_task,
+        )
     })
     .await
     .map_err(|error| {
@@ -1421,11 +1850,14 @@ async fn config_set_name(
         )
     })??;
     if result.changed {
+        fleet.clear_cached_node(target.as_str());
         let audit_args = json!({
             "document": "node.toml",
             "previous": result.previous,
             "node": result.node,
             "backup": result.backup,
+            "moved": result.moved,
+            "conflicts": result.conflicts,
         });
         ctx.node()
             .record_audit_with_device(
@@ -1519,7 +1951,8 @@ struct SyncArgs {
     device_registry_push: Option<DeviceRegistryPushAudit>,
 }
 
-/// How `fleet.sync` handled a machine whose reported node name differed from its fleet name.
+/// How `fleet.sync` handled a machine whose reported node name differed from its fleet name, or
+/// whose target node answered for more than one fleet entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeNameSyncStatus {
@@ -1529,6 +1962,9 @@ pub enum NodeNameSyncStatus {
     /// The remote node reports a different name and was left untouched (explicit in `node.toml`,
     /// unknown from an older node, or read-only `status`/`pull` direction).
     NameMismatch,
+    /// More than one fleet entry reached the same node, so none of them renamed it; see
+    /// `other_entries` and `error`.
+    Ambiguous,
     /// Attempting to write `name` to `node.toml` failed; see `error`.
     Error,
 }
@@ -1545,6 +1981,16 @@ pub enum NodeNameSource {
     Unknown,
 }
 
+impl NodeNameSource {
+    fn from_explicit(explicit: Option<bool>) -> Self {
+        match explicit {
+            Some(true) => Self::Explicit,
+            Some(false) => Self::Host,
+            None => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct NodeNameSyncOutcome {
     status: NodeNameSyncStatus,
@@ -1553,6 +1999,12 @@ struct NodeNameSyncOutcome {
     source: NodeNameSource,
     #[serde(skip_serializing_if = "Option::is_none")]
     backup: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    other_entries: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    moved: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    conflicts: Vec<ProjectRenameConflict>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1652,30 +2104,100 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
     };
 
     let device_push_ref = args.device_registry_push.as_ref();
+    let all_skipped_locally = args.direction != SyncDirection::Status
+        && ctx.grant().role() != OWNER
+        && explicit_docs.as_deref() == Some(&[SharedDocument::Devices]);
+
+    // Step 1: Probe every target machine's identity concurrently before deciding any renames so
+    // two fleet entries pointing at the same node never race to name it.
+    let probe_results: BTreeMap<String, Result<Option<ReportedNode>, ErrorBody>> =
+        if all_skipped_locally {
+            BTreeMap::new()
+        } else {
+            type ProbeBatchItem = (String, Result<Option<ReportedNode>, ErrorBody>);
+            let probe_futs: Vec<BoxFuture<'_, ProbeBatchItem>> = targets
+                .iter()
+                .map(|machine| {
+                    let machine = machine.clone();
+                    Box::pin(async move {
+                        let outcome = match fleet
+                            .probe_identity_with_timeout(ctx, &machine, per_machine_timeout)
+                            .await
+                        {
+                            Ok(identity) => Ok(Some(identity)),
+                            // On a relayed machine, a principal allowed `config.*` might not be
+                            // allowed `meta.version`; keep document sync working.
+                            Err(error) if error.code == ErrorCode::Denied => Ok(None),
+                            Err(error) => Err(error),
+                        };
+                        (machine, outcome)
+                    }) as BoxFuture<'_, _>
+                })
+                .collect();
+            join_all_concurrent(probe_futs).await.into_iter().collect()
+        };
+
+    if ctx.is_cancelled() {
+        return Err(ErrorBody::new(
+            ErrorCode::Cancelled,
+            "The call to fleet.sync was cancelled.",
+        ));
+    }
+
+    // Step 2 & 3: Group answers by node identity, refuse ambiguous duplicates, and apply
+    // unambiguous host-derived renames one at a time.
+    let node_names = resolve_and_apply_node_names(
+        fleet,
+        ctx,
+        &fleet_file,
+        &here,
+        &probe_results,
+        args.direction,
+        args.dry_run,
+        device_push_ref.is_some(),
+        per_machine_timeout,
+    )
+    .await;
+
+    if ctx.is_cancelled() {
+        return Err(ErrorBody::new(
+            ErrorCode::Cancelled,
+            "The call to fleet.sync was cancelled.",
+        ));
+    }
+
+    // Step 4: Sync shared documents across targets (reusing probe errors for unreachable peers).
     let mut results = BTreeMap::new();
-    let mut node_names = BTreeMap::new();
     match args.direction {
         SyncDirection::Pull => {
             // Pull targets exactly one machine so local files are never overwritten by racing peers.
             if let Some(machine) = targets.into_iter().next() {
-                let (per_doc, name_outcome) = sync_one_machine_with_timeout(
-                    fleet,
-                    ctx,
-                    &machine,
-                    args.direction,
-                    explicit_docs.as_deref(),
-                    &local_docs,
-                    args.force,
-                    args.dry_run,
-                    per_machine_timeout,
-                    device_push_ref,
-                )
-                .await;
+                let per_doc = match probe_results.get(&machine) {
+                    Some(Err(probe_err)) => fallback_doc_outcomes_for_probe_error(
+                        explicit_docs.as_deref(),
+                        &local_docs,
+                        args.direction,
+                        ctx.grant().role(),
+                        probe_err,
+                    ),
+                    _ => {
+                        sync_one_machine_with_timeout(
+                            fleet,
+                            ctx,
+                            &machine,
+                            args.direction,
+                            explicit_docs.as_deref(),
+                            &local_docs,
+                            args.force,
+                            args.dry_run,
+                            per_machine_timeout,
+                            device_push_ref,
+                        )
+                        .await
+                    }
+                };
                 let any_ok = per_doc.values().any(|o| o.status != SyncStatus::Error);
                 results.insert(machine.clone(), per_doc);
-                if let Some(outcome) = name_outcome {
-                    node_names.insert(machine.clone(), outcome);
-                }
                 if explicit_docs.is_none() && !args.dry_run && any_ok {
                     crate::updates::pull_missing_sets_from_peer(
                         fleet,
@@ -1688,31 +2210,39 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
             }
         }
         SyncDirection::Status | SyncDirection::Push => {
-            type MachineSyncBatchItem = (
-                String,
-                BTreeMap<String, DocSyncOutcome>,
-                Option<NodeNameSyncOutcome>,
-            );
+            type MachineSyncBatchItem = (String, BTreeMap<String, DocSyncOutcome>);
+            let probe_results_ref = &probe_results;
             let futs: Vec<BoxFuture<'_, MachineSyncBatchItem>> = targets
                 .into_iter()
                 .map(|machine| {
                     let explicit_docs = explicit_docs.as_deref();
                     let local_docs = local_docs.as_slice();
                     Box::pin(async move {
-                        let (per_doc, name_outcome) = sync_one_machine_with_timeout(
-                            fleet,
-                            ctx,
-                            &machine,
-                            args.direction,
-                            explicit_docs,
-                            local_docs,
-                            args.force,
-                            args.dry_run,
-                            per_machine_timeout,
-                            device_push_ref,
-                        )
-                        .await;
-                        (machine, per_doc, name_outcome)
+                        let per_doc = match probe_results_ref.get(&machine) {
+                            Some(Err(probe_err)) => fallback_doc_outcomes_for_probe_error(
+                                explicit_docs,
+                                local_docs,
+                                args.direction,
+                                ctx.grant().role(),
+                                probe_err,
+                            ),
+                            _ => {
+                                sync_one_machine_with_timeout(
+                                    fleet,
+                                    ctx,
+                                    &machine,
+                                    args.direction,
+                                    explicit_docs,
+                                    local_docs,
+                                    args.force,
+                                    args.dry_run,
+                                    per_machine_timeout,
+                                    device_push_ref,
+                                )
+                                .await
+                            }
+                        };
+                        (machine, per_doc)
                     }) as BoxFuture<'_, _>
                 })
                 .collect();
@@ -1723,18 +2253,13 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
             {
                 synced_peers
                     .iter()
-                    .filter(|(_, per_doc, _)| {
-                        per_doc.values().any(|o| o.status != SyncStatus::Error)
-                    })
-                    .map(|(machine, _, _)| machine.clone())
+                    .filter(|(_, per_doc)| per_doc.values().any(|o| o.status != SyncStatus::Error))
+                    .map(|(machine, _)| machine.clone())
                     .collect()
             } else {
                 Vec::new()
             };
-            for (machine, per_doc, name_outcome) in synced_peers {
-                if let Some(outcome) = name_outcome {
-                    node_names.insert(machine.clone(), outcome);
-                }
+            for (machine, per_doc) in synced_peers {
                 results.insert(machine, per_doc);
             }
             if ctx.is_cancelled() {
@@ -1769,6 +2294,28 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
     })
 }
 
+fn fallback_doc_outcomes_for_probe_error(
+    explicit_docs: Option<&[SharedDocument]>,
+    local_docs: &[String],
+    direction: SyncDirection,
+    role: &str,
+    error: &ErrorBody,
+) -> BTreeMap<String, DocSyncOutcome> {
+    let mut map = BTreeMap::new();
+    for doc in default_doc_list(explicit_docs, local_docs) {
+        let outcome = if doc == SharedDocument::Devices
+            && direction != SyncDirection::Status
+            && role != OWNER
+        {
+            skipped_devices_outcome()
+        } else {
+            error_outcome(error.clone())
+        };
+        map.insert(doc.canonical_name(), outcome);
+    }
+    map
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn sync_one_machine_with_timeout(
     fleet: &Fleet,
@@ -1781,10 +2328,7 @@ async fn sync_one_machine_with_timeout(
     dry_run: bool,
     timeout: Option<Duration>,
     device_registry_push: Option<&DeviceRegistryPushAudit>,
-) -> (
-    BTreeMap<String, DocSyncOutcome>,
-    Option<NodeNameSyncOutcome>,
-) {
+) -> BTreeMap<String, DocSyncOutcome> {
     let fut = sync_one_machine(
         fleet,
         ctx,
@@ -1814,7 +2358,7 @@ async fn sync_one_machine_with_timeout(
             for doc in default_doc_list(explicit_docs, local_docs) {
                 map.insert(doc.canonical_name(), error_outcome(err.clone()));
             }
-            (map, None)
+            map
         }
     }
 }
@@ -1902,47 +2446,7 @@ async fn sync_one_machine(
     force: bool,
     dry_run: bool,
     device_registry_push: Option<&DeviceRegistryPushAudit>,
-) -> (
-    BTreeMap<String, DocSyncOutcome>,
-    Option<NodeNameSyncOutcome>,
-) {
-    let all_skipped_locally = direction != SyncDirection::Status
-        && ctx.grant().role() != OWNER
-        && explicit_docs == Some(&[SharedDocument::Devices]);
-
-    let name_outcome = if all_skipped_locally {
-        None
-    } else {
-        match sync_machine_node_name(
-            fleet,
-            ctx,
-            machine,
-            direction,
-            dry_run,
-            device_registry_push.is_some(),
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let mut map = BTreeMap::new();
-                let fallback_docs = default_doc_list(explicit_docs, local_docs);
-                for doc in fallback_docs {
-                    let outcome = if doc == SharedDocument::Devices
-                        && direction != SyncDirection::Status
-                        && ctx.grant().role() != OWNER
-                    {
-                        skipped_devices_outcome()
-                    } else {
-                        error_outcome(error.clone())
-                    };
-                    map.insert(doc.canonical_name(), outcome);
-                }
-                return (map, None);
-            }
-        }
-    };
-
+) -> BTreeMap<String, DocSyncOutcome> {
     let docs = match determine_documents_for_machine(fleet, ctx, machine, explicit_docs, local_docs)
         .await
     {
@@ -1953,7 +2457,7 @@ async fn sync_one_machine(
             for doc in fallback_docs {
                 map.insert(doc.canonical_name(), error_outcome(error.clone()));
             }
-            return (map, name_outcome);
+            return map;
         }
     };
 
@@ -1973,154 +2477,350 @@ async fn sync_one_machine(
         .await;
         outcomes.insert(name, outcome);
     }
-    (outcomes, name_outcome)
+    outcomes
 }
 
-async fn sync_machine_node_name(
+/// Strongest identity key available to tell whether two fleet entries reached the same node:
+/// 1. Persistent `node_id` (from `<state_dir>/node-id`, carried by `hello` and `meta.version`),
+/// 2. Kernel `boot_id` fallback for older nodes that do not report `node_id`,
+/// 3. Identical direct single-system transport (`ssh` target or `command` argv) if neither is set.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SyncNodeKey {
+    NodeId(String),
+    BootId(String),
+    DirectTransport(String),
+    Unique(String),
+}
+
+fn node_identity_key(
+    fleet_file: &FleetFile,
+    machine: &str,
+    reported: &ReportedNode,
+) -> SyncNodeKey {
+    if let Some(node_id) = reported.node_id.as_deref().filter(|s| !s.is_empty()) {
+        return SyncNodeKey::NodeId(node_id.to_owned());
+    }
+    if let Some(boot_id) = reported.boot_id.as_deref().filter(|s| !s.is_empty()) {
+        return SyncNodeKey::BootId(boot_id.to_owned());
+    }
+    if let Some(entry) = fleet_file.machine(machine)
+        && entry.via.is_none()
+    {
+        let systems = entry.resolved_systems();
+        if systems.len() == 1 {
+            match &systems[0].transport {
+                Transport::Ssh {
+                    target, program, ..
+                } => {
+                    return SyncNodeKey::DirectTransport(format!(
+                        "ssh:{target}:{}",
+                        program.as_deref().unwrap_or("")
+                    ));
+                }
+                Transport::Command { argv } => {
+                    return SyncNodeKey::DirectTransport(format!("cmd:{}", argv.join("\0")));
+                }
+            }
+        }
+    }
+    SyncNodeKey::Unique(machine.to_owned())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_and_apply_node_names(
     fleet: &Fleet,
     ctx: &Ctx,
-    machine: &str,
+    fleet_file: &FleetFile,
+    here: &str,
+    probes: &BTreeMap<String, Result<Option<ReportedNode>, ErrorBody>>,
     direction: SyncDirection,
     dry_run: bool,
     is_device_registry_push: bool,
-) -> Result<Option<NodeNameSyncOutcome>, ErrorBody> {
-    let identity = match fleet.probe_identity(ctx, machine).await {
-        Ok(identity) => identity,
-        // On a relayed machine, a principal allowed `config.*` might not be allowed `meta.version`;
-        // do not fail the whole document sync for an optional identity read.
-        Err(error) if error.code == ErrorCode::Denied => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    if identity.node == machine {
-        return Ok(None);
+    per_machine_timeout: Option<Duration>,
+) -> BTreeMap<String, NodeNameSyncOutcome> {
+    let mut groups: BTreeMap<SyncNodeKey, Vec<String>> = BTreeMap::new();
+    for (machine, probe) in probes {
+        if let Ok(Some(reported)) = probe {
+            let key = node_identity_key(fleet_file, machine, reported);
+            groups.entry(key).or_default().push(machine.clone());
+        }
     }
 
-    let reported = identity.node;
+    let mut outcomes = BTreeMap::new();
+    let mut ambiguous_machines = BTreeSet::new();
+    for entries in groups.values() {
+        if entries.len() <= 1 {
+            continue;
+        }
+        for machine in entries {
+            ambiguous_machines.insert(machine.clone());
+            let Some(Ok(Some(reported))) = probes.get(machine) else {
+                continue;
+            };
+            let others: Vec<String> = entries
+                .iter()
+                .filter(|other| other.as_str() != machine.as_str())
+                .cloned()
+                .collect();
+            let others_text = others.join(", ");
+            let message = format!(
+                "{machine} and {others_text} in fleet.toml reached the same node (currently calling itself {}), so none of them renamed it.",
+                reported.node
+            );
+            let hint = format!(
+                "Remove the stale entry ({others_text} or {machine}) from fleet.toml, then run `legion fleet.sync direction=push` again."
+            );
+            outcomes.insert(
+                machine.clone(),
+                NodeNameSyncOutcome {
+                    status: NodeNameSyncStatus::Ambiguous,
+                    expected: machine.clone(),
+                    reported: reported.node.clone(),
+                    source: NodeNameSource::from_explicit(reported.explicit),
+                    backup: None,
+                    other_entries: others,
+                    moved: Vec::new(),
+                    conflicts: Vec::new(),
+                    detail: Some(message.clone()),
+                    error: Some(
+                        ErrorBody::new(ErrorCode::Conflict, message)
+                            .with_hint(hint)
+                            .with_machine(machine)
+                            .with_details(json!({
+                                "kind": "ambiguous_fleet_entries",
+                                "entries": entries,
+                                "expected": machine,
+                                "reported": reported.node,
+                            })),
+                    ),
+                },
+            );
+        }
+    }
+
+    // Apply unambiguous renames sequentially (one machine at a time).
+    for (machine, probe) in probes {
+        if ambiguous_machines.contains(machine) {
+            continue;
+        }
+        let Ok(Some(identity)) = probe else {
+            continue;
+        };
+        if identity.node == *machine {
+            continue;
+        }
+        if ctx.is_cancelled() {
+            break;
+        }
+        let outcome = apply_one_machine_node_name(
+            fleet,
+            ctx,
+            here,
+            machine,
+            identity,
+            direction,
+            dry_run,
+            is_device_registry_push,
+            per_machine_timeout,
+        )
+        .await;
+        outcomes.insert(machine.clone(), outcome);
+    }
+
+    outcomes
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_one_machine_node_name(
+    fleet: &Fleet,
+    ctx: &Ctx,
+    here: &str,
+    machine: &str,
+    identity: &ReportedNode,
+    direction: SyncDirection,
+    dry_run: bool,
+    is_device_registry_push: bool,
+    per_machine_timeout: Option<Duration>,
+) -> NodeNameSyncOutcome {
+    let reported = identity.node.clone();
     match identity.explicit {
         Some(false) => {
             if direction == SyncDirection::Push && !is_device_registry_push {
                 if dry_run {
-                    return Ok(Some(NodeNameSyncOutcome {
+                    return NodeNameSyncOutcome {
                         status: NodeNameSyncStatus::Set,
                         expected: machine.to_owned(),
                         reported: reported.clone(),
                         source: NodeNameSource::Host,
                         backup: None,
+                        other_entries: Vec::new(),
+                        moved: Vec::new(),
+                        conflicts: Vec::new(),
                         detail: Some(format!(
                             "Would set `name = \"{machine}\"` in node.toml on {machine} (was host-derived {reported}; dry_run)."
                         )),
                         error: None,
-                    }));
+                    };
                 }
-                match fleet
-                    .call_remote(
-                        ctx,
-                        machine,
-                        "config.set_name",
-                        json!({"name": machine}),
-                        EventSink::discard(),
-                    )
-                    .await
-                {
-                    Ok(value) => {
-                        let written: ConfigSetNameResult = serde_json::from_value(value)
-                            .map_err(|error| {
+                let call_fut = fleet.call_remote(
+                    ctx,
+                    machine,
+                    "config.set_name",
+                    json!({
+                        "name": machine,
+                        "caller": here,
+                    }),
+                    EventSink::discard(),
+                );
+                let call_res = match per_machine_timeout {
+                    Some(limit) => match tokio::time::timeout(limit, call_fut).await {
+                        Ok(res) => res,
+                        Err(_) => Err(ErrorBody::new(
+                            ErrorCode::Timeout,
+                            format!(
+                                "Timed out setting node name on {machine} after {:.1}s.",
+                                limit.as_secs_f64()
+                            ),
+                        )
+                        .with_machine(machine)),
+                    },
+                    None => call_fut.await,
+                };
+                match call_res {
+                    Ok(value) => match serde_json::from_value::<ConfigSetNameResult>(value) {
+                        Ok(written) => {
+                            fleet.record_reported_node(
+                                machine,
+                                ReportedNode {
+                                    node: machine.to_owned(),
+                                    explicit: Some(true),
+                                    node_id: identity.node_id.clone(),
+                                    boot_id: identity.boot_id.clone(),
+                                },
+                            );
+                            fleet.evict(machine).await;
+                            NodeNameSyncOutcome {
+                                status: NodeNameSyncStatus::Set,
+                                expected: machine.to_owned(),
+                                reported: reported.clone(),
+                                source: NodeNameSource::Host,
+                                backup: written.backup,
+                                other_entries: Vec::new(),
+                                moved: written.moved,
+                                conflicts: written.conflicts,
+                                detail: Some(format!(
+                                    "Set `name = \"{machine}\"` in node.toml on {machine} (was host-derived {reported})."
+                                )),
+                                error: None,
+                            }
+                        }
+                        Err(error) => NodeNameSyncOutcome {
+                            status: NodeNameSyncStatus::Error,
+                            expected: machine.to_owned(),
+                            reported,
+                            source: NodeNameSource::Host,
+                            backup: None,
+                            other_entries: Vec::new(),
+                            moved: Vec::new(),
+                            conflicts: Vec::new(),
+                            detail: None,
+                            error: Some(
                                 ErrorBody::new(
                                     ErrorCode::Failed,
                                     format!(
                                         "Remote config.set_name returned an unexpected shape: {error}."
                                     ),
                                 )
-                                .with_machine(machine)
-                            })?;
-                        fleet.record_reported_node(machine, machine, Some(true));
-                        fleet.evict(machine).await;
-                        Ok(Some(NodeNameSyncOutcome {
-                            status: NodeNameSyncStatus::Set,
-                            expected: machine.to_owned(),
-                            reported: reported.clone(),
-                            source: NodeNameSource::Host,
-                            backup: written.backup,
-                            detail: Some(format!(
-                                "Set `name = \"{machine}\"` in node.toml on {machine} (was host-derived {reported})."
-                            )),
-                            error: None,
-                        }))
-                    }
-                    Err(error) if error.code == ErrorCode::NameMismatch => {
-                        Ok(Some(NodeNameSyncOutcome {
-                            status: NodeNameSyncStatus::NameMismatch,
-                            expected: machine.to_owned(),
-                            reported,
-                            source: NodeNameSource::Explicit,
-                            backup: None,
-                            detail: Some(error.message.clone()),
-                            error: Some(error),
-                        }))
-                    }
-                    Err(error) if error.code == ErrorCode::UnknownTool => {
-                        Ok(Some(NodeNameSyncOutcome {
-                            status: NodeNameSyncStatus::NameMismatch,
-                            expected: machine.to_owned(),
-                            reported: reported.clone(),
-                            source: NodeNameSource::Host,
-                            backup: None,
-                            detail: Some(format!(
-                                "{machine} calls itself {reported}, and does not offer config.set_name; left unchanged."
-                            )),
-                            error: Some(
-                                ErrorBody::new(
-                                    ErrorCode::NameMismatch,
-                                    format!("{machine} calls itself {reported}."),
-                                )
-                                .with_hint(format!(
-                                    "Update legion on {machine}, or set `name = \"{machine}\"` in its node.toml."
-                                ))
-                                .with_machine(machine)
-                                .with_details(json!({
-                                    "expected": machine,
-                                    "reported": reported,
-                                    "explicit": false,
-                                })),
+                                .with_machine(machine),
                             ),
-                        }))
-                    }
-                    Err(error) => Ok(Some(NodeNameSyncOutcome {
+                        },
+                    },
+                    Err(error) if is_name_mismatch_error(&error) => NodeNameSyncOutcome {
+                        status: NodeNameSyncStatus::NameMismatch,
+                        expected: machine.to_owned(),
+                        reported,
+                        source: NodeNameSource::Explicit,
+                        backup: None,
+                        other_entries: Vec::new(),
+                        moved: Vec::new(),
+                        conflicts: Vec::new(),
+                        detail: Some(error.message.clone()),
+                        error: Some(error),
+                    },
+                    Err(error) if error.code == ErrorCode::UnknownTool => NodeNameSyncOutcome {
+                        status: NodeNameSyncStatus::NameMismatch,
+                        expected: machine.to_owned(),
+                        reported: reported.clone(),
+                        source: NodeNameSource::Host,
+                        backup: None,
+                        other_entries: Vec::new(),
+                        moved: Vec::new(),
+                        conflicts: Vec::new(),
+                        detail: Some(format!(
+                            "{machine} calls itself {reported}, and does not offer config.set_name; left unchanged."
+                        )),
+                        error: Some(
+                            ErrorBody::new(
+                                ErrorCode::Conflict,
+                                format!("{machine} calls itself {reported}."),
+                            )
+                            .with_hint(format!(
+                                "Update legion on {machine}, or set `name = \"{machine}\"` in its node.toml."
+                            ))
+                            .with_machine(machine)
+                            .with_details(json!({
+                                "kind": "name_mismatch",
+                                "expected": machine,
+                                "reported": reported,
+                                "explicit": false,
+                            })),
+                        ),
+                    },
+                    Err(error) => NodeNameSyncOutcome {
                         status: NodeNameSyncStatus::Error,
                         expected: machine.to_owned(),
                         reported,
                         source: NodeNameSource::Host,
                         backup: None,
+                        other_entries: Vec::new(),
+                        moved: Vec::new(),
+                        conflicts: Vec::new(),
                         detail: None,
                         error: Some(error),
-                    })),
+                    },
                 }
             } else {
-                Ok(Some(NodeNameSyncOutcome {
+                NodeNameSyncOutcome {
                     status: NodeNameSyncStatus::NameMismatch,
                     expected: machine.to_owned(),
                     reported: reported.clone(),
                     source: NodeNameSource::Host,
                     backup: None,
+                    other_entries: Vec::new(),
+                    moved: Vec::new(),
+                    conflicts: Vec::new(),
                     detail: Some(format!(
                         "{machine} calls itself {reported} (host-derived; no explicit name in node.toml). Run `legion fleet.sync direction=push machines='[\"{machine}\"]'` to set it."
                     )),
                     error: Some(name_mismatch_error(machine, &reported)),
-                }))
+                }
             }
         }
-        Some(true) => Ok(Some(NodeNameSyncOutcome {
+        Some(true) => NodeNameSyncOutcome {
             status: NodeNameSyncStatus::NameMismatch,
             expected: machine.to_owned(),
             reported: reported.clone(),
             source: NodeNameSource::Explicit,
             backup: None,
+            other_entries: Vec::new(),
+            moved: Vec::new(),
+            conflicts: Vec::new(),
             detail: Some(format!(
                 "{machine} calls itself {reported} (set explicitly in node.toml); left unchanged."
             )),
             error: Some(
                 ErrorBody::new(
-                    ErrorCode::NameMismatch,
+                    ErrorCode::Conflict,
                     format!("{machine} calls itself {reported}."),
                 )
                 .with_hint(format!(
@@ -2128,24 +2828,28 @@ async fn sync_machine_node_name(
                 ))
                 .with_machine(machine)
                 .with_details(json!({
+                    "kind": "name_mismatch",
                     "expected": machine,
                     "reported": reported,
                     "explicit": true,
                 })),
             ),
-        })),
-        None => Ok(Some(NodeNameSyncOutcome {
+        },
+        None => NodeNameSyncOutcome {
             status: NodeNameSyncStatus::NameMismatch,
             expected: machine.to_owned(),
             reported: reported.clone(),
             source: NodeNameSource::Unknown,
             backup: None,
+            other_entries: Vec::new(),
+            moved: Vec::new(),
+            conflicts: Vec::new(),
             detail: Some(format!(
                 "{machine} calls itself {reported} and did not report whether that name is explicit (older node); left unchanged."
             )),
             error: Some(
                 ErrorBody::new(
-                    ErrorCode::NameMismatch,
+                    ErrorCode::Conflict,
                     format!("{machine} calls itself {reported}."),
                 )
                 .with_hint(format!(
@@ -2153,12 +2857,13 @@ async fn sync_machine_node_name(
                 ))
                 .with_machine(machine)
                 .with_details(json!({
+                    "kind": "name_mismatch",
                     "expected": machine,
                     "reported": reported,
                     "source": "unknown",
                 })),
             ),
-        })),
+        },
     }
 }
 
@@ -6281,6 +6986,207 @@ removed_on = \"box-a\"
                 .unwrap()
                 .contains(&id_holder),
             "holder must be stripped from authorized_keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_name_handles_bom_symlinks_projects_migration_and_conflicts() {
+        use legion_core::{Call, Door, Node, Paths};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+
+        let fleet = Fleet::new(&paths);
+        let mut reg = Registry::new();
+        register(&mut reg, fleet.clone());
+        let node = Node::new(paths.clone(), reg);
+        let old_host_name = node.name();
+        let target_name = if old_host_name == "studio" {
+            "studio-peer"
+        } else {
+            "studio"
+        };
+
+        // 1. Refuses `caller` equal to `name`.
+        let err = node
+            .call(Call::new(
+                Door::Cli,
+                "config.set_name",
+                json!({"name": target_name, "caller": target_name}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert_eq!(
+            err.details.as_ref().and_then(|d| d.get("kind")),
+            Some(&json!("caller_name_conflict"))
+        );
+
+        // 2. Refuses a name mapped to a provably different machine in this node's own fleet.toml.
+        std::fs::write(
+            paths.config_file("fleet.toml"),
+            "[machines.tower]\nssh = \"tower.example\"\n",
+        )
+        .unwrap();
+        fleet.record_reported_node(
+            "tower",
+            ReportedNode {
+                node: "tower".to_owned(),
+                explicit: Some(true),
+                node_id: Some("ffffffffffffffffffffffffffffffff".to_owned()),
+                boot_id: Some("other-boot".to_owned()),
+            },
+        );
+        let err = node
+            .call(Call::new(
+                Door::Cli,
+                "config.set_name",
+                json!({"name": "tower"}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert_eq!(
+            err.details.as_ref().and_then(|d| d.get("kind")),
+            Some(&json!("fleet_name_conflict"))
+        );
+        assert!(!paths.config_file("node.toml").exists());
+
+        // 3. Symlink outside what this node may write is refused without touching the target.
+        #[cfg(unix)]
+        {
+            let outside_dir = tempfile::tempdir().unwrap();
+            let outside_file = outside_dir.path().join("outside-node.toml");
+            std::fs::write(&outside_file, b"[svc]\nsudo = false\n").unwrap();
+            std::os::unix::fs::symlink(&outside_file, paths.config_file("node.toml")).unwrap();
+            let err = node
+                .call(Call::new(
+                    Door::Cli,
+                    "config.set_name",
+                    json!({"name": target_name}),
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{err:?}");
+            assert!(
+                err.message.contains("outside"),
+                "expected clear sentence: {}",
+                err.message
+            );
+            assert_eq!(
+                std::fs::read(&outside_file).unwrap(),
+                b"[svc]\nsudo = false\n"
+            );
+            std::fs::remove_file(paths.config_file("node.toml")).unwrap();
+
+            // Dangling symlink is also refused.
+            std::os::unix::fs::symlink(
+                dir.path().join("missing-node.toml"),
+                paths.config_file("node.toml"),
+            )
+            .unwrap();
+            let err = node
+                .call(Call::new(
+                    Door::Cli,
+                    "config.set_name",
+                    json!({"name": target_name}),
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{err:?}");
+            std::fs::remove_file(paths.config_file("node.toml")).unwrap();
+        }
+
+        // 4. Symlink inside allowed home + UTF-8 BOM + CRLF + projects.toml migration & conflict.
+        let real_node_target = dir.path().join("dotfiles-node.toml");
+        let bom_body = b"\xEF\xBB\xBF[svc]\r\nsudo = true\r\n";
+        std::fs::write(&real_node_target, bom_body).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_node_target, paths.config_file("node.toml")).unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(paths.config_file("node.toml"), bom_body).unwrap();
+
+        let projects_toml = format!(
+            "[projects.app]\n\
+             description = \"Main app\"\n\
+             [projects.app.on]\n\
+             {old_host_name} = \"/work/app\"\n\
+             tower = \"/srv/app\"\n\n\
+             [projects.dup]\n\
+             [projects.dup.on]\n\
+             {old_host_name} = \"/old/dup\"\n\
+             {target_name} = \"/keep/dup\"\n"
+        );
+        std::fs::write(paths.config_file("projects.toml"), &projects_toml).unwrap();
+
+        let res = node
+            .call(Call::new(
+                Door::Cli,
+                "config.set_name",
+                json!({"name": target_name, "caller": "tower"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res["changed"], json!(true), "{res}");
+        assert_eq!(res["node"], json!(target_name), "{res}");
+        assert_eq!(
+            res["moved"],
+            json!([format!("projects.app.on: {old_host_name} -> {target_name}")]),
+            "{res}"
+        );
+        assert_eq!(
+            res["conflicts"],
+            json!([{
+                "project": "dup",
+                "old_path": "/old/dup",
+                "new_path": "/keep/dup"
+            }]),
+            "{res}"
+        );
+
+        // Symlink stayed a symlink, and the target file keeps the UTF-8 BOM at byte 0.
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(paths.config_file("node.toml"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "node.toml must remain a symlink"
+        );
+        let written_node = std::fs::read(paths.config_file("node.toml")).unwrap();
+        assert_eq!(
+            written_node,
+            format!("\u{feff}name = \"{target_name}\"\r\n[svc]\r\nsudo = true\r\n").into_bytes()
+        );
+        let parsed_node =
+            parse::<NodeFile>(&paths.config_file("node.toml"), &written_node).unwrap();
+        assert_eq!(
+            parsed_node.name.as_ref().map(NodeName::as_str),
+            Some(target_name)
+        );
+        assert!(parsed_node.svc.sudo);
+
+        // projects.toml moved `app` and left `dup`'s existing `target_name` intact.
+        let parsed_projects = parse::<ProjectsFile>(
+            &paths.config_file("projects.toml"),
+            &std::fs::read(paths.config_file("projects.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed_projects.path_on("app", target_name),
+            Some("/work/app")
+        );
+        assert_eq!(parsed_projects.path_on("app", &old_host_name), None);
+        assert_eq!(parsed_projects.path_on("app", "tower"), Some("/srv/app"));
+        assert_eq!(
+            parsed_projects.path_on("dup", target_name),
+            Some("/keep/dup")
+        );
+        assert_eq!(
+            parsed_projects.path_on("dup", &old_host_name),
+            Some("/old/dup")
         );
     }
 }

@@ -513,32 +513,51 @@ impl InstallBackend for SystemInstallBackend {
             };
             let params = CallParams {
                 tool: "config.set_name".to_owned(),
-                args: serde_json::json!({"name": machine}),
+                args: serde_json::json!({
+                    "name": machine,
+                    "caller": self.here,
+                }),
                 as_principal: Some(self.principal.clone()),
                 on: None,
                 hops: 1,
             };
             match session.call(params, cancel, EventSink::discard()).await {
                 Ok(value) => {
-                    self.fleet
-                        .record_reported_node(machine, machine, Some(true));
+                    let hello = &session.info().hello;
+                    self.fleet.record_reported_node(
+                        machine,
+                        crate::state::ReportedNode {
+                            node: machine.to_owned(),
+                            explicit: Some(true),
+                            node_id: hello.node_id.clone(),
+                            boot_id: hello.boot_id.clone(),
+                        },
+                    );
                     if value.get("changed").and_then(Value::as_bool) == Some(true) {
                         self.fleet.evict(machine).await;
                     }
                     None
                 }
-                Err(CallError::Remote(err)) if err.code == ErrorCode::NameMismatch => {
+                Err(CallError::Remote(err)) if crate::pool::is_name_mismatch_error(&err) => {
+                    let hello = &session.info().hello;
                     let reported = err
                         .details
                         .as_ref()
                         .and_then(|d| d.get("reported"))
                         .and_then(Value::as_str)
-                        .unwrap_or_else(|| session.info().hello.node.as_str());
-                    self.fleet
-                        .record_reported_node(machine, reported, Some(true));
+                        .unwrap_or(hello.node.as_str());
+                    self.fleet.record_reported_node(
+                        machine,
+                        crate::state::ReportedNode {
+                            node: reported.to_owned(),
+                            explicit: Some(true),
+                            node_id: hello.node_id.clone(),
+                            boot_id: hello.boot_id.clone(),
+                        },
+                    );
                     Some(
                         ErrorBody::new(
-                            ErrorCode::NameMismatch,
+                            ErrorCode::Conflict,
                             format!(
                                 "{machine} is already explicitly named {reported} in node.toml, so its name was left unchanged."
                             ),
@@ -548,6 +567,7 @@ impl InstallBackend for SystemInstallBackend {
                         ))
                         .with_machine(machine)
                         .with_details(serde_json::json!({
+                            "kind": "name_mismatch",
                             "expected": machine,
                             "reported": reported,
                             "explicit": true,
@@ -559,7 +579,7 @@ impl InstallBackend for SystemInstallBackend {
                     if hello.node != machine {
                         Some(
                             ErrorBody::new(
-                                ErrorCode::NameMismatch,
+                                ErrorCode::Conflict,
                                 format!(
                                     "{machine} calls itself {}, and the installed binary does not support config.set_name.",
                                     hello.node
@@ -568,22 +588,17 @@ impl InstallBackend for SystemInstallBackend {
                             .with_hint(format!(
                                 "Set `name = \"{machine}\"` in {machine}'s node.toml, or install a newer legion release."
                             ))
-                            .with_machine(machine),
-                        )
-                    } else if hello.node_explicit != Some(true) {
-                        Some(
-                            ErrorBody::new(
-                                ErrorCode::Unsupported,
-                                format!(
-                                    "Could not write `name = \"{machine}\"` to node.toml on {machine}: the installed binary does not offer config.set_name."
-                                ),
-                            )
-                            .with_hint(format!(
-                                "Add `name = \"{machine}\"` to {machine}'s node.toml, or install a newer legion release."
-                            ))
-                            .with_machine(machine),
+                            .with_machine(machine)
+                            .with_details(serde_json::json!({
+                                "kind": "name_mismatch",
+                                "expected": machine,
+                                "reported": hello.node,
+                            })),
                         )
                     } else {
+                        // The remote node already answers under the fleet name, so there is no
+                        // mismatch problem to report even when the installed binary predates
+                        // `config.set_name`.
                         None
                     }
                 }
@@ -3231,11 +3246,16 @@ program = "/opt/legion/legion"
         let mut mismatch_backend = FakeInstallBackend::linux_x86_64("0.2.0", None, "0.2.0");
         mismatch_backend.node_name_problem = Some(
             ErrorBody::new(
-                ErrorCode::NameMismatch,
+                ErrorCode::Conflict,
                 "tower is already explicitly named studio in node.toml, so its name was left unchanged.",
             )
             .with_hint("Set `name = \"tower\"` in tower's node.toml, or rename the entry in fleet.toml to `studio`.")
-            .with_machine("tower"),
+            .with_machine("tower")
+            .with_details(serde_json::json!({
+                "kind": "name_mismatch",
+                "expected": "tower",
+                "reported": "studio",
+            })),
         );
         let with_problem = run_fleet_install(
             &paths,
@@ -3255,7 +3275,10 @@ program = "/opt/legion/legion"
         .unwrap();
         assert_eq!(with_problem.installed_version, "0.2.0");
         assert_eq!(with_problem.problems.len(), 1);
-        assert_eq!(with_problem.problems[0].code, ErrorCode::NameMismatch);
+        assert_eq!(with_problem.problems[0].code, ErrorCode::Conflict);
+        assert!(crate::pool::is_name_mismatch_error(
+            &with_problem.problems[0]
+        ));
         assert!(with_problem.problems[0].message.contains("studio"));
         assert!(with_problem.problems[0].hint.is_some());
     }
@@ -3269,6 +3292,7 @@ program = "/opt/legion/legion"
         async fn run_case(
             initial_node_toml: Option<&[u8]>,
             offer_set_name: bool,
+            legacy_reported_name: Option<&str>,
         ) -> (Option<ErrorBody>, Option<Vec<u8>>) {
             let local_dir = tempdir().unwrap();
             let remote_dir = tempdir().unwrap();
@@ -3296,6 +3320,7 @@ program = "/opt/legion/legion"
             let (client, server) = tokio::io::duplex(64 * 1024);
             let (client_r, client_w) = tokio::io::split(client);
             let (server_r, mut server_w) = tokio::io::split(server);
+            let legacy_name = legacy_reported_name.map(str::to_owned);
             let node_task = {
                 let remote_node = remote_node.clone();
                 tokio::spawn(async move {
@@ -3307,8 +3332,11 @@ program = "/opt/legion/legion"
                                 let params = serde_json::from_value(req.params).unwrap();
                                 let mut hello = remote_node.hello(&params).unwrap();
                                 if !offer_set_name {
-                                    hello.node = "someones-laptop".to_owned();
+                                    if let Some(ref name) = legacy_name {
+                                        hello.node = name.clone();
+                                    }
                                     hello.node_explicit = None;
+                                    hello.node_id = None;
                                 }
                                 Response::ok(req.id, serde_json::to_value(hello).unwrap())
                             }
@@ -3375,13 +3403,13 @@ program = "/opt/legion/legion"
         }
 
         // 1. Missing node.toml -> written with `name = "studio"\n`, no problem.
-        let (problem, after) = run_case(None, true).await;
+        let (problem, after) = run_case(None, true, None).await;
         assert_eq!(problem, None);
         assert_eq!(after.as_deref(), Some(b"name = \"studio\"\n".as_slice()));
 
         // 2. Existing node.toml without `name` -> keeps rest of file byte for byte.
         let original = b"# keep this comment\n[svc]\nsudo = true\n";
-        let (problem, after) = run_case(Some(original), true).await;
+        let (problem, after) = run_case(Some(original), true, None).await;
         assert_eq!(problem, None);
         let written = after.unwrap();
         assert!(written.starts_with(b"name = \"studio\"\n"));
@@ -3389,19 +3417,27 @@ program = "/opt/legion/legion"
 
         // 3. Different explicit name -> left untouched byte for byte and reported as a problem.
         let explicit_other = b"# pinned\nname = \"tower\"\n";
-        let (problem, after) = run_case(Some(explicit_other), true).await;
+        let (problem, after) = run_case(Some(explicit_other), true, None).await;
         let problem = problem.expect("expected mismatch problem");
-        assert_eq!(problem.code, ErrorCode::NameMismatch);
+        assert_eq!(problem.code, ErrorCode::Conflict);
+        assert!(crate::pool::is_name_mismatch_error(&problem));
         assert!(problem.message.contains("tower"), "{}", problem.message);
         assert!(problem.hint.is_some());
         assert_eq!(after.as_deref(), Some(explicit_other.as_slice()));
 
-        // 4. Older remote binary lacking `config.set_name` -> reports mismatch problem cleanly.
-        let (problem, after) = run_case(None, false).await;
+        // 4. Older remote binary lacking `config.set_name` with wrong name -> reports mismatch.
+        let (problem, after) = run_case(None, false, Some("someones-laptop")).await;
         let problem = problem.expect("expected problem for older binary");
-        assert_eq!(problem.code, ErrorCode::NameMismatch);
+        assert_eq!(problem.code, ErrorCode::Conflict);
+        assert!(crate::pool::is_name_mismatch_error(&problem));
         assert!(problem.message.contains("someones-laptop"));
         assert!(problem.hint.is_some());
+        assert_eq!(after, None);
+
+        // 5. Older remote binary lacking `config.set_name` that already answers under the right
+        //    name -> no spurious problem reported.
+        let (problem, after) = run_case(None, false, Some("studio")).await;
+        assert_eq!(problem, None);
         assert_eq!(after, None);
     }
 }
