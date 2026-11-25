@@ -374,15 +374,19 @@ mount it:
   download})`, `content_status({url})`, and `content_revoke({url})`, reading through
   `Link::open_content`. Every platform (Linux, macOS, Windows, iOS/iPadOS, and Android) mounts it
   lazily on a streaming HTTP/1.1 listener bound strictly to `127.0.0.1:0` on a system-chosen port
-  (deciding liveness strictly from Legion's own accept-task state and always binding a fresh
-  OS-chosen port on recovery; capped at 32 simultaneous connections with a 5-second header-read
-  timeout, a 2-second header timeout for connections that have not yet presented a valid ticket,
-  `Connection: close` on `404` and guard rejections, eviction of the oldest unauthenticated
-  connection before refusing a new one at the cap, status tracking strictly after ticket lookup
-  succeeds, exponential backoff on accept errors, mobile resume recovery, and stopping 60 seconds
-  after no live tickets or active streams remain), protected by `HostOriginGuard` (loopback
-  host+port and only that platform's bundled page origins, never `null`) and
-  `Cross-Origin-Resource-Policy: cross-origin`. On Android, `res/xml/network_security_config.xml`
+  (deciding liveness from both Legion's own accept-task state and a short loopback
+  proof-of-ownership probe using a per-listener random 256-bit secret that is never logged or
+  placed in any URL — run on mobile resume and before minting once the last verified proof is
+  older than 2 seconds, answering only keyed challenge/response probes with `Connection: close`
+  under unauthenticated connection limits and returning the same generic `404` to callers without
+  the secret — and always tearing down and binding a fresh OS-chosen port on failure; capped at 32
+  simultaneous connections with a 5-second header-read timeout, a 2-second header timeout for
+  connections that have not yet presented a valid ticket, `Connection: close` on `404` and guard
+  rejections, eviction of the oldest unauthenticated connection before refusing a new one at the
+  cap, status tracking strictly after ticket lookup succeeds, exponential backoff on accept errors,
+  mobile resume recovery, and stopping 60 seconds after no live tickets or active streams remain),
+  protected by `HostOriginGuard` (loopback host+port and only that platform's bundled page
+  origins, never `null`) and `Cross-Origin-Resource-Policy: cross-origin`. On Android, `res/xml/network_security_config.xml`
   denies cleartext traffic globally while exempting only the loopback literal `127.0.0.1`, allowing
   WebView to stream and seek arbitrarily large media with flat memory without permitting cleartext
   to any other host. On Android, any app on the phone can connect to `127.0.0.1` and send any
