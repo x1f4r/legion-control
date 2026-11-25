@@ -1374,3 +1374,183 @@ test('Player: reaching an unplayable file in full screen keeps top bar, exit ful
     await server.stop();
   }
 });
+
+
+test('Player: deleting a picture, full-screen video, music track, or deep-linked file from the viewer leaves no history entry for it', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    // 1. Folder -> Picture -> More -> Delete -> Confirm -> system Back leaves folder (never reopens deleted picture).
+    {
+      const context = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
+      const page = await context.newPage();
+      page.on('console', (msg) => {
+        if (msg.type() === 'error') consoleErrors.push(msg.text());
+      });
+      page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+      await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme`, { waitUntil: 'domcontentloaded' });
+      await page.locator('a.row', { hasText: 'Videos' }).first().click();
+      await page.locator('a.row', { hasText: 'Holiday' }).first().click();
+      await page.locator('.grid a.cell[aria-label="IMG_2041.jpg"]').waitFor({ timeout: 5000 });
+      const holidayHash = await page.evaluate(() => window.location.hash);
+
+      await page.locator('.grid a.cell[aria-label="IMG_2041.jpg"]').click();
+      await page.locator('.viewer').waitFor({ timeout: 5000 });
+      await page.locator('.viewer button[aria-label="More options"]').click();
+      await page.locator('.sheet button', { hasText: 'Delete' }).click();
+      await page.locator('.sheet button.danger', { hasText: 'Delete' }).click();
+      await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
+      await page.waitForTimeout(150);
+
+      assert.equal(await page.evaluate(() => window.location.hash), holidayHash);
+      assert.equal(await page.locator('.grid a.cell[aria-label="IMG_2041.jpg"]').count(), 0);
+
+      // System Back must go from Holiday to Videos, never reopening the viewer on the deleted file.
+      await page.evaluate(() => window.history.back());
+      await page.waitForFunction(
+        () => decodeURIComponent(window.location.hash).endsWith('/home/me/Videos'),
+        null,
+        { timeout: 5000 },
+      );
+      assert.equal(await page.locator('.viewer').count(), 0);
+
+      // Another Back leaves Videos cleanly for /home/me.
+      await page.evaluate(() => window.history.back());
+      await page.waitForFunction(
+        () => decodeURIComponent(window.location.hash).endsWith('/home/me'),
+        null,
+        { timeout: 5000 },
+      );
+      assert.equal(await page.locator('.viewer').count(), 0);
+      await context.close();
+    }
+
+    // 2. Folder -> Video -> Full screen -> Next sibling -> More -> Delete -> Confirm -> system Back leaves folder.
+    {
+      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+      const page = await context.newPage();
+      page.on('console', (msg) => {
+        if (msg.type() === 'error') consoleErrors.push(msg.text());
+      });
+      page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+      await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos`, { waitUntil: 'domcontentloaded' });
+      await page.locator('a.row', { hasText: 'Holiday' }).first().click();
+      await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').waitFor({ timeout: 5000 });
+      const holidayHash = await page.evaluate(() => window.location.hash);
+
+      await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+      await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+      await page.locator('.viewer button[aria-label="Full screen"]').click();
+      await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor({ timeout: 3000 });
+
+      // Step to Beach.mp4 while in full screen, then delete it via More -> Delete.
+      await page.keyboard.press('n');
+      await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor({ timeout: 5000 });
+      await page.locator('.viewer button[aria-label="More options"]').click();
+      await page.locator('.sheet button', { hasText: 'Delete' }).click();
+      await page.locator('.sheet button.danger', { hasText: 'Delete' }).click();
+      await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
+      await page.waitForTimeout(150);
+
+      assert.equal(await page.evaluate(() => window.location.hash), holidayHash);
+      assert.equal(await page.locator('.grid a.cell[aria-label="Beach.mp4"]').count(), 0);
+
+      await page.evaluate(() => window.history.back());
+      await page.waitForFunction(
+        () => decodeURIComponent(window.location.hash).endsWith('/home/me/Videos'),
+        null,
+        { timeout: 5000 },
+      );
+      assert.equal(await page.locator('.viewer').count(), 0);
+      await context.close();
+    }
+
+    // 3. Folder -> Music -> More -> Delete -> Confirm -> system Back leaves folder.
+    {
+      const context = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
+      const page = await context.newPage();
+      page.on('console', (msg) => {
+        if (msg.type() === 'error') consoleErrors.push(msg.text());
+      });
+      page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+      await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FMusic`, { waitUntil: 'domcontentloaded' });
+      await page.locator('a.row', { hasText: 'Album' }).first().click();
+      await page.locator('a.row', { hasText: '01 - Morning Light.flac' }).waitFor({ timeout: 5000 });
+      const albumHash = await page.evaluate(() => window.location.hash);
+
+      await page.locator('a.row', { hasText: '01 - Morning Light.flac' }).click();
+      await page.locator('.viewer audio[src]').waitFor({ state: 'attached', timeout: 5000 });
+      await page.locator('.viewer button[aria-label="More options"]').click();
+      await page.locator('.sheet button', { hasText: 'Delete' }).click();
+      await page.locator('.sheet button.danger', { hasText: 'Delete' }).click();
+      await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
+      await page.waitForTimeout(150);
+
+      assert.equal(await page.evaluate(() => window.location.hash), albumHash);
+      assert.equal(await page.locator('a.row', { hasText: '01 - Morning Light.flac' }).count(), 0);
+
+      await page.evaluate(() => window.history.back());
+      await page.waitForFunction(
+        () => decodeURIComponent(window.location.hash).endsWith('/home/me/Music'),
+        null,
+        { timeout: 5000 },
+      );
+      assert.equal(await page.locator('.viewer').count(), 0);
+      await context.close();
+    }
+
+    // 4. Deep-linked viewer -> Delete -> Confirm -> viewer replaced in place with folder; Back goes to prior page.
+    {
+      const context = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
+      const page = await context.newPage();
+      page.on('console', (msg) => {
+        if (msg.type() === 'error') consoleErrors.push(msg.text());
+      });
+      page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+      await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos`, { waitUntil: 'domcontentloaded' });
+      await page.locator('a.row', { hasText: 'Holiday' }).waitFor({ timeout: 5000 });
+      await page.goto(
+        `${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday?view=${encodeURIComponent('/home/me/Videos/Holiday/IMG_2042.jpg')}`,
+        { waitUntil: 'domcontentloaded' },
+      );
+      await page.locator('.viewer').waitFor({ timeout: 5000 });
+      await page.locator('.viewer button[aria-label="More options"]').click();
+      await page.locator('.sheet button', { hasText: 'Delete' }).click();
+      await page.locator('.sheet button.danger', { hasText: 'Delete' }).click();
+      await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
+      await page.waitForTimeout(150);
+
+      assert.equal(
+        decodeURIComponent(await page.evaluate(() => window.location.hash)),
+        '#/files/tower//home/me/Videos/Holiday',
+      );
+      assert.equal(await page.locator('.grid a.cell[aria-label="IMG_2042.jpg"]').count(), 0);
+
+      await page.evaluate(() => window.history.back());
+      await page.waitForFunction(
+        () => decodeURIComponent(window.location.hash).endsWith('/home/me/Videos'),
+        null,
+        { timeout: 5000 },
+      );
+      assert.equal(await page.locator('.viewer').count(), 0);
+      await context.close();
+    }
+
+    assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});
