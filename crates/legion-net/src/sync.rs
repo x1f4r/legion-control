@@ -39,8 +39,9 @@ use legion_tools::device::sessions::{
 };
 use legion_tools::ext::def::parse_toml as parse_extension_toml;
 use legion_tools::fav::{
-    FavoritesFile, MAX_FAVORITES_BYTES, apply_favorites_merge_blocking, favorites_size_limit_error,
-    merge_favorites, parse_favorites_bytes, prune_expired_tombstones,
+    FavoritesFile, MAX_FAVORITES_BYTES, apply_favorites_merge_blocking, build_time_floor,
+    enforce_merged_bounds, favorites_size_limit_error, merge_favorites, parse_favorites_bytes,
+    prune_expired_tombstones, sanitize_received_favorites,
 };
 use legion_tools::proj::ProjectsFile;
 use legion_xfer::hash::{Hash, hash_bytes};
@@ -1258,12 +1259,17 @@ async fn apply_local_write(
             .as_deref()
             .map(|b| hash_bytes(b).to_string());
         let hash_after = hash_bytes(merge_outcome.canonical_toml.as_bytes()).to_string();
-        let audit_args = json!({
+        let mut audit_args = json!({
             "document": "favorites.toml",
             "hash_before": hash_before,
             "hash_after": hash_after,
             "backup": merge_outcome.backup,
         });
+        if !merge_outcome.warnings.is_empty()
+            && let Some(obj) = audit_args.as_object_mut()
+        {
+            obj.insert("warnings".to_owned(), json!(merge_outcome.warnings));
+        }
         ctx.node()
             .record_audit_with_device(
                 ctx.node_name().to_owned(),
@@ -1282,7 +1288,7 @@ async fn apply_local_write(
             hash_before,
             hash_after,
             backup: merge_outcome.backup,
-            warnings: Vec::new(),
+            warnings: merge_outcome.warnings,
         });
     }
 
@@ -2324,8 +2330,11 @@ async fn sync_favorites_document(
         None => FavoritesFile::default(),
     };
 
-    let mut merged = merge_favorites(&local_favs, &remote_favs);
-    prune_expired_tombstones(&mut merged, Timestamp::now());
+    let now = Timestamp::now();
+    let (sanitized_remote, mut sync_warnings) = sanitize_received_favorites(&remote_favs, now);
+    let mut merged = merge_favorites(&local_favs, &sanitized_remote);
+    prune_expired_tombstones(&mut merged, now.max(build_time_floor()));
+    enforce_merged_bounds(&mut merged);
 
     if direction == SyncDirection::Status {
         let (status, detail) = if local_favs == remote_favs && local.exists == remote.exists {
@@ -2445,6 +2454,7 @@ async fn sync_favorites_document(
                             }
                         };
                         final_remote_hash = Some(written.hash.clone());
+                        sync_warnings.extend(written.warnings);
                         if written.hash != merged_hash
                             && let Ok(again_val) = fleet
                                 .call_remote(
@@ -2484,6 +2494,11 @@ async fn sync_favorites_document(
                     Ok(written) => {
                         final_local_hash = Some(written.hash_after);
                         local_backup = written.backup;
+                        for w in written.warnings {
+                            if !sync_warnings.contains(&w) {
+                                sync_warnings.push(w);
+                            }
+                        }
                     }
                     Err(error) => {
                         return DocSyncOutcome {
@@ -2515,7 +2530,7 @@ async fn sync_favorites_document(
                 last_synced_hash: agreed.or(last_synced_hash),
                 backup: local_backup,
                 detail: None,
-                warnings: Vec::new(),
+                warnings: sync_warnings,
                 error: None,
             }
         }
@@ -2571,7 +2586,7 @@ async fn sync_favorites_document(
                         last_synced_hash: Some(written.hash_after),
                         backup: written.backup,
                         detail: None,
-                        warnings: Vec::new(),
+                        warnings: written.warnings,
                         error: None,
                     }
                 }

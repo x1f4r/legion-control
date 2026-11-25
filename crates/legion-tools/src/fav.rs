@@ -11,13 +11,14 @@
 //! owner-only restrictions. Every incoming file is strictly validated and size-bounded on receipt,
 //! and `fav.list` omits entries outside the caller's `paths`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jiff::Timestamp;
 use legion_core::config::{Document, parse, write_atomically};
@@ -36,17 +37,32 @@ use crate::device::registry::{FleetPushOutcome, fleet_peer_names};
 /// Schema version of `favorites.toml`.
 pub const FAVORITES_VERSION: u32 = 1;
 
-/// Maximum serialized size of `favorites.toml` accepted from any peer or written locally (256 KiB).
-pub const MAX_FAVORITES_BYTES: usize = 256 * 1024;
+/// Maximum serialized size of `favorites.toml` accepted from any peer or written locally (1 MiB).
+pub const MAX_FAVORITES_BYTES: usize = 1024 * 1024;
 
-/// Maximum number of live favourite entries allowed in `favorites.toml`.
-pub const MAX_LIVE_FAVORITES: usize = 1000;
+/// Maximum number of live favourite entries a person may add locally with `fav.add`.
+pub const MAX_LOCAL_LIVE_FAVORITES: usize = 1000;
 
-/// Maximum number of tombstone records allowed in `favorites.toml`.
-pub const MAX_REMOVED_FAVORITES: usize = 2000;
+/// Alias for [`MAX_LOCAL_LIVE_FAVORITES`].
+pub const MAX_LIVE_FAVORITES: usize = MAX_LOCAL_LIVE_FAVORITES;
+
+/// Maximum number of live favourite entries accepted when receiving or merging `favorites.toml`.
+pub const MAX_RECEIVED_LIVE_FAVORITES: usize = 4096;
+
+/// Maximum number of tombstone records accepted when receiving or merging `favorites.toml`.
+pub const MAX_RECEIVED_TOMBSTONES: usize = 16384;
+
+/// Alias for [`MAX_RECEIVED_TOMBSTONES`].
+pub const MAX_REMOVED_FAVORITES: usize = MAX_RECEIVED_TOMBSTONES;
 
 /// Days a removal tombstone is retained before automatic pruning.
 pub const TOMBSTONE_RETENTION_DAYS: i64 = 90;
+
+/// Maximum forward clock skew tolerated on received entries and tombstones (24 hours).
+pub const MAX_FUTURE_SKEW_SECS: i64 = 24 * 60 * 60;
+
+/// Maximum individual future-timestamp warnings emitted per merge before summarising the rest.
+const MAX_INDIVIDUAL_FUTURE_WARNINGS: usize = 20;
 
 /// Maximum byte length of a stored favourite path.
 pub const MAX_PATH_BYTES: usize = 4096;
@@ -56,6 +72,9 @@ pub const MAX_LABEL_CHARS: usize = 120;
 
 /// Per-peer timeout used when pushing `favorites.toml` after a local mutation.
 const FAV_PUSH_TIMEOUT_S: f64 = 5.0;
+
+/// Minimum interval between consecutive automatic favourites pushes on the same node.
+const FAV_PUSH_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Maximum time to wait for `<state_dir>/sync/favorites.lock`.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -187,15 +206,15 @@ impl Document for FavoritesFile {
                 self.version
             ));
         }
-        if self.entries.len() > MAX_LIVE_FAVORITES {
+        if self.entries.len() > MAX_RECEIVED_LIVE_FAVORITES {
             return Err(format!(
-                "favorites.toml holds {} entries, exceeding the maximum of {MAX_LIVE_FAVORITES}",
+                "favorites.toml holds {} entries, exceeding the maximum of {MAX_RECEIVED_LIVE_FAVORITES}",
                 self.entries.len()
             ));
         }
-        if self.removed.len() > MAX_REMOVED_FAVORITES {
+        if self.removed.len() > MAX_RECEIVED_TOMBSTONES {
             return Err(format!(
-                "favorites.toml holds {} tombstones, exceeding the maximum of {MAX_REMOVED_FAVORITES}",
+                "favorites.toml holds {} tombstones, exceeding the maximum of {MAX_RECEIVED_TOMBSTONES}",
                 self.removed.len()
             ));
         }
@@ -353,7 +372,185 @@ pub fn merge_favorites(a: &FavoritesFile, b: &FavoritesFile) -> FavoritesFile {
         out.entries.insert(id.clone(), entry_b.clone());
     }
 
+    enforce_merged_bounds(&mut out);
     out
+}
+
+/// Deterministically enforces hard document limits ([`MAX_RECEIVED_TOMBSTONES`],
+/// [`MAX_RECEIVED_LIVE_FAVORITES`], and [`MAX_FAVORITES_BYTES`]) solely from the merged content so
+/// merging two valid documents always succeeds, stays commutative and idempotent, drops oldest
+/// tombstones first, and never drops a live entry in favour of a tombstone.
+pub fn enforce_merged_bounds(file: &mut FavoritesFile) {
+    if file.removed.len() > MAX_RECEIVED_TOMBSTONES {
+        let mut tomb_order: Vec<(i128, String, String, String)> = file
+            .removed
+            .iter()
+            .map(|(id, tomb)| {
+                let (nanos, _, _) = stamp_key(&tomb.removed_at, &tomb.removed_on);
+                (
+                    nanos,
+                    tomb.removed_at.clone(),
+                    tomb.removed_on.clone(),
+                    id.clone(),
+                )
+            })
+            .collect();
+        tomb_order.sort();
+        let excess = file.removed.len() - MAX_RECEIVED_TOMBSTONES;
+        for (_, _, _, id) in tomb_order.into_iter().take(excess) {
+            file.removed.remove(&id);
+        }
+    }
+
+    if file.entries.len() > MAX_RECEIVED_LIVE_FAVORITES {
+        let mut entry_order: Vec<(i128, String, String, String)> = file
+            .entries
+            .iter()
+            .map(|(id, rec)| {
+                let (nanos, _, _) = stamp_key(&rec.updated_at, &rec.updated_on);
+                (
+                    nanos,
+                    rec.updated_at.clone(),
+                    rec.updated_on.clone(),
+                    id.clone(),
+                )
+            })
+            .collect();
+        entry_order.sort();
+        let excess = file.entries.len() - MAX_RECEIVED_LIVE_FAVORITES;
+        for (_, _, _, id) in entry_order.into_iter().take(excess) {
+            file.entries.remove(&id);
+        }
+    }
+
+    if file.to_toml_string().len() <= MAX_FAVORITES_BYTES {
+        return;
+    }
+
+    // First drop oldest tombstones until under MAX_FAVORITES_BYTES (or no tombstones remain).
+    if !file.removed.is_empty() {
+        let mut tomb_order: Vec<(i128, String, String, String)> = file
+            .removed
+            .iter()
+            .map(|(id, tomb)| {
+                let (nanos, _, _) = stamp_key(&tomb.removed_at, &tomb.removed_on);
+                (
+                    nanos,
+                    tomb.removed_at.clone(),
+                    tomb.removed_on.clone(),
+                    id.clone(),
+                )
+            })
+            .collect();
+        tomb_order.sort();
+        let mut idx = 0usize;
+        while idx < tomb_order.len() && file.to_toml_string().len() > MAX_FAVORITES_BYTES {
+            let over = file.to_toml_string().len() - MAX_FAVORITES_BYTES;
+            // Each tombstone is ~80 bytes; remove an adaptive batch so large overflows converge fast.
+            let step = (over / 100).max(1).min(tomb_order.len() - idx);
+            for (_, _, _, id) in &tomb_order[idx..idx + step] {
+                file.removed.remove(id);
+            }
+            idx += step;
+        }
+    }
+
+    if file.to_toml_string().len() <= MAX_FAVORITES_BYTES {
+        return;
+    }
+
+    // Only once all tombstones are gone, drop oldest live entries until under MAX_FAVORITES_BYTES.
+    if !file.entries.is_empty() {
+        let mut entry_order: Vec<(i128, String, String, String)> = file
+            .entries
+            .iter()
+            .map(|(id, rec)| {
+                let (nanos, _, _) = stamp_key(&rec.updated_at, &rec.updated_on);
+                (
+                    nanos,
+                    rec.updated_at.clone(),
+                    rec.updated_on.clone(),
+                    id.clone(),
+                )
+            })
+            .collect();
+        entry_order.sort();
+        let mut idx = 0usize;
+        while idx < entry_order.len() && file.to_toml_string().len() > MAX_FAVORITES_BYTES {
+            let over = file.to_toml_string().len() - MAX_FAVORITES_BYTES;
+            let step = (over / 300).max(1).min(entry_order.len() - idx);
+            for (_, _, _, id) in &entry_order[idx..idx + step] {
+                file.entries.remove(id);
+            }
+            idx += step;
+        }
+    }
+}
+
+/// Filters out received entries and tombstones stamped more than 24 hours ahead of `now` (floored
+/// by the build time), returning the accepted subset plus human-readable warnings for anything
+/// skipped. Valid entries in the same document are still accepted.
+pub fn sanitize_received_favorites(
+    incoming: &FavoritesFile,
+    now: Timestamp,
+) -> (FavoritesFile, Vec<String>) {
+    let ref_now = now.max(build_time_floor());
+    let max_nanos = ref_now
+        .as_nanosecond()
+        .saturating_add(i128::from(MAX_FUTURE_SKEW_SECS) * 1_000_000_000);
+    let is_future = |ts: &str| {
+        ts.parse::<Timestamp>()
+            .is_ok_and(|parsed| parsed.as_nanosecond() > max_nanos)
+    };
+
+    let mut accepted = FavoritesFile {
+        version: incoming.version,
+        entries: BTreeMap::new(),
+        removed: BTreeMap::new(),
+    };
+    let mut warnings = Vec::new();
+    let mut skipped_extra = 0usize;
+
+    for (id, entry) in &incoming.entries {
+        let future_entry = is_future(&entry.added_at)
+            || is_future(&entry.updated_at)
+            || is_future(&entry.label_updated_at)
+            || is_future(&entry.pinned_updated_at);
+        if future_entry {
+            if warnings.len() < MAX_INDIVIDUAL_FUTURE_WARNINGS {
+                warnings.push(format!(
+                    "Skipped favourite {id} ({}:{}): timestamp is more than 24 hours in the future.",
+                    entry.machine, entry.path
+                ));
+            } else {
+                skipped_extra += 1;
+            }
+        } else {
+            accepted.entries.insert(id.clone(), entry.clone());
+        }
+    }
+
+    for (id, tomb) in &incoming.removed {
+        if is_future(&tomb.removed_at) {
+            if warnings.len() < MAX_INDIVIDUAL_FUTURE_WARNINGS {
+                warnings.push(format!(
+                    "Skipped favourite removal tombstone {id}: timestamp is more than 24 hours in the future."
+                ));
+            } else {
+                skipped_extra += 1;
+            }
+        } else {
+            accepted.removed.insert(id.clone(), tomb.clone());
+        }
+    }
+
+    if skipped_extra > 0 {
+        warnings.push(format!(
+            "Skipped {skipped_extra} additional favourites or tombstones stamped more than 24 hours in the future."
+        ));
+    }
+
+    (accepted, warnings)
 }
 
 fn stamp_key<'a>(at: &'a str, on: &'a str) -> (i128, &'a str, &'a str) {
@@ -449,10 +646,13 @@ pub struct FavoritesMergeOutcome {
     pub favorites: FavoritesFile,
     /// Backup path under `<state_dir>/sync/backups/favorites.toml.bak`, if a previous file existed.
     pub backup: Option<String>,
+    /// Warnings about received entries or tombstones skipped (for example future-dated stamps).
+    pub warnings: Vec<String>,
 }
 
 /// Acquires `<state_dir>/sync/favorites.lock`, checks `check_precondition`, merges `incoming` into
-/// local `favorites.toml`, prunes expired tombstones, validates bounds, backs up any previous file,
+/// local `favorites.toml`, skips individual entries stamped more than 24 hours in the future,
+/// prunes expired tombstones, enforces hard bounds deterministically, backs up any previous file,
 /// and writes the merged file atomically.
 pub fn apply_favorites_merge_blocking<F>(
     paths: &Paths,
@@ -473,8 +673,11 @@ where
         Some(bytes) => parse_favorites_bytes(&target, bytes)?,
         None => FavoritesFile::default(),
     };
-    let mut merged = merge_favorites(&local, incoming);
-    prune_expired_tombstones(&mut merged, Timestamp::now());
+    let now = Timestamp::now();
+    let (sanitized_incoming, warnings) = sanitize_received_favorites(incoming, now);
+    let mut merged = merge_favorites(&local, &sanitized_incoming);
+    prune_expired_tombstones(&mut merged, now.max(build_time_floor()));
+    enforce_merged_bounds(&mut merged);
     merged.validate().map_err(|reason| {
         ErrorBody::new(
             ErrorCode::InvalidArgs,
@@ -494,6 +697,7 @@ where
         canonical_toml,
         favorites: merged,
         backup,
+        warnings,
     })
 }
 
@@ -862,7 +1066,8 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
             None => FavoritesFile::default(),
         };
         let now = Timestamp::now();
-        prune_expired_tombstones(&mut file, now);
+        let floor = build_time_floor();
+        prune_expired_tombstones(&mut file, now.max(floor));
 
         // Idempotent add: if `(machine, path)` is already live, update label/pinned stamps in place.
         let existing_id = file
@@ -875,7 +1080,7 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
             let rec = file.entries.get_mut(&existing_id).ok_or_else(|| {
                 ErrorBody::new(ErrorCode::Internal, "Favourite entry disappeared under lock.")
             })?;
-            let stamp = next_stamp(now, &rec.updated_at);
+            let stamp = format_timestamp(effective_stamp(now, Some(&rec.updated_at), floor));
             if label.is_some() && label != rec.label {
                 rec.label = label;
                 rec.label_updated_at = stamp.clone();
@@ -890,16 +1095,17 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
             rec.updated_on = node_name;
             (existing_id, rec.clone(), true)
         } else {
-            if file.entries.len() >= MAX_LIVE_FAVORITES {
+            if file.entries.len() >= MAX_LOCAL_LIVE_FAVORITES {
                 return Err(ErrorBody::new(
                     ErrorCode::Failed,
                     format!(
-                        "Cannot add favourite: favorites.toml already holds the maximum of {MAX_LIVE_FAVORITES} entries."
+                        "You already have {MAX_LOCAL_LIVE_FAVORITES} favourites. Remove some before adding more."
                     ),
-                ));
+                )
+                .with_hint("Run `fav.remove` to remove favourites you no longer need."));
             }
             let id = generate_fav_id(&file);
-            let stamp = format_timestamp(now);
+            let stamp = format_timestamp(effective_stamp(now, None, floor));
             let record = FavoriteRecord {
                 machine,
                 path: normalized_path,
@@ -919,6 +1125,7 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
             (id, record, false)
         };
 
+        enforce_merged_bounds(&mut file);
         file.validate().map_err(|reason| {
             ErrorBody::new(
                 ErrorCode::InvalidArgs,
@@ -1027,13 +1234,14 @@ async fn set(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             None => FavoritesFile::default(),
         };
         let now = Timestamp::now();
-        prune_expired_tombstones(&mut file, now);
+        let floor = build_time_floor();
+        prune_expired_tombstones(&mut file, now.max(floor));
 
         let rec = file
             .entries
             .get_mut(&id)
             .ok_or_else(|| not_found_fav(&id))?;
-        let stamp = next_stamp(now, &rec.updated_at);
+        let stamp = format_timestamp(effective_stamp(now, Some(&rec.updated_at), floor));
         if let Some(label_update) = next_label {
             rec.label = label_update;
             rec.label_updated_at = stamp.clone();
@@ -1047,6 +1255,8 @@ async fn set(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         rec.updated_at = stamp;
         rec.updated_on = node_name;
         let out = rec.clone();
+
+        enforce_merged_bounds(&mut file);
 
         file.validate().map_err(|reason| {
             ErrorBody::new(
@@ -1126,24 +1336,11 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<RemoveResult, ToolError> 
             None => FavoritesFile::default(),
         };
         let now = Timestamp::now();
-        prune_expired_tombstones(&mut file, now);
+        let floor = build_time_floor();
+        prune_expired_tombstones(&mut file, now.max(floor));
 
         if let Some(prev) = file.entries.remove(&id) {
-            if file.removed.len() >= MAX_REMOVED_FAVORITES {
-                // Drop the oldest tombstone to stay within bounds.
-                if let Some(oldest_id) = file
-                    .removed
-                    .iter()
-                    .min_by(|(_, a), (_, b)| {
-                        stamp_key(&a.removed_at, &a.removed_on)
-                            .cmp(&stamp_key(&b.removed_at, &b.removed_on))
-                    })
-                    .map(|(k, _)| k.clone())
-                {
-                    file.removed.remove(&oldest_id);
-                }
-            }
-            let stamp = next_stamp(now, &prev.updated_at);
+            let stamp = format_timestamp(effective_stamp(now, Some(&prev.updated_at), floor));
             file.removed.insert(
                 id,
                 FavoriteTombstone {
@@ -1151,10 +1348,8 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<RemoveResult, ToolError> 
                     removed_on: node_name,
                 },
             );
+            enforce_merged_bounds(&mut file);
             let canonical = file.to_toml_string();
-            if canonical.len() > MAX_FAVORITES_BYTES {
-                return Err(favorites_size_limit_error(canonical.len()));
-            }
             write_backup_if_present(&paths, bytes_before.as_deref())?;
             write_favorites_atomically(&target, &canonical)?;
             Ok(true)
@@ -1190,17 +1385,179 @@ fn not_found_fav(id: &str) -> ErrorBody {
     .with_details(json!({"id": id}))
 }
 
-/// Pushes `favorites.toml` to every reachable peer in `fleet.toml` with node authority.
+struct PushCoalescer {
+    state: tokio::sync::Mutex<PushState>,
+    settled: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct PushState {
+    in_flight: bool,
+    dirty: bool,
+    trailing_scheduled: bool,
+    last_completed: Option<Instant>,
+    pending_ctx: Option<PendingPushCtx>,
+}
+
+#[derive(Clone)]
+struct PendingPushCtx {
+    node: Node,
+    door: Door,
+    device: Option<String>,
+    credential_expires: Option<Timestamp>,
+}
+
+fn coalescer_for(state_dir: &Path) -> Arc<PushCoalescer> {
+    static MAP: OnceLock<StdMutex<HashMap<PathBuf, Arc<PushCoalescer>>>> = OnceLock::new();
+    let map = MAP.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+    Arc::clone(
+        guard
+            .entry(state_dir.to_path_buf())
+            .or_insert_with(|| {
+                Arc::new(PushCoalescer {
+                    state: tokio::sync::Mutex::new(PushState::default()),
+                    settled: tokio::sync::Notify::new(),
+                })
+            }),
+    )
+}
+
+/// Pushes `favorites.toml` to every reachable peer in `fleet.toml` with node authority,
+/// rate-limiting and coalescing rapid bursts on the same node into a single trailing push.
 pub async fn push_favorites_to_fleet(
     node: &Node,
     door: Door,
     device: Option<String>,
     credential_expires: Option<Timestamp>,
 ) -> BTreeMap<String, FleetPushOutcome> {
+    push_favorites_with_interval(node, door, device, credential_expires, FAV_PUSH_MIN_INTERVAL).await
+}
+
+async fn push_favorites_with_interval(
+    node: &Node,
+    door: Door,
+    device: Option<String>,
+    credential_expires: Option<Timestamp>,
+    min_interval: Duration,
+) -> BTreeMap<String, FleetPushOutcome> {
     let peers = fleet_peer_names(node.paths(), &node.name());
     if peers.is_empty() {
         return BTreeMap::new();
     }
+    let coalescer = coalescer_for(node.paths().state_dir());
+    let pending_ctx = PendingPushCtx {
+        node: node.clone(),
+        door,
+        device: device.clone(),
+        credential_expires,
+    };
+
+    let run_now = {
+        let mut guard = coalescer.state.lock().await;
+        let now = Instant::now();
+        let within_cooldown = guard
+            .last_completed
+            .is_some_and(|t| now.saturating_duration_since(t) < min_interval);
+        if guard.in_flight || within_cooldown {
+            guard.dirty = true;
+            guard.pending_ctx = Some(pending_ctx);
+            if !guard.in_flight && !guard.trailing_scheduled {
+                guard.trailing_scheduled = true;
+                let wait_for = guard
+                    .last_completed
+                    .map(|t| min_interval.saturating_sub(now.saturating_duration_since(t)))
+                    .unwrap_or(Duration::ZERO);
+                spawn_trailing_push(Arc::clone(&coalescer), wait_for, min_interval);
+            }
+            false
+        } else {
+            guard.in_flight = true;
+            guard.dirty = false;
+            true
+        }
+    };
+
+    if !run_now {
+        return BTreeMap::new();
+    }
+
+    let outcomes = execute_favorites_push(node, door, device, credential_expires, &peers).await;
+
+    let mut guard = coalescer.state.lock().await;
+    guard.in_flight = false;
+    guard.last_completed = Some(Instant::now());
+    if guard.dirty && !guard.trailing_scheduled {
+        guard.trailing_scheduled = true;
+        spawn_trailing_push(Arc::clone(&coalescer), min_interval, min_interval);
+    } else if !guard.dirty && !guard.trailing_scheduled {
+        coalescer.settled.notify_waiters();
+    }
+    outcomes
+}
+
+fn spawn_trailing_push(
+    coalescer: Arc<PushCoalescer>,
+    initial_delay: Duration,
+    min_interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut delay = initial_delay;
+        loop {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let maybe_ctx = {
+                let mut guard = coalescer.state.lock().await;
+                if guard.in_flight {
+                    guard.trailing_scheduled = false;
+                    return;
+                }
+                if !guard.dirty {
+                    guard.trailing_scheduled = false;
+                    coalescer.settled.notify_waiters();
+                    return;
+                }
+                guard.dirty = false;
+                guard.in_flight = true;
+                guard.pending_ctx.take()
+            };
+
+            if let Some(pctx) = maybe_ctx {
+                let peers = fleet_peer_names(pctx.node.paths(), &pctx.node.name());
+                if !peers.is_empty() {
+                    let _ = execute_favorites_push(
+                        &pctx.node,
+                        pctx.door,
+                        pctx.device,
+                        pctx.credential_expires,
+                        &peers,
+                    )
+                    .await;
+                }
+            }
+
+            let mut guard = coalescer.state.lock().await;
+            guard.in_flight = false;
+            guard.last_completed = Some(Instant::now());
+            if guard.dirty {
+                delay = min_interval;
+            } else {
+                guard.trailing_scheduled = false;
+                coalescer.settled.notify_waiters();
+                return;
+            }
+        }
+    });
+}
+
+async fn execute_favorites_push(
+    node: &Node,
+    door: Door,
+    device: Option<String>,
+    credential_expires: Option<Timestamp>,
+    peers: &[String],
+) -> BTreeMap<String, FleetPushOutcome> {
     let all_not_reached = |reason: &str| -> BTreeMap<String, FleetPushOutcome> {
         peers
             .iter()
@@ -1225,7 +1582,7 @@ pub async fn push_favorites_to_fleet(
     match reply {
         Ok(value) => {
             let mut outcomes = parse_favorites_push_outcomes(&value);
-            for peer in &peers {
+            for peer in peers {
                 outcomes.entry(peer.clone()).or_insert_with(|| {
                     FleetPushOutcome::not_reached("machine did not finish syncing favorites.toml")
                 });
@@ -1269,16 +1626,28 @@ fn format_timestamp(ts: Timestamp) -> String {
     ts.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
-fn next_stamp(now: Timestamp, prev: &str) -> String {
+/// Build-time floor used so a machine with an unset clock (such as 1970-01-01 on a Raspberry Pi
+/// before NTP sync) never stamps edits in the distant past.
+pub fn build_time_floor() -> Timestamp {
+    let secs: i64 = option_env!("LEGION_BUILD_TIME_SECS")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_735_689_600);
+    Timestamp::from_second(secs).unwrap_or(Timestamp::UNIX_EPOCH)
+}
+
+/// Computes `max(now, prev + 1 ms, build_floor)` so local edits always advance past earlier stamps
+/// and never stamp before the binary's build time when the host clock is unset.
+pub fn effective_stamp(now: Timestamp, prev: Option<&str>, build_floor: Timestamp) -> Timestamp {
     let min_next = prev
-        .parse::<Timestamp>()
-        .ok()
+        .and_then(|p| p.parse::<Timestamp>().ok())
         .and_then(|p| p.checked_add(jiff::SignedDuration::from_millis(1)).ok());
-    let chosen = match min_next {
-        Some(next) if next > now => next,
-        _ => now,
-    };
-    format_timestamp(chosen)
+    let mut chosen = now.max(build_floor);
+    if let Some(next) = min_next
+        && next > chosen
+    {
+        chosen = next;
+    }
+    chosen
 }
 
 fn generate_fav_id(file: &FavoritesFile) -> String {
@@ -1844,5 +2213,340 @@ paths = [{:?}]
             node.call(bad_set).await.unwrap_err().code,
             ErrorCode::NotFound
         );
+    }
+
+    fn sample_record(id: &str, ts: &str, node: &str) -> FavoriteRecord {
+        FavoriteRecord {
+            machine: node.to_owned(),
+            path: format!("/srv/files/{id}.txt"),
+            kind: FavoriteKind::File,
+            label: None,
+            pinned: false,
+            added_at: ts.to_owned(),
+            added_by: "owner".to_owned(),
+            updated_at: ts.to_owned(),
+            updated_on: node.to_owned(),
+            label_updated_at: ts.to_owned(),
+            label_updated_on: node.to_owned(),
+            pinned_updated_at: ts.to_owned(),
+            pinned_updated_on: node.to_owned(),
+        }
+    }
+
+    #[test]
+    fn merging_two_600_entry_documents_and_many_tombstones_always_succeeds() {
+        let mut a = FavoritesFile::default();
+        let mut b = FavoritesFile::default();
+        for i in 0..600 {
+            a.entries.insert(
+                format!("a-{i:04}"),
+                sample_record(&format!("a-{i:04}"), "2026-11-01T00:00:00.000Z", "tower"),
+            );
+            b.entries.insert(
+                format!("b-{i:04}"),
+                sample_record(&format!("b-{i:04}"), "2026-11-01T00:00:01.000Z", "pi"),
+            );
+        }
+        // Add 2500 tombstones across the two documents (above the old 2000 cap).
+        for i in 0..1300 {
+            a.removed.insert(
+                format!("ra-{i:04}"),
+                FavoriteTombstone {
+                    removed_at: "2026-11-02T00:00:00.000Z".to_owned(),
+                    removed_on: "tower".to_owned(),
+                },
+            );
+            b.removed.insert(
+                format!("rb-{i:04}"),
+                FavoriteTombstone {
+                    removed_at: "2026-11-02T00:00:01.000Z".to_owned(),
+                    removed_on: "pi".to_owned(),
+                },
+            );
+        }
+        a.validate().unwrap();
+        b.validate().unwrap();
+
+        let ab = merge_favorites(&a, &b);
+        let ba = merge_favorites(&b, &a);
+        assert_eq!(ab, ba, "merge must remain commutative past 1000 live entries");
+        assert_eq!(ab.entries.len(), 1200);
+        assert_eq!(ab.removed.len(), 2600);
+        ab.validate().unwrap();
+        let toml = ab.to_toml_string();
+        assert!(toml.len() <= MAX_FAVORITES_BYTES);
+        let parsed = parse_favorites_bytes(Path::new("favorites.toml"), toml.as_bytes()).unwrap();
+        assert_eq!(parsed, ab);
+    }
+
+    #[test]
+    fn hard_size_bound_drops_oldest_tombstones_first_and_never_drops_live_entries_for_tombstones() {
+        let mut a = FavoritesFile::default();
+        let mut b = FavoritesFile::default();
+
+        // 50 live entries that MUST all survive.
+        for i in 0..50 {
+            a.entries.insert(
+                format!("live-{i:04}"),
+                sample_record(
+                    &format!("live-{i:04}"),
+                    "2026-11-01T00:00:00.000Z",
+                    "tower",
+                ),
+            );
+        }
+        // Enough tombstones to exceed MAX_FAVORITES_BYTES (~1 MiB) when serialized.
+        // Each tombstone is ~75 bytes, so 15_000 tombstones > 1.1 MiB.
+        for i in 0..7_500 {
+            let secs = 1_793_500_000_i64 + i as i64;
+            let ts_a = format_timestamp(Timestamp::from_second(secs).unwrap());
+            let ts_b = format_timestamp(Timestamp::from_second(secs + 10_000).unwrap());
+            a.removed.insert(
+                format!("ta-{i:05}"),
+                FavoriteTombstone {
+                    removed_at: ts_a,
+                    removed_on: "tower".to_owned(),
+                },
+            );
+            b.removed.insert(
+                format!("tb-{i:05}"),
+                FavoriteTombstone {
+                    removed_at: ts_b,
+                    removed_on: "pi".to_owned(),
+                },
+            );
+        }
+
+        let ab = merge_favorites(&a, &b);
+        let ba = merge_favorites(&b, &a);
+        assert_eq!(ab, ba, "bounded merge must be strictly commutative");
+        assert_eq!(merge_favorites(&ab, &ab), ab, "bounded merge must be idempotent");
+        assert!(ab.to_toml_string().len() <= MAX_FAVORITES_BYTES);
+        assert_eq!(
+            ab.entries.len(),
+            50,
+            "must never drop live entries while tombstones can be dropped"
+        );
+        // The newest tombstones (`tb-*`) must be retained over the oldest (`ta-00000`).
+        assert!(!ab.removed.contains_key("ta-00000"));
+        assert!(ab.removed.contains_key("tb-07499"));
+    }
+
+    #[test]
+    fn future_stamped_entries_and_tombstones_are_skipped_individually_with_warnings() {
+        let now: Timestamp = "2026-11-25T12:00:00.000Z".parse().unwrap();
+        let valid_ts = "2026-11-25T12:05:00.000Z";
+        let future_ts = "2026-11-28T00:00:00.000Z"; // > 24h in future
+
+        let mut incoming = FavoritesFile::default();
+        incoming
+            .entries
+            .insert("good-live".to_owned(), sample_record("good", valid_ts, "pi"));
+        incoming.entries.insert(
+            "future-live".to_owned(),
+            sample_record("future", future_ts, "pi"),
+        );
+        incoming.removed.insert(
+            "good-tomb".to_owned(),
+            FavoriteTombstone {
+                removed_at: valid_ts.to_owned(),
+                removed_on: "pi".to_owned(),
+            },
+        );
+        incoming.removed.insert(
+            "future-tomb".to_owned(),
+            FavoriteTombstone {
+                removed_at: future_ts.to_owned(),
+                removed_on: "pi".to_owned(),
+            },
+        );
+
+        let (accepted, warnings) = sanitize_received_favorites(&incoming, now);
+        assert!(accepted.entries.contains_key("good-live"));
+        assert!(!accepted.entries.contains_key("future-live"));
+        assert!(accepted.removed.contains_key("good-tomb"));
+        assert!(!accepted.removed.contains_key("future-tomb"));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("future-live")));
+        assert!(warnings.iter().any(|w| w.contains("future-tomb")));
+    }
+
+    #[test]
+    fn unset_clock_uses_build_time_floor_and_advances_past_previous_stamp() {
+        let floor = build_time_floor();
+        assert!(
+            floor.as_second() >= 1_735_689_600,
+            "build floor should be >= 2025-01-01"
+        );
+        // Simulated 1970-01-01 unset clock -> clamped up to build_floor.
+        let epoch_now = Timestamp::UNIX_EPOCH;
+        let stamped = effective_stamp(epoch_now, None, floor);
+        assert_eq!(stamped, floor);
+
+        // If an existing entry is already newer than build_floor, advance by +1 ms.
+        let newer = floor
+            .checked_add(jiff::SignedDuration::from_hours(48))
+            .unwrap();
+        let newer_str = format_timestamp(newer);
+        let next = effective_stamp(epoch_now, Some(&newer_str), floor);
+        assert!(next > newer);
+    }
+
+    #[tokio::test]
+    async fn local_fav_add_caps_at_1000_with_clear_message_and_fav_remove_keeps_tombstones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(tmp.path().join("home"));
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+
+        // Seed 1000 live entries and 2100 recent tombstones directly on disk.
+        let now_str = format_timestamp(Timestamp::now().max(build_time_floor()));
+        let mut seed = FavoritesFile::default();
+        for i in 0..MAX_LOCAL_LIVE_FAVORITES {
+            seed.entries.insert(
+                format!("live-{i:04}"),
+                sample_record(&format!("live-{i:04}"), &now_str, "tower"),
+            );
+        }
+        for i in 0..2100 {
+            seed.removed.insert(
+                format!("tomb-{i:04}"),
+                FavoriteTombstone {
+                    removed_at: now_str.clone(),
+                    removed_on: "tower".to_owned(),
+                },
+            );
+        }
+        std::fs::write(
+            paths.config_file(FavoritesFile::FILE),
+            seed.to_toml_string(),
+        )
+        .unwrap();
+
+        let mut registry = Registry::new();
+        register(&mut registry);
+        let node = Node::new(paths.clone(), registry);
+
+        // Adding a 1001st favourite locally fails with a plain message telling the user to remove some.
+        let err = node
+            .call(Call::new(
+                Door::Cli,
+                "fav.add",
+                json!({ "path": "/srv/files/one-too-many.txt" }),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Failed, "{err:?}");
+        assert!(
+            err.message.contains("Remove some"),
+            "expected plain removal guidance: {err:?}"
+        );
+
+        // Removing one favourite succeeds and NEVER drops any of the 2100 existing tombstones.
+        let removed = node
+            .call(Call::new(
+                Door::Cli,
+                "fav.remove",
+                json!({ "id": "live-0000" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(removed["removed"], json!(true));
+        let after = load_favorites(&paths).unwrap();
+        assert_eq!(after.entries.len(), MAX_LOCAL_LIVE_FAVORITES - 1);
+        assert_eq!(after.removed.len(), 2101);
+    }
+
+    #[tokio::test]
+    async fn rapid_burst_of_favourite_edits_coalesces_pushes() {
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(tmp.path().join("home"));
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+        std::fs::write(
+            paths.config_file("fleet.toml"),
+            "[machines.pi]\nconnector = \"ssh\"\ntarget = \"pi\"\n",
+        )
+        .unwrap();
+
+        let push_count = Arc::new(AtomicUsize::new(0));
+        let push_count_clone = Arc::clone(&push_count);
+
+        struct CountingSyncTool {
+            spec: legion_core::proto::ToolSpec,
+            count: Arc<AtomicUsize>,
+        }
+
+        impl legion_core::Tool for CountingSyncTool {
+            fn spec(&self) -> &legion_core::proto::ToolSpec {
+                &self.spec
+            }
+
+            fn call<'a>(
+                &'a self,
+                _ctx: &'a Ctx,
+                _args: Value,
+            ) -> legion_core::BoxFuture<'a, Result<Value, ToolError>> {
+                let count = Arc::clone(&self.count);
+                Box::pin(async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({
+                        "results": {
+                            "pi": {
+                                "favorites.toml": { "status": "pushed" }
+                            }
+                        }
+                    }))
+                })
+            }
+        }
+
+        let mut registry = Registry::new();
+        register(&mut registry);
+        registry.add(CountingSyncTool {
+            spec: legion_core::proto::ToolSpec {
+                name: "fleet.sync".to_owned(),
+                description: "counting test stub".to_owned(),
+                effect: Effect::Admin,
+                input_schema: legion_core::input_schema::<Value>(),
+            },
+            count: Arc::clone(&push_count_clone),
+        });
+
+        let node = Node::new(paths.clone(), registry);
+        // Fire 10 rapid fav.add mutations within milliseconds.
+        for i in 0..10 {
+            let _ = node
+                .call(Call::new(
+                    Door::Cli,
+                    "fav.add",
+                    json!({ "path": format!("/srv/burst/file-{i}.txt") }),
+                ))
+                .await
+                .unwrap();
+        }
+        // Wait for the coalesced trailing push to settle.
+        let coalescer = coalescer_for(paths.state_dir());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let guard = coalescer.state.lock().await;
+                if !guard.in_flight && !guard.dirty && !guard.trailing_scheduled {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "trailing push did not settle");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let pushes = push_count.load(Ordering::SeqCst);
+        assert!(
+            pushes <= 2,
+            "expected burst of 10 fav.add calls to coalesce to <= 2 pushes, got {pushes}"
+        );
+        assert!(pushes >= 1, "at least one push must have occurred");
+        assert_eq!(load_favorites(&paths).unwrap().entries.len(), 10);
     }
 }
