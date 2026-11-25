@@ -207,6 +207,8 @@ pub(super) struct JobRecord {
     pub pairing_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transfer_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transfer_has_remote: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_local_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1297,6 +1299,7 @@ mod tests {
             device: None,
             pairing_id: None,
             transfer_paths: Vec::new(),
+            transfer_has_remote: false,
             transfer_local_from: None,
             transfer_local_to: None,
             transfer_move: false,

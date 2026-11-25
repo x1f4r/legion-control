@@ -325,83 +325,136 @@ pub fn parse_favorites_bytes(path: &Path, bytes: &[u8]) -> Result<FavoritesFile,
     parse::<FavoritesFile>(path, bytes)
 }
 
-/// Merges two `favorites.toml` documents using a join-semilattice:
-/// - Removals (tombstones) always win over live entries for the same `id`; two tombstones keep the
-///   newer `(removed_at, removed_on)`.
+/// Maximum number of merged entries + tombstones retained by [`merge_favorites`] before trimming
+/// by one total order `(stamp, is_removed, id)`.
+pub const MAX_MERGED_FAVORITES: usize = 8192;
+
+/// Merges two `favorites.toml` documents using a join-semilattice bounded by keeping the newest
+/// [`MAX_MERGED_FAVORITES`] items (live entries and tombstones together) in one total order
+/// `(stamp, is_removed, id)`.
+///
+/// - For the same `id`, a tombstone wins when `(removed_at, removed_on) >= (updated_at,
+///   updated_on)` (which holds for every removal produced by `fav.remove` and all equal-stamp
+///   ties); two tombstones keep the newer `(removed_at, removed_on)`.
 /// - Live entries with the same `id` merge field by field (`label` and `pinned` independently) by
 ///   comparing `(timestamp, updated_on, value)` so ties break deterministically.
-///
-/// This function is strictly commutative (`merge(a, b) == merge(b, a)`), associative
-/// (`merge(merge(a, b), c) == merge(a, merge(b, c))`), and idempotent (`merge(a, a) == a`).
+/// - Keeping the newest `N` of the unified merged set guarantees a removed favourite cannot
+///   resurrect when tombstones exceed the bound (any `N` items newer than the tombstone are also
+///   newer than the older live entry).
 pub fn merge_favorites(a: &FavoritesFile, b: &FavoritesFile) -> FavoritesFile {
+    let mut out = merge_favorites_with_limit(a, b, MAX_MERGED_FAVORITES);
+    enforce_byte_limit(&mut out, MAX_FAVORITES_BYTES);
+    out
+}
+
+/// Pure bounded merge retaining at most `max_items` combined entries and tombstones by the single
+/// total order `(stamp, is_removed, id)`. Exposed so property tests can exercise the exact bound
+/// with small `max_items` across many ids.
+pub fn merge_favorites_with_limit(
+    a: &FavoritesFile,
+    b: &FavoritesFile,
+    max_items: usize,
+) -> FavoritesFile {
+    let mut all_ids = std::collections::BTreeSet::new();
+    for id in a
+        .entries
+        .keys()
+        .chain(b.entries.keys())
+        .chain(a.removed.keys())
+        .chain(b.removed.keys())
+    {
+        all_ids.insert(id.as_str());
+    }
+
     let mut out = FavoritesFile {
         version: FAVORITES_VERSION,
         entries: BTreeMap::new(),
         removed: BTreeMap::new(),
     };
 
-    // First, collect every tombstoned id from either side; tombstones dominate live entries.
-    for (id, tomb_a) in &a.removed {
-        let chosen = match b.removed.get(id) {
-            Some(tomb_b) => merge_tombstone(tomb_a, tomb_b),
-            None => tomb_a.clone(),
+    for id in all_ids {
+        let tomb = match (a.removed.get(id), b.removed.get(id)) {
+            (Some(ta), Some(tb)) => Some(merge_tombstone(ta, tb)),
+            (Some(ta), None) => Some(ta.clone()),
+            (None, Some(tb)) => Some(tb.clone()),
+            (None, None) => None,
         };
-        out.removed.insert(id.clone(), chosen);
-    }
-    for (id, tomb_b) in &b.removed {
-        if !out.removed.contains_key(id) {
-            out.removed.insert(id.clone(), tomb_b.clone());
+        let live = match (a.entries.get(id), b.entries.get(id)) {
+            (Some(ea), Some(eb)) => Some(merge_record(ea, eb)),
+            (Some(ea), None) => Some(ea.clone()),
+            (None, Some(eb)) => Some(eb.clone()),
+            (None, None) => None,
+        };
+        match (tomb, live) {
+            (Some(t), _) => {
+                // Removals always dominate live entries for the same id; `fav.remove` stamps
+                // `removed_at` strictly past `updated_at` so a unified top-N trim never evicts a
+                // tombstone while keeping the older live entry it removed.
+                out.removed.insert(id.to_owned(), t);
+            }
+            (None, Some(l)) => {
+                out.entries.insert(id.to_owned(), l);
+            }
+            (None, None) => {}
         }
     }
 
-    // Next, merge live entries that are not tombstoned on either side.
-    for (id, entry_a) in &a.entries {
-        if out.removed.contains_key(id) {
-            continue;
-        }
-        let chosen = match b.entries.get(id) {
-            Some(entry_b) => merge_record(entry_a, entry_b),
-            None => entry_a.clone(),
-        };
-        out.entries.insert(id.clone(), chosen);
-    }
-    for (id, entry_b) in &b.entries {
-        if out.removed.contains_key(id) || out.entries.contains_key(id) {
-            continue;
-        }
-        out.entries.insert(id.clone(), entry_b.clone());
-    }
-
-    enforce_merged_bounds(&mut out);
+    trim_to_newest(&mut out, max_items);
     out
 }
 
-/// Deterministically enforces hard document limits ([`MAX_RECEIVED_TOMBSTONES`],
-/// [`MAX_RECEIVED_LIVE_FAVORITES`], and [`MAX_FAVORITES_BYTES`]) solely from the merged content so
-/// merging two valid documents always succeeds, stays commutative and idempotent, drops oldest
-/// tombstones first, and never drops a live entry in favour of a tombstone.
-pub fn enforce_merged_bounds(file: &mut FavoritesFile) {
-    if file.removed.len() > MAX_RECEIVED_TOMBSTONES {
-        let mut tomb_order: Vec<(i128, String, String, String)> = file
-            .removed
-            .iter()
-            .map(|(id, tomb)| {
-                let (nanos, _, _) = stamp_key(&tomb.removed_at, &tomb.removed_on);
-                (
-                    nanos,
-                    tomb.removed_at.clone(),
-                    tomb.removed_on.clone(),
-                    id.clone(),
-                )
-            })
-            .collect();
-        tomb_order.sort();
-        let excess = file.removed.len() - MAX_RECEIVED_TOMBSTONES;
-        for (_, _, _, id) in tomb_order.into_iter().take(excess) {
+/// Keeps only the newest `max_items` combined entries and tombstones in `file`, ordered by one
+/// total order: `(stamp_nanos, stamp_at, is_removed, stamp_on, id)`.
+///
+/// Placing `is_removed` before `stamp_on` ensures that when a removal and a live edit carry the
+/// exact same timestamp on different nodes, the removal's rank is strictly higher than the live
+/// entry's rank so the join is monotonic with respect to the truncation order.
+fn trim_to_newest(file: &mut FavoritesFile, max_items: usize) {
+    let total = file.entries.len() + file.removed.len();
+    if total <= max_items {
+        return;
+    }
+    let mut ranked: Vec<(i128, String, bool, String, String)> = Vec::with_capacity(total);
+    for (id, rec) in &file.entries {
+        let (nanos, _, _) = stamp_key(&rec.updated_at, &rec.updated_on);
+        ranked.push((
+            nanos,
+            rec.updated_at.clone(),
+            false,
+            rec.updated_on.clone(),
+            id.clone(),
+        ));
+    }
+    for (id, tomb) in &file.removed {
+        let (nanos, _, _) = stamp_key(&tomb.removed_at, &tomb.removed_on);
+        ranked.push((
+            nanos,
+            tomb.removed_at.clone(),
+            true,
+            tomb.removed_on.clone(),
+            id.clone(),
+        ));
+    }
+    ranked.sort();
+    let excess = total - max_items;
+    for (_, _, is_removed, _, id) in ranked.into_iter().take(excess) {
+        if is_removed {
             file.removed.remove(&id);
+        } else {
+            file.entries.remove(&id);
         }
     }
+}
 
+/// Deterministically enforces hard document limits ([`MAX_MERGED_FAVORITES`],
+/// [`MAX_RECEIVED_LIVE_FAVORITES`], [`MAX_RECEIVED_TOMBSTONES`], and [`MAX_FAVORITES_BYTES`])
+/// solely from the merged content using the single total order `(stamp, is_removed, node, id)`.
+pub fn enforce_merged_bounds(file: &mut FavoritesFile) {
+    trim_to_newest(file, MAX_MERGED_FAVORITES);
+    enforce_byte_limit(file, MAX_FAVORITES_BYTES);
+}
+
+fn enforce_byte_limit(file: &mut FavoritesFile, max_bytes: usize) {
     if file.entries.len() > MAX_RECEIVED_LIVE_FAVORITES {
         let mut entry_order: Vec<(i128, String, String, String)> = file
             .entries
@@ -422,68 +475,45 @@ pub fn enforce_merged_bounds(file: &mut FavoritesFile) {
             file.entries.remove(&id);
         }
     }
-
-    if file.to_toml_string().len() <= MAX_FAVORITES_BYTES {
+    if file.to_toml_string().len() <= max_bytes {
         return;
     }
-
-    // First drop oldest tombstones until under MAX_FAVORITES_BYTES (or no tombstones remain).
-    if !file.removed.is_empty() {
-        let mut tomb_order: Vec<(i128, String, String, String)> = file
-            .removed
-            .iter()
-            .map(|(id, tomb)| {
-                let (nanos, _, _) = stamp_key(&tomb.removed_at, &tomb.removed_on);
-                (
-                    nanos,
-                    tomb.removed_at.clone(),
-                    tomb.removed_on.clone(),
-                    id.clone(),
-                )
-            })
-            .collect();
-        tomb_order.sort();
-        let mut idx = 0usize;
-        while idx < tomb_order.len() && file.to_toml_string().len() > MAX_FAVORITES_BYTES {
-            let over = file.to_toml_string().len() - MAX_FAVORITES_BYTES;
-            // Each tombstone is ~80 bytes; remove an adaptive batch so large overflows converge fast.
-            let step = (over / 100).max(1).min(tomb_order.len() - idx);
-            for (_, _, _, id) in &tomb_order[idx..idx + step] {
+    // Trim oldest items by the same total order until the serialized TOML fits within `max_bytes`.
+    let total = file.entries.len() + file.removed.len();
+    let mut ranked: Vec<(i128, String, bool, String, String)> = Vec::with_capacity(total);
+    for (id, rec) in &file.entries {
+        let (nanos, _, _) = stamp_key(&rec.updated_at, &rec.updated_on);
+        ranked.push((
+            nanos,
+            rec.updated_at.clone(),
+            false,
+            rec.updated_on.clone(),
+            id.clone(),
+        ));
+    }
+    for (id, tomb) in &file.removed {
+        let (nanos, _, _) = stamp_key(&tomb.removed_at, &tomb.removed_on);
+        ranked.push((
+            nanos,
+            tomb.removed_at.clone(),
+            true,
+            tomb.removed_on.clone(),
+            id.clone(),
+        ));
+    }
+    ranked.sort();
+    let mut idx = 0usize;
+    while idx < ranked.len() && file.to_toml_string().len() > max_bytes {
+        let over = file.to_toml_string().len() - max_bytes;
+        let step = (over / 100).max(1).min(ranked.len() - idx);
+        for (_, _, is_removed, _, id) in &ranked[idx..idx + step] {
+            if *is_removed {
                 file.removed.remove(id);
-            }
-            idx += step;
-        }
-    }
-
-    if file.to_toml_string().len() <= MAX_FAVORITES_BYTES {
-        return;
-    }
-
-    // Only once all tombstones are gone, drop oldest live entries until under MAX_FAVORITES_BYTES.
-    if !file.entries.is_empty() {
-        let mut entry_order: Vec<(i128, String, String, String)> = file
-            .entries
-            .iter()
-            .map(|(id, rec)| {
-                let (nanos, _, _) = stamp_key(&rec.updated_at, &rec.updated_on);
-                (
-                    nanos,
-                    rec.updated_at.clone(),
-                    rec.updated_on.clone(),
-                    id.clone(),
-                )
-            })
-            .collect();
-        entry_order.sort();
-        let mut idx = 0usize;
-        while idx < entry_order.len() && file.to_toml_string().len() > MAX_FAVORITES_BYTES {
-            let over = file.to_toml_string().len() - MAX_FAVORITES_BYTES;
-            let step = (over / 300).max(1).min(entry_order.len() - idx);
-            for (_, _, _, id) in &entry_order[idx..idx + step] {
+            } else {
                 file.entries.remove(id);
             }
-            idx += step;
         }
+        idx += step;
     }
 }
 
@@ -883,16 +913,107 @@ fn view_of(
     }
 }
 
+/// Operating system family of a machine for cross-platform path validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetOs {
+    /// Linux, macOS, and other Unix-like systems.
+    Unix,
+    /// Windows (drive letters and UNC paths).
+    Windows,
+}
+
+impl TargetOs {
+    /// Operating system family of the host running this binary.
+    pub const HOST: TargetOs = if cfg!(windows) {
+        TargetOs::Windows
+    } else {
+        TargetOs::Unix
+    };
+}
+
+/// Looks up the operating system family of fleet machine `machine` from `fleet.toml` (explicit
+/// `os` field or systems' `os` fields) and, failing that, `<state_dir>/fleet-cache.json`.
+/// Returns `None` when the machine's OS is not known locally.
+fn fleet_machine_os(paths: &Paths, machine: &str) -> Option<TargetOs> {
+    let parse_os = |s: &str| match s.to_ascii_lowercase().as_str() {
+        "unix" | "linux" | "macos" | "darwin" => Some(TargetOs::Unix),
+        "windows" | "win" => Some(TargetOs::Windows),
+        _ => None,
+    };
+
+    if let Ok(text) = std::fs::read_to_string(paths.config_file("fleet.toml"))
+        && let Ok(doc) = text.parse::<DocumentMut>()
+        && let Some(entry) = doc
+            .get("machines")
+            .and_then(Item::as_table_like)
+            .and_then(|m| m.get(machine))
+            .and_then(Item::as_table_like)
+    {
+        if let Some(os) = entry.get("os").and_then(Item::as_str).and_then(parse_os) {
+            return Some(os);
+        }
+        if let Some(systems) = entry.get("systems").and_then(Item::as_array_of_tables) {
+            let mut seen: Option<TargetOs> = None;
+            let mut mixed = false;
+            for sys in systems.iter() {
+                if let Some(os) = sys.get("os").and_then(Item::as_str).and_then(parse_os) {
+                    match seen {
+                        None => seen = Some(os),
+                        Some(prev) if prev == os => {}
+                        Some(_) => mixed = true,
+                    }
+                }
+            }
+            if !mixed && let Some(os) = seen {
+                return Some(os);
+            }
+        }
+    }
+
+    if let Ok(bytes) = std::fs::read(paths.state_dir().join("fleet-cache.json"))
+        && let Ok(cache) = serde_json::from_slice::<Value>(&bytes)
+    {
+        let last_sys = cache
+            .get("last_system")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get(machine))
+            .and_then(Value::as_str);
+        if let Some(last_os) = cache.get("last_os").and_then(Value::as_object) {
+            if let Some(sys) = last_sys
+                && let Some(os) = last_os
+                    .get(&format!("{machine}::{sys}"))
+                    .and_then(Value::as_str)
+                    .and_then(parse_os)
+            {
+                return Some(os);
+            }
+            if let Some(os) = last_os
+                .get(machine)
+                .and_then(Value::as_str)
+                .and_then(parse_os)
+            {
+                return Some(os);
+            }
+        }
+    }
+
+    None
+}
+
 /// Checks whether a favourite entry is visible to `ctx.grant()`, returning the checked local path
 /// when `record.machine == ctx.node_name()`.
 fn check_visibility(ctx: &Ctx, record: &FavoriteRecord) -> Option<Option<PathBuf>> {
     if record.machine == ctx.node_name() {
         let checked = ctx.grant().check_path(&record.path, Access::Read).ok()?;
         Some(Some(checked))
-    } else if ctx.grant().roots().is_some() {
-        // A caller confined by `paths` only sees entries whose path falls inside its allowed roots.
-        ctx.grant().check_path(&record.path, Access::Read).ok()?;
-        Some(None)
+    } else if let Some(roots) = ctx.grant().roots() {
+        let peer_os = fleet_machine_os(ctx.paths(), &record.machine);
+        let root_strs: Vec<&str> = roots.iter().map(|r| r.as_str()).collect();
+        if remote_path_within_roots(&record.path, &root_strs, peer_os) {
+            Some(None)
+        } else {
+            None
+        }
     } else {
         Some(None)
     }
@@ -999,12 +1120,19 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
         None => here.clone(),
     };
     let had_trailing_sep = args.path.ends_with('/') || args.path.ends_with('\\');
-    let normalized_path = normalize_path(&args.path).map_err(|reason| {
+    let peer_os = if machine == here {
+        Some(TargetOs::HOST)
+    } else {
+        fleet_machine_os(ctx.paths(), &machine)
+    };
+    validate_path_for_os(&args.path, peer_os).map_err(|reason| {
         ErrorBody::new(
             ErrorCode::InvalidArgs,
             format!("fav.add: `path`: {reason}."),
         )
     })?;
+    // Store the path exactly as given.
+    let stored_path = args.path;
     let label = match args.label {
         Some(raw) => {
             let trimmed = raw.trim().to_owned();
@@ -1024,9 +1152,20 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
     };
 
     let local_checked = if machine == here {
-        Some(ctx.grant().check_path(&normalized_path, Access::Read)?)
-    } else if ctx.grant().roots().is_some() {
-        ctx.grant().check_path(&normalized_path, Access::Read)?;
+        Some(ctx.grant().check_path(&stored_path, Access::Read)?)
+    } else if let Some(roots) = ctx.grant().roots() {
+        let root_strs: Vec<&str> = roots.iter().map(|r| r.as_str()).collect();
+        if !remote_path_within_roots(&stored_path, &root_strs, peer_os) {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "{} may not add favourite {} on {}: path is outside the role's allowed paths.",
+                    ctx.principal(),
+                    stored_path,
+                    machine
+                ),
+            ));
+        }
         None
     } else {
         None
@@ -1073,7 +1212,7 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
         let existing_id = file
             .entries
             .iter()
-            .find(|(_, rec)| rec.machine == machine && rec.path == normalized_path)
+            .find(|(_, rec)| rec.machine == machine && rec.path == stored_path)
             .map(|(id, _)| id.clone());
 
         let (id, record, existing) = if let Some(existing_id) = existing_id {
@@ -1108,7 +1247,7 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
             let stamp = format_timestamp(effective_stamp(now, None, floor));
             let record = FavoriteRecord {
                 machine,
-                path: normalized_path,
+                path: stored_path,
                 kind: detected_kind,
                 label,
                 pinned: pinned_arg,
@@ -1730,10 +1869,7 @@ fn validate_node_stamp(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_absolute_or_tilde(path: &str) -> bool {
-    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") || path.starts_with('/') {
-        return true;
-    }
+fn is_windows_drive_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
@@ -1741,31 +1877,29 @@ fn is_absolute_or_tilde(path: &str) -> bool {
         && (bytes[2] == b'\\' || bytes[2] == b'/')
 }
 
-fn normalize_path(raw: &str) -> Result<String, String> {
-    validate_path(raw)?;
-    let is_drive_root = raw.len() == 3
-        && raw.as_bytes()[0].is_ascii_alphabetic()
-        && raw.as_bytes()[1] == b':'
-        && (raw.as_bytes()[2] == b'\\' || raw.as_bytes()[2] == b'/');
-    let trimmed = if raw == "/" || raw == "~" || is_drive_root {
-        raw.to_owned()
-    } else {
-        let stripped = raw.trim_end_matches(['/', '\\']);
-        if stripped.is_empty() {
-            "/".to_owned()
-        } else if stripped.len() == 2
-            && stripped.as_bytes()[0].is_ascii_alphabetic()
-            && stripped.as_bytes()[1] == b':'
-        {
-            format!("{stripped}\\")
-        } else {
-            stripped.to_owned()
-        }
+fn is_windows_unc_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("\\\\") else {
+        return false;
     };
-    Ok(trimmed)
+    let mut parts = rest.split(['\\', '/']).filter(|s| !s.is_empty());
+    parts.next().is_some() && parts.next().is_some()
 }
 
-fn validate_path(path: &str) -> Result<(), String> {
+fn is_tilde_path(path: &str, windows_sep: bool) -> bool {
+    path == "~" || path.starts_with("~/") || (windows_sep && path.starts_with("~\\"))
+}
+
+/// Validates a favourite path according to the operating system of the machine it belongs to.
+///
+/// - `Some(TargetOs::Unix)`: accepts `/…`, `~`, `~/…`.
+/// - `Some(TargetOs::Windows)`: accepts `~`, `~/…`, `~\…`, drive-letter paths (`C:\…`, `C:/…`),
+///   and UNC paths (`\\server\share\…`), rejecting Unix-only `/…` paths and Windows path hazards.
+/// - `None` (remote OS unknown): accepts every absolute form Legion understands (`/…`, `~`, `~/…`,
+///   `~\…`, drive-letter paths, UNC paths).
+///
+/// Always refuses empty strings, over-long paths, control characters, relative paths, and `..`
+/// segments.
+pub fn validate_path_for_os(path: &str, os: Option<TargetOs>) -> Result<(), String> {
     if path.is_empty() {
         return Err("path must not be empty".to_owned());
     }
@@ -1775,13 +1909,121 @@ fn validate_path(path: &str) -> Result<(), String> {
     if path.chars().any(char::is_control) {
         return Err("path must not contain control characters".to_owned());
     }
-    if !is_absolute_or_tilde(path) {
-        return Err("path must be absolute or start with ~".to_owned());
+    let valid_root = match os {
+        Some(TargetOs::Unix) => path.starts_with('/') || is_tilde_path(path, false),
+        Some(TargetOs::Windows) => {
+            is_windows_drive_path(path) || is_windows_unc_path(path) || is_tilde_path(path, true)
+        }
+        None => {
+            path.starts_with('/')
+                || is_windows_drive_path(path)
+                || is_windows_unc_path(path)
+                || is_tilde_path(path, true)
+        }
+    };
+    if !valid_root {
+        return Err(match os {
+            Some(TargetOs::Unix) => "path must be a Unix absolute path or start with ~".to_owned(),
+            Some(TargetOs::Windows) => {
+                "path must be a Windows drive/UNC path or start with ~".to_owned()
+            }
+            None => "path must be absolute or start with ~".to_owned(),
+        });
     }
     if path.split(['/', '\\']).any(|seg| seg == "..") {
         return Err("path must not contain `..` segments".to_owned());
     }
+    if os == Some(TargetOs::Windows) {
+        crate::fs::validate_windows_path(path).map_err(|err| err.message)?;
+    }
     Ok(())
+}
+
+fn validate_path(path: &str) -> Result<(), String> {
+    validate_path_for_os(path, None)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedRemotePath {
+    Unix(Vec<String>),
+    Tilde(Vec<String>),
+    WindowsDrive(char, Vec<String>),
+    WindowsUnc(String, String, Vec<String>),
+}
+
+fn parse_remote_path(path: &str, os: Option<TargetOs>) -> Option<ParsedRemotePath> {
+    validate_path_for_os(path, os).ok()?;
+    let normalize_segs = |rest: &str, split_backslash: bool, fold_case: bool| -> Vec<String> {
+        let iter: Box<dyn Iterator<Item = &str>> = if split_backslash {
+            Box::new(rest.split(['/', '\\']))
+        } else {
+            Box::new(rest.split('/'))
+        };
+        iter.filter(|s| !s.is_empty() && *s != ".")
+            .map(|s| {
+                if fold_case {
+                    s.to_lowercase()
+                } else {
+                    s.to_owned()
+                }
+            })
+            .collect()
+    };
+    let fold_win = os == Some(TargetOs::Windows);
+    if path == "~" {
+        return Some(ParsedRemotePath::Tilde(Vec::new()));
+    }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        return Some(ParsedRemotePath::Tilde(normalize_segs(
+            rest,
+            os != Some(TargetOs::Unix),
+            fold_win,
+        )));
+    }
+    if is_windows_unc_path(path) {
+        let rest = path.strip_prefix("\\\\")?;
+        let mut parts = rest.split(['\\', '/']).filter(|s| !s.is_empty());
+        let server = parts.next()?.to_lowercase();
+        let share = parts.next()?.to_lowercase();
+        let segs = parts.filter(|s| *s != ".").map(str::to_lowercase).collect();
+        return Some(ParsedRemotePath::WindowsUnc(server, share, segs));
+    }
+    if is_windows_drive_path(path) {
+        let drive = path.as_bytes()[0].to_ascii_lowercase() as char;
+        let segs = normalize_segs(&path[3..], true, true);
+        return Some(ParsedRemotePath::WindowsDrive(drive, segs));
+    }
+    if let Some(rest) = path.strip_prefix('/') {
+        return Some(ParsedRemotePath::Unix(normalize_segs(rest, false, false)));
+    }
+    None
+}
+
+/// Cross-platform syntactic containment check for a remote favourite path against the caller's
+/// `paths` roots. Fails closed (`false`) whenever the path or root cannot be judged on the same
+/// path shape (for example a Windows path against Linux roots, or a remote `~` path against
+/// concrete roots).
+pub fn remote_path_within_roots(path: &str, roots: &[&str], os: Option<TargetOs>) -> bool {
+    let Some(target) = parse_remote_path(path, os) else {
+        return false;
+    };
+    roots.iter().any(|root| {
+        let Some(parsed_root) = parse_remote_path(root, os) else {
+            return false;
+        };
+        match (&target, &parsed_root) {
+            (ParsedRemotePath::Unix(t), ParsedRemotePath::Unix(r))
+            | (ParsedRemotePath::Tilde(t), ParsedRemotePath::Tilde(r)) => t.starts_with(r),
+            (ParsedRemotePath::WindowsDrive(td, t), ParsedRemotePath::WindowsDrive(rd, r)) => {
+                td == rd && t.starts_with(r)
+            }
+            (
+                ParsedRemotePath::WindowsUnc(ts, tsh, t),
+                ParsedRemotePath::WindowsUnc(rs, rsh, r),
+            ) => ts == rs && tsh == rsh && t.starts_with(r),
+            _ => false,
+        }
+    })
 }
 
 fn validate_label(label: &str) -> Result<(), String> {
@@ -2286,19 +2528,18 @@ paths = [{:?}]
     }
 
     #[test]
-    fn hard_size_bound_drops_oldest_tombstones_first_and_never_drops_live_entries_for_tombstones() {
+    fn hard_size_bound_keeps_newest_by_single_total_order_and_never_resurrects_removed() {
         let mut a = FavoritesFile::default();
         let mut b = FavoritesFile::default();
 
-        // 50 live entries that MUST all survive.
+        // 50 newer live entries that must survive over older tombstones.
         for i in 0..50 {
             a.entries.insert(
                 format!("live-{i:04}"),
-                sample_record(&format!("live-{i:04}"), "2026-11-01T00:00:00.000Z", "tower"),
+                sample_record(&format!("live-{i:04}"), "2026-11-25T00:00:00.000Z", "tower"),
             );
         }
-        // Enough tombstones to exceed MAX_FAVORITES_BYTES (~1 MiB) when serialized.
-        // Each tombstone is ~75 bytes, so 15_000 tombstones > 1.1 MiB.
+        // 15,000 tombstones across `a` and `b`, exceeding MAX_MERGED_FAVORITES (8192).
         for i in 0..7_500 {
             let secs = 1_793_500_000_i64 + i as i64;
             let ts_a = format_timestamp(Timestamp::from_second(secs).unwrap());
@@ -2328,14 +2569,295 @@ paths = [{:?}]
             "bounded merge must be idempotent"
         );
         assert!(ab.to_toml_string().len() <= MAX_FAVORITES_BYTES);
-        assert_eq!(
-            ab.entries.len(),
-            50,
-            "must never drop live entries while tombstones can be dropped"
-        );
+        assert_eq!(ab.entries.len() + ab.removed.len(), MAX_MERGED_FAVORITES);
+        assert_eq!(ab.entries.len(), 50);
         // The newest tombstones (`tb-*`) must be retained over the oldest (`ta-00000`).
         assert!(!ab.removed.contains_key("ta-00000"));
         assert!(ab.removed.contains_key("tb-07499"));
+    }
+
+    #[test]
+    fn merge_with_small_bound_is_commutative_associative_and_never_resurrects_removed() {
+        const BOUND: usize = 6;
+        const ID_COUNT: usize = 24;
+        const STAMPS: &[&str] = &[
+            "2026-11-01T00:00:01.000Z",
+            "2026-11-01T00:00:02.000Z",
+            "2026-11-01T00:00:03.000Z",
+            "2026-11-01T00:00:04.000Z",
+            "2026-11-01T00:00:05.000Z",
+            "2026-11-01T00:00:06.000Z",
+            "2026-11-01T00:00:07.000Z",
+            "2026-11-01T00:00:08.000Z",
+        ];
+        const NODES: &[&str] = &["tower", "pi", "nas"];
+
+        // Per-id causal stamps: a removal of `id` always carries a stamp >= its live entry's
+        // stamp (matching `fav.remove`, which advances `removed_at` past `prev.updated_at`).
+        let mut rng = Rng(0x1234_5678_9abc_def0);
+        let mut hit_bound = 0usize;
+        for case in 0..400 {
+            let live_stamps: Vec<usize> =
+                (0..ID_COUNT).map(|_| rng.gen_range(STAMPS.len())).collect();
+            let make_doc = |rng: &mut Rng| -> FavoritesFile {
+                let mut file = FavoritesFile::default();
+                for (idx, &live_idx) in live_stamps.iter().enumerate() {
+                    let id = format!("f{idx:02}");
+                    match rng.gen_range(5) {
+                        0..=2 => {}
+                        3 => {
+                            let rem_idx = live_idx + rng.gen_range(STAMPS.len() - live_idx);
+                            let ts = STAMPS[rem_idx].to_owned();
+                            let node = NODES[rng.gen_range(NODES.len())].to_owned();
+                            file.removed.insert(
+                                id,
+                                FavoriteTombstone {
+                                    removed_at: ts,
+                                    removed_on: node,
+                                },
+                            );
+                        }
+                        _ => {
+                            let ts = STAMPS[live_idx];
+                            let node = NODES[rng.gen_range(NODES.len())];
+                            file.entries
+                                .insert(id.clone(), sample_record(&id, ts, node));
+                        }
+                    }
+                }
+                trim_to_newest(&mut file, BOUND);
+                file
+            };
+            let a = make_doc(&mut rng);
+            let b = make_doc(&mut rng);
+            let c = make_doc(&mut rng);
+            let union_size = a
+                .entries
+                .keys()
+                .chain(a.removed.keys())
+                .chain(b.entries.keys())
+                .chain(b.removed.keys())
+                .chain(c.entries.keys())
+                .chain(c.removed.keys())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            if union_size > BOUND {
+                hit_bound += 1;
+            }
+
+            let ab = merge_favorites_with_limit(&a, &b, BOUND);
+            let ba = merge_favorites_with_limit(&b, &a, BOUND);
+            assert_eq!(ab, ba, "bounded commutativity failed on case {case}");
+
+            let ab_c = merge_favorites_with_limit(&ab, &c, BOUND);
+            let bc = merge_favorites_with_limit(&b, &c, BOUND);
+            let a_bc = merge_favorites_with_limit(&a, &bc, BOUND);
+            assert_eq!(ab_c, a_bc, "bounded associativity failed on case {case}");
+
+            assert_eq!(
+                merge_favorites_with_limit(&a, &a, BOUND),
+                a,
+                "bounded idempotence failed on case {case}"
+            );
+            assert!(ab_c.entries.len() + ab_c.removed.len() <= BOUND);
+        }
+        assert!(
+            hit_bound >= 200,
+            "property test must regularly exceed the bound (only hit {hit_bound}/400)"
+        );
+
+        // Explicit resurrection regression: `a` has old live `victim` (T=1), `b` removes `victim`
+        // (T=2), and `c` has `BOUND` newer tombstones (T=3..T=2+BOUND). Regardless of merge order,
+        // `victim` MUST NOT come back as a live entry.
+        let mut a = FavoritesFile::default();
+        a.entries.insert(
+            "victim".to_owned(),
+            sample_record("victim", "2026-11-01T00:00:01.000Z", "tower"),
+        );
+        let mut b = FavoritesFile::default();
+        b.removed.insert(
+            "victim".to_owned(),
+            FavoriteTombstone {
+                removed_at: "2026-11-01T00:00:02.000Z".to_owned(),
+                removed_on: "pi".to_owned(),
+            },
+        );
+        let mut c = FavoritesFile::default();
+        for i in 0..BOUND {
+            c.removed.insert(
+                format!("newer-{i:02}"),
+                FavoriteTombstone {
+                    removed_at: format!("2026-11-01T00:00:{:02}.000Z", 10 + i),
+                    removed_on: "nas".to_owned(),
+                },
+            );
+        }
+        let left =
+            merge_favorites_with_limit(&merge_favorites_with_limit(&a, &b, BOUND), &c, BOUND);
+        let right =
+            merge_favorites_with_limit(&a, &merge_favorites_with_limit(&b, &c, BOUND), BOUND);
+        assert_eq!(left, right);
+        assert!(!left.entries.contains_key("victim"));
+        assert!(!right.entries.contains_key("victim"));
+    }
+
+    #[test]
+    fn cross_platform_favorite_path_validation_and_visibility_work_on_every_os() {
+        // Known Unix peer: accepts Unix `/...` and `~/...`, refuses Windows drive/UNC & relative.
+        assert!(validate_path_for_os("/srv/films", Some(TargetOs::Unix)).is_ok());
+        assert!(validate_path_for_os("~/films", Some(TargetOs::Unix)).is_ok());
+        assert!(validate_path_for_os(r"C:\Users\me\Videos", Some(TargetOs::Unix)).is_err());
+        assert!(validate_path_for_os(r"\\nas\media\clip.mp4", Some(TargetOs::Unix)).is_err());
+
+        // Known Windows peer: accepts drive (either separator), UNC, `~/...`, `~\...`; refuses
+        // bare Unix `/...`, relative, `..`, ADS `:`, and reserved names.
+        assert!(validate_path_for_os(r"C:\Users\me\Videos", Some(TargetOs::Windows)).is_ok());
+        assert!(validate_path_for_os("C:/Users/me/Videos", Some(TargetOs::Windows)).is_ok());
+        assert!(validate_path_for_os(r"\\nas\media\clip.mp4", Some(TargetOs::Windows)).is_ok());
+        assert!(validate_path_for_os("~/Videos", Some(TargetOs::Windows)).is_ok());
+        assert!(validate_path_for_os(r"~\Videos", Some(TargetOs::Windows)).is_ok());
+        assert!(validate_path_for_os("/srv/films", Some(TargetOs::Windows)).is_err());
+        assert!(validate_path_for_os(r"C:\Users\me\file:stream", Some(TargetOs::Windows)).is_err());
+
+        // Unknown remote OS: accepts every absolute form Legion understands, refuses relative,
+        // `..`, control chars, and over-long paths.
+        assert!(validate_path_for_os("/srv/films", None).is_ok());
+        assert!(validate_path_for_os("~/films", None).is_ok());
+        assert!(validate_path_for_os(r"C:\Users\me\Videos", None).is_ok());
+        assert!(validate_path_for_os("C:/Users/me/Videos", None).is_ok());
+        assert!(validate_path_for_os(r"\\nas\media\clip.mp4", None).is_ok());
+        assert!(validate_path_for_os("relative/path.txt", None).is_err());
+        assert!(validate_path_for_os("/srv/../etc/passwd", None).is_err());
+        assert!(validate_path_for_os("/srv/bad\nline", None).is_err());
+        assert!(validate_path_for_os(&format!("/{}", "a".repeat(MAX_PATH_BYTES)), None).is_err());
+
+        // Cross-platform `fav.list` root filtering: matches matching path shapes and fails closed
+        // whenever a path cannot be judged against the caller's roots.
+        assert!(remote_path_within_roots(
+            "/srv/films/holiday.mp4",
+            &["/srv/films"],
+            Some(TargetOs::Unix)
+        ));
+        assert!(!remote_path_within_roots(
+            "/srv/films2/holiday.mp4",
+            &["/srv/films"],
+            Some(TargetOs::Unix)
+        ));
+        assert!(remote_path_within_roots(
+            r"C:\Users\me\Videos\clip.mp4",
+            &[r"c:/users/me/videos"],
+            Some(TargetOs::Windows)
+        ));
+        assert!(remote_path_within_roots(
+            r"\\NAS\Media\2026\clip.mp4",
+            &[r"\\nas\media"],
+            Some(TargetOs::Windows)
+        ));
+        // Mismatched OS or remote `~` against concrete root MUST fail closed (hidden).
+        assert!(!remote_path_within_roots(
+            r"C:\Users\me\Videos\clip.mp4",
+            &["/srv/films"],
+            Some(TargetOs::Windows)
+        ));
+        assert!(!remote_path_within_roots(
+            "/srv/films/clip.mp4",
+            &[r"C:\Users\me\Videos"],
+            Some(TargetOs::Unix)
+        ));
+        assert!(!remote_path_within_roots(
+            "~/films/clip.mp4",
+            &["/srv/films"],
+            Some(TargetOs::Unix)
+        ));
+    }
+
+    #[tokio::test]
+    async fn fav_add_accepts_foreign_os_paths_verbatim_for_remote_peers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(tmp.path().join("home"));
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+        std::fs::write(
+            paths.config_file("fleet.toml"),
+            r#"
+[machines.linux_peer]
+os = "unix"
+connector = "ssh"
+target = "linux_peer"
+
+[machines.win_peer]
+os = "windows"
+connector = "ssh"
+target = "win_peer"
+
+[machines.unknown_peer]
+connector = "ssh"
+target = "unknown_peer"
+"#,
+        )
+        .unwrap();
+
+        let mut registry = Registry::new();
+        register(&mut registry);
+        let node = Node::new(paths.clone(), registry);
+
+        // Regardless of whether this test runs on Linux, macOS, or Windows:
+        // - Adding `/srv/films/` on a Linux peer succeeds and stores the path verbatim.
+        let unix_add = node
+            .call(Call::new(
+                Door::Cli,
+                "fav.add",
+                json!({ "machine": "linux_peer", "path": "/srv/films/" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unix_add["entry"]["path"], json!("/srv/films/"));
+        assert_eq!(unix_add["entry"]["kind"], json!("dir"));
+
+        // - Adding `C:\Users\me\Videos` and a UNC path on a Windows peer succeeds verbatim.
+        let win_add = node
+            .call(Call::new(
+                Door::Cli,
+                "fav.add",
+                json!({ "machine": "win_peer", "path": r"C:\Users\me\Videos" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(win_add["entry"]["path"], json!(r"C:\Users\me\Videos"));
+
+        let unc_add = node
+            .call(Call::new(
+                Door::Cli,
+                "fav.add",
+                json!({ "machine": "win_peer", "path": r"\\nas\media\clip.mp4" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unc_add["entry"]["path"], json!(r"\\nas\media\clip.mp4"));
+
+        // - Adding a bare Unix path on a known Windows peer is refused.
+        let bad_win = node
+            .call(Call::new(
+                Door::Cli,
+                "fav.add",
+                json!({ "machine": "win_peer", "path": "/srv/films" }),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(bad_win.code, ErrorCode::InvalidArgs);
+
+        // - Adding either Unix or Windows paths on an unknown-OS peer succeeds.
+        for path in ["/srv/unknown", r"D:\Archive\notes.txt"] {
+            let res = node
+                .call(Call::new(
+                    Door::Cli,
+                    "fav.add",
+                    json!({ "machine": "unknown_peer", "path": path }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res["entry"]["path"], json!(path));
+        }
     }
 
     #[test]
@@ -2435,11 +2957,12 @@ paths = [{:?}]
         let node = Node::new(paths.clone(), registry);
 
         // Adding a 1001st favourite locally fails with a plain message telling the user to remove some.
+        let overflow_path = tmp.path().join("one-too-many.txt");
         let err = node
             .call(Call::new(
                 Door::Cli,
                 "fav.add",
-                json!({ "path": "/srv/files/one-too-many.txt" }),
+                json!({ "path": overflow_path.to_string_lossy() }),
             ))
             .await
             .unwrap_err();
@@ -2525,11 +3048,12 @@ paths = [{:?}]
         let node = Node::new(paths.clone(), registry);
         // Fire 10 rapid fav.add mutations within milliseconds.
         for i in 0..10 {
+            let burst_path = tmp.path().join("burst").join(format!("file-{i}.txt"));
             let _ = node
                 .call(Call::new(
                     Door::Cli,
                     "fav.add",
-                    json!({ "path": format!("/srv/burst/file-{i}.txt") }),
+                    json!({ "path": burst_path.to_string_lossy() }),
                 ))
                 .await
                 .unwrap();

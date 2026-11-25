@@ -225,11 +225,30 @@ fn can_see_job(ctx: &Ctx, record: &JobRecord) -> bool {
     }
     match record.kind {
         JobKind::Transfer => {
-            !record.transfer_paths.is_empty()
-                && record
-                    .transfer_paths
+            let local_paths: Vec<&str> = record
+                .transfer_local_from
+                .as_deref()
+                .into_iter()
+                .chain(record.transfer_local_to.as_deref())
+                .collect();
+            if record.transfer_has_remote
+                || (!local_paths.is_empty() && record.transfer_paths.len() > local_paths.len())
+            {
+                // This node does not hold the remote machine's policy.toml, so it cannot judge
+                // whether a path-confined caller is allowed to see the remote path: fail closed.
+                return false;
+            }
+            if !local_paths.is_empty() {
+                local_paths
                     .iter()
                     .all(|path| ctx.grant().check_path(path, Access::Read).is_ok())
+            } else {
+                !record.transfer_paths.is_empty()
+                    && record
+                        .transfer_paths
+                        .iter()
+                        .all(|path| ctx.grant().check_path(path, Access::Read).is_ok())
+            }
         }
         JobKind::Exec => {
             let Ok(policy) = ctx.config().get::<Policy>() else {
@@ -302,23 +321,24 @@ fn load_live_policy_and_devices(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Policy::default(),
         Err(_) => return None,
     };
-    let devices = crate::device::registry::load_devices_raw(paths)
-        .ok()
-        .flatten();
+    // Fail closed if `devices.toml` exists on disk but cannot be read or parsed.
+    let devices = crate::device::registry::load_devices_raw(paths).ok()?;
     Some((policy, devices))
 }
 
 /// Checks live `policy.toml` and `devices.toml` for a running transfer job by id.
 ///
 /// Used periodically by the detached transfer supervisor so direct edits to `policy.toml` or
-/// `devices.toml` revoke a running transfer promptly.
+/// `devices.toml` revoke a running transfer promptly. Fails closed when the job record,
+/// `policy.toml`, or `devices.toml` cannot be read or parsed so a transfer whose authorisation
+/// cannot be established stops rather than continuing unchecked.
 pub fn is_transfer_job_authorized(paths: &Paths, id: &str) -> bool {
     let dir = job_dir(paths.state_dir(), id);
     let Ok(record) = read_job_record(&dir, id) else {
-        return true;
+        return false;
     };
     let Some((policy, devices)) = load_live_policy_and_devices(paths) else {
-        return true;
+        return false;
     };
     transfer_record_still_authorized(paths, &policy, devices.as_ref(), &record)
 }
@@ -383,7 +403,7 @@ pub async fn cancel_revoked_transfer_jobs(
     pairing_id_filter: Option<&str>,
 ) -> Vec<String> {
     let paths_clone = paths.clone();
-    let Ok(Some((policy, devices))) =
+    let Ok(live_auth) =
         tokio::task::spawn_blocking(move || load_live_policy_and_devices(&paths_clone)).await
     else {
         return Vec::new();
@@ -418,7 +438,14 @@ pub async fn cancel_revoked_transfer_jobs(
         if !derived.state.is_active() {
             continue;
         }
-        if !transfer_record_still_authorized(paths, &policy, devices.as_ref(), &record)
+        // Fail closed when `policy.toml` or `devices.toml` cannot be parsed or read.
+        let still_authorized = match live_auth.as_ref() {
+            Some((policy, devices)) => {
+                transfer_record_still_authorized(paths, policy, devices.as_ref(), &record)
+            }
+            None => false,
+        };
+        if !still_authorized
             && cancel_job_internal(paths.state_dir(), &record.id, false)
                 .await
                 .is_ok()
@@ -442,8 +469,10 @@ pub struct TransferJobSpec {
     pub device: Option<String>,
     /// Paired device pairing id, when started through a paired device gate.
     pub pairing_id: Option<String>,
-    /// All paths named by the transfer (source and destination) for path-confined visibility.
+    /// Local paths named by the transfer for path-confined visibility.
     pub transfer_paths: Vec<String>,
+    /// `true` when either endpoint is on a remote machine whose policy this node does not hold.
+    pub transfer_has_remote: bool,
     /// Local source path on this node (when `from` is local), for live revocation checks.
     pub transfer_local_from: Option<String>,
     /// Local destination path on this node (when `to` is local), for live revocation checks.
@@ -543,6 +572,7 @@ pub async fn create_transfer_job(
             device: spec.device,
             pairing_id: spec.pairing_id,
             transfer_paths: spec.transfer_paths,
+            transfer_has_remote: spec.transfer_has_remote,
             transfer_local_from: spec.transfer_local_from,
             transfer_local_to: spec.transfer_local_to,
             transfer_move: spec.transfer_move,
@@ -1141,6 +1171,7 @@ where
             device,
             pairing_id,
             transfer_paths: Vec::new(),
+            transfer_has_remote: false,
             transfer_local_from: None,
             transfer_local_to: None,
             transfer_move: false,

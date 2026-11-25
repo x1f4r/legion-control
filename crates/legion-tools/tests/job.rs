@@ -1961,6 +1961,7 @@ paths = ["~/allowed"]
             device: None,
             pairing_id: None,
             transfer_paths: vec!["~/allowed/a.txt".to_owned(), "~/allowed/b.txt".to_owned()],
+            transfer_has_remote: false,
             transfer_local_from: Some("~/allowed/a.txt".to_owned()),
             transfer_local_to: Some("~/allowed/b.txt".to_owned()),
             transfer_move: false,
@@ -1996,6 +1997,7 @@ paths = ["~/allowed"]
             device: None,
             pairing_id: None,
             transfer_paths: vec!["~/allowed/a.txt".to_owned(), "~/secret/leak.txt".to_owned()],
+            transfer_has_remote: false,
             transfer_local_from: Some("~/allowed/a.txt".to_owned()),
             transfer_local_to: Some("~/secret/leak.txt".to_owned()),
             transfer_move: false,
@@ -2021,6 +2023,29 @@ paths = ["~/allowed"]
     .unwrap();
     legion_tools::job::finish_transfer_job_ok(&xfer_out.dir, json!({"ok": true})).unwrap();
 
+    // 3b. Owner transfer job naming a REMOTE destination whose string happens to look like
+    // `~/allowed/remote.txt`: because this node does not hold the remote machine's policy.toml,
+    // a path-confined non-owner MUST NOT see it (fail closed).
+    let xfer_remote = legion_tools::job::create_transfer_job(
+        &state_dir,
+        TransferJobSpec {
+            name: "copy-remote".to_owned(),
+            title: "Copy a.txt to pi".to_owned(),
+            principal: "owner".to_owned(),
+            device: None,
+            pairing_id: None,
+            transfer_paths: vec!["~/allowed/a.txt".to_owned()],
+            transfer_has_remote: true,
+            transfer_local_from: Some("~/allowed/a.txt".to_owned()),
+            transfer_local_to: None,
+            transfer_move: false,
+            exclusive: false,
+        },
+    )
+    .await
+    .unwrap();
+    legion_tools::job::finish_transfer_job_ok(&xfer_remote.dir, json!({"ok": true})).unwrap();
+
     // 4. `confined_ro`'s own transfer job (even if naming an external destination, own job is always visible).
     let own_xfer = legion_tools::job::create_transfer_job(
         &state_dir,
@@ -2030,10 +2055,8 @@ paths = ["~/allowed"]
             principal: "confined_ro".to_owned(),
             device: None,
             pairing_id: None,
-            transfer_paths: vec![
-                "~/allowed/mine.txt".to_owned(),
-                "~/secret/dest.txt".to_owned(),
-            ],
+            transfer_paths: vec!["~/allowed/mine.txt".to_owned()],
+            transfer_has_remote: true,
             transfer_local_from: Some("~/allowed/mine.txt".to_owned()),
             transfer_local_to: None,
             transfer_move: false,
@@ -2059,6 +2082,7 @@ paths = ["~/allowed"]
                 "~/allowed/dev.txt".to_owned(),
                 "~/allowed/dev2.txt".to_owned(),
             ],
+            transfer_has_remote: false,
             transfer_local_from: Some("~/allowed/dev.txt".to_owned()),
             transfer_local_to: Some("~/allowed/dev2.txt".to_owned()),
             transfer_move: false,
@@ -2084,6 +2108,7 @@ paths = ["~/allowed"]
         &exec_id,
         &xfer_in.id,
         &xfer_out.id,
+        &xfer_remote.id,
         &own_xfer.id,
         &dev_xfer.id,
     ] {
@@ -2094,8 +2119,8 @@ paths = ["~/allowed"]
     }
 
     // Path-confined read-only role (`confined_ro`):
-    // - Sees its own job (`own_xfer`) and transfers whose paths are all inside `~/allowed` (`xfer_in`, `dev_xfer`).
-    // - Does NOT see `exec_id` or `xfer_out` anywhere (`job.list`, `job.status`, `job.logs`, `job.wait`).
+    // - Sees its own job (`own_xfer`) and local transfers whose paths are all inside `~/allowed` (`xfer_in`, `dev_xfer`).
+    // - Does NOT see `exec_id`, `xfer_out`, or remote-path transfer `xfer_remote` anywhere (`job.list`, `job.status`, `job.logs`, `job.wait`).
     // - Hidden jobs return `not_found`, NEVER `denied`, and emit ZERO progress events from `job.wait`.
     let cro_list = fixture
         .call_as("confined_ro", "job.list", json!({}))
@@ -2117,6 +2142,10 @@ paths = ["~/allowed"]
         !cro_ids.contains(&xfer_out.id.as_str()),
         "confined_ro saw out-of-scope transfer: {cro_ids:?}"
     );
+    assert!(
+        !cro_ids.contains(&xfer_remote.id.as_str()),
+        "confined_ro saw remote-path transfer: {cro_ids:?}"
+    );
 
     assert!(
         fixture
@@ -2137,7 +2166,7 @@ paths = ["~/allowed"]
             .is_ok()
     );
 
-    for hidden_id in [&exec_id, &xfer_out.id] {
+    for hidden_id in [&exec_id, &xfer_out.id, &xfer_remote.id] {
         assert_eq!(
             fixture
                 .call_as("confined_ro", "job.status", json!({"id": hidden_id}))
@@ -2217,4 +2246,21 @@ paths = ["~/allowed"]
     orig_cancel.device = Some("phone".to_owned());
     orig_cancel.pairing_id = Some(pid1.to_owned());
     assert!(fixture.node.call(orig_cancel).await.is_ok());
+
+    // Fail-closed live authorization check: valid `policy.toml` authorizes `xfer_in`, while an
+    // unparsable `policy.toml` MUST return `false` so running transfers stop instead of
+    // continuing unchecked.
+    assert!(legion_tools::job::is_transfer_job_authorized(
+        fixture.node.paths(),
+        &xfer_in.id
+    ));
+    fs::write(
+        fixture.node.paths().config_file("policy.toml"),
+        "this is = [not valid toml\n",
+    )
+    .unwrap();
+    assert!(
+        !legion_tools::job::is_transfer_job_authorized(fixture.node.paths(), &xfer_in.id),
+        "corrupt policy.toml must fail closed"
+    );
 }
