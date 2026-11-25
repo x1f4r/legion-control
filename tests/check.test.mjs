@@ -72,7 +72,7 @@ test('the rust leg runs fmt, clippy, workspace tests, and the generated tool ref
   assert.deepEqual(green.calls, [
     'cargo fmt --all --check',
     'cargo clippy --workspace --all-targets --locked -- -D warnings',
-    'cargo test --workspace --locked',
+    'cargo test --workspace --locked --no-fail-fast',
     'node scripts/legion-tools-doc.mjs --bin target/debug/legion --check',
   ]);
 });
