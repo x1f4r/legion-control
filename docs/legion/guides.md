@@ -1267,7 +1267,8 @@ never signs releases; the offline Ed25519 signature is created locally before pu
 
    The script downloads `SHA256SUMS` and every release asset, re-hashes them locally, checks that
    the signing key matches `contract/release-public-key.pem`, writes and verifies `SHA256SUMS.sig`,
-   uploads it to the draft release, and prints the publish command.
+   uploads it to the draft release, and prints the publish command. Node GitHub releases intentionally
+   omit `update.json` so a raw node release `SHA256SUMS` cannot be replayed as a fleet update set.
 5. Review the listed artifacts and digests, then publish the draft release:
 
    ```sh
@@ -1309,7 +1310,9 @@ that never enters the repository:
    Official release builds leave `LEGION_PREVIEW_UPDATE_KEY` unset and never trust preview sets.
 
 3. Assemble and sign the update set directory (`update.json`, artifacts, `SHA256SUMS`,
-   `SHA256SUMS.sig`):
+   `SHA256SUMS.sig`). The script inspects each artifact's embedded sequence metadata without
+   executing it, records exact artifact byte sizes in `update.json`, and refuses sequences more than
+   24 hours ahead of UTC now:
 
    ```sh
    REV="$(git rev-parse --short=12 HEAD)"
