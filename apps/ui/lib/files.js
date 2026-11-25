@@ -1,5 +1,6 @@
 // Pure helpers for Files: categories, client-side degrade rules, sorting, selection, paths, and history.
 
+import { computeFileCapabilities } from './capabilities.js';
 import { routeHref } from './route.js';
 
 export const FILE_CATEGORIES = ['image', 'video', 'audio', 'document', 'text', 'archive', 'other'];
@@ -454,85 +455,18 @@ export function isHiddenName(name) {
 
 /**
  * Feature detection from a machine's tool catalogue, caller's allowed tool set, and link surface.
- * Nothing in the UI may break when a node lacks the newer Files tools or fields.
+ * Rebuilt on `computeFileCapabilities` in `capabilities.js`: unknown capabilities assume the least.
  */
-export function detectFileCapabilities({ tools = [], allowedSet = null, link = null, machine = null } = {}) {
-  const map = new Map();
-  for (const t of tools || []) {
-    if (t && typeof t.name === 'string') map.set(t.name, t);
-  }
-  const hasTool = (name) => {
-    const inCatalog = map.size === 0 ? false : map.has(name);
-    if (!inCatalog) return false;
-    return allowedSet ? allowedSet.has(name) : true;
-  };
-  const propOf = (toolName, propName) => {
-    const spec = map.get(toolName);
-    return Boolean(spec?.input_schema?.properties && Object.prototype.hasOwnProperty.call(spec.input_schema.properties, propName));
-  };
-
-  const hasList = map.size === 0 ? true : hasTool('fs.list');
-  const hasRead = map.size === 0 ? true : hasTool('fs.read');
-  const hasFind = hasTool('fs.find');
-  const hasThumb = hasTool('fs.thumb');
-  const hasFav = hasTool('fav.list');
-  const hasFavWrite = hasFav && hasTool('fav.add') && hasTool('fav.remove');
-  const hasSync = hasTool('sync.list');
-  const hasSyncWrite = hasSync && (hasTool('sync.pause') || hasTool('sync.add'));
-  const hasMkdir = hasTool('fs.mkdir');
-  const hasCopy = hasTool('fs.copy');
-  const hasMove = hasTool('fs.move');
-  const hasRemove = hasTool('fs.remove');
-  const hasHash = hasTool('fs.hash');
-  const hasTransfer = hasTool('fs.transfer');
-  const hasTransferBg = hasTransfer && propOf('fs.transfer', 'background');
-  const hasTransferMove = hasTransfer && propOf('fs.transfer', 'move') && hasRemove;
-  const hasTransferIfExists = hasTransfer && propOf('fs.transfer', 'if_exists');
-
-  // Content URLs are supported when the link exposes `contentUrl` and either reports per-machine
-  // content support (from `/v1/health` + session-scoped `unsupported` memory), runs in mock mode,
-  // or talks to a node advertising newer file tools.
-  const linkHasContent = typeof link?.contentUrl === 'function';
-  const nodeSupportsContent =
-    typeof link?.supportsContentFor === 'function'
-      ? linkHasContent && Boolean(link.supportsContentFor(machine))
-      : link?.kind === 'mock'
-        ? linkHasContent
-        : linkHasContent && (link?.supportsContent === true || hasThumb || propOf('fs.list', 'offset'));
-
-  const hasDownload = typeof link?.download === 'function' && (link?.kind !== 'http' || nodeSupportsContent);
-  const hasOpenExternally = typeof link?.openExternally === 'function';
-  const hasUpload = typeof link?.upload === 'function';
-  const hasDeviceTransfers = typeof link?.transfers === 'function';
-
-  return {
-    hasList,
-    hasRead,
-    hasListSort: propOf('fs.list', 'sort'),
-    hasListOffset: propOf('fs.list', 'offset'),
-    hasListCategories: propOf('fs.list', 'categories'),
-    hasFind,
-    hasFindEnhanced: hasFind && (propOf('fs.find', 'name') || propOf('fs.find', 'categories')),
-    hasThumb,
-    hasFav,
-    hasFavWrite,
-    hasSync,
-    hasSyncWrite,
-    hasMkdir,
-    hasCopy,
-    hasMove,
-    hasRemove,
-    hasHash,
-    hasTransfer,
-    hasTransferBg,
-    hasTransferMove,
-    hasTransferIfExists,
-    hasContentUrl: nodeSupportsContent,
-    hasDownload,
-    hasOpenExternally,
-    hasUpload,
-    hasDeviceTransfers,
-  };
+export function detectFileCapabilities({
+  tools = [],
+  allowedSet = null,
+  link = null,
+  machine = null,
+  known = undefined,
+} = {}) {
+  const isKnown =
+    typeof known === 'boolean' ? known : Array.isArray(tools) && tools.length > 0;
+  return computeFileCapabilities({ known: isKnown, tools, allowedSet, link, machine });
 }
 
 /**
@@ -583,7 +517,7 @@ export function sortEntries(entries, { sort = 'name', order = 'asc' } = {}) {
  */
 export function filterEntries(
   entries,
-  { hidden = false, query = '', categories = [], minSize = null, maxSize = null, modifiedAfter = null } = {},
+  { hidden = false, query = '', categories = [], minSize = null, maxSize = null, modifiedAfter = null, keepDirs = false } = {},
 ) {
   const list = Array.isArray(entries) ? entries : [];
   const words = String(query || '')
@@ -608,7 +542,7 @@ export function filterEntries(
     if (catSet) {
       const cat = entryCategory(entry);
       if (cat === 'folder') {
-        if (!catSet.has('folder')) return false;
+        if (!keepDirs && !catSet.has('folder')) return false;
       } else if (!catSet.has(cat)) {
         return false;
       }

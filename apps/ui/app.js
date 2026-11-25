@@ -11,6 +11,8 @@ import {
   plainRefusalParts,
 } from './lib/activity.js';
 import { createCache } from './lib/cache.js';
+import { createCapabilitiesStore } from './lib/capabilities.js';
+import { containsTechnicalText, isTerminalHint, plainErrorMessage } from './lib/errors.js';
 import {
   hydrateFleetCache,
   refreshFleetProgressive,
@@ -145,6 +147,16 @@ function ConfirmSheet({ request, technical, onClose }) {
       ? dryResult.would_send.map((addr) => `WoL packet -> ${addr}`)
       : [];
   const refusalParts = dryResult?.would_refuse ? plainRefusalParts(dryResult.would_refuse) : null;
+  const plainRefusalDetailMsg =
+    refusalParts?.detailMessage && !containsTechnicalText(refusalParts.detailMessage)
+      ? refusalParts.detailMessage
+      : null;
+  const plainRefusalDetailHint =
+    refusalParts?.detailHint &&
+    !isTerminalHint(refusalParts.detailHint) &&
+    !containsTechnicalText(refusalParts.detailHint)
+      ? refusalParts.detailHint
+      : null;
   const plainDrySummary = dryResult
     ? describeDryRunSummary(request.tool, request.targetName || request.target, request.args)
     : '';
@@ -173,8 +185,8 @@ function ConfirmSheet({ request, technical, onClose }) {
           `
         : null}
 
-      ${dryError ? html`<${Notice} error=${dryError} />` : null}
-      ${realError ? html`<${Notice} error=${realError} />` : null}
+      ${dryError ? html`<${Notice} error=${dryError} technical=${technical} />` : null}
+      ${realError ? html`<${Notice} error=${realError} technical=${technical} />` : null}
 
       ${dryResult
         ? html`
@@ -193,15 +205,15 @@ function ConfirmSheet({ request, technical, onClose }) {
                   : html`
                       <div class="notice neutral">
                         <strong>It would refuse right now: ${refusalParts.first}</strong>
-                        ${refusalParts.detailMessage || refusalParts.detailHint
+                        ${plainRefusalDetailMsg || plainRefusalDetailHint
                           ? html`
                               <details class="more">
                                 <summary>More</summary>
-                                ${refusalParts.detailMessage
-                                  ? html`<p>${refusalParts.detailMessage}</p>`
+                                ${plainRefusalDetailMsg
+                                  ? html`<p>${plainRefusalDetailMsg}</p>`
                                   : null}
-                                ${refusalParts.detailHint
-                                  ? html`<p>${refusalParts.detailHint}</p>`
+                                ${plainRefusalDetailHint
+                                  ? html`<p>${plainRefusalDetailHint}</p>`
                                   : null}
                               </details>
                             `
@@ -272,6 +284,8 @@ function App() {
   const sessionCache = useMemo(() => createSessionCache(), []);
   const persistentCache = useMemo(() => createPersistentCache(), []);
   const thumbCache = useMemo(() => createThumbCache({ maxEntries: 180, storage: null }), []);
+  const capsStore = useMemo(() => createCapabilitiesStore(link), [link]);
+  useEffect(() => () => capsStore.dispose(), [capsStore]);
   const shellRef = useRef(null);
   const mainRef = useRef(null);
   const refreshAbortRef = useRef(null);
@@ -326,6 +340,7 @@ function App() {
   const [toast, setToast] = useState(null);
   const [deviceTransfers, setDeviceTransfers] = useState([]);
   const [filesSortPref, setFilesSortPref] = useState(() => readSortPreference(safeLocalStorage()));
+  const [filesKindFilter, setFilesKindFilter] = useState('');
   const [filesShowHidden, setFilesShowHidden] = useState(false);
   const [filesSelecting, setFilesSelecting] = useState(false);
   const [filesSelectedPaths, setFilesSelectedPaths] = useState(() => new Set());
@@ -413,7 +428,10 @@ function App() {
       const item = failedList[0];
       const verb = item.direction === 'upload' ? 'Upload' : 'Download';
       const name = item.name || 'file';
-      const detail = item.error?.message ? ` ${item.error.message}` : '';
+      const detailText = item.error
+        ? plainErrorMessage(item.error, '', { technical: Boolean(settingsRef.current?.technical), deviceNoun })
+        : '';
+      const detail = detailText ? ` ${detailText}` : '';
       return `${verb} of ${name} failed.${detail}`;
     }
     return `${failedList.length} transfers failed.`;
@@ -673,8 +691,12 @@ function App() {
         scrollByFolderRef.current.set(`${prevRoute.machine || ''}\0${prevRoute.path || '~'}`, mainRef.current.scrollTop);
       }
       const next = parseRoute(window.location.hash);
-      if (prevRoute?.section === 'files' && (next.section !== 'files' || next.machine !== prevRoute.machine || next.path !== prevRoute.path)) {
+      if (
+        (prevRoute?.section === 'files' && (next.section !== 'files' || next.machine !== prevRoute.machine || next.path !== prevRoute.path)) ||
+        (prevRoute?.section === 'machines' && (next.section !== 'machines' || next.machine !== prevRoute.machine || next.tab !== prevRoute.tab))
+      ) {
         setFilesViewModeOverride(null);
+        setFilesKindFilter('');
       }
       setRoute((prev) => {
         if (mainRef.current && next.section !== 'files' && (prev.section !== next.section || !wideRef.current)) {
@@ -914,6 +936,7 @@ function App() {
 
   const hydrate = useCallback(
     async (nextState) => {
+      nodeInfoRef.current = nextState?.nodes?.[0] || null;
       setLinkState(nextState);
       if (!nextState?.ready) {
         setBooting(false);
@@ -939,11 +962,17 @@ function App() {
       const toolsCacheKey = `tools:${primary.node}`;
       const cachedNodeTools = sessionCache.get(toolsCacheKey)?.value;
       setTools(Array.isArray(cachedNodeTools) ? cachedNodeTools : []);
+      capsStore.syncMachineMeta(primary.node, {
+        version: primary.version || null,
+        build: primary.build || null,
+        reachable: primary.reachable !== false,
+      });
       if (primary.reachable !== false) {
-        link
-          .tools({ on: primary.node })
-          .then((toolList) => {
-            if (Array.isArray(toolList) && nodeInfoRef.current?.node === primary.node) {
+        capsStore
+          .ensure(primary.node)
+          .then((entry) => {
+            const toolList = entry?.tools;
+            if (Array.isArray(toolList) && toolList.length > 0 && nodeInfoRef.current?.node === primary.node) {
               setTools(toolList);
               sessionCache.set(toolsCacheKey, toolList);
             }
@@ -957,8 +986,23 @@ function App() {
         checkUpdatesQuietly();
       }
     },
-    [link, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
+    [link, capsStore, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
   );
+
+  // Feed fleet version/build/reachability into the per-machine capabilities store so build
+  // upgrades and reconnects invalidate cached tool schemas automatically.
+  useEffect(() => {
+    if (!snapshot?.machines) return;
+    for (const m of snapshot.machines) {
+      if (m?.name) {
+        capsStore.syncMachineMeta(m.name, {
+          version: m.version || null,
+          build: m.build || null,
+          reachable: m.reachable,
+        });
+      }
+    }
+  }, [capsStore, snapshot]);
 
   // Subscribe to native updater state and apply ready updates on startup before user interaction.
   useEffect(() => {
@@ -1128,6 +1172,7 @@ function App() {
         resuming = true;
         try {
           await link.invalidateSessions();
+          capsStore.invalidate();
         } finally {
           resuming = false;
         }
@@ -1163,7 +1208,7 @@ function App() {
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [link, linkState?.ready, nodeInfo, refreshFleet, settings.refreshSeconds]);
+  }, [link, capsStore, linkState?.ready, nodeInfo, refreshFleet, settings.refreshSeconds]);
 
   const openConfirm = useCallback((req) => {
     if (!sheetHistoryRef.current) {
@@ -1455,6 +1500,9 @@ function App() {
         writeSortPreference(safeLocalStorage(), pref);
         setFilesSortPref(pref);
       },
+      setKindFilter(kind) {
+        setFilesKindFilter(kind ? String(kind) : '');
+      },
       setShowHidden(val) {
         setFilesShowHidden(Boolean(val));
       },
@@ -1509,7 +1557,12 @@ function App() {
           }
           return;
         } catch (err) {
-          showToast(err?.message || 'Could not open this download.');
+          showToast(
+            plainErrorMessage(err, 'Could not open this download.', {
+              technical: Boolean(settingsRef.current?.technical),
+              deviceNoun,
+            }),
+          );
           return;
         }
       }
@@ -1549,11 +1602,14 @@ function App() {
     inMachinePhone &&
     route.tab === 'command' &&
     Boolean(selectedMachine?.reachable || (selectedMachine?.canWake && allowedSet?.has('power.wake')));
+  const isPhoneMachineFiles =
+    inMachinePhone && route.tab === 'files' && Boolean(selectedMachine?.reachable);
   const isActionsRoot =
     route.section === 'actions' && !route.action && !route.allTools;
   const hasFilesDock =
-    route.section === 'files' &&
-    (filesSelecting || (!wide && (isFilesRoot || isFilesFolder || isFilesSearch)) || (wide && isFilesSearch));
+    (route.section === 'files' &&
+      (filesSelecting || (!wide && (isFilesRoot || isFilesFolder || isFilesSearch)) || (wide && isFilesSearch))) ||
+    isPhoneMachineFiles;
   const hasDock = isActionsRoot || isPhoneCommand || hasFilesDock;
 
   // Hide bottom bar on phone for Settings, single-item detail pages, and Files selection mode.
@@ -2021,16 +2077,25 @@ function App() {
 
   function renderDock() {
     if (hasFilesDock) {
+      const dockRoute = isPhoneMachineFiles
+        ? {
+            section: 'files',
+            view: 'folder',
+            machine: route.machine,
+            path: filesMeta.resolvedPath || '~',
+          }
+        : route;
       return html`
         <${FilesDock}
-          route=${route}
+          route=${dockRoute}
           filesState=${{
             caps: filesMeta.caps,
-            selecting: filesSelecting,
+            selecting: isPhoneMachineFiles ? false : filesSelecting,
             selectedPaths: filesSelectedPaths,
             entries: filesMeta.entries,
             resolvedPath: filesMeta.resolvedPath,
             sortPref: filesSortPref,
+            kindFilter: filesKindFilter,
             resolvedViewMode: filesResolvedViewMode,
           }}
           filesActions=${filesActions}
@@ -2192,6 +2257,7 @@ function App() {
                 onConnected=${(next) => {
                   setPairingOpen(false);
                   setFleetError(null);
+                  capsStore.invalidate();
                   setPairNotice(
                     next?.last_paired ? { summary: next.last_paired, screen: 'machines' } : null,
                   );
@@ -2264,12 +2330,24 @@ function App() {
                           wide=${wide}
                           route=${route}
                           link=${link}
+                          capsStore=${capsStore}
                           nodeInfo=${nodeInfo}
                           tools=${tools}
                           allowedSet=${allowedSet}
                           settings=${settings}
                           deviceNoun=${deviceNoun}
                           thumbCache=${thumbCache}
+                          filesState=${{
+                            sortPref: filesSortPref,
+                            kindFilter: filesKindFilter,
+                            showHidden: filesShowHidden,
+                            selecting: filesSelecting,
+                            selectedPaths: filesSelectedPaths,
+                            sheet: filesSheet,
+                            viewModeOverride: filesViewModeOverride,
+                            resolvedViewMode: filesResolvedViewMode,
+                          }}
+                          filesActions=${filesActions}
                           wakePendingSet=${wakePendingSet}
                           onEnsureAwake=${ensureAwakeMachine}
                           onWakeSent=${markWakeSent}
@@ -2290,6 +2368,7 @@ function App() {
                             wide=${wide}
                             snapshot=${snapshot}
                             link=${link}
+                            capsStore=${capsStore}
                             nodeInfo=${nodeInfo}
                             tools=${tools}
                             allowedSet=${allowedSet}
@@ -2298,6 +2377,7 @@ function App() {
                             thumbCache=${thumbCache}
                             filesState=${{
                               sortPref: filesSortPref,
+                              kindFilter: filesKindFilter,
                               showHidden: filesShowHidden,
                               selecting: filesSelecting,
                               selectedPaths: filesSelectedPaths,
@@ -2329,88 +2409,92 @@ function App() {
                               onRefreshFleet=${() => refreshFleet(nodeInfo)}
                             />
                           `
-                      : route.section === 'actions'
-                        ? html`
-                            <${ActionsView}
-                              route=${route}
-                              tools=${tools}
-                              allowedSet=${allowedSet}
-                              nodeInfo=${nodeInfo}
-                              snapshot=${snapshot}
-                              link=${link}
-                              settings=${settings}
-                              wide=${wide}
-                              query=${actionsQuery}
-                              onWakeSent=${markWakeSent}
-                              onEnsureAwake=${ensureAwakeMachine}
-                              onRequestConfirm=${openConfirm}
-                              onRefreshFleet=${() => refreshFleet(nodeInfo)}
-                            />
-                          `
-                        : html`
-                            <${SettingsView}
-                              route=${route}
-                              wide=${wide}
-                              deviceNoun=${deviceNoun}
-                              link=${link}
-                              linkState=${linkState}
-                              nodeInfo=${nodeInfo}
-                              tools=${tools}
-                              allowedSet=${allowedSet}
-                              snapshot=${snapshot}
-                              settings=${settings}
-                              pairNotice=${pairNotice?.screen === 'connections' ? pairNotice.summary : null}
-                              onDismissPairNotice=${() => setPairNotice(null)}
-                              updateState=${updateState}
-                              onCheckUpdates=${handleCheckUpdates}
-                              onInstallUpdate=${handleInstallUpdate}
-                              onSetAutoUpdate=${handleSetAutoUpdate}
-                              onDismissUpdateNotice=${handleDismissUpdateNotice}
-                              onUpdateSettings=${updateSettings}
-                              onRequestConfirm=${openConfirm}
-                              onAcceptIdentityChange=${handleAcceptIdentityChange}
-                              onDismissIdentityChange=${handleDismissIdentityChange}
-                              onConnected=${(next) => {
-                                setFleetError(null);
-                                setPairNotice(
-                                  next?.last_paired
-                                    ? { summary: next.last_paired, screen: 'connections' }
-                                    : null,
-                                );
-                                hydrate(next);
-                              }}
-                              onSelectNode=${
-                                link.kind === 'app' && typeof link.selectNode === 'function'
-                                  ? async (node) => {
-                                      if (refreshAbortRef.current) {
-                                        refreshAbortRef.current.abort();
-                                        refreshAbortRef.current = null;
+                        : route.section === 'actions'
+                          ? html`
+                              <${ActionsView}
+                                route=${route}
+                                tools=${tools}
+                                allowedSet=${allowedSet}
+                                nodeInfo=${nodeInfo}
+                                snapshot=${snapshot}
+                                link=${link}
+                                settings=${settings}
+                                wide=${wide}
+                                query=${actionsQuery}
+                                onWakeSent=${markWakeSent}
+                                onEnsureAwake=${ensureAwakeMachine}
+                                onRequestConfirm=${openConfirm}
+                                onRefreshFleet=${() => refreshFleet(nodeInfo)}
+                              />
+                            `
+                          : html`
+                              <${SettingsView}
+                                route=${route}
+                                wide=${wide}
+                                deviceNoun=${deviceNoun}
+                                link=${link}
+                                capsStore=${capsStore}
+                                linkState=${linkState}
+                                nodeInfo=${nodeInfo}
+                                tools=${tools}
+                                allowedSet=${allowedSet}
+                                snapshot=${snapshot}
+                                settings=${settings}
+                                pairNotice=${pairNotice?.screen === 'connections' ? pairNotice.summary : null}
+                                onDismissPairNotice=${() => setPairNotice(null)}
+                                updateState=${updateState}
+                                onCheckUpdates=${handleCheckUpdates}
+                                onInstallUpdate=${handleInstallUpdate}
+                                onSetAutoUpdate=${handleSetAutoUpdate}
+                                onDismissUpdateNotice=${handleDismissUpdateNotice}
+                                onUpdateSettings=${updateSettings}
+                                onRequestConfirm=${openConfirm}
+                                onAcceptIdentityChange=${handleAcceptIdentityChange}
+                                onDismissIdentityChange=${handleDismissIdentityChange}
+                                onConnected=${(next) => {
+                                  setFleetError(null);
+                                  capsStore.invalidate();
+                                  setPairNotice(
+                                    next?.last_paired
+                                      ? { summary: next.last_paired, screen: 'connections' }
+                                      : null,
+                                  );
+                                  hydrate(next);
+                                }}
+                                onSelectNode=${
+                                  link.kind === 'app' && typeof link.selectNode === 'function'
+                                    ? async (node) => {
+                                        if (refreshAbortRef.current) {
+                                          refreshAbortRef.current.abort();
+                                          refreshAbortRef.current = null;
+                                        }
+                                        refreshInFlightRef.current = false;
+                                        sessionCache.clear();
+                                        persistentCache.clear();
+                                        capsStore.invalidate();
+                                        setSnapshot(null);
+                                        setTools([]);
+                                        const next = await link.selectNode(node);
+                                        await hydrate(next);
                                       }
-                                      refreshInFlightRef.current = false;
-                                      sessionCache.clear();
-                                      persistentCache.clear();
-                                      setSnapshot(null);
-                                      setTools([]);
-                                      const next = await link.selectNode(node);
-                                      await hydrate(next);
-                                    }
-                                  : null
-                              }
-                              onDisconnected=${async () => {
-                                if (refreshAbortRef.current) {
-                                  refreshAbortRef.current.abort();
-                                  refreshAbortRef.current = null;
+                                    : null
                                 }
-                                refreshInFlightRef.current = false;
-                                sessionCache.clear();
-                                persistentCache.clear();
-                                setSnapshot(null);
-                                setTools([]);
-                                const st = await link.state();
-                                await hydrate(st);
-                              }}
-                            />
-                          `}
+                                onDisconnected=${async () => {
+                                  if (refreshAbortRef.current) {
+                                    refreshAbortRef.current.abort();
+                                    refreshAbortRef.current = null;
+                                  }
+                                  refreshInFlightRef.current = false;
+                                  sessionCache.clear();
+                                  persistentCache.clear();
+                                  capsStore.invalidate();
+                                  setSnapshot(null);
+                                  setTools([]);
+                                  const st = await link.state();
+                                  await hydrate(st);
+                                }}
+                              />
+                            `}
                 </main>
                 ${renderDock()}
                 ${renderNav()}

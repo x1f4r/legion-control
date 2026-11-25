@@ -5,6 +5,7 @@
 
 import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
+import { plainErrorMessage } from '../lib/errors.js';
 import {
   baseFileName,
   canOpenExternally,
@@ -50,22 +51,49 @@ function contentTypeMatchesMedia(kind, contentType) {
 
 function classifyMintError(err) {
   if (err?.details?.reason === 'too_large_for_inline' || err?.status === 413) {
-    return { code: 'too_large', message: err?.message || '', hint: err?.hint || '' };
+    return {
+      code: 'too_large',
+      status: err?.status || 413,
+      message: err?.message || '',
+      hint: err?.hint || '',
+      details: err?.details || null,
+      machine: err?.machine || null,
+    };
+  }
+  if (err?.code === 'unsupported' || err?.code === 'needs_newer_legion') {
+    return {
+      code: err.code,
+      message: err.message || '',
+      hint: err.hint || '',
+      details: err.details || null,
+      machine: err.machine || null,
+    };
   }
   if (err?.code === 'denied') {
     return {
       code: 'denied',
-      message: err?.message || "You're not allowed to open this file.",
-      hint: err?.hint || '',
+      message: err.message || "You're not allowed to open this file.",
+      hint: err.hint || '',
+      details: err.details || null,
+      machine: err.machine || null,
     };
   }
   if (err?.code === 'not_found') {
-    return { code: 'not_found', message: err?.message || '', hint: err?.hint || '' };
+    return {
+      code: 'not_found',
+      message: err.message || '',
+      hint: err.hint || '',
+      details: err.details || null,
+      machine: err.machine || null,
+    };
   }
-  if (err?.code === 'unsupported') {
-    return { code: 'unsupported', message: err?.message || '', hint: err?.hint || '' };
-  }
-  return { code: 'unreachable', message: err?.message || '', hint: err?.hint || '' };
+  return {
+    code: 'unreachable',
+    message: err?.message || '',
+    hint: err?.hint || '',
+    details: err?.details || null,
+    machine: err?.machine || null,
+  };
 }
 
 function safeStorage() {
@@ -104,6 +132,7 @@ export function FilesViewer({
   entry,
   siblings = [],
   link,
+  capsStore = null,
   caps,
   deviceNoun = 'phone',
   technical = false,
@@ -562,20 +591,22 @@ export function FilesViewer({
     if (result && typeof result.catch === 'function') {
       result.catch((err) => {
         if (activeFileKeyRef.current === fileKey) {
-          showViewerNotice(err?.message || "Couldn't start download.", 'error');
+          showViewerNotice(
+            plainErrorMessage(err, "Couldn't start download.", { technical, deviceNoun }),
+            'error',
+          );
         }
       });
     }
   }
 
   async function fetchMachinePreview(targetKey, signal) {
-    if (!caps?.hasThumb || typeof link?.call !== 'function') return false;
+    if (!caps?.hasThumb || (!capsStore && typeof link?.call !== 'function')) return false;
     try {
-      const res = await link.call(
-        'fs.thumb',
-        { paths: [path], size: PREVIEW_THUMB_SIZE, fit: 'contain' },
-        { on: machine, signal },
-      );
+      const thumbArgs = { paths: [path], size: PREVIEW_THUMB_SIZE, fit: 'contain' };
+      const res = capsStore
+        ? (await capsStore.call('fs.thumb', thumbArgs, { on: machine, signal })).value
+        : await link.call('fs.thumb', thumbArgs, { on: machine, signal });
       if (signal?.aborted || activeFileKeyRef.current !== targetKey) return true;
       const t = res?.thumbnails?.[path];
       if (t?.content && t?.mime) {
@@ -600,11 +631,12 @@ export function FilesViewer({
   useEffect(() => {
     const prev = prevHasContentRef.current;
     prevHasContentRef.current = hasContentUrl;
+    const errCode = mediaStateRef.current.error?.code;
     if (
       !prev &&
       hasContentUrl &&
       mediaStateRef.current.key === fileKey &&
-      mediaStateRef.current.error?.code === 'unsupported'
+      (errCode === 'unsupported' || errCode === 'needs_newer_legion')
     ) {
       setRetryNonce((n) => n + 1);
     }
@@ -641,19 +673,46 @@ export function FilesViewer({
       error: null,
     });
 
+    const runCall = (tool, args, opts = {}) =>
+      capsStore
+        ? capsStore.call(tool, args, { ...opts, on: machine }).then((r) => r.value)
+        : link.call(tool, args, { ...opts, on: machine });
+
+    if (caps && caps.known === false) {
+      if (category === 'text' || isExtensionlessProbe) {
+        setTextState((prev) => ({ ...prev, key: targetKey, loading: true, error: null }));
+      } else if (category === 'image' || category === 'video' || category === 'audio') {
+        setMediaState({
+          key: targetKey,
+          url: null,
+          loading: true,
+          error: null,
+          isFreshAddress: false,
+          isMachinePreview: false,
+        });
+      }
+      return () => {
+        ctrl.abort();
+        stopMediaElements();
+      };
+    }
+
     if (category === 'text' || isExtensionlessProbe) {
-      setTextState({
-        key: targetKey,
-        content: '',
-        size: 0,
-        loaded: 0,
-        eof: true,
-        binary: false,
-        loading: true,
-        error: null,
-      });
-      link
-        .call('fs.read', { path, offset: 0, length: TEXT_CHUNK_BYTES }, { on: machine, signal: ctrl.signal })
+      setTextState((prev) =>
+        prev.key === targetKey
+          ? { ...prev, loading: true, error: null }
+          : {
+              key: targetKey,
+              content: '',
+              size: 0,
+              loaded: 0,
+              eof: true,
+              binary: false,
+              loading: true,
+              error: null,
+            },
+      );
+      runCall('fs.read', { path, offset: 0, length: TEXT_CHUNK_BYTES }, { signal: ctrl.signal })
         .then((res) => {
           if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
           if (res?.encoding === 'base64') {
@@ -803,6 +862,56 @@ export function FilesViewer({
             });
           }
         });
+      } else if (
+        category === 'image' &&
+        caps?.hasRead &&
+        effectiveEntry.size != null &&
+        effectiveEntry.size > 0 &&
+        effectiveEntry.size <= 1048576
+      ) {
+        // Inline fallback for small pictures on older machines without content addresses or thumbnails.
+        setMediaState({
+          key: targetKey,
+          url: null,
+          loading: true,
+          error: null,
+          isFreshAddress: false,
+          isMachinePreview: false,
+        });
+        runCall('fs.read', { path, offset: 0, length: 1048576, encoding: 'base64' }, { signal: ctrl.signal })
+          .then((res) => {
+            if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
+            if (res?.eof && res?.content) {
+              setMediaState({
+                key: targetKey,
+                url: `data:${mime};base64,${res.content}`,
+                loading: false,
+                error: null,
+                isFreshAddress: false,
+                isMachinePreview: false,
+              });
+            } else {
+              setMediaState({
+                key: targetKey,
+                url: null,
+                loading: false,
+                error: { code: 'unsupported', message: 'Preview is not available on this machine yet.' },
+                isFreshAddress: false,
+                isMachinePreview: false,
+              });
+            }
+          })
+          .catch((err) => {
+            if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
+            setMediaState({
+              key: targetKey,
+              url: null,
+              loading: false,
+              error: err,
+              isFreshAddress: false,
+              isMachinePreview: false,
+            });
+          });
       } else {
         setMediaState({
           key: targetKey,
@@ -819,7 +928,20 @@ export function FilesViewer({
       ctrl.abort();
       stopMediaElements();
     };
-  }, [machine, path, category, isExtensionlessProbe, skipMediaPlayer, preferThumbPreview, retryNonce]);
+  }, [
+    machine,
+    path,
+    category,
+    isExtensionlessProbe,
+    skipMediaPlayer,
+    preferThumbPreview,
+    retryNonce,
+    caps?.known,
+    caps?.hasContentUrl,
+    caps?.hasThumb,
+    caps?.hasRead,
+    capsStore,
+  ]);
 
   // Keyboard navigation inside viewer: Escape closes, Left/Right steps through pictures.
   useEffect(() => {
@@ -845,8 +967,10 @@ export function FilesViewer({
     if (!moreOpen || !technical || !caps?.hasHash || activeHash) return;
     let alive = true;
     const targetKey = fileKey;
-    link
-      .call('fs.hash', { path }, { on: machine })
+    const hashReq = capsStore
+      ? capsStore.call('fs.hash', { path }, { on: machine }).then((r) => r.value)
+      : link.call('fs.hash', { path }, { on: machine });
+    hashReq
       .then((res) => {
         if (alive && res?.hash && activeFileKeyRef.current === targetKey) {
           setHashInfo({ key: targetKey, value: res.hash });
@@ -856,18 +980,17 @@ export function FilesViewer({
     return () => {
       alive = false;
     };
-  }, [moreOpen, technical, caps?.hasHash, machine, path, fileKey, activeHash]);
+  }, [moreOpen, technical, caps?.hasHash, capsStore, machine, path, fileKey, activeHash]);
 
   async function loadMoreText() {
     if (activeText.loading || activeText.eof) return;
     const targetKey = fileKey;
     setTextState((prev) => ({ ...prev, key: targetKey, loading: true, error: null }));
     try {
-      const res = await link.call(
-        'fs.read',
-        { path, offset: activeText.loaded, length: TEXT_CHUNK_BYTES },
-        { on: machine, signal: abortRef.current?.signal },
-      );
+      const readOpts = { on: machine, signal: abortRef.current?.signal };
+      const res = capsStore
+        ? (await capsStore.call('fs.read', { path, offset: activeText.loaded, length: TEXT_CHUNK_BYTES }, readOpts)).value
+        : await link.call('fs.read', { path, offset: activeText.loaded, length: TEXT_CHUNK_BYTES }, readOpts);
       if (activeFileKeyRef.current !== targetKey) return;
       const chunk = String(res?.content ?? '');
       setTextState((prev) => ({
@@ -967,6 +1090,8 @@ export function FilesViewer({
           confirmedDecode: false,
           code: 'too_large',
           retryable: false,
+          status: st.status || 413,
+          errorCode: st.error_code || null,
           message: st.error_message || '',
         };
       }
@@ -975,6 +1100,8 @@ export function FilesViewer({
           confirmedDecode: false,
           code: 'denied',
           retryable: false,
+          status: 403,
+          errorCode: st.error_code || null,
           message: st.error_message || '',
         };
       }
@@ -983,6 +1110,8 @@ export function FilesViewer({
           confirmedDecode: false,
           code: 'not_found',
           retryable: true,
+          status: st.status || null,
+          errorCode: st.error_code || null,
           message: st.error_message || '',
         };
       }
@@ -996,6 +1125,8 @@ export function FilesViewer({
           confirmedDecode: false,
           code: 'unreachable',
           retryable: true,
+          status: st.status || null,
+          errorCode: st.stream_failed ? 'stream_failed' : st.error_code || null,
           message: st.error_message || '',
         };
       }
@@ -1005,7 +1136,7 @@ export function FilesViewer({
         contentTypeMatchesMedia(kind, st.content_type)
       ) {
         if (isMediaNetworkErr) {
-          return { confirmedDecode: false, code: 'unreachable', retryable: true, message: '' };
+          return { confirmedDecode: false, code: 'unreachable', retryable: true, errorCode: 'media_err_network', message: '' };
         }
         return { confirmedDecode: true, code: 'decode', retryable: false, message: '' };
       }
@@ -1013,6 +1144,8 @@ export function FilesViewer({
         confirmedDecode: false,
         code: 'unreachable',
         retryable: true,
+        status: st.status || null,
+        errorCode: st.error_code || null,
         message: st.error_message || '',
       };
     }
@@ -1026,27 +1159,27 @@ export function FilesViewer({
       const probe = await fetch(expectedUrl, { method: 'HEAD', signal });
       if (signal?.aborted) return null;
       if (probe.status === 413) {
-        return { confirmedDecode: false, code: 'too_large', retryable: false, message: '' };
+        return { confirmedDecode: false, code: 'too_large', retryable: false, status: 413, message: '' };
       }
       if (probe.status === 403) {
-        return { confirmedDecode: false, code: 'denied', retryable: false, message: '' };
+        return { confirmedDecode: false, code: 'denied', retryable: false, status: 403, message: '' };
       }
       if (probe.status === 404 || probe.status === 410) {
-        return { confirmedDecode: false, code: 'not_found', retryable: true, message: '' };
+        return { confirmedDecode: false, code: 'not_found', retryable: true, status: probe.status, message: '' };
       }
       if (probe.status === 429 || probe.status >= 500) {
-        return { confirmedDecode: false, code: 'unreachable', retryable: true, message: '' };
+        return { confirmedDecode: false, code: 'unreachable', retryable: true, status: probe.status, message: '' };
       }
       if (probe.ok && contentTypeMatchesMedia(kind, probe.headers.get('content-type'))) {
         if (isMediaNetworkErr) {
-          return { confirmedDecode: false, code: 'unreachable', retryable: true, message: '' };
+          return { confirmedDecode: false, code: 'unreachable', retryable: true, errorCode: 'media_err_network', message: '' };
         }
         return { confirmedDecode: true, code: 'decode', retryable: false, message: '' };
       }
-      return { confirmedDecode: false, code: 'unreachable', retryable: true, message: '' };
+      return { confirmedDecode: false, code: 'unreachable', retryable: true, status: probe.status, message: '' };
     } catch {
       if (signal?.aborted) return null;
-      return { confirmedDecode: false, code: 'unreachable', retryable: true, message: '' };
+      return { confirmedDecode: false, code: 'unreachable', retryable: true, errorCode: 'network_error', message: '' };
     }
   }
 
@@ -1159,7 +1292,12 @@ export function FilesViewer({
       key: expectedKey,
       url: null,
       loading: false,
-      error: { code: inspection.code, message: inspection.message || '' },
+      error: {
+        code: inspection.code,
+        message: inspection.message || '',
+        status: inspection.status || null,
+        errorCode: inspection.errorCode || null,
+      },
       isFreshAddress: false,
       isMachinePreview: false,
     });
@@ -1380,11 +1518,15 @@ export function FilesViewer({
       const errHeading = isNoHandler
         ? `No app on this ${deviceNoun} can open this file`
         : "Couldn't open in another app";
-      const errBody =
-        err.message ||
-        (isNoHandler
-          ? `No app on this ${deviceNoun} handles this file type.`
-          : 'Try again, or download the file instead.');
+      const defaultErrBody = isNoHandler
+        ? `No app on this ${deviceNoun} handles this file type.`
+        : 'Try again, or download the file instead.';
+      const errBody = plainErrorMessage(err, defaultErrBody, { technical, deviceNoun });
+      const techMeta = technical
+        ? [err.hint, err.code ? `code: ${err.code}` : '', err.reason ? `reason: ${err.reason}` : '']
+            .filter(Boolean)
+            .join(' · ')
+        : '';
       const showDownload = Boolean(caps?.hasDownload);
       const showTryAgain = allowExternalOpen && !isNoHandler && !isDenied;
       return html`
@@ -1394,7 +1536,7 @@ export function FilesViewer({
           </div>
           <strong>${errHeading}</strong>
           <span>${errBody}</span>
-          ${err.hint ? html`<span class="viewer-open-hint">${err.hint}</span>` : null}
+          ${techMeta ? html`<span class="viewer-open-hint">${techMeta}</span>` : null}
           <div class="viewer-said-actions">
             ${showTryAgain
               ? html`
@@ -1471,19 +1613,39 @@ export function FilesViewer({
     `;
   }
 
+  function technicalErrorDetail(err) {
+    if (!technical || !err) return '';
+    return [
+      err.status ? `HTTP ${err.status}` : '',
+      err.errorCode || err.details?.reason || (err.code && err.code !== 'decode' ? err.code : ''),
+      err.hint || '',
+    ]
+      .filter(Boolean)
+      .join(' · ');
+  }
+
   function renderCommonMediaError(err, kindLabel) {
+    const techHint = technicalErrorDetail(err);
     if (err.code === 'unreachable') {
       return renderFallbackCard(
         "Couldn't reach this file",
-        err.message || `Couldn't load this file from ${machine}. Check that it's on and try again.`,
-        { showRetry: true, hint: err.hint || '' },
+        plainErrorMessage(
+          err,
+          `Couldn't load this file from ${machine}. Check that it's on and try again.`,
+          { technical, deviceNoun },
+        ),
+        { showRetry: true, hint: techHint },
       );
     }
     if (err.code === 'not_found') {
       return renderFallbackCard(
         "Couldn't reach this file",
-        err.message || `${machine} couldn't serve this file, or it may have moved.`,
-        { showRetry: true, hint: err.hint || '' },
+        plainErrorMessage(
+          err,
+          `${machine} couldn't serve this file, or it may have moved.`,
+          { technical, deviceNoun },
+        ),
+        { showRetry: true, hint: techHint },
       );
     }
     if (err.code === 'too_large') {
@@ -1492,16 +1654,17 @@ export function FilesViewer({
         allowExternalOpen
           ? `Open it in another app, or download it to this ${deviceNoun}.`
           : `Download it to this ${deviceNoun} to open it.`,
+        { hint: techHint },
       );
     }
     if (err.code === 'denied') {
       return renderFallbackCard(
         "Can't open this file",
-        err.message || "You're not allowed to open this file.",
-        { hideActions: true, hint: err.hint || '' },
+        plainErrorMessage(err, "You're not allowed to open this file.", { technical, deviceNoun }),
+        { hideActions: true, hint: techHint },
       );
     }
-    if (err.code === 'unsupported') {
+    if (err.code === 'unsupported' || err.code === 'needs_newer_legion') {
       const heading =
         kindLabel === 'picture'
           ? "Can't show this picture here"
@@ -1511,11 +1674,12 @@ export function FilesViewer({
       const body =
         kindLabel === 'picture'
           ? `This version of Legion on ${machine} doesn't serve picture previews yet.`
-          : err.message ||
-            (allowExternalOpen || caps?.hasDownload
-              ? 'Open it in another app that can, or download it first.'
-              : `This machine needs a newer Legion version to stream ${kindLabel} here.`);
-      return renderFallbackCard(heading, body, { hint: err.hint || '' });
+          : allowExternalOpen
+            ? 'Open it in another app that can, or download it first.'
+            : caps?.hasDownload
+              ? `Download it to this ${deviceNoun} to play it.`
+              : `${machine} needs a newer Legion to stream ${kindLabel} here.`;
+      return renderFallbackCard(heading, body, { hint: techHint });
     }
     return null;
   }
@@ -1525,6 +1689,17 @@ export function FilesViewer({
       if (mediaError) {
         const common = renderCommonMediaError(mediaError, 'picture');
         if (common) return common;
+        if (mediaError.code !== 'decode') {
+          return renderFallbackCard(
+            "Couldn't reach this file",
+            plainErrorMessage(
+              mediaError,
+              `Couldn't load this file from ${machine}. Check that it's on and try again.`,
+              { technical, deviceNoun },
+            ),
+            { showRetry: true, hint: technicalErrorDetail(mediaError) },
+          );
+        }
         const msg =
           allowExternalOpen || caps?.hasDownload
             ? allowExternalOpen
@@ -1570,6 +1745,17 @@ export function FilesViewer({
       if (mediaError) {
         const common = renderCommonMediaError(mediaError, 'video');
         if (common) return common;
+        if (mediaError.code !== 'decode') {
+          return renderFallbackCard(
+            "Couldn't reach this file",
+            plainErrorMessage(
+              mediaError,
+              `Couldn't load this file from ${machine}. Check that it's on and try again.`,
+              { technical, deviceNoun },
+            ),
+            { showRetry: true, hint: technicalErrorDetail(mediaError) },
+          );
+        }
         const body = allowExternalOpen
           ? 'Open it in another app that can, or download it first.'
           : caps?.hasDownload
@@ -1617,6 +1803,17 @@ export function FilesViewer({
       if (mediaError) {
         const common = renderCommonMediaError(mediaError, 'audio');
         if (common) return common;
+        if (mediaError.code !== 'decode') {
+          return renderFallbackCard(
+            "Couldn't reach this file",
+            plainErrorMessage(
+              mediaError,
+              `Couldn't load this file from ${machine}. Check that it's on and try again.`,
+              { technical, deviceNoun },
+            ),
+            { showRetry: true, hint: technicalErrorDetail(mediaError) },
+          );
+        }
         const body = allowExternalOpen
           ? 'Open it in another app that can, or download it first.'
           : caps?.hasDownload
@@ -1657,7 +1854,7 @@ export function FilesViewer({
 
     if (category === 'text' || isExtensionlessProbe) {
       if (activeText.error) {
-        return html`<div class="said"><${Notice} error=${activeText.error} /></div>`;
+        return html`<div class="said"><${Notice} error=${activeText.error} technical=${technical} deviceNoun=${deviceNoun} /></div>`;
       }
       if (activeText.binary) {
         if (isExtensionlessProbe) {
@@ -1786,12 +1983,24 @@ export function FilesViewer({
     if (activeOpen.status === 'error') {
       const err = activeOpen.error || {};
       const isNoHandler = err.reason === 'no_handler' || err.code === 'unsupported';
+      const errMsg = plainErrorMessage(
+        err,
+        isNoHandler
+          ? `No app on this ${deviceNoun} can open this file type.`
+          : "Couldn't open this file in another app.",
+        { technical, deviceNoun },
+      );
+      const techMeta = technical
+        ? [err.hint, err.code ? `code: ${err.code}` : '', err.reason ? `reason: ${err.reason}` : '']
+            .filter(Boolean)
+            .join(' · ')
+        : '';
       return html`
         <div class="viewer-open-banner error" role="alert">
           <div class="viewer-open-banner-row">
             <div class="viewer-open-banner-copy">
-              ${err.message || "Couldn't open this file in another app."}
-              ${err.hint ? html`<small>${err.hint}</small>` : null}
+              ${errMsg}
+              ${techMeta ? html`<small>${techMeta}</small>` : null}
             </div>
             <div class="viewer-open-banner-actions">
               ${caps?.hasDownload
