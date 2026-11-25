@@ -17,6 +17,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 import { chromium } from 'playwright-core';
 import { SAMPLE_VIDEO_WEBM_BASE64 } from '../link/mock-media.js';
 
@@ -1982,5 +1983,446 @@ test('Player: wide 1440x900 two-pane split layout isolates inert panes and rail,
   } finally {
     await browser.close();
     await server.stop();
+  }
+});
+
+const PLAYER_PNG_CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let c = i;
+    for (let k = 0; k < 8; k += 1) {
+      c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function makePlayerSolidPng(width, height, r, g, b) {
+  function crc32(buf) {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i += 1) {
+      c = PLAYER_PNG_CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    }
+    return (c ^ 0xffffffff) >>> 0;
+  }
+  function chunk(type, data) {
+    const typeBuf = Buffer.from(type, 'ascii');
+    const lenBuf = Buffer.alloc(4);
+    lenBuf.writeUInt32BE(data.length, 0);
+    const crcBuf = Buffer.alloc(4);
+    crcBuf.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+    return Buffer.concat([lenBuf, typeBuf, data, crcBuf]);
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  const stride = 1 + width * 3;
+  const raw = Buffer.alloc(height * stride);
+  for (let y = 0; y < height; y += 1) {
+    const row = y * stride;
+    raw[row] = 0;
+    for (let x = 0; x < width; x += 1) {
+      const px = row + 1 + x * 3;
+      raw[px] = r;
+      raw[px + 1] = g;
+      raw[px + 2] = b;
+    }
+  }
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(raw)),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+function makePlayerWav({ title = null, artist = null, album = null, coverPng = null, durationSecs = 2 } = {}) {
+  const sampleRate = 8000;
+  const byteRate = sampleRate * 2;
+  const dataLen = byteRate * durationSecs;
+
+  const fmt = Buffer.alloc(24);
+  fmt.write('fmt ', 0, 'ascii');
+  fmt.writeUInt32LE(16, 4);
+  fmt.writeUInt16LE(1, 8);
+  fmt.writeUInt16LE(1, 10);
+  fmt.writeUInt32LE(sampleRate, 12);
+  fmt.writeUInt32LE(byteRate, 16);
+  fmt.writeUInt16LE(2, 20);
+  fmt.writeUInt16LE(16, 22);
+
+  const dataHdr = Buffer.alloc(8);
+  dataHdr.write('data', 0, 'ascii');
+  dataHdr.writeUInt32LE(dataLen, 4);
+  const parts = [Buffer.from('WAVE', 'ascii'), fmt, dataHdr, Buffer.alloc(dataLen)];
+
+  const frames = [];
+  function textFrame(id, value) {
+    const payload = Buffer.concat([Buffer.from([3]), Buffer.from(value, 'utf8')]);
+    const hdr = Buffer.alloc(10);
+    hdr.write(id, 0, 'ascii');
+    hdr.writeUInt32BE(payload.length, 4);
+    frames.push(hdr, payload);
+  }
+  if (title) textFrame('TIT2', title);
+  if (artist) textFrame('TPE1', artist);
+  if (album) textFrame('TALB', album);
+  if (coverPng) {
+    const payload = Buffer.concat([
+      Buffer.from([0]),
+      Buffer.from('image/png', 'ascii'),
+      Buffer.from([0, 3]),
+      Buffer.from('cover', 'ascii'),
+      Buffer.from([0]),
+      coverPng,
+    ]);
+    const hdr = Buffer.alloc(10);
+    hdr.write('APIC', 0, 'ascii');
+    hdr.writeUInt32BE(payload.length, 4);
+    frames.push(hdr, payload);
+  }
+  if (frames.length > 0) {
+    const body = Buffer.concat(frames);
+    const len = body.length;
+    const id3Hdr = Buffer.from([
+      0x49,
+      0x44,
+      0x33,
+      3,
+      0,
+      0,
+      (len >> 21) & 0x7f,
+      (len >> 14) & 0x7f,
+      (len >> 7) & 0x7f,
+      len & 0x7f,
+    ]);
+    const id3 = Buffer.concat([id3Hdr, body]);
+    const chunkHdr = Buffer.alloc(8);
+    chunkHdr.write('ID3 ', 0, 'ascii');
+    chunkHdr.writeUInt32LE(id3.length, 4);
+    parts.push(chunkHdr, id3);
+    if (id3.length % 2 === 1) parts.push(Buffer.from([0]));
+  }
+
+  const waveBody = Buffer.concat(parts);
+  const riff = Buffer.alloc(8);
+  riff.write('RIFF', 0, 'ascii');
+  riff.writeUInt32LE(waveBody.length, 4);
+  return Buffer.concat([riff, waveBody]);
+}
+
+test('Player: real legion serve music screen reads title, artist, album, and cover from real fs.tags and fs.thumb', async (t) => {
+  if (!fs.existsSync(LEGION_BIN)) {
+    t.skip(`Release binary not found at ${LEGION_BIN}`);
+    return;
+  }
+  const cacheBase = path.join(os.homedir(), '.cache', 'legion-ui-test');
+  fs.mkdirSync(cacheBase, { recursive: true });
+  const root = fs.mkdtempSync(path.join(cacheBase, 'player-music-real-'));
+  const legionHome = path.join(root, 'legion');
+  const userHome = path.join(root, 'home');
+  const musicDir = path.join(userHome, 'Music');
+  const folderCoverDir = path.join(userHome, 'FolderCover');
+  fs.mkdirSync(path.join(legionHome, 'config'), { recursive: true });
+  fs.mkdirSync(path.join(legionHome, 'state'), { recursive: true });
+  fs.mkdirSync(musicDir, { recursive: true });
+  fs.mkdirSync(folderCoverDir, { recursive: true });
+
+  const taggedPath = path.join(musicDir, '01 - harbor_file.wav');
+  const untaggedPath = path.join(musicDir, '02 - plain_recording.wav');
+  const folderTrackPath = path.join(folderCoverDir, '01 - dusk_demo.wav');
+
+  fs.writeFileSync(
+    taggedPath,
+    makePlayerWav({
+      title: 'Harbor Fog',
+      artist: 'Maren',
+      album: 'North Coast',
+      coverPng: makePlayerSolidPng(180, 180, 42, 130, 195),
+      durationSecs: 2,
+    }),
+  );
+  fs.writeFileSync(untaggedPath, makePlayerWav({ durationSecs: 2 }));
+  fs.writeFileSync(folderTrackPath, makePlayerWav({ durationSecs: 2 }));
+  fs.writeFileSync(path.join(folderCoverDir, 'cover.png'), makePlayerSolidPng(160, 160, 210, 120, 45));
+
+  fs.writeFileSync(
+    path.join(legionHome, 'config', 'node.toml'),
+    'name = "tower"\nsystem = "linux"\nbusy = "none"\n',
+  );
+  fs.writeFileSync(
+    path.join(legionHome, 'config', 'policy.toml'),
+    '[roles.operator]\nallow = ["effect:read", "effect:write"]\n\n[principals.ui]\nrole = "operator"\n',
+  );
+  fs.writeFileSync(
+    path.join(legionHome, 'config', 'fleet.toml'),
+    '[machines.tower]\nssh = "tower.example"\n',
+  );
+
+  const env = { ...process.env, LEGION_HOME: legionHome, HOME: userHome, USERPROFILE: userHome };
+  delete env.XDG_CONFIG_HOME;
+  delete env.XDG_STATE_HOME;
+  const tokenOut = JSON.parse(
+    execFileSync(LEGION_BIN, ['token.add', 'name=ui', 'principal=ui', '--json'], { env, encoding: 'utf8' }),
+  );
+
+  const child = spawn(LEGION_BIN, ['serve', '--listen', '127.0.0.1:0'], {
+    env,
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  const url = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`legion serve timeout:\n${stderr}`)), 15_000);
+    const rl = readline.createInterface({ input: child.stderr });
+    rl.on('line', (line) => {
+      stderr += `${line}\n`;
+      const prefix = 'legion serve: listening on ';
+      if (line.startsWith(prefix)) {
+        clearTimeout(timer);
+        resolve(line.slice(prefix.length).trim());
+      }
+    });
+    child.once('exit', (code) => {
+      clearTimeout(timer);
+      reject(new Error(`legion serve exited (${code}):\n${stderr}`));
+    });
+  });
+
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+  const toolResponses = [];
+
+  try {
+    const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+    const page = await context.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    page.on('response', async (resp) => {
+      if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return;
+      try {
+        const reqBody = JSON.parse(resp.request().postData() || '{}');
+        if (reqBody.tool === 'fs.tags' || reqBody.tool === 'fs.thumb') {
+          const json = await resp.json();
+          toolResponses.push({ tool: reqBody.tool, args: reqBody.args, status: resp.status(), body: json });
+        }
+      } catch {
+        // Ignore aborted or non-JSON responses during teardown.
+      }
+    });
+
+    await page.goto(`${url}/#token=${encodeURIComponent(tokenOut.token)}`, { waitUntil: 'domcontentloaded' });
+    await page.locator('.nav a[href="#/files"]').waitFor({ timeout: 10_000 });
+
+    // 1. Folder listing renders the real embedded cover via real `fs.thumb` (`size: 128`).
+    await page.goto(`${url}/#/files/tower/${encodeURIComponent(musicDir)}`, { waitUntil: 'domcontentloaded' });
+    const taggedRow = page.locator('a.row', { hasText: '01 - harbor_file.wav' });
+    await taggedRow.waitFor({ timeout: 10_000 });
+    await taggedRow.locator('.thumb img').waitFor({ timeout: 10_000 });
+    await page.waitForFunction(
+      () => {
+        const rows = [...document.querySelectorAll('a.row')];
+        const row = rows.find((r) => r.textContent?.includes('01 - harbor_file.wav'));
+        const img = row?.querySelector('.thumb img');
+        return Boolean(img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0);
+      },
+      null,
+      { timeout: 10_000 },
+    );
+
+    // 2. Open tagged track -> title, artist, album, and high-res cover come from real `fs.tags` + `fs.thumb`.
+    const taggedTagsRespPromise = page.waitForResponse(async (resp) => {
+      if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
+      try {
+        const body = JSON.parse(resp.request().postData() || '{}');
+        return body.tool === 'fs.tags' && Array.isArray(body.args?.paths) && body.args.paths.includes(taggedPath);
+      } catch {
+        return false;
+      }
+    });
+    const taggedHighResRespPromise = page.waitForResponse(async (resp) => {
+      if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
+      try {
+        const body = JSON.parse(resp.request().postData() || '{}');
+        return (
+          body.tool === 'fs.thumb' &&
+          body.args?.size === 1024 &&
+          Array.isArray(body.args?.paths) &&
+          body.args.paths.includes(taggedPath)
+        );
+      } catch {
+        return false;
+      }
+    });
+    await taggedRow.click();
+    await page.locator('.music-screen').waitFor({ timeout: 10_000 });
+    await page.locator('.music-title', { hasText: 'Harbor Fog' }).waitFor({ timeout: 10_000 });
+    await page.locator('.music-subtitle', { hasText: 'Maren · North Coast' }).waitFor({ timeout: 10_000 });
+    const taggedTagsResp = await taggedTagsRespPromise;
+    const taggedHighResResp = await taggedHighResRespPromise;
+    assert.equal(taggedTagsResp.status(), 200);
+    const taggedTagsJson = await taggedTagsResp.json();
+    const taggedResult = taggedTagsJson?.results?.find((item) => item.path === taggedPath)?.ok;
+    assert.equal(taggedResult?.title, 'Harbor Fog');
+    assert.equal(taggedResult?.artist, 'Maren');
+    assert.equal(taggedResult?.album, 'North Coast');
+    assert.equal(taggedResult?.cover, true);
+
+    assert.equal(taggedHighResResp.status(), 200);
+    const taggedHighResJson = await taggedHighResResp.json();
+    const highResOk = taggedHighResJson?.results?.find((item) => item.path === taggedPath)?.ok;
+    assert.ok(highResOk?.mime?.startsWith('image/') && highResOk?.content, 'Expected decoded image payload from real fs.thumb');
+    const expectedCoverSrc = `data:${highResOk.mime};base64,${highResOk.content}`;
+    await page.waitForFunction(
+      (expected) => {
+        const img = document.querySelector('img.music-cover');
+        return Boolean(img && img.getAttribute('src') === expected && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0);
+      },
+      expectedCoverSrc,
+      { timeout: 10_000 },
+    );
+    const taggedDom = await page.evaluate(() => ({
+      coverSrc: document.querySelector('img.music-cover')?.getAttribute('src') || '',
+      backdropSrc: document.querySelector('.music-backdrop img')?.getAttribute('src') || '',
+      mediaSessionTitle: navigator.mediaSession?.metadata?.title || '',
+      mediaSessionArtist: navigator.mediaSession?.metadata?.artist || '',
+      mediaSessionAlbum: navigator.mediaSession?.metadata?.album || '',
+    }));
+    assert.equal(taggedDom.coverSrc, expectedCoverSrc);
+    assert.equal(taggedDom.backdropSrc, expectedCoverSrc);
+    assert.equal(taggedDom.mediaSessionTitle, 'Harbor Fog');
+    assert.equal(taggedDom.mediaSessionArtist, 'Maren');
+    assert.equal(taggedDom.mediaSessionAlbum, 'North Coast');
+
+    // Real WAV audio stream plays from `/v1/content/`.
+    await page.waitForFunction(
+      () => {
+        const a = document.querySelector('.viewer audio');
+        return Boolean(a && a.readyState >= 1 && Number.isFinite(a.duration) && a.duration > 0);
+      },
+      null,
+      { timeout: 10_000 },
+    );
+    await page.locator('.music-play-btn').click();
+    await page.waitForFunction(
+      () => {
+        const a = document.querySelector('.viewer audio');
+        return Boolean(a && !a.paused);
+      },
+      null,
+      { timeout: 10_000 },
+    );
+    await page.locator('.music-play-btn').click();
+
+    // 3. Advance to untagged track -> real `fs.tags` reports `cover: false`, filename shown without extension,
+    //    no subtitle, no "Unknown artist", placeholder tile, and no `fs.thumb` (size 1024) call.
+    const untaggedTagsRespPromise = page.waitForResponse(async (resp) => {
+      if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
+      try {
+        const body = JSON.parse(resp.request().postData() || '{}');
+        return body.tool === 'fs.tags' && Array.isArray(body.args?.paths) && body.args.paths.includes(untaggedPath);
+      } catch {
+        return false;
+      }
+    });
+    await page.locator('.music-screen button[aria-label="Next track"]').click();
+    await page.locator('.music-title', { hasText: '02 - plain_recording' }).waitFor({ timeout: 10_000 });
+    const untaggedTagsResp = await untaggedTagsRespPromise;
+    await page.waitForFunction(
+      () => Boolean(document.querySelector('.music-cover-tile')) && !document.querySelector('img.music-cover'),
+      null,
+      { timeout: 10_000 },
+    );
+    assert.equal(await page.locator('.music-subtitle').count(), 0);
+    assert.equal(await page.locator('.music-backdrop').count(), 0);
+    assert.equal((await page.locator('.viewer').innerText()).includes('Unknown artist'), false);
+
+    const untaggedTagsJson = await untaggedTagsResp.json();
+    const untaggedOk = untaggedTagsJson?.results?.find((item) => item.path === untaggedPath)?.ok;
+    assert.equal(untaggedOk?.cover, false);
+    assert.equal(untaggedOk?.title, undefined);
+    const untaggedHighResCall = toolResponses.find(
+      (r) =>
+        r.tool === 'fs.thumb' &&
+        r.args?.size === 1024 &&
+        Array.isArray(r.args?.paths) &&
+        r.args.paths.includes(untaggedPath),
+    );
+    assert.equal(untaggedHighResCall, undefined, 'Should skip high-res fs.thumb when real fs.tags reports cover: false');
+
+    // 4. Folder-cover fallback: untagged track next to `cover.png` gets `cover: true` from real `fs.tags`
+    //    and loads the decoded folder cover from real `fs.thumb`.
+    await page.goto(`${url}/#/files/tower/${encodeURIComponent(folderCoverDir)}`, { waitUntil: 'domcontentloaded' });
+    const folderRow = page.locator('a.row', { hasText: '01 - dusk_demo.wav' });
+    await folderRow.waitFor({ timeout: 10_000 });
+    const folderTagsRespPromise = page.waitForResponse(async (resp) => {
+      if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
+      try {
+        const body = JSON.parse(resp.request().postData() || '{}');
+        return body.tool === 'fs.tags' && Array.isArray(body.args?.paths) && body.args.paths.includes(folderTrackPath);
+      } catch {
+        return false;
+      }
+    });
+    const folderHighResRespPromise = page.waitForResponse(async (resp) => {
+      if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
+      try {
+        const body = JSON.parse(resp.request().postData() || '{}');
+        return (
+          body.tool === 'fs.thumb' &&
+          body.args?.size === 1024 &&
+          Array.isArray(body.args?.paths) &&
+          body.args.paths.includes(folderTrackPath)
+        );
+      } catch {
+        return false;
+      }
+    });
+    await folderRow.click();
+    await page.locator('.music-title', { hasText: '01 - dusk_demo' }).waitFor({ timeout: 10_000 });
+    const folderTagsResp = await folderTagsRespPromise;
+    const folderTagsJson = await folderTagsResp.json();
+    assert.equal(folderTagsJson?.results?.find((item) => item.path === folderTrackPath)?.ok?.cover, true);
+    const folderHighResResp = await folderHighResRespPromise;
+    assert.equal(folderHighResResp.status(), 200);
+    const folderCoverJson = await folderHighResResp.json();
+    const folderCoverOk = folderCoverJson?.results?.find((item) => item.path === folderTrackPath)?.ok;
+    assert.ok(folderCoverOk?.mime?.startsWith('image/') && folderCoverOk?.content);
+    const expectedFolderCoverSrc = `data:${folderCoverOk.mime};base64,${folderCoverOk.content}`;
+    await page.waitForFunction(
+      (expected) => {
+        const img = document.querySelector('img.music-cover');
+        return Boolean(img && img.getAttribute('src') === expected && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0);
+      },
+      expectedFolderCoverSrc,
+      { timeout: 10_000 },
+    );
+
+    assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+    await context.close();
+  } finally {
+    await browser.close();
+    child.kill('SIGTERM');
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        resolve();
+      }, 5000);
+      child.once('exit', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });

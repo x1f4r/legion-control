@@ -2400,6 +2400,61 @@ function makeSolidPng(width, height, r, g, b) {
   ]);
 }
 
+function makeTaggedFlac({ title, artist, album, coverPng, durationSecs = 4 } = {}) {
+  const sampleRate = 44_100;
+  const totalSamples = sampleRate * durationSecs;
+  const streaminfo = Buffer.alloc(34);
+  streaminfo[10] = (sampleRate >> 12) & 0xff;
+  streaminfo[11] = (sampleRate >> 4) & 0xff;
+  streaminfo[12] = ((sampleRate & 0x0f) << 4) | 0x02;
+  streaminfo[13] = 0xf0 | (Math.floor(totalSamples / 2 ** 32) & 0x0f);
+  streaminfo.writeUInt32BE(totalSamples >>> 0, 14);
+
+  const blocks = [[0, streaminfo]];
+  const comments = [];
+  if (title) comments.push(`TITLE=${title}`);
+  if (artist) comments.push(`ARTIST=${artist}`);
+  if (album) comments.push(`ALBUM=${album}`);
+  if (comments.length > 0) {
+    const vendor = Buffer.from('legion-test', 'utf8');
+    const parts = [Buffer.alloc(4), vendor, Buffer.alloc(4)];
+    parts[0].writeUInt32LE(vendor.length, 0);
+    parts[2].writeUInt32LE(comments.length, 0);
+    for (const c of comments) {
+      const buf = Buffer.from(c, 'utf8');
+      const len = Buffer.alloc(4);
+      len.writeUInt32LE(buf.length, 0);
+      parts.push(len, buf);
+    }
+    blocks.push([4, Buffer.concat(parts)]);
+  }
+  if (coverPng) {
+    const mime = Buffer.from('image/png', 'ascii');
+    const desc = Buffer.from('cover', 'ascii');
+    const header = Buffer.alloc(8);
+    header.writeUInt32BE(3, 0);
+    header.writeUInt32BE(mime.length, 4);
+    const descLen = Buffer.alloc(4);
+    descLen.writeUInt32BE(desc.length, 0);
+    const dims = Buffer.alloc(16);
+    const imgLen = Buffer.alloc(4);
+    imgLen.writeUInt32BE(coverPng.length, 0);
+    blocks.push([6, Buffer.concat([header, mime, descLen, desc, dims, imgLen, coverPng])]);
+  }
+
+  const out = [Buffer.from('fLaC', 'ascii')];
+  for (let i = 0; i < blocks.length; i += 1) {
+    const [btype, payload] = blocks[i];
+    const hdr = Buffer.alloc(4);
+    hdr[0] = i === blocks.length - 1 ? btype | 0x80 : btype;
+    hdr[1] = (payload.length >> 16) & 0xff;
+    hdr[2] = (payload.length >> 8) & 0xff;
+    hdr[3] = payload.length & 0xff;
+    out.push(hdr, payload);
+  }
+  return Buffer.concat(out);
+}
+
 async function waitForLoadedThumb(locator, label) {
   const img = locator.locator('img').first();
   await img.waitFor({ timeout: 10_000 });
@@ -2587,10 +2642,13 @@ test('delayed capability replies still render thumbnails in pinned strip, folder
   const piAmberPath = path.join(piGallery, 'pi-amber.png');
   const piVioletPath = path.join(piGallery, 'pi-violet.png');
   const piSongPath = path.join(piGallery, 'pi-song.flac');
-  const piSongCoverBase64 = makeSolidPng(128, 128, 45, 175, 155).toString('base64');
+  const piSongCover = makeSolidPng(128, 128, 45, 175, 155);
   fs.writeFileSync(piAmberPath, makeSolidPng(160, 120, 225, 165, 35));
   fs.writeFileSync(piVioletPath, makeSolidPng(160, 120, 125, 70, 200));
-  fs.writeFileSync(piSongPath, Buffer.from('fLaC\x00\x00\x00\x22'));
+  fs.writeFileSync(
+    piSongPath,
+    makeTaggedFlac({ title: 'Pi Song', artist: 'Maren', album: 'Harbor', coverPng: piSongCover }),
+  );
 
   const legacyMedia = path.join(legacyUser, 'media');
   fs.mkdirSync(legacyMedia, { recursive: true });
@@ -2700,31 +2758,6 @@ test('delayed capability replies still render thumbnails in pinned strip, folder
       } else if (isCapProbe && body.on === 'legacy' && legacyCapsGate.isHeld()) {
         legacyCapsGate.markArrived();
         await legacyCapsGate.waitRelease();
-      }
-      if (body && body.on === 'pi' && body.tool === 'meta.whoami') {
-        const resp = await route.fetch();
-        const data = await resp.json();
-        if (Array.isArray(data?.tools) && !data.tools.includes('fs.tags')) {
-          data.tools = [...data.tools, 'fs.tags'];
-        }
-        await route.fulfill({ response: resp, json: data });
-        return;
-      }
-      if (body && body.on === 'pi' && body.tool === 'fs.thumb') {
-        const resp = await route.fetch();
-        const data = await resp.json();
-        if (Array.isArray(data?.results)) {
-          data.results = data.results.map((item) =>
-            item && item.path === piSongPath && !item.ok
-              ? {
-                  path: piSongPath,
-                  ok: { mime: 'image/png', content: piSongCoverBase64, width: 128, height: 128 },
-                }
-              : item,
-          );
-        }
-        await route.fulfill({ response: resp, json: data });
-        return;
       }
       await route.continue();
     });
