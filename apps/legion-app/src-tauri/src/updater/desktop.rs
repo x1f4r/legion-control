@@ -36,6 +36,31 @@ const MAX_SYMLINK_CHAIN_DEPTH: usize = 40;
 /// Default seconds the detached desktop watchdog waits for the new build to confirm startup.
 pub const DEFAULT_STARTUP_WAIT_SECS: u64 = 30;
 
+/// Grace seconds the detached desktop watchdog keeps polling for the ready marker if the launched
+/// PID exits non-zero before the marker appears (for example if a wrapper exited after handing off
+/// to the real app process). Clean exit code 0 keeps polling up to the full `wait_secs`.
+pub const DEFAULT_EXIT_GRACE_SECS: u64 = 8;
+
+/// Maximum bytes retained in the captured first-start log (`new-start.log`) beside update state.
+pub const MAX_CAPTURED_START_LOG_BYTES: usize = 32 * 1024;
+
+/// Maximum characters surfaced in Technical details from captured first-start output.
+const MAX_STARTUP_DETAIL_CHARS: usize = 1024;
+
+/// Filename beside update state holding the capped first-start stdout/stderr of a new build.
+pub const NEW_START_LOG_FILENAME: &str = "new-start.log";
+
+/// Filename beside update state holding the process list captured at the moment of a rollback.
+pub const ROLLBACK_PS_FILENAME: &str = "rollback-ps.txt";
+
+/// D-Bus well-known name registered by `tauri-plugin-single-instance` on Linux.
+#[cfg(target_os = "linux")]
+const LINUX_SINGLE_INSTANCE_DBUS_NAME: &str = "com.x1f4r.legion.SingleInstance";
+
+/// Unix socket path created by `tauri-plugin-single-instance` on macOS.
+#[cfg(target_os = "macos")]
+const MACOS_SINGLE_INSTANCE_SOCKET: &str = "/tmp/com_x1f4r_legion_si.sock";
+
 /// Fixed minimal system `PATH` passed to the Unix swap supervisor shell itself.
 #[cfg(unix)]
 const SUPERVISOR_MINIMAL_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
@@ -1004,6 +1029,9 @@ fn validate_all_symlink_chains(symlinks: &BTreeMap<PathBuf, PathBuf>) -> Result<
 pub struct UnixSwapPlan {
     /// PID of the currently running app to wait for before swapping.
     pub old_pid: u32,
+    /// Optional parent PID when running under an AppImage extract-and-run wrapper runtime so the
+    /// supervisor waits for the wrapper process to exit and clean up too.
+    pub old_ppid: Option<u32>,
     /// Target path to replace (`.AppImage` file on Linux, `.app` directory on macOS).
     pub target_path: PathBuf,
     /// Staged replacement path on the same filesystem as `target_path`.
@@ -1021,12 +1049,111 @@ pub struct UnixSwapPlan {
     pub rollback_json: String,
     /// Optional diagnostic log file for supervisor stdout/stderr (`<updates_dir>/supervisor.log`).
     pub log_path: Option<PathBuf>,
+    /// Optional size-capped log capturing the new copy's first-start stdout/stderr
+    /// (`<updates_dir>/new-start.log`).
+    pub new_start_log_path: Option<PathBuf>,
+    /// Optional process-list snapshot captured at the exact moment of a rollback decision
+    /// (`<updates_dir>/rollback-ps.txt`).
+    pub rollback_ps_path: Option<PathBuf>,
+    /// Optional Linux D-Bus single-instance name to wait to clear before launching the new copy.
+    pub single_instance_dbus_name: Option<String>,
+    /// Optional macOS Unix socket path to wait to clear before launching the new copy.
+    pub single_instance_socket_path: Option<PathBuf>,
     /// Seconds to wait for `ready_marker_path` before restoring `backup_path`.
     pub wait_secs: u64,
+    /// Grace seconds to keep polling for `ready_marker_path` if the launched PID exits non-zero
+    /// early (clamped to `wait_secs`).
+    pub exit_grace_secs: u64,
     /// When `true` (window-close install), launches the new build with `LEGION_UPDATE_VERIFY_ONLY=1`
     /// so it confirms startup and exits cleanly without opening a window, and does not relaunch a
     /// window on rollback.
     pub verify_only: bool,
+}
+
+/// Reads the captured first-start output (`new-start.log`, capped to 32 KiB) and any exit reason
+/// recorded in `supervisor.log` so Technical details can explain why a desktop update rolled back.
+pub fn read_captured_startup_detail(updates_dir: &Path) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Ok(sup_raw) = fs::read(updates_dir.join("supervisor.log")) {
+        let sup_text = String::from_utf8_lossy(&sup_raw);
+        let interesting = sup_text
+            .lines()
+            .rev()
+            .find(|line| {
+                line.contains("exited with")
+                    || line.contains("NSIS installer exited")
+                    || line.contains("supervisor exception")
+            })
+            .or_else(|| {
+                sup_text.lines().rev().find(|line| {
+                    line.contains("ready marker missing")
+                        || line.contains("ready marker not observed")
+                })
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(line) = interesting {
+            parts.push(line.to_owned());
+        }
+    }
+
+    if let Ok(file) = fs::File::open(updates_dir.join(NEW_START_LOG_FILENAME)) {
+        let mut buf = Vec::new();
+        let _ = file
+            .take((MAX_CAPTURED_START_LOG_BYTES + 1) as u64)
+            .read_to_end(&mut buf);
+        if buf.len() > MAX_CAPTURED_START_LOG_BYTES {
+            let start = buf.len() - MAX_CAPTURED_START_LOG_BYTES;
+            buf.drain(0..start);
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !lines.is_empty() {
+            let tail_start = lines.len().saturating_sub(6);
+            let excerpt = lines[tail_start..].join(" | ");
+            if !excerpt.is_empty() {
+                parts.push(excerpt);
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+    let combined = parts.join(" — ");
+    if combined.chars().count() <= MAX_STARTUP_DETAIL_CHARS {
+        Some(combined)
+    } else {
+        let truncated: String = combined
+            .chars()
+            .take(MAX_STARTUP_DETAIL_CHARS.saturating_sub(1))
+            .collect();
+        Some(format!("{truncated}…"))
+    }
+}
+
+/// Returns the parent PID on Linux ONLY when the parent process is the AppImage runtime binary
+/// (`APPIMAGE_EXTRACT_AND_RUN=1` forks the child instead of `exec`ing in place). In FUSE mode the
+/// runtime `exec`s `legion-app` in place, so our parent is the user's shell or desktop launcher and
+/// must NOT be waited on.
+#[cfg(target_os = "linux")]
+fn detect_appimage_wrapper_ppid(appimage_path: &Path) -> Option<u32> {
+    let ppid = rustix::process::getppid()?.as_raw_nonzero().get() as u32;
+    if ppid <= 1 {
+        return None;
+    }
+    let proc_exe = fs::canonicalize(format!("/proc/{ppid}/exe")).ok()?;
+    let target_canon = fs::canonicalize(appimage_path).ok()?;
+    if proc_exe == target_canon {
+        Some(ppid)
+    } else {
+        None
+    }
 }
 
 /// Sanitized environment prepared for the detached Unix swap supervisor and relaunched desktop app.
@@ -1214,19 +1341,100 @@ MV="$(find_sys_bin mv)" || exit 1
 RM="$(find_sys_bin rm)" || exit 1
 PS="$(find_sys_bin ps)" || exit 1
 SLEEP="$(find_sys_bin sleep)" || exit 1
+TAIL="$(find_sys_bin tail 2>/dev/null || true)"
+DBUS_SEND="$(find_sys_bin dbus-send 2>/dev/null || true)"
 
-printf 'supervisor: start old_pid=%s verify_only=%s target=%s\n' "$LEGION_OLD_PID" "${LEGION_VERIFY_ONLY:-0}" "$LEGION_TARGET"
+collect_children() {
+  parent="$1"
+  ps_snap="$("$PS" -eo pid=,ppid= 2>/dev/null || true)"
+  out=""
+  if [ -n "$ps_snap" ]; then
+    set -- $ps_snap
+    while [ "$#" -ge 2 ]; do
+      cpid="$1"
+      cppid="$2"
+      shift 2
+      case "$cpid" in ''|*[!0-9]*) continue ;; esac
+      if [ "$cppid" = "$parent" ] && [ "$cpid" != "$$" ]; then
+        out="$out $cpid"
+      fi
+    done
+  fi
+  printf '%s\n' "$out"
+}
 
-# 1. Wait up to 15s for the previous process to exit cleanly.
+dbus_name_owned() {
+  if [ -z "${LEGION_SINGLE_INSTANCE_DBUS:-}" ] || [ -z "$DBUS_SEND" ] || [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    return 1
+  fi
+  reply="$("$DBUS_SEND" --session --dest=org.freedesktop.DBus --type=method_call --print-reply \
+    /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner "string:$LEGION_SINGLE_INSTANCE_DBUS" 2>/dev/null || true)"
+  case "$reply" in
+    *"boolean true"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+cap_log_file() {
+  log_file="$1"
+  if [ -z "$log_file" ] || [ ! -f "$log_file" ]; then
+    return 0
+  fi
+  if [ -n "$TAIL" ]; then
+    tmp_cap="${log_file}.cap"
+    if (umask 077 && "$TAIL" -c 32768 "$log_file" > "$tmp_cap" 2>/dev/null); then
+      "$MV" -f -- "$tmp_cap" "$log_file" 2>/dev/null || "$RM" -f -- "$tmp_cap"
+    else
+      "$RM" -f -- "$tmp_cap"
+    fi
+  fi
+}
+
+capture_rollback_ps() {
+  ps_file="${LEGION_ROLLBACK_PS_FILE:-}"
+  if [ -z "$ps_file" ]; then
+    return 0
+  fi
+  (umask 077 && { "$PS" -ef 2>/dev/null || "$PS" aux 2>/dev/null || true; } > "$ps_file") 2>/dev/null || true
+}
+
+old_children="$(collect_children "$LEGION_OLD_PID")"
+printf 'supervisor: start old_pid=%s old_ppid=%s old_children=[%s] verify_only=%s target=%s\n' \
+  "$LEGION_OLD_PID" "${LEGION_OLD_PPID:-}" "$old_children" "${LEGION_VERIFY_ONLY:-0}" "$LEGION_TARGET"
+
+# 1. Wait up to 15s for the previous process, its AppImage wrapper parent (if any), its helper
+# children (such as WebKit helpers), and its single-instance lock (D-Bus name / Unix socket) to
+# exit completely before swapping and launching the new copy.
 i=0
+still_up=0
 while [ "$i" -lt 60 ]; do
-  if ! kill -0 "$LEGION_OLD_PID" 2>/dev/null; then
+  still_up=0
+  if kill -0 "$LEGION_OLD_PID" 2>/dev/null; then
+    still_up=1
+  fi
+  if [ -n "${LEGION_OLD_PPID:-}" ] && kill -0 "$LEGION_OLD_PPID" 2>/dev/null; then
+    still_up=1
+  fi
+  for cpid in $old_children; do
+    if kill -0 "$cpid" 2>/dev/null; then
+      still_up=1
+      break
+    fi
+  done
+  if [ "$still_up" -eq 0 ]; then
+    if dbus_name_owned; then
+      still_up=1
+    elif [ -n "${LEGION_SINGLE_INSTANCE_SOCK:-}" ] && [ -S "$LEGION_SINGLE_INSTANCE_SOCK" ]; then
+      still_up=1
+    fi
+  fi
+  if [ "$still_up" -eq 0 ]; then
     break
   fi
   "$SLEEP" 0.25 2>/dev/null || "$SLEEP" 1
   i=$((i + 1))
 done
-printf 'supervisor: old_pid=%s exited after %s ticks\n' "$LEGION_OLD_PID" "$i"
+printf 'supervisor: old instance gone after %s ticks (still_up=%s)\n' "$i" "$still_up"
 
 "$RM" -f -- "$LEGION_READY_MARKER"
 "$RM" -rf -- "$LEGION_BACKUP"
@@ -1247,38 +1455,70 @@ printf 'supervisor: swapped new copy into target\n'
 
 launch_target() {
   verify_flag="$1"
+  capture_log="$2"
   exec_bin="$LEGION_EXEC"
-  (
-    PATH="${LEGION_RELAUNCH_PATH:-/usr/local/bin:/usr/bin:/bin}"
-    export PATH
-    if [ "$verify_flag" = "1" ]; then
-      LEGION_UPDATE_VERIFY_ONLY=1
-      export LEGION_UPDATE_VERIFY_ONLY
-    else
-      unset LEGION_UPDATE_VERIFY_ONLY
-    fi
-    unset LEGION_OLD_PID LEGION_TARGET LEGION_NEW LEGION_BACKUP LEGION_EXEC \
-      LEGION_READY_MARKER LEGION_ROLLBACK_FILE LEGION_ROLLBACK_JSON \
-      LEGION_WAIT_SECS LEGION_RELAUNCH_PATH LEGION_VERIFY_ONLY \
-      APPIMAGE APPDIR ARGV0 OWD LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT \
-      GTK_DATA_PREFIX GTK_EXE_PREFIX GTK_PATH GTK_IM_MODULE_FILE \
-      GDK_PIXBUF_MODULE_FILE GSETTINGS_SCHEMA_DIR GI_TYPELIB_PATH GIO_MODULE_DIR \
-      GST_PLUGIN_SYSTEM_PATH_1_0 GST_PLUGIN_PATH_1_0 GST_PLUGIN_SCANNER_1_0 GST_PTP_HELPER_1_0
-    exec "$exec_bin"
-  ) >/dev/null 2>&1 &
+  if [ -n "$capture_log" ]; then
+    "$RM" -f -- "$capture_log"
+    (umask 077 && : > "$capture_log") 2>/dev/null || true
+    (
+      PATH="${LEGION_RELAUNCH_PATH:-/usr/local/bin:/usr/bin:/bin}"
+      export PATH
+      if [ "$verify_flag" = "1" ]; then
+        LEGION_UPDATE_VERIFY_ONLY=1
+        export LEGION_UPDATE_VERIFY_ONLY
+      else
+        unset LEGION_UPDATE_VERIFY_ONLY
+      fi
+      unset LEGION_OLD_PID LEGION_OLD_PPID LEGION_TARGET LEGION_NEW LEGION_BACKUP LEGION_EXEC \
+        LEGION_READY_MARKER LEGION_ROLLBACK_FILE LEGION_ROLLBACK_JSON \
+        LEGION_WAIT_SECS LEGION_EXIT_GRACE_SECS LEGION_RELAUNCH_PATH LEGION_VERIFY_ONLY \
+        LEGION_NEW_LOG LEGION_ROLLBACK_PS_FILE LEGION_SINGLE_INSTANCE_DBUS LEGION_SINGLE_INSTANCE_SOCK \
+        APPIMAGE APPDIR ARGV0 OWD LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT \
+        GTK_DATA_PREFIX GTK_EXE_PREFIX GTK_PATH GTK_IM_MODULE_FILE \
+        GDK_PIXBUF_MODULE_FILE GSETTINGS_SCHEMA_DIR GI_TYPELIB_PATH GIO_MODULE_DIR \
+        GST_PLUGIN_SYSTEM_PATH_1_0 GST_PLUGIN_PATH_1_0 GST_PLUGIN_SCANNER_1_0 GST_PTP_HELPER_1_0
+      exec "$exec_bin"
+    ) >"$capture_log" 2>&1 &
+  else
+    (
+      PATH="${LEGION_RELAUNCH_PATH:-/usr/local/bin:/usr/bin:/bin}"
+      export PATH
+      if [ "$verify_flag" = "1" ]; then
+        LEGION_UPDATE_VERIFY_ONLY=1
+        export LEGION_UPDATE_VERIFY_ONLY
+      else
+        unset LEGION_UPDATE_VERIFY_ONLY
+      fi
+      unset LEGION_OLD_PID LEGION_OLD_PPID LEGION_TARGET LEGION_NEW LEGION_BACKUP LEGION_EXEC \
+        LEGION_READY_MARKER LEGION_ROLLBACK_FILE LEGION_ROLLBACK_JSON \
+        LEGION_WAIT_SECS LEGION_EXIT_GRACE_SECS LEGION_RELAUNCH_PATH LEGION_VERIFY_ONLY \
+        LEGION_NEW_LOG LEGION_ROLLBACK_PS_FILE LEGION_SINGLE_INSTANCE_DBUS LEGION_SINGLE_INSTANCE_SOCK \
+        APPIMAGE APPDIR ARGV0 OWD LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT \
+        GTK_DATA_PREFIX GTK_EXE_PREFIX GTK_PATH GTK_IM_MODULE_FILE \
+        GDK_PIXBUF_MODULE_FILE GSETTINGS_SCHEMA_DIR GI_TYPELIB_PATH GIO_MODULE_DIR \
+        GST_PLUGIN_SYSTEM_PATH_1_0 GST_PLUGIN_PATH_1_0 GST_PLUGIN_SCANNER_1_0 GST_PTP_HELPER_1_0
+      exec "$exec_bin"
+    ) >/dev/null 2>&1 &
+  fi
   NEW_PID=$!
 }
 
-# 3. Start the new build and wait for its ready marker.
+# 3. Start the new build and decide startup strictly by whether the ready marker appears.
 verify_mode="${LEGION_VERIFY_ONLY:-0}"
-launch_target "$verify_mode"
-printf 'supervisor: launched new_pid=%s exec=%s\n' "$NEW_PID" "$LEGION_EXEC"
+new_log="${LEGION_NEW_LOG:-}"
+if [ -n "${LEGION_ROLLBACK_PS_FILE:-}" ]; then
+  "$RM" -f -- "$LEGION_ROLLBACK_PS_FILE"
+fi
+launch_target "$verify_mode" "$new_log"
+printf 'supervisor: launched new_pid=%s exec=%s log=%s\n' "$NEW_PID" "$LEGION_EXEC" "$new_log"
 wait_limit="${LEGION_WAIT_SECS:-30}"
-ticks=$((wait_limit * 4))
+grace_limit="${LEGION_EXIT_GRACE_SECS:-8}"
+max_ticks=$((wait_limit * 4))
+grace_ticks=$((grace_limit * 4))
 j=0
 started=0
 proc_done=0
-while [ "$j" -lt "$ticks" ]; do
+while [ "$j" -lt "$max_ticks" ]; do
   if [ -f "$LEGION_READY_MARKER" ]; then
     started=1
     break
@@ -1290,20 +1530,23 @@ while [ "$j" -lt "$ticks" ]; do
     else
       new_stat="$("$PS" -o stat= -p "$NEW_PID" 2>/dev/null || true)"
       case "$new_stat" in
-        ""|*Z*) exited_now=1 ;;
+        *Z*) exited_now=1 ;;
       esac
     fi
     if [ "$exited_now" -eq 1 ]; then
       proc_done=1
       wait "$NEW_PID" 2>/dev/null
       new_rc=$?
-      printf 'supervisor: new_pid=%s exited with rc=%s\n' "$NEW_PID" "$new_rc"
+      printf 'supervisor: new_pid=%s exited with rc=%s after %s ticks\n' "$NEW_PID" "$new_rc" "$j"
+      # Never roll back immediately on a single PID exit: on exit 0 keep polling for the full
+      # wait_limit (single-instance handover or wrapper fork); on non-zero exit keep polling for
+      # grace_limit seconds in case a wrapper exited while another process finishes starting.
       if [ "$new_rc" -ne 0 ]; then
-        break
+        grace_end=$((j + grace_ticks))
+        if [ "$grace_end" -lt "$max_ticks" ]; then
+          max_ticks="$grace_end"
+        fi
       fi
-      # Exit code 0 before the ready marker appears can occur if the user reopened the new build
-      # concurrently (single-instance hand-over); keep polling until wait_limit for that running
-      # instance to write the ready marker instead of rolling back prematurely.
     fi
   fi
   "$SLEEP" 0.25 2>/dev/null || "$SLEEP" 1
@@ -1318,19 +1561,44 @@ fi
 if [ "$started" -eq 1 ]; then
   printf 'supervisor: ready marker observed at %s; removing backup\n' "$LEGION_READY_MARKER"
   "$RM" -rf -- "$LEGION_BACKUP"
+  if [ -n "$new_log" ]; then
+    "$RM" -f -- "$new_log"
+  fi
+  if [ -n "${LEGION_ROLLBACK_PS_FILE:-}" ]; then
+    "$RM" -f -- "$LEGION_ROLLBACK_PS_FILE"
+  fi
   exit 0
 fi
 
-# 4. New build failed to start: stop it, record rollback, restore previous copy, and relaunch if interactive.
+# 4. New build failed to confirm startup: capture live process list at the moment of rollback,
+# stop the new process and any children, cap the captured startup output, record rollback,
+# restore the previous copy, wait briefly for any lock to clear, and relaunch if interactive.
 printf 'supervisor: ready marker missing after %s ticks; rolling back\n' "$j"
+capture_rollback_ps
+new_children="$(collect_children "$NEW_PID")"
 kill "$NEW_PID" 2>/dev/null || true
+for cpid in $new_children; do
+  kill "$cpid" 2>/dev/null || true
+done
 "$SLEEP" 1
 kill -9 "$NEW_PID" 2>/dev/null || true
+for cpid in $new_children; do
+  kill -9 "$cpid" 2>/dev/null || true
+done
+cap_log_file "$new_log"
 printf '%s\n' "$LEGION_ROLLBACK_JSON" > "$LEGION_ROLLBACK_FILE" || true
 "$RM" -rf -- "$LEGION_TARGET" || true
 "$MV" -f -- "$LEGION_BACKUP" "$LEGION_TARGET" || true
+k=0
+while [ "$k" -lt 8 ]; do
+  if ! dbus_name_owned && { [ -z "${LEGION_SINGLE_INSTANCE_SOCK:-}" ] || [ ! -S "$LEGION_SINGLE_INSTANCE_SOCK" ]; }; then
+    break
+  fi
+  "$SLEEP" 0.25 2>/dev/null || "$SLEEP" 1
+  k=$((k + 1))
+done
 if [ "$verify_mode" != "1" ] && [ -x "$LEGION_EXEC" ]; then
-  launch_target 0 || true
+  launch_target 0 "" || true
 fi
 exit 1
 "#;
@@ -1386,8 +1654,19 @@ pub fn stage_and_spawn_linux_appimage(
         0o755,
     )?;
 
+    #[cfg(target_os = "linux")]
+    let old_ppid = detect_appimage_wrapper_ppid(appimage_path);
+    #[cfg(not(target_os = "linux"))]
+    let old_ppid = None;
+    #[cfg(target_os = "linux")]
+    let single_instance_dbus_name = Some(LINUX_SINGLE_INSTANCE_DBUS_NAME.to_owned());
+    #[cfg(not(target_os = "linux"))]
+    let single_instance_dbus_name = None;
+
+    let updates_dir = ready_marker_path.parent();
     spawn_unix_swap_supervisor(&UnixSwapPlan {
         old_pid: pid,
+        old_ppid,
         target_path: appimage_path.to_path_buf(),
         staged_new_path: staged_new,
         backup_path,
@@ -1395,8 +1674,13 @@ pub fn stage_and_spawn_linux_appimage(
         ready_marker_path: ready_marker_path.to_path_buf(),
         rollback_marker_path: rollback_marker_path.to_path_buf(),
         rollback_json,
-        log_path: ready_marker_path.parent().map(|d| d.join("supervisor.log")),
+        log_path: updates_dir.map(|d| d.join("supervisor.log")),
+        new_start_log_path: updates_dir.map(|d| d.join(NEW_START_LOG_FILENAME)),
+        rollback_ps_path: updates_dir.map(|d| d.join(ROLLBACK_PS_FILENAME)),
+        single_instance_dbus_name,
+        single_instance_socket_path: None,
         wait_secs,
+        exit_grace_secs: DEFAULT_EXIT_GRACE_SECS,
         verify_only,
     })
 }
@@ -1472,8 +1756,14 @@ pub fn stage_and_spawn_macos_bundle(
     let _ = fs::remove_dir_all(&extract_root);
 
     let exec_path = bundle_dir.join(executable_rel);
+    #[cfg(target_os = "macos")]
+    let single_instance_socket_path = Some(PathBuf::from(MACOS_SINGLE_INSTANCE_SOCKET));
+    #[cfg(not(target_os = "macos"))]
+    let single_instance_socket_path = None;
+    let updates_dir = ready_marker_path.parent();
     spawn_unix_swap_supervisor(&UnixSwapPlan {
         old_pid: pid,
+        old_ppid: None,
         target_path: bundle_dir.to_path_buf(),
         staged_new_path: staged_bundle,
         backup_path,
@@ -1481,8 +1771,13 @@ pub fn stage_and_spawn_macos_bundle(
         ready_marker_path: ready_marker_path.to_path_buf(),
         rollback_marker_path: rollback_marker_path.to_path_buf(),
         rollback_json,
-        log_path: ready_marker_path.parent().map(|d| d.join("supervisor.log")),
+        log_path: updates_dir.map(|d| d.join("supervisor.log")),
+        new_start_log_path: updates_dir.map(|d| d.join(NEW_START_LOG_FILENAME)),
+        rollback_ps_path: updates_dir.map(|d| d.join(ROLLBACK_PS_FILENAME)),
+        single_instance_dbus_name: None,
+        single_instance_socket_path,
         wait_secs,
+        exit_grace_secs: DEFAULT_EXIT_GRACE_SECS,
         verify_only,
     })
 }
@@ -1528,10 +1823,26 @@ pub fn spawn_unix_swap_supervisor_with_env(
         .env("LEGION_ROLLBACK_FILE", &plan.rollback_marker_path)
         .env("LEGION_ROLLBACK_JSON", &plan.rollback_json)
         .env("LEGION_WAIT_SECS", plan.wait_secs.to_string())
+        .env("LEGION_EXIT_GRACE_SECS", plan.exit_grace_secs.to_string())
         .env(
             "LEGION_VERIFY_ONLY",
             if plan.verify_only { "1" } else { "0" },
         );
+    if let Some(ppid) = plan.old_ppid {
+        cmd.env("LEGION_OLD_PPID", ppid.to_string());
+    }
+    if let Some(new_log) = &plan.new_start_log_path {
+        cmd.env("LEGION_NEW_LOG", new_log);
+    }
+    if let Some(ps_path) = &plan.rollback_ps_path {
+        cmd.env("LEGION_ROLLBACK_PS_FILE", ps_path);
+    }
+    if let Some(dbus_name) = &plan.single_instance_dbus_name {
+        cmd.env("LEGION_SINGLE_INSTANCE_DBUS", dbus_name);
+    }
+    if let Some(sock_path) = &plan.single_instance_socket_path {
+        cmd.env("LEGION_SINGLE_INSTANCE_SOCK", sock_path);
+    }
 
     cmd.spawn().map_err(|err| {
         AppError::new(
@@ -1616,25 +1927,90 @@ function Start-Direct([string]$filePath, [string]$arguments, [bool]$noWindow) {
   return [System.Diagnostics.Process]::Start($psi)
 }
 
+function Get-InstallDirProcesses([string]$installDir) {
+  if (-not $installDir) { return @() }
+  $prefix = $installDir.TrimEnd('\') + '\'
+  $found = New-Object System.Collections.Generic.List[object]
+  foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) {
+    if ($p.Id -eq $PID) { continue }
+    $pPath = ''
+    try { $pPath = $p.Path } catch {}
+    if ($pPath -and $pPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+      $found.Add($p)
+    }
+  }
+  return $found.ToArray()
+}
+
+function Capture-RollbackPs {
+  if (-not $env:LEGION_ROLLBACK_PS_FILE) { return }
+  try {
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($p in (Get-Process -ErrorAction SilentlyContinue | Sort-Object Id)) {
+      $pPath = ''
+      try { $pPath = $p.Path } catch {}
+      $lines.Add("pid=$($p.Id) name=$($p.ProcessName) path=$pPath")
+    }
+    Set-Content -LiteralPath $env:LEGION_ROLLBACK_PS_FILE -Value ($lines -join "`n") -Encoding UTF8
+  } catch {
+    Write-Log "failed to write rollback process list: $($_.Exception.Message)"
+  }
+}
+
+function Save-CappedNewStartLog([string]$outLog, [string]$errLog) {
+  if (-not $env:LEGION_NEW_LOG) { return }
+  try {
+    $chunks = New-Object System.Collections.Generic.List[string]
+    foreach ($src in @($outLog, $errLog)) {
+      if ($src -and (Test-Path -LiteralPath $src)) {
+        $raw = Get-Content -LiteralPath $src -Raw -ErrorAction SilentlyContinue
+        if ($raw) { $chunks.Add($raw) }
+      }
+    }
+    $combined = ($chunks -join "`n")
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($combined)
+    if ($bytes.Length -gt 32768) {
+      $combined = [System.Text.Encoding]::UTF8.GetString($bytes, $bytes.Length - 32768, 32768)
+    }
+    Set-Content -LiteralPath $env:LEGION_NEW_LOG -Value $combined -Encoding UTF8
+  } catch {
+    Write-Log "failed to save capped startup log: $($_.Exception.Message)"
+  }
+  foreach ($src in @($outLog, $errLog)) {
+    if ($src -and (Test-Path -LiteralPath $src)) {
+      Remove-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
 $oldPid = [int]$env:LEGION_OLD_PID
 $verifyOnly = ($env:LEGION_VERIFY_ONLY -eq '1')
 Write-Log "supervisor start oldPid=$oldPid verifyOnly=$verifyOnly installer=$($env:LEGION_INSTALLER) installDir=$($env:LEGION_INSTALL_DIR) exe=$($env:LEGION_EXE)"
 
 for ($i = 0; $i -lt 80; $i++) {
-  if (-not (Get-Process -Id $oldPid -ErrorAction SilentlyContinue)) { break }
+  $oldAlive = [bool](Get-Process -Id $oldPid -ErrorAction SilentlyContinue)
+  $dirProcs = @(Get-InstallDirProcesses $env:LEGION_INSTALL_DIR)
+  if (-not $oldAlive -and $dirProcs.Count -eq 0) { break }
   Start-Sleep -Milliseconds 250
 }
-if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) {
-  Write-Log "oldPid $oldPid still alive after 20s; forcing stop"
+$lingering = @(Get-InstallDirProcesses $env:LEGION_INSTALL_DIR)
+if ((Get-Process -Id $oldPid -ErrorAction SilentlyContinue) -or $lingering.Count -gt 0) {
+  Write-Log "old instance still alive after 20s (oldPid=$oldPid, dirProcs=$($lingering.Count)); forcing stop"
   Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
+  foreach ($p in $lingering) {
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+  }
   Start-Sleep -Milliseconds 500
 } else {
-  Write-Log "oldPid $oldPid exited cleanly"
+  Write-Log "old instance exited cleanly"
   Start-Sleep -Milliseconds 250
 }
 
 if (Test-Path -LiteralPath $env:LEGION_READY_MARKER) {
   Remove-Item -LiteralPath $env:LEGION_READY_MARKER -Force -ErrorAction SilentlyContinue
+}
+if ($env:LEGION_ROLLBACK_PS_FILE -and (Test-Path -LiteralPath $env:LEGION_ROLLBACK_PS_FILE)) {
+  Remove-Item -LiteralPath $env:LEGION_ROLLBACK_PS_FILE -Force -ErrorAction SilentlyContinue
 }
 
 $script:restoreAttempted = $false
@@ -1717,14 +2093,33 @@ try {
   } else {
     Remove-Item Env:LEGION_UPDATE_VERIFY_ONLY -ErrorAction SilentlyContinue
   }
+  $outLog = $null
+  $errLog = $null
+  if ($env:LEGION_NEW_LOG) {
+    $outLog = "$($env:LEGION_NEW_LOG).stdout"
+    $errLog = "$($env:LEGION_NEW_LOG).stderr"
+    foreach ($f in @($env:LEGION_NEW_LOG, $outLog, $errLog)) {
+      if (Test-Path -LiteralPath $f) {
+        Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+      }
+    }
+  }
   Write-Log "launching updated app: $($env:LEGION_EXE)"
-  $proc = Start-Direct $env:LEGION_EXE '' $false
+  if ($outLog -and $errLog) {
+    $proc = Start-Process -FilePath $env:LEGION_EXE -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
+  } else {
+    $proc = Start-Direct $env:LEGION_EXE '' $false
+  }
   Write-Log "launched updated app pid=$($proc.Id)"
   $waitSecs = [int]$env:LEGION_WAIT_SECS
   if ($waitSecs -le 0) { $waitSecs = 30 }
+  $graceSecs = [int]$env:LEGION_EXIT_GRACE_SECS
+  if ($graceSecs -le 0) { $graceSecs = 8 }
+  $maxTicks = $waitSecs * 4
+  $graceTicks = $graceSecs * 4
   $started = $false
   $exitedLogged = $false
-  for ($j = 0; $j -lt ($waitSecs * 4); $j++) {
+  for ($j = 0; $j -lt $maxTicks; $j++) {
     if (Test-Path -LiteralPath $env:LEGION_READY_MARKER) {
       $started = $true
       break
@@ -1732,10 +2127,13 @@ try {
     if ($proc.HasExited) {
       if (-not $exitedLogged) {
         $exitedLogged = $true
-        Write-Log "updated app exited with code $($proc.ExitCode)"
-      }
-      if ($proc.ExitCode -ne 0) {
-        break
+        Write-Log "updated app pid=$($proc.Id) exited with code $($proc.ExitCode) after $j ticks"
+        if ($proc.ExitCode -ne 0) {
+          $graceEnd = $j + $graceTicks
+          if ($graceEnd -lt $maxTicks) {
+            $maxTicks = $graceEnd
+          }
+        }
       }
     }
     Start-Sleep -Milliseconds 250
@@ -1751,12 +2149,21 @@ try {
     if (Test-Path -LiteralPath $env:LEGION_INSTALLER) {
       Remove-Item -LiteralPath $env:LEGION_INSTALLER -Force -ErrorAction SilentlyContinue
     }
+    if ($env:LEGION_ROLLBACK_PS_FILE -and (Test-Path -LiteralPath $env:LEGION_ROLLBACK_PS_FILE)) {
+      Remove-Item -LiteralPath $env:LEGION_ROLLBACK_PS_FILE -Force -ErrorAction SilentlyContinue
+    }
     exit 0
   }
+  Capture-RollbackPs
   if (-not $proc.HasExited) {
-    Write-Log "ready marker not observed after ${waitSecs}s; stopping pid=$($proc.Id)"
+    Write-Log "ready marker not observed after $j ticks; stopping pid=$($proc.Id)"
     Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
   }
+  foreach ($p in (Get-InstallDirProcesses $env:LEGION_INSTALL_DIR)) {
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+  }
+  Start-Sleep -Milliseconds 500
+  Save-CappedNewStartLog $outLog $errLog
   Restore-Previous "ready marker not observed"
   exit 1
 } catch {
@@ -1917,7 +2324,10 @@ pub fn stage_and_spawn_windows_nsis(
 
     let sanitized_win_env = build_sanitized_windows_env(std::env::vars_os());
     let encoded_script = encode_powershell_command(WINDOWS_NSIS_SUPERVISOR_SCRIPT);
-    let log_path = ready_marker_path.parent().map(|d| d.join("supervisor.log"));
+    let updates_dir = ready_marker_path.parent();
+    let log_path = updates_dir.map(|d| d.join("supervisor.log"));
+    let new_start_log_path = updates_dir.map(|d| d.join(NEW_START_LOG_FILENAME));
+    let rollback_ps_path = updates_dir.map(|d| d.join(ROLLBACK_PS_FILENAME));
     if let Some(lp) = &log_path {
         let _ = fs::remove_file(lp);
         if let Some(dir) = lp.parent() {
@@ -1956,9 +2366,19 @@ pub fn stage_and_spawn_windows_nsis(
             .env("LEGION_ROLLBACK_FILE", rollback_marker_path)
             .env("LEGION_ROLLBACK_JSON", &rollback_json)
             .env("LEGION_WAIT_SECS", wait_secs.to_string())
+            .env(
+                "LEGION_EXIT_GRACE_SECS",
+                DEFAULT_EXIT_GRACE_SECS.to_string(),
+            )
             .env("LEGION_VERIFY_ONLY", if verify_only { "1" } else { "0" });
         if let Some(lp) = &log_path {
             cmd.env("LEGION_SUPERVISOR_LOG", lp);
+        }
+        if let Some(nl) = &new_start_log_path {
+            cmd.env("LEGION_NEW_LOG", nl);
+        }
+        if let Some(ps) = &rollback_ps_path {
+            cmd.env("LEGION_ROLLBACK_PS_FILE", ps);
         }
         cmd
     };
@@ -2212,6 +2632,24 @@ mod tests {
         assert!(
             WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("if ($proc.ExitCode -ne 0)"),
             "Windows supervisor must keep polling for ready marker after clean exit code 0 (close-then-reopen race)"
+        );
+        assert!(
+            WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("$graceEnd = $j + $graceTicks"),
+            "Windows supervisor must wait a grace period on non-zero exit instead of rolling back immediately"
+        );
+        assert!(
+            WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("Get-InstallDirProcesses"),
+            "Windows supervisor must wait for lingering processes under installDir to exit"
+        );
+        assert!(
+            WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("Capture-RollbackPs")
+                && WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("$env:LEGION_ROLLBACK_PS_FILE"),
+            "Windows supervisor must snapshot processes at rollback decision"
+        );
+        assert!(
+            WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("Save-CappedNewStartLog")
+                && WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("$env:LEGION_NEW_LOG"),
+            "Windows supervisor must capture size-capped first-start output"
         );
     }
 
@@ -2713,6 +3151,7 @@ mod tests {
         spawn_unix_swap_supervisor_with_env(
             &UnixSwapPlan {
                 old_pid: exited_pid,
+                old_ppid: None,
                 target_path: target.clone(),
                 staged_new_path: staged,
                 backup_path: backup.clone(),
@@ -2721,7 +3160,12 @@ mod tests {
                 rollback_marker_path: rollback,
                 rollback_json: "{}".to_owned(),
                 log_path: None,
+                new_start_log_path: None,
+                rollback_ps_path: None,
+                single_instance_dbus_name: None,
+                single_instance_socket_path: None,
                 wait_secs: 5,
+                exit_grace_secs: 2,
                 verify_only: false,
             },
             &sanitized,
@@ -2815,6 +3259,7 @@ mod tests {
 
         spawn_unix_swap_supervisor(&UnixSwapPlan {
             old_pid: exited_pid,
+            old_ppid: None,
             target_path: target.clone(),
             staged_new_path: staged,
             backup_path: backup.clone(),
@@ -2823,7 +3268,12 @@ mod tests {
             rollback_marker_path: rollback.clone(),
             rollback_json: "{\"sequence\":2}".to_owned(),
             log_path: None,
+            new_start_log_path: None,
+            rollback_ps_path: None,
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
             wait_secs: 5,
+            exit_grace_secs: 2,
             verify_only: true,
         })
         .unwrap();
@@ -2887,6 +3337,7 @@ mod tests {
 
         spawn_unix_swap_supervisor(&UnixSwapPlan {
             old_pid: exited_pid,
+            old_ppid: None,
             target_path: target.clone(),
             staged_new_path: staged_ok,
             backup_path: backup.clone(),
@@ -2895,7 +3346,12 @@ mod tests {
             rollback_marker_path: rollback_ok.clone(),
             rollback_json: "{\"sequence\":2}".to_owned(),
             log_path: None,
+            new_start_log_path: None,
+            rollback_ps_path: None,
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
             wait_secs: 5,
+            exit_grace_secs: 2,
             verify_only: true,
         })
         .unwrap();
@@ -2922,6 +3378,7 @@ mod tests {
 
         spawn_unix_swap_supervisor(&UnixSwapPlan {
             old_pid: exited_pid,
+            old_ppid: None,
             target_path: target.clone(),
             staged_new_path: staged_bad,
             backup_path: backup.clone(),
@@ -2931,7 +3388,12 @@ mod tests {
             rollback_json: "{\"version\":\"0.3.0\",\"sequence\":3,\"reason\":\"crashed\"}"
                 .to_owned(),
             log_path: None,
+            new_start_log_path: None,
+            rollback_ps_path: None,
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
             wait_secs: 3,
+            exit_grace_secs: 1,
             verify_only: false,
         })
         .unwrap();
@@ -2947,5 +3409,241 @@ mod tests {
         assert!(ready_ok.exists());
         assert!(fs::read_to_string(&target).unwrap().contains("v2:"));
         assert!(!backup.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_swap_supervisor_waits_grace_period_on_nonzero_exit_and_captures_capped_log_and_ps() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Legion.AppImage");
+        let staged_handover = dir.path().join(".Legion.AppImage.new-handover");
+        let backup = dir.path().join(".Legion.AppImage.prev");
+        let ready = dir.path().join("started-10.ok");
+        let rollback = dir.path().join("rollback-10.json");
+        let sup_log = dir.path().join("supervisor.log");
+        let new_log = dir.path().join(NEW_START_LOG_FILENAME);
+        let rollback_ps = dir.path().join(ROLLBACK_PS_FILENAME);
+
+        fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // 1. Even if the launched PID exits non-zero (rc=42) immediately, the supervisor waits the
+        //    grace period; a handover child writing the ready marker 0.8s later succeeds cleanly
+        //    without rolling back and cleans up new-start.log.
+        fs::write(
+            &staged_handover,
+            format!(
+                "#!/bin/sh\necho 'handover starting' >&2\n(sleep 0.8; printf 'ok\\n' > '{}') &\nexit 42\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&staged_handover, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut exited_child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let exited_pid = exited_child.id();
+        let _ = exited_child.wait();
+
+        spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid: exited_pid,
+            old_ppid: None,
+            target_path: target.clone(),
+            staged_new_path: staged_handover,
+            backup_path: backup.clone(),
+            exec_path: target.clone(),
+            ready_marker_path: ready.clone(),
+            rollback_marker_path: rollback.clone(),
+            rollback_json: "{\"sequence\":10}".to_owned(),
+            log_path: Some(sup_log.clone()),
+            new_start_log_path: Some(new_log.clone()),
+            rollback_ps_path: Some(rollback_ps.clone()),
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            wait_secs: 6,
+            exit_grace_secs: 3,
+            verify_only: true,
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if ready.exists() && !backup.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            ready.exists(),
+            "handover during non-zero exit grace period must succeed"
+        );
+        assert!(
+            !rollback.exists(),
+            "must not roll back when marker appears during grace period"
+        );
+        assert!(
+            !new_log.exists(),
+            "new-start.log should be cleaned up on success"
+        );
+        assert!(
+            !rollback_ps.exists(),
+            "rollback-ps.txt should not exist on success"
+        );
+
+        // 2. When a build truly crashes and prints > 64 KiB before exiting without writing the
+        //    ready marker, the supervisor waits the grace period, captures rollback-ps.txt, caps
+        //    new-start.log to <= 32 KiB, and read_captured_startup_detail surfaces the failure.
+        let staged_crash = dir.path().join(".Legion.AppImage.new-crash");
+        let ready_crash = dir.path().join("started-11.ok");
+        let rollback_crash = dir.path().join("rollback-11.json");
+        fs::write(
+            &staged_crash,
+            "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 800 ]; do\n  printf 'noisy startup line %04d 0123456789abcdefghijklmnopqrstuvwxyz0123456789\\n' \"$i\"\n  i=$((i + 1))\ndone\nprintf 'fatal: missing shared library libbroken.so.1\\n' >&2\nexit 127\n",
+        )
+        .unwrap();
+        fs::set_permissions(&staged_crash, fs::Permissions::from_mode(0o755)).unwrap();
+
+        spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid: exited_pid,
+            old_ppid: None,
+            target_path: target.clone(),
+            staged_new_path: staged_crash,
+            backup_path: backup.clone(),
+            exec_path: target.clone(),
+            ready_marker_path: ready_crash,
+            rollback_marker_path: rollback_crash.clone(),
+            rollback_json: "{\"version\":\"0.4.0\",\"sequence\":11,\"reason\":\"crashed\"}"
+                .to_owned(),
+            log_path: Some(sup_log.clone()),
+            new_start_log_path: Some(new_log.clone()),
+            rollback_ps_path: Some(rollback_ps.clone()),
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            wait_secs: 6,
+            exit_grace_secs: 1,
+            verify_only: true,
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if rollback_crash.exists() && rollback_ps.exists() && !backup.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            rollback_crash.exists(),
+            "expected rollback marker after crash"
+        );
+        assert!(
+            rollback_ps.exists(),
+            "expected rollback-ps.txt captured at rollback"
+        );
+        assert!(
+            !fs::read_to_string(&rollback_ps).unwrap().trim().is_empty(),
+            "rollback-ps.txt must contain process snapshot"
+        );
+        let new_log_meta = fs::metadata(&new_log).unwrap();
+        assert!(
+            new_log_meta.len() > 0 && new_log_meta.len() <= MAX_CAPTURED_START_LOG_BYTES as u64,
+            "new-start.log must be non-empty and capped to <= 32 KiB, got {} bytes",
+            new_log_meta.len()
+        );
+        let detail = read_captured_startup_detail(dir.path()).unwrap();
+        assert!(
+            detail.contains("rc=127") && detail.contains("libbroken.so.1"),
+            "captured startup detail should surface exit status and stderr tail: {detail}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_swap_supervisor_waits_for_old_children_and_wrapper_parent_before_swap() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Legion.AppImage");
+        let staged = dir.path().join(".Legion.AppImage.new-wait");
+        let backup = dir.path().join(".Legion.AppImage.prev");
+        let ready = dir.path().join("started-12.ok");
+        let rollback = dir.path().join("rollback-12.json");
+        let child_gone_marker = dir.path().join("old-child-gone.txt");
+        let new_started_check = dir.path().join("new-saw-child-gone.txt");
+
+        fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // New binary asserts that the old child already finished before the new copy launched!
+        fs::write(
+            &staged,
+            format!(
+                "#!/bin/sh\nif [ -f '{}' ]; then printf 'clean\\n' > '{}'; fi\nprintf 'ok\\n' > '{}'\n",
+                child_gone_marker.display(),
+                new_started_check.display(),
+                ready.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Simulate old process + lingering helper child (e.g., WebKitNetworkProcess) that exits
+        // 0.8s after old_pid exits, plus a lingering AppImage wrapper parent (`old_ppid`).
+        let mut old_proc = Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!(
+                    "(sleep 0.9; printf 'done\\n' > '{}') &\nsleep 0.25\nexit 0\n",
+                    child_gone_marker.display()
+                ),
+            ])
+            .spawn()
+            .unwrap();
+        let old_pid = old_proc.id();
+        // Give the shell a moment to spawn its background child before spawning the supervisor so
+        // `collect_children "$LEGION_OLD_PID"` sees it while old_pid is still running.
+        std::thread::sleep(Duration::from_millis(80));
+
+        spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid,
+            old_ppid: None,
+            target_path: target.clone(),
+            staged_new_path: staged,
+            backup_path: backup.clone(),
+            exec_path: target.clone(),
+            ready_marker_path: ready.clone(),
+            rollback_marker_path: rollback.clone(),
+            rollback_json: "{\"sequence\":12}".to_owned(),
+            log_path: Some(dir.path().join("supervisor.log")),
+            new_start_log_path: Some(dir.path().join(NEW_START_LOG_FILENAME)),
+            rollback_ps_path: Some(dir.path().join(ROLLBACK_PS_FILENAME)),
+            single_instance_dbus_name: None,
+            single_instance_socket_path: None,
+            wait_secs: 6,
+            exit_grace_secs: 2,
+            verify_only: true,
+        })
+        .unwrap();
+
+        let _ = old_proc.wait();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if ready.exists() && !backup.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ready.exists(), "expected new build ready marker");
+        assert!(!rollback.exists(), "expected no rollback");
+        assert!(
+            new_started_check.exists(),
+            "supervisor must wait until old helper children exit before launching new build"
+        );
     }
 }

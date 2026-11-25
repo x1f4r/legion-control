@@ -157,10 +157,13 @@ pub fn run() {
         {
             let close_updater = Arc::clone(&updater);
             let close_backend = Arc::clone(&backend);
+            let close_handle = app.handle().clone();
             window.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { .. } = event {
-                    let _ = close_updater
-                        .try_spawn_desktop_close_install(close_backend.active_operations());
+                if let tauri::WindowEvent::CloseRequested { .. } = event
+                    && close_updater
+                        .try_spawn_desktop_close_install(close_backend.active_operations())
+                {
+                    tauri_plugin_single_instance::destroy(&close_handle);
                 }
             });
         }

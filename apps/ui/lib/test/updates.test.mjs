@@ -301,4 +301,44 @@ test('formatUpdateTechnicalRows includes channel, build, sequence (including seq
   });
   const seqRow = seqZeroRows.find((r) => r.key === 'sequence');
   assert.equal(seqRow?.value, '0 (updates disabled)');
+
+  // Skipped after two rollbacks surfaces plain message + Try again in summary and attempt count +
+  // captured startup output under Technical details.
+  const skippedState = {
+    phase: 'error',
+    auto_update: true,
+    can_self_install: true,
+    current: { os: 'linux', arch: 'x86_64', install_kind: 'appimage', sequence: 202611250200 },
+    available: { version: '0.2.0', sequence: 202611250205, channel: 'preview', build: 'b2', signer: 'preview', key_fingerprint: 'SHA256:k', source_node: 'tower' },
+    failed_update: {
+      version: '0.2.0',
+      sequence: 202611250205,
+      reason: 'The new version did not start cleanly, so Legion kept the previous copy.',
+      attempts: 2,
+      skipped: true,
+      detail: 'new_pid=42 exited with rc=127: missing libfoo.so',
+    },
+  };
+  const skippedSummary = describeUpdateSummary(skippedState);
+  assert.equal(skippedSummary.line, 'The new version did not start cleanly, so Legion kept the previous copy.');
+  assert.equal(skippedSummary.actionLabel, 'Try again');
+  assert.ok(!skippedSummary.line.includes('libfoo.so'));
+  const skippedRows = Object.fromEntries(formatUpdateTechnicalRows(skippedState).map((r) => [r.key, r.value]));
+  assert.equal(skippedRows.failed, '0.2.0 · seq 202611250205 (2 attempts, skipped)');
+  assert.equal(skippedRows['last error'], 'new_pid=42 exited with rc=127: missing libfoo.so');
+
+  // First rollback (not yet skipped) indicates retry-once status in Technical details.
+  const firstRollbackRows = Object.fromEntries(
+    formatUpdateTechnicalRows({
+      current: { os: 'linux', arch: 'x86_64', install_kind: 'appimage', sequence: 202611250200 },
+      failed_update: {
+        version: '0.2.0',
+        sequence: 202611250205,
+        reason: 'The new version did not start cleanly, so Legion kept the previous copy.',
+        attempts: 1,
+        skipped: false,
+      },
+    }).map((r) => [r.key, r.value]),
+  );
+  assert.equal(firstRollbackRows.failed, '0.2.0 · seq 202611250205 (attempt 1, will retry once)');
 });

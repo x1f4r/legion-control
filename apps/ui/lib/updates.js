@@ -256,14 +256,21 @@ export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName 
   }
 
   if (phase === 'error') {
+    const failed = updateState.failed_update || null;
     const actionLabel =
       avail && updateState.can_self_install
-        ? updateState.failed_update
+        ? failed
           ? 'Try again'
           : 'Update now'
         : null;
+    const line =
+      updateState.last_error ||
+      failed?.reason ||
+      (failed
+        ? 'The new version did not start cleanly, so Legion kept the previous copy.'
+        : 'Could not finish the update.');
     return {
-      line: updateState.last_error || 'Could not finish the update.',
+      line,
       detail: avail ? `Version ${avail.version}` : '',
       actionLabel,
       canAction: Boolean(actionLabel),
@@ -341,16 +348,30 @@ export function formatUpdateTechnicalRows(updateState) {
     }
   }
   if (updateState.failed_update) {
+    const f = updateState.failed_update;
+    let suffix = '';
+    if (typeof f.attempts === 'number' && f.attempts > 0) {
+      if (f.skipped) {
+        suffix = ` (${f.attempts} ${f.attempts === 1 ? 'attempt' : 'attempts'}, skipped)`;
+      } else {
+        suffix = ` (attempt ${f.attempts}, will retry once)`;
+      }
+    }
     rows.push({
       key: 'failed',
-      value: `${updateState.failed_update.version} · seq ${updateState.failed_update.sequence}`,
+      value: `${f.version} · seq ${f.sequence}${suffix}`,
     });
   }
   if (Array.isArray(updateState.checked_nodes) && updateState.checked_nodes.length > 0) {
     rows.push({ key: 'checked', value: updateState.checked_nodes.join(', ') });
   }
-  if (updateState.last_error_detail) {
-    rows.push({ key: 'last error', value: updateState.last_error_detail });
+  const errorDetail =
+    updateState.last_error_detail ||
+    updateState.failed_update?.detail ||
+    updateState.rolled_back?.detail ||
+    null;
+  if (errorDetail) {
+    rows.push({ key: 'last error', value: errorDetail });
   }
   return rows;
 }

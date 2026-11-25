@@ -348,6 +348,7 @@ pub async fn update_install(
             let handle = app.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                tauri_plugin_single_instance::destroy(&handle);
                 handle.exit(0);
             });
         }
@@ -414,6 +415,7 @@ pub async fn update_maybe_auto_install(
             let handle = app.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                tauri_plugin_single_instance::destroy(&handle);
                 handle.exit(0);
             });
         }

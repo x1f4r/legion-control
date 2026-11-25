@@ -134,6 +134,18 @@ pub const AUTO_INSTALL_RATE_LIMIT: Duration = Duration::from_secs(5);
 /// Per-chunk timeout for artifact `update.read` calls.
 const CHUNK_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Minimum cooldown (1 hour) after a first desktop rollback before retrying the same sequence once
+/// automatically at a later natural install point.
+pub const ROLLBACK_RETRY_COOLDOWN_SECS: i64 = 60 * 60;
+
+/// Number of rollbacks on the same sequence before Legion skips automatic installation until a
+/// newer sequence arrives or the user taps "Try again".
+pub const MAX_AUTO_ROLLBACK_ATTEMPTS: u32 = 2;
+
+/// Plain-language headline shown when a new desktop build failed to start and was rolled back.
+pub const ROLLBACK_REASON: &str =
+    "The new version did not start cleanly, so Legion kept the previous copy.";
+
 /// Computes the download deadline scaled to `remaining_bytes` and [`MIN_PROGRESS_BYTES_PER_SEC`],
 /// guaranteeing an honest node sustaining at least the rate floor can always finish.
 pub fn download_deadline_for_bytes(remaining_bytes: u64) -> Duration {
@@ -251,12 +263,25 @@ pub struct RollbackInfo {
     pub sequence: u64,
     /// Plain-language explanation.
     pub reason: String,
+    /// Optional captured startup output or supervisor exit reason shown ONLY under Technical details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
-/// Persisted record of an update sequence that failed to install or take effect on this device.
+fn default_failed_attempts() -> u32 {
+    1
+}
+
+fn default_failed_skipped() -> bool {
+    true
+}
+
+/// Persisted record of an update sequence that failed to install or start on this device.
 ///
-/// Failed sequences are never retried automatically; the user can tap "Try again" manually, and
-/// automatic updates resume as soon as a strictly newer sequence is published.
+/// After a first desktop rollback, the same sequence is retried once automatically at a later
+/// natural install point at least [`ROLLBACK_RETRY_COOLDOWN_SECS`] (1 hour) later. After a second
+/// rollback (or a non-rollback install error), `skipped` becomes `true` and the sequence is skipped
+/// until a strictly newer sequence arrives or the user taps "Try again".
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailedUpdateRecord {
     /// Update channel of the failed set.
@@ -269,6 +294,19 @@ pub struct FailedUpdateRecord {
     pub reason: String,
     /// RFC 3339 UTC timestamp when the failure was recorded.
     pub failed_at: String,
+    /// Number of failed attempts recorded for this sequence.
+    #[serde(default = "default_failed_attempts")]
+    pub attempts: u32,
+    /// True once automatic installation of this sequence is skipped until a newer sequence arrives
+    /// or the user taps "Try again".
+    #[serde(default = "default_failed_skipped")]
+    pub skipped: bool,
+    /// RFC 3339 UTC timestamp after which a single automatic retry is permitted (`None` when skipped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<String>,
+    /// Captured first-start output or supervisor diagnostic shown ONLY under Technical details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Complete updater state exposed to the interface via `update_state` and `update_watch`.
@@ -656,13 +694,44 @@ impl PersistedPrefs {
                         sequence,
                         reason: "A previous attempt to install this version failed.".to_owned(),
                         failed_at: now_rfc3339_utc(),
+                        attempts: MAX_AUTO_ROLLBACK_ATTEMPTS,
+                        skipped: true,
+                        retry_after: None,
+                        detail: None,
                     })
             })
     }
 
+    fn auto_block_reason_at(&self, sequence: u64, now_unix: i64) -> Option<&'static str> {
+        if let Some(rec) = self.failed_updates.iter().find(|r| r.sequence == sequence) {
+            if rec.skipped || rec.attempts >= MAX_AUTO_ROLLBACK_ATTEMPTS {
+                return Some("sequence_skipped");
+            }
+            if let Some(retry_at) = rec.retry_after.as_deref().and_then(parse_rfc3339_utc) {
+                if now_unix < retry_at {
+                    return Some("rollback_retry_cooldown");
+                }
+                return None;
+            }
+            return Some("sequence_skipped");
+        }
+        if self.failed_sequences.contains(&sequence) {
+            return Some("sequence_skipped");
+        }
+        None
+    }
+
+    fn is_auto_blocked_at(&self, sequence: u64, now_unix: i64) -> bool {
+        self.auto_block_reason_at(sequence, now_unix).is_some()
+    }
+
     fn record_failure(&mut self, record: FailedUpdateRecord) {
-        if !self.failed_sequences.contains(&record.sequence) {
-            self.failed_sequences.push(record.sequence);
+        if record.skipped {
+            if !self.failed_sequences.contains(&record.sequence) {
+                self.failed_sequences.push(record.sequence);
+            }
+        } else {
+            self.failed_sequences.retain(|&s| s != record.sequence);
         }
         self.failed_updates
             .retain(|r| r.sequence != record.sequence);
@@ -681,6 +750,13 @@ impl PersistedPrefs {
     fn clear_failure(&mut self, sequence: u64) {
         self.failed_sequences.retain(|&s| s != sequence);
         self.failed_updates.retain(|r| r.sequence != sequence);
+        if self
+            .rolled_back
+            .as_ref()
+            .is_some_and(|r| r.sequence == sequence)
+        {
+            self.rolled_back = None;
+        }
     }
 }
 
@@ -829,6 +905,33 @@ impl UpdateManager {
         current_build: String,
         current_sequence: u64,
     ) -> Self {
+        Self::with_config_at(
+            updates_dir,
+            anchors,
+            os,
+            arch,
+            platform,
+            current_version,
+            current_build,
+            current_sequence,
+            now_unix_secs(),
+        )
+    }
+
+    /// Creates an update manager evaluating persisted rollback retry windows at `now_unix`
+    /// (seconds since Unix epoch), used directly by deterministic retry tests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_config_at(
+        updates_dir: PathBuf,
+        anchors: TrustAnchors,
+        os: Os,
+        arch: Arch,
+        platform: PlatformEnv,
+        current_version: String,
+        current_build: String,
+        current_sequence: u64,
+        now_unix: i64,
+    ) -> Self {
         let floor_path = updates_dir.join("floor.json");
         let sequence_floor = read_floor_value(&floor_path).max(current_sequence);
         let prefs = load_prefs(&updates_dir.join("prefs.json")).unwrap_or_default();
@@ -866,6 +969,8 @@ impl UpdateManager {
         let mut manual_command = None;
         let mut manual_sha256 = None;
         let mut failed_update = None;
+        let mut initial_last_error = None;
+        let mut initial_last_error_detail = None;
         if !seq_zero_disabled
             && let Some(cached) = &prefs.cached_available
             && cached.sequence > current_sequence
@@ -895,7 +1000,11 @@ impl UpdateManager {
                     manual_command = platform.manual_command_for(Some(&art_path));
                 }
 
-                if let Some(fail_rec) = prefs.failed_record(cached.sequence) {
+                if prefs.is_auto_blocked_at(cached.sequence, now_unix)
+                    && let Some(fail_rec) = prefs.failed_record(cached.sequence)
+                {
+                    initial_last_error = Some(fail_rec.reason.clone());
+                    initial_last_error_detail = fail_rec.detail.clone();
                     failed_update = Some(fail_rec);
                     initial_phase = "error".to_owned();
                 } else if manual_command.is_some() {
@@ -927,8 +1036,8 @@ impl UpdateManager {
             rolled_back: prefs.rolled_back.clone(),
             failed_update,
             android: None,
-            last_error: None,
-            last_error_detail: None,
+            last_error: initial_last_error,
+            last_error_detail: initial_last_error_detail,
         };
 
         let (cancel_tx, _rx) = watch::channel(0u64);
@@ -1023,6 +1132,12 @@ impl UpdateManager {
     ///   when a `pending_install` did not take effect (`current_sequence != pending.sequence`) or
     ///   when the desktop watchdog left a rollback marker.
     pub fn on_app_ready(&self) {
+        self.on_app_ready_at(now_unix_secs());
+    }
+
+    /// Deterministic variant of [`Self::on_app_ready`] evaluating rollback retry timestamps at
+    /// `now_unix` (seconds since Unix epoch).
+    pub fn on_app_ready_at(&self, now_unix: i64) {
         self.first_screen_shown.store(true, Ordering::SeqCst);
         if ensure_updates_root(&self.updates_dir).is_err() {
             return;
@@ -1068,6 +1183,7 @@ impl UpdateManager {
         let mut prefs = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let mut prefs_dirty = false;
         let mut saw_rollback = false;
+        let mut rollback_detail: Option<String> = None;
 
         // 1. Check for a desktop rollback marker left by the detached supervisor.
         if let Some((rb_path, rb)) = read_and_take_rollback(&self.updates_dir) {
@@ -1076,12 +1192,42 @@ impl UpdateManager {
                 .pending_install
                 .as_ref()
                 .map_or(Channel::Stable, |p| p.channel);
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let rb = RollbackInfo {
+                detail: rb
+                    .detail
+                    .or_else(|| desktop::read_captured_startup_detail(&self.updates_dir)),
+                ..rb
+            };
+            let prev_attempts = prefs
+                .failed_updates
+                .iter()
+                .find(|r| r.sequence == rb.sequence)
+                .map_or(0, |r| r.attempts);
+            let attempts = prev_attempts.saturating_add(1);
+            let skipped = attempts >= MAX_AUTO_ROLLBACK_ATTEMPTS;
+            let retry_after = if skipped {
+                None
+            } else {
+                Some(format_rfc3339_utc(
+                    now_unix.saturating_add(ROLLBACK_RETRY_COOLDOWN_SECS),
+                ))
+            };
+            rollback_detail = rb.detail.clone();
             prefs.record_failure(FailedUpdateRecord {
                 channel,
                 version: rb.version.clone(),
                 sequence: rb.sequence,
-                reason: rb.reason.clone(),
-                failed_at: now_rfc3339_utc(),
+                reason: if rb.reason.trim().is_empty() {
+                    ROLLBACK_REASON.to_owned()
+                } else {
+                    rb.reason.clone()
+                },
+                failed_at: format_rfc3339_utc(now_unix),
+                attempts,
+                skipped,
+                retry_after,
+                detail: rb.detail.clone(),
             });
             prefs.pending_install = None;
             prefs.rolled_back = Some(rb);
@@ -1110,25 +1256,39 @@ impl UpdateManager {
                     build: pending.build,
                     sequence: pending.sequence,
                     notes: pending.notes,
-                    updated_at: now_rfc3339_utc(),
+                    updated_at: format_rfc3339_utc(now_unix),
                 });
                 prefs_dirty = true;
                 cleanup_old_downloads(&self.updates_dir, self.current_sequence);
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                {
+                    let _ = fs::remove_file(self.updates_dir.join(desktop::NEW_START_LOG_FILENAME));
+                    let _ = fs::remove_file(self.updates_dir.join(desktop::ROLLBACK_PS_FILENAME));
+                }
             } else {
                 // Pending install was recorded, but the running build after restart does NOT have
                 // the expected sequence (for example, an artifact with a mismatched compiled
-                // sequence or an aborted/ineffective install). Record it as failed so Legion never
+                // sequence or an aborted/ineffective install). Record it as skipped so Legion never
                 // loops retrying it automatically.
                 let reason = format!(
                     "Version {} did not take effect after installation, so Legion will not retry it automatically.",
                     pending.version
                 );
+                let prev_attempts = prefs
+                    .failed_updates
+                    .iter()
+                    .find(|r| r.sequence == pending.sequence)
+                    .map_or(0, |r| r.attempts);
                 prefs.record_failure(FailedUpdateRecord {
                     channel: pending.channel,
                     version: pending.version,
                     sequence: pending.sequence,
                     reason,
-                    failed_at: now_rfc3339_utc(),
+                    failed_at: format_rfc3339_utc(now_unix),
+                    attempts: prev_attempts.saturating_add(1),
+                    skipped: true,
+                    retry_after: None,
+                    detail: None,
                 });
                 prefs.pending_install = None;
                 prefs_dirty = true;
@@ -1145,11 +1305,11 @@ impl UpdateManager {
         st.sequence_floor = new_floor.max(self.current_sequence);
         st.just_updated = prefs.just_updated.clone();
         st.rolled_back = prefs.rolled_back.clone();
-        if let Some(detail) = floor_recovery_detail {
+        if let Some(detail) = floor_recovery_detail.as_ref() {
             st.last_error = Some(
                 "Legion rebuilt a damaged update floor file at the running version.".to_owned(),
             );
-            st.last_error_detail = Some(detail);
+            st.last_error_detail = Some(detail.clone());
         }
         if let Some(avail) = &st.available {
             if avail.sequence <= st.sequence_floor {
@@ -1160,8 +1320,11 @@ impl UpdateManager {
                 if st.phase != "unsupported" {
                     st.phase = "up_to_date".to_owned();
                 }
-            } else if let Some(fail) = prefs.failed_record(avail.sequence) {
+            } else if prefs.is_auto_blocked_at(avail.sequence, now_unix)
+                && let Some(fail) = prefs.failed_record(avail.sequence)
+            {
                 st.last_error = Some(fail.reason.clone());
+                st.last_error_detail = fail.detail.clone().or(floor_recovery_detail);
                 st.failed_update = Some(fail);
                 if st.phase != "unsupported" {
                     st.phase = "error".to_owned();
@@ -1170,11 +1333,16 @@ impl UpdateManager {
         } else if let Some(last_fail) = prefs
             .failed_updates
             .iter()
-            .filter(|r| r.sequence > st.sequence_floor)
+            .filter(|r| {
+                r.sequence > st.sequence_floor && prefs.is_auto_blocked_at(r.sequence, now_unix)
+            })
             .max_by_key(|r| r.sequence)
             .cloned()
         {
+            st.last_error_detail = last_fail.detail.clone().or(floor_recovery_detail);
             st.failed_update = Some(last_fail);
+        } else if saw_rollback && let Some(detail) = rollback_detail {
+            st.last_error_detail = Some(detail);
         }
         self.publish_state(st);
     }
@@ -1244,6 +1412,20 @@ impl UpdateManager {
         nodes: &[String],
         force_download: bool,
         is_metered: bool,
+    ) -> Result<UpdateState, AppError> {
+        self.check_with_client_at(client, nodes, force_download, is_metered, now_unix_secs())
+            .await
+    }
+
+    /// Deterministic variant of [`Self::check_with_client`] evaluating rollback retry windows at
+    /// `now_unix` (seconds since Unix epoch).
+    pub async fn check_with_client_at(
+        &self,
+        client: &dyn UpdateSourceClient,
+        nodes: &[String],
+        force_download: bool,
+        is_metered: bool,
+        now_unix: i64,
     ) -> Result<UpdateState, AppError> {
         if self.current_sequence == 0 {
             return Ok(self.update_state(|st| {
@@ -1524,11 +1706,13 @@ impl UpdateManager {
                         }
                         self.clear_bad_node(cand.channel, cand.sequence, &verified.source_node);
                         let seq = verified.meta.manifest.sequence;
-                        if !force_download && let Some(fail_rec) = prefs_snapshot.failed_record(seq)
+                        if !force_download
+                            && prefs_snapshot.is_auto_blocked_at(seq, now_unix)
+                            && let Some(fail_rec) = prefs_snapshot.failed_record(seq)
                         {
-                            // Skip failed sequences automatically so a newer/alternate valid set
-                            // can still be chosen, while remembering the newest failed one so the
-                            // user can tap "Try again".
+                            // Skip sequences currently blocked by rollback cooldown or skip limit
+                            // so a newer/alternate valid set can still be chosen, while remembering
+                            // the newest blocked one so the user can tap "Try again".
                             if newest_failed_verified.is_none() {
                                 newest_failed_verified = Some((*verified, fail_rec));
                             }
@@ -1616,7 +1800,7 @@ impl UpdateManager {
                 st.last_checked_at = Some(checked_at);
                 st.checked_nodes = answered_nodes;
                 st.last_error = Some(fail_rec.reason);
-                st.last_error_detail = floor_recovery_detail;
+                st.last_error_detail = fail_rec.detail.or(floor_recovery_detail);
             }));
         }
 
@@ -2800,14 +2984,23 @@ impl UpdateManager {
         sequence: u64,
         reason: &str,
     ) -> FailedUpdateRecord {
+        let mut prefs = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let prev_attempts = prefs
+            .failed_updates
+            .iter()
+            .find(|r| r.sequence == sequence)
+            .map_or(0, |r| r.attempts);
         let record = FailedUpdateRecord {
             channel,
             version: version.to_owned(),
             sequence,
             reason: reason.to_owned(),
             failed_at: now_rfc3339_utc(),
+            attempts: prev_attempts.saturating_add(1),
+            skipped: true,
+            retry_after: None,
+            detail: None,
         };
-        let mut prefs = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
         prefs.pending_install = None;
         prefs.record_failure(record.clone());
         if save_prefs(&self.updates_dir.join("prefs.json"), &prefs).is_ok() {
@@ -2817,23 +3010,71 @@ impl UpdateManager {
         record
     }
 
-    fn clear_failed_sequence(&self, sequence: u64) {
+    /// Clears any recorded failure/skip state for `sequence` (invoked when the user taps "Try
+    /// again") and restores `phase = "ready"` if that sequence is already downloaded on disk.
+    pub fn clear_failed_sequence(&self, sequence: u64) {
         let mut prefs = self.prefs.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        if prefs.has_failed(sequence) {
+        let had_entry = prefs.has_failed(sequence)
+            || prefs
+                .rolled_back
+                .as_ref()
+                .is_some_and(|r| r.sequence == sequence);
+        if had_entry {
             prefs.clear_failure(sequence);
             if save_prefs(&self.updates_dir.join("prefs.json"), &prefs).is_ok() {
                 let mut guard = self.prefs.lock().unwrap_or_else(|p| p.into_inner());
                 *guard = prefs;
             }
         }
+        self.update_state(|st| {
+            if st
+                .failed_update
+                .as_ref()
+                .is_some_and(|f| f.sequence == sequence)
+            {
+                st.failed_update = None;
+                st.last_error = None;
+                st.last_error_detail = None;
+            }
+            if st
+                .rolled_back
+                .as_ref()
+                .is_some_and(|r| r.sequence == sequence)
+            {
+                st.rolled_back = None;
+            }
+            if st.phase == "error"
+                && st
+                    .available
+                    .as_ref()
+                    .is_some_and(|a| a.sequence == sequence && a.downloaded)
+                && st.can_self_install
+            {
+                st.phase = "ready".to_owned();
+            }
+        });
     }
 
-    /// Returns whether `sequence` already failed previously on this device.
+    /// Returns whether `sequence` has any failure record on this device.
     pub fn sequence_failed_before(&self, sequence: u64) -> bool {
         self.prefs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .has_failed(sequence)
+    }
+
+    /// Returns the reason automatic installation of `sequence` is currently blocked at `now_unix`,
+    /// or `None` when automatic installation (including a single retry >= 1 hour after a first
+    /// rollback) is permitted.
+    pub fn auto_install_block_reason_at(
+        &self,
+        sequence: u64,
+        now_unix: i64,
+    ) -> Option<&'static str> {
+        self.prefs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .auto_block_reason_at(sequence, now_unix)
     }
 
     /// Re-verifies the currently ready downloaded update on disk and returns its verified info,
@@ -2903,6 +3144,18 @@ impl UpdateManager {
         active_ops: usize,
         from_page: bool,
     ) -> Result<(), &'static str> {
+        self.evaluate_auto_install_gate_at(trigger, active_ops, from_page, now_unix_secs())
+    }
+
+    /// Deterministic variant of [`Self::evaluate_auto_install_gate`] evaluating rollback retry
+    /// cooldowns at `now_unix` (seconds since Unix epoch).
+    pub fn evaluate_auto_install_gate_at(
+        &self,
+        trigger: &str,
+        active_ops: usize,
+        from_page: bool,
+        now_unix: i64,
+    ) -> Result<(), &'static str> {
         let now = Instant::now();
         if from_page {
             let mut last = self
@@ -2954,24 +3207,24 @@ impl UpdateManager {
         if !st.auto_update || !st.can_self_install || !ready_or_checking_downloaded {
             return Err("not_ready");
         }
-        if st
-            .available
-            .as_ref()
-            .is_some_and(|a| self.sequence_failed_before(a.sequence))
+        if let Some(avail) = st.available.as_ref()
+            && let Some(reason) = self.auto_install_block_reason_at(avail.sequence, now_unix)
         {
-            return Err("sequence_failed_before");
+            return Err(reason);
         }
         Ok(())
     }
 
     /// Synchronous hook called when the last desktop window closes: if automatic updates are on,
-    /// no native operations are in flight, and a verified update is ready (and has not failed
-    /// before), stages it via copy-while-hashing and spawns the detached swapper in `verify_only`
-    /// mode so the new build verifies startup and exits cleanly without popping a window open.
+    /// no native operations are in flight, and a verified update is ready (and not blocked by
+    /// rollback cooldown or skip limit), stages it via copy-while-hashing and spawns the detached
+    /// swapper in `verify_only` mode so the new build verifies startup and exits cleanly without
+    /// popping a window open.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn try_spawn_desktop_close_install(&self, active_ops: usize) -> bool {
+        let now_unix = now_unix_secs();
         if self
-            .evaluate_auto_install_gate("close", active_ops, false)
+            .evaluate_auto_install_gate_at("close", active_ops, false, now_unix)
             .is_err()
         {
             return false;
@@ -2981,7 +3234,10 @@ impl UpdateManager {
         else {
             return false;
         };
-        if self.sequence_failed_before(avail.sequence) {
+        if self
+            .auto_install_block_reason_at(avail.sequence, now_unix)
+            .is_some()
+        {
             return false;
         }
         self.spawn_desktop_install_inner(
@@ -3072,7 +3328,11 @@ impl UpdateManager {
             })??
         };
 
-        if auto_triggered && self.sequence_failed_before(avail.sequence) {
+        if auto_triggered
+            && self
+                .auto_install_block_reason_at(avail.sequence, now_unix_secs())
+                .is_some()
+        {
             return Ok((self.snapshot(), false));
         }
 
@@ -3126,8 +3386,8 @@ impl UpdateManager {
         let rollback_json = serde_json::to_string(&RollbackInfo {
             version: avail.version.clone(),
             sequence: avail.sequence,
-            reason: "The new version did not start cleanly, so Legion kept the previous copy."
-                .to_owned(),
+            reason: ROLLBACK_REASON.to_owned(),
+            detail: None,
         })
         .unwrap_or_else(|_| "{}".to_owned());
         let verified_dir = self.updates_dir.join("verified");
@@ -3346,7 +3606,11 @@ impl UpdateManager {
             })??
         };
 
-        if auto_triggered && self.sequence_failed_before(avail.sequence) {
+        if auto_triggered
+            && self
+                .auto_install_block_reason_at(avail.sequence, now_unix_secs())
+                .is_some()
+        {
             return Ok(self.snapshot());
         }
 
@@ -4048,11 +4312,15 @@ pub fn current_arch() -> Arch {
     }
 }
 
-fn now_rfc3339_utc() -> String {
-    let secs = SystemTime::now()
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs() as i64
+}
+
+fn format_rfc3339_utc(unix_secs: i64) -> String {
+    let secs = unix_secs.max(0) as u64;
     let days = (secs / 86_400) as i64;
     let sod = secs % 86_400;
     let hour = sod / 3_600;
@@ -4069,6 +4337,46 @@ fn now_rfc3339_utc() -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = y + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn parse_rfc3339_utc(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || (bytes[10] != b'T' && bytes[10] != b't')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || !s.ends_with('Z')
+    {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: i64 = s.get(11..13)?.parse().ok()?;
+    let minute: i64 = s.get(14..16)?.parse().ok()?;
+    let second: i64 = s.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if month > 2 { month - 3 } else { month + 9 } as u64;
+    let doy = (153 * mp + 2) / 5 + (day as u64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + (doe as i64) - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn now_rfc3339_utc() -> String {
+    format_rfc3339_utc(now_unix_secs())
 }
 
 #[cfg(test)]
@@ -6026,6 +6334,437 @@ mod tests {
         tokio::time::advance(AUTO_INSTALL_RATE_LIMIT + Duration::from_millis(10)).await;
         assert_eq!(
             android_mgr.evaluate_auto_install_gate("background", 0, true),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rfc3339_utc_round_trip() {
+        for ts in [
+            0i64,
+            1_700_000_000,
+            1_795_593_600,
+            1_893_456_000,
+            2_000_000_000,
+        ] {
+            let formatted = format_rfc3339_utc(ts);
+            assert_eq!(
+                parse_rfc3339_utc(&formatted),
+                Some(ts),
+                "round-trip failed for {ts} -> {formatted}"
+            );
+        }
+        assert!(parse_rfc3339_utc("not-a-timestamp").is_none());
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn rollback_retries_once_after_one_hour_and_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let appimage = dir.path().join("Legion.AppImage");
+        let (rel_sk, rel_pk) = keypair(0x91);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600; // 2026-11-25T08:00:00Z
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"v2-appimage",
+                &rel_sk,
+            ),
+        );
+
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage.clone(),
+        });
+
+        // 1. Download v2 on seq1 and begin install.
+        let mgr1 = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let st1 = mgr1
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap();
+        assert_eq!(st1.phase, "ready");
+        let avail_v2 = st1.available.unwrap();
+        mgr1.record_pending_install(&avail_v2).unwrap();
+
+        // 2. Simulate first rollback with captured startup log + supervisor log.
+        fs::write(
+            updates_dir.join("supervisor.log"),
+            "supervisor: new_pid=9001 exited with rc=1 after 2 ticks\nsupervisor: ready marker missing after 34 ticks; rolling back\n",
+        )
+        .unwrap();
+        fs::write(
+            updates_dir.join(desktop::NEW_START_LOG_FILENAME),
+            "transient display error\n",
+        )
+        .unwrap();
+        fs::write(
+            updates_dir.join("rollback-202611250210.json"),
+            serde_json::to_vec(&RollbackInfo {
+                version: "0.2.0".to_owned(),
+                sequence: 202611250210,
+                reason: ROLLBACK_REASON.to_owned(),
+                detail: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Relaunched seq1 right after rollback (at t0 + 10s): records attempt 1 (not skipped),
+        // surfaces captured detail under Technical details, and blocks immediate auto-retry.
+        let mgr_after_rb1 = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0 + 10,
+        );
+        mgr_after_rb1.on_app_ready_at(t0 + 10);
+        let st_rb1 = mgr_after_rb1.snapshot();
+        assert_eq!(st_rb1.phase, "error");
+        let fail1 = st_rb1.failed_update.as_ref().unwrap();
+        assert_eq!(fail1.attempts, 1);
+        assert!(!fail1.skipped);
+        assert!(
+            st_rb1
+                .last_error_detail
+                .as_deref()
+                .is_some_and(|d| d.contains("transient display error")),
+            "expected captured startup error under Technical details: {:?}",
+            st_rb1.last_error_detail
+        );
+
+        // 30 minutes later (< 1 hour): next app start MUST still respect the 1-hour cooldown.
+        let mgr_too_soon = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0 + 10 + 1800,
+        );
+        assert_eq!(mgr_too_soon.snapshot().phase, "error");
+        assert!(
+            mgr_too_soon
+                .evaluate_auto_install_gate_at("startup", 0, true, t0 + 10 + 1800)
+                .is_err()
+        );
+
+        // 3. Next app start >= 1 hour later: same sequence is eligible for its single automatic
+        //    retry (phase == "ready", auto-install gate allows startup install).
+        let retry_time = t0 + 10 + ROLLBACK_RETRY_COOLDOWN_SECS;
+        let mgr_retry = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            retry_time,
+        );
+        let st_retry = mgr_retry.snapshot();
+        assert_eq!(st_retry.phase, "ready", "{st_retry:?}");
+        assert!(st_retry.failed_update.is_none());
+        assert_eq!(
+            mgr_retry.evaluate_auto_install_gate_at("startup", 0, true, retry_time),
+            Ok(())
+        );
+        mgr_retry.record_pending_install(&avail_v2).unwrap();
+
+        // 4. Retry succeeds: new build boots at seq 202611250210 -> just_updated recorded,
+        //    failure cleared, and new-start.log removed.
+        let mgr_v2 = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.2.0".to_owned(),
+            "new".to_owned(),
+            202611250210,
+            retry_time + 5,
+        );
+        mgr_v2.on_app_ready_at(retry_time + 5);
+        let st_v2 = mgr_v2.snapshot();
+        assert_eq!(st_v2.phase, "up_to_date");
+        assert_eq!(st_v2.just_updated.as_ref().unwrap().sequence, 202611250210);
+        assert!(st_v2.rolled_back.is_none());
+        assert!(st_v2.failed_update.is_none());
+        assert!(!updates_dir.join(desktop::NEW_START_LOG_FILENAME).exists());
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn two_rollbacks_skip_sequence_try_again_clears_and_newer_sequence_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let appimage = dir.path().join("Legion.AppImage");
+        let (rel_sk, rel_pk) = keypair(0x92);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250210,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"broken-v2-appimage",
+                &rel_sk,
+            ),
+        );
+
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage.clone(),
+        });
+
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let st = mgr
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap();
+        let avail_v2 = st.available.unwrap();
+
+        // Rollback #1 at t0 + 10.
+        mgr.record_pending_install(&avail_v2).unwrap();
+        fs::write(
+            updates_dir.join("rollback-202611250210.json"),
+            serde_json::to_vec(&RollbackInfo {
+                version: "0.2.0".to_owned(),
+                sequence: 202611250210,
+                reason: ROLLBACK_REASON.to_owned(),
+                detail: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mgr_rb1 = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0 + 10,
+        );
+        mgr_rb1.on_app_ready_at(t0 + 10);
+        assert!(!mgr_rb1.snapshot().failed_update.as_ref().unwrap().skipped);
+
+        // Rollback #2 at t0 + 10 + 1 hour (automatic retry fails again).
+        let t_retry = t0 + 10 + ROLLBACK_RETRY_COOLDOWN_SECS;
+        let mgr_retry = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t_retry,
+        );
+        assert_eq!(mgr_retry.snapshot().phase, "ready");
+        mgr_retry.record_pending_install(&avail_v2).unwrap();
+        fs::write(
+            updates_dir.join(desktop::NEW_START_LOG_FILENAME),
+            "fatal: missing libwebkit2gtk-4.1.so.0\n",
+        )
+        .unwrap();
+        fs::write(
+            updates_dir.join("rollback-202611250210.json"),
+            serde_json::to_vec(&RollbackInfo {
+                version: "0.2.0".to_owned(),
+                sequence: 202611250210,
+                reason: ROLLBACK_REASON.to_owned(),
+                detail: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mgr_rb2 = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t_retry + 10,
+        );
+        mgr_rb2.on_app_ready_at(t_retry + 10);
+        let st_rb2 = mgr_rb2.snapshot();
+        assert_eq!(st_rb2.phase, "error");
+        assert_eq!(st_rb2.last_error.as_deref(), Some(ROLLBACK_REASON));
+        let fail2 = st_rb2.failed_update.as_ref().unwrap();
+        assert_eq!(fail2.attempts, 2);
+        assert!(fail2.skipped, "second rollback must mark sequence skipped");
+        assert!(fail2.retry_after.is_none());
+        assert!(
+            st_rb2
+                .last_error_detail
+                .as_deref()
+                .is_some_and(|d| d.contains("libwebkit2gtk-4.1.so.0")),
+            "second rollback must surface captured startup error: {:?}",
+            st_rb2.last_error_detail
+        );
+
+        // Even 24 hours later, seq 202611250210 remains skipped on launch AND on check!
+        let t_next_day = t_retry + 24 * 3600;
+        let mgr_next_day = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t_next_day,
+        );
+        assert_eq!(mgr_next_day.snapshot().phase, "error");
+        assert_eq!(
+            mgr_next_day.auto_install_block_reason_at(202611250210, t_next_day),
+            Some("sequence_skipped")
+        );
+        let st_check_skipped = mgr_next_day
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t_next_day)
+            .await
+            .unwrap();
+        assert_eq!(st_check_skipped.phase, "error");
+        assert_eq!(
+            st_check_skipped.last_error.as_deref(),
+            Some(ROLLBACK_REASON)
+        );
+        assert!(st_check_skipped.failed_update.as_ref().unwrap().skipped);
+        assert!(
+            st_check_skipped
+                .last_error_detail
+                .as_deref()
+                .is_some_and(|d| d.contains("libwebkit2gtk-4.1.so.0"))
+        );
+
+        // "Try again" clears the skip for that sequence and restores phase == "ready".
+        mgr_next_day.clear_failed_sequence(202611250210);
+        let st_cleared = mgr_next_day.snapshot();
+        assert_eq!(st_cleared.phase, "ready", "{st_cleared:?}");
+        assert!(st_cleared.failed_update.is_none());
+        assert!(st_cleared.rolled_back.is_none());
+        assert_eq!(
+            mgr_next_day.auto_install_block_reason_at(202611250210, t_next_day),
+            None
+        );
+        let mgr_after_clear = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t_next_day + 5,
+        );
+        assert_eq!(mgr_after_clear.snapshot().phase, "ready");
+        assert_eq!(
+            mgr_after_clear.evaluate_auto_install_gate_at("startup", 0, true, t_next_day + 5),
+            Ok(())
+        );
+
+        // Re-skip seq 202611250210, then publish strictly newer seq 202611250215:
+        // the newer sequence MUST be completely unaffected by the older sequence's skip.
+        mgr_after_clear.record_failed_update(
+            Channel::Stable,
+            "0.2.0",
+            202611250210,
+            ROLLBACK_REASON,
+        );
+        assert_eq!(
+            mgr_after_clear.auto_install_block_reason_at(202611250210, t_next_day + 10),
+            Some("sequence_skipped")
+        );
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.1",
+                202611250215,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"fixed-v2.1-appimage",
+                &rel_sk,
+            ),
+        );
+        let st_newer = mgr_after_clear
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t_next_day + 10)
+            .await
+            .unwrap();
+        assert_eq!(st_newer.phase, "ready", "{st_newer:?}");
+        assert_eq!(st_newer.available.as_ref().unwrap().sequence, 202611250215);
+        assert!(st_newer.failed_update.is_none());
+        let mgr_newer_boot = UpdateManager::with_config_at(
+            updates_dir,
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t_next_day + 20,
+        );
+        assert_eq!(mgr_newer_boot.snapshot().phase, "ready");
+        assert_eq!(
+            mgr_newer_boot.evaluate_auto_install_gate_at("startup", 0, true, t_next_day + 20),
             Ok(())
         );
     }

@@ -142,11 +142,26 @@ and scheduled daily node update timers are **planned** and not yet implemented.
 | iPhone and iPad app | Cannot update itself; Apple allows updates only through the App Store or TestFlight. |
 | Browser | Always as new as the node that serves it. |
 
-Desktop self-replacing installs (Linux AppImage, macOS `.app`, Windows NSIS) keep the previous copy
-until the new build starts once and writes its startup marker, restoring the previous copy if it
-fails. If a device's `floor.json` becomes damaged or unreadable, Legion rebuilds the floor at the
-running build's sequence and surfaces the recovery in Settings > About (with raw error details under
-Technical details).
+Desktop self-replacing installs (Linux AppImage, macOS `.app`, Windows NSIS) release their
+single-instance lock before exiting, wait in the detached supervisor until the previous process,
+its helper children, any AppImage runtime wrapper, and the single-instance lock are gone, and keep
+the previous copy until the new build starts once and writes its startup marker within 30 seconds.
+"Did not start" is decided by the ready marker failing to appear within the wait window (never by a
+single PID check): if the launched process exits before the marker appears, the supervisor keeps
+polling through a grace period (the full remaining wait on exit code 0, or 8 seconds on non-zero
+exit) in case the app handed over to another process. The supervisor captures the new build's
+first-start output in a private, 32 KiB-capped log (`new-start.log`) beside the update state so any
+failed start can be explained under Technical details.
+
+A single transient rollback never pins a desktop to the old version forever: after a first rollback,
+Legion retries the same sequence once more at the next natural install point at least one hour
+later. If that second attempt also rolls back, Legion skips that sequence automatically until a
+newer sequence arrives, shows in plain words in Settings > About > Updates that the new version did
+not start cleanly and the previous copy was kept, and offers **Try again** to clear the skip for
+that sequence. Failures on an older sequence never affect a strictly newer sequence. If a device's
+`floor.json` becomes damaged or unreadable, Legion rebuilds the floor at the running build's
+sequence and surfaces the recovery in Settings > About (with raw error details under Technical
+details).
 
 ## What a person sees
 
