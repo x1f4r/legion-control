@@ -1070,7 +1070,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(collect_body(resp.into_body()).await.unwrap(), data[10..20]);
 
-        // If-Range mismatch serves full 200 OK (even when Range would be out-of-range!)
+        // If-Range mismatch serves full 200 OK even when Range would be out of range.
         h.insert(RANGE, HeaderValue::from_static("bytes=500-600"));
         h.insert(IF_RANGE, HeaderValue::from_static("\"stale-etag\""));
         let resp = handle_request(

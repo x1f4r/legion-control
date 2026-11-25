@@ -524,12 +524,7 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
     )
     .await;
 
-    // Attach a drop hook via an outer body wrapper? Simpler: forward `bytes_served` directly into
-    // the ticket's coalesced bucket by handing the bucket's own counter to `StreamHooks` if we
-    // can, OR even simpler: `DoorContentSource::open_range` records the open and attaches the
-    // bucket counter via a tiny `CountingBody`! Wait — let's check: `bytes_slot` receives the
-    // bucket's `Arc<AtomicU64>` when `open_range` succeeds, and a lightweight `CountingBody`
-    // wrapper increments it as frames flow out.
+    // Wrap the streaming body with the ticket's coalesced byte counter when `open_range` succeeded.
     let bucket_counter = bytes_slot
         .lock()
         .unwrap_or_else(PoisonError::into_inner)

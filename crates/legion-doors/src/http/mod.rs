@@ -450,17 +450,24 @@ impl hyper::service::Service<axum::http::Request<hyper::body::Incoming>> for Inj
     }
 }
 
-/// Wraps a [`TcpStream`] to enforce a write/idle timeout and minimum sustained progress rate while
+/// Wraps a [`TcpStream`] to enforce a write-idle timeout and minimum sustained progress rate while
 /// a content response is actively streaming on the connection.
+///
+/// Only time spent blocked on a full client socket counts toward the minimum-rate window, so a
+/// slow upstream source never causes a fast client to be disconnected. When no content stream is
+/// active on the connection, reads, writes, and vectored writes pass straight through to the inner
+/// [`TcpStream`].
 struct MonitoredTcpStream {
     inner: TcpStream,
     active: Arc<AtomicUsize>,
     write_idle_timeout: Duration,
     min_rate_window: Duration,
     min_rate_bytes: u64,
-    stall_sleep: Option<Pin<Box<Sleep>>>,
-    rate_window_start: Option<Instant>,
+    monitoring_active: bool,
+    blocked_since: Option<Instant>,
+    blocked_accum: Duration,
     rate_window_bytes: u64,
+    stall_sleep: Option<Pin<Box<Sleep>>>,
     rate_sleep: Option<Pin<Box<Sleep>>>,
 }
 
@@ -478,18 +485,119 @@ impl MonitoredTcpStream {
             write_idle_timeout,
             min_rate_window,
             min_rate_bytes,
-            stall_sleep: None,
-            rate_window_start: None,
+            monitoring_active: false,
+            blocked_since: None,
+            blocked_accum: Duration::ZERO,
             rate_window_bytes: 0,
+            stall_sleep: None,
             rate_sleep: None,
         }
     }
 
     fn reset_monitoring(&mut self) {
-        self.stall_sleep = None;
-        self.rate_window_start = None;
+        self.monitoring_active = false;
+        self.blocked_since = None;
+        self.blocked_accum = Duration::ZERO;
         self.rate_window_bytes = 0;
+        self.stall_sleep = None;
         self.rate_sleep = None;
+    }
+
+    fn monitor_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        write_op: impl FnOnce(&mut TcpStream, &mut Context<'_>) -> Poll<io::Result<usize>>,
+    ) -> Poll<io::Result<usize>> {
+        if self.active.load(Ordering::Acquire) == 0 {
+            if self.monitoring_active {
+                self.reset_monitoring();
+            }
+            return write_op(&mut self.inner, cx);
+        }
+        self.monitoring_active = true;
+
+        let now = Instant::now();
+        match write_op(&mut self.inner, cx) {
+            Poll::Ready(Ok(n)) => {
+                if let Some(since) = self.blocked_since.take() {
+                    self.blocked_accum = self
+                        .blocked_accum
+                        .saturating_add(now.saturating_duration_since(since));
+                    self.stall_sleep = None;
+                    self.rate_sleep = None;
+                    self.rate_window_bytes = self.rate_window_bytes.saturating_add(n as u64);
+                } else if !self.blocked_accum.is_zero() {
+                    self.rate_window_bytes = self.rate_window_bytes.saturating_add(n as u64);
+                }
+                if self.blocked_accum >= self.min_rate_window {
+                    if self.rate_window_bytes < self.min_rate_bytes {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "content stream transfer rate fell below minimum threshold",
+                        )));
+                    }
+                    self.blocked_accum = Duration::ZERO;
+                    self.rate_window_bytes = 0;
+                }
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => {
+                let since = *self.blocked_since.get_or_insert(now);
+                let write_idle_timeout = self.write_idle_timeout;
+                let stall = self
+                    .stall_sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(write_idle_timeout)));
+                if stall.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "content stream stalled waiting for client to read",
+                    )));
+                }
+
+                let total_blocked = self
+                    .blocked_accum
+                    .saturating_add(now.saturating_duration_since(since));
+                if total_blocked >= self.min_rate_window {
+                    if self.rate_window_bytes < self.min_rate_bytes {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "content stream transfer rate fell below minimum threshold",
+                        )));
+                    }
+                    self.blocked_accum = Duration::ZERO;
+                    self.rate_window_bytes = 0;
+                    self.blocked_since = Some(now);
+                    self.rate_sleep = None;
+                }
+
+                let current_since = self.blocked_since.unwrap_or(now);
+                let remaining_window = self.min_rate_window.saturating_sub(
+                    self.blocked_accum
+                        .saturating_add(now.saturating_duration_since(current_since)),
+                );
+                let rate_sleep = self
+                    .rate_sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(remaining_window)));
+                if rate_sleep.as_mut().poll(cx).is_ready() {
+                    if self.rate_window_bytes < self.min_rate_bytes {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "content stream transfer rate fell below minimum threshold",
+                        )));
+                    }
+                    self.blocked_accum = Duration::ZERO;
+                    self.rate_window_bytes = 0;
+                    self.blocked_since = Some(now);
+                    let next = Box::pin(tokio::time::sleep(self.min_rate_window));
+                    self.rate_sleep = Some(next);
+                    if let Some(sleep) = self.rate_sleep.as_mut() {
+                        let _ = sleep.as_mut().poll(cx);
+                    }
+                }
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -505,75 +613,25 @@ impl AsyncRead for MonitoredTcpStream {
 
 impl AsyncWrite for MonitoredTcpStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.active.load(Ordering::Acquire) == 0 {
-            self.reset_monitoring();
-            return Pin::new(&mut self.inner).poll_write(cx, buf);
-        }
+        self.get_mut()
+            .monitor_write(cx, |inner, cx| Pin::new(inner).poll_write(cx, buf))
+    }
 
-        let now = Instant::now();
-        if self.rate_window_start.is_none() {
-            self.rate_window_start = Some(now);
-            self.rate_window_bytes = 0;
-            self.rate_sleep = Some(Box::pin(tokio::time::sleep(self.min_rate_window)));
-        }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut()
+            .monitor_write(cx, |inner, cx| Pin::new(inner).poll_write_vectored(cx, bufs))
+    }
 
-        match Pin::new(&mut self.inner).poll_write(cx, buf) {
-            Poll::Ready(Ok(n)) => {
-                if n > 0 {
-                    self.stall_sleep = None;
-                    self.rate_window_bytes = self.rate_window_bytes.saturating_add(n as u64);
-                }
-                if let Some(start) = self.rate_window_start
-                    && now.saturating_duration_since(start) >= self.min_rate_window
-                {
-                    if self.rate_window_bytes < self.min_rate_bytes {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "content stream transfer rate fell below minimum threshold",
-                        )));
-                    }
-                    self.rate_window_start = Some(now);
-                    self.rate_window_bytes = 0;
-                    self.rate_sleep = Some(Box::pin(tokio::time::sleep(self.min_rate_window)));
-                }
-                Poll::Ready(Ok(n))
-            }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => {
-                let write_idle_timeout = self.write_idle_timeout;
-                let stall = self
-                    .stall_sleep
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(write_idle_timeout)));
-                if stall.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "content stream stalled waiting for client to read",
-                    )));
-                }
-                if let Some(rate_sleep) = self.rate_sleep.as_mut()
-                    && rate_sleep.as_mut().poll(cx).is_ready()
-                {
-                    if self.rate_window_bytes < self.min_rate_bytes {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "content stream transfer rate fell below minimum threshold",
-                        )));
-                    }
-                    self.rate_window_start = Some(now);
-                    self.rate_window_bytes = 0;
-                    let next = Box::pin(tokio::time::sleep(self.min_rate_window));
-                    self.rate_sleep = Some(next);
-                    if let Some(next_sleep) = self.rate_sleep.as_mut() {
-                        let _ = next_sleep.as_mut().poll(cx);
-                    }
-                }
-                Poll::Pending
-            }
-        }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1278,5 +1336,115 @@ mod tests {
         assert_eq!(b_reads.len(), 1, "{final_audit:?}");
         assert_eq!(b_reads[0]["args"]["requests"], serde_json::json!(3));
         assert_eq!(b_reads[0]["args"]["bytes_served"], serde_json::json!(600));
+    }
+
+    #[tokio::test]
+    async fn monitored_tcp_stream_forwards_vectored_writes_and_exempts_slow_sources() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_fut = TcpStream::connect(addr);
+        let accept_fut = listener.accept();
+        let (client, server) = tokio::join!(client_fut, accept_fut);
+        let mut client = client.unwrap();
+        let (server, _) = server.unwrap();
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut monitored = MonitoredTcpStream::new(
+            server,
+            Arc::clone(&active),
+            Duration::from_secs(5),
+            Duration::from_millis(120),
+            64 * 1024,
+        );
+        assert!(
+            monitored.is_write_vectored(),
+            "MonitoredTcpStream must advertise vectored writes from TcpStream"
+        );
+
+        // Inactive connection forwards vectored writes directly.
+        let slices = [
+            io::IoSlice::new(b"HTTP/1.1 200 OK\r\n\r\n"),
+            io::IoSlice::new(b"{\"ok\":true}"),
+        ];
+        let written = monitored.write_vectored(&slices).await.unwrap();
+        assert_eq!(written, b"HTTP/1.1 200 OK\r\n\r\n{\"ok\":true}".len());
+        let mut recv = vec![0u8; written];
+        client.read_exact(&mut recv).await.unwrap();
+        assert_eq!(recv, b"HTTP/1.1 200 OK\r\n\r\n{\"ok\":true}");
+
+        // Active content stream with a slow source (1 KiB every 60ms over 420ms, far slower than
+        // 64 KiB / 120ms) and a fast client must NEVER trip the minimum-rate timeout because the
+        // client socket never blocks.
+        active.store(1, Ordering::Release);
+        let reader = tokio::spawn(async move {
+            let mut total = 0usize;
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = client.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            total
+        });
+        let chunk = [b'S'; 1024];
+        for _ in 0..7 {
+            monitored.write_all(&chunk).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        monitored.shutdown().await.unwrap();
+        assert_eq!(reader.await.unwrap(), 7 * 1024);
+    }
+
+    #[tokio::test]
+    async fn monitored_tcp_stream_disconnects_slow_trickling_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_fut = TcpStream::connect(addr);
+        let accept_fut = listener.accept();
+        let (client, server) = tokio::join!(client_fut, accept_fut);
+        let mut client = client.unwrap();
+        let (server, _) = server.unwrap();
+
+        let active = Arc::new(AtomicUsize::new(1));
+        // Long write_idle_timeout (5s) so only the minimum-rate rule (200ms / 512 KiB) can fire
+        // while the client trickles 512 bytes every 50ms.
+        let mut monitored = MonitoredTcpStream::new(
+            server,
+            active,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+            512 * 1024,
+        );
+
+        let trickle = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if client.read(&mut buf).await.unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+        });
+
+        let payload = vec![b'X'; 64 * 1024];
+        let mut err = None;
+        for _ in 0..512 {
+            match monitored.write_all(&payload).await {
+                Ok(()) => {}
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = err.expect("trickling client must be disconnected by minimum-rate rule");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        trickle.abort();
     }
 }
