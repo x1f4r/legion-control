@@ -122,17 +122,48 @@ if [[ "$MODE" == "source" ]]; then
   sed -i "s/^sha256sums=.*/sha256sums=('${HASH}')/" "${WORK}/PKGBUILD"
 else
   CARCH="$(uname -m)"
+  command -v openssl >/dev/null 2>&1 || die "openssl is required to sign the local test SHA256SUMS for legion-bin."
+  ASSET_NAME="legion-${PKGVER}-${CARCH}-unknown-linux-musl"
   cp "${REPO_ROOT}/packaging/systemd/legion-serve.service" "${WORK}/legion-serve.service-${PKGVER}"
   cp "${REPO_ROOT}/packaging/man/legion.1" "${WORK}/legion.1-${PKGVER}"
   cp "${REPO_ROOT}/LICENSE" "${WORK}/LICENSE-${PKGVER}"
-  cp "$STATIC_BIN" "${WORK}/legion-${PKGVER}-${CARCH}-unknown-linux-musl"
+  cp "$STATIC_BIN" "${WORK}/${ASSET_NAME}"
 
+  # Exercise legion-bin's real Ed25519 + SHA256SUMS verify() hook with an ephemeral keypair in
+  # the temporary build directory (never modifying the repository's pinned release public key).
   H_UNIT="$(sha256sum "${WORK}/legion-serve.service-${PKGVER}" | awk '{print $1}')"
   H_MAN="$(sha256sum "${WORK}/legion.1-${PKGVER}" | awk '{print $1}')"
   H_LIC="$(sha256sum "${WORK}/LICENSE-${PKGVER}" | awk '{print $1}')"
-  H_BIN="$(sha256sum "${WORK}/legion-${PKGVER}-${CARCH}-unknown-linux-musl" | awk '{print $1}')"
-  sed -i "s/^sha256sums=.*/sha256sums=('${H_UNIT}' '${H_MAN}' '${H_LIC}')/" "${WORK}/PKGBUILD"
-  sed -i "s/^sha256sums_${CARCH}=.*/sha256sums_${CARCH}=('${H_BIN}')/" "${WORK}/PKGBUILD"
+  H_BIN="$(sha256sum "${WORK}/${ASSET_NAME}" | awk '{print $1}')"
+  printf '%s  %s\n' "$H_BIN" "$ASSET_NAME" > "${WORK}/SHA256SUMS-${PKGVER}"
+
+  openssl genpkey -algorithm ED25519 -out "${WORK}/local-sign.pem" >/dev/null 2>&1
+  openssl pkey -in "${WORK}/local-sign.pem" -pubout -out "${WORK}/local-pub.pem" >/dev/null 2>&1
+  openssl pkeyutl -sign -inkey "${WORK}/local-sign.pem" -rawin \
+    -in "${WORK}/SHA256SUMS-${PKGVER}" -out "${WORK}/SHA256SUMS.sig.bin"
+  base64 -w 0 "${WORK}/SHA256SUMS.sig.bin" > "${WORK}/SHA256SUMS.sig-${PKGVER}"
+  printf '\n' >> "${WORK}/SHA256SUMS.sig-${PKGVER}"
+  rm -f "${WORK}/local-sign.pem" "${WORK}/SHA256SUMS.sig.bin"
+
+  H_SUMS="$(sha256sum "${WORK}/SHA256SUMS-${PKGVER}" | awk '{print $1}')"
+  H_SIG="$(sha256sum "${WORK}/SHA256SUMS.sig-${PKGVER}" | awk '{print $1}')"
+  LOCAL_PUB_BODY="$(awk '!/^-----/' "${WORK}/local-pub.pem" | tr -d '\n')"
+  rm -f "${WORK}/local-pub.pem"
+
+  sed -i "s/^sha256sums=.*/sha256sums=('${H_UNIT}' '${H_MAN}' '${H_LIC}' '${H_SUMS}' '${H_SIG}' '${H_BIN}')/" "${WORK}/PKGBUILD"
+  awk -v body="$LOCAL_PUB_BODY" '
+    /^_release_pubkey=/ {
+      print "_release_pubkey='\''-----BEGIN PUBLIC KEY-----"
+      print body
+      print "-----END PUBLIC KEY-----'\''"
+      in_key = 1
+      next
+    }
+    in_key && /-----END PUBLIC KEY-----/ { in_key = 0; next }
+    in_key { next }
+    { print }
+  ' "${WORK}/PKGBUILD" > "${WORK}/PKGBUILD.tmp"
+  mv "${WORK}/PKGBUILD.tmp" "${WORK}/PKGBUILD"
   MAKEPKG_ENV=(PKGDEST="$OUT_DIR_ABS")
 fi
 

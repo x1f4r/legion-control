@@ -25,3 +25,13 @@ test('release signature authenticates exact manifest bytes and refuses another s
     await assert.rejects(verifyArtifact(file('asset.zip'), digest), /do not match/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('Arch legion-bin PKGBUILD pins the exact contract release public key and verifies signatures', () => {
+  const repoRoot = path.resolve(import.meta.dirname, '..');
+  const contractPem = fs.readFileSync(path.join(repoRoot, 'contract', 'release-public-key.pem'), 'utf8').trim();
+  const pkgbuild = fs.readFileSync(path.join(repoRoot, 'packaging', 'arch', 'legion-bin', 'PKGBUILD'), 'utf8');
+  assert.ok(pkgbuild.includes(contractPem), 'packaging/arch/legion-bin/PKGBUILD must pin contract/release-public-key.pem verbatim');
+  assert.match(pkgbuild, /prepare\(\)\s*\{/, 'packaging/arch/legion-bin/PKGBUILD must verify release signatures in prepare()');
+  assert.match(pkgbuild, /openssl pkeyutl -verify -pubin/, 'packaging/arch/legion-bin/PKGBUILD must verify SHA256SUMS.sig with OpenSSL Ed25519');
+  assert.match(pkgbuild, /SHA256SUMS\.sig/, 'packaging/arch/legion-bin/PKGBUILD must fetch SHA256SUMS.sig');
+});
