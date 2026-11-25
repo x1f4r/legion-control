@@ -5310,7 +5310,6 @@ mod tests {
             role_updated_on: "node-a".to_owned(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         };
         let dev_b = FleetDevice {
             name: "phone-b".to_owned(),
@@ -5330,7 +5329,6 @@ mod tests {
             role_updated_on: "node-b".to_owned(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         };
 
         let mut only_a = DevicesFile::default();
@@ -5425,7 +5423,6 @@ role = \"phone_admin\"
                 role_updated_on: "box-a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         local.removed.insert(
@@ -5467,7 +5464,6 @@ role = \"phone_admin\"
                 role_updated_on: "box-b".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         incoming.devices.insert(
@@ -5490,7 +5486,6 @@ role = \"phone_admin\"
                 role_updated_on: "box-b".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
 
@@ -5551,7 +5546,6 @@ role = \"phone_admin\"
                 role_updated_on: "box-b".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         let mut rogue_call = Call::new(
@@ -5656,7 +5650,6 @@ device = \"11111111111111111111111111111111\"
                 role_updated_on: "box-a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         std::fs::write(paths.config_file("devices.toml"), initial.to_toml_string()).unwrap();
@@ -5685,7 +5678,6 @@ device = \"11111111111111111111111111111111\"
                 role_updated_on: "box-a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         let mut add_call = Call::new(
@@ -5807,7 +5799,6 @@ role = \"phone_admin\"
                 role_updated_on: "box-a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         std::fs::write(paths.config_file("devices.toml"), local.to_toml_string()).unwrap();
@@ -5835,7 +5826,6 @@ role = \"phone_admin\"
                 role_updated_on: "box-b".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         let mut hijack_call = Call::new(
@@ -5903,7 +5893,6 @@ role = \"phone_admin\"
                 role_updated_on: "box-b".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         let err3 = node
@@ -5977,7 +5966,6 @@ role = \"phone_admin\"
                 role_updated_on: "box-a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         std::fs::write(paths.config_file("devices.toml"), initial.to_toml_string()).unwrap();
@@ -6093,7 +6081,6 @@ role = \"phone_admin\"
                 added: "2026-11-24T10:00:00Z".to_owned(),
                 fingerprint: fp,
                 pairing_id: Some(id),
-                confirmed: false,
             },
         );
         save_state(&paths, &st).unwrap();
@@ -6214,7 +6201,6 @@ role = \"ops\"
                 role_updated_on: "box-a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         initial.devices.insert(
@@ -6240,7 +6226,6 @@ role = \"ops\"
                 role_updated_on: "box-a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         std::fs::write(paths.config_file("devices.toml"), initial.to_toml_string()).unwrap();
@@ -6274,7 +6259,6 @@ role = \"ops\"
                 role_updated_on: "box-a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         let mut hijack_call = Call::new(
@@ -6331,7 +6315,6 @@ role = \"ops\"
                     role_updated_on: "box-a".to_owned(),
                     conflict: false,
                     role_conflict: false,
-                    unconfirmed: false,
                 },
             );
             f
@@ -6609,7 +6592,6 @@ role = \"ops\"
                 role_updated_on: "box-a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         std::fs::write(paths.config_file("devices.toml"), initial.to_toml_string()).unwrap();
@@ -6644,7 +6626,6 @@ role = \"ops\"
                 role_updated_on: "box-a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         let mut add_call = Call::new(
@@ -6803,7 +6784,6 @@ role = \"ops\"
                 role_updated_on: "box-a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         std::fs::write(paths.config_file("devices.toml"), local.to_toml_string()).unwrap();
@@ -6840,7 +6820,6 @@ role = \"ops\"
                 role_updated_on: "box-a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         let res1 = node
@@ -6897,7 +6876,6 @@ role = \"ops\"
                 role_updated_on: "box-b".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         let res2 = node
@@ -7004,7 +6982,6 @@ role = \"ops\"
                 role_updated_on: "a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         let init_count = ((MAX_DOCUMENT_BYTES - 2500) / per_tomb) as u32;
@@ -7156,7 +7133,6 @@ role = \"ops\"
                 role_updated_on: "a".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         let err = node
@@ -7442,7 +7418,6 @@ name_updated_on = \"box-b\"
             role_updated_on: "box-b".to_owned(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         };
         let make_tomb = |name: &str, principal: &str| DeviceTombstone {
             name: name.to_owned(),

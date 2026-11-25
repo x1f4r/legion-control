@@ -217,10 +217,24 @@ async fn run(command: Command) -> ExitCode {
             code
         }
         Command::Rpc { pinned } => {
+            if let Ok(node_file) = node.config().get::<legion_core::config::NodeFile>() {
+                legion_tools::device::registry::repair_incomplete_enrolments_at_start(
+                    node.paths(),
+                    &node.name(),
+                    &node_file,
+                );
+            }
             let shutdown = install_shutdown_token();
             serve_rpc(node, router, pinned, Door::Rpc, None, None, shutdown).await
         }
         Command::Mcp { pinned, compact } => {
+            if let Ok(node_file) = node.config().get::<legion_core::config::NodeFile>() {
+                legion_tools::device::registry::repair_incomplete_enrolments_at_start(
+                    node.paths(),
+                    &node.name(),
+                    &node_file,
+                );
+            }
             let shutdown = install_shutdown_token();
             serve_mcp(node, router, pinned, compact, shutdown).await
         }
@@ -237,6 +251,13 @@ async fn run(command: Command) -> ExitCode {
             account,
             ..
         }) => {
+            if let Ok(node_file) = node.config().get::<legion_core::config::NodeFile>() {
+                legion_tools::device::registry::repair_incomplete_enrolments_at_start(
+                    node.paths(),
+                    &node.name(),
+                    &node_file,
+                );
+            }
             let shutdown = install_shutdown_token();
             gate(
                 node, fleet, router, pinned, device, pairing, account, shutdown,
@@ -254,6 +275,13 @@ async fn run(command: Command) -> ExitCode {
             code
         }
         Command::Serve { listen, help } => {
+            if let Ok(node_file) = node.config().get::<legion_core::config::NodeFile>() {
+                legion_tools::device::registry::repair_incomplete_enrolments_at_start(
+                    node.paths(),
+                    &node.name(),
+                    &node_file,
+                );
+            }
             let shutdown = install_shutdown_token();
             serve::run(node, router, listen, help, shutdown).await
         }

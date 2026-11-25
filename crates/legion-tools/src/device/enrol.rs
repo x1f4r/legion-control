@@ -33,13 +33,13 @@ use super::registry::{
     FleetPushOutcome, MAX_DEVICES_TOML_BYTES, NON_OWNER_DEVICES_TOML_LIMIT_BYTES, PairedBy,
     adopt_legacy_devices_from_auth_keys, attach_rollback_failures, devices_reserved_bytes,
     devices_size_limit_error, format_precise_rfc3339, load_devices_raw, lock_config,
-    mark_device_unconfirmed_blocking, non_owner_devices_half_limit_error, push_devices_to_fleet,
-    reconcile_authorized_keys_in_memory, remove_device_principal_locked, restore_file_snapshot,
+    non_owner_devices_half_limit_error, push_devices_to_fleet, reconcile_authorized_keys_in_memory,
+    remove_device_principal_locked, repair_incomplete_enrolments_locked, restore_file_snapshot,
     save_devices_locked, upsert_device_principal_locked,
 };
 use super::store::{
-    DeviceRecord, format_rfc3339, load_state, lock_auth_keys, parse_rfc3339, save_state, sweep,
-    unique_device_name,
+    DeviceRecord, UnconfirmedRecord, format_rfc3339, load_state, lock_auth_keys, parse_rfc3339,
+    save_state, state_path, sweep, unique_device_name,
 };
 
 /// Maximum time `legion gate --enrol` waits for the client's one-line JSON request on stdin.
@@ -133,16 +133,35 @@ impl EnrolReply {
 }
 
 /// Outcome of [`run_enrol_io`], including whether the reply line was written and flushed to the
-/// client and whether the enrolled device was marked unconfirmed because the client had gone.
+/// client and whether the enrolled device is locally awaiting its first authenticated session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnrolIoResult {
     /// The JSON reply generated for this enrolment attempt.
     pub reply: EnrolReply,
     /// `true` when the reply JSON line was written and flushed to `output` without error.
     pub delivered: bool,
-    /// `true` when enrolment committed on disk but the reply could not be delivered, so the device
-    /// was recorded as `unconfirmed = true` in `devices.toml` and in the audit log.
+    /// `true` when enrolment committed on disk; every newly enrolled device starts locally
+    /// unconfirmed in `state/devices.json` until it opens its first real authenticated
+    /// `legion gate` session on this machine.
     pub unconfirmed: bool,
+}
+
+/// Fault-injection hook used only by unit tests to simulate a sudden process kill between steps of
+/// the enrolment write order without running rollback.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EnrolKillPoint {
+    /// Simulate kill right after step 1 (writing local `state.unconfirmed` to `state/devices.json`),
+    /// before touching `policy.toml`, `devices.toml`, or `authorized_keys`.
+    AfterUnconfirmedState,
+    /// Simulate kill right after step 2 (writing `policy.toml` and `devices.toml`), before writing
+    /// the permanent device key line to `authorized_keys`.
+    AfterDevicesAndPolicy,
+    /// Simulate kill right after step 3 (writing the permanent device key line to `authorized_keys`),
+    /// before step 4 removes the temporary invite from `authorized_keys` and `state.invites`.
+    AfterAuthKeysBeforeInviteRemoval,
+    /// Simulate step 4's `save_state` failing after `authorized_keys` already committed.
+    FailStep4StateSave,
 }
 
 /// Executes one enrolment session for `forced_id`, reading one JSON line from `input`, auditing
@@ -159,13 +178,37 @@ pub async fn run_enrol(node: &Node, forced_id: &str, input: impl AsyncRead + Unp
     .reply
 }
 
+#[cfg(test)]
+pub(crate) async fn run_enrol_with_kill_point(
+    node: &Node,
+    forced_id: &str,
+    input: impl AsyncRead + Unpin,
+    kill_point: EnrolKillPoint,
+) -> EnrolReply {
+    let request = match read_request_line(input).await {
+        Ok(req) => req,
+        Err(err) => return EnrolReply::from_error(err),
+    };
+    let node_clone = node.clone();
+    let forced_owned = forced_id.to_owned();
+    let (_, _, _, _, outcome) = tokio::task::spawn_blocking(move || {
+        process_enrol_blocking_impl(&node_clone, &forced_owned, request, Some(kill_point))
+    })
+    .await
+    .expect("enrol kill-point task panicked");
+    match outcome {
+        Ok(reply) => reply,
+        Err(err) => EnrolReply::from_error(err),
+    }
+}
+
 /// Executes one enrolment session for `forced_id`, reading one JSON line from `input`, writing and
 /// flushing the single-line JSON reply to `output`, and auditing the outcome under door `ssh`
 /// (`device.enrol`).
 ///
-/// If the enrolment commits on disk and the reply cannot be written because the client disconnected
-/// (or `shutdown` fired after commit), records the device as `unconfirmed = true` in `devices.toml`
-/// (unless it already opened a session) and records `"unconfirmed": true` in the audit log.
+/// Every newly committed device is recorded as locally unconfirmed in `state/devices.json` before
+/// `devices.toml`, `policy.toml`, or `authorized_keys` are mutated, and remains unconfirmed until
+/// it opens its first real authenticated `legion gate` session on this machine.
 pub async fn run_enrol_io(
     node: &Node,
     forced_id: &str,
@@ -191,7 +234,7 @@ pub async fn run_enrol_io(
         }
     };
 
-    let (principal, push_audit, committed_pairing_id, mut audit_args, mut outcome) =
+    let (principal, push_audit, _committed_pairing_id, mut audit_args, mut outcome) =
         match read_result {
             Err(error) => (None, None, None, json!({ "id": forced_id }), Err(error)),
             Ok(request) => {
@@ -287,23 +330,11 @@ pub async fn run_enrol_io(
         write_enrol_reply(&mut output, &reply).await
     };
 
-    let mut unconfirmed = false;
-    if outcome.is_ok()
-        && !delivered
-        && let Some(pid) = committed_pairing_id
-    {
-        let paths = node.paths().clone();
-        if let Ok(Ok(marked)) =
-            tokio::task::spawn_blocking(move || mark_device_unconfirmed_blocking(&paths, &pid))
-                .await
-        {
-            unconfirmed = marked;
-        }
-        if let Some(obj) = audit_args.as_object_mut() {
+    let unconfirmed = outcome.is_ok();
+    if unconfirmed && let Some(obj) = audit_args.as_object_mut() {
+        obj.insert("unconfirmed".to_owned(), json!(true));
+        if !delivered {
             obj.insert("reply_delivered".to_owned(), json!(false));
-            if unconfirmed {
-                obj.insert("unconfirmed".to_owned(), json!(true));
-            }
         }
     }
 
@@ -429,6 +460,22 @@ fn process_enrol_blocking(
     forced_id: &str,
     request: EnrolRequest,
 ) -> ProcessEnrolResult {
+    #[cfg(test)]
+    {
+        process_enrol_blocking_impl(node, forced_id, request, None)
+    }
+    #[cfg(not(test))]
+    {
+        process_enrol_blocking_impl(node, forced_id, request)
+    }
+}
+
+fn process_enrol_blocking_impl(
+    node: &Node,
+    forced_id: &str,
+    request: EnrolRequest,
+    #[cfg(test)] kill_point: Option<EnrolKillPoint>,
+) -> ProcessEnrolResult {
     let base_args = json!({ "id": forced_id });
 
     if let Err(error) = validate_invite_id(forced_id) {
@@ -495,6 +542,32 @@ fn process_enrol_blocking(
         Err(error) => return (None, None, None, base_args, Err(error)),
     };
 
+    let caller_account = match legion_os::user::current_username() {
+        Ok(name) => Some(name),
+        Err(error) if target.windows_admin_acl => {
+            return (
+                None,
+                None,
+                None,
+                base_args,
+                Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Cannot determine current OS account to scope shared administrators_authorized_keys: {error}."
+                    ),
+                )),
+            );
+        }
+        Err(_) => None,
+    };
+
+    // Repair any incomplete enrolment left on disk by an earlier kill before checking invites.
+    if let Err(error) =
+        repair_incomplete_enrolments_locked(paths, &target, &write_path, caller_account.as_deref())
+    {
+        return (None, None, None, base_args, Err(error));
+    }
+
     let node_name = node.name();
     let valid_node_name = NodeName::try_from(node_name.clone())
         .map(|n| n.as_str().to_owned())
@@ -502,11 +575,16 @@ fn process_enrol_blocking(
 
     let policy_path = paths.config_file(Policy::FILE);
     let devices_path = paths.config_file(DevicesFile::FILE);
+    let state_file_path = state_path(paths);
     let policy_before = match legion_core::config::read_regular_file(&policy_path) {
         Ok(bytes) => bytes,
         Err(error) => return (None, None, None, base_args, Err(error)),
     };
     let devices_before = match legion_core::config::read_regular_file(&devices_path) {
+        Ok(bytes) => bytes,
+        Err(error) => return (None, None, None, base_args, Err(error)),
+    };
+    let state_before = match legion_core::config::read_regular_file(&state_file_path) {
         Ok(bytes) => bytes,
         Err(error) => return (None, None, None, base_args, Err(error)),
     };
@@ -751,15 +829,16 @@ fn process_enrol_blocking(
 
     let replaced_unconfirmed: Option<(String, FleetDevice)> = if !has_non_owned_auth_key
         && matching_registry.len() == 1
-        && matching_registry[0].1.unconfirmed
+        && state.unconfirmed.contains_key(&matching_registry[0].0)
     {
-        // A fresh invite from the same device key whose previous enrolment never delivered its
-        // confirmation replaces that unconfirmed leftover atomically under the same locks.
+        // A fresh invite from the same device key whose previous enrolment on this machine has not
+        // yet opened an authenticated session replaces that unconfirmed leftover atomically under
+        // the same locks.
         Some(matching_registry[0].clone())
     } else if !matching_registry.is_empty() {
         let existing = matching_registry
             .iter()
-            .find(|(_, dev)| !dev.unconfirmed)
+            .find(|(id, _)| !state.unconfirmed.contains_key(id))
             .map(|(_, dev)| dev)
             .unwrap_or(&matching_registry[0].1);
         return fail_with_sweep(
@@ -914,11 +993,10 @@ fn process_enrol_blocking(
             updated_on: valid_node_name.clone(),
             name_updated_at: precise_now.clone(),
             name_updated_on: valid_node_name.clone(),
-            role_updated_at: precise_now,
+            role_updated_at: precise_now.clone(),
             role_updated_on: valid_node_name.clone(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         },
     );
 
@@ -940,16 +1018,28 @@ fn process_enrol_blocking(
     let added = Timestamp::from_second(now.as_second())
         .map(format_rfc3339)
         .unwrap_or_else(|_| format_rfc3339(now));
-    if let Some((old_id, old_dev)) = &replaced_unconfirmed
-        && state
+    if let Some((old_id, old_dev)) = &replaced_unconfirmed {
+        state.unconfirmed.remove(old_id);
+        if state
             .devices
             .get(&old_dev.name)
             .and_then(|rec| rec.pairing_id.as_deref())
             == Some(old_id.as_str())
-    {
-        state.devices.remove(&old_dev.name);
+        {
+            state.devices.remove(&old_dev.name);
+        }
     }
-    state.invites.remove(forced_id);
+    state.unconfirmed.insert(
+        pairing_id.clone(),
+        UnconfirmedRecord {
+            pairing_id: pairing_id.clone(),
+            invite_id: forced_id.to_owned(),
+            name: device_name.clone(),
+            principal: principal.clone(),
+            fingerprint: validated_key.fingerprint.clone(),
+            created: precise_now,
+        },
+    );
     state.devices.insert(
         device_name.clone(),
         DeviceRecord {
@@ -958,25 +1048,42 @@ fn process_enrol_blocking(
             added,
             fingerprint: validated_key.fingerprint.clone(),
             pairing_id: Some(pairing_id.clone()),
-            confirmed: false,
         },
     );
 
-    // 1. Update `policy.toml` (removing any replaced unconfirmed `device:*` principal and
-    //    creating the new `device:*` principal when requested) and `devices.toml` FIRST, before
-    //    touching `authorized_keys`. If anything fails here, roll back so nothing on disk changed.
-    let mut policy_touched = false;
-    if let Some((old_id, old_dev)) = &replaced_unconfirmed
-        && old_dev.principal.starts_with(DEVICE_PRINCIPAL_PREFIX)
-    {
-        match remove_device_principal_locked(paths, &old_dev.principal, old_id) {
-            Ok(changed) => policy_touched |= changed,
-            Err(error) => return (Some(principal), None, None, base_args, Err(error)),
-        }
+    // 1. Write the local `state.unconfirmed` record (still keeping `forced_id` in `state.invites`)
+    //    to `state/devices.json` FIRST, before touching `policy.toml`, `devices.toml`, or
+    //    `authorized_keys`. Any kill after this step leaves a durable marker for automatic repair.
+    if let Err(error) = save_state(paths, &state) {
+        return (Some(principal), None, None, base_args, Err(error));
     }
-    if invite.create_principal {
-        if let Err(error) = upsert_device_principal_locked(paths, &principal, &role, &pairing_id) {
+    #[cfg(test)]
+    if kill_point == Some(EnrolKillPoint::AfterUnconfirmedState) {
+        return (
+            Some(principal),
+            None,
+            None,
+            base_args,
+            Err(ErrorBody::new(
+                ErrorCode::Internal,
+                "simulated kill after step 1 (state.unconfirmed)",
+            )),
+        );
+    }
+
+    let rollback_state =
+        |error: ErrorBody, policy_touched: bool, devices_touched: bool| -> ErrorBody {
             let mut rollback_failures = Vec::new();
+            if devices_touched
+                && let Err(msg) = restore_file_snapshot(
+                    paths,
+                    "device.enrol",
+                    &devices_path,
+                    devices_before.as_deref(),
+                )
+            {
+                rollback_failures.push(msg);
+            }
             if policy_touched
                 && let Err(msg) = restore_file_snapshot(
                     paths,
@@ -987,59 +1094,71 @@ fn process_enrol_blocking(
             {
                 rollback_failures.push(msg);
             }
+            if let Err(msg) = restore_file_snapshot(
+                paths,
+                "device.enrol",
+                &state_file_path,
+                state_before.as_deref(),
+            ) {
+                rollback_failures.push(msg);
+            }
+            attach_rollback_failures(error, &rollback_failures)
+        };
+
+    // 2. Update `policy.toml` (removing any replaced unconfirmed `device:*` principal and
+    //    creating the new `device:*` principal when requested) and `devices.toml`.
+    //    On failure, roll back `policy.toml` and `state/devices.json`.
+    let mut policy_touched = false;
+    if let Some((old_id, old_dev)) = &replaced_unconfirmed
+        && old_dev.principal.starts_with(DEVICE_PRINCIPAL_PREFIX)
+    {
+        match remove_device_principal_locked(paths, &old_dev.principal, old_id) {
+            Ok(changed) => policy_touched |= changed,
+            Err(error) => {
+                return (
+                    Some(principal),
+                    None,
+                    None,
+                    base_args,
+                    Err(rollback_state(error, false, false)),
+                );
+            }
+        }
+    }
+    if invite.create_principal {
+        if let Err(error) = upsert_device_principal_locked(paths, &principal, &role, &pairing_id) {
             return (
                 Some(principal),
                 None,
                 None,
                 base_args,
-                Err(attach_rollback_failures(error, &rollback_failures)),
+                Err(rollback_state(error, policy_touched, false)),
             );
         }
         policy_touched = true;
     }
     if let Err(error) = save_devices_locked(paths, &devices) {
-        let mut rollback_failures = Vec::new();
-        if policy_touched
-            && let Err(msg) = restore_file_snapshot(
-                paths,
-                "device.enrol",
-                &policy_path,
-                policy_before.as_deref(),
-            )
-        {
-            rollback_failures.push(msg);
-        }
         return (
             Some(principal),
             None,
             None,
             base_args,
-            Err(attach_rollback_failures(error, &rollback_failures)),
+            Err(rollback_state(error, policy_touched, false)),
         );
     }
-
-    let rollback_both = |error: ErrorBody| -> ErrorBody {
-        let mut rollback_failures = Vec::new();
-        if let Err(msg) = restore_file_snapshot(
-            paths,
-            "device.enrol",
-            &devices_path,
-            devices_before.as_deref(),
-        ) {
-            rollback_failures.push(msg);
-        }
-        if policy_touched
-            && let Err(msg) = restore_file_snapshot(
-                paths,
-                "device.enrol",
-                &policy_path,
-                policy_before.as_deref(),
-            )
-        {
-            rollback_failures.push(msg);
-        }
-        attach_rollback_failures(error, &rollback_failures)
-    };
+    #[cfg(test)]
+    if kill_point == Some(EnrolKillPoint::AfterDevicesAndPolicy) {
+        return (
+            Some(principal),
+            None,
+            None,
+            base_args,
+            Err(ErrorBody::new(
+                ErrorCode::Internal,
+                "simulated kill after step 2 (devices.toml and policy.toml)",
+            )),
+        );
+    }
 
     let live_policy = match legion_core::config::read_regular_file(&policy_path) {
         Ok(Some(bytes)) => match parse::<Policy>(&policy_path, &bytes) {
@@ -1050,7 +1169,7 @@ fn process_enrol_blocking(
                     None,
                     None,
                     base_args,
-                    Err(rollback_both(error)),
+                    Err(rollback_state(error, policy_touched, true)),
                 );
             }
         },
@@ -1061,18 +1180,15 @@ fn process_enrol_blocking(
                 None,
                 None,
                 base_args,
-                Err(rollback_both(error)),
+                Err(rollback_state(error, policy_touched, true)),
             );
         }
     };
 
-    // 2. Swap the temporary invite line for the permanent device line in `authorized_keys` LAST.
-    //    If the swap fails, roll back BOTH `devices.toml` and `policy.toml`.
-    let swap_result = edit_auth_keys_with_retry(&target, &write_path, |mut disk_auth| {
-        let mut disk_state = load_state(paths)?;
-        let _ = sweep(&mut disk_auth, &mut disk_state, now);
-        disk_auth
-            .retain(|line| !matches!(&line.kind, LineKind::Invite { id, .. } if id == forced_id));
+    // 3. Add the permanent device key line to `authorized_keys` (leaving the temporary invite line
+    //    in place until step 4). If this fails, roll back `devices.toml`, `policy.toml`, and
+    //    `state/devices.json`.
+    let add_key_result = edit_auth_keys_with_retry(&target, &write_path, |mut disk_auth| {
         let report = reconcile_authorized_keys_in_memory(
             &mut disk_auth,
             &devices,
@@ -1102,15 +1218,58 @@ fn process_enrol_blocking(
         }
         Ok((Some(disk_auth), ()))
     });
-    if let Err(error) = swap_result {
+    if let Err(error) = add_key_result {
         return (
             Some(principal),
             None,
             None,
             base_args,
-            Err(rollback_both(error)),
+            Err(rollback_state(error, policy_touched, true)),
         );
     }
+    #[cfg(test)]
+    if kill_point == Some(EnrolKillPoint::AfterAuthKeysBeforeInviteRemoval) {
+        return (
+            Some(principal),
+            None,
+            None,
+            base_args,
+            Err(ErrorBody::new(
+                ErrorCode::Internal,
+                "simulated kill after step 3 (authorized_keys device line before invite removal)",
+            )),
+        );
+    }
+
+    // 4. Remove the single-use invite line from `authorized_keys` and `state.invites` LAST.
+    //    The permanent device is already active in `devices.toml`, `policy.toml`,
+    //    `authorized_keys`, and `state.unconfirmed`, so if step 4 fails we record a warning and
+    //    still reply `ok: true`; the next run automatically removes the leftover invite via
+    //    `state.unconfirmed`.
+    let mut step4_warnings = Vec::new();
+    if let Err(error) = edit_auth_keys_with_retry(&target, &write_path, |mut disk_auth| {
+        let removed = disk_auth
+            .retain(|line| !matches!(&line.kind, LineKind::Invite { id, .. } if id == forced_id));
+        Ok((removed.then_some(disk_auth), ()))
+    }) {
+        step4_warnings.push(error.message);
+    }
+    state.invites.remove(forced_id);
+    #[cfg(test)]
+    let step4_save_result = if kill_point == Some(EnrolKillPoint::FailStep4StateSave) {
+        Err(ErrorBody::new(
+            ErrorCode::Failed,
+            "simulated step 4 state/devices.json write failure",
+        ))
+    } else {
+        save_state(paths, &state)
+    };
+    #[cfg(not(test))]
+    let step4_save_result = save_state(paths, &state);
+    if let Err(error) = step4_save_result {
+        step4_warnings.push(error.message);
+    }
+    let state_warning = (!step4_warnings.is_empty()).then(|| step4_warnings.join("; "));
 
     let push_audit = Some(DeviceRegistryPushAudit {
         trigger: "device.enrol".to_owned(),
@@ -1120,13 +1279,6 @@ fn process_enrol_blocking(
         source_node: Some(node.name()),
     });
     let fingerprint = validated_key.fingerprint;
-
-    // authorized_keys, devices.toml, and policy.toml already hold the permanent device (with the
-    // temporary invite line removed), and device.list tolerates missing state/devices.json
-    // metadata. If persisting state/devices.json fails after the swap, record the warning in the
-    // audit args and still reply ok: true so the controller does not mistakenly believe enrolment
-    // failed.
-    let state_warning = save_state(paths, &state).err().map(|error| error.message);
 
     let mut audit_args = json!({
         "id": forced_id,

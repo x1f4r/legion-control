@@ -2996,7 +2996,6 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
             added: "2026-11-24T10:00:00Z".to_owned(),
             fingerprint: legacy_validated.fingerprint,
             pairing_id: Some(legacy_pairing_id.to_owned()),
-            confirmed: false,
         },
     );
     let paths_c = legion_core::Paths::under(home_c_root.clone());
@@ -3141,7 +3140,6 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
                 role_updated_on: "b".to_owned(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             },
         );
         std::fs::write(&b_devices_path, b_devices.to_toml_string()).unwrap();
@@ -3377,7 +3375,6 @@ role = \"phone_admin\"
             role_updated_on: "a".to_owned(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         },
     );
     devices_a.devices.insert(
@@ -3400,7 +3397,6 @@ role = \"phone_admin\"
             role_updated_on: "a".to_owned(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         },
     );
     node_a.write_config("devices.toml", &devices_a.to_toml_string());
@@ -3426,7 +3422,6 @@ role = \"phone_admin\"
             role_updated_on: "a".to_owned(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         },
     );
     devices_b.removed.insert(
@@ -3621,7 +3616,6 @@ role = \"ops\"
             role_updated_on: "stamp-box".to_owned(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         },
     );
     initial.devices.insert(
@@ -3644,7 +3638,6 @@ role = \"ops\"
             role_updated_on: "stamp-box".to_owned(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         },
     );
     home.write_config("devices.toml", &initial.to_toml_string());
@@ -3964,7 +3957,6 @@ role = \"ops\"
             role_updated_on: "a".to_owned(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         },
     );
     node_a.write_config("devices.toml", &dev_a.to_toml_string());
@@ -3995,7 +3987,6 @@ role = \"ops\"
             role_updated_on: "a".to_owned(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         },
     );
     node_b.write_config("devices.toml", &dev_b.to_toml_string());
@@ -4058,7 +4049,6 @@ role = \"ops\"
             role_updated_on: "b".to_owned(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         },
     );
     node_b.write_config("devices.toml", &dev_b2.to_toml_string());

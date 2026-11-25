@@ -326,8 +326,6 @@ struct RawFleetDevice {
     conflict: bool,
     #[serde(default)]
     role_conflict: bool,
-    #[serde(default)]
-    unconfirmed: bool,
 }
 
 impl TryFrom<RawFleetDevice> for FleetDevice {
@@ -376,7 +374,6 @@ impl TryFrom<RawFleetDevice> for FleetDevice {
             role_updated_on,
             conflict: raw.conflict,
             role_conflict: raw.role_conflict,
-            unconfirmed: raw.unconfirmed,
         })
     }
 }
@@ -446,11 +443,6 @@ pub struct FleetDevice {
     /// `role_updated_at`) or removes the device.
     #[serde(default, skip_serializing_if = "is_false")]
     pub role_conflict: bool,
-    /// `true` when the enrolment reply could not be delivered because the client disconnected
-    /// before receiving confirmation. Cleared automatically the first time this device opens a
-    /// session with its key, and omitted from `devices.toml` once confirmed.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub unconfirmed: bool,
 }
 
 /// One removed-device tombstone in `devices.toml`.
@@ -696,9 +688,6 @@ fn build_live_device_table(dev: &FleetDevice) -> Table {
     }
     if dev.role_conflict {
         t["role_conflict"] = value(true);
-    }
-    if dev.unconfirmed {
-        t["unconfirmed"] = value(true);
     }
     t
 }
@@ -1147,7 +1136,6 @@ fn merge_live_device(da: &FleetDevice, db: &FleetDevice) -> FleetDevice {
         role_updated_on,
         conflict,
         role_conflict,
-        unconfirmed: da.unconfirmed && db.unconfirmed,
     }
 }
 
@@ -2206,7 +2194,6 @@ pub fn adopt_legacy_devices_from_auth_keys(
                 role_updated_on: valid_node.clone(),
                 conflict: false,
                 role_conflict: false,
-                unconfirmed: false,
             });
     }
 
@@ -2759,19 +2746,27 @@ pub fn reconcile_devices_and_auth_keys_with_config_lock(
 
     let exe = legion_core::current_exe()?;
     let shell = ForcedCommandShell::host()?;
-    let report = edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
-        let report = reconcile_authorized_keys_in_memory(
-            &mut auth_keys,
-            &devices,
-            &live_policy,
-            paths,
-            &target,
-            caller_account.as_deref(),
-            &exe,
-            shell,
-        )?;
-        Ok((report.changed.then_some(auth_keys), report))
-    })?;
+    let (report, state_to_save) =
+        edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
+            let mut state = load_state(paths).unwrap_or_default();
+            let (repaired_auth, repaired_state) =
+                repair_unconfirmed_state_in_memory(&mut auth_keys, &mut state, &devices, paths);
+            let report = reconcile_authorized_keys_in_memory(
+                &mut auth_keys,
+                &devices,
+                &live_policy,
+                paths,
+                &target,
+                caller_account.as_deref(),
+                &exe,
+                shell,
+            )?;
+            let write_auth = (repaired_auth || report.changed).then_some(auth_keys);
+            Ok((write_auth, (report, repaired_state.then_some(state))))
+        })?;
+    if let Some(state) = state_to_save {
+        let _ = save_state(paths, &state);
+    }
 
     Ok(ReconcileOutcome {
         devices,
@@ -2782,92 +2777,241 @@ pub fn reconcile_devices_and_auth_keys_with_config_lock(
     })
 }
 
-/// Marks live device `pairing_id` as `unconfirmed = true` in `devices.toml` after the enrolment
-/// reply could not be delivered, unless that device has already authenticated and opened a live
-/// session with its key (recorded in `state/devices.json`).
+/// Repairs incomplete enrolments left behind if the machine was killed mid-enrolment:
 ///
-/// Returns `Ok(true)` when the entry is recorded as unconfirmed and `Ok(false)` when it was
-/// already confirmed by a session or is no longer live.
-pub fn mark_device_unconfirmed_blocking(
+/// 1. For every local `state.unconfirmed` record, if `rec.invite_id` still exists in
+///    `state.invites` or `auth_keys` (belonging to this Legion home), removes that invite from
+///    both `state.invites` and `auth_keys`.
+/// 2. If `devices` no longer has a live entry for `rec.pairing_id` (either because the process
+///    was killed before writing `devices.toml`, or because the device was later removed/tombstoned),
+///    prunes the stale record from `state.unconfirmed` (and any matching orphan from
+///    `state.devices`).
+///
+/// Missing `authorized_keys` lines for live entries already committed to `devices.toml` are
+/// restored by [`reconcile_authorized_keys_in_memory`] right alongside this step.
+///
+/// Returns `(auth_keys_changed, state_changed)`.
+pub fn repair_unconfirmed_state_in_memory(
+    auth_keys: &mut AuthKeysFile,
+    state: &mut DevicesState,
+    devices: &DevicesFile,
+    paths: &Paths,
+) -> (bool, bool) {
+    if state.unconfirmed.is_empty() {
+        return (false, false);
+    }
+    let invite_ids: HashSet<String> = state
+        .unconfirmed
+        .values()
+        .map(|rec| rec.invite_id.clone())
+        .collect();
+    let auth_changed = auth_keys.retain(|line| match &line.kind {
+        LineKind::Invite { id, home, .. } => {
+            !(invite_ids.contains(id) && line_matches_home(home.as_ref(), paths))
+        }
+        LineKind::Device { .. } | LineKind::Foreign => true,
+    });
+    let mut state_changed = false;
+    for invite_id in &invite_ids {
+        if state.invites.remove(invite_id).is_some() {
+            state_changed = true;
+        }
+    }
+    let stale_pids: Vec<String> = state
+        .unconfirmed
+        .keys()
+        .filter(|pid| !devices.devices.contains_key(pid.as_str()))
+        .cloned()
+        .collect();
+    for pid in stale_pids {
+        if let Some(rec) = state.unconfirmed.remove(&pid) {
+            state_changed = true;
+            if state
+                .devices
+                .get(&rec.name)
+                .and_then(|d| d.pairing_id.as_deref())
+                == Some(pid.as_str())
+            {
+                state.devices.remove(&rec.name);
+            }
+        }
+    }
+    (auth_changed, state_changed)
+}
+
+/// Repairs any incomplete enrolment left on disk by an earlier kill while the caller already holds
+/// both [`lock_config`] and [`lock_auth_keys`].
+///
+/// Fast no-op when `state.unconfirmed` is empty. When an unconfirmed record has a leftover invite
+/// in `state.invites` or `authorized_keys`, is orphaned (not in `devices.toml`), or is live in
+/// `devices.toml` without its `authorized_keys` line, removes the leftover invite, prunes orphan
+/// records, and restores any missing permanent device key line via
+/// [`reconcile_authorized_keys_in_memory`].
+pub(crate) fn repair_incomplete_enrolments_locked(
+    paths: &Paths,
+    target: &AuthKeysTarget,
+    write_path: &Path,
+    caller_account: Option<&str>,
+) -> Result<bool, ErrorBody> {
+    let initial_state = load_state(paths)?;
+    if initial_state.unconfirmed.is_empty() {
+        return Ok(false);
+    }
+    let devices = load_devices_raw(paths)?.unwrap_or_default();
+    let policy_path = paths.config_file(Policy::FILE);
+    let live_policy = match legion_core::config::read_regular_file(&policy_path)? {
+        Some(bytes) => parse::<Policy>(&policy_path, &bytes)?,
+        None => Policy::default(),
+    };
+    let (changed, state_to_save) =
+        edit_auth_keys_with_retry(target, write_path, |mut auth_keys| {
+            let mut state = load_state(paths)?;
+            let (repaired_auth, repaired_state) =
+                repair_unconfirmed_state_in_memory(&mut auth_keys, &mut state, &devices, paths);
+            let missing_unconfirmed_line = state.unconfirmed.keys().any(|pid| {
+                devices.devices.contains_key(pid)
+                    && !auth_keys.lines.iter().any(|line| {
+                        matches!(
+                            &line.kind,
+                            LineKind::Device {
+                                pairing_id,
+                                home,
+                                account,
+                                ..
+                            } if pairing_id == pid
+                                && line_matches_home(home.as_ref(), paths)
+                                && line_matches_account(
+                                    account.as_deref(),
+                                    caller_account,
+                                    target.windows_admin_acl,
+                                    cfg!(windows),
+                                )
+                        )
+                    })
+            });
+            let reconciled_changed = if repaired_auth || missing_unconfirmed_line {
+                let exe = legion_core::current_exe()?;
+                let shell = ForcedCommandShell::host()?;
+                reconcile_authorized_keys_in_memory(
+                    &mut auth_keys,
+                    &devices,
+                    &live_policy,
+                    paths,
+                    target,
+                    caller_account,
+                    &exe,
+                    shell,
+                )?
+                .changed
+            } else {
+                false
+            };
+            let auth_changed = repaired_auth || reconciled_changed;
+            Ok((
+                auth_changed.then_some(auth_keys),
+                (
+                    auth_changed || repaired_state,
+                    repaired_state.then_some(state),
+                ),
+            ))
+        })?;
+    if let Some(state) = state_to_save {
+        save_state(paths, &state)?;
+    }
+    Ok(changed)
+}
+
+/// Fast startup check that repairs any incomplete enrolment left on disk by an earlier kill
+/// (an unconfirmed record whose invite still exists, or a live `devices.toml` entry whose
+/// `authorized_keys` line is missing).
+///
+/// Takes no locks and touches no files in the common steady state when there are no incomplete
+/// enrolments to repair.
+pub fn repair_incomplete_enrolments_at_start(paths: &Paths, node_name: &str, node_file: &NodeFile) {
+    let Ok(state) = load_state(paths) else {
+        return;
+    };
+    if state.unconfirmed.is_empty() {
+        return;
+    }
+    let has_leftover_invite = state
+        .unconfirmed
+        .values()
+        .any(|rec| state.invites.contains_key(&rec.invite_id));
+    let needs_repair = if has_leftover_invite {
+        true
+    } else if let Ok(Some(devices)) = load_devices_raw(paths) {
+        let has_orphan = state
+            .unconfirmed
+            .keys()
+            .any(|pid| !devices.devices.contains_key(pid));
+        if has_orphan {
+            true
+        } else if let Ok(target) = resolve_target(paths, node_file)
+            && let Ok(write_path) = resolve_safe_write_path(&target, paths.home())
+            && let Ok(auth_keys) = read_auth_keys(&write_path)
+        {
+            let auth_pids: HashSet<&str> = auth_keys
+                .lines
+                .iter()
+                .filter_map(|line| match &line.kind {
+                    LineKind::Device {
+                        pairing_id, home, ..
+                    } if line_matches_home(home.as_ref(), paths) => Some(pairing_id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let auth_inv_ids: HashSet<&str> = auth_keys
+                .lines
+                .iter()
+                .filter_map(|line| match &line.kind {
+                    LineKind::Invite { id, home, .. }
+                        if line_matches_home(home.as_ref(), paths) =>
+                    {
+                        Some(id.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            state.unconfirmed.values().any(|rec| {
+                auth_inv_ids.contains(rec.invite_id.as_str())
+                    || (devices.devices.contains_key(&rec.pairing_id)
+                        && !auth_pids.contains(rec.pairing_id.as_str()))
+            })
+        } else {
+            false
+        }
+    } else {
+        true
+    };
+    if needs_repair {
+        let _ = reconcile_devices_and_auth_keys_blocking(paths, node_name, node_file, false);
+    }
+}
+
+/// Clears the local `unconfirmed` mark for `pairing_id` in `state/devices.json` once the device
+/// has authenticated and opened a real `legion gate` session with its permanent key on this
+/// machine.
+///
+/// Never modifies `devices.toml`.
+pub fn clear_device_unconfirmed_blocking(
     paths: &Paths,
     pairing_id: &str,
 ) -> Result<bool, ErrorBody> {
     let _cfg_guard = lock_config(paths)?;
-    if let Ok(state) = load_state(paths)
-        && state
-            .devices
-            .values()
-            .any(|rec| rec.pairing_id.as_deref() == Some(pairing_id) && rec.confirmed)
-    {
-        return Ok(false);
-    }
-    let Some(mut devices) = load_devices_raw(paths)? else {
-        return Ok(false);
-    };
-    let Some(entry) = devices.devices.get_mut(pairing_id) else {
-        return Ok(false);
-    };
-    if !entry.unconfirmed {
-        entry.unconfirmed = true;
-        save_devices_locked(paths, &devices)?;
-    }
-    Ok(true)
-}
-
-/// Records that `pairing_id` opened a live session with its permanent key, clearing
-/// `unconfirmed = true` from `devices.toml` if present and marking `confirmed = true` in
-/// `state/devices.json`.
-pub fn confirm_device_session_blocking(paths: &Paths, pairing_id: &str) -> Result<bool, ErrorBody> {
-    let _cfg_guard = lock_config(paths)?;
-    if let Ok(mut state) = load_state(paths) {
-        let mut state_changed = false;
-        for rec in state.devices.values_mut() {
-            if rec.pairing_id.as_deref() == Some(pairing_id) && !rec.confirmed {
-                rec.confirmed = true;
-                state_changed = true;
-            }
-        }
-        if state_changed {
-            let _ = save_state(paths, &state);
-        }
-    }
-    let Some(mut devices) = load_devices_raw(paths)? else {
-        return Ok(false);
-    };
-    let Some(entry) = devices.devices.get_mut(pairing_id) else {
-        return Ok(false);
-    };
-    if entry.unconfirmed {
-        entry.unconfirmed = false;
-        save_devices_locked(paths, &devices)?;
+    let mut state = load_state(paths)?;
+    if state.unconfirmed.remove(pairing_id).is_some() {
+        save_state(paths, &state)?;
         return Ok(true);
     }
     Ok(false)
 }
 
-fn note_gate_session_confirmed(paths: &Paths, pairing_id: &str, entry: &FleetDevice) {
-    if entry.unconfirmed {
-        let _ = confirm_device_session_blocking(paths, pairing_id);
-        return;
-    }
-    // For very recently paired devices (within 2 minutes), also mark `state/devices.json`
-    // confirmed once so an immediate post-enrol probe cannot race a late `BrokenPipe` write
-    // failure on the enrolment reply channel.
-    let recently_paired = entry
-        .paired_at
-        .parse::<Timestamp>()
-        .ok()
-        .is_some_and(|paired_ts| {
-            Timestamp::now().duration_since(paired_ts) < SignedDuration::from_secs(120)
-        });
-    if recently_paired
-        && let Ok(state) = load_state(paths)
-        && state
-            .devices
-            .values()
-            .any(|rec| rec.pairing_id.as_deref() == Some(pairing_id) && !rec.confirmed)
+fn note_gate_session_confirmed(paths: &Paths, pairing_id: &str) {
+    if let Ok(state) = load_state(paths)
+        && state.unconfirmed.contains_key(pairing_id)
     {
-        let _ = confirm_device_session_blocking(paths, pairing_id);
+        let _ = clear_device_unconfirmed_blocking(paths, pairing_id);
     }
 }
 
@@ -3119,11 +3263,11 @@ pub fn verify_gate_device(
                 ),
             ));
         }
-        note_gate_session_confirmed(paths, pairing_id, entry);
+        note_gate_session_confirmed(paths, pairing_id);
         return Ok(outcome.removed_targets);
     }
 
-    note_gate_session_confirmed(paths, pairing_id, entry);
+    note_gate_session_confirmed(paths, pairing_id);
     Ok(Vec::new())
 }
 
@@ -3289,20 +3433,28 @@ fn save_and_reconcile_devices_locked(
 
     let exe = legion_core::current_exe().map_err(after_save)?;
     let shell = ForcedCommandShell::host().map_err(after_save)?;
-    let auth_report = edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
-        let report = reconcile_authorized_keys_in_memory(
-            &mut auth_keys,
-            &merged,
-            &reconciled_policy,
-            paths,
-            &target,
-            caller_account.as_deref(),
-            &exe,
-            shell,
-        )?;
-        Ok((report.changed.then_some(auth_keys), report))
-    })
-    .map_err(after_save)?;
+    let (auth_report, state_to_save) =
+        edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
+            let mut state = load_state(paths).unwrap_or_default();
+            let (repaired_auth, repaired_state) =
+                repair_unconfirmed_state_in_memory(&mut auth_keys, &mut state, &merged, paths);
+            let report = reconcile_authorized_keys_in_memory(
+                &mut auth_keys,
+                &merged,
+                &reconciled_policy,
+                paths,
+                &target,
+                caller_account.as_deref(),
+                &exe,
+                shell,
+            )?;
+            let write_auth = (repaired_auth || report.changed).then_some(auth_keys);
+            Ok((write_auth, (report, repaired_state.then_some(state))))
+        })
+        .map_err(after_save)?;
+    if let Some(state) = state_to_save {
+        let _ = save_state(paths, &state);
+    }
     warnings.extend(auth_report.warnings);
 
     let mut removed_set: BTreeSet<SessionTarget> =
@@ -3797,7 +3949,6 @@ mod tests {
             role_updated_on: node.to_owned(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         }
     }
 
@@ -3862,7 +4013,6 @@ mod tests {
                     let role_updated_on = *rng.pick(&nodes);
                     let conflict = rng.next().is_multiple_of(5);
                     let role_conflict = rng.next().is_multiple_of(5);
-                    let unconfirmed = rng.next().is_multiple_of(4);
                     let key_seed = ((idx + 1) as u8) * 10 + (rng.next() % 3) as u8;
                     let paired_by = match rng.next() % 3 {
                         0 => None,
@@ -3902,7 +4052,6 @@ mod tests {
                             role_updated_on: role_updated_on.to_owned(),
                             conflict,
                             role_conflict,
-                            unconfirmed,
                         },
                     );
                 }
@@ -3975,7 +4124,6 @@ mod tests {
             role_updated_on: "pi".to_owned(),
             conflict: false,
             role_conflict: false,
-            unconfirmed: false,
         };
 
         let mut variants: Vec<FleetDevice> = Vec::new();
@@ -3991,7 +4139,6 @@ mod tests {
         push_variant(|d| d.role = Some("editor".to_owned()));
         push_variant(|d| d.conflict = true);
         push_variant(|d| d.role_conflict = true);
-        push_variant(|d| d.unconfirmed = true);
         push_variant(|d| d.principal = "device:beta".to_owned());
         push_variant(|d| d.public_key = sample_key(11));
         push_variant(|d| d.paired_at = "2026-11-24T09:30:00Z".to_owned());
@@ -4709,7 +4856,6 @@ role = "editor"
                 added: "2026-11-24T10:00:00Z".to_owned(),
                 fingerprint: legacy_fp,
                 pairing_id: Some(legacy_id.clone()),
-                confirmed: false,
             },
         );
         crate::device::store::save_state(&paths, &legacy_state).unwrap();

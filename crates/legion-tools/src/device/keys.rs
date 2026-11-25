@@ -257,6 +257,20 @@ pub fn fingerprint_key_b64(key_b64: &str) -> Option<String> {
     Some(fingerprint_blob(&blob))
 }
 
+/// Computes sorted, deduplicated `SHA256:...` fingerprints for a slice of OpenSSH public host keys
+/// (`"<type> <base64>[ comment]"`).
+pub fn host_key_fingerprints(host_keys: &[String]) -> Vec<String> {
+    let mut fps = BTreeSet::new();
+    for raw in host_keys {
+        if let Some(key_b64) = raw.split_whitespace().nth(1)
+            && let Some(fp) = fingerprint_key_b64(key_b64)
+        {
+            fps.insert(fp);
+        }
+    }
+    fps.into_iter().collect()
+}
+
 /// Strictly validated `ssh-ed25519` public key ready to be written to `authorized_keys`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedEd25519Key {
