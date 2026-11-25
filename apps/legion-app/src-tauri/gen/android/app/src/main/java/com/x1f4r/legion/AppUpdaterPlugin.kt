@@ -51,7 +51,11 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
         pm.getInstallerPackageName(pkg)
       }
     } catch (e: Exception) {
-      Log.w(TAG, "Could not inspect install source info: ${e.message}")
+      if (BuildConfig.DEBUG) {
+        Log.w(TAG, "Could not inspect install source info: ${e.message}")
+      } else {
+        Log.w(TAG, "Could not inspect install source info")
+      }
       null
     }
   }
@@ -63,7 +67,11 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     return try {
       appContext.packageManager.getInstallSourceInfo(appContext.packageName).updateOwnerPackageName
     } catch (e: Exception) {
-      Log.w(TAG, "Could not inspect update owner info: ${e.message}")
+      if (BuildConfig.DEBUG) {
+        Log.w(TAG, "Could not inspect update owner info: ${e.message}")
+      } else {
+        Log.w(TAG, "Could not inspect update owner info")
+      }
       null
     }
   }
@@ -94,7 +102,9 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun capabilities(invoke: Invoke) {
     val payload = capabilitiesPayload()
-    Log.i(TAG, "capabilities: $payload")
+    if (BuildConfig.DEBUG) {
+      Log.i(TAG, "capabilities: $payload")
+    }
     invoke.resolve(payload)
   }
 
@@ -149,10 +159,17 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     val installerPkg = currentInstallerPackage()
-    Log.i(
-      TAG,
-      "Starting PackageInstaller session: apk=${apkFile.name} bytes=${apkFile.length()} api=${Build.VERSION.SDK_INT} installer=$installerPkg",
-    )
+    if (BuildConfig.DEBUG) {
+      Log.i(
+        TAG,
+        "Starting PackageInstaller session: apk=${apkFile.name} bytes=${apkFile.length()} api=${Build.VERSION.SDK_INT} installer=$installerPkg",
+      )
+    } else {
+      Log.i(
+        TAG,
+        "Starting PackageInstaller session: bytes=${apkFile.length()} api=${Build.VERSION.SDK_INT}",
+      )
+    }
 
     ioExecutor.execute {
       var session: PackageInstaller.Session? = null
@@ -198,7 +215,11 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
         Log.i(TAG, "Committing PackageInstaller session $sessionId")
         session.commit(pendingIntent.intentSender)
       } catch (e: Exception) {
-        Log.e(TAG, "Failed to commit PackageInstaller session $sessionId", e)
+        if (BuildConfig.DEBUG) {
+          Log.e(TAG, "Failed to commit PackageInstaller session $sessionId", e)
+        } else {
+          Log.e(TAG, "Failed to commit PackageInstaller session $sessionId (${e.javaClass.simpleName})")
+        }
         if (sessionId >= 0) {
           pendingInstalls.remove(sessionId)
         }
@@ -231,7 +252,11 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
         put("prompted", entry.prompted.get())
         put("message", message)
       }
-      Log.i(TAG, "Session $sessionId finished: $payload")
+      if (BuildConfig.DEBUG) {
+        Log.i(TAG, "Session $sessionId finished: $payload")
+      } else {
+        Log.i(TAG, "Session $sessionId finished: status=$status prompted=${entry.prompted.get()}")
+      }
       entry.invoke.resolve(payload)
     }
   }

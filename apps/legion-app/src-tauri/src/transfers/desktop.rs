@@ -280,6 +280,7 @@ pub fn confirm_quit_with_active_transfers() -> bool {
 
 /// Emits a best-effort desktop system notification using the platform's standard mechanism.
 pub fn notify_background_transfer(title: &str, body: &str) {
+    #[cfg(debug_assertions)]
     println!("legion-app: background notification: {title} — {body}");
     let title = title.to_owned();
     let body = body.to_owned();

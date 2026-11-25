@@ -129,7 +129,11 @@ class TransferForegroundService : Service() {
           )
           inForeground.set(true)
         } catch (e: Exception) {
-          Log.w(TAG, "startForeground(dataSync) failed: ${e.message}")
+          if (BuildConfig.DEBUG) {
+            Log.w(TAG, "startForeground(dataSync) failed: ${e.message}")
+          } else {
+            Log.w(TAG, "startForeground(dataSync) failed (${e.javaClass.simpleName})")
+          }
           notifySafely(this, nm, ONGOING_NOTIFICATION_ID, notification)
         }
       } else {
@@ -265,7 +269,11 @@ class TransferForegroundService : Service() {
       val shape = "active=$activeCount paused=$pausedCount canPause=$canPause canResume=$canResume"
       if (shape != lastLoggedShape) {
         lastLoggedShape = shape
-        Log.i(TAG, "Transfer notification state: $shape title=${summary.optString("title", "")}")
+        if (BuildConfig.DEBUG) {
+          Log.i(TAG, "Transfer notification state: $shape title=${summary.optString("title", "")}")
+        } else {
+          Log.i(TAG, "Transfer notification state: $shape")
+        }
       }
       val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
       val instance = runningInstance
@@ -279,7 +287,11 @@ class TransferForegroundService : Service() {
           try {
             ContextCompat.startForegroundService(context, intent)
           } catch (e: Exception) {
-            Log.w(TAG, "Background foreground-service start disallowed: ${e.message}")
+            if (BuildConfig.DEBUG) {
+              Log.w(TAG, "Background foreground-service start disallowed: ${e.message}")
+            } else {
+              Log.w(TAG, "Background foreground-service start disallowed")
+            }
             val fallback = buildOngoingNotification(context, summary, isActive = false)
             notifySafely(context, nm, ONGOING_NOTIFICATION_ID, fallback)
           }

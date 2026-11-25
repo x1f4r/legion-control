@@ -97,7 +97,11 @@ object TransferBridge {
         writer?.write(line)
         writer?.flush()
       } catch (e: Exception) {
-        Log.w(TAG, "Could not push event to Rust transfer bridge: ${e.message}")
+        if (BuildConfig.DEBUG) {
+          Log.w(TAG, "Could not push event to Rust transfer bridge: ${e.message}")
+        } else {
+          Log.w(TAG, "Could not push event to Rust transfer bridge")
+        }
       }
     }
   }
@@ -110,7 +114,11 @@ object TransferBridge {
       val caps = cm.getNetworkCapabilities(active) ?: return false
       caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
     } catch (e: Exception) {
-      Log.w(TAG, "Could not inspect active network meter state: ${e.message}")
+      if (BuildConfig.DEBUG) {
+        Log.w(TAG, "Could not inspect active network meter state: ${e.message}")
+      } else {
+        Log.w(TAG, "Could not inspect active network meter state")
+      }
       true
     }
   }
@@ -134,7 +142,11 @@ object TransferBridge {
         }
       })
     } catch (e: Exception) {
-      Log.w(TAG, "Could not register default network callback: ${e.message}")
+      if (BuildConfig.DEBUG) {
+        Log.w(TAG, "Could not register default network callback: ${e.message}")
+      } else {
+        Log.w(TAG, "Could not register default network callback")
+      }
     }
   }
 
@@ -165,7 +177,11 @@ object TransferBridge {
         break
       } catch (e: Exception) {
         if (attempt == 20) {
-          Log.e(TAG, "Failed to connect to Rust transfer bridge socket: ${e.message}")
+          if (BuildConfig.DEBUG) {
+            Log.e(TAG, "Failed to connect to Rust transfer bridge socket: ${e.message}")
+          } else {
+            Log.e(TAG, "Failed to connect to Rust transfer bridge socket")
+          }
           return
         }
         try {
@@ -208,7 +224,11 @@ object TransferBridge {
         }
       }
     } catch (e: Exception) {
-      Log.i(TAG, "Rust transfer bridge reader closed: ${e.message}")
+      if (BuildConfig.DEBUG) {
+        Log.i(TAG, "Rust transfer bridge reader closed: ${e.message}")
+      } else {
+        Log.i(TAG, "Rust transfer bridge reader closed")
+      }
     } finally {
       closeAllUriReaders()
       synchronized(writerLock) {
@@ -228,7 +248,11 @@ object TransferBridge {
         writer?.write(line)
         writer?.flush()
       } catch (e: Exception) {
-        Log.w(TAG, "Failed writing to Rust transfer bridge: ${e.message}")
+        if (BuildConfig.DEBUG) {
+          Log.w(TAG, "Failed writing to Rust transfer bridge: ${e.message}")
+        } else {
+          Log.w(TAG, "Failed writing to Rust transfer bridge")
+        }
       }
     }
   }
@@ -261,7 +285,11 @@ object TransferBridge {
         put("result", result)
       })
     } catch (e: Exception) {
-      Log.w(TAG, "Bridge method $method failed: ${e.message}")
+      if (BuildConfig.DEBUG) {
+        Log.w(TAG, "Bridge method $method failed: ${e.message}")
+      } else {
+        Log.w(TAG, "Bridge method $method failed (${e.javaClass.simpleName})")
+      }
       sendRaw(JSONObject().apply {
         put("id", id)
         put("error", e.message ?: "Android transfer operation failed.")
@@ -326,7 +354,9 @@ object TransferBridge {
     }
 
     runCatching { partFile.delete() }
-    Log.i(TAG, "Saved download to MediaStore Downloads/Legion/$fileName ($uri)")
+    if (BuildConfig.DEBUG) {
+      Log.i(TAG, "Saved download to MediaStore Downloads/Legion/$fileName ($uri)")
+    }
     return JSONObject().put("uri", uri.toString())
   }
 
@@ -464,7 +494,13 @@ object TransferBridge {
     if (act != null) {
       act.runOnUiThread {
         runCatching { act.startActivity(chooser) }
-          .onFailure { e -> Log.w(TAG, "Activity chooser launch failed: ${e.message}") }
+          .onFailure { e ->
+            if (BuildConfig.DEBUG) {
+              Log.w(TAG, "Activity chooser launch failed: ${e.message}")
+            } else {
+              Log.w(TAG, "Activity chooser launch failed")
+            }
+          }
       }
     } else {
       chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -479,7 +515,13 @@ object TransferBridge {
     if (act != null) {
       act.runOnUiThread {
         runCatching { act.startActivity(downloadsIntent) }
-          .onFailure { e -> Log.w(TAG, "Could not open Downloads folder: ${e.message}") }
+          .onFailure { e ->
+            if (BuildConfig.DEBUG) {
+              Log.w(TAG, "Could not open Downloads folder: ${e.message}")
+            } else {
+              Log.w(TAG, "Could not open Downloads folder")
+            }
+          }
       }
     } else {
       downloadsIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)

@@ -929,7 +929,7 @@ impl AppContentServer {
             log.push_back(entry);
         }
 
-        #[cfg(target_os = "android")]
+        #[cfg(all(debug_assertions, target_os = "android"))]
         log::info!(
             target: "legion-content",
             "legion-content: {} {} range={} -> {} content-range={} len={}",
@@ -940,7 +940,7 @@ impl AppContentServer {
             content_range.as_deref().unwrap_or("none"),
             content_length.map_or_else(|| "none".to_owned(), |n| n.to_string()),
         );
-        #[cfg(not(target_os = "android"))]
+        #[cfg(all(debug_assertions, not(target_os = "android")))]
         if std::env::var_os("LEGION_CONTENT_LOG").is_some_and(|v| v == "1") {
             eprintln!(
                 "legion-content: {} {} range={} -> {} content-range={} len={}",

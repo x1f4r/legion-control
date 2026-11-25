@@ -123,11 +123,22 @@ pub fn create_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<()> {
 /// Starts the Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", debug_assertions))]
     android_logger::init_once(
         android_logger::Config::default()
             .with_max_level(log::LevelFilter::Info)
             .with_tag("legion-app"),
+    );
+    #[cfg(all(target_os = "android", not(debug_assertions)))]
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("legion-app")
+            .with_filter(
+                android_logger::FilterBuilder::new()
+                    .parse("error,legion-app=info,legion-transfers=info")
+                    .build(),
+            ),
     );
 
     let builder = tauri::Builder::default();

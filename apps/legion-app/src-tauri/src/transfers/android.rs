@@ -204,10 +204,19 @@ impl AndroidTransferPlatform {
             match UnixListener::from_std(std_listener) {
                 Ok(listener) => accept_platform.accept_loop(listener).await,
                 Err(err) => {
+                    #[cfg(debug_assertions)]
                     log::error!(
                         target: "legion-transfers",
                         "Could not register Android transfer bridge socket with runtime: {err}"
                     );
+                    #[cfg(not(debug_assertions))]
+                    {
+                        let _ = err;
+                        log::error!(
+                            target: "legion-transfers",
+                            "Could not register Android transfer bridge socket with runtime"
+                        );
+                    }
                 }
             }
         });
@@ -250,7 +259,13 @@ impl AndroidTransferPlatform {
                 )
                 .await;
             if let Err(err) = res {
+                #[cfg(debug_assertions)]
                 log::warn!(target: "legion-transfers", "connectBridge failed: {err}");
+                #[cfg(not(debug_assertions))]
+                {
+                    let _ = err;
+                    log::warn!(target: "legion-transfers", "connectBridge failed");
+                }
             }
         });
     }
@@ -402,10 +417,19 @@ impl AndroidTransferPlatform {
                             "recreating main WebView window for resumed Android Activity"
                         );
                         if let Err(err) = crate::create_main_webview_window(&app) {
+                            #[cfg(debug_assertions)]
                             log::warn!(
                                 target: "legion-transfers",
                                 "failed to recreate main WebView window: {err}"
                             );
+                            #[cfg(not(debug_assertions))]
+                            {
+                                let _ = err;
+                                log::warn!(
+                                    target: "legion-transfers",
+                                    "failed to recreate main WebView window"
+                                );
+                            }
                         }
                     }
                 });
@@ -449,10 +473,17 @@ impl AndroidTransferPlatform {
                         continue;
                     }
                     Err(err) => {
+                        #[cfg(debug_assertions)]
                         log::warn!(
                             target: "legion-transfers",
                             "Android syncService failed: {}",
                             err.message
+                        );
+                        #[cfg(not(debug_assertions))]
+                        log::warn!(
+                            target: "legion-transfers",
+                            "Android syncService failed ({:?})",
+                            err.code
                         );
                         tokio::select! {
                             () = self.sync_notify.notified() => {}

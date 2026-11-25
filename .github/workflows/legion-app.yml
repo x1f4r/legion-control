@@ -319,23 +319,39 @@ jobs:
             --legion "$MEDIA_WORK/bin/legion" \
             --out "$MEDIA_WORK/result.json" >/dev/null
 
-          # 1) Release binary: must paint ready and ignore LEGION_APP_MEDIA_CHECK_FILE (no test hooks in release).
+          # 1) Release binary: verify zero debug switches/hooks are embedded, then paint ready via
+          # the fixed stdout log line and prove LEGION_APP_READY_FILE and LEGION_APP_MEDIA_CHECK_FILE
+          # are both ignored.
+          node scripts/check-binary-paths.mjs \
+            apps/legion-app/src-tauri/target/release/legion-app \
+            --no-defaults \
+            --forbid LEGION_APP_READY_FILE \
+            --forbid LEGION_APP_MEDIA_CHECK_FILE \
+            --forbid LEGION_APP_TEST_QUIT_CONFIRM \
+            --forbid LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS \
+            --forbid LEGION_CONTENT_LOG \
+            --forbid transfer_upload_test_files \
+            --forbid allow-loopback-endpoints \
+            --forbid legion-content:
+
           READY_FILE="$RUNNER_TEMP/legion-linux-ready.txt"
-          rm -f "$READY_FILE" "$MEDIA_WORK/result.json"
+          REL_LOG="$RUNNER_TEMP/legion-linux-release.log"
+          rm -f "$READY_FILE" "$REL_LOG" "$MEDIA_WORK/result.json"
           PATH="$MEDIA_WORK/bin:$PATH" \
           LEGION_HOME="$MEDIA_WORK/node" \
           LEGION_APP_READY_FILE="$READY_FILE" \
           LEGION_APP_MEDIA_CHECK_FILE="$MEDIA_WORK/media-check.json" \
+          LEGION_CONTENT_LOG=1 \
           WEBKIT_DISABLE_DMABUF_RENDERER=1 \
           WEBKIT_DISABLE_COMPOSITING_MODE=1 \
           dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" \
             apps/legion-app/src-tauri/target/release/legion-app \
-            >"$RUNNER_TEMP/legion-linux-release.log" 2>&1 &
+            >"$REL_LOG" 2>&1 &
           REL_PID=$!
           REL_READY=0
           for i in $(seq 1 45); do
-            if [ -f "$READY_FILE" ] && grep -q "legion-app: interface ready" "$READY_FILE"; then
-              echo "Linux desktop release ready after ${i}s: $(cat "$READY_FILE")"
+            if [ -f "$REL_LOG" ] && grep -q "legion-app: interface ready" "$REL_LOG"; then
+              echo "Linux desktop release ready (stdout) after ${i}s"
               REL_READY=1
               sleep 2
               break
@@ -344,8 +360,12 @@ jobs:
           done
           kill "$REL_PID" 2>/dev/null || true
           wait "$REL_PID" 2>/dev/null || true
-          cat "$RUNNER_TEMP/legion-linux-release.log" || true
+          cat "$REL_LOG" || true
           [ "$REL_READY" -eq 1 ]
+          if [ -e "$READY_FILE" ]; then
+            echo "ERROR: Release build unexpectedly honored LEGION_APP_READY_FILE"
+            exit 1
+          fi
           if [ -f "$MEDIA_WORK/result.json" ]; then
             echo "ERROR: Release build unexpectedly honored LEGION_APP_MEDIA_CHECK_FILE"
             exit 1
@@ -639,6 +659,22 @@ jobs:
           cargo tauri ios build --target aarch64 --no-sign --ci
           IPA_PATH="$(find src-tauri/gen/apple/build -maxdepth 4 -name '*.ipa' | head -n 1)"
           test -s "$IPA_PATH"
+          IPA_UNPACK="$RUNNER_TEMP/ios-ipa-check"
+          rm -rf "$IPA_UNPACK"
+          unzip -q "$IPA_PATH" -d "$IPA_UNPACK"
+          IOS_BIN="$(find "$IPA_UNPACK/Payload" -maxdepth 2 -type f -perm -111 | head -n 1)"
+          test -f "$IOS_BIN"
+          node ../../scripts/check-binary-paths.mjs \
+            "$IOS_BIN" \
+            --no-defaults \
+            --forbid LEGION_APP_READY_FILE \
+            --forbid LEGION_APP_MEDIA_CHECK_FILE \
+            --forbid LEGION_APP_TEST_QUIT_CONFIRM \
+            --forbid LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS \
+            --forbid LEGION_CONTENT_LOG \
+            --forbid transfer_upload_test_files \
+            --forbid allow-loopback-endpoints \
+            --forbid legion-content:
           mkdir -p ../../ci-artifacts
           cp "$IPA_PATH" ../../ci-artifacts/Legion-ios-unsigned.ipa
           ls -lh ../../ci-artifacts/Legion-ios-unsigned.ipa
@@ -697,6 +733,18 @@ jobs:
           EXEC_PATH="$APP_PATH/Contents/MacOS/$EXEC_NAME"
           test -x "$EXEC_PATH"
 
+          node scripts/check-binary-paths.mjs \
+            "$EXEC_PATH" \
+            --no-defaults \
+            --forbid LEGION_APP_READY_FILE \
+            --forbid LEGION_APP_MEDIA_CHECK_FILE \
+            --forbid LEGION_APP_TEST_QUIT_CONFIRM \
+            --forbid LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS \
+            --forbid LEGION_CONTENT_LOG \
+            --forbid transfer_upload_test_files \
+            --forbid allow-loopback-endpoints \
+            --forbid legion-content:
+
           MEDIA_WORK="$RUNNER_TEMP/macos-media"
           rm -rf "$MEDIA_WORK"
           mkdir -p "$MEDIA_WORK/bin"
@@ -709,21 +757,23 @@ jobs:
             --out "$MEDIA_WORK/result.json" >/dev/null
 
           READY_FILE="$RUNNER_TEMP/legion-macos-ready.txt"
-          rm -f "$READY_FILE" "$MEDIA_WORK/result.json"
+          REL_LOG="$RUNNER_TEMP/legion-macos-release.log"
+          rm -f "$READY_FILE" "$REL_LOG" "$MEDIA_WORK/result.json"
           mkdir -p ci-shots/macos
 
           PATH="$MEDIA_WORK/bin:$PATH" \
           LEGION_HOME="$MEDIA_WORK/node" \
           LEGION_APP_READY_FILE="$READY_FILE" \
           LEGION_APP_MEDIA_CHECK_FILE="$MEDIA_WORK/media-check.json" \
-            "$EXEC_PATH" >"$RUNNER_TEMP/legion-macos-release.log" 2>&1 &
+          LEGION_CONTENT_LOG=1 \
+            "$EXEC_PATH" >"$REL_LOG" 2>&1 &
           APP_PID=$!
 
           FOUND=0
           EXITED_EARLY=0
           for i in $(seq 1 60); do
-            if [ "$FOUND" -eq 0 ] && [ -f "$READY_FILE" ] && grep -q "legion-app: interface ready" "$READY_FILE"; then
-              echo "macOS desktop release ready after ${i}s: $(cat "$READY_FILE")"
+            if [ "$FOUND" -eq 0 ] && [ -f "$REL_LOG" ] && grep -q "legion-app: interface ready" "$REL_LOG"; then
+              echo "macOS desktop release ready (stdout) after ${i}s"
               FOUND=1
               sleep 2
               break
@@ -755,11 +805,15 @@ jobs:
 
           kill "$APP_PID" 2>/dev/null || true
           wait "$APP_PID" 2>/dev/null || true
-          cat "$RUNNER_TEMP/legion-macos-release.log" || true
+          cat "$REL_LOG" || true
           if [ "$FOUND" -ne 1 ]; then
             if [ "$EXITED_EARLY" -ne 1 ]; then
               echo "ERROR: Timed out waiting for macOS release ready"
             fi
+            exit 1
+          fi
+          if [ -e "$READY_FILE" ]; then
+            echo "ERROR: macOS release build unexpectedly honored LEGION_APP_READY_FILE"
             exit 1
           fi
           if [ -f "$MEDIA_WORK/result.json" ]; then
@@ -983,23 +1037,41 @@ jobs:
             Get-ChildItem -Path $installDir -Recurse | ForEach-Object { Write-Host $_.FullName }
             throw 'Installed Legion executable not found.'
           }
+          Write-Host "Checking installed release executable for forbidden debug switches: $($exe.FullName)"
+          node scripts/check-binary-paths.mjs $exe.FullName --no-defaults `
+            --forbid LEGION_APP_READY_FILE `
+            --forbid LEGION_APP_MEDIA_CHECK_FILE `
+            --forbid LEGION_APP_TEST_QUIT_CONFIRM `
+            --forbid LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS `
+            --forbid LEGION_CONTENT_LOG `
+            --forbid transfer_upload_test_files `
+            --forbid allow-loopback-endpoints `
+            --forbid legion-content:
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           Write-Host "Launching installed executable: $($exe.FullName)"
 
           $readyFile = Join-Path $env:RUNNER_TEMP 'legion-windows-ready.txt'
-          Remove-Item -LiteralPath $readyFile, $mediaOut -Force -ErrorAction SilentlyContinue
+          $relStdout = Join-Path $env:RUNNER_TEMP 'legion-windows-release.out.log'
+          $relStderr = Join-Path $env:RUNNER_TEMP 'legion-windows-release.err.log'
+          Remove-Item -LiteralPath $readyFile, $relStdout, $relStderr, $mediaOut -Force -ErrorAction SilentlyContinue
           $env:PATH = "$mediaBin;$env:PATH"
           $env:LEGION_HOME = Join-Path $mediaWork 'node'
           $env:LEGION_APP_READY_FILE = $readyFile
           $env:LEGION_APP_MEDIA_CHECK_FILE = Join-Path $mediaWork 'media-check.json'
+          $env:LEGION_CONTENT_LOG = '1'
 
-          $appProc = Start-Process -FilePath $exe.FullName -PassThru
+          $appProc = Start-Process -FilePath $exe.FullName -RedirectStandardOutput $relStdout -RedirectStandardError $relStderr -PassThru
           $found = $false
           for ($i = 1; $i -le 60; $i++) {
-            if (-not $found -and (Test-Path -LiteralPath $readyFile) -and ((Get-Content -LiteralPath $readyFile -Raw) -match 'legion-app: interface ready')) {
-              Write-Host "Windows desktop release ready after ${i}s: $((Get-Content -LiteralPath $readyFile -Raw).Trim())"
-              $found = $true
-              Start-Sleep -Seconds 2
-              break
+            if (-not $found -and (Test-Path -LiteralPath $relStdout)) {
+              $outText = Get-Content -LiteralPath $relStdout -Raw -ErrorAction SilentlyContinue
+              if ($outText -and ($outText -match 'legion-app: interface ready')) {
+                Write-Host "Windows desktop release ready (stdout) after ${i}s"
+                $found = $true
+                Start-Sleep -Seconds 2
+                break
+              }
             }
             if ($appProc.HasExited) {
               throw "Legion Windows process exited early with code $($appProc.ExitCode)"
@@ -1027,8 +1099,13 @@ jobs:
           if (-not $appProc.HasExited) {
             Stop-Process -Id $appProc.Id -Force -ErrorAction SilentlyContinue
           }
+          if (Test-Path -LiteralPath $relStdout) { Get-Content -LiteralPath $relStdout }
+          if (Test-Path -LiteralPath $relStderr) { Get-Content -LiteralPath $relStderr }
           if (-not $found) {
-            throw 'Timed out waiting for Windows release ready marker'
+            throw 'Timed out waiting for Windows release ready marker on stdout'
+          }
+          if (Test-Path -LiteralPath $readyFile) {
+            throw 'Windows release binary unexpectedly honored LEGION_APP_READY_FILE'
           }
           if (Test-Path -LiteralPath $mediaOut) {
             throw 'Windows release binary unexpectedly honored LEGION_APP_MEDIA_CHECK_FILE'

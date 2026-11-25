@@ -1,7 +1,9 @@
 //! Tauri command surface backed by [`Backend`].
 
+#[cfg(debug_assertions)]
 use std::fs;
 use std::io::Write;
+#[cfg(debug_assertions)]
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +34,9 @@ use crate::updater::{SharedUpdater, UpdateState};
 pub const INTERFACE_READY_MARKER: &str = "legion-app: interface ready";
 
 /// Optional environment variable naming a file to write [`INTERFACE_READY_MARKER`] to on ready.
+/// Compiled ONLY in debug builds so release binaries ignore environment switches and never write
+/// arbitrary paths.
+#[cfg(debug_assertions)]
 pub const READY_FILE_ENV: &str = "LEGION_APP_READY_FILE";
 
 /// Optional environment variable naming a JSON spec file for the CI content-media smoke check.
@@ -671,9 +676,8 @@ pub fn media_check_report(app: tauri::AppHandle, report: MediaCheckReport) -> Re
 
 /// Signals that the web interface has mounted and painted its initial view.
 ///
-/// Logs [`INTERFACE_READY_MARKER`] once to stdout (and logcat on Android). When
-/// `LEGION_APP_READY_FILE` is set, also writes the marker line to that path so automated smoke
-/// checks can assert startup without guessing a sleep duration.
+/// Logs [`INTERFACE_READY_MARKER`] once to stdout (and logcat on Android). In debug builds only,
+/// when `LEGION_APP_READY_FILE` is set, also writes the marker line to that path.
 #[tauri::command]
 pub fn ready(updater: State<'_, SharedUpdater>) -> Result<(), AppError> {
     if !READY_LOGGED.swap(true, Ordering::SeqCst) {
@@ -684,6 +688,7 @@ pub fn ready(updater: State<'_, SharedUpdater>) -> Result<(), AppError> {
         updater.0.on_app_ready();
     }
 
+    #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os(READY_FILE_ENV).filter(|val| !val.is_empty()) {
         write_ready_marker(Path::new(&path))?;
     }
@@ -832,6 +837,7 @@ pub async fn update_maybe_auto_install(
     }
 }
 
+#[cfg(debug_assertions)]
 fn write_ready_marker(path: &Path) -> Result<(), AppError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -992,6 +998,7 @@ pub async fn scan_invite() -> Result<ScanInviteResult, AppError> {
 mod tests {
     use super::*;
 
+    #[cfg(debug_assertions)]
     #[test]
     fn ready_marker_writes_expected_line() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;

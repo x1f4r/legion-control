@@ -140,7 +140,11 @@ class FilesTransferPlugin(private val activity: Activity) : Plugin(activity) {
       runCatching {
         resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
       }.onFailure { e ->
-        Log.w(TAG, "Could not persist read permission for $uri: ${e.message}")
+        if (BuildConfig.DEBUG) {
+          Log.w(TAG, "Could not persist read permission for $uri: ${e.message}")
+        } else {
+          Log.w(TAG, "Could not persist read permission for selected document")
+        }
       }
 
       var displayName = uri.lastPathSegment?.substringAfterLast('/') ?: "file"

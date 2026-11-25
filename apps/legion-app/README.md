@@ -67,11 +67,11 @@ placeholder page and emits a Cargo warning.
 ### Startup ready marker (`ready`)
 
 Every platform registers a `ready` command. Once the interface has mounted and painted its first
-frame, it calls `invoke("ready")`. The Rust side logs one line — `legion-app: interface ready` —
-to stdout (and Android logcat under tag `legion-app`). When `LEGION_APP_READY_FILE` is set in the
-environment, it also writes that line to the given file path. Automated checks use this marker
-instead of fixed sleeps; in normal runs the environment variable is unset and the command is a
-harmless one-time log.
+frame, it calls `invoke("ready")`. The Rust side logs one fixed line — `legion-app: interface ready` —
+to stdout (and Android logcat under tag `legion-app`). In debug builds only, when
+`LEGION_APP_READY_FILE` is set in the environment, it also writes that line to the given file path.
+Release builds ignore all debug/test environment switches and signal readiness solely through the
+fixed log line.
 
 ### QR invite scanning (`scan_invite`)
 
@@ -148,9 +148,12 @@ harmless one-time log.
     stall timeouts, BLAKE3 verification via `fs.hash` for downloads and `Link::open_put` with
     `fs.stat` non-overwrite naming for uploads, optional Wi-Fi-only rule for transfers >= 50 MB,
     default off). Downloads sanitize file names against Windows/POSIX/Unicode rules, place without
-    overwriting, derive MIME on-device from the saved extension, refuse to open executable,
-    installer, script, shortcut or disk-image types directly (offering Show in folder instead), and
-    write Mark-of-the-Web (`:Zone.Identifier`) on Windows and `com.apple.quarantine` on macOS.
+    overwriting, derive MIME on-device from pure ASCII-alphanumeric extensions, allow direct
+    opening ONLY for an explicit data-type allow-list (raster pictures, audio, video, PDF, plain
+    text, and macro-free documents — never HTML, SVG, XML, archives, scripts, shortcuts,
+    installers, or unknown types; offering Show in folder instead), remove all partial, saved,
+    MediaStore, and cache files on cancel, and write Mark-of-the-Web (`:Zone.Identifier`) on
+    Windows and `com.apple.quarantine` on macOS.
     Uploads accept only session-scoped opaque handles minted by the native file picker; pre-selected
     local paths exist only behind the debug compile-time flag `test-upload-paths`.
   - **Android:** `TransferForegroundService` (`foregroundServiceType="dataSync"`,
