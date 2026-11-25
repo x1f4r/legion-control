@@ -80,6 +80,31 @@ fn android_app_updater_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
         .build()
 }
 
+/// Returns `true` when this desktop launch should defer to an in-progress update instead of
+/// grabbing the single-instance lock, opening a window, or holding install files open.
+///
+/// Runs before `tauri_plugin_single_instance::init` so a user double-clicking the app icon during
+/// an update never steals the single-instance name or blocks the swap/NSIS installer. When the
+/// active update is a headless window-close update (`verify_only == true`), leaves a
+/// `reopen-requested` flag so the supervisor opens the newly installed app interactively once the
+/// swap finishes.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn should_defer_to_active_update(verify_only: bool) -> bool {
+    if verify_only || updater::desktop::is_supervised_launch() {
+        return false;
+    }
+    let Some(updates_dir) = updater::desktop::early_desktop_updates_dir() else {
+        return false;
+    };
+    let Some(active_lock) = updater::desktop::inspect_active_update_lock(&updates_dir) else {
+        return false;
+    };
+    if active_lock.verify_only {
+        updater::desktop::request_reopen_after_update(&updates_dir);
+    }
+    true
+}
+
 /// Starts the Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -90,10 +115,15 @@ pub fn run() {
             .with_tag("legion-app"),
     );
 
-    let builder = tauri::Builder::default();
-
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let verify_only = is_verify_only_launch();
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if should_defer_to_active_update(verify_only) {
+        return;
+    }
+
+    let builder = tauri::Builder::default();
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = if should_register_single_instance(verify_only) {

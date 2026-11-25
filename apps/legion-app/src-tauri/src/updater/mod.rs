@@ -266,6 +266,19 @@ pub struct RollbackInfo {
     /// Optional captured startup output or supervisor exit reason shown ONLY under Technical details.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Exact install directory state recorded by the supervisor (`"restored_previous"` or
+    /// `"new_kept_files_in_use"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_state: Option<String>,
+}
+
+/// Marker written by a desktop supervisor when it deferred cleanly before touching the install
+/// because another process held the install open past the pre-swap wait bound.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DeferredInstallRecord {
+    sequence: u64,
+    #[serde(default)]
+    reason: String,
 }
 
 fn default_failed_attempts() -> u32 {
@@ -1185,6 +1198,21 @@ impl UpdateManager {
         let mut saw_rollback = false;
         let mut rollback_detail: Option<String> = None;
 
+        // 0. Check for a clean pre-swap deferral left by a desktop supervisor (install was busy
+        //    when the pre-swap wait bound expired). Clear matching `pending_install` quietly
+        //    without counting as a failed update or incrementing rollback attempts.
+        if let Some((defer_path, deferred)) = read_and_take_deferred(&self.updates_dir) {
+            let _ = fs::remove_file(defer_path);
+            if prefs
+                .pending_install
+                .as_ref()
+                .is_some_and(|p| p.sequence == deferred.sequence)
+            {
+                prefs.pending_install = None;
+                prefs_dirty = true;
+            }
+        }
+
         // 1. Check for a desktop rollback marker left by the detached supervisor.
         if let Some((rb_path, rb)) = read_and_take_rollback(&self.updates_dir) {
             let _ = fs::remove_file(rb_path);
@@ -1193,11 +1221,20 @@ impl UpdateManager {
                 .as_ref()
                 .map_or(Channel::Stable, |p| p.channel);
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            let rb = RollbackInfo {
-                detail: rb
-                    .detail
-                    .or_else(|| desktop::read_captured_startup_detail(&self.updates_dir)),
-                ..rb
+            let rb = {
+                let captured = desktop::read_captured_startup_detail(&self.updates_dir);
+                let state_note = if rb.install_state.as_deref() == Some("new_kept_files_in_use") {
+                    Some("Previous copy could not be restored because install files were in use; kept new copy intact.".to_owned())
+                } else {
+                    None
+                };
+                let detail = match (rb.detail.or(state_note), captured) {
+                    (Some(a), Some(b)) if !a.contains(&b) => Some(format!("{a}\n{b}")),
+                    (Some(a), _) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                RollbackInfo { detail, ..rb }
             };
             let prev_attempts = prefs
                 .failed_updates
@@ -3240,14 +3277,16 @@ impl UpdateManager {
         {
             return false;
         }
-        self.spawn_desktop_install_inner(
-            &avail,
-            &artifact_path,
-            &expected_sha256,
-            expected_size,
-            true,
+        matches!(
+            self.spawn_desktop_install_inner(
+                &avail,
+                &artifact_path,
+                &expected_sha256,
+                expected_size,
+                true,
+            ),
+            Ok(true)
         )
-        .is_ok()
     }
 
     /// Installs the verified update on desktop hosts and returns `true` when the caller should exit
@@ -3356,14 +3395,14 @@ impl UpdateManager {
                 Err(AppError::new(ErrorCode::Unsupported, reason.clone()))
             }
             _ => {
-                self.spawn_desktop_install_inner(
+                let spawned = self.spawn_desktop_install_inner(
                     &avail,
                     &artifact_path,
                     &expected_sha256,
                     expected_size,
                     false,
                 )?;
-                Ok((self.snapshot(), true))
+                Ok((self.snapshot(), spawned))
             }
         }
     }
@@ -3376,18 +3415,44 @@ impl UpdateManager {
         expected_sha256: &str,
         expected_size: u64,
         verify_only: bool,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
+        // Exclusive update lock: only one instance may stage, record pending_install, and spawn
+        // the supervisor for an update. A second instance seeing an active lock does nothing.
+        let Some(lock_guard) =
+            desktop::try_acquire_update_lock(&self.updates_dir, avail.sequence, verify_only)?
+        else {
+            return Ok(false);
+        };
+
         let ready_marker = self
             .updates_dir
             .join(format!("started-{}.ok", avail.sequence));
         let rollback_marker = self
             .updates_dir
             .join(format!("rollback-{}.json", avail.sequence));
+        let deferred_marker = self
+            .updates_dir
+            .join(format!("deferred-{}.json", avail.sequence));
         let rollback_json = serde_json::to_string(&RollbackInfo {
             version: avail.version.clone(),
             sequence: avail.sequence,
             reason: ROLLBACK_REASON.to_owned(),
             detail: None,
+            install_state: Some("restored_previous".to_owned()),
+        })
+        .unwrap_or_else(|_| "{}".to_owned());
+        let rollback_kept_new_json = serde_json::to_string(&RollbackInfo {
+            version: avail.version.clone(),
+            sequence: avail.sequence,
+            reason: ROLLBACK_REASON.to_owned(),
+            detail: None,
+            install_state: Some("new_kept_files_in_use".to_owned()),
+        })
+        .unwrap_or_else(|_| "{}".to_owned());
+        let deferred_json = serde_json::to_string(&DeferredInstallRecord {
+            sequence: avail.sequence,
+            reason: "Install files were still in use; deferred without changing the install."
+                .to_owned(),
         })
         .unwrap_or_else(|_| "{}".to_owned());
         let verified_dir = self.updates_dir.join("verified");
@@ -3402,7 +3467,7 @@ impl UpdateManager {
                     st.last_error = None;
                     st.last_error_detail = None;
                 });
-                if let Err(err) = desktop::stage_and_spawn_linux_appimage(
+                let sup_pid = match desktop::stage_and_spawn_linux_appimage(
                     artifact_path,
                     expected_sha256,
                     expected_size,
@@ -3410,25 +3475,33 @@ impl UpdateManager {
                     &ready_marker,
                     &rollback_marker,
                     rollback_json,
+                    rollback_kept_new_json,
+                    &deferred_marker,
+                    deferred_json,
+                    avail.sequence,
                     DEFAULT_STARTUP_WAIT_SECS,
                     verify_only,
                 ) {
-                    self.clear_pending_install();
-                    let rec = self.record_failed_update(
-                        avail.channel,
-                        &avail.version,
-                        avail.sequence,
-                        "Legion could not start the update helper.",
-                    );
-                    self.update_state(|st| {
-                        st.phase = "error".to_owned();
-                        st.failed_update = Some(rec);
-                        st.last_error = Some("Legion could not start the update.".to_owned());
-                        st.last_error_detail = Some(err.message.clone());
-                    });
-                    return Err(err);
-                }
-                Ok(())
+                    Ok(pid) => pid,
+                    Err(err) => {
+                        self.clear_pending_install();
+                        let rec = self.record_failed_update(
+                            avail.channel,
+                            &avail.version,
+                            avail.sequence,
+                            "Legion could not start the update helper.",
+                        );
+                        self.update_state(|st| {
+                            st.phase = "error".to_owned();
+                            st.failed_update = Some(rec);
+                            st.last_error = Some("Legion could not start the update.".to_owned());
+                            st.last_error_detail = Some(err.message.clone());
+                        });
+                        return Err(err);
+                    }
+                };
+                let _ = lock_guard.hand_over_to_supervisor(sup_pid);
+                Ok(true)
             }
             #[cfg(unix)]
             PlatformEnv::Desktop(DesktopInstall::MacosAppBundle {
@@ -3442,7 +3515,7 @@ impl UpdateManager {
                     st.last_error = None;
                     st.last_error_detail = None;
                 });
-                if let Err(err) = desktop::stage_and_spawn_macos_bundle(
+                let sup_pid = match desktop::stage_and_spawn_macos_bundle(
                     artifact_path,
                     expected_sha256,
                     expected_size,
@@ -3452,25 +3525,33 @@ impl UpdateManager {
                     &ready_marker,
                     &rollback_marker,
                     rollback_json,
+                    rollback_kept_new_json,
+                    &deferred_marker,
+                    deferred_json,
+                    avail.sequence,
                     DEFAULT_STARTUP_WAIT_SECS,
                     verify_only,
                 ) {
-                    self.clear_pending_install();
-                    let rec = self.record_failed_update(
-                        avail.channel,
-                        &avail.version,
-                        avail.sequence,
-                        "Legion could not unpack the macOS update.",
-                    );
-                    self.update_state(|st| {
-                        st.phase = "error".to_owned();
-                        st.failed_update = Some(rec);
-                        st.last_error = Some("Legion could not start the update.".to_owned());
-                        st.last_error_detail = Some(err.message.clone());
-                    });
-                    return Err(err);
-                }
-                Ok(())
+                    Ok(pid) => pid,
+                    Err(err) => {
+                        self.clear_pending_install();
+                        let rec = self.record_failed_update(
+                            avail.channel,
+                            &avail.version,
+                            avail.sequence,
+                            "Legion could not unpack the macOS update.",
+                        );
+                        self.update_state(|st| {
+                            st.phase = "error".to_owned();
+                            st.failed_update = Some(rec);
+                            st.last_error = Some("Legion could not start the update.".to_owned());
+                            st.last_error_detail = Some(err.message.clone());
+                        });
+                        return Err(err);
+                    }
+                };
+                let _ = lock_guard.hand_over_to_supervisor(sup_pid);
+                Ok(true)
             }
             #[cfg(windows)]
             PlatformEnv::Desktop(DesktopInstall::WindowsNsis {
@@ -3487,7 +3568,7 @@ impl UpdateManager {
                 let backup_dir = self
                     .updates_dir
                     .join(format!("backup-{}", self.current_sequence));
-                if let Err(err) = desktop::stage_and_spawn_windows_nsis(
+                let sup_pid = match desktop::stage_and_spawn_windows_nsis(
                     artifact_path,
                     expected_sha256,
                     expected_size,
@@ -3498,25 +3579,33 @@ impl UpdateManager {
                     &ready_marker,
                     &rollback_marker,
                     rollback_json,
+                    rollback_kept_new_json,
+                    &deferred_marker,
+                    deferred_json,
+                    avail.sequence,
                     DEFAULT_STARTUP_WAIT_SECS,
                     verify_only,
                 ) {
-                    self.clear_pending_install();
-                    let rec = self.record_failed_update(
-                        avail.channel,
-                        &avail.version,
-                        avail.sequence,
-                        "Legion could not start the Windows installer.",
-                    );
-                    self.update_state(|st| {
-                        st.phase = "error".to_owned();
-                        st.failed_update = Some(rec);
-                        st.last_error = Some("Legion could not start the update.".to_owned());
-                        st.last_error_detail = Some(err.message.clone());
-                    });
-                    return Err(err);
-                }
-                Ok(())
+                    Ok(pid) => pid,
+                    Err(err) => {
+                        self.clear_pending_install();
+                        let rec = self.record_failed_update(
+                            avail.channel,
+                            &avail.version,
+                            avail.sequence,
+                            "Legion could not start the Windows installer.",
+                        );
+                        self.update_state(|st| {
+                            st.phase = "error".to_owned();
+                            st.failed_update = Some(rec);
+                            st.last_error = Some("Legion could not start the update.".to_owned());
+                            st.last_error_detail = Some(err.message.clone());
+                        });
+                        return Err(err);
+                    }
+                };
+                let _ = lock_guard.hand_over_to_supervisor(sup_pid);
+                Ok(true)
             }
             _ => Err(AppError::new(
                 ErrorCode::Unsupported,
@@ -4191,10 +4280,30 @@ fn read_and_take_rollback(updates_dir: &Path) -> Option<(PathBuf, RollbackInfo)>
         let Some(s) = name.to_str() else { continue };
         if s.starts_with("rollback-") && s.ends_with(".json") {
             let path = entry.path();
-            if let Ok(bytes) = fs::read(&path)
-                && let Ok(info) = serde_json::from_slice::<RollbackInfo>(&bytes)
-            {
-                return Some((path, info));
+            if let Ok(bytes) = fs::read(&path) {
+                let slice = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+                if let Ok(info) = serde_json::from_slice::<RollbackInfo>(slice) {
+                    return Some((path, info));
+                }
+            }
+            let _ = fs::remove_file(&path);
+        }
+    }
+    None
+}
+
+fn read_and_take_deferred(updates_dir: &Path) -> Option<(PathBuf, DeferredInstallRecord)> {
+    let entries = fs::read_dir(updates_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        if s.starts_with("deferred-") && s.ends_with(".json") {
+            let path = entry.path();
+            if let Ok(bytes) = fs::read(&path) {
+                let slice = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+                if let Ok(info) = serde_json::from_slice::<DeferredInstallRecord>(slice) {
+                    return Some((path, info));
+                }
             }
             let _ = fs::remove_file(&path);
         }
@@ -6425,6 +6534,7 @@ mod tests {
                 sequence: 202611250210,
                 reason: ROLLBACK_REASON.to_owned(),
                 detail: None,
+                install_state: Some("restored_previous".to_owned()),
             })
             .unwrap(),
         )
@@ -6578,6 +6688,7 @@ mod tests {
                 sequence: 202611250210,
                 reason: ROLLBACK_REASON.to_owned(),
                 detail: None,
+                install_state: Some("restored_previous".to_owned()),
             })
             .unwrap(),
         )
@@ -6623,6 +6734,7 @@ mod tests {
                 sequence: 202611250210,
                 reason: ROLLBACK_REASON.to_owned(),
                 detail: None,
+                install_state: Some("restored_previous".to_owned()),
             })
             .unwrap(),
         )
@@ -6767,5 +6879,171 @@ mod tests {
             mgr_newer_boot.evaluate_auto_install_gate_at("startup", 0, true, t_next_day + 20),
             Ok(())
         );
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn deferred_update_clears_pending_install_without_counting_as_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let appimage = dir.path().join("Legion.AppImage");
+        let (rel_sk, rel_pk) = keypair(0x93);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250220,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"v2-appimage",
+                &rel_sk,
+            ),
+        );
+
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage,
+        });
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform.clone(),
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let st = mgr
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap();
+        let avail = st.available.unwrap();
+        mgr.record_pending_install(&avail).unwrap();
+
+        // Simulate a supervisor deferring cleanly pre-swap (even with a UTF-8 BOM prefix).
+        let mut deferred_bytes = vec![0xEF, 0xBB, 0xBF];
+        deferred_bytes.extend_from_slice(
+            br#"{"sequence":202611250220,"reason":"Install files were in use"}"#,
+        );
+        fs::write(
+            updates_dir.join("deferred-202611250220.json"),
+            deferred_bytes,
+        )
+        .unwrap();
+
+        let mgr_next = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0 + 20,
+        );
+        mgr_next.on_app_ready_at(t0 + 20);
+        let st_next = mgr_next.snapshot();
+        assert_eq!(st_next.phase, "ready", "deferred update must stay ready");
+        assert!(
+            st_next.failed_update.is_none(),
+            "deferred update must NOT count as a failed update"
+        );
+        assert!(
+            !mgr_next.sequence_failed_before(202611250220),
+            "deferred update must NOT increment failed_updates or failed_sequences"
+        );
+        assert_eq!(
+            mgr_next.auto_install_block_reason_at(202611250220, t0 + 20),
+            None
+        );
+        assert!(
+            !updates_dir.join("deferred-202611250220.json").exists(),
+            "deferred marker should be consumed"
+        );
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn second_instance_cannot_stage_while_update_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        let appimage = dir.path().join("Legion.AppImage");
+        fs::write(&appimage, b"v1-appimage").unwrap();
+        let (rel_sk, rel_pk) = keypair(0x94);
+        let anchors = TrustAnchors::with_keys(rel_pk, None);
+        let t0: i64 = 1_795_593_600;
+
+        let mut fleet = FakeFleet::new();
+        fleet.add_set(
+            "tower",
+            build_fake_set(
+                Channel::Stable,
+                "0.2.0",
+                202611250225,
+                "Legion-linux-x86_64.AppImage",
+                Os::Linux,
+                Arch::X86_64,
+                InstallKind::AppImage,
+                b"v2-appimage",
+                &rel_sk,
+            ),
+        );
+
+        let platform = PlatformEnv::Desktop(DesktopInstall::LinuxAppImage {
+            appimage_path: appimage.clone(),
+        });
+        let mgr = UpdateManager::with_config_at(
+            updates_dir.clone(),
+            anchors,
+            Os::Linux,
+            Arch::X86_64,
+            platform,
+            "0.1.0".to_owned(),
+            "old".to_owned(),
+            202611250200,
+            t0,
+        );
+        let st = mgr
+            .check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
+            .await
+            .unwrap();
+        assert_eq!(st.phase, "ready");
+        let (avail, size, sha, art_path) = mgr.prepare_verified_install().unwrap();
+
+        // Hold the exclusive update lock as Instance 1.
+        let lock1 = desktop::try_acquire_update_lock(&updates_dir, avail.sequence, false)
+            .unwrap()
+            .expect("instance 1 must acquire lock");
+
+        // Instance 2 attempting to stage/spawn MUST return Ok(false) without staging any copy,
+        // without touching pending_install, and without spawning a second supervisor.
+        let spawned = mgr
+            .spawn_desktop_install_inner(&avail, &art_path, &sha, size, false)
+            .unwrap();
+        assert!(
+            !spawned,
+            "second instance must not stage or spawn a supervisor while update.lock is held"
+        );
+        assert!(
+            !dir.path()
+                .join(format!(".Legion.AppImage.new-{}", std::process::id()))
+                .exists(),
+            "second instance must not create a second staged copy"
+        );
+        assert!(
+            !mgr.try_spawn_desktop_close_install(0),
+            "close-update path must also skip when update.lock is held"
+        );
+
+        drop(lock1);
     }
 }

@@ -142,16 +142,30 @@ and scheduled daily node update timers are **planned** and not yet implemented.
 | iPhone and iPad app | Cannot update itself; Apple allows updates only through the App Store or TestFlight. |
 | Browser | Always as new as the node that serves it. |
 
-Desktop self-replacing installs (Linux AppImage, macOS `.app`, Windows NSIS) release their
-single-instance lock before exiting, wait in the detached supervisor until the previous process,
-its helper children, any AppImage runtime wrapper, and the single-instance lock are gone, and keep
-the previous copy until the new build starts once and writes its startup marker within 30 seconds.
-"Did not start" is decided by the ready marker failing to appear within the wait window (never by a
-single PID check): if the launched process exits before the marker appears, the supervisor keeps
-polling through a grace period (the full remaining wait on exit code 0, or 8 seconds on non-zero
-exit) in case the app handed over to another process. The supervisor captures the new build's
-first-start output in a private, 32 KiB-capped log (`new-start.log`) beside the update state so any
-failed start can be explained under Technical details.
+Desktop self-replacing installs (Linux AppImage, macOS `.app`, Windows NSIS) serialize every update
+under an exclusive lock (`update.lock` plus an OS-enforced stage/supervisor lock file) so only one
+process may stage an installer or spawn a supervisor at a time; a second instance that starts while
+an update is in progress checks the lock before registering single-instance ownership or opening a
+window and exits cleanly (touching `reopen-requested` if a headless window-close update is running
+so the supervisor opens the updated window as soon as the swap finishes). Before swapping or running
+NSIS, the exiting instance releases its single-instance lock and the detached supervisor waits with
+a bounded timeout (15 s on Unix, 20 s on Windows) until the old process, every other process running
+from the install being replaced, any AppImage runtime wrapper or helper children (including Legion
+WebView2 processes on Windows), and the single-instance lock are gone. If the install is still in
+use when that bound expires, the supervisor defers cleanly (`deferred-<seq>.json`) without modifying
+the install and without counting as a failed update.
+
+Once the swap or NSIS upgrade runs, the supervisor keeps the previous copy until the new build
+starts once and writes its startup marker within 30 seconds. "Did not start" is decided strictly by
+the ready marker failing to appear within the wait window (never by a single PID check): if the
+launched process exits before the marker appears, the supervisor keeps polling through a grace
+period (the full remaining wait on exit code 0, or 8 seconds on non-zero exit) in case the app
+handed over to another process. The supervisor captures the new build's first-start output in a
+private, 32 KiB-capped log (`new-start.log`) beside the update state so any failed start can be
+explained under Technical details. If rollback is needed while another process holds install files
+open, the supervisor retries boundedly and restores transactionally (undoing any partial move/copy);
+if files remain busy past the retry bound, it leaves the new copy completely intact rather than
+half-copying and records the exact install state in `rollback-<seq>.json`.
 
 A single transient rollback never pins a desktop to the old version forever: after a first rollback,
 Legion retries the same sequence once more at the next natural install point at least one hour
