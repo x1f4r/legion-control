@@ -117,7 +117,7 @@ process.exit(0);
   return { dir, binDir, mediaOut, callLog };
 }
 
-function runResumeScript(envSetup, extraArgs = []) {
+function runResumeScript(envSetup, { frontmostTimeout = 5, waitSecs = 1, extraArgs = [] } = {}) {
   return spawnSync(
     'bash',
     [
@@ -131,9 +131,9 @@ function runResumeScript(envSetup, extraArgs = []) {
       '--cycles',
       '3',
       '--wait-secs',
-      '1',
+      String(waitSecs),
       '--frontmost-timeout',
-      '1',
+      String(frontmostTimeout),
       '--poll-interval',
       '0.1',
       '--frontmost-poll-interval',
@@ -211,7 +211,7 @@ test('ios-sim-resume.sh fails cleanly after 3 cycles and names the missing stage
 
   // Case B: Preferences never confirmed frontmost across all 3 cycles.
   const envNoFrontmost = makeFakeEnv(t, { frontmostOnPoll: 0, passOnLegionCycle: 0 });
-  const resNoFrontmost = runResumeScript(envNoFrontmost);
+  const resNoFrontmost = runResumeScript(envNoFrontmost, { frontmostTimeout: 1 });
   assert.equal(resNoFrontmost.status, 1, resNoFrontmost.stdout + resNoFrontmost.stderr);
   assert.match(
     resNoFrontmost.stdout,

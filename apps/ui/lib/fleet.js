@@ -1,6 +1,12 @@
 // Progressive fleet loading, independent per-machine timeouts, and non-secret local cache.
 
 import { firstSentence } from './format.js';
+import {
+  isLocalConnectionName,
+  isPendingLocalName,
+  isRealMachineName,
+  PENDING_LOCAL_MACHINE_NAME,
+} from './local-machine.js';
 
 export const PING_TIMEOUT_S = 4;
 export const PING_CLIENT_TIMEOUT_MS = 6_000;
@@ -75,10 +81,11 @@ export async function callWithTimeout(link, tool, args, options = {}, timeoutMs 
 
 export function sortMachines(machines) {
   const rank = (m) => {
-    if (m.thisNode) return 0;
-    if (m.status === 'answering' || m.reachable) return 1;
-    if (m.status === 'asking' || m.asking) return 2;
-    return 3;
+    if (m.isLocalComputer) return 0;
+    if (m.thisNode) return 1;
+    if (m.status === 'answering' || m.reachable) return 2;
+    if (m.status === 'asking' || m.asking) return 3;
+    return 4;
   };
   return [...machines].sort((a, b) => {
     const ra = rank(a);
@@ -105,10 +112,11 @@ export function collectRunningJobs(machines) {
  */
 export function serializeFleetCache(node, machines, now = Date.now()) {
   const safeMachines = (machines || [])
-    .filter((m) => m && typeof m.name === 'string' && m.name)
+    .filter((m) => m && isRealMachineName(m.name))
     .map((m) => ({
       name: m.name,
       thisNode: Boolean(m.thisNode),
+      isLocalComputer: Boolean(m.isLocalComputer),
       os: m.os || null,
       arch: m.arch || null,
       system: m.system || null,
@@ -120,7 +128,7 @@ export function serializeFleetCache(node, machines, now = Date.now()) {
       lastCheckedAt: typeof m.lastCheckedAt === 'number' ? m.lastCheckedAt : now,
     }));
   return {
-    node: node || null,
+    node: isRealMachineName(node) ? node : null,
     savedAt: now,
     machines: safeMachines,
   };
@@ -132,16 +140,19 @@ export function serializeFleetCache(node, machines, now = Date.now()) {
  */
 export function hydrateFleetCache(cached, expectedNode = null) {
   if (!cached || typeof cached !== 'object' || !Array.isArray(cached.machines)) return null;
+  if (expectedNode && !isRealMachineName(expectedNode)) return null;
   if (expectedNode && cached.node && cached.node !== expectedNode) return null;
   if (cached.machines.length === 0) return null;
 
   const machines = cached.machines
-    .filter((m) => m && typeof m.name === 'string' && m.name)
+    .filter((m) => m && isRealMachineName(m.name))
     .map((m) => {
       const wasOff = m.reachable === false && !m.thisNode;
       return {
         name: m.name,
         thisNode: Boolean(m.thisNode),
+        isLocalComputer: Boolean(m.isLocalComputer),
+        nodeNamePending: false,
         status: wasOff ? 'offline' : 'asking',
         reachable: false,
         asking: !wasOff,
@@ -180,12 +191,14 @@ export function hydrateFleetCache(cached, expectedNode = null) {
   };
 }
 
-function makeEntry(name, isLocal, listed, prev) {
+function makeEntry(name, isLocal, listed, prev, { isLocalComputer = false, nodeNamePending = false } = {}) {
   const keepLive = prev && !prev.fromCache && prev.status === 'answering';
   const keepOff = prev && prev.status === 'offline' && !isLocal;
   return {
     name,
     thisNode: isLocal,
+    isLocalComputer: Boolean(isLocal && (isLocalComputer || prev?.isLocalComputer)),
+    nodeNamePending: Boolean(isLocal && nodeNamePending),
     status: keepLive ? 'answering' : keepOff ? 'offline' : 'asking',
     reachable: keepLive ? true : false,
     asking: !keepLive && !keepOff,
@@ -241,11 +254,14 @@ async function runPool(items, concurrency, worker) {
 export async function refreshFleetProgressive({
   link,
   localNode,
+  isLocalComputer = false,
+  nodeNamePending = false,
   initialMachines = [],
   cachedAt = null,
   signal,
   onUpdate,
   onSettled,
+  onLocalNodeResolved = null,
   onActiveNodeChanged,
   now = () => Date.now(),
   pingTimeoutS = PING_TIMEOUT_S,
@@ -258,15 +274,32 @@ export async function refreshFleetProgressive({
 }) {
   const map = new Map();
   for (const m of initialMachines || []) {
-    if (m && m.name) map.set(m.name, { ...m });
+    if (m && m.name && !isLocalConnectionName(m.name)) map.set(m.name, { ...m });
   }
 
-  const initialLocalNode = localNode;
-  let here = localNode;
+  let localIsDesktop = Boolean(isLocalComputer || isLocalConnectionName(localNode));
+  let localPending = Boolean(
+    nodeNamePending || isLocalConnectionName(localNode) || isPendingLocalName(localNode),
+  );
+  let here = localPending ? PENDING_LOCAL_MACHINE_NAME : localNode;
   let activeCachedAt = cachedAt;
 
   if (here && !map.has(here)) {
-    map.set(here, makeEntry(here, true, null, null));
+    map.set(
+      here,
+      makeEntry(here, true, null, null, {
+        isLocalComputer: localIsDesktop,
+        nodeNamePending: localPending,
+      }),
+    );
+  } else if (here && map.has(here)) {
+    const prev = map.get(here);
+    map.set(here, {
+      ...prev,
+      thisNode: true,
+      isLocalComputer: Boolean(localIsDesktop || prev.isLocalComputer),
+      nodeNamePending: localPending,
+    });
   }
 
   function snapshot(settled = false) {
@@ -284,10 +317,67 @@ export async function refreshFleetProgressive({
     if (typeof onUpdate === 'function') onUpdate(snapshot(settled));
   }
 
+  function settleLocalName(candidate) {
+    if (!localPending || !isRealMachineName(candidate)) return false;
+    const realName = candidate.trim();
+    const prevKey = here;
+    const pendingEntry = map.get(prevKey);
+    const existingReal = map.get(realName);
+    if (prevKey && prevKey !== realName) {
+      map.delete(prevKey);
+    }
+    const base = existingReal || pendingEntry || makeEntry(realName, true, null, null);
+    const reachable = Boolean(pendingEntry?.reachable || existingReal?.reachable);
+    const status =
+      pendingEntry?.status === 'answering' || existingReal?.status === 'answering'
+        ? 'answering'
+        : pendingEntry?.status || existingReal?.status || 'asking';
+    map.set(realName, {
+      ...base,
+      ...(pendingEntry || {}),
+      name: realName,
+      thisNode: true,
+      isLocalComputer: localIsDesktop,
+      nodeNamePending: false,
+      status,
+      reachable,
+      asking: !reachable && status === 'asking',
+      os: pendingEntry?.os || existingReal?.os || null,
+      arch: pendingEntry?.arch || existingReal?.arch || null,
+      version: pendingEntry?.version || existingReal?.version || null,
+      build: pendingEntry?.build || existingReal?.build || null,
+      system: pendingEntry?.system || existingReal?.system || null,
+      sys: pendingEntry?.sys || existingReal?.sys || null,
+      jobs: pendingEntry?.jobs?.length ? pendingEntry.jobs : existingReal?.jobs || [],
+      runningJobs: Math.max(pendingEntry?.runningJobs || 0, existingReal?.runningJobs || 0),
+      canWake: Boolean(pendingEntry?.canWake || existingReal?.canWake),
+      lastSeenAt: Math.max(pendingEntry?.lastSeenAt || 0, existingReal?.lastSeenAt || 0) || null,
+      lastCheckedAt:
+        Math.max(pendingEntry?.lastCheckedAt || 0, existingReal?.lastCheckedAt || 0) || null,
+    });
+    here = realName;
+    localPending = false;
+    if (typeof link?.setLocalMachineName === 'function') {
+      link.setLocalMachineName(realName);
+    }
+    if (typeof onLocalNodeResolved === 'function') {
+      onLocalNodeResolved(realName);
+    }
+    emit(false);
+    return true;
+  }
+
   function updateMachine(name, updater) {
-    const prev = map.get(name) || makeEntry(name, name === here, null, null);
+    const key = name;
+    const isSelected = key === here;
+    const prev =
+      map.get(key) ||
+      makeEntry(key, isSelected, null, null, {
+        isLocalComputer: isSelected && localIsDesktop,
+        nodeNamePending: isSelected && localPending,
+      });
     const next = updater(prev);
-    map.set(name, next);
+    map.set(key, next);
     emit(false);
     return next;
   }
@@ -300,12 +390,16 @@ export async function refreshFleetProgressive({
 
   async function fetchMachineDetails(name, isLocal) {
     const on = name || undefined;
+    const targetKey = () => (isLocal ? here : name);
     const onErr = isLocal ? capturePairingError(undefined) : () => {};
     const tasks = [
       callWithTimeout(link, 'sys.info', {}, { on, signal }, detailTimeoutMs)
         .then((sys) => {
           if (signal?.aborted || !sys) return;
-          updateMachine(name, (prev) => ({
+          if (isLocal && localPending && isRealMachineName(sys.node)) {
+            settleLocalName(sys.node);
+          }
+          updateMachine(targetKey(), (prev) => ({
             ...prev,
             status: 'answering',
             reachable: true,
@@ -324,7 +418,7 @@ export async function refreshFleetProgressive({
         .then((res) => {
           if (signal?.aborted || !res) return;
           const jobs = Array.isArray(res.jobs) ? res.jobs : [];
-          updateMachine(name, (prev) => ({
+          updateMachine(targetKey(), (prev) => ({
             ...prev,
             jobs,
             runningJobs: jobs.length,
@@ -338,7 +432,7 @@ export async function refreshFleetProgressive({
           const busyState = typeof power?.busy?.state === 'string' ? power.busy.state : null;
           const busyReasons =
             busyState === 'busy' && Array.isArray(power.busy.reasons) ? power.busy.reasons : [];
-          updateMachine(name, (prev) => ({
+          updateMachine(targetKey(), (prev) => ({
             ...prev,
             system: power.system || prev.system,
             busyState,
@@ -354,7 +448,10 @@ export async function refreshFleetProgressive({
         callWithTimeout(link, 'meta.version', {}, { on, signal }, detailTimeoutMs)
           .then((ver) => {
             if (signal?.aborted || !ver) return;
-            updateMachine(name, (prev) => ({
+            if (localPending && isRealMachineName(ver.node)) {
+              settleLocalName(ver.node);
+            }
+            updateMachine(targetKey(), (prev) => ({
               ...prev,
               status: 'answering',
               reachable: true,
@@ -369,6 +466,18 @@ export async function refreshFleetProgressive({
           })
           .catch(onErr),
       );
+      if (localPending) {
+        tasks.push(
+          callWithTimeout(link, 'meta.whoami', {}, { on, signal }, detailTimeoutMs)
+            .then((whoami) => {
+              if (signal?.aborted || !whoami) return;
+              if (isRealMachineName(whoami.node)) {
+                settleLocalName(whoami.node);
+              }
+            })
+            .catch(onErr),
+        );
+      }
     }
 
     await Promise.all(tasks);
@@ -384,16 +493,47 @@ export async function refreshFleetProgressive({
   if (signal?.aborted) return null;
   if (fatalError) throw fatalError;
 
-  const answeringNode = fleetList?.answered_by || fleetList?.node || here;
-  const answeredByPeer = Boolean(answeringNode && here && answeringNode !== here);
+  // If the link learned the local node's real name during fleet.list (or a local-pipe fleet.list
+  // returned it directly), settle "This computer" into that real name before reconciling rows.
+  if (localPending) {
+    const linkKnown =
+      typeof link?.getLocalMachineName === 'function' ? link.getLocalMachineName() : null;
+    if (isRealMachineName(linkKnown)) {
+      settleLocalName(linkKnown);
+    } else {
+      const rawAns = fleetList?.answered_by;
+      const answeredViaLocal = !rawAns || isLocalConnectionName(rawAns);
+      if (answeredViaLocal) {
+        if (isRealMachineName(fleetList?.node)) {
+          settleLocalName(fleetList.node);
+        } else {
+          const selfEntry = (fleetList?.machines || []).find(
+            (m) => m?.this_node && isRealMachineName(m.name),
+          );
+          if (selfEntry) settleLocalName(selfEntry.name);
+        }
+      }
+    }
+  }
+
+  const rawAnsweredBy = fleetList?.answered_by;
+  const rawListNode = fleetList?.node;
+  const answeringNode = isLocalConnectionName(rawAnsweredBy)
+    ? here
+    : rawAnsweredBy || (isLocalConnectionName(rawListNode) ? here : rawListNode) || here;
+  const answeredByPeer = Boolean(
+    answeringNode && here && answeringNode !== here && !isLocalConnectionName(answeringNode),
+  );
   const listedMap = new Map();
   for (const m of fleetList?.machines || []) {
-    if (m && m.name) listedMap.set(m.name, m);
+    if (m && m.name && !isLocalConnectionName(m.name)) {
+      listedMap.set(m.name, m);
+    }
   }
   if (here && !listedMap.has(here)) {
     listedMap.set(here, { name: here, this_node: true, systems: [], wake_via: [] });
   }
-  if (answeringNode && !listedMap.has(answeringNode)) {
+  if (answeringNode && !isLocalConnectionName(answeringNode) && !listedMap.has(answeringNode)) {
     listedMap.set(answeringNode, { name: answeringNode, this_node: false, systems: [], wake_via: [] });
   }
 
@@ -410,11 +550,17 @@ export async function refreshFleetProgressive({
     const prev = map.get(name);
     if (isSelected) {
       map.set(name, {
-        ...(prev || makeEntry(name, true, listed, null)),
+        ...(prev ||
+          makeEntry(name, true, listed, null, {
+            isLocalComputer: localIsDesktop,
+            nodeNamePending: localPending,
+          })),
         thisNode: true,
+        isLocalComputer: localIsDesktop,
+        nodeNamePending: localPending,
         canWake: Boolean(listed.mac || (listed.wake_via && listed.wake_via.length > 0)),
       });
-      if (answeredByPeer) {
+      if (answeredByPeer && !localPending) {
         // Selected node did not answer `fleet.list`; probe it like any peer so if it is off it
         // settles cleanly into `offline` rather than staying `asking`.
         remoteNames.push(name);
@@ -423,11 +569,15 @@ export async function refreshFleetProgressive({
       map.set(name, {
         ...makeEntry(name, false, listed, prev),
         thisNode: false,
+        isLocalComputer: false,
+        nodeNamePending: false,
         canWake: Boolean(listed.mac || (listed.wake_via && listed.wake_via.length > 0)),
       });
     } else {
       const nextEntry = makeEntry(name, false, listed, prev);
       nextEntry.thisNode = false;
+      nextEntry.isLocalComputer = false;
+      nextEntry.nodeNamePending = false;
       map.set(name, nextEntry);
       remoteNames.push(name);
     }
@@ -520,6 +670,19 @@ export async function refreshFleetProgressive({
   await Promise.all([localPromise, answeringPeerPromise, remotesPromise]);
   if (signal?.aborted) return null;
   if (fatalError) throw fatalError;
+
+  if (here) {
+    const localEntry = map.get(here);
+    if (localEntry && !localEntry.reachable && (localEntry.status === 'asking' || localEntry.asking)) {
+      map.set(here, {
+        ...localEntry,
+        status: 'offline',
+        asking: false,
+        fromCache: false,
+        lastCheckedAt: now(),
+      });
+    }
+  }
 
   activeCachedAt = null;
   const finalSnap = snapshot(true);

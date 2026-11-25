@@ -24,6 +24,8 @@ import {
 //   nosync    - hides sync.* tools so the Kept in sync section is omitted
 //   large     - adds a 5 000-entry folder (/home/me/Archive5000) for paging tests
 //   transfers - seeds live running machine & device transfers for Activity preview
+//   longnames - adds a machine and folder with very long names for truncation/alignment tests
+//   longlist  - adds enough machines and Home items so both split panes scroll independently
 
 const isoAgo = (sec) => new Date(Date.now() - sec * 1000).toISOString();
 
@@ -592,6 +594,12 @@ export function createMockLink(mode = '') {
   const isMinimal = flags.has('minimal');
   const isAmber = flags.has('amber') || flags.has('hot');
   const isWakeNever = flags.has('wake-never');
+  const isLongNames = flags.has('longnames');
+  const isLongList = flags.has('longlist');
+  const LONG_MACHINE_NAME = 'studio-rendering-workstation-north-01';
+  const extraListMachines = isLongList
+    ? Array.from({ length: 12 }, (_, i) => `node-${String(i + 1).padStart(2, '0')}`)
+    : [];
   let wakeTicksTarget = null;
   for (const f of flags) {
     if (f.startsWith('wake-ticks=')) {
@@ -1076,6 +1084,65 @@ export function createMockLink(mode = '') {
     };
   }
 
+  if (isLongNames) {
+    machines[LONG_MACHINE_NAME] = {
+      reachable: true,
+      sys: {
+        node: LONG_MACHINE_NAME,
+        hostname: LONG_MACHINE_NAME,
+        os: { family: 'linux', name: 'Linux', version: '7.2', kernel: '7.2.0', arch: 'x86_64' },
+        uptime_s: 5 * 86400 + 2400,
+        boot_id: 'f100c60a-0d29-42b0-9c52-88b6d5a10099',
+        cpu: { model: 'Ryzen 9 9950X', cores: 32, usage_pct: 18.0, load: [0.9, 0.8, 0.7], temperature_c: 54.0 },
+        memory: { total: 128e9, used: 34e9, available: 94e9, swap_total: 0, swap_used: 0 },
+        disks: [{ mount: '/', fs: 'btrfs', total: 4e12, available: 1.8e12 }],
+        gpus: [],
+      },
+      procs: [],
+      jobs: [],
+      services: [],
+      projects: [],
+      power: {
+        system: 'linux',
+        boot_id: 'f100c60a-0d29-42b0-9c52-88b6d5a10099',
+        busy: { state: 'idle', reasons: [] },
+        targets: [],
+        sudo: true,
+        pending: null,
+      },
+    };
+  }
+
+  for (let i = 0; i < extraListMachines.length; i += 1) {
+    const mName = extraListMachines[i];
+    machines[mName] = {
+      reachable: true,
+      sys: {
+        node: mName,
+        hostname: mName,
+        os: { family: 'linux', name: 'Linux', version: '6.12', kernel: '6.12.0', arch: 'x86_64' },
+        uptime_s: (i + 2) * 86400,
+        boot_id: `e200c60a-0d29-42b0-9c52-88b6d5a200${String(i + 1).padStart(2, '0')}`,
+        cpu: { model: 'EPYC 9354', cores: 16, usage_pct: 8 + ((i * 7) % 35), load: [0.5, 0.4, 0.4] },
+        memory: { total: 32e9, used: (6 + (i % 10)) * 1e9, available: 20e9, swap_total: 0, swap_used: 0 },
+        disks: [{ mount: '/', fs: 'ext4', total: 1e12, available: (400 + i * 30) * 1e9 }],
+        gpus: [],
+      },
+      procs: [],
+      jobs: [],
+      services: [],
+      projects: [],
+      power: {
+        system: 'linux',
+        boot_id: `e200c60a-0d29-42b0-9c52-88b6d5a200${String(i + 1).padStart(2, '0')}`,
+        busy: { state: 'idle', reasons: [] },
+        targets: [],
+        sudo: true,
+        pending: null,
+      },
+    };
+  }
+
   function bringMockMachineOnline(wakeTarget, targetMachine) {
     targetMachine.reachable = true;
     targetMachine.error = null;
@@ -1229,6 +1296,22 @@ export function createMockLink(mode = '') {
             wake_via: [],
           });
         }
+        if (isLongNames) {
+          list.push({
+            name: LONG_MACHINE_NAME,
+            this_node: false,
+            systems: [{ name: 'linux', via: 'ssh', target: `${LONG_MACHINE_NAME}.example` }],
+            wake_via: [],
+          });
+        }
+        for (const mName of extraListMachines) {
+          list.push({
+            name: mName,
+            this_node: false,
+            systems: [{ name: 'linux', via: 'ssh', target: `${mName}.example` }],
+            wake_via: [],
+          });
+        }
         return { node: answering, answered_by: answering, machines: list };
       }
       case 'fleet.ping': {
@@ -1290,6 +1373,33 @@ export function createMockLink(mode = '') {
         ];
         if (isFirst) {
           all.push({ machine: 'mini', reachable: false, error: machines.mini.error });
+        }
+        if (isLongNames) {
+          all.push({
+            machine: LONG_MACHINE_NAME,
+            reachable: true,
+            node: LONG_MACHINE_NAME,
+            system: 'linux',
+            version: '0.1.0',
+            build: 'mock00000000',
+            os: 'linux',
+            arch: 'x86_64',
+            latency_ms: 9,
+          });
+        }
+        for (let i = 0; i < extraListMachines.length; i += 1) {
+          const mName = extraListMachines[i];
+          all.push({
+            machine: mName,
+            reachable: true,
+            node: mName,
+            system: 'linux',
+            version: '0.1.0',
+            build: 'mock00000000',
+            os: 'linux',
+            arch: 'x86_64',
+            latency_ms: 5 + i,
+          });
         }
         if (requested.length > 0) {
           const wanted = new Set(requested);

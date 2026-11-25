@@ -1545,3 +1545,257 @@ test('createAppLink onWindowHidden listens to legion://window-hidden, ends immer
     else delete globalThis.navigator;
   }
 });
+
+test('createAppLink resolves local pipe to the node name, routes calls through local pipe, and never exposes local', async () => {
+  const prevWindow = globalThis.window;
+  const calls = [];
+  let transferChannel = null;
+  let ticketSeq = 0;
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          calls.push({ command, payload });
+          if (command === 'state') {
+            return Promise.resolve({
+              ready: true,
+              nodes: [
+                { node: 'local', principal: 'local', role: 'owner', via: 'local' },
+                { node: 'studio', principal: 'device:desktop', role: 'owner', via: 'ssh' },
+                { node: 'tower', principal: 'device:desktop', role: 'owner', via: 'ssh' },
+              ],
+              routes: {
+                local: { kind: 'direct' },
+                tower: { kind: 'direct' },
+              },
+            });
+          }
+          if (command === 'call' && payload.tool === 'meta.whoami') {
+            assert.equal(payload.on, 'local');
+            return Promise.resolve({ node: 'studio', principal: 'local', role: 'owner', tools: ['fleet.list', 'fs.list'] });
+          }
+          if (command === 'call' && payload.tool === 'meta.version') {
+            assert.equal(payload.on, 'local');
+            return Promise.resolve({ version: '0.2.0', protocol: 1 });
+          }
+          if (command === 'call' && payload.tool === 'fleet.list') {
+            return Promise.resolve({
+              node: 'studio',
+              answered_by: 'local',
+              machines: [
+                { name: 'studio', this_node: true, systems: [], wake_via: [] },
+                { name: 'tower', this_node: false, systems: [], wake_via: [] },
+              ],
+            });
+          }
+          if (command === 'call' && payload.tool === 'fs.list') {
+            return Promise.resolve({ path: '/home/me', entries: [] });
+          }
+          if (command === 'tools') {
+            return Promise.resolve([{ name: 'fs.list', effect: 'read' }]);
+          }
+          if (command === 'content_url') {
+            ticketSeq += 1;
+            const fileName = String(payload.path || 'file').split('/').pop();
+            return Promise.resolve({
+              url: `http://127.0.0.1:42001/v1/content/tok-${payload.machine}-${ticketSeq}/${fileName}`,
+              expires_in: 900,
+            });
+          }
+          if (command === 'content_status') {
+            return Promise.resolve({ request_count: 1, status: 200, stream_failed: false, ticket_live: true });
+          }
+          if (command === 'content_revoke') {
+            return Promise.resolve(true);
+          }
+          if (command === 'transfer_download' || command === 'transfer_upload' || command === 'transfer_open_externally') {
+            return Promise.resolve({ id: 'tr-local' });
+          }
+          if (command === 'transfers') {
+            return Promise.resolve([{ id: 'tr-local', machine: 'local', direction: 'download', state: 'running' }]);
+          }
+          if (command === 'transfer_watch') {
+            transferChannel = payload.onEvent;
+            return Promise.resolve(99);
+          }
+          if (command === 'learn') {
+            return Promise.resolve({
+              report: { introducer: 'local', added: [], updated: [], identity_changed: [], skipped: [] },
+              state: {
+                ready: true,
+                nodes: [
+                  { node: 'local', principal: 'local', role: 'owner', via: 'local' },
+                  { node: 'studio', principal: 'device:desktop', role: 'owner', via: 'ssh' },
+                  { node: 'tower', principal: 'device:desktop', role: 'owner', via: 'ssh' },
+                ],
+              },
+            });
+          }
+          return Promise.resolve({});
+        },
+        Channel: class FakeChannel {
+          constructor() {
+            this.onmessage = null;
+          }
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    const st = await link.state();
+    assert.deepEqual(
+      st.nodes.map((n) => n.node),
+      ['studio', 'tower'],
+      'duplicate studio/local nodes must collapse to one local-pipe entry',
+    );
+    assert.equal(st.nodes[0].via, 'local');
+    assert.equal(st.nodes[0].isLocalComputer, true);
+    assert.equal(st.nodes[0].nodeNamePending, false);
+    assert.equal('local' in st.routes, false);
+    assert.ok('studio' in st.routes);
+
+    // Fleet list rewrites answered_by: 'local' to the real node name.
+    const fl = await link.call('fleet.list', {});
+    assert.equal(fl.answered_by, 'studio');
+
+    // Outgoing calls addressed to the local computer's real node name use the local pipe.
+    await link.call('fs.list', { path: '~' }, { on: 'studio' });
+    await link.tools({ on: 'studio' });
+    const localPic = await link.contentUrl({ machine: 'studio', path: '/home/me/a.png' });
+    const localVid = await link.contentUrl({ machine: 'studio', path: '/home/me/clip.mp4' });
+    const remotePic = await link.contentUrl({ machine: 'tower', path: '/home/me/b.png' });
+    const remoteVid = await link.contentUrl({ machine: 'tower', path: '/home/me/clip.mp4' });
+    await link.download({ machine: 'studio', path: '/home/me/a.png' });
+    await link.upload({ machine: 'studio', dir: '/home/me' });
+    await link.openExternally({ machine: 'studio', path: '/home/me/a.png' });
+
+    assert.equal(calls.find((c) => c.command === 'call' && c.payload.tool === 'fs.list')?.payload?.on, 'local');
+    assert.equal(calls.find((c) => c.command === 'tools')?.payload?.on, 'local');
+    const urlCalls = calls.filter((c) => c.command === 'content_url');
+    assert.deepEqual(
+      urlCalls.map((c) => [c.payload.machine, c.payload.path]),
+      [
+        ['local', '/home/me/a.png'],
+        ['local', '/home/me/clip.mp4'],
+        ['tower', '/home/me/b.png'],
+        ['tower', '/home/me/clip.mp4'],
+      ],
+    );
+    assert.equal(calls.find((c) => c.command === 'transfer_download')?.payload?.machine, 'local');
+    assert.equal(calls.find((c) => c.command === 'transfer_upload')?.payload?.machine, 'local');
+    assert.equal(calls.find((c) => c.command === 'transfer_open_externally')?.payload?.machine, 'local');
+
+    // Content status and revocation work identically for local-pipe and remote-machine URLs.
+    for (const minted of [localPic, localVid, remotePic, remoteVid]) {
+      const status = await link.contentStatus(minted.url);
+      assert.equal(status.status, 200);
+      assert.equal(await link.revokeContentUrl(minted.url), true);
+    }
+    const revokedUrls = calls.filter((c) => c.command === 'content_revoke').map((c) => c.payload.url);
+    assert.deepEqual(revokedUrls, [localPic.url, localVid.url, remotePic.url, remoteVid.url]);
+
+    // Remote machines still keep their own node name.
+    await link.call('fs.list', { path: '~' }, { on: 'tower' });
+    assert.equal(
+      calls.filter((c) => c.command === 'call' && c.payload.tool === 'fs.list').at(-1)?.payload?.on,
+      'tower',
+    );
+
+    // Transfers and learn() normalize 'local' back to 'studio'.
+    const trList = await link.transfers();
+    assert.equal(trList[0].machine, 'studio');
+    const seenEvents = [];
+    const unsub = link.onTransferEvent((items) => seenEvents.push(items));
+    transferChannel.onmessage([{ id: 'tr-local', machine: 'local', state: 'done' }]);
+    assert.equal(seenEvents[0][0].machine, 'studio');
+    unsub();
+
+    const learned = await link.learn();
+    assert.equal(learned.report.introducer, 'studio');
+    assert.deepEqual(
+      learned.state.nodes.map((n) => n.node),
+      ['studio', 'tower'],
+    );
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+});
+
+test('createAppLink exposes This computer while local node name cannot be read yet and routes through local pipe', async () => {
+  const prevWindow = globalThis.window;
+  let whoamiReady = false;
+  const calls = [];
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          calls.push({ command, payload });
+          if (command === 'state') {
+            return Promise.resolve({
+              ready: true,
+              nodes: [{ node: 'local', principal: 'local', role: 'owner', via: 'local' }],
+            });
+          }
+          if (command === 'call' && payload.tool === 'meta.whoami') {
+            if (!whoamiReady) {
+              return Promise.reject({ code: 'unreachable', message: 'Starting up.', machine: 'local' });
+            }
+            return Promise.resolve({ node: 'studio', principal: 'local', role: 'owner', tools: [] });
+          }
+          if (command === 'call' && payload.tool === 'meta.version') {
+            return Promise.reject({ code: 'unreachable', message: 'Starting up.', machine: 'local' });
+          }
+          if (command === 'content_url') {
+            return Promise.resolve({
+              url: 'http://127.0.0.1:42001/v1/content/tok-pending/pic.png',
+              expires_in: 900,
+            });
+          }
+          if (command === 'content_revoke') {
+            return Promise.resolve(true);
+          }
+          return Promise.resolve({});
+        },
+        Channel: class FakeChannel {
+          constructor() {
+            this.onmessage = null;
+          }
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    const initial = await link.state();
+    assert.equal(initial.nodes.length, 1);
+    assert.equal(initial.nodes[0].node, 'This computer');
+    assert.equal(initial.nodes[0].isLocalComputer, true);
+    assert.equal(initial.nodes[0].nodeNamePending, true);
+    assert.equal(initial.nodes[0].unreachableError.machine, 'This computer');
+
+    // Minting and revoking content URLs for "This computer" before name resolution routes over local pipe.
+    const pendingUrl = await link.contentUrl({ machine: 'This computer', path: '/home/me/pic.png' });
+    assert.equal(calls.find((c) => c.command === 'content_url')?.payload?.machine, 'local');
+    assert.equal(await link.revokeContentUrl(pendingUrl.url), true);
+
+    // Subsequent call addressed to "This computer" routes over the local pipe and settles the name.
+    whoamiReady = true;
+    const who = await link.call('meta.whoami', {}, { on: 'This computer' });
+    assert.equal(who.node, 'studio');
+    assert.equal(calls.at(-1).payload.on, 'local');
+    assert.equal(link.getLocalMachineName(), 'studio');
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+});

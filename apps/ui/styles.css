@@ -537,7 +537,7 @@ textarea {
     gap: 4px;
     border-top: 0;
     border-right: 1px solid var(--line);
-    padding: 64px 8px calc(12px + var(--safe-bottom));
+    padding: 18px 8px calc(12px + var(--safe-bottom));
   }
 
   .nav a {
@@ -558,35 +558,269 @@ textarea {
     padding: 4px 28px 40px;
   }
 
-  .split {
-    display: grid;
-    grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
-    gap: 28px;
-    align-items: start;
+  .main.split-host {
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
   }
 
-  .split > section {
+  .main.split-host > .pull-indicator {
+    display: none;
+  }
+
+  .main.split-host > :not(.pull-indicator):not(.split) {
+    flex: 1 1 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .app.split-screen .toast-banner {
+    margin-top: 12px;
+  }
+
+  .split {
+    flex: 1 1 0;
+    min-height: 0;
+    height: 100%;
+    display: grid;
+    grid-template-columns: clamp(300px, 28vw, 380px) minmax(0, 1fr);
+    grid-template-rows: [title] auto [tools] auto [label] auto [body] minmax(0, 1fr);
+    gap: 0;
+    align-items: stretch;
+  }
+
+  .split-pane {
+    display: grid;
+    grid-row: 1 / -1;
+    grid-template-rows: subgrid;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .split-left {
+    border-right: 1px solid var(--line);
+  }
+
+  .split-left > .split-row {
+    padding-left: 28px;
+    padding-right: 24px;
+  }
+
+  .split-right > .split-row {
+    padding-left: 24px;
+    padding-right: 28px;
+  }
+
+  .split-row {
+    min-width: 0;
+    scrollbar-gutter: stable;
+    scrollbar-width: thin;
+  }
+
+  .split-title {
+    grid-row: title;
+    display: flex;
+    align-items: baseline;
+    padding-top: 22px;
+    padding-bottom: 12px;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  .split-title::before {
+    content: "\200b";
+    width: 0;
+    flex: none;
+    overflow: hidden;
+    font: 600 22px/28px var(--sans);
+  }
+
+  .split-fact {
+    flex: none;
+    margin-left: auto;
+    padding-left: 12px;
+    color: var(--dim);
+    font: 400 var(--text-sub)/20px var(--sans);
+    white-space: nowrap;
+  }
+
+  .split-tools {
+    grid-row: tools;
+    display: flex;
+    align-items: center;
+    padding-top: 4px;
+    padding-bottom: 10px;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  .split-tools:empty {
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+
+  .split-tools > * {
+    flex: 1 1 auto;
     min-width: 0;
   }
 
-  .split > section:last-child {
-    position: sticky;
-    top: 4px;
-    max-height: calc(100dvh - 104px);
+  .split-tools .files-wide-tools {
+    margin: 0;
+  }
+
+  .split-tools .tabs {
+    margin: 0;
+    padding: 0;
+  }
+
+  .split-label {
+    grid-row: label;
+    display: flex;
+    align-items: baseline;
+    padding-top: 6px;
+    padding-bottom: 10px;
     overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  .split-label::before {
+    content: "\200b";
+    width: 0;
+    flex: none;
+    overflow: hidden;
+    font: 400 var(--text-sub)/20px var(--sans);
+  }
+
+  .split-label-text,
+  .split-label-fact {
+    font: 500 11px/16px var(--mono);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--faint);
+    white-space: nowrap;
+  }
+
+  .split-label-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .split-label-fact {
+    flex: none;
+    margin-left: auto;
+    padding-left: 12px;
+  }
+
+  .split-label .where {
+    position: static;
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    margin: 0;
+    padding: 0;
+    background: none;
+    font: 400 var(--text-sub)/20px var(--sans);
+    color: var(--dim);
+  }
+
+  .split-label .where a {
+    padding: 0;
+    line-height: 20px;
+  }
+
+  .split-label .machine-state {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 8px;
+    margin: 0;
+    margin-left: auto;
+    padding: 0 0 0 12px;
+    font: 400 var(--text-sub)/20px var(--sans);
+    color: var(--dim);
+    white-space: nowrap;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .split-label .machine-state .dot {
+    align-self: center;
+  }
+
+  .split-body {
+    grid-row: body;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
     overscroll-behavior-y: contain;
-    scrollbar-width: thin;
+    padding-top: 0;
+    padding-bottom: calc(28px + var(--safe-bottom));
+  }
+
+  .split-body > .pull-indicator + * > :first-child,
+  .split-body > .pull-indicator + * > section:first-child > :first-child {
+    margin-top: 0;
+  }
+
+  .split-body .label {
+    margin-left: 0;
+    margin-right: 0;
+  }
+
+  .split-body-empty {
+    display: grid;
+    place-items: center;
+    padding-bottom: 28px;
+  }
+
+  .split-empty {
+    margin: 0;
+    color: var(--dim);
+    font-size: var(--text-base);
+    text-align: center;
+    max-width: 36ch;
   }
 }
 
-/* The name of what the detail pane shows, when a list sits beside it. */
+/* Shared title style for both panes of a split view. */
 .pane-title {
+  flex: 1;
+  min-width: 0;
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 10px;
-  margin: 8px 2px 12px;
-  font: 600 20px/1.2 var(--mono);
-  letter-spacing: -0.01em;
+  margin: 0;
+  font: 600 22px/28px var(--sans);
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+.pane-title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pane-title .dot,
+.pane-title .chip,
+.pane-title .split-back {
+  flex: none;
+  align-self: center;
+}
+
+.split-back {
+  min-height: 26px;
+  height: 26px;
+  width: 26px;
+  margin-left: -4px;
+  padding: 0;
+  color: var(--dim);
 }
 
 /* ── Text blocks ────────────────────────────────────────────────────────────────────────────── */
@@ -601,6 +835,18 @@ textarea {
 
 .label:first-child {
   margin-top: 8px;
+}
+
+.label.label-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.label.label-row .label-fact {
+  flex: none;
+  white-space: nowrap;
 }
 
 .lede {
@@ -660,6 +906,7 @@ small code,
 
 /* A machine: its name, how it is in words, and three numbers that say what they are. */
 .machine {
+  container-type: inline-size;
   display: grid;
   gap: 12px;
   padding: var(--card-p);
@@ -726,6 +973,18 @@ a.machine:active {
 .stat span b {
   font: 500 var(--text-small) var(--mono);
   color: var(--text);
+}
+
+@container (max-width: 280px) {
+  .stats {
+    gap: 8px;
+  }
+
+  .stat span {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
+  }
 }
 
 .machine.off,
@@ -2019,7 +2278,8 @@ button.row:active {
 }
 
 .where a:last-child,
-.where a.current {
+.where a.current,
+.where .current {
   color: var(--text);
 }
 
@@ -3600,7 +3860,7 @@ button.row:active {
 }
 
 @container shell (min-width: 820px) {
-  .split > section:first-child .tiles {
+  .split-left .tiles {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

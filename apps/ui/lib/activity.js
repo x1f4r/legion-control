@@ -292,27 +292,35 @@ export function groupActivity(items, nowMs = Date.now()) {
  */
 export function formatMachineStatusPhrase(machine, nowMs = Date.now(), { wakePending = false } = {}) {
   if (!machine) return '';
+  let phrase = '';
   if (machine.status === 'asking' || machine.asking) {
-    return 'Checking…';
-  }
-  if (!machine.reachable) {
-    if (wakePending) return 'Wake sent · waiting for it to answer';
-    if (machine.lastSeenAt) {
+    phrase = 'Checking…';
+  } else if (!machine.reachable) {
+    if (wakePending) {
+      phrase = 'Wake sent · waiting for it to answer';
+    } else if (machine.lastSeenAt) {
       const seen = formatRelativeTime(machine.lastSeenAt, nowMs);
-      if (seen) return `Last on ${seen}`;
+      phrase = seen ? `Last on ${seen}` : 'Off';
+    } else {
+      phrase = 'Off';
     }
-    return 'Off';
-  }
-  if (machine.runningJobs > 0) {
-    return `Busy · ${machine.runningJobs} ${machine.runningJobs === 1 ? 'thing' : 'things'} running`;
-  }
-  if (machine.busy && Array.isArray(machine.busyReasons) && machine.busyReasons.length > 0) {
+  } else if (machine.runningJobs > 0) {
+    phrase = `Busy · ${machine.runningJobs} ${machine.runningJobs === 1 ? 'thing' : 'things'} running`;
+  } else if (machine.busy && Array.isArray(machine.busyReasons) && machine.busyReasons.length > 0) {
     const labels = machine.busyReasons.map(busyReasonLabel).filter(Boolean);
-    if (labels.length === 1) return `Busy · ${labels[0]}`;
-    if (labels.length > 1) return `Busy · ${labels[0]} +${labels.length - 1}`;
+    if (labels.length === 1) phrase = `Busy · ${labels[0]}`;
+    else if (labels.length > 1) phrase = `Busy · ${labels[0]} +${labels.length - 1}`;
+    else phrase = 'Busy';
+  } else if (machine.busy) {
+    phrase = 'Busy';
+  } else {
+    phrase = 'Idle';
   }
-  if (machine.busy) return 'Busy';
-  return 'Idle';
+
+  if (machine.isLocalComputer && machine.name !== 'This computer') {
+    return phrase ? `This computer · ${phrase}` : 'This computer';
+  }
+  return phrase;
 }
 
 /**

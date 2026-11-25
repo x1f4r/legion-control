@@ -8,6 +8,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
+import { SAMPLE_PNG_BASE64, SAMPLE_VIDEO_WEBM_BASE64 } from '../link/mock-media.js';
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const UI_ROOT = path.resolve(TEST_DIR, '..');
@@ -1431,5 +1432,265 @@ test('Mixed-version fleet side by side (?mock=multi,mixed): current tower + old 
   } finally {
     await browser.close();
     await server.stop();
+  }
+});
+
+test('desktop split view opens picture and video on This computer and remote machine and revokes every URL on close', async () => {
+  const pngBytes = Buffer.from(SAMPLE_PNG_BASE64, 'base64');
+  const webmBytes = Buffer.from(SAMPLE_VIDEO_WEBM_BASE64, 'base64');
+  const mediaServer = http.createServer((req, res) => {
+    const urlPath = (req.url || '/').split('?')[0];
+    if (urlPath.startsWith('/v1/content/')) {
+      const isVideo = urlPath.endsWith('.webm');
+      const body = isVideo ? webmBytes : pngBytes;
+      res.writeHead(200, {
+        'Content-Type': isVideo ? 'video/webm' : 'image/png',
+        'Content-Length': String(body.length),
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'no-store',
+      });
+      res.end(body);
+      return;
+    }
+    const rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
+    const full = path.resolve(UI_ROOT, rel);
+    if (!full.startsWith(UI_ROOT) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
+      res.writeHead(404);
+      res.end('Not found');
+      return;
+    }
+    const ext = path.extname(full).toLowerCase();
+    res.writeHead(200, {
+      'Content-Type': MIME_BY_EXT[ext] || 'application/octet-stream',
+      'Content-Security-Policy': MOCK_TEST_CSP,
+      'Cache-Control': 'no-store',
+    });
+    fs.createReadStream(full).pipe(res);
+  });
+  await new Promise((resolve) => mediaServer.listen(0, '127.0.0.1', resolve));
+  const { port } = mediaServer.address();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const browser = await chromium.launch({ executablePath: findBrowser(), headless: true });
+
+  try {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    const page = await ctx.newPage();
+    const pageErrors = [];
+    const consoleErrors = [];
+    page.on('pageerror', (err) => pageErrors.push(err.message));
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+
+    await page.addInitScript((origin) => {
+      const minted = [];
+      const revoked = [];
+      const externalOpens = [];
+      let ticketSeq = 0;
+      const nowIso = new Date().toISOString();
+      const toolsList = [
+        { name: 'meta.whoami', effect: 'read', input_schema: { type: 'object', properties: {} } },
+        { name: 'meta.version', effect: 'read', input_schema: { type: 'object', properties: {} } },
+        { name: 'meta.tools', effect: 'read', input_schema: { type: 'object', properties: {} } },
+        { name: 'fleet.list', effect: 'read', input_schema: { type: 'object', properties: {} } },
+        {
+          name: 'fs.list',
+          effect: 'read',
+          input_schema: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' },
+              depth: { type: 'integer' },
+              hidden: { type: 'boolean' },
+              limit: { type: 'integer' },
+              offset: { type: 'integer' },
+              sort: { type: 'string' },
+              order: { type: 'string' },
+              categories: { type: 'array' },
+            },
+          },
+        },
+        { name: 'fs.stat', effect: 'read', input_schema: { type: 'object', properties: { path: { type: 'string' } } } },
+        { name: 'fs.read', effect: 'read', input_schema: { type: 'object', properties: { path: { type: 'string' } } } },
+        {
+          name: 'fs.thumb',
+          effect: 'read',
+          input_schema: {
+            type: 'object',
+            properties: { paths: { type: 'array' }, size: { type: 'integer' }, fit: { type: 'string' } },
+          },
+        },
+      ];
+      const filesFor = (home) => [
+        { name: 'photo.png', path: `${home}/photo.png`, kind: 'file', size: 1024, mtime: nowIso },
+        { name: 'clip.webm', path: `${home}/clip.webm`, kind: 'file', size: 4096, mtime: nowIso },
+        { name: 'notes.pdf', path: `${home}/notes.pdf`, kind: 'file', size: 2048, mtime: nowIso },
+      ];
+
+      window.__DESKTOP_TRACE__ = { minted, revoked, externalOpens };
+      window.__TAURI__ = {
+        event: {
+          listen: () => Promise.resolve(() => {}),
+        },
+        core: {
+          Channel: class FakeChannel {
+            constructor() {
+              this.onmessage = null;
+            }
+          },
+          invoke(command, payload = {}) {
+            if (command === 'ready') return Promise.resolve();
+            if (command === 'media_check_spec') return Promise.resolve(null);
+            if (command === 'update_state') return Promise.resolve({ phase: 'up_to_date', auto_update: true });
+            if (command === 'update_watch') return Promise.resolve();
+            if (command === 'transfers') return Promise.resolve([]);
+            if (command === 'transfer_watch') return Promise.resolve(1);
+            if (command === 'transfer_unwatch') return Promise.resolve();
+            if (command === 'learn') {
+              return Promise.resolve({
+                report: { introducer: 'local', added: [], updated: [], identity_changed: [], skipped: [] },
+              });
+            }
+            if (command === 'state') {
+              return Promise.resolve({
+                ready: true,
+                nodes: [
+                  { node: 'local', principal: 'local', role: 'owner', via: 'local' },
+                  { node: 'studio', principal: 'device:desktop', role: 'owner', via: 'ssh' },
+                  { node: 'tower', principal: 'device:desktop', role: 'owner', via: 'ssh' },
+                ],
+                routes: { local: { kind: 'direct' }, tower: { kind: 'direct' } },
+              });
+            }
+            if (command === 'tools') return Promise.resolve(toolsList);
+            if (command === 'content_url') {
+              ticketSeq += 1;
+              const name = String(payload.path || 'file').split('/').pop();
+              const url = `${origin}/v1/content/tok-${payload.machine}-${ticketSeq}/${name}`;
+              minted.push({ machine: payload.machine, path: payload.path, url });
+              return Promise.resolve({ url, expires_in: 900 });
+            }
+            if (command === 'content_revoke') {
+              revoked.push(payload.url);
+              return Promise.resolve(true);
+            }
+            if (command === 'content_status') {
+              return Promise.resolve({ request_count: 1, status: 200, stream_failed: false, ticket_live: true });
+            }
+            if (command === 'transfer_open_externally') {
+              externalOpens.push({ machine: payload.machine, path: payload.path });
+              return Promise.resolve({ id: 'tr-ext-1', ok: true, opened_immediately: true });
+            }
+            if (command === 'call') {
+              const { tool, on } = payload;
+              if (tool === 'meta.whoami') {
+                return Promise.resolve({
+                  node: on === 'tower' ? 'tower' : 'studio',
+                  principal: on === 'tower' ? 'device:desktop' : 'local',
+                  role: 'owner',
+                  tools: toolsList.map((t) => t.name),
+                });
+              }
+              if (tool === 'meta.version') {
+                return Promise.resolve({ node: on === 'tower' ? 'tower' : 'studio', version: '0.2.0', protocol: 1 });
+              }
+              if (tool === 'meta.tools') {
+                return Promise.resolve({ node: on === 'tower' ? 'tower' : 'studio', tools: toolsList });
+              }
+              if (tool === 'fleet.list') {
+                return Promise.resolve({
+                  node: 'studio',
+                  answered_by: 'local',
+                  machines: [
+                    { name: 'studio', this_node: true, os: 'linux', arch: 'x86_64', systems: [], wake_via: [] },
+                    { name: 'tower', this_node: false, os: 'linux', arch: 'x86_64', systems: [], wake_via: [] },
+                  ],
+                });
+              }
+              if (tool === 'fleet.ping') {
+                const machines = Array.isArray(payload.args?.machines) ? payload.args.machines : ['tower'];
+                return Promise.resolve({
+                  results: machines.map((m) => ({
+                    machine: m,
+                    reachable: true,
+                    os: 'linux',
+                    arch: 'x86_64',
+                    version: '0.2.0',
+                  })),
+                });
+              }
+              if (tool === 'sys.info') {
+                return Promise.resolve({ node: on === 'tower' ? 'tower' : 'studio', os: 'linux', arch: 'x86_64' });
+              }
+              if (tool === 'fs.list') {
+                const home = on === 'tower' ? '/home/me/tower' : '/home/me/studio';
+                return Promise.resolve({ path: home, entries: filesFor(home) });
+              }
+              if (tool === 'fs.thumb') {
+                return Promise.resolve({ results: [] });
+              }
+              return Promise.resolve({});
+            }
+            return Promise.resolve({});
+          },
+        },
+      };
+    }, baseUrl);
+
+    await page.goto(`${baseUrl}/#/files/studio/~`, { waitUntil: 'domcontentloaded' });
+    await page.locator('.split-left a.row', { hasText: 'studio' }).waitFor({ timeout: 10_000 });
+    await page.locator('.split-left a.row', { hasText: 'tower' }).waitFor({ timeout: 10_000 });
+    assert.equal(await page.locator('.split-left a.row', { hasText: /^local$/i }).count(), 0);
+
+    const openAndClose = async (machineLabel, fileName, mediaSelector) => {
+      await page.locator('.split-left a.row', { hasText: machineLabel }).click();
+      await page
+        .locator(`.split-right a.cell[aria-label="${fileName}"], .split-right a.row:has-text("${fileName}")`)
+        .first()
+        .click();
+      await page.locator(`.viewer ${mediaSelector}`).waitFor({ timeout: 10_000 });
+      await page.locator('.viewer-top button[aria-label="Close"]').click();
+      await page.locator('.viewer').waitFor({ state: 'hidden', timeout: 5_000 });
+    };
+
+    // Open picture and video on "This computer" (studio -> local pipe) and on remote machine (tower).
+    await openAndClose('studio', 'photo.png', 'img.viewer-img');
+    await openAndClose('studio', 'clip.webm', 'video');
+    await openAndClose('tower', 'photo.png', 'img.viewer-img');
+    await openAndClose('tower', 'clip.webm', 'video');
+
+    // Open a non-inline file on "This computer" in another app and verify it routes through local pipe.
+    await page.locator('.split-left a.row', { hasText: 'studio' }).click();
+    await page
+      .locator('.split-right a.cell[aria-label="notes.pdf"], .split-right a.row:has-text("notes.pdf")')
+      .first()
+      .click();
+    await page.locator('.viewer').getByRole('button', { name: 'Open in another app' }).click();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden', timeout: 5_000 });
+
+    const trace = await page.evaluate(() => window.__DESKTOP_TRACE__);
+    assert.deepEqual(
+      trace.minted.map((m) => [m.machine, m.path]),
+      [
+        ['local', '/home/me/studio/photo.png'],
+        ['local', '/home/me/studio/clip.webm'],
+        ['tower', '/home/me/tower/photo.png'],
+        ['tower', '/home/me/tower/clip.webm'],
+      ],
+    );
+    assert.deepEqual(
+      trace.revoked,
+      trace.minted.map((m) => m.url),
+      'closing the viewer must revoke every minted URL for both This computer and remote machines',
+    );
+    assert.deepEqual(trace.externalOpens, [{ machine: 'local', path: '/home/me/studio/notes.pdf' }]);
+
+    await ctx.close();
+    assert.deepEqual(pageErrors, [], `Uncaught page errors (desktop split): ${pageErrors.join('\n')}`);
+    assert.deepEqual(consoleErrors, [], `Console/CSP errors (desktop split): ${consoleErrors.join('\n')}`);
+  } finally {
+    await browser.close();
+    await new Promise((resolve) => mediaServer.close(resolve));
   }
 });
