@@ -304,15 +304,15 @@ fn get_sends_the_size_then_the_bytes_from_the_offset() {
         b"",
     );
     let (line, rest) = ran.ok().first();
+    assert_eq!(line["size"], json!(200_000));
+    assert_eq!(line["offset"], json!(1000));
+    assert_eq!(line["length"], json!(199_000));
     assert_eq!(
-        line,
-        json!({
-            "size": 200_000,
-            "offset": 1000,
-            "length": 199_000,
-            "mtime": {"secs": expected_mtime.secs, "nanos": expected_mtime.nanos}
-        })
+        line["mtime"],
+        json!({"secs": expected_mtime.secs, "nanos": expected_mtime.nanos})
     );
+    #[cfg(unix)]
+    assert!(line["file_id"].as_u64().is_some(), "{line}");
     assert_eq!(rest, &data[1000..]);
     assert_eq!(node.last_audit()["tool"], "stream.get");
 
@@ -1131,4 +1131,89 @@ fn a_refused_unpack_reads_nothing_of_what_follows() {
     let mut rest = Vec::new();
     cursor.read_to_end(&mut rest).unwrap();
     assert!(rest.len() > 900_000, "{}", rest.len());
+}
+
+#[test]
+fn keep_open_get_serves_multiple_ranges_frames_done_and_coalesces_audit() {
+    let node = Node::new();
+    fs::create_dir_all(node.home().join("projects/src")).unwrap();
+    let file = node.home().join("projects/src/clip.bin");
+    fs::write(&file, b"0123456789abcdefghijklmnopqrstuvwxyz").unwrap();
+
+    let mut input = Vec::new();
+    for req in [
+        json!({"protocol": 1, "op": "get", "path": "~/projects/src/clip.bin", "offset": 0, "length": 10, "keep_open": true}),
+        json!({"protocol": 1, "op": "get", "path": "~/projects/src/clip.bin", "offset": 10, "length": 6, "keep_open": true}),
+        json!({"protocol": 1, "op": "get", "path": "~/projects/src/clip.bin", "offset": 999, "length": 4, "keep_open": true}),
+        json!({"protocol": 1, "op": "get", "path": "~/projects/src/clip.bin", "offset": 20, "length": 5, "keep_open": true}),
+    ] {
+        input.extend_from_slice(req.to_string().as_bytes());
+        input.push(b'\n');
+    }
+
+    let mut output = Vec::new();
+    serve(&node.host, None, Cursor::new(input), &mut output).unwrap();
+
+    // Parse protocol greeting, then 4 framed replies.
+    let mut rest = after_protocol(&output);
+
+    let take_line = |slice: &mut &[u8]| -> Value {
+        let pos = slice.iter().position(|&b| b == b'\n').unwrap();
+        let line = &slice[..pos];
+        *slice = &slice[pos + 1..];
+        serde_json::from_slice(line).unwrap()
+    };
+
+    // Frame 1: 10 bytes
+    let r1 = take_line(&mut rest);
+    assert_eq!(r1["size"], 36);
+    assert_eq!(r1["offset"], 0);
+    assert_eq!(r1["length"], 10);
+    assert_eq!(r1["keep_open"], true);
+    #[cfg(unix)]
+    assert!(r1["file_id"].as_u64().is_some());
+    assert_eq!(&rest[..10], b"0123456789");
+    rest = &rest[10..];
+    assert_eq!(take_line(&mut rest), json!({"done": true}));
+
+    // Frame 2: 6 bytes
+    let r2 = take_line(&mut rest);
+    assert_eq!(r2["offset"], 10);
+    assert_eq!(r2["length"], 6);
+    assert_eq!(&rest[..6], b"abcdef");
+    rest = &rest[6..];
+    assert_eq!(take_line(&mut rest), json!({"done": true}));
+
+    // Frame 3: out of range error does not break the persistent pipe
+    let r3 = take_line(&mut rest);
+    assert_eq!(r3["error"]["code"], "conflict");
+
+    // Frame 4: 5 bytes still succeed on the same pipe
+    let r4 = take_line(&mut rest);
+    assert_eq!(r4["offset"], 20);
+    assert_eq!(r4["length"], 5);
+    assert_eq!(&rest[..5], b"klmno");
+    rest = &rest[5..];
+    assert_eq!(take_line(&mut rest), json!({"done": true}));
+    assert!(rest.is_empty());
+
+    // Audit: 3 successful range reads coalesced into 1 ok `stream.get` line (21 bytes total) plus
+    // 1 error line for the out-of-range request.
+    let audit = node.audit();
+    let ok_gets: Vec<&Value> = audit
+        .iter()
+        .filter(|e| e["tool"] == "stream.get" && e["outcome"] == "ok")
+        .collect();
+    assert_eq!(
+        ok_gets.len(),
+        1,
+        "expected 1 coalesced ok audit line: {audit:?}"
+    );
+    assert_eq!(ok_gets[0]["args"]["requests"], 3);
+    assert_eq!(ok_gets[0]["args"]["bytes_served"], 21);
+    let err_gets: Vec<&Value> = audit
+        .iter()
+        .filter(|e| e["tool"] == "stream.get" && e["outcome"] != "ok")
+        .collect();
+    assert_eq!(err_gets.len(), 1, "expected 1 error audit line: {audit:?}");
 }

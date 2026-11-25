@@ -143,6 +143,8 @@ pub(crate) enum Op {
         offset: u64,
         #[serde(default)]
         length: Option<u64>,
+        #[serde(default)]
+        keep_open: bool,
     },
     /// A sender's `offset` is not read: what is on disk decides where it starts. `mtime`, the
     /// source's modification time, is given to the file once it is in place, so a tree that holds
@@ -264,6 +266,10 @@ pub(crate) struct GetReady {
     pub length: u64,
     #[serde(default)]
     pub mtime: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_open: Option<bool>,
 }
 
 /// The line that answers a `put` before its bytes: where the sender is to start.
@@ -370,6 +376,15 @@ pub fn serve_with_door<R: Read, W: Write>(
             return Err(error);
         }
     };
+    if matches!(
+        header.op,
+        Op::Get {
+            keep_open: true,
+            ..
+        }
+    ) {
+        return serve_keep_open_gets(host, pinned, door, device, header, recorded, input, output);
+    }
     let tool = format!("stream.{}", header.op.name());
     let config = ConfigStore::new(host.paths.config_dir());
     let (principal, result) = match authorise(host, &config, pinned, &header) {
@@ -402,12 +417,245 @@ pub fn serve_with_door<R: Read, W: Write>(
     result
 }
 
+/// Coalescing window for persistent `keep_open` `get` audit records on one stream pipe: at most
+/// one audit line per `(principal, path)` per minute, summarizing request count and total bytes.
+const GET_AUDIT_COALESCE_WINDOW: Duration = Duration::from_secs(60);
+
+struct GetAuditBucket {
+    principal: String,
+    path: String,
+    requests: u64,
+    bytes: u64,
+    started: Instant,
+}
+
+impl GetAuditBucket {
+    fn flush(self, host: &Host, door: Door, device: Option<&str>) {
+        let args = json!({
+            "op": "get",
+            "path": self.path,
+            "requests": self.requests,
+            "bytes_served": self.bytes,
+        });
+        record(
+            host,
+            Some(self.principal),
+            door,
+            device,
+            "stream.get",
+            args,
+            self.started,
+            &Ok(()),
+        );
+    }
+}
+
+/// Serves a persistent sequence of `get` operations over one `legion stream` pipe (`keep_open:
+/// true`). Each request re-authorises live `policy.toml` and `Grant::check_path`, emits
+/// `GetReady` with `keep_open: true`, streams exact `length` bytes, and terminates each frame with
+/// `{"done": true}\n`. Successful range reads for the same `(principal, path)` coalesce into at
+/// most one `stream.get` audit record per minute with total bytes served.
+#[allow(clippy::too_many_arguments)]
+fn serve_keep_open_gets<R: Read, W: Write>(
+    host: &Host,
+    pinned: Option<&str>,
+    door: Door,
+    device: Option<&str>,
+    first_header: Header,
+    first_recorded: Value,
+    mut input: BufReader<R>,
+    mut output: BufWriter<W>,
+) -> Result<(), ErrorBody> {
+    let config = ConfigStore::new(host.paths.config_dir());
+    let mut bucket: Option<GetAuditBucket> = None;
+    let mut current = Some((first_header, first_recorded));
+
+    loop {
+        let (header, recorded) = match current.take() {
+            Some(pair) => pair,
+            None => match read_next_header(&mut input) {
+                Ok(Some(pair)) => pair,
+                Ok(None) => break,
+                Err(error) => {
+                    if let Some(pending) = bucket.take() {
+                        pending.flush(host, door, device);
+                    }
+                    let error = error.with_machine(host.name.clone());
+                    let _ = reply_error(&mut output, &error);
+                    return Err(error);
+                }
+            },
+        };
+
+        let started = Instant::now();
+        let Op::Get {
+            path,
+            offset,
+            length,
+            ..
+        } = &header.op
+        else {
+            let err = ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "A persistent keep_open stream accepts only get operations.",
+            )
+            .with_machine(host.name.clone());
+            let _ = reply_error(&mut output, &err);
+            record(
+                host,
+                pinned.map(str::to_owned),
+                door,
+                device,
+                &format!("stream.{}", header.op.name()),
+                recorded,
+                started,
+                &Err(err.clone()),
+            );
+            continue;
+        };
+
+        let path = path.clone();
+        let offset = *offset;
+        let length = *length;
+
+        let grant = match authorise(host, &config, pinned, &header) {
+            Ok(grant) => grant,
+            Err((principal, error)) => {
+                let error = machine(error, host);
+                let _ = reply_error(&mut output, &error);
+                record(
+                    host,
+                    principal,
+                    door,
+                    device,
+                    "stream.get",
+                    recorded,
+                    started,
+                    &Err(error),
+                );
+                continue;
+            }
+        };
+        let principal = grant.principal().to_owned();
+
+        match get_range_framed(&grant, &path, offset, length, true, &mut output) {
+            Ok(served_bytes) => {
+                if let Err(err) =
+                    line(&mut output, &json!({ "done": true })).and_then(|()| output.flush())
+                {
+                    if let Some(pending) = bucket.take() {
+                        pending.flush(host, door, device);
+                    }
+                    let err = machine(gone(&err), host);
+                    record(
+                        host,
+                        Some(principal),
+                        door,
+                        device,
+                        "stream.get",
+                        recorded,
+                        started,
+                        &Err(err.clone()),
+                    );
+                    return Err(err);
+                }
+                let matches_existing = bucket
+                    .as_ref()
+                    .is_some_and(|b| b.principal == principal && b.path == path);
+                if matches_existing {
+                    if let Some(b) = bucket.as_mut() {
+                        b.requests = b.requests.saturating_add(1);
+                        b.bytes = b.bytes.saturating_add(served_bytes);
+                        if b.started.elapsed() >= GET_AUDIT_COALESCE_WINDOW
+                            && let Some(finished) = bucket.take()
+                        {
+                            finished.flush(host, door, device);
+                        }
+                    }
+                } else {
+                    if let Some(prev) = bucket.take() {
+                        prev.flush(host, door, device);
+                    }
+                    bucket = Some(GetAuditBucket {
+                        principal,
+                        path,
+                        requests: 1,
+                        bytes: served_bytes,
+                        started,
+                    });
+                }
+            }
+            Err(Failure::Reply(error)) => {
+                let error = machine(error, host);
+                if reply_error(&mut output, &error).is_err() {
+                    if let Some(pending) = bucket.take() {
+                        pending.flush(host, door, device);
+                    }
+                    return Err(error);
+                }
+                record(
+                    host,
+                    Some(principal),
+                    door,
+                    device,
+                    "stream.get",
+                    recorded,
+                    started,
+                    &Err(error),
+                );
+            }
+            Err(Failure::Raw(error)) => {
+                if let Some(pending) = bucket.take() {
+                    pending.flush(host, door, device);
+                }
+                let error = machine(error, host);
+                record(
+                    host,
+                    Some(principal),
+                    door,
+                    device,
+                    "stream.get",
+                    recorded,
+                    started,
+                    &Err(error.clone()),
+                );
+                return Err(error);
+            }
+        }
+    }
+
+    if let Some(pending) = bucket.take() {
+        pending.flush(host, door, device);
+    }
+    Ok(())
+}
+
 fn machine(error: ErrorBody, host: &Host) -> ErrorBody {
     if error.machine.is_some() {
         error
     } else {
         error.with_machine(host.name.clone())
     }
+}
+
+/// Reads and parses a subsequent header line on a persistent stream, returning `Ok(None)` on clean
+/// EOF.
+fn read_next_header<R: BufRead>(input: &mut R) -> Result<Option<(Header, Value)>, ErrorBody> {
+    let mut line = Vec::new();
+    let read = input
+        .by_ref()
+        .take(LONGEST_HEADER as u64 + 1)
+        .read_until(b'\n', &mut line)
+        .map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("The stream's header could not be read: {error}."),
+            )
+        })?;
+    if read == 0 {
+        return Ok(None);
+    }
+    parse_header_bytes(&line).map(Some)
 }
 
 /// Reads and parses the header line, returning it and the arguments the audit log records.
@@ -430,6 +678,10 @@ fn read_header<R: BufRead>(input: &mut R) -> Result<(Header, Value), ErrorBody> 
         )
         .with_hint("Send one JSON object on the first line, such as {\"op\":\"stat\",\"path\":\"~/notes.txt\"}."));
     }
+    parse_header_bytes(&line)
+}
+
+fn parse_header_bytes(line: &[u8]) -> Result<(Header, Value), ErrorBody> {
     if line.len() > LONGEST_HEADER {
         return Err(ErrorBody::new(
             ErrorCode::InvalidArgs,
@@ -437,7 +689,7 @@ fn read_header<R: BufRead>(input: &mut R) -> Result<(Header, Value), ErrorBody> 
         )
         .with_hint("Send the names of a big tree in several operations."));
     }
-    let value: Value = serde_json::from_slice(&line).map_err(|error| {
+    let value: Value = serde_json::from_slice(line).map_err(|error| {
         ErrorBody::new(
             ErrorCode::InvalidArgs,
             format!("The stream's header is not JSON: {error}."),
@@ -590,6 +842,7 @@ fn run<R: BufRead, W: Write>(
             path,
             offset,
             length,
+            keep_open: _,
         } => get(grant, &path, offset, length, output),
         Op::Put {
             path,
@@ -806,6 +1059,17 @@ fn get<W: Write>(
     length: Option<u64>,
     output: &mut W,
 ) -> Result<(), Failure> {
+    get_range_framed(grant, path, offset, length, false, output).map(|_| ())
+}
+
+fn get_range_framed<W: Write>(
+    grant: &Grant,
+    path: &str,
+    offset: u64,
+    length: Option<u64>,
+    keep_open: bool,
+    output: &mut W,
+) -> Result<u64, Failure> {
     let path = grant.check_path(path, Access::Read)?;
     let source = legion_xfer::open_get_range(&path, offset, length).map_err(xfer_error)?;
     reply(
@@ -815,12 +1079,14 @@ fn get<W: Write>(
             offset: source.offset(),
             length: source.length(),
             mtime: Some(source.mtime()),
+            file_id: source.file_id(),
+            keep_open: keep_open.then_some(true),
         },
     )?;
-    source
+    let written = source
         .stream_to(&mut *output)
         .map_err(|error| Failure::Raw(xfer_error(error)))?;
-    Ok(())
+    Ok(written)
 }
 
 #[allow(clippy::too_many_arguments)]

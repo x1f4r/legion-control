@@ -72,6 +72,7 @@ pub struct GetStream {
     offset: u64,
     length: u64,
     mtime: Timestamp,
+    file_id: Option<u64>,
 }
 
 impl GetStream {
@@ -112,6 +113,7 @@ impl GetStream {
             None => available,
         };
         let mtime = Timestamp::from_metadata(&meta);
+        let file_id = platform::file_id(&meta);
 
         if offset > 0 {
             file.seek(SeekFrom::Start(offset))
@@ -125,6 +127,7 @@ impl GetStream {
             offset,
             length: actual_length,
             mtime,
+            file_id,
         })
     }
 
@@ -146,6 +149,11 @@ impl GetStream {
     /// Returns the file's modification time captured via `fstat` when opened.
     pub fn mtime(&self) -> Timestamp {
         self.mtime
+    }
+
+    /// Returns a platform file identity (derived from device and inode on Unix) when available.
+    pub fn file_id(&self) -> Option<u64> {
+        self.file_id
     }
 
     /// Returns the exact number of bytes [`Self::stream_to`] will emit.
