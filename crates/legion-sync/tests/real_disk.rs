@@ -1060,7 +1060,7 @@ fn real_disk_platform_problems_status_and_security_refusals() {
         Some(FsCapabilities::windows()),
     );
 
-    assert_eq!(winbox.status().unwrap().state, MemberState::UpToDate);
+    assert_eq!(winbox.status().unwrap().state, MemberState::NeverReached);
 
     winbox.set_paused(true).unwrap();
     assert_eq!(winbox.status().unwrap().state, MemberState::Paused);
@@ -1240,7 +1240,13 @@ fn real_disk_windows_target_holds_back_unrepresentable_peer_records() {
     let pull2 = winbox.pull_from_peer(&peer, t1).unwrap();
     assert_eq!(pull2.held_back, 0);
     assert_eq!(pull2.held_back_resolved, 2);
-    assert_eq!(winbox.status().unwrap().state, MemberState::UpToDate);
+    // All held-back problems are resolved and nothing inbound remains; winbox only awaits the
+    // one-way mock peer pulling the synthesized `dir` ancestor record.
+    let st2 = winbox.status().unwrap();
+    assert!(!matches!(st2.state, MemberState::Problem { .. }));
+    let tower_st2 = st2.members.iter().find(|m| m.member == "tower").unwrap();
+    assert_eq!(tower_st2.pending_incoming, 0);
+    assert_eq!(tower_st2.pending_outgoing, 1);
     assert_eq!(
         fs::read(tmp.path().join("winbox/readme.md")).unwrap(),
         b"lower"

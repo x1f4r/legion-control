@@ -711,10 +711,16 @@ skipped paths.
 ### Status in words
 
 `sync.status` reports per member one of: up to date, syncing (files and bytes left), waiting for
-a machine that is off, paused, or a problem with the sentence that explains it. A member with pull
-errors, unapplied held-back records, or records refused by a peer reports a problem rather than
-"up to date" or merely "syncing", and stale problems clear automatically once resolved. The
-interface shows exactly those.
+a member (unreachable or with unacknowledged outbound changes), never reached, paused, or a problem
+with the sentence that explains it. For every other member, status tracks how many of this
+machine's changes it has not yet acknowledged (including deletions still in the settle window) and
+since when, how many of its offered changes have not yet been applied, when the last successful
+exchange took place, and the last exchange error persisted across restarts so a reboot never hides
+a failing peer. The one-line summary says "up to date" (with as-of time) only when every other
+member has been reached, has acknowledged everything of ours, and we hold everything they offered
+at the last exchange with no open problems; otherwise it says plainly what is waiting for whom
+(for example `"3 changes waiting for pi, last reached 2 days ago"` or `"pi has never been reached"`).
+Stale problems clear automatically once resolved. The interface shows exactly those.
 
 ## Order of work
 

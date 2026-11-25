@@ -524,6 +524,10 @@ pub struct FolderMeta {
     /// Rolling window state for the outbound move-aware deletion brake.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_window: Option<DeletionWindowState>,
+    /// Bounded `(seq, timestamp)` marks recording when local changes were emitted so status can
+    /// report how long unacknowledged changes have been waiting for each peer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unacked_change_marks: Vec<(u64, Timestamp)>,
 }
 
 impl FolderMeta {
@@ -551,7 +555,45 @@ impl FolderMeta {
             needs_rescan: BTreeSet::new(),
             pending_deletions: BTreeMap::new(),
             deletion_window: None,
+            unacked_change_marks: Vec::new(),
         }
+    }
+
+    /// Records the timestamp `at` when sequence number `seq` was emitted, coalescing nearby
+    /// timestamps so the table stays bounded (<= 64 entries) while preserving the earliest
+    /// unacknowledged timestamp.
+    pub fn record_change_mark(&mut self, seq: u64, at: Timestamp) {
+        if seq == 0 {
+            return;
+        }
+        if let Some((last_seq, last_ts)) = self.unacked_change_marks.last()
+            && *last_seq < seq
+            && at.secs.saturating_sub(last_ts.secs).abs() < 60
+            && self.unacked_change_marks.len() >= 16
+        {
+            return;
+        }
+        self.unacked_change_marks.push((seq, at));
+        if self.unacked_change_marks.len() > 64 {
+            // Keep index 0 (oldest unacked mark) and the most recent 63 marks.
+            self.unacked_change_marks.remove(1);
+        }
+    }
+
+    /// Drops recorded change marks whose sequence numbers have been acknowledged by every member.
+    pub fn prune_change_marks_through(&mut self, acked_seq: u64) -> bool {
+        let before = self.unacked_change_marks.len();
+        self.unacked_change_marks.retain(|(s, _)| *s > acked_seq);
+        self.unacked_change_marks.len() != before
+    }
+
+    /// Returns the timestamp of the oldest emitted change with `seq > acked_seq`, if known.
+    pub fn oldest_change_since(&self, acked_seq: u64) -> Option<Timestamp> {
+        self.unacked_change_marks
+            .iter()
+            .find(|(s, _)| *s > acked_seq)
+            .or_else(|| self.unacked_change_marks.last())
+            .map(|(_, ts)| *ts)
     }
 
     /// Computes and advances the chained digest for sequence number `seq` with `record_fp`,
@@ -693,6 +735,19 @@ pub struct PeerCursor {
     /// deletion brake, re-asserting local live files across all pending pages of that batch.
     #[serde(default)]
     pub keep_local_files_until_seq: u64,
+    /// Timestamp of the last successful exchange with this peer (`None` if never reached).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_synced_at: Option<Timestamp>,
+    /// Highest `snapshot_seq` advertised by this peer in `incarnation`.
+    #[serde(default)]
+    pub last_seen_snapshot_seq: u64,
+    /// Durable last exchange error for this peer, persisted across restarts until cleared by a
+    /// clean exchange.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<SyncProblem>,
+    /// Timestamp when [`Self::last_error`] occurred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_at: Option<Timestamp>,
 }
 
 /// Compact summary carried in handshakes informing the remote peer that this member could not
@@ -1509,11 +1564,12 @@ pub enum ConflictChoice {
     KeepBoth,
 }
 
-/// High-level state of a sync member, matching the exact five states in the design.
+/// High-level state of a sync member or folder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum MemberState {
-    /// All known changes are applied and no problems are open.
+    /// Every other member has been reached, has acknowledged everything of ours, we hold
+    /// everything they offered at the last exchange, and no problems are open.
     UpToDate,
     /// Actively syncing changes with remaining file and byte counts.
     Syncing {
@@ -1522,11 +1578,13 @@ pub enum MemberState {
         /// Number of bytes left to transfer.
         bytes_left: u64,
     },
-    /// Up to date with reachable members, waiting for one or more offline members.
+    /// Waiting for one or more other members (unreachable or with unacknowledged outbound changes).
     WaitingForMember {
-        /// Members currently unreachable.
+        /// Members currently waited on.
         members: Vec<MemberId>,
     },
+    /// No successful exchange has ever occurred yet with this peer (or with any other member).
+    NeverReached,
     /// Syncing is paused for this folder.
     Paused,
     /// One or more items are held back or failed and need attention.
@@ -1547,6 +1605,24 @@ pub struct MemberStatus {
     pub state: MemberState,
     /// Highest sequence number pulled from this peer (or `local_seq` for self).
     pub cursor_seq: u64,
+    /// Number of our changes this peer has not yet acknowledged (including local deletions waiting
+    /// in the settle window). Always `0` for self.
+    #[serde(default)]
+    pub pending_outgoing: u64,
+    /// Timestamp of the oldest unacknowledged change waiting for this peer, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_outgoing_since: Option<Timestamp>,
+    /// Number of changes advertised by this peer that we have not yet applied. Always `0` for
+    /// self.
+    #[serde(default)]
+    pub pending_incoming: u64,
+    /// Timestamp of the last successful exchange with this peer (or the earliest `last_synced_at`
+    /// across other members for self when every other member has been reached).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_synced_at: Option<Timestamp>,
+    /// Durable last exchange error sentence for this peer, if any (persisted across restarts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Complete status snapshot for a sync folder.
@@ -1558,6 +1634,14 @@ pub struct FolderStatus {
     pub local_member: MemberId,
     /// Overall state of this member.
     pub state: MemberState,
+    /// One-line plain-language summary (for example `"Up to date as of 2 minutes ago"`,
+    /// `"3 changes waiting for pi, last reached 2 days ago"`, or `"pi has never been reached"`).
+    #[serde(default)]
+    pub summary: String,
+    /// Timestamp as of which this folder is up to date across all members (`Some` only when
+    /// `state == MemberState::UpToDate` and there is at least one other member).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_to_date_as_of: Option<Timestamp>,
     /// Status per folder member (including self).
     pub members: Vec<MemberStatus>,
     /// Files that currently have two versions awaiting resolution.

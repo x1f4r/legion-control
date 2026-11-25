@@ -1331,6 +1331,7 @@ pub fn apply_decision<F: SyncFs, S: IndexStore>(
             let mut meta = load_meta_required(store)?;
             meta.bump_version(&mut record.version);
             let seq = meta.next_seq();
+            meta.record_change_mark(seq, now);
             record.seq = seq;
             record.modified_by = meta.local_member.clone();
             record.from_join = false;
@@ -1428,6 +1429,7 @@ pub fn apply_decision<F: SyncFs, S: IndexStore>(
             let mut version = base_version;
             meta.bump_version(&mut version);
             let seq = meta.next_seq();
+            meta.record_change_mark(seq, now);
             let stat = fs.stat_live(&path)?;
             let mtime = stat.as_ref().map_or(now, |m| m.mtime);
             let revived = IndexRecord {
@@ -2086,6 +2088,7 @@ fn flush_group_commit_records<F: SyncFs, S: IndexStore>(
             });
         }
         let seq = meta.next_seq();
+        meta.record_change_mark(seq, rec.mtime);
         rec.seq = seq;
         rec.conflict_of = derive_conflict_of(&rec, &meta);
         let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
@@ -2657,6 +2660,7 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                 let mut meta = load_meta_required(store)?;
                 meta.kept_deleted_dirs.insert(path.clone());
                 let seq = meta.next_seq();
+                meta.record_change_mark(seq, now);
                 let mut tomb = tombstone;
                 tomb.seq = seq;
                 let chain = meta.advance_chain_fingerprint(seq, tomb.head_fingerprint());
@@ -3961,6 +3965,7 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                     .map_or_else(VersionVector::new, |p| p.version.clone());
                 meta.bump_version(&mut version);
                 let seq = meta.next_seq();
+                meta.record_change_mark(seq, now);
                 let dir_stat = fs.stat_live(anc)?;
                 let dir_mtime = dir_stat.as_ref().map_or(now, |m| m.mtime);
                 let dir_rec = IndexRecord {
@@ -4198,6 +4203,7 @@ fn promote_modified_bin_entry<F: SyncFs, S: IndexStore>(
     let vkey = meta.version_key();
     let clock = meta.next_clock();
     let seq = meta.next_seq();
+    meta.record_change_mark(seq, now);
     let mut rec = IndexRecord {
         path: conflict_path.clone(),
         kind: EntryKind::File,
@@ -5141,6 +5147,7 @@ pub fn resolve_conflict<F: SyncFs, S: IndexStore>(
             let mut updated = conflict_rec;
             meta.bump_version(&mut updated.version);
             let seq = meta.next_seq();
+            meta.record_change_mark(seq, now);
             updated.seq = seq;
             updated.conflict_dismissed = true;
             updated.conflict_of = None;
@@ -6350,6 +6357,7 @@ fn preserve_tmp_as_conflict_copy_with_hash<F: SyncFs, S: IndexStore>(
     let vkey = meta.version_key();
     let clock = meta.next_clock();
     let seq = meta.next_seq();
+    meta.record_change_mark(seq, now);
     let mut rec = IndexRecord {
         path: conflict_path.clone(),
         kind: EntryKind::File,
@@ -6510,6 +6518,7 @@ fn commit_records_and_clear_pending<F: SyncFs, S: IndexStore>(
             });
         }
         let seq = meta.next_seq();
+        meta.record_change_mark(seq, rec.mtime);
         rec.seq = seq;
         if rec.deleted && !rec.recent_hashes.is_empty() {
             let mut merged_dh = rec.recent_hashes.clone();

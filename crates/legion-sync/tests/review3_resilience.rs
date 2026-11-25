@@ -760,6 +760,14 @@ fn r3c_cascade_slow_member() {
             incs.push(inc);
         }
     }
+    // Let the three healthy members finish acknowledging the final round's change among themselves.
+    for a in 0..3 {
+        for b in 0..3 {
+            if a != b {
+                let _ = do_pull(&mut es, a, b, 100 + 36 * 1200);
+            }
+        }
+    }
     let conflicts = fs::read_dir(t.join("pi"))
         .unwrap()
         .flatten()
@@ -1165,6 +1173,16 @@ fn r7_held_handle_save_in_bin_unrestorable_then_expired() {
             "expected immediate promotion out of bin, got {locs:?}"
         );
         pi.scan(ts(12)).unwrap();
+        // Promoted conflict copy is a new local change waiting for tower until synced back.
+        assert!(matches!(
+            pi.status().unwrap().state,
+            MemberState::WaitingForMember { ref members } if members == &["tower".to_string()]
+        ));
+        tower
+            .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(12))
+            .unwrap();
+        pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(12))
+            .unwrap();
         assert_eq!(pi.status().unwrap().state, MemberState::UpToDate);
         let gone = pi.expire_bin(ts(13 + 31 * 86_400)).unwrap();
         assert!(gone.is_empty());
@@ -2472,7 +2490,13 @@ fn r14_separate_mount_inside_folder_syncs_cleanly() {
         assert!(t.join(format!("pi/doc{i}.txt")).exists());
     }
     assert_eq!(fs::read(t.join("pi/doc0.txt")).unwrap(), b"doc 0 edited");
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(31))
+        .unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(32))
+        .unwrap();
     assert_eq!(pi.status().unwrap().state, MemberState::UpToDate);
+    assert_eq!(tower.status().unwrap().state, MemberState::UpToDate);
 }
 
 /// Real btrfs subvolume test on Linux btrfs filesystems (skips cleanly on non-btrfs hosts).
@@ -2525,7 +2549,13 @@ fn r14b_real_btrfs_subvolume_inside_folder_syncs_cleanly() {
         for i in 1..10 {
             assert!(t.join(format!("pi/doc{i}.txt")).exists());
         }
+        tower
+            .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(31))
+            .unwrap();
+        pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(32))
+            .unwrap();
         assert_eq!(pi.status().unwrap().state, MemberState::UpToDate);
+        assert_eq!(tower.status().unwrap().state, MemberState::UpToDate);
         assert_eq!(pi.store().held_back_count().unwrap(), 0);
         drop(pi);
         let _ = std::process::Command::new("btrfs")

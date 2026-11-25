@@ -832,6 +832,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         let mut version = old.version;
         meta.bump_version(&mut version);
         let seq = meta.next_seq();
+        meta.record_change_mark(seq, now);
         meta_dirty = true;
 
         let mut recent_hashes = old.recent_hashes;
@@ -908,6 +909,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         };
         meta.bump_version(&mut version);
         let seq = meta.next_seq();
+        meta.record_change_mark(seq, now);
         meta_dirty = true;
 
         let mode = fmeta.mode.or_else(|| {
@@ -1166,6 +1168,7 @@ pub fn flush_settled_deletions<F: SyncFs, S: IndexStore>(
         let mut version = old.version;
         meta.bump_version(&mut version);
         let seq = meta.next_seq();
+        meta.record_change_mark(seq, now);
         let mut recent_hashes = old.recent_hashes;
         if let Some(h) = old.hash {
             recent_hashes.retain(|x| *x != h);
@@ -1313,6 +1316,7 @@ pub fn rescan_single_path_with_force<F: SyncFs, S: IndexStore>(
                 let mut version = item.version;
                 meta.bump_version(&mut version);
                 let seq = meta.next_seq();
+                meta.record_change_mark(seq, now);
                 let mut recent_hashes = item.recent_hashes;
                 if let Some(h) = item.hash {
                     recent_hashes.retain(|x| *x != h);
@@ -1470,6 +1474,7 @@ pub fn rescan_single_path_with_force<F: SyncFs, S: IndexStore>(
             };
             meta.bump_version(&mut version);
             let seq = meta.next_seq();
+            meta.record_change_mark(seq, now);
             let mode = disk_meta.mode.or_else(|| {
                 prev_opt
                     .as_ref()

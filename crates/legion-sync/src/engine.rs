@@ -764,6 +764,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             cursor.inbound_binned_in_window.clear();
             cursor.inbound_window_start = None;
             cursor.inbound_window_start_live_files = 0;
+            cursor.last_error = None;
+            cursor.last_error_at = None;
 
             match decision {
                 InboundDeletionBrakeDecision::ApplyDeletions => {
@@ -801,6 +803,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         local.version.merge_in_place(&tomb.version);
                         meta.bump_version(&mut local.version);
                         let seq = meta.next_seq();
+                        meta.record_change_mark(seq, now);
                         local.seq = seq;
                         local.modified_by = meta.local_member.clone();
                         local.from_join = false;
@@ -1215,15 +1218,15 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         | SyncError::IndexDamaged { .. }
                         | SyncError::FolderUnavailable { .. }
                 ) {
-                    self.last_pull_errors.insert(
-                        peer_id.clone(),
-                        SyncProblem {
-                            path: String::new(),
-                            kind: ProblemKind::FilesystemError,
-                            peer: Some(peer_id),
-                            sentence: format!("Could not finish syncing: {err}"),
-                        },
-                    );
+                    let err_prob = SyncProblem {
+                        path: String::new(),
+                        kind: ProblemKind::FilesystemError,
+                        peer: Some(peer_id.clone()),
+                        sentence: format!("Could not finish syncing with '{peer_id}': {err}"),
+                    };
+                    self.last_pull_errors
+                        .insert(peer_id.clone(), err_prob.clone());
+                    self.persist_peer_pull_error(&peer_id, err_prob, now);
                 }
             }
         }
@@ -1402,6 +1405,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         let mut observed_cursor =
             self.observe_peer_incarnation_with(&peer_id, hs.incarnation, initial_cursors)?;
         let mut cursor_dirty = false;
+        if hs.snapshot_seq > observed_cursor.last_seen_snapshot_seq {
+            observed_cursor.last_seen_snapshot_seq = hs.snapshot_seq;
+            cursor_dirty = true;
+        }
 
         let mut hs_ack_advanced = false;
         if peer_expected_rejoin {
@@ -1615,6 +1622,11 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
             if page.records.is_empty() {
                 cursor.incarnation = page.incarnation;
+                cursor.last_seen_snapshot_seq =
+                    cursor.last_seen_snapshot_seq.max(page.snapshot_seq);
+                cursor.last_synced_at = Some(now);
+                cursor.last_error = None;
+                cursor.last_error_at = None;
                 if page.snapshot_seq >= cursor.seq {
                     cursor.seq = page.snapshot_seq;
                     if let Some(&fp) = page.chain_fingerprints.get(&cursor.seq) {
@@ -1628,7 +1640,9 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     let defs_now = self.store.list_deferrals()?;
                     recompute_peer_applied_ack(&peer_id, &mut cursor, &held_now, &defs_now);
                 }
-                let clear_rejoin = !page.has_more && local_meta.rejoining_peers.contains(&peer_id);
+                let clear_rejoin = !page.has_more
+                    && local_meta.rejoining_peers.contains(&peer_id)
+                    && self.peer_caught_up_for_rejoin(&local_meta, &cursor)?;
                 if cursor != cursor_before_page || clear_rejoin {
                     self.persist_peer_cursor_and_clear_rejoin(&peer_id, cursor, clear_rejoin)?;
                 }
@@ -2386,6 +2400,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             let defs_now = self.store.list_deferrals()?;
 
             cursor.incarnation = page_incarnation;
+            cursor.last_seen_snapshot_seq = cursor.last_seen_snapshot_seq.max(page.snapshot_seq);
+            cursor.last_synced_at = Some(now);
+            cursor.last_error = None;
+            cursor.last_error_at = None;
             if all_done && !page.has_more {
                 cursor.seq = cursor.seq.max(page.snapshot_seq);
                 if let Some(&fp) = chain_fps.get(&cursor.seq) {
@@ -2394,7 +2412,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     cursor.head_fingerprint = page.head_fingerprint;
                 }
                 recompute_peer_applied_ack(&peer_id, &mut cursor, &held_now, &defs_now);
-                self.persist_peer_cursor_and_clear_rejoin(&peer_id, cursor, true)?;
+                let clear_rejoin = self.peer_caught_up_for_rejoin(&local_meta, &cursor)?;
+                self.persist_peer_cursor_and_clear_rejoin(&peer_id, cursor, clear_rejoin)?;
                 self.active_progress.remove(&peer_id);
                 report.tombstones_gc += self.gc_tombstones()?;
                 break;
@@ -3380,6 +3399,9 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         cursor.inbound_brake = None;
         cursor.allow_inbound_mass_deletion_until_seq = 0;
         cursor.keep_local_files_until_seq = 0;
+        cursor.last_seen_snapshot_seq = 0;
+        cursor.last_error = None;
+        cursor.last_error_at = None;
 
         let remove_held_back: Vec<(MemberId, String)> = self
             .store
@@ -3514,6 +3536,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         new_meta.join_mode = true;
         new_meta.head_fingerprint = None;
         new_meta.pending_deletions.clear();
+        new_meta.unacked_change_marks.clear();
         let mut updated_peer_history = peer_recent;
         updated_peer_history.push(now);
         new_meta
@@ -3560,6 +3583,23 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             },
         )?;
         Ok(())
+    }
+
+    fn peer_caught_up_for_rejoin(
+        &self,
+        local_meta: &FolderMeta,
+        cursor: &PeerCursor,
+    ) -> Result<bool> {
+        if local_meta.local_seq == 0 {
+            return Ok(true);
+        }
+        if cursor.acked_local_incarnation != local_meta.incarnation || cursor.acked_local_seq == 0 {
+            return Ok(false);
+        }
+        Ok(self
+            .store
+            .get_seq_fingerprint(cursor.acked_local_seq)?
+            .is_some())
     }
 
     fn persist_peer_cursor_and_clear_rejoin(
@@ -3643,7 +3683,10 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
 
         let removed = to_remove.len();
+        let mut meta_for_marks = meta;
+        let marks_changed = meta_for_marks.prune_change_marks_through(min_direct_ack);
         let batch = StoreBatch {
+            folder_meta: marks_changed.then_some(meta_for_marks),
             remove_records: to_remove,
             prune_seq_fingerprints_below: Some(min_direct_ack),
             ..StoreBatch::default()
@@ -4109,6 +4152,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
     /// configured bin retention (30 days by default), refusing to run when `now` is implausible.
     pub fn expire_bin(&mut self, now: Timestamp) -> Result<Vec<BinEntry>> {
         self.guard_mut("expire_bin", |e| {
+            e.last_now = now;
             e.verify_folder_marker()?;
             expire_bin(&e.fs, &mut e.store, e.bin_retention_secs, now)
         })
@@ -4124,6 +4168,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         now: Timestamp,
     ) -> Result<String> {
         self.guard_mut("restore_from_bin", |e| {
+            e.last_now = now;
             e.verify_folder_marker()?;
             restore_from_bin(&e.fs, &mut e.store, entry_id, dest_path, strategy, now)
         })
@@ -4165,9 +4210,31 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         now: Timestamp,
     ) -> Result<()> {
         self.guard_mut("resolve_conflict", |e| {
+            e.last_now = now;
             e.verify_folder_marker()?;
             resolve_conflict(&e.fs, &mut e.store, conflict_path, choice, now)
         })
+    }
+
+    fn persist_peer_pull_error(&mut self, peer_id: &str, err_prob: SyncProblem, now: Timestamp) {
+        if self.index_damaged {
+            return;
+        }
+        let Ok(Some(meta)) = self.store.load_meta() else {
+            return;
+        };
+        if !meta.members.contains(peer_id) || peer_id == meta.local_member {
+            return;
+        }
+        let Ok(cursors) = self.store.load_peer_cursors() else {
+            return;
+        };
+        let mut cursor = cursors.get(peer_id).cloned().unwrap_or_default();
+        cursor.last_error = Some(err_prob);
+        cursor.last_error_at = Some(now);
+        let mut batch = StoreBatch::default();
+        batch.set_peer_cursors.insert(peer_id.to_string(), cursor);
+        let _ = self.store.apply_batch(batch);
     }
 
     fn damaged_status(&self) -> FolderStatus {
@@ -4175,8 +4242,9 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             .folder_problem
             .clone()
             .unwrap_or_else(index_damaged_problem);
+        let summary = prob.sentence.clone();
         let state = MemberState::Problem {
-            sentence: prob.sentence.clone(),
+            sentence: summary.clone(),
             problems: vec![prob],
         };
         let members = self
@@ -4191,12 +4259,19 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     MemberState::Paused
                 },
                 cursor_seq: 0,
+                pending_outgoing: 0,
+                pending_outgoing_since: None,
+                pending_incoming: 0,
+                last_synced_at: None,
+                last_error: None,
             })
             .collect();
         FolderStatus {
             folder_id: self.config.id.clone(),
             local_member: self.config.local_member.clone(),
             state,
+            summary,
+            up_to_date_as_of: None,
             members,
             conflicts: Vec::new(),
             bin: Vec::new(),
@@ -4206,13 +4281,21 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
     }
 
-    /// Returns the complete [`FolderStatus`] matching the exact five states from the design,
-    /// together with conflicts, bin contents, any tripped deletion brake, and durable deferred items.
+    /// Returns the complete [`FolderStatus`] formatted as of the engine's latest logical timestamp,
+    /// together with per-member outbound/inbound pending counts, last successful exchange time,
+    /// persisted exchange failures, conflicts, bin contents, any tripped deletion brake, and
+    /// durable deferred items.
     pub fn status(&self) -> Result<FolderStatus> {
+        self.status_at(self.last_now)
+    }
+
+    /// Returns the complete [`FolderStatus`] with relative ages in [`FolderStatus::summary`]
+    /// formatted against `now`.
+    pub fn status_at(&self, now: Timestamp) -> Result<FolderStatus> {
         if self.index_damaged {
             return Ok(self.damaged_status());
         }
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.status_inner())) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.status_inner(now))) {
             Ok(Ok(st)) => Ok(st),
             Ok(Err(SyncError::IndexDamaged { .. } | SyncError::CorruptData { .. })) => {
                 Ok(self.damaged_status())
@@ -4222,7 +4305,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
     }
 
-    fn status_inner(&self) -> Result<FolderStatus> {
+    fn status_inner(&self, now: Timestamp) -> Result<FolderStatus> {
         let meta = self.meta()?;
         let cursors = self.store.load_peer_cursors()?;
         let held = self.store.list_held_back()?;
@@ -4280,6 +4363,16 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         }
         let mut inbound_brakes: Vec<InboundDeletionBrake> = Vec::new();
         for (member, c) in &cursors {
+            if !meta.members.contains(member) {
+                continue;
+            }
+            if let Some(ref err_prob) = c.last_error
+                && !all_problems
+                    .iter()
+                    .any(|p| p.peer.as_deref() == Some(member.as_str()))
+            {
+                all_problems.push(err_prob.clone());
+            }
             if c.duplicate_detected
                 && !all_problems.iter().any(|p| {
                     p.kind == ProblemKind::DuplicateMemberId
@@ -4320,59 +4413,20 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         });
         all_problems.dedup();
 
+        // Build each other member's honest status first so overall folder state and summary are
+        // derived directly from per-member outbound/inbound counts, last sync time, and problems.
+        let pending_del_count = meta.pending_deletions.len() as u64;
+        let oldest_pending_del_at = meta.pending_deletions.values().map(|p| p.detected_at).min();
+
+        let mut peer_statuses: BTreeMap<MemberId, MemberStatus> = BTreeMap::new();
         let mut total_files_left: u64 = self.active_progress.values().map(|p| p.files_left).sum();
         let total_bytes_left: u64 = self.active_progress.values().map(|p| p.bytes_left).sum();
+
         for member in &meta.members {
             if member == &meta.local_member {
                 continue;
             }
-            let has_active = self
-                .active_progress
-                .get(member)
-                .is_some_and(|p| p.files_left > 0 || p.bytes_left > 0);
-            if !has_active {
-                let def_count = deferred.iter().filter(|d| d.peer == *member).count() as u64;
-                total_files_left = total_files_left.saturating_add(def_count);
-            }
-        }
-        let offline: Vec<MemberId> = self
-            .unreachable_peers
-            .iter()
-            .filter(|m| meta.members.contains(*m) && *m != &meta.local_member)
-            .cloned()
-            .collect();
-
-        let local_state = if !all_problems.is_empty() {
-            MemberState::Problem {
-                sentence: summarize_problems(&all_problems),
-                problems: all_problems.clone(),
-            }
-        } else if meta.paused {
-            MemberState::Paused
-        } else if total_files_left > 0 || total_bytes_left > 0 {
-            MemberState::Syncing {
-                files_left: total_files_left,
-                bytes_left: total_bytes_left,
-            }
-        } else if !offline.is_empty() {
-            MemberState::WaitingForMember {
-                members: offline.clone(),
-            }
-        } else {
-            MemberState::UpToDate
-        };
-
-        let mut members_vec = Vec::with_capacity(meta.members.len());
-        for member in &meta.members {
-            if member == &meta.local_member {
-                members_vec.push(MemberStatus {
-                    member: member.clone(),
-                    state: local_state.clone(),
-                    cursor_seq: meta.local_seq,
-                });
-                continue;
-            }
-
+            let cursor_opt = cursors.get(member);
             let mut peer_problems: Vec<SyncProblem> = held
                 .iter()
                 .filter(|h| h.from_peer == *member)
@@ -4391,7 +4445,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             {
                 peer_problems.push(peer_refused_problem(member, summary));
             }
-            if let Some(c) = cursors.get(member)
+            if let Some(c) = cursor_opt
                 && c.duplicate_detected
                 && !peer_problems
                     .iter()
@@ -4404,8 +4458,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     sentence: peer_identity_problem_sentence(member, c.alternation_detected),
                 });
             }
+            let persisted_err = cursor_opt.and_then(|c| c.last_error.as_ref());
+            let last_error_str = self
+                .last_pull_errors
+                .get(member)
+                .or(persisted_err)
+                .map(|p| p.sentence.clone());
             if peer_problems.is_empty()
-                && let Some(err_prob) = self.last_pull_errors.get(member)
+                && let Some(err_prob) = self.last_pull_errors.get(member).or(persisted_err)
             {
                 peer_problems.push(err_prob.clone());
             }
@@ -4417,7 +4477,68 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             });
             peer_problems.dedup();
 
+            let peer_acked_seq = cursor_opt
+                .filter(|c| c.acked_local_incarnation == meta.incarnation)
+                .map_or(0, |c| c.acked_local_seq);
+            let seq_gap = meta.local_seq.saturating_sub(peer_acked_seq);
+            let emitted_outgoing = if seq_gap == 0
+                || (meta.local_clock == 0
+                    && meta.members.len() <= 2
+                    && cursor_opt.is_some_and(|c| c.incarnation != 0 && c.seq > 0))
+            {
+                0
+            } else if cursor_opt.is_none_or(|c| c.incarnation == 0) || seq_gap > 4096 {
+                seq_gap
+            } else {
+                let peer_inc = cursor_opt.map_or(0, |c| c.incarnation);
+                let page =
+                    self.store
+                        .records_since(member, meta.incarnation, peer_acked_seq, 4096)?;
+                let peer_vkey = crate::version::VersionKey::new(member.clone(), peer_inc);
+                page.records
+                    .iter()
+                    .filter(|r| !(r.modified_by == *member && r.version.get(&peer_vkey) > 0))
+                    .count() as u64
+            };
+            let pending_outgoing = emitted_outgoing.saturating_add(pending_del_count);
+            let pending_outgoing_since = if pending_outgoing == 0 {
+                None
+            } else {
+                let emitted_since = if emitted_outgoing > 0 {
+                    meta.oldest_change_since(peer_acked_seq)
+                } else {
+                    None
+                };
+                match (emitted_since, oldest_pending_del_at) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                }
+            };
+
+            let peer_held_count = held.iter().filter(|h| h.from_peer == *member).count() as u64;
             let peer_deferred_count = deferred.iter().filter(|d| d.peer == *member).count() as u64;
+            let seq_unapplied = cursor_opt.map_or(0, |c| {
+                c.last_seen_snapshot_seq
+                    .max(c.seq)
+                    .saturating_sub(c.applied_ack_seq)
+            });
+            let pending_incoming =
+                seq_unapplied.max(peer_held_count.saturating_add(peer_deferred_count));
+
+            let has_active = self
+                .active_progress
+                .get(member)
+                .is_some_and(|p| p.files_left > 0 || p.bytes_left > 0);
+            if !has_active
+                && (peer_deferred_count > 0 || (peer_problems.is_empty() && pending_incoming > 0))
+            {
+                total_files_left =
+                    total_files_left.saturating_add(peer_deferred_count.max(pending_incoming));
+            }
+
+            let last_synced_at = cursor_opt.and_then(|c| c.last_synced_at);
             let peer_state = if !peer_problems.is_empty() {
                 MemberState::Problem {
                     sentence: summarize_problems(&peer_problems),
@@ -4432,12 +4553,18 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     files_left: prog.files_left,
                     bytes_left: prog.bytes_left,
                 }
-            } else if peer_deferred_count > 0 {
+            } else if peer_deferred_count > 0 || pending_incoming > 0 {
                 MemberState::Syncing {
-                    files_left: peer_deferred_count,
+                    files_left: peer_deferred_count.max(pending_incoming),
                     bytes_left: 0,
                 }
             } else if self.unreachable_peers.contains(member) {
+                MemberState::WaitingForMember {
+                    members: vec![member.clone()],
+                }
+            } else if last_synced_at.is_none() {
+                MemberState::NeverReached
+            } else if pending_outgoing > 0 {
                 MemberState::WaitingForMember {
                     members: vec![member.clone()],
                 }
@@ -4445,17 +4572,115 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 MemberState::UpToDate
             };
 
-            members_vec.push(MemberStatus {
-                member: member.clone(),
-                state: peer_state,
-                cursor_seq: cursors.get(member).map_or(0, |c| c.seq),
-            });
+            peer_statuses.insert(
+                member.clone(),
+                MemberStatus {
+                    member: member.clone(),
+                    state: peer_state,
+                    cursor_seq: cursor_opt.map_or(0, |c| c.seq),
+                    pending_outgoing,
+                    pending_outgoing_since,
+                    pending_incoming,
+                    last_synced_at,
+                    last_error: last_error_str,
+                },
+            );
         }
+
+        let waiting_peers: Vec<MemberId> = peer_statuses
+            .values()
+            .filter(|ms| {
+                matches!(
+                    ms.state,
+                    MemberState::WaitingForMember { .. } | MemberState::NeverReached
+                )
+            })
+            .map(|ms| ms.member.clone())
+            .collect();
+        let all_others_never_reached = !peer_statuses.is_empty()
+            && peer_statuses
+                .values()
+                .all(|ms| matches!(ms.state, MemberState::NeverReached));
+        let total_pending_outgoing: u64 =
+            peer_statuses.values().map(|ms| ms.pending_outgoing).sum();
+
+        let local_state = if !all_problems.is_empty() {
+            MemberState::Problem {
+                sentence: summarize_problems(&all_problems),
+                problems: all_problems.clone(),
+            }
+        } else if meta.paused {
+            MemberState::Paused
+        } else if total_files_left > 0 || total_bytes_left > 0 {
+            MemberState::Syncing {
+                files_left: total_files_left,
+                bytes_left: total_bytes_left,
+            }
+        } else if all_others_never_reached
+            && self.unreachable_peers.is_empty()
+            && total_pending_outgoing == 0
+        {
+            MemberState::NeverReached
+        } else if !waiting_peers.is_empty() {
+            MemberState::WaitingForMember {
+                members: waiting_peers,
+            }
+        } else {
+            MemberState::UpToDate
+        };
+
+        let up_to_date_as_of = if local_state == MemberState::UpToDate && !peer_statuses.is_empty()
+        {
+            peer_statuses
+                .values()
+                .filter_map(|m| m.last_synced_at)
+                .min()
+        } else {
+            None
+        };
+        let self_last_synced_at = if !peer_statuses.is_empty()
+            && peer_statuses.values().all(|m| m.last_synced_at.is_some())
+        {
+            peer_statuses
+                .values()
+                .filter_map(|m| m.last_synced_at)
+                .min()
+        } else {
+            None
+        };
+
+        let mut members_vec = Vec::with_capacity(meta.members.len());
+        for member in &meta.members {
+            if member == &meta.local_member {
+                members_vec.push(MemberStatus {
+                    member: member.clone(),
+                    state: local_state.clone(),
+                    cursor_seq: meta.local_seq,
+                    pending_outgoing: 0,
+                    pending_outgoing_since: None,
+                    pending_incoming: 0,
+                    last_synced_at: self_last_synced_at,
+                    last_error: None,
+                });
+            } else if let Some(ms) = peer_statuses.get(member) {
+                members_vec.push(ms.clone());
+            }
+        }
+
+        let summary = summarize_folder_status(
+            &local_state,
+            &meta.local_member,
+            &members_vec,
+            now,
+            up_to_date_as_of,
+        );
 
         Ok(FolderStatus {
             folder_id: meta.folder_id,
             local_member: meta.local_member,
             state: local_state,
+            summary,
+            up_to_date_as_of,
             members: members_vec,
             conflicts,
             bin,
@@ -4775,6 +5000,7 @@ fn reissue_carried_deletions<F: SyncFs, S: IndexStore>(
         let mut version = rec.version;
         meta.bump_version(&mut version);
         let seq = meta.next_seq();
+        meta.record_change_mark(seq, rec.mtime);
         if !rec.hashes.is_empty() {
             let mut merged = store.get_deleted_history(&path)?;
             for &h in &rec.hashes {
@@ -4918,6 +5144,7 @@ fn rotate_incarnation_on_marker_mismatch<F: SyncFs, S: IndexStore>(
     meta.join_mode = true;
     meta.head_fingerprint = None;
     meta.pending_deletions.clear();
+    meta.unacked_change_marks.clear();
 
     let batch = StoreBatch {
         folder_meta: Some(meta),
@@ -4969,4 +5196,95 @@ fn summarize_problems(problems: &[SyncProblem]) -> String {
         problems.len(),
         problems[0].sentence
     )
+}
+
+fn format_relative_age(now: Timestamp, then: Timestamp) -> String {
+    let diff = now.secs.saturating_sub(then.secs).max(0);
+    if diff < 60 {
+        "just now".to_string()
+    } else if diff < 3_600 {
+        let m = diff / 60;
+        if m == 1 {
+            "1 minute ago".to_string()
+        } else {
+            format!("{m} minutes ago")
+        }
+    } else if diff < 86_400 {
+        let h = diff / 3_600;
+        if h == 1 {
+            "1 hour ago".to_string()
+        } else {
+            format!("{h} hours ago")
+        }
+    } else {
+        let d = diff / 86_400;
+        if d == 1 {
+            "1 day ago".to_string()
+        } else {
+            format!("{d} days ago")
+        }
+    }
+}
+
+fn summarize_folder_status(
+    local_state: &MemberState,
+    local_member: &str,
+    members: &[MemberStatus],
+    now: Timestamp,
+    up_to_date_as_of: Option<Timestamp>,
+) -> String {
+    match local_state {
+        MemberState::Problem { sentence, .. } => sentence.clone(),
+        MemberState::Paused => "Sync is paused.".to_string(),
+        MemberState::Syncing {
+            files_left,
+            bytes_left,
+        } => {
+            let item_word = if *files_left == 1 { "item" } else { "items" };
+            if *bytes_left > 0 {
+                format!("Syncing {files_left} {item_word} ({bytes_left} bytes left)")
+            } else {
+                format!("Syncing {files_left} {item_word}")
+            }
+        }
+        MemberState::UpToDate => match up_to_date_as_of {
+            Some(as_of) => format!("Up to date as of {}", format_relative_age(now, as_of)),
+            None => "Up to date".to_string(),
+        },
+        MemberState::NeverReached | MemberState::WaitingForMember { .. } => {
+            let mut clauses = Vec::new();
+            for m in members {
+                if m.member == local_member || m.state == MemberState::UpToDate {
+                    continue;
+                }
+                let change_word = if m.pending_outgoing == 1 {
+                    "change"
+                } else {
+                    "changes"
+                };
+                match (m.last_synced_at, m.pending_outgoing) {
+                    (None, 0) => clauses.push(format!("{} has never been reached", m.member)),
+                    (None, n) => clauses.push(format!(
+                        "{n} {change_word} waiting for {}, never reached",
+                        m.member
+                    )),
+                    (Some(last), 0) => clauses.push(format!(
+                        "Waiting for {}, last reached {}",
+                        m.member,
+                        format_relative_age(now, last)
+                    )),
+                    (Some(last), n) => clauses.push(format!(
+                        "{n} {change_word} waiting for {}, last reached {}",
+                        m.member,
+                        format_relative_age(now, last)
+                    )),
+                }
+            }
+            if clauses.is_empty() {
+                "Waiting for another member".to_string()
+            } else {
+                clauses.join("; ")
+            }
+        }
+    }
 }

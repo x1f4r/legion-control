@@ -220,7 +220,7 @@ fn i2_missing_index_beside_existing_marker_stops_as_damaged_until_rebuilt() {
     assert_eq!(tower.list_bin().unwrap().len(), 1);
     assert!(matches!(
         tower.status().unwrap().state,
-        MemberState::UpToDate
+        MemberState::WaitingForMember { .. } | MemberState::NeverReached
     ));
 }
 
@@ -381,7 +381,7 @@ fn i3_store_panic_is_caught_at_engine_boundary() {
     assert!(!engine.is_index_damaged());
     assert!(matches!(
         engine.status().unwrap().state,
-        MemberState::UpToDate
+        MemberState::WaitingForMember { .. } | MemberState::NeverReached
     ));
 }
 

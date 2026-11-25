@@ -956,31 +956,135 @@ fn p8_status_honesty() {
     fs::create_dir_all(t.join("tower")).unwrap();
     fs::write(t.join("tower/a.txt"), b"a").unwrap();
     let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
+    tower.set_deletion_brake(legion_sync::DeletionBrakeConfig {
+        min_deleted_files: 1,
+        min_deleted_percent: 25,
+        settle_secs: 30,
+        window_secs: 600,
+    });
+
+    // 0) Fresh folder before any scan or peer contact: pi has never been reached!
+    let s0 = tower.status().unwrap();
+    assert_eq!(s0.state, MemberState::NeverReached);
+    assert!(
+        s0.summary.contains("pi has never been reached"),
+        "unexpected summary before first contact: {}",
+        s0.summary
+    );
+    let pi_m0 = s0.members.iter().find(|m| m.member == "pi").unwrap();
+    assert_eq!(pi_m0.state, MemberState::NeverReached);
+    assert_eq!(pi_m0.last_synced_at, None);
+
+    // 1) Never contacted pi, 1 unsent local file: MUST NOT say UpToDate!
     tower.scan(ts(0)).unwrap();
-    eprintln!("1 never contacted pi, unsent local file: {}", st(&tower));
+    let s1 = tower.status().unwrap();
+    assert_ne!(s1.state, MemberState::UpToDate);
+    assert_eq!(s1.up_to_date_as_of, None);
+    let pi_m1 = s1.members.iter().find(|m| m.member == "pi").unwrap();
+    assert_eq!(pi_m1.state, MemberState::NeverReached);
+    assert_eq!(pi_m1.pending_outgoing, 1);
+    assert_eq!(pi_m1.pending_outgoing_since, Some(ts(0)));
+    assert_eq!(pi_m1.last_synced_at, None);
+    assert!(
+        s1.summary.contains("1 change waiting for pi") && s1.summary.contains("never reached"),
+        "unexpected summary with unsent file and never-reached peer: {}",
+        s1.summary
+    );
+
+    // 2) Full sync: BOTH members have acked everything -> UpToDate with as-of timestamp!
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     sync_all(&mut [&mut tower, &mut pi], 1);
-    eprintln!("2 synced: {}", st(&tower));
+    let s2 = tower.status().unwrap();
+    assert_eq!(s2.state, MemberState::UpToDate);
+    assert!(s2.up_to_date_as_of.is_some());
+    assert!(
+        s2.summary.starts_with("Up to date as of "),
+        "expected 'Up to date as of ...', got {}",
+        s2.summary
+    );
+    let pi_m2 = s2.members.iter().find(|m| m.member == "pi").unwrap();
+    assert_eq!(pi_m2.state, MemberState::UpToDate);
+    assert_eq!(pi_m2.pending_outgoing, 0);
+    assert_eq!(pi_m2.pending_incoming, 0);
+    assert!(pi_m2.last_synced_at.is_some());
+
+    // 3) New local change not yet pulled by pi: MUST NOT say UpToDate, reports exact count & age!
     fs::write(t.join("tower/b.txt"), b"b").unwrap();
     tower.scan(ts(10)).unwrap();
-    eprintln!("3 new local change not yet pulled by pi: {}", st(&tower));
+    let s3 = tower.status_at(ts(10 + 2 * 86_400)).unwrap();
+    assert_eq!(
+        s3.state,
+        MemberState::WaitingForMember {
+            members: vec!["pi".to_string()]
+        }
+    );
+    let pi_m3 = s3.members.iter().find(|m| m.member == "pi").unwrap();
+    assert_eq!(pi_m3.pending_outgoing, 1);
+    assert_eq!(pi_m3.pending_outgoing_since, Some(ts(10)));
+    assert!(
+        s3.summary
+            .contains("1 change waiting for pi, last reached 2 days ago"),
+        "expected waiting summary with age, got {}",
+        s3.summary
+    );
+
+    // 4) Local deletion in 30-second settle window ALSO counts as waiting outbound change!
     fs::remove_file(t.join("tower/a.txt")).unwrap();
     tower.scan(ts(11)).unwrap();
-    eprintln!(
-        "4 deletion in settle window: {} ; pending={}",
-        st(&tower),
-        tower.meta().unwrap().pending_deletions.len()
+    assert_eq!(tower.meta().unwrap().pending_deletions.len(), 1);
+    let s4 = tower.status_at(ts(11 + 2 * 86_400)).unwrap();
+    assert_ne!(s4.state, MemberState::UpToDate);
+    let pi_m4 = s4.members.iter().find(|m| m.member == "pi").unwrap();
+    assert_eq!(pi_m4.pending_outgoing, 2);
+    assert!(
+        s4.summary
+            .contains("2 changes waiting for pi, last reached 2 days ago"),
+        "expected 2 changes waiting (edit + pending deletion), got {}",
+        s4.summary
     );
-    // pull error then restart
+
+    // 5a) Failed pull on pi records a durable Problem naming tower (NOT UpToDate).
     let r = pi.pull_from_peer(&NoPages(EnginePeer::new(&tower, "pi")), ts(12));
-    eprintln!(
-        "5a pi after failed pull: err={:?} {}",
-        r.err().map(|e| e.to_string()),
-        st(&pi)
+    assert!(r.is_err());
+    let s5a = pi.status().unwrap();
+    assert!(
+        matches!(s5a.state, MemberState::Problem { .. }),
+        "5a: pi must report Problem after failed pull, got {:?}",
+        s5a.state
     );
+    let tw_m5a = s5a.members.iter().find(|m| m.member == "tower").unwrap();
+    assert!(matches!(tw_m5a.state, MemberState::Problem { .. }));
+    assert!(tw_m5a.last_error.is_some());
+
+    // 5b) Restarting pi MUST NOT forget that pulls from tower are failing!
     drop(pi);
-    let pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
-    eprintln!("5b pi after restart (pull still failing): {}", st(&pi));
+    let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
+    let s5b = pi.status().unwrap();
+    assert!(
+        matches!(s5b.state, MemberState::Problem { .. }),
+        "5b: pi after restart must still report persisted pull failure, got {:?}",
+        s5b.state
+    );
+    let tw_m5b = s5b.members.iter().find(|m| m.member == "tower").unwrap();
+    assert!(matches!(tw_m5b.state, MemberState::Problem { .. }));
+    assert!(tw_m5b.last_error.is_some());
+
+    // 6) Once the pull succeeds cleanly and deletions settle & sync, the persisted error clears
+    //    and both members return to honest UpToDate!
+    tower.flush_settled_deletions(ts(100)).unwrap();
+    sync_all(&mut [&mut tower, &mut pi], 101);
+    assert_eq!(pi.status().unwrap().state, MemberState::UpToDate);
+    assert_eq!(tower.status().unwrap().state, MemberState::UpToDate);
+    assert_eq!(
+        pi.status()
+            .unwrap()
+            .members
+            .iter()
+            .find(|m| m.member == "tower")
+            .unwrap()
+            .last_error,
+        None
+    );
 }
 
 /// tower on a case-sensitive btrfs folder, pi on a real case-folding, normalising ext4 folder.
