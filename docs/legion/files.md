@@ -49,9 +49,13 @@ One table in `legion-core` (`media`) maps a file extension to a **category** and
 | `archive` | zip, tar, gz, xz, zst, 7z, rar |
 | `other` | everything else |
 
-The table is by extension only, case-insensitive; nothing is opened to guess. `fs.list`,
-`fs.find` and `fs.stat` report `category` and `mime` for regular files. The existing `kind`
-(`file`, `dir`, `symlink`, `other`) keeps its meaning.
+The table is by extension only, case-insensitive; `fs.list` and `fs.stat` never open files to guess.
+As a targeted exception for `.ts`, `fs.find` and `fs.thumb` sniff the leading bytes of regular `.ts`
+files for MPEG-TS sync packets (`0x47` at 188/192-byte intervals, rejecting plain UTF-8 text) so
+video recordings named `.ts` match `categories: ["video"]` (`video/mp2t`) and thumbnail with
+`ffmpeg`, while TypeScript `.ts` files remain `text` (`text/typescript`). `fs.list`, `fs.find` and
+`fs.stat` report `category` and `mime` for regular files. The existing `kind` (`file`, `dir`,
+`symlink`, `other`) keeps its meaning.
 
 ## Tools
 
@@ -61,22 +65,75 @@ node.
 ### Looking
 
 - `fs.list` gains `sort` (`name`, `modified`, `size`), `order` (`asc`, `desc`), `categories`
-  (list, keeps directories), `offset`, and reports `total` and `truncated`. Directories still
-  come first.
-- `fs.find` gains `name` (words that must all appear in the file name, case-insensitive),
-  `categories`, `min_size`, `max_size`, `modified_after`, `modified_before`, `sort`, `order`,
-  `hidden` (separate from `ignore`, so a search can skip dot files without obeying `.gitignore`)
-  and `budget_ms` (default 10 000, at most 60 000). A search that runs out of time or reaches
+  (list, keeps directories), `offset`, and reports `total`, `total_exact` and `truncated`.
+  Directories still come first; `name` uses natural case-insensitive order (`file2` before
+  `file10`). `depth: 1` always counts every direct child (`total_exact: true`); recursive
+  listings (`depth > 1`) stay on one filesystem and bound counting once the requested page is
+  full, reporting a lower-bound `total` with `total_exact: false` when cut short.
+- `fs.find` gains `name` (whitespace-separated words that must all appear in the file name,
+  case-insensitive, Unicode-aware), `categories`, `min_size`, `max_size`, `modified_after`,
+  `modified_before` (RFC 3339 timestamps in the same format `fs.stat` and `fs.list` return),
+  `sort`, `order`, `hidden` (separate from `ignore`, defaulting to `false` when `ignore` is
+  `true` and `true` when `ignore` is `false`, so a search can skip hidden entries without obeying
+  `.gitignore`) and `budget_ms` (default 10 000, at most 60 000). Without `sort`, results stream
+  in directory-entry order for speed; pass `sort` when deterministic ordering is needed. Each
+  reply carries `machine` (the node that produced it); a search that runs out of time or reaches
   `limit` returns what it has with `truncated: true` and `reason` (`time` or `limit`). With
-  `on: "all"` it is a search of the fleet; machines that are off are reported, not waited for.
-- `fs.thumb` (read): `{paths: [1..32], size: 96..512 = 256, fit: "cover" | "contain"}` returns,
-  per path, `{mime, content (base64), width, height}` or an error. Pictures are decoded on the
-  node (JPEG, PNG, GIF first frame, WebP, BMP; EXIF orientation applied) inside hard limits:
-  source at most 64 MiB and 100 megapixels, decoding off the async threads, a bounded number at
-  once. Video posters are made with `ffmpeg` when the node has it and reported `unsupported`
-  otherwise. Results are cached in the state directory under a key of path, size, modification
-  time and parameters, with the cache capped (256 MiB, least recently used first). A thumbnail of
-  a file is allowed exactly when `fs.read` of it is.
+  `on: "all"` it fans out concurrently across the fleet, returning `{"results": {"<machine>":
+  {"ok": {machine, matches, truncated, reason?}} | {"error": {code, message, hint?, machine}}}}`
+  so unreachable machines are reported per key rather than failing the search.
+- `fs.thumb` (read): `{paths: [1..32], size: 96..512 = 256, fit: "contain" | "cover"}` returns
+  exactly one entry per input path in input order: `{"results": [{path, ok: {mime, content
+  (base64), width, height}} | {path, error}]}`. Regular files are opened non-blockingly once
+  (`O_NONBLOCK | O_NOCTTY` plus `fstat` regular-file verification on Unix; disk file check on
+  Windows) across `fs.*` and `legion-xfer` so swapping a regular file for a FIFO or special file
+  cannot block a node thread. Pictures are header-peeked (`<= 128 KiB`, cross-checking inner frame
+  dimensions in JPEG/GIF/WebP against outer container headers and walking GIF extension blocks up
+  to the peek bound without a fixed block cutoff), reserved against the shared in-flight byte
+  budget before reading the full file, and decoded out-of-process in a memory-bounded worker that
+  receives the already-opened file handle on `stdin`, starts with a cleared minimal environment,
+  validates its CLI arguments strictly before allocating, and opens nothing by path (JPEG, PNG, GIF
+  first frame, WebP, BMP; EXIF orientation applied). Admission caps source files at 64 MiB and
+  estimated peak decode memory at 256 MiB per image (admitting 48–61 MP baseline JPEGs while
+  capping heavier progressive/16-bit/interlaced encodings). Over-cap JPEGs fall back to a validated
+  embedded MPF preview (preferred) or EXIF IFD1 thumbnail through the same limits with the main
+  image's EXIF orientation, returning a per-path `too_large` error only when none is usable. Every
+  worker enforces an exact cross-OS live-heap cap via a capped global allocator (sized at
+  `1.35x estimated_peak + 8 MiB`, floored at `16 MiB`, exiting immediately on overshoot; unlimited
+  in the normal node at the cost of one relaxed atomic load) backed by a 10 ms RSS watchdog on
+  every platform (including macOS) set above the measured per-platform worker startup baseline plus
+  `heap_cap` plus `max(6 MiB, 10% of heap_cap)` headroom, an OS backstop limit above that watchdog
+  limit (`RLIMIT_AS` with virtual-address headroom on Linux, `RLIMIT_DATA` on other non-macOS Unix,
+  suspended-create Job Object memory limit on Windows), and a 10 s wall-clock kill timeout. Each
+  worker's in-flight reservation equals its watchdog resident limit (`baseline + heap_cap + max(6
+  MiB, 10%)`), so the sum of live image and `<= 1080p` video worker limits never exceeds the shared
+  budget of `min(512 MiB, effective RAM / 8)` (floored at 256 MiB, honoring Linux cgroup v2/v1 and
+  Windows Job Object memory limits), scheduled round-robin by principal with anti-starvation aging
+  across up to 16 concurrent decodes (scaled to CPU cores, bounded by the shared byte budget) and a
+  10 s bounded wait (returning retryable `busy`). Only allocator-cap memory kills (when the capped
+  allocator itself stops an image exceeding its heap cap) are recorded as negative bad-file entries
+  in `thumb-cache/` keyed to file identity plus `size` and `fit`, and those entries expire after
+  1 day so the file is retried after expiry; backstop kills (`rss_watchdog` / OS limit while the
+  allocator stayed under cap), external signals (`SIGKILL`, `SIGTERM`), and crashes return a
+  transient per-path error without poisoning the cache (logging baseline/cap/limit/peak
+  diagnostics). Timeouts are never remembered permanently as bad; repeated CPU-busy timeouts of the
+  same file/size/fit trigger a short 5-minute in-memory back-off. Output is JPEG, or PNG when the
+  source has transparency. Video posters (including sniffed MPEG-TS `.ts` recordings) run `ffmpeg`
+  by resolved absolute path with a cleared minimal environment and `MALLOC_ARENA_MAX=2` (capping
+  glibc arena reservations; `-threads 1` limits decoder, encoder, and filter threads rather than
+  making `ffmpeg` strictly single-threaded), under the RSS watchdog as the deciding resident limit
+  plus a +1 GiB virtual-address backstop (256 MiB resident cap for `<= 1080p` videos sharing the
+  512 MiB pool; `> 1080p` 4K/8K videos drain the entire shared pool and all video slots so they run
+  strictly one at a time with zero concurrent images or videos under an exclusive `min(768 MiB,
+  max(256 MiB, effective RAM / 4))` resident budget, preserving rotation metadata; no shell,
+  `-max_pixels 67108864`, `-max_alloc 134217728`, `-protocol_whitelist file`, MOV/MP4 demuxer
+  pinned with `-enable_drefs 0 -use_absolute_path 0`, non-MOV `-format_whitelist` excluding MOV and
+  playlists/manifests, video-only mapping, 15 s time limit) when `ffmpeg` is on `PATH` and report
+  `unsupported`
+  otherwise. Positive thumbnails and expiring bad-file entries share a process-wide lock-free cache
+  handle in the state directory (`thumb-cache/`) keyed by path, OS file identity, metadata change
+  time, source size, modification time and parameters, reconciled directly on disk against the
+  256 MiB LRU cap. A thumbnail of a file is allowed exactly when `fs.read` of it is.
 
 ### Moving
 
@@ -268,28 +325,55 @@ mount it:
   in bounded windows over a dedicated pool of warm `keep_open` `legion stream` pipes per target
   machine, separate from transfer and RPC pipes (which never share permits with content), with
   per-holder fair sharing and a short acquire timeout (`503 Service Unavailable` with `Retry-After`).
-- **The app**: the native side mounts the same module on a listener bound to `127.0.0.1` on a
-  port the system picks, reading through `Link::open_content`. The interface asks the native
-  command `content_url({machine, path})` for an address. The ticket in the path is the only
-  thing another program on the device would need and cannot guess; tickets are read-only, short
-  lived and exist only for files the person opened. Where a platform's web view refuses loopback
-  media from the app's origin, the same module is mounted on the app's custom scheme instead,
-  answering open-ended ranges in bounded pieces.
+- **The app**: the native side mounts `legion-content` behind `content_url({machine, path,
+  download})`, reading through `Link::open_content`. Linux, macOS, Windows, iOS and iPadOS mount it
+  lazily on a listener bound to `127.0.0.1` on a system-chosen port (capped at 32 simultaneous
+  connections with a 5-second header-read timeout, exponential backoff on accept errors, iOS
+  resume recovery, and stopping 60 seconds after no live tickets or active streams remain),
+  protected by `HostOriginGuard` (loopback host+port and only that platform's bundled page origins,
+  never `null`) and `Cross-Origin-Resource-Policy: cross-origin`. Android keeps
+  `android:usesCleartextTraffic="false"` in its manifest, which causes Chromium WebView to refuse
+  cleartext loopback HTTP; Android therefore mounts the same `legion-content` crate on a Tauri
+  custom URI scheme (`legion-content`, reached as
+  `http://legion-content.localhost/v1/content/<ticket>/<name>` and intercepted in-process via
+  `shouldInterceptRequest`), answering open-ended `Range` requests in bounded 2 MiB pieces,
+  refusing unranged responses over 16 MiB with `413 Payload Too Large` before reading a byte, and
+  capping total concurrent buffered memory at 24 MiB. Tickets are read-only, short-lived, exist
+  only for files opened in the app, and die immediately when their pairing is removed or replaced
+  or when the app quits.
 
 The interface's content security policy grows by exactly what this needs: `img-src` and
-`media-src` for the content origin.
+`media-src` for `http://127.0.0.1:*` (desktop and iOS) or `http://legion-content.localhost`
+(Android).
 
 ### To and from the device
 
-- **Download to this device** (app): a native command streams the file to the device's Downloads
-  (Android: the shared Downloads collection, in a `Legion` folder; desktop: the user's Downloads
-  folder; iOS and iPadOS: the app's folder in Files). It resumes from a partial file, checks the
-  finished file against `fs.hash`, reports progress, and shows up in Activity as a row that can be
-  opened. In a browser it is a link to the content address with `?download=1`.
-- **Open in another app** (app): downloads to the app's cache and hands the file to the system's
-  chooser.
-- **Add from this device** (app): the system's file picker, then the bulk pipe's `put`, with the
-  same resume and hash check.
+- **Download to this device** (app): a native command streams the file into a private `.part` file
+  with bounded 64 KiB memory, resumes from the partial file's byte offset across network drops,
+  pauses, or restarts, verifies the completed file against `fs.hash` (BLAKE3), sanitizes the file
+  name against the union of Windows, POSIX and Unicode control/format rules (stripping separators,
+  drive prefixes, NTFS streams, BiDi overrides and reserved Windows device names), and places it
+  without overwriting existing files (atomic `hard_link` / exclusive create with `name (2).ext`
+  numbering) into the device's Downloads destination (Android: shared `Downloads/Legion` through
+  `MediaStore.Downloads` with no broad storage permission; desktop: the user's Downloads folder,
+  marked with `:Zone.Identifier` on Windows and `com.apple.quarantine` on macOS; iOS and iPadOS:
+  `Documents/Downloads` exposed to Apple Files). In a browser it is a link to the content address
+  with `?download=1`.
+- **Open in another app** (app): downloads to the app's cache (`open-externally/`, pruned by count,
+  age and total size), verifies the hash, derives MIME on the device strictly from the saved
+  file's real extension (never trusting remote MIME claims), and hands safe types to the system
+  viewer or chooser (always `Intent.createChooser` on Android via a non-exported `FileProvider`
+  scoped solely to `cache/open-externally/`). Executables, installers, scripts, shortcuts, disk
+  images and macro documents are never opened directly by Legion; finished rows offer "Show in
+  folder" instead, and tapping their completion notification on Android opens Downloads.
+- **Add from this device** (app): picks files exclusively via the native system file picker
+  (`ACTION_OPEN_DOCUMENT` with persistable read URI grants released on completion/failure/cancel on
+  Android; native file dialog on desktop) and issues session-only opaque upload handles so the web
+  view can never name an arbitrary device file. Pre-selected local upload paths exist only behind
+  the debug compile-time flag `test-upload-paths`. Files are hashed in 64 KiB chunks, checked with
+  `fs.stat` to choose a non-colliding `name (2).ext` remote target before starting, and uploaded
+  over the bulk pipe's `put` through `Link::open_put` with remote `.legion-part` resume and BLAKE3
+  verification.
 
 Nothing here makes a person wait. Starting a download, an upload or a transfer returns at once;
 the interface stays free to browse, play something else or leave Files, and the work shows in
@@ -298,20 +382,32 @@ Activity. A viewer can be closed while it is still loading, which stops the load
 Transfers to and from the device run in a queue on the app's native side, not in the web view,
 so they do not depend on a screen being open:
 
-- **Android**: a foreground service of the data-sync kind with one ongoing notification (what is
-  moving, how far, Pause and Cancel). It keeps going when the person switches apps, locks the
-  screen or swipes Legion away. The queue is written to disk; after the process is killed, the
-  phone restarts or the connection drops, each transfer resumes from its partial file the next
-  time the service can run, and a finished one leaves a notification that opens the file.
-- **Desktop**: the same queue. Closing the window while it is working leaves the app running
-  without a window until the queue is empty, and says so; quitting outright asks first. What was
-  unfinished resumes on the next start.
-- **iPhone and iPad**: the system gives an app only a short time in the background, so a transfer
-  pauses when the app is left and resumes when it is opened again. The interface says that
-  instead of pretending otherwise.
+- **Android**: a `dataSync` foreground service (`TransferForegroundService`) with one ongoing
+  notification (what is moving, progress, Pause/Resume and Cancel; `POST_NOTIFICATIONS` requested
+  lazily on first user transfer with a one-sentence rationale). It keeps going when the person
+  switches apps, locks the screen or swipes Legion away from Recents. While all transfers are
+  paused, the service detaches from foreground state so paused jobs do not consume Android 15+'s
+  6-hour rolling `dataSync` quota while keeping Resume and Cancel buttons live. If Android's
+  `dataSync` time limit fires (`onTimeout`), active transfers pause cleanly with a tap-to-resume
+  notification and the service stops within Android's grace window. The queue is persisted to disk;
+  after process death (`force-stop`, OOM) or reboot (Android 15+ forbids `BOOT_COMPLETED` receivers
+  from starting `dataSync` foreground services), unfinished transfers resume from their partial
+  files the next time Legion opens, and finished downloads post a notification that opens the file.
+- **Desktop (Linux, macOS, Windows)**: the same queue. Closing the window while it is working
+  hides the window, sends a system notification, and exits automatically once the queue drains;
+  quitting outright asks for confirmation first. Unfinished transfers resume on the next start.
+- **iPhone and iPad**: runs the same queue while Legion is in the foreground; when iOS suspends
+  the app, active transfers pause automatically and resume when Legion returns to the foreground.
+  `state()` reports `transfer_capabilities: { background: false, pauses_in_background: true,
+  can_upload: false, can_open_externally: false, can_open_downloads: false }` and the app link
+  omits upload and open-in-another-app until native iOS document picker / share-sheet bridges exist.
+  Downloads land in `Documents/Downloads` visible in Apple Files (`UIFileSharingEnabled` and
+  `LSSupportsOpeningDocumentsInPlace`).
 
-A few transfers run at once (two by default), the rest wait their turn, and a setting keeps large
-transfers for Wi-Fi.
+Two transfers run at once by default while the rest wait in order, stalled streams pause
+automatically with a visible reason, and a persisted Wi-Fi-only setting (default off; threshold
+50 MB in SI decimal units matching the interface) pauses large transfers on metered networks and
+resumes them automatically on unmetered Wi-Fi.
 
 ## The interface
 

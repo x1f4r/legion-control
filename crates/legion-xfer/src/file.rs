@@ -85,27 +85,28 @@ pub enum StreamCheckedError<E> {
 }
 
 impl GetStream {
-    /// Opens `path`, verifies it is a regular file with `offset <= size`, and seeks to `offset`,
-    /// streaming through the end of the file.
+    /// Opens `path`, verifies on the open handle that it is a regular file (without blocking on
+    /// FIFOs) with `offset <= size`, and seeks to `offset`, streaming through the end of the file.
     pub fn open(path: &Path, offset: u64) -> Result<Self> {
         Self::open_range(path, offset, None)
     }
 
-    /// Opens `path` as a regular file, validates `offset <= size`, clamps `length` (when given) to
-    /// `size - offset`, and seeks to `offset`.
+    /// Opens `path` as a regular file (without blocking on FIFOs), validates `offset <= size`,
+    /// clamps `length` (when given) to `size - offset`, and seeks to `offset`.
     ///
     /// Returns [`Error::BadOffset`] when `offset > size` and [`Error::Conflict`] when `path` is
     /// not a regular file. A `length` of `Some(0)` with `offset <= size` succeeds and streams zero
     /// bytes, allowing callers to inspect `size` and `mtime` without transferring file data.
     pub fn open_range(path: &Path, offset: u64, length: Option<u64>) -> Result<Self> {
-        let mut file = File::open(path).map_err(|e| classify_io(path, e))?;
-        let meta = file.metadata().map_err(|e| classify_io(path, e))?;
-        if !meta.is_file() {
-            return Err(Error::Conflict {
-                path: path.to_path_buf(),
-                reason: "source path is not a regular file".to_string(),
-            });
-        }
+        let (mut file, meta) =
+            legion_os::open_regular::open_regular_read(path).map_err(|err| match err {
+                legion_os::open_regular::OpenRegularError::IsDirectory
+                | legion_os::open_regular::OpenRegularError::NotRegularFile => Error::Conflict {
+                    path: path.to_path_buf(),
+                    reason: "source path is not a regular file".to_string(),
+                },
+                legion_os::open_regular::OpenRegularError::Io(io_err) => classify_io(path, io_err),
+            })?;
 
         let size = meta.len();
         if offset > size {

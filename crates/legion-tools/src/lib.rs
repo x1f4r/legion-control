@@ -5,6 +5,8 @@
 //! never know which door or machine a call came from beyond what their [`Ctx`](legion_core::Ctx)
 //! says, so they work the same on the command line, over MCP and when forwarded from another node.
 
+#![forbid(unsafe_code)]
+
 pub mod agent;
 pub mod audit;
 pub mod binfmt;
