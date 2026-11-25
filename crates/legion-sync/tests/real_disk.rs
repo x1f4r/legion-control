@@ -4,18 +4,20 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
 use legion_sync::{
-    BinReason, ConflictChoice, FolderConfig, FsCapabilities, FsErrorKind, FsMeta, FsWalkResult,
-    IgnoreMatcher, IndexStore, MemberState, Peer, ProblemKind, RealFs, RecordsPage, RedbIndexStore,
-    RestoreStrategy, ScanOptions, SyncEngine, SyncError, SyncFs, SyncWrite,
+    BinReason, CausalMatrix, ConflictChoice, FolderConfig, FsCapabilities, FsErrorKind, FsMeta,
+    FsWalkResult, IgnoreMatcher, IndexRecord, IndexStore, MemberState, Peer, ProblemKind, RealFs,
+    RecordsPage, RedbIndexStore, RestoreStrategy, ScanOptions, SyncEngine, SyncError, SyncFs,
+    SyncWrite, VersionVector,
 };
 use legion_xfer::hash::hash_bytes;
-use legion_xfer::{Hash, Timestamp};
+use legion_xfer::{EntryKind, Hash, Timestamp};
 
 struct EnginePeer<'a, F: SyncFs, S: IndexStore> {
     engine: &'a SyncEngine<F, S>,
@@ -692,10 +694,202 @@ fn real_disk_local_edit_between_scan_and_apply_is_never_overwritten() {
     assert_eq!(fs::read(tmp.path().join("tower/doc.txt")).unwrap(), b"v2");
 }
 
+fn list_dir_names(dir: &Path) -> BTreeSet<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+struct SyntheticLinuxPeer {
+    member_id: String,
+    records: Vec<IndexRecord>,
+    files: BTreeMap<String, Vec<u8>>,
+    seq: u64,
+    clock: u64,
+}
+
+impl SyntheticLinuxPeer {
+    fn new(member_id: &str) -> Self {
+        Self {
+            member_id: member_id.to_string(),
+            records: Vec::new(),
+            files: BTreeMap::new(),
+            seq: 0,
+            clock: 0,
+        }
+    }
+
+    fn put_file(&mut self, path: &str, bytes: &[u8], mtime: Timestamp) {
+        self.seq += 1;
+        self.clock += 1;
+        let hash = hash_bytes(bytes);
+        self.files.insert(path.to_string(), bytes.to_vec());
+        self.records.push(IndexRecord {
+            path: path.to_string(),
+            kind: EntryKind::File,
+            size: bytes.len() as u64,
+            mtime,
+            disk_mtime: Some(mtime),
+            disk_change_id: None,
+            mode: Some(0o644),
+            hash: Some(hash),
+            link_target: None,
+            deleted: false,
+            version: VersionVector::singleton(self.member_id.clone(), self.clock),
+            modified_by: self.member_id.clone(),
+            seq: self.seq,
+            tombstone_deps: BTreeMap::new(),
+            conflict_of: None,
+        });
+    }
+
+    fn put_dir(&mut self, path: &str, mtime: Timestamp) {
+        self.seq += 1;
+        self.clock += 1;
+        self.records.push(IndexRecord {
+            path: path.to_string(),
+            kind: EntryKind::Dir,
+            size: 0,
+            mtime,
+            disk_mtime: Some(mtime),
+            disk_change_id: None,
+            mode: Some(0o755),
+            hash: None,
+            link_target: None,
+            deleted: false,
+            version: VersionVector::singleton(self.member_id.clone(), self.clock),
+            modified_by: self.member_id.clone(),
+            seq: self.seq,
+            tombstone_deps: BTreeMap::new(),
+            conflict_of: None,
+        });
+    }
+
+    fn put_symlink(&mut self, path: &str, target: &str, mtime: Timestamp) {
+        self.seq += 1;
+        self.clock += 1;
+        self.records.push(IndexRecord {
+            path: path.to_string(),
+            kind: EntryKind::Symlink,
+            size: 0,
+            mtime,
+            disk_mtime: Some(mtime),
+            disk_change_id: None,
+            mode: None,
+            hash: None,
+            link_target: Some(target.to_string()),
+            deleted: false,
+            version: VersionVector::singleton(self.member_id.clone(), self.clock),
+            modified_by: self.member_id.clone(),
+            seq: self.seq,
+            tombstone_deps: BTreeMap::new(),
+            conflict_of: None,
+        });
+    }
+
+    fn delete_path(&mut self, path: &str, mtime: Timestamp) {
+        let prev = self
+            .records
+            .iter()
+            .rev()
+            .find(|r| r.path == path)
+            .cloned()
+            .unwrap();
+        self.seq += 1;
+        self.clock += 1;
+        let mut version = prev.version;
+        version.bump_above(self.member_id.clone(), self.clock);
+        self.files.remove(path);
+        let mut deps = BTreeMap::new();
+        deps.insert(self.member_id.clone(), self.seq);
+        self.records.push(IndexRecord {
+            path: path.to_string(),
+            kind: prev.kind,
+            size: 0,
+            mtime,
+            disk_mtime: None,
+            disk_change_id: None,
+            mode: None,
+            hash: None,
+            link_target: None,
+            deleted: true,
+            version,
+            modified_by: self.member_id.clone(),
+            seq: self.seq,
+            tombstone_deps: deps,
+            conflict_of: None,
+        });
+    }
+}
+
+impl Peer for SyntheticLinuxPeer {
+    fn member_id(&self) -> &str {
+        &self.member_id
+    }
+
+    fn records_since(&self, since_seq: u64, limit: usize) -> legion_sync::Result<RecordsPage> {
+        // Keep only the latest record per path whose seq > since_seq, matching IndexStore semantics.
+        let mut latest_by_path: BTreeMap<String, IndexRecord> = BTreeMap::new();
+        for rec in &self.records {
+            latest_by_path.insert(rec.path.clone(), rec.clone());
+        }
+        let mut records: Vec<IndexRecord> = latest_by_path
+            .into_values()
+            .filter(|r| r.seq > since_seq)
+            .collect();
+        records.sort_by_key(|r| r.seq);
+        let has_more = records.len() > limit;
+        records.truncate(limit);
+        let mut matrix = CausalMatrix::default();
+        matrix.record_seen(&self.member_id, &self.member_id, self.seq);
+        Ok(RecordsPage {
+            records,
+            snapshot_seq: self.seq,
+            has_more,
+            matrix,
+        })
+    }
+
+    fn fetch_file(
+        &self,
+        path: &str,
+        expected_hash: Hash,
+    ) -> legion_sync::Result<Box<dyn Read + Send>> {
+        let bytes = self
+            .files
+            .get(path)
+            .ok_or_else(|| SyncError::Fs {
+                path: Some(path.to_string()),
+                detail: "not found".to_string(),
+                kind: FsErrorKind::NotFound,
+            })?
+            .clone();
+        let actual = hash_bytes(&bytes);
+        if actual != expected_hash {
+            return Err(SyncError::HashMismatch {
+                path: path.to_string(),
+                expected: expected_hash,
+                actual,
+            });
+        }
+        Ok(Box::new(Cursor::new(bytes)))
+    }
+}
+
 #[test]
 fn real_disk_platform_problems_status_and_security_refusals() {
     let tmp = tempfile::tempdir().unwrap();
     let t0 = Timestamp::new(1_795_608_000, 0);
+
+    // Probe the actual host filesystem's case sensitivity before setting up fixtures on disk:
+    // a case-insensitive host volume (Windows NTFS or default macOS APFS) cannot hold two files
+    // whose names differ only in letter case, and Win32 redirects non-verbatim `CON.txt` to the
+    // console device `\??\CON` instead of creating a file on disk.
+    let host_case_insensitive = RealFs::open(tmp.path().join("linux"))
+        .unwrap()
+        .capabilities()
+        .case_insensitive;
 
     let mut linux = open_real_engine(
         &tmp.path().join("linux"),
@@ -745,13 +939,21 @@ fn real_disk_platform_problems_status_and_security_refusals() {
         Err(SyncError::Denied { .. })
     ));
 
-    // Create both representable and Windows-unrepresentable names on Linux.
+    // Create only the fixtures that the host OS's real filesystem can actually store in `linux/`.
     fs::write(tmp.path().join("linux/ok.txt"), b"ok").unwrap();
-    fs::write(tmp.path().join("linux/CON.txt"), b"reserved").unwrap();
     fs::write(tmp.path().join("linux/README.md"), b"upper").unwrap();
-    fs::write(tmp.path().join("linux/readme.md"), b"lower").unwrap();
+    let mut expected_problems: BTreeMap<String, ProblemKind> = BTreeMap::new();
+    if !host_case_insensitive {
+        fs::write(tmp.path().join("linux/readme.md"), b"lower").unwrap();
+        expected_problems.insert("readme.md".to_string(), ProblemKind::CaseClash);
+    }
     #[cfg(unix)]
-    std::os::unix::fs::symlink("ok.txt", tmp.path().join("linux/sym")).unwrap();
+    {
+        fs::write(tmp.path().join("linux/CON.txt"), b"reserved").unwrap();
+        expected_problems.insert("CON.txt".to_string(), ProblemKind::ReservedWindowsName);
+        std::os::unix::fs::symlink("ok.txt", tmp.path().join("linux/sym")).unwrap();
+        expected_problems.insert("sym".to_string(), ProblemKind::UnsupportedSymlink);
+    }
     linux.scan(t0).unwrap();
 
     // Never serves `.legion-sync/` even to a valid member.
@@ -764,49 +966,167 @@ fn real_disk_platform_problems_status_and_security_refusals() {
         Err(SyncError::InvalidPath { .. })
     ));
 
-    // Pull on Windows-capability member: ok.txt syncs, invalid names + case clash + symlink held back.
+    // Pull on Windows-capability member and assert the exact expected outcome for this host OS.
     let pull = winbox
         .pull_from_peer(&EnginePeer::new(&linux, "winbox"), t0)
         .unwrap();
-    assert!(pull.held_back >= 2);
+    assert_eq!(pull.held_back, expected_problems.len());
     assert_eq!(fs::read(tmp.path().join("winbox/ok.txt")).unwrap(), b"ok");
-    assert!(!tmp.path().join("winbox/CON.txt").exists());
+    let winbox_entries = list_dir_names(&tmp.path().join("winbox"));
+    assert!(winbox_entries.contains("ok.txt"));
+    assert!(winbox_entries.contains("README.md"));
+    assert!(!winbox_entries.contains("CON.txt"));
+    assert!(!winbox_entries.contains("readme.md"));
+    assert!(!winbox_entries.contains("sym"));
 
     let st = winbox.status().unwrap();
-    match st.state {
+    if expected_problems.is_empty() {
+        assert_eq!(st.state, MemberState::UpToDate);
+    } else {
+        match st.state {
+            MemberState::Problem { sentence, problems } => {
+                assert!(!sentence.is_empty());
+                let actual: BTreeMap<String, ProblemKind> =
+                    problems.into_iter().map(|p| (p.path, p.kind)).collect();
+                assert_eq!(actual, expected_problems);
+            }
+            other => panic!("expected Problem state, got {other:?}"),
+        }
+
+        // Deleting the blocking / unrepresentable files on `linux` resolves every problem cleanly.
+        let t1 = Timestamp::new(t0.secs + 60, 0);
+        if !host_case_insensitive {
+            fs::remove_file(tmp.path().join("linux/README.md")).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            fs::remove_file(tmp.path().join("linux/CON.txt")).unwrap();
+            fs::remove_file(tmp.path().join("linux/sym")).unwrap();
+        }
+        linux.scan(t1).unwrap();
+
+        winbox
+            .pull_from_peer(&EnginePeer::new(&linux, "winbox"), t1)
+            .unwrap();
+        assert_eq!(winbox.status().unwrap().state, MemberState::UpToDate);
+        if !host_case_insensitive {
+            assert_eq!(
+                fs::read(tmp.path().join("winbox/readme.md")).unwrap(),
+                b"lower"
+            );
+        }
+    }
+}
+
+#[test]
+fn real_disk_windows_target_holds_back_unrepresentable_peer_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t0 = Timestamp::new(1_795_608_000, 0);
+
+    // Real `RealFs` + `RedbIndexStore` on disk with Windows capabilities pulling from a synthetic
+    // Linux peer so all Windows-unrepresentable names and case clashes are exercised against real
+    // disk storage on Linux, macOS, and Windows alike.
+    let mut winbox = open_real_engine(
+        &tmp.path().join("winbox"),
+        &tmp.path().join("winbox.redb"),
+        "winbox",
+        &["tower", "winbox"],
+        vec![],
+        Some(FsCapabilities::windows()),
+    );
+
+    let mut peer = SyntheticLinuxPeer::new("tower");
+    let over_long_path = format!("{}/{}/long-name.txt", "d".repeat(115), "e".repeat(115));
+
+    peer.put_file("ok.txt", b"ok", t0);
+    peer.put_dir("Dir", t0);
+    peer.put_file("Dir/a.txt", b"dir-a", t0);
+    peer.put_file("README.md", b"upper", t0);
+    peer.put_file("readme.md", b"lower", t0);
+    peer.put_file("dir/b.txt", b"dir-b", t0);
+    peer.put_file("CON.txt", b"reserved", t0);
+    peer.put_file("a:b.txt", b"colon", t0);
+    peer.put_file("trailing.", b"dot", t0);
+    peer.put_file("trailing ", b"space", t0);
+    peer.put_symlink("sym", "ok.txt", t0);
+    peer.put_file(&over_long_path, b"long-path", t0);
+
+    let pull = winbox.pull_from_peer(&peer, t0).unwrap();
+    assert_eq!(pull.held_back, 8);
+
+    let entries = list_dir_names(&tmp.path().join("winbox"));
+    assert_eq!(
+        entries,
+        BTreeSet::from([
+            ".legion-sync".to_string(),
+            "Dir".to_string(),
+            "README.md".to_string(),
+            "ok.txt".to_string(),
+        ])
+    );
+    assert_eq!(fs::read(tmp.path().join("winbox/ok.txt")).unwrap(), b"ok");
+    assert_eq!(
+        fs::read(tmp.path().join("winbox/README.md")).unwrap(),
+        b"upper"
+    );
+    assert_eq!(
+        fs::read(tmp.path().join("winbox/Dir/a.txt")).unwrap(),
+        b"dir-a"
+    );
+
+    let expected_by_path: BTreeMap<String, ProblemKind> = BTreeMap::from([
+        ("CON.txt".to_string(), ProblemKind::ReservedWindowsName),
+        ("a:b.txt".to_string(), ProblemKind::ForbiddenWindowsChar),
+        ("dir/b.txt".to_string(), ProblemKind::CaseClash),
+        (over_long_path.clone(), ProblemKind::PathTooLong),
+        ("readme.md".to_string(), ProblemKind::CaseClash),
+        ("sym".to_string(), ProblemKind::UnsupportedSymlink),
+        ("trailing ".to_string(), ProblemKind::TrailingDotOrSpace),
+        ("trailing.".to_string(), ProblemKind::TrailingDotOrSpace),
+    ]);
+    match winbox.status().unwrap().state {
         MemberState::Problem { sentence, problems } => {
             assert!(!sentence.is_empty());
-            assert!(
-                problems
-                    .iter()
-                    .any(|p| p.kind == ProblemKind::ReservedWindowsName)
-            );
-            assert!(problems.iter().any(|p| p.kind == ProblemKind::CaseClash));
-            #[cfg(unix)]
-            assert!(
-                problems
-                    .iter()
-                    .any(|p| p.kind == ProblemKind::UnsupportedSymlink)
-            );
+            let actual_by_path: BTreeMap<String, ProblemKind> =
+                problems.into_iter().map(|p| (p.path, p.kind)).collect();
+            assert_eq!(actual_by_path, expected_by_path);
         }
         other => panic!("expected Problem state, got {other:?}"),
     }
 
-    // Deleting the clashing `README.md` on Linux unblocks `readme.md` on Windows automatically!
+    // Deleting the clashing and Windows-unrepresentable entries on the Linux peer resolves every
+    // problem and materializes the previously held-back case-clash losers onto real disk.
     let t1 = Timestamp::new(t0.secs + 60, 0);
-    fs::remove_file(tmp.path().join("linux/README.md")).unwrap();
-    fs::remove_file(tmp.path().join("linux/CON.txt")).unwrap();
-    #[cfg(unix)]
-    fs::remove_file(tmp.path().join("linux/sym")).unwrap();
-    linux.scan(t1).unwrap();
+    peer.delete_path("README.md", t1);
+    peer.delete_path("Dir/a.txt", t1);
+    peer.delete_path("Dir", t1);
+    peer.delete_path("CON.txt", t1);
+    peer.delete_path("a:b.txt", t1);
+    peer.delete_path("trailing.", t1);
+    peer.delete_path("trailing ", t1);
+    peer.delete_path("sym", t1);
+    peer.delete_path(&over_long_path, t1);
 
-    winbox
-        .pull_from_peer(&EnginePeer::new(&linux, "winbox"), t1)
-        .unwrap();
+    let pull2 = winbox.pull_from_peer(&peer, t1).unwrap();
+    assert_eq!(pull2.held_back, 0);
+    assert_eq!(pull2.held_back_resolved, 2);
     assert_eq!(winbox.status().unwrap().state, MemberState::UpToDate);
+    assert_eq!(
+        list_dir_names(&tmp.path().join("winbox")),
+        BTreeSet::from([
+            ".legion-sync".to_string(),
+            "dir".to_string(),
+            "ok.txt".to_string(),
+            "readme.md".to_string(),
+        ])
+    );
     assert_eq!(
         fs::read(tmp.path().join("winbox/readme.md")).unwrap(),
         b"lower"
+    );
+    assert_eq!(
+        fs::read(tmp.path().join("winbox/dir/b.txt")).unwrap(),
+        b"dir-b"
     );
 }
 
