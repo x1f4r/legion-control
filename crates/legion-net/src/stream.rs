@@ -1440,6 +1440,10 @@ impl StreamAuthCheck {
     }
 
     fn verify(&self) -> io::Result<()> {
+        self.verify_with_pause(std::thread::sleep)
+    }
+
+    fn verify_with_pause(&self, mut pause: impl FnMut(Duration)) -> io::Result<()> {
         const RETRY_DELAY: Duration = Duration::from_millis(200);
         const RETRIES: usize = 2;
 
@@ -1448,7 +1452,7 @@ impl StreamAuthCheck {
             // Confirm a negative read twice after a short pause so an in-place editor save or
             // momentary unreadable file never cancels an active stream spuriously.
             for _ in 0..RETRIES {
-                std::thread::sleep(RETRY_DELAY);
+                pause(RETRY_DELAY);
                 res = self.verify_once();
                 if res.is_ok() {
                     break;
@@ -5544,38 +5548,48 @@ mod tests {
             Some(CreateKind::File),
         );
 
-        // 1. Transient half-written `policy.toml` restored after 150 ms must pass after retry.
+        // 1. Transient half-written `policy.toml` restored before the first confirmation retry
+        //    must pass without triggering revocation.
         fs::write(&policy_path, &valid_policy[..12]).unwrap();
-        let restore_path = policy_path.clone();
-        let restorer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            fs::write(&restore_path, valid_policy).unwrap();
-        });
+        let mut pauses = Vec::new();
         assert!(
-            check.verify().is_ok(),
+            check
+                .verify_with_pause(|d| {
+                    pauses.push(d);
+                    if pauses.len() == 1 {
+                        fs::write(&policy_path, valid_policy).unwrap();
+                    }
+                })
+                .is_ok(),
             "transient in-place save must not trigger revocation"
         );
-        restorer.join().unwrap();
+        assert_eq!(pauses, vec![Duration::from_millis(200)]);
         assert!(!check.is_denied());
 
-        // 2. Genuinely broken `policy.toml` still denies within 2 seconds.
+        // 2. Genuinely broken `policy.toml` fails closed after exactly two confirmation pauses.
         fs::write(&policy_path, "this is = [broken toml\n").unwrap();
-        let started = Instant::now();
-        assert!(check.verify().is_err());
+        pauses.clear();
+        assert!(check.verify_with_pause(|d| pauses.push(d)).is_err());
+        assert_eq!(
+            pauses,
+            vec![Duration::from_millis(200), Duration::from_millis(200)]
+        );
         assert!(check.is_denied());
-        assert!(started.elapsed() < Duration::from_secs(2));
         let _ = check.take_denied();
 
-        // 3. Genuine right narrowing (`effect:read` only) still denies within 2 seconds.
+        // 3. Genuine right narrowing (`effect:read` only) fails closed after two confirmation pauses.
         fs::write(
             &policy_path,
             valid_policy.replace("effect:write", "effect:read"),
         )
         .unwrap();
-        let started = Instant::now();
-        assert!(check.verify().is_err());
+        pauses.clear();
+        assert!(check.verify_with_pause(|d| pauses.push(d)).is_err());
+        assert_eq!(
+            pauses,
+            vec![Duration::from_millis(200), Duration::from_millis(200)]
+        );
         assert!(check.is_denied());
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
