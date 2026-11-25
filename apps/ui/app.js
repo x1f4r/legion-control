@@ -1896,9 +1896,17 @@ function App() {
     inMachinePhone && route.tab === 'files' && Boolean(selectedMachine?.reachable);
   const isActionsRoot =
     route.section === 'actions' && !route.action && !route.allTools;
+  const isWideSplitHost =
+    wide &&
+    (route.section === 'machines' ||
+      route.section === 'files' ||
+      route.section === 'activity' ||
+      route.section === 'settings' ||
+      (route.section === 'actions' && Boolean(route.allTools)));
+  const isWideSplitScreen = isWideSplitHost && !filesSelecting;
   const hasFilesDock =
     (route.section === 'files' &&
-      (filesSelecting || (!wide && (isFilesRoot || isFilesFolder || isFilesSearch)) || (wide && isFilesSearch))) ||
+      (filesSelecting || (!wide && (isFilesRoot || isFilesFolder || isFilesSearch)))) ||
     isPhoneMachineFiles;
   const hasDock = isActionsRoot || isPhoneCommand || hasFilesDock;
 
@@ -2155,6 +2163,10 @@ function App() {
   }
 
   function renderHeader() {
+    if (isWideSplitScreen) {
+      return null;
+    }
+
     // Files headers: selection mode, folder, search, sync, favourites, recent, and root.
     if (route.section === 'files') {
       if (filesSelecting) {
@@ -2588,6 +2600,7 @@ function App() {
     'app',
     !showBottomNav ? 'standalone' : '',
     hasDock ? 'docked' : '',
+    isWideSplitScreen ? 'split-screen' : '',
   ]
     .filter(Boolean)
     .join(' ');
@@ -2656,9 +2669,9 @@ function App() {
                 <${ScrollContainer}
                   as="main"
                   containerRef=${mainRef}
-                  className=${isPhoneCommand ? 'main command-stream' : 'main'}
-                  onRefresh=${handlePullRefresh}
-                  disabled=${pullDisabled}
+                  className=${isPhoneCommand ? 'main command-stream' : isWideSplitHost ? 'main split-host' : 'main'}
+                  onRefresh=${isWideSplitHost ? null : handlePullRefresh}
+                  disabled=${pullDisabled || isWideSplitHost}
                   onTouchStart=${onMainTouchStart}
                   onTouchEnd=${onMainTouchEnd}
                   onTouchCancel=${onMainTouchCancel}

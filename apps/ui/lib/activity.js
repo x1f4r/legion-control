@@ -382,6 +382,29 @@ export function formatMachinesHeaderSubtitle(machines, { cachedAt = null, nowMs 
 }
 
 /**
+ * Short fact for the wide split label row ("3 on, 2 off", "4 on").
+ */
+export function formatMachinesShortFact(machines, { cachedAt = null, nowMs = Date.now() } = {}) {
+  const list = Array.isArray(machines) ? machines : [];
+  if (list.length === 0) return '';
+  const on = list.filter((m) => m.reachable).length;
+  const asking = list.filter((m) => m.status === 'asking' || m.asking).length;
+  const off = list.length - on - asking;
+
+  const parts = [];
+  if (on > 0) parts.push(`${on} on`);
+  if (off > 0) parts.push(`${off} off`);
+  if (asking > 0) parts.push(on === 0 && off === 0 ? 'Checking…' : `${asking} checking`);
+
+  let text = parts.join(', ');
+  if (cachedAt) {
+    const asOf = formatRelativeTime(cachedAt, nowMs);
+    if (asOf) text = text ? `${text} · ${asOf}` : asOf;
+  }
+  return text;
+}
+
+/**
  * Plain-language summary of what a device's role allows, for Settings and Connections.
  */
 export function describePlainPermissions(whoami, tools = []) {
