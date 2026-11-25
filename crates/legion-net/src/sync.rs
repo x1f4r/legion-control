@@ -22,15 +22,16 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use legion_core::config::{
-    InsertNodeName, NodeFile, NodeName, insert_node_name, parse, write_atomically,
+    InsertNodeName, NodeFile, NodeName, insert_node_name, parse, read_regular_file,
+    write_atomically,
 };
-use legion_core::policy::{Access, Grant, OWNER, Place, Policy};
+use legion_core::policy::{OWNER, Policy};
 use legion_core::{
     BoxFuture, Ctx, EventSink, NoArgs, Registry, Tool, ToolError, input_schema, parse_args,
 };
 use legion_os::OsError;
 use legion_os::lock::{FileLock, LockMode};
-use legion_proto::{Effect, ErrorBody, ErrorCode, MAX_HOPS, ToolSpec};
+use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::device::registry::{
     DEVICES_VERSION, DeviceRegistryPushAudit, DevicesFile, MergeApplyError, MergeChange,
     apply_devices_merge_blocking, merge_devices, preserve_local_confirmations,
@@ -48,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use toml_edit::{DocumentMut, Item};
 
-use crate::config::{FleetFile, Transport};
+use crate::config::FleetFile;
 use crate::pool::{Fleet, is_name_mismatch_error, name_mismatch_error};
 use crate::state::ReportedNode;
 
@@ -94,14 +95,14 @@ pub(crate) fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add(SyncTool::<ConfigSetNameArgs, ConfigSetNameResult, _>::new(
         "config.set_name",
         Effect::Admin,
-        "Set `name = \"<name>\"` in this node's `node.toml` when `node.toml` does not exist or omits `name`, keeping every other byte in the file unchanged (preserving a UTF-8 BOM and updating a symlink's target atomically when it points inside directories this node may write). Never overwrites a different explicit `name`, refuses `caller` equal to `name`, and refuses a name that this node's own `fleet.toml` maps to a different machine it can tell apart (all with `conflict`). When renaming from a host-derived name, moves matching `[projects.<name>.on]` entries in `projects.toml` to the new name under lock without overwriting an existing entry under the new name (reporting moved entries and any conflicts).",
+        "Set `name = \"<name>\"` in this node's `node.toml` when `node.toml` does not exist or omits `name`, keeping every other byte in the file unchanged (preserving a UTF-8 BOM and line endings). Never writes through symbolic links (refuses with `conflict`, `details.kind = \"linked_config\"`), never overwrites a different explicit `name` (`conflict`, `details.kind = \"name_mismatch\"`), and refuses `caller` equal to `name` (`conflict`). Validates and prepares both `projects.toml` and `node.toml` before writing (`projects.toml` first, `node.toml` last) under lock, moving matching `[projects.<name>.on]` entries to the new name without overwriting existing entries (reporting moved entries and conflicts) and healing any remaining host-derived project keys if `node.toml` already matches.",
         fleet.clone(),
         |fleet, ctx, args| Box::pin(config_set_name(fleet, ctx, args)),
     ));
     registry.add(SyncTool::<SyncArgs, SyncResult, _>::new(
         "fleet.sync",
         Effect::Admin,
-        "Compare, push, or pull shared configuration documents (devices.toml, fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts, and check each machine's reported node name against its fleet name. Naming is decided only after every target machine has answered so two fleet entries pointing at the same node never race to rename it: any node reached under more than one fleet entry is left untouched and reported as `ambiguous` with the other entry names and a hint to remove the stale entry. For unambiguous machines whose name differs and is host-derived (no explicit `name` in node.toml), `direction=push` sets `name = \"<fleet name>\"` one machine at a time via `config.set_name` (keeping all other bytes unchanged and migrating matching `projects.toml` entries) and reports the update in `node_names`; when the machine has a different explicit `name` or is an older node that does not say, `fleet.sync` reports `name_mismatch` in `node_names` and leaves `node.toml` untouched. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there without importing anything. Pushing or pulling devices.toml requires the owner role on the node doing the writing (for non-owner callers, fleet.sync syncs the other documents and reports devices.toml as skipped with the reason; propagation after local device tools runs node to node with the node's own authority). Paired devices (devices.toml) obey a strict one-way trust rule for live entries: push sends local entries to peers and imports ONLY tombstones back — never a peer's live devices. New or changed live devices from a peer are accepted only via an explicit `fleet.sync direction=pull from=<peer>` run by an owner, or when that peer pushes to this node with owner authority. Tombstones always win and may flow in every direction. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs whole node.toml or tokens.toml files.",
+        "Compare, push, or pull shared configuration documents (devices.toml, fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts, and check each machine's reported node name against its fleet name. Naming is decided only after every target machine has answered so two fleet entries pointing at the same node never race to rename it: when two or more entries report the same `node_id`, none of them renames the node and each reports `ambiguous`. A node that reports no `node_id` (older Legion or an unwritable state directory) is never renamed and reports `name_mismatch`. For unambiguous machines with a `node_id` whose name differs and is host-derived (no explicit `name` in node.toml), `direction=push` sets `name = \"<fleet name>\"` one machine at a time via `config.set_name` (keeping all other bytes unchanged and migrating matching `projects.toml` entries) and reports `set` in `node_names`, or `manual` when `node.toml` or `projects.toml` is a symbolic link; when the machine has a different explicit `name`, `fleet.sync` reports `name_mismatch` and leaves `node.toml` untouched. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there without importing anything. Pushing or pulling devices.toml requires the owner role on the node doing the writing (for non-owner callers, fleet.sync syncs the other documents and reports devices.toml as skipped with the reason; propagation after local device tools runs node to node with the node's own authority). Paired devices (devices.toml) obey a strict one-way trust rule for live entries: push sends local entries to peers and imports ONLY tombstones back — never a peer's live devices. New or changed live devices from a peer are accepted only via an explicit `fleet.sync direction=pull from=<peer>` run by an owner, or when that peer pushes to this node with owner authority. Tombstones always win and may flow in every direction. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs whole node.toml or tokens.toml files.",
         fleet,
         |fleet, ctx, args| Box::pin(fleet_sync(fleet, ctx, args)),
     ));
@@ -1329,177 +1330,100 @@ pub(crate) struct ConfigSetNameResult {
     pub(crate) conflicts: Vec<ProjectRenameConflict>,
 }
 
-/// Resolves the concrete path to write for a config file (`node.toml` or `projects.toml`).
-///
-/// If `file_path` is a symbolic link, resolves it and verifies that the target is a regular file
-/// inside directories this node may write (its own `config_dir`, or `explicit_home` / `home`
-/// outside protected secret and state locations, plus any path confinement on `grant`), so atomic
-/// replacement updates the symlink's target while keeping the symlink intact.
-fn resolve_config_write_path(
-    file_path: &Path,
-    file_label: &str,
-    config_dir: &Path,
-    explicit_home: Option<&Path>,
-    home: Option<&Path>,
-    grant: &Grant,
-) -> Result<PathBuf, ErrorBody> {
-    let meta = match std::fs::symlink_metadata(file_path) {
-        Ok(meta) => meta,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(file_path.to_path_buf()),
-        Err(error) => {
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be inspected: {error}.", file_path.display()),
-            ));
-        }
-    };
-    if !meta.file_type().is_symlink() {
-        if meta.is_dir() {
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} is a directory, not a file.", file_path.display()),
-            ));
-        }
-        return Ok(file_path.to_path_buf());
-    }
-
-    let link_target = std::fs::read_link(file_path)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "<unreadable>".to_owned());
-    let resolved = std::fs::canonicalize(file_path).map_err(|error| {
-        ErrorBody::new(
-            ErrorCode::Denied,
-            format!(
-                "Refusing to follow symbolic link {} -> {link_target}: {error}.",
-                file_path.display()
-            ),
-        )
-        .with_hint(format!(
-            "Point {file_label} at an existing regular file inside the configuration or home directory, or replace it with a regular file."
-        ))
-    })?;
-    if !resolved.is_file() {
-        return Err(ErrorBody::new(
-            ErrorCode::Failed,
-            format!(
-                "{} points to {}, which is not a regular file.",
-                file_path.display(),
-                resolved.display()
-            ),
-        ));
-    }
-
-    let in_config_dir = std::fs::canonicalize(config_dir)
-        .ok()
-        .is_some_and(|canon| resolved.starts_with(&canon));
-    if in_config_dir {
-        return Ok(resolved);
-    }
-
-    let in_explicit_home = explicit_home
-        .and_then(|dir| std::fs::canonicalize(dir).ok())
-        .is_some_and(|canon| resolved.starts_with(&canon));
-    let in_home = home
-        .and_then(|dir| std::fs::canonicalize(dir).ok())
-        .is_some_and(|canon| resolved.starts_with(&canon));
-    if in_explicit_home || in_home {
-        if let Ok(Some(Place::Secret | Place::State)) = grant.protected(&resolved) {
-            return Err(ErrorBody::new(
-                ErrorCode::Denied,
-                format!(
-                    "Refusing to update {file_label} through symbolic link {} pointing to protected path {}.",
-                    file_path.display(),
-                    resolved.display()
-                ),
-            )
-            .with_hint(format!(
-                "Move the target of {file_label} out of protected secret/state locations, or edit it directly."
-            )));
-        }
-        if grant.roots().is_some() {
-            grant.check_path(&resolved, Access::Write).map_err(|_| {
-                ErrorBody::new(
-                    ErrorCode::Denied,
-                    format!(
-                        "Refusing to update {file_label} through symbolic link {} pointing to {}, which is outside the paths this role may write.",
-                        file_path.display(),
-                        resolved.display()
-                    ),
-                )
-                .with_hint(format!(
-                    "Move the target of {file_label} inside an allowed path, or edit it directly."
-                ))
-            })?;
-        }
-        return Ok(resolved);
-    }
-
-    Err(ErrorBody::new(
-        ErrorCode::Denied,
+fn linked_config_error(file_name: &str, target: &str, node_path: &Path) -> ErrorBody {
+    let hint = if file_name == "node.toml" {
         format!(
-            "Refusing to update {file_label} through symbolic link {} pointing to {}, which is outside the directories this node may write.",
-            file_path.display(),
-            resolved.display()
-        ),
+            "Add `name = \"{target}\"` to {} by hand.",
+            node_path.display()
+        )
+    } else {
+        format!(
+            "Update {file_name} and add `name = \"{target}\"` to {} by hand.",
+            node_path.display()
+        )
+    };
+    ErrorBody::new(
+        ErrorCode::Conflict,
+        format!("{file_name} on {target} is a link; Legion does not write through links."),
     )
-    .with_hint(format!(
-        "Move the target of {file_label} inside the configuration or home directory, or edit it directly."
-    )))
+    .with_hint(hint)
+    .with_details(json!({
+        "kind": "linked_config",
+        "file": file_name,
+        "node": target,
+    }))
 }
 
-/// Moves `[projects.<name>.on]` entries keyed by `old_name` to `new_name` under `projects.lock`.
-/// Never overwrites an entry that already exists under `new_name`; reports those as conflicts.
-#[allow(clippy::too_many_arguments)]
-fn migrate_projects_node_name_blocking(
-    config_dir: &Path,
-    state_dir: &Path,
-    explicit_home: Option<&Path>,
-    home: Option<&Path>,
-    grant: &Grant,
+fn is_linked_config_error(err: &ErrorBody) -> bool {
+    err.code == ErrorCode::Conflict
+        && err
+            .details
+            .as_ref()
+            .and_then(|d| d.get("kind"))
+            .and_then(Value::as_str)
+            == Some("linked_config")
+}
+
+/// Converts any bare `\n` (not preceded by `\r`) into `\r\n`, preserving existing CRLF endings.
+fn normalize_crlf(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut prev_cr = false;
+    for ch in text.chars() {
+        if ch == '\n' && !prev_cr {
+            out.push('\r');
+        }
+        out.push(ch);
+        prev_cr = ch == '\r';
+    }
+    out
+}
+
+struct PlannedProjectsMigration {
+    path: PathBuf,
+    original_bytes: Vec<u8>,
+    updated_bytes: Option<Vec<u8>>,
+    moved: Vec<String>,
+    conflicts: Vec<ProjectRenameConflict>,
+}
+
+/// Reads, validates, and computes any `projects.toml` key migration completely in memory without
+/// writing anything. Refuses before any write if `projects.toml` is invalid, unreadable, or a
+/// symlink that needs keys moved (or is dangling).
+fn plan_projects_migration(
+    projects_path: &Path,
+    node_path: &Path,
     old_name: &str,
     new_name: &str,
-) -> Result<(Vec<String>, Vec<ProjectRenameConflict>), ErrorBody> {
+) -> Result<Option<PlannedProjectsMigration>, ErrorBody> {
     if old_name == new_name {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(None);
     }
-    let projects_path = config_dir.join("projects.toml");
-    if matches!(
-        std::fs::symlink_metadata(&projects_path),
-        Err(ref err) if err.kind() == io::ErrorKind::NotFound
-    ) {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let projects_lock = state_dir.join("projects.lock");
-    let _proj_held = acquire_lock(&projects_lock, "projects.toml")?;
-
-    let write_path = resolve_config_write_path(
-        &projects_path,
-        "projects.toml",
-        config_dir,
-        explicit_home,
-        home,
-        grant,
-    )?;
-    let bytes = match std::fs::read(&write_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok((Vec::new(), Vec::new()));
-        }
+    let meta = match std::fs::symlink_metadata(projects_path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(ErrorBody::new(
                 ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", projects_path.display()),
+                format!("{} cannot be inspected: {error}.", projects_path.display()),
             ));
         }
     };
-    // Ensure the existing file parses cleanly before touching it.
-    let parsed = parse::<ProjectsFile>(&projects_path, &bytes)?;
+    let is_symlink = meta.file_type().is_symlink();
+
+    let Some(bytes) = read_regular_file(projects_path)? else {
+        if is_symlink {
+            return Err(linked_config_error("projects.toml", new_name, node_path));
+        }
+        return Ok(None);
+    };
+
+    let parsed = parse::<ProjectsFile>(projects_path, &bytes)?;
     let has_old = parsed
         .projects
         .values()
         .any(|proj| proj.on.contains_key(old_name));
     if !has_old {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(None);
     }
 
     let text = std::str::from_utf8(&bytes).map_err(|error| {
@@ -1512,6 +1436,7 @@ fn migrate_projects_node_name_blocking(
         Some(rest) => ("\u{feff}", rest),
         None => ("", text),
     };
+    let had_crlf = body.contains("\r\n");
     let mut doc: DocumentMut = body.parse().map_err(|error: toml_edit::TomlError| {
         ErrorBody::new(
             ErrorCode::Failed,
@@ -1569,48 +1494,56 @@ fn migrate_projects_node_name_blocking(
         }
     }
 
-    if !moved.is_empty() {
-        let updated_text = format!("{bom}{doc}");
-        parse::<ProjectsFile>(&projects_path, updated_text.as_bytes())?;
-        let backup_path = state_dir
-            .join("sync")
-            .join("backups")
-            .join("projects.toml.bak");
-        if let Some(parent) = backup_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!("{} cannot be created: {error}.", parent.display()),
-                )
-            })?;
+    if !moved.is_empty() && is_symlink {
+        return Err(linked_config_error("projects.toml", new_name, node_path));
+    }
+
+    let updated_bytes = if moved.is_empty() {
+        None
+    } else {
+        let mut rendered = doc.to_string();
+        if had_crlf {
+            rendered = normalize_crlf(&rendered);
         }
-        write_atomically(&backup_path, &bytes).map_err(|error| {
+        let updated_text = format!("{bom}{rendered}");
+        parse::<ProjectsFile>(projects_path, updated_text.as_bytes())?;
+        Some(updated_text.into_bytes())
+    };
+
+    Ok(Some(PlannedProjectsMigration {
+        path: projects_path.to_path_buf(),
+        original_bytes: bytes,
+        updated_bytes,
+        moved,
+        conflicts,
+    }))
+}
+
+fn write_sync_backup(state_dir: &Path, filename: &str, bytes: &[u8]) -> Result<String, ErrorBody> {
+    let backup_path = state_dir.join("sync").join("backups").join(filename);
+    if let Some(parent) = backup_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
             ErrorBody::new(
                 ErrorCode::Failed,
-                format!(
-                    "Backup {} cannot be written: {error}.",
-                    backup_path.display()
-                ),
-            )
-        })?;
-        write_atomically(&write_path, updated_text.as_bytes()).map_err(|error| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be written: {error}.", projects_path.display()),
+                format!("{} cannot be created: {error}.", parent.display()),
             )
         })?;
     }
-
-    Ok((moved, conflicts))
+    write_atomically(&backup_path, bytes).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Backup {} cannot be written: {error}.",
+                backup_path.display()
+            ),
+        )
+    })?;
+    Ok(backup_path.display().to_string())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn set_local_node_name_blocking(
     config_dir: &Path,
     state_dir: &Path,
-    explicit_home: Option<&Path>,
-    home: Option<&Path>,
-    grant: &Grant,
     previous_node: &str,
     target: &NodeName,
 ) -> Result<ConfigSetNameResult, ErrorBody> {
@@ -1618,123 +1551,133 @@ fn set_local_node_name_blocking(
     let _held = acquire_lock(&lock_path, "node configuration")?;
 
     let node_path = config_dir.join("node.toml");
-    let write_path = resolve_config_write_path(
-        &node_path,
-        "node.toml",
-        config_dir,
-        explicit_home,
-        home,
-        grant,
-    )?;
-    let existing = match std::fs::read(&write_path) {
-        Ok(bytes) => Some(bytes),
+    let projects_path = config_dir.join("projects.toml");
+    let _proj_held = match std::fs::symlink_metadata(&projects_path) {
+        Ok(_) => Some(acquire_lock(
+            &state_dir.join("projects.lock"),
+            "projects.toml",
+        )?),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(ErrorBody::new(
                 ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", node_path.display()),
+                format!("{} cannot be inspected: {error}.", projects_path.display()),
             ));
         }
     };
 
-    match insert_node_name(existing.as_deref(), &node_path, target)? {
-        InsertNodeName::AlreadyMatches => Ok(ConfigSetNameResult {
-            node: target.as_str().to_owned(),
-            previous: target.as_str().to_owned(),
-            changed: false,
-            backup: None,
-            moved: Vec::new(),
-            conflicts: Vec::new(),
-        }),
-        InsertNodeName::ExplicitMismatch(current) => Err(ErrorBody::new(
-            ErrorCode::Conflict,
-            format!(
-                "This node is already explicitly named {current} in node.toml, so it was not renamed to {target}."
-            ),
-        )
-        .with_hint(format!(
-            "Edit {} to set `name = \"{target}\"`, or rename this machine in fleet.toml to `{current}`.",
-            node_path.display()
-        ))
-        .with_details(json!({
-            "kind": "name_mismatch",
-            "expected": target.as_str(),
-            "reported": current.as_str(),
-            "explicit": true,
-        }))),
-        InsertNodeName::Write(updated) => {
-            let backup = if let Some(old_bytes) = existing.as_deref() {
-                let backup_path = state_dir.join("sync").join("backups").join("node.toml.bak");
-                if let Some(parent) = backup_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|error| {
-                        ErrorBody::new(
-                            ErrorCode::Failed,
-                            format!("{} cannot be created: {error}.", parent.display()),
-                        )
-                    })?;
-                }
-                write_atomically(&backup_path, old_bytes).map_err(|error| {
-                    ErrorBody::new(
-                        ErrorCode::Failed,
-                        format!(
-                            "Backup {} cannot be written: {error}.",
-                            backup_path.display()
-                        ),
-                    )
-                })?;
-                Some(backup_path.display().to_string())
-            } else {
-                None
-            };
-            if let Some(parent) = write_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| {
-                    ErrorBody::new(
-                        ErrorCode::Failed,
-                        format!("{} cannot be created: {error}.", parent.display()),
-                    )
-                })?;
-            }
-            write_atomically(&write_path, &updated).map_err(|error| {
-                ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!("{} cannot be written: {error}.", node_path.display()),
-                )
-            })?;
-            let (moved, conflicts) = migrate_projects_node_name_blocking(
-                config_dir,
-                state_dir,
-                explicit_home,
-                home,
-                grant,
-                previous_node,
+    // Phase 1: Inspect, read, validate, and compute both new file contents completely in memory
+    // before writing anything.
+    match std::fs::symlink_metadata(&node_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(linked_config_error(
+                "node.toml",
                 target.as_str(),
-            )?;
-            Ok(ConfigSetNameResult {
-                node: target.as_str().to_owned(),
-                previous: previous_node.to_owned(),
-                changed: true,
-                backup,
-                moved,
-                conflicts,
-            })
+                &node_path,
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be inspected: {error}.", node_path.display()),
+            ));
         }
     }
-}
 
-fn is_provably_different_machine(
-    reported: &ReportedNode,
-    self_node_id: Option<&str>,
-    self_boot_id: Option<&str>,
-    target: &str,
-    previous: &str,
-) -> bool {
-    if let (Some(other_id), Some(own_id)) = (reported.node_id.as_deref(), self_node_id) {
-        return other_id != own_id;
-    }
-    if let (Some(other_boot), Some(own_boot)) = (reported.boot_id.as_deref(), self_boot_id) {
-        return other_boot != own_boot;
-    }
-    reported.node == target && target != previous && reported.explicit == Some(true)
+    let existing_node = read_regular_file(&node_path)?;
+    let (node_write, projects_old_name, reported_previous) = match insert_node_name(
+        existing_node.as_deref(),
+        &node_path,
+        target,
+    )? {
+        InsertNodeName::AlreadyMatches => {
+            // Also heal any project keys still left under the host-derived name (for example
+            // after an interrupted previous rename).
+            let host_name = NodeName::from_host().to_string();
+            (None, host_name, target.as_str().to_owned())
+        }
+        InsertNodeName::ExplicitMismatch(current) => {
+            return Err(ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "This node is already explicitly named {current} in node.toml, so it was not renamed to {target}."
+                    ),
+                )
+                .with_hint(format!(
+                    "Edit {} to set `name = \"{target}\"`, or rename this machine in fleet.toml to `{current}`.",
+                    node_path.display()
+                ))
+                .with_details(json!({
+                    "kind": "name_mismatch",
+                    "expected": target.as_str(),
+                    "reported": current.as_str(),
+                    "explicit": true,
+                })));
+        }
+        InsertNodeName::Write(updated) => (
+            Some(updated),
+            previous_node.to_owned(),
+            previous_node.to_owned(),
+        ),
+    };
+
+    let planned_projects = plan_projects_migration(
+        &projects_path,
+        &node_path,
+        &projects_old_name,
+        target.as_str(),
+    )?;
+
+    // Phase 2: Commit writes in order — `projects.toml` first, `node.toml` last — so a failure
+    // while migrating `projects.toml` never leaves `node.toml` renamed, and a crash between writes
+    // is cleanly healed on retry.
+    let (moved, conflicts) = if let Some(plan) = planned_projects {
+        if let Some(updated_proj_bytes) = plan.updated_bytes {
+            write_sync_backup(state_dir, "projects.toml.bak", &plan.original_bytes)?;
+            write_atomically(&plan.path, &updated_proj_bytes).map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} cannot be written: {error}.", plan.path.display()),
+                )
+            })?;
+        }
+        (plan.moved, plan.conflicts)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let (node_changed, backup) = if let Some(updated_node) = node_write {
+        let backup = match existing_node.as_deref() {
+            Some(old_bytes) => Some(write_sync_backup(state_dir, "node.toml.bak", old_bytes)?),
+            None => None,
+        };
+        std::fs::create_dir_all(config_dir).map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be created: {error}.", config_dir.display()),
+            )
+        })?;
+        write_atomically(&node_path, &updated_node).map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be written: {error}.", node_path.display()),
+            )
+        })?;
+        (true, backup)
+    } else {
+        (false, None)
+    };
+
+    Ok(ConfigSetNameResult {
+        node: target.as_str().to_owned(),
+        previous: reported_previous,
+        changed: node_changed || !moved.is_empty(),
+        backup,
+        moved,
+        conflicts,
+    })
 }
 
 async fn config_set_name(
@@ -1763,84 +1706,13 @@ async fn config_set_name(
         })));
     }
 
-    let previous = ctx.node_name().to_owned();
-    if target.as_str() != previous
-        && let Ok(fleet_file) = ctx.config().get::<FleetFile>()
-        && fleet_file.machine(target.as_str()).is_some()
-    {
-        let self_node_id = ctx.node_id();
-        let self_boot_id = ctx.boot_id();
-        let mut provably_different = false;
-        let mut provably_same = false;
-
-        if let Some(cached) = fleet.last_reported_node(target.as_str()) {
-            if is_provably_different_machine(
-                &cached,
-                self_node_id.as_deref(),
-                self_boot_id.as_deref(),
-                target.as_str(),
-                &previous,
-            ) {
-                provably_different = true;
-            } else if let (Some(other_id), Some(own_id)) =
-                (cached.node_id.as_deref(), self_node_id.as_deref())
-                && other_id == own_id
-            {
-                provably_same = true;
-            }
-        }
-
-        if !provably_different
-            && !provably_same
-            && ctx.hops() < MAX_HOPS
-            && let Ok(probed) = fleet
-                .probe_identity_with_timeout(ctx, target.as_str(), Some(Duration::from_secs(2)))
-                .await
-        {
-            provably_different = is_provably_different_machine(
-                &probed,
-                self_node_id.as_deref(),
-                self_boot_id.as_deref(),
-                target.as_str(),
-                &previous,
-            );
-        }
-
-        if provably_different {
-            return Err(ErrorBody::new(
-                ErrorCode::Conflict,
-                format!(
-                    "Refusing to rename this node to {target}: this node's fleet.toml already maps {target} to a different machine."
-                ),
-            )
-            .with_hint(format!(
-                "Choose another name, or remove the stale `{target}` entry from fleet.toml first."
-            ))
-            .with_details(json!({
-                "kind": "fleet_name_conflict",
-                "target": target.as_str(),
-            })));
-        }
-    }
-
     let started = Instant::now();
     let config_dir = ctx.paths().config_dir().to_path_buf();
     let state_dir = ctx.paths().state_dir().to_path_buf();
-    let explicit_home = ctx.paths().explicit_home().map(Path::to_path_buf);
-    let home = ctx.paths().home().map(Path::to_path_buf);
-    let grant = ctx.grant().clone();
-    let previous_for_task = previous.clone();
+    let previous = ctx.node_name().to_owned();
     let target_for_task = target.clone();
     let result = tokio::task::spawn_blocking(move || {
-        set_local_node_name_blocking(
-            &config_dir,
-            &state_dir,
-            explicit_home.as_deref(),
-            home.as_deref(),
-            &grant,
-            &previous_for_task,
-            &target_for_task,
-        )
+        set_local_node_name_blocking(&config_dir, &state_dir, &previous, &target_for_task)
     })
     .await
     .map_err(|error| {
@@ -1960,11 +1832,15 @@ pub enum NodeNameSyncStatus {
     /// `dry_run`).
     Set,
     /// The remote node reports a different name and was left untouched (explicit in `node.toml`,
-    /// unknown from an older node, or read-only `status`/`pull` direction).
+    /// no `node_id` from an older node or unwritable state dir, or read-only `status`/`pull`
+    /// direction).
     NameMismatch,
-    /// More than one fleet entry reached the same node, so none of them renamed it; see
+    /// More than one fleet entry reported the same `node_id`, so none of them renamed it; see
     /// `other_entries` and `error`.
     Ambiguous,
+    /// `node.toml` or `projects.toml` on the remote node is a symbolic link and must be edited by
+    /// hand; see `detail` and `error`.
+    Manual,
     /// Attempting to write `name` to `node.toml` failed; see `error`.
     Error,
 }
@@ -2144,12 +2020,11 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
         ));
     }
 
-    // Step 2 & 3: Group answers by node identity, refuse ambiguous duplicates, and apply
-    // unambiguous host-derived renames one at a time.
+    // Step 2 & 3: Group answers by node_id, refuse ambiguous duplicates, and apply unambiguous
+    // host-derived renames one at a time.
     let node_names = resolve_and_apply_node_names(
         fleet,
         ctx,
-        &fleet_file,
         &here,
         &probe_results,
         args.direction,
@@ -2480,57 +2355,19 @@ async fn sync_one_machine(
     outcomes
 }
 
-/// Strongest identity key available to tell whether two fleet entries reached the same node:
-/// 1. Persistent `node_id` (from `<state_dir>/node-id`, carried by `hello` and `meta.version`),
-/// 2. Kernel `boot_id` fallback for older nodes that do not report `node_id`,
-/// 3. Identical direct single-system transport (`ssh` target or `command` argv) if neither is set.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum SyncNodeKey {
-    NodeId(String),
-    BootId(String),
-    DirectTransport(String),
-    Unique(String),
-}
-
-fn node_identity_key(
-    fleet_file: &FleetFile,
-    machine: &str,
-    reported: &ReportedNode,
-) -> SyncNodeKey {
-    if let Some(node_id) = reported.node_id.as_deref().filter(|s| !s.is_empty()) {
-        return SyncNodeKey::NodeId(node_id.to_owned());
+fn join_machine_names(entries: &[String]) -> String {
+    match entries {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [head @ .., last] => format!("{} and {last}", head.join(", ")),
     }
-    if let Some(boot_id) = reported.boot_id.as_deref().filter(|s| !s.is_empty()) {
-        return SyncNodeKey::BootId(boot_id.to_owned());
-    }
-    if let Some(entry) = fleet_file.machine(machine)
-        && entry.via.is_none()
-    {
-        let systems = entry.resolved_systems();
-        if systems.len() == 1 {
-            match &systems[0].transport {
-                Transport::Ssh {
-                    target, program, ..
-                } => {
-                    return SyncNodeKey::DirectTransport(format!(
-                        "ssh:{target}:{}",
-                        program.as_deref().unwrap_or("")
-                    ));
-                }
-                Transport::Command { argv } => {
-                    return SyncNodeKey::DirectTransport(format!("cmd:{}", argv.join("\0")));
-                }
-            }
-        }
-    }
-    SyncNodeKey::Unique(machine.to_owned())
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn resolve_and_apply_node_names(
     fleet: &Fleet,
     ctx: &Ctx,
-    fleet_file: &FleetFile,
     here: &str,
     probes: &BTreeMap<String, Result<Option<ReportedNode>, ErrorBody>>,
     direction: SyncDirection,
@@ -2538,11 +2375,16 @@ async fn resolve_and_apply_node_names(
     is_device_registry_push: bool,
     per_machine_timeout: Option<Duration>,
 ) -> BTreeMap<String, NodeNameSyncOutcome> {
-    let mut groups: BTreeMap<SyncNodeKey, Vec<String>> = BTreeMap::new();
+    // Only a reported `node_id` proves two fleet entries reached the same Legion node.
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (machine, probe) in probes {
-        if let Ok(Some(reported)) = probe {
-            let key = node_identity_key(fleet_file, machine, reported);
-            groups.entry(key).or_default().push(machine.clone());
+        if let Ok(Some(reported)) = probe
+            && let Some(node_id) = reported.node_id.as_deref().filter(|s| !s.is_empty())
+        {
+            groups
+                .entry(node_id.to_owned())
+                .or_default()
+                .push(machine.clone());
         }
     }
 
@@ -2552,6 +2394,11 @@ async fn resolve_and_apply_node_names(
         if entries.len() <= 1 {
             continue;
         }
+        let names_joined = join_machine_names(entries);
+        let message = format!(
+            "{names_joined} answered with the same identity. If they are one machine, remove the entry that is out of date. If they are two machines whose Legion state was copied, delete `node-id` in the state directory of one and sync again."
+        );
+        let hint = "Remove the out-of-date entry from fleet.toml, or delete `node-id` in one machine's state directory if they are separate machines, then run `legion fleet.sync direction=push` again.";
         for machine in entries {
             ambiguous_machines.insert(machine.clone());
             let Some(Ok(Some(reported))) = probes.get(machine) else {
@@ -2562,14 +2409,6 @@ async fn resolve_and_apply_node_names(
                 .filter(|other| other.as_str() != machine.as_str())
                 .cloned()
                 .collect();
-            let others_text = others.join(", ");
-            let message = format!(
-                "{machine} and {others_text} in fleet.toml reached the same node (currently calling itself {}), so none of them renamed it.",
-                reported.node
-            );
-            let hint = format!(
-                "Remove the stale entry ({others_text} or {machine}) from fleet.toml, then run `legion fleet.sync direction=push` again."
-            );
             outcomes.insert(
                 machine.clone(),
                 NodeNameSyncOutcome {
@@ -2583,7 +2422,7 @@ async fn resolve_and_apply_node_names(
                     conflicts: Vec::new(),
                     detail: Some(message.clone()),
                     error: Some(
-                        ErrorBody::new(ErrorCode::Conflict, message)
+                        ErrorBody::new(ErrorCode::Conflict, message.clone())
                             .with_hint(hint)
                             .with_machine(machine)
                             .with_details(json!({
@@ -2643,7 +2482,37 @@ async fn apply_one_machine_node_name(
     per_machine_timeout: Option<Duration>,
 ) -> NodeNameSyncOutcome {
     let reported = identity.node.clone();
+    let has_node_id = identity.node_id.as_deref().is_some_and(|s| !s.is_empty());
     match identity.explicit {
+        Some(false) if !has_node_id => NodeNameSyncOutcome {
+            status: NodeNameSyncStatus::NameMismatch,
+            expected: machine.to_owned(),
+            reported: reported.clone(),
+            source: NodeNameSource::Host,
+            backup: None,
+            other_entries: Vec::new(),
+            moved: Vec::new(),
+            conflicts: Vec::new(),
+            detail: Some(format!(
+                "{machine} calls itself {reported} (host-derived) and did not report a node identity (older Legion or its state directory is not writable); left unchanged."
+            )),
+            error: Some(
+                ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!("{machine} calls itself {reported}."),
+                )
+                .with_hint(format!(
+                    "Ensure {machine} runs current Legion with a writable state directory, or set `name = \"{machine}\"` in its node.toml."
+                ))
+                .with_machine(machine)
+                .with_details(json!({
+                    "kind": "name_mismatch",
+                    "expected": machine,
+                    "reported": reported,
+                    "reason": "missing_node_id",
+                })),
+            ),
+        },
         Some(false) => {
             if direction == SyncDirection::Push && !is_device_registry_push {
                 if dry_run {
@@ -2695,7 +2564,6 @@ async fn apply_one_machine_node_name(
                                     node: machine.to_owned(),
                                     explicit: Some(true),
                                     node_id: identity.node_id.clone(),
-                                    boot_id: identity.boot_id.clone(),
                                 },
                             );
                             fleet.evict(machine).await;
@@ -2734,6 +2602,18 @@ async fn apply_one_machine_node_name(
                                 .with_machine(machine),
                             ),
                         },
+                    },
+                    Err(error) if is_linked_config_error(&error) => NodeNameSyncOutcome {
+                        status: NodeNameSyncStatus::Manual,
+                        expected: machine.to_owned(),
+                        reported,
+                        source: NodeNameSource::Host,
+                        backup: None,
+                        other_entries: Vec::new(),
+                        moved: Vec::new(),
+                        conflicts: Vec::new(),
+                        detail: Some(error.message.clone()),
+                        error: Some(error),
                     },
                     Err(error) if is_name_mismatch_error(&error) => NodeNameSyncOutcome {
                         status: NodeNameSyncStatus::NameMismatch,
@@ -2845,7 +2725,7 @@ async fn apply_one_machine_node_name(
             moved: Vec::new(),
             conflicts: Vec::new(),
             detail: Some(format!(
-                "{machine} calls itself {reported} and did not report whether that name is explicit (older node); left unchanged."
+                "{machine} calls itself {reported} and did not report a node identity or whether that name is explicit (older Legion); left unchanged."
             )),
             error: Some(
                 ErrorBody::new(
@@ -6990,7 +6870,7 @@ removed_on = \"box-a\"
     }
 
     #[tokio::test]
-    async fn config_set_name_handles_bom_symlinks_projects_migration_and_conflicts() {
+    async fn config_set_name_atomic_migration_symlinks_crlf_and_caller_conflict() {
         use legion_core::{Call, Door, Node, Paths};
 
         let dir = tempfile::tempdir().unwrap();
@@ -7009,7 +6889,7 @@ removed_on = \"box-a\"
             "studio"
         };
 
-        // 1. Refuses `caller` equal to `name`.
+        // 1. Finding D: Refuses `caller` equal to `name`.
         let err = node
             .call(Call::new(
                 Door::Cli,
@@ -7024,43 +6904,49 @@ removed_on = \"box-a\"
             Some(&json!("caller_name_conflict"))
         );
 
-        // 2. Refuses a name mapped to a provably different machine in this node's own fleet.toml.
+        // 2. Finding D: A `fleet.toml` entry with the same name does NOT block `config.set_name`.
         std::fs::write(
             paths.config_file("fleet.toml"),
-            "[machines.tower]\nssh = \"tower.example\"\n",
+            format!("[machines.{target_name}]\nssh = \"other.example\"\n"),
         )
         .unwrap();
         fleet.record_reported_node(
-            "tower",
+            target_name,
             ReportedNode {
-                node: "tower".to_owned(),
+                node: target_name.to_owned(),
                 explicit: Some(true),
                 node_id: Some("ffffffffffffffffffffffffffffffff".to_owned()),
-                boot_id: Some("other-boot".to_owned()),
             },
         );
+
+        // 3. Finding A: Invalid `projects.toml` fails before touching `node.toml`.
+        let orig_node_body = b"\xEF\xBB\xBF[svc]\r\nsudo = true\r\n";
+        std::fs::write(paths.config_file("node.toml"), orig_node_body).unwrap();
+        std::fs::write(paths.config_file("projects.toml"), "[projects.broken\n").unwrap();
         let err = node
             .call(Call::new(
                 Door::Cli,
                 "config.set_name",
-                json!({"name": "tower"}),
+                json!({"name": target_name}),
             ))
             .await
             .unwrap_err();
-        assert_eq!(err.code, ErrorCode::Conflict);
+        assert_eq!(err.code, ErrorCode::Failed, "{err:?}");
         assert_eq!(
-            err.details.as_ref().and_then(|d| d.get("kind")),
-            Some(&json!("fleet_name_conflict"))
+            std::fs::read(paths.config_file("node.toml")).unwrap(),
+            orig_node_body,
+            "invalid projects.toml must leave node.toml untouched"
         );
-        assert!(!paths.config_file("node.toml").exists());
+        std::fs::remove_file(paths.config_file("projects.toml")).unwrap();
 
-        // 3. Symlink outside what this node may write is refused without touching the target.
+        // 4. Finding B: Never writes through symbolic links (node.toml, projects.toml with keys,
+        //    or dangling projects.toml), refusing with `conflict` / `linked_config` and exact text.
         #[cfg(unix)]
         {
-            let outside_dir = tempfile::tempdir().unwrap();
-            let outside_file = outside_dir.path().join("outside-node.toml");
-            std::fs::write(&outside_file, b"[svc]\nsudo = false\n").unwrap();
-            std::os::unix::fs::symlink(&outside_file, paths.config_file("node.toml")).unwrap();
+            let linked_node = dir.path().join("linked-node.toml");
+            std::fs::write(&linked_node, b"[svc]\nsudo = false\n").unwrap();
+            std::fs::remove_file(paths.config_file("node.toml")).unwrap();
+            std::os::unix::fs::symlink(&linked_node, paths.config_file("node.toml")).unwrap();
             let err = node
                 .call(Call::new(
                     Door::Cli,
@@ -7069,19 +6955,31 @@ removed_on = \"box-a\"
                 ))
                 .await
                 .unwrap_err();
-            assert_eq!(err.code, ErrorCode::Denied, "{err:?}");
-            assert!(
-                err.message.contains("outside"),
-                "expected clear sentence: {}",
-                err.message
+            assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+            assert_eq!(
+                err.details.as_ref().and_then(|d| d.get("kind")),
+                Some(&json!("linked_config")),
+                "{err:?}"
             );
             assert_eq!(
-                std::fs::read(&outside_file).unwrap(),
+                err.message,
+                format!(
+                    "node.toml on {target_name} is a link; Legion does not write through links."
+                )
+            );
+            assert!(
+                err.hint
+                    .as_deref()
+                    .is_some_and(|h| h.contains("by hand") || h.contains("Edit")),
+                "{err:?}"
+            );
+            assert_eq!(
+                std::fs::read(&linked_node).unwrap(),
                 b"[svc]\nsudo = false\n"
             );
             std::fs::remove_file(paths.config_file("node.toml")).unwrap();
 
-            // Dangling symlink is also refused.
+            // Dangling node.toml symlink is also refused with `linked_config`.
             std::os::unix::fs::symlink(
                 dir.path().join("missing-node.toml"),
                 paths.config_file("node.toml"),
@@ -7095,31 +6993,96 @@ removed_on = \"box-a\"
                 ))
                 .await
                 .unwrap_err();
-            assert_eq!(err.code, ErrorCode::Denied, "{err:?}");
+            assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+            assert_eq!(
+                err.details.as_ref().and_then(|d| d.get("kind")),
+                Some(&json!("linked_config")),
+                "{err:?}"
+            );
             std::fs::remove_file(paths.config_file("node.toml")).unwrap();
+
+            // Regular node.toml + symlinked projects.toml with keys to move is refused before
+            // touching node.toml.
+            std::fs::write(paths.config_file("node.toml"), orig_node_body).unwrap();
+            let linked_proj = dir.path().join("linked-projects.toml");
+            let linked_proj_body =
+                format!("[projects.app]\n[projects.app.on]\n{old_host_name} = \"/work/app\"\n");
+            std::fs::write(&linked_proj, &linked_proj_body).unwrap();
+            std::os::unix::fs::symlink(&linked_proj, paths.config_file("projects.toml")).unwrap();
+            let err = node
+                .call(Call::new(
+                    Door::Cli,
+                    "config.set_name",
+                    json!({"name": target_name}),
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+            assert_eq!(
+                err.details.as_ref().and_then(|d| d.get("kind")),
+                Some(&json!("linked_config")),
+                "{err:?}"
+            );
+            assert_eq!(
+                err.message,
+                format!(
+                    "projects.toml on {target_name} is a link; Legion does not write through links."
+                )
+            );
+            assert_eq!(
+                std::fs::read(paths.config_file("node.toml")).unwrap(),
+                orig_node_body,
+                "symlinked projects.toml refusal must leave node.toml untouched"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&linked_proj).unwrap(),
+                linked_proj_body
+            );
+            std::fs::remove_file(paths.config_file("projects.toml")).unwrap();
+
+            // Dangling projects.toml symlink is also refused before touching node.toml.
+            std::os::unix::fs::symlink(
+                dir.path().join("missing-projects.toml"),
+                paths.config_file("projects.toml"),
+            )
+            .unwrap();
+            let err = node
+                .call(Call::new(
+                    Door::Cli,
+                    "config.set_name",
+                    json!({"name": target_name}),
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+            assert_eq!(
+                err.details.as_ref().and_then(|d| d.get("kind")),
+                Some(&json!("linked_config")),
+                "{err:?}"
+            );
+            assert_eq!(
+                std::fs::read(paths.config_file("node.toml")).unwrap(),
+                orig_node_body
+            );
+            std::fs::remove_file(paths.config_file("projects.toml")).unwrap();
         }
 
-        // 4. Symlink inside allowed home + UTF-8 BOM + CRLF + projects.toml migration & conflict.
-        let real_node_target = dir.path().join("dotfiles-node.toml");
-        let bom_body = b"\xEF\xBB\xBF[svc]\r\nsudo = true\r\n";
-        std::fs::write(&real_node_target, bom_body).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&real_node_target, paths.config_file("node.toml")).unwrap();
-        #[cfg(not(unix))]
-        std::fs::write(paths.config_file("node.toml"), bom_body).unwrap();
-
-        let projects_toml = format!(
-            "[projects.app]\n\
-             description = \"Main app\"\n\
-             [projects.app.on]\n\
-             {old_host_name} = \"/work/app\"\n\
-             tower = \"/srv/app\"\n\n\
-             [projects.dup]\n\
-             [projects.dup.on]\n\
-             {old_host_name} = \"/old/dup\"\n\
-             {target_name} = \"/keep/dup\"\n"
+        // 5. Finding A & D: Regular node.toml (with UTF-8 BOM + CRLF) + projects.toml (with CRLF)
+        //    migrates keys, keeps CRLF in projects.toml, keeps BOM+CRLF in node.toml, succeeds
+        //    even though `fleet.toml` listed `target_name`, and audits `config.set_name.applied`.
+        std::fs::write(paths.config_file("node.toml"), orig_node_body).unwrap();
+        let projects_crlf = format!(
+            "[projects.app]\r\n\
+             description = \"Main app\"\r\n\
+             [projects.app.on]\r\n\
+             {old_host_name} = \"/work/app\"\r\n\
+             tower = \"/srv/app\"\r\n\r\n\
+             [projects.dup]\r\n\
+             [projects.dup.on]\r\n\
+             {old_host_name} = \"/old/dup\"\r\n\
+             {target_name} = \"/keep/dup\"\r\n"
         );
-        std::fs::write(paths.config_file("projects.toml"), &projects_toml).unwrap();
+        std::fs::write(paths.config_file("projects.toml"), &projects_crlf).unwrap();
 
         let res = node
             .call(Call::new(
@@ -7146,15 +7109,6 @@ removed_on = \"box-a\"
             "{res}"
         );
 
-        // Symlink stayed a symlink, and the target file keeps the UTF-8 BOM at byte 0.
-        #[cfg(unix)]
-        assert!(
-            std::fs::symlink_metadata(paths.config_file("node.toml"))
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "node.toml must remain a symlink"
-        );
         let written_node = std::fs::read(paths.config_file("node.toml")).unwrap();
         assert_eq!(
             written_node,
@@ -7168,10 +7122,20 @@ removed_on = \"box-a\"
         );
         assert!(parsed_node.svc.sudo);
 
-        // projects.toml moved `app` and left `dup`'s existing `target_name` intact.
+        // projects.toml kept CRLF line endings everywhere (no bare `\n`).
+        let written_projects_raw =
+            std::fs::read_to_string(paths.config_file("projects.toml")).unwrap();
+        assert!(
+            written_projects_raw.contains("\r\n"),
+            "projects.toml must preserve CRLF: {written_projects_raw:?}"
+        );
+        assert!(
+            !written_projects_raw.replace("\r\n", "").contains('\n'),
+            "projects.toml must not introduce bare LF lines: {written_projects_raw:?}"
+        );
         let parsed_projects = parse::<ProjectsFile>(
             &paths.config_file("projects.toml"),
-            &std::fs::read(paths.config_file("projects.toml")).unwrap(),
+            written_projects_raw.as_bytes(),
         )
         .unwrap();
         assert_eq!(
@@ -7188,5 +7152,77 @@ removed_on = \"box-a\"
             parsed_projects.path_on("dup", &old_host_name),
             Some("/old/dup")
         );
+
+        // 6. Finding A: Simulated half-applied crash where `node.toml` already has `name = target`
+        //    but `projects.toml` still has a key under `NodeName::from_host()` heals on retry.
+        let half_applied_projects = format!(
+            "[projects.healed]\r\n[projects.healed.on]\r\n{old_host_name} = \"/work/healed\"\r\n"
+        );
+        std::fs::write(paths.config_file("projects.toml"), &half_applied_projects).unwrap();
+        let heal = node
+            .call(Call::new(
+                Door::Cli,
+                "config.set_name",
+                json!({"name": target_name}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(heal["changed"], json!(true), "{heal}");
+        assert_eq!(
+            heal["moved"],
+            json!([format!(
+                "projects.healed.on: {old_host_name} -> {target_name}"
+            )]),
+            "{heal}"
+        );
+        let healed_projects = std::fs::read_to_string(paths.config_file("projects.toml")).unwrap();
+        assert!(
+            !healed_projects.replace("\r\n", "").contains('\n'),
+            "healed projects.toml must keep CRLF: {healed_projects:?}"
+        );
+        let parsed_healed = parse::<ProjectsFile>(
+            &paths.config_file("projects.toml"),
+            healed_projects.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed_healed.path_on("healed", target_name),
+            Some("/work/healed")
+        );
+        assert_eq!(parsed_healed.path_on("healed", &old_host_name), None);
+
+        // 7. Finding B: Symlinked `projects.toml` with NO keys to move still allows renaming
+        //    regular `node.toml` without touching `projects.toml`.
+        #[cfg(unix)]
+        {
+            let dir2 = tempfile::tempdir().unwrap();
+            let paths2 = Paths::under(dir2.path());
+            std::fs::create_dir_all(paths2.config_dir()).unwrap();
+            std::fs::create_dir_all(paths2.state_dir()).unwrap();
+            let fleet2 = Fleet::new(&paths2);
+            let mut reg2 = Registry::new();
+            register(&mut reg2, fleet2);
+            let node2 = Node::new(paths2.clone(), reg2);
+            let linked_proj2 = dir2.path().join("other-projects.toml");
+            let proj2_body = "[projects.other]\n[projects.other.on]\ntower = \"/srv/other\"\n";
+            std::fs::write(&linked_proj2, proj2_body).unwrap();
+            std::os::unix::fs::symlink(&linked_proj2, paths2.config_file("projects.toml")).unwrap();
+            let ok = node2
+                .call(Call::new(
+                    Door::Cli,
+                    "config.set_name",
+                    json!({"name": target_name}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(ok["changed"], json!(true), "{ok}");
+            assert!(
+                std::fs::symlink_metadata(paths2.config_file("projects.toml"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read_to_string(&linked_proj2).unwrap(), proj2_body);
+        }
     }
 }

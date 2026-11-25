@@ -65,12 +65,10 @@ pub struct Version {
     /// (`Some(false)`), or unknown because `node.toml` failed to parse (`None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_explicit: Option<bool>,
-    /// Persistent identifier for this node's state directory, when available.
+    /// Persistent identifier for this node's state directory, returned only to callers whose role
+    /// includes the `admin` effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
-    /// Identifier of this machine's current boot, when available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot_id: Option<String>,
     /// The operating system.
     pub os: &'static str,
     /// The CPU architecture.
@@ -79,6 +77,11 @@ pub struct Version {
 
 async fn version(ctx: &Ctx, _args: NoArgs) -> Result<Version, ToolError> {
     let exe = legion_core::current_exe().ok();
+    let node_id = ctx
+        .grant()
+        .allows_effect(Effect::Admin)
+        .then(|| ctx.node_id())
+        .flatten();
     Ok(Version {
         name: "legion",
         version: VERSION,
@@ -87,8 +90,7 @@ async fn version(ctx: &Ctx, _args: NoArgs) -> Result<Version, ToolError> {
         protocol: PROTOCOL,
         node: ctx.node_name().to_owned(),
         node_explicit: ctx.node_name_explicit(),
-        node_id: ctx.node_id(),
-        boot_id: ctx.boot_id(),
+        node_id,
         os: ctx.os(),
         arch: ctx.arch(),
     })

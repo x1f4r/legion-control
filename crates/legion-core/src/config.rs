@@ -9,11 +9,12 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use legion_os::open_regular::{OpenRegularError, open_regular_read};
 use legion_proto::{ErrorBody, ErrorCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -85,17 +86,7 @@ impl ConfigStore {
     /// nothing.
     pub fn get<D: Document>(&self) -> Result<Arc<D>, ErrorBody> {
         let path = self.path_of::<D>();
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!("{} cannot be read: {error}.", path.display()),
-                )
-                .with_hint("Make the file readable by the account legion runs as."));
-            }
-        };
+        let bytes = read_regular_file(&path)?;
 
         // A poisoned lock means another call panicked while holding it; the cache is still a
         // plain map, so carry on with it rather than spreading the panic.
@@ -145,6 +136,52 @@ impl ConfigStore {
                 )
             })
     }
+}
+
+/// Reads a configuration file non-blockingly after verifying it is a regular file, so a FIFO,
+/// socket, device node, or directory returns a clear error instead of hanging.
+///
+/// Returns `Ok(None)` when `path` does not exist.
+pub fn read_regular_file(path: &Path) -> Result<Option<Vec<u8>>, ErrorBody> {
+    let (mut file, _meta) = match open_regular_read(path) {
+        Ok(opened) => opened,
+        Err(OpenRegularError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(OpenRegularError::IsDirectory) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} is a directory, not a regular file.", path.display()),
+            )
+            .with_hint("Replace it with a regular TOML file."));
+        }
+        Err(OpenRegularError::NotRegularFile) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "{} is not a regular file (for example a FIFO, socket, or device).",
+                    path.display()
+                ),
+            )
+            .with_hint("Replace it with a regular TOML file."));
+        }
+        Err(OpenRegularError::Io(error)) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be read: {error}.", path.display()),
+            )
+            .with_hint("Make the file readable by the account legion runs as."));
+        }
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} cannot be read: {error}.", path.display()),
+        )
+        .with_hint("Make the file readable by the account legion runs as.")
+    })?;
+    Ok(Some(bytes))
 }
 
 /// How long replacing a file keeps trying while something holds it open. On Windows an indexer or
@@ -1087,5 +1124,31 @@ verify = ["check-next-entry", "Other"]
 
         // Unparseable node.toml returns an error rather than overwriting it.
         assert!(insert_node_name(Some(b"name = 3\n"), path, &studio).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_store_refuses_fifo_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("node.toml");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo failed");
+
+        let store = ConfigStore::new(dir.path());
+        let started = Instant::now();
+        let err = store.get::<NodeFile>().unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "reading a FIFO config file must fail promptly"
+        );
+        assert_eq!(err.code, ErrorCode::Failed);
+        assert!(
+            err.message.contains("not a regular file"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 }

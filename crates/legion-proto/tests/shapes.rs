@@ -89,7 +89,7 @@ fn an_error_body_leaves_out_what_it_does_not_have() {
     let unknown_with_details: ErrorBody = serde_json::from_value(json!({
         "code": "future_code",
         "message": "Something new happened.",
-        "details": {"expected": "studio"}
+        "details": {"expected": "studio", "unknown_code": "spoofed"}
     }))
     .unwrap();
     assert_eq!(unknown_with_details.code, ErrorCode::Failed);

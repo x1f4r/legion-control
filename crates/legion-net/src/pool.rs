@@ -1186,10 +1186,6 @@ impl Fleet {
                         .get("node_id")
                         .and_then(Value::as_str)
                         .map(str::to_owned);
-                    let boot_id = value
-                        .get("boot_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
                     if let Some(ref rep) = reported {
                         self.inner.state.record_node(
                             machine,
@@ -1197,7 +1193,6 @@ impl Fleet {
                                 node: rep.clone(),
                                 explicit,
                                 node_id,
-                                boot_id,
                             },
                         );
                     }
@@ -1415,15 +1410,10 @@ impl Fleet {
                 .get("node_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let boot_id = value
-                .get("boot_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
             let reported = ReportedNode {
                 node,
                 explicit,
                 node_id,
-                boot_id,
             };
             self.inner.state.record_node(machine, reported.clone());
             return Ok(reported);
@@ -1763,17 +1753,12 @@ impl Fleet {
                         .get("node_id")
                         .and_then(Value::as_str)
                         .map(str::to_owned);
-                    let boot_id = probe_val
-                        .get("boot_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
                     self.inner.state.record_node(
                         target_machine,
                         ReportedNode {
                             node: reported.to_owned(),
                             explicit,
                             node_id,
-                            boot_id,
                         },
                     );
                     if reported != target_machine {
@@ -1837,7 +1822,6 @@ impl Fleet {
                         node: reported.to_owned(),
                         explicit: direct_same.then_some(hello.node_explicit).flatten(),
                         node_id: direct_same.then_some(hello.node_id.clone()).flatten(),
-                        boot_id: direct_same.then_some(hello.boot_id.clone()).flatten(),
                     },
                 );
                 return Err(name_mismatch_error(target_machine, reported));
@@ -3743,7 +3727,6 @@ fn reported_from_hello(hello: &legion_proto::HelloResult) -> ReportedNode {
         node: hello.node.clone(),
         explicit: hello.node_explicit,
         node_id: hello.node_id.clone(),
-        boot_id: hello.boot_id.clone(),
     }
 }
 

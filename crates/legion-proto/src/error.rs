@@ -146,8 +146,7 @@ impl<'de> Deserialize<'de> for ErrorBody {
                         Value::Object(map)
                     }
                     Some(Value::Object(mut map)) => {
-                        map.entry("unknown_code".to_owned())
-                            .or_insert_with(|| Value::String(raw.code));
+                        map.insert("unknown_code".to_owned(), Value::String(raw.code));
                         Value::Object(map)
                     }
                     Some(other) => {

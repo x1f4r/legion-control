@@ -20,8 +20,6 @@ pub(crate) struct ReportedNode {
     pub(crate) explicit: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) node_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) boot_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,7 +175,6 @@ mod tests {
                 node: "someones-laptop".to_owned(),
                 explicit: Some(false),
                 node_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
-                boot_id: Some("boot-1".to_owned()),
             },
         );
         let reloaded2 = StateStore::new(dir.path());
@@ -187,7 +184,6 @@ mod tests {
                 node: "someones-laptop".to_owned(),
                 explicit: Some(false),
                 node_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
-                boot_id: Some("boot-1".to_owned()),
             })
         );
         reloaded2.clear_node("studio");

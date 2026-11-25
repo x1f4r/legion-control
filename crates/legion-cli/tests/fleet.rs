@@ -111,6 +111,14 @@ fn main() -> ExitCode {
             fleet_sync_rename_migrates_projects_and_reports_conflicts,
         ),
         (
+            "fleet_sync_reports_manual_for_linked_config_and_skips_missing_node_id",
+            fleet_sync_reports_manual_for_linked_config_and_skips_missing_node_id,
+        ),
+        (
+            "node_id_and_boot_id_visibility_follows_admin_effect",
+            node_id_and_boot_id_visibility_follows_admin_effect,
+        ),
+        (
             "pipe_handle_drop_is_non_blocking_and_kills_lingering_child",
             pipe_handle_drop_is_non_blocking_and_kills_lingering_child,
         ),
@@ -491,6 +499,96 @@ fn run_helper(args: &[String]) -> ExitCode {
                                     }
                                 }
                             })
+                        }
+                    }
+                    _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                };
+                writeln!(stdout, "{reply}").unwrap();
+                stdout.flush().unwrap();
+            }
+            ExitCode::SUCCESS
+        }
+        // no-node-id <reported_name> <boot_id> <call_log>
+        // Simulates a node reporting `node_explicit: false` and a `boot_id` but NO `node_id` (e.g.
+        // unwritable state dir) so tests can verify `fleet.sync` never groups by `boot_id` and
+        // never renames without a `node_id`.
+        "no-node-id" => {
+            let reported = &rest[0];
+            let boot_id = &rest[1];
+            let call_log = Path::new(&rest[2]);
+            let mut stdout = std::io::stdout().lock();
+            for line in BufReader::new(std::io::stdin()).lines() {
+                let Ok(line) = line else { break };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let reply = match req["method"].as_str().unwrap_or_default() {
+                    "hello" => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "node": reported,
+                            "node_explicit": false,
+                            "boot_id": boot_id,
+                            "version": "0.1.0",
+                            "protocol": 1,
+                            "os": std::env::consts::OS,
+                            "arch": std::env::consts::ARCH,
+                            "systems": []
+                        }
+                    }),
+                    "call" => {
+                        let tool = req["params"]["tool"].as_str().unwrap_or_default();
+                        append_line(call_log, tool);
+                        match tool {
+                            "meta.version" => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "name": "legion",
+                                    "version": "0.1.0",
+                                    "install": "standalone",
+                                    "protocol": 1,
+                                    "node": reported,
+                                    "node_explicit": false,
+                                    "os": std::env::consts::OS,
+                                    "arch": std::env::consts::ARCH
+                                }
+                            }),
+                            "config.list" => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {"documents": []}
+                            }),
+                            "config.read" => {
+                                let doc = req["params"]["args"]["document"]
+                                    .as_str()
+                                    .unwrap_or_default();
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {
+                                        "document": doc,
+                                        "exists": false,
+                                        "hash": null,
+                                        "content": null
+                                    }
+                                })
+                            }
+                            _ => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32000,
+                                    "message": format!("Unexpected tool {tool}."),
+                                    "data": {
+                                        "code": "failed",
+                                        "message": format!("Unexpected tool {tool}."),
+                                        "machine": reported
+                                    }
+                                }
+                            }),
                         }
                     }
                     _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
@@ -2610,10 +2708,18 @@ fn duplicate_fleet_entries_report_ambiguous_and_relayed_invite_prechecks_older_r
             json!([studio_old]),
             "{names}"
         );
+        let expected_ambiguous = format!(
+            "{studio_name} and {studio_old} answered with the same identity. If they are one machine, remove the entry that is out of date. If they are two machines whose Legion state was copied, delete `node-id` in the state directory of one and sync again."
+        );
+        assert_eq!(
+            names[studio_name]["error"]["message"],
+            json!(expected_ambiguous),
+            "{names}"
+        );
         assert!(
             names[studio_name]["error"]["hint"]
                 .as_str()
-                .is_some_and(|h| h.contains("Remove the stale entry")),
+                .is_some_and(|h| h.contains("node-id") && h.contains("out-of-date")),
             "{names}"
         );
         assert_eq!(names[&studio_old]["status"], json!("ambiguous"), "{names}");
@@ -2738,6 +2844,308 @@ fn fleet_sync_rename_migrates_projects_and_reports_conflicts() {
     let proj_list = tower.run(&["proj.list", "--on", studio_name]);
     assert_eq!(proj_list.code, 0, "{}", proj_list.stdout);
     assert_eq!(proj_list.json()["node"], json!(studio_name));
+}
+
+fn fleet_sync_reports_manual_for_linked_config_and_skips_missing_node_id() {
+    let tower = Home::new();
+    tower.write_config("node.toml", "name = \"tower\"\n");
+
+    // 1. Finding C: Two distinct machines that share the same `boot_id` and omit `node_id` must
+    //    NOT be grouped as `ambiguous` and must NEVER be renamed; each reports `name_mismatch`
+    //    explaining why.
+    let no_id_a_log = tower.home().join("no-id-a.log");
+    let no_id_b_log = tower.home().join("no-id-b.log");
+    let no_id_a = helper_argv(
+        "no-node-id",
+        &[
+            "box-a".to_owned(),
+            "shared-kernel-boot".to_owned(),
+            no_id_a_log.to_string_lossy().into_owned(),
+        ],
+    );
+    let no_id_b = helper_argv(
+        "no-node-id",
+        &[
+            "box-b".to_owned(),
+            "shared-kernel-boot".to_owned(),
+            no_id_b_log.to_string_lossy().into_owned(),
+        ],
+    );
+
+    #[cfg(unix)]
+    let (
+        host_derived,
+        linked_node_name,
+        linked_proj_name,
+        linked_node_home,
+        linked_proj_home,
+        linked_node_target,
+        linked_proj_target,
+    ) = {
+        let host_derived = legion_core::config::NodeName::from_host().to_string();
+        let linked_node_name = if host_derived == "studio" {
+            "studio-link"
+        } else {
+            "studio"
+        };
+        let linked_proj_name = if host_derived == "pi" {
+            "pi-link"
+        } else {
+            "pi"
+        };
+        let linked_node_home = Home::new();
+        let linked_proj_home = Home::new();
+        let linked_node_target = linked_node_home.home().join("dotfiles-node.toml");
+        fs::write(&linked_node_target, "[svc]\nsudo = false\n").unwrap();
+        let cfg_a = legion_home_of(&linked_node_home).join("config");
+        fs::create_dir_all(&cfg_a).unwrap();
+        std::os::unix::fs::symlink(&linked_node_target, cfg_a.join("node.toml")).unwrap();
+
+        let linked_proj_target = linked_proj_home.home().join("dotfiles-projects.toml");
+        fs::write(
+            &linked_proj_target,
+            format!("[projects.app]\n[projects.app.on]\n{host_derived} = \"/work/app\"\n"),
+        )
+        .unwrap();
+        let cfg_b = legion_home_of(&linked_proj_home).join("config");
+        fs::create_dir_all(&cfg_b).unwrap();
+        std::os::unix::fs::symlink(&linked_proj_target, cfg_b.join("projects.toml")).unwrap();
+
+        (
+            host_derived,
+            linked_node_name,
+            linked_proj_name,
+            linked_node_home,
+            linked_proj_home,
+            linked_node_target,
+            linked_proj_target,
+        )
+    };
+
+    #[cfg(unix)]
+    let fleet_toml = format!(
+        "[machines.noid-a]\ncommand = {}\n\n\
+         [machines.noid-b]\ncommand = {}\n\n\
+         [machines.{linked_node_name}]\ncommand = {}\n\n\
+         [machines.{linked_proj_name}]\ncommand = {}\n",
+        toml_argv(&no_id_a),
+        toml_argv(&no_id_b),
+        toml_argv(&run_argv(&linked_node_home, None)),
+        toml_argv(&run_argv(&linked_proj_home, None)),
+    );
+    #[cfg(not(unix))]
+    let fleet_toml = format!(
+        "[machines.noid-a]\ncommand = {}\n\n[machines.noid-b]\ncommand = {}\n",
+        toml_argv(&no_id_a),
+        toml_argv(&no_id_b),
+    );
+    tower.write_config("fleet.toml", &fleet_toml);
+
+    let push = tower.run(&["fleet.sync", "direction=push"]);
+    assert_eq!(push.code, 0, "{}", push.stdout);
+    let names = &push.json()["node_names"];
+
+    for (entry, log) in [("noid-a", &no_id_a_log), ("noid-b", &no_id_b_log)] {
+        assert_eq!(
+            names[entry]["status"],
+            json!("name_mismatch"),
+            "shared boot_id without node_id must never be ambiguous or renamed: {names}"
+        );
+        assert_eq!(
+            names[entry]["error"]["details"]["reason"],
+            json!("missing_node_id"),
+            "{names}"
+        );
+        assert!(
+            names[entry]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("node identity")),
+            "{names}"
+        );
+        let calls = fs::read_to_string(log).unwrap_or_default();
+        assert!(
+            !calls.contains("config.set_name"),
+            "{entry} without node_id must never receive config.set_name: {calls}"
+        );
+    }
+
+    // 2. Finding B: Linked `node.toml` and linked `projects.toml` (with keys to move) report
+    //    `status: "manual"` with the exact sentence and hint, leaving all files untouched.
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            names[linked_node_name]["status"],
+            json!("manual"),
+            "{names}"
+        );
+        assert_eq!(
+            names[linked_node_name]["error"]["code"],
+            json!("conflict"),
+            "{names}"
+        );
+        assert_eq!(
+            names[linked_node_name]["error"]["details"]["kind"],
+            json!("linked_config"),
+            "{names}"
+        );
+        assert_eq!(
+            names[linked_node_name]["error"]["message"],
+            json!(format!(
+                "node.toml on {linked_node_name} is a link; Legion does not write through links."
+            )),
+            "{names}"
+        );
+        assert_eq!(
+            names[linked_node_name]["detail"], names[linked_node_name]["error"]["message"],
+            "{names}"
+        );
+        assert!(
+            names[linked_node_name]["error"]["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("by hand")),
+            "{names}"
+        );
+        assert_eq!(
+            fs::read_to_string(&linked_node_target).unwrap(),
+            "[svc]\nsudo = false\n"
+        );
+
+        assert_eq!(
+            names[linked_proj_name]["status"],
+            json!("manual"),
+            "{names}"
+        );
+        assert_eq!(
+            names[linked_proj_name]["error"]["details"]["kind"],
+            json!("linked_config"),
+            "{names}"
+        );
+        assert_eq!(
+            names[linked_proj_name]["error"]["message"],
+            json!(format!(
+                "projects.toml on {linked_proj_name} is a link; Legion does not write through links."
+            )),
+            "{names}"
+        );
+        assert!(
+            names[linked_proj_name]["error"]["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("by hand")),
+            "{names}"
+        );
+        assert!(
+            !legion_home_of(&linked_proj_home)
+                .join("config")
+                .join("node.toml")
+                .exists(),
+            "refused linked projects.toml must leave node.toml uncreated"
+        );
+        assert!(
+            fs::read_to_string(&linked_proj_target)
+                .unwrap()
+                .contains(&host_derived),
+            "linked projects.toml target must stay untouched"
+        );
+    }
+}
+
+fn node_id_and_boot_id_visibility_follows_admin_effect() {
+    let tower = Home::new();
+    tower.write_config("node.toml", "name = \"tower\"\n");
+    tower.write_config(
+        "policy.toml",
+        r#"
+[principals.viewer]
+role = "observer"
+
+[principals."device:phone"]
+role = "phone_op"
+
+[principals."device:admin-pad"]
+role = "keeper"
+
+[roles.observer]
+allow = ["effect:read"]
+
+[roles.phone_op]
+allow = ["effect:read", "effect:write"]
+
+[roles.keeper]
+allow = ["effect:read", "effect:admin"]
+"#,
+    );
+
+    // 1. `meta.version` omits `boot_id` for everyone and returns `node_id` ONLY for admin-effect roles.
+    let owner_ver = tower.run(&["meta.version"]);
+    assert_eq!(owner_ver.code, 0, "{}", owner_ver.stdout);
+    let owner_json = owner_ver.json();
+    assert!(
+        owner_json["node_id"].is_string(),
+        "owner meta.version must include node_id: {owner_json}"
+    );
+    assert!(
+        owner_json.get("boot_id").is_none(),
+        "meta.version must omit boot_id: {owner_json}"
+    );
+
+    let keeper_ver = tower.run(&["meta.version", "--as", "device:admin-pad"]);
+    assert_eq!(keeper_ver.code, 0, "{}", keeper_ver.stdout);
+    let keeper_json = keeper_ver.json();
+    assert_eq!(
+        keeper_json["node_id"], owner_json["node_id"],
+        "admin-effect role must receive node_id: {keeper_json}"
+    );
+    assert!(
+        keeper_json.get("boot_id").is_none(),
+        "meta.version must omit boot_id: {keeper_json}"
+    );
+
+    for non_admin in ["viewer", "device:phone"] {
+        let ver = tower.run(&["meta.version", "--as", non_admin]);
+        assert_eq!(ver.code, 0, "{non_admin}: {}", ver.stdout);
+        let j = ver.json();
+        assert!(
+            j.get("node_id").is_none(),
+            "{non_admin} meta.version must omit node_id: {j}"
+        );
+        assert!(
+            j.get("boot_id").is_none(),
+            "{non_admin} meta.version must omit boot_id: {j}"
+        );
+    }
+
+    // 2. `legion rpc` `hello` returns `node_id` ONLY for admin-effect roles (keeping `boot_id`).
+    let send_hello = |args: &[&str]| -> Value {
+        let mut rpc = tower.session(args);
+        rpc.send_json(&rpc_request(
+            json!(1),
+            "hello",
+            json!({"client": "test", "version": "0.1.0", "protocol": 1}),
+        ));
+        let (reply, _) = rpc.reply_to(&json!(1));
+        assert_eq!(rpc.finish(), 0);
+        reply
+    };
+
+    let owner_hello = send_hello(&[]);
+    assert_eq!(
+        owner_hello["result"]["node_id"], owner_json["node_id"],
+        "{owner_hello}"
+    );
+
+    let keeper_hello = send_hello(&["--as", "device:admin-pad"]);
+    assert_eq!(
+        keeper_hello["result"]["node_id"], owner_json["node_id"],
+        "{keeper_hello}"
+    );
+
+    for non_admin in ["viewer", "device:phone"] {
+        let hello = send_hello(&["--as", non_admin]);
+        assert!(
+            hello["result"].get("node_id").is_none(),
+            "{non_admin} hello must omit node_id: {hello}"
+        );
+    }
 }
 
 #[cfg(unix)]

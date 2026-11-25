@@ -215,7 +215,19 @@ impl Node {
     }
 
     /// Answers a `hello`, refusing a client that speaks another protocol.
+    ///
+    /// Includes `node_id` only when the session's principal holds a role with the `admin` effect;
+    /// callers without a pinned principal (local / owner SSH `legion rpc`) act as `owner`.
     pub fn hello(&self, params: &HelloParams) -> Result<HelloResult, ErrorBody> {
+        self.hello_for(params, None)
+    }
+
+    /// Answers a `hello` for an optionally pinned principal (`legion gate --as` / `legion rpc --as`).
+    pub fn hello_for(
+        &self,
+        params: &HelloParams,
+        pinned: Option<&str>,
+    ) -> Result<HelloResult, ErrorBody> {
         if params.protocol != PROTOCOL {
             return Err(ErrorBody::new(
                 ErrorCode::Unsupported,
@@ -241,10 +253,16 @@ impl Node {
             }
         }
         let node_explicit = file.as_ref().map(|file| file.name.is_some());
+        let allow_node_id = self.inner.config.get::<Policy>().is_ok_and(|policy| {
+            let principal = pinned.unwrap_or(crate::policy::OWNER);
+            policy
+                .grant(principal, &self.inner.paths)
+                .allows_effect(legion_proto::Effect::Admin)
+        });
         Ok(HelloResult {
             node: self.name(),
             node_explicit,
-            node_id: self.node_id(),
+            node_id: allow_node_id.then(|| self.node_id()).flatten(),
             version: VERSION.to_owned(),
             build: BUILD.map(str::to_owned),
             protocol: PROTOCOL,
@@ -598,5 +616,58 @@ mod tests {
         std::fs::write(dir.path().join("config").join("node.toml"), "name = 3\n").unwrap();
         let broken = node.hello(&hello_params()).unwrap();
         assert_eq!(broken.node_explicit, None);
+
+        // `node_id` is returned only to principals whose role allows `Effect::Admin`.
+        std::fs::write(
+            dir.path().join("config").join("node.toml"),
+            "name = \"studio\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config").join("policy.toml"),
+            "[roles.observer]\n\
+             allow = [\"effect:read\"]\n\
+             [roles.device-operator]\n\
+             allow = [\"effect:read\", \"effect:write\"]\n\
+             [roles.keeper]\n\
+             allow = [\"effect:read\", \"effect:admin\"]\n\
+             [principals.viewer]\n\
+             role = \"observer\"\n\
+             [principals.\"device:phone\"]\n\
+             role = \"device-operator\"\n\
+             [principals.\"device:admin-pad\"]\n\
+             role = \"keeper\"\n",
+        )
+        .unwrap();
+        assert!(
+            node.hello_for(&hello_params(), None)
+                .unwrap()
+                .node_id
+                .is_some()
+        );
+        assert!(
+            node.hello_for(&hello_params(), Some("owner"))
+                .unwrap()
+                .node_id
+                .is_some()
+        );
+        assert!(
+            node.hello_for(&hello_params(), Some("device:admin-pad"))
+                .unwrap()
+                .node_id
+                .is_some()
+        );
+        assert_eq!(
+            node.hello_for(&hello_params(), Some("viewer"))
+                .unwrap()
+                .node_id,
+            None
+        );
+        assert_eq!(
+            node.hello_for(&hello_params(), Some("device:phone"))
+                .unwrap()
+                .node_id,
+            None
+        );
     }
 }

@@ -1064,18 +1064,24 @@ async fn reader_loop<R: AsyncBufRead + Unpin>(
     death_error: Arc<Mutex<Option<ErrorBody>>>,
     transport: Arc<tokio::sync::Mutex<Option<BoxHandle>>>,
 ) {
+    enum ReaderEnd {
+        Eof,
+        TooLong,
+        Io(io::Error),
+    }
+
     let mut line = Vec::new();
-    let read_err = loop {
+    let ended = loop {
         match read_line(&mut reader, &mut line, LONGEST_LINE).await {
-            Ok(Line::End) => break None,
-            Ok(Line::TooLong) => continue,
+            Ok(Line::End) => break ReaderEnd::Eof,
+            Ok(Line::TooLong) => break ReaderEnd::TooLong,
             Ok(Line::Read) => {
                 if line.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
                 dispatch_incoming(&line, &machine, &remote_version, &pending);
             }
-            Err(err) => break Some(err),
+            Err(err) => break ReaderEnd::Io(err),
         }
     };
 
@@ -1085,35 +1091,71 @@ async fn reader_loop<R: AsyncBufRead + Unpin>(
         guard.take();
     }
 
-    let (exit_code, stderr_text) = {
-        let mut handle_guard = transport.lock().await;
-        if let Some(h) = handle_guard.as_mut() {
-            h.collect_exit_info(EXIT_COLLECT_WAIT).await
-        } else {
-            let text = stderr.as_ref().map_or_else(String::new, |s| s.text());
-            (None, text)
+    let err = match ended {
+        ReaderEnd::TooLong => {
+            let trimmed_ver = remote_version.trim();
+            let message = if trimmed_ver.is_empty() {
+                format!(
+                    "{machine} sent a reply larger than this version of legion accepts (limit {LONGEST_LINE} bytes)."
+                )
+            } else {
+                format!(
+                    "{machine} (legion {trimmed_ver}) sent a reply larger than this version of legion accepts (limit {LONGEST_LINE} bytes)."
+                )
+            };
+            let details = if trimmed_ver.is_empty() {
+                json!({"reason": "reply_too_long", "limit_bytes": LONGEST_LINE})
+            } else {
+                json!({
+                    "reason": "reply_too_long",
+                    "limit_bytes": LONGEST_LINE,
+                    "remote_version": trimmed_ver,
+                })
+            };
+            ErrorBody::new(ErrorCode::Internal, message)
+                .with_hint(
+                    "Send bulk data with legion stream, or update legion if the peer sent an unexpectedly large reply.",
+                )
+                .with_machine(&machine)
+                .with_details(details)
+        }
+        ReaderEnd::Eof | ReaderEnd::Io(_) => {
+            let read_err = match ended {
+                ReaderEnd::Io(err) => Some(err),
+                _ => None,
+            };
+            let (exit_code, stderr_text) = {
+                let mut handle_guard = transport.lock().await;
+                if let Some(h) = handle_guard.as_mut() {
+                    h.collect_exit_info(EXIT_COLLECT_WAIT).await
+                } else {
+                    let text = stderr.as_ref().map_or_else(String::new, |s| s.text());
+                    (None, text)
+                }
+            };
+
+            let reason = match (read_err, exit_code) {
+                (Some(err), _) => format!("read error: {err}"),
+                (None, Some(code)) => format!("exit status {code}"),
+                (None, None) => "connection closed".to_owned(),
+            };
+            let mut err = ErrorBody::new(
+                ErrorCode::Unreachable,
+                format!(
+                    "The session to {machine} ended while the call was running ({reason}); the outcome of the call is unknown."
+                ),
+            )
+            .with_machine(&machine);
+            if !stderr_text.is_empty() {
+                err = err.with_hint(format!("Remote stderr: {stderr_text}"));
+            } else {
+                err = err.with_hint(format!(
+                    "Retry the call once {machine} is reachable again; check its state if the operation was not idempotent."
+                ));
+            }
+            err
         }
     };
-
-    let reason = match (read_err, exit_code) {
-        (Some(err), _) => format!("read error: {err}"),
-        (None, Some(code)) => format!("exit status {code}"),
-        (None, None) => "connection closed".to_owned(),
-    };
-    let mut err = ErrorBody::new(
-        ErrorCode::Unreachable,
-        format!(
-            "The session to {machine} ended while the call was running ({reason}); the outcome of the call is unknown."
-        ),
-    )
-    .with_machine(&machine);
-    if !stderr_text.is_empty() {
-        err = err.with_hint(format!("Remote stderr: {stderr_text}"));
-    } else {
-        err = err.with_hint(format!(
-            "Retry the call once {machine} is reachable again; check its state if the operation was not idempotent."
-        ));
-    }
 
     *death_error
         .lock()
@@ -2077,5 +2119,103 @@ mod tests {
 
         session.close().await;
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_reply_ends_session_and_fails_pending_call_without_hanging() {
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+
+        let server_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let first = lines.next_line().await.unwrap().unwrap();
+            assert!(first.contains("\"method\":\"hello\""));
+            let hello = Response::ok(
+                Some(Id::Number(1)),
+                serde_json::to_value(HelloResult {
+                    node: "tower".to_owned(),
+                    node_explicit: Some(true),
+                    node_id: None,
+                    version: "9.9.0".to_owned(),
+                    build: None,
+                    protocol: PROTOCOL,
+                    os: "linux".to_owned(),
+                    arch: "x86_64".to_owned(),
+                    systems: Vec::new(),
+                    system: None,
+                    boot_id: None,
+                })
+                .unwrap(),
+            );
+            server_w
+                .write_all(format!("{}\n", serde_json::to_string(&hello).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            server_w.flush().await.unwrap();
+
+            let _call: Request =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            // Send a single JSON line larger than LONGEST_LINE without closing the stream.
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut remaining = LONGEST_LINE + 1024;
+            let _ = server_w
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":\"")
+                .await;
+            while remaining > 0 {
+                let n = remaining.min(chunk.len());
+                if server_w.write_all(&chunk[..n]).await.is_err() {
+                    break;
+                }
+                remaining -= n;
+            }
+            let _ = server_w.write_all(b"\"}\n").await;
+            let _ = server_w.flush().await;
+            let _ = lines.next_line().await;
+        });
+
+        let session = Session::open_io(
+            client_r,
+            client_w,
+            "tower",
+            None,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            session.call(
+                CallParams {
+                    tool: "meta.version".into(),
+                    args: json!({}),
+                    as_principal: None,
+                    on: None,
+                    hops: 1,
+                },
+                CancellationToken::new(),
+                EventSink::discard(),
+            ),
+        )
+        .await
+        .expect("oversized reply must not hang")
+        .unwrap_err()
+        .into_error();
+
+        assert_eq!(err.code, ErrorCode::Internal, "{err:?}");
+        assert!(
+            err.message.contains("tower")
+                && err.message.contains("9.9.0")
+                && err.message.contains("larger than this version"),
+            "unexpected message: {}",
+            err.message
+        );
+        assert_eq!(err.machine.as_deref(), Some("tower"));
+        assert!(!session.is_alive(), "oversized reply must end the session");
+
+        session.close().await;
+        let _ = server_task.await;
     }
 }

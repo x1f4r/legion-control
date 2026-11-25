@@ -530,7 +530,6 @@ impl InstallBackend for SystemInstallBackend {
                             node: machine.to_owned(),
                             explicit: Some(true),
                             node_id: hello.node_id.clone(),
-                            boot_id: hello.boot_id.clone(),
                         },
                     );
                     if value.get("changed").and_then(Value::as_bool) == Some(true) {
@@ -552,7 +551,6 @@ impl InstallBackend for SystemInstallBackend {
                             node: reported.to_owned(),
                             explicit: Some(true),
                             node_id: hello.node_id.clone(),
-                            boot_id: hello.boot_id.clone(),
                         },
                     );
                     Some(
