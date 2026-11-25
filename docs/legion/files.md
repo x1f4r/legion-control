@@ -197,8 +197,9 @@ mount it:
   `{url, expires_in}`; the URL is `/v1/content/<ticket>/<file name>` on the same origin, with
   `Cross-Origin-Resource-Policy: same-origin` always set (origins listed in `[serve] origins` read
   content via CORS `fetch()` or `crossorigin`, not no-cors embedding). The door reads remote files
-  over pooled `keep_open` `legion stream` pipes and multiplexed SSH (`ControlMaster` on Unix),
-  capped below `MaxSessions` of 10 per target machine.
+  in bounded windows over a dedicated pool of warm `keep_open` `legion stream` pipes per target
+  machine, separate from transfer and RPC pipes, with per-holder fair sharing and a short acquire
+  timeout (`503 Service Unavailable` with `Retry-After`).
 - **The app**: the native side mounts the same module on a listener bound to `127.0.0.1` on a
   port the system picks, reading through `Link::open_content`. The interface asks the native
   command `content_url({machine, path})` for an address. The ticket in the path is the only

@@ -6,7 +6,6 @@
 //! name or path.
 
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -27,24 +26,12 @@ pub fn ssh_args(
     connect_timeout_secs: u64,
     remote_cmd: &str,
 ) -> Result<Vec<String>, ErrorBody> {
-    ssh_args_with_control(target, connect_timeout_secs, remote_cmd, None)
-}
-
-/// Like [`ssh_args`], optionally enabling OpenSSH `ControlMaster` connection multiplexing over
-/// `control_path` on Unix so repeated `legion rpc` and `legion stream` channels reuse one
-/// authenticated SSH connection.
-pub(crate) fn ssh_args_with_control(
-    target: &str,
-    connect_timeout_secs: u64,
-    remote_cmd: &str,
-    control_path: Option<&Path>,
-) -> Result<Vec<String>, ErrorBody> {
     validate_ssh_target(target).map_err(|reason| {
         ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}."))
             .with_hint("Check the ssh target in fleet.toml.")
     })?;
     let timeout = connect_timeout_secs.max(1);
-    let mut args = vec![
+    Ok(vec![
         "-T".to_owned(),
         "-o".to_owned(),
         "BatchMode=yes".to_owned(),
@@ -54,20 +41,9 @@ pub(crate) fn ssh_args_with_control(
         "ServerAliveInterval=15".to_owned(),
         "-o".to_owned(),
         "ServerAliveCountMax=3".to_owned(),
-    ];
-    if let Some(ctl) = control_path
-        && let Some(ctl_str) = ctl.to_str()
-    {
-        args.push("-o".to_owned());
-        args.push("ControlMaster=auto".to_owned());
-        args.push("-o".to_owned());
-        args.push(format!("ControlPath={ctl_str}"));
-        args.push("-o".to_owned());
-        args.push("ControlPersist=120".to_owned());
-    }
-    args.push(target.to_owned());
-    args.push(remote_cmd.to_owned());
-    Ok(args)
+        target.to_owned(),
+        remote_cmd.to_owned(),
+    ])
 }
 
 /// Derives the command argv for `subcommand` from a `fleet.toml` `command` entry.
@@ -128,22 +104,9 @@ impl Pipe {
         program: Option<&str>,
         connect_timeout: Duration,
     ) -> Result<Pipe, ErrorBody> {
-        Self::spawn_ssh_with_control(target, os, subcommand, program, connect_timeout, None)
-    }
-
-    /// Spawns `ssh` targeting `target`, optionally reusing an OpenSSH `ControlMaster` socket at
-    /// `control_path`.
-    pub(crate) fn spawn_ssh_with_control(
-        target: &str,
-        os: RemoteOs,
-        subcommand: Subcommand,
-        program: Option<&str>,
-        connect_timeout: Duration,
-        control_path: Option<&Path>,
-    ) -> Result<Pipe, ErrorBody> {
         let remote_cmd = remote_command(os, subcommand, program)?;
         let timeout_secs = connect_timeout.as_secs().max(1);
-        let args = ssh_args_with_control(target, timeout_secs, &remote_cmd, control_path)?;
+        let args = ssh_args(target, timeout_secs, &remote_cmd)?;
         spawn_process("ssh", &args)
     }
 
@@ -178,44 +141,6 @@ pub struct PipeHandle {
     stderr: Arc<StderrTail>,
     stderr_task: Option<JoinHandle<()>>,
     permit: Option<OwnedSemaphorePermit>,
-}
-
-/// Best-effort shutdown of an OpenSSH `ControlMaster` socket created for `target`.
-#[cfg(unix)]
-pub(crate) async fn close_ssh_control_master(target: &str, control_path: &Path) {
-    if !control_path.exists() {
-        return;
-    }
-    let Some(ctl_str) = control_path.to_str() else {
-        return;
-    };
-    let mut cmd = Command::new("ssh");
-    cmd.args(["-o", "BatchMode=yes", "-S", ctl_str, "-O", "exit", target])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    if let Ok(mut child) = cmd.spawn() {
-        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-    }
-    let _ = std::fs::remove_file(control_path);
-}
-
-/// Non-blocking best-effort shutdown of an OpenSSH `ControlMaster` socket (for `Drop`).
-#[cfg(unix)]
-pub(crate) fn close_ssh_control_master_sync(target: &str, control_path: &Path) {
-    if !control_path.exists() {
-        return;
-    }
-    if let Some(ctl_str) = control_path.to_str() {
-        let _ = std::process::Command::new("ssh")
-            .args(["-o", "BatchMode=yes", "-S", ctl_str, "-O", "exit", target])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = std::fs::remove_file(control_path);
 }
 
 impl PipeHandle {
@@ -448,6 +373,31 @@ mod tests {
                 .code,
             ErrorCode::InvalidArgs
         );
+    }
+
+    #[test]
+    fn no_ssh_invocation_contains_control_options() {
+        for os in [RemoteOs::Unix, RemoteOs::Windows] {
+            for subcommand in [Subcommand::Rpc, Subcommand::Stream] {
+                for program in [None, Some("/opt/legion/legion")] {
+                    let remote_cmd = remote_command(os, subcommand, program).unwrap();
+                    let args = ssh_args("me@tower.example", 10, &remote_cmd).unwrap();
+                    // Check every option flag and `-o` value before the target and remote command.
+                    for arg in &args[..args.len() - 2] {
+                        let lower = arg.to_ascii_lowercase();
+                        assert!(
+                            !lower.contains("controlmaster")
+                                && !lower.contains("controlpath")
+                                && !lower.contains("controlpersist")
+                                && arg != "-M"
+                                && arg != "-S"
+                                && arg != "-O",
+                            "unexpected control option {arg:?} in {args:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

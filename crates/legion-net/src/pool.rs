@@ -88,7 +88,6 @@ struct PoolInner {
     slots: Mutex<HashMap<String, Arc<MachineSlot>>>,
     connect_permits: Arc<Semaphore>,
     state: StateStore,
-    mux: ControlMux,
     /// Bumped on [`Fleet::close`] so an in-flight connect started before shutdown never installs a
     /// session afterwards.
     generation: AtomicU64,
@@ -114,133 +113,6 @@ struct IdleContentPipe {
     last_used: Instant,
 }
 
-#[cfg(unix)]
-struct ControlMux {
-    dir: Mutex<Option<std::path::PathBuf>>,
-    sockets: Mutex<HashMap<String, Vec<(String, std::path::PathBuf)>>>,
-}
-
-#[cfg(not(unix))]
-struct ControlMux;
-
-#[cfg(unix)]
-impl ControlMux {
-    fn new() -> Self {
-        Self {
-            dir: Mutex::new(None),
-            sockets: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn control_path(&self, machine: &str, target: &str) -> Option<std::path::PathBuf> {
-        use std::os::unix::fs::DirBuilderExt;
-        static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
-
-        let dir = {
-            let mut guard = self.dir.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(existing) = guard.as_ref() {
-                existing.clone()
-            } else {
-                let base = {
-                    let tmp = std::env::temp_dir();
-                    if tmp.to_string_lossy().len() <= 40 {
-                        tmp
-                    } else {
-                        std::path::PathBuf::from("/tmp")
-                    }
-                };
-                let seq = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-                let path = base.join(format!("lgn-{}-{seq}", std::process::id()));
-                let mut builder = std::fs::DirBuilder::new();
-                builder.mode(0o700);
-                if builder.create(&path).is_err() && !path.is_dir() {
-                    return None;
-                }
-                *guard = Some(path.clone());
-                path
-            }
-        };
-
-        let hash = fnv1a64(target.as_bytes());
-        let sock = dir.join(format!("{hash:016x}.ctl"));
-        if sock.to_string_lossy().len() >= 96 {
-            return None;
-        }
-        let mut sockets = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
-        let list = sockets.entry(machine.to_owned()).or_default();
-        if !list.iter().any(|(_, existing)| existing == &sock) {
-            list.push((target.to_owned(), sock.clone()));
-        }
-        Some(sock)
-    }
-
-    async fn close_machine(&self, machine: &str) {
-        let removed = self
-            .sockets
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(machine)
-            .unwrap_or_default();
-        for (target, sock) in removed {
-            crate::connector::close_ssh_control_master(&target, &sock).await;
-        }
-    }
-
-    async fn close_all(&self) {
-        let all: Vec<(String, std::path::PathBuf)> = {
-            let mut guard = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
-            guard.drain().flat_map(|(_, v)| v).collect()
-        };
-        for (target, sock) in all {
-            crate::connector::close_ssh_control_master(&target, &sock).await;
-        }
-        if let Some(dir) = self.dir.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for ControlMux {
-    fn drop(&mut self) {
-        let all: Vec<(String, std::path::PathBuf)> = {
-            let mut guard = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
-            guard.drain().flat_map(|(_, v)| v).collect()
-        };
-        for (target, sock) in all {
-            crate::connector::close_ssh_control_master_sync(&target, &sock);
-        }
-        if let Some(dir) = self.dir.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
-#[cfg(not(unix))]
-impl ControlMux {
-    fn new() -> Self {
-        Self
-    }
-
-    fn control_path(&self, _machine: &str, _target: &str) -> Option<std::path::PathBuf> {
-        None
-    }
-
-    async fn close_machine(&self, _machine: &str) {}
-
-    async fn close_all(&self) {}
-}
-
 #[derive(Clone)]
 struct LiveEntry {
     session: Arc<Session>,
@@ -259,7 +131,6 @@ impl Fleet {
                 slots: Mutex::new(HashMap::new()),
                 connect_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTS)),
                 state: StateStore::new(paths.state_dir()),
-                mux: ControlMux::new(),
                 generation: AtomicU64::new(0),
             }),
         }
@@ -625,14 +496,12 @@ impl Fleet {
                 target, program, ..
             } => {
                 let os = resolved_os.unwrap_or(RemoteOs::Unix);
-                let control = self.inner.mux.control_path(machine, target);
-                Pipe::spawn_ssh_with_control(
+                Pipe::spawn_ssh(
                     target,
                     os,
                     subcommand,
                     program.as_deref(),
                     SINGLE_SYSTEM_TIMEOUT,
-                    control.as_deref(),
                 )
             }
         }
@@ -935,11 +804,10 @@ impl Fleet {
                 live.session.close().await;
             }
         }
-        self.inner.mux.close_machine(machine).await;
     }
 
-    /// Closes every open session, idle stream pipe, and SSH control master cleanly (EOF on stdin,
-    /// short wait, then kill).
+    /// Closes every open session and idle stream pipe cleanly (EOF on stdin, short wait, then
+    /// kill).
     pub async fn close(&self) {
         self.inner.generation.fetch_add(1, Ordering::AcqRel);
         let slots: Vec<Arc<MachineSlot>> = {
@@ -978,7 +846,6 @@ impl Fleet {
             }
         }
         while closing.join_next().await.is_some() {}
-        self.inner.mux.close_all().await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1447,14 +1314,12 @@ impl Fleet {
                 };
                 let mut last_err = None;
                 for (index, candidate_os) in attempts.iter().copied().enumerate() {
-                    let control = self.inner.mux.control_path(machine, target);
-                    let pipe = Pipe::spawn_ssh_with_control(
+                    let pipe = Pipe::spawn_ssh(
                         target,
                         candidate_os,
                         Subcommand::Rpc,
                         program.as_deref(),
                         timeout,
-                        control.as_deref(),
                     )
                     .map_err(|err| OpenError::Unreachable {
                         error: err.with_machine(machine),

@@ -1055,8 +1055,9 @@ Security and lifecycle guarantees:
   holder (16), and globally (64), answering `429 Too Many Requests` with `Retry-After` and
   `Connection: close`, and stalled or overly slow readers are disconnected after a write-idle
   timeout (15 s) or minimum transfer rate window (40 KiB / 10 s) so API and UI routes stay
-  responsive. Remote reads reuse pooled `keep_open` `legion stream` pipes and multiplexed SSH
-  connections (`ControlMaster` on Unix), capped at 8 concurrent streams per target machine.
+  responsive. Remote reads reuse warm `keep_open` `legion stream` pipes from a dedicated per-target
+  content pool (separate from transfers and RPC), reading in bounded windows with per-holder fair
+  sharing and returning `503 Service Unavailable` with `Retry-After` if acquiring a pipe times out.
 
 ### Event stream (SSE)
 
