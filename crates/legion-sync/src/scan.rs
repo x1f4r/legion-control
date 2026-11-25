@@ -1128,6 +1128,21 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
     rel_path: &str,
     now: Timestamp,
 ) -> Result<SingleRescanOutcome> {
+    rescan_single_path_with_force(fs, store, rel_path, now, false)
+}
+
+/// Rescans a single relative path on disk; when `force_bump` is `true` (used after the engine
+/// already displaced the previously indexed file and a person concurrently placed a new file at
+/// `rel_path`), a live entry on disk always receives a bumped version even if its content hash
+/// matches the displaced record's hash (for example when the person renamed a conflict copy back
+/// into place or undid an edit).
+pub fn rescan_single_path_with_force<F: SyncFs, S: IndexStore>(
+    fs: &F,
+    store: &mut S,
+    rel_path: &str,
+    now: Timestamp,
+    force_bump: bool,
+) -> Result<SingleRescanOutcome> {
     let clean = validate_sync_path(rel_path)?;
     let mut meta = store
         .load_meta()?
@@ -1281,7 +1296,8 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                 None
             };
 
-            if let Some(ref existing) = prev_opt
+            if !force_bump
+                && let Some(ref existing) = prev_opt
                 && !existing.deleted
                 && existing.kind == disk_meta.kind
                 && existing.hash == hash

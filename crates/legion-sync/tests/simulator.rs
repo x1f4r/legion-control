@@ -2870,7 +2870,7 @@ impl SimWorld {
 
         // Reconcile any mid-apply human edits into provenance tables BEFORE checking invariants!
         for fired in self.members[dst_idx].engine.fs().take_mid_apply_fired() {
-            for h in fired.removed_hashes {
+            for &h in &fired.removed_hashes {
                 self.note_person_removed(&dst_id, h);
             }
             if let Some(h) = fired.created_hash {
@@ -2882,7 +2882,19 @@ impl SimWorld {
                 self.note_person_touched_path(&dst_id, sec);
                 self.clear_universally_deleted_for_path(sec);
             }
-            self.log(|| format!("{dst_id} MID_APPLY_HUMAN on {:?}", fired.touched_path));
+            self.log(|| {
+                format!(
+                    "{dst_id} MID_APPLY_HUMAN on {:?} created={:?} removed={:?} secondary={:?}",
+                    fired.touched_path,
+                    fired.created_hash.map(|h| h.to_hex()[..8].to_string()),
+                    fired
+                        .removed_hashes
+                        .iter()
+                        .map(|h| h.to_hex()[..8].to_string())
+                        .collect::<Vec<_>>(),
+                    fired.secondary_path
+                )
+            });
         }
 
         if leaked {
@@ -5799,7 +5811,7 @@ const REGRESSION_SEEDS: &[u64] = &[
     1276023, 1381582, 1442864, 1631700, 1735939, 1845682, 1905590, 2132430, 2242736, 2469631,
     2508764, 2770489, 2777393, 2838112, 2844675, 2972224, 3137180, 3286448, 3660488, 3804523,
     3954961, 4066064, 4319726, 4377839, 4395930, 4560644, 4628071, 4717156, 6102439, 6250401,
-    8730315, 9067232, 13635160, 17469556, 18877611, 37147542,
+    8730315, 9067232, 13635160, 17469556, 18877611, 19447454, 37147542,
 ];
 
 #[test]

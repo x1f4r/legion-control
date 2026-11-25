@@ -281,3 +281,62 @@ fn r7_fallback_claim_putback_fails() {
     let w1 = where_is(&t.join("pi"), b"pi save 1 (in place)");
     assert!(!w1.is_empty(), "save 1 erased");
 }
+
+/// A person saving the previous version's bytes (e.g. hitting Undo or renaming a conflict copy
+/// back into place) right after sync displaced the old file must bump the version so both
+/// versions survive live instead of the remote edit silently clobbering the person's save.
+#[test]
+fn r8_same_hash_undo_after_displace_survives_live() {
+    let tmp = scratch();
+    let t = tmp.path();
+    let (mut tower, mut pi) = two_members(t);
+    pi.fs_mut().no_exchange = true;
+    fs::write(t.join("tower/doc.txt"), b"tower edit v2").unwrap();
+    tower.scan(ts(10)).unwrap();
+
+    // Right after pi claims & removes `doc.txt` ("v1 original") during claim-then-rename, the
+    // person puts "v1 original" back into `doc.txt` (identical hash to the displaced file).
+    let p = t.join("pi/doc.txt");
+    pi.fs()
+        .add("move_live_to_tmp_no_replace", When::After, 1, move || {
+            write_via_rename(&p, b"v1 original");
+            Act::Continue
+        });
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(20))
+        .unwrap();
+    assert!(pi.fs().all_fired());
+    pi.fs().clear();
+
+    // Converge both directions; BOTH "v1 original" (person's post-displace save) AND
+    // "tower edit v2" must survive LIVE on both machines!
+    for step in 0..3 {
+        pi.scan(ts(30 + step)).unwrap();
+        tower.scan(ts(30 + step)).unwrap();
+        tower
+            .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(30 + step))
+            .unwrap();
+        pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(30 + step))
+            .unwrap();
+    }
+    let live_v1_pi: Vec<_> = where_is(&t.join("pi"), b"v1 original")
+        .into_iter()
+        .filter(|p| !p.starts_with(".legion-sync"))
+        .collect();
+    let live_v2_pi: Vec<_> = where_is(&t.join("pi"), b"tower edit v2")
+        .into_iter()
+        .filter(|p| !p.starts_with(".legion-sync"))
+        .collect();
+    let live_v1_tower: Vec<_> = where_is(&t.join("tower"), b"v1 original")
+        .into_iter()
+        .filter(|p| !p.starts_with(".legion-sync"))
+        .collect();
+    assert!(
+        !live_v1_pi.is_empty(),
+        "person's post-displace v1 save lost on pi"
+    );
+    assert!(!live_v2_pi.is_empty(), "tower edit v2 lost on pi");
+    assert!(
+        !live_v1_tower.is_empty(),
+        "person's post-displace v1 save never reached tower"
+    );
+}

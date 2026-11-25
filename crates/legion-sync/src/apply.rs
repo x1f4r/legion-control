@@ -28,7 +28,9 @@ use crate::reconcile::{
     LocalIndexView, ReconcileDecision, check_local_representable, choose_conflict_path,
     derive_conflict_of,
 };
-use crate::scan::{SingleRescanOutcome, disk_matches_index, rescan_single_path};
+use crate::scan::{
+    SingleRescanOutcome, disk_matches_index, rescan_single_path, rescan_single_path_with_force,
+};
 use crate::traits::{FsMeta, IndexStore, Peer, StoreBatch, SyncFs, SyncWrite};
 use crate::version::VersionVector;
 
@@ -1968,7 +1970,7 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                         Vec::new()
                     };
                     mark_needs_rescan_and_clear_pending(store, &[&path], bins)?;
-                    return handle_local_changed(fs, store, &path, now);
+                    return handle_local_changed_after_displace(fs, store, &path, now);
                 }
                 SafeReplaceResult::RaceBeforePlace => {
                     // `tmp` was never exchanged and still holds our staged download.
@@ -2047,6 +2049,15 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
         }
 
         // Place new entry using non-replacing primitives!
+        let displaced_existing = existing_live.is_some();
+        let on_place_race = |store: &mut S, bins: Vec<BinEntry>| -> Result<ApplyOutcome> {
+            mark_needs_rescan_and_clear_pending(store, &[&path], bins)?;
+            if displaced_existing {
+                handle_local_changed_after_displace(fs, store, &path, now)
+            } else {
+                handle_local_changed(fs, store, &path, now)
+            }
+        };
         match target.kind {
             EntryKind::File => {
                 if let Some(ref tmp) = staged_tmp {
@@ -2054,8 +2065,7 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                         Ok(()) => {}
                         Err(err) if is_mid_apply_race_error(&err) => {
                             let _ = fs.remove_tmp(tmp);
-                            mark_needs_rescan_and_clear_pending(store, &[&path], persisted_bins)?;
-                            return handle_local_changed(fs, store, &path, now);
+                            return on_place_race(store, persisted_bins);
                         }
                         Err(err) => return Err(err),
                     }
@@ -2068,16 +2078,14 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                     true,
                     now,
                 )? {
-                    mark_needs_rescan_and_clear_pending(store, &[&path], persisted_bins)?;
-                    return handle_local_changed(fs, store, &path, now);
+                    return on_place_race(store, persisted_bins);
                 }
             }
             EntryKind::Dir => {
                 match fs.create_dir_all_live(&path) {
                     Ok(()) => {}
                     Err(err) if is_mid_apply_race_error(&err) => {
-                        mark_needs_rescan_and_clear_pending(store, &[&path], persisted_bins)?;
-                        return handle_local_changed(fs, store, &path, now);
+                        return on_place_race(store, persisted_bins);
                     }
                     Err(err) => return Err(err),
                 }
@@ -2095,8 +2103,7 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                 match fs.create_symlink_live(&path, link_target) {
                     Ok(()) => {}
                     Err(err) if is_mid_apply_race_error(&err) => {
-                        mark_needs_rescan_and_clear_pending(store, &[&path], persisted_bins)?;
-                        return handle_local_changed(fs, store, &path, now);
+                        return on_place_race(store, persisted_bins);
                     }
                     Err(err) => return Err(err),
                 }
@@ -2651,6 +2658,32 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
             }
         }
 
+        let commit_loser_if_still_on_disk = |store: &mut S,
+                                             mut loser: IndexRecord,
+                                             bins: Vec<BinEntry>,
+                                             peer_id: &str|
+         -> Result<()> {
+            if disk_matches_record(fs, &conflict_path, &loser)? {
+                record_disk_stat(fs, &conflict_path, &mut loser)?;
+                commit_records_and_clear_pending(
+                    fs,
+                    store,
+                    vec![loser],
+                    bins,
+                    vec![(peer_id.to_string(), conflict_path.clone())],
+                    Vec::new(),
+                )?;
+                mark_needs_rescan(store, &[&orig_path])?;
+            } else {
+                // A person moved, deleted, or modified `conflict_path` before Step 6 ran; do
+                // NOT commit a phantom live record for `conflict_path` (which would cause a
+                // phantom tombstone on the next scan).
+                mark_needs_rescan_and_clear_pending(store, &[&orig_path, &conflict_path], bins)?;
+                let _ = rescan_single_path(fs, store, &conflict_path, now)?;
+            }
+            Ok(())
+        };
+
         // 6. Place remote winner at `orig_path` using non-replacing rename!
         match winner_record.kind {
             EntryKind::File => {
@@ -2659,16 +2692,13 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                         Ok(()) => {}
                         Err(err) if is_mid_apply_race_error(&err) => {
                             let _ = fs.remove_tmp(tmp);
-                            commit_records_and_clear_pending(
-                                fs,
+                            commit_loser_if_still_on_disk(
                                 store,
-                                vec![loser_record],
+                                loser_record,
                                 persisted_bins,
-                                vec![(peer.member_id().to_string(), conflict_path)],
-                                Vec::new(),
+                                peer.member_id(),
                             )?;
-                            mark_needs_rescan(store, &[&orig_path])?;
-                            return handle_local_changed(fs, store, &orig_path, now);
+                            return handle_local_changed_after_displace(fs, store, &orig_path, now);
                         }
                         Err(err) => return Err(err),
                     }
@@ -2681,32 +2711,26 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                     true,
                     now,
                 )? {
-                    commit_records_and_clear_pending(
-                        fs,
+                    commit_loser_if_still_on_disk(
                         store,
-                        vec![loser_record],
+                        loser_record,
                         persisted_bins,
-                        vec![(peer.member_id().to_string(), conflict_path)],
-                        Vec::new(),
+                        peer.member_id(),
                     )?;
-                    mark_needs_rescan(store, &[&orig_path])?;
-                    return handle_local_changed(fs, store, &orig_path, now);
+                    return handle_local_changed_after_displace(fs, store, &orig_path, now);
                 }
             }
             EntryKind::Dir => {
                 match fs.create_dir_all_live(&orig_path) {
                     Ok(()) => {}
                     Err(err) if is_mid_apply_race_error(&err) => {
-                        commit_records_and_clear_pending(
-                            fs,
+                        commit_loser_if_still_on_disk(
                             store,
-                            vec![loser_record],
+                            loser_record,
                             persisted_bins,
-                            vec![(peer.member_id().to_string(), conflict_path)],
-                            Vec::new(),
+                            peer.member_id(),
                         )?;
-                        mark_needs_rescan(store, &[&orig_path])?;
-                        return handle_local_changed(fs, store, &orig_path, now);
+                        return handle_local_changed_after_displace(fs, store, &orig_path, now);
                     }
                     Err(err) => return Err(err),
                 }
@@ -2724,16 +2748,13 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                 match fs.create_symlink_live(&orig_path, link_target) {
                     Ok(()) => {}
                     Err(err) if is_mid_apply_race_error(&err) => {
-                        commit_records_and_clear_pending(
-                            fs,
+                        commit_loser_if_still_on_disk(
                             store,
-                            vec![loser_record],
+                            loser_record,
                             persisted_bins,
-                            vec![(peer.member_id().to_string(), conflict_path)],
-                            Vec::new(),
+                            peer.member_id(),
                         )?;
-                        mark_needs_rescan(store, &[&orig_path])?;
-                        return handle_local_changed(fs, store, &orig_path, now);
+                        return handle_local_changed_after_displace(fs, store, &orig_path, now);
                     }
                     Err(err) => return Err(err),
                 }
@@ -2741,18 +2762,33 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
             }
         }
 
-        // 7. Commit BOTH records atomically and clear pending op.
-        commit_records_and_clear_pending(
-            fs,
-            store,
-            vec![loser_record, winner_record],
-            persisted_bins,
-            vec![
-                (peer.member_id().to_string(), orig_path),
-                (peer.member_id().to_string(), conflict_path),
-            ],
-            Vec::new(),
-        )?;
+        // 7. Commit records atomically and clear pending op, verifying `conflict_path` is still
+        // intact on disk before committing `loser_record` so a concurrent move never becomes a
+        // phantom live record + phantom deletion.
+        if disk_matches_record(fs, &conflict_path, &loser_record)? {
+            record_disk_stat(fs, &conflict_path, &mut loser_record)?;
+            commit_records_and_clear_pending(
+                fs,
+                store,
+                vec![loser_record, winner_record],
+                persisted_bins,
+                vec![
+                    (peer.member_id().to_string(), orig_path),
+                    (peer.member_id().to_string(), conflict_path),
+                ],
+                Vec::new(),
+            )?;
+        } else {
+            commit_records_and_clear_pending(
+                fs,
+                store,
+                vec![winner_record],
+                persisted_bins,
+                vec![(peer.member_id().to_string(), orig_path)],
+                Vec::new(),
+            )?;
+            mark_needs_rescan(store, &[&conflict_path])?;
+        }
         Ok(ApplyOutcome::Applied)
     })();
 
@@ -3158,31 +3194,54 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                         Ok(()) => {}
                         Err(err) if is_mid_apply_race_error(&err) => {
                             // A person wrote a new non-directory at `anc` right after we moved the
-                            // previous entry aside! Commit `loser` (already safely at
-                            // `conflict_path`), rescan `anc`, and retry so both entries survive.
-                            commit_records_and_clear_pending(
-                                fs,
-                                store,
-                                vec![loser],
-                                persisted_bins,
-                                Vec::new(),
-                                Vec::new(),
-                            )?;
-                            mark_needs_rescan(store, &[anc])?;
+                            // previous entry aside! Commit `loser` only if still intact on disk,
+                            // rescan `anc`, and retry so both entries survive.
+                            if disk_matches_record(fs, &conflict_path, &loser)? {
+                                record_disk_stat(fs, &conflict_path, &mut loser)?;
+                                commit_records_and_clear_pending(
+                                    fs,
+                                    store,
+                                    vec![loser],
+                                    persisted_bins,
+                                    Vec::new(),
+                                    Vec::new(),
+                                )?;
+                                mark_needs_rescan(store, &[anc])?;
+                            } else {
+                                mark_needs_rescan_and_clear_pending(
+                                    store,
+                                    &[anc, &conflict_path],
+                                    persisted_bins,
+                                )?;
+                                let _ = rescan_single_path(fs, store, &conflict_path, now)?;
+                            }
                             let _ = rescan_single_path(fs, store, anc, now)?;
                             return Ok(AncestorOutcome::ChangedRetry);
                         }
                         Err(err) => return Err(err),
                     }
                     record_disk_stat(fs, anc, &mut dir_record)?;
-                    commit_records_and_clear_pending(
-                        fs,
-                        store,
-                        vec![loser, dir_record],
-                        persisted_bins,
-                        Vec::new(),
-                        Vec::new(),
-                    )?;
+                    if disk_matches_record(fs, &conflict_path, &loser)? {
+                        record_disk_stat(fs, &conflict_path, &mut loser)?;
+                        commit_records_and_clear_pending(
+                            fs,
+                            store,
+                            vec![loser, dir_record],
+                            persisted_bins,
+                            Vec::new(),
+                            Vec::new(),
+                        )?;
+                    } else {
+                        commit_records_and_clear_pending(
+                            fs,
+                            store,
+                            vec![dir_record],
+                            persisted_bins,
+                            Vec::new(),
+                            Vec::new(),
+                        )?;
+                        mark_needs_rescan(store, &[&conflict_path])?;
+                    }
                     Ok(AncestorOutcome::Ready)
                 })();
                 match recover_on_non_crash_error(fs, store, anc_res, now)? {
@@ -4507,6 +4566,22 @@ fn handle_local_changed<F: SyncFs, S: IndexStore>(
     now: Timestamp,
 ) -> Result<ApplyOutcome> {
     match rescan_single_path(fs, store, path, now)? {
+        SingleRescanOutcome::Updated(_) | SingleRescanOutcome::Unchanged => {
+            Ok(ApplyOutcome::LocalChangedRetry)
+        }
+        SingleRescanOutcome::Unstable => Ok(ApplyOutcome::Deferred {
+            reason: format!("'{path}' is actively changing on disk"),
+        }),
+    }
+}
+
+fn handle_local_changed_after_displace<F: SyncFs, S: IndexStore>(
+    fs: &F,
+    store: &mut S,
+    path: &str,
+    now: Timestamp,
+) -> Result<ApplyOutcome> {
+    match rescan_single_path_with_force(fs, store, path, now, true)? {
         SingleRescanOutcome::Updated(_) | SingleRescanOutcome::Unchanged => {
             Ok(ApplyOutcome::LocalChangedRetry)
         }
