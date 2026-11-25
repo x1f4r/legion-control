@@ -43,7 +43,7 @@ One table in `legion-core` (`media`) maps a file extension to a **category** and
 | --- | --- |
 | `image` | jpg, jpeg, png, gif, webp, avif, heic, bmp, svg, tif |
 | `video` | mp4, m4v, mov, webm, mkv, avi |
-| `audio` | mp3, m4a, aac, flac, ogg, opus, wav |
+| `audio` | mp3, m4a, m4b, aac, flac, ogg, opus, wav, aif, aiff |
 | `document` | pdf, epub, doc(x), xls(x), ppt(x), odt, ods, odp |
 | `text` | txt, md, log, csv, json, toml, yaml, xml, html, css, source code |
 | `archive` | zip, tar, gz, xz, zst, 7z, rar |
@@ -82,7 +82,20 @@ node.
   `on: "all"` it fans out concurrently across the fleet, returning `{"results": {"<machine>":
   {"ok": {machine, matches, truncated, reason?}} | {"error": {code, message, hint?, machine}}}}`
   so unreachable machines are reported per key rather than failing the search.
-- `fs.thumb` (read): `{paths: [1..32], size: 96..512 = 256, fit: "contain" | "cover"}` returns
+- `fs.tags` (read): `{paths: [1..32]}` returns one entry per input path in input order:
+  `{"results": [{path, ok: {title?, artist?, album?, album_artist?, track?, disc?, year?,
+  duration_s?, cover}} | {path, error}]}`. Reads ID3v2 (2.2/2.3/2.4 including unsynchronisation
+  and text encodings) and ID3v1 in MP3, ID3 chunks in WAV and AIFF, FLAC metadata blocks, Vorbis
+  comments in Ogg Vorbis and Opus (including `METADATA_BLOCK_PICTURE`), and MP4 items in M4A, M4B
+  and MP4, with container `duration_s` without decoding audio. Text fields are trimmed, stripped of
+  control characters, capped at 512 characters and omitted when empty; `cover` reports whether
+  `fs.thumb` has an embedded or folder picture for the file; non-audio regular files report
+  per-path `unsupported`. Parsing runs inside the same out-of-process worker from the already-opened
+  file handle under the same memory cap, pool budget and time limit, reading at most 16 MiB of tag
+  data per file. Allowed exactly when `fs.read` of the file is (and folder cover detection checks
+  `fs.read` of the folder picture per caller); file-intrinsic tags share `thumb-cache/` and its
+  invalidation key.
+- `fs.thumb` (read): `{paths: [1..32], size: 96..1024 = 256, fit: "contain" | "cover"}` returns
   exactly one entry per input path in input order: `{"results": [{path, ok: {mime, content
   (base64), width, height}} | {path, error}]}`. Regular files are opened non-blockingly once
   (`O_NONBLOCK | O_NOCTTY` plus `fstat` regular-file verification on Unix; disk file check on
@@ -93,7 +106,14 @@ node.
   budget before reading the full file, and decoded out-of-process in a memory-bounded worker that
   receives the already-opened file handle on `stdin`, starts with a cleared minimal environment,
   validates its CLI arguments strictly before allocating, and opens nothing by path (JPEG, PNG, GIF
-  first frame, WebP, BMP; EXIF orientation applied). Admission caps source files at 64 MiB and
+  first frame, WebP, BMP; EXIF orientation applied; target sizes above 512 add 8 MiB of output
+  buffer headroom to admission sizing). Audio files (including audio-only MP4) extract their
+  embedded cover (front cover preferred, else first valid picture; at most 16 MiB of tag data)
+  inside the same worker and decode it through the exact same picture probe, tightened allocator
+  cap and limits; when no embedded cover exists, `fs.thumb` falls back to a regular picture file in
+  the same folder named `cover`, `folder`, `front` or `album` (`jpg`, `jpeg`, `png` or `webp`, any
+  case, allowed when `fs.read` of that file is) and returns per-path `not_found` when none exists.
+  Admission caps source image files at 64 MiB and
   estimated peak decode memory at 256 MiB per image (admitting 48–61 MP baseline JPEGs while
   capping heavier progressive/16-bit/interlaced encodings). Over-cap JPEGs fall back to a validated
   embedded MPF preview (preferred) or EXIF IFD1 thumbnail through the same limits with the main
