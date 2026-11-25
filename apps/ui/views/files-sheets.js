@@ -37,6 +37,8 @@ export function SendToSheet({
   machines = [],
   favourites = [],
   caps,
+  capsStore = null,
+  folderChanges = null,
   allowedSet,
   wakePendingSet = null,
   deviceNoun = 'phone',
@@ -49,7 +51,20 @@ export function SendToSheet({
   onClose,
 }) {
   const [mode, setMode] = useState('copy'); // 'copy' | 'move'
+  const [, setCapsRev] = useState(0);
   const canWake = allowedSet ? allowedSet.has('power.wake') : false;
+
+  useEffect(() => {
+    if (!capsStore) return undefined;
+    const unsub = capsStore.subscribe(() => setCapsRev((n) => n + 1));
+    if (sourceMachine) capsStore.ensure(sourceMachine).catch(() => {});
+    return unsub;
+  }, [capsStore, sourceMachine]);
+
+  const sourceCaps = useMemo(
+    () => (capsStore && sourceMachine ? capsStore.fileCapabilities(sourceMachine, { fallbackAllowedSet: allowedSet }) : caps),
+    [capsStore, sourceMachine, allowedSet, caps, capsStore ? capsStore.getRevision() : 0],
+  );
 
   // Order machines: online other machines first, then off machines, then source machine last.
   const orderedMachines = useMemo(() => {
@@ -78,8 +93,12 @@ export function SendToSheet({
 
   const isSameMachine = dest === sourceMachine;
   const canMove = isSameMachine
-    ? Boolean(caps?.hasMove || caps?.hasTransferMove)
-    : Boolean(caps?.hasTransferMove);
+    ? Boolean(sourceCaps?.hasMove || sourceCaps?.hasTransferMove)
+    : Boolean(sourceCaps?.hasTransferMove);
+
+  useEffect(() => {
+    if (!canMove && mode === 'move') setMode('copy');
+  }, [canMove, mode]);
 
   // While any offline machine shown in this sheet is waking, poll fleet status so it becomes
   // selectable in place as soon as it answers.
@@ -139,8 +158,10 @@ export function SendToSheet({
     let alive = true;
     setBrowseLoading(true);
     setBrowseError(null);
-    link
-      .call('fs.list', { path: browsePath, depth: 1, hidden: false }, { on: dest })
+    const listCall = capsStore
+      ? capsStore.call('fs.list', { path: browsePath, depth: 1, hidden: false }, { on: dest }).then((r) => r.value)
+      : link.call('fs.list', { path: browsePath, depth: 1, hidden: false }, { on: dest });
+    listCall
       .then((res) => {
         if (!alive) return;
         const resolved = res?.path || browsePath;
@@ -156,7 +177,7 @@ export function SendToSheet({
     return () => {
       alive = false;
     };
-  }, [pickingFolder, dest, browsePath]);
+  }, [pickingFolder, dest, browsePath, capsStore]);
 
   const allSizesKnown =
     items.length > 0 && items.every((it) => it && it.kind !== 'dir' && Number.isFinite(it.size));
@@ -172,7 +193,7 @@ export function SendToSheet({
   ].filter(Boolean);
 
   const isDeviceDest = dest === '__device__';
-  const effectiveMode = isDeviceDest ? 'copy' : mode;
+  const effectiveMode = !isDeviceDest && canMove ? mode : 'copy';
   const confirmLabel = isDeviceDest
     ? `Download to this ${deviceNoun}`
     : dest === sourceMachine
@@ -222,14 +243,49 @@ export function SendToSheet({
     recordRecentDestination(safeStorage(), destMachine, targetDir);
 
     // Same-machine Move uses `fs.move` and same-machine Copy uses `fs.copy` — instant, no job.
-    if (destMachine === sourceMachine && ((isMove && caps?.hasMove) || (!isMove && caps?.hasCopy))) {
+    if (destMachine === sourceMachine && ((isMove && sourceCaps?.hasMove) || (!isMove && sourceCaps?.hasCopy))) {
       const toolName = isMove ? 'fs.move' : 'fs.copy';
       const folderName = folderDisplayName(targetDir, { technical });
       const runLocal = async () => {
-        for (const item of items) {
+        const touchedSources = new Set();
+        let anySucceeded = false;
+        for (let idx = 0; idx < items.length; idx += 1) {
+          const item = items[idx];
           const destPath = buildTransferDestination(targetDir, item.path);
           if (destPath === item.path) continue;
-          await link.call(toolName, { from: item.path, to: destPath }, { on: sourceMachine }).catch(() => {});
+          const callPromise = capsStore
+            ? capsStore.call(toolName, { from: item.path, to: destPath }, { on: sourceMachine })
+            : link.call(toolName, { from: item.path, to: destPath }, { on: sourceMachine });
+          const ok = await callPromise.then(() => true, () => false);
+          if (ok) {
+            anySucceeded = true;
+            const srcParent = parentFilePath(item.path) || '~';
+            if (isMove) touchedSources.add(srcParent);
+            if (idx < items.length - 1 && folderChanges) {
+              folderChanges.changed(sourceMachine, targetDir, {
+                throttle: true,
+                reason: isMove ? 'move' : 'copy',
+              });
+              if (isMove) {
+                folderChanges.changed(sourceMachine, srcParent, {
+                  throttle: true,
+                  reason: 'move',
+                });
+              }
+            }
+          }
+        }
+        if (anySucceeded && folderChanges) {
+          folderChanges.changed(sourceMachine, targetDir, {
+            throttle: false,
+            reason: isMove ? 'move' : 'copy',
+          });
+          for (const srcParent of touchedSources) {
+            folderChanges.changed(sourceMachine, srcParent, {
+              throttle: false,
+              reason: 'move',
+            });
+          }
         }
         if (onLocalDone) onLocalDone();
       };
@@ -248,17 +304,34 @@ export function SendToSheet({
       const startedJobs = [];
       for (const item of items) {
         const destPath = buildTransferDestination(targetDir, item.path);
+        const srcDir = parentFilePath(item.path) || '~';
         const baseArgs = {
           from: item.path,
           to: `${destMachine}:${destPath}`,
+          background: true,
+          if_exists: 'rename',
         };
-        if (caps?.hasTransferBg) baseArgs.background = true;
-        if (caps?.hasTransferIfExists) baseArgs.if_exists = 'rename';
-        if (isMove && caps?.hasTransferMove) baseArgs.move = true;
+        if (isMove) baseArgs.move = true;
+
+        const callTransfer = (targetMachine, transferArgs) => {
+          if (capsStore) {
+            return capsStore
+              .call('fs.transfer', transferArgs, {
+                on: targetMachine,
+                optional: isMove ? ['background', 'if_exists'] : ['background', 'if_exists', 'move'],
+              })
+              .then((r) => r.value);
+          }
+          const pruned = { from: transferArgs.from, to: transferArgs.to };
+          if (sourceCaps?.hasTransferBg) pruned.background = true;
+          if (sourceCaps?.hasTransferIfExists) pruned.if_exists = 'rename';
+          if (isMove && sourceCaps?.hasTransferMove) pruned.move = true;
+          return link.call('fs.transfer', pruned, { on: targetMachine });
+        };
 
         let res = null;
         try {
-          res = await link.call('fs.transfer', baseArgs, { on: sourceMachine });
+          res = await callTransfer(sourceMachine, baseArgs);
         } catch {
           // Fall back to starting the transfer on the destination when the source cannot reach it.
           const fallbackArgs = {
@@ -266,7 +339,7 @@ export function SendToSheet({
             from: `${sourceMachine}:${item.path}`,
             to: destPath,
           };
-          res = await link.call('fs.transfer', fallbackArgs, { on: destMachine }).catch(() => null);
+          res = await callTransfer(destMachine, fallbackArgs).catch(() => null);
         }
         if (res?.job?.id) {
           startedJobs.push({
@@ -275,7 +348,22 @@ export function SendToSheet({
             label: item.name || baseFileName(item.path),
             move: isMove,
             destMachine,
+            destDir: targetDir,
+            srcMachine: sourceMachine,
+            srcDir,
           });
+        } else if (res && folderChanges) {
+          // Synchronous transfer (older machine without background jobs).
+          folderChanges.changed(destMachine, targetDir, {
+            throttle: false,
+            reason: 'transfer',
+          });
+          if (isMove) {
+            folderChanges.changed(sourceMachine, srcDir, {
+              throttle: false,
+              reason: 'transfer',
+            });
+          }
         }
       }
       return startedJobs;
@@ -296,20 +384,19 @@ export function SendToSheet({
     <${Sheet} title=${title} onClose=${onClose}>
       <p class="sheet-sub">${subParts.join(' · ')}</p>
 
-      ${!isDeviceDest
+      ${!isDeviceDest && canMove
         ? html`
             <div class="seg" role="group" aria-label="Copy or move">
               <button
                 type="button"
-                aria-pressed=${mode === 'copy' ? 'true' : 'false'}
+                aria-pressed=${effectiveMode === 'copy' ? 'true' : 'false'}
                 onClick=${() => setMode('copy')}
               >
                 Copy
               </button>
               <button
                 type="button"
-                aria-pressed=${mode === 'move' ? 'true' : 'false'}
-                disabled=${!canMove}
+                aria-pressed=${effectiveMode === 'move' ? 'true' : 'false'}
                 onClick=${() => setMode('move')}
               >
                 Move
@@ -481,7 +568,7 @@ export function SendToSheet({
                   </button>
                 `;
               })}
-              ${caps?.hasDownload && mode !== 'move'
+              ${caps?.hasDownload && effectiveMode !== 'move'
                 ? html`
                     <button
                       type="button"
@@ -540,7 +627,7 @@ export function SendToSheet({
 
 // ── Sort sheet ───────────────────────────────────────────────────────────────────────────────
 
-export function SortSheet({ sortPref, onChange, onClose }) {
+export function SortSheet({ sortPref, kindFilter = '', onChange, onChangeKind = null, onClose }) {
   const options = [
     { sort: 'name', order: 'asc', label: 'Name (A–Z)' },
     { sort: 'name', order: 'desc', label: 'Name (Z–A)' },
@@ -549,9 +636,18 @@ export function SortSheet({ sortPref, onChange, onClose }) {
     { sort: 'size', order: 'desc', label: 'Largest first' },
     { sort: 'size', order: 'asc', label: 'Smallest first' },
   ];
+  const kindOptions = [
+    { id: '', label: 'All' },
+    { id: 'image', label: 'Pictures' },
+    { id: 'video', label: 'Videos' },
+    { id: 'audio', label: 'Music' },
+    { id: 'document', label: 'Documents' },
+    { id: 'text', label: 'Text' },
+    { id: 'archive', label: 'Archives' },
+  ];
 
   return html`
-    <${Sheet} title="Sort" onClose=${onClose}>
+    <${Sheet} title=${onChangeKind ? 'Sort and filter' : 'Sort'} onClose=${onClose}>
       <div class="list" role="radiogroup" aria-label="Sort order">
         ${options.map((opt) => {
           const picked = sortPref.sort === opt.sort && sortPref.order === opt.order;
@@ -573,6 +669,29 @@ export function SortSheet({ sortPref, onChange, onClose }) {
           `;
         })}
       </div>
+      ${onChangeKind
+        ? html`
+            <p class="label">Kind</p>
+            <div class="chips" role="group" aria-label="Filter by kind">
+              ${kindOptions.map(
+                (opt) => html`
+                  <button
+                    key=${opt.id || 'all'}
+                    type="button"
+                    class="chip-btn"
+                    aria-pressed=${(kindFilter || '') === opt.id ? 'true' : 'false'}
+                    onClick=${() => {
+                      onChangeKind(opt.id);
+                      onClose();
+                    }}
+                  >
+                    ${opt.label}
+                  </button>
+                `,
+              )}
+            </div>
+          `
+        : null}
     <//>
   `;
 }
@@ -720,7 +839,7 @@ export function FolderMoreSheet({
 
 // ── New folder & Rename sheets ───────────────────────────────────────────────────────────────
 
-export function NewFolderSheet({ machine, parentPath, link, onCreated, onClose }) {
+export function NewFolderSheet({ machine, parentPath, link, capsStore = null, folderChanges = null, onCreated, onClose }) {
   const [name, setName] = useState('');
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -736,7 +855,14 @@ export function NewFolderSheet({ machine, parentPath, link, onCreated, onClose }
     setError(null);
     try {
       const target = joinFilePath(parentPath, trimmed);
-      await link.call('fs.mkdir', { path: target, parents: false }, { on: machine });
+      if (capsStore) {
+        await capsStore.call('fs.mkdir', { path: target, parents: false }, { on: machine, optional: ['parents'] });
+      } else {
+        await link.call('fs.mkdir', { path: target, parents: false }, { on: machine });
+      }
+      if (folderChanges) {
+        folderChanges.changed(machine, parentPath, { reason: 'mkdir' });
+      }
       onClose();
       if (onCreated) onCreated(target);
     } catch (err) {
@@ -771,7 +897,7 @@ export function NewFolderSheet({ machine, parentPath, link, onCreated, onClose }
   `;
 }
 
-export function RenameSheet({ machine, entry, link, onRenamed, onClose }) {
+export function RenameSheet({ machine, entry, link, capsStore = null, folderChanges = null, onRenamed, onClose }) {
   const [name, setName] = useState(entry?.name || baseFileName(entry?.path || ''));
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -792,7 +918,18 @@ export function RenameSheet({ machine, entry, link, onRenamed, onClose }) {
     setBusy(true);
     setError(null);
     try {
-      await link.call('fs.move', { from: entry.path, to: nextPath, overwrite: false }, { on: machine });
+      if (capsStore) {
+        await capsStore.call(
+          'fs.move',
+          { from: entry.path, to: nextPath, overwrite: false },
+          { on: machine, optional: ['overwrite'] },
+        );
+      } else {
+        await link.call('fs.move', { from: entry.path, to: nextPath, overwrite: false }, { on: machine });
+      }
+      if (folderChanges) {
+        folderChanges.changed(machine, parent || '~', { reason: 'rename' });
+      }
       onClose();
       if (onRenamed) onRenamed(nextPath, trimmed);
     } catch (err) {
@@ -910,7 +1047,7 @@ export function SearchFiltersSheet({ size, changed, onApply, onClose }) {
 
 // ── Sync folder action sheets ────────────────────────────────────────────────────────────────
 
-export function SyncConflictsSheet({ syncFolder, link, onChanged, onClose }) {
+export function SyncConflictsSheet({ syncFolder, link, folderChanges = null, onChanged, onClose }) {
   const [conflicts, setConflicts] = useState(syncFolder?.conflicts || []);
   const [busyPath, setBusyPath] = useState('');
   const [error, setError] = useState(null);
@@ -933,6 +1070,13 @@ export function SyncConflictsSheet({ syncFolder, link, onChanged, onClose }) {
     setError(null);
     try {
       await link.call('sync.resolve', { id: syncFolder.id, path: c.path, keep });
+      if (folderChanges) {
+        for (const mem of syncFolder?.members || []) {
+          if (!mem?.machine || !mem?.path) continue;
+          const full = joinFilePath(mem.path, c.path);
+          folderChanges.changed(mem.machine, parentFilePath(full) || mem.path, { reason: 'sync-resolve' });
+        }
+      }
       setConflicts((prev) => prev.filter((item) => item.path !== c.path));
       if (onChanged) onChanged();
     } catch (err) {
@@ -983,7 +1127,7 @@ export function SyncConflictsSheet({ syncFolder, link, onChanged, onClose }) {
   `;
 }
 
-export function SyncBinSheet({ syncFolder, link, onChanged, onClose }) {
+export function SyncBinSheet({ syncFolder, link, folderChanges = null, onChanged, onClose }) {
   const [entries, setEntries] = useState(syncFolder?.bin || []);
   const [busyPath, setBusyPath] = useState('');
   const [error, setError] = useState(null);
@@ -1006,6 +1150,13 @@ export function SyncBinSheet({ syncFolder, link, onChanged, onClose }) {
     setError(null);
     try {
       await link.call('sync.restore', { id: syncFolder.id, path: item.path });
+      if (folderChanges) {
+        for (const mem of syncFolder?.members || []) {
+          if (!mem?.machine || !mem?.path) continue;
+          const full = joinFilePath(mem.path, item.path);
+          folderChanges.changed(mem.machine, parentFilePath(full) || mem.path, { reason: 'sync-restore' });
+        }
+      }
       setEntries((prev) => prev.filter((e) => e.path !== item.path));
       if (onChanged) onChanged();
     } catch (err) {

@@ -64,7 +64,7 @@ next
   - Check that everything is configured and reachable with `legion meta.doctor`.
 ```
 
-List the tools built into the binary (83 tools across 16 families, plus any local extensions):
+List the tools built into the binary (86 tools across 17 families, plus any local extensions):
 
 ```sh
 legion tools
@@ -120,10 +120,7 @@ duration_ms       0
 ```
 
 Add a second machine to `fleet.toml` (replace `pi` with any host or alias `ssh` accepts) and check
-that it answers. Each machine carries the name the fleet gives it: `fleet.install` writes
-`name = "<machine>"` into `node.toml` when missing or unset, `fleet.sync direction=push` repairs
-host-derived mismatches automatically while leaving explicit different names untouched and reporting
-`name_mismatch`, and `fleet.list`, `fleet.ping`, and `meta.doctor` surface any remaining mismatch:
+that it answers:
 
 ```sh
 legion fleet.add name=pi ssh=pi

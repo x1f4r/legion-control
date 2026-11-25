@@ -3402,7 +3402,81 @@ fn fifo_config_documents_fail_fast_without_hanging() {
         }
     }
 
-    // 7. FIFO `tools.d/demo.toml`: `config.read` fails fast and `ext.list` reports it as broken
+    // 7. FIFO `favorites.toml` locally AND on a peer: `config.read`, `fav.list`, `fav.add`,
+    //    `fleet.sync direction=push` (local FIFO), and `fleet.sync direction=status` (peer FIFO).
+    {
+        let tower = make_tower();
+        make_fifo(&legion_home_of(&tower).join("config").join("favorites.toml"));
+        for args in [
+            &["config.read", "document=favorites.toml"][..],
+            &["fav.list"][..],
+            &["fav.add", "path=~"][..],
+        ] {
+            let (code, stdout, stderr) = run_with_timeout(&tower, args, limit);
+            assert_eq!(code, 1, "{args:?}: stdout={stdout} stderr={stderr}");
+            let err: Value = serde_json::from_str(stdout.trim()).unwrap();
+            assert_eq!(err["code"], json!("failed"), "{args:?}: {err}");
+            assert!(
+                err["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("not a regular file")),
+                "{args:?}: {err}"
+            );
+        }
+
+        let (push_code, push_out, push_err) = run_with_timeout(
+            &tower,
+            &[
+                "fleet.sync",
+                "direction=push",
+                "documents=[\"favorites.toml\"]",
+            ],
+            limit,
+        );
+        assert_eq!(push_code, 0, "stdout={push_out} stderr={push_err}");
+        let push_json: Value = serde_json::from_str(push_out.trim()).unwrap();
+        assert_eq!(
+            push_json["results"]["pi"]["favorites.toml"]["status"],
+            json!("error"),
+            "{push_json}"
+        );
+        assert!(
+            push_json["results"]["pi"]["favorites.toml"]["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not a regular file")),
+            "{push_json}"
+        );
+    }
+    {
+        let tower = make_tower();
+        let peer_fav = legion_home_of(&peer).join("config").join("favorites.toml");
+        make_fifo(&peer_fav);
+        let (st_code, st_out, st_err) = run_with_timeout(
+            &tower,
+            &[
+                "fleet.sync",
+                "direction=status",
+                "documents=[\"favorites.toml\"]",
+            ],
+            limit,
+        );
+        let _ = fs::remove_file(&peer_fav);
+        assert_eq!(st_code, 0, "stdout={st_out} stderr={st_err}");
+        let st_json: Value = serde_json::from_str(st_out.trim()).unwrap();
+        assert_eq!(
+            st_json["results"]["pi"]["favorites.toml"]["status"],
+            json!("error"),
+            "{st_json}"
+        );
+        assert!(
+            st_json["results"]["pi"]["favorites.toml"]["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not a regular file")),
+            "{st_json}"
+        );
+    }
+
+    // 8. FIFO `tools.d/demo.toml`: `config.read` fails fast and `ext.list` reports it as broken
     //    without hanging.
     {
         let tower = make_tower();

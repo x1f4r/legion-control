@@ -332,8 +332,20 @@ function makeLongLogText() {
   return `${lines.join('\n')}\n`;
 }
 
-export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedRef = () => true, canReadRef = () => true }) {
+export function createMockFilesState({
+  machines,
+  flags,
+  isMachineOld: isMachineOldProp = null,
+  activeNodeRef,
+  isAuthedRef = () => true,
+  canReadRef = () => true,
+}) {
   const isOld = flags.has('old') || flags.has('legacy');
+  const isMixed = !isOld && (flags.has('mixed') || flags.has('old-peer'));
+  const isMachineOld =
+    typeof isMachineOldProp === 'function'
+      ? isMachineOldProp
+      : (name) => isOld || (isMixed && name === 'studio');
   const isNoSync = flags.has('nosync') || isOld;
   const isLarge = flags.has('large');
   const isInexact = flags.has('inexact');
@@ -601,6 +613,9 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           makeEntry('/home/me/Projects', { kind: 'dir', mtime: isoAgo(day) }),
           makeEntry('/home/me/Documents', { kind: 'dir', mtime: isoAgo(day * 3) }),
           makeEntry('/home/me/Pictures', { kind: 'dir', mtime: isoAgo(day * 2) }),
+          ...(isMixed
+            ? [makeEntry('/home/me/BigFolder', { kind: 'dir', mtime: isoAgo(day * 4) })]
+            : []),
         ],
       ],
       [
@@ -620,11 +635,30 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       ],
       [
         '/home/me/Documents',
-        [makeEntry('/home/me/Documents/design-notes.md', { size: 840, mtime: isoAgo(day * 3) })],
+        [
+          makeEntry('/home/me/Documents/design-notes.md', { size: 840, mtime: isoAgo(day * 3) }),
+          ...(isMixed
+            ? [
+                makeEntry('/home/me/Documents/Report.pdf', { size: 2_400_000, mtime: isoAgo(day * 5) }),
+                makeEntry('/home/me/Documents/avatar.png', { size: 48_000, mtime: isoAgo(day), palette: PALETTES[2], sampleMedia: 'image' }),
+                makeEntry('/home/me/Documents/Poster.jpg', { size: 4_800_000, mtime: isoAgo(day * 6), palette: PALETTES[4], sampleMedia: 'image' }),
+                makeEntry('/home/me/Documents/Clip.mp4', { size: 640_000_000, mtime: isoAgo(day * 2), duration_s: 312, palette: PALETTES[0], sampleMedia: 'video' }),
+                makeEntry('/home/me/Documents/Track.mp3', { size: 6_200_000, mtime: isoAgo(day * 7), sampleMedia: 'audio' }),
+                makeEntry('/home/me/Documents/archive.zip', { size: 18_500_000, mtime: isoAgo(day * 8) }),
+              ]
+            : []),
+        ],
       ],
       [
         '/home/me/Pictures',
-        [makeEntry('/home/me/Pictures/Camera', { kind: 'dir', mtime: isoAgo(day * 2) })],
+        [
+          makeEntry('/home/me/Pictures/Camera', { kind: 'dir', mtime: isoAgo(day * 2) }),
+          ...(isMixed
+            ? [
+                makeEntry('/home/me/Pictures/avatar.png', { size: 48_000, mtime: isoAgo(day), palette: PALETTES[2], sampleMedia: 'image' }),
+              ]
+            : []),
+        ],
       ],
       [
         '/home/me/Pictures/Camera',
@@ -645,6 +679,21 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       ['/home/me/Downloads', []],
     ]),
   };
+
+  if (isMixed) {
+    const big = [];
+    for (let i = 1; i <= 520; i += 1) {
+      const idx = String(i).padStart(3, '0');
+      const ext = i % 4 === 0 ? 'jpg' : i % 4 === 1 ? 'txt' : i % 4 === 2 ? 'pdf' : 'mp4';
+      big.push(
+        makeEntry(`/home/me/BigFolder/file-${idx}.${ext}`, {
+          size: 2048 * ((i % 40) + 1),
+          mtime: isoAgo(day + i * 30),
+        }),
+      );
+    }
+    trees.studio.set('/home/me/BigFolder', big);
+  }
 
   if (isLarge) {
     const big = [];
@@ -732,18 +781,22 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       added_at: isoAgo(day * 15),
       added_by: 'phone',
     },
-    {
-      id: 'fav-4',
-      machine: 'studio',
-      path: '/home/me/Projects',
-      kind: 'dir',
-      category: null,
-      label: 'Projects',
-      pinned: true,
-      exists: true,
-      added_at: isoAgo(day * 12),
-      added_by: 'phone',
-    },
+    ...(!isMixed
+      ? [
+          {
+            id: 'fav-4',
+            machine: 'studio',
+            path: '/home/me/Projects',
+            kind: 'dir',
+            category: null,
+            label: 'Projects',
+            pinned: true,
+            exists: true,
+            added_at: isoAgo(day * 12),
+            added_by: 'phone',
+          },
+        ]
+      : []),
     {
       id: 'fav-5',
       machine: 'tower',
@@ -1051,6 +1104,22 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           continue;
         }
         if (t.bytes_done >= t.bytes_total) {
+          if (t._mockPendingUpload) {
+            const { target, normDir, destPath, size, sampleMedia } = t._mockPendingUpload;
+            delete t._mockPendingUpload;
+            if (trees[target]?.has(normDir)) {
+              const destList = trees[target].get(normDir);
+              if (!destList.some((e) => e.path === destPath)) {
+                destList.push(
+                  makeEntry(destPath, {
+                    size,
+                    mtime: new Date().toISOString(),
+                    sampleMedia,
+                  }),
+                );
+              }
+            }
+          }
           t.state = 'done';
           t.rate = 0;
           t.finished = new Date().toISOString();
@@ -1069,6 +1138,32 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           job.progress.rate = step * 3;
           job.duration_s = (job.duration_s || 0) + 0.35;
           if (job.progress.bytes_done >= total) {
+            if (job._mockPendingTransfer) {
+              const pt = job._mockPendingTransfer;
+              delete job._mockPendingTransfer;
+              if (trees[pt.destMachine]?.has(pt.destParent)) {
+                const destList = trees[pt.destMachine].get(pt.destParent);
+                if (!destList.some((e) => e.path === pt.destPath)) {
+                  destList.push(
+                    makeEntry(pt.destPath, {
+                      kind: pt.kind,
+                      size: pt.totalBytes,
+                      mtime: new Date().toISOString(),
+                      palette: pt.palette,
+                      sampleMedia: pt.sampleMedia,
+                    }),
+                  );
+                }
+              }
+              if (pt.move && trees[pt.srcMachine]) {
+                const srcParent = parentFilePath(pt.srcPath);
+                const srcList = trees[pt.srcMachine].get(srcParent);
+                if (srcList) {
+                  const sIdx = srcList.findIndex((e) => e.path === pt.srcPath);
+                  if (sIdx !== -1) srcList.splice(sIdx, 1);
+                }
+              }
+            }
             job.state = 'succeeded';
             job.exit_code = 0;
             job.finished = new Date().toISOString();
@@ -1113,7 +1208,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
     return p.replace(/\/+$/, '') || '/';
   }
 
-  function formatEntry(entry) {
+  function formatEntry(entry, oldMachine = isOld) {
     const out = {
       name: entry.name,
       path: entry.path,
@@ -1122,7 +1217,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       mtime: entry.mtime,
       mode: entry.mode,
     };
-    if (!isOld && entry.kind === 'file') {
+    if (!oldMachine && entry.kind === 'file') {
       out.category = categoryFromName(entry.name);
       out.mime = mimeFromName(entry.name);
       if (entry.duration_s != null) out.duration_s = entry.duration_s;
@@ -1166,6 +1261,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
 
   function handleTool(machineName, tool, args, onEvent) {
     const tree = trees[machineName];
+    const oldMachine = isMachineOld(machineName);
     switch (tool) {
       case 'fs.list': {
         const requested = normalizePath(args?.path || '~');
@@ -1183,25 +1279,25 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
         }
         const includeHidden = args?.hidden !== false;
         let filtered = rawEntries.filter((e) => includeHidden || !isHiddenName(e.name));
-        if (!isOld && Array.isArray(args?.categories) && args.categories.length > 0) {
+        if (!oldMachine && Array.isArray(args?.categories) && args.categories.length > 0) {
           const catSet = new Set(args.categories);
           filtered = filtered.filter((e) => e.kind === 'dir' || catSet.has(categoryFromName(e.name)));
         }
-        const sorted = !isOld
+        const sorted = !oldMachine
           ? sortEntries(filtered, { sort: args?.sort || 'name', order: args?.order || 'asc' })
           : sortEntries(filtered, { sort: 'name', order: 'asc' });
 
         const total = sorted.length;
-        const offset = !isOld && Number.isInteger(args?.offset) && args.offset > 0 ? args.offset : 0;
+        const offset = !oldMachine && Number.isInteger(args?.offset) && args.offset > 0 ? args.offset : 0;
         const limit = Number.isInteger(args?.limit) && args.limit > 0 ? args.limit : 500;
-        const slice = sorted.slice(offset, offset + limit).map(formatEntry);
+        const slice = sorted.slice(offset, offset + limit).map((e) => formatEntry(e, oldMachine));
         const truncated = offset + slice.length < total;
         const res = {
           path: requested,
           entries: slice,
           truncated,
         };
-        if (!isOld) {
+        if (!oldMachine) {
           res.total = total;
           res.total_exact = !(isInexact && requested === '/home/me/Archive5000');
           res.offset = offset;
@@ -1219,14 +1315,18 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
         if (content === undefined) {
           const entry = findEntryOnMachine(machineName, requested);
           if (entry && entry.kind === 'file') {
+            const isSmallPng =
+              categoryFromName(entry.name) === 'image' && entry.size <= 1048576;
+            const b64 = isSmallPng ? SAMPLE_PNG_BASE64 : 'AAECAwQFBgcICQoLDA0ODw==';
+            const eof = entry.size <= (Number.isInteger(args?.length) ? args.length : 1048576);
             return {
               path: requested,
               size: entry.size,
               offset: 0,
-              length: 16,
+              length: isSmallPng ? entry.size : 16,
               encoding: 'base64',
-              content: 'AAECAwQFBgcICQoLDA0ODw==',
-              eof: true,
+              content: b64,
+              eof,
             };
           }
           throw { code: 'not_found', message: `${requested} does not exist.`, hint: null, machine: machineName };
@@ -1252,7 +1352,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           throw { code: 'not_found', message: `${requested} does not exist.`, hint: null, machine: machineName };
         }
         return {
-          ...formatEntry(entry),
+          ...formatEntry(entry, oldMachine),
           readonly: false,
         };
       }
@@ -1276,7 +1376,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       }
 
       case 'fs.thumb': {
-        if (isOld) {
+        if (oldMachine) {
           throw { code: 'unknown_tool', message: 'Unknown tool: fs.thumb', hint: null, machine: machineName };
         }
         const paths = Array.isArray(args?.paths) ? args.paths.slice(0, 32) : [];
@@ -1322,7 +1422,10 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
         const includeHidden = Boolean(args?.hidden);
         let q = args?.name || '';
         if (!q && typeof args?.glob === 'string') {
-          q = args.glob.replace(/[*?]/g, '');
+          // Support both simple `*word*` globs and case-insensitive character-class globs like `*[nN][oO]*`.
+          q = args.glob
+            .replace(/\[([a-zA-Z])[a-zA-Z]\]/g, '$1')
+            .replace(/[*?]/g, '');
         }
         const categories = Array.isArray(args?.categories) ? [...args.categories] : [];
         if (args?.kind === 'dir' && categories.length === 0) {
@@ -1341,10 +1444,11 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           order: args?.order || 'asc',
         });
         const limit = Number.isInteger(args?.limit) && args.limit > 0 ? args.limit : 200;
-        const slice = sorted.slice(0, limit).map(formatEntry);
+        const slice = sorted.slice(0, limit).map((e) => formatEntry(e, oldMachine));
         const payload = {
           path: requested,
           entries: slice,
+          matches: slice,
           truncated: sorted.length > slice.length,
           reason: sorted.length > slice.length ? 'limit' : undefined,
         };
@@ -1488,24 +1592,8 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
         const verb = args?.move ? 'Moving' : 'Copying';
         const title = `${verb} ${baseName} to ${destMachine}`;
 
-        // Add copied entry to destination directory in mock tree so browsing dest shows it.
         const destParent = parentFilePath(destPath);
-        if (!args?.dry_run && trees[destMachine]?.has(destParent)) {
-          const destList = trees[destMachine].get(destParent);
-          if (!destList.some((e) => e.path === destPath)) {
-            destList.push(
-              makeEntry(destPath, {
-                kind: srcEntry?.kind || 'file',
-                size: totalBytes,
-                mtime: new Date().toISOString(),
-                palette: srcEntry?.palette || null,
-                sampleMedia: srcEntry?.sampleMedia || null,
-              }),
-            );
-          }
-        }
-
-        if (!isOld && args?.background && !args?.dry_run) {
+        if (!oldMachine && args?.background && !args?.dry_run) {
           const id = `j-xfer-${transferSeq++}`;
           const job = {
             id,
@@ -1529,10 +1617,46 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
             },
             logs: `Started ${title}\n`,
             _mockLive: true,
+            _mockPendingTransfer: {
+              srcMachine,
+              srcPath,
+              destMachine,
+              destPath,
+              destParent,
+              move: Boolean(args?.move),
+              kind: srcEntry?.kind || 'file',
+              totalBytes,
+              palette: srcEntry?.palette || null,
+              sampleMedia: srcEntry?.sampleMedia || null,
+            },
           };
           machines[machineName].jobs.unshift(job);
           ensureTransferPump();
           return { job: { id, machine: machineName }, title };
+        }
+
+        // Synchronous transfer: apply destination mutation immediately.
+        if (!args?.dry_run && trees[destMachine]?.has(destParent)) {
+          const destList = trees[destMachine].get(destParent);
+          if (!destList.some((e) => e.path === destPath)) {
+            destList.push(
+              makeEntry(destPath, {
+                kind: srcEntry?.kind || 'file',
+                size: totalBytes,
+                mtime: new Date().toISOString(),
+                palette: srcEntry?.palette || null,
+                sampleMedia: srcEntry?.sampleMedia || null,
+              }),
+            );
+          }
+          if (args?.move && trees[srcMachine]) {
+            const srcParent = parentFilePath(srcPath);
+            const srcList = trees[srcMachine].get(srcParent);
+            if (srcList) {
+              const sIdx = srcList.findIndex((e) => e.path === srcPath);
+              if (sIdx !== -1) srcList.splice(sIdx, 1);
+            }
+          }
         }
 
         return {
@@ -1743,8 +1867,16 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           if (!m.reachable) {
             throw m.error || { code: 'unreachable', message: `${target} is off.`, hint: null, machine: target };
           }
-          if (!canReadRef()) {
+          if (!canReadRef(target)) {
             throw { code: 'denied', message: 'Not allowed to read files on this machine.', hint: null, machine: target };
+          }
+          if (isMachineOld(target)) {
+            throw {
+              code: 'unsupported',
+              message: `${target} does not support content streaming yet.`,
+              hint: null,
+              machine: target,
+            };
           }
           const norm = normalizePath(path);
           const entry = findEntryOnMachine(target, norm);
@@ -1864,16 +1996,14 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
               finished: null,
               hash: null,
               canOpen: false,
+              _mockPendingUpload: {
+                target,
+                normDir,
+                destPath,
+                size: f.size || 2_000_000,
+                sampleMedia: categoryFromName(fileName) === 'image' ? 'image' : null,
+              },
             });
-            if (trees[target]?.has(normDir)) {
-              trees[target].get(normDir).push(
-                makeEntry(destPath, {
-                  size: f.size || 2_000_000,
-                  mtime: new Date().toISOString(),
-                  sampleMedia: categoryFromName(fileName) === 'image' ? 'image' : null,
-                }),
-              );
-            }
             ids.push(id);
           }
           emitTransfers();
@@ -1909,6 +2039,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
               ensureTransferPump();
             }
           } else if (action === 'cancel') {
+            delete item._mockPendingUpload;
             item.state = 'cancelled';
             item.rate = 0;
             item.finished = new Date().toISOString();
@@ -1933,6 +2064,86 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           };
         },
       };
+
+  if (typeof window !== 'undefined') {
+    window.__LEGION_MOCK__ = {
+      addExternalFile(machineName, dirPath, name, opts = {}) {
+        const normDir = normalizePath(dirPath || '~');
+        const list = trees[machineName]?.get(normDir);
+        if (!list) return null;
+        const full = joinFilePath(normDir, name);
+        if (list.some((e) => e.path === full)) return full;
+        list.push(
+          makeEntry(full, {
+            kind: opts.kind || 'file',
+            size: opts.size ?? 4096,
+            mtime: opts.mtime || new Date().toISOString(),
+            sampleMedia: opts.sampleMedia || null,
+          }),
+        );
+        if (opts.kind === 'dir' && !trees[machineName].has(full)) {
+          trees[machineName].set(full, []);
+        }
+        return full;
+      },
+      addExternalJob(machineName, job) {
+        const m = machines[machineName];
+        if (!m) return null;
+        const entry = {
+          id: job.id || `j-ext-${Date.now()}`,
+          kind: job.kind || 'exec',
+          name: job.name || 'External task',
+          state: job.state || 'succeeded',
+          created: job.created || new Date().toISOString(),
+          finished: job.finished || new Date().toISOString(),
+          exit_code: job.exit_code ?? 0,
+          command: job.command || job.name || 'echo ok',
+          ...job,
+        };
+        m.jobs.unshift(entry);
+        return entry;
+      },
+      simulateUploadTransition(machineName, dirPath, name, states) {
+        const normDir = normalizePath(dirPath || '~');
+        const destPath = joinFilePath(normDir, name);
+        const id = `dt-sim-${transferSeq++}`;
+        const item = {
+          id,
+          direction: 'upload',
+          machine: machineName,
+          path: destPath,
+          name,
+          localPath: `Device/${name}`,
+          mime: mimeFromName(name),
+          state: 'queued',
+          bytes_done: 0,
+          bytes_total: 1024,
+          rate: 0,
+          error: null,
+          created: new Date().toISOString(),
+          finished: null,
+          hash: null,
+          canOpen: false,
+        };
+        deviceTransfers.unshift(item);
+        for (const st of states || []) {
+          item.state = st;
+          if (st === 'done') {
+            item.bytes_done = item.bytes_total;
+            item.finished = new Date().toISOString();
+            const list = trees[machineName]?.get(normDir);
+            if (list && !list.some((e) => e.path === destPath)) {
+              list.push(makeEntry(destPath, { size: item.bytes_total, mtime: item.finished }));
+            }
+          } else if (st === 'cancelled' || st === 'failed') {
+            item.finished = new Date().toISOString();
+          }
+          emitTransfers();
+        }
+        return id;
+      },
+    };
+  }
 
   return {
     isOld,

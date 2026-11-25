@@ -11,6 +11,8 @@ import {
   plainRefusalParts,
 } from './lib/activity.js';
 import { createCache } from './lib/cache.js';
+import { createCapabilitiesStore } from './lib/capabilities.js';
+import { containsTechnicalText, isTerminalHint, plainErrorMessage } from './lib/errors.js';
 import {
   hydrateFleetCache,
   refreshFleetProgressive,
@@ -25,13 +27,13 @@ import {
   toggleSelection,
 } from './lib/files.js';
 import { readSortPreference, writeSortPreference } from './lib/files-store.js';
+import { createFolderChangesStore } from './lib/folder-changes.js';
 import { formatBytes, formatRelativeTime } from './lib/format.js';
 import { createThumbCache } from './lib/thumb-cache.js';
 import {
   classifyHorizontalSwipe,
-  classifyPullRefresh,
+  EDGE_BACK_ZONE_PX,
   hasNativeEdgeBack,
-  PULL_REFRESH_PX,
   shouldIgnoreSwipeTarget,
   stepTab,
 } from './lib/gestures.js';
@@ -61,6 +63,7 @@ import { Notice, Sheet, WakeSheet } from './views/common.js';
 import { FilesDock, FilesView } from './views/files.js';
 import { CommandComposer } from './views/machine.js';
 import { MachinesView } from './views/machines.js';
+import { ScrollContainer } from './views/scroll-container.js';
 import { SettingsView } from './views/settings.js';
 import { StartView } from './views/start.js';
 
@@ -145,6 +148,16 @@ function ConfirmSheet({ request, technical, onClose }) {
       ? dryResult.would_send.map((addr) => `WoL packet -> ${addr}`)
       : [];
   const refusalParts = dryResult?.would_refuse ? plainRefusalParts(dryResult.would_refuse) : null;
+  const plainRefusalDetailMsg =
+    refusalParts?.detailMessage && !containsTechnicalText(refusalParts.detailMessage)
+      ? refusalParts.detailMessage
+      : null;
+  const plainRefusalDetailHint =
+    refusalParts?.detailHint &&
+    !isTerminalHint(refusalParts.detailHint) &&
+    !containsTechnicalText(refusalParts.detailHint)
+      ? refusalParts.detailHint
+      : null;
   const plainDrySummary = dryResult
     ? describeDryRunSummary(request.tool, request.targetName || request.target, request.args)
     : '';
@@ -173,8 +186,8 @@ function ConfirmSheet({ request, technical, onClose }) {
           `
         : null}
 
-      ${dryError ? html`<${Notice} error=${dryError} />` : null}
-      ${realError ? html`<${Notice} error=${realError} />` : null}
+      ${dryError ? html`<${Notice} error=${dryError} technical=${technical} />` : null}
+      ${realError ? html`<${Notice} error=${realError} technical=${technical} />` : null}
 
       ${dryResult
         ? html`
@@ -193,15 +206,15 @@ function ConfirmSheet({ request, technical, onClose }) {
                   : html`
                       <div class="notice neutral">
                         <strong>It would refuse right now: ${refusalParts.first}</strong>
-                        ${refusalParts.detailMessage || refusalParts.detailHint
+                        ${plainRefusalDetailMsg || plainRefusalDetailHint
                           ? html`
                               <details class="more">
                                 <summary>More</summary>
-                                ${refusalParts.detailMessage
-                                  ? html`<p>${refusalParts.detailMessage}</p>`
+                                ${plainRefusalDetailMsg
+                                  ? html`<p>${plainRefusalDetailMsg}</p>`
                                   : null}
-                                ${refusalParts.detailHint
-                                  ? html`<p>${refusalParts.detailHint}</p>`
+                                ${plainRefusalDetailHint
+                                  ? html`<p>${plainRefusalDetailHint}</p>`
                                   : null}
                               </details>
                             `
@@ -272,12 +285,19 @@ function App() {
   const sessionCache = useMemo(() => createSessionCache(), []);
   const persistentCache = useMemo(() => createPersistentCache(), []);
   const thumbCache = useMemo(() => createThumbCache({ maxEntries: 180, storage: null }), []);
+  const capsStore = useMemo(() => createCapabilitiesStore(link), [link]);
+  const folderChanges = useMemo(() => createFolderChangesStore(), []);
+  useEffect(() => () => capsStore.dispose(), [capsStore]);
+  useEffect(() => () => folderChanges.dispose(), [folderChanges]);
   const shellRef = useRef(null);
   const mainRef = useRef(null);
   const refreshAbortRef = useRef(null);
   const refreshInFlightRef = useRef(false);
+  const screenRefreshRef = useRef(null);
   const swipeRef = useRef(null);
+  const touchSwipeRef = useRef(null);
   const scrollByFolderRef = useRef(new Map());
+  const pendingScrollRestoreKeyRef = useRef(null);
   const filesHistoryDepthRef = useRef(0);
   const filesSheetHistoryRef = useRef(false);
   const filesSelectHistoryRef = useRef(false);
@@ -288,6 +308,9 @@ function App() {
   const toastRef = useRef(null);
   const deviceTransfersRef = useRef([]);
   const prevTransferStatesRef = useRef(null);
+  const activeTransferJobsRef = useRef(new Map());
+  const seenTransferJobsRef = useRef(new Map());
+  const [activeTransferJobCount, setActiveTransferJobCount] = useState(0);
 
   const [settings, setSettings] = useState(() => {
     const loaded = readSettings(safeLocalStorage());
@@ -305,7 +328,6 @@ function App() {
   const [snapshot, setSnapshot] = useState(null);
   const [fleetError, setFleetError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [pullState, setPullState] = useState(''); // '' | 'pull' | 'release' | 'refreshing'
   const [confirmRequest, setConfirmRequest] = useState(null);
   const [actionsQuery, setActionsQuery] = useState('');
   const [commandRunsByMachine, setCommandRunsByMachine] = useState({});
@@ -326,6 +348,7 @@ function App() {
   const [toast, setToast] = useState(null);
   const [deviceTransfers, setDeviceTransfers] = useState([]);
   const [filesSortPref, setFilesSortPref] = useState(() => readSortPreference(safeLocalStorage()));
+  const [filesKindFilter, setFilesKindFilter] = useState('');
   const [filesShowHidden, setFilesShowHidden] = useState(false);
   const [filesSelecting, setFilesSelecting] = useState(false);
   const [filesSelectedPaths, setFilesSelectedPaths] = useState(() => new Set());
@@ -413,7 +436,10 @@ function App() {
       const item = failedList[0];
       const verb = item.direction === 'upload' ? 'Upload' : 'Download';
       const name = item.name || 'file';
-      const detail = item.error?.message ? ` ${item.error.message}` : '';
+      const detailText = item.error
+        ? plainErrorMessage(item.error, '', { technical: Boolean(settingsRef.current?.technical), deviceNoun })
+        : '';
+      const detail = detailText ? ` ${detailText}` : '';
       return `${verb} of ${name} failed.${detail}`;
     }
     return `${failedList.length} transfers failed.`;
@@ -435,6 +461,44 @@ function App() {
     }
   }, []);
 
+  const registerScreenRefresh = useCallback((fn) => {
+    if (typeof fn !== 'function') return () => {};
+    screenRefreshRef.current = fn;
+    return () => {
+      if (screenRefreshRef.current === fn) {
+        screenRefreshRef.current = null;
+      }
+    };
+  }, []);
+
+  const observeTransferJobs = useCallback(
+    (jobs) => {
+      folderChanges.observeTransferJobs(jobs, seenTransferJobsRef.current);
+    },
+    [folderChanges],
+  );
+
+  const trackTransferJobs = useCallback((jobs, toastSeq = null) => {
+    const clean = Array.isArray(jobs) ? jobs.filter((j) => j && j.id) : [];
+    if (clean.length === 0) return;
+    let added = false;
+    for (const job of clean) {
+      const key = `${job.machine || ''}:${job.id}`;
+      activeTransferJobsRef.current.set(key, {
+        ...job,
+        toastSeq,
+        startedAt: Date.now(),
+      });
+      if (!seenTransferJobsRef.current.has(key)) {
+        seenTransferJobsRef.current.set(key, { state: 'running', filesDone: 0 });
+      }
+      added = true;
+    }
+    if (added) {
+      setActiveTransferJobCount(activeTransferJobsRef.current.size);
+    }
+  }, []);
+
   const showToast = useCallback(
     (message, opts = {}) => {
       if (!message) return;
@@ -443,6 +507,30 @@ function App() {
         opts.suppressOnActivity !== undefined
           ? Boolean(opts.suppressOnActivity)
           : actionHref === '#/activity';
+      const transferJobs = Array.isArray(opts.transferJobs)
+        ? opts.transferJobs.filter((j) => j && j.id)
+        : [];
+      const seq = ++toastSeqRef.current;
+
+      // Always track background transfer jobs for live folder refresh, even if the toast
+      // is suppressed on Activity or later dismissed.
+      if (transferJobs.length > 0) {
+        trackTransferJobs(transferJobs, seq);
+      }
+      if (opts.transferJobsPromise && typeof opts.transferJobsPromise.then === 'function') {
+        opts.transferJobsPromise
+          .then((jobs) => {
+            const clean = Array.isArray(jobs) ? jobs.filter((j) => j && j.id) : [];
+            if (clean.length === 0) return;
+            trackTransferJobs(clean, seq);
+            if (toastRef.current?.seq !== seq) return;
+            const updated = { ...toastRef.current, transferJobs: clean };
+            toastRef.current = updated;
+            setToast(updated);
+          })
+          .catch(() => {});
+      }
+
       if (suppressOnActivity && routeRef.current?.section === 'activity') {
         return;
       }
@@ -450,14 +538,10 @@ function App() {
       if (transferIds.length > 0 && allTrackedTransfersTerminal(transferIds, deviceTransfersRef.current)) {
         return;
       }
-      const transferJobs = Array.isArray(opts.transferJobs)
-        ? opts.transferJobs.filter((j) => j && j.id)
-        : [];
       if (toastTimerRef.current) {
         clearTimeout(toastTimerRef.current);
         toastTimerRef.current = null;
       }
-      const seq = ++toastSeqRef.current;
       const tracksTransfer =
         transferIds.length > 0 ||
         transferJobs.length > 0 ||
@@ -499,20 +583,8 @@ function App() {
           })
           .catch(() => {});
       }
-
-      if (opts.transferJobsPromise && typeof opts.transferJobsPromise.then === 'function') {
-        opts.transferJobsPromise
-          .then((jobs) => {
-            const clean = Array.isArray(jobs) ? jobs.filter((j) => j && j.id) : [];
-            if (clean.length === 0 || toastRef.current?.seq !== seq) return;
-            const updated = { ...toastRef.current, transferJobs: clean };
-            toastRef.current = updated;
-            setToast(updated);
-          })
-          .catch(() => {});
-      }
     },
-    [clearToast],
+    [clearToast, trackTransferJobs],
   );
 
   useEffect(() => {
@@ -540,10 +612,12 @@ function App() {
       const newlyFailed = [];
       if (prevStates !== null) {
         for (const item of list) {
-          if (item.state === 'failed' && prevStates.get(item.id) !== 'failed') {
+          const prev = prevStates.get(item.id);
+          if (item.state === 'failed' && prev !== 'failed') {
             newlyFailed.push(item);
           }
         }
+        folderChanges.observeDeviceTransfers(list, prevStates);
       }
       prevTransferStatesRef.current = nextStates;
       deviceTransfersRef.current = list;
@@ -578,54 +652,138 @@ function App() {
       alive = false;
       if (typeof unsub === 'function') unsub();
     };
-  }, [link, linkState?.ready, clearToast, showToast]);
+  }, [link, linkState?.ready, clearToast, showToast, folderChanges]);
 
-  const trackedTransferJobs = toast?.transferJobs;
-  const trackedTransferToastSeq = toast?.seq;
+  // Track background fs.transfer jobs until they finish — even minutes after the toast closes —
+  // so destination (and source, on move) folders refresh live as files arrive and when done.
   useEffect(() => {
-    if (!trackedTransferJobs || trackedTransferJobs.length === 0 || !linkState?.ready) {
+    if (activeTransferJobCount <= 0 || !linkState?.ready) {
       return undefined;
     }
     let alive = true;
     let timer = null;
+    const isTerminalJob = (s) => s === 'succeeded' || s === 'failed' || s === 'cancelled';
+
     const checkJobs = async () => {
-      if (!alive || toastRef.current?.seq !== trackedTransferToastSeq) return;
-      const statuses = await Promise.all(
-        trackedTransferJobs.map((job) =>
-          link
-            .call('job.status', { id: job.id }, { on: job.machine || nodeInfoRef.current?.node })
-            .then((st) => ({ job, status: st }))
-            .catch(() => ({ job, status: null })),
-        ),
-      );
-      if (!alive || toastRef.current?.seq !== trackedTransferToastSeq) return;
-      const isTerminalJob = (s) => s === 'succeeded' || s === 'failed' || s === 'cancelled';
-      if (statuses.every((entry) => entry.status && isTerminalJob(entry.status.state))) {
-        clearToast();
-        const failed = statuses.filter((entry) => entry.status?.state === 'failed');
-        if (failed.length > 0) {
-          const onActivity = routeRef.current?.section === 'activity';
-          const first = failed[0].job;
-          const msg =
-            failed.length === 1
-              ? `${first.move ? 'Move' : 'Copy'} of ${first.label || 'item'} to ${first.destMachine || 'machine'} failed.`
-              : `${failed.length} transfers failed.`;
-          showToast(msg, {
-            tone: 'error',
-            suppressOnActivity: false,
-            ...(onActivity ? {} : { actionLabel: 'Activity', actionHref: '#/activity' }),
-          });
-        }
+      if (!alive) return;
+      const entries = Array.from(activeTransferJobsRef.current.entries());
+      if (entries.length === 0) {
+        setActiveTransferJobCount(0);
         return;
       }
-      timer = window.setTimeout(checkJobs, 700);
+
+      const statuses = await Promise.all(
+        entries.map(([key, job]) =>
+          link
+            .call('job.status', { id: job.id }, { on: job.machine || nodeInfoRef.current?.node })
+            .then((st) => ({ key, job, status: st }))
+            .catch(() => ({ key, job, status: null })),
+        ),
+      );
+      if (!alive) return;
+
+      const failed = [];
+      const completedToastSeqs = new Set();
+
+      for (const { key, job, status } of statuses) {
+        if (!status) continue;
+        const normalized = {
+          ...status,
+          kind: status.kind || 'transfer',
+          machine: job.machine || status.machine || nodeInfoRef.current?.node,
+          move: status.move ?? job.move,
+          destMachine: job.destMachine,
+          srcMachine: job.srcMachine,
+        };
+        const prevSeen = seenTransferJobsRef.current.get(key);
+        folderChanges.observeTransferJobs([normalized], seenTransferJobsRef.current);
+
+        // Fallback if a minimal node's job.status omits `to` / `from`: use our tracked destination.
+        const justFinished = status.state === 'succeeded' && prevSeen?.state !== 'succeeded';
+        if (justFinished && !status.to && job.destMachine && job.destDir) {
+          folderChanges.changed(job.destMachine, job.destDir, { throttle: false, reason: 'transfer' });
+          if (job.move && job.srcMachine && job.srcDir) {
+            folderChanges.changed(job.srcMachine, job.srcDir, { throttle: false, reason: 'transfer' });
+          }
+        } else if (
+          !justFinished &&
+          !status.to &&
+          (status.state === 'running' || status.state === 'starting') &&
+          (status.progress?.files_done || 0) > (prevSeen?.filesDone || 0) &&
+          job.destMachine &&
+          job.destDir
+        ) {
+          folderChanges.changed(job.destMachine, job.destDir, {
+            throttle: true,
+            reason: 'transfer-progress',
+          });
+        }
+
+        if (isTerminalJob(status.state)) {
+          activeTransferJobsRef.current.delete(key);
+          if (job.toastSeq != null) completedToastSeqs.add(job.toastSeq);
+          if (status.state === 'failed') failed.push(job);
+        }
+      }
+
+      if (activeTransferJobsRef.current.size !== entries.length) {
+        setActiveTransferJobCount(activeTransferJobsRef.current.size);
+      }
+
+      const curToast = toastRef.current;
+      if (curToast && completedToastSeqs.has(curToast.seq)) {
+        const stillForToast = Array.from(activeTransferJobsRef.current.values()).some(
+          (j) => j.toastSeq === curToast.seq,
+        );
+        if (!stillForToast) clearToast();
+      }
+
+      if (failed.length > 0) {
+        const onActivity = routeRef.current?.section === 'activity';
+        const first = failed[0];
+        const msg =
+          failed.length === 1
+            ? `${first.move ? 'Move' : 'Copy'} of ${first.label || 'item'} to ${first.destMachine || 'machine'} failed.`
+            : `${failed.length} transfers failed.`;
+        showToast(msg, {
+          tone: 'error',
+          suppressOnActivity: false,
+          ...(onActivity ? {} : { actionLabel: 'Activity', actionHref: '#/activity' }),
+        });
+      }
+
+      if (activeTransferJobsRef.current.size > 0 && alive) {
+        const oldest = Math.min(
+          ...Array.from(activeTransferJobsRef.current.values()).map((j) => j.startedAt || Date.now()),
+        );
+        const delayMs = Date.now() - oldest > 15_000 ? 1500 : 700;
+        timer = window.setTimeout(checkJobs, delayMs);
+      }
     };
+
     timer = window.setTimeout(checkJobs, 700);
     return () => {
       alive = false;
       if (timer) window.clearTimeout(timer);
     };
-  }, [trackedTransferJobs, trackedTransferToastSeq, link, linkState?.ready, clearToast, showToast]);
+  }, [activeTransferJobCount, link, linkState?.ready, clearToast, showToast, folderChanges]);
+
+  // Also observe transfer jobs discovered through fleet refreshes.
+  useEffect(() => {
+    if (!snapshot?.machines) return;
+    const allJobs = [];
+    for (const m of snapshot.machines) {
+      if (!m?.name || !Array.isArray(m.jobs)) continue;
+      for (const j of m.jobs) {
+        if (j && j.kind === 'transfer') {
+          allJobs.push({ ...j, machine: m.name });
+        }
+      }
+    }
+    if (allJobs.length > 0) {
+      folderChanges.observeTransferJobs(allJobs, seenTransferJobsRef.current);
+    }
+  }, [snapshot, folderChanges]);
 
   useEffect(() => {
     if (mainRef.current && route.section !== 'files') mainRef.current.scrollTop = 0;
@@ -637,11 +795,25 @@ function App() {
     }
   }, [wide, route.section, route.machine, route.tab, route.tool, route.action, route.jobId, route.page, route.sub]);
 
-  // Restore saved folder scroll position when arriving at a Files folder (e.g. via Back).
+  // Mark pending scroll restore only when navigating to a different Files folder (never on live refresh).
+  useEffect(() => {
+    if (route.section !== 'files' || route.view !== 'folder' || route.viewer) {
+      pendingScrollRestoreKeyRef.current = null;
+      return;
+    }
+    pendingScrollRestoreKeyRef.current = `${route.machine || ''}\0${route.path || '~'}`;
+  }, [route.section, route.view, route.machine, route.path, route.viewer]);
+
+  // Restore saved folder scroll position once when arriving at a Files folder (e.g. via Back).
   useEffect(() => {
     if (route.section !== 'files' || route.view !== 'folder' || route.viewer) return;
     const key = `${route.machine || ''}\0${route.path || '~'}`;
+    if (pendingScrollRestoreKeyRef.current !== key) return;
     const saved = scrollByFolderRef.current.get(key);
+    if (typeof saved === 'number' && saved > 0 && filesMeta.entries.length === 0) {
+      return;
+    }
+    pendingScrollRestoreKeyRef.current = null;
     if (mainRef.current) {
       const target = typeof saved === 'number' ? saved : 0;
       window.requestAnimationFrame(() => {
@@ -673,8 +845,12 @@ function App() {
         scrollByFolderRef.current.set(`${prevRoute.machine || ''}\0${prevRoute.path || '~'}`, mainRef.current.scrollTop);
       }
       const next = parseRoute(window.location.hash);
-      if (prevRoute?.section === 'files' && (next.section !== 'files' || next.machine !== prevRoute.machine || next.path !== prevRoute.path)) {
+      if (
+        (prevRoute?.section === 'files' && (next.section !== 'files' || next.machine !== prevRoute.machine || next.path !== prevRoute.path)) ||
+        (prevRoute?.section === 'machines' && (next.section !== 'machines' || next.machine !== prevRoute.machine || next.tab !== prevRoute.tab))
+      ) {
         setFilesViewModeOverride(null);
+        setFilesKindFilter('');
       }
       setRoute((prev) => {
         if (mainRef.current && next.section !== 'files' && (prev.section !== next.section || !wideRef.current)) {
@@ -886,7 +1062,6 @@ function App() {
           refreshAbortRef.current = null;
           refreshInFlightRef.current = false;
           setRefreshing(false);
-          setPullState('');
         }
       }
     },
@@ -914,6 +1089,7 @@ function App() {
 
   const hydrate = useCallback(
     async (nextState) => {
+      nodeInfoRef.current = nextState?.nodes?.[0] || null;
       setLinkState(nextState);
       if (!nextState?.ready) {
         setBooting(false);
@@ -939,11 +1115,17 @@ function App() {
       const toolsCacheKey = `tools:${primary.node}`;
       const cachedNodeTools = sessionCache.get(toolsCacheKey)?.value;
       setTools(Array.isArray(cachedNodeTools) ? cachedNodeTools : []);
+      capsStore.syncMachineMeta(primary.node, {
+        version: primary.version || null,
+        build: primary.build || null,
+        reachable: primary.reachable !== false,
+      });
       if (primary.reachable !== false) {
-        link
-          .tools({ on: primary.node })
-          .then((toolList) => {
-            if (Array.isArray(toolList) && nodeInfoRef.current?.node === primary.node) {
+        capsStore
+          .ensure(primary.node)
+          .then((entry) => {
+            const toolList = entry?.tools;
+            if (Array.isArray(toolList) && toolList.length > 0 && nodeInfoRef.current?.node === primary.node) {
               setTools(toolList);
               sessionCache.set(toolsCacheKey, toolList);
             }
@@ -957,8 +1139,23 @@ function App() {
         checkUpdatesQuietly();
       }
     },
-    [link, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
+    [link, capsStore, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
   );
+
+  // Feed fleet version/build/reachability into the per-machine capabilities store so build
+  // upgrades and reconnects invalidate cached tool schemas automatically.
+  useEffect(() => {
+    if (!snapshot?.machines) return;
+    for (const m of snapshot.machines) {
+      if (m?.name) {
+        capsStore.syncMachineMeta(m.name, {
+          version: m.version || null,
+          build: m.build || null,
+          reachable: m.reachable,
+        });
+      }
+    }
+  }, [capsStore, snapshot]);
 
   // Subscribe to native updater state and apply ready updates on startup before user interaction.
   useEffect(() => {
@@ -1128,6 +1325,7 @@ function App() {
         resuming = true;
         try {
           await link.invalidateSessions();
+          capsStore.invalidate();
         } finally {
           resuming = false;
         }
@@ -1163,7 +1361,7 @@ function App() {
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [link, linkState?.ready, nodeInfo, refreshFleet, settings.refreshSeconds]);
+  }, [link, capsStore, linkState?.ready, nodeInfo, refreshFleet, settings.refreshSeconds]);
 
   const openConfirm = useCallback((req) => {
     if (!sheetHistoryRef.current) {
@@ -1451,9 +1649,24 @@ function App() {
           return selectAllEntries(entries);
         });
       },
+      pruneSelection(validPaths) {
+        setFilesSelectedPaths((prev) => {
+          if (!prev || prev.size === 0) return prev;
+          let changed = false;
+          const next = new Set();
+          for (const p of prev) {
+            if (validPaths.has(p)) next.add(p);
+            else changed = true;
+          }
+          return changed ? next : prev;
+        });
+      },
       setSortPref(pref) {
         writeSortPreference(safeLocalStorage(), pref);
         setFilesSortPref(pref);
+      },
+      setKindFilter(kind) {
+        setFilesKindFilter(kind ? String(kind) : '');
       },
       setShowHidden(val) {
         setFilesShowHidden(Boolean(val));
@@ -1509,7 +1722,12 @@ function App() {
           }
           return;
         } catch (err) {
-          showToast(err?.message || 'Could not open this download.');
+          showToast(
+            plainErrorMessage(err, 'Could not open this download.', {
+              technical: Boolean(settingsRef.current?.technical),
+              deviceNoun,
+            }),
+          );
           return;
         }
       }
@@ -1549,11 +1767,14 @@ function App() {
     inMachinePhone &&
     route.tab === 'command' &&
     Boolean(selectedMachine?.reachable || (selectedMachine?.canWake && allowedSet?.has('power.wake')));
+  const isPhoneMachineFiles =
+    inMachinePhone && route.tab === 'files' && Boolean(selectedMachine?.reachable);
   const isActionsRoot =
     route.section === 'actions' && !route.action && !route.allTools;
   const hasFilesDock =
-    route.section === 'files' &&
-    (filesSelecting || (!wide && (isFilesRoot || isFilesFolder || isFilesSearch)) || (wide && isFilesSearch));
+    (route.section === 'files' &&
+      (filesSelecting || (!wide && (isFilesRoot || isFilesFolder || isFilesSearch)) || (wide && isFilesSearch))) ||
+    isPhoneMachineFiles;
   const hasDock = isActionsRoot || isPhoneCommand || hasFilesDock;
 
   // Hide bottom bar on phone for Settings, single-item detail pages, and Files selection mode.
@@ -1632,57 +1853,13 @@ function App() {
     }
   }
 
-  // Pointer-event gestures: root-place swipe, machine-part swipe, pull-to-refresh, non-Android edge back.
-  function onMainPointerDown(e) {
-    if (e.button > 0) return;
-    if (shouldIgnoreSwipeTarget(e.target, mainRef.current)) return;
-    swipeRef.current = {
-      id: e.pointerId,
-      x: e.clientX,
-      y: e.clientY,
-      t: Date.now(),
-      scrollTop: mainRef.current ? mainRef.current.scrollTop : 0,
-    };
-  }
+  // Horizontal navigation gestures: root-place swipe, machine-part swipe, non-Android edge back.
+  function finishHorizontalSwipe(start, endX, endY) {
+    if (wide || !start) return;
 
-  function onMainPointerMove(e) {
-    const start = swipeRef.current;
-    if (!start || start.id !== e.pointerId) return;
-    const dx = e.clientX - start.x;
-    const dy = e.clientY - start.y;
-    const canPull =
-      (route.section === 'machines' && (!route.machine || route.tab === 'overview')) ||
-      (route.section === 'activity' && !route.jobId);
-    if (canPull && start.scrollTop <= 2 && dy > 20 && dy > Math.abs(dx) * 1.5) {
-      setPullState(dy >= PULL_REFRESH_PX ? 'release' : 'pull');
-    } else if (pullState === 'pull' || pullState === 'release') {
-      setPullState('');
-    }
-  }
-
-  function onMainPointerUp(e) {
-    const start = swipeRef.current;
-    swipeRef.current = null;
-    if (!start || start.id !== e.pointerId) return;
-
-    const dx = e.clientX - start.x;
-    const dy = e.clientY - start.y;
+    const dx = endX - start.x;
+    const dy = endY - start.y;
     const elapsedMs = Date.now() - start.t;
-
-    const canPull =
-      (route.section === 'machines' && (!route.machine || route.tab === 'overview')) ||
-      (route.section === 'activity' && !route.jobId);
-    if (canPull && classifyPullRefresh({ dx, dy, scrollTop: start.scrollTop })) {
-      setPullState('refreshing');
-      refreshFleet(nodeInfo, { forceOffline: true });
-      triggerLearnInBackground();
-      return;
-    }
-    if (pullState === 'pull' || pullState === 'release') {
-      setPullState('');
-    }
-
-    if (wide) return;
 
     const allowEdgeBack = !isRootPlace && !hasNativeEdgeBack();
     const swipe = classifyHorizontalSwipe({
@@ -1698,6 +1875,8 @@ function App() {
       goBack();
       return;
     }
+
+    if (start.edgeBackOnly) return;
 
     if (isRootPlace) {
       const nextSection = stepTab(ROOT_SECTIONS, route.section, swipe);
@@ -1720,10 +1899,118 @@ function App() {
     }
   }
 
+  function onMainTouchStart(e) {
+    if (!e.touches || e.touches.length !== 1) {
+      touchSwipeRef.current = null;
+      return;
+    }
+    const t = e.touches[0];
+    const allowEdgeBack =
+      !wide && !isRootPlace && !hasNativeEdgeBack() && t.clientX <= EDGE_BACK_ZONE_PX;
+    const ignored = shouldIgnoreSwipeTarget(e.target, mainRef.current);
+    if (ignored && !allowEdgeBack) {
+      touchSwipeRef.current = null;
+      return;
+    }
+    // Own real touch swipes via touch events so browser pointercancel on links never drops edge-back.
+    swipeRef.current = null;
+    touchSwipeRef.current = {
+      id: t.identifier,
+      x: t.clientX,
+      y: t.clientY,
+      t: Date.now(),
+      edgeBackOnly: ignored && allowEdgeBack,
+    };
+  }
+
+  function onMainTouchEnd(e) {
+    const start = touchSwipeRef.current;
+    touchSwipeRef.current = null;
+    if (!start || !e.changedTouches) return;
+    let touch = null;
+    for (let i = 0; i < e.changedTouches.length; i += 1) {
+      if (e.changedTouches[i].identifier === start.id) {
+        touch = e.changedTouches[i];
+        break;
+      }
+    }
+    if (!touch) return;
+    finishHorizontalSwipe(start, touch.clientX, touch.clientY);
+  }
+
+  function onMainTouchCancel() {
+    touchSwipeRef.current = null;
+  }
+
+  function onMainPointerDown(e) {
+    if (e.button > 0) return;
+    const allowEdgeBack =
+      !wide && !isRootPlace && !hasNativeEdgeBack() && e.clientX <= EDGE_BACK_ZONE_PX;
+    const ignored = shouldIgnoreSwipeTarget(e.target, mainRef.current);
+    if (ignored && !allowEdgeBack) return;
+    swipeRef.current = {
+      id: e.pointerId,
+      x: e.clientX,
+      y: e.clientY,
+      t: Date.now(),
+      edgeBackOnly: ignored && allowEdgeBack,
+    };
+  }
+
+  function onMainPointerUp(e) {
+    const start = swipeRef.current;
+    swipeRef.current = null;
+    if (!start || start.id !== e.pointerId) return;
+    finishHorizontalSwipe(start, e.clientX, e.clientY);
+  }
+
   function onMainPointerCancel() {
     swipeRef.current = null;
-    if (pullState === 'pull' || pullState === 'release') setPullState('');
   }
+
+  const handlePullRefresh = useCallback(async () => {
+    if (typeof screenRefreshRef.current === 'function') {
+      await screenRefreshRef.current();
+      return;
+    }
+    const cur = routeRef.current;
+    if (cur?.section === 'settings') {
+      if (cur.page === 'about' && typeof link.checkUpdates === 'function') {
+        await checkUpdatesQuietly();
+      }
+      if (typeof link.state === 'function') {
+        const st = await link.state().catch(() => null);
+        if (st) mergeBackendState(st);
+      }
+      await refreshFleet(nodeInfoRef.current, { background: true });
+      return;
+    }
+    if (cur?.section === 'actions') {
+      const primary = nodeInfoRef.current?.node;
+      if (primary) {
+        capsStore.invalidate(primary);
+        const entry = await capsStore.ensure(primary, { force: true }).catch(() => null);
+        if (Array.isArray(entry?.tools) && entry.tools.length > 0 && nodeInfoRef.current?.node === primary) {
+          setTools(entry.tools);
+          sessionCache.set(`tools:${primary}`, entry.tools);
+        }
+      }
+      await refreshFleet(nodeInfoRef.current, { forceOffline: true });
+      return;
+    }
+    await refreshFleet(nodeInfoRef.current, { forceOffline: true });
+    triggerLearnInBackground();
+  }, [link, capsStore, sessionCache, checkUpdatesQuietly, mergeBackendState, refreshFleet, triggerLearnInBackground]);
+
+  const pullDisabled = Boolean(
+    confirmRequest ||
+      whatIsNewOpen ||
+      pairingOpen ||
+      filesSheet ||
+      route.viewer ||
+      filesSelecting ||
+      wakeUiState?.sheet,
+  );
 
   function settingsHeaderTitle() {
     if (!route.page) return 'Settings';
@@ -2021,16 +2308,25 @@ function App() {
 
   function renderDock() {
     if (hasFilesDock) {
+      const dockRoute = isPhoneMachineFiles
+        ? {
+            section: 'files',
+            view: 'folder',
+            machine: route.machine,
+            path: filesMeta.resolvedPath || '~',
+          }
+        : route;
       return html`
         <${FilesDock}
-          route=${route}
+          route=${dockRoute}
           filesState=${{
             caps: filesMeta.caps,
-            selecting: filesSelecting,
+            selecting: isPhoneMachineFiles ? false : filesSelecting,
             selectedPaths: filesSelectedPaths,
             entries: filesMeta.entries,
             resolvedPath: filesMeta.resolvedPath,
             sortPref: filesSortPref,
+            kindFilter: filesKindFilter,
             resolvedViewMode: filesResolvedViewMode,
           }}
           filesActions=${filesActions}
@@ -2192,6 +2488,7 @@ function App() {
                 onConnected=${(next) => {
                   setPairingOpen(false);
                   setFleetError(null);
+                  capsStore.invalidate();
                   setPairNotice(
                     next?.last_paired ? { summary: next.last_paired, screen: 'machines' } : null,
                   );
@@ -2231,25 +2528,19 @@ function App() {
                       </div>
                     `
                   : null}
-                <main
-                  ref=${mainRef}
-                  class=${isPhoneCommand ? 'main command-stream' : 'main'}
+                <${ScrollContainer}
+                  as="main"
+                  containerRef=${mainRef}
+                  className=${isPhoneCommand ? 'main command-stream' : 'main'}
+                  onRefresh=${handlePullRefresh}
+                  disabled=${pullDisabled}
+                  onTouchStart=${onMainTouchStart}
+                  onTouchEnd=${onMainTouchEnd}
+                  onTouchCancel=${onMainTouchCancel}
                   onPointerDown=${onMainPointerDown}
-                  onPointerMove=${onMainPointerMove}
                   onPointerUp=${onMainPointerUp}
                   onPointerCancel=${onMainPointerCancel}
                 >
-                  ${pullState
-                    ? html`
-                        <div class="pull-hint" role="status">
-                          ${pullState === 'refreshing'
-                            ? 'Refreshing…'
-                            : pullState === 'release'
-                              ? 'Release to refresh'
-                              : 'Pull to refresh'}
-                        </div>
-                      `
-                    : null}
                   ${route.section === 'machines'
                     ? html`
                         <${MachinesView}
@@ -2264,19 +2555,35 @@ function App() {
                           wide=${wide}
                           route=${route}
                           link=${link}
+                          capsStore=${capsStore}
+                          folderChanges=${folderChanges}
+                          onObserveTransferJobs=${observeTransferJobs}
+                          onRegisterRefresh=${registerScreenRefresh}
                           nodeInfo=${nodeInfo}
                           tools=${tools}
                           allowedSet=${allowedSet}
                           settings=${settings}
                           deviceNoun=${deviceNoun}
                           thumbCache=${thumbCache}
+                          filesState=${{
+                            sortPref: filesSortPref,
+                            kindFilter: filesKindFilter,
+                            showHidden: filesShowHidden,
+                            selecting: filesSelecting,
+                            selectedPaths: filesSelectedPaths,
+                            sheet: filesSheet,
+                            viewModeOverride: filesViewModeOverride,
+                            resolvedViewMode: filesResolvedViewMode,
+                          }}
+                          filesActions=${filesActions}
                           wakePendingSet=${wakePendingSet}
                           onEnsureAwake=${ensureAwakeMachine}
                           onWakeSent=${markWakeSent}
                           onRequestConfirm=${openConfirm}
                           onRefresh=${() => {
-                            refreshFleet(nodeInfo, { forceOffline: true });
+                            const p = refreshFleet(nodeInfo, { forceOffline: true });
                             triggerLearnInBackground();
+                            return p;
                           }}
                           onUpdateMachineSys=${handleUpdateMachineSys}
                           commandRuns=${{ byMachine: commandRunsByMachine, draft: commandDraft }}
@@ -2290,6 +2597,9 @@ function App() {
                             wide=${wide}
                             snapshot=${snapshot}
                             link=${link}
+                            capsStore=${capsStore}
+                            folderChanges=${folderChanges}
+                            onRegisterRefresh=${registerScreenRefresh}
                             nodeInfo=${nodeInfo}
                             tools=${tools}
                             allowedSet=${allowedSet}
@@ -2298,6 +2608,7 @@ function App() {
                             thumbCache=${thumbCache}
                             filesState=${{
                               sortPref: filesSortPref,
+                              kindFilter: filesKindFilter,
                               showHidden: filesShowHidden,
                               selecting: filesSelecting,
                               selectedPaths: filesSelectedPaths,
@@ -2325,93 +2636,105 @@ function App() {
                               wide=${wide}
                               deviceNoun=${deviceNoun}
                               deviceTransfers=${deviceTransfers}
+                              onObserveTransferJobs=${observeTransferJobs}
+                              onRegisterRefresh=${registerScreenRefresh}
                               onOpenTransfer=${handleOpenDeviceTransfer}
                               onRefreshFleet=${() => refreshFleet(nodeInfo)}
                             />
                           `
-                      : route.section === 'actions'
-                        ? html`
-                            <${ActionsView}
-                              route=${route}
-                              tools=${tools}
-                              allowedSet=${allowedSet}
-                              nodeInfo=${nodeInfo}
-                              snapshot=${snapshot}
-                              link=${link}
-                              settings=${settings}
-                              wide=${wide}
-                              query=${actionsQuery}
-                              onWakeSent=${markWakeSent}
-                              onEnsureAwake=${ensureAwakeMachine}
-                              onRequestConfirm=${openConfirm}
-                              onRefreshFleet=${() => refreshFleet(nodeInfo)}
-                            />
-                          `
-                        : html`
-                            <${SettingsView}
-                              route=${route}
-                              wide=${wide}
-                              deviceNoun=${deviceNoun}
-                              link=${link}
-                              linkState=${linkState}
-                              nodeInfo=${nodeInfo}
-                              tools=${tools}
-                              allowedSet=${allowedSet}
-                              snapshot=${snapshot}
-                              settings=${settings}
-                              pairNotice=${pairNotice?.screen === 'connections' ? pairNotice.summary : null}
-                              onDismissPairNotice=${() => setPairNotice(null)}
-                              updateState=${updateState}
-                              onCheckUpdates=${handleCheckUpdates}
-                              onInstallUpdate=${handleInstallUpdate}
-                              onSetAutoUpdate=${handleSetAutoUpdate}
-                              onDismissUpdateNotice=${handleDismissUpdateNotice}
-                              onUpdateSettings=${updateSettings}
-                              onRequestConfirm=${openConfirm}
-                              onAcceptIdentityChange=${handleAcceptIdentityChange}
-                              onDismissIdentityChange=${handleDismissIdentityChange}
-                              onConnected=${(next) => {
-                                setFleetError(null);
-                                setPairNotice(
-                                  next?.last_paired
-                                    ? { summary: next.last_paired, screen: 'connections' }
-                                    : null,
-                                );
-                                hydrate(next);
-                              }}
-                              onSelectNode=${
-                                link.kind === 'app' && typeof link.selectNode === 'function'
-                                  ? async (node) => {
-                                      if (refreshAbortRef.current) {
-                                        refreshAbortRef.current.abort();
-                                        refreshAbortRef.current = null;
+                        : route.section === 'actions'
+                          ? html`
+                              <${ActionsView}
+                                route=${route}
+                                tools=${tools}
+                                allowedSet=${allowedSet}
+                                nodeInfo=${nodeInfo}
+                                snapshot=${snapshot}
+                                link=${link}
+                                folderChanges=${folderChanges}
+                                onRegisterRefresh=${registerScreenRefresh}
+                                settings=${settings}
+                                wide=${wide}
+                                query=${actionsQuery}
+                                onWakeSent=${markWakeSent}
+                                onEnsureAwake=${ensureAwakeMachine}
+                                onRequestConfirm=${openConfirm}
+                                onRefreshFleet=${() => refreshFleet(nodeInfo)}
+                              />
+                            `
+                          : html`
+                              <${SettingsView}
+                                route=${route}
+                                wide=${wide}
+                                deviceNoun=${deviceNoun}
+                                link=${link}
+                                capsStore=${capsStore}
+                                onRegisterRefresh=${registerScreenRefresh}
+                                linkState=${linkState}
+                                nodeInfo=${nodeInfo}
+                                tools=${tools}
+                                allowedSet=${allowedSet}
+                                snapshot=${snapshot}
+                                settings=${settings}
+                                pairNotice=${pairNotice?.screen === 'connections' ? pairNotice.summary : null}
+                                onDismissPairNotice=${() => setPairNotice(null)}
+                                updateState=${updateState}
+                                onCheckUpdates=${handleCheckUpdates}
+                                onInstallUpdate=${handleInstallUpdate}
+                                onSetAutoUpdate=${handleSetAutoUpdate}
+                                onDismissUpdateNotice=${handleDismissUpdateNotice}
+                                onUpdateSettings=${updateSettings}
+                                onRequestConfirm=${openConfirm}
+                                onAcceptIdentityChange=${handleAcceptIdentityChange}
+                                onDismissIdentityChange=${handleDismissIdentityChange}
+                                onConnected=${(next) => {
+                                  setFleetError(null);
+                                  capsStore.invalidate();
+                                  folderChanges.clearCache();
+                                  setPairNotice(
+                                    next?.last_paired
+                                      ? { summary: next.last_paired, screen: 'connections' }
+                                      : null,
+                                  );
+                                  hydrate(next);
+                                }}
+                                onSelectNode=${
+                                  link.kind === 'app' && typeof link.selectNode === 'function'
+                                    ? async (node) => {
+                                        if (refreshAbortRef.current) {
+                                          refreshAbortRef.current.abort();
+                                          refreshAbortRef.current = null;
+                                        }
+                                        refreshInFlightRef.current = false;
+                                        sessionCache.clear();
+                                        persistentCache.clear();
+                                        capsStore.invalidate();
+                                        folderChanges.clearCache();
+                                        setSnapshot(null);
+                                        setTools([]);
+                                        const next = await link.selectNode(node);
+                                        await hydrate(next);
                                       }
-                                      refreshInFlightRef.current = false;
-                                      sessionCache.clear();
-                                      persistentCache.clear();
-                                      setSnapshot(null);
-                                      setTools([]);
-                                      const next = await link.selectNode(node);
-                                      await hydrate(next);
-                                    }
-                                  : null
-                              }
-                              onDisconnected=${async () => {
-                                if (refreshAbortRef.current) {
-                                  refreshAbortRef.current.abort();
-                                  refreshAbortRef.current = null;
+                                    : null
                                 }
-                                refreshInFlightRef.current = false;
-                                sessionCache.clear();
-                                persistentCache.clear();
-                                setSnapshot(null);
-                                setTools([]);
-                                const st = await link.state();
-                                await hydrate(st);
-                              }}
-                            />
-                          `}
-                </main>
+                                onDisconnected=${async () => {
+                                  if (refreshAbortRef.current) {
+                                    refreshAbortRef.current.abort();
+                                    refreshAbortRef.current = null;
+                                  }
+                                  refreshInFlightRef.current = false;
+                                  sessionCache.clear();
+                                  persistentCache.clear();
+                                  capsStore.invalidate();
+                                  folderChanges.clearCache();
+                                  setSnapshot(null);
+                                  setTools([]);
+                                  const st = await link.state();
+                                  await hydrate(st);
+                                }}
+                              />
+                            `}
+                <//>
                 ${renderDock()}
                 ${renderNav()}
               </div>

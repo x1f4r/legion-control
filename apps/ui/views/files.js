@@ -34,10 +34,12 @@ import {
   recordRecentFile,
   writeFolderViewMode,
 } from '../lib/files-store.js';
+import { plainErrorMessage } from '../lib/errors.js';
+import { createCoalescedRefetch, STALE_AFTER_MS } from '../lib/folder-changes.js';
 import { formatBytes, formatElapsed, formatRelativeTime, primaryDisk } from '../lib/format.js';
 import { routeHref } from '../lib/route.js';
 import { thumbCacheKey } from '../lib/thumb-cache.js';
-import { Notice, ProgressBar, SwipeRow } from './common.js';
+import { Notice, OlderMachineNote, ProgressBar, SwipeRow } from './common.js';
 import {
   FolderMoreSheet,
   NewFolderSheet,
@@ -50,11 +52,99 @@ import {
   SyncConflictsSheet,
 } from './files-sheets.js';
 import { FilesViewer } from './files-viewer.js';
+import { ScrollContainer } from './scroll-container.js';
 
 const PAGE_SIZE = 200;
 const RENDER_STEP = 120;
 const THUMB_BATCH_MAX = 32;
 const LONG_PRESS_MS = 450;
+
+const KIND_FILTER_LABELS = {
+  image: 'Pictures',
+  video: 'Videos',
+  audio: 'Music',
+  document: 'Documents',
+  text: 'Text',
+  archive: 'Archives',
+};
+
+function useMachineCaps(capsStore, machine, { fallbackTools = [], fallbackAllowedSet = null, link = null, enabled = true } = {}) {
+  const [rev, setRev] = useState(0);
+
+  useEffect(() => {
+    if (capsStore) {
+      return capsStore.subscribe(() => setRev((n) => n + 1));
+    }
+    if (typeof link?.onContentSupportChange === 'function') {
+      return link.onContentSupportChange(() => setRev((n) => n + 1));
+    }
+    return undefined;
+  }, [capsStore, link]);
+
+  useEffect(() => {
+    if (!capsStore || !machine || !enabled) return;
+    if (!capsStore.isKnown(machine)) {
+      capsStore.ensure(machine).catch(() => {});
+    }
+  }, [capsStore, machine, enabled, rev]);
+
+  return useMemo(() => {
+    if (capsStore && machine) {
+      return {
+        caps: capsStore.fileCapabilities(machine, { fallbackAllowedSet }),
+        entry: capsStore.get(machine),
+        missing: capsStore.missingFeatures(machine),
+      };
+    }
+    return {
+      caps: detectFileCapabilities({
+        tools: fallbackTools,
+        allowedSet: fallbackAllowedSet,
+        link,
+        machine: machine || null,
+      }),
+      entry: null,
+      missing: [],
+    };
+  }, [capsStore, machine, fallbackTools, fallbackAllowedSet, link, rev]);
+}
+
+function buildOldFindGlob(query) {
+  const trimmed = String(query || '').trim();
+  if (!trimmed) return null;
+  if (/[*?]/.test(trimmed)) return trimmed;
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  const longest = words.reduce((a, b) => (b.length > a.length ? b : a), trimmed);
+  let pattern = '';
+  for (const ch of longest) {
+    if (ch >= 'a' && ch <= 'z') {
+      pattern += `[${ch}${ch.toUpperCase()}]`;
+    } else if (ch >= 'A' && ch <= 'Z') {
+      pattern += `[${ch.toLowerCase()}${ch}]`;
+    } else if ('[]{}*?!\\'.includes(ch)) {
+      pattern += `\\${ch}`;
+    } else {
+      pattern += ch;
+    }
+  }
+  return `*${pattern}*`;
+}
+
+function normalizeFindEntries(rawList) {
+  if (!Array.isArray(rawList)) return [];
+  return rawList
+    .filter((item) => item && typeof item === 'object' && item.path)
+    .map((item) => (item.name ? item : { ...item, name: baseFileName(item.path) }));
+}
+
+function isMachineFilesRoot(filePath) {
+  const p = String(filePath || '').trim().replace(/[/\\]+$/, '');
+  if (!p || p === '~') return true;
+  if (/^\/(?:home|Users)\/[^/]+$/.test(p)) return true;
+  if (/^[A-Za-z]:\\Users\\[^\\]+$/i.test(p)) return true;
+  if (p === '/' || /^[A-Za-z]:$/.test(p)) return true;
+  return false;
+}
 
 function safeStorage() {
   try {
@@ -113,7 +203,7 @@ function joinMemberNames(members) {
 const THUMB_MAX_RETRIES = 3;
 const THUMB_RETRY_BASE_MS = 350;
 
-function useBatchedThumbs({ machine, entries, link, enabled, thumbCache }) {
+function useBatchedThumbs({ machine, entries, link, capsStore = null, enabled, thumbCache }) {
   const [, setTick] = useState(0);
   const queueRef = useRef(new Set());
   const inFlightRef = useRef(new Set());
@@ -173,8 +263,10 @@ function useBatchedThumbs({ machine, entries, link, enabled, thumbCache }) {
     }
     if (batch.length === 0) return;
 
-    link
-      .call('fs.thumb', { paths: batch, size: 128, fit: 'cover' }, { on: machine })
+    const thumbPromise = capsStore
+      ? capsStore.call('fs.thumb', { paths: batch, size: 128, fit: 'cover' }, { on: machine }).then((r) => r.value)
+      : link.call('fs.thumb', { paths: batch, size: 128, fit: 'cover' }, { on: machine });
+    thumbPromise
       .then((res) => {
         const map = res?.thumbnails || {};
         for (const p of batch) {
@@ -207,7 +299,7 @@ function useBatchedThumbs({ machine, entries, link, enabled, thumbCache }) {
           thumbCache.set(key, { failed: true });
         }
       });
-  }, [enabled, machine, link, thumbCache, scheduleRetry]);
+  }, [enabled, machine, link, capsStore, thumbCache, scheduleRetry]);
 
   flushRef.current = flush;
 
@@ -310,6 +402,7 @@ export function FilesHome({
   syncFolders,
   recentFiles,
   caps,
+  capsStore = null,
   deviceNoun,
   link,
   thumbCache,
@@ -323,9 +416,9 @@ export function FilesHome({
   const pinned = useMemo(() => (favourites || []).filter((f) => f.pinned), [favourites]);
   const [tileThumbs, setTileThumbs] = useState({});
 
-  // Load thumbnails for pinned files (e.g. Passport.pdf or pinned photos).
+  // Load thumbnails for pinned files, checking fs.thumb capability per pinned item's machine.
   useEffect(() => {
-    if (!caps?.hasThumb || pinned.length === 0) return;
+    if ((!capsStore && !caps?.hasThumb) || pinned.length === 0) return;
     let alive = true;
     const byMachine = new Map();
     for (const p of pinned) {
@@ -340,10 +433,24 @@ export function FilesHome({
       byMachine.get(p.machine).push(p);
     }
     for (const [mName, items] of byMachine.entries()) {
-      link
-        .call('fs.thumb', { paths: items.map((i) => i.path), size: 128, fit: 'cover' }, { on: mName })
+      const fetchThumbs = async () => {
+        if (capsStore) {
+          if (!capsStore.isKnown(mName)) {
+            await capsStore.ensure(mName).catch(() => null);
+          }
+          if (!alive || !capsStore.hasTool(mName, 'fs.thumb')) return;
+          const r = await capsStore.call(
+            'fs.thumb',
+            { paths: items.map((i) => i.path), size: 128, fit: 'cover' },
+            { on: mName },
+          );
+          return r.value;
+        }
+        return link.call('fs.thumb', { paths: items.map((i) => i.path), size: 128, fit: 'cover' }, { on: mName });
+      };
+      fetchThumbs()
         .then((res) => {
-          if (!alive) return;
+          if (!alive || !res) return;
           const map = res?.thumbnails || {};
           const patch = {};
           for (const item of items) {
@@ -363,7 +470,7 @@ export function FilesHome({
     return () => {
       alive = false;
     };
-  }, [caps?.hasThumb, pinned, link, thumbCache]);
+  }, [capsStore, caps?.hasThumb, pinned, link, thumbCache]);
 
   return html`
     <div>
@@ -558,12 +665,20 @@ export function FolderBrowser({
   path,
   link,
   caps,
+  capsStore = null,
+  capsEntry = null,
+  missingFeatures = [],
+  folderChanges = null,
+  onPruneSelection = null,
+  onRegisterRefresh = null,
   allowedSet,
   technical,
   deviceNoun,
   favourites,
   thumbCache,
   sortPref,
+  kindFilter = '',
+  onClearKindFilter = null,
   showHidden,
   selecting,
   selectedPaths,
@@ -595,17 +710,29 @@ export function FolderBrowser({
   const [totalCount, setTotalCount] = useState(null);
   const [totalExact, setTotalExact] = useState(true);
   const [hasMorePages, setHasMorePages] = useState(false);
+  const [oldTruncated, setOldTruncated] = useState(false);
+  const [serverSorted, setServerSorted] = useState(false);
+  const [serverFilteredKind, setServerFilteredKind] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [renderLimit, setRenderLimit] = useState(RENDER_STEP);
   const [error, setError] = useState(null);
+  const [justAddedPaths, setJustAddedPaths] = useState(() => new Set());
 
   const pagerRef = useRef(null);
   const crumbsRef = useRef(null);
   const longPressTimerRef = useRef(null);
   const longPressFiredRef = useRef(false);
+  const justAddedTimerRef = useRef(null);
   const abortRef = useRef(null);
   const offsetRef = useRef(0);
+  const lastLoadRef = useRef(null);
+  const loadedAtRef = useRef(null);
+  const rawEntriesRef = useRef(rawEntries);
+  rawEntriesRef.current = rawEntries;
+  const resolvedPathRef = useRef(resolvedPath);
+  resolvedPathRef.current = resolvedPath;
+  const coalescedRef = useRef(null);
 
   const favPathSet = useMemo(() => {
     const s = new Set();
@@ -619,6 +746,31 @@ export function FolderBrowser({
   const isWaking = Boolean(machine && wakePendingSet?.has(machine));
   const canWake = allowedSet ? allowedSet.has('power.wake') : false;
 
+  const propsRef = useRef(null);
+  propsRef.current = {
+    machine,
+    path: path || '~',
+    reachable,
+    showHidden,
+    sortPref,
+    kindFilter: kindFilter || '',
+    caps,
+    capsStore,
+    link,
+    allowedSet,
+    folderChanges,
+    onPruneSelection,
+    onRefreshFleet,
+    reloadToken,
+  };
+
+  useEffect(() => () => {
+    if (justAddedTimerRef.current) {
+      clearTimeout(justAddedTimerRef.current);
+      justAddedTimerRef.current = null;
+    }
+  }, []);
+
   // Poll fleet status while waking this offline machine so the folder reopens at the same path.
   useEffect(() => {
     if ((reachable && error?.code !== 'unreachable') || !isWaking || typeof onRefreshFleet !== 'function') {
@@ -630,60 +782,346 @@ export function FolderBrowser({
     return () => window.clearInterval(timer);
   }, [reachable, error?.code, isWaking, onRefreshFleet]);
 
-  // Load initial page of directory.
+  const runDirectoryFetch = useCallback(async ({ quiet = false, highlightNew = false, signal = null } = {}) => {
+    const p = propsRef.current;
+    if (!p.machine || !p.reachable) return;
+    const reqPath = p.path || '~';
+    const queryKey = JSON.stringify({
+      showHidden: Boolean(p.showHidden),
+      sort: p.sortPref.sort,
+      order: p.sortPref.order,
+      kind: p.kindFilter,
+    });
+
+    let ctrl = null;
+    let activeSignal = signal;
+    if (!activeSignal) {
+      if (abortRef.current) abortRef.current.abort();
+      ctrl = new AbortController();
+      abortRef.current = ctrl;
+      activeSignal = ctrl.signal;
+    }
+
+    if (!quiet) {
+      setLoading(true);
+      setError(null);
+      setRenderLimit(RENDER_STEP);
+      setOldTruncated(false);
+      offsetRef.current = 0;
+    }
+
+    try {
+      if (p.capsStore && !p.capsStore.isKnown(p.machine)) {
+        await p.capsStore.ensure(p.machine, { signal: activeSignal });
+      }
+      if (activeSignal.aborted) return;
+
+      const liveCaps = p.capsStore
+        ? p.capsStore.fileCapabilities(p.machine, { fallbackAllowedSet: p.allowedSet })
+        : p.caps;
+
+      const reqArgs = {
+        path: reqPath,
+        depth: 1,
+        hidden: p.showHidden,
+        limit: liveCaps?.hasListOffset ? PAGE_SIZE : 500,
+      };
+      if (liveCaps?.hasListSort) {
+        reqArgs.sort = p.sortPref.sort;
+        reqArgs.order = p.sortPref.order;
+      }
+      if (liveCaps?.hasListCategories && p.kindFilter) {
+        reqArgs.categories = [p.kindFilter];
+      }
+      if (liveCaps?.hasListOffset) {
+        reqArgs.offset = 0;
+      }
+
+      let res;
+      let dropped = [];
+      if (p.capsStore) {
+        const outcome = await p.capsStore.call('fs.list', reqArgs, {
+          on: p.machine,
+          optional: ['sort', 'order', 'categories', 'offset'],
+          signal: activeSignal,
+          onDrop(sentArgs, droppedList) {
+            if (droppedList.includes('offset')) {
+              sentArgs.limit = 500;
+            }
+          },
+        });
+        res = outcome.value;
+        dropped = outcome.dropped;
+      } else {
+        res = await p.link.call('fs.list', reqArgs, { on: p.machine, signal: activeSignal });
+      }
+      if (activeSignal.aborted) return;
+
+      const usedServerSort = Boolean(
+        liveCaps?.hasListSort && !dropped.includes('sort') && !dropped.includes('order'),
+      );
+      const usedServerCategories = Boolean(
+        liveCaps?.hasListCategories && p.kindFilter && !dropped.includes('categories'),
+      );
+      const usedServerOffset = Boolean(liveCaps?.hasListOffset && !dropped.includes('offset'));
+
+      const actualPath = res?.path || reqPath;
+      const list = Array.isArray(res?.entries) ? res.entries : [];
+      const nowMs = Date.now();
+
+      if (p.folderChanges) {
+        if (reqPath === '~' && actualPath && actualPath !== '~') {
+          p.folderChanges.registerHome(p.machine, actualPath);
+        }
+        p.folderChanges.markLoaded(p.machine, actualPath, nowMs);
+        if (actualPath !== reqPath) {
+          p.folderChanges.markLoaded(p.machine, reqPath, nowMs);
+        }
+      }
+
+      if (quiet) {
+        const prevPaths = new Set((rawEntriesRef.current || []).map((e) => e.path));
+        if (highlightNew && prevPaths.size > 0) {
+          const added = new Set();
+          for (const entry of list) {
+            if (entry?.path && !prevPaths.has(entry.path)) {
+              added.add(entry.path);
+            }
+          }
+          if (added.size > 0) {
+            setJustAddedPaths(added);
+            if (justAddedTimerRef.current) clearTimeout(justAddedTimerRef.current);
+            justAddedTimerRef.current = window.setTimeout(() => {
+              justAddedTimerRef.current = null;
+              setJustAddedPaths(new Set());
+            }, 1500);
+          }
+        }
+        if (typeof p.onPruneSelection === 'function') {
+          p.onPruneSelection(new Set(list.map((e) => e.path)));
+        }
+        setError(null);
+      }
+
+      const nextTotalCount = typeof res?.total === 'number' ? res.total : list.length;
+      const nextTotalExact = res?.total_exact !== false;
+      const nextHasMorePages = Boolean(res?.truncated && usedServerOffset);
+      const nextOldTruncated = Boolean(res?.truncated && !usedServerOffset);
+
+      lastLoadRef.current = {
+        machine: p.machine,
+        path: reqPath,
+        showHidden: p.showHidden,
+        reloadToken: p.reloadToken,
+        sort: p.sortPref.sort,
+        order: p.sortPref.order,
+        kind: p.kindFilter,
+        usedServerSort,
+        usedServerCategories,
+      };
+      loadedAtRef.current = nowMs;
+
+      setResolvedPath(actualPath);
+      setRawEntries(list);
+      setTotalCount(nextTotalCount);
+      setTotalExact(nextTotalExact);
+      setServerSorted(usedServerSort);
+      setServerFilteredKind(usedServerCategories);
+      setHasMorePages(nextHasMorePages);
+      setOldTruncated(nextOldTruncated);
+      offsetRef.current = list.length;
+      setLoading(false);
+
+      if (p.folderChanges) {
+        const cacheSnap = {
+          queryKey,
+          loadedAt: nowMs,
+          resolvedPath: actualPath,
+          rawEntries: list,
+          totalCount: nextTotalCount,
+          totalExact: nextTotalExact,
+          hasMorePages: nextHasMorePages,
+          oldTruncated: nextOldTruncated,
+          serverSorted: usedServerSort,
+          serverFilteredKind: usedServerCategories,
+        };
+        p.folderChanges.setCached(p.machine, actualPath, cacheSnap);
+        if (actualPath !== reqPath) {
+          p.folderChanges.setCached(p.machine, reqPath, cacheSnap);
+        }
+      }
+    } catch (err) {
+      if (activeSignal.aborted) return;
+      if (!quiet) {
+        lastLoadRef.current = null;
+        setError(err);
+        setLoading(false);
+      } else {
+        setError(err);
+      }
+    }
+  }, []);
+
+  // Load initial page of directory (restoring cached snapshot when available and refetching
+  // quietly if stale) and set up a non-overlapping coalesced refecher for live announcements.
   useEffect(() => {
+    const reqPath = path || '~';
+    if (coalescedRef.current) {
+      coalescedRef.current.cancel();
+      coalescedRef.current = null;
+    }
+
     if (!machine || !reachable) {
+      lastLoadRef.current = null;
+      loadedAtRef.current = null;
       setLoading(false);
       setRawEntries([]);
-      return;
+      setOldTruncated(false);
+      return undefined;
     }
+
+    const prev = lastLoadRef.current;
+    const sameDir =
+      prev &&
+      prev.machine === machine &&
+      prev.path === reqPath &&
+      prev.showHidden === showHidden &&
+      prev.reloadToken === reloadToken;
+    const queryKey = JSON.stringify({
+      showHidden: Boolean(showHidden),
+      sort: sortPref.sort,
+      order: sortPref.order,
+      kind: kindFilter || '',
+    });
+
+    const runner = createCoalescedRefetch((opts) =>
+      runDirectoryFetch({ quiet: true, highlightNew: opts?.highlightNew !== false }),
+    );
+    coalescedRef.current = runner;
+
+    if (sameDir) {
+      const sortChanged = prev.sort !== sortPref.sort || prev.order !== sortPref.order;
+      const kindChanged = prev.kind !== (kindFilter || '');
+      const needsServerForSort = sortChanged && prev.usedServerSort;
+      const needsServerForKind = kindChanged && prev.usedServerCategories;
+      if (!needsServerForSort && !needsServerForKind) {
+        return () => {
+          runner.cancel();
+        };
+      }
+    }
+
+    // Switching directories: check cache first so back navigation paints instantly, then
+    // quietly refetch if anything changed while off-screen or data is older than 10s.
+    const switchingDir = !prev || prev.machine !== machine || prev.path !== reqPath;
+    if (switchingDir) {
+      setJustAddedPaths(new Set());
+      const cached = folderChanges ? folderChanges.getCached(machine, reqPath) : null;
+      if (cached && cached.queryKey === queryKey) {
+        setResolvedPath(cached.resolvedPath || reqPath);
+        setRawEntries(cached.rawEntries || []);
+        setTotalCount(cached.totalCount);
+        setTotalExact(cached.totalExact);
+        setServerSorted(cached.serverSorted);
+        setServerFilteredKind(cached.serverFilteredKind);
+        setHasMorePages(cached.hasMorePages);
+        setOldTruncated(cached.oldTruncated);
+        setRenderLimit(RENDER_STEP);
+        setError(null);
+        setLoading(false);
+        offsetRef.current = (cached.rawEntries || []).length;
+        loadedAtRef.current = cached.loadedAt;
+        lastLoadRef.current = {
+          machine,
+          path: reqPath,
+          showHidden,
+          reloadToken,
+          sort: sortPref.sort,
+          order: sortPref.order,
+          kind: kindFilter || '',
+          usedServerSort: cached.serverSorted,
+          usedServerCategories: cached.serverFilteredKind,
+        };
+        const stale = folderChanges.isStale(machine, cached.resolvedPath || reqPath, {
+          loadedAt: cached.loadedAt,
+          maxAgeMs: STALE_AFTER_MS,
+        });
+        if (stale) {
+          runner.trigger({ highlightNew: false });
+        }
+        return () => {
+          runner.cancel();
+        };
+      }
+    }
+
     if (abortRef.current) abortRef.current.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
-    setLoading(true);
-    setError(null);
-    setRenderLimit(RENDER_STEP);
-    offsetRef.current = 0;
-
-    const reqArgs = {
-      path: path || '~',
-      depth: 1,
-      hidden: showHidden,
-      limit: caps?.hasListOffset ? PAGE_SIZE : 5000,
-    };
-    if (caps?.hasListSort) {
-      reqArgs.sort = sortPref.sort;
-      reqArgs.order = sortPref.order;
-    }
-    if (caps?.hasListOffset) {
-      reqArgs.offset = 0;
-    }
-
-    link
-      .call('fs.list', reqArgs, { on: machine, signal: ctrl.signal })
-      .then((res) => {
-        if (ctrl.signal.aborted) return;
-        const actualPath = res?.path || path || '~';
-        const list = Array.isArray(res?.entries) ? res.entries : [];
-        setResolvedPath(actualPath);
-        setRawEntries(list);
-        setTotalCount(typeof res?.total === 'number' ? res.total : list.length);
-        setTotalExact(res?.total_exact !== false);
-        setHasMorePages(Boolean(res?.truncated && caps?.hasListOffset));
-        offsetRef.current = list.length;
-        setLoading(false);
-      })
-      .catch((err) => {
-        if (ctrl.signal.aborted) return;
-        setError(err);
-        setLoading(false);
-      });
+    const quietReload = Boolean(prev && prev.machine === machine && prev.path === reqPath && rawEntriesRef.current.length > 0);
+    runDirectoryFetch({ quiet: quietReload, highlightNew: quietReload, signal: ctrl.signal });
 
     return () => {
       ctrl.abort();
+      runner.cancel();
     };
-  }, [machine, path, reachable, showHidden, sortPref.sort, sortPref.order, caps?.hasListSort, caps?.hasListOffset, reloadToken]);
+  }, [machine, path, reachable, showHidden, sortPref.sort, sortPref.order, kindFilter, reloadToken, folderChanges, runDirectoryFetch]);
+
+  // Subscribe to live folder change announcements for this folder (both requested and resolved paths).
+  useEffect(() => {
+    if (!folderChanges || !machine || !reachable) return undefined;
+    const reqPath = path || '~';
+    const onChanged = () => {
+      coalescedRef.current?.trigger({ highlightNew: true });
+    };
+    const unsubs = [folderChanges.subscribe(machine, reqPath, onChanged)];
+    if (resolvedPath && resolvedPath !== reqPath) {
+      unsubs.push(folderChanges.subscribe(machine, resolvedPath, onChanged));
+    }
+    return () => {
+      for (const u of unsubs) u();
+    };
+  }, [folderChanges, machine, path, resolvedPath, reachable]);
+
+  // Refetch quietly for external changes when returning to foreground/focus if older than 10s.
+  useEffect(() => {
+    if (!machine || !reachable) return undefined;
+    const checkStaleOnVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      const loadedAt = loadedAtRef.current;
+      if (typeof loadedAt !== 'number') return;
+      const targetPath = resolvedPathRef.current || path || '~';
+      const stale = folderChanges
+        ? folderChanges.isStale(machine, targetPath, { loadedAt, maxAgeMs: STALE_AFTER_MS })
+        : Date.now() - loadedAt > STALE_AFTER_MS;
+      if (stale) {
+        coalescedRef.current?.trigger({ highlightNew: false });
+      }
+    };
+    document.addEventListener('visibilitychange', checkStaleOnVisible);
+    window.addEventListener('focus', checkStaleOnVisible);
+    return () => {
+      document.removeEventListener('visibilitychange', checkStaleOnVisible);
+      window.removeEventListener('focus', checkStaleOnVisible);
+    };
+  }, [folderChanges, machine, path, reachable]);
+
+  // Register this folder's quiet refetch with the shell's pull-to-refresh container.
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function') return undefined;
+    return onRegisterRefresh(async () => {
+      if (!propsRef.current.reachable) {
+        await propsRef.current.onRefreshFleet?.({ forceOffline: true });
+        return;
+      }
+      if (coalescedRef.current) {
+        await coalescedRef.current.trigger({ highlightNew: true });
+      } else {
+        await runDirectoryFetch({ quiet: true, highlightNew: true });
+      }
+    });
+  }, [onRegisterRefresh, runDirectoryFetch, machine, path, reachable]);
 
   const loadNextPage = useCallback(() => {
     if (loadingMore || !hasMorePages || !caps?.hasListOffset) return;
@@ -699,8 +1137,19 @@ export function FolderBrowser({
       reqArgs.sort = sortPref.sort;
       reqArgs.order = sortPref.order;
     }
-    link
-      .call('fs.list', reqArgs, { on: machine, signal: abortRef.current?.signal })
+    if (caps?.hasListCategories && kindFilter) {
+      reqArgs.categories = [kindFilter];
+    }
+    const nextPromise = capsStore
+      ? capsStore
+          .call('fs.list', reqArgs, {
+            on: machine,
+            optional: ['sort', 'order', 'categories'],
+            signal: abortRef.current?.signal,
+          })
+          .then((r) => r.value)
+      : link.call('fs.list', reqArgs, { on: machine, signal: abortRef.current?.signal });
+    nextPromise
       .then((res) => {
         const more = Array.isArray(res?.entries) ? res.entries : [];
         setRawEntries((prev) => {
@@ -719,20 +1168,25 @@ export function FolderBrowser({
       .catch(() => {
         setLoadingMore(false);
       });
-  }, [loadingMore, hasMorePages, caps?.hasListOffset, caps?.hasListSort, resolvedPath, showHidden, sortPref.sort, sortPref.order, link, machine]);
+  }, [loadingMore, hasMorePages, caps?.hasListOffset, caps?.hasListSort, caps?.hasListCategories, resolvedPath, showHidden, sortPref.sort, sortPref.order, kindFilter, capsStore, link, machine]);
 
   // Client-side filter & sort guarantees consistent behavior on older nodes too.
   const entries = useMemo(() => {
-    const filtered = filterEntries(rawEntries, { hidden: showHidden });
-    return caps?.hasListSort ? filtered : sortEntries(filtered, sortPref);
-  }, [rawEntries, showHidden, caps?.hasListSort, sortPref]);
+    const applyCats = Boolean(kindFilter) && !serverFilteredKind;
+    const filtered = filterEntries(rawEntries, {
+      hidden: showHidden,
+      categories: applyCats ? [kindFilter] : [],
+      keepDirs: true,
+    });
+    return serverSorted ? filtered : sortEntries(filtered, sortPref);
+  }, [rawEntries, showHidden, kindFilter, serverFilteredKind, serverSorted, sortPref]);
 
   useEffect(() => {
     if (onEntriesChange) onEntriesChange(entries, resolvedPath);
   }, [entries, resolvedPath]);
 
   const savedMode = readFolderViewMode(safeStorage(), machine, resolvedPath);
-  const effectiveMode = viewModeOverride || savedMode || (shouldDefaultToGrid(entries) ? 'grid' : 'list');
+  const effectiveMode = viewModeOverride || savedMode || (shouldDefaultToGrid(rawEntries) ? 'grid' : 'list');
 
   useEffect(() => {
     if (onViewModeResolved) onViewModeResolved(effectiveMode, resolvedPath);
@@ -770,7 +1224,8 @@ export function FolderBrowser({
     machine,
     entries: visibleEntries,
     link,
-    enabled: Boolean(caps?.hasThumb && reachable),
+    capsStore,
+    enabled: Boolean(caps?.known && caps?.hasThumb && reachable),
     thumbCache,
   });
 
@@ -859,7 +1314,9 @@ export function FolderBrowser({
             viewer: { machine, path: entry.path },
           });
 
-    const rowCls = ['row', picked ? 'picked' : ''].filter(Boolean).join(' ');
+    const rowCls = ['row', picked ? 'picked' : '', justAddedPaths.has(entry.path) ? 'just-added' : '']
+      .filter(Boolean)
+      .join(' ');
     const rowEl = html`
       <a
         class=${rowCls}
@@ -953,7 +1410,12 @@ export function FolderBrowser({
                         path: resolvedPath,
                         viewer: { machine, path: entry.path },
                       });
-                  const cls = ['cell', isDir ? 'folder' : '', picked ? 'picked' : '']
+                  const cls = [
+                    'cell',
+                    isDir ? 'folder' : '',
+                    picked ? 'picked' : '',
+                    justAddedPaths.has(entry.path) ? 'just-added' : '',
+                  ]
                     .filter(Boolean)
                     .join(' ');
                   return html`
@@ -1005,7 +1467,8 @@ export function FolderBrowser({
     `;
   }
 
-  const inlineTools = (wide || embedded) && !selecting;
+  const inlineTools = wide && !selecting;
+  const atMachineFilesRoot = !path || path === '~' || isMachineFilesRoot(resolvedPath);
 
   return html`
     <div data-no-swipe="true">
@@ -1038,7 +1501,10 @@ export function FolderBrowser({
               <button
                 type="button"
                 class="btn icon"
-                aria-label=${`Sort: ${sortDescription(sortPref)}`}
+                aria-label=${kindFilter
+                  ? `Sort: ${sortDescription(sortPref)}, showing ${KIND_FILTER_LABELS[kindFilter] || kindFilter}`
+                  : `Sort: ${sortDescription(sortPref)}`}
+                aria-pressed=${kindFilter ? 'true' : 'false'}
                 onClick=${onOpenSort}
               >
                 <${Icon} name="sort" />
@@ -1082,6 +1548,33 @@ export function FolderBrowser({
         })}
       </nav>
 
+      ${atMachineFilesRoot && missingFeatures?.length > 0
+        ? html`
+            <${OlderMachineNote}
+              machine=${machine}
+              version=${capsEntry?.version || machineObj?.version || null}
+              build=${capsEntry?.build || machineObj?.build || null}
+              missing=${missingFeatures}
+              technical=${technical}
+            />
+          `
+        : null}
+
+      ${kindFilter
+        ? html`
+            <div class="folder-filter-bar" role="status">
+              <span>Showing ${KIND_FILTER_LABELS[kindFilter] || kindFilter}</span>
+              ${onClearKindFilter
+                ? html`
+                    <button type="button" class="btn small quiet" onClick=${onClearKindFilter}>
+                      Show all
+                    </button>
+                  `
+                : null}
+            </div>
+          `
+        : null}
+
       ${error?.code === 'denied'
         ? html`
             <div class="empty">
@@ -1096,7 +1589,7 @@ export function FolderBrowser({
             </div>
           `
         : error
-          ? html`<${Notice} error=${error} />`
+          ? html`<${Notice} error=${error} technical=${technical} deviceNoun=${deviceNoun} />`
           : null}
 
       ${error?.code === 'denied'
@@ -1104,7 +1597,22 @@ export function FolderBrowser({
         : loading && rawEntries.length === 0
           ? html`<div class="empty">Loading folder…</div>`
           : entries.length === 0 && !error
-            ? html`
+            ? kindFilter
+              ? html`
+                  <div class="empty">
+                    <p>No ${(KIND_FILTER_LABELS[kindFilter] || kindFilter).toLowerCase()} in this folder.</p>
+                    ${onClearKindFilter
+                      ? html`
+                          <div class="empty-actions">
+                            <button type="button" class="btn small" onClick=${onClearKindFilter}>
+                              Show all
+                            </button>
+                          </div>
+                        `
+                      : null}
+                  </div>
+                `
+              : html`
                 <div class="empty">
                   <p>This folder is empty.</p>
                   ${(caps?.hasMkdir && onNewFolder) || (caps?.hasUpload && onUpload)
@@ -1141,6 +1649,14 @@ export function FolderBrowser({
               ? renderGrid()
               : html`<div class="list">${visibleEntries.map(renderListRow)}</div>`}
 
+      ${oldTruncated
+        ? html`
+            <p class="folder-limit-note">
+              Showing the first ${rawEntries.length.toLocaleString()}. Update Legion on ${machine} to see everything.
+            </p>
+          `
+        : null}
+
       ${hasMoreToRender || hasMorePages
         ? html`
             <div ref=${pagerRef} class="folder-pager">
@@ -1170,9 +1686,11 @@ export function FilesSearchView({
   machines,
   favourites,
   caps,
+  capsStore = null,
   link,
   technical,
   thumbCache,
+  onRegisterRefresh = null,
   onNavigateFolder,
   onOpenFile,
   onResultCountChange,
@@ -1191,15 +1709,35 @@ export function FilesSearchView({
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState(null);
   const [, setThumbTick] = useState(0);
+  const [searchRev, setSearchRev] = useState(0);
   const abortRef = useRef(null);
+  const refreshResolversRef = useRef([]);
 
-  // Batch-load thumbnails for picture/video search hits across machines.
+  const settleRefreshWaiters = useCallback(() => {
+    const waiters = refreshResolversRef.current;
+    refreshResolversRef.current = [];
+    for (const resolve of waiters) resolve();
+  }, []);
+
   useEffect(() => {
-    if (!caps?.hasThumb) return undefined;
+    if (typeof onRegisterRefresh !== 'function') return undefined;
+    return onRegisterRefresh(
+      () =>
+        new Promise((resolve) => {
+          refreshResolversRef.current.push(resolve);
+          setSearchRev((n) => n + 1);
+        }),
+    );
+  }, [onRegisterRefresh]);
+
+  // Batch-load thumbnails for picture/video search hits, checking fs.thumb per machine.
+  useEffect(() => {
+    if (!capsStore && !caps?.hasThumb) return undefined;
     let alive = true;
     const byMachine = new Map();
     for (const [mName, items] of Object.entries(resultsByMachine)) {
       if (!Array.isArray(items) || items.length === 0) continue;
+      if (capsStore && !capsStore.hasTool(mName, 'fs.thumb')) continue;
       for (const entry of items) {
         if (!isThumbEligible(entry)) continue;
         const key = thumbCacheKey(mName, entry.path, entry.mtime || '', 128);
@@ -1210,30 +1748,34 @@ export function FilesSearchView({
     }
     for (const [mName, entries] of byMachine.entries()) {
       const batch = entries.slice(0, 16);
-      link
-        .call('fs.thumb', { paths: batch.map((e) => e.path), size: 128, fit: 'cover' }, { on: mName })
+      const req = capsStore
+        ? capsStore
+            .call('fs.thumb', { paths: batch.map((e) => e.path), size: 128, fit: 'cover' }, { on: mName })
+            .then((r) => r.value)
+        : link.call('fs.thumb', { paths: batch.map((e) => e.path), size: 128, fit: 'cover' }, { on: mName });
+      req
         .then((res) => {
           if (!alive) return;
           const map = res?.thumbnails || {};
-          let changed = false;
+          let didChange = false;
           for (const entry of batch) {
             const t = map[entry.path];
             const key = thumbCacheKey(mName, entry.path, entry.mtime || '', 128);
             if (t?.content && t?.mime) {
               thumbCache.set(key, { url: `data:${t.mime};base64,${t.content}` });
-              changed = true;
+              didChange = true;
             } else {
               thumbCache.set(key, { failed: true });
             }
           }
-          if (changed) setThumbTick((n) => n + 1);
+          if (didChange) setThumbTick((n) => n + 1);
         })
         .catch(() => {});
     }
     return () => {
       alive = false;
     };
-  }, [caps?.hasThumb, resultsByMachine, link, thumbCache]);
+  }, [capsStore, caps?.hasThumb, resultsByMachine, link, thumbCache]);
 
   const favKeySet = useMemo(
     () => new Set((favourites || []).map((f) => `${f.machine}\0${f.path}`)),
@@ -1242,6 +1784,7 @@ export function FilesSearchView({
 
   const onlineMachines = useMemo(() => machines.filter((m) => m.reachable), [machines]);
   const offMachines = useMemo(() => machines.filter((m) => !m.reachable), [machines]);
+  const onlineKey = useMemo(() => onlineMachines.map((m) => m.name).join(','), [onlineMachines]);
 
   useEffect(() => {
     if (abortRef.current) abortRef.current.abort();
@@ -1254,19 +1797,22 @@ export function FilesSearchView({
       setTruncatedByMachine({});
       setSearching(false);
       if (onResultCountChange) onResultCountChange({ count: 0, machineCount: 0, searching: false });
+      settleRefreshWaiters();
       return () => ctrl.abort();
     }
 
     setSearching(true);
     setError(null);
-    setResultsByMachine({});
-    setTruncatedByMachine({});
+    if (searchRev === 0) {
+      setResultsByMachine({});
+      setTruncatedByMachine({});
+    }
 
     const { min_size, max_size } = sizePresetBounds(size);
     const modified_after = changedPresetCutoff(changed);
 
-    const buildFindArgs = (basePath) => {
-      if (caps?.hasFindEnhanced) {
+    const buildArgsForMachine = (basePath, mCaps) => {
+      if (mCaps?.hasFindEnhanced) {
         const args = { path: basePath, limit: 100 };
         if (q.trim()) args.name = q.trim();
         if (kinds.length > 0) {
@@ -1277,20 +1823,38 @@ export function FilesSearchView({
             args.categories = fileCats;
           }
         }
-        if (min_size != null) args.min_size = min_size;
-        if (max_size != null) args.max_size = max_size;
-        if (modified_after) args.modified_after = modified_after;
-        return args;
+        if (mCaps.hasFindFilters) {
+          if (min_size != null) args.min_size = min_size;
+          if (max_size != null) args.max_size = max_size;
+          if (modified_after) args.modified_after = modified_after;
+        }
+        return {
+          args,
+          optional: [
+            'name',
+            'categories',
+            'kind',
+            'min_size',
+            'max_size',
+            'modified_after',
+            'sort',
+            'order',
+            'hidden',
+            'budget_ms',
+          ],
+        };
       }
       // Older node degrade: basic glob/kind + client-side filtering.
       const args = { path: basePath, limit: 300 };
-      if (q.trim()) args.glob = `*${q.trim()}*`;
+      const glob = buildOldFindGlob(q);
+      if (glob) args.glob = glob;
       if (kinds.length === 1 && kinds[0] === 'folder') args.kind = 'dir';
-      return args;
+      return { args, optional: ['glob', 'kind'] };
     };
 
-    const filterClient = (list) =>
-      filterEntries(list || [], {
+    const filterClient = (rawRes) => {
+      const normalized = normalizeFindEntries(rawRes?.matches || rawRes?.entries || []);
+      return filterEntries(normalized, {
         hidden: false,
         query: q.trim(),
         categories: kinds,
@@ -1298,29 +1862,90 @@ export function FilesSearchView({
         maxSize: max_size,
         modifiedAfter: modified_after,
       });
+    };
+
+    const searchOneMachine = async (mName, basePath) => {
+      if (capsStore) {
+        if (!capsStore.isKnown(mName)) {
+          await capsStore.ensure(mName, { signal: ctrl.signal });
+        }
+        if (ctrl.signal.aborted) return null;
+        const mCaps = capsStore.fileCapabilities(mName);
+        const { args, optional } = buildArgsForMachine(basePath, mCaps);
+        const outcome = await capsStore.call('fs.find', args, {
+          on: mName,
+          optional,
+          signal: ctrl.signal,
+        });
+        const entries = filterClient(outcome.value);
+        return { entries, truncated: Boolean(outcome.value?.truncated) };
+      }
+      const { args } = buildArgsForMachine(basePath, caps);
+      const res = await link.call('fs.find', args, { on: mName, signal: ctrl.signal });
+      const entries = filterClient(res);
+      return { entries, truncated: Boolean(res?.truncated) };
+    };
 
     if (scopeMachine) {
-      const args = buildFindArgs(scopePath || '~');
-      link
-        .call('fs.find', args, { on: scopeMachine, signal: ctrl.signal })
-        .then((res) => {
-          if (ctrl.signal.aborted) return;
-          const entries = filterClient(res?.entries || []);
-          setResultsByMachine({ [scopeMachine]: entries });
-          setTruncatedByMachine({ [scopeMachine]: Boolean(res?.truncated) });
+      searchOneMachine(scopeMachine, scopePath || '~')
+        .then((hit) => {
+          if (ctrl.signal.aborted || !hit) return;
+          setResultsByMachine({ [scopeMachine]: hit.entries });
+          setTruncatedByMachine({ [scopeMachine]: hit.truncated });
           setSearching(false);
           if (onResultCountChange) {
-            onResultCountChange({ count: entries.length, machineCount: 1, searching: false });
+            onResultCountChange({ count: hit.entries.length, machineCount: 1, searching: false });
           }
+          settleRefreshWaiters();
         })
         .catch((err) => {
           if (ctrl.signal.aborted) return;
           setError(err);
           setSearching(false);
           if (onResultCountChange) onResultCountChange({ count: 0, machineCount: 0, searching: false });
+          settleRefreshWaiters();
         });
+    } else if (capsStore && onlineMachines.length > 0) {
+      // Fan out per online machine using each machine's own capabilities so mixed-version fleets
+      // never send unsupported arguments to older machines.
+      (async () => {
+        const nextMap = {};
+        const nextTrunc = {};
+        let firstErr = null;
+        let okCount = 0;
+
+        await Promise.all(
+          onlineMachines.map(async (m) => {
+            try {
+              const hit = await searchOneMachine(m.name, '~');
+              if (ctrl.signal.aborted || !hit) return;
+              okCount += 1;
+              nextMap[m.name] = hit.entries;
+              nextTrunc[m.name] = hit.truncated;
+              setResultsByMachine((prev) => ({ ...prev, [m.name]: hit.entries }));
+              setTruncatedByMachine((prev) => ({ ...prev, [m.name]: hit.truncated }));
+            } catch (err) {
+              if (ctrl.signal.aborted) return;
+              if (!firstErr) firstErr = err;
+              nextMap[m.name] = [];
+              setResultsByMachine((prev) => ({ ...prev, [m.name]: [] }));
+            }
+          }),
+        );
+
+        if (ctrl.signal.aborted) return;
+        if (okCount === 0 && firstErr) {
+          setError(firstErr);
+        }
+        setSearching(false);
+        const total = Object.values(nextMap).reduce((s, arr) => s + arr.length, 0);
+        if (onResultCountChange) {
+          onResultCountChange({ count: total, machineCount: okCount, searching: false });
+        }
+        settleRefreshWaiters();
+      })();
     } else {
-      const args = buildFindArgs('~');
+      const { args } = buildArgsForMachine('~', caps);
       link
         .call('fs.find', args, {
           on: 'all',
@@ -1328,7 +1953,7 @@ export function FilesSearchView({
           onEvent(evt) {
             if (ctrl.signal.aborted) return;
             if (evt?.kind === 'find_machine' && evt.machine && evt.data) {
-              const entries = filterClient(evt.data.entries || []);
+              const entries = filterClient(evt.data);
               setResultsByMachine((prev) => ({ ...prev, [evt.machine]: entries }));
               setTruncatedByMachine((prev) => ({ ...prev, [evt.machine]: Boolean(evt.data.truncated) }));
             }
@@ -1341,7 +1966,7 @@ export function FilesSearchView({
           const rawResults = res?.results || {};
           for (const [mName, outcome] of Object.entries(rawResults)) {
             if (outcome?.ok) {
-              nextMap[mName] = filterClient(outcome.ok.entries || []);
+              nextMap[mName] = filterClient(outcome.ok);
               nextTrunc[mName] = Boolean(outcome.ok.truncated);
             }
           }
@@ -1352,17 +1977,22 @@ export function FilesSearchView({
           if (onResultCountChange) {
             onResultCountChange({ count: total, machineCount: Object.keys(nextMap).length, searching: false });
           }
+          settleRefreshWaiters();
         })
         .catch((err) => {
           if (ctrl.signal.aborted) return;
           setError(err);
           setSearching(false);
           if (onResultCountChange) onResultCountChange({ count: 0, machineCount: 0, searching: false });
+          settleRefreshWaiters();
         });
     }
 
-    return () => ctrl.abort();
-  }, [q, kindsKey, size, changed, scopeMachine, scopePath, caps?.hasFindEnhanced]);
+    return () => {
+      ctrl.abort();
+      settleRefreshWaiters();
+    };
+  }, [q, kindsKey, size, changed, scopeMachine, scopePath, onlineKey, capsStore, link, searchRev, settleRefreshWaiters]);
 
   const machineOrder = scopeMachine
     ? [scopeMachine]
@@ -1431,7 +2061,8 @@ export function FilesSearchView({
                       ]
                         .filter(Boolean)
                         .join(' · ');
-                      const starred = caps?.hasFav && favKeySet.has(`${mName}\0${entry.path}`);
+                      const machineHasFav = capsStore ? capsStore.hasTool(mName, 'fav.list') : caps?.hasFav;
+                      const starred = machineHasFav && favKeySet.has(`${mName}\0${entry.path}`);
                       const thumbHit = thumbCache.get(thumbCacheKey(mName, entry.path, entry.mtime || '', 128));
                       const thumbUrl = thumbHit && !thumbHit.failed ? thumbHit.url : null;
                       return html`
@@ -1589,6 +2220,7 @@ function SyncFolderView({
   machines,
   link,
   technical,
+  onRegisterRefresh = null,
   onNavigateFolder,
   onRequestConfirm,
   onSyncChanged,
@@ -1601,7 +2233,7 @@ function SyncFolderView({
 
   const load = useCallback(() => {
     setError(null);
-    link
+    return link
       .call('sync.status', { id: syncId })
       .then((res) => setDetail(res))
       .catch((err) => setError(err));
@@ -1610,6 +2242,11 @@ function SyncFolderView({
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function') return undefined;
+    return onRegisterRefresh(() => load());
+  }, [onRegisterRefresh, load]);
 
   if (error) return html`<${Notice} error=${error} />`;
   if (!detail) return html`<div class="empty">Loading synced folder…</div>`;
@@ -1824,6 +2461,9 @@ export function FilesView({
   wide,
   snapshot,
   link,
+  capsStore = null,
+  folderChanges = null,
+  onRegisterRefresh = null,
   nodeInfo,
   tools,
   allowedSet,
@@ -1841,18 +2481,73 @@ export function FilesView({
   const machines = snapshot?.machines || [];
   const technical = Boolean(settings?.technical);
   const localNode = nodeInfo?.node || machines.find((m) => m.reachable)?.name || null;
-  const activeMachine = route.viewer?.machine || route.machine || localNode;
 
-  const [contentSupportRev, setContentSupportRev] = useState(0);
-  useEffect(() => {
-    if (typeof link?.onContentSupportChange !== 'function') return undefined;
-    return link.onContentSupportChange(() => setContentSupportRev((n) => n + 1));
-  }, [link]);
-
-  const caps = useMemo(
-    () => detectFileCapabilities({ tools, allowedSet, link, machine: activeMachine }),
-    [tools, allowedSet, link, activeMachine, contentSupportRev],
+  // Determine active machine/folder for wide split detail when on `#/files`.
+  const defaultWideMachine = useMemo(
+    () => machines.find((m) => m.reachable)?.name || machines[0]?.name || null,
+    [machines],
   );
+  const activeFolderMachine =
+    route.view === 'folder' ? route.machine : wide && route.view === 'home' ? defaultWideMachine : null;
+  const activeFolderPath = route.view === 'folder' ? route.path || '~' : '~';
+  const activeMachineObj = activeFolderMachine
+    ? machines.find((m) => m.name === activeFolderMachine) || null
+    : null;
+  const viewerMachine = route.viewer?.machine || null;
+  const searchMachine = route.view === 'search' ? route.machine || null : null;
+
+  const { caps: localCaps } = useMachineCaps(capsStore, localNode, {
+    fallbackTools: tools,
+    fallbackAllowedSet: allowedSet,
+    link,
+    enabled: Boolean(localNode),
+  });
+  const {
+    caps: folderCaps,
+    entry: folderCapsEntry,
+    missing: folderMissing,
+  } = useMachineCaps(capsStore, activeFolderMachine, {
+    fallbackTools: tools,
+    fallbackAllowedSet: allowedSet,
+    link,
+    enabled: Boolean(activeFolderMachine && (!activeMachineObj || activeMachineObj.reachable)),
+  });
+  const { caps: viewerCaps } = useMachineCaps(capsStore, viewerMachine, {
+    fallbackTools: tools,
+    fallbackAllowedSet: allowedSet,
+    link,
+    enabled: Boolean(viewerMachine),
+  });
+  const { caps: scopedSearchCaps } = useMachineCaps(capsStore, searchMachine, {
+    fallbackTools: tools,
+    fallbackAllowedSet: allowedSet,
+    link,
+    enabled: Boolean(searchMachine),
+  });
+
+  // Effective capabilities for the currently active view/dock.
+  const activeSearchCaps = useMemo(() => {
+    if (searchMachine) return scopedSearchCaps;
+    if (!capsStore) return localCaps;
+    const online = machines.filter((m) => m.reachable);
+    const knownOnline = online.filter((m) => capsStore.isKnown(m.name));
+    if (knownOnline.length === 0) return localCaps;
+    const anyFindFilters = knownOnline.some((m) => capsStore.fileCapabilities(m.name).hasFindFilters);
+    const anyFindEnhanced = knownOnline.some((m) => capsStore.fileCapabilities(m.name).hasFindEnhanced);
+    return {
+      ...localCaps,
+      known: true,
+      hasFindEnhanced: anyFindEnhanced,
+      hasFindFilters: anyFindFilters,
+    };
+  }, [searchMachine, scopedSearchCaps, capsStore, localCaps, machines]);
+
+  const dockCaps =
+    route.view === 'search'
+      ? activeSearchCaps
+      : activeFolderMachine
+        ? folderCaps
+        : localCaps;
 
   const [favourites, setFavourites] = useState([]);
   const [syncFolders, setSyncFolders] = useState([]);
@@ -1863,41 +2558,62 @@ export function FilesView({
   const [viewerEntryCache, setViewerEntryCache] = useState(null);
 
   const loadFavourites = useCallback(() => {
-    if (!caps.hasFav || !localNode) {
+    if (!localCaps.hasFav || !localNode) {
       setFavourites([]);
-      return;
+      return Promise.resolve();
     }
-    link
-      .call('fav.list', {}, { on: localNode })
+    const req = capsStore
+      ? capsStore.call('fav.list', {}, { on: localNode }).then((r) => r.value)
+      : link.call('fav.list', {}, { on: localNode });
+    return req
       .then((res) => setFavourites(Array.isArray(res?.entries) ? res.entries : []))
       .catch(() => setFavourites([]));
-  }, [caps.hasFav, link, localNode]);
+  }, [localCaps.hasFav, capsStore, link, localNode]);
 
   const loadSyncFolders = useCallback(() => {
-    if (!caps.hasSync || !localNode) {
+    if (!localCaps.hasSync || !localNode) {
       setSyncFolders([]);
-      return;
+      return Promise.resolve();
     }
-    link
-      .call('sync.list', {}, { on: localNode })
+    const req = capsStore
+      ? capsStore.call('sync.list', {}, { on: localNode }).then((r) => r.value)
+      : link.call('sync.list', {}, { on: localNode });
+    return req
       .then((res) => setSyncFolders(Array.isArray(res?.folders) ? res.folders : []))
       .catch(() => setSyncFolders([]));
-  }, [caps.hasSync, link, localNode]);
+  }, [localCaps.hasSync, capsStore, link, localNode]);
 
   useEffect(() => {
     loadFavourites();
     loadSyncFolders();
   }, [loadFavourites, loadSyncFolders]);
 
+  const refreshFilesHome = useCallback(async () => {
+    setRecentFiles(readRecentFiles(safeStorage()));
+    await Promise.all([
+      loadFavourites(),
+      loadSyncFolders(),
+      onRefreshFleet ? onRefreshFleet({ forceOffline: true }) : Promise.resolve(),
+    ]);
+  }, [loadFavourites, loadSyncFolders, onRefreshFleet]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function' || wide) return undefined;
+    if (route.view === 'home' || route.view === 'favourites' || route.view === 'recent') {
+      return onRegisterRefresh(refreshFilesHome);
+    }
+    return undefined;
+  }, [onRegisterRefresh, wide, route.view, refreshFilesHome]);
+
   // Share caps & current folder metadata with shell header/dock.
   useEffect(() => {
     filesActions.setMeta({
-      caps,
+      caps: dockCaps,
       resolvedPath: resolvedFolderPath,
       entries: folderEntries,
       syncFolders,
     });
-  }, [caps, resolvedFolderPath, folderEntries, syncFolders]);
+  }, [dockCaps, resolvedFolderPath, folderEntries, syncFolders]);
 
   const navigateHref = useCallback(
     (href) => {
@@ -1931,9 +2647,20 @@ export function FilesView({
     [route, folderEntries, navigateHref],
   );
 
+  const machineCapsFor = useCallback(
+    (machine) => {
+      if (capsStore && machine) {
+        return capsStore.fileCapabilities(machine, { fallbackAllowedSet: allowedSet });
+      }
+      return folderCaps;
+    },
+    [capsStore, allowedSet, folderCaps],
+  );
+
   const toggleStar = useCallback(
     async (machine, entry) => {
-      if (!caps.hasFavWrite) return;
+      const targetCaps = machineCapsFor(machine);
+      if (!localCaps.hasFavWrite || (machine && !targetCaps.hasFavWrite)) return;
       const existing = favourites.find((f) => f.machine === machine && f.path === entry.path);
       try {
         if (existing) {
@@ -1949,15 +2676,16 @@ export function FilesView({
         }
         loadFavourites();
       } catch (err) {
-        if (onToast) onToast(err?.message || 'Could not update favourite.');
+        if (onToast) onToast(plainErrorMessage(err, 'Could not update favourite.', { technical, deviceNoun }));
       }
     },
-    [caps.hasFavWrite, favourites, link, localNode, loadFavourites, onToast],
+    [localCaps.hasFavWrite, machineCapsFor, favourites, link, localNode, loadFavourites, onToast, technical, deviceNoun],
   );
 
   const togglePin = useCallback(
     async (machine, entry) => {
-      if (!caps.hasFavWrite) return;
+      const targetCaps = machineCapsFor(machine);
+      if (!localCaps.hasFavWrite || (machine && !targetCaps.hasFavWrite)) return;
       const existing = favourites.find((f) => f.machine === machine && f.path === entry.path);
       try {
         if (existing) {
@@ -1971,15 +2699,16 @@ export function FilesView({
         }
         loadFavourites();
       } catch (err) {
-        if (onToast) onToast(err?.message || 'Could not update pin.');
+        if (onToast) onToast(plainErrorMessage(err, 'Could not update pin.', { technical, deviceNoun }));
       }
     },
-    [caps.hasFavWrite, favourites, link, localNode, loadFavourites, onToast],
+    [localCaps.hasFavWrite, machineCapsFor, favourites, link, localNode, loadFavourites, onToast, technical, deviceNoun],
   );
 
   const startDownload = useCallback(
     async (machine, items) => {
-      if (!caps.hasDownload || typeof link?.download !== 'function') return;
+      const targetCaps = machineCapsFor(machine);
+      if (!targetCaps.hasDownload || typeof link?.download !== 'function') return;
       const list = Array.isArray(items) ? items.filter((i) => i.kind !== 'dir') : [items];
       if (list.length === 0) return;
       let firstError = null;
@@ -2003,7 +2732,7 @@ export function FilesView({
       const transferIds = started.map((r) => r?.id).filter(Boolean);
       if (onToast) {
         if (started.length === 0 && firstError) {
-          onToast(firstError?.message || 'Could not start download.', { tone: 'error' });
+          onToast(plainErrorMessage(firstError, 'Could not start download.', { technical, deviceNoun }), { tone: 'error' });
           return;
         }
         onToast(
@@ -2014,17 +2743,17 @@ export function FilesView({
         );
       }
     },
-    [caps.hasDownload, link, onToast],
+    [machineCapsFor, link, onToast, technical, deviceNoun],
   );
 
   const startUpload = useCallback(
     (machine, dir) => {
-      if (!caps.hasUpload || typeof link?.upload !== 'function') return;
+      const targetCaps = machineCapsFor(machine);
+      if (!targetCaps.hasUpload || typeof link?.upload !== 'function') return;
       link
         .upload({ machine, dir })
         .then((res) => {
           if (!res) return;
-          setReloadToken((n) => n + 1);
           const transferIds =
             Array.isArray(res.ids) && res.ids.length > 0
               ? res.ids.filter(Boolean)
@@ -2041,16 +2770,17 @@ export function FilesView({
         })
         .catch((err) => {
           if (onToast && err?.code !== 'cancelled') {
-            onToast(err?.message || `Could not upload to ${machine}.`, { tone: 'error' });
+            onToast(plainErrorMessage(err, `Could not upload to ${machine}.`, { technical, deviceNoun }), { tone: 'error' });
           }
         });
     },
-    [caps.hasUpload, link, onToast],
+    [machineCapsFor, link, onToast, technical, deviceNoun],
   );
 
   const startOpenExternally = useCallback(
     (machine, entry) => {
-      if (!caps.hasOpenExternally || typeof link?.openExternally !== 'function') return;
+      const targetCaps = machineCapsFor(machine);
+      if (!targetCaps.hasOpenExternally || typeof link?.openExternally !== 'function') return;
       link
         .openExternally({
           machine,
@@ -2062,15 +2792,16 @@ export function FilesView({
           if (onToast) onToast(`Opening ${entry.name || baseFileName(entry.path)} in another app.`);
         })
         .catch((err) => {
-          if (onToast) onToast(err?.message || 'Could not open in another app.');
+          if (onToast) onToast(plainErrorMessage(err, 'Could not open in another app.', { technical, deviceNoun }));
         });
     },
-    [caps.hasOpenExternally, link, onToast],
+    [machineCapsFor, link, onToast, technical, deviceNoun],
   );
 
   const requestDelete = useCallback(
     (machine, items) => {
-      if (!caps.hasRemove || !onRequestConfirm || !items?.length) return;
+      const targetCaps = machineCapsFor(machine);
+      if (!targetCaps.hasRemove || !onRequestConfirm || !items?.length) return;
       const single = items.length === 1 ? items[0] : null;
       const label = single ? single.name || baseFileName(single.path) : `${items.length} items`;
       onRequestConfirm({
@@ -2086,23 +2817,52 @@ export function FilesView({
         danger: true,
         canDryRun: Boolean(single),
         async onDryRun() {
+          if (capsStore) {
+            const res = await capsStore.call(
+              'fs.remove',
+              { path: single.path, recursive: single.kind === 'dir', dry_run: true },
+              { on: machine, optional: ['recursive'] },
+            );
+            return res.value;
+          }
           return link.call('fs.remove', { path: single.path, recursive: single.kind === 'dir', dry_run: true }, { on: machine });
         },
         async onConfirm() {
-          for (const item of items) {
-            await link.call('fs.remove', { path: item.path, recursive: item.kind === 'dir' }, { on: machine });
+          const touchedParents = new Set();
+          for (let idx = 0; idx < items.length; idx += 1) {
+            const item = items[idx];
+            if (capsStore) {
+              await capsStore.call(
+                'fs.remove',
+                { path: item.path, recursive: item.kind === 'dir' },
+                { on: machine, optional: ['recursive'] },
+              );
+            } else {
+              await link.call('fs.remove', { path: item.path, recursive: item.kind === 'dir' }, { on: machine });
+            }
+            const parent = parentFilePath(item.path) || '~';
+            touchedParents.add(parent);
+            if (folderChanges && idx < items.length - 1) {
+              folderChanges.changed(machine, parent, { throttle: true, reason: 'delete' });
+            }
           }
           filesActions.endSelect();
           if (route.viewer && items.some((i) => i.path === route.viewer.path)) {
             filesActions.closeViewer();
           }
-          setReloadToken((n) => n + 1);
+          if (folderChanges) {
+            for (const parent of touchedParents) {
+              folderChanges.changed(machine, parent, { throttle: false, reason: 'delete' });
+            }
+          } else {
+            setReloadToken((n) => n + 1);
+          }
           loadFavourites();
           if (onToast) onToast(`Deleted ${label}.`);
         },
       });
     },
-    [caps.hasRemove, onRequestConfirm, link, filesActions, route.viewer, loadFavourites, onToast],
+    [machineCapsFor, onRequestConfirm, capsStore, folderChanges, link, filesActions, route.viewer, loadFavourites, onToast],
   );
 
   // Wire bulk selection actions triggered from the shell dock.
@@ -2127,19 +2887,6 @@ export function FilesView({
     });
   }, [filesActions, startDownload, toggleStar, requestDelete]);
 
-  // Determine active machine/folder for wide split detail when on `#/files`.
-  const defaultWideMachine = useMemo(
-    () => machines.find((m) => m.reachable)?.name || machines[0]?.name || null,
-    [machines],
-  );
-
-  const activeFolderMachine =
-    route.view === 'folder' ? route.machine : wide && route.view === 'home' ? defaultWideMachine : null;
-  const activeFolderPath = route.view === 'folder' ? route.path || '~' : '~';
-  const activeMachineObj = activeFolderMachine
-    ? machines.find((m) => m.name === activeFolderMachine) || null
-    : null;
-
   const folderViewEl = activeFolderMachine
     ? html`
         <${FolderBrowser}
@@ -2147,13 +2894,21 @@ export function FilesView({
           machineObj=${activeMachineObj}
           path=${activeFolderPath}
           link=${link}
-          caps=${caps}
+          caps=${folderCaps}
+          capsStore=${capsStore}
+          capsEntry=${folderCapsEntry}
+          missingFeatures=${folderMissing}
+          folderChanges=${folderChanges}
+          onPruneSelection=${filesActions.pruneSelection}
+          onRegisterRefresh=${wide ? null : onRegisterRefresh}
           allowedSet=${allowedSet}
           technical=${technical}
           deviceNoun=${deviceNoun}
           favourites=${favourites}
           thumbCache=${thumbCache}
           sortPref=${filesState.sortPref}
+          kindFilter=${filesState.kindFilter || ''}
+          onClearKindFilter=${() => filesActions.setKindFilter?.('')}
           showHidden=${filesState.showHidden}
           selecting=${filesState.selecting}
           selectedPaths=${filesState.selectedPaths}
@@ -2205,10 +2960,12 @@ export function FilesView({
           route=${route}
           machines=${machines}
           favourites=${favourites}
-          caps=${caps}
+          caps=${activeSearchCaps}
+          capsStore=${capsStore}
           link=${link}
           technical=${technical}
           thumbCache=${thumbCache}
+          onRegisterRefresh=${wide ? null : onRegisterRefresh}
           onNavigateFolder=${navigateFolder}
           onOpenFile=${openFile}
           onResultCountChange=${filesActions.setSearchSummary}
@@ -2228,7 +2985,7 @@ export function FilesView({
         <${FavouritesView}
           favourites=${favourites}
           technical=${technical}
-          caps=${caps}
+          caps=${localCaps}
           onNavigateFolder=${navigateFolder}
           onOpenFile=${openFile}
           onTogglePin=${(item) => togglePin(item.machine, { path: item.path, name: item.label })}
@@ -2253,6 +3010,7 @@ export function FilesView({
           machines=${machines}
           link=${link}
           technical=${technical}
+          onRegisterRefresh=${wide ? null : onRegisterRefresh}
           onNavigateFolder=${navigateFolder}
           onRequestConfirm=${onRequestConfirm}
           onSyncChanged=${loadSyncFolders}
@@ -2270,7 +3028,8 @@ export function FilesView({
         favourites=${favourites}
         syncFolders=${syncFolders}
         recentFiles=${recentFiles}
-        caps=${caps}
+        caps=${localCaps}
+        capsStore=${capsStore}
         deviceNoun=${deviceNoun}
         link=${link}
         thumbCache=${thumbCache}
@@ -2318,13 +3077,14 @@ export function FilesView({
       ${wide
         ? html`
             <div class="split">
-              <section>
+              <${ScrollContainer} as="section" onRefresh=${refreshFilesHome}>
                 <${FilesHome}
                   machines=${machines}
                   favourites=${favourites}
                   syncFolders=${syncFolders}
                   recentFiles=${recentFiles}
-                  caps=${caps}
+                  caps=${localCaps}
+                  capsStore=${capsStore}
                   deviceNoun=${deviceNoun}
                   link=${link}
                   thumbCache=${thumbCache}
@@ -2338,10 +3098,10 @@ export function FilesView({
                       routeHref({ section: 'files', view: 'search', query: { q: q || '', kinds: [], size: '', changed: '' } }),
                     )}
                 />
-              </section>
-              <section>
+              <//>
+              <${ScrollContainer} as="section">
                 ${route.view === 'home' ? folderViewEl || html`<div class="empty">Choose a machine to browse its files.</div>` : renderMainContent()}
-              </section>
+              <//>
             </div>
           `
         : renderMainContent()}
@@ -2354,7 +3114,8 @@ export function FilesView({
               entry=${viewerEntry}
               siblings=${viewerSiblings}
               link=${link}
-              caps=${caps}
+              caps=${viewerCaps}
+              capsStore=${capsStore}
               deviceNoun=${deviceNoun}
               technical=${technical}
               isStarred=${Boolean(viewerFav)}
@@ -2385,7 +3146,9 @@ export function FilesView({
               items=${sheet.items}
               machines=${machines}
               favourites=${favourites}
-              caps=${caps}
+              caps=${machineCapsFor(sheet.sourceMachine)}
+              capsStore=${capsStore}
+              folderChanges=${folderChanges}
               allowedSet=${allowedSet}
               wakePendingSet=${wakePendingSet}
               deviceNoun=${deviceNoun}
@@ -2393,7 +3156,9 @@ export function FilesView({
               link=${link}
               onEnsureAwake=${onEnsureAwake}
               onRefreshFleet=${onRefreshFleet}
-              onLocalDone=${() => setReloadToken((n) => n + 1)}
+              onLocalDone=${() => {
+                if (!folderChanges) setReloadToken((n) => n + 1);
+              }}
               onStarted=${(info) => {
                 filesActions.finishBulkAction();
                 if (onToast) {
@@ -2420,7 +3185,9 @@ export function FilesView({
         ? html`
             <${SortSheet}
               sortPref=${filesState.sortPref}
+              kindFilter=${filesState.kindFilter || ''}
               onChange=${filesActions.setSortPref}
+              onChangeKind=${filesActions.setKindFilter}
               onClose=${filesActions.closeSheet}
             />
           `
@@ -2431,7 +3198,7 @@ export function FilesView({
             <${FolderMoreSheet}
               machine=${sheet.machine || activeFolderMachine}
               path=${sheet.path || resolvedFolderPath}
-              caps=${caps}
+              caps=${machineCapsFor(sheet.machine || activeFolderMachine)}
               deviceNoun=${deviceNoun}
               showHidden=${filesState.showHidden}
               isStarred=${Boolean(currentFolderFav)}
@@ -2468,8 +3235,10 @@ export function FilesView({
               machine=${sheet.machine}
               parentPath=${sheet.parentPath}
               link=${link}
+              capsStore=${capsStore}
+              folderChanges=${folderChanges}
               onCreated=${() => {
-                setReloadToken((n) => n + 1);
+                if (!folderChanges) setReloadToken((n) => n + 1);
                 if (onToast) onToast('Folder created.');
               }}
               onClose=${filesActions.closeSheet}
@@ -2483,8 +3252,10 @@ export function FilesView({
               machine=${sheet.machine}
               entry=${sheet.entry}
               link=${link}
+              capsStore=${capsStore}
+              folderChanges=${folderChanges}
               onRenamed=${(nextPath) => {
-                setReloadToken((n) => n + 1);
+                if (!folderChanges) setReloadToken((n) => n + 1);
                 loadFavourites();
                 if (route.viewer && route.viewer.path === sheet.entry.path) {
                   const href = routeHref({ ...route, viewer: { machine: sheet.machine, path: nextPath } });
@@ -2521,6 +3292,7 @@ export function FilesView({
             <${SyncConflictsSheet}
               syncFolder=${sheet.syncFolder}
               link=${link}
+              folderChanges=${folderChanges}
               onChanged=${sheet.onChanged}
               onClose=${filesActions.closeSheet}
             />
@@ -2532,6 +3304,7 @@ export function FilesView({
             <${SyncBinSheet}
               syncFolder=${sheet.syncFolder}
               link=${link}
+              folderChanges=${folderChanges}
               onChanged=${sheet.onChanged}
               onClose=${filesActions.closeSheet}
             />
@@ -2561,28 +3334,58 @@ export function MachineFilesBrowser({
   tools,
   allowedSet,
   link,
+  capsStore = null,
+  folderChanges = null,
+  onRegisterRefresh = null,
+  onRefreshFleet = null,
   settings,
   deviceNoun,
   thumbCache,
+  wide = false,
+  filesState = null,
+  filesActions = null,
   onEnsureAwake,
 }) {
-  const [contentSupportRev, setContentSupportRev] = useState(0);
-  useEffect(() => {
-    if (typeof link?.onContentSupportChange !== 'function') return undefined;
-    return link.onContentSupportChange(() => setContentSupportRev((n) => n + 1));
-  }, [link]);
-
-  const caps = useMemo(
-    () => detectFileCapabilities({ tools, allowedSet, link, machine: machine?.name || null }),
-    [tools, allowedSet, link, machine?.name, contentSupportRev],
-  );
+  const { caps, entry: capsEntry, missing: missingFeatures } = useMachineCaps(capsStore, machine?.name, {
+    fallbackTools: tools,
+    fallbackAllowedSet: allowedSet,
+    link,
+    enabled: Boolean(machine?.name && machine?.reachable !== false),
+  });
   const technical = Boolean(settings?.technical);
-  const [sortPref, setSortPref] = useState({ sort: 'name', order: 'asc' });
-  const [showHidden, setShowHidden] = useState(false);
-  const [viewMode, setViewMode] = useState(null);
-  const [resolvedMode, setResolvedMode] = useState('list');
+  const [localSortPref, setLocalSortPref] = useState({ sort: 'name', order: 'asc' });
+  const [localKindFilter, setLocalKindFilter] = useState('');
+  const [localShowHidden, setLocalShowHidden] = useState(false);
+  const [localViewMode, setLocalViewMode] = useState(null);
+  const [localResolvedMode, setLocalResolvedMode] = useState('list');
   const [resolvedPath, setResolvedPath] = useState('~');
-  const [sheet, setSheet] = useState(null);
+  const [folderEntries, setFolderEntries] = useState([]);
+  const [localSheet, setLocalSheet] = useState(null);
+  const [reloadToken, setReloadToken] = useState(0);
+
+  const sortPref = filesState?.sortPref || localSortPref;
+  const setSortPref = filesActions?.setSortPref || setLocalSortPref;
+  const kindFilter = filesState ? filesState.kindFilter || '' : localKindFilter;
+  const setKindFilter = filesActions?.setKindFilter || setLocalKindFilter;
+  const showHidden = filesState ? Boolean(filesState.showHidden) : localShowHidden;
+  const setShowHidden = filesActions?.setShowHidden || setLocalShowHidden;
+  const viewModeOverride = filesState ? filesState.viewModeOverride : localViewMode;
+  const setViewModeOverride = filesActions?.setViewModeOverride || setLocalViewMode;
+  const resolvedMode = filesState ? filesState.resolvedViewMode : localResolvedMode;
+  const setResolvedMode = filesActions?.setResolvedViewMode || setLocalResolvedMode;
+  const activeSheet = filesState ? filesState.sheet : localSheet;
+  const openSheet = filesActions?.openSheet || setLocalSheet;
+  const closeSheet = filesActions?.closeSheet || (() => setLocalSheet(null));
+
+  useEffect(() => {
+    if (filesActions?.setMeta) {
+      filesActions.setMeta({
+        caps,
+        resolvedPath,
+        entries: folderEntries,
+      });
+    }
+  }, [filesActions, caps, resolvedPath, folderEntries]);
 
   return html`
     <div>
@@ -2592,18 +3395,30 @@ export function MachineFilesBrowser({
         path="~"
         link=${link}
         caps=${caps}
+        capsStore=${capsStore}
+        capsEntry=${capsEntry}
+        missingFeatures=${missingFeatures}
+        folderChanges=${folderChanges}
+        onRegisterRefresh=${wide ? null : onRegisterRefresh}
+        onRefreshFleet=${onRefreshFleet}
         allowedSet=${allowedSet}
         technical=${technical}
         deviceNoun=${deviceNoun}
         favourites=${[]}
         thumbCache=${thumbCache}
         sortPref=${sortPref}
+        kindFilter=${kindFilter}
+        onClearKindFilter=${() => setKindFilter('')}
         showHidden=${showHidden}
         selecting=${false}
         selectedPaths=${new Set()}
-        viewModeOverride=${viewMode}
+        viewModeOverride=${viewModeOverride}
         onViewModeResolved=${(m, p) => {
           setResolvedMode(m);
+          setResolvedPath(p);
+        }}
+        onEntriesChange=${(list, p) => {
+          setFolderEntries(list);
           setResolvedPath(p);
         }}
         onNavigateFolder=${(m, p) => {
@@ -2629,19 +3444,56 @@ export function MachineFilesBrowser({
             query: { q: q || '', kinds: [], size: '', changed: '' },
           });
         }}
-        onOpenSort=${() => setSheet('sort')}
-        onToggleView=${() => setViewMode(resolvedMode === 'grid' ? 'list' : 'grid')}
-        onOpenMore=${() => {
-          window.location.hash = routeHref({ section: 'files', view: 'folder', machine: machine.name, path: resolvedPath });
+        onOpenSort=${() => openSheet({ kind: 'sort' })}
+        onToggleView=${() => {
+          const next = resolvedMode === 'grid' ? 'list' : 'grid';
+          writeFolderViewMode(safeStorage(), machine.name, resolvedPath, next);
+          setViewModeOverride(next);
         }}
+        onOpenMore=${() => openSheet({ kind: 'more', machine: machine.name, path: resolvedPath })}
         embedded=${true}
+        wide=${wide}
+        reloadToken=${reloadToken}
       />
-      ${sheet === 'sort'
+      ${activeSheet?.kind === 'sort'
         ? html`
             <${SortSheet}
               sortPref=${sortPref}
+              kindFilter=${kindFilter}
               onChange=${setSortPref}
-              onClose=${() => setSheet(null)}
+              onChangeKind=${setKindFilter}
+              onClose=${closeSheet}
+            />
+          `
+        : null}
+      ${activeSheet?.kind === 'more'
+        ? html`
+            <${FolderMoreSheet}
+              machine=${activeSheet.machine || machine.name}
+              path=${activeSheet.path || resolvedPath}
+              caps=${caps}
+              deviceNoun=${deviceNoun}
+              showHidden=${showHidden}
+              isStarred=${false}
+              isPinned=${false}
+              onNewFolder=${() => openSheet({ kind: 'mkdir', machine: machine.name, parentPath: resolvedPath })}
+              onToggleHidden=${setShowHidden}
+              onClose=${closeSheet}
+            />
+          `
+        : null}
+      ${activeSheet?.kind === 'mkdir'
+        ? html`
+            <${NewFolderSheet}
+              machine=${activeSheet.machine || machine.name}
+              parentPath=${activeSheet.parentPath || resolvedPath}
+              link=${link}
+              capsStore=${capsStore}
+              folderChanges=${folderChanges}
+              onCreated=${() => {
+                if (!folderChanges) setReloadToken((n) => n + 1);
+              }}
+              onClose=${closeSheet}
             />
           `
         : null}
@@ -2660,7 +3512,7 @@ const SEARCH_KIND_CHIPS = [
 ];
 
 export function FilesDock({ route, filesState, filesActions, onNavigateHref }) {
-  const { caps, selecting, selectedPaths, entries, resolvedPath, sortPref, resolvedViewMode } = filesState;
+  const { caps, selecting, selectedPaths, entries, resolvedPath, sortPref, kindFilter = '', resolvedViewMode } = filesState;
   const [searchInput, setSearchInput] = useState(route.query?.q || '');
 
   useEffect(() => {
@@ -2800,7 +3652,10 @@ export function FilesDock({ route, filesState, filesActions, onNavigateHref }) {
         <button
           type="button"
           class="btn icon"
-          aria-label=${`Sort: ${sortDescription(sortPref)}`}
+          aria-label=${kindFilter
+            ? `Sort: ${sortDescription(sortPref)}, showing ${KIND_FILTER_LABELS[kindFilter] || kindFilter}`
+            : `Sort: ${sortDescription(sortPref)}`}
+          aria-pressed=${kindFilter ? 'true' : 'false'}
           onClick=${() => filesActions.openSheet({ kind: 'sort' })}
         >
           <${Icon} name="sort" />
@@ -2834,6 +3689,7 @@ export function FilesDock({ route, filesState, filesActions, onNavigateHref }) {
   if (route.view === 'search') {
     const activeKinds = new Set(route.query?.kinds || []);
     const hasMoreFilters = Boolean(route.query?.size || route.query?.changed);
+    const showMoreFilters = caps ? Boolean(caps.known && caps.hasFindFilters) : true;
 
     const updateSearchRoute = (patch) => {
       const nextQuery = {
@@ -2874,13 +3730,17 @@ export function FilesDock({ route, filesState, filesActions, onNavigateHref }) {
               </button>
             `,
           )}
-          <button
-            type="button"
-            aria-pressed=${hasMoreFilters ? 'true' : 'false'}
-            onClick=${() => filesActions.openSheet({ kind: 'filters' })}
-          >
-            More filters
-          </button>
+          ${showMoreFilters
+            ? html`
+                <button
+                  type="button"
+                  aria-pressed=${hasMoreFilters ? 'true' : 'false'}
+                  onClick=${() => filesActions.openSheet({ kind: 'filters' })}
+                >
+                  More filters
+                </button>
+              `
+            : null}
         </div>
         <input
           class="input plain"

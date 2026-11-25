@@ -125,8 +125,9 @@ impl StateStore {
     }
 
     fn load(&self) -> CacheData {
-        std::fs::read(&self.path)
+        legion_core::config::read_regular_file(&self.path)
             .ok()
+            .flatten()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default()
     }

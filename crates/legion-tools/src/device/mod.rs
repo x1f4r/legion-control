@@ -887,6 +887,8 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         .map(|n| n.as_str().to_owned())
         .unwrap_or_else(|_| "node".to_owned());
     let paths = ctx.paths().clone();
+    let paths_for_cancel = paths.clone();
+    let role_changed = args.role.is_some();
     let should_push_fleet = args.role.is_some() || new_name.is_some();
     let new_role = args.role;
     let confirm = args.confirm;
@@ -1289,6 +1291,15 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         })
     })
     .await?;
+
+    if role_changed {
+        let _ = crate::job::cancel_revoked_transfer_jobs(
+            &paths_for_cancel,
+            Some(&result.principal),
+            Some(&result.id),
+        )
+        .await;
+    }
 
     if should_push_fleet {
         let trigger = registry::DeviceRegistryPushAudit {
@@ -2624,6 +2635,13 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                     sessions::DEFAULT_TERMINATE_GRACE,
                 )
                 .await;
+                let _ = crate::job::cancel_transfer_jobs_for_device(
+                    &paths_for_sessions,
+                    &target.device,
+                    target.pairing_id.as_deref(),
+                    None,
+                )
+                .await;
             }
             return Err(error);
         }
@@ -2636,6 +2654,13 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
             sessions::DEFAULT_TERMINATE_GRACE,
         )
         .await;
+        let _ = crate::job::cancel_transfer_jobs_for_device(
+            &paths_for_sessions,
+            &target.device,
+            target.pairing_id.as_deref(),
+            Some(&removed.principal),
+        )
+        .await;
         for stale in extra_stale {
             if stale != target {
                 let _ = sessions::terminate_device_sessions_for_target(
@@ -2644,15 +2669,24 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                     sessions::DEFAULT_TERMINATE_GRACE,
                 )
                 .await;
+                let _ = crate::job::cancel_transfer_jobs_for_device(
+                    &paths_for_sessions,
+                    &stale.device,
+                    stale.pairing_id.as_deref(),
+                    None,
+                )
+                .await;
             }
         }
         let paths_for_jobs = paths_for_sessions.clone();
         let principal_for_jobs = removed.principal.clone();
         let device_for_jobs = target.device.clone();
+        let pairing_for_jobs = target.pairing_id.clone();
         removed.jobs_left_running = blocking(move || {
             Ok(crate::job::running_job_ids_for_device(
                 &paths_for_jobs,
                 &device_for_jobs,
+                pairing_for_jobs.as_deref(),
                 &principal_for_jobs,
             ))
         })

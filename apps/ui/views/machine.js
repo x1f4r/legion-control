@@ -1,7 +1,7 @@
 // One machine screen: Overview, Files, Power, More, Command, Services, Projects, and Activity.
 
 import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
-import { Meter, Notice, Sheet } from './common.js';
+import { Meter, Notice, OlderMachineNote, Sheet } from './common.js';
 import { ActivityDetail, ActivityGroups, ActivityRow } from './activity.js';
 import { MachineFilesBrowser } from './files.js';
 import { plainDenyReason } from '../lib/actions.js';
@@ -43,7 +43,7 @@ function targetFor(machineName, nodeName) {
 
 // ── Program detail and Stop / Force stop sheet ───────────────────────────────────────────────
 
-function ProgramSheet({ program, machine, on, link, canKill, technical, onStopped, onClose }) {
+function ProgramSheet({ program, machine, on, link, capsStore = null, canKill, technical, onStopped, onClose }) {
   const [step, setStep] = useState('detail'); // 'detail' | 'confirm' | 'stopping' | 'still_running' | 'refused'
   const [stillTargets, setStillTargets] = useState([]);
   const [refusals, setRefusals] = useState([]);
@@ -68,7 +68,9 @@ function ProgramSheet({ program, machine, on, link, canKill, technical, onStoppe
         targets.length > 0
           ? { targets, force }
           : { pid: pidList[0], force };
-      const res = await link.call('sys.kill', args, { on });
+      const res = capsStore
+        ? (await capsStore.call('sys.kill', args, { on })).value
+        : await link.call('sys.kill', args, { on });
       const items = Array.isArray(res?.results) ? res.results : [];
       if (items.length === 0) {
         if (res?.stopped === false) {
@@ -269,20 +271,31 @@ function OverviewTab({
   machine,
   nodeInfo,
   link,
+  capsStore = null,
   allowedSet,
   technical,
   wide,
   wakePending,
+  onRegisterRefresh = null,
   onEnsureAwake,
   onStopJob,
+  onRefreshFleet,
   onUpdateMachineSys,
 }) {
+  const [, setCapsRev] = useState(0);
   const [liveSys, setLiveSys] = useState(() => machine.sys || null);
   const [liveProcs, setLiveProcs] = useState(null);
   const [stale, setStale] = useState(false);
   const [selectedProgram, setSelectedProgram] = useState(null);
   const pollerRef = useRef(null);
   const on = targetFor(machine.name, nodeInfo?.node);
+
+  useEffect(() => {
+    if (!capsStore || !machine?.reachable || !machine?.name) return undefined;
+    const unsub = capsStore.subscribe(() => setCapsRev((n) => n + 1));
+    capsStore.ensure(machine.name).catch(() => {});
+    return unsub;
+  }, [capsStore, machine?.name, machine?.reachable]);
 
   useEffect(() => {
     setLiveSys(machine.sys || null);
@@ -300,10 +313,24 @@ function OverviewTab({
         if (mounted) setStale(nextStale);
       },
       async fetchTick() {
-        const [sysRes, procsRes] = await Promise.allSettled([
-          link.call('sys.info', {}, { on }),
-          link.call('sys.procs', { group: true, limit: 12 }, { on }),
-        ]);
+        if (capsStore && !capsStore.isKnown(machine.name)) {
+          await capsStore.ensure(machine.name).catch(() => null);
+          if (!mounted) return false;
+        }
+        const supportsGroupProcs = capsStore
+          ? capsStore.acceptsArg(machine.name, 'sys.procs', 'group')
+          : true;
+
+        const infoCall = capsStore
+          ? capsStore.call('sys.info', {}, { on }).then((r) => r.value)
+          : link.call('sys.info', {}, { on });
+        const procsCall = supportsGroupProcs
+          ? capsStore
+            ? capsStore.call('sys.procs', { group: true, limit: 12 }, { on }).then((r) => r.value)
+            : link.call('sys.procs', { group: true, limit: 12 }, { on })
+          : Promise.resolve(null);
+
+        const [sysRes, procsRes] = await Promise.allSettled([infoCall, procsCall]);
         if (!mounted) return false;
         let gotAny = false;
         if (sysRes.status === 'fulfilled' && sysRes.value) {
@@ -313,7 +340,7 @@ function OverviewTab({
             onUpdateMachineSys(machine.name, sysRes.value);
           }
         }
-        if (procsRes.status === 'fulfilled' && Array.isArray(procsRes.value?.procs)) {
+        if (supportsGroupProcs && procsRes.status === 'fulfilled' && Array.isArray(procsRes.value?.procs)) {
           gotAny = true;
           setLiveProcs(procsRes.value.procs);
         }
@@ -335,7 +362,17 @@ function OverviewTab({
         document.removeEventListener('visibilitychange', onVis);
       }
     };
-  }, [machine.name, machine.reachable, link, on]);
+  }, [machine.name, machine.reachable, link, capsStore, on]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function' || wide) return undefined;
+    return onRegisterRefresh(async () => {
+      await Promise.all([
+        pollerRef.current ? pollerRef.current.refreshNow() : Promise.resolve(),
+        onRefreshFleet ? onRefreshFleet() : Promise.resolve(),
+      ]);
+    });
+  }, [onRegisterRefresh, wide, onRefreshFleet, machine.name, machine.reachable]);
 
   if (machine.status === 'asking' || machine.asking) {
     return html`<div class="empty">Checking ${machine.name}…</div>`;
@@ -410,6 +447,12 @@ function OverviewTab({
     .join(' ')
     .replace(' ·', ' ·');
 
+  const capsEntry = capsStore && machine?.name ? capsStore.get(machine.name) : null;
+  const missingFeatures = capsStore && machine?.name ? capsStore.missingFeatures(machine.name) : [];
+  const capsKnown = capsStore ? capsStore.isKnown(machine.name) : true;
+  const canGroupProcs = capsStore ? capsKnown && capsStore.acceptsArg(machine.name, 'sys.procs', 'group') : true;
+  const canKillTargets = capsStore ? capsKnown && capsStore.acceptsArg(machine.name, 'sys.kill', 'targets') : true;
+
   const hasAboutRows =
     Boolean(systemLine) ||
     busyReasonLines.length > 0 ||
@@ -423,6 +466,18 @@ function OverviewTab({
               <span class=${activeBusy ? 'dot busy' : 'dot'} aria-hidden="true"></span>
               <span>${stateLine}</span>
             </div>
+          `
+        : null}
+
+      ${missingFeatures.length > 0
+        ? html`
+            <${OlderMachineNote}
+              machine=${machine.name}
+              version=${capsEntry?.version || machine.version || null}
+              build=${capsEntry?.build || machine.build || null}
+              missing=${missingFeatures}
+              technical=${technical}
+            />
           `
         : null}
 
@@ -448,41 +503,44 @@ function OverviewTab({
           `
         : null}
 
-      <p class="label">Using it now</p>
-      <div class=${stale ? 'list stale-values' : 'list'}>
-        ${liveProcs === null
-          ? html`
-              <div class="row off">
-                <span class="body"><span class="sub">Checking…</span></span>
-              </div>
-            `
-          : busyPrograms.length === 0
-            ? html`
-                <div class="row off">
-                  <span class="body"><span class="sub">Nothing much is running.</span></span>
-                </div>
-              `
-            : busyPrograms.map(
-                (prog) => html`
-                  <button
-                    type="button"
-                    class="row"
-                    key=${`${prog.name}:${prog.user || ''}`}
-                    onClick=${() => setSelectedProgram(prog)}
-                  >
-                    <span class="body">
-                      <span class="title">
-                        ${prog.name}
-                        ${prog.count > 1 ? html`<span class="proc-count">× ${prog.count}</span>` : null}
-                      </span>
-                      <span class="sub">${prog.primaryText}</span>
-                    </span>
-                    <span class="chev" aria-hidden="true">›</span>
-                  </button>
-                `,
-              )}
-      </div>
-
+      ${canGroupProcs
+        ? html`
+            <p class="label">Using it now</p>
+            <div class=${stale ? 'list stale-values' : 'list'}>
+              ${liveProcs === null
+                ? html`
+                    <div class="row off">
+                      <span class="body"><span class="sub">Checking…</span></span>
+                    </div>
+                  `
+                : busyPrograms.length === 0
+                  ? html`
+                      <div class="row off">
+                        <span class="body"><span class="sub">Nothing much is running.</span></span>
+                      </div>
+                    `
+                  : busyPrograms.map(
+                      (prog) => html`
+                        <button
+                          type="button"
+                          class="row"
+                          key=${`${prog.name}:${prog.user || ''}`}
+                          onClick=${() => setSelectedProgram(prog)}
+                        >
+                          <span class="body">
+                            <span class="title">
+                              ${prog.name}
+                              ${prog.count > 1 ? html`<span class="proc-count">× ${prog.count}</span>` : null}
+                            </span>
+                            <span class="sub">${prog.primaryText}</span>
+                          </span>
+                          <span class="chev" aria-hidden="true">›</span>
+                        </button>
+                      `,
+                    )}
+            </div>
+          `
+        : null}
       ${runningJobs.length > 0
         ? html`
             <p class="label">Running now</p>
@@ -557,7 +615,8 @@ function OverviewTab({
               machine=${machine}
               on=${on}
               link=${link}
-              canKill=${canKill}
+              capsStore=${capsStore}
+              canKill=${canKill && canKillTargets}
               technical=${technical}
               onStopped=${() => pollerRef.current?.refreshNow()}
               onClose=${() => setSelectedProgram(null)}
@@ -906,6 +965,8 @@ function MachineActivityTab({
   allowedSet,
   technical,
   jobId,
+  onObserveTransferJobs = null,
+  onRegisterRefresh = null,
   onRefreshFleet,
 }) {
   const [jobs, setJobs] = useState(null);
@@ -925,6 +986,9 @@ function MachineActivityTab({
         ? res.jobs.map((j) => ({ ...j, machine: machine.name }))
         : [];
       setJobs(list);
+      if (onObserveTransferJobs && list.length > 0) {
+        onObserveTransferJobs(list);
+      }
     } catch (err) {
       setError(err);
     }
@@ -933,6 +997,11 @@ function MachineActivityTab({
   useEffect(() => {
     load();
   }, [machine.name, machine.reachable, jobId]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function' || jobId) return undefined;
+    return onRegisterRefresh(() => load());
+  }, [onRegisterRefresh, jobId, machine.name, machine.reachable]);
 
   async function handleStop(job) {
     setError(null);
@@ -954,6 +1023,8 @@ function MachineActivityTab({
         link=${link}
         allowedSet=${allowedSet}
         technical=${technical}
+        onObserveTransferJobs=${onObserveTransferJobs}
+        onRegisterRefresh=${onRegisterRefresh}
         onChanged=${() => {
           load();
           if (onRefreshFleet) onRefreshFleet();
@@ -981,7 +1052,7 @@ function MachineActivityTab({
 
 // ── Services tab ─────────────────────────────────────────────────────────────────────────────
 
-function ServicesTab({ machine, nodeInfo, link, allowedSet }) {
+function ServicesTab({ machine, nodeInfo, link, allowedSet, onRegisterRefresh = null }) {
   const [services, setServices] = useState(null);
   const [filter, setFilter] = useState('');
   const [selected, setSelected] = useState(null);
@@ -989,6 +1060,10 @@ function ServicesTab({ machine, nodeInfo, link, allowedSet }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const on = targetFor(machine.name, nodeInfo?.node);
+  const filterRef = useRef(filter);
+  filterRef.current = filter;
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
 
   async function load(q = filter) {
     if (!machine.reachable) {
@@ -1011,6 +1086,17 @@ function ServicesTab({ machine, nodeInfo, link, allowedSet }) {
     setLogs(null);
     load('');
   }, [machine.name, machine.reachable]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function') return undefined;
+    return onRegisterRefresh(async () => {
+      if (selectedRef.current) {
+        await openService(selectedRef.current);
+      } else {
+        await load(filterRef.current);
+      }
+    });
+  }, [onRegisterRefresh, machine.name, machine.reachable]);
 
   async function openService(svc) {
     setSelected(svc);
@@ -1164,7 +1250,7 @@ ${logs === null
 
 // ── Projects tab ─────────────────────────────────────────────────────────────────────────────
 
-function ProjectsTab({ machine, nodeInfo, link, allowedSet }) {
+function ProjectsTab({ machine, nodeInfo, link, allowedSet, onRegisterRefresh = null }) {
   const [projects, setProjects] = useState(null);
   const [output, setOutput] = useState('');
   const [busyKey, setBusyKey] = useState('');
@@ -1197,6 +1283,11 @@ function ProjectsTab({ machine, nodeInfo, link, allowedSet }) {
     setOutput('');
     load();
   }, [machine.name, machine.reachable]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function') return undefined;
+    return onRegisterRefresh(() => load());
+  }, [onRegisterRefresh, machine.name, machine.reachable]);
 
   async function pull(project) {
     setBusyKey(`pull:${project.name}`);
@@ -1342,6 +1433,7 @@ function PowerTab({
   allowedSet,
   technical,
   wakePending,
+  onRegisterRefresh = null,
   onEnsureAwake,
   onWakeSent,
   onRequestConfirm,
@@ -1371,6 +1463,13 @@ function PowerTab({
     setResult(null);
     load();
   }, [machine.name, machine.reachable]);
+
+  useEffect(() => {
+    if (typeof onRegisterRefresh !== 'function') return undefined;
+    return onRegisterRefresh(async () => {
+      await Promise.all([load(), onRefreshFleet ? onRefreshFleet() : Promise.resolve()]);
+    });
+  }, [onRegisterRefresh, onRefreshFleet, machine.name, machine.reachable]);
 
   async function runAction(tool, args, target, hasDry) {
     setError(null);
@@ -1635,12 +1734,18 @@ export function MachineDetail({
   jobId,
   wide,
   link,
+  capsStore = null,
+  folderChanges = null,
+  onObserveTransferJobs = null,
+  onRegisterRefresh = null,
   nodeInfo,
   tools,
   allowedSet,
   settings,
   deviceNoun,
   thumbCache,
+  filesState = null,
+  filesActions = null,
   wakePending,
   onEnsureAwake,
   onWakeSent,
@@ -1733,8 +1838,11 @@ export function MachineDetail({
               technical=${technical}
               wide=${wide}
               wakePending=${wakePending}
+              capsStore=${capsStore}
+              onRegisterRefresh=${onRegisterRefresh}
               onEnsureAwake=${onEnsureAwake}
               onStopJob=${handleStopJob}
+              onRefreshFleet=${onRefreshFleet}
               onUpdateMachineSys=${onUpdateMachineSys}
             />
           `
@@ -1781,9 +1889,16 @@ export function MachineDetail({
                     tools=${tools}
                     allowedSet=${allowedSet}
                     link=${link}
+                    capsStore=${capsStore}
+                    folderChanges=${folderChanges}
+                    onRegisterRefresh=${onRegisterRefresh}
+                    onRefreshFleet=${onRefreshFleet}
                     settings=${settings}
                     deviceNoun=${deviceNoun}
                     thumbCache=${thumbCache}
+                    wide=${wide}
+                    filesState=${filesState}
+                    filesActions=${filesActions}
                     onEnsureAwake=${onEnsureAwake}
                   />
                 `
@@ -1796,6 +1911,8 @@ export function MachineDetail({
                       allowedSet=${allowedSet}
                       technical=${technical}
                       jobId=${jobId}
+                      onObserveTransferJobs=${onObserveTransferJobs}
+                      onRegisterRefresh=${onRegisterRefresh}
                       onRefreshFleet=${onRefreshFleet}
                     />
                   `
@@ -1806,6 +1923,7 @@ export function MachineDetail({
                         nodeInfo=${nodeInfo}
                         link=${link}
                         allowedSet=${allowedSet}
+                        onRegisterRefresh=${onRegisterRefresh}
                       />
                     `
                   : effectiveTab === 'projects'
@@ -1815,6 +1933,7 @@ export function MachineDetail({
                           nodeInfo=${nodeInfo}
                           link=${link}
                           allowedSet=${allowedSet}
+                          onRegisterRefresh=${onRegisterRefresh}
                         />
                       `
                     : html`
@@ -1825,6 +1944,7 @@ export function MachineDetail({
                           allowedSet=${allowedSet}
                           technical=${technical}
                           wakePending=${wakePending}
+                          onRegisterRefresh=${onRegisterRefresh}
                           onEnsureAwake=${onEnsureAwake}
                           onWakeSent=${onWakeSent}
                           onRequestConfirm=${onRequestConfirm}
