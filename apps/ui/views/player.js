@@ -650,6 +650,24 @@ export function VideoPlayer({
     };
   }, [touchOrientationDevice, fullscreenController, enterFullscreen, leaveFullscreen]);
 
+  // Pause in place and clear pending autoplay if the desktop window is hidden/closed.
+  useEffect(() => {
+    if (typeof link?.onWindowHidden !== 'function') return undefined;
+    return link.onWindowHidden(() => {
+      wantPlayAfterSwapRef.current = false;
+      const v = videoRef.current;
+      if (v && !v.paused) {
+        try {
+          v.pause();
+        } catch {
+          // Ignore pause errors.
+        }
+      }
+      controller.setPlaying(false);
+      controller.notifyActivity({ show: true });
+    });
+  }, [link, controller]);
+
   // Always release keep-screen-on, save resume position, and clear `<video>` on unmount.
   useEffect(() => {
     return () => {
@@ -1478,6 +1496,23 @@ export function MusicPlayer({
       ctrl.abort();
     };
   }, [machine, path, entry?.mtime, caps?.hasTags, caps?.hasAudioCovers, caps?.thumbMaxSize, capsStore, link, thumbCache]);
+
+  // Pause in place and clear pending autoplay if the desktop window is hidden/closed.
+  useEffect(() => {
+    if (typeof link?.onWindowHidden !== 'function') return undefined;
+    return link.onWindowHidden(() => {
+      autoPlayNextRef.current = null;
+      const a = audioRef.current;
+      if (a && !a.paused) {
+        try {
+          a.pause();
+        } catch {
+          // Ignore pause errors.
+        }
+      }
+      setPlaying(false);
+    });
+  }, [link, autoPlayNextRef]);
 
   // Save resume position & clean up timers/audio on unmount.
   useEffect(() => {

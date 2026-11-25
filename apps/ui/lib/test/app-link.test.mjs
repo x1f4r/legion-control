@@ -1432,3 +1432,62 @@ test('createAppLink onImmersiveChange and debug verifyDesktopImmersive cover bot
     else delete globalThis.navigator;
   }
 });
+
+test('createAppLink onWindowHidden listens to legion://window-hidden, ends immersive, and cleans up', async () => {
+  const prevWindow = globalThis.window;
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const tauriListeners = new Map();
+  let unlistenCount = 0;
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { userAgent: 'Mozilla/5.0 (X11; Linux x86_64)', platform: 'Linux x86_64', maxTouchPoints: 0 },
+  });
+
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          if (command === 'window_set_immersive') {
+            return Promise.resolve({ active: payload.on, fullscreen: payload.on });
+          }
+          return Promise.resolve({});
+        },
+      },
+      event: {
+        listen(name, cb) {
+          tauriListeners.set(name, cb);
+          return Promise.resolve(() => {
+            unlistenCount += 1;
+            tauriListeners.delete(name);
+          });
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    const hiddenEvents = [];
+    const immersiveEvents = [];
+    const unsubHidden = link.onWindowHidden(() => hiddenEvents.push('hidden'));
+    const unsubImm = link.onImmersiveChange((active) => immersiveEvents.push(active));
+    await new Promise((r) => setTimeout(r, 0));
+
+    assert.ok(tauriListeners.has('legion://window-hidden'));
+    await link.immersive(true);
+    tauriListeners.get('legion://window-hidden')({});
+    assert.deepEqual(hiddenEvents, ['hidden']);
+    assert.deepEqual(immersiveEvents, [false]);
+
+    unsubHidden();
+    unsubImm();
+    assert.equal(unlistenCount, 2);
+    assert.equal(tauriListeners.size, 0);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+    else delete globalThis.navigator;
+  }
+});

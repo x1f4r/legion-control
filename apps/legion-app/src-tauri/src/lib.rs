@@ -472,6 +472,9 @@ pub fn run() {
             ..
         } => {
             let window = app_handle.get_webview_window(&label);
+            if let Some(win) = window.as_ref() {
+                let _ = win.emit(commands::EVENT_WINDOW_HIDDEN, ());
+            }
             reset_desktop_player_state(app_handle, window.as_ref());
             let transfers = app_handle.state::<SharedTransfers>();
             if transfers.0.has_active_work() {
@@ -491,6 +494,9 @@ pub fn run() {
             ..
         } => {
             let window = app_handle.get_webview_window(&label);
+            if let Some(win) = window.as_ref() {
+                let _ = win.emit(commands::EVENT_WINDOW_HIDDEN, ());
+            }
             reset_desktop_player_state(app_handle, window.as_ref());
         }
         #[cfg(target_os = "macos")]

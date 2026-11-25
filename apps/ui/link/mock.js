@@ -2302,11 +2302,31 @@ export function createMockLink(mode = '') {
   const immersiveCalls = [];
   const keepScreenOnCalls = [];
   const immersiveListeners = new Set();
+  const windowHiddenListeners = new Set();
   let mockImmersiveActive = false;
 
   if (typeof window !== 'undefined') {
     window.__LEGION_MOCK_IMMERSIVE_CALLS__ = immersiveCalls;
     window.__LEGION_MOCK_KEEP_SCREEN_ON_CALLS__ = keepScreenOnCalls;
+    window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__ = () => {
+      if (mockImmersiveActive) {
+        mockImmersiveActive = false;
+        for (const l of immersiveListeners) {
+          try {
+            l(false);
+          } catch {
+            // Keep notifying remaining listeners.
+          }
+        }
+      }
+      for (const l of windowHiddenListeners) {
+        try {
+          l();
+        } catch {
+          // Keep notifying remaining listeners.
+        }
+      }
+    };
   }
 
   function canImmersive(options = {}) {
@@ -2348,6 +2368,14 @@ export function createMockLink(mode = '') {
     };
   }
 
+  function onWindowHidden(listener) {
+    if (typeof listener !== 'function') return () => {};
+    windowHiddenListeners.add(listener);
+    return () => {
+      windowHiddenListeners.delete(listener);
+    };
+  }
+
   async function keepScreenOn(on) {
     const active = Boolean(on);
     keepScreenOnCalls.push({ on: active, at: Date.now() });
@@ -2379,6 +2407,7 @@ export function createMockLink(mode = '') {
     canImmersive,
     immersive,
     onImmersiveChange,
+    onWindowHidden,
     keepScreenOn,
     immersiveCalls,
     keepScreenOnCalls,

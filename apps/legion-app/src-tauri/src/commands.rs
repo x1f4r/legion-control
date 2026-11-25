@@ -115,6 +115,11 @@ pub struct SharedBackend(pub Arc<dyn Backend>);
 /// outside Legion's own `window_set_immersive(false)` call.
 pub const EVENT_IMMERSIVE_CHANGED: &str = "legion://immersive-changed";
 
+/// Native desktop event emitted to the web view when the main window is hidden (for example while
+/// background transfers drain) or closed, so active playback pauses where it is and leaves full
+/// screen.
+pub const EVENT_WINDOW_HIDDEN: &str = "legion://window-hidden";
+
 /// Tracks whether Legion entered desktop full screen so leaving only undoes what Legion did.
 ///
 /// If the window was already full screen when immersive started, entering changes nothing and

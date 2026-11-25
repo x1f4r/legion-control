@@ -1482,9 +1482,13 @@ export function createAppLink() {
 
   let desktopImmersiveActive = false;
   const immersiveListeners = new Set();
+  const windowHiddenListeners = new Set();
   let nativeImmersiveUnlisten = null;
   let nativeImmersiveReady = null;
   let nativeImmersiveToken = null;
+  let nativeWindowHiddenUnlisten = null;
+  let nativeWindowHiddenReady = null;
+  let nativeWindowHiddenToken = null;
 
   function notifyImmersiveListeners(active) {
     for (const listener of immersiveListeners) {
@@ -1494,6 +1498,77 @@ export function createAppLink() {
         // Keep notifying remaining listeners.
       }
     }
+  }
+
+  function notifyWindowHiddenListeners() {
+    if (desktopImmersiveActive) {
+      desktopImmersiveActive = false;
+      notifyImmersiveListeners(false);
+    }
+    for (const listener of windowHiddenListeners) {
+      try {
+        listener();
+      } catch {
+        // Keep notifying remaining listeners.
+      }
+    }
+  }
+
+  function ensureNativeWindowHiddenSubscription() {
+    if (nativeWindowHiddenReady) return nativeWindowHiddenReady;
+    const ev = tauriEvent();
+    if (!ev) return Promise.resolve(false);
+    const token = {};
+    nativeWindowHiddenToken = token;
+    const onHidden = () => {
+      notifyWindowHiddenListeners();
+    };
+    nativeWindowHiddenReady = Promise.resolve(ev.listen('legion://window-hidden', onHidden))
+      .catch(() => null)
+      .then((unlisten) => {
+        if (typeof unlisten !== 'function') return false;
+        if (nativeWindowHiddenToken !== token || windowHiddenListeners.size === 0) {
+          try {
+            const res = unlisten();
+            if (res && typeof res.catch === 'function') res.catch(() => {});
+          } catch {
+            // Best-effort cleanup.
+          }
+          return false;
+        }
+        nativeWindowHiddenUnlisten = unlisten;
+        return true;
+      });
+    return nativeWindowHiddenReady;
+  }
+
+  function teardownNativeWindowHiddenSubscription() {
+    nativeWindowHiddenToken = null;
+    nativeWindowHiddenReady = null;
+    const unlisten = nativeWindowHiddenUnlisten;
+    nativeWindowHiddenUnlisten = null;
+    if (typeof unlisten === 'function') {
+      try {
+        const res = unlisten();
+        if (res && typeof res.catch === 'function') res.catch(() => {});
+      } catch {
+        // Best-effort cleanup.
+      }
+    }
+  }
+
+  function onWindowHidden(listener) {
+    if (typeof listener !== 'function') return () => {};
+    windowHiddenListeners.add(listener);
+    if (currentImmersiveCap().mode === 'desktop') {
+      ensureNativeWindowHiddenSubscription().catch(() => {});
+    }
+    return () => {
+      windowHiddenListeners.delete(listener);
+      if (windowHiddenListeners.size === 0) {
+        teardownNativeWindowHiddenSubscription();
+      }
+    };
   }
 
   function ensureNativeImmersiveSubscription() {
@@ -1714,6 +1789,7 @@ export function createAppLink() {
     immersive,
     canImmersive,
     onImmersiveChange,
+    onWindowHidden,
     keepScreenOn,
   };
 

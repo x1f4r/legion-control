@@ -1068,3 +1068,122 @@ test('Player: real legion serve HTTP door enters Fullscreen API on viewer elemen
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('Player: hiding the desktop window pauses video and music in place and leaves full screen', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+    const page = await context.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    // 1. Video playing in full screen -> window hides -> paused right where it was, no longer in full screen.
+    await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+    await page.waitForFunction(
+      () => {
+        const v = document.querySelector('.viewer video');
+        return v && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 0;
+      },
+      null,
+      { timeout: 5000 },
+    );
+    await page.locator('.viewer button[aria-label="Full screen"]').click();
+    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor({ timeout: 3000 });
+    const targetVideoTime = await page.evaluate(async () => {
+      const v = document.querySelector('.viewer video');
+      const t = Math.min(0.4, Math.max(0.1, v.duration * 0.35));
+      v.currentTime = t;
+      await v.play();
+      return t;
+    });
+    await page.waitForFunction(
+      () => {
+        const v = document.querySelector('.viewer video');
+        return v && !v.paused;
+      },
+      null,
+      { timeout: 3000 },
+    );
+
+    await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__());
+    await page.locator('.viewer button[aria-label="Full screen"]').waitFor({ timeout: 3000 });
+    assert.equal(await page.locator('.viewer button[aria-label="Exit full screen"]').count(), 0);
+    const videoAfterHide = await page.evaluate(() => {
+      const v = document.querySelector('.viewer video');
+      const keepCalls = window.__LEGION_MOCK_KEEP_SCREEN_ON_CALLS__ || [];
+      return {
+        paused: v?.paused,
+        currentTime: v?.currentTime ?? 0,
+        lastKeepScreenOn: keepCalls.length ? keepCalls[keepCalls.length - 1].on : null,
+      };
+    });
+    assert.equal(videoAfterHide.paused, true);
+    assert.ok(
+      videoAfterHide.currentTime >= targetVideoTime - 0.05,
+      `Video lost position on hide: ${videoAfterHide.currentTime} < ${targetVideoTime}`,
+    );
+    assert.equal(videoAfterHide.lastKeepScreenOn, false);
+
+    // 2. Music playing -> window hides -> paused in place with Play button shown.
+    await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FMusic%2FAlbum`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.list a.row', { hasText: '01 - Morning Light.flac' }).click();
+    await page.locator('.viewer audio[src]').waitFor({ state: 'attached', timeout: 5000 });
+    await page.waitForFunction(
+      () => {
+        const a = document.querySelector('.viewer audio');
+        return a && a.readyState >= 1 && Number.isFinite(a.duration) && a.duration > 0;
+      },
+      null,
+      { timeout: 5000 },
+    );
+    const targetAudioTime = await page.evaluate(async () => {
+      const a = document.querySelector('.viewer audio');
+      const t = Math.min(0.25, Math.max(0.05, a.duration * 0.3));
+      a.currentTime = t;
+      await a.play();
+      return t;
+    });
+    await page.waitForFunction(
+      () => {
+        const a = document.querySelector('.viewer audio');
+        return a && !a.paused;
+      },
+      null,
+      { timeout: 3000 },
+    );
+    await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__());
+    await page.locator('.music-play-btn[aria-label="Play"]').waitFor({ timeout: 3000 });
+    const audioAfterHide = await page.evaluate(() => {
+      const a = document.querySelector('.viewer audio');
+      return { paused: a?.paused, currentTime: a?.currentTime ?? 0 };
+    });
+    assert.equal(audioAfterHide.paused, true);
+    assert.ok(
+      audioAfterHide.currentTime >= targetAudioTime - 0.05,
+      `Audio lost position on hide: ${audioAfterHide.currentTime} < ${targetAudioTime}`,
+    );
+
+    assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+    await context.close();
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});

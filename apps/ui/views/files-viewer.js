@@ -433,6 +433,34 @@ export function FilesViewer({
     };
   }, [fullscreenController, link]);
 
+  // When a desktop window hides (e.g. closing while background transfers drain) or closes,
+  // pause active media right where it is and leave full screen so reopening shows it paused.
+  useEffect(() => {
+    if (typeof link?.onWindowHidden !== 'function') return undefined;
+    return link.onWindowHidden(() => {
+      playbackRef.current.wantPlay = false;
+      if (pendingResumeRef.current) {
+        pendingResumeRef.current = { ...pendingResumeRef.current, play: false };
+      }
+      musicAutoPlayRef.current = null;
+      for (const ref of [videoRef, audioRef]) {
+        const el = ref.current;
+        if (el && !el.paused) {
+          try {
+            el.pause();
+          } catch {
+            // Ignore pause errors on unready elements.
+          }
+        }
+      }
+      if (fullscreenController.getState().active) {
+        fullscreenController.leave();
+      }
+      setChromeHidden(false);
+      link?.keepScreenOn?.(false);
+    });
+  }, [link, fullscreenController]);
+
   // Modal focus isolation: mark background shell siblings outside `.viewer` inert while open,
   // and keep Tab focus cycling strictly inside `.viewer` when no sheet scrim is on top.
   useEffect(() => {
