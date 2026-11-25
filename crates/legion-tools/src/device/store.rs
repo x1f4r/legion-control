@@ -92,6 +92,11 @@ pub struct DeviceRecord {
     /// Random per-pairing identifier pinned via `--pairing <id>` in `authorized_keys`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing_id: Option<String>,
+    /// `true` once this device has authenticated and opened at least one `legion gate` session
+    /// with its permanent key. Used to avoid racing an immediate post-enrol probe against a
+    /// `BrokenPipe` write failure on the enrolment reply channel.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirmed: bool,
 }
 
 /// Returns the owner-only lock file path placed beside `write_path` so distinct Legion homes

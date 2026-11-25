@@ -1367,6 +1367,56 @@ export function createAppLink() {
     }
   }
 
+  async function restorePairing(inviteText, existingPrincipal, name, options = {}) {
+    const { signal } = options || {};
+    const cancelledError = () => ({
+      code: 'cancelled',
+      message: 'Restoring pairing was cancelled.',
+      hint: null,
+      machine: null,
+      details: { sent: false },
+    });
+    if (signal?.aborted) {
+      throw cancelledError();
+    }
+    const granted = await ensureLocalNetworkPermission();
+    if (!granted) {
+      throw {
+        code: 'denied',
+        message: 'Local network permission was denied.',
+        hint: 'Allow local network access for Legion in Android Settings to connect to machines on your LAN or Tailscale.',
+        machine: null,
+        details: null,
+      };
+    }
+    if (signal?.aborted) {
+      throw cancelledError();
+    }
+    const onAbort = () => {
+      invoke('cancel_pair').catch(() => {});
+    };
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    try {
+      const restored = await invoke('restore_pairing', {
+        invite: inviteText,
+        existingPrincipal,
+        name: name || null,
+      });
+      clearUnsupportedContentMachines();
+      const next = await state();
+      return {
+        ...next,
+        last_paired: restored?.last_paired || next?.last_paired || null,
+      };
+    } catch (err) {
+      throw normalizeError(err);
+    } finally {
+      if (signal) signal.removeEventListener('abort', onAbort);
+    }
+  }
+
   async function learn() {
     try {
       const res = await invoke('learn');
@@ -1814,6 +1864,7 @@ export function createAppLink() {
     call,
     deviceName,
     pair,
+    restorePairing,
     unpair,
     selectNode,
     learn,

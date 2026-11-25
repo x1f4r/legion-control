@@ -23,12 +23,15 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use legion_link::proto::{ErrorCode, PROTOCOL};
+use legion_link::session::TransportHandle;
+use legion_link::ssh::open_exec_raw;
 use legion_link::{
     CancellationToken, DETAIL_SENT, DeviceKey, Invite, Link, LinkConfig, NodeLink,
     REASON_AUTH_FAILED, REASON_DEVICE_REMOVED_OR_UNKNOWN, SshTimeouts, enrol,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -1027,7 +1030,11 @@ async fn real_sshd_cancel_before_and_after_send_behaves_honestly() {
     assert_eq!(pre_err.code, ErrorCode::Cancelled);
     assert_eq!(pre_err.details.as_ref().unwrap()[DETAIL_SENT], json!(false));
     assert!(link.config().node("tower").is_none());
-    assert!(!fs::read_to_string(&auth_keys).unwrap().contains("--device cancel-phone"));
+    assert!(
+        !fs::read_to_string(&auth_keys)
+            .unwrap()
+            .contains("--device cancel-phone")
+    );
 
     // 2. Cancel RIGHT AFTER the machine commits `authorized_keys` (reproducing the race where
     //    cancel fires after the request left): pairing MUST succeed and save `tower` instead of
@@ -1070,4 +1077,359 @@ async fn real_sshd_cancel_before_and_after_send_behaves_honestly() {
         .unwrap();
     assert_eq!(whoami["principal"], json!("device:cancel-phone"));
     link.close().await;
+}
+
+#[tokio::test]
+async fn real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat() {
+    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
+        eprintln!(
+            "skipping real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat: sshd/ssh-keygen unavailable"
+        );
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        eprintln!(
+            "skipping real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat: built `legion` binary not found"
+        );
+        return;
+    };
+
+    let root = strict_tempdir();
+    let user_home = root.path().join("home");
+    let legion_home = root.path().join("legion");
+    let config_dir = legion_home.join("config");
+    let ssh_dir = user_home.join(".ssh");
+    let auth_keys = ssh_dir.join("authorized_keys");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&ssh_dir).unwrap();
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(&user_home, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700));
+    }
+
+    let Some(sshd) = ThrowawaySshd::start(&auth_keys, &user_home) else {
+        eprintln!("skipping: throwaway sshd unavailable");
+        return;
+    };
+
+    let node_toml = format!(
+        "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+        toml_literal(&auth_keys),
+        toml_literal(&sshd.host_key_pub),
+    );
+    fs::write(config_dir.join("node.toml"), node_toml).unwrap();
+    fs::write(
+        config_dir.join("policy.toml"),
+        "default = \"owner\"\n\n[roles.operator]\nallow = [\"effect:read\"]\n",
+    )
+    .unwrap();
+
+    let port_arg = format!("port={}", sshd.port);
+    let user_arg = format!("user={}", sshd.user);
+    let fleet_path = config_dir.join("fleet.toml");
+    let audit_path = legion_home.join("state").join("audit.jsonl");
+
+    // Helper: enrols a device key with `invite` over real `sshd`, waits until the machine enters
+    // `push_devices_to_fleet` (after committing policy/devices/authorized_keys, before replying),
+    // then abruptly drops the SSH connection so the client vanishes before receiving the reply.
+    let vanish_after_send = |invite: &Invite,
+                             device_key: &DeviceKey,
+                             device_name: &str,
+                             tag: &str| {
+        let entered = root.path().join(format!("entered-{tag}"));
+        let release = root.path().join(format!("release-{tag}"));
+        let fleet_toml = format!(
+            "[machines.slowpeer]\ncommand = [\"/bin/sh\", \"-c\", \"touch '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 250 ]; do sleep 0.02; i=$((i+1)); done; exit 1\"]\n",
+            entered.display(),
+            release.display(),
+        );
+        fs::write(&fleet_path, fleet_toml).unwrap();
+        let enrol_audit_before = fs::read_to_string(&audit_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("\"tool\":\"device.enrol\""))
+            .count();
+
+        let invite = invite.clone();
+        let pub_key = device_key.public_key_line(device_name).unwrap();
+        let device_name = device_name.to_owned();
+        let audit_path = audit_path.clone();
+        let fleet_path = fleet_path.clone();
+        async move {
+            let temp_key = DeviceKey::from_seed(*invite.key_seed().unwrap());
+            let pipe = open_exec_raw(
+                &invite.target(),
+                &temp_key,
+                "legion enrol",
+                SshTimeouts::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let (reader, mut writer, handle) = pipe.into_parts();
+            let req = format!(
+                "{}\n",
+                json!({
+                    "enrol": 1,
+                    "id": invite.id,
+                    "public_key": pub_key,
+                    "name": device_name,
+                })
+            );
+            writer.write_all(req.as_bytes()).await.unwrap();
+            writer.flush().await.unwrap();
+            writer.shutdown().await.unwrap();
+
+            // Wait deterministically until commit finished and `push_devices_to_fleet` began.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !entered.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for enrol to reach fleet push"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            // Client vanishes while machine is still finishing before writing its stdout reply.
+            drop(writer);
+            drop(reader);
+            Box::new(handle).close(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = fs::write(&release, b"go\n");
+
+            // Wait for `legion gate --enrol` to finish and append its own `tool: "device.enrol"` audit entry.
+            let audit_deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let enrol_count = fs::read_to_string(&audit_path)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| line.contains("\"tool\":\"device.enrol\""))
+                    .count();
+                if enrol_count > enrol_audit_before {
+                    break;
+                }
+                assert!(
+                    Instant::now() < audit_deadline,
+                    "timed out waiting for device.enrol audit entry"
+                );
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            let _ = fs::remove_file(&fleet_path);
+        }
+    };
+
+    // 1. Client vanishes after sending -> recorded as `unconfirmed = true` in devices.toml,
+    //    `device.list`, and `audit.jsonl`.
+    let inv1_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=vanish-a",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv1 = Invite::parse(inv1_res["invite"].as_str().unwrap()).unwrap();
+    let key_a = DeviceKey::generate().unwrap();
+    vanish_after_send(&inv1, &key_a, "vanish-a", "a").await;
+
+    let devices_toml_1 = fs::read_to_string(config_dir.join("devices.toml")).unwrap();
+    assert!(
+        devices_toml_1.contains("unconfirmed = true"),
+        "devices.toml must record unconfirmed = true:\n{devices_toml_1}\n--- audit ---\n{}\n--- sshd ---\n{}",
+        fs::read_to_string(&audit_path).unwrap_or_default(),
+        sshd.log(),
+    );
+    let list_1 = run_legion(&legion_bin, &legion_home, &user_home, &["device.list"]);
+    let devs_1 = list_1["devices"].as_array().unwrap();
+    assert_eq!(devs_1.len(), 1);
+    assert_eq!(devs_1[0]["unconfirmed"], json!(true));
+    assert_eq!(devs_1[0]["status"], json!("Pairing not finished"));
+
+    let audit_1 = fs::read_to_string(&audit_path).unwrap();
+    assert!(
+        audit_1.contains("\"reply_delivered\":false") && audit_1.contains("\"unconfirmed\":true"),
+        "audit.jsonl must record undelivered/unconfirmed enrolment:\n{audit_1}"
+    );
+
+    // Older-client compatibility: strict struct without `unconfirmed` deserializes `device.list`.
+    #[derive(serde::Deserialize)]
+    struct LegacyListEntry {
+        name: String,
+        principal: String,
+    }
+    let legacy_entry: LegacyListEntry = serde_json::from_value(devs_1[0].clone()).unwrap();
+    assert_eq!(legacy_entry.name, "vanish-a");
+    assert_eq!(legacy_entry.principal, "device:vanish-a");
+
+    // 2. Fresh invite presented by the SAME device key replaces the unconfirmed leftover and
+    //    succeeds cleanly over real `sshd`.
+    let inv2_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=vanish-a-fresh",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv2_text = inv2_res["invite"].as_str().unwrap();
+    let link_a = Link::new(LinkConfig {
+        device_key: Some(key_a.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let enrolled_a = link_a
+        .pair(inv2_text, "vanish-a-fresh")
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "fresh invite must replace unconfirmed leftover: {e}\n--- sshd log ---\n{}",
+                sshd.log()
+            )
+        });
+    assert_eq!(enrolled_a.principal, "device:vanish-a-fresh");
+    link_a.close().await;
+
+    let list_2 = run_legion(&legion_bin, &legion_home, &user_home, &["device.list"]);
+    let devs_2 = list_2["devices"].as_array().unwrap();
+    assert_eq!(devs_2.len(), 1);
+    assert_eq!(devs_2[0]["principal"], json!("device:vanish-a-fresh"));
+    assert!(devs_2[0].get("unconfirmed").is_none());
+
+    // 3. First session from an unconfirmed device marks it confirmed on the machine.
+    let inv3_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=session-b",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv3_text = inv3_res["invite"].as_str().unwrap();
+    let inv3 = Invite::parse(inv3_text).unwrap();
+    let key_b = DeviceKey::generate().unwrap();
+    vanish_after_send(&inv3, &key_b, "session-b", "b").await;
+
+    let list_3_before = run_legion(&legion_bin, &legion_home, &user_home, &["device.list"]);
+    let dev_b_before = list_3_before["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["principal"] == json!("device:session-b"))
+        .unwrap();
+    assert_eq!(dev_b_before["unconfirmed"], json!(true));
+
+    // Device B opens its first RPC session (`meta.whoami`) using its key.
+    let link_b = Link::new(LinkConfig {
+        device_key: Some(key_b.to_openssh().unwrap()),
+        nodes: vec![NodeLink::ssh(
+            "tower",
+            inv3.target(),
+            Some("device:session-b".to_owned()),
+        )],
+        ..LinkConfig::default()
+    });
+    let whoami_b = link_b
+        .call("tower", "meta.whoami", json!({}), None, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(whoami_b["principal"], json!("device:session-b"));
+    link_b.close().await;
+
+    let list_3_after = run_legion(&legion_bin, &legion_home, &user_home, &["device.list"]);
+    let dev_b_after = list_3_after["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["principal"] == json!("device:session-b"))
+        .unwrap();
+    assert!(
+        dev_b_after.get("unconfirmed").is_none(),
+        "first session open must clear unconfirmed flag: {dev_b_after}"
+    );
+    let devices_toml_after = fs::read_to_string(config_dir.join("devices.toml")).unwrap();
+    assert!(
+        !devices_toml_after.contains("unconfirmed = true"),
+        "devices.toml must clear unconfirmed after session:\n{devices_toml_after}"
+    );
+
+    // 4. Confirmed device presenting a second fresh invite is refused with `ErrorCode::Conflict`
+    //    and `details.existing_principal`, and restores via the pinned-key probe.
+    let inv4_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=session-b-dup",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv4_text = inv4_res["invite"].as_str().unwrap();
+    let link_b_fresh = Link::new(LinkConfig {
+        device_key: Some(key_b.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let conflict_err = link_b_fresh
+        .pair(inv4_text, "session-b-dup")
+        .await
+        .unwrap_err();
+    assert_eq!(conflict_err.code, ErrorCode::Conflict, "{conflict_err}");
+    let details = conflict_err
+        .details
+        .as_ref()
+        .expect("confirmed conflict must include details");
+    assert_eq!(details["existing_principal"], json!("device:session-b"));
+    assert_eq!(details["existing_device"], json!("session-b"));
+    assert_eq!(details["node"], json!("tower"));
+    assert!(link_b_fresh.config().node("tower").is_none());
+
+    // Restore via pinned-key probe using the reported `existing_principal`.
+    let restored = link_b_fresh
+        .restore_pairing(
+            inv4_text,
+            details["existing_principal"].as_str().unwrap(),
+            "session-b",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("restore_pairing failed: {e}"));
+    assert_eq!(restored.node, "tower");
+    assert_eq!(restored.principal, "device:session-b");
+    assert!(restored.recovered);
+    assert!(link_b_fresh.config().node("tower").is_some());
+    let whoami_restored = link_b_fresh
+        .call("tower", "meta.whoami", json!({}), None, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(whoami_restored["principal"], json!("device:session-b"));
+    link_b_fresh.close().await;
+
+    // 5. New-device vs older-machine compatibility: an older machine returning `Conflict`
+    //    WITHOUT `details` decodes cleanly into `ErrorBody` with `details: None`.
+    let older_machine_reply: legion_link::proto::ErrorBody = serde_json::from_value(json!({
+        "code": "conflict",
+        "message": "That public key is already present in authorized_keys.",
+        "hint": "Generate a fresh key pair."
+    }))
+    .unwrap();
+    assert_eq!(older_machine_reply.code, ErrorCode::Conflict);
+    assert!(older_machine_reply.details.is_none());
 }

@@ -314,20 +314,33 @@ export function StartView({
                     role="status"
                   >
                     <strong>${pairNotice.title}</strong>
-                    ${pairNotice.retryable && invite
+                    ${pairNotice.restorable && invite && typeof ctrl.restorePair === 'function'
                       ? html`
                           <div class="actions">
                             <button
                               type="button"
                               class="btn small primary"
                               disabled=${controlsDisabled}
-                              onClick=${() => ctrl.retryPair()}
+                              onClick=${() => ctrl.restorePair()}
                             >
-                              Try again
+                              Restore pairing
                             </button>
                           </div>
                         `
-                      : null}
+                      : pairNotice.retryable && invite
+                        ? html`
+                            <div class="actions">
+                              <button
+                                type="button"
+                                class="btn small primary"
+                                disabled=${controlsDisabled}
+                                onClick=${() => ctrl.retryPair()}
+                              >
+                                Try again
+                              </button>
+                            </div>
+                          `
+                        : null}
                   </div>
                 `
               : null}

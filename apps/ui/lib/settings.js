@@ -210,6 +210,44 @@ export function findIncomingDevice(devices, routeItem) {
 }
 
 /**
+ * Formats the subtitle for an incoming device row in Settings ("Devices that may come in").
+ * Unconfirmed enrolments (where the client vanished before receiving the confirmation reply)
+ * always surface `"Pairing not finished"` cleanly in both plain and technical modes.
+ */
+export function formatIncomingDeviceSubtitle(
+  dev,
+  { roleDescriptions = {}, technical = false, relativeTime = '', describeRole = null } = {},
+) {
+  const addedPart = relativeTime ? `paired ${relativeTime}` : '';
+  if (dev?.unconfirmed) {
+    if (technical) {
+      const parts = ['Pairing not finished', dev.principal || ''];
+      if (dev.role) parts.push(dev.role);
+      if (addedPart) parts.push(addedPart);
+      return parts.filter(Boolean).join(' · ');
+    }
+    return ['Pairing not finished', addedPart].filter(Boolean).join(' · ');
+  }
+  if (technical) {
+    const parts = [dev?.principal || ''];
+    if (dev?.role) parts.push(dev.role);
+    if (addedPart) parts.push(addedPart);
+    return parts.filter(Boolean).join(' · ');
+  }
+  const roleLabel =
+    (dev?.role && roleDescriptions?.[dev.role]) ||
+    (dev?.role === 'owner'
+      ? 'everything, including changing who may do what'
+      : dev?.role && typeof describeRole === 'function'
+        ? describeRole(dev.role)
+        : '');
+  const accessPart = roleLabel
+    ? roleLabel.charAt(0).toUpperCase() + roleLabel.slice(1)
+    : 'Allowed in';
+  return [accessPart, addedPart].filter(Boolean).join(' · ');
+}
+
+/**
  * Plain-language notice after `device.remove` succeeds, or `null` when nothing extra needs
  * attention. Never lists fleet machines as still trusting a `local_only` device.
  */

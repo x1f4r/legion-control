@@ -33,7 +33,7 @@ use super::authkeys::{
 };
 use super::keys::{fingerprint_key_b64, validate_ed25519_public_key, validate_pairing_id};
 use super::sessions::{SessionTarget, validate_device_label};
-use super::store::{DevicesState, load_state, lock_auth_keys};
+use super::store::{DevicesState, load_state, lock_auth_keys, save_state};
 
 /// Current schema version of `devices.toml`.
 pub const DEVICES_VERSION: u32 = 1;
@@ -326,6 +326,8 @@ struct RawFleetDevice {
     conflict: bool,
     #[serde(default)]
     role_conflict: bool,
+    #[serde(default)]
+    unconfirmed: bool,
 }
 
 impl TryFrom<RawFleetDevice> for FleetDevice {
@@ -374,6 +376,7 @@ impl TryFrom<RawFleetDevice> for FleetDevice {
             role_updated_on,
             conflict: raw.conflict,
             role_conflict: raw.role_conflict,
+            unconfirmed: raw.unconfirmed,
         })
     }
 }
@@ -443,6 +446,11 @@ pub struct FleetDevice {
     /// `role_updated_at`) or removes the device.
     #[serde(default, skip_serializing_if = "is_false")]
     pub role_conflict: bool,
+    /// `true` when the enrolment reply could not be delivered because the client disconnected
+    /// before receiving confirmation. Cleared automatically the first time this device opens a
+    /// session with its key, and omitted from `devices.toml` once confirmed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unconfirmed: bool,
 }
 
 /// One removed-device tombstone in `devices.toml`.
@@ -688,6 +696,9 @@ fn build_live_device_table(dev: &FleetDevice) -> Table {
     }
     if dev.role_conflict {
         t["role_conflict"] = value(true);
+    }
+    if dev.unconfirmed {
+        t["unconfirmed"] = value(true);
     }
     t
 }
@@ -1136,6 +1147,7 @@ fn merge_live_device(da: &FleetDevice, db: &FleetDevice) -> FleetDevice {
         role_updated_on,
         conflict,
         role_conflict,
+        unconfirmed: da.unconfirmed && db.unconfirmed,
     }
 }
 
@@ -2194,6 +2206,7 @@ pub fn adopt_legacy_devices_from_auth_keys(
                 role_updated_on: valid_node.clone(),
                 conflict: false,
                 role_conflict: false,
+                unconfirmed: false,
             });
     }
 
@@ -2769,6 +2782,95 @@ pub fn reconcile_devices_and_auth_keys_with_config_lock(
     })
 }
 
+/// Marks live device `pairing_id` as `unconfirmed = true` in `devices.toml` after the enrolment
+/// reply could not be delivered, unless that device has already authenticated and opened a live
+/// session with its key (recorded in `state/devices.json`).
+///
+/// Returns `Ok(true)` when the entry is recorded as unconfirmed and `Ok(false)` when it was
+/// already confirmed by a session or is no longer live.
+pub fn mark_device_unconfirmed_blocking(
+    paths: &Paths,
+    pairing_id: &str,
+) -> Result<bool, ErrorBody> {
+    let _cfg_guard = lock_config(paths)?;
+    if let Ok(state) = load_state(paths)
+        && state
+            .devices
+            .values()
+            .any(|rec| rec.pairing_id.as_deref() == Some(pairing_id) && rec.confirmed)
+    {
+        return Ok(false);
+    }
+    let Some(mut devices) = load_devices_raw(paths)? else {
+        return Ok(false);
+    };
+    let Some(entry) = devices.devices.get_mut(pairing_id) else {
+        return Ok(false);
+    };
+    if !entry.unconfirmed {
+        entry.unconfirmed = true;
+        save_devices_locked(paths, &devices)?;
+    }
+    Ok(true)
+}
+
+/// Records that `pairing_id` opened a live session with its permanent key, clearing
+/// `unconfirmed = true` from `devices.toml` if present and marking `confirmed = true` in
+/// `state/devices.json`.
+pub fn confirm_device_session_blocking(paths: &Paths, pairing_id: &str) -> Result<bool, ErrorBody> {
+    let _cfg_guard = lock_config(paths)?;
+    if let Ok(mut state) = load_state(paths) {
+        let mut state_changed = false;
+        for rec in state.devices.values_mut() {
+            if rec.pairing_id.as_deref() == Some(pairing_id) && !rec.confirmed {
+                rec.confirmed = true;
+                state_changed = true;
+            }
+        }
+        if state_changed {
+            let _ = save_state(paths, &state);
+        }
+    }
+    let Some(mut devices) = load_devices_raw(paths)? else {
+        return Ok(false);
+    };
+    let Some(entry) = devices.devices.get_mut(pairing_id) else {
+        return Ok(false);
+    };
+    if entry.unconfirmed {
+        entry.unconfirmed = false;
+        save_devices_locked(paths, &devices)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn note_gate_session_confirmed(paths: &Paths, pairing_id: &str, entry: &FleetDevice) {
+    if entry.unconfirmed {
+        let _ = confirm_device_session_blocking(paths, pairing_id);
+        return;
+    }
+    // For very recently paired devices (within 2 minutes), also mark `state/devices.json`
+    // confirmed once so an immediate post-enrol probe cannot race a late `BrokenPipe` write
+    // failure on the enrolment reply channel.
+    let recently_paired = entry
+        .paired_at
+        .parse::<Timestamp>()
+        .ok()
+        .is_some_and(|paired_ts| {
+            Timestamp::now().duration_since(paired_ts) < SignedDuration::from_secs(120)
+        });
+    if recently_paired
+        && let Ok(state) = load_state(paths)
+        && state
+            .devices
+            .values()
+            .any(|rec| rec.pairing_id.as_deref() == Some(pairing_id) && !rec.confirmed)
+    {
+        let _ = confirm_device_session_blocking(paths, pairing_id);
+    }
+}
+
 /// Verifies a `legion gate --as <principal> --device <name> --pairing <id>` session against
 /// `devices.toml` (adopting legacy devices on first run if `devices.toml` is absent) and keeps
 /// `authorized_keys` reconciled with `devices.toml`.
@@ -3017,9 +3119,11 @@ pub fn verify_gate_device(
                 ),
             ));
         }
+        note_gate_session_confirmed(paths, pairing_id, entry);
         return Ok(outcome.removed_targets);
     }
 
+    note_gate_session_confirmed(paths, pairing_id, entry);
     Ok(Vec::new())
 }
 
@@ -3693,6 +3797,7 @@ mod tests {
             role_updated_on: node.to_owned(),
             conflict: false,
             role_conflict: false,
+            unconfirmed: false,
         }
     }
 
@@ -3757,6 +3862,7 @@ mod tests {
                     let role_updated_on = *rng.pick(&nodes);
                     let conflict = rng.next().is_multiple_of(5);
                     let role_conflict = rng.next().is_multiple_of(5);
+                    let unconfirmed = rng.next().is_multiple_of(4);
                     let key_seed = ((idx + 1) as u8) * 10 + (rng.next() % 3) as u8;
                     let paired_by = match rng.next() % 3 {
                         0 => None,
@@ -3796,6 +3902,7 @@ mod tests {
                             role_updated_on: role_updated_on.to_owned(),
                             conflict,
                             role_conflict,
+                            unconfirmed,
                         },
                     );
                 }
@@ -3868,6 +3975,7 @@ mod tests {
             role_updated_on: "pi".to_owned(),
             conflict: false,
             role_conflict: false,
+            unconfirmed: false,
         };
 
         let mut variants: Vec<FleetDevice> = Vec::new();
@@ -3883,6 +3991,7 @@ mod tests {
         push_variant(|d| d.role = Some("editor".to_owned()));
         push_variant(|d| d.conflict = true);
         push_variant(|d| d.role_conflict = true);
+        push_variant(|d| d.unconfirmed = true);
         push_variant(|d| d.principal = "device:beta".to_owned());
         push_variant(|d| d.public_key = sample_key(11));
         push_variant(|d| d.paired_at = "2026-11-24T09:30:00Z".to_owned());
@@ -4600,6 +4709,7 @@ role = "editor"
                 added: "2026-11-24T10:00:00Z".to_owned(),
                 fingerprint: legacy_fp,
                 pairing_id: Some(legacy_id.clone()),
+                confirmed: false,
             },
         );
         crate::device::store::save_state(&paths, &legacy_state).unwrap();

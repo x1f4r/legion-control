@@ -1370,8 +1370,6 @@ function App() {
     [link, capsStore, sessionCache, persistentCache, applyLocalNodeMigration, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
   );
 
-  const pairingOpenRef = useRef(pairingOpen);
-  pairingOpenRef.current = pairingOpen;
   const linkReadyRef = useRef(Boolean(linkState?.ready));
   linkReadyRef.current = Boolean(linkState?.ready);
   const hydrateRef = useRef(hydrate);
@@ -1384,6 +1382,7 @@ function App() {
   const pairingController = useMemo(() => {
     const ctrl = createPairingController({
       link,
+      getDeviceNoun: () => deviceNounRef.current,
       isOnPairingScreen: () => {
         if (!linkReadyRef.current || pairingOpenRef.current) return true;
         const r = routeRef.current;
@@ -1412,7 +1411,16 @@ function App() {
         hydrateRef.current(next);
         showToastRef.current(node ? `Paired with ${node}` : 'Paired');
       },
-      onBackgroundOutcome: ({ kind, message, error, retryable }) => {
+      onBackgroundOutcome: ({ kind, message, error, retryable, restorable }) => {
+        if (kind === 'already_paired') {
+          showToastRef.current(message, {
+            tone: 'error',
+            actionLabel: restorable ? 'Restore pairing' : null,
+            onAction: restorable ? () => ctrl.restorePair() : null,
+            ttlMs: 12000,
+          });
+          return;
+        }
         if (kind === 'uncertain') {
           showToastRef.current(message, {
             tone: 'error',

@@ -28,6 +28,7 @@ import {
   findIncomingDevice,
   formatDeviceRemovedNotice,
   formatDisagreementNotice,
+  formatIncomingDeviceSubtitle,
   formatInvitedDeviceSyncNotice,
   formatLearnRejectionTechnical,
   formatPairSyncNotice,
@@ -307,20 +308,33 @@ function PairMachineSubpage({
               role="status"
             >
               <strong>${pairNotice.title}</strong>
-              ${pairNotice.retryable && invite
+              ${pairNotice.restorable && invite && typeof ctrl.restorePair === 'function'
                 ? html`
                     <div class="actions">
                       <button
                         type="button"
                         class="btn small primary"
                         disabled=${busy}
-                        onClick=${() => ctrl.retryPair()}
+                        onClick=${() => ctrl.restorePair()}
                       >
-                        Try again
+                        Restore pairing
                       </button>
                     </div>
                   `
-                : null}
+                : pairNotice.retryable && invite
+                  ? html`
+                      <div class="actions">
+                        <button
+                          type="button"
+                          class="btn small primary"
+                          disabled=${busy}
+                          onClick=${() => ctrl.retryPair()}
+                        >
+                          Try again
+                        </button>
+                      </div>
+                    `
+                  : null}
             </div>
           `
         : null}
@@ -1252,10 +1266,12 @@ function IncomingDeviceSubpage({
   function askRemove() {
     onRequestConfirm({
       title: `Remove ${device.name}?`,
-      summary: device.local_only
-        ? `${device.name} is only paired with this machine and will lose access here right away.`
-        : `${device.name} will lose access to this machine right away.`,
-      confirmLabel: 'Remove access',
+      summary: device.unconfirmed
+        ? `${device.name} never finished pairing and will be removed from this machine right away.`
+        : device.local_only
+          ? `${device.name} is only paired with this machine and will lose access here right away.`
+          : `${device.name} will lose access to this machine right away.`,
+      confirmLabel: device.unconfirmed ? 'Remove' : 'Remove access',
       danger: true,
       async onConfirm() {
         setBusy(true);
@@ -1276,10 +1292,12 @@ function IncomingDeviceSubpage({
     });
   }
 
+  const statusNotice = device.status || (device.unconfirmed ? 'Pairing not finished' : null);
+
   return html`
     <div>
       ${error ? html`<${Notice} error=${error} />` : null}
-      ${device.status ? html`<${Notice} title=${device.status} kind="warn" />` : null}
+      ${statusNotice ? html`<${Notice} title=${statusNotice} kind="warn" />` : null}
       <div class="list">
         <dl class=${technical ? 'kv' : 'kv plain'}>
           <dt>${technical ? 'name' : 'Device'}</dt>
@@ -1343,7 +1361,7 @@ function IncomingDeviceSubpage({
                 disabled=${busy}
                 onClick=${askRemove}
               >
-                Remove access
+                ${device.unconfirmed ? 'Remove' : 'Remove access'}
               </button>
             </div>
           `
@@ -1391,6 +1409,9 @@ function ConnectionsPage({
   const canListDevices =
     Boolean((tools || []).find((t) => t.name === 'device.list')) &&
     (!allowedSet || allowedSet.has('device.list'));
+  const canRemoveDevices =
+    Boolean((tools || []).find((t) => t.name === 'device.remove')) &&
+    (!allowedSet || allowedSet.has('device.remove'));
   const hasDeviceRoles = Boolean((tools || []).find((t) => t.name === 'device.roles'));
   const canReadPolicy =
     Boolean((tools || []).find((t) => t.name === 'config.read')) &&
@@ -1622,23 +1643,43 @@ function ConnectionsPage({
   const hasMakeSection = link.kind === 'app' || canInvite || canFleetAdd;
   const incomingDevices = incoming?.devices || [];
 
+  function askRemoveIncoming(dev) {
+    onRequestConfirm({
+      title: `Remove ${dev.name}?`,
+      summary: dev.unconfirmed
+        ? `${dev.name} never finished pairing and will be removed from this machine right away.`
+        : dev.local_only
+          ? `${dev.name} is only paired with this machine and will lose access here right away.`
+          : `${dev.name} will lose access to this machine right away.`,
+      confirmLabel: dev.unconfirmed ? 'Remove' : 'Remove access',
+      danger: true,
+      async onConfirm() {
+        setBusy(true);
+        setError(null);
+        try {
+          const res = await link.call(
+            'device.remove',
+            buildDeviceRemoveArgs(dev),
+            { on: connectionsNode || undefined },
+          );
+          setNotice(formatDeviceRemovedNotice(dev, res) || null);
+          await loadIncoming();
+        } catch (err) {
+          setError(err);
+        } finally {
+          setBusy(false);
+        }
+      },
+    });
+  }
+
   function formatIncomingSubtitle(dev) {
-    const addedPart = dev.added ? `paired ${formatRelativeTime(dev.added)}` : '';
-    if (technical) {
-      const parts = [dev.principal || ''];
-      if (dev.role) parts.push(dev.role);
-      if (addedPart) parts.push(addedPart);
-      return parts.filter(Boolean).join(' · ');
-    }
-    const roleLabel =
-      (dev.role && roleDescriptions[dev.role]) ||
-      (dev.role === 'owner'
-        ? 'everything, including changing who may do what'
-        : dev.role
-          ? describeRolePlain(dev.role)
-          : '');
-    const accessPart = roleLabel ? capitalize(roleLabel) : 'Allowed in';
-    return [accessPart, addedPart].filter(Boolean).join(' · ');
+    return formatIncomingDeviceSubtitle(dev, {
+      roleDescriptions,
+      technical,
+      relativeTime: dev.added ? formatRelativeTime(dev.added) : '',
+      describeRole: describeRolePlain,
+    });
   }
 
   return html`
@@ -1866,26 +1907,41 @@ function ConnectionsPage({
             ${incomingDevices.length > 0
               ? html`
                   <div class="list">
-                    ${incomingDevices.map(
-                      (dev) => html`
-                        <a
-                          key=${dev.id || dev.name}
-                          class="row"
-                          href=${routeHref({
-                            section: 'settings',
-                            page: 'connections',
-                            sub: 'incoming',
-                            item: dev.id || dev.name,
-                          })}
-                        >
+                    ${incomingDevices.map((dev) => {
+                      const href = routeHref({
+                        section: 'settings',
+                        page: 'connections',
+                        sub: 'incoming',
+                        item: dev.id || dev.name,
+                      });
+                      if (dev.unconfirmed && canRemoveDevices) {
+                        return html`
+                          <div key=${dev.id || dev.name} class="row">
+                            <a class="body" href=${href}>
+                              <span class="title">${dev.name}</span>
+                              <span class="sub">${formatIncomingSubtitle(dev)}</span>
+                            </a>
+                            <button
+                              type="button"
+                              class="btn small danger"
+                              disabled=${busy}
+                              onClick=${() => askRemoveIncoming(dev)}
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        `;
+                      }
+                      return html`
+                        <a key=${dev.id || dev.name} class="row" href=${href}>
                           <span class="body">
                             <span class="title">${dev.name}</span>
                             <span class="sub">${formatIncomingSubtitle(dev)}</span>
                           </span>
                           <span class="chev" aria-hidden="true">›</span>
                         </a>
-                      `,
-                    )}
+                      `;
+                    })}
                   </div>
                 `
               : html`<div class="empty">No other devices paired with ${connectionsNode || 'this machine'}.</div>`}

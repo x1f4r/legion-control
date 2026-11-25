@@ -7,29 +7,34 @@
 //! the device, audits the attempt under door `ssh` (`device.enrol`), and writes one JSON reply line.
 
 use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use jiff::Timestamp;
 use legion_core::config::{Document, NodeFile, NodeName, parse};
 use legion_core::policy::{NOBODY, OWNER, Policy};
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::{Door, Node};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use super::authkeys::{
-    ForcedCommandShell, LineKind, PinnedHome, edit_auth_keys_with_retry, format_device_line,
-    read_auth_keys, resolve_safe_write_path, resolve_target,
-    verify_exe_not_group_or_world_writable, verify_owner_matches_euid,
+    AuthKeysFile, ForcedCommandShell, LineKind, PinnedHome, edit_auth_keys_with_retry,
+    format_device_line, line_matches_account, line_matches_home, read_auth_keys,
+    resolve_safe_write_path, resolve_target, verify_exe_not_group_or_world_writable,
+    verify_owner_matches_euid,
 };
 use super::keys::{generate_pairing_id, validate_ed25519_public_key, validate_invite_id};
 use super::registry::{
-    DeviceRegistryPushAudit, DevicesFile, FleetDevice, FleetPushOutcome, MAX_DEVICES_TOML_BYTES,
-    NON_OWNER_DEVICES_TOML_LIMIT_BYTES, PairedBy, adopt_legacy_devices_from_auth_keys,
-    attach_rollback_failures, devices_reserved_bytes, devices_size_limit_error,
-    format_precise_rfc3339, load_devices_raw, lock_config, non_owner_devices_half_limit_error,
-    push_devices_to_fleet, reconcile_authorized_keys_in_memory, restore_file_snapshot,
+    DEVICE_PRINCIPAL_PREFIX, DeviceRegistryPushAudit, DeviceTombstone, DevicesFile, FleetDevice,
+    FleetPushOutcome, MAX_DEVICES_TOML_BYTES, NON_OWNER_DEVICES_TOML_LIMIT_BYTES, PairedBy,
+    adopt_legacy_devices_from_auth_keys, attach_rollback_failures, devices_reserved_bytes,
+    devices_size_limit_error, format_precise_rfc3339, load_devices_raw, lock_config,
+    mark_device_unconfirmed_blocking, non_owner_devices_half_limit_error, push_devices_to_fleet,
+    reconcile_authorized_keys_in_memory, remove_device_principal_locked, restore_file_snapshot,
     save_devices_locked, upsert_device_principal_locked,
 };
 use super::store::{
@@ -102,6 +107,9 @@ pub struct EnrolError {
     /// Actionable guidance when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// Optional structured error details (for example `existing_principal` on `conflict`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
 }
 
 impl EnrolReply {
@@ -113,6 +121,7 @@ impl EnrolReply {
                 code: error.code,
                 message: error.message,
                 hint: error.hint,
+                details: error.details,
             },
         }
     }
@@ -123,36 +132,100 @@ impl EnrolReply {
     }
 }
 
+/// Outcome of [`run_enrol_io`], including whether the reply line was written and flushed to the
+/// client and whether the enrolled device was marked unconfirmed because the client had gone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnrolIoResult {
+    /// The JSON reply generated for this enrolment attempt.
+    pub reply: EnrolReply,
+    /// `true` when the reply JSON line was written and flushed to `output` without error.
+    pub delivered: bool,
+    /// `true` when enrolment committed on disk but the reply could not be delivered, so the device
+    /// was recorded as `unconfirmed = true` in `devices.toml` and in the audit log.
+    pub unconfirmed: bool,
+}
+
 /// Executes one enrolment session for `forced_id`, reading one JSON line from `input`, auditing
 /// the outcome under door `ssh` (`device.enrol`), and returning the single-line [`EnrolReply`].
 pub async fn run_enrol(node: &Node, forced_id: &str, input: impl AsyncRead + Unpin) -> EnrolReply {
+    run_enrol_io(
+        node,
+        forced_id,
+        input,
+        tokio::io::sink(),
+        std::future::pending(),
+    )
+    .await
+    .reply
+}
+
+/// Executes one enrolment session for `forced_id`, reading one JSON line from `input`, writing and
+/// flushing the single-line JSON reply to `output`, and auditing the outcome under door `ssh`
+/// (`device.enrol`).
+///
+/// If the enrolment commits on disk and the reply cannot be written because the client disconnected
+/// (or `shutdown` fired after commit), records the device as `unconfirmed = true` in `devices.toml`
+/// (unless it already opened a session) and records `"unconfirmed": true` in the audit log.
+pub async fn run_enrol_io(
+    node: &Node,
+    forced_id: &str,
+    input: impl AsyncRead + Unpin,
+    mut output: impl AsyncWrite + Unpin,
+    shutdown: impl Future<Output = ()>,
+) -> EnrolIoResult {
     let started = Instant::now();
     let target_node = node.name();
     let forced_id_owned = forced_id.to_owned();
+    tokio::pin!(shutdown);
+    let mut shutdown_fired = false;
 
-    let (principal, push_audit, audit_args, mut outcome) = match read_request_line(input).await {
-        Err(error) => (None, None, json!({ "id": forced_id }), Err(error)),
-        Ok(request) => {
-            let node_clone = node.clone();
-            let id_for_task = forced_id_owned.clone();
-            match tokio::task::spawn_blocking(move || {
-                process_enrol_blocking(&node_clone, &id_for_task, request)
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => (
-                    None,
-                    None,
-                    json!({ "id": forced_id }),
-                    Err(ErrorBody::new(
-                        ErrorCode::Internal,
-                        format!("Device enrolment stopped unexpectedly: {error}."),
-                    )),
-                ),
-            }
+    let read_result = tokio::select! {
+        biased;
+        res = read_request_line(input) => res,
+        () = &mut shutdown => {
+            shutdown_fired = true;
+            Err(ErrorBody::new(
+                ErrorCode::Cancelled,
+                "Device enrolment was cancelled by signal.",
+            ))
         }
     };
+
+    let (principal, push_audit, committed_pairing_id, mut audit_args, mut outcome) =
+        match read_result {
+            Err(error) => (None, None, None, json!({ "id": forced_id }), Err(error)),
+            Ok(request) => {
+                let node_clone = node.clone();
+                let id_for_task = forced_id_owned.clone();
+                match tokio::task::spawn_blocking(move || {
+                    process_enrol_blocking(&node_clone, &id_for_task, request)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => (
+                        None,
+                        None,
+                        None,
+                        json!({ "id": forced_id }),
+                        Err(ErrorBody::new(
+                            ErrorCode::Internal,
+                            format!("Device enrolment stopped unexpectedly: {error}."),
+                        )),
+                    ),
+                }
+            }
+        };
+
+    if !shutdown_fired {
+        tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                shutdown_fired = true;
+            }
+            () = std::future::ready(()) => {}
+        }
+    }
 
     if let Ok(EnrolReply::Ok {
         ref mut fleet,
@@ -160,6 +233,7 @@ pub async fn run_enrol(node: &Node, forced_id: &str, input: impl AsyncRead + Unp
         ref mut sync_command,
         ..
     }) = outcome
+        && !shutdown_fired
     {
         let trigger = push_audit.unwrap_or_else(|| DeviceRegistryPushAudit {
             trigger: "device.enrol".to_owned(),
@@ -168,16 +242,68 @@ pub async fn run_enrol(node: &Node, forced_id: &str, input: impl AsyncRead + Unp
             pairing_id: None,
             source_node: Some(target_node.clone()),
         });
-        *fleet = push_devices_to_fleet(node, Door::Ssh, trigger, None).await;
-        let pending: Vec<String> = fleet
-            .iter()
-            .filter(|(_, outcome)| outcome.status != "synced")
-            .map(|(machine, _)| machine.clone())
-            .collect();
-        if !pending.is_empty() {
-            *not_synced_to = pending;
-            *sync_command =
-                Some("legion fleet.sync direction=push documents='[\"devices.toml\"]'".to_owned());
+        let pushed = tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                shutdown_fired = true;
+                None
+            }
+            map = push_devices_to_fleet(node, Door::Ssh, trigger, None) => Some(map),
+        };
+        if let Some(map) = pushed {
+            *fleet = map;
+            let pending: Vec<String> = fleet
+                .iter()
+                .filter(|(_, outcome)| outcome.status != "synced")
+                .map(|(machine, _)| machine.clone())
+                .collect();
+            if !pending.is_empty() {
+                *not_synced_to = pending;
+                *sync_command = Some(
+                    "legion fleet.sync direction=push documents='[\"devices.toml\"]'".to_owned(),
+                );
+            }
+        }
+    }
+
+    if !shutdown_fired {
+        tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                shutdown_fired = true;
+            }
+            () = std::future::ready(()) => {}
+        }
+    }
+
+    let reply = match &outcome {
+        Ok(reply) => reply.clone(),
+        Err(error) => EnrolReply::from_error(error.clone()),
+    };
+
+    let delivered = if shutdown_fired {
+        false
+    } else {
+        write_enrol_reply(&mut output, &reply).await
+    };
+
+    let mut unconfirmed = false;
+    if outcome.is_ok()
+        && !delivered
+        && let Some(pid) = committed_pairing_id
+    {
+        let paths = node.paths().clone();
+        if let Ok(Ok(marked)) =
+            tokio::task::spawn_blocking(move || mark_device_unconfirmed_blocking(&paths, &pid))
+                .await
+        {
+            unconfirmed = marked;
+        }
+        if let Some(obj) = audit_args.as_object_mut() {
+            obj.insert("reply_delivered".to_owned(), json!(false));
+            if unconfirmed {
+                obj.insert("unconfirmed".to_owned(), json!(true));
+            }
         }
     }
 
@@ -187,7 +313,13 @@ pub async fn run_enrol(node: &Node, forced_id: &str, input: impl AsyncRead + Unp
     });
     let audit_result = outcome
         .as_ref()
-        .map(|reply| serde_json::to_value(reply).unwrap_or_else(|_| json!({ "ok": true })))
+        .map(|reply| {
+            let mut val = serde_json::to_value(reply).unwrap_or_else(|_| json!({ "ok": true }));
+            if unconfirmed && let Some(obj) = val.as_object_mut() {
+                obj.insert("unconfirmed".to_owned(), json!(true));
+            }
+            val
+        })
         .map_err(Clone::clone);
     node.record_audit_with_device(
         target_node,
@@ -201,10 +333,32 @@ pub async fn run_enrol(node: &Node, forced_id: &str, input: impl AsyncRead + Unp
     )
     .await;
 
-    match outcome {
-        Ok(reply) => reply,
-        Err(error) => EnrolReply::from_error(error),
+    EnrolIoResult {
+        reply,
+        delivered,
+        unconfirmed,
     }
+}
+
+async fn write_enrol_reply(output: &mut (impl AsyncWrite + Unpin), reply: &EnrolReply) -> bool {
+    let serialized = match serde_json::to_string(reply) {
+        Ok(line) => line,
+        Err(error) => {
+            let fallback = EnrolReply::from_error(ErrorBody::new(
+                ErrorCode::Internal,
+                format!("The enrolment reply cannot be written as JSON: {error}."),
+            ));
+            match serde_json::to_string(&fallback) {
+                Ok(line) => line,
+                Err(_) => return false,
+            }
+        }
+    };
+    let line = format!("{serialized}\n");
+    if output.write_all(line.as_bytes()).await.is_err() {
+        return false;
+    }
+    output.flush().await.is_ok()
 }
 
 async fn read_request_line(input: impl AsyncRead + Unpin) -> Result<EnrolRequest, ErrorBody> {
@@ -262,23 +416,27 @@ async fn read_request_line(input: impl AsyncRead + Unpin) -> Result<EnrolRequest
     })
 }
 
+type ProcessEnrolResult = (
+    Option<String>,
+    Option<DeviceRegistryPushAudit>,
+    Option<String>,
+    serde_json::Value,
+    Result<EnrolReply, ErrorBody>,
+);
+
 fn process_enrol_blocking(
     node: &Node,
     forced_id: &str,
     request: EnrolRequest,
-) -> (
-    Option<String>,
-    Option<DeviceRegistryPushAudit>,
-    serde_json::Value,
-    Result<EnrolReply, ErrorBody>,
-) {
+) -> ProcessEnrolResult {
     let base_args = json!({ "id": forced_id });
 
     if let Err(error) = validate_invite_id(forced_id) {
-        return (None, None, base_args, Err(error));
+        return (None, None, None, base_args, Err(error));
     }
     if request.enrol != ENROL_PROTOCOL {
         return (
+            None,
             None,
             None,
             base_args,
@@ -296,6 +454,7 @@ fn process_enrol_blocking(
         return (
             None,
             None,
+            None,
             base_args,
             Err(ErrorBody::new(
                 ErrorCode::Denied,
@@ -308,15 +467,15 @@ fn process_enrol_blocking(
     let paths = node.paths();
     let node_file = match node.config().get::<NodeFile>() {
         Ok(file) => file,
-        Err(error) => return (None, None, base_args, Err(error)),
+        Err(error) => return (None, None, None, base_args, Err(error)),
     };
     let target = match resolve_target(paths, &node_file) {
         Ok(target) => target,
-        Err(error) => return (None, None, base_args, Err(error)),
+        Err(error) => return (None, None, None, base_args, Err(error)),
     };
     let write_path = match resolve_safe_write_path(&target, paths.home()) {
         Ok(path) => path,
-        Err(error) => return (None, None, base_args, Err(error)),
+        Err(error) => return (None, None, None, base_args, Err(error)),
     };
     if let Err(error) = verify_owner_matches_euid(
         &write_path,
@@ -324,16 +483,16 @@ fn process_enrol_blocking(
         target.is_default_home_ssh,
         legion_os::user::effective_uid(),
     ) {
-        return (None, None, base_args, Err(error));
+        return (None, None, None, base_args, Err(error));
     }
 
     let _cfg_guard = match lock_config(paths) {
         Ok(guard) => guard,
-        Err(error) => return (None, None, base_args, Err(error)),
+        Err(error) => return (None, None, None, base_args, Err(error)),
     };
     let _guard = match lock_auth_keys(&target, &write_path) {
         Ok(guard) => guard,
-        Err(error) => return (None, None, base_args, Err(error)),
+        Err(error) => return (None, None, None, base_args, Err(error)),
     };
 
     let node_name = node.name();
@@ -345,20 +504,20 @@ fn process_enrol_blocking(
     let devices_path = paths.config_file(DevicesFile::FILE);
     let policy_before = match legion_core::config::read_regular_file(&policy_path) {
         Ok(bytes) => bytes,
-        Err(error) => return (None, None, base_args, Err(error)),
+        Err(error) => return (None, None, None, base_args, Err(error)),
     };
     let devices_before = match legion_core::config::read_regular_file(&devices_path) {
         Ok(bytes) => bytes,
-        Err(error) => return (None, None, base_args, Err(error)),
+        Err(error) => return (None, None, None, base_args, Err(error)),
     };
 
     let mut auth_keys = match read_auth_keys(&write_path) {
         Ok(file) => file,
-        Err(error) => return (None, None, base_args, Err(error)),
+        Err(error) => return (None, None, None, base_args, Err(error)),
     };
     let mut state = match load_state(paths) {
         Ok(state) => state,
-        Err(error) => return (None, None, base_args, Err(error)),
+        Err(error) => return (None, None, None, base_args, Err(error)),
     };
     let now = Timestamp::now();
     // Inspect the requested invite before sweeping so we can distinguish "expired" from "unknown/used".
@@ -377,7 +536,7 @@ fn process_enrol_blocking(
         if swept_state {
             let _ = save_state(paths, &state);
         }
-        (principal, None, base_args.clone(), Err(error))
+        (principal, None, None, base_args.clone(), Err(error))
     };
 
     let Some(invite) = state.invites.get(forced_id).cloned() else {
@@ -542,12 +701,87 @@ fn process_enrol_blocking(
             ),
         );
     }
-    let key_in_registry = devices.devices.values().any(|dev| {
-        dev.public_key == validated_key.canonical
-            || validate_ed25519_public_key(&dev.public_key)
-                .is_ok_and(|existing| existing.wire_blob == validated_key.wire_blob)
+    let matching_registry: Vec<(String, FleetDevice)> = devices
+        .devices
+        .iter()
+        .filter(|(_, dev)| {
+            dev.public_key == validated_key.canonical
+                || validate_ed25519_public_key(&dev.public_key)
+                    .is_ok_and(|existing| existing.wire_blob == validated_key.wire_blob)
+        })
+        .map(|(id, dev)| (id.clone(), dev.clone()))
+        .collect();
+    let matching_ids: HashSet<&str> = matching_registry
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let has_non_owned_auth_key = auth_keys.lines.iter().any(|line| {
+        if let LineKind::Device {
+            pairing_id,
+            home,
+            account,
+            ..
+        } = &line.kind
+            && matching_ids.contains(pairing_id.as_str())
+            && line_matches_home(home.as_ref(), paths)
+            && line_matches_account(
+                account.as_deref(),
+                pinned_account.as_deref(),
+                target.windows_admin_acl,
+                cfg!(windows),
+            )
+        {
+            return false;
+        }
+        match &line.kind {
+            LineKind::Device { key_b64, .. } | LineKind::Invite { key_b64, .. } => {
+                STANDARD.decode(key_b64).ok().as_deref() == Some(validated_key.wire_blob.as_slice())
+            }
+            LineKind::Foreign => {
+                AuthKeysFile::parse(&line.raw).contains_key_blob(&validated_key.wire_blob)
+            }
+        }
     });
-    if key_in_registry || auth_keys.contains_key_blob(&validated_key.wire_blob) {
+
+    let precise_now = format_precise_rfc3339(now);
+    let paired_by = invite.created_by.as_ref().map(|creator| PairedBy {
+        principal: creator.clone(),
+        device: invite.created_by_device.clone(),
+    });
+
+    let replaced_unconfirmed: Option<(String, FleetDevice)> = if !has_non_owned_auth_key
+        && matching_registry.len() == 1
+        && matching_registry[0].1.unconfirmed
+    {
+        // A fresh invite from the same device key whose previous enrolment never delivered its
+        // confirmation replaces that unconfirmed leftover atomically under the same locks.
+        Some(matching_registry[0].clone())
+    } else if !matching_registry.is_empty() {
+        let existing = matching_registry
+            .iter()
+            .find(|(_, dev)| !dev.unconfirmed)
+            .map(|(_, dev)| dev)
+            .unwrap_or(&matching_registry[0].1);
+        return fail_with_sweep(
+            Some(principal),
+            ErrorBody::new(
+                ErrorCode::Conflict,
+                format!(
+                    "This device is already paired with {} as {}.",
+                    node.name(),
+                    existing.principal
+                ),
+            )
+            .with_hint(
+                "Restore the existing pairing on this device, or remove it on this machine with `legion device.remove` before pairing again.",
+            )
+            .with_details(json!({
+                "existing_principal": existing.principal,
+                "existing_device": existing.name,
+                "node": node.name(),
+            })),
+        );
+    } else if has_non_owned_auth_key {
         return fail_with_sweep(
             Some(principal),
             ErrorBody::new(
@@ -558,14 +792,18 @@ fn process_enrol_blocking(
                 "Generate a fresh, dedicated Ed25519 key pair for this device and try again.",
             ),
         );
-    }
+    } else {
+        None
+    };
+    let replaced_id_ref = replaced_unconfirmed.as_ref().map(|(id, _)| id.as_str());
     if invite.create_principal
-        && (devices.devices.values().any(|dev| {
-            dev.principal == principal
-                || invite
-                    .device_name
-                    .as_deref()
-                    .is_some_and(|slug| dev.name == slug)
+        && (devices.devices.iter().any(|(id, dev)| {
+            replaced_id_ref != Some(id.as_str())
+                && (dev.principal == principal
+                    || invite
+                        .device_name
+                        .as_deref()
+                        .is_some_and(|slug| dev.name == slug))
         }) || devices
             .removed
             .values()
@@ -593,13 +831,22 @@ fn process_enrol_blocking(
 
     let existing_names: HashSet<String> = devices
         .devices
-        .values()
-        .map(|d| d.name.clone())
+        .iter()
+        .filter(|(id, _)| replaced_id_ref != Some(id.as_str()))
+        .map(|(_, d)| d.name.clone())
         .chain(auth_keys.lines.iter().filter_map(|line| match &line.kind {
-            LineKind::Device { name, .. } => Some(name.clone()),
+            LineKind::Device {
+                name, pairing_id, ..
+            } if replaced_id_ref != Some(pairing_id.as_str()) => Some(name.clone()),
             _ => None,
         }))
-        .chain(state.devices.keys().cloned())
+        .chain(state.devices.iter().filter_map(|(name, rec)| {
+            if replaced_id_ref.is_some() && rec.pairing_id.as_deref() == replaced_id_ref {
+                None
+            } else {
+                Some(name.clone())
+            }
+        }))
         .collect();
     let requested_name = invite
         .device_name
@@ -629,16 +876,28 @@ fn process_enrol_blocking(
         return fail_with_sweep(Some(principal), error);
     }
 
-    let precise_now = format_precise_rfc3339(now);
     let recorded_role = if invite.create_principal {
         Some(role.clone())
     } else {
         None
     };
-    let paired_by = invite.created_by.as_ref().map(|creator| PairedBy {
-        principal: creator.clone(),
-        device: invite.created_by_device.clone(),
-    });
+    if let Some((old_id, old_dev)) = &replaced_unconfirmed {
+        devices.devices.remove(old_id);
+        devices.removed.insert(
+            old_id.clone(),
+            DeviceTombstone {
+                name: old_dev.name.clone(),
+                principal: old_dev.principal.clone(),
+                fingerprint: Some(DevicesFile::fingerprint_of(old_dev)),
+                paired_at: Some(old_dev.paired_at.clone()),
+                paired_on: Some(old_dev.paired_on.clone()),
+                paired_by: old_dev.paired_by.clone(),
+                removed_by: paired_by.clone(),
+                removed_at: precise_now.clone(),
+                removed_on: valid_node_name.clone(),
+            },
+        );
+    }
     devices.devices.insert(
         pairing_id.clone(),
         FleetDevice {
@@ -659,6 +918,7 @@ fn process_enrol_blocking(
             role_updated_on: valid_node_name.clone(),
             conflict: false,
             role_conflict: false,
+            unconfirmed: false,
         },
     );
 
@@ -680,6 +940,15 @@ fn process_enrol_blocking(
     let added = Timestamp::from_second(now.as_second())
         .map(format_rfc3339)
         .unwrap_or_else(|_| format_rfc3339(now));
+    if let Some((old_id, old_dev)) = &replaced_unconfirmed
+        && state
+            .devices
+            .get(&old_dev.name)
+            .and_then(|rec| rec.pairing_id.as_deref())
+            == Some(old_id.as_str())
+    {
+        state.devices.remove(&old_dev.name);
+    }
     state.invites.remove(forced_id);
     state.devices.insert(
         device_name.clone(),
@@ -689,20 +958,48 @@ fn process_enrol_blocking(
             added,
             fingerprint: validated_key.fingerprint.clone(),
             pairing_id: Some(pairing_id.clone()),
+            confirmed: false,
         },
     );
 
-    // 1. Save the new principal in `policy.toml` (when creating a dedicated `device:*` principal)
-    //    and `devices.toml` FIRST, before touching `authorized_keys`. If anything fails here, roll
-    //    back so nothing on disk has changed (and report any rollback failure loudly).
-    if invite.create_principal
-        && let Err(error) = upsert_device_principal_locked(paths, &principal, &role, &pairing_id)
+    // 1. Update `policy.toml` (removing any replaced unconfirmed `device:*` principal and
+    //    creating the new `device:*` principal when requested) and `devices.toml` FIRST, before
+    //    touching `authorized_keys`. If anything fails here, roll back so nothing on disk changed.
+    let mut policy_touched = false;
+    if let Some((old_id, old_dev)) = &replaced_unconfirmed
+        && old_dev.principal.starts_with(DEVICE_PRINCIPAL_PREFIX)
     {
-        return (Some(principal), None, base_args, Err(error));
+        match remove_device_principal_locked(paths, &old_dev.principal, old_id) {
+            Ok(changed) => policy_touched |= changed,
+            Err(error) => return (Some(principal), None, None, base_args, Err(error)),
+        }
+    }
+    if invite.create_principal {
+        if let Err(error) = upsert_device_principal_locked(paths, &principal, &role, &pairing_id) {
+            let mut rollback_failures = Vec::new();
+            if policy_touched
+                && let Err(msg) = restore_file_snapshot(
+                    paths,
+                    "device.enrol",
+                    &policy_path,
+                    policy_before.as_deref(),
+                )
+            {
+                rollback_failures.push(msg);
+            }
+            return (
+                Some(principal),
+                None,
+                None,
+                base_args,
+                Err(attach_rollback_failures(error, &rollback_failures)),
+            );
+        }
+        policy_touched = true;
     }
     if let Err(error) = save_devices_locked(paths, &devices) {
         let mut rollback_failures = Vec::new();
-        if invite.create_principal
+        if policy_touched
             && let Err(msg) = restore_file_snapshot(
                 paths,
                 "device.enrol",
@@ -714,6 +1011,7 @@ fn process_enrol_blocking(
         }
         return (
             Some(principal),
+            None,
             None,
             base_args,
             Err(attach_rollback_failures(error, &rollback_failures)),
@@ -730,7 +1028,7 @@ fn process_enrol_blocking(
         ) {
             rollback_failures.push(msg);
         }
-        if invite.create_principal
+        if policy_touched
             && let Err(msg) = restore_file_snapshot(
                 paths,
                 "device.enrol",
@@ -747,12 +1045,24 @@ fn process_enrol_blocking(
         Ok(Some(bytes)) => match parse::<Policy>(&policy_path, &bytes) {
             Ok(policy) => policy,
             Err(error) => {
-                return (Some(principal), None, base_args, Err(rollback_both(error)));
+                return (
+                    Some(principal),
+                    None,
+                    None,
+                    base_args,
+                    Err(rollback_both(error)),
+                );
             }
         },
         Ok(None) => Policy::default(),
         Err(error) => {
-            return (Some(principal), None, base_args, Err(rollback_both(error)));
+            return (
+                Some(principal),
+                None,
+                None,
+                base_args,
+                Err(rollback_both(error)),
+            );
         }
     };
 
@@ -793,7 +1103,13 @@ fn process_enrol_blocking(
         Ok((Some(disk_auth), ()))
     });
     if let Err(error) = swap_result {
-        return (Some(principal), None, base_args, Err(rollback_both(error)));
+        return (
+            Some(principal),
+            None,
+            None,
+            base_args,
+            Err(rollback_both(error)),
+        );
     }
 
     let push_audit = Some(DeviceRegistryPushAudit {
@@ -817,6 +1133,11 @@ fn process_enrol_blocking(
         "device": device_name,
         "fingerprint": fingerprint,
     });
+    if let Some((old_id, _)) = &replaced_unconfirmed
+        && let Some(obj) = audit_args.as_object_mut()
+    {
+        obj.insert("replaced_unconfirmed".to_owned(), json!(old_id));
+    }
     if let Some(warning) = state_warning
         && let Some(obj) = audit_args.as_object_mut()
     {
@@ -825,6 +1146,7 @@ fn process_enrol_blocking(
     (
         Some(principal.clone()),
         push_audit,
+        Some(pairing_id),
         audit_args,
         Ok(EnrolReply::Ok {
             ok: true,

@@ -465,12 +465,12 @@ pub struct Enrolled {
     pub recovered: bool,
 }
 
-#[cfg(feature = "ssh")]
-pub use self::enrol_client::enrol;
 #[cfg(all(test, feature = "ssh"))]
 pub(crate) use self::enrol_client::enrol_exchange;
 #[cfg(feature = "ssh")]
 pub(crate) use self::enrol_client::enrol_with_recovery;
+#[cfg(feature = "ssh")]
+pub use self::enrol_client::{enrol, restore_pairing};
 
 #[cfg(feature = "ssh")]
 mod enrol_client {
@@ -536,7 +536,7 @@ mod enrol_client {
     /// post-send-cancelled enrolment attempt.
     pub(crate) enum ProbeOutcome {
         /// The node authenticated `device_key` and confirmed `invite.node` + `invite.principal`.
-        Confirmed(Enrolled),
+        Confirmed(Box<Enrolled>),
         /// The node answered and definitively showed this device is not enrolled under
         /// `invite.principal`.
         NotEnrolled,
@@ -720,7 +720,7 @@ mod enrol_client {
                         && is_device_principal(&invite.principal)
                         && let ProbeOutcome::Confirmed(enrolled) = probe().await
                     {
-                        return Ok(enrolled);
+                        return Ok(*enrolled);
                     }
                     return Err(err.with_hint(format!(
                         "The invite key was rejected; invites are single-use and this invite expires at {}. Generate a fresh invite with `legion pair`.",
@@ -740,7 +740,7 @@ mod enrol_client {
                     // Once the request left the device, Cancel means "stop waiting", not "undo":
                     // ask the machine once with the pinned key whether enrolment finished.
                     return match probe().await {
-                        ProbeOutcome::Confirmed(enrolled) => Ok(enrolled),
+                        ProbeOutcome::Confirmed(enrolled) => Ok(*enrolled),
                         ProbeOutcome::NotEnrolled => {
                             Err(cancelled_not_enrolled_error(&invite.node))
                         }
@@ -752,7 +752,7 @@ mod enrol_client {
                     ErrorCode::Timeout | ErrorCode::Unreachable | ErrorCode::NotFound
                 ) {
                     if let ProbeOutcome::Confirmed(enrolled) = probe().await {
-                        return Ok(enrolled);
+                        return Ok(*enrolled);
                     }
                     if err.hint.is_none() {
                         return Err(err.with_hint(
@@ -773,7 +773,25 @@ mod enrol_client {
         device_name: &str,
         timeouts: SshTimeouts,
     ) -> ProbeOutcome {
-        let probe_cancel = CancellationToken::new();
+        probe_enrolled_with_device_key_for_principal(
+            invite,
+            device_key,
+            device_name,
+            &invite.principal,
+            timeouts,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    async fn probe_enrolled_with_device_key_for_principal(
+        invite: &Invite,
+        device_key: &DeviceKey,
+        device_name: &str,
+        expected_principal: &str,
+        timeouts: SshTimeouts,
+        probe_cancel: CancellationToken,
+    ) -> ProbeOutcome {
         let target = invite.target();
         let session = match crate::ssh::open(
             &invite.node,
@@ -823,16 +841,15 @@ mod enrol_client {
         let Some(role) = whoami.get("role").and_then(Value::as_str) else {
             return ProbeOutcome::Unreachable;
         };
-        if node != invite.node || principal != invite.principal || role.is_empty() {
+        if node != invite.node || principal != expected_principal || role.is_empty() {
             return ProbeOutcome::NotEnrolled;
         }
-        let device = invite
-            .principal
+        let device = expected_principal
             .strip_prefix("device:")
             .filter(|s| !s.is_empty())
             .unwrap_or(device_name.trim())
             .to_owned();
-        ProbeOutcome::Confirmed(Enrolled {
+        ProbeOutcome::Confirmed(Box::new(Enrolled {
             node: node.to_owned(),
             target,
             principal: principal.to_owned(),
@@ -842,7 +859,76 @@ mod enrol_client {
             not_synced_to: Vec::new(),
             sync_command: None,
             recovered: true,
-        })
+        }))
+    }
+
+    /// Restores an existing pairing on `invite.node` by authenticating with `device_key` against
+    /// the invite's pinned host keys and verifying `meta.whoami` matches `invite.node` and
+    /// `expected_principal`.
+    pub async fn restore_pairing(
+        invite: &Invite,
+        device_key: &DeviceKey,
+        device_name: &str,
+        expected_principal: &str,
+        timeouts: SshTimeouts,
+        cancel: CancellationToken,
+    ) -> Result<Enrolled, ErrorBody> {
+        let name = device_name.trim();
+        if name.is_empty() || name.chars().any(|c| c.is_control()) {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Device name must be a non-empty single-line string.",
+            )
+            .with_hint("Pass a short label such as `phone` or `tablet`."));
+        }
+        let expected = expected_principal.trim();
+        if expected.is_empty() || expected.chars().any(|c| c.is_control()) {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Existing principal must be a non-empty single-line string.",
+            ));
+        }
+        if cancel.is_cancelled() {
+            return Err(cancelled_unsent_error(&invite.node));
+        }
+        match probe_enrolled_with_device_key_for_principal(
+            invite,
+            device_key,
+            name,
+            expected,
+            timeouts,
+            cancel.clone(),
+        )
+        .await
+        {
+            ProbeOutcome::Confirmed(enrolled) => Ok(*enrolled),
+            ProbeOutcome::NotEnrolled => Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "{} did not confirm this device under {expected}.",
+                    invite.node
+                ),
+            )
+            .with_machine(&invite.node)
+            .with_hint(
+                "Remove any old entry for this device on the machine and create a fresh invite with `legion pair`.",
+            )),
+            ProbeOutcome::Unreachable => {
+                if cancel.is_cancelled() {
+                    Err(cancelled_unsent_error(&invite.node))
+                } else {
+                    Err(ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!(
+                            "Could not reach {} to restore the existing pairing.",
+                            invite.node
+                        ),
+                    )
+                    .with_machine(&invite.node)
+                    .with_hint("Check that the machine is online and try again."))
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1604,7 +1690,7 @@ mod tests {
                 let expected = sample_enrolled();
                 async move {
                     probes_c.fetch_add(1, Ordering::SeqCst);
-                    enrol_client::ProbeOutcome::Confirmed(expected)
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
                 }
             },
         )
@@ -1667,7 +1753,7 @@ mod tests {
             },
             || {
                 let expected = sample_device_enrolled();
-                async move { enrol_client::ProbeOutcome::Confirmed(expected) }
+                async move { enrol_client::ProbeOutcome::Confirmed(Box::new(expected)) }
             },
         )
         .await
@@ -1693,7 +1779,7 @@ mod tests {
                 let expected = sample_enrolled();
                 async move {
                     shared_probes_c.fetch_add(1, Ordering::SeqCst);
-                    enrol_client::ProbeOutcome::Confirmed(expected)
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
                 }
             },
         )
@@ -1728,7 +1814,7 @@ mod tests {
                 let expected = sample_device_enrolled();
                 async move {
                     blocked_probes_c.fetch_add(1, Ordering::SeqCst);
-                    enrol_client::ProbeOutcome::Confirmed(expected)
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
                 }
             },
         )
@@ -1789,7 +1875,7 @@ mod tests {
                 let expected = sample_enrolled();
                 async move {
                     pre_send_probes_c.fetch_add(1, Ordering::SeqCst);
-                    enrol_client::ProbeOutcome::Confirmed(expected)
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
                 }
             },
         )
@@ -1843,7 +1929,7 @@ mod tests {
                 let expected = sample_enrolled();
                 async move {
                     late_cancel_probes_c.fetch_add(1, Ordering::SeqCst);
-                    enrol_client::ProbeOutcome::Confirmed(expected)
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
                 }
             },
         )
@@ -1932,7 +2018,7 @@ mod tests {
                 let expected = sample_enrolled();
                 async move {
                     unsent_probes_c.fetch_add(1, Ordering::SeqCst);
-                    enrol_client::ProbeOutcome::Confirmed(expected)
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
                 }
             },
         )
@@ -1964,7 +2050,7 @@ mod tests {
                 let expected = sample_enrolled();
                 async move {
                     not_found_probes_c.fetch_add(1, Ordering::SeqCst);
-                    enrol_client::ProbeOutcome::Confirmed(expected)
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
                 }
             },
         )
@@ -1990,7 +2076,7 @@ mod tests {
                 let expected = sample_enrolled();
                 async move {
                     unsent_nf_probes_c.fetch_add(1, Ordering::SeqCst);
-                    enrol_client::ProbeOutcome::Confirmed(expected)
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
                 }
             },
         )

@@ -581,6 +581,23 @@ pub trait Backend: Send + Sync {
     /// Enrols this device with a node using a pairing invite and returns the updated state.
     fn pair(&self, invite: String, name: String) -> BoxFuture<'_, Result<AppState, AppError>>;
 
+    /// Restores an already-enrolled pairing on the node named in `invite` by authenticating with
+    /// this device's saved key against the invite's pinned host keys and verifying
+    /// `existing_principal`.
+    fn restore_pairing(
+        &self,
+        _invite: String,
+        _existing_principal: String,
+        _name: String,
+    ) -> BoxFuture<'_, Result<AppState, AppError>> {
+        Box::pin(async {
+            Err(AppError::new(
+                ErrorCode::Unsupported,
+                "Restoring an existing pairing is not supported by this backend.",
+            ))
+        })
+    }
+
     /// Cancels any in-flight device pairing operation.
     fn cancel_pair(&self) -> BoxFuture<'_, Result<CancelResult, AppError>> {
         Box::pin(async { Ok(CancelResult {}) })

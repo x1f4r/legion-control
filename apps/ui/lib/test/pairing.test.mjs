@@ -253,3 +253,69 @@ test('classifyPairError never swallows post-send cancelled without details.sent=
     'not_enrolled',
   );
 });
+
+test('confirmed conflict detail offers restore pairing via pinned-key probe while older conflict stays plain error', async () => {
+  const invite = makeFakeInvite('tower');
+  const restoreCalls = [];
+  const pairedEvents = [];
+
+  const ctrl = createPairingController({
+    link: {
+      pair() {
+        return Promise.reject({
+          code: 'conflict',
+          message: 'This device is already paired with tower as device:pixel.',
+          machine: 'tower',
+          details: {
+            existing_principal: 'device:pixel',
+            existing_device: 'pixel',
+            node: 'tower',
+          },
+        });
+      },
+      restorePairing(inv, existingPrincipal, name) {
+        restoreCalls.push({ inv, existingPrincipal, name });
+        return Promise.resolve({
+          ready: true,
+          nodes: [{ node: 'tower' }],
+          last_paired: { node: 'tower', device: 'pixel', role: 'operator', synced: [], not_synced: [] },
+        });
+      },
+    },
+    getDeviceNoun: () => 'phone',
+    isOnPairingScreen: () => true,
+    onPaired: (ev) => pairedEvents.push(ev),
+  });
+
+  const first = await ctrl.startPair({ invite, deviceName: 'phone', source: 'scan', screen: 'start' });
+  assert.equal(first.ok, false);
+  assert.equal(first.outcome.kind, 'already_paired');
+  assert.equal(
+    ctrl.getState().notice?.title,
+    'This phone is already paired with tower as device:pixel.',
+  );
+  assert.equal(ctrl.getState().notice?.restorable, true);
+  assert.equal(ctrl.getState().invite, invite);
+
+  const restored = await ctrl.restorePair();
+  assert.equal(restored.ok, true);
+  assert.equal(restored.restored, true);
+  assert.deepEqual(restoreCalls, [{ inv: invite, existingPrincipal: 'device:pixel', name: 'phone' }]);
+  assert.equal(pairedEvents.length, 1);
+  assert.equal(pairedEvents[0].node, 'tower');
+  assert.equal(ctrl.getState().invite, '');
+
+  // Older machine returning `conflict` WITHOUT `details.existing_principal` stays a normal error.
+  const olderOutcome = classifyPairError(
+    {
+      code: 'conflict',
+      message: 'That public key is already present in authorized_keys.',
+      machine: 'tower',
+      details: null,
+    },
+    'tower',
+    'phone',
+  );
+  assert.equal(olderOutcome.kind, 'error');
+  assert.equal(olderOutcome.restorable, false);
+});

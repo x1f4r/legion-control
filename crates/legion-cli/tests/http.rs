@@ -2301,6 +2301,7 @@ fn expiring_token_cannot_forward_credential_minting_tools() {
             role_updated_on: "laptop".to_owned(),
             conflict: false,
             role_conflict: false,
+            unconfirmed: false,
         };
     let mut pi_devices = legion_tools::device::registry::DevicesFile::default();
     pi_devices

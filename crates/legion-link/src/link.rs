@@ -979,6 +979,115 @@ impl Link {
         Ok((enrolled, learn_report))
     }
 
+    /// Restores an existing pairing on the node named in `invite_text` by authenticating with this
+    /// [`Link`]'s saved device key against the invite's pinned host keys and verifying
+    /// `meta.whoami` reports `expected_principal`.
+    #[cfg(feature = "ssh")]
+    pub async fn restore_pairing(
+        &self,
+        invite_text: &str,
+        expected_principal: &str,
+        device_name: &str,
+        cancel: CancellationToken,
+    ) -> Result<Enrolled, ErrorBody> {
+        self.restore_pairing_with_learn(invite_text, expected_principal, device_name, cancel)
+            .await
+            .map(|(enrolled, _)| enrolled)
+    }
+
+    /// Like [`Link::restore_pairing`], also returning the [`LearnReport`] from the immediate
+    /// post-restore [`Link::learn`] call.
+    #[cfg(feature = "ssh")]
+    pub async fn restore_pairing_with_learn(
+        &self,
+        invite_text: &str,
+        expected_principal: &str,
+        device_name: &str,
+        cancel: CancellationToken,
+    ) -> Result<(Enrolled, Option<LearnReport>), ErrorBody> {
+        let invite = crate::invite::Invite::parse(invite_text)?;
+        let name = device_name.trim();
+        if name.is_empty() || name.chars().any(|c| c.is_control()) {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Device name must be a non-empty single-line string.",
+            )
+            .with_hint("Pass a short label such as `phone` or `tablet`."));
+        }
+        let expected = expected_principal.trim();
+        if expected.is_empty() || expected.chars().any(|c| c.is_control()) {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Existing principal must be a non-empty single-line string.",
+            ));
+        }
+        if cancel.is_cancelled() {
+            return Err(ErrorBody::new(
+                ErrorCode::Cancelled,
+                format!("Restoring pairing with {} was cancelled.", invite.node),
+            )
+            .with_machine(&invite.node)
+            .with_details(json!({ crate::DETAIL_SENT: false })));
+        }
+
+        let existing_key = {
+            let _mutation_guard = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Cancelled,
+                        format!("Restoring pairing with {} was cancelled.", invite.node),
+                    )
+                    .with_machine(&invite.node)
+                    .with_details(json!({ crate::DETAIL_SENT: false })));
+                }
+                guard = self.inner.mutation_lock.lock() => guard,
+            };
+            self.inner
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .device_key
+                .clone()
+        };
+        let Some(pem) = existing_key else {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                "This device does not have a saved key to restore.",
+            )
+            .with_machine(&invite.node));
+        };
+        let device_key = crate::key::DeviceKey::from_openssh(&pem)?;
+
+        let enrolled = crate::invite::restore_pairing(
+            &invite,
+            &device_key,
+            name,
+            expected,
+            self.inner.options.ssh_timeouts,
+            cancel,
+        )
+        .await?;
+
+        let entry = NodeLink::from(enrolled.clone());
+        {
+            let _mutation_guard = self.inner.mutation_lock.lock().await;
+            {
+                let mut cfg = self
+                    .inner
+                    .config
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                cfg.upsert_node(entry);
+            }
+            self.clear_route_state(&enrolled.node);
+            self.retire_node(&enrolled.node);
+        }
+
+        let learn_report = self.learn().await.ok();
+        Ok((enrolled, learn_report))
+    }
+
     /// Stores a validated OpenSSH device key in the live [`LinkConfig`] in place without closing
     /// existing sessions.
     ///
@@ -5358,7 +5467,8 @@ mod tests {
 
     #[cfg(feature = "ssh")]
     #[tokio::test]
-    async fn pair_releases_mutation_lock_during_wait_keeps_completed_enrol_and_learns_on_recovery() {
+    async fn pair_releases_mutation_lock_during_wait_keeps_completed_enrol_and_learns_on_recovery()
+    {
         use tokio::sync::Notify;
 
         use crate::invite::Invite;
@@ -5495,8 +5605,11 @@ mod tests {
 
         let pair_task = tokio::spawn(async move {
             link_pair
-                .pair_with_learn(&inv, "phone", cancel_c, move |invite, _, name, _, _, _| {
-                    async move {
+                .pair_with_learn(
+                    &inv,
+                    "phone",
+                    cancel_c,
+                    move |invite, _, name, _, _, _| async move {
                         entered_c.notify_one();
                         release_c.notified().await;
                         Ok(Enrolled {
@@ -5510,8 +5623,8 @@ mod tests {
                             sync_command: None,
                             recovered: true,
                         })
-                    }
-                })
+                    },
+                )
                 .await
         });
 

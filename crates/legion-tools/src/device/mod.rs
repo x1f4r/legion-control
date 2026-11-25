@@ -74,7 +74,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "device.list",
         Effect::Admin,
-        "List paired devices (from devices.toml, adopting state-matched --pairing lines on first run and listing any unmatched local-only lines) and pending pairing invites for principals the caller could act as, reconciling authorized_keys with devices.toml and sweeping any expired or used invites. For owner callers, also reports Legion lines in authorized_keys belonging to another or missing Legion home (marked with `foreign`, `missing_home`, and `home`).",
+        "List paired devices (from devices.toml, adopting state-matched --pairing lines on first run and listing any unmatched local-only lines) and pending pairing invites for principals the caller could act as, reconciling authorized_keys with devices.toml and sweeping any expired or used invites. Devices whose enrolment reply was never delivered are marked with optional `unconfirmed: true` until they open their first session. For owner callers, also reports Legion lines in authorized_keys belonging to another or missing Legion home (marked with `foreign`, `missing_home`, and `home`).",
         list,
     );
     registry.add_fn(
@@ -1359,6 +1359,8 @@ struct ListedDevice {
     local_only: bool,
     #[serde(skip_serializing_if = "is_false")]
     missing_home: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    unconfirmed: bool,
 }
 
 /// One pending pairing invite listed by `device.list`.
@@ -1498,6 +1500,8 @@ async fn list(ctx: &Ctx, _args: ListArgs) -> Result<ListResult, ToolError> {
                     )
                 } else if report.foreign_key_ids.contains(id) {
                     (false, Some(registry::FOREIGN_KEY_COLLISION_STATUS.to_owned()))
+                } else if entry.unconfirmed {
+                    (false, Some("Pairing not finished".to_owned()))
                 } else {
                     (false, None)
                 };
@@ -1515,6 +1519,7 @@ async fn list(ctx: &Ctx, _args: ListArgs) -> Result<ListResult, ToolError> {
                     quarantined,
                     local_only: false,
                     missing_home: false,
+                    unconfirmed: entry.unconfirmed,
                 }
             })
             .collect();
@@ -1566,6 +1571,7 @@ async fn list(ctx: &Ctx, _args: ListArgs) -> Result<ListResult, ToolError> {
                             quarantined: false,
                             local_only: true,
                             missing_home: false,
+                            unconfirmed: false,
                         });
                         continue;
                     }
@@ -1589,6 +1595,7 @@ async fn list(ctx: &Ctx, _args: ListArgs) -> Result<ListResult, ToolError> {
                         quarantined: false,
                         local_only: false,
                         missing_home,
+                        unconfirmed: false,
                     });
                 }
                 LineKind::Invite {
@@ -4509,6 +4516,7 @@ allow = ["effect:read", "effect:write"]
                     role_updated_on: "tower".to_owned(),
                     conflict: false,
                     role_conflict: false,
+                    unconfirmed: false,
                 },
             );
         }
@@ -4732,6 +4740,7 @@ allow = ["effect:read", "effect:write"]
                 added: "2026-11-24T10:00:00Z".to_owned(),
                 fingerprint: adopted_fp,
                 pairing_id: Some(adopted_id.clone()),
+                confirmed: false,
             },
         );
         state.devices.insert(
@@ -4742,6 +4751,7 @@ allow = ["effect:read", "effect:write"]
                 added: "2026-11-24T10:00:00Z".to_owned(),
                 fingerprint: wrong_fp,
                 pairing_id: Some(mismatch_id.clone()),
+                confirmed: false,
             },
         );
         save_state(h.node.paths(), &state).unwrap();
@@ -4941,6 +4951,7 @@ allow = ["effect:read", "effect:write"]
                 role_updated_on: "tower".to_owned(),
                 conflict: false,
                 role_conflict: false,
+                unconfirmed: false,
             },
         );
         let dev_a = devices_file.devices.remove(&id_a).unwrap();
@@ -5276,6 +5287,7 @@ device = \"{id_healthy}\"
                     role_updated_on: "tower".to_owned(),
                     conflict: false,
                     role_conflict: false,
+                    unconfirmed: false,
                 },
             );
         }
@@ -6292,6 +6304,7 @@ role = \"owner\"
             role_updated_on: "a".to_owned(),
             conflict: false,
             role_conflict: false,
+            unconfirmed: false,
         };
         let make_tomb = |idx: u32, pad_len: usize| DeviceTombstone {
             name: format!("d{idx:04}-{}", "p".repeat(pad_len)),
@@ -7016,5 +7029,312 @@ role = "observer"
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn enrol_unconfirmed_on_broken_pipe_replaced_by_fresh_invite_confirmed_on_session_and_conflict_detail()
+     {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct BrokenPipeWriter;
+
+        impl tokio::io::AsyncWrite for BrokenPipeWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "client disconnected before reply",
+                )))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "client disconnected before flush",
+                )))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let h = Harness::new();
+
+        // 1. Client sends enrolment request, machine commits, then writing the reply hits
+        //    BrokenPipe because the client has gone -> recorded as `unconfirmed = true` in
+        //    devices.toml, `device.list`, and `audit.jsonl`.
+        let inv1 = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "vanish-phone", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let inv1_id = inv1["id"].as_str().unwrap().to_owned();
+        let key1 = generate_ephemeral_ed25519().unwrap();
+        let req1 = format!(
+            "{}\n",
+            json!({
+                "enrol": 1,
+                "id": inv1_id,
+                "public_key": key1.public_key,
+                "name": "vanish-phone",
+            })
+        );
+        let io1 = enrol::run_enrol_io(
+            &h.node,
+            &inv1_id,
+            req1.as_bytes(),
+            BrokenPipeWriter,
+            std::future::pending(),
+        )
+        .await;
+        assert!(
+            io1.reply.is_ok(),
+            "commit itself succeeded: {:?}",
+            io1.reply
+        );
+        assert!(!io1.delivered, "BrokenPipe must report delivered = false");
+        assert!(io1.unconfirmed, "BrokenPipe must mark device unconfirmed");
+
+        let reg1 = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+        assert_eq!(reg1.devices.len(), 1);
+        let (pid1, dev1) = reg1.devices.iter().next().unwrap();
+        let pid1 = pid1.clone();
+        assert!(
+            dev1.unconfirmed,
+            "devices.toml must record unconfirmed = true"
+        );
+
+        let listed1 = h.call("device.list", json!({})).await.unwrap();
+        let list_devs1 = listed1["devices"].as_array().unwrap();
+        assert_eq!(list_devs1.len(), 1);
+        assert_eq!(list_devs1[0]["unconfirmed"], json!(true));
+        assert_eq!(list_devs1[0]["status"], json!("Pairing not finished"));
+
+        let audit_text = std::fs::read_to_string(h.node.paths().audit_log()).unwrap();
+        assert!(
+            audit_text.contains("\"reply_delivered\":false")
+                && audit_text.contains("\"unconfirmed\":true"),
+            "audit.jsonl must record undelivered/unconfirmed enrolment: {audit_text}"
+        );
+
+        // 2. A fresh invite presented with the SAME device key replaces that unconfirmed leftover
+        //    under the same locks, tombstones the old entry, removes the old `device:*` principal,
+        //    and succeeds cleanly.
+        let inv2 = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "vanish-retry", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let inv2_id = inv2["id"].as_str().unwrap().to_owned();
+        let req2 = format!(
+            "{}\n",
+            json!({
+                "enrol": 1,
+                "id": inv2_id,
+                "public_key": key1.public_key,
+                "name": "vanish-retry",
+            })
+        );
+        let mut out2 = Vec::new();
+        let io2 = enrol::run_enrol_io(
+            &h.node,
+            &inv2_id,
+            req2.as_bytes(),
+            &mut out2,
+            std::future::pending(),
+        )
+        .await;
+        assert!(
+            io2.reply.is_ok(),
+            "fresh invite should replace unconfirmed entry: {:?}",
+            io2.reply
+        );
+        assert!(io2.delivered);
+        assert!(!io2.unconfirmed);
+        assert!(
+            String::from_utf8(out2).unwrap().contains("\"ok\":true"),
+            "reply line must be written on stdout"
+        );
+
+        let reg2 = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+        assert_eq!(reg2.devices.len(), 1);
+        assert!(!reg2.devices.contains_key(&pid1));
+        assert!(
+            reg2.removed.contains_key(&pid1),
+            "replaced unconfirmed entry must be tombstoned"
+        );
+        let (_, dev2) = reg2.devices.iter().next().unwrap();
+        assert!(!dev2.unconfirmed);
+        assert_eq!(dev2.principal, "device:vanish-retry");
+
+        let policy_text =
+            std::fs::read_to_string(h.node.paths().config_file(legion_core::Policy::FILE)).unwrap();
+        assert!(
+            !policy_text.contains("device:vanish-phone"),
+            "replaced unconfirmed device principal must be removed from policy.toml: {policy_text}"
+        );
+        assert!(policy_text.contains("device:vanish-retry"));
+
+        let listed2 = h.call("device.list", json!({})).await.unwrap();
+        let list_devs2 = listed2["devices"].as_array().unwrap();
+        assert_eq!(list_devs2.len(), 1);
+        assert!(
+            list_devs2[0].get("unconfirmed").is_none(),
+            "confirmed device omits optional unconfirmed flag: {list_devs2:?}"
+        );
+        assert!(list_devs2[0].get("status").is_none());
+
+        // 3. Another unconfirmed device gets confirmed automatically on its first session open
+        //    (`verify_gate_device`).
+        let inv3 = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "confirm-on-open", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let inv3_id = inv3["id"].as_str().unwrap().to_owned();
+        let key2 = generate_ephemeral_ed25519().unwrap();
+        let req3 = format!(
+            "{}\n",
+            json!({
+                "enrol": 1,
+                "id": inv3_id,
+                "public_key": key2.public_key,
+                "name": "confirm-on-open",
+            })
+        );
+        let io3 = enrol::run_enrol_io(
+            &h.node,
+            &inv3_id,
+            req3.as_bytes(),
+            BrokenPipeWriter,
+            std::future::pending(),
+        )
+        .await;
+        assert!(io3.unconfirmed);
+        let reg3 = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+        let (pid3, dev3) = reg3
+            .devices
+            .iter()
+            .find(|(_, d)| d.principal == "device:confirm-on-open")
+            .unwrap();
+        let (pid3, dev3_name, dev3_principal) =
+            (pid3.clone(), dev3.name.clone(), dev3.principal.clone());
+        assert!(dev3.unconfirmed);
+
+        let node_file = h
+            .node
+            .config()
+            .get::<legion_core::config::NodeFile>()
+            .unwrap();
+        registry::verify_gate_device(
+            h.node.paths(),
+            &h.node.name(),
+            &node_file,
+            &dev3_name,
+            &pid3,
+            &dev3_principal,
+            None,
+        )
+        .unwrap();
+
+        let reg3_after = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+        assert!(
+            !reg3_after.devices[&pid3].unconfirmed,
+            "first session open must mark unconfirmed device confirmed"
+        );
+        let listed3 = h.call("device.list", json!({})).await.unwrap();
+        let entry3 = listed3["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == json!(pid3))
+            .unwrap();
+        assert!(entry3.get("unconfirmed").is_none());
+        assert!(entry3.get("status").is_none());
+
+        // 4. Confirmed device presenting a fresh invite is still refused with `ErrorCode::Conflict`
+        //    and now includes optional `details.existing_principal`, `existing_device`, and `node`.
+        let inv4 = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "confirm-dup", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let inv4_id = inv4["id"].as_str().unwrap().to_owned();
+        let req4 = format!(
+            "{}\n",
+            json!({
+                "enrol": 1,
+                "id": inv4_id,
+                "public_key": key2.public_key,
+                "name": "confirm-dup",
+            })
+        );
+        let mut out4 = Vec::new();
+        let io4 = enrol::run_enrol_io(
+            &h.node,
+            &inv4_id,
+            req4.as_bytes(),
+            &mut out4,
+            std::future::pending(),
+        )
+        .await;
+        match io4.reply {
+            EnrolReply::Err { ok: false, error } => {
+                assert_eq!(error.code, ErrorCode::Conflict);
+                assert!(
+                    error
+                        .message
+                        .contains("already paired with tower as device:confirm-on-open"),
+                    "unexpected conflict message: {}",
+                    error.message
+                );
+                let details = error
+                    .details
+                    .expect("confirmed conflict must include details");
+                assert_eq!(
+                    details["existing_principal"],
+                    json!("device:confirm-on-open")
+                );
+                assert_eq!(details["existing_device"], json!(dev3_name));
+                assert_eq!(details["node"], json!("tower"));
+            }
+            other => panic!("expected Conflict for confirmed duplicate key, got {other:?}"),
+        }
+
+        // 5. Wire backward compatibility: an older client struct without `details` or `unconfirmed`
+        //    deserializes the new replies cleanly.
+        #[derive(serde::Deserialize)]
+        struct LegacyEnrolErr {
+            ok: bool,
+            error: LegacyErrBody,
+        }
+        #[derive(serde::Deserialize)]
+        struct LegacyErrBody {
+            code: ErrorCode,
+            message: String,
+        }
+        let legacy_err: LegacyEnrolErr = serde_json::from_slice(&out4).unwrap();
+        assert!(!legacy_err.ok);
+        assert_eq!(legacy_err.error.code, ErrorCode::Conflict);
+        assert!(legacy_err.error.message.contains("device:confirm-on-open"));
     }
 }

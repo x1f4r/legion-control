@@ -31,12 +31,14 @@ export function inviteTargetNode(text) {
  *
  * Pre-send cancellations (`code === 'cancelled' && details?.sent === false`) are quiet resets;
  * post-send cancellations (`sent !== false`) are NEVER swallowed.
+ * Confirmed duplicate-key conflicts carrying `details.existing_principal` offer an explicit
+ * restore flow via the pinned-key probe instead of asking for a new key.
  */
-export function classifyPairError(err, nodeName = '') {
+export function classifyPairError(err, nodeName = '', deviceNoun = 'device') {
   const target = nodeName || err?.machine || '';
   if (err?.code === 'cancelled') {
     if (err?.details?.sent === false) {
-      return { kind: 'cancelled_before_send', message: '', retryable: false };
+      return { kind: 'cancelled_before_send', message: '', retryable: false, restorable: false };
     }
     if (err?.details?.outcome === 'uncertain') {
       const message =
@@ -44,16 +46,38 @@ export function classifyPairError(err, nodeName = '') {
         (target
           ? `Pairing may have finished on ${target}. Try again to check.`
           : 'Pairing may have finished. Try again to check.');
-      return { kind: 'uncertain', message, retryable: true };
+      return { kind: 'uncertain', message, retryable: true, restorable: false };
     }
     const message =
       (typeof err?.message === 'string' && err.message.trim()) ||
       (target
         ? `Pairing with ${target} was stopped. Nothing was saved.`
         : 'Pairing was stopped. Nothing was saved.');
-    return { kind: 'not_enrolled', message, retryable: false };
+    return { kind: 'not_enrolled', message, retryable: false, restorable: false };
   }
-  return { kind: 'error', error: err, retryable: true };
+  const existingPrincipal =
+    typeof err?.details?.existing_principal === 'string'
+      ? err.details.existing_principal.trim()
+      : '';
+  if (err?.code === 'conflict' && existingPrincipal) {
+    const conflictNode =
+      (typeof err?.details?.node === 'string' && err.details.node.trim()) ||
+      target ||
+      'this machine';
+    const existingDevice =
+      typeof err?.details?.existing_device === 'string' ? err.details.existing_device.trim() : '';
+    const noun = String(deviceNoun || 'device').trim() || 'device';
+    return {
+      kind: 'already_paired',
+      existingPrincipal,
+      existingDevice,
+      node: conflictNode,
+      message: `This ${noun} is already paired with ${conflictNode} as ${existingPrincipal}.`,
+      retryable: false,
+      restorable: true,
+    };
+  }
+  return { kind: 'error', error: err, retryable: true, restorable: false };
 }
 
 /**
@@ -62,6 +86,7 @@ export function classifyPairError(err, nodeName = '') {
  */
 export function createPairingController({
   link,
+  getDeviceNoun = () => 'device',
   isOnPairingScreen = () => true,
   onPaired = null,
   onBackgroundOutcome = null,
@@ -189,7 +214,8 @@ export function createPairingController({
         }
         return { ok: true, state: next, node: pairedNode };
       } catch (err) {
-        const outcome = classifyPairError(err, node);
+        const noun = typeof getDeviceNoun === 'function' ? getDeviceNoun() : 'device';
+        const outcome = classifyPairError(err, node, noun);
         const onScreen = Boolean(isOnPairingScreen());
 
         if (outcome.kind === 'cancelled_before_send') {
@@ -201,6 +227,35 @@ export function createPairingController({
             error: null,
             notice: null,
           });
+          return { ok: false, outcome };
+        }
+
+        if (outcome.kind === 'already_paired') {
+          const canRestore = typeof link?.restorePairing === 'function';
+          update({
+            inFlight: false,
+            cancelling: false,
+            error: null,
+            notice: {
+              kind: 'warn',
+              title: outcome.message,
+              retryable: false,
+              restorable: canRestore,
+              existingPrincipal: outcome.existingPrincipal,
+              node: outcome.node,
+            },
+          });
+          if (!onScreen && typeof onBackgroundOutcome === 'function') {
+            onBackgroundOutcome({
+              kind: 'already_paired',
+              message: outcome.message,
+              node: outcome.node,
+              existingPrincipal: outcome.existingPrincipal,
+              retryable: false,
+              restorable: canRestore,
+              startedScreen: screen,
+            });
+          }
           return { ok: false, outcome };
         }
 
@@ -296,6 +351,107 @@ export function createPairingController({
     });
   }
 
+  function restorePair() {
+    if (
+      activePromise ||
+      state.inFlight ||
+      !state.invite.trim() ||
+      !state.notice?.restorable ||
+      !state.notice?.existingPrincipal ||
+      typeof link?.restorePairing !== 'function'
+    ) {
+      return Promise.resolve({ ok: false, empty: true });
+    }
+    const trimmed = state.invite.trim();
+    const existingPrincipal = state.notice.existingPrincipal;
+    const resolvedName = String(state.deviceName ?? '').trim();
+    const node = state.notice.node || state.node || inviteTargetNode(trimmed);
+    const screen = state.screen || 'start';
+    const controller = new AbortController();
+    abortController = controller;
+
+    update({
+      inFlight: true,
+      cancelling: false,
+      node,
+      error: null,
+      notice: null,
+    });
+
+    const run = (async () => {
+      try {
+        const next = await link.restorePairing(
+          trimmed,
+          existingPrincipal,
+          resolvedName || undefined,
+          { signal: controller.signal },
+        );
+        const pairedNode =
+          next?.last_paired?.node || node || next?.nodes?.[0]?.node || '';
+        const wasCancelling = state.cancelling;
+        update({
+          inFlight: false,
+          cancelling: false,
+          invite: '',
+          source: null,
+          node: '',
+          screen: null,
+          error: null,
+          notice: null,
+        });
+        if (typeof onPaired === 'function') {
+          onPaired({
+            next,
+            node: pairedNode,
+            startedScreen: screen,
+            onPairingScreen: Boolean(isOnPairingScreen()),
+            wasCancelling,
+          });
+        }
+        return { ok: true, state: next, node: pairedNode, restored: true };
+      } catch (err) {
+        const noun = typeof getDeviceNoun === 'function' ? getDeviceNoun() : 'device';
+        const outcome = classifyPairError(err, node, noun);
+        const onScreen = Boolean(isOnPairingScreen());
+        if (outcome.kind === 'cancelled_before_send') {
+          update({
+            inFlight: false,
+            cancelling: false,
+            error: null,
+            notice: null,
+          });
+          return { ok: false, outcome };
+        }
+        update({
+          inFlight: false,
+          cancelling: false,
+          error: err,
+          notice: null,
+        });
+        if (!onScreen && typeof onBackgroundOutcome === 'function') {
+          onBackgroundOutcome({
+            kind: 'error',
+            error: err,
+            node: node || err?.machine || '',
+            retryable: false,
+            startedScreen: screen,
+          });
+        }
+        return { ok: false, outcome };
+      } finally {
+        if (abortController === controller) {
+          abortController = null;
+        }
+        if (activePromise === run) {
+          activePromise = null;
+        }
+      }
+    })();
+
+    activePromise = run;
+    return run;
+  }
+
   function cancelPair() {
     if (!state.inFlight || state.cancelling) return;
     update({ cancelling: true });
@@ -310,6 +466,7 @@ export function createPairingController({
     clearOutcome,
     startPair,
     retryPair,
+    restorePair,
     cancelPair,
   };
 }

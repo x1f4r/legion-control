@@ -1899,3 +1899,53 @@ test('debug media check reports separate pairing and media stages and tags pairi
     else globalThis.Image = prevImage;
   }
 });
+
+test('createAppLink restorePairing() invokes restore_pairing with existingPrincipal and refreshes state', async () => {
+  const prevWindow = globalThis.window;
+  const calls = [];
+  globalThis.window = {
+    location: { origin: 'tauri://localhost' },
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          calls.push({ command, payload });
+          if (command === 'restore_pairing') {
+            return Promise.resolve({
+              ready: true,
+              nodes: [{ node: 'tower' }],
+              last_paired: { node: 'tower', device: 'phone', role: 'operator', synced: [], not_synced: [] },
+            });
+          }
+          if (command === 'state') {
+            return Promise.resolve({ ready: true, nodes: [{ node: 'tower', via: 'ssh' }] });
+          }
+          if (command === 'call' && payload?.tool === 'meta.whoami') {
+            return Promise.resolve({ node: 'tower', principal: 'device:phone', role: 'operator', tools: [] });
+          }
+          if (command === 'call' && payload?.tool === 'meta.version') {
+            return Promise.resolve({ version: '0.1.0', protocol: 1 });
+          }
+          return Promise.resolve({});
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    const res = await link.restorePairing('legion-invite-1.fake', 'device:phone', 'phone');
+    assert.equal(res.ready, true);
+    assert.equal(res.last_paired?.node, 'tower');
+    assert.deepEqual(calls[0], {
+      command: 'restore_pairing',
+      payload: {
+        invite: 'legion-invite-1.fake',
+        existingPrincipal: 'device:phone',
+        name: 'phone',
+      },
+    });
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+  }
+});

@@ -181,6 +181,34 @@ pub async fn pair(
     Ok(state)
 }
 
+/// Restores an existing pairing on the node named in `invite` by probing with this device's saved
+/// key against the invite's pinned host keys and verifying `existing_principal`.
+#[tauri::command]
+pub async fn restore_pairing(
+    backend: State<'_, SharedBackend>,
+    content: State<'_, SharedContentServer>,
+    invite: String,
+    existing_principal: String,
+    name: Option<String>,
+) -> Result<AppState, AppError> {
+    validate_invite_size(&invite)?;
+    validate_label_size("Principal", &existing_principal)?;
+    if let Some(raw_name) = &name {
+        validate_label_size("Device name", raw_name)?;
+    }
+    let resolved_name = name
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(default_device_name);
+    validate_label_size("Device name", &resolved_name)?;
+    let state = backend
+        .0
+        .restore_pairing(invite, existing_principal, resolved_name)
+        .await?;
+    content.0.revoke_stale_pairings();
+    Ok(state)
+}
+
 /// Cancels an in-flight device pairing operation.
 #[tauri::command]
 pub async fn cancel_pair(backend: State<'_, SharedBackend>) -> Result<CancelResult, AppError> {

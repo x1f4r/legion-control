@@ -1251,6 +1251,97 @@ impl Backend for LinkBackend {
         })
     }
 
+    fn restore_pairing(
+        &self,
+        invite: String,
+        existing_principal: String,
+        name: String,
+    ) -> BoxFuture<'_, Result<AppState, AppError>> {
+        Box::pin(async move {
+            let _op = self.track_operation();
+            self.require_healthy_store()?;
+            let trimmed_invite = invite.trim();
+            if trimmed_invite.is_empty() {
+                return Err(
+                    AppError::new(ErrorCode::InvalidArgs, "Invite text cannot be empty.")
+                        .with_hint(
+                            "Scan the QR code or paste the invite line printed by `legion pair`.",
+                        ),
+                );
+            }
+            let trimmed_principal = existing_principal.trim();
+            if trimmed_principal.is_empty() {
+                return Err(AppError::new(
+                    ErrorCode::InvalidArgs,
+                    "Existing principal cannot be empty.",
+                ));
+            }
+            let parsed = Invite::parse(trimmed_invite).map_err(AppError::from)?;
+            let target_node_name = parsed.node.clone();
+            let device_label = {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    default_device_name()
+                } else {
+                    trimmed.to_owned()
+                }
+            };
+
+            let pair_seq = self.next_call_seq.fetch_add(1, Ordering::Relaxed);
+            let cancel = CancellationToken::new();
+            {
+                self.active_pairs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((pair_seq, cancel.clone()));
+            }
+            let _pair_guard = ActivePairGuard {
+                active_pairs: Arc::clone(&self.active_pairs),
+                seq: pair_seq,
+            };
+
+            let link = {
+                let _mutation = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        return Err(AppError::new(
+                            ErrorCode::Cancelled,
+                            format!("Restoring pairing with {target_node_name} was cancelled."),
+                        )
+                        .with_details(serde_json::json!({ "sent": false })));
+                    }
+                    guard = self.mutate_lock.lock() => guard,
+                };
+                let guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(err) = &guard.store_error {
+                    return Err(err.clone());
+                }
+                if guard.data.link.device_key.is_none() {
+                    return Err(AppError::new(
+                        ErrorCode::Denied,
+                        "This device does not have a saved key to restore.",
+                    ));
+                }
+                guard.link.clone()
+            };
+
+            let (enrolled, learn_report) = link
+                .restore_pairing_with_learn(
+                    trimmed_invite,
+                    trimmed_principal,
+                    &device_label,
+                    cancel,
+                )
+                .await
+                .map_err(AppError::from)?;
+
+            self.commit_enrolled_pairing(enrolled, learn_report).await
+        })
+    }
+
     fn unpair(&self, node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
         Box::pin(async move {
             let _op = self.track_operation();
@@ -4769,11 +4860,9 @@ mod tests {
             Some("beta")
         );
 
-        let unpaired = tokio::time::timeout(
-            Duration::from_secs(1),
-            backend.unpair("alpha".to_owned()),
-        )
-        .await??;
+        let unpaired =
+            tokio::time::timeout(Duration::from_secs(1), backend.unpair("alpha".to_owned()))
+                .await??;
         assert_eq!(unpaired.node, "alpha");
 
         backend.cancel_pair().await?;
@@ -4829,12 +4918,9 @@ mod tests {
         {
             let guard = backend.state.lock().unwrap_or_else(|p| p.into_inner());
             guard.link.upsert_node(LinkNode::from(enrolled.clone()));
-            guard.link.upsert_node(LinkNode::learned(
-                "pi",
-                pi_target,
-                None,
-                "tower",
-            ));
+            guard
+                .link
+                .upsert_node(LinkNode::learned("pi", pi_target, None, "tower"));
         }
         let report = legion_link::LearnReport {
             introducer: "tower".to_owned(),
