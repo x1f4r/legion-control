@@ -777,6 +777,9 @@ pub struct MediaCheckReport {
     /// Result of desktop window immersive full-screen transition check when requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub immersive_check: Option<Value>,
+    /// Lifecycle trigger that fired the post-resume media check (e.g. `tauri://resumed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_trigger: Option<String>,
     /// Failure description when `ok` is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
