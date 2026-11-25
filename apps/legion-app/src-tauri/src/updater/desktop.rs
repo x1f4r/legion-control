@@ -713,6 +713,7 @@ fn extract_macos_app_tar_with_limit(
     // symlink loops.
     validate_all_symlink_chains(&pending_symlinks)?;
 
+    #[cfg_attr(not(unix), allow(clippy::never_loop))]
     for (clean_rel, link_target) in &pending_symlinks {
         if let Some(parent_rel) = clean_rel.parent()
             && !parent_rel.as_os_str().is_empty()
@@ -1150,6 +1151,7 @@ where
 /// utility (`mv`, `rm`, `ps`, `sleep`) exclusively from fixed system directories, restores the
 /// pre-sanitized `LEGION_RELAUNCH_PATH` only inside the relaunched child, and strips all supervisor
 /// helper variables before `exec`.
+#[cfg_attr(not(unix), allow(dead_code))]
 const UNIX_SWAP_SUPERVISOR_SCRIPT: &str = r#"
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin

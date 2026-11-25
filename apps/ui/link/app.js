@@ -309,10 +309,10 @@ export function createAppLink() {
       if (checks.length === 0) return null;
 
       const appOrigin = window.location.origin;
-      let leakedIpc = false;
+      let scriptProbe = null;
       const onMsg = (evt) => {
         if (evt?.data && typeof evt.data === 'object' && evt.data.legionProbe) {
-          leakedIpc = true;
+          scriptProbe = evt.data;
         }
       };
       window.addEventListener('message', onMsg);
@@ -355,20 +355,54 @@ export function createAppLink() {
           }
 
           // 3) Attempt to frame the content URL and ensure neither script nor IPC is reachable.
+          // Wait for load/error plus a brief settle window so any framed script would have time to
+          // postMessage. When CSP `default-src 'none'` or WebView2's `on_navigation` blocks the
+          // navigation before commit, the iframe can remain on its initial untouched empty
+          // `about:blank` document (which inherits the app origin and receives Tauri's
+          // `withGlobalTauri` init script on WebView2). Only fail if content actually framed into
+          // a same-origin document (navigated away from `about:blank` or populated DOM) or ran
+          // script.
           const iframe = document.createElement('iframe');
           iframe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:10px;height:10px;';
+          let settleIframe;
+          const iframeSettled = new Promise((resolve) => {
+            settleIframe = resolve;
+          });
+          iframe.addEventListener('load', () => settleIframe(), { once: true });
+          iframe.addEventListener('error', () => settleIframe(), { once: true });
           iframe.src = ticket.url;
           document.body.appendChild(iframe);
-          await new Promise((r) => window.setTimeout(r, 400));
+          await Promise.race([
+            iframeSettled,
+            new Promise((r) => window.setTimeout(r, 800)),
+          ]);
+          await new Promise((r) => window.setTimeout(r, 200));
+
+          let iframeLeak = null;
           try {
             const win = iframe.contentWindow;
-            if (win && win.__TAURI__) {
-              leakedIpc = true;
+            if (win) {
+              const href = String(win.location?.href || '');
+              const doc = win.document;
+              const rootTag = String(doc?.documentElement?.tagName || '').toLowerCase();
+              const hasDom = Boolean(
+                doc &&
+                  ((doc.head?.childNodes?.length || 0) > 0 ||
+                    (doc.body?.childNodes?.length || 0) > 0 ||
+                    (rootTag && rootTag !== 'html')),
+              );
+              const isUntouchedBlank = href === 'about:blank' && !hasDom;
+              if (!isUntouchedBlank) {
+                iframeLeak = `href=${href || '<empty>'} tauri=${Boolean(win.__TAURI__)} dom=${hasDom}`;
+              }
             }
           } catch {
-            // Cross-origin SecurityError is expected and proves isolation.
+            // Cross-origin SecurityError (opaque sandbox or error page) proves isolation.
           }
           iframe.remove();
+          if (iframeLeak) {
+            throw new Error(`Content ${item.kind} framed into same-origin document (${iframeLeak})`);
+          }
 
           // 4) Attempt top-level navigation to the content URL; on_navigation must refuse it so
           // the WebView stays on the bundled app origin.
@@ -381,8 +415,10 @@ export function createAppLink() {
           if (window.location.origin !== appOrigin) {
             throw new Error(`WebView navigated to content origin for ${item.kind}`);
           }
-          if (leakedIpc) {
-            throw new Error(`Content ${item.kind} reached script or Tauri IPC`);
+          if (scriptProbe) {
+            throw new Error(
+              `Content ${item.kind} executed script (ipc=${Boolean(scriptProbe.ipc)})`,
+            );
           }
         }
         return true;

@@ -485,6 +485,7 @@ mod tests {
             "http://localhost:8080/",
             "http://127.0.0.1/",
             "http://127.0.0.1:45123/v1/content/tok/evil.html",
+            "http://127.0.0.1:45123/v1/content/tok/evil.html?download=1",
             "http://127.0.0.1:45123/v1/content/tok/evil.svg",
             "http://legion-content.localhost/v1/content/tok/evil.html",
             "http://legion-content.localhost/v1/content/tok/evil.svg",
@@ -492,12 +493,20 @@ mod tests {
             "legion-content://localhost/v1/content/tok/evil.svg",
             "http://tauri.localhost:9999/",
             "http://user@tauri.localhost/",
+            "http://tauri.localhost.evil.example/",
             "tauri://evil.example/",
             "tauri://localhost:1234/",
+            "tauri://localhost.evil.example/",
             "file:///etc/passwd",
             "data:text/html,<h1>hi</h1>",
             "javascript:alert(1)",
             "about:blank",
+            "chrome-error://chromewebdata/",
+            "blob:http://127.0.0.1:45123/00000000-0000-0000-0000-000000000000",
+            "blob:http://tauri.localhost/00000000-0000-0000-0000-000000000000",
+            "blob:tauri://localhost/00000000-0000-0000-0000-000000000000",
+            "view-source:http://127.0.0.1:45123/v1/content/tok/evil.html",
+            "ws://127.0.0.1:45123/v1/content/tok/evil.html",
         ];
 
         for raw in blocked {

@@ -1288,9 +1288,21 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    enum MockStreamFault {
+        #[default]
+        None,
+        ErrorOnGet {
+            code: ProtoCode,
+            message: &'static str,
+        },
+        TruncateAfterBytes(usize),
+    }
+
     struct MemoryFilesOpener {
         files: Arc<HashMap<String, Vec<u8>>>,
         window_policy: Option<legion_link::content::WindowPolicy>,
+        fault: Arc<Mutex<MockStreamFault>>,
     }
 
     impl StreamOpener for MemoryFilesOpener {
@@ -1304,6 +1316,7 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>> {
             let files = Arc::clone(&self.files);
             let supports_keep_open = self.window_policy.is_some();
+            let fault = Arc::clone(&self.fault);
             Box::pin(async move {
                 let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
                 let (server_in, client_out) = tokio::io::duplex(64 * 1024);
@@ -1343,6 +1356,12 @@ mod tests {
                             .get("length")
                             .and_then(Value::as_u64)
                             .map(|n| n as usize);
+                        let active_fault = fault.lock().unwrap().clone();
+                        if let MockStreamFault::ErrorOnGet { code, message } = active_fault {
+                            let err = json!({ "error": ErrorBody::new(code, message) });
+                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                            return;
+                        }
                         if offset > payload.len() {
                             let err = json!({
                                 "error": ErrorBody::new(ProtoCode::Conflict, "offset past end")
@@ -1370,6 +1389,13 @@ mod tests {
                             .await
                             .is_err()
                         {
+                            return;
+                        }
+                        if let MockStreamFault::TruncateAfterBytes(cut) = active_fault
+                            && len > cut
+                        {
+                            let _ = server_out.write_all(&payload[offset..offset + cut]).await;
+                            let _ = server_out.shutdown().await;
                             return;
                         }
                         let write_ok = tokio::select! {
@@ -1407,6 +1433,7 @@ mod tests {
         link: Link,
         live: Arc<AtomicBool>,
         holder: String,
+        fault: Arc<Mutex<MockStreamFault>>,
     }
 
     impl MockContentBackend {
@@ -1419,9 +1446,11 @@ mod tests {
             link_options: LinkOptions,
             window_policy: Option<legion_link::content::WindowPolicy>,
         ) -> Self {
+            let fault = Arc::new(Mutex::new(MockStreamFault::None));
             let opener_files = Arc::new(MemoryFilesOpener {
                 files: Arc::new(files),
                 window_policy,
+                fault: Arc::clone(&fault),
             });
             let session_opener: SessionOpener = Arc::new(move |entry, _, cancel| {
                 let opener_files = Arc::clone(&opener_files);
@@ -1490,6 +1519,7 @@ mod tests {
                 link: Link::with_opener(cfg, link_options, session_opener),
                 live: Arc::new(AtomicBool::new(true)),
                 holder: "pairing:tower:1".to_owned(),
+                fault,
             }
         }
     }
@@ -2085,20 +2115,97 @@ mod tests {
 
     #[tokio::test]
     async fn html_and_svg_carry_sandbox_csp_nosniff_and_safe_content_types_on_both_mounts() {
+        fn assert_raw_security_headers(head: &str, expected_ct: Option<&str>) {
+            let lower = head.to_ascii_lowercase();
+            assert!(
+                lower.contains("x-content-type-options: nosniff"),
+                "missing nosniff: {head}"
+            );
+            assert!(
+                lower.contains(
+                    "content-security-policy: sandbox; default-src 'none'; frame-ancestors 'none'"
+                ),
+                "missing sandbox CSP: {head}"
+            );
+            assert!(
+                lower.contains("cross-origin-resource-policy: cross-origin"),
+                "missing CORP: {head}"
+            );
+            assert!(
+                lower.contains("cache-control: private, no-store"),
+                "missing private, no-store: {head}"
+            );
+            assert!(
+                !lower.contains("content-type: text/html"),
+                "content response must never emit text/html: {head}"
+            );
+            if let Some(ct) = expected_ct {
+                assert!(
+                    lower.contains(&format!("content-type: {ct}")),
+                    "expected content-type {ct}: {head}"
+                );
+            }
+        }
+
+        fn assert_response_security_headers<B>(resp: &Response<B>, expected_ct: Option<&str>) {
+            assert_eq!(
+                resp.headers()
+                    .get(X_CONTENT_TYPE_OPTIONS)
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff")
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(CONTENT_SECURITY_POLICY)
+                    .and_then(|v| v.to_str().ok()),
+                Some(CONTENT_SANDBOX_CSP)
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(CROSS_ORIGIN_RESOURCE_POLICY)
+                    .and_then(|v| v.to_str().ok()),
+                Some("cross-origin")
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("private, no-store")
+            );
+            let actual_ct = resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_ascii_lowercase);
+            assert!(
+                !actual_ct
+                    .as_deref()
+                    .is_some_and(|ct| ct.contains("text/html")),
+                "content response must never emit text/html: {actual_ct:?}"
+            );
+            if let Some(ct) = expected_ct {
+                assert_eq!(actual_ct.as_deref(), Some(ct));
+            }
+        }
+
+        let html_bytes =
+            b"<html><script>window.__TAURI__.core.invoke('state')</script></html>".to_vec();
+        let mut large_html = Vec::with_capacity(128 * 1024);
+        while large_html.len() < 128 * 1024 {
+            large_html.extend_from_slice(&html_bytes);
+        }
+        large_html.truncate(128 * 1024);
+        let svg_bytes =
+            b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>".to_vec();
         let mut files = HashMap::new();
-        files.insert(
-            "/home/me/evil.html".to_owned(),
-            b"<html><script>window.__TAURI__.core.invoke('state')</script></html>".to_vec(),
-        );
-        files.insert(
-            "/home/me/evil.svg".to_owned(),
-            b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>".to_vec(),
-        );
+        files.insert("/home/me/evil.html".to_owned(), html_bytes.clone());
+        files.insert("/home/me/evil-large.html".to_owned(), large_html.clone());
+        files.insert("/home/me/evil.svg".to_owned(), svg_bytes.clone());
 
         // 1) Loopback mount (desktop & iOS).
         let lb_backend = Arc::new(MockContentBackend::new(files.clone()));
         let lb = Arc::new(AppContentServer::with_config(
-            lb_backend,
+            Arc::clone(&lb_backend) as Arc<dyn Backend>,
             ContentMountMode::Loopback,
             TicketConfig::default(),
             Duration::from_secs(30),
@@ -2113,13 +2220,23 @@ mod tests {
             .await
             .unwrap();
         let port = lb.loopback_port().unwrap();
-        for (url, expected_ct) in [
-            (&lb_html.url, "content-type: text/plain; charset=utf-8"),
-            (&lb_svg.url, "content-type: image/svg+xml"),
+        let lb_html_path = lb_html
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        let lb_svg_path = lb_svg
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+
+        // 200 OK & 206 Partial Content for both HTML and SVG.
+        let mut html_etag = String::new();
+        for (path, expected_ct) in [
+            (lb_html_path.as_str(), "text/plain; charset=utf-8"),
+            (lb_svg_path.as_str(), "image/svg+xml"),
         ] {
-            let path = url
-                .strip_prefix(&format!("http://127.0.0.1:{port}"))
-                .unwrap();
             let (status, head, _) = raw_http(
                 port,
                 &format!(
@@ -2127,27 +2244,217 @@ mod tests {
                 ),
             )
             .await;
-            assert_eq!(status, 200);
-            let lower = head.to_ascii_lowercase();
-            assert!(lower.contains(expected_ct), "{head}");
-            assert!(lower.contains("x-content-type-options: nosniff"), "{head}");
-            assert!(
-                lower.contains(
-                    "content-security-policy: sandbox; default-src 'none'; frame-ancestors 'none'"
+            assert_eq!(status, 200, "{head}");
+            assert_raw_security_headers(&head, Some(expected_ct));
+            if path == lb_html_path {
+                for line in head.lines() {
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("etag")
+                    {
+                        html_etag = v.trim().to_owned();
+                    }
+                }
+            }
+
+            let (status206, head206, _) = raw_http(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=0-7\r\nConnection: close\r\n\r\n"
                 ),
-                "{head}"
-            );
+            )
+            .await;
+            assert_eq!(status206, 206, "{head206}");
+            assert_raw_security_headers(&head206, Some(expected_ct));
         }
+
+        // Conditional If-None-Match: responses are `Cache-Control: private, no-store`, so no
+        // unguarded 304 is returned — returns 200 with full sandbox headers.
+        assert!(!html_etag.is_empty());
+        let (status_cond, head_cond, _) = raw_http(
+            port,
+            &format!(
+                "GET {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nIf-None-Match: {html_etag}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status_cond, 200, "{head_cond}");
+        assert_raw_security_headers(&head_cond, Some("text/plain; charset=utf-8"));
+
+        // 403 Forbidden (bad Origin), 421 Misdirected Request (bad Host), 405 Method Not Allowed.
+        let (status403, head403, _) = raw_http(
+            port,
+            &format!(
+                "GET {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status403, 403, "{head403}");
+        assert_raw_security_headers(&head403, Some("application/json"));
+
+        let (status421, head421, _) = raw_http(
+            port,
+            &format!("GET {lb_html_path} HTTP/1.1\r\nHost: evil.example:{port}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status421, 421, "{head421}");
+        assert_raw_security_headers(&head421, Some("application/json"));
+
+        let (status405, head405, _) = raw_http(
+            port,
+            &format!("POST {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status405, 405, "{head405}");
+        assert_raw_security_headers(&head405, Some("application/json"));
+
+        // 404 Not Found (unknown ticket and unknown route).
+        for bad_path in [
+            "/v1/content/doesnotexist/evil.html",
+            "/not-content/evil.html",
+        ] {
+            let (status404, head404, _) = raw_http(
+                port,
+                &format!(
+                    "GET {bad_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await;
+            assert_eq!(status404, 404, "{head404}");
+            assert_raw_security_headers(&head404, Some("application/json"));
+        }
+
+        // 413 Payload Too Large (via handle_checked_request with max_full_bytes).
+        let lb_guard = HostOriginGuard {
+            port,
+            allowed_hosts: Vec::new(),
+            allowed_origins: vec!["tauri://localhost".to_owned()],
+            allow_same_origin: false,
+        };
+        let mut lb_headers = HeaderMap::new();
+        lb_headers.insert(
+            HOST,
+            HeaderValue::from_str(&format!("127.0.0.1:{port}")).unwrap(),
+        );
+        let resp413 = lb
+            .handle_checked_request(
+                &lb_guard,
+                &Method::GET,
+                &lb_html_path.parse::<Uri>().unwrap(),
+                &lb_headers,
+                ServeOptions {
+                    corp: CorpPolicy::CrossOrigin,
+                    max_full_bytes: Some(8),
+                    ..ServeOptions::default()
+                },
+            )
+            .await;
+        assert_eq!(resp413.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_response_security_headers(&resp413, Some("application/json"));
+
+        // 416 Range Not Satisfiable.
+        let (status416, head416, _) = raw_http(
+            port,
+            &format!(
+                "GET {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=99999-\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status416, 416, "{head416}");
+        assert_raw_security_headers(&head416, None);
+
+        // 429 Too Many Requests (saturate holder permits using distinct ticket hashes).
+        let mut held = Vec::new();
+        for idx in 0u8..64 {
+            let mut key_hash = [0xAAu8; 32];
+            key_hash[0] = idx;
+            match lb.limiter.try_acquire(key_hash, "pairing:tower:1") {
+                Ok(permit) => held.push(permit),
+                Err(_) => break,
+            }
+        }
+        let (status429, head429, _) = raw_http(
+            port,
+            &format!(
+                "GET {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        drop(held);
+        assert_eq!(status429, 429, "{head429}");
+        assert_raw_security_headers(&head429, Some("application/json"));
+
+        // 502 Bad Gateway (upstream unreachable) & 503 Service Unavailable (upstream busy).
+        *lb_backend.fault.lock().unwrap() = MockStreamFault::ErrorOnGet {
+            code: ProtoCode::Unreachable,
+            message: "machine unreachable",
+        };
+        let (status502, head502, _) = raw_http(
+            port,
+            &format!(
+                "GET {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status502, 502, "{head502}");
+        assert_raw_security_headers(&head502, Some("application/json"));
+
+        *lb_backend.fault.lock().unwrap() = MockStreamFault::ErrorOnGet {
+            code: ProtoCode::Busy,
+            message: "all stream slots busy",
+        };
+        let (status503, head503, _) = raw_http(
+            port,
+            &format!(
+                "GET {lb_html_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status503, 503, "{head503}");
+        assert_raw_security_headers(&head503, Some("application/json"));
+
+        // Aborted body mid-stream on loopback: pre-abort headers carry sandbox CSP, nosniff, and
+        // text/plain, and the connection aborts strictly before Content-Length with no error HTML.
+        *lb_backend.fault.lock().unwrap() = MockStreamFault::None;
+        let lb_large_html = lb
+            .mint_url("tower", "/home/me/evil-large.html", false)
+            .await
+            .unwrap();
+        let lb_large_path = lb_large_html
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        *lb_backend.fault.lock().unwrap() = MockStreamFault::TruncateAfterBytes(70 * 1024);
+        let (status_abort, head_abort, body_abort) = raw_http(
+            port,
+            &format!(
+                "GET {lb_large_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        *lb_backend.fault.lock().unwrap() = MockStreamFault::None;
+        assert_eq!(status_abort, 200, "{head_abort}");
+        assert_raw_security_headers(&head_abort, Some("text/plain; charset=utf-8"));
+        assert!(
+            body_abort.len() < large_html.len(),
+            "aborted loopback body must terminate early ({} vs {})",
+            body_abort.len(),
+            large_html.len()
+        );
         lb.shutdown();
 
         // 2) Custom-scheme mount (Android).
         let cs_backend = Arc::new(MockContentBackend::new(files));
-        let cs = Arc::new(AppContentServer::with_config(
-            cs_backend,
+        let cs = Arc::new(AppContentServer::with_limits(
+            Arc::clone(&cs_backend) as Arc<dyn Backend>,
             ContentMountMode::CustomScheme,
             TicketConfig::default(),
             Duration::from_secs(30),
             vec!["http://tauri.localhost".to_owned()],
+            MAX_LOOPBACK_CONNECTIONS,
+            LOOPBACK_HEADER_READ_TIMEOUT,
+            1024,
+            64 * 1024,
         ));
         let cs_html = cs
             .mint_url("tower", "/home/me/evil.html", false)
@@ -2157,6 +2464,9 @@ mod tests {
             .mint_url("tower", "/home/me/evil.svg", false)
             .await
             .unwrap();
+
+        // 200 OK & 206 Partial Content for both HTML and SVG.
+        let mut cs_html_etag = HeaderValue::from_static("");
         for (url, expected_ct) in [
             (&cs_html.url, "text/plain; charset=utf-8"),
             (&cs_svg.url, "image/svg+xml"),
@@ -2168,16 +2478,199 @@ mod tests {
                 .unwrap();
             let resp = cs.handle_custom_scheme(req).await;
             assert_eq!(resp.status(), StatusCode::OK);
-            assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), expected_ct);
-            assert_eq!(
-                resp.headers().get(X_CONTENT_TYPE_OPTIONS).unwrap(),
-                "nosniff"
-            );
-            assert_eq!(
-                resp.headers().get(CONTENT_SECURITY_POLICY).unwrap(),
-                CONTENT_SANDBOX_CSP
-            );
+            assert_response_security_headers(&resp, Some(expected_ct));
+            if url == &cs_html.url {
+                cs_html_etag = resp.headers().get(http::header::ETAG).unwrap().clone();
+            }
+
+            let req206 = Request::builder()
+                .method(Method::GET)
+                .uri(url)
+                .header(RANGE, "bytes=0-7")
+                .body(Vec::new())
+                .unwrap();
+            let resp206 = cs.handle_custom_scheme(req206).await;
+            assert_eq!(resp206.status(), StatusCode::PARTIAL_CONTENT);
+            assert_response_security_headers(&resp206, Some(expected_ct));
         }
+
+        // Conditional If-None-Match on custom scheme -> 200 OK (no 304, no-store preserved).
+        let req_cond = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .header("if-none-match", cs_html_etag)
+            .body(Vec::new())
+            .unwrap();
+        let resp_cond = cs.handle_custom_scheme(req_cond).await;
+        assert_eq!(resp_cond.status(), StatusCode::OK);
+        assert_response_security_headers(&resp_cond, Some("text/plain; charset=utf-8"));
+
+        // 403, 421, 405, 404 on custom scheme.
+        let req403 = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .header("origin", "https://evil.example")
+            .body(Vec::new())
+            .unwrap();
+        let resp403 = cs.handle_custom_scheme(req403).await;
+        assert_eq!(resp403.status(), StatusCode::FORBIDDEN);
+        assert_response_security_headers(&resp403, Some("application/json"));
+
+        let req421 = Request::builder()
+            .method(Method::GET)
+            .uri("http://evil.example/v1/content/tok/evil.html")
+            .body(Vec::new())
+            .unwrap();
+        let resp421 = cs.handle_custom_scheme(req421).await;
+        assert_eq!(resp421.status(), StatusCode::MISDIRECTED_REQUEST);
+        assert_response_security_headers(&resp421, Some("application/json"));
+
+        let req405 = Request::builder()
+            .method(Method::POST)
+            .uri(&cs_html.url)
+            .body(Vec::new())
+            .unwrap();
+        let resp405 = cs.handle_custom_scheme(req405).await;
+        assert_eq!(resp405.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_response_security_headers(&resp405, Some("application/json"));
+
+        for bad_uri in [
+            "http://legion-content.localhost/v1/content/doesnotexist/evil.html",
+            "http://legion-content.localhost/not-content/evil.html",
+        ] {
+            let req404 = Request::builder()
+                .method(Method::GET)
+                .uri(bad_uri)
+                .body(Vec::new())
+                .unwrap();
+            let resp404 = cs.handle_custom_scheme(req404).await;
+            assert_eq!(resp404.status(), StatusCode::NOT_FOUND);
+            assert_response_security_headers(&resp404, Some("application/json"));
+        }
+
+        // 413 Payload Too Large on custom scheme (max_full_bytes = 8 < html_bytes.len()).
+        let cs_small = Arc::new(AppContentServer::with_limits(
+            Arc::clone(&cs_backend) as Arc<dyn Backend>,
+            ContentMountMode::CustomScheme,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+            MAX_LOOPBACK_CONNECTIONS,
+            LOOPBACK_HEADER_READ_TIMEOUT,
+            8,
+            64 * 1024,
+        ));
+        let cs_small_html = cs_small
+            .mint_url("tower", "/home/me/evil.html", false)
+            .await
+            .unwrap();
+        let req413 = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_small_html.url)
+            .body(Vec::new())
+            .unwrap();
+        let resp413 = cs_small.handle_custom_scheme(req413).await;
+        assert_eq!(resp413.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_response_security_headers(&resp413, Some("application/json"));
+
+        // 416 Range Not Satisfiable on custom scheme.
+        let req416 = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .header(RANGE, "bytes=99999-")
+            .body(Vec::new())
+            .unwrap();
+        let resp416 = cs.handle_custom_scheme(req416).await;
+        assert_eq!(resp416.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_response_security_headers(&resp416, None);
+
+        // 429 Too Many Requests on custom scheme (saturate holder permits).
+        let mut cs_held = Vec::new();
+        for idx in 0u8..64 {
+            let mut key_hash = [0xBBu8; 32];
+            key_hash[0] = idx;
+            match cs.limiter.try_acquire(key_hash, "pairing:tower:1") {
+                Ok(permit) => cs_held.push(permit),
+                Err(_) => break,
+            }
+        }
+        let req429 = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .body(Vec::new())
+            .unwrap();
+        let resp429 = cs.handle_custom_scheme(req429).await;
+        drop(cs_held);
+        assert_eq!(resp429.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_response_security_headers(&resp429, Some("application/json"));
+
+        // 502 Bad Gateway (upstream unreachable) & 503 Service Unavailable (upstream busy).
+        *cs_backend.fault.lock().unwrap() = MockStreamFault::ErrorOnGet {
+            code: ProtoCode::Unreachable,
+            message: "machine unreachable",
+        };
+        let req502 = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .body(Vec::new())
+            .unwrap();
+        let resp502 = cs.handle_custom_scheme(req502).await;
+        assert_eq!(resp502.status(), StatusCode::BAD_GATEWAY);
+        assert_response_security_headers(&resp502, Some("application/json"));
+
+        *cs_backend.fault.lock().unwrap() = MockStreamFault::ErrorOnGet {
+            code: ProtoCode::Busy,
+            message: "all stream slots busy",
+        };
+        let req503 = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .body(Vec::new())
+            .unwrap();
+        let resp503 = cs.handle_custom_scheme(req503).await;
+        assert_eq!(resp503.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_response_security_headers(&resp503, Some("application/json"));
+
+        // Aborted body on custom scheme -> 502 Bad Gateway (EOF/I/O error) and 410 Gone
+        // (PermissionDenied / evicted parked stream), both carrying full security headers.
+        *cs_backend.fault.lock().unwrap() = MockStreamFault::TruncateAfterBytes(10);
+        let req_abort = Request::builder()
+            .method(Method::GET)
+            .uri(&cs_html.url)
+            .body(Vec::new())
+            .unwrap();
+        let resp_abort = cs.handle_custom_scheme(req_abort).await;
+        *cs_backend.fault.lock().unwrap() = MockStreamFault::None;
+        assert_eq!(resp_abort.status(), StatusCode::BAD_GATEWAY);
+        assert_response_security_headers(&resp_abort, Some("application/json"));
+
+        // 410 Gone on custom scheme when a parked stream is evicted mid-body.
+        struct EvictedReader;
+        impl tokio::io::AsyncRead for EvictedReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Content stream was closed while idle.",
+                )))
+            }
+        }
+        let budget = Arc::new(tokio::sync::Semaphore::new(16));
+        let buffered = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let resp410 = collect_bounded_response(
+            Response::new(ContentBody::stream(Box::new(EvictedReader), 64)),
+            1024,
+            &budget,
+            &buffered,
+            &peak,
+        )
+        .await;
+        assert_eq!(resp410.status(), StatusCode::GONE);
+        assert_response_security_headers(&resp410, Some("application/json"));
     }
 
     async fn read_http_head_and_prefix(
